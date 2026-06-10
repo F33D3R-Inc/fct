@@ -2,7 +2,7 @@
 
 All notable changes. Pre-1.0: minor versions may break.
 
-## Unreleased
+## v0.11.0
 
 ### Language & compiler
 - **The full primitive taxonomy now compiles.** The parser accepts all 8
