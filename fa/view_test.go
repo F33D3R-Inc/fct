@@ -131,3 +131,29 @@ func TestParseViewHandlesRealMarkup(t *testing.T) {
 		t.Errorf("button children: want 1 icon + 1 'Play' text, got icons=%d texts=%d (%+v)", icons, texts, btn.Children)
 	}
 }
+
+// The server resolves layout/style so native clients render exactly, not by
+// guessing from class names: a row container reports direction=row; an inline
+// width and a button's design-system style come through structured.
+func TestStyleResolution(t *testing.T) {
+	// A known stdlib row container.
+	row, _ := ParseView(`<div class="fa-row"><span>a</span></div>`)
+	if row.Style == nil || row.Style.Direction != "row" {
+		t.Errorf("fa-row should resolve direction=row, got %+v", row.Style)
+	}
+	// Inline width (e.g. a progress fill) parses to a structured width.
+	bar, _ := ParseView(`<span class="fa-progress__fill" style="width:30%"></span>`)
+	if bar.Style == nil || bar.Style.Width != "30%" {
+		t.Errorf("inline width not resolved, got %+v", bar.Style)
+	}
+	// A primary button carries its design-system paint + shape.
+	btn, _ := ParseView(`<button class="fa-btn fa-btn--primary" data-action="x">Go</button>`)
+	if btn.Style == nil || btn.Style.BG != "#1d9bf0" || btn.Style.Radius != 999 || btn.Style.FontWeight != 600 {
+		t.Errorf("button style not resolved, got %+v", btn.Style)
+	}
+	// A plain element with no style info stays nil (clients use defaults).
+	plain, _ := ParseView(`<div></div>`)
+	if plain.Style != nil {
+		t.Errorf("plain div should have no style, got %+v", plain.Style)
+	}
+}

@@ -73,6 +73,7 @@ runtime/
   fa-runtime.js     the fixed ~8 KB web client runtime
   runtime.go        embeds it
 clients/swift/      FacetKit — the SwiftUI (iOS/macOS) native client runtime
+clients/android/    FacetKit — the Jetpack Compose (Android) native client runtime
 examples/demo/      the reference app (same machinery as a scaffold)
 DECISIONS.md        ADR log — the "why"
 ```
@@ -414,23 +415,35 @@ renders this to DOM; a Swift runtime renders it to UIKit/SwiftUI; a Kotlin runti
 renders it to Jetpack Compose — all consuming the same SSE protocol and posting to
 the same `/events`. **State and logic stay on the server for every platform.**
 
-**iOS / macOS is built:** `clients/swift` is **FacetKit**, the SwiftUI client
-runtime — it loads a route as a neutral tree (`FA-Native: 1`), renders it to native
-views (`box→VStack/HStack`, `text→Text`, `button→Button`, `image→AsyncImage`, …),
-holds the SSE connection, applies surgical updates by `facetId`, and forwards taps
-to `/events`. A whole iOS app is:
+**iOS and Android are built.** Two native client runtimes consume the same wire
+protocol:
+
+- `clients/swift` — **FacetKit** (SwiftUI): `FacetScreen(client:route:)` is a whole app.
+- `clients/android` — **FacetKit** (Jetpack Compose): `FacetScreen(client, route)` is a whole app.
 
 ```swift
+// iOS
 struct ContentView: View {
     @StateObject var client = FacetClient(baseURL: URL(string: "https://app.example.com")!)
     var body: some View { FacetScreen(client: client, route: "/") }
 }
 ```
 
-Built and tested: the server-side neutral tree (`RenderTree`/`ParseView`, proven on
-the real stdlib) **and** the Swift client (model, HTML→tree parser, SSE, surgical
-updates, SwiftUI renderer; tests mirror the Go parser). Next: an explicit
-server-driven style/layout model, and the Android/Compose sibling client.
+Both load a route as a neutral tree (`FA-Native: 1`), render it to native views,
+hold the SSE connection, apply surgical updates by `facetId`, and forward taps to
+`/events` — **zero app logic on device**.
+
+**Layout is server-driven, not guessed.** The server resolves each node's
+`Style` (`direction`/`gap`/`pad`/`align` + `bg`/`fg`/`fontWeight`/`radius`) from
+inline styles and a design-system class table (`fa/style.go`), so native renderers
+lay out exactly. Live SSE fragments are re-resolved on-device through a kept-in-sync
+mirror so updates match.
+
+Built and tested: the server-side neutral tree + style model (`RenderTree`,
+`ParseView`, `Style`; proven on the real stdlib) and both client runtimes (model,
+HTML→tree parser, on-device style resolver, SSE, surgical updates, native renderer;
+unit tests mirror the Go parser). Roadmap: push already-styled trees over SSE
+(single source of truth), HMAC event verification on native.
 
 ---
 

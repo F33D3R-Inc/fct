@@ -24,6 +24,7 @@ type ViewNode struct {
 	Text     string            `json:"text,omitempty"`    // text content (for kind "text")
 	FacetID  string            `json:"facetId,omitempty"` // data-facet-id (surgical update target)
 	Action   string            `json:"action,omitempty"`  // data-action (tap/click → event)
+	Style    *Style            `json:"style,omitempty"`   // server-resolved layout + appearance
 	Children []*ViewNode       `json:"children,omitempty"`
 }
 
@@ -261,6 +262,7 @@ func nodeFromTag(name string, attrs map[string]string) *ViewNode {
 	if v, ok := attrs["data-action"]; ok {
 		n.Action = v
 	}
+	n.Style = resolveStyle(name, attrs)
 	return n
 }
 

@@ -148,6 +148,7 @@ public enum FacetHTMLParser {
             if !attrs.isEmpty { n.attrs = attrs }
             n.facetId = attrs["data-facet-id"]
             n.action = attrs["data-action"]
+            n.style = StyleResolver.resolve(tag: name, attrs: attrs)
             return n
         }
 

@@ -14,6 +14,7 @@ public struct ViewNode: Codable, Equatable {
     public var text: String?
     public var facetId: String?
     public var action: String?
+    public var style: Style?
     public var children: [ViewNode]?
 
     public init(kind: String,
@@ -22,6 +23,7 @@ public struct ViewNode: Codable, Equatable {
                 text: String? = nil,
                 facetId: String? = nil,
                 action: String? = nil,
+                style: Style? = nil,
                 children: [ViewNode]? = nil) {
         self.kind = kind
         self.tag = tag
@@ -29,6 +31,7 @@ public struct ViewNode: Codable, Equatable {
         self.text = text
         self.facetId = facetId
         self.action = action
+        self.style = style
         self.children = children
     }
 
@@ -80,6 +83,25 @@ public struct ViewNode: Codable, Equatable {
             .map { $0.removingFacet(id) }
         return copy
     }
+}
+
+/// Style is the server-resolved, platform-neutral layout + appearance of a node
+/// (the Swift mirror of Go's `fa.Style`). The renderer reads this instead of
+/// guessing from class names — direction/gap/pad/align drive the stack; bg/fg/
+/// fontWeight/radius drive the paint.
+public struct Style: Codable, Equatable {
+    public var direction: String?
+    public var gap: Int?
+    public var pad: Int?
+    public var align: String?
+    public var justify: String?
+    public var grow: Bool?
+    public var width: String?
+    public var bg: String?
+    public var fg: String?
+    public var fontSize: Int?
+    public var fontWeight: Int?
+    public var radius: Int?
 }
 
 /// The JSON a route returns to a native client (`FA-Native: 1`): the screen title
