@@ -2,6 +2,24 @@
 
 All notable changes. Pre-1.0: minor versions may break.
 
+## Unreleased
+
+### Language & compiler
+- **The full primitive taxonomy now compiles.** The parser accepts all 8
+  primitives (`facet`/`feed`/`stream`/`lifecycle`/`pipe`/`vault`/`media`/`signal`)
+  with their per-kind blocks (`order`/`throttle`/`window`/`states`/`ttl`,
+  `decrypt:`/`source:`), each type-checking its `what:` contract and emitting the
+  right artifacts. An unknown primitive or a block on the wrong kind is a compile
+  error that names the fix.
+- **Structural guarantee enforced:** client-rendered kinds (`vault`/`media`/
+  `signal`) emit **zero server template** — `looks:` on them is rejected, codegen
+  produces no `.tmpl.html`, and the manifest carries the client render body
+  instead. A compromised server has nothing to render vault plaintext with.
+- Manifest gains `kind` plus per-primitive fields (`order`/`throttle`/`window`/
+  `ttl`/`states`/`client`). Typed `<Kind>Data` structs are emitted for every kind.
+- Note: per-primitive **runtime** semantics (ranking, windowing, client-side
+  decrypt, binary delivery, ephemeral relay) are staged for the next round.
+
 ## v0.10.1
 
 ### Fixed

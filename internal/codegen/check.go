@@ -22,6 +22,11 @@ func checkFieldRefs(facets []*ast.Facet) error {
 		for _, fl := range f.Fields {
 			declared[fl.Name] = true
 		}
+		// Only server-rendered bodies (looks:) are field-checked against what:.
+		// A client body (vault decrypt: / media source:) legitimately references
+		// values the client runtime produces — decrypted plaintext, player state —
+		// which are NOT what: props (what: holds the encrypted envelope), so the
+		// data-contract check does not apply there.
 		if err := checkNodeRefs(f.Name, f.Looks, declared, nil); err != nil {
 			return err
 		}

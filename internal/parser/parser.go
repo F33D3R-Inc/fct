@@ -92,15 +92,15 @@ func (p *parser) expectLine(what string) (lexer.Token, error) {
 // ── facet skeleton ──────────────────────────────────────────────────────────
 
 func (p *parser) parseFacet() (*ast.Facet, error) {
-	hdr, err := p.expectLine("`facet <Name>:`")
+	hdr, err := p.expectLine("`<primitive> <Name>:`")
 	if err != nil {
 		return nil, err
 	}
-	name, err := parseFacetHeader(hdr)
+	kind, name, err := parsePrimitiveHeader(hdr)
 	if err != nil {
 		return nil, err
 	}
-	f := &ast.Facet{Name: name, Pos: ast.Pos{Line: hdr.Line, Col: hdr.Col}}
+	f := &ast.Facet{Kind: kind, Name: name, Pos: ast.Pos{Line: hdr.Line, Col: hdr.Col}}
 
 	if _, err := p.expect(lexer.INDENT, "indented facet body"); err != nil {
 		return nil, err
@@ -118,9 +118,81 @@ func (p *parser) parseFacet() (*ast.Facet, error) {
 				return nil, err
 			}
 		case head == "looks:":
+			if !f.ServerRendered() {
+				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`looks:` is not allowed on a %s — it renders on the client; use %s", f.Kind, clientBlockHint(f.Kind))}
+			}
 			if err := p.parseLooks(f); err != nil {
 				return nil, err
 			}
+		case head == "decrypt:":
+			if f.Kind != "vault" {
+				return nil, &perr{t.Line, t.Col, "`decrypt:` is only valid in a vault (client-side render of decrypted content)"}
+			}
+			if err := p.parseClientBody(f); err != nil {
+				return nil, err
+			}
+		case head == "source:":
+			if f.Kind != "media" {
+				return nil, &perr{t.Line, t.Col, "`source:` is only valid in a media primitive"}
+			}
+			if err := p.parseClientBody(f); err != nil {
+				return nil, err
+			}
+		case strings.HasPrefix(head, "order:"):
+			if f.Kind != "feed" {
+				return nil, &perr{t.Line, t.Col, "`order:` is only valid in a feed"}
+			}
+			v := strings.TrimSpace(strings.TrimPrefix(head, "order:"))
+			if v == "" {
+				return nil, &perr{t.Line, t.Col, "order: requires a field or expression"}
+			}
+			f.Order = v
+			p.next()
+		case strings.HasPrefix(head, "throttle:"):
+			if f.Kind != "stream" && f.Kind != "pipe" {
+				return nil, &perr{t.Line, t.Col, "`throttle:` is only valid in a stream or pipe"}
+			}
+			v := strings.TrimSpace(strings.TrimPrefix(head, "throttle:"))
+			if v == "" {
+				return nil, &perr{t.Line, t.Col, "throttle: requires a duration (e.g. 200ms)"}
+			}
+			f.Throttle = v
+			p.next()
+		case strings.HasPrefix(head, "window:"):
+			if f.Kind != "stream" {
+				return nil, &perr{t.Line, t.Col, "`window:` is only valid in a stream"}
+			}
+			v := strings.TrimSpace(strings.TrimPrefix(head, "window:"))
+			if v == "" {
+				return nil, &perr{t.Line, t.Col, "window: requires a count"}
+			}
+			f.Window = v
+			p.next()
+		case strings.HasPrefix(head, "ttl:"):
+			if f.Kind != "signal" {
+				return nil, &perr{t.Line, t.Col, "`ttl:` is only valid in a signal"}
+			}
+			v := strings.TrimSpace(strings.TrimPrefix(head, "ttl:"))
+			if v == "" {
+				return nil, &perr{t.Line, t.Col, "ttl: requires a duration (e.g. 5s)"}
+			}
+			f.TTL = v
+			p.next()
+		case strings.HasPrefix(head, "states:"):
+			if f.Kind != "lifecycle" {
+				return nil, &perr{t.Line, t.Col, "`states:` is only valid in a lifecycle"}
+			}
+			states := splitList(strings.TrimPrefix(head, "states:"))
+			if len(states) == 0 {
+				return nil, &perr{t.Line, t.Col, "states: requires at least one state name"}
+			}
+			for _, s := range states {
+				if !isIdent(s) {
+					return nil, &perr{t.Line, t.Col, fmt.Sprintf("invalid state name %q", s)}
+				}
+			}
+			f.States = states
+			p.next()
 		case head == "when" || strings.HasPrefix(head, "when "):
 			if err := p.parseWhen(f); err != nil {
 				return nil, err
@@ -160,19 +232,55 @@ func (p *parser) parseFacet() (*ast.Facet, error) {
 	return f, nil
 }
 
-func parseFacetHeader(t lexer.Token) (string, error) {
+// primitiveKinds is the canonical taxonomy (README). The parser accepts a header
+// led by any of these; anything else is a teaching error.
+var primitiveKinds = map[string]bool{
+	"facet": true, "feed": true, "stream": true, "lifecycle": true,
+	"pipe": true, "vault": true, "media": true, "signal": true,
+}
+
+// parsePrimitiveHeader parses `<kind> <Name>:` and returns the kind and name.
+func parsePrimitiveHeader(t lexer.Token) (kind, name string, err error) {
 	s := strings.TrimSuffix(t.Text, ":")
 	if s == t.Text {
-		return "", &perr{t.Line, t.Col, "facet header must end with ':'"}
+		return "", "", &perr{t.Line, t.Col, "primitive header must end with ':'"}
 	}
 	parts := strings.Fields(s)
-	if len(parts) != 2 || parts[0] != "facet" {
-		return "", &perr{t.Line, t.Col, "expected `facet <Name>:`"}
+	if len(parts) != 2 {
+		return "", "", &perr{t.Line, t.Col, "expected `<primitive> <Name>:` (e.g. `facet Card:`)"}
+	}
+	if !primitiveKinds[parts[0]] {
+		return "", "", &perr{t.Line, t.Col, fmt.Sprintf("unknown primitive %q; expected one of facet, feed, stream, lifecycle, pipe, vault, media, signal", parts[0])}
 	}
 	if !isIdent(parts[1]) {
-		return "", &perr{t.Line, t.Col, fmt.Sprintf("invalid facet name %q", parts[1])}
+		return "", "", &perr{t.Line, t.Col, fmt.Sprintf("invalid %s name %q", parts[0], parts[1])}
 	}
-	return parts[1], nil
+	return parts[0], parts[1], nil
+}
+
+// clientBlockHint names the render block a client-rendered kind uses instead of
+// looks:, for a helpful error.
+func clientBlockHint(kind string) string {
+	switch kind {
+	case "vault":
+		return "`decrypt:` (rendered in the browser after client-side decryption)"
+	case "media":
+		return "`source:` (the runtime owns the player)"
+	case "signal":
+		return "no render block — a signal relays its `what:` payload to peers"
+	}
+	return "the kind's client block"
+}
+
+// splitList splits a comma- or whitespace-separated list (e.g. lifecycle states).
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parseFacetIDLine(t lexer.Token) (string, error) {
@@ -346,9 +454,34 @@ type rawLine struct {
 }
 
 func (p *parser) parseLooks(f *ast.Facet) error {
-	p.next() // consume `looks:`
-	if _, err := p.expect(lexer.INDENT, "indented looks block"); err != nil {
+	nodes, err := p.parseRenderBody("looks")
+	if err != nil {
 		return err
+	}
+	f.Looks = nodes
+	return nil
+}
+
+// parseClientBody parses a `decrypt:` (vault) or `source:` (media) block into
+// f.Client. It uses the exact same body grammar as looks: ({expr} holes, control
+// lines, child facets) — but codegen never lowers it to a server template, so the
+// content is rendered only on the client.
+func (p *parser) parseClientBody(f *ast.Facet) error {
+	nodes, err := p.parseRenderBody("client render")
+	if err != nil {
+		return err
+	}
+	f.Client = nodes
+	return nil
+}
+
+// parseRenderBody consumes the current block header (looks:/decrypt:/source:) and
+// its indented body, returning the flat render node stream. The two render blocks
+// share one grammar; only where the result lands (Looks vs Client) differs.
+func (p *parser) parseRenderBody(what string) ([]ast.Node, error) {
+	p.next() // consume the block header
+	if _, err := p.expect(lexer.INDENT, "indented "+what+" block"); err != nil {
+		return nil, err
 	}
 	// Collect raw lines until the matching DEDENT, flattening any nested
 	// INDENT/DEDENT that HTML line-wraps or control bodies produced.
@@ -365,12 +498,7 @@ func (p *parser) parseLooks(f *ast.Facet) error {
 			lines = append(lines, rawLine{indent: t.Col - 1, text: t.Text, line: t.Line})
 		}
 	}
-	nodes, err := parseLooksLines(lines)
-	if err != nil {
-		return err
-	}
-	f.Looks = nodes
-	return nil
+	return parseLooksLines(lines)
 }
 
 // parseLooksLines builds the flat node stream from collected looks lines.

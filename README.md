@@ -13,17 +13,26 @@ truth; UI is a live projection of it, pushed over SSE.
 
 ---
 
-## Status — walking skeleton, proven end to end
+## Status — proven end to end
 
-One primitive (`facet`) works through the entire pipeline, and a scaffolded
-project boots a live page out of the box.
+The `facet` pipeline works through to a live page, a scaffolded project boots out
+of the box, and the rest of the primitive taxonomy now compiles.
 
 | Stage | State |
 |---|---|
 | Lexer → Parser → Codegen → Client runtime | ✅ working for `facet` |
 | `fa` server library (SSE hub, HMAC-signed events, event router) | ✅ |
 | Playground (the page base) + `fct new` scaffold + `fct dev` | ✅ |
-| Other 7 primitives, child-facet composition, typed codegen | ⬜ not built |
+| Child-facet composition (`<Avatar/>` + `slot:`) | ✅ |
+| Typed codegen (`<Facet>Data` structs, idiomatic initialisms) | ✅ |
+| All 8 primitives — parser + codegen + manifest surface | ✅ |
+| Per-primitive **runtime** semantics (feed ranking, stream window, vault decrypt, …) | ⬜ staged |
+
+The other 7 primitives are accepted by the compiler: each parses, type-checks its
+`what:` contract, and emits the right artifacts — crucially, the client-rendered
+kinds (`vault`/`media`/`signal`) emit **zero server template** (the structural
+guarantee). Their per-primitive *runtime behavior* (ranking, windowing, client-side
+decrypt, binary delivery, ephemeral relay) is the next build phase.
 
 Verified loop: `fct new` → `go run .` → a page with the Playground, a `Home`
 facet and a live `LikeButton`; clicking it POSTs to one `/events` endpoint, the
@@ -125,9 +134,29 @@ DECISIONS.md        ADR log — the "why"
 
 ## The language (FDL v0)
 
-v0 accepts exactly the `facet` primitive. Anything outside this surface is a
-**syntax error with a clear message** (we never silently ignore unsupported
-input).
+FDL accepts all 8 primitives (`facet`/`feed`/`stream`/`lifecycle`/`pipe`/`vault`/
+`media`/`signal`). They share one block set — `who`/`what`/`looks`/`when` — and
+each adds a small declarative surface of its own (below). Anything outside this is
+a **syntax error with a clear message** (we never silently ignore unsupported
+input — an unknown primitive, or a block on the wrong kind, names the fix).
+
+### Primitive-specific blocks
+
+| Kind | Renders | Extra blocks |
+|---|---|---|
+| `facet` | server | — |
+| `feed` | server | `order: <field>` |
+| `stream` | server | `throttle: <dur>`, `window: <n>` |
+| `lifecycle` | server | `states: a, b, c` |
+| `pipe` | server | `throttle: <dur>` |
+| `vault` | **client** | `decrypt:` body (no `looks:`) |
+| `media` | **client** | `source:` body (no `looks:`) |
+| `signal` | **client** | `ttl: <dur>` (relays `what:`) |
+
+Client-rendered kinds replace `looks:` with their own render/transport block and
+the compiler emits **no server template** for them — the bytes that render vault
+content never exist on the server. (Per-primitive *runtime* behavior is staged;
+see Status.)
 
 ### Lexical rules
 - UTF-8, case-sensitive.
@@ -219,7 +248,11 @@ not yet implemented — until then, concatenate rendered facets in the handler.
 
 ---
 
-## The primitive taxonomy (canonical; only `facet` is built)
+## The primitive taxonomy (canonical; all 8 compile, runtime staged)
+
+All 8 are accepted by the compiler today (parser + codegen + manifest). The
+"Server renders?" column is the architectural line the compiler **enforces**:
+client-rendered kinds emit zero server template.
 
 | Primitive  | Role                          | Server renders? |
 |------------|-------------------------------|-----------------|
@@ -621,7 +654,10 @@ broken code. `fct add` also takes a URL or a local path. Editor support:
    handle initialisms (`id` → `ID`, not `Id`).
 - ✅ **Richer expressions** — comparisons, boolean, arithmetic, method calls, literals.
 4. **Typed data + computed fields** — see #3 above (the big remaining language gap).
-5. **The next primitive** — `vault` (most architecturally distinct) or `stream`.
+5. **Primitive runtime semantics** — all 8 compile; the per-kind *behavior* is
+   the next build: feed ranking/ordering, stream `throttle`/`window` enforcement,
+   lifecycle state transitions, signal relay + TTL expiry, media binary delivery,
+   and `vault` client-side decrypt in the web + native runtimes.
 
 **Tooling / ecosystem**
 - ✅ `fct check` / `fct fmt` / `fct lsp` (editor diagnostics) / `fct add` (registry).

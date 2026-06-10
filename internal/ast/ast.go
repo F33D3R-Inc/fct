@@ -1,7 +1,11 @@
-// Package ast defines the v0 FDL syntax tree — the `facet` primitive only.
+// Package ast defines the FDL syntax tree for the whole primitive taxonomy —
+// facet/feed/stream/lifecycle/pipe (server-rendered) and vault/media/signal
+// (client-rendered), distinguished by Facet.Kind.
 //
 // Block keywords (canonical, see README.md): `who` (authorization), `what`
-// (data), `looks` (template), `when <event>` (handler; subscription is implied).
+// (data), `looks` (template; server-rendered kinds), `when <event>` (handler;
+// subscription is implied). Client-rendered kinds use `decrypt:`/`source:` bodies
+// (Facet.Client) and never compile to a server template.
 //
 // The looks/render body is represented as a FLAT stream of nodes (Text / Interp
 // / Ctrl) rather than a tree. This mirrors the Go html/template output it will
@@ -19,15 +23,59 @@ type Pos struct {
 	Col  int
 }
 
-// Facet is one `facet Name:` definition.
+// Facet is one primitive definition — `<kind> Name:`. Despite the type name, it
+// covers the whole taxonomy: Kind distinguishes facet/feed/stream/lifecycle/pipe
+// (server-rendered) from vault/media/signal (client-rendered).
 type Facet struct {
+	Kind    string // facet (default) | feed | stream | lifecycle | pipe | vault | media | signal
 	Name    string
 	FacetID string  // explicit `facet-id:` override; "" means derive
 	Who     Who     // the `who:` authorization block (zero value = public)
 	Fields  []Field // the `what:` block
-	Looks   []Node  // the `looks:` block, as a flat render stream
+	Looks   []Node  // the `looks:` block (server-rendered kinds), as a flat render stream
+	Client  []Node  // the `decrypt:`/`source:` body (client-rendered kinds); never lowered to a server template
 	Whens   []When  // the `when <event>:` handlers
-	Pos     Pos
+	// Per-kind declarative extras. Recorded in the manifest; runtime semantics are
+	// staged for a later round (this is the compiler-surface pass).
+	Order    string   // feed: ordering field/expression
+	Throttle string   // stream | pipe: min interval between pushes
+	Window   string   // stream: max retained items
+	TTL      string   // signal: time-to-live of the ephemeral value
+	States   []string // lifecycle: the state-machine states
+	Pos      Pos
+}
+
+// KindName returns the primitive kind, normalising the zero value to "facet" (so
+// an AST built without an explicit Kind — e.g. in tests — behaves as a facet).
+func (f *Facet) KindName() string {
+	if f.Kind == "" {
+		return "facet"
+	}
+	return f.Kind
+}
+
+// ServerRendered reports whether this primitive renders on the server (its body
+// compiles to an html/template). The client-rendered kinds — vault, media,
+// signal — emit ZERO server template: their content is produced in the browser,
+// which is the architectural guarantee (a compromised server cannot render vault
+// plaintext). See README "primitive taxonomy".
+func (f *Facet) ServerRendered() bool {
+	switch f.Kind {
+	case "vault", "media", "signal":
+		return false
+	default: // "", facet, feed, stream, lifecycle, pipe
+		return true
+	}
+}
+
+// RenderBody returns the active render node stream for the facet — Looks for
+// server-rendered kinds, Client for client-rendered kinds. Compiler passes that
+// are render-target-agnostic (field-ref + composition checks) walk this.
+func (f *Facet) RenderBody() []Node {
+	if f.ServerRendered() {
+		return f.Looks
+	}
+	return f.Client
 }
 
 // Who is the `who:` authorization block (audit C2). v0 uses named policies the

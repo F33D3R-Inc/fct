@@ -89,13 +89,22 @@ func Generate(facets []*ast.Facet) (*Output, error) {
 	out := &Output{Templates: make(map[string]string, len(facets)), Aux: map[string]string{}}
 	var man manifest
 	for _, f := range facets {
-		tmpl, aux, err := genTemplate(f)
-		if err != nil {
-			return nil, fmt.Errorf("facet %s: %w", f.Name, err)
-		}
-		out.Templates[f.Name] = tmpl
-		for k, v := range aux {
-			out.Aux[k] = v
+		if f.ServerRendered() {
+			tmpl, aux, err := genTemplate(f)
+			if err != nil {
+				return nil, fmt.Errorf("%s %s: %w", f.KindName(), f.Name, err)
+			}
+			out.Templates[f.Name] = tmpl
+			for k, v := range aux {
+				out.Aux[k] = v
+			}
+		} else if len(f.Looks) > 0 {
+			// Structural backstop for the taxonomy's defining guarantee: a
+			// client-rendered primitive (vault/media/signal) must emit ZERO server
+			// template. The parser already rejects looks: on these kinds; this catches
+			// any AST that slips through (so a compromised server literally cannot
+			// produce vault plaintext — there is no template to render it).
+			return nil, fmt.Errorf("%s %s: client-rendered primitives emit no server template (unexpected looks: body)", f.KindName(), f.Name)
 		}
 		man.Facets = append(man.Facets, genManifest(f))
 	}
@@ -230,7 +239,7 @@ func checkComposition(facets []*ast.Facet) error {
 	deps := make(map[string][]string, len(facets))
 	var checkErr error
 	for _, f := range facets {
-		walkChildren(f.Looks, func(ch ast.Child) {
+		walkChildren(f.RenderBody(), func(ch ast.Child) {
 			if checkErr != nil {
 				return
 			}
@@ -395,9 +404,20 @@ type manifest struct {
 }
 
 type facetEntry struct {
-	Name     string      `json:"name"`
-	FacetID  string      `json:"facet_id"`
-	Template string      `json:"template"`
+	Name    string `json:"name"`
+	Kind    string `json:"kind"`
+	FacetID string `json:"facet_id"`
+	// Server-rendered kinds carry a Template (the html/template file); client-
+	// rendered kinds (vault/media/signal) carry Client (the raw render body the
+	// browser interprets) and NO template — the structural guarantee.
+	Template string `json:"template,omitempty"`
+	Client   string `json:"client,omitempty"`
+	// Per-kind declarative extras (recorded; runtime semantics staged).
+	Order    string      `json:"order,omitempty"`
+	Throttle string      `json:"throttle,omitempty"`
+	Window   string      `json:"window,omitempty"`
+	TTL      string      `json:"ttl,omitempty"`
+	States   []string    `json:"states,omitempty"`
 	Who      *whoEntry   `json:"who,omitempty"`
 	When     []whenEntry `json:"when"`
 }
@@ -426,8 +446,18 @@ type mutationEntry struct {
 func genManifest(f *ast.Facet) facetEntry {
 	e := facetEntry{
 		Name:     f.Name,
+		Kind:     f.KindName(),
 		FacetID:  f.DerivedFacetID(),
-		Template: TemplateFileName(f.Name),
+		Order:    f.Order,
+		Throttle: f.Throttle,
+		Window:   f.Window,
+		TTL:      f.TTL,
+		States:   f.States,
+	}
+	if f.ServerRendered() {
+		e.Template = TemplateFileName(f.Name)
+	} else {
+		e.Client = clientBodyText(f.Client)
 	}
 	if f.HasWho() {
 		who := &whoEntry{Require: f.Who.Require}
@@ -444,6 +474,36 @@ func genManifest(f *ast.Facet) facetEntry {
 		e.When = append(e.When, we)
 	}
 	return e
+}
+
+// clientBodyText reconstructs a client-rendered primitive's body (decrypt:/
+// source:) as an FDL-shaped string for the manifest. Unlike server templates this
+// is NOT lowered to html/template — it is the render description the (future)
+// client runtime interprets in the browser. Storing it is safe and necessary: the
+// render logic is shipped to the client anyway (like a React component); the
+// secret is the runtime-encrypted data, which never appears here.
+func clientBodyText(nodes []ast.Node) string {
+	var b strings.Builder
+	for _, n := range nodes {
+		switch v := n.(type) {
+		case ast.Text:
+			b.WriteString(v.S)
+		case ast.Interp:
+			b.WriteString("{" + v.Expr + "}")
+		case ast.Ctrl:
+			switch v.Op {
+			case "if":
+				b.WriteString("{if " + v.Expr + "}")
+			case "for":
+				b.WriteString("{for " + v.Var + " in " + v.Iter + "}")
+			case "else":
+				b.WriteString("{else}")
+			case "end":
+				b.WriteString("{end}")
+			}
+		}
+	}
+	return b.String()
 }
 
 // ── small helpers ───────────────────────────────────────────────────────────
