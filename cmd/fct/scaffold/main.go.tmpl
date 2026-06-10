@@ -1,0 +1,97 @@
+// __MODULE__ — a Facet Architecture app.
+//
+// Everything here is wiring: compile the facets, declare what happens on each
+// client event, serve the Playground. There is no client-side framework.
+package main
+
+import (
+	"context"
+	"html/template"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"fct.dev/fa"
+)
+
+func main() {
+	// Compile every facet in facets/ at startup — no build step.
+	c, err := fa.CompileDir("facets")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Server-authoritative state (the real state lives here, not in the browser).
+	post := struct {
+		ID    string
+		Count int
+		Liked bool
+	}{ID: "p1", Count: 3}
+
+	like := func() template.HTML {
+		return c.MustRender("LikeButton", map[string]any{
+			"Post": map[string]any{"ID": post.ID}, "Count": post.Count, "Liked": post.Liked,
+		})
+	}
+
+	app := fa.New(c.Manifest)
+
+	// One handler per client event type. The client has no route table — it POSTs
+	// {type, payload} to /events and the server decides what happens.
+	app.On("post.like", func(ctx fa.Ctx) ([]fa.Event, error) {
+		if post.Liked {
+			post.Liked, post.Count = false, post.Count-1
+		} else {
+			post.Liked, post.Count = true, post.Count+1
+		}
+		return []fa.Event{{Op: "replace", FacetID: "LikeButton:post:" + post.ID, Fragment: string(like())}}, nil
+	})
+
+	mux := http.NewServeMux()
+	app.Mount(mux) // /sse, /events, /manifest.json, /fa-runtime.js
+
+	// Serve the Playground with the Home facet and a live LikeButton inside it.
+	app.HandlePage(mux, fa.ShellOptions{Title: "__MODULE__", CSS: appCSS},
+		func(r *http.Request) template.HTML {
+			return c.MustRender("Home", nil) + like()
+		})
+
+	addr := os.Getenv("FA_ADDR")
+	if addr == "" {
+		addr = "localhost:7373"
+	}
+	srv := &http.Server{Addr: addr, Handler: fa.LogRequests(mux)}
+
+	go func() {
+		log.Printf("__MODULE__ on http://%s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	// Graceful shutdown: on SIGTERM/SIGINT, drain (/readyz → 503 so the load
+	// balancer stops routing here), close SSE connections, then stop the server.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	log.Println("shutting down…")
+	app.Shutdown()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+}
+
+const appCSS template.CSS = `
+  body { font-family: system-ui, sans-serif; background:#0f1419; color:#e7e9ea;
+         display:grid; place-items:center; min-height:100vh; margin:0; }
+  .fa-home { max-width:34rem; text-align:center; }
+  .fa-home h1 { font-size:2rem; }
+  .fa-home code { background:#1d2630; padding:.1em .4em; border-radius:4px; }
+  .post-action { background:none; border:0; color:#8b98a5; cursor:pointer;
+                 font-size:18px; display:inline-flex; align-items:center; gap:8px;
+                 padding:10px 14px; border-radius:999px; }
+  .post-action--like.active { color:#f91880; }
+`
