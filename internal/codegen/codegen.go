@@ -83,6 +83,9 @@ func Generate(facets []*ast.Facet) (*Output, error) {
 	if err := checkComposition(facets); err != nil {
 		return nil, err
 	}
+	if err := checkFieldRefs(facets); err != nil {
+		return nil, err
+	}
 	out := &Output{Templates: make(map[string]string, len(facets)), Aux: map[string]string{}}
 	var man manifest
 	for _, f := range facets {

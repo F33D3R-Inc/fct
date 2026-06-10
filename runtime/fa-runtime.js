@@ -152,13 +152,52 @@
 
   function assign(dst, src) { for (var k in src) dst[k] = src[k]; return dst; }
 
+  // ── client-side navigation ───────────────────────────────────────────────
+  // A link marked data-nav is fetched as a fragment ({title, html}) and swapped
+  // into the root mount WITHOUT a page reload, so the one SSE connection and all
+  // live facets survive across pages. Falls back to a full load on any error.
+
+  function rootMount() { return document.querySelector('[data-facet-id="fa:root"]'); }
+
+  function navigate(url, push) {
+    fetch(url, { headers: { 'FA-Nav': '1' }, credentials: 'same-origin' })
+      .then(function (r) { return (r.ok || r.status === 404) ? r.json() : null; })
+      .then(function (data) {
+        if (!data) { window.location.href = url; return; }
+        var root = rootMount();
+        if (root) root.innerHTML = data.html;
+        if (data.title) document.title = data.title;
+        if (push) history.pushState({ faNav: 1 }, '', url);
+        window.scrollTo(0, 0);
+      })
+      .catch(function () { window.location.href = url; });
+  }
+
+  function wireNav() {
+    document.addEventListener('click', function (e) {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
+      var a = e.target.closest('a[data-nav]');
+      if (!a) return;
+      var href = a.getAttribute('href');
+      if (!href || href.charAt(0) === '#' || a.target === '_blank') return;
+      var u;
+      try { u = new URL(href, location.href); } catch (_) { return; }
+      if (u.origin !== location.origin) return; // same-origin only
+      e.preventDefault();
+      navigate(u.pathname + u.search, true);
+    });
+    window.addEventListener('popstate', function () {
+      navigate(location.pathname + location.search, false);
+    });
+  }
+
   function boot() {
     fetch(cfg.manifest_path)
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (m) { if (m && m.runtime) assign(cfg, m.runtime); })
       .catch(function () {})
       .then(initKey)
-      .then(function () { connectSSE(); wireActions(); });
+      .then(function () { connectSSE(); wireActions(); wireNav(); });
   }
 
   // Public API: subscribe to a channel for topic fan-out (server authorizes).

@@ -58,6 +58,10 @@ type App struct {
 	identify    func(*http.Request) string          // resolves a connection's identity
 	channelAuth func(identity, channel string) bool // channel_auth (default: deny)
 	limiter     *rateLimiter                        // per-IP /events throttle (audit H2)
+
+	routes    []*route     // URL routes (see router.go)
+	shellOpts ShellOptions // base Playground chrome for routed pages
+	notFound  PageFunc     // optional custom 404 content
 }
 
 // Option configures an App at construction (see WithSigningKey, WithBroker).

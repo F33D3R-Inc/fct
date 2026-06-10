@@ -321,6 +321,77 @@ auto-reverts.
 
 ---
 
+## Application building blocks
+
+A render model isn't a framework on its own — real apps have many URLs, logged-in
+users, validated forms, and more than one server. These are built in.
+
+### Routing (multi-page, SPA-style)
+
+`Route` registers a page at a URL pattern (`:name` captures a path parameter);
+`MountRouter` serves them. A normal load returns the full document; a `data-nav`
+link is fetched as a fragment and swapped into the page **without a reload — the
+SSE connection and every live facet survive across pages**.
+
+```go
+app.Route("/", "Home", func(rc fa.RouteCtx) template.HTML { return c.MustRender("Home", nil) })
+app.Route("/u/:handle", "Profile", func(rc fa.RouteCtx) template.HTML {
+    u := db.UserByHandle(rc.Param("handle"))
+    return c.RenderFor(rc.View(), "Profile", u) // who:-aware render
+})
+app.NotFound(func(rc fa.RouteCtx) template.HTML { return c.MustRender("NotFound", nil) })
+app.Mount(mux)                                   // /sse, /events, runtime
+app.MountRouter(mux, fa.ShellOptions{CSS: ...})  // the pages
+```
+
+A link renders client-side when marked: `<a href="/u/ada" data-nav>` (the stdlib
+nav/feed facets already emit `data-nav`).
+
+### Compile-time data safety
+
+Every identifier a facet uses in `looks:` must be declared in `what:`. A typo or a
+renamed field is a **compile error naming the facet and field** — not a blank spot
+at runtime. The compiler enforces the data contract each facet states.
+
+### Sessions & auth
+
+Signed-cookie sessions (HMAC with the app key, HttpOnly/SameSite, tamper-rejected).
+You verify credentials however you like, then record the user id:
+
+```go
+sess := app.Sessions()
+app.Identify(sess.Identity)             // logged-in user → SSE delivery identity
+// on login:  sess.Save(w, map[string]string{"uid": user.ID})
+// on logout: sess.Clear(w)
+```
+
+### Forms & validation
+
+A fluent validator that accumulates one error per field (binds to the stdlib
+`FieldError` facet):
+
+```go
+f := fa.NewForm(r)
+f.Required("email", "Email is required").Email("email", "Enter a valid email")
+f.Required("password", "Required").MinLen("password", 8, "At least 8 characters")
+if !f.Valid() { /* re-render the form facet with f.Errors */ }
+file, hdr, _ := f.File("avatar") // multipart uploads
+```
+
+### Multi-instance fan-out (production broker)
+
+A built-in, **zero-dependency** Redis-backed `Broker` (raw RESP over TCP) delivers
+events across instances. Run behind sticky load-balancing:
+
+```go
+b, _ := fa.NewRedisBroker(os.Getenv("REDIS_ADDR"))
+app := fa.New(manifest, fa.WithBroker(b), fa.WithSigningKey(key))
+```
+
+See "Running in production" for the deployment shape.
+
+---
+
 ## Standard library (`github.com/F33D3R-Inc/fct/std`)
 
 So you don't start from a blank file. **229 ready facets**, every one tested to

@@ -171,6 +171,9 @@ func TestCompositionGuards(t *testing.T) {
 func TestForLoopCodegen(t *testing.T) {
 	src := "" +
 		"facet List:\n" +
+		"    facet-id: \"List\"\n" +
+		"    what:\n" +
+		"        users: UserList\n" +
 		"    looks:\n" +
 		"        <ul>\n" +
 		"        for u in users:\n" +
