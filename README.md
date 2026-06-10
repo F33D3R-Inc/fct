@@ -390,6 +390,33 @@ app := fa.New(manifest, fa.WithBroker(b), fa.WithSigningKey(key))
 
 See "Running in production" for the deployment shape.
 
+### Beyond the browser — native iOS / Android (the renderer-neutral path)
+
+FA's client is a thin renderer of a wire protocol, not an HTML-bound web app. The
+same way React swaps `react-dom` for `react-native` under one component tree, FA
+swaps the *renderer* under one wire protocol — and goes further: **no application
+logic ships to the device at all**, so web, iOS, and Android are all thin
+renderers of one server.
+
+The keystone is `Compiled.RenderTree`, which renders a facet to a **platform-neutral
+view tree** instead of HTML:
+
+```go
+node, _ := c.RenderTree("TipButton", data)
+// → {kind:"button", action:"tip.send", facetId:"TipButton",
+//    children:[{kind:"text", text:"🪙 100"}]}
+```
+
+`kind` is abstract (`box`/`text`/`button`/`image`/`input`/`link`/`icon`), `facetId`
+still targets surgical updates, and `action` is the event a tap sends. A web client
+renders this to DOM; a Swift runtime renders it to UIKit/SwiftUI; a Kotlin runtime
+renders it to Jetpack Compose — all consuming the same SSE protocol and posting to
+the same `/events`. **State and logic stay on the server for every platform.**
+
+Built and tested today: the server-side neutral tree (`RenderTree` / `ParseView`),
+proven on the real stdlib. Next: the native client runtimes (Swift, Kotlin) that
+render the tree — platform code that lives alongside the JS runtime.
+
 ---
 
 ## Standard library (`github.com/F33D3R-Inc/fct/std`)
