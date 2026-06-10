@@ -57,7 +57,17 @@ func runNew(dir, module string) error {
 		return err
 	}
 
-	fmt.Printf("created %s\n\nnext:\n  cd %s\n  go run .\n  open http://localhost:7373\n", dir, dir)
+	// Resolve dependencies now so `go run .` works immediately (writes go.sum).
+	// Best-effort: if the developer is offline or the module isn't published yet,
+	// don't fail the scaffold — just tell them to run it themselves.
+	fmt.Printf("created %s\n", dir)
+	tidy := exec.Command("go", "mod", "tidy")
+	tidy.Dir, tidy.Stdout, tidy.Stderr = dir, os.Stderr, os.Stderr
+	if err := tidy.Run(); err != nil {
+		fmt.Printf("\nnote: `go mod tidy` failed (offline?). Run it yourself, then `go run .`\n")
+	}
+
+	fmt.Printf("\nnext:\n  cd %s\n  go run .\n  open http://localhost:7373\n", dir)
 	return nil
 }
 
