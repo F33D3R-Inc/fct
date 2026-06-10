@@ -15,6 +15,9 @@ import (
 //go:embed scaffold
 var scaffoldFS embed.FS
 
+// faModule is the framework's own module path — scaffolded apps depend on it.
+const faModule = "github.com/F33D3R-Inc/fct"
+
 // runNew writes a runnable FA project into dir with the given Go module path.
 // In .tmpl files the sentinel __MODULE__ is replaced with the module path (plain
 // string replace, so Go's own {{ }} in the templates is left untouched). The
@@ -57,14 +60,21 @@ func runNew(dir, module string) error {
 		return err
 	}
 
-	// Resolve dependencies now so `go run .` works immediately (writes go.sum).
-	// Best-effort: if the developer is offline or the module isn't published yet,
-	// don't fail the scaffold — just tell them to run it themselves.
+	// Pin the framework to the newest release and resolve deps now, so the project
+	// starts current and `go run .` works immediately (writes go.sum). Best-effort:
+	// if the developer is offline or the module isn't published yet, don't fail the
+	// scaffold — just tell them to run it themselves.
 	fmt.Printf("created %s\n", dir)
+	get := exec.Command("go", "get", faModule+"@latest")
+	get.Dir, get.Stdout, get.Stderr = dir, os.Stderr, os.Stderr
+	tidyOK := get.Run() == nil
 	tidy := exec.Command("go", "mod", "tidy")
 	tidy.Dir, tidy.Stdout, tidy.Stderr = dir, os.Stderr, os.Stderr
-	if err := tidy.Run(); err != nil {
-		fmt.Printf("\nnote: `go mod tidy` failed (offline?). Run it yourself, then `go run .`\n")
+	if tidy.Run() != nil {
+		tidyOK = false
+	}
+	if !tidyOK {
+		fmt.Printf("\nnote: resolving dependencies failed (offline?). Run `go mod tidy` yourself, then `go run .`\n")
 	}
 
 	fmt.Printf("\nnext:\n  cd %s\n  go run .\n  open http://localhost:7373\n", dir)
