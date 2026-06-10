@@ -70,8 +70,9 @@ fa/                 SERVER runtime library (imported by every FA app)
   event.go          Event + HMAC signing
   shell.go          the Playground (fa.Shell) — the page base canvas
 runtime/
-  fa-runtime.js     the fixed ~8 KB client runtime
+  fa-runtime.js     the fixed ~8 KB web client runtime
   runtime.go        embeds it
+clients/swift/      FacetKit — the SwiftUI (iOS/macOS) native client runtime
 examples/demo/      the reference app (same machinery as a scaffold)
 DECISIONS.md        ADR log — the "why"
 ```
@@ -413,9 +414,23 @@ renders this to DOM; a Swift runtime renders it to UIKit/SwiftUI; a Kotlin runti
 renders it to Jetpack Compose — all consuming the same SSE protocol and posting to
 the same `/events`. **State and logic stay on the server for every platform.**
 
-Built and tested today: the server-side neutral tree (`RenderTree` / `ParseView`),
-proven on the real stdlib. Next: the native client runtimes (Swift, Kotlin) that
-render the tree — platform code that lives alongside the JS runtime.
+**iOS / macOS is built:** `clients/swift` is **FacetKit**, the SwiftUI client
+runtime — it loads a route as a neutral tree (`FA-Native: 1`), renders it to native
+views (`box→VStack/HStack`, `text→Text`, `button→Button`, `image→AsyncImage`, …),
+holds the SSE connection, applies surgical updates by `facetId`, and forwards taps
+to `/events`. A whole iOS app is:
+
+```swift
+struct ContentView: View {
+    @StateObject var client = FacetClient(baseURL: URL(string: "https://app.example.com")!)
+    var body: some View { FacetScreen(client: client, route: "/") }
+}
+```
+
+Built and tested: the server-side neutral tree (`RenderTree`/`ParseView`, proven on
+the real stdlib) **and** the Swift client (model, HTML→tree parser, SSE, surgical
+updates, SwiftUI renderer; tests mirror the Go parser). Next: an explicit
+server-driven style/layout model, and the Android/Compose sibling client.
 
 ---
 

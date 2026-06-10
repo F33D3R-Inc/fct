@@ -1,0 +1,90 @@
+import Foundation
+
+/// ViewNode is the platform-neutral UI element the FA server emits (the Swift
+/// mirror of Go's `fa.ViewNode`). A tree of these is everything the client needs
+/// to render a screen natively — no HTML, no WebView.
+///
+/// `kind` is abstract: `box` (a layout container), `text`, `button`, `image`,
+/// `input`, `link`, `icon`. `facetId` identifies the node for surgical updates;
+/// `action` is the event a tap sends back to the server.
+public struct ViewNode: Codable, Equatable {
+    public var kind: String
+    public var tag: String?
+    public var attrs: [String: String]?
+    public var text: String?
+    public var facetId: String?
+    public var action: String?
+    public var children: [ViewNode]?
+
+    public init(kind: String,
+                tag: String? = nil,
+                attrs: [String: String]? = nil,
+                text: String? = nil,
+                facetId: String? = nil,
+                action: String? = nil,
+                children: [ViewNode]? = nil) {
+        self.kind = kind
+        self.tag = tag
+        self.attrs = attrs
+        self.text = text
+        self.facetId = facetId
+        self.action = action
+        self.children = children
+    }
+
+    /// The data-* payload a tap carries back (every data-* attribute except the
+    /// reserved action / facet-id / fa-* ones) — mirrors the web runtime.
+    public var actionPayload: [String: String] {
+        var out: [String: String] = [:]
+        for (k, v) in attrs ?? [:] where k.hasPrefix("data-") {
+            let name = String(k.dropFirst("data-".count))
+            if name == "action" || name == "facet-id" || name.hasPrefix("fa-") { continue }
+            out[name] = v
+        }
+        return out
+    }
+
+    /// A CSS class token test, used by the renderer for layout heuristics.
+    public func hasClass(_ token: String) -> Bool {
+        (attrs?["class"] ?? "").split(separator: " ").contains { $0 == Substring(token) }
+    }
+
+    // MARK: - Surgical tree updates (mirror the web runtime's DOM ops)
+
+    /// Returns a copy of the tree with the node identified by `facetId` replaced.
+    public func replacingFacet(_ id: String, with newNode: ViewNode) -> ViewNode {
+        if facetId == id { return newNode }
+        var copy = self
+        copy.children = children?.map { $0.replacingFacet(id, with: newNode) }
+        return copy
+    }
+
+    /// Returns a copy with `child` appended/prepended to the node `facetId`.
+    public func insertingChild(into id: String, _ child: ViewNode, prepend: Bool) -> ViewNode {
+        var copy = self
+        if facetId == id {
+            var kids = copy.children ?? []
+            if prepend { kids.insert(child, at: 0) } else { kids.append(child) }
+            copy.children = kids
+            return copy
+        }
+        copy.children = children?.map { $0.insertingChild(into: id, child, prepend: prepend) }
+        return copy
+    }
+
+    /// Returns a copy with the node `facetId` removed.
+    public func removingFacet(_ id: String) -> ViewNode {
+        var copy = self
+        copy.children = children?
+            .filter { $0.facetId != id }
+            .map { $0.removingFacet(id) }
+        return copy
+    }
+}
+
+/// The JSON a route returns to a native client (`FA-Native: 1`): the screen title
+/// and its neutral view tree.
+public struct ScreenResponse: Codable {
+    public var title: String?
+    public var tree: ViewNode
+}

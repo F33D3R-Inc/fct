@@ -95,6 +95,41 @@ func TestClientNavReturnsFragment(t *testing.T) {
 	}
 }
 
+func TestNativeRouteReturnsViewTree(t *testing.T) {
+	app := New([]byte(`{}`), WithSigningKey([]byte("0123456789abcdef")))
+	app.Route("/tip", "Tip", func(rc RouteCtx) template.HTML {
+		return `<button class="fa-tip" data-action="tip.send" data-facet-id="TipButton"><span>Tip 100</span></button>`
+	})
+	mux := http.NewServeMux()
+	app.MountRouter(mux, ShellOptions{})
+
+	req := httptest.NewRequest("GET", "/tip", nil)
+	req.Header.Set("FA-Native", "1")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("native response should be JSON, got %q", ct)
+	}
+	var resp struct {
+		Title string
+		Tree  ViewNode
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("native body not JSON: %v", err)
+	}
+	if resp.Title != "Tip" {
+		t.Errorf("title = %q", resp.Title)
+	}
+	// A native client builds a button view from this — no HTML, no WebView.
+	if resp.Tree.Kind != "button" || resp.Tree.Action != "tip.send" {
+		t.Errorf("tree root = kind %q action %q, want button/tip.send", resp.Tree.Kind, resp.Tree.Action)
+	}
+	if len(resp.Tree.Children) != 1 || resp.Tree.Children[0].Text != "Tip 100" {
+		t.Errorf("tree child wrong: %+v", resp.Tree.Children)
+	}
+}
+
 func TestUnmatchedRouteIs404(t *testing.T) {
 	app := newRoutedApp()
 	mux := http.NewServeMux()

@@ -143,9 +143,15 @@ func (a *App) serveRoute(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "404 not found", http.StatusNotFound)
 }
 
-// writePage emits either the full shell (normal load) or a nav fragment (client
-// navigation), with the route's title merged onto the base chrome.
+// writePage emits a route's content in one of three shapes, by request header:
+//   - FA-Native: 1 → a neutral view tree as JSON {title, tree} (iOS/Android);
+//   - FA-Nav: 1    → an HTML fragment as JSON {title, html} (web client nav);
+//   - otherwise    → the full Playground document (a normal browser load).
 func (a *App) writePage(w http.ResponseWriter, r *http.Request, title string, content template.HTML) {
+	if isNative(r) {
+		writeNative(w, title, content)
+		return
+	}
 	if isNav(r) {
 		writeNav(w, title, content)
 		return
@@ -159,10 +165,24 @@ func (a *App) writePage(w http.ResponseWriter, r *http.Request, title string, co
 	w.Write([]byte(a.Page(content, opts)))
 }
 
-func isNav(r *http.Request) bool { return r.Header.Get("FA-Nav") == "1" }
+func isNav(r *http.Request) bool    { return r.Header.Get("FA-Nav") == "1" }
+func isNative(r *http.Request) bool { return r.Header.Get("FA-Native") == "1" }
 
 func writeNav(w http.ResponseWriter, title string, content template.HTML) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_ = json.NewEncoder(w).Encode(map[string]string{"title": title, "html": string(content)})
+}
+
+// writeNative renders the content to a platform-neutral view tree so an iOS or
+// Android client can build native views from it (no HTML, no WebView).
+func writeNative(w http.ResponseWriter, title string, content template.HTML) {
+	tree, err := ParseView(string(content))
+	if err != nil {
+		http.Error(w, "render error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_ = json.NewEncoder(w).Encode(map[string]any{"title": title, "tree": tree})
 }
