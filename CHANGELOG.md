@@ -26,8 +26,8 @@ All notable changes. Pre-1.0: minor versions may break.
 
 ### Tooling & ecosystem
 - CLI: `new`, `dev`, `build`, **`check`**, **`fmt`**, **`add`**, `audit`, **`lsp`**.
-- `fct.dev/fatest` — unit-test facets and handlers.
-- `fct.dev/std` — standard library (44 facets) + default theme.
+- `github.com/F33D3R-Inc/fct/fatest` — unit-test facets and handlers.
+- `github.com/F33D3R-Inc/fct/std` — standard library (44 facets) + default theme.
 - VS Code extension (highlighting + LSP diagnostics).
 
 ### Docs

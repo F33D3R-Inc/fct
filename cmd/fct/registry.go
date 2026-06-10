@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"fct.dev/internal/parser"
+	"github.com/F33D3R-Inc/fct/internal/parser"
 )
 
 // runAdd installs a facet package into destDir. A source is a registry package

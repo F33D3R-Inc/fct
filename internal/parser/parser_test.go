@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"fct.dev/internal/ast"
+	"github.com/F33D3R-Inc/fct/internal/ast"
 )
 
 func parseOne(t *testing.T, src string) *ast.Facet {

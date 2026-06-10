@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"fct.dev/internal/parser"
+	"github.com/F33D3R-Inc/fct/internal/parser"
 )
 
 // runLSP is a minimal Language Server (JSON-RPC over stdio) that publishes FDL

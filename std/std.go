@@ -18,6 +18,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/F33D3R-Inc/fct/fa"
 )
 
 //go:embed facets
@@ -44,6 +46,14 @@ func Source() string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// CompileDir compiles every .fct file in dir on top of the standard library, so
+// app facets can use the full catalog (Avatar, PostCard, LiveChat, …) by name.
+// This is what a scaffolded app calls: fa.CompileDir("facets") but with the
+// stdlib already available.
+func CompileDir(dir string) (*fa.Compiled, error) {
+	return fa.CompileDirWith(Source(), dir)
 }
 
 var facetRe = regexp.MustCompile(`(?m)^facet\s+([A-Za-z_][A-Za-z0-9_]*)\s*:`)

@@ -12,8 +12,8 @@ import (
 	"sort"
 	"strings"
 
-	"fct.dev/internal/codegen"
-	"fct.dev/internal/parser"
+	"github.com/F33D3R-Inc/fct/internal/codegen"
+	"github.com/F33D3R-Inc/fct/internal/parser"
 )
 
 // PkgManifest (fct.pkg.json) describes a publishable facet package — the unit a

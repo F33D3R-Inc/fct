@@ -9,13 +9,13 @@ import (
 	"sort"
 	"strings"
 
-	"fct.dev/internal/codegen"
-	"fct.dev/internal/parser"
+	"github.com/F33D3R-Inc/fct/internal/codegen"
+	"github.com/F33D3R-Inc/fct/internal/parser"
 )
 
 // Compiled holds the result of compiling FDL: all facets in one shared
 // html/template set, plus the manifest. This is the public entry point to the
-// compiler for applications — they import "fct.dev/fa", never the internal
+// compiler for applications — they import "github.com/F33D3R-Inc/fct/fa", never the internal
 // compiler packages (Go forbids external internal imports).
 type Compiled struct {
 	root     *template.Template // all facets, one set, so child calls resolve
@@ -153,6 +153,14 @@ func faData(pairs ...any) (map[string]any, error) {
 // CompileDir compiles every *.fct file in dir (sorted) as one facet set. This is
 // what a scaffolded app calls at startup so it runs from .fct with no build step.
 func CompileDir(dir string) (*Compiled, error) {
+	return CompileDirWith("", dir)
+}
+
+// CompileDirWith compiles every .fct file in dir, prepended with prelude source.
+// The prelude is typically the standard library (std.Source()), so app facets can
+// use Avatar, PostCard, LiveChat, … directly. Pass "" for no prelude (identical
+// to CompileDir).
+func CompileDirWith(prelude, dir string) (*Compiled, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -169,6 +177,10 @@ func CompileDir(dir string) (*Compiled, error) {
 	sort.Strings(names)
 
 	var b strings.Builder
+	if prelude != "" {
+		b.WriteString(prelude)
+		b.WriteByte('\n')
+	}
 	for _, n := range names {
 		data, err := os.ReadFile(filepath.Join(dir, n))
 		if err != nil {

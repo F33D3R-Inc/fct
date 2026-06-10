@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"fct.dev/fa"
+	"github.com/F33D3R-Inc/fct/fa"
 )
 
 // Render compiles FDL source and renders a (public) facet, failing the test on

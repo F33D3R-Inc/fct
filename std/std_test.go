@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"fct.dev/fa"
-	"fct.dev/std"
+	"github.com/F33D3R-Inc/fct/fa"
+	"github.com/F33D3R-Inc/fct/std"
 )
 
 // TestStdlibCompiles is the load-bearing test: every standard-library facet must
@@ -37,6 +37,16 @@ func TestStdlibCompiles(t *testing.T) {
 		{"Card", map[string]any{"Title": "Hi"}, "fa-card__title"},
 		{"Checkbox", map[string]any{"Name": "agree", "Label": "OK", "Checked": true}, "checked"},
 		{"Spinner", map[string]any{}, "fa-spinner"},
+		// Live / streaming, commerce, status, player, form — newer catalog tiers.
+		{"ViewerCount", map[string]any{"Count": 1234}, "1234"},
+		{"TipGoal", map[string]any{"Current": 30, "Goal": 100}, "width:30%"}, // arithmetic: 30*100/100
+		{"CoinBalance", map[string]any{"Coins": 500}, "500"},
+		{"Pill", map[string]any{"Label": "Pro", "Tone": "accent"}, "fa-pill--accent"},
+		{"Stars", map[string]any{"Rating": 3}, "★"},
+		{"VideoControls", map[string]any{"Playing": true, "Percent": 25, "Current": "0:30", "Total": "2:00"}, "width:25%"},
+		{"Switch", map[string]any{"On": true, "Label": "Mute"}, "checked"},
+		{"CharCounter", map[string]any{"Count": 281, "Max": 280}, "fa-charcount--over"}, // comparison
+		{"StatusDot", map[string]any{"Online": true}, "fa-statusdot--online"},
 	}
 	for _, tc := range cases {
 		h, err := c.Render(tc.facet, tc.data)
@@ -114,6 +124,46 @@ func TestFeedComposition(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("PostCard missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestLiveComposition renders a live-stream surface: the player wraps a chat and
+// overlay built from ViewerCount + LiveBadge + TipGoal — proving the streaming
+// catalog composes the way Instagram Live / Chaturbate screens are built.
+func TestLiveComposition(t *testing.T) {
+	app := `
+facet LiveScreen:
+    what:
+        viewers: int
+        current: int
+        goal: int
+        msg: ChatMsg
+    looks:
+        <div class="screen">
+            <LiveBadge />
+            <ViewerCount count="{viewers}" />
+            <TipGoal current="{current}" goal="{goal}" />
+            <LiveChat>
+                <ChatMessage message="{msg}" />
+            </LiveChat>
+        </div>
+`
+	c, err := fa.Compile(std.Source() + app)
+	if err != nil {
+		t.Fatalf("live screen does not compile: %v", err)
+	}
+	h, err := c.Render("LiveScreen", map[string]any{
+		"Viewers": 1200, "Current": 50, "Goal": 200,
+		"Msg": map[string]any{"Handle": "ada", "Body": "hi!", "Color": "#1d9bf0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(h)
+	for _, want := range []string{"fa-live", "1200", "width:25%", "fa-livechat", "fa-chatmsg"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("live screen missing %q:\n%s", want, got)
 		}
 	}
 }

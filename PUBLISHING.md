@@ -1,45 +1,46 @@
 # Publishing
 
-The module path is **`fct.dev`** (a vanity import path), so `go install fct.dev/...`
-works regardless of where the code is hosted.
+The module path is **`github.com/F33D3R-Inc/fct`**, so it installs straight from
+GitHub — no domain, no hosting, no extra service.
 
-## 1. Host the code
+## 1. Push the code
 
-Push this repo to a Git host (e.g. `github.com/<org>/facet`).
-
-## 2. Serve the vanity import meta at `fct.dev`
-
-Go's tooling fetches `https://fct.dev/<path>?go-get=1` and reads a meta tag to find
-the real repo. Serve this for any `fct.dev/...` request (a one-file static host or
-a tiny redirect service):
-
-```html
-<meta name="go-import" content="fct.dev git https://github.com/<org>/facet">
-<meta name="go-source" content="fct.dev https://github.com/<org>/facet https://github.com/<org>/facet/tree/main{/dir} https://github.com/<org>/facet/blob/main{/dir}/{file}#L{line}">
+```sh
+git push origin main
 ```
 
-Then `go install fct.dev/cmd/fct@latest` and `import "fct.dev/fa"` resolve to your
-GitHub repo. (`k8s.io`, `gorm.io`, `gopkg.in` work exactly this way.)
-
-> Hosting on GitHub without a vanity domain instead? Change the module path to
-> `github.com/<org>/facet` (`go mod edit -module …` + update imports) and skip this
-> step.
-
-## 3. Tag releases (SemVer)
+## 2. Tag a release (SemVer)
 
 ```sh
 git tag v0.1.0 && git push --tags
 ```
 
-Pre-1.0, minor versions may break. After `v1.0.0`, the `fa` API and FDL follow
-semantic versioning (see GOVERNANCE.md). The release notes live in CHANGELOG.md.
+`@latest` resolves to the newest tag (or a pseudo-version off the default branch
+if there are no tags yet). Pre-1.0, minor versions may break; after `v1.0.0` the
+`fa` API and FDL follow semantic versioning (see GOVERNANCE.md). Release notes
+live in CHANGELOG.md.
+
+## 3. That's it — anyone can now install
+
+```sh
+go install github.com/F33D3R-Inc/fct/cmd/fct@latest   # the `fct` command
+```
+
+and in their app: `import "github.com/F33D3R-Inc/fct/fa"` — `go` fetches it from
+GitHub on first build. The same machinery that powers `k8s.io`/`gorm.io`, minus
+the vanity domain.
+
+> Want a branded import path like `fct.dev` later? Own the domain and serve a
+> one-line `go-import` meta tag pointing back to this repo, then change the module
+> path. Purely cosmetic — not required to ship.
 
 ## 4. The facet registry (`fct add`)
 
-`fct add <name>` fetches `${FA_REGISTRY:-https://registry.fct.dev}/<name>.fct`;
-`fct add <url>` and `fct add <path>` also work. To run a registry, serve `.fct`
-package files over HTTPS at those paths. Validation (`fct check`) runs on install,
-so malformed packages are rejected before anything is written.
+`fct add <name>` fetches `${FA_REGISTRY}/<name>.fct`; `fct add <url>` and
+`fct add <path>` also work. To run a registry, serve `.fct`/`.tgz` package files
+over HTTPS (or `fct registry <dir>` for a self-hosted file-backed server).
+Validation (`fct check`) runs on install, so malformed packages are rejected
+before anything is written. Point apps at a registry with `FA_REGISTRY`.
 
 ## 5. Editor extension
 

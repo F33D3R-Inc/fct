@@ -15,8 +15,8 @@ import (
 	"fmt"
 	"strings"
 
-	"fct.dev/internal/ast"
-	"fct.dev/internal/lexer"
+	"github.com/F33D3R-Inc/fct/internal/ast"
+	"github.com/F33D3R-Inc/fct/internal/lexer"
 )
 
 // Parse lexes and parses src into the facets it declares.

@@ -17,7 +17,7 @@ import (
 	"net/http"
 	"os"
 
-	"fct.dev/fa"
+	"github.com/F33D3R-Inc/fct/fa"
 )
 
 func main() {

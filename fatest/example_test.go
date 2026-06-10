@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"fct.dev/fa"
-	"fct.dev/fatest"
+	"github.com/F33D3R-Inc/fct/fa"
+	"github.com/F33D3R-Inc/fct/fatest"
 )
 
 const src = `

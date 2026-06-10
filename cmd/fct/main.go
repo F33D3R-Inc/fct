@@ -12,9 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"fct.dev/internal/codegen"
-	"fct.dev/internal/lexer"
-	"fct.dev/internal/parser"
+	"github.com/F33D3R-Inc/fct/internal/codegen"
+	"github.com/F33D3R-Inc/fct/internal/lexer"
+	"github.com/F33D3R-Inc/fct/internal/parser"
 )
 
 const version = "0.0.0-walking-skeleton"

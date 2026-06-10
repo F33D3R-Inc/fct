@@ -16,7 +16,7 @@ import (
 	"strings"
 	"unicode"
 
-	"fct.dev/internal/ast"
+	"github.com/F33D3R-Inc/fct/internal/ast"
 )
 
 // Output is the result of compiling a set of facets.

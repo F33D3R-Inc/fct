@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"fct.dev/internal/parser"
+	"github.com/F33D3R-Inc/fct/internal/parser"
 )
 
 func compileExample(t *testing.T) *Output {

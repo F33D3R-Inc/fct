@@ -35,19 +35,21 @@ the runtime verifies + swaps it by `data-facet-id`.
 ## Quick start
 
 ```sh
-go install fct.dev/cmd/fct@latest   # (once published)
+go install github.com/F33D3R-Inc/fct/cmd/fct@latest   # installs the `fct` command
 fct new myapp
 cd myapp
 go run .            # open http://localhost:7373  (FA_ADDR overrides the port)
 fct dev             # same, but rebuilds on .fct change
 ```
 
-A scaffolded `main.go` is pure wiring: compile the facets, declare what each
-event does, serve the Playground. No client framework, no API layer, no shell
-HTML to hand-write.
+`go run .` automatically downloads the framework (`github.com/F33D3R-Inc/fct/fa`
+and `/std`) from GitHub — there is no separate "install the library" step. A
+scaffolded `main.go` is pure wiring: compile the facets, declare what each event
+does, serve the Playground. No client framework, no API layer, no shell HTML to
+hand-write.
 
-> Pre-release: until the module is published, point a scaffold at a local
-> checkout with `go mod edit -replace fct.dev=/path/to/facet`.
+> Working from a local checkout instead of the published module? Point a scaffold
+> at it with `go mod edit -replace github.com/F33D3R-Inc/fct=/path/to/fct`.
 
 ---
 
@@ -295,7 +297,7 @@ instance — is the production-validation step.)
 
 ### Testing your app
 
-`fct.dev/fatest` (like `httptest`) tests facets and handlers with no server:
+`github.com/F33D3R-Inc/fct/fatest` (like `httptest`) tests facets and handlers with no server:
 
 ```go
 html := fatest.Render(t, src, "LikeButton", map[string]any{...})
@@ -319,27 +321,56 @@ auto-reverts.
 
 ---
 
-## Standard library (`fct.dev/std`)
+## Standard library (`github.com/F33D3R-Inc/fct/std`)
 
-So you don't start from a blank file. **44 ready facets**, every one tested to
-compile:
+So you don't start from a blank file. **229 ready facets**, every one tested to
+compile — enough to cover the surfaces of a real social / live-streaming / video
+product (X.com, Instagram Live, Chaturbate, YouTube) without writing a component
+from scratch:
 
 - **atomic** — Button, IconButton, Icon, Avatar, Badge, Tag, Count, Spinner,
   Skeleton, Divider, Link, Toggle
-- **feedback** — Alert, Toast, EmptyState, ProgressBar
-- **layout** (slot-based) — Card, Stack, Row, Modal
-- **form** — FormField, TextInput, TextArea, Checkbox, SubmitButton
-- **nav** — NavBar, NavItem, TabBar, Tab, Crumb
-- **feed** — PostCard, PostHeader, PostBody, PostActionBar, QuotedPost,
-  CommentItem, WhoToFollowRow, Timeline *(compose atomics; per-instance ids so a
-  like updates one card surgically)*
-- **media** — Image, VideoPlayer, AudioPlayer, GifPlayer, LinkPreview, SensitiveVeil
+- **feedback / state** — Alert, Toast, Banner, EmptyState, ProgressBar,
+  ErrorState, RetryCard, LoadMoreButton, NewItemsPill, Paginator, SkeletonCard,
+  OfflineBanner, EndOfFeed
+- **layout / app shell** (slot-based) — Card, Stack, Row, Modal, AppShell,
+  LeftRail, MainColumn, RightRail, RightRailCard, NavRail, NavRailItem, FeedTabs,
+  Sidebar, TopBar, BottomNav, Grid, ScrollArea, BackBar, SectionHeader
+- **form** — FormField, TextInput, TextArea, Checkbox, SubmitButton, Switch,
+  RadioOption, Slider, FileUpload, SearchInput, OTPInput, CharCounter, FieldError
+- **nav / search** — NavBar, NavItem, TabBar, Tab, Crumb, SearchBar,
+  SearchResultPerson, TrendingItem, ExploreTile, CategoryChips
+- **feed / compose** — PostCard, PostHeader, PostBody, PostActionBar, QuotedPost,
+  CommentItem, WhoToFollowRow, Timeline, Composer, ReplyComposer, QuoteComposer,
+  Poll, PollEditor, MediaPreview *(compose atomics; per-instance ids so a like
+  updates one card surgically)*
+- **media / video** — Image, VideoPlayer, AudioPlayer, GifPlayer, LinkPreview,
+  SensitiveVeil, VideoControls, Scrubber, MediaGrid, Carousel, VideoCard,
+  ChannelHeader, EngagementBar, ChapterList, ShortCard, PlaylistCard, WatchNextList
+- **stories** — StoryRing, StoryBar, StoryProgress, StoryViewer
+- **live / streaming** — LiveBadge, ViewerCount, LiveStreamPlayer, LiveChat,
+  ChatMessage, TipButton, TipGoal, GiftTray, GoLiveButton, BroadcastControls,
+  ReactionRail, PrivateShowBar, TokenBalance
+- **commerce** — CoinBalance, SubscribeButton, Paywall, WalletCard, PriceTag, GiftItem
+- **audio rooms** — SpaceCard, SpaceBar, SpeakerGrid, SpeakerTile, MicButton,
+  RaiseHandButton, RoomControls
+- **comments** — CommentThread, CommentNode, CommentComposer, CommentVote, PinnedComment
+- **profile** — ProfileHeader, ProfileTabs, ProfileStats, BioBlock, ProfileSummary
+- **overlays** — Sheet, Drawer, Dropdown, ContextMenu, Tooltip, ConfirmDialog,
+  Lightbox, EmojiPicker, GifPicker
+- **notifications** — NotificationItem, NotificationList, NotificationBell, ToastStack
+- **settings** — SettingsSection, SettingsRow, SettingsToggleRow, AccountSwitchRow
+- **analytics / studio** — StatCard, AnalyticsCard, KPIRow, Table, Sparkline, MetricDelta
+- **status atoms** — StatusDot, Pill, Stars, Chip, VerifiedTick
 
-Compile them alongside your own facets, and serve the default theme:
+A scaffolded project (`fct new`) is wired to the standard library out of the box —
+`std.CompileDir("facets")` makes the whole catalog available to your facets by
+name, and `std.CSS` is served as the default theme. To use it in an existing app:
 
 ```go
-c, _ := fa.Compile(std.Source() + myFDL)   // std.Names() lists them all
-// in HandlePage opts: HeadHTML: `<style>` + std.CSS + `</style>`
+c, _ := std.CompileDir("facets")            // your facets on top of the stdlib
+// or: c, _ := fa.Compile(std.Source() + myFDL)   // std.Names() lists them all
+// in HandlePage opts: CSS: template.CSS(std.CSS) + appCSS
 ```
 
 Use them by name — in a facet via `<Card title="Stats"> <Badge .../> </Card>`, or
@@ -399,11 +430,11 @@ broken code. `fct add` also takes a URL or a local path. Editor support:
 
 **Tooling / ecosystem**
 - ✅ `fct check` / `fct fmt` / `fct lsp` (editor diagnostics) / `fct add` (registry).
-- ✅ Standard library (`std`, 56 facets) + VS Code extension.
+- ✅ Standard library (`std`, 229 facets, wired into `fct new`) + VS Code extension.
 6. **More backend targets** — codegen for Node / Python / Rust, not just Go
    (FA's pitch is language-agnostic via the compiler).
-7. **Grow the catalog** toward the full ~224 (live, notifications, search, overlays)
-   and add a hosted registry + docs site (see `PUBLISHING.md`).
+7. **Hosting** — add a hosted registry + docs site (see `PUBLISHING.md`); the
+   catalog (live, video, audio rooms, commerce, settings, analytics) is built.
 
 ---
 
