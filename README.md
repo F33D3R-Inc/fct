@@ -347,17 +347,39 @@ directly with `c.Render("Button", ...)`.
 
 ---
 
+## Community packages (the registry)
+
+Create, save, and share facets like npm packages. The whole loop is built in:
+
+```sh
+fct init my-pkg social/post-card   # a package (fct.pkg.json + .fct files)
+# …edit the manifest + facets…
+fct pack my-pkg                    # build a .tgz (validates it compiles)
+fct publish my-pkg                 # submit to the registry (FA_REGISTRY)
+fct search post                    # discover packages
+fct add social/post-card           # install into facets/ (validated on install)
+fct registry ./store               # run your own registry (self-hostable)
+```
+
+The registry rejects packages whose facets don't compile, so you can't publish
+broken code. `fct add` also takes a URL or a local path. Editor support:
+`editor/vscode` (highlighting + `fct lsp` diagnostics).
+
+---
+
 ## CLI reference
 
 | Command | Purpose |
 |---|---|
 | `fct new <dir> [module]` | scaffold a runnable project |
 | `fct dev [dir]` | run, rebuilding on `.fct` change |
-| `fct build <file.fct> [outdir]` | compile to `<Name>.tmpl.html` + `manifest.json` |
-| `fct parse <file.fct>` | dump the parsed facet (debug) |
-| `fct audit <file.fct>` | print the access-control surface (`who:` requirements) |
-| `fct lex <file.fct>` | dump the token stream (debug) |
-| `fct version` | version |
+| `fct build <file.fct> [outdir]` | compile to template + manifest + typed structs |
+| `fct check <file\|dir>` | validate (parse + codegen + composition) |
+| `fct fmt <file\|dir>` | format `.fct` files |
+| `fct lsp` | language server (editor diagnostics) |
+| `fct audit <file.fct>` | print the access-control surface |
+| `fct init / pack / publish / search / add / registry` | community packages |
+| `fct parse / lex / version` | debug / info |
 
 ---
 

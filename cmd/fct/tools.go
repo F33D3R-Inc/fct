@@ -7,9 +7,22 @@ import (
 	"sort"
 	"strings"
 
+	"fct.dev/internal/ast"
 	"fct.dev/internal/codegen"
 	"fct.dev/internal/parser"
 )
+
+// compileCheck parses + generates FDL, returning the facets or the first error.
+func compileCheck(src string) ([]*ast.Facet, error) {
+	facets, err := parser.Parse(src)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := codegen.Generate(facets); err != nil {
+		return nil, err
+	}
+	return facets, nil
+}
 
 // fctFiles returns the .fct files for a path: the file itself, or every .fct in
 // a directory (sorted).

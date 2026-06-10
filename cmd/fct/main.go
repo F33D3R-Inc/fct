@@ -90,6 +90,59 @@ func main() {
 			fmt.Fprintln(os.Stderr, "fct: "+err.Error())
 			os.Exit(1)
 		}
+	case "init":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: fct init <dir> [name]")
+			os.Exit(2)
+		}
+		name := filepath.Base(os.Args[2])
+		if len(os.Args) >= 4 {
+			name = os.Args[3]
+		}
+		if err := runInit(os.Args[2], name); err != nil {
+			fmt.Fprintln(os.Stderr, "fct: "+err.Error())
+			os.Exit(1)
+		}
+	case "pack":
+		dir := "."
+		if len(os.Args) >= 3 {
+			dir = os.Args[2]
+		}
+		if err := runPack(dir); err != nil {
+			fmt.Fprintln(os.Stderr, "fct: "+err.Error())
+			os.Exit(1)
+		}
+	case "publish":
+		dir := "."
+		if len(os.Args) >= 3 {
+			dir = os.Args[2]
+		}
+		if err := runPublish(dir); err != nil {
+			fmt.Fprintln(os.Stderr, "fct: "+err.Error())
+			os.Exit(1)
+		}
+	case "search":
+		q := ""
+		if len(os.Args) >= 3 {
+			q = strings.Join(os.Args[2:], " ")
+		}
+		if err := runSearch(q); err != nil {
+			fmt.Fprintln(os.Stderr, "fct: "+err.Error())
+			os.Exit(1)
+		}
+	case "registry":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: fct registry <store-dir> [addr]")
+			os.Exit(2)
+		}
+		addr := "localhost:7575"
+		if len(os.Args) >= 4 {
+			addr = os.Args[3]
+		}
+		if err := runRegistry(os.Args[2], addr); err != nil {
+			fmt.Fprintln(os.Stderr, "fct: "+err.Error())
+			os.Exit(1)
+		}
 	case "audit":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "usage: fct audit <file.fct>")
@@ -307,7 +360,14 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  fct dev [dir]            run, rebuilding on .fct change")
 	fmt.Fprintln(os.Stderr, "  fct check <file|dir>     validate facets (parse + codegen + composition)")
 	fmt.Fprintln(os.Stderr, "  fct fmt <file|dir>       format .fct files in place")
+	fmt.Fprintln(os.Stderr, "  fct lsp                  language server (editor diagnostics)")
+	fmt.Fprintln(os.Stderr, "  community registry:")
+	fmt.Fprintln(os.Stderr, "  fct init <dir> [name]    scaffold a publishable facet package")
+	fmt.Fprintln(os.Stderr, "  fct pack [dir]           build a package .tgz")
+	fmt.Fprintln(os.Stderr, "  fct publish [dir]        submit a package to the registry")
+	fmt.Fprintln(os.Stderr, "  fct search <query>       find packages")
 	fmt.Fprintln(os.Stderr, "  fct add <pkg|url|path>   install a facet package into facets/")
+	fmt.Fprintln(os.Stderr, "  fct registry <dir>       run a registry server")
 	fmt.Fprintln(os.Stderr, "  fct build <file.fct> [outdir]")
 	fmt.Fprintln(os.Stderr, "  fct audit <file.fct>     print the access-control surface")
 	fmt.Fprintln(os.Stderr, "  fct parse <file.fct>")
