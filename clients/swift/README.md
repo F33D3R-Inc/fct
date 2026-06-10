@@ -70,4 +70,9 @@ lives only on the server** — native SSE connections (`FA-Native: 1`) receive e
 update as an already-styled neutral tree, so the client holds no style table; a
 small HTML→tree parser remains only as a fallback for fragment-only events. The
 server side (`FA-Native` responses, `RenderTree`, `Style`) is in `fa`, tested in Go.
-Next: HMAC event verification (parity with the web runtime).
+
+**Pushed events are HMAC-verified** (CryptoKit, parity with the web runtime): the
+signing key arrives on the `_conn` frame, and each event's HMAC-SHA256 over
+`op\0facet_id\0fragment` is checked before it is applied — a tampered frame is
+dropped. The native frame's fragment is the signed tree JSON, so the bytes the
+device renders are exactly the bytes that were authenticated.

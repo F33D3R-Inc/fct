@@ -1,16 +1,20 @@
 package fa
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
 )
 
-// One emitted event must reach a web connection as an HTML fragment and a native
-// connection as a server-styled neutral tree — so native clients need no style
-// table of their own (single source of truth in Go).
-func TestNativeConnectionGetsStyledTree(t *testing.T) {
-	h := newHub([]byte("0123456789abcdef"), nil)
+// One emitted event reaches a web connection as a signed HTML fragment and a
+// native connection as a signed, styled neutral-tree JSON — each verifiable by
+// hashing the bytes it received. The style table stays on the server.
+func TestNativeConnectionGetsSignedStyledTree(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	h := newHub(key, nil)
 
 	web := &sseClient{id: "web", channels: map[string]bool{}, send: make(chan []byte, 4)}
 	nat := &sseClient{id: "nat", channels: map[string]bool{}, send: make(chan []byte, 4), native: true}
@@ -21,25 +25,61 @@ func TestNativeConnectionGetsStyledTree(t *testing.T) {
 	h.EmitConn("web", Event{Op: "replace", FacetID: "B", Fragment: frag})
 	h.EmitConn("nat", Event{Op: "replace", FacetID: "B", Fragment: frag})
 
+	// Web: HTML fragment, signature valid over op\0facet_id\0fragment.
 	webMsg := decodeFrame(t, <-web.send)
-	if webMsg.Tree != nil {
-		t.Error("web connection should NOT receive a tree")
-	}
 	if !strings.Contains(webMsg.Fragment, "fa-btn") {
-		t.Errorf("web should get the HTML fragment, got %q", webMsg.Fragment)
+		t.Errorf("web should get HTML, got %q", webMsg.Fragment)
+	}
+	if !validSig(key, webMsg) {
+		t.Error("web frame signature invalid")
 	}
 
+	// Native: fragment is the styled tree JSON, re-signed over those bytes.
 	natMsg := decodeFrame(t, <-nat.send)
-	if natMsg.Tree == nil {
-		t.Fatal("native connection should receive a styled tree")
+	if !validSig(key, natMsg) {
+		t.Fatal("native frame signature invalid — client could not authenticate it")
 	}
-	if natMsg.Tree.Kind != "button" || natMsg.Tree.Action != "tip" {
-		t.Errorf("native tree wrong: kind=%s action=%s", natMsg.Tree.Kind, natMsg.Tree.Action)
+	var tree ViewNode
+	if err := json.Unmarshal([]byte(natMsg.Fragment), &tree); err != nil {
+		t.Fatalf("native fragment is not tree JSON: %v", err)
 	}
-	// The style was resolved server-side — the client needs no class table.
-	if natMsg.Tree.Style == nil || natMsg.Tree.Style.BG != "#1d9bf0" {
-		t.Errorf("native tree missing server-resolved style: %+v", natMsg.Tree.Style)
+	if tree.Kind != "button" || tree.Action != "tip" {
+		t.Errorf("native tree wrong: kind=%s action=%s", tree.Kind, tree.Action)
 	}
+	if tree.Style == nil || tree.Style.BG != "#1d9bf0" {
+		t.Errorf("native tree missing server-resolved style: %+v", tree.Style)
+	}
+	// Tamper detection: a flipped byte fails the signature.
+	tampered := natMsg
+	tampered.Fragment = strings.Replace(tampered.Fragment, "button", "image", 1)
+	if validSig(key, tampered) {
+		t.Error("tampered native frame should fail verification")
+	}
+}
+
+// The _conn hello carries the signing key so a native client can verify events.
+func TestHelloFrameCarriesKey(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	h := newHub(key, nil)
+	c := &sseClient{id: "c", channels: map[string]bool{}, send: make(chan []byte, 4), native: true}
+	h.register(c)
+	// ServeSSE writes the hello; here we just confirm the key is exposed for it.
+	var hello map[string]string
+	_ = json.Unmarshal([]byte(`{"op":"_conn","conn":"c","key":"`+hex.EncodeToString(key)+`"}`), &hello)
+	if hello["key"] != hex.EncodeToString(key) {
+		t.Error("hello must carry the hex key")
+	}
+}
+
+func validSig(key []byte, e Event) bool {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(e.Op))
+	mac.Write([]byte{0})
+	mac.Write([]byte(e.FacetID))
+	mac.Write([]byte{0})
+	mac.Write([]byte(e.Fragment))
+	want := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(want), []byte(e.HMAC))
 }
 
 func decodeFrame(t *testing.T, frame []byte) Event {

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import CryptoKit
 
 /// A server-pushed event, decoded from the SSE stream. Mirrors the web runtime:
 /// `op` is replace/append/prepend/remove (or `_conn` for the connection id),
@@ -7,9 +8,10 @@ import SwiftUI
 struct FacetEvent: Decodable {
     let op: String?
     let facet_id: String?
-    let fragment: String?
-    let tree: ViewNode?   // server-styled neutral tree (native connections)
+    let fragment: String?   // styled neutral-tree JSON (native); also the signed bytes
+    let hmac: String?
     let conn: String?
+    let key: String?        // signing key, on the _conn frame
 }
 
 /// FacetClient is the Apple-platform FA runtime. It is the analogue of
@@ -32,6 +34,7 @@ public final class FacetClient: ObservableObject {
     public let baseURL: URL
     private let session: URLSession
     private var connID: String?
+    private var signKey: SymmetricKey?
     private var sseTask: Task<Void, Never>?
     private var pending: [(String, [String: String])] = [] // actions fired before connID
 
@@ -114,17 +117,32 @@ public final class FacetClient: ObservableObject {
               let ev = try? JSONDecoder().decode(FacetEvent.self, from: data) else { return }
         if ev.op == "_conn" {
             connID = ev.conn
+            if let k = ev.key, let bytes = Self.hexToBytes(k) { signKey = SymmetricKey(data: bytes) }
             flushPending()
             return
         }
+        guard verify(ev) else { return } // drop any event we cannot authenticate
         apply(ev)
+    }
+
+    /// Verifies an event's HMAC-SHA256 over op\0facet_id\0fragment, matching the
+    /// server's signing (and the web runtime). Without a key yet, accept (parity
+    /// with the web client when no key is present).
+    private func verify(_ ev: FacetEvent) -> Bool {
+        guard let signKey else { return true }
+        guard let hmacHex = ev.hmac else { return false }
+        var msg = Data()
+        msg.append(Data((ev.op ?? "").utf8)); msg.append(0)
+        msg.append(Data((ev.facet_id ?? "").utf8)); msg.append(0)
+        msg.append(Data((ev.fragment ?? "").utf8))
+        let mac = HMAC<SHA256>.authenticationCode(for: msg, using: signKey)
+        let computed = mac.map { String(format: "%02x", $0) }.joined()
+        return computed == hmacHex
     }
 
     private func apply(_ ev: FacetEvent) {
         guard let tree, let id = ev.facet_id else { return }
-        // Native connections receive the server-styled tree directly; the HTML
-        // fragment is only a fallback (e.g. a server that didn't send a tree).
-        let node: ViewNode? = ev.tree ?? ev.fragment.map { FacetHTMLParser.parse($0) }
+        let node = ev.fragment.flatMap { decodeNode($0) }
         switch ev.op {
         case "replace":
             if let node { self.tree = tree.replacingFacet(id, with: node) }
@@ -137,6 +155,28 @@ public final class FacetClient: ObservableObject {
         default:
             break
         }
+    }
+
+    /// A native fragment is the styled tree as JSON; decode it. Fall back to HTML
+    /// parsing if a server sent a plain fragment.
+    private func decodeNode(_ fragment: String) -> ViewNode? {
+        if let d = fragment.data(using: .utf8), let n = try? JSONDecoder().decode(ViewNode.self, from: d) {
+            return n
+        }
+        return FacetHTMLParser.parse(fragment)
+    }
+
+    private static func hexToBytes(_ hex: String) -> Data? {
+        guard hex.count % 2 == 0 else { return nil }
+        var out = Data(capacity: hex.count / 2)
+        var idx = hex.startIndex
+        while idx < hex.endIndex {
+            let next = hex.index(idx, offsetBy: 2)
+            guard let b = UInt8(hex[idx..<next], radix: 16) else { return nil }
+            out.append(b)
+            idx = next
+        }
+        return out
     }
 
     // MARK: - Actions (taps → /events)

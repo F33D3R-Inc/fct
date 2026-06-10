@@ -61,5 +61,9 @@ updates, action forwarding, and the Compose renderer. Style is resolved entirely
 the server (`fa.Style`); the client carries no style table. A small HTML→tree parser
 remains only as a fallback for fragment-only events.
 
-Roadmap: HMAC event verification (parity with web); richer layout (explicit
-width/spacing units).
+**Pushed events are HMAC-verified** (`javax.crypto.Mac`, parity with the web
+runtime): the signing key arrives on the `_conn` frame, and each event's HMAC-SHA256
+over `op\0facet_id\0fragment` is checked before it is applied — a tampered frame is
+dropped.
+
+Roadmap: richer layout (explicit width/spacing units).

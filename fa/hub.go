@@ -112,7 +112,10 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request, identity string) 
 	}
 	defer h.unregister(c)
 
-	hello, _ := json.Marshal(map[string]string{"op": "_conn", "conn": c.id})
+	// The hello frame carries the connection id and the signing key (already public
+	// — it ships in every web page's <meta name="fa-key">), so a native client can
+	// verify pushed events before any arrive.
+	hello, _ := json.Marshal(map[string]string{"op": "_conn", "conn": c.id, "key": hex.EncodeToString(h.key)})
 	c.send <- []byte(fmt.Sprintf("data: %s\n\n", hello))
 
 	ticker := time.NewTicker(heartbeatInterval)
@@ -293,7 +296,7 @@ func (h *Hub) deliverLocal(msg []byte) {
 	}
 	nat := func() []byte {
 		if nativeLine == nil {
-			nativeLine = sseLine(withTree(m.Event))
+			nativeLine = sseLine(h.nativeEvent(m.Event))
 		}
 		return nativeLine
 	}
@@ -330,13 +333,20 @@ func (h *Hub) deliverLocal(msg []byte) {
 	}
 }
 
-// withTree returns a copy of the event carrying the styled neutral tree parsed
-// from its HTML fragment — the form native clients apply directly (no on-device
-// HTML parsing or style resolution; the style table lives only on the server).
-func withTree(e Event) Event {
+// nativeEvent transforms a web event (HTML fragment) into the native form: the
+// fragment becomes the styled neutral tree as a JSON string, and the event is
+// RE-SIGNED over those bytes. This keeps verification symmetric — a native client
+// hashes the fragment it received (the tree JSON) exactly as a web client hashes
+// its HTML — so the tree the device renders is authenticated, and the style table
+// stays solely on the server.
+func (h *Hub) nativeEvent(e Event) Event {
 	if e.Fragment != "" {
 		if tree, err := ParseView(e.Fragment); err == nil {
-			e.Tree = tree
+			if js, err := json.Marshal(tree); err == nil {
+				e.Fragment = string(js)
+				e.HMAC = ""
+				sign(h.key, &e)
+			}
 		}
 	}
 	return e

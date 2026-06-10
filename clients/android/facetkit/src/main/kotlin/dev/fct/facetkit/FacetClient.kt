@@ -15,15 +15,18 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.net.HttpURLConnection
 import java.net.URL
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /** A server-pushed SSE event (mirror of the web runtime's frame). */
 @Serializable
 private data class FacetEvent(
     val op: String? = null,
     val facet_id: String? = null,
-    val fragment: String? = null,
-    val tree: ViewNode? = null, // server-styled neutral tree (native connections)
+    val fragment: String? = null, // styled neutral-tree JSON (native); the signed bytes
+    val hmac: String? = null,
     val conn: String? = null,
+    val key: String? = null,      // signing key, on the _conn frame
 )
 
 @Serializable
@@ -56,6 +59,7 @@ class FacetClient(
         private set
 
     private var connId: String? = null
+    private var signKey: ByteArray? = null
     private val pending = mutableListOf<Pair<String, Map<String, String>>>()
 
     /** Loads [route] as a native view tree and opens the live connection. */
@@ -127,18 +131,31 @@ class FacetClient(
         val ev = try { json.decodeFromString<FacetEvent>(frame) } catch (_: Exception) { return }
         if (ev.op == "_conn") {
             connId = ev.conn
+            ev.key?.let { signKey = hexToBytes(it) }
             flushPending()
             return
         }
+        if (!verify(ev)) return // drop any event we cannot authenticate
         apply(ev)
+    }
+
+    /** Verifies HMAC-SHA256 over op\0facet_id\0fragment (matches the server/web). */
+    private fun verify(ev: FacetEvent): Boolean {
+        val key = signKey ?: return true // no key yet → accept (parity with web)
+        val expected = ev.hmac ?: return false
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(key, "HmacSHA256"))
+        mac.update((ev.op ?: "").toByteArray()); mac.update(0.toByte())
+        mac.update((ev.facet_id ?: "").toByteArray()); mac.update(0.toByte())
+        mac.update((ev.fragment ?: "").toByteArray())
+        val computed = mac.doFinal().joinToString("") { "%02x".format(it) }
+        return computed == expected
     }
 
     private fun apply(ev: FacetEvent) {
         val cur = tree ?: return
         val id = ev.facet_id ?: return
-        // Native connections receive the server-styled tree directly; the HTML
-        // fragment is only a fallback.
-        val node = ev.tree ?: ev.fragment?.let { FacetHtmlParser.parse(it) }
+        val node = ev.fragment?.let { decodeNode(it) }
         tree = when (ev.op) {
             "replace" -> node?.let { cur.replacingFacet(id, it) } ?: cur
             "append" -> node?.let { cur.insertingChild(id, it, false) } ?: cur
@@ -147,6 +164,14 @@ class FacetClient(
             else -> cur
         }
     }
+
+    /** A native fragment is the styled tree as JSON; decode it (HTML fallback). */
+    private fun decodeNode(fragment: String): ViewNode? =
+        try { json.decodeFromString<ViewNode>(fragment) } catch (_: Exception) { FacetHtmlParser.parse(fragment) }
+
+    private fun hexToBytes(hex: String): ByteArray? =
+        if (hex.length % 2 != 0) null
+        else ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 
     /** Sends an action to the server (a tap). Queued until the connection id is known. */
     fun send(type: String, payload: Map<String, String> = emptyMap()) {

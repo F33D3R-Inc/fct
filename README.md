@@ -440,10 +440,15 @@ resolves each node's `Style` (`direction`/`gap`/`pad`/`align` + `bg`/`fg`/
 (`FA-Native: 1`) receive each update as an **already-styled neutral tree**, so the
 clients hold no style logic at all — `fa/style.go` is the only style table.
 
+**Pushed events are HMAC-verified on native too** (parity with the web runtime):
+the signing key arrives on the `_conn` frame; the native frame's fragment is the
+**signed** tree JSON, so the bytes the device renders are exactly the bytes
+authenticated, and a tampered frame is dropped.
+
 Built and tested: the server-side neutral tree + style model (`RenderTree`,
-`ParseView`, `Style`; styled trees over SSE; proven on the real stdlib) and both
-client runtimes (model, SSE, surgical updates, native renderer driven by the server
-style; unit tests). Roadmap: HMAC event verification on native.
+`ParseView`, `Style`; signed styled trees over SSE; proven on the real stdlib) and
+both client runtimes (model, SSE, HMAC verification, surgical updates, native
+renderer driven by the server style; unit tests).
 
 ---
 
