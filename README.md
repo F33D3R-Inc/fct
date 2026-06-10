@@ -380,6 +380,27 @@ if !f.Valid() { /* re-render the form facet with f.Errors */ }
 file, hdr, _ := f.File("avatar") // multipart uploads
 ```
 
+### Admin panel (the Django feature, built in)
+
+React never had one; Django is loved for it. FA ships a built-in, **auth-gated
+(deny-by-default)** admin: register your resources and it auto-generates a
+navigable UI — a dashboard with live system metrics, a list view per resource, and
+a detail view — mounted under any prefix.
+
+```go
+adm := fa.NewAdmin("Acme").
+    Authorize(func(r *http.Request) bool { return sess.Get(r, "role") == "admin" }).
+    WithMetrics(app.Metrics()).
+    Resource(fa.AdminResource{
+        Name: "users", Label: "Users", Columns: []string{"Handle", "Name"},
+        List: func(ctx context.Context) ([]fa.AdminRow, error) { /* your data */ },
+        Get:  func(ctx context.Context, id string) ([]fa.AdminField, error) { /* one record */ },
+    })
+adm.Mount(mux, "/admin")
+```
+
+Self-contained and server-rendered; you provide `List`/`Get`, FA renders the UI.
+
 ### Multi-instance fan-out (production broker)
 
 A built-in, **zero-dependency** Redis-backed `Broker` (raw RESP over TCP) delivers
