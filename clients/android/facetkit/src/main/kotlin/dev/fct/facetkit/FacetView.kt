@@ -5,8 +5,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -96,10 +99,29 @@ private fun styleModifier(style: Style?): Modifier {
     var m: Modifier = Modifier
     val s = style ?: return m
     if (s.grow == true) m = m.fillMaxWidth()
+    s.width?.let { m = applyDim(m, it, horizontal = true) }
+    s.height?.let { m = applyDim(m, it, horizontal = false) }
     s.radius?.let { if (it > 0) m = m.clip(RoundedCornerShape(minOf(it, 28).dp)) }
     s.bg?.let { colorOf(it)?.let { c -> m = m.background(c) } }
-    s.pad?.let { if (it > 0) m = m.padding(it.dp) }
+    val l = s.padL ?: 0; val t = s.padT ?: 0; val r = s.padR ?: 0; val b = s.padB ?: 0
+    if (l > 0 || t > 0 || r > 0 || b > 0) {
+        m = m.padding(start = l.dp, top = t.dp, end = r.dp, bottom = b.dp)
+    }
     return m
+}
+
+// applyDim applies an explicit dimension: px size, fill/100%, or a fraction.
+// Compose renders fractional widths exactly via fillMaxWidth(fraction).
+private fun applyDim(m: Modifier, value: String, horizontal: Boolean): Modifier = when {
+    value == "fill" || value == "100%" -> if (horizontal) m.fillMaxWidth() else m.fillMaxHeight()
+    value.endsWith("%") -> {
+        val f = (value.dropLast(1).toFloatOrNull() ?: 100f) / 100f
+        if (horizontal) m.fillMaxWidth(f) else m.fillMaxHeight(f)
+    }
+    else -> {
+        val px = (if (value.endsWith("px")) value.dropLast(2) else value).toIntOrNull()
+        if (px != null) (if (horizontal) m.width(px.dp) else m.height(px.dp)) else m
+    }
 }
 
 private fun collectText(n: ViewNode): String =

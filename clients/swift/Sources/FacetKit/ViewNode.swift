@@ -92,11 +92,15 @@ public struct ViewNode: Codable, Equatable {
 public struct Style: Codable, Equatable {
     public var direction: String?
     public var gap: Int?
-    public var pad: Int?
+    public var padT: Int?
+    public var padR: Int?
+    public var padB: Int?
+    public var padL: Int?
     public var align: String?
     public var justify: String?
     public var grow: Bool?
     public var width: String?
+    public var height: String?
     public var bg: String?
     public var fg: String?
     public var fontSize: Int?

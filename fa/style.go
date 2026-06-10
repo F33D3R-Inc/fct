@@ -16,13 +16,20 @@ import (
 // node's inline style="" plus a built-in table for the standard library's design
 // system; unknown classes simply contribute nothing (sane defaults remain).
 type Style struct {
-	Direction  string `json:"direction,omitempty"`  // "row" | "column"
-	Gap        int    `json:"gap,omitempty"`        // spacing between children, px
-	Pad        int    `json:"pad,omitempty"`        // uniform padding, px
+	Direction string `json:"direction,omitempty"` // "row" | "column"
+	Gap       int    `json:"gap,omitempty"`       // spacing between children, px
+	// Pad is an internal uniform-padding shorthand used by the class table; the
+	// resolver expands it into per-side padding, so it is never emitted directly.
+	Pad        int    `json:"-"`
+	PadT       int    `json:"padT,omitempty"`       // padding, per side, px
+	PadR       int    `json:"padR,omitempty"`       //
+	PadB       int    `json:"padB,omitempty"`       //
+	PadL       int    `json:"padL,omitempty"`       //
 	Align      string `json:"align,omitempty"`      // start | center | end | stretch
 	Justify    string `json:"justify,omitempty"`    // start | center | end | between
 	Grow       bool   `json:"grow,omitempty"`       // expand to fill the main axis
-	Width      string `json:"width,omitempty"`      // "30%" | "120" | "fill"
+	Width      string `json:"width,omitempty"`      // "120px" | "30%" | "fill"
+	Height     string `json:"height,omitempty"`     // "120px" | "50%" | "fill"
 	BG         string `json:"bg,omitempty"`         // background color (css token)
 	FG         string `json:"fg,omitempty"`         // text/foreground color
 	FontSize   int    `json:"fontSize,omitempty"`   // px
@@ -31,6 +38,26 @@ type Style struct {
 }
 
 func (s *Style) isZero() bool { return *s == Style{} }
+
+// expandPad fills any per-side padding left unset from the uniform Pad shorthand,
+// then clears Pad (it is never serialized). Called once after resolution.
+func (s *Style) expandPad() {
+	if s.Pad != 0 {
+		if s.PadT == 0 {
+			s.PadT = s.Pad
+		}
+		if s.PadR == 0 {
+			s.PadR = s.Pad
+		}
+		if s.PadB == 0 {
+			s.PadB = s.Pad
+		}
+		if s.PadL == 0 {
+			s.PadL = s.Pad
+		}
+		s.Pad = 0
+	}
+}
 
 func (s *Style) merge(o Style) {
 	if o.Direction != "" {
@@ -41,6 +68,18 @@ func (s *Style) merge(o Style) {
 	}
 	if o.Pad != 0 {
 		s.Pad = o.Pad
+	}
+	if o.PadT != 0 {
+		s.PadT = o.PadT
+	}
+	if o.PadR != 0 {
+		s.PadR = o.PadR
+	}
+	if o.PadB != 0 {
+		s.PadB = o.PadB
+	}
+	if o.PadL != 0 {
+		s.PadL = o.PadL
 	}
 	if o.Align != "" {
 		s.Align = o.Align
@@ -53,6 +92,9 @@ func (s *Style) merge(o Style) {
 	}
 	if o.Width != "" {
 		s.Width = o.Width
+	}
+	if o.Height != "" {
+		s.Height = o.Height
 	}
 	if o.BG != "" {
 		s.BG = o.BG
@@ -139,6 +181,7 @@ func resolveStyle(tag string, attrs map[string]string) *Style {
 	if inline := attrs["style"]; inline != "" {
 		applyInlineStyle(s, inline)
 	}
+	s.expandPad()
 	if s.isZero() {
 		return nil
 	}
@@ -158,12 +201,22 @@ func applyInlineStyle(s *Style, inline string) {
 		switch prop {
 		case "width":
 			s.Width = val
+		case "height":
+			s.Height = val
 		case "background", "background-color":
 			s.BG = val
 		case "color":
 			s.FG = val
 		case "padding":
-			s.Pad = pxOf(val)
+			setPadding(s, val)
+		case "padding-top":
+			s.PadT = pxOf(val)
+		case "padding-right":
+			s.PadR = pxOf(val)
+		case "padding-bottom":
+			s.PadB = pxOf(val)
+		case "padding-left":
+			s.PadL = pxOf(val)
 		case "border-radius":
 			s.Radius = pxOf(val)
 		case "font-size":
@@ -189,6 +242,25 @@ func applyInlineStyle(s *Style, inline string) {
 		case "align-items":
 			s.Align = mapAlign(val)
 		}
+	}
+}
+
+// setPadding parses the CSS padding shorthand (1–4 values) into per-side padding,
+// following CSS order: all | vert horiz | top horiz bottom | top right bottom left.
+func setPadding(s *Style, val string) {
+	p := strings.Fields(val)
+	switch len(p) {
+	case 1:
+		n := pxOf(p[0])
+		s.PadT, s.PadR, s.PadB, s.PadL = n, n, n, n
+	case 2:
+		v, h := pxOf(p[0]), pxOf(p[1])
+		s.PadT, s.PadB, s.PadR, s.PadL = v, v, h, h
+	case 3:
+		t, h, b := pxOf(p[0]), pxOf(p[1]), pxOf(p[2])
+		s.PadT, s.PadR, s.PadL, s.PadB = t, h, h, b
+	case 4:
+		s.PadT, s.PadR, s.PadB, s.PadL = pxOf(p[0]), pxOf(p[1]), pxOf(p[2]), pxOf(p[3])
 	}
 }
 

@@ -156,4 +156,17 @@ func TestStyleResolution(t *testing.T) {
 	if plain.Style != nil {
 		t.Errorf("plain div should have no style, got %+v", plain.Style)
 	}
+	// Richer units: a uniform class pad expands to per-side; CSS shorthand and
+	// explicit height parse into structured units.
+	card, _ := ParseView(`<div class="fa-card"></div>`)
+	if card.Style == nil || card.Style.PadT != 16 || card.Style.PadL != 16 {
+		t.Errorf("fa-card uniform pad should expand to per-side 16, got %+v", card.Style)
+	}
+	box, _ := ParseView(`<div style="padding:4px 8px 12px 16px;height:50%"></div>`)
+	if box.Style == nil || box.Style.PadT != 4 || box.Style.PadR != 8 || box.Style.PadB != 12 || box.Style.PadL != 16 {
+		t.Errorf("padding shorthand not parsed per-side: %+v", box.Style)
+	}
+	if box.Style.Height != "50%" {
+		t.Errorf("height not resolved, got %q", box.Style.Height)
+	}
 }

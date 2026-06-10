@@ -118,17 +118,34 @@ private struct StyleModifier: ViewModifier {
         if let fg = s.fg, let c = Color(hex: fg) {
             v = AnyView(v.foregroundColor(c))
         }
-        if let pad = s.pad, pad > 0 {
-            v = AnyView(v.padding(CGFloat(pad)))
-        }
+        // Per-side padding (explicit units from the server).
+        let insets = EdgeInsets(top: CGFloat(s.padT ?? 0), leading: CGFloat(s.padL ?? 0),
+                                bottom: CGFloat(s.padB ?? 0), trailing: CGFloat(s.padR ?? 0))
+        if insets != EdgeInsets() { v = AnyView(v.padding(insets)) }
         if let bg = s.bg, let c = Color(hex: bg) {
             v = AnyView(v.background(c))
         }
         if let r = s.radius, r > 0 {
             v = AnyView(v.clipShape(RoundedRectangle(cornerRadius: CGFloat(min(r, 28)))))
         }
+        if let w = s.width { v = Self.dim(v, w, .horizontal) }
+        if let h = s.height { v = Self.dim(v, h, .vertical) }
         if s.grow == true {
             v = AnyView(v.frame(maxWidth: .infinity))
+        }
+        return v
+    }
+
+    /// Applies an explicit dimension: a fixed px size, or `fill`/`100%` → expand.
+    /// (Fractional `%` other than 100 renders as fill on iOS — exact fractions are
+    /// a SwiftUI GeometryReader concern tracked for a later revision.)
+    static func dim(_ v: AnyView, _ value: String, _ axis: Axis) -> AnyView {
+        if value == "fill" || value.hasSuffix("%") {
+            return AnyView(axis == .horizontal ? v.frame(maxWidth: .infinity) : v.frame(maxHeight: .infinity))
+        }
+        let n = value.hasSuffix("px") ? String(value.dropLast(2)) : value
+        if let px = Double(n) {
+            return AnyView(axis == .horizontal ? v.frame(width: CGFloat(px)) : v.frame(height: CGFloat(px)))
         }
         return v
     }
