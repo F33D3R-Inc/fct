@@ -2,6 +2,19 @@
 
 All notable changes. Pre-1.0: minor versions may break.
 
+## v0.10.1
+
+### Fixed
+- **`who: redact` now applies to typed structs** (and pointers/slices), not just
+  `map[string]any`. A declared redaction that names a non-existent field now
+  **fails closed** (render errors) instead of silently leaking the field.
+- **Release binaries report the real version.** `fct version` now prints the tag
+  (e.g. `v0.10.1`) — release builds stamp it via `-ldflags -X main.version`,
+  instead of the hardcoded `0.0.0-walking-skeleton`.
+- Aligned the Go toolchain version across the repo: README and the release
+  workflow now state **Go 1.26** (matching `go.mod`, the scaffold, and the
+  Dockerfile).
+
 ## [Unreleased] — v0.1.0 (walking skeleton → usable)
 
 ### Language & compiler

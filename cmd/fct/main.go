@@ -17,7 +17,10 @@ import (
 	"github.com/F33D3R-Inc/fct/internal/parser"
 )
 
-const version = "0.0.0-walking-skeleton"
+// version is the CLI version. Release builds stamp the real tag in via
+// -ldflags "-X main.version=<tag>" (see .github/workflows/release.yml); a plain
+// `go build`/`go install` keeps this dev default.
+var version = "0.0.0-dev"
 
 func main() {
 	if len(os.Args) < 2 {

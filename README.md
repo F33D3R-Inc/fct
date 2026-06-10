@@ -34,7 +34,7 @@ the runtime verifies + swaps it by `data-facet-id`.
 
 ## Install
 
-> **Prerequisite — Go 1.23+.** FA apps *are* Go programs (the server is a single Go
+> **Prerequisite — Go 1.26+.** FA apps *are* Go programs (the server is a single Go
 > binary), so you need Go installed to build one. Get it at <https://go.dev/dl/>.
 
 Install the **`fct`** command one of two ways.

@@ -2,8 +2,10 @@ package fa
 
 import (
 	"errors"
+	"fmt"
 	"html/template"
 	"net/http"
+	"reflect"
 	"strings"
 	"unicode"
 )
@@ -54,16 +56,20 @@ func (c *Compiled) RenderFor(v View, facet string, data any) (template.HTML, err
 			return "", ErrForbidden
 		}
 	}
-	if len(a.redactions) > 0 {
-		data = cloneData(data)
-		for _, r := range a.redactions {
-			if r.unless != "" {
-				if fn := c.policies[r.unless]; fn != nil && fn(v) {
-					continue // policy passes → keep the field
-				}
+	for _, r := range a.redactions {
+		if r.unless != "" {
+			if fn := c.policies[r.unless]; fn != nil && fn(v) {
+				continue // policy passes → keep the field
 			}
-			redactPath(data, r.field)
 		}
+		redacted, ok := redactField(data, r.field)
+		if !ok {
+			// A declared redaction that cannot be located in the render data is a
+			// misconfiguration we MUST NOT ignore: silently rendering would leak the
+			// very field the app asked to hide. Fail closed.
+			return "", fmt.Errorf("fa: facet %q declares `redact %s` but no such field exists in the render data; refusing to render rather than risk leaking it", facet, r.field)
+		}
+		data = redacted
 	}
 	return c.render(facet, data)
 }
@@ -78,39 +84,122 @@ func (c Ctx) View() View {
 	return View{Identity: c.Identity, R: c.R}
 }
 
-// cloneData deep-copies nested map[string]any so redaction never mutates the
-// caller's data. Non-map values are returned as-is (immutable enough for v0).
-func cloneData(v any) any {
-	m, ok := v.(map[string]any)
-	if !ok {
-		return v
+// redactField returns a copy of data with the dotted field path (e.g. "user.ssn")
+// removed, plus whether the path could be resolved. It walks maps, structs,
+// pointers, and slices, so redaction applies whether the app renders with
+// map[string]any or fct-generated typed structs. Field names are matched against
+// the idiomatic Go keys the templates use (user.avatar_url → .User.AvatarURL).
+//
+// The caller's data is never mutated: every container along the path is rebuilt;
+// sibling subtrees are shared by reference (the templates only read them). The
+// returned ok is false only when a redaction provably cannot apply (a struct with
+// no such field) — the caller fails closed rather than leak the unredacted field.
+func redactField(data any, path string) (any, bool) {
+	v := reflect.ValueOf(data)
+	if !v.IsValid() {
+		return data, true // nil data → nothing to leak
 	}
-	out := make(map[string]any, len(m))
-	for k, vv := range m {
-		out[k] = cloneData(vv)
+	out, ok := redactedValue(v, strings.Split(path, "."))
+	if !out.IsValid() {
+		return data, ok
 	}
-	return out
+	return out.Interface(), ok
 }
 
-// redactPath deletes a dotted field (e.g. "user.ssn") from map data, matching
-// the idiomatic Go keys the templates use (user.avatar_url → .User.AvatarURL).
-func redactPath(data any, path string) {
-	m, ok := data.(map[string]any)
-	if !ok {
-		return
-	}
-	parts := strings.Split(path, ".")
-	for i, p := range parts {
-		key := goName(p)
-		if i == len(parts)-1 {
-			delete(m, key)
-			return
+// redactedValue is redactField's recursive core, working on reflect.Values. It
+// always returns freshly built containers (so nothing the caller holds is
+// mutated) and never panics on unexported struct fields (those are skipped — the
+// templates can't read them anyway).
+func redactedValue(v reflect.Value, parts []string) (reflect.Value, bool) {
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return v, true
 		}
-		next, ok := m[key].(map[string]any)
-		if !ok {
-			return
+		inner, ok := redactedValue(v.Elem(), parts)
+		out := reflect.New(v.Type()).Elem()
+		out.Set(inner) // concrete value is assignable to the interface
+		return out, ok
+
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v, true
 		}
-		m = next
+		inner, ok := redactedValue(v.Elem(), parts)
+		out := reflect.New(v.Type().Elem())
+		out.Elem().Set(inner)
+		return out, ok
+
+	case reflect.Slice:
+		if v.IsNil() {
+			return v, true
+		}
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		ok := true
+		for i := 0; i < v.Len(); i++ {
+			e, eok := redactedValue(v.Index(i), parts)
+			out.Index(i).Set(e)
+			ok = ok && eok
+		}
+		return out, ok
+
+	case reflect.Array:
+		out := reflect.New(v.Type()).Elem()
+		ok := true
+		for i := 0; i < v.Len(); i++ {
+			e, eok := redactedValue(v.Index(i), parts)
+			out.Index(i).Set(e)
+			ok = ok && eok
+		}
+		return out, ok
+
+	case reflect.Map:
+		// Only string-keyed maps can be addressed by a field path. They are a
+		// dynamic shape we can't validate, so they always count as applicable.
+		if v.IsNil() || v.Type().Key().Kind() != reflect.String {
+			return v, v.Kind() == reflect.Map
+		}
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		key := goName(parts[0])
+		for _, k := range v.MapKeys() {
+			if k.String() == key {
+				if len(parts) == 1 {
+					continue // drop the key → redacted
+				}
+				nv, _ := redactedValue(v.MapIndex(k), parts[1:])
+				out.SetMapIndex(k, nv)
+				continue
+			}
+			out.SetMapIndex(k, v.MapIndex(k)) // sibling shared (read-only render)
+		}
+		return out, true
+
+	case reflect.Struct:
+		out := reflect.New(v.Type()).Elem()
+		field := goName(parts[0])
+		idx := -1
+		for i := 0; i < v.NumField(); i++ {
+			if !out.Field(i).CanSet() {
+				continue // unexported — templates can't see it; leave zero
+			}
+			out.Field(i).Set(v.Field(i)) // sibling shared (read-only render)
+			if v.Type().Field(i).Name == field {
+				idx = i
+			}
+		}
+		if idx == -1 {
+			return out, false // declared redaction targets a non-existent field
+		}
+		if len(parts) == 1 {
+			out.Field(idx).Set(reflect.Zero(v.Type().Field(idx).Type)) // redact
+			return out, true
+		}
+		nv, ok := redactedValue(v.Field(idx), parts[1:])
+		out.Field(idx).Set(nv)
+		return out, ok
+
+	default:
+		return v, false // a leaf where we expected a container → cannot apply
 	}
 }
 

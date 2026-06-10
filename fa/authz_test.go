@@ -87,6 +87,65 @@ func TestRedactUnlessPolicy(t *testing.T) {
 	}
 }
 
+func TestRedactWorksOnTypedStructs(t *testing.T) {
+	// The typed-data path (fct-generated structs) must redact too — not silently
+	// pass the field through as the old map-only redactor did.
+	src := "facet Secret:\n" +
+		"    who:\n" +
+		"        redact user.ssn always\n" +
+		"    what:\n" +
+		"        user: User\n" +
+		"    looks:\n" +
+		"        <div>name={user.name} ssn={user.ssn}</div>\n"
+	c, err := Compile(src)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	type userRec struct {
+		ID   string
+		Name string
+		Ssn  string
+	}
+	type data struct{ User userRec }
+	orig := data{User: userRec{ID: "1", Name: "Ada", Ssn: "SECRET123"}}
+
+	html, err := c.RenderFor(View{Identity: "anyone"}, "Secret", orig)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(string(html), "name=Ada") {
+		t.Errorf("expected name to render: %s", html)
+	}
+	if strings.Contains(string(html), "SECRET123") {
+		t.Errorf("ssn must be redacted from a typed struct: %s", html)
+	}
+	if orig.User.Ssn != "SECRET123" {
+		t.Error("RenderFor mutated the caller's struct")
+	}
+}
+
+func TestRedactFailsClosedOnUnknownField(t *testing.T) {
+	// A redaction that names a field the struct doesn't have is a misconfiguration;
+	// rendering anyway could leak data, so RenderFor must error instead.
+	src := "facet Secret:\n" +
+		"    who:\n" +
+		"        redact user.nope always\n" +
+		"    what:\n" +
+		"        user: User\n" +
+		"    looks:\n" +
+		"        <div>name={user.name}</div>\n"
+	c, err := Compile(src)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	type userRec struct{ Name string }
+	type data struct{ User userRec }
+	if _, err := c.RenderFor(View{}, "Secret", data{User: userRec{Name: "Ada"}}); err == nil || !strings.Contains(err.Error(), "no such field") {
+		t.Fatalf("expected fail-closed error for an unknown redact field, got: %v", err)
+	}
+}
+
 func TestMissingPolicyErrors(t *testing.T) {
 	src := "facet X:\n    who:\n        require: nope\n    what:\n        u: User\n    looks:\n        <p>x</p>\n"
 	c, err := Compile(src)
