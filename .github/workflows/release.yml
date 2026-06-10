@@ -1,0 +1,59 @@
+name: release
+
+# On any v* tag push, cross-compile the `fct` CLI for every platform and publish a
+# GitHub Release with the binaries + checksums attached. Uses the repo's built-in
+# GITHUB_TOKEN — no extra secrets needed.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Cross-compile
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"
+          targets="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
+          for t in $targets; do
+            os="${t%/*}"; arch="${t#*/}"; ext=""
+            [ "$os" = "windows" ] && ext=".exe"
+            out="fct-${VERSION}-${os}-${arch}${ext}"
+            echo "building $out"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o "dist/${out}" ./cmd/fct
+          done
+          cd dist && sha256sum * > checksums.txt && cat checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **Prebuilt binary (no Go needed)** — download the file for your platform
+            below, then:
+
+            - **macOS / Linux:** `chmod +x fct-*` and move it onto your PATH as `fct`
+              (e.g. `sudo mv fct-* /usr/local/bin/fct`).
+            - **Windows:** rename the `.exe` to `fct.exe` and put it on your PATH.
+
+            **With Go:** `go install github.com/F33D3R-Inc/fct/cmd/fct@${{ github.ref_name }}`
+
+            Then: `fct new myapp && cd myapp && go run .`

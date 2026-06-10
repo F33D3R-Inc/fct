@@ -168,6 +168,7 @@
         if (root) root.innerHTML = data.html;
         if (data.title) document.title = data.title;
         if (push) history.pushState({ faNav: 1 }, '', url);
+        scanSubscribes(); // new content may declare channel subscriptions
         window.scrollTo(0, 0);
       })
       .catch(function () { window.location.href = url; });
@@ -191,13 +192,24 @@
     });
   }
 
+  // scanSubscribes auto-subscribes to channels declared on the page via
+  // data-fa-subscribe="channel" — a CSP-safe way (no inline script) for a
+  // server-rendered surface to opt into scoped live updates.
+  function scanSubscribes() {
+    var els = document.querySelectorAll('[data-fa-subscribe]');
+    for (var i = 0; i < els.length; i++) {
+      var ch = els[i].getAttribute('data-fa-subscribe');
+      if (ch) window.fa.subscribe(ch);
+    }
+  }
+
   function boot() {
     fetch(cfg.manifest_path)
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (m) { if (m && m.runtime) assign(cfg, m.runtime); })
       .catch(function () {})
       .then(initKey)
-      .then(function () { connectSSE(); wireActions(); wireNav(); });
+      .then(function () { connectSSE(); wireActions(); wireNav(); scanSubscribes(); });
   }
 
   // Public API: subscribe to a channel for topic fan-out (server authorizes).

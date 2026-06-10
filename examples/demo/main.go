@@ -60,11 +60,17 @@ func main() {
 
 	mux := http.NewServeMux()
 	app.Mount(mux) // /sse, /events, /manifest.json, /fa-runtime.js
-	app.HandlePage(mux, fa.ShellOptions{Title: "Facet Architecture — composition", Theme: "dark", CSS: demoCSS},
-		func(r *http.Request) template.HTML {
-			return `<div class="card">` + profile() +
-				`<p class="hint">click Follow — only the button re-renders, and only on your screen</p></div>`
-		})
+	app.Route("/", "Composition", func(rc fa.RouteCtx) template.HTML {
+		return `<div class="card">` + profile() +
+			`<p class="hint">click Follow — only the button re-renders, and only on your screen. ` +
+			`<a href="/about" data-nav>About →</a></p></div>`
+	})
+	app.Route("/about", "About", func(rc fa.RouteCtx) template.HTML {
+		return `<div class="card"><h2>About</h2>` +
+			`<p>You navigated here with no page reload — the SSE connection stayed open. ` +
+			`<a href="/" data-nav>← Back</a></p></div>`
+	})
+	app.MountRouter(mux, fa.ShellOptions{Title: "Facet Architecture — composition", Theme: "dark", CSS: demoCSS})
 
 	addr := os.Getenv("FA_ADDR")
 	if addr == "" {

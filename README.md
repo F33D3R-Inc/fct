@@ -32,21 +32,64 @@ the runtime verifies + swaps it by `data-facet-id`.
 
 ---
 
+## Install
+
+> **Prerequisite — Go 1.23+.** FA apps *are* Go programs (the server is a single Go
+> binary), so you need Go installed to build one. Get it at <https://go.dev/dl/>.
+
+Install the **`fct`** command one of two ways.
+
+### A) With Go (any OS — simplest)
+
+```sh
+go install github.com/F33D3R-Inc/fct/cmd/fct@latest
+```
+
+This puts `fct` in your Go bin dir (`go env GOBIN`, or `$(go env GOPATH)/bin`).
+Make sure that's on your `PATH`.
+
+### B) Prebuilt binary (from the Releases page)
+
+Download the binary for your platform from
+**[Releases](https://github.com/F33D3R-Inc/fct/releases/latest)**, then:
+
+**macOS** (Apple Silicon → `darwin-arm64`, Intel → `darwin-amd64`)
+```sh
+chmod +x fct-*-darwin-*
+sudo mv fct-*-darwin-* /usr/local/bin/fct
+xattr -d com.apple.quarantine /usr/local/bin/fct 2>/dev/null || true   # if Gatekeeper blocks it
+```
+
+**Linux** (`linux-amd64` or `linux-arm64`)
+```sh
+chmod +x fct-*-linux-*
+sudo mv fct-*-linux-* /usr/local/bin/fct
+```
+
+**Windows** (`windows-amd64.exe`) — rename to `fct.exe` and put it in a folder on
+your `PATH` (e.g. PowerShell):
+```powershell
+mkdir "$env:USERPROFILE\bin" -Force
+move .\fct-*-windows-amd64.exe "$env:USERPROFILE\bin\fct.exe"
+setx PATH "$env:PATH;$env:USERPROFILE\bin"   # reopen the terminal after this
+```
+
+Verify: `fct version`.
+
 ## Quick start
 
 ```sh
-go install github.com/F33D3R-Inc/fct/cmd/fct@latest   # installs the `fct` command
 fct new myapp
 cd myapp
 go run .            # open http://localhost:7373  (FA_ADDR overrides the port)
 fct dev             # same, but rebuilds on .fct change
 ```
 
-`go run .` automatically downloads the framework (`github.com/F33D3R-Inc/fct/fa`
-and `/std`) from GitHub — there is no separate "install the library" step. A
-scaffolded `main.go` is pure wiring: compile the facets, declare what each event
-does, serve the Playground. No client framework, no API layer, no shell HTML to
-hand-write.
+`fct new` runs `go mod tidy` for you, so `go run .` downloads the framework
+(`github.com/F33D3R-Inc/fct/fa` and `/std`) from GitHub and boots — there is no
+separate "install the library" step. A scaffolded `main.go` is pure wiring:
+compile the facets, declare what each event does, serve the Playground. No client
+framework, no API layer, no shell HTML to hand-write.
 
 > Working from a local checkout instead of the published module? Point a scaffold
 > at it with `go mod edit -replace github.com/F33D3R-Inc/fct=/path/to/fct`.
