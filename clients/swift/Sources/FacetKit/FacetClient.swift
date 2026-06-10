@@ -8,6 +8,7 @@ struct FacetEvent: Decodable {
     let op: String?
     let facet_id: String?
     let fragment: String?
+    let tree: ViewNode?   // server-styled neutral tree (native connections)
     let conn: String?
 }
 
@@ -82,6 +83,7 @@ public final class FacetClient: ObservableObject {
                 do {
                     var req = URLRequest(url: self.url("/sse"))
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    req.setValue("1", forHTTPHeaderField: "FA-Native") // get styled trees, not HTML
                     let (bytes, _) = try await self.session.bytes(for: req)
                     await self.setConnected(true)
                     var dataLines: [String] = []
@@ -120,19 +122,16 @@ public final class FacetClient: ObservableObject {
 
     private func apply(_ ev: FacetEvent) {
         guard let tree, let id = ev.facet_id else { return }
+        // Native connections receive the server-styled tree directly; the HTML
+        // fragment is only a fallback (e.g. a server that didn't send a tree).
+        let node: ViewNode? = ev.tree ?? ev.fragment.map { FacetHTMLParser.parse($0) }
         switch ev.op {
         case "replace":
-            if let frag = ev.fragment {
-                self.tree = tree.replacingFacet(id, with: FacetHTMLParser.parse(frag))
-            }
+            if let node { self.tree = tree.replacingFacet(id, with: node) }
         case "append":
-            if let frag = ev.fragment {
-                self.tree = tree.insertingChild(into: id, FacetHTMLParser.parse(frag), prepend: false)
-            }
+            if let node { self.tree = tree.insertingChild(into: id, node, prepend: false) }
         case "prepend":
-            if let frag = ev.fragment {
-                self.tree = tree.insertingChild(into: id, FacetHTMLParser.parse(frag), prepend: true)
-            }
+            if let node { self.tree = tree.insertingChild(into: id, node, prepend: true) }
         case "remove":
             self.tree = tree.removingFacet(id)
         default:

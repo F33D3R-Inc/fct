@@ -16,10 +16,11 @@ import (
 // Event is a single server→client DOM mutation pushed over SSE. It mirrors the
 // shape the client runtime (runtime/fa-runtime.js) applies.
 type Event struct {
-	Op       string `json:"op"`                 // replace | append | prepend | remove
-	FacetID  string `json:"facet_id"`           // target data-facet-id
-	Fragment string `json:"fragment,omitempty"` // new HTML (empty for remove)
-	HMAC     string `json:"hmac,omitempty"`     // set by the hub before send
+	Op       string    `json:"op"`                 // replace | append | prepend | remove
+	FacetID  string    `json:"facet_id"`           // target data-facet-id
+	Fragment string    `json:"fragment,omitempty"` // new HTML (web clients)
+	Tree     *ViewNode `json:"tree,omitempty"`     // styled neutral tree (native clients)
+	HMAC     string    `json:"hmac,omitempty"`     // set by the hub before send
 }
 
 // sign attaches an HMAC-SHA256 over the event's meaningful fields so the client

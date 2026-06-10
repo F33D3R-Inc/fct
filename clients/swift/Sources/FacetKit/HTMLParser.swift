@@ -148,7 +148,9 @@ public enum FacetHTMLParser {
             if !attrs.isEmpty { n.attrs = attrs }
             n.facetId = attrs["data-facet-id"]
             n.action = attrs["data-action"]
-            n.style = StyleResolver.resolve(tag: name, attrs: attrs)
+            // No style resolution here: style is server-resolved and arrives on the
+            // tree (initial load + SSE events). This parser is only a fallback for
+            // fragment-only events, where structural layout is enough.
             return n
         }
 

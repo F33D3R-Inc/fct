@@ -433,17 +433,17 @@ Both load a route as a neutral tree (`FA-Native: 1`), render it to native views,
 hold the SSE connection, apply surgical updates by `facetId`, and forward taps to
 `/events` — **zero app logic on device**.
 
-**Layout is server-driven, not guessed.** The server resolves each node's
-`Style` (`direction`/`gap`/`pad`/`align` + `bg`/`fg`/`fontWeight`/`radius`) from
-inline styles and a design-system class table (`fa/style.go`), so native renderers
-lay out exactly. Live SSE fragments are re-resolved on-device through a kept-in-sync
-mirror so updates match.
+**Layout is server-driven, and the style table is single-source.** The server
+resolves each node's `Style` (`direction`/`gap`/`pad`/`align` + `bg`/`fg`/
+`fontWeight`/`radius`) from inline styles and a design-system class table
+(`fa/style.go`), so native renderers lay out exactly. Native SSE connections
+(`FA-Native: 1`) receive each update as an **already-styled neutral tree**, so the
+clients hold no style logic at all — `fa/style.go` is the only style table.
 
 Built and tested: the server-side neutral tree + style model (`RenderTree`,
-`ParseView`, `Style`; proven on the real stdlib) and both client runtimes (model,
-HTML→tree parser, on-device style resolver, SSE, surgical updates, native renderer;
-unit tests mirror the Go parser). Roadmap: push already-styled trees over SSE
-(single source of truth), HMAC event verification on native.
+`ParseView`, `Style`; styled trees over SSE; proven on the real stdlib) and both
+client runtimes (model, SSE, surgical updates, native renderer driven by the server
+style; unit tests). Roadmap: HMAC event verification on native.
 
 ---
 

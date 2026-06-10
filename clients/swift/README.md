@@ -64,8 +64,10 @@ swift test     # FacetKitTests mirrors the Go fa.ParseView tests
 
 ## Status
 
-Built: the view-tree model, the HTML→tree parser (port of `fa.ParseView`), the SSE
-client, surgical update application, action forwarding, and the SwiftUI renderer.
-The server side (`FA-Native` route responses, `RenderTree`) is in `fa` and tested in
-Go. Next: an explicit server-driven style/layout model, HMAC event verification
-(parity with the web runtime), and the Android/Compose sibling client.
+Built: the view-tree model, the SSE client, surgical update application, action
+forwarding, and the SwiftUI renderer driven by the server-resolved `Style`. **Style
+lives only on the server** — native SSE connections (`FA-Native: 1`) receive each
+update as an already-styled neutral tree, so the client holds no style table; a
+small HTML→tree parser remains only as a fallback for fragment-only events. The
+server side (`FA-Native` responses, `RenderTree`, `Style`) is in `fa`, tested in Go.
+Next: HMAC event verification (parity with the web runtime).

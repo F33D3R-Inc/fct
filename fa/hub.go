@@ -58,6 +58,7 @@ type sseClient struct {
 	identity string          // app-resolved identity ("" = anonymous)
 	ip       string          // client IP (for the per-IP connection cap)
 	channels map[string]bool // subscribed channels
+	native   bool            // a native client (FA-Native) — gets styled trees, not HTML
 	send     chan []byte
 }
 
@@ -103,6 +104,7 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request, identity string) 
 	c := &sseClient{
 		id: newConnID(), identity: identity, ip: clientIP(r),
 		channels: make(map[string]bool), send: make(chan []byte, clientSendBuffer),
+		native: r.Header.Get("FA-Native") == "1",
 	}
 	if !h.register(c) {
 		http.Error(w, "too many connections", http.StatusTooManyRequests)
@@ -278,32 +280,64 @@ func (h *Hub) deliverLocal(msg []byte) {
 	if err := json.Unmarshal(msg, &m); err != nil {
 		return
 	}
-	line := sseLine(m.Event)
-	if line == nil {
-		return
+	// Web connections get the HTML fragment; native connections get the same event
+	// with the server-resolved, styled neutral tree (built once, lazily). The
+	// signature is unchanged (it covers op/facet_id/fragment), so the web frame is
+	// untouched and native clients need no style table of their own.
+	var webLine, nativeLine []byte
+	web := func() []byte {
+		if webLine == nil {
+			webLine = sseLine(m.Event)
+		}
+		return webLine
 	}
+	nat := func() []byte {
+		if nativeLine == nil {
+			nativeLine = sseLine(withTree(m.Event))
+		}
+		return nativeLine
+	}
+	lineFor := func(c *sseClient) []byte {
+		if c.native {
+			return nat()
+		}
+		return web()
+	}
+
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	switch m.Scope {
 	case "conn":
 		if c := h.clients[m.Target]; c != nil {
-			h.sendLine(c, line)
+			h.sendLine(c, lineFor(c))
 		}
 	case "identity":
 		for _, c := range h.clients {
 			if c.identity == m.Target {
-				h.sendLine(c, line)
+				h.sendLine(c, lineFor(c))
 			}
 		}
 	case "channel":
 		for id := range h.rooms[m.Target] {
 			if c := h.clients[id]; c != nil {
-				h.sendLine(c, line)
+				h.sendLine(c, lineFor(c))
 			}
 		}
 	case "broadcast":
 		for _, c := range h.clients {
-			h.sendLine(c, line)
+			h.sendLine(c, lineFor(c))
 		}
 	}
+}
+
+// withTree returns a copy of the event carrying the styled neutral tree parsed
+// from its HTML fragment — the form native clients apply directly (no on-device
+// HTML parsing or style resolution; the style table lives only on the server).
+func withTree(e Event) Event {
+	if e.Fragment != "" {
+		if tree, err := ParseView(e.Fragment); err == nil {
+			e.Tree = tree
+		}
+	}
+	return e
 }

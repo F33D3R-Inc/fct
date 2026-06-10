@@ -22,6 +22,7 @@ private data class FacetEvent(
     val op: String? = null,
     val facet_id: String? = null,
     val fragment: String? = null,
+    val tree: ViewNode? = null, // server-styled neutral tree (native connections)
     val conn: String? = null,
 )
 
@@ -92,6 +93,7 @@ class FacetClient(
                 try {
                     val conn = (URL("$base/sse").openConnection() as HttpURLConnection).apply {
                         setRequestProperty("Accept", "text/event-stream")
+                        setRequestProperty("FA-Native", "1") // get styled trees, not HTML
                         connectTimeout = 5000
                         readTimeout = 0
                     }
@@ -134,10 +136,13 @@ class FacetClient(
     private fun apply(ev: FacetEvent) {
         val cur = tree ?: return
         val id = ev.facet_id ?: return
+        // Native connections receive the server-styled tree directly; the HTML
+        // fragment is only a fallback.
+        val node = ev.tree ?: ev.fragment?.let { FacetHtmlParser.parse(it) }
         tree = when (ev.op) {
-            "replace" -> ev.fragment?.let { cur.replacingFacet(id, FacetHtmlParser.parse(it)) } ?: cur
-            "append" -> ev.fragment?.let { cur.insertingChild(id, FacetHtmlParser.parse(it), false) } ?: cur
-            "prepend" -> ev.fragment?.let { cur.insertingChild(id, FacetHtmlParser.parse(it), true) } ?: cur
+            "replace" -> node?.let { cur.replacingFacet(id, it) } ?: cur
+            "append" -> node?.let { cur.insertingChild(id, it, false) } ?: cur
+            "prepend" -> node?.let { cur.insertingChild(id, it, true) } ?: cur
             "remove" -> cur.removingFacet(id)
             else -> cur
         }

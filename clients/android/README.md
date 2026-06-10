@@ -40,9 +40,9 @@ the SSE connection.
 | `icon` | placeholder |
 
 Layout comes from the server-resolved `style` (direction/gap/pad/align/paint), not
-guessed from class names. Live SSE fragments are parsed on-device and re-resolved
-through `StyleResolver` (a kept-in-sync mirror of `fa/style.go`) so updates look
-identical to the initial server-rendered screen.
+guessed from class names. **The style table lives only on the server** — native SSE
+connections (`FA-Native: 1`) receive each update as an already-styled neutral tree,
+so the client holds no style logic at all.
 
 ## Build & test
 
@@ -56,11 +56,10 @@ cd clients/android
 
 ## Status
 
-Built: the view-tree model, the HTML→tree parser (port of `fa.ParseView`), the
-on-device style resolver (mirror of `fa.Style`), the SSE client, surgical updates,
-action forwarding, and the Compose renderer. The server side (`FA-Native` responses,
-`RenderTree`, `Style`) is in `fa` and tested in Go.
+Built: the view-tree model, the SSE client (receives already-styled trees), surgical
+updates, action forwarding, and the Compose renderer. Style is resolved entirely on
+the server (`fa.Style`); the client carries no style table. A small HTML→tree parser
+remains only as a fallback for fragment-only events.
 
-Roadmap: push already-styled neutral trees over SSE so the style table lives only on
-the server (removing the client mirror); HMAC event verification (parity with web);
-richer layout (explicit width/spacing units).
+Roadmap: HMAC event verification (parity with web); richer layout (explicit
+width/spacing units).

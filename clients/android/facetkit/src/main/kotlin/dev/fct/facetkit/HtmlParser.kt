@@ -135,13 +135,15 @@ object FacetHtmlParser {
             }
         }
 
+        // No style resolution here: style is server-resolved and arrives on the
+        // tree (initial load + SSE events). This parser is only a fallback for
+        // fragment-only events, where structural layout is enough.
         fun nodeFromTag(name: String, attrs: Map<String, String>): ViewNode = ViewNode(
             kind = kindFor(name),
             tag = name,
             attrs = attrs.ifEmpty { null },
             facetId = attrs["data-facet-id"],
             action = attrs["data-action"],
-            style = StyleResolver.resolve(name, attrs),
         )
 
         fun foldText(children: List<ViewNode>): String? {

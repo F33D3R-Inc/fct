@@ -41,19 +41,19 @@ class FacetKitTest {
         assertEquals(1, n.children?.count { it.kind == "text" && it.text == "Play" })
     }
 
-    @Test fun stylesResolveOnDeviceLikeServer() {
-        // Class-based row + design-system button paint, resolved client-side from
-        // the parsed fragment (kept consistent with fa/style.go).
-        val row = FacetHtmlParser.parse("""<div class="fa-row"><span>a</span></div>""")
-        assertEquals("row", row.style?.direction)
+    @Test fun styleArrivesFromServerOnTheTree() {
+        // Style is resolved on the SERVER and decoded from the tree — the client
+        // holds no style table. A fragment parsed as a fallback carries no style.
+        val json = Json { ignoreUnknownKeys = true }
+        val node = json.decodeFromString<ViewNode>(
+            """{"kind":"button","style":{"direction":"row","bg":"#1d9bf0","radius":999}}"""
+        )
+        assertEquals("row", node.style?.direction)
+        assertEquals("#1d9bf0", node.style?.bg)
+        assertEquals(999, node.style?.radius)
 
-        val btn = FacetHtmlParser.parse("""<button class="fa-btn fa-btn--primary" data-action="x">Go</button>""")
-        assertEquals("#1d9bf0", btn.style?.bg)
-        assertEquals(999, btn.style?.radius)
-
-        // Inline width (a progress fill).
-        val bar = FacetHtmlParser.parse("""<span class="fa-progress__fill" style="width:30%"></span>""")
-        assertEquals("30%", bar.style?.width)
+        val fallback = FacetHtmlParser.parse("""<div class="fa-row"></div>""")
+        assertNull(fallback.style) // parser no longer resolves style (single source: server)
     }
 
     @Test fun surgicalUpdates() {
