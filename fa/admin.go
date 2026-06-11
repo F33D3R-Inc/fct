@@ -368,4 +368,13 @@ const adminCSS template.CSS = `
 .adm-fields dt{padding:10px 12px;color:var(--mut);border-bottom:1px solid var(--b);font-weight:600}
 .adm-fields dd{padding:10px 12px;margin:0;border-bottom:1px solid var(--b)}
 .adm-err{color:#f4212e}
+@media (max-width:768px){
+.adm{grid-template-columns:1fr}
+.adm__side{border-right:0;border-bottom:1px solid var(--b);position:sticky;top:0;z-index:10}
+.adm__side nav{flex-direction:row;flex-wrap:wrap}
+.adm__main{padding:16px}
+.adm-fields{grid-template-columns:1fr}
+.adm-fields dt{border-bottom:0;padding-bottom:2px}
+.adm-table{display:block;overflow-x:auto}
+}
 `

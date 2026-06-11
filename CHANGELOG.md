@@ -36,6 +36,19 @@ The taxonomy that compiled in v0.11.0 now *behaves*:
   `[data-fa-media]` elements, filling `{field}` holes from `data-*` attributes;
   `<hls>`/`<dash>` normalize to `<video controls>`.
 
+### Responsive layouts (enterprise polish)
+
+- **std theme**: added the page-level breakpoints the fluid components needed —
+  the AppShell now collapses like a first-class product: 3 columns → the right
+  rail drops (≤1100px) → the nav rail goes icon-only (≤768px) → single column
+  with a fixed bottom nav bar incl. safe-area inset (≤520px). Tables scroll
+  horizontally instead of overflowing; story viewer goes full-bleed on phones.
+- **Admin panel**: the fixed 240px sidebar grid now collapses to a sticky top
+  bar with wrapping nav on narrow windows; detail field grids go single-column;
+  tables scroll instead of crushing the layout.
+- (Everything else was already fluid: viewport meta in the shell, flex-wrap,
+  `minmax()` grids, aspect-ratio, percentage caps.)
+
 ### Compiler / library plumbing
 
 - `Compile` now type-checks the per-kind extras: a malformed `throttle:` /
