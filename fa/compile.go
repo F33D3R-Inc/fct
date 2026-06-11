@@ -22,6 +22,7 @@ type Compiled struct {
 	Manifest []byte
 	auth     map[string]facetAuth       // facet → who: requirements (protected facets)
 	policies map[string]func(View) bool // policy name → implementation
+	meta     map[string]facetMeta       // facet → per-kind runtime rules (primitives.go)
 }
 
 // Compile compiles FDL source (one or more facets) into renderable templates.
@@ -74,11 +75,19 @@ func Compile(src string) (*Compiled, error) {
 			return nil, fmt.Errorf("slot template invalid: %w", err)
 		}
 	}
+	// Typed per-kind runtime rules (feed order, stream throttle/window, signal
+	// ttl, lifecycle states). A malformed duration/count fails compilation here
+	// rather than misbehaving silently at runtime.
+	meta, err := parseFacetMeta(out.Manifest)
+	if err != nil {
+		return nil, err
+	}
 	c := &Compiled{
 		root:     root,
 		Manifest: out.Manifest,
 		auth:     make(map[string]facetAuth),
 		policies: make(map[string]func(View) bool),
+		meta:     meta,
 	}
 	// Record who: requirements so protected facets can only render via RenderFor.
 	for _, f := range facets {

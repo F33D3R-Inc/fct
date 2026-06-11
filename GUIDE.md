@@ -167,11 +167,13 @@ and pushed updates are HMAC-signed so a tampered fragment is rejected.
 
 ## 9. What's not built yet (so you're not surprised)
 
-This is an early, working core. Today: one primitive (`facet`), facets compose by
-rendering and concatenating, expressions are simple field paths. Not yet:
-child-facet tags (`<Avatar/>` inside another facet), the richer primitives
-(`feed`/`stream`/`vault`/`media`), and typed data structs. See the roadmap in
-`README.md`.
+This is an early, working core. All 8 primitives compile and run (server + web
+runtime): child-facet tags (`<Avatar/>` + `slot:`), typed data structs, rich
+expressions, feed ranking, stream throttle/window, lifecycle transitions, signal
+relay + TTL, vault client-side decrypt, and media mounting all work. Not yet:
+per-primitive enforcement in the **native** runtimes (FacetKit / Compose), named
+slots, client-side `if`/`for` in vault/media bodies, and non-Go backend targets.
+See the roadmap in `README.md`.
 
 ---
 

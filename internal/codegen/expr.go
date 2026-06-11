@@ -350,10 +350,10 @@ func lowerPath(segs, scope []string) string {
 	if inScope(scope, segs[0]) {
 		b.WriteString("$" + segs[0])
 	} else {
-		b.WriteString("." + goName(segs[0]))
+		b.WriteString("." + GoName(segs[0]))
 	}
 	for _, s := range segs[1:] {
-		b.WriteString("." + goName(s))
+		b.WriteString("." + GoName(s))
 	}
 	return b.String()
 }

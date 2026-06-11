@@ -60,7 +60,7 @@ func TestGuardBlocksUnauthorized(t *testing.T) {
 }
 
 func TestConnCapPerIP(t *testing.T) {
-	h := newHub(nil, nil)
+	h := newHub(nil, nil, nil)
 	mk := func(ip string) *sseClient {
 		return &sseClient{id: newConnID(), ip: ip, channels: make(map[string]bool), send: make(chan []byte, 1)}
 	}

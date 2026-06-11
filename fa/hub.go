@@ -36,10 +36,26 @@ type Hub struct {
 	broker  Broker // cross-instance event fan-out
 	metrics *Metrics
 
+	rules map[string]facetMeta // per-primitive runtime rules (throttle enforcement)
+
 	mu      sync.RWMutex
 	clients map[string]*sseClient      // connID → client (LOCAL to this instance)
 	rooms   map[string]map[string]bool // channel → set of connID
 	ipConns map[string]int             // client IP → live connection count
+
+	gateMu sync.Mutex
+	gates  map[string]*throttleGate // scope\0target\0facetID → throttle state
+}
+
+// throttleGate is the per-(scope,target,facet-instance) state for a stream/pipe
+// `throttle:`. Trailing-edge coalescing: the first event in a quiet period goes
+// out immediately; events arriving inside the interval replace each other and
+// the LATEST is flushed when the interval elapses. Intermediates are dropped —
+// for a stream, delivering the final state is the contract; every intermediate
+// frame is not.
+type throttleGate struct {
+	last    time.Time
+	pending *fanoutMsg // latest deferred emit; nil when no flush is scheduled
 }
 
 // fanoutMsg is the wire form of an emit, routed through the Broker to every
@@ -62,16 +78,18 @@ type sseClient struct {
 	send     chan []byte
 }
 
-func newHub(key []byte, broker Broker) *Hub {
+func newHub(key []byte, broker Broker, rules map[string]facetMeta) *Hub {
 	if broker == nil {
 		broker = newLocalBroker()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
 		ctx: ctx, cancel: cancel, key: key, broker: broker, metrics: &Metrics{},
+		rules:   rules,
 		clients: make(map[string]*sseClient),
 		rooms:   make(map[string]map[string]bool),
 		ipConns: make(map[string]int),
+		gates:   make(map[string]*throttleGate),
 	}
 	broker.Subscribe(h.deliverLocal) // apply events from this and other instances
 	return h
@@ -245,20 +263,83 @@ func (h *Hub) sendLine(c *sseClient, line []byte) {
 
 // emit signs each event and publishes a routing message to the broker, which
 // fans it out to every instance (including this one); deliverLocal applies it to
-// matching local connections.
+// matching local connections. Events targeting a stream/pipe with a declared
+// `throttle:` go through a per-instance gate first (trailing-edge coalescing);
+// throttling happens at the EMITTING instance, before the broker.
 func (h *Hub) emit(scope, target string, events []Event) {
 	for _, e := range events {
 		sign(h.key, &e) // e is a copy (range value) — caller's slice not mutated
-		msg, err := json.Marshal(fanoutMsg{Scope: scope, Target: target, Event: e})
-		if err != nil {
-			slog.Error("fa: marshal fanout", "err", err)
+		m := fanoutMsg{Scope: scope, Target: target, Event: e}
+		if d := h.throttleFor(e.FacetID); d > 0 {
+			h.throttle(m, d)
 			continue
 		}
-		if err := h.broker.Publish(msg); err != nil {
-			slog.Error("fa: broker publish", "err", err)
-		}
-		h.metrics.EventsOut.Add(1)
+		h.publish(m)
 	}
+}
+
+// publish sends one signed fanout message to the broker.
+func (h *Hub) publish(m fanoutMsg) {
+	msg, err := json.Marshal(m)
+	if err != nil {
+		slog.Error("fa: marshal fanout", "err", err)
+		return
+	}
+	if err := h.broker.Publish(msg); err != nil {
+		slog.Error("fa: broker publish", "err", err)
+	}
+	h.metrics.EventsOut.Add(1)
+}
+
+// throttleFor returns the declared throttle interval for the primitive a
+// facet-id instance belongs to (0 = unthrottled).
+func (h *Hub) throttleFor(facetID string) time.Duration {
+	if facetID == "" || len(h.rules) == 0 {
+		return 0
+	}
+	return h.rules[facetName(facetID)].throttle
+}
+
+// throttle applies trailing-edge coalescing to one emit. The gate key includes
+// scope and target so e.g. two channels of the same stream throttle
+// independently (one room's chatter cannot starve another room's update).
+func (h *Hub) throttle(m fanoutMsg, d time.Duration) {
+	key := m.Scope + "\x00" + m.Target + "\x00" + m.Event.FacetID
+	now := time.Now()
+
+	h.gateMu.Lock()
+	g := h.gates[key]
+	if g == nil {
+		g = &throttleGate{}
+		h.gates[key] = g
+	}
+	if g.pending != nil {
+		g.pending = &m // a flush is already scheduled — latest wins
+		h.gateMu.Unlock()
+		return
+	}
+	since := now.Sub(g.last)
+	if since >= d {
+		g.last = now
+		h.gateMu.Unlock()
+		h.publish(m)
+		return
+	}
+	g.pending = &m
+	h.gateMu.Unlock()
+	time.AfterFunc(d-since, func() {
+		if h.ctx.Err() != nil {
+			return // hub shut down — drop the pending frame
+		}
+		h.gateMu.Lock()
+		pending := g.pending
+		g.pending = nil
+		g.last = time.Now()
+		h.gateMu.Unlock()
+		if pending != nil {
+			h.publish(*pending)
+		}
+	})
 }
 
 // EmitConn delivers events to a single connection — the actor of an action.
@@ -340,6 +421,9 @@ func (h *Hub) deliverLocal(msg []byte) {
 // its HTML — so the tree the device renders is authenticated, and the style table
 // stays solely on the server.
 func (h *Hub) nativeEvent(e Event) Event {
+	if e.Op == "signal" {
+		return e // a signal's fragment is already a JSON payload, not HTML
+	}
 	if e.Fragment != "" {
 		if tree, err := ParseView(e.Fragment); err == nil {
 			if js, err := json.Marshal(tree); err == nil {

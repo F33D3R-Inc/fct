@@ -62,7 +62,7 @@ func BenchmarkDispatch(b *testing.B) {
 
 // BenchmarkEmitChannel measures signed fan-out to N local subscribers.
 func BenchmarkEmitChannel(b *testing.B) {
-	h := newHub([]byte("bench-key-bench-key-bench-key-bk"), nil)
+	h := newHub([]byte("bench-key-bench-key-bench-key-bk"), nil, nil)
 	const subs = 1000
 	for i := 0; i < subs; i++ {
 		c := &sseClient{id: newConnID(), channels: make(map[string]bool), send: make(chan []byte, 1<<16)}

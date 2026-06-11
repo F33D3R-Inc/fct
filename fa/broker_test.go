@@ -35,8 +35,8 @@ func (b *memBroker) Subscribe(fn func([]byte)) {
 func TestCrossInstanceFanout(t *testing.T) {
 	key := []byte("shared-signing-key-shared-key!!!")
 	broker := &memBroker{}
-	hubA := newHub(key, broker) // instance A
-	hubB := newHub(key, broker) // instance B
+	hubA := newHub(key, broker, nil) // instance A
+	hubB := newHub(key, broker, nil) // instance B
 
 	// A client is connected (and subscribed to "post:9") on instance B only.
 	cb := &sseClient{id: newConnID(), channels: make(map[string]bool), send: make(chan []byte, 4)}
@@ -73,7 +73,7 @@ func TestCrossInstanceFanout(t *testing.T) {
 
 // TestSingleInstanceStillWorks confirms the default (nil broker) delivers locally.
 func TestSingleInstanceStillWorks(t *testing.T) {
-	h := newHub([]byte("k-k-k-k-k-k-k-k-k-k-k-k-k-k-k-k!"), nil)
+	h := newHub([]byte("k-k-k-k-k-k-k-k-k-k-k-k-k-k-k-k!"), nil, nil)
 	c := &sseClient{id: newConnID(), channels: make(map[string]bool), send: make(chan []byte, 2)}
 	h.register(c)
 	h.EmitConn(c.id, Event{Op: "replace", FacetID: "X", Fragment: "<b>1</b>"})

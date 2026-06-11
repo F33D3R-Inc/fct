@@ -2,6 +2,55 @@
 
 All notable changes. Pre-1.0: minor versions may break.
 
+## v0.12.0
+
+### Primitive runtime semantics (server + web runtime)
+
+The taxonomy that compiled in v0.11.0 now *behaves*:
+
+- **feed** — `Compiled.SortFeed(facet, items)` orders a slice (structs, struct
+  pointers, or maps) by the declared `order:` field in place. Bare field =
+  descending (ranked list); `asc` flips. Snake_case fields resolve idiomatic Go
+  struct names (`created_at` → `CreatedAt`). Fails closed: a missing field or
+  non-comparable type errors and leaves the slice untouched.
+- **stream / pipe `throttle:`** — enforced in the hub, per (scope, target,
+  facet instance), at the emitting instance. Trailing-edge coalescing: first
+  frame immediate, frames inside the interval replace each other, the latest
+  flushes when it elapses. The final state is always delivered.
+- **stream `window:`** — the web runtime trims the container after
+  `append`/`prepend` (from the opposite end), capping DOM growth.
+- **lifecycle `states:`** — `Compiled.Lifecycle(facet)` returns the validated
+  machine (`Initial`/`Valid`/`Next`/`CanTransition`, forward-by-one).
+- **signal** — `App.Signal` / `Ctx.Signal` relay a signed `signal` event
+  (payload JSON as the fragment) to channel subscribers; nothing is stored.
+  Fails closed unless the target is a declared `signal`. The web runtime applies
+  the payload to `[data-fa-signal]` elements as `data-*` attributes +
+  `.fa-signal-live`, and reverts after the declared `ttl:`.
+- **vault** — client-side decrypt in the web runtime: `fa.vault.key(name,
+  hexKey)` registers an AES-GCM key (never sent to the server); the runtime
+  decrypts each `[data-fa-vault]` element's `data-fa-envelope` (base64 IV‖CT)
+  and renders the manifest's `decrypt:` body with `{plaintext}` (JSON plaintext
+  exposes fields), HTML-escaped. Round 1 supports field interpolation (no
+  client-side if/for).
+- **media** — the web runtime mounts the player from the `source:` body inside
+  `[data-fa-media]` elements, filling `{field}` holes from `data-*` attributes;
+  `<hls>`/`<dash>` normalize to `<video controls>`.
+
+### Compiler / library plumbing
+
+- `Compile` now type-checks the per-kind extras: a malformed `throttle:` /
+  `ttl:` (non-Go-duration) or `window:` (non-positive-int) is a **compile
+  error**, not a silent runtime no-op.
+- The manifest's primitive rules are parsed once into typed runtime metadata
+  shared by `Compiled` and `App`; the client runtime builds the same registry
+  from `/manifest.json` (no wire-format change, nothing new to sign).
+- The hub's native transform passes `signal` events through untouched (their
+  fragment is the JSON payload, not HTML).
+- `codegen.GoName` (the snake_case → Go name mapping) is now exported for reuse.
+
+Native runtimes (FacetKit / Compose) get window/TTL/vault/media enforcement in
+the next round; they already receive signal events over the same signed wire.
+
 ## v0.11.0
 
 ### Language & compiler

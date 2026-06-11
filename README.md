@@ -26,13 +26,16 @@ of the box, and the rest of the primitive taxonomy now compiles.
 | Child-facet composition (`<Avatar/>` + `slot:`) | ✅ |
 | Typed codegen (`<Facet>Data` structs, idiomatic initialisms) | ✅ |
 | All 8 primitives — parser + codegen + manifest surface | ✅ |
-| Per-primitive **runtime** semantics (feed ranking, stream window, vault decrypt, …) | ⬜ staged |
+| Per-primitive **runtime** semantics — web (feed ranking, stream throttle/window, lifecycle transitions, signal relay + TTL, vault decrypt, media mount) | ✅ |
+| Per-primitive runtime semantics — native clients (FacetKit / Compose) | ⬜ staged |
 
-The other 7 primitives are accepted by the compiler: each parses, type-checks its
-`what:` contract, and emits the right artifacts — crucially, the client-rendered
-kinds (`vault`/`media`/`signal`) emit **zero server template** (the structural
-guarantee). Their per-primitive *runtime behavior* (ranking, windowing, client-side
-decrypt, binary delivery, ephemeral relay) is the next build phase.
+Every primitive now has runtime behavior, server-side and in the web runtime:
+feeds rank via `SortFeed`, stream/pipe `throttle:` is enforced in the hub
+(trailing-edge coalescing), `window:` trims the DOM, lifecycles validate
+transitions, signals relay ephemerally and expire after `ttl:`, vaults decrypt
+client-side (AES-GCM via `fa.vault.key`), and the runtime mounts media players
+from `source:`. The client-rendered kinds (`vault`/`media`/`signal`) still emit
+**zero server template** (the structural guarantee).
 
 Verified loop: `fct new` → `go run .` → a page with the Playground, a `Home`
 facet and a live `LikeButton`; clicking it POSTs to one `/events` endpoint, the
@@ -155,8 +158,8 @@ input — an unknown primitive, or a block on the wrong kind, names the fix).
 
 Client-rendered kinds replace `looks:` with their own render/transport block and
 the compiler emits **no server template** for them — the bytes that render vault
-content never exist on the server. (Per-primitive *runtime* behavior is staged;
-see Status.)
+content never exist on the server. (Per-primitive *runtime* behavior: see "How
+the primitives behave at runtime" below.)
 
 ### Lexical rules
 - UTF-8, case-sensitive.
@@ -248,11 +251,12 @@ not yet implemented — until then, concatenate rendered facets in the handler.
 
 ---
 
-## The primitive taxonomy (canonical; all 8 compile, runtime staged)
+## The primitive taxonomy (canonical; all 8 compile and run)
 
-All 8 are accepted by the compiler today (parser + codegen + manifest). The
-"Server renders?" column is the architectural line the compiler **enforces**:
-client-rendered kinds emit zero server template.
+All 8 are accepted by the compiler (parser + codegen + manifest) and have
+runtime behavior on the server and in the web runtime. The "Server renders?"
+column is the architectural line the compiler **enforces**: client-rendered
+kinds emit zero server template.
 
 | Primitive  | Role                          | Server renders? |
 |------------|-------------------------------|-----------------|
@@ -274,6 +278,43 @@ because React has no notion of *where* rendering happens as a security primitive
 
 **`media`** delivers binary (HLS/DASH/WebRTC via a `source:` block); `looks:` is
 just the player container and the runtime owns what's inside it.
+
+### How the primitives behave at runtime
+
+- **feed `order:`** — `c.SortFeed("Timeline", items)` sorts a slice (structs,
+  struct pointers, or maps) by the declared field before render. A bare field
+  ranks **descending** (a feed is best/newest-first); `order: <field> asc` flips
+  it. Fails closed: a missing field or non-comparable type is an error and the
+  slice is untouched.
+- **stream/pipe `throttle:`** — enforced in the hub at the emitting instance.
+  Trailing-edge coalescing per (scope, target, facet instance): the first frame
+  in a quiet period goes out immediately; frames arriving inside the interval
+  replace each other and the **latest** flushes when it elapses. Final state is
+  always delivered; intermediate frames are dropped.
+- **stream `window:`** — enforced by the web runtime: after an `append`/
+  `prepend` the container is trimmed from the opposite end, so the DOM never
+  grows unbounded.
+- **lifecycle `states:`** — `c.Lifecycle("Order")` returns the validated state
+  machine: `Initial`, `Valid`, `Next`, and `CanTransition(from, to)` (forward by
+  exactly one declared state; branches like cancellation are app logic on top of
+  `Valid`).
+- **signal `ttl:`** — `app.Signal(channel, facetID, payload)` (or `ctx.Signal`
+  from a handler) relays a signed `signal` event to a channel's subscribers and
+  stores **nothing**. In the page, elements opt in with
+  `data-fa-signal="Typing"`: the runtime sets each payload key as a `data-*`
+  attribute, adds `.fa-signal-live`, and reverts both after `ttl:` — a typing
+  indicator is pure CSS, zero app JS.
+- **vault `decrypt:`** — the app provides the key in the browser via
+  `fa.vault.key("DM", hexKey)` (derived client-side; never sent). The runtime
+  AES-GCM-decrypts each `[data-fa-vault="DM"]` element's `data-fa-envelope`
+  (base64 of 12-byte IV ‖ ciphertext) and renders the `decrypt:` body with
+  `{plaintext}` (a JSON plaintext also exposes its fields), HTML-escaped.
+- **media `source:`** — the runtime mounts the player inside each
+  `[data-fa-media="Clip"]` element, filling `{field}` holes from the element's
+  `data-*` attributes; `<hls>`/`<dash>` normalize to `<video controls>`.
+
+Native runtimes (FacetKit / Compose) receive signal events over the same SSE
+wire today; their window/TTL/vault/media enforcement is the staged next round.
 
 ---
 
@@ -654,10 +695,13 @@ broken code. `fct add` also takes a URL or a local path. Editor support:
    handle initialisms (`id` → `ID`, not `Id`).
 - ✅ **Richer expressions** — comparisons, boolean, arithmetic, method calls, literals.
 4. **Typed data + computed fields** — see #3 above (the big remaining language gap).
-5. **Primitive runtime semantics** — all 8 compile; the per-kind *behavior* is
-   the next build: feed ranking/ordering, stream `throttle`/`window` enforcement,
-   lifecycle state transitions, signal relay + TTL expiry, media binary delivery,
-   and `vault` client-side decrypt in the web + native runtimes.
+- ✅ **Primitive runtime semantics (server + web)** — feed ranking (`SortFeed`),
+  stream `throttle` (hub coalescing) + `window` (DOM trim), lifecycle state
+  transitions, signal relay + TTL expiry, `vault` client-side decrypt (AES-GCM),
+  media player mounting.
+5. **Primitive runtime semantics — native** — bring window/TTL/vault/media
+   enforcement to FacetKit (SwiftUI) and the Compose client (they already share
+   the SSE wire and signed events).
 
 **Tooling / ecosystem**
 - ✅ `fct check` / `fct fmt` / `fct lsp` (editor diagnostics) / `fct add` (registry).

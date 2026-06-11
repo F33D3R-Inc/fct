@@ -4,6 +4,40 @@ Newest first. Each entry: the call, the reasoning, and what would reverse it.
 
 ---
 
+## ADR-0006 — Primitive runtime semantics, round 1: the specific calls
+
+**Decision.** The per-kind behaviors shipped in v0.12.0 pin down five
+underspecified corners:
+
+1. **Stream/pipe `throttle:` is trailing-edge coalescing at the emitting
+   instance** (per scope+target+facet-instance): first frame immediate, frames
+   inside the interval replace each other, the latest flushes when it elapses.
+   Intermediates are dropped, the final state is always delivered. It runs
+   before the broker, so multi-instance deployments throttle where the events
+   originate.
+2. **A bare feed `order:` field sorts descending.** A feed is a *ranked* list —
+   best/newest first is the overwhelming default (`score`, `created_at`);
+   `asc` is explicit. Fails closed on a missing/non-comparable field.
+3. **Lifecycle transitions are forward-by-one** through the declared `states:`
+   list. Branches (cancel, refund) are app logic on top of `Valid` — the
+   declaration stays a simple ordered list instead of growing a transition
+   grammar prematurely.
+4. **Signal `ttl:` is enforced client-side from the manifest**, not carried on
+   the wire. The client already fetches the manifest; adding a TTL field to the
+   event would either be unsigned (spoofable) or change the HMAC layout for one
+   kind. The relay stores nothing on the server either way.
+5. **Vault envelopes are AES-GCM, base64(12-byte IV ‖ ciphertext)**, key
+   registered in the browser via `fa.vault.key(name, hexKey)` and never sent.
+   Round 1 client bodies support field interpolation only (no `if`/`for`) —
+   decrypted values are always HTML-escaped, so plaintext can't inject markup.
+
+**Reverses if.** Apps need leading-edge or rate-N throttling (becomes a
+`throttle:` mode), feeds need multi-key ordering (becomes a list), lifecycles
+need declared branch transitions (becomes a grammar), or vault needs algorithm
+agility (the envelope gains a version byte).
+
+---
+
 ## ADR-0005 — Unified block keywords `who/what/looks/when`; subscription folded into `when`
 
 **Decision.** Adopt one set of block keywords across all primitives:

@@ -48,7 +48,7 @@ func GoStructs(pkg string, facets []*ast.Facet) string {
 		b.WriteString("\n// " + f.Name + "Data is the typed data for facet " + f.Name + ".\n")
 		b.WriteString("type " + f.Name + "Data struct {\n")
 		for _, fld := range f.Fields {
-			b.WriteString("\t" + goName(fld.Name) + " " + goType(fld.Type) + "\n")
+			b.WriteString("\t" + GoName(fld.Name) + " " + goType(fld.Type) + "\n")
 		}
 		b.WriteString("}\n")
 	}
@@ -318,7 +318,7 @@ func emitChild(c ast.Child, scope []string, ctx *genCtx) (string, error) {
 		} else {
 			val = strconv.Quote(p.Literal)
 		}
-		b.WriteString(" " + strconv.Quote(goName(p.Name)) + " " + val)
+		b.WriteString(" " + strconv.Quote(GoName(p.Name)) + " " + val)
 	}
 	// Block form: render the slot content into an auxiliary template (executed
 	// with the parent's data via faSlot) and pass it as "__children".
@@ -516,11 +516,11 @@ var goInitialisms = map[string]string{
 	"udp": "UDP", "tls": "TLS", "ssh": "SSH", "ui": "UI", "cpu": "CPU", "ttl": "TTL",
 }
 
-// goName maps an FDL field name to its idiomatic exported Go name: snake_case
+// GoName maps an FDL field name to its idiomatic exported Go name: snake_case
 // words are Title-cased and known initialisms are upper-cased — user_id → UserID,
 // avatar_url → AvatarURL, id → ID, title → Title. This makes templates and data
 // interop cleanly with idiomatic Go structs (fixing the old id→Id hack).
-func goName(field string) string {
+func GoName(field string) string {
 	var b strings.Builder
 	for _, p := range strings.Split(field, "_") {
 		if p == "" {

@@ -51,6 +51,8 @@ type App struct {
 	metrics  *Metrics
 	draining atomic.Bool // set during graceful shutdown so /readyz fails
 
+	rules map[string]facetMeta // per-primitive runtime rules from the manifest
+
 	mu          sync.RWMutex
 	handlers    map[string]Handler
 	guards      map[string]func(Ctx) bool // per-event authorization (audit C2)
@@ -116,9 +118,20 @@ func New(manifest []byte, opts ...Option) *App {
 		})
 	}
 
-	hub := newHub(key, cfg.broker)
+	// Per-primitive runtime rules (stream/pipe throttle is enforced in the hub;
+	// feed/lifecycle/signal rules are looked up by name). A manifest that doesn't
+	// parse yields no rules — Compile validates these strictly, so this lenient
+	// path only matters for hand-built manifests.
+	rules, err := parseFacetMeta(manifest)
+	if err != nil {
+		slog.Warn("fa: manifest has no usable primitive rules", "err", err)
+		rules = nil
+	}
+
+	hub := newHub(key, cfg.broker, rules)
 	return &App{
 		hub:      hub,
+		rules:    rules,
 		manifest: manifest,
 		metrics:  hub.metrics,
 		handlers: make(map[string]Handler),
