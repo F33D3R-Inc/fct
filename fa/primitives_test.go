@@ -240,7 +240,7 @@ func TestSignalRejectsNonSignal(t *testing.T) {
 // A signal's fragment is a JSON payload, not HTML — the native transform must
 // pass it through untouched.
 func TestNativeEventLeavesSignalPayload(t *testing.T) {
-	h := newHub([]byte("k-k-k-k-k-k-k-k-k-k-k-k-k-k-k-k!"), nil, nil)
+	h := newHub([]byte("k-k-k-k-k-k-k-k-k-k-k-k-k-k-k-k!"), nil, nil, nil)
 	in := Event{Op: "signal", FacetID: "Typing", Fragment: `{"who":"ada"}`}
 	sign(h.key, &in)
 	out := h.nativeEvent(in)

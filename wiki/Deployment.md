@@ -140,7 +140,8 @@ Built in, on the app's mux:
 |---|---|
 | `GET /healthz` | liveness — process is up |
 | `GET /readyz` | readiness — returns **503 once `app.Shutdown()` starts**, so the LB drains the node before it dies |
-| `GET /debug/metrics` | JSON counters: events in/out, active/total connections, rate-limited, forbidden |
+| `GET /metrics` | **Prometheus exposition format** — the counters below plus `fa_dispatch_duration_seconds` / `fa_fanout_duration_seconds` latency histograms; point a Prometheus scrape job here |
+| `GET /debug/metrics` | the same counters as JSON: events in/out, active/total connections, rate-limited, forbidden |
 
 The scaffold already wires SIGTERM → `app.Shutdown()` (drain) →
 `http.Server.Shutdown` — rolling deploys work out of the box. Point your
@@ -154,6 +155,37 @@ readinessProbe: { httpGet: { path: /readyz,  port: 7373 } }
 
 Wrap your mux in `fa.LogRequests(mux)` (the scaffold does) for structured
 method/path/status/duration request logs.
+
+## Distributed tracing (OpenTelemetry)
+
+FA stays dependency-free by exposing a three-method `fa.Tracer` hook instead of
+importing OTel. Implement it with the OTel SDK and pass `fa.WithTracer(t)`;
+FA then opens spans around its pipeline — `fa.dispatch` (guard + handler +
+emit, per client action), `fa.emit` (sign + publish to the broker), and
+`fa.deliver` (a broker message applied to local connections). The emitter's
+trace context rides inside the broker message (`Tracer.Inject` /
+`Tracer.Extract`, one call each on a W3C `TraceContext` propagator), so a
+request stays traceable across instances:
+
+```go
+type otelTracer struct{ tr trace.Tracer; prop propagation.TextMapPropagator }
+
+func (t otelTracer) StartSpan(ctx context.Context, name string, attrs map[string]string) (context.Context, func(error)) {
+    var kv []attribute.KeyValue
+    for k, v := range attrs { kv = append(kv, attribute.String(k, v)) }
+    ctx, span := t.tr.Start(ctx, name, trace.WithAttributes(kv...))
+    return ctx, func(err error) {
+        if err != nil { span.RecordError(err); span.SetStatus(codes.Error, err.Error()) }
+        span.End()
+    }
+}
+func (t otelTracer) Inject(ctx context.Context) string {
+    c := propagation.MapCarrier{}; t.prop.Inject(ctx, c); return c["traceparent"]
+}
+func (t otelTracer) Extract(ctx context.Context, carrier string) context.Context {
+    return t.prop.Extract(ctx, propagation.MapCarrier{"traceparent": carrier})
+}
+```
 
 ## systemd (plain VM deploy)
 

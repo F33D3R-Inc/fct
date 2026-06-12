@@ -82,7 +82,7 @@ func postEvent(t *testing.T, mux *http.ServeMux, body string) int {
 }
 
 func TestBroadcastReachesAllClients(t *testing.T) {
-	h := newHub([]byte("key-key-key-key-key-key-key-key!"), nil, nil)
+	h := newHub([]byte("key-key-key-key-key-key-key-key!"), nil, nil, nil)
 	a, b := testConn(h, ""), testConn(h, "")
 	h.Broadcast(Event{Op: "replace", FacetID: "F:1", Fragment: "<b>x</b>"})
 	for _, c := range []*sseClient{a, b} {

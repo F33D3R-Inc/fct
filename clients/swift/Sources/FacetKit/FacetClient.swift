@@ -12,6 +12,7 @@ struct FacetEvent: Decodable {
     let hmac: String?
     let conn: String?
     let key: String?        // signing key, on the _conn frame
+    let v: String?          // server's SSE wire version, on the _conn frame
 }
 
 /// FacetClient is the Apple-platform FA runtime. It is the analogue of
@@ -26,10 +27,18 @@ struct FacetEvent: Decodable {
 /// ```
 @MainActor
 public final class FacetClient: ObservableObject {
+    /// The SSE wire version this client speaks. The server rejects a mismatch at
+    /// connect (426) and announces its own version on the hello frame; either
+    /// way an incompatible pairing surfaces as `wireError`, not silent breakage.
+    public static let wireVersion = "1"
+
     /// The current screen tree; SwiftUI re-renders when it changes.
     @Published public private(set) var tree: ViewNode?
     @Published public private(set) var title: String = ""
     @Published public private(set) var connected = false
+    /// Set (and reconnection stopped) when this client and the server speak
+    /// different SSE wire versions — fail loud, never render garbage.
+    @Published public private(set) var wireError: String?
 
     public let baseURL: URL
     private let session: URLSession
@@ -118,7 +127,13 @@ public final class FacetClient: ObservableObject {
                     var req = URLRequest(url: self.url("/sse"))
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     req.setValue("1", forHTTPHeaderField: "FA-Native") // get styled trees, not HTML
-                    let (bytes, _) = try await self.session.bytes(for: req)
+                    req.setValue(Self.wireVersion, forHTTPHeaderField: "FA-Wire-Version")
+                    let (bytes, response) = try await self.session.bytes(for: req)
+                    if (response as? HTTPURLResponse)?.statusCode == 426 {
+                        let server = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "FA-Wire-Version") ?? "?"
+                        await self.failWire("server speaks SSE wire v\(server), this client speaks v\(Self.wireVersion)")
+                        return // fatal — do not reconnect-loop against an incompatible server
+                    }
                     await self.setConnected(true)
                     var dataLines: [String] = []
                     for try await line in bytes.lines {
@@ -143,10 +158,23 @@ public final class FacetClient: ObservableObject {
 
     private func setConnected(_ v: Bool) { connected = v }
 
+    private func failWire(_ msg: String) {
+        wireError = msg
+        connected = false
+        sseTask?.cancel()
+        sseTask = nil
+    }
+
     private func handleFrame(_ json: String) {
         guard let data = json.data(using: .utf8),
               let ev = try? JSONDecoder().decode(FacetEvent.self, from: data) else { return }
         if ev.op == "_conn" {
+            // Hello-frame version check: catches a new client against an old server
+            // (the other direction is rejected with 426 before any frame arrives).
+            if let v = ev.v, v != Self.wireVersion {
+                failWire("server speaks SSE wire v\(v), this client speaks v\(Self.wireVersion)")
+                return
+            }
             connID = ev.conn
             if let k = ev.key, let bytes = Self.hexToBytes(k) { signKey = SymmetricKey(data: bytes) }
             flushPending()

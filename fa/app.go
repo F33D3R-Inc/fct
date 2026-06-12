@@ -1,6 +1,7 @@
 package fa
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/F33D3R-Inc/fct/runtime"
 )
@@ -28,14 +30,27 @@ type Ctx struct {
 	app      *App
 }
 
+// emitCtx is the trace context a handler's fan-out emits run under — the
+// request context (which carries the fa.dispatch span) when there is one.
+func (c Ctx) emitCtx() context.Context {
+	if c.R != nil {
+		return c.R.Context()
+	}
+	return context.Background()
+}
+
 // EmitChannel pushes events to every subscriber of a channel (topic fan-out).
-func (c Ctx) EmitChannel(channel string, events ...Event) { c.app.hub.EmitChannel(channel, events...) }
+func (c Ctx) EmitChannel(channel string, events ...Event) {
+	c.app.hub.emit(c.emitCtx(), "channel", channel, events)
+}
 
 // EmitTo pushes events to all connections of an identity (a user across tabs).
-func (c Ctx) EmitTo(identity string, events ...Event) { c.app.hub.EmitTo(identity, events...) }
+func (c Ctx) EmitTo(identity string, events ...Event) {
+	c.app.hub.emit(c.emitCtx(), "identity", identity, events)
+}
 
 // Broadcast pushes events to every connection. Public content only.
-func (c Ctx) Broadcast(events ...Event) { c.app.hub.Broadcast(events...) }
+func (c Ctx) Broadcast(events ...Event) { c.app.hub.emit(c.emitCtx(), "broadcast", "", events) }
 
 // Handler processes one client event and returns the DOM mutations to push to
 // the ACTOR. This is where application logic lives — on the server, where the
@@ -72,6 +87,7 @@ type Option func(*appConfig)
 type appConfig struct {
 	key    []byte
 	broker Broker
+	tracer Tracer
 }
 
 // WithSigningKey sets a STABLE event-signing key. Use this (or the FA_SIGNING_KEY
@@ -128,7 +144,7 @@ func New(manifest []byte, opts ...Option) *App {
 		rules = nil
 	}
 
-	hub := newHub(key, cfg.broker, rules)
+	hub := newHub(key, cfg.broker, rules, cfg.tracer)
 	return &App{
 		hub:      hub,
 		rules:    rules,
@@ -342,6 +358,14 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown or mismatched connection", http.StatusForbidden)
 		return
 	}
+	// The fa.dispatch span covers guard + handler + emit; the request context it
+	// returns is what Ctx.Emit* and the actor emit run under, so a handler's
+	// fan-out (and its broker hop — fa.deliver) parents back to this action.
+	start := time.Now()
+	tctx, endSpan := a.hub.span(r.Context(), "fa.dispatch", map[string]string{"fa.event": req.Type})
+	r = r.WithContext(tctx)
+	defer func() { a.metrics.DispatchSeconds.Observe(time.Since(start)) }()
+
 	ctx := Ctx{Type: req.Type, Payload: req.Payload, Identity: identity, ConnID: req.Conn, R: r, app: a}
 	// Authorization guard (structural, enforced before any handler logic).
 	a.mu.RLock()
@@ -349,14 +373,17 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	a.mu.RUnlock()
 	if guard != nil && !guard(ctx) {
 		a.metrics.Forbidden.Add(1)
+		endSpan(ErrForbidden)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	events, err := h(ctx)
 	if err != nil {
+		endSpan(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.hub.EmitConn(req.Conn, events...) // actor only — no fan-out by default
+	a.hub.emit(tctx, "conn", req.Conn, events) // actor only — no fan-out by default
+	endSpan(nil)
 	w.WriteHeader(http.StatusNoContent)
 }

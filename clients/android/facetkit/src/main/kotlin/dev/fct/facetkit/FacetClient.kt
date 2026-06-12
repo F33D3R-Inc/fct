@@ -19,6 +19,12 @@ import java.net.URL
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
+/**
+ * The SSE wire version this client speaks (see STABILITY.md). The server rejects
+ * a mismatch at connect (426) and announces its own version on the hello frame.
+ */
+private const val WIRE_VERSION = "1"
+
 /** A server-pushed SSE event (mirror of the web runtime's frame). */
 @Serializable
 private data class FacetEvent(
@@ -28,6 +34,7 @@ private data class FacetEvent(
     val hmac: String? = null,
     val conn: String? = null,
     val key: String? = null,      // signing key, on the _conn frame
+    val v: String? = null,        // server's SSE wire version, on the _conn frame
 )
 
 @Serializable
@@ -57,6 +64,13 @@ class FacetClient(
     var title by mutableStateOf("")
         private set
     var connected by mutableStateOf(false)
+        private set
+
+    /**
+     * Set (and reconnection stopped) when this client and the server speak
+     * different SSE wire versions — fail loud, never render garbage.
+     */
+    var wireError by mutableStateOf<String?>(null)
         private set
 
     private var connId: String? = null
@@ -147,8 +161,17 @@ class FacetClient(
                     val conn = (URL("$base/sse").openConnection() as HttpURLConnection).apply {
                         setRequestProperty("Accept", "text/event-stream")
                         setRequestProperty("FA-Native", "1") // get styled trees, not HTML
+                        setRequestProperty("FA-Wire-Version", WIRE_VERSION)
                         connectTimeout = 5000
                         readTimeout = 0
+                    }
+                    if (conn.responseCode == 426) {
+                        // Fatal — do not reconnect-loop against an incompatible server.
+                        val server = conn.getHeaderField("FA-Wire-Version") ?: "?"
+                        withContext(Dispatchers.Main) {
+                            failWire("server speaks SSE wire v$server, this client speaks v$WIRE_VERSION")
+                        }
+                        return@launch
                     }
                     conn.inputStream.bufferedReader().use { reader ->
                         withContext(Dispatchers.Main) { connected = true }
@@ -160,6 +183,7 @@ class FacetClient(
                                 if (data.isNotEmpty()) {
                                     val frame = data.toString(); data.clear()
                                     withContext(Dispatchers.Main) { handleFrame(frame) }
+                                    if (wireError != null) return@launch // fatal — stop the stream
                                 }
                             } else if (l.startsWith("data:")) {
                                 data.append(l.removePrefix("data:").trim())
@@ -176,9 +200,20 @@ class FacetClient(
         }
     }
 
+    private fun failWire(msg: String) {
+        wireError = msg
+        connected = false
+    }
+
     private fun handleFrame(frame: String) {
         val ev = try { json.decodeFromString<FacetEvent>(frame) } catch (_: Exception) { return }
         if (ev.op == "_conn") {
+            // Hello-frame version check: catches a new client against an old server
+            // (the other direction is rejected with 426 before any frame arrives).
+            if (ev.v != null && ev.v != WIRE_VERSION) {
+                failWire("server speaks SSE wire v${ev.v}, this client speaks v$WIRE_VERSION")
+                return
+            }
             connId = ev.conn
             ev.key?.let { signKey = hexToBytes(it) }
             flushPending()

@@ -18,10 +18,12 @@
   'use strict';
 
   var cfg = { sse_path: '/sse', events_path: '/events', manifest_path: '/manifest.json' };
+  var WIRE_VERSION = '1';    // SSE wire version this runtime speaks (see STABILITY.md)
   var connID = null;
   var pending = [];          // actions fired before connID is known
   var subscriptions = {};    // channels to (re)subscribe to
   var registry = {};         // facet name → manifest entry (kind, window, ttl, client body)
+  var wireMismatch = null;   // set when the server speaks a different wire version (fatal)
 
   function facetName(id) { return String(id || '').split(':')[0]; }
   function metaFor(id) { return registry[facetName(id)] || null; }
@@ -236,7 +238,17 @@
   }
 
   function handleEvent(ev) {
-    if (ev.op === '_conn') { onConn(ev.conn); return; } // control frame, not a DOM op
+    if (ev.op === '_conn') { // control frame, not a DOM op
+      // Fail loud on a wire-version mismatch (new runtime against an old server
+      // — the other direction is rejected server-side with 426 at connect).
+      if (ev.v && ev.v !== WIRE_VERSION) {
+        wireMismatch = 'server speaks SSE wire v' + ev.v + ', this runtime speaks v' + WIRE_VERSION;
+        console.error('[fa] FATAL: ' + wireMismatch + ' — not reconnecting; upgrade the page or the server');
+        return;
+      }
+      onConn(ev.conn);
+      return;
+    }
     verify(ev).then(function (ok) {
       if (!ok) { console.warn('[fa] dropped event with bad signature', ev.op, ev.facet_id); return; }
       apply(ev);
@@ -257,11 +269,18 @@
 
   var delay = 1000;
   function connectSSE() {
-    var es = new EventSource(cfg.sse_path);
-    es.onmessage = function (e) { try { handleEvent(JSON.parse(e.data)); } catch (_) {} };
+    // Declare the wire version we speak as ?v= (EventSource cannot set headers);
+    // a server that doesn't speak it rejects the connect with 426 — fail loud.
+    var url = cfg.sse_path + (cfg.sse_path.indexOf('?') < 0 ? '?' : '&') + 'v=' + WIRE_VERSION;
+    var es = new EventSource(url);
+    es.onmessage = function (e) {
+      try { handleEvent(JSON.parse(e.data)); } catch (_) {}
+      if (wireMismatch) es.close(); // fatal — stop the stream, no reconnect
+    };
     es.onopen = function () { delay = 1000; };
     es.onerror = function () {
       es.close();
+      if (wireMismatch) return;      // fatal — do not reconnect-loop
       connID = null;                 // a reconnect gets a fresh connection id
       setTimeout(connectSSE, delay);
       delay = Math.min(delay * 2, 30000);

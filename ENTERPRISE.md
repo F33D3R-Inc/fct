@@ -14,11 +14,11 @@ Last updated: 2026-06-11 (v0.13.0).
 | Security (app-level) | ✅ shipped — full suite, audited (`SECURITY_AUDIT.md`); disclosure policy in `SECURITY.md` |
 | Horizontal scale-out | ✅ shipped (Redis broker, shared key) — ⬜ unvalidated under real load |
 | Operations | ✅ shipped (health, drain, Docker, logs) |
-| Observability | 🟡 partial — JSON metrics only; no Prometheus/OTel |
+| Observability | ✅ shipped — Prometheus `/metrics` (counters + latency histograms), `fa.Tracer` OTel hooks traceable across the broker |
 | Data / persistence | ✅ documented (BYO database — see `wiki/Working-with-Databases.md`) |
 | AuthN / SSO | 🟡 partial — sessions + identity built in; no OIDC/SAML story |
-| API stability | ⬜ open — pre-1.0, minor versions may break |
-| Supply chain | ⬜ open — no signed releases / SBOM / vuln scanning in CI |
+| API stability | ✅ shipped — `STABILITY.md` (semver, 1.0 surface freeze, deprecation policy) + wire-version negotiation in all three runtimes |
+| Supply chain | ✅ shipped — cosign-signed releases, SLSA provenance, SBOM, govulncheck + dependency review in CI, reproducible builds (`docs/REPRODUCIBLE_BUILDS.md`) |
 | Native client parity | ✅ shipped — wire, HMAC, surgical updates, and per-primitive semantics (window/ttl/vault/media) in both runtimes, unit-tested |
 | Docs | ✅ shipped — user wiki (`wiki/`), guide, ADRs, security audit |
 | Accessibility / i18n | ⬜ open |
@@ -61,26 +61,40 @@ Last updated: 2026-06-11 (v0.13.0).
    connections per instance, event dispatch p99 under fan-out, memory per
    connection, broker saturation point, and reconnect-storm behavior after a
    deploy. The README performance table gains a "validated at scale" section.
-2. **API stability commitment.** Today "pre-1.0: minor versions may break"
-   (CHANGELOG). Done = a 1.0 surface freeze for `fa`, `std`, `fatest`, the
-   manifest schema, and the SSE wire format; semver + a written deprecation
-   policy (one minor of warning before removal); wire-format version
-   negotiation so old native clients fail loud, not weird.
+- ✅ **API stability commitment** *(v0.14.0)* — `STABILITY.md` defines semver,
+  the 1.0 surface freeze (`fa`, `std`, `fatest`, the manifest schema, the SSE
+  wire format), and the deprecation policy (≥ one full minor of `Deprecated:`
+  warning before removal; post-1.0 removal only at a major). Wire-format
+  version negotiation shipped in all three runtimes: clients declare their
+  version at connect (`FA-Wire-Version` header; `?v=` for EventSource) and a
+  mismatch is a loud **426** at the handshake; the `_conn` hello frame carries
+  the server's version (`fa.WireVersion`) and every runtime fails fatal — no
+  reconnect loop, no garbage rendering — on mismatch (`fa/wire.go`,
+  `runtime/fa-runtime.js`, `FacetClient.swift`/`.kt` `wireError`; test
+  `fa/wire_test.go`).
 - ✅ **Native primitive parity** *(v0.13.0)* — `window:` trimming, signal
   `ttl:` apply/revert, vault AES-GCM decrypt (device-held key), and media
   mounting enforced in both FacetKit (SwiftUI) and the Compose client, from
   the same manifest registry as the web runtime, with unit tests
   (`clients/swift`, `clients/android`).
-3. **Observability in standard formats.** `/debug/metrics` is bespoke JSON.
-   Done = Prometheus exposition format on `/metrics` (counters it already
-   tracks: events in/out, conns, rate-limited, forbidden — plus dispatch
-   latency histograms), and OpenTelemetry trace hooks around
-   dispatch→render→emit so a request is traceable across the broker.
-4. **Supply-chain hardening.** Done = signed release artifacts (cosign) +
-   SLSA provenance in the release workflow, SBOM per release, `govulncheck`
-   + dependency scanning in CI, and a pinned reproducible-build doc. (The
-   framework is dependency-free, which makes this cheap — do it while that's
-   still true.)
+- ✅ **Observability in standard formats** *(v0.14.0)* — `GET /metrics` serves
+  Prometheus exposition format, dependency-free (events in/out, conns
+  active/total, rate-limited, forbidden, plus `fa_dispatch_duration_seconds`
+  and `fa_fanout_duration_seconds` histograms); `/debug/metrics` JSON kept for
+  back-compat. `fa.Tracer` + `fa.WithTracer` open spans around
+  `fa.dispatch` → `fa.emit` → `fa.deliver`, with the emitter's trace context
+  carried inside the broker message (Inject/Extract — one call each on an OTel
+  W3C propagator), so a request is traceable across instances. OTel wiring
+  example in `wiki/Deployment.md`; tests `fa/observe_test.go`,
+  `fa/trace_test.go`.
+- ✅ **Supply-chain hardening** *(v0.14.0)* — the release workflow now ships,
+  per release: keyless **cosign** signature over `checksums.txt` (Sigstore,
+  Rekor-logged), **SLSA build provenance** as GitHub artifact attestations
+  (`gh attestation verify`), and an **SPDX SBOM**; builds are reproducible
+  (`-trimpath -buildid= -buildvcs=false`, CGO off, zero deps). `ci.yml` runs
+  **govulncheck** on every push/PR plus dependency review on PRs; every
+  third-party action is pinned to a commit SHA. Recipe + the three
+  verification commands: `docs/REPRODUCIBLE_BUILDS.md`.
 
 ### P1 — expected by enterprise evaluators
 

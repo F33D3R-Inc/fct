@@ -35,6 +35,7 @@ type Hub struct {
 	key     []byte
 	broker  Broker // cross-instance event fan-out
 	metrics *Metrics
+	tracer  Tracer // optional dispatch→render→emit trace hooks (see Tracer)
 
 	rules map[string]facetMeta // per-primitive runtime rules (throttle enforcement)
 
@@ -65,6 +66,9 @@ type fanoutMsg struct {
 	Scope  string `json:"s"` // conn | identity | channel | broadcast
 	Target string `json:"t,omitempty"`
 	Event  Event  `json:"e"`
+	// Trace is the emitter's serialized trace context (Tracer.Inject), restored
+	// by the delivering instance so a request is traceable across the broker.
+	Trace string `json:"tr,omitempty"`
 }
 
 // sseClient is one active connection. Only the ServeSSE goroutine writes to the
@@ -78,13 +82,13 @@ type sseClient struct {
 	send     chan []byte
 }
 
-func newHub(key []byte, broker Broker, rules map[string]facetMeta) *Hub {
+func newHub(key []byte, broker Broker, rules map[string]facetMeta, tracer Tracer) *Hub {
 	if broker == nil {
 		broker = newLocalBroker()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
-		ctx: ctx, cancel: cancel, key: key, broker: broker, metrics: &Metrics{},
+		ctx: ctx, cancel: cancel, key: key, broker: broker, metrics: &Metrics{}, tracer: tracer,
 		rules:   rules,
 		clients: make(map[string]*sseClient),
 		rooms:   make(map[string]map[string]bool),
@@ -109,6 +113,9 @@ func newConnID() string {
 // first frame (op "_conn") so the client can address its own connection when it
 // POSTs to /events.
 func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request, identity string) {
+	if !checkWireVersion(w, r) { // fail loud at connect, not weird at render
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -130,10 +137,11 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request, identity string) 
 	}
 	defer h.unregister(c)
 
-	// The hello frame carries the connection id and the signing key (already public
-	// — it ships in every web page's <meta name="fa-key">), so a native client can
-	// verify pushed events before any arrive.
-	hello, _ := json.Marshal(map[string]string{"op": "_conn", "conn": c.id, "key": hex.EncodeToString(h.key)})
+	// The hello frame carries the connection id, the signing key (already public
+	// — it ships in every web page's <meta name="fa-key">) so a native client can
+	// verify pushed events before any arrive, and the server's wire version so
+	// every client re-verifies compatibility on each (re)connect.
+	hello, _ := json.Marshal(map[string]string{"op": "_conn", "conn": c.id, "key": hex.EncodeToString(h.key), "v": WireVersion})
 	c.send <- []byte(fmt.Sprintf("data: %s\n\n", hello))
 
 	ticker := time.NewTicker(heartbeatInterval)
@@ -266,10 +274,21 @@ func (h *Hub) sendLine(c *sseClient, line []byte) {
 // matching local connections. Events targeting a stream/pipe with a declared
 // `throttle:` go through a per-instance gate first (trailing-edge coalescing);
 // throttling happens at the EMITTING instance, before the broker.
-func (h *Hub) emit(scope, target string, events []Event) {
+func (h *Hub) emit(ctx context.Context, scope, target string, events []Event) {
+	if len(events) == 0 {
+		return
+	}
+	ctx, end := h.span(ctx, "fa.emit", map[string]string{
+		"fa.scope": scope, "fa.target": target, "fa.events": fmt.Sprint(len(events)),
+	})
+	defer end(nil)
+	var trace string
+	if h.tracer != nil {
+		trace = h.tracer.Inject(ctx)
+	}
 	for _, e := range events {
 		sign(h.key, &e) // e is a copy (range value) — caller's slice not mutated
-		m := fanoutMsg{Scope: scope, Target: target, Event: e}
+		m := fanoutMsg{Scope: scope, Target: target, Event: e, Trace: trace}
 		if d := h.throttleFor(e.FacetID); d > 0 {
 			h.throttle(m, d)
 			continue
@@ -344,18 +363,22 @@ func (h *Hub) throttle(m fanoutMsg, d time.Duration) {
 
 // EmitConn delivers events to a single connection — the actor of an action.
 // This is the default scope for a handler's returned events: no fan-out, no leak.
-func (h *Hub) EmitConn(id string, events ...Event) { h.emit("conn", id, events) }
+func (h *Hub) EmitConn(id string, events ...Event) { h.emit(context.Background(), "conn", id, events) }
 
 // EmitTo delivers events to every connection of an identity (a user across tabs/
 // devices), wherever those connections live.
-func (h *Hub) EmitTo(identity string, events ...Event) { h.emit("identity", identity, events) }
+func (h *Hub) EmitTo(identity string, events ...Event) {
+	h.emit(context.Background(), "identity", identity, events)
+}
 
 // EmitChannel delivers events to the subscribers of a channel (topic fan-out).
-func (h *Hub) EmitChannel(channel string, events ...Event) { h.emit("channel", channel, events) }
+func (h *Hub) EmitChannel(channel string, events ...Event) {
+	h.emit(context.Background(), "channel", channel, events)
+}
 
 // Broadcast delivers events to ALL connections. Public content only — anything
 // user-specific must use EmitConn / EmitTo / EmitChannel.
-func (h *Hub) Broadcast(events ...Event) { h.emit("broadcast", "", events) }
+func (h *Hub) Broadcast(events ...Event) { h.emit(context.Background(), "broadcast", "", events) }
 
 // deliverLocal applies a fanout message (from this or another instance) to this
 // instance's matching connections.
@@ -363,6 +386,15 @@ func (h *Hub) deliverLocal(msg []byte) {
 	var m fanoutMsg
 	if err := json.Unmarshal(msg, &m); err != nil {
 		return
+	}
+	start := time.Now()
+	defer func() { h.metrics.FanoutSeconds.Observe(time.Since(start)) }()
+	if h.tracer != nil {
+		ctx := h.tracer.Extract(h.ctx, m.Trace) // child of the emitting instance's span
+		_, end := h.tracer.StartSpan(ctx, "fa.deliver", map[string]string{
+			"fa.scope": m.Scope, "fa.op": m.Event.Op, "fa.facet_id": m.Event.FacetID,
+		})
+		defer end(nil)
 	}
 	// Web connections get the HTML fragment; native connections get the same event
 	// with the server-resolved, styled neutral tree (built once, lazily). The

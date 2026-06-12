@@ -1,6 +1,52 @@
 # Changelog
 
-All notable changes. Pre-1.0: minor versions may break.
+All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
+policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
+minor bumps, never at patch bumps, with migration notes here).
+
+## [Unreleased] — v0.14.0
+
+Enterprise P0 round: observability in standard formats, the API stability
+contract, and supply-chain hardening (see `ENTERPRISE.md`).
+
+### Observability (Prometheus + tracing)
+
+- **`GET /metrics`** — Prometheus exposition format, dependency-free:
+  `fa_events_in_total`, `fa_events_out_total`, `fa_sse_connections_active`,
+  `fa_sse_connections_total`, `fa_events_rate_limited_total`,
+  `fa_events_forbidden_total`, plus two latency histograms —
+  `fa_dispatch_duration_seconds` (guard + handler + emit, per client action)
+  and `fa_fanout_duration_seconds` (one broker message applied to local
+  connections). `/debug/metrics` JSON unchanged.
+- **`fa.Tracer` + `fa.WithTracer`** — a three-method hook (StartSpan /
+  Inject / Extract) FA calls around `fa.dispatch` → `fa.emit` → `fa.deliver`.
+  The emitter's trace context rides inside the broker message, so one request
+  is traceable across instances; wire it to OpenTelemetry with ~20 lines
+  (example in `wiki/Deployment.md`). FA itself stays dependency-free.
+
+### API stability
+
+- **`STABILITY.md`** — semver commitment, the 1.0 surface freeze (`fa`, `std`,
+  `fatest`, manifest schema, SSE wire format), and the deprecation policy
+  (≥ one full minor of `Deprecated:` warning before any removal).
+- **Wire-format version negotiation** (`fa.WireVersion`, currently `"1"`):
+  clients declare their version at connect — `FA-Wire-Version` header (native)
+  or `?v=` (web; EventSource can't set headers) — and a mismatch is rejected
+  loud with **426 Upgrade Required**. The `_conn` hello frame now carries the
+  server's version (`"v"`); all three runtimes check it on every (re)connect
+  and stop with a fatal, human-readable error (`wireError` on FacetKit/Compose,
+  console error on web) instead of rendering garbage or reconnect-looping.
+  Clients that predate negotiation are treated as v1 — nothing breaks today.
+
+### Supply chain
+
+- Releases now ship a keyless **cosign** signature over `checksums.txt`
+  (Sigstore/Rekor), **SLSA build provenance** (GitHub artifact attestations),
+  and an **SPDX SBOM**; binaries build reproducibly (`-trimpath -buildid=`,
+  `-buildvcs=false`, CGO off). Verify with three commands —
+  `docs/REPRODUCIBLE_BUILDS.md`.
+- New `ci.yml`: vet + tests, **govulncheck** on every push/PR, dependency
+  review on PRs. All third-party actions pinned to commit SHAs.
 
 ## v0.13.0
 

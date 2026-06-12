@@ -14,7 +14,7 @@ import (
 // hashing the bytes it received. The style table stays on the server.
 func TestNativeConnectionGetsSignedStyledTree(t *testing.T) {
 	key := []byte("0123456789abcdef")
-	h := newHub(key, nil, nil)
+	h := newHub(key, nil, nil, nil)
 
 	web := &sseClient{id: "web", channels: map[string]bool{}, send: make(chan []byte, 4)}
 	nat := &sseClient{id: "nat", channels: map[string]bool{}, send: make(chan []byte, 4), native: true}
@@ -60,7 +60,7 @@ func TestNativeConnectionGetsSignedStyledTree(t *testing.T) {
 // The _conn hello carries the signing key so a native client can verify events.
 func TestHelloFrameCarriesKey(t *testing.T) {
 	key := []byte("0123456789abcdef")
-	h := newHub(key, nil, nil)
+	h := newHub(key, nil, nil, nil)
 	c := &sseClient{id: "c", channels: map[string]bool{}, send: make(chan []byte, 4), native: true}
 	h.register(c)
 	// ServeSSE writes the hello; here we just confirm the key is exposed for it.
