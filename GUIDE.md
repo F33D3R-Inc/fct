@@ -5,6 +5,8 @@ this will feel familiar — except your UI is server-rendered and updates live w
 **no client-side framework, no API layer, and no JavaScript you write.**
 
 > New here? Read the one-paragraph mental model, then just follow the steps.
+> This is the quick version — the full user documentation (databases/Postgres,
+> Docker, deployment, auth, realtime patterns, testing) is the **[wiki](wiki/Home.md)**.
 
 ## Mental model (the one thing to understand)
 

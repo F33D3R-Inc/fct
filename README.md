@@ -8,8 +8,11 @@ client manifest. The browser runs one fixed ~8 KB runtime that is pure plumbing 
 truth; UI is a live projection of it, pushed over SSE.
 
 > **This file is the single source of truth for the framework.** Read it first.
-> New to FA? **`GUIDE.md`** is the hands-on "build a website" tutorial.
+> New to FA? **`GUIDE.md`** is the hands-on "build a website" tutorial, and the
+> **[`wiki/`](wiki/Home.md)** is the full user documentation (getting started,
+> databases/Postgres, Docker, deployment, auth, testing, native clients).
 > `DECISIONS.md` records *why* choices were made (the ADR log).
+> `ENTERPRISE.md` tracks the remaining path to enterprise readiness.
 
 ---
 
@@ -685,6 +688,10 @@ broken code. `fct add` also takes a URL or a local path. Editor support:
 
 ## Known gaps & roadmap (in priority order)
 
+> This section tracks **language/DX** gaps. Production/organizational gaps
+> (load validation, API stability, supply chain, SSO, a11y, …) are tracked in
+> **`ENTERPRISE.md`** — the enterprise-readiness scorecard.
+
 **Core language / compiler**
 - ✅ **Composition** — child facets `<Avatar …/>` and `slot:` (block-form fill).
 - ✅ **Security** — scoped SSE, `who:` authz (Guard + RenderFor), CSRF, CSP, rate
@@ -708,8 +715,10 @@ broken code. `fct add` also takes a URL or a local path. Editor support:
 - ✅ Standard library (`std`, 229 facets, wired into `fct new`) + VS Code extension.
 6. **More backend targets** — codegen for Node / Python / Rust, not just Go
    (FA's pitch is language-agnostic via the compiler).
-7. **Hosting** — add a hosted registry + docs site (see `PUBLISHING.md`); the
-   catalog (live, video, audio rooms, commerce, settings, analytics) is built.
+7. **Hosting** — add a hosted registry + deploy the docs site (see
+   `PUBLISHING.md`); the catalog (live, video, audio rooms, commerce, settings,
+   analytics) is built, and the user wiki (`wiki/`) + mkdocs config are ready
+   to publish.
 
 ---
 
