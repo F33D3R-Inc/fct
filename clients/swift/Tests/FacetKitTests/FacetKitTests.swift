@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 @testable import FacetKit
 
@@ -62,6 +63,74 @@ final class FacetKitTests: XCTestCase {
         XCTAssertEqual(tree.children?.map { $0.facetId }, ["r0", "r1"])
         tree = tree.removingFacet("r1")
         XCTAssertEqual(tree.children?.map { $0.facetId }, ["r0"])
+    }
+
+    // ── primitive runtime semantics (native mirror of fa-runtime.js) ────────
+
+    // Stream `window:` — children cap, trimming the opposite end of the insert.
+    func testTrimmingChildren() {
+        var tree = ViewNode(kind: "box", facetId: "LiveChat", children: [
+            ViewNode(kind: "text", text: "1"), ViewNode(kind: "text", text: "2"),
+            ViewNode(kind: "text", text: "3"), ViewNode(kind: "text", text: "4"),
+        ])
+        let appended = tree.trimmingChildren(of: "LiveChat", max: 2, dropFromStart: true)
+        XCTAssertEqual(appended.children?.map { $0.text }, ["3", "4"]) // oldest dropped
+        let prepended = tree.trimmingChildren(of: "LiveChat", max: 2, dropFromStart: false)
+        XCTAssertEqual(prepended.children?.map { $0.text }, ["1", "2"])
+        tree = tree.trimmingChildren(of: "Other", max: 1, dropFromStart: true)
+        XCTAssertEqual(tree.children?.count, 4) // non-matching facet untouched
+    }
+
+    func testFacetNameAndDurations() {
+        XCTAssertEqual(FacetPrimitives.facetName("LikeButton:post:42"), "LikeButton")
+        XCTAssertEqual(FacetPrimitives.facetName("Typing"), "Typing")
+        XCTAssertEqual(FacetPrimitives.goDurationMs("200ms"), 200)
+        XCTAssertEqual(FacetPrimitives.goDurationMs("5s"), 5000)
+        XCTAssertEqual(FacetPrimitives.goDurationMs("2m"), 120_000)
+        XCTAssertEqual(FacetPrimitives.goDurationMs("nope"), 0)
+    }
+
+    // fill substitutes only {field} holes, HTML-escaping values (vault safety:
+    // decrypted plaintext can never inject elements).
+    func testFillEscapes() {
+        let out = FacetPrimitives.fill("<p>{plaintext}</p>{ if x }{missing}",
+                                       ["plaintext": "<b>&hi'\""])
+        XCTAssertEqual(out, "<p>&lt;b&gt;&amp;hi&#39;&quot;</p>{ if x }")
+    }
+
+    func testNormalizeMedia() {
+        XCTAssertEqual(FacetPrimitives.normalizeMedia(#"<hls src="/v.m3u8"/>"#),
+                       #"<video src="/v.m3u8"/>"#)
+        XCTAssertEqual(FacetPrimitives.normalizeMedia("<dash src=\"x\"></dash>"),
+                       "<video src=\"x\"></video>")
+    }
+
+    // Vault round-trip: AES-GCM over base64(IV ‖ ciphertext ‖ tag) — the same
+    // combined envelope the web runtime decrypts.
+    func testVaultEnvelopeRoundTrip() throws {
+        let key = SymmetricKey(size: .bits256)
+        let sealed = try AES.GCM.seal(Data("hello vault".utf8), using: key)
+        let envelope = sealed.combined!.base64EncodedString()
+        XCTAssertEqual(FacetPrimitives.decryptEnvelope(envelope, key: key), "hello vault")
+        // Fail closed: wrong key decrypts to nil, never garbage.
+        XCTAssertNil(FacetPrimitives.decryptEnvelope(envelope, key: SymmetricKey(size: .bits256)))
+        XCTAssertNil(FacetPrimitives.decryptEnvelope("not-base64!", key: key))
+    }
+
+    // Signal payload keys must not hijack reserved attributes.
+    func testSafeSignalKeys() {
+        XCTAssertTrue(FacetPrimitives.safeSignalKey("who"))
+        XCTAssertFalse(FacetPrimitives.safeSignalKey("action"))
+        XCTAssertFalse(FacetPrimitives.safeSignalKey("fa-anything"))
+        XCTAssertFalse(FacetPrimitives.safeSignalKey("1bad"))
+    }
+
+    // The manifest registry decodes per-primitive rules.
+    func testDecodeManifest() throws {
+        let json = #"{"facets":[{"name":"LiveChat","kind":"stream","facet_id":"LiveChat","window":"100","ttl":"","when":null},{"name":"Typing","kind":"signal","facet_id":"Typing","ttl":"5s","when":null}]}"#
+        let m = try JSONDecoder().decode(FacetManifest.self, from: Data(json.utf8))
+        XCTAssertEqual(m.facets.first?.windowCount, 100)
+        XCTAssertEqual(m.facets.last?.ttlMs, 5000)
     }
 
     // ScreenResponse decodes the server's FA-Native JSON.

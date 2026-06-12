@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(AVKit)
+import AVKit
+#endif
 
 /// FacetView renders one neutral `ViewNode` (and its subtree) to native SwiftUI
 /// views. It reads the SERVER-RESOLVED `style` (direction/gap/pad/align/paint) so
@@ -61,6 +64,10 @@ public struct FacetView: View {
 
         case "icon":
             Image(systemName: "circle.fill").imageScale(.small).foregroundColor(.secondary)
+
+        case "media":
+            // A mounted media primitive (the runtime owns the player — README).
+            FacetMediaPlayer(node: node, base: client.baseURL)
 
         default: // "box"
             childrenStack()
@@ -148,6 +155,31 @@ private struct StyleModifier: ViewModifier {
             return AnyView(axis == .horizontal ? v.frame(width: CGFloat(px)) : v.frame(height: CGFloat(px)))
         }
         return v
+    }
+}
+
+/// FacetMediaPlayer renders a mounted `media` node with the system player
+/// (AVKit handles HLS natively on Apple platforms). The src resolves against the
+/// app's base URL so relative paths from the server work.
+private struct FacetMediaPlayer: View {
+    let node: ViewNode
+    let base: URL
+
+    var body: some View {
+        #if canImport(AVKit)
+        if let src = node.attrs?["src"], let u = URL(string: src, relativeTo: base) {
+            VideoPlayer(player: AVPlayer(url: u))
+                .aspectRatio(16 / 9, contentMode: .fit)
+        } else {
+            placeholder
+        }
+        #else
+        placeholder
+        #endif
+    }
+
+    private var placeholder: some View {
+        Color.black.opacity(0.85).aspectRatio(16 / 9, contentMode: .fit)
     }
 }
 

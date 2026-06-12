@@ -83,6 +83,27 @@ public struct ViewNode: Codable, Equatable {
             .map { $0.removingFacet(id) }
         return copy
     }
+
+    /// Returns a copy with the children of node `id` capped at `max` — the native
+    /// mirror of the web runtime's stream `window:` trim. After an append, excess
+    /// drops from the start (oldest first); after a prepend, from the end.
+    public func trimmingChildren(of id: String, max: Int, dropFromStart: Bool) -> ViewNode {
+        var copy = self
+        if facetId == id, let kids = children, kids.count > max {
+            copy.children = dropFromStart ? Array(kids.suffix(max)) : Array(kids.prefix(max))
+            return copy
+        }
+        copy.children = children?.map { $0.trimmingChildren(of: id, max: max, dropFromStart: dropFromStart) }
+        return copy
+    }
+
+    /// Returns a copy with `transform` applied to every node, bottom-up. The
+    /// primitive scans (signal apply, vault decrypt, media mount) are tree maps.
+    public func mapping(_ transform: (ViewNode) -> ViewNode) -> ViewNode {
+        var copy = self
+        copy.children = children?.map { $0.mapping(transform) }
+        return transform(copy)
+    }
 }
 
 /// Style is the server-resolved, platform-neutral layout + appearance of a node

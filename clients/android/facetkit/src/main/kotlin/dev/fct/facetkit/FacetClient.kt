@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -62,10 +63,58 @@ class FacetClient(
     private var signKey: ByteArray? = null
     private val pending = mutableListOf<Pair<String, Map<String, String>>>()
 
+    // Per-primitive runtime state (mirrors the web runtime's manifest registry).
+    private val registry = mutableMapOf<String, FacetMeta>()   // facet name → rules
+    private val vaultKeys = mutableMapOf<String, ByteArray>()  // vault name → AES-GCM key
+    private val signalJobs = mutableMapOf<String, Job>()       // facet-id → ttl expiry
+    private val signalAttrs = mutableMapOf<String, List<String>>() // facet-id → applied data-* keys
+
+    /**
+     * Called on every relayed `signal` event with (facet id, payload) — the
+     * programmatic hook for ephemeral peer state (typing, presence) when a tree
+     * attribute isn't enough.
+     */
+    var onSignal: ((String, Map<String, String>) -> Unit)? = null
+
     /** Loads [route] as a native view tree and opens the live connection. */
     fun start(route: String) {
+        loadManifest()
         navigate(route)
         openSse()
+    }
+
+    /**
+     * Fetches the compiled manifest and indexes its per-primitive rules (stream
+     * window, signal ttl, vault/media client bodies) by facet name — the same
+     * registry the web runtime builds from /manifest.json.
+     */
+    private fun loadManifest() {
+        scope.launch {
+            val m = withContext(Dispatchers.IO) {
+                try {
+                    val conn = (URL("$base/manifest.json").openConnection() as HttpURLConnection)
+                        .apply { connectTimeout = 5000 }
+                    conn.inputStream.bufferedReader().use {
+                        json.decodeFromString<FacetManifest>(it.readText())
+                    }
+                } catch (_: Exception) {
+                    null
+                }
+            } ?: return@launch
+            for (f in m.facets) registry[f.name] = f
+            tree?.let { tree = postProcess(it) } // rules may unlock vault/media nodes
+        }
+    }
+
+    /**
+     * Registers a vault's AES-GCM key (hex) and decrypts any visible envelopes.
+     * The key exists only on this device — it is never sent to the server, which
+     * is the vault guarantee (the native mirror of web `fa.vault.key`).
+     */
+    fun vaultKey(facet: String, hexKey: String) {
+        val bytes = hexToBytes(hexKey) ?: return
+        vaultKeys[facet] = bytes
+        tree?.let { tree = postProcess(it) }
     }
 
     fun stop() {
@@ -76,7 +125,7 @@ class FacetClient(
     fun navigate(route: String) {
         scope.launch {
             val screen = withContext(Dispatchers.IO) { fetchScreen(route) } ?: return@launch
-            tree = screen.tree
+            tree = postProcess(screen.tree)
             title = screen.title ?: ""
         }
     }
@@ -153,16 +202,167 @@ class FacetClient(
     }
 
     private fun apply(ev: FacetEvent) {
+        if (ev.op == "signal") {
+            applySignal(ev)
+            return
+        }
         val cur = tree ?: return
         val id = ev.facet_id ?: return
         val node = ev.fragment?.let { decodeNode(it) }
         tree = when (ev.op) {
-            "replace" -> node?.let { cur.replacingFacet(id, it) } ?: cur
-            "append" -> node?.let { cur.insertingChild(id, it, false) } ?: cur
-            "prepend" -> node?.let { cur.insertingChild(id, it, true) } ?: cur
+            "replace" -> node?.let { postProcess(cur.replacingFacet(id, it)) } ?: cur
+            "append", "prepend" -> node?.let {
+                val prepend = ev.op == "prepend"
+                var next = cur.insertingChild(id, it, prepend)
+                // stream `window:` — cap retained children, trimming the opposite end
+                val meta = registry[Primitives.facetName(id)]
+                if (meta != null && meta.kind == "stream" && meta.windowCount > 0) {
+                    next = next.trimmingChildren(id, meta.windowCount, dropFromStart = !prepend)
+                }
+                postProcess(next)
+            } ?: cur
             "remove" -> cur.removingFacet(id)
             else -> cur
         }
+    }
+
+    // ── signal (ephemeral peer state) ──────────────────────────────────────────
+
+    /**
+     * Applies a relayed signal: the payload lands as data-* attributes (plus the
+     * fa-signal-live class) on every node whose data-fa-signal matches the
+     * signal's facet id or name, and reverts after the declared `ttl:` — exactly
+     * the web runtime. [onSignal] fires regardless, for programmatic consumers.
+     */
+    private fun applySignal(ev: FacetEvent) {
+        val id = ev.facet_id ?: return
+        val payload: Map<String, String> = try {
+            json.decodeFromString(ev.fragment ?: "{}")
+        } catch (_: Exception) {
+            emptyMap()
+        }
+        onSignal?.invoke(id, payload)
+
+        val name = Primitives.facetName(id)
+        val attrsToSet = payload
+            .filterKeys { Primitives.safeSignalKey(it) }
+            .mapKeys { (k, _) -> "data-" + k.lowercase() }
+        tree?.let { cur ->
+            tree = cur.mapping { node ->
+                val want = node.attrs?.get("data-fa-signal")
+                if (want != id && want != name) return@mapping node
+                val a = (node.attrs ?: emptyMap()).toMutableMap()
+                a.putAll(attrsToSet)
+                a["class"] = addClass(a["class"], "fa-signal-live")
+                node.copy(attrs = a)
+            }
+        }
+        signalAttrs[id] = attrsToSet.keys.toList()
+
+        signalJobs.remove(id)?.cancel()
+        val ttl = registry[name]?.ttlMs ?: 0
+        if (ttl <= 0) return
+        signalJobs[id] = scope.launch {
+            delay(ttl)
+            expireSignal(id)
+        }
+    }
+
+    private fun expireSignal(id: String) {
+        val name = Primitives.facetName(id)
+        val keys = signalAttrs.remove(id) ?: emptyList()
+        val cur = tree ?: return
+        tree = cur.mapping { node ->
+            val want = node.attrs?.get("data-fa-signal")
+            if (want != id && want != name) return@mapping node
+            val a = (node.attrs ?: emptyMap()).toMutableMap()
+            for (k in keys) a.remove(k)
+            val cls = removeClass(a["class"], "fa-signal-live")
+            if (cls == null) a.remove("class") else a["class"] = cls
+            node.copy(attrs = a)
+        }
+    }
+
+    private fun addClass(cls: String?, token: String): String {
+        val parts = (cls ?: "").split(' ').filter { it.isNotEmpty() }
+        return if (token in parts) parts.joinToString(" ") else (parts + token).joinToString(" ")
+    }
+
+    private fun removeClass(cls: String?, token: String): String? {
+        val parts = (cls ?: "").split(' ').filter { it.isNotEmpty() && it != token }
+        return if (parts.isEmpty()) null else parts.joinToString(" ")
+    }
+
+    // ── vault decrypt + media mount (client-rendered primitives) ──────────────
+
+    /**
+     * Applies the client-rendered primitives to the tree: decrypts ready vault
+     * envelopes and mounts media players. Runs after every tree change, when the
+     * manifest arrives, and when a vault key is registered. Already-processed
+     * nodes are skipped via marker attributes, so the map is cheap.
+     */
+    private fun postProcess(tree: ViewNode): ViewNode =
+        tree.mapping { node -> vaultNode(node) ?: mediaNode(node) ?: node }
+
+    /**
+     * Decrypts one vault node: data-fa-vault names the primitive, the manifest
+     * carries its decrypt: body (there is NO server template — the structural
+     * guarantee), data-fa-envelope is base64(IV ‖ ciphertext ‖ tag). The
+     * decrypted values are escaped, filled into the body, and parsed into the
+     * node's children. Any failure leaves the node untouched.
+     */
+    private fun vaultNode(node: ViewNode): ViewNode? {
+        val attrs = node.attrs ?: return null
+        val name = attrs["data-fa-vault"] ?: return null
+        val meta = registry[name] ?: return null
+        if (meta.kind != "vault") return null
+        val body = meta.client ?: return null
+        if (body.isEmpty()) return null
+        val env = attrs["data-fa-envelope"] ?: return null
+        if (attrs["data-fa-decrypted"] == env) return null
+        val key = vaultKeys[name] ?: return null
+        val plaintext = Primitives.decryptEnvelope(env, key) ?: return null
+
+        val values = mutableMapOf("plaintext" to plaintext)
+        try { // a JSON plaintext exposes its fields to the decrypt: body too
+            for ((k, v) in json.decodeFromString<Map<String, String>>(plaintext)) values[k] = v
+        } catch (_: Exception) {
+        }
+        val a = attrs.toMutableMap()
+        a["data-fa-decrypted"] = env
+        return node.copy(
+            attrs = a,
+            children = listOf(FacetHtmlParser.parse(Primitives.fill(body, values))),
+        )
+    }
+
+    /**
+     * Mounts one media node: the manifest's source: body, holes filled from the
+     * node's data-* attributes, <hls>/<dash> normalized to <video>, parsed, and
+     * marked kind "media" so the renderer shows a real player.
+     */
+    private fun mediaNode(node: ViewNode): ViewNode? {
+        val attrs = node.attrs ?: return null
+        val name = attrs["data-fa-media"] ?: return null
+        val meta = registry[name] ?: return null
+        if (meta.kind != "media") return null
+        val body = meta.client ?: return null
+        if (body.isEmpty() || attrs["data-fa-mounted"] != null) return null
+
+        val values = mutableMapOf<String, String>()
+        for ((k, v) in attrs) {
+            if (!k.startsWith("data-")) continue
+            val f = k.removePrefix("data-")
+            if (f == "action" || f.startsWith("fa-")) continue
+            values[f] = v
+        }
+        val html = Primitives.normalizeMedia(Primitives.fill(body, values))
+        val player = FacetHtmlParser.parse(html).mapping { p ->
+            if (p.tag == "video" || p.tag == "audio") p.copy(kind = "media") else p
+        }
+        val a = attrs.toMutableMap()
+        a["data-fa-mounted"] = "1"
+        return node.copy(attrs = a, children = listOf(player))
     }
 
     /** A native fragment is the styled tree as JSON; decode it (HTML fallback). */

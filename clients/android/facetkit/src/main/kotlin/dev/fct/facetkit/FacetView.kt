@@ -67,8 +67,38 @@ fun FacetView(node: ViewNode, client: FacetClient) {
 
         "icon" -> Text("●", color = Color.Gray, modifier = mod)
 
+        "media" -> {
+            // A mounted media primitive (the runtime owns the player — README).
+            // FacetKit stays dependency-light: install an ExoPlayer-backed
+            // composable via FacetKitConfig.mediaRenderer; the default is a
+            // poster-style placeholder showing the source.
+            val renderer = FacetKitConfig.mediaRenderer
+            if (renderer != null) renderer(node) else MediaPlaceholder(node, mod)
+        }
+
         else -> box(node, client, mod) // "box"
     }
+}
+
+/**
+ * App-level FacetKit configuration. [mediaRenderer], when set, renders every
+ * mounted `media` node (typically with Media3/ExoPlayer — FacetKit itself adds
+ * no player dependency); the node's attrs carry `src` and the element's data-*.
+ */
+object FacetKitConfig {
+    var mediaRenderer: (@Composable (ViewNode) -> Unit)? = null
+}
+
+@Composable
+private fun MediaPlaceholder(node: ViewNode, mod: Modifier) {
+    Text(
+        text = "▶ " + (node.attrs?.get("src") ?: "media"),
+        color = Color.White,
+        modifier = mod
+            .fillMaxWidth()
+            .background(Color(0xE6000000))
+            .padding(24.dp),
+    )
 }
 
 @Composable

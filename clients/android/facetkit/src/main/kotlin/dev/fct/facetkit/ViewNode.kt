@@ -68,6 +68,26 @@ data class ViewNode(
 
     fun removingFacet(id: String): ViewNode =
         copy(children = children?.filter { it.facetId != id }?.map { it.removingFacet(id) })
+
+    /**
+     * Returns a copy with the children of node [id] capped at [max] — the native
+     * mirror of the web runtime's stream `window:` trim. After an append, excess
+     * drops from the start (oldest first); after a prepend, from the end.
+     */
+    fun trimmingChildren(id: String, max: Int, dropFromStart: Boolean): ViewNode {
+        val kids = children
+        if (facetId == id && kids != null && kids.size > max) {
+            return copy(children = if (dropFromStart) kids.takeLast(max) else kids.take(max))
+        }
+        return copy(children = kids?.map { it.trimmingChildren(id, max, dropFromStart) })
+    }
+
+    /**
+     * Returns a copy with [transform] applied to every node, bottom-up. The
+     * primitive scans (signal apply, vault decrypt, media mount) are tree maps.
+     */
+    fun mapping(transform: (ViewNode) -> ViewNode): ViewNode =
+        transform(copy(children = children?.map { it.mapping(transform) }))
 }
 
 /** The JSON a route returns to a native client (`FA-Native: 1`). */
