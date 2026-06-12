@@ -59,9 +59,27 @@ setContent {
 Your handlers, guards, sessions, and facets are shared with the web app
 unchanged — one server, three renderers.
 
-## Current limits
+## Primitive semantics on device
 
-Signal events arrive over the same signed wire, but per-primitive *semantics*
-(`window:` trimming, signal `ttl:` revert, vault client-side decrypt, media
-mounting) are enforced in the **web** runtime only today. Native enforcement
-is the next staged round — see [ENTERPRISE.md](../ENTERPRISE.md) (P0 #3).
+Both runtimes fetch `/manifest.json` and enforce the same per-primitive rules
+as the web runtime:
+
+- **stream `window:`** — appended/prepended children are capped; the DOM-
+  equivalent tree never grows unbounded.
+- **signal `ttl:`** — payloads land as `data-*` attributes +
+  `fa-signal-live` on matching `data-fa-signal` nodes and revert after the
+  TTL. A programmatic hook is available too: `client.onSignal = { id, payload in … }`.
+- **vault** — register the key on the device with
+  `client.vaultKey("DM", hexKey: …)` (Swift) / `client.vaultKey("DM", hexKey)`
+  (Kotlin); it is never sent to the server. Envelopes decrypt locally
+  (AES-GCM) and render the `decrypt:` body; any failure leaves the envelope
+  untouched.
+- **media** — mounted nodes render a real player: AVKit on Apple platforms
+  (HLS native). On Android, FacetKit ships no player dependency — plug one in
+  once at startup:
+
+  ```kotlin
+  FacetKitConfig.mediaRenderer = { node -> MyExoPlayerComposable(node) }
+  ```
+
+  (default: a poster-style placeholder).

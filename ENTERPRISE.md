@@ -5,7 +5,7 @@ The single tracker for "can a company bet a product on FA?" Each item is either
 "done" means). The README roadmap tracks *language/DX* gaps; this file tracks
 *production/organizational* gaps. Update it in the same PR that closes an item.
 
-Last updated: 2026-06-11 (v0.12.0).
+Last updated: 2026-06-11 (v0.13.0).
 
 ## Scorecard
 
@@ -19,7 +19,7 @@ Last updated: 2026-06-11 (v0.12.0).
 | AuthN / SSO | 🟡 partial — sessions + identity built in; no OIDC/SAML story |
 | API stability | ⬜ open — pre-1.0, minor versions may break |
 | Supply chain | ⬜ open — no signed releases / SBOM / vuln scanning in CI |
-| Native client parity | 🟡 partial — wire + HMAC + surgical updates done; primitive semantics staged |
+| Native client parity | ✅ shipped — wire, HMAC, surgical updates, and per-primitive semantics (window/ttl/vault/media) in both runtimes, unit-tested |
 | Docs | ✅ shipped — user wiki (`wiki/`), guide, ADRs, security audit |
 | Accessibility / i18n | ⬜ open |
 | Support / governance | 🟡 partial — `GOVERNANCE.md` exists; no LTS or CVE process |
@@ -66,17 +66,17 @@ Last updated: 2026-06-11 (v0.12.0).
    manifest schema, and the SSE wire format; semver + a written deprecation
    policy (one minor of warning before removal); wire-format version
    negotiation so old native clients fail loud, not weird.
-3. **Native primitive parity.** FacetKit (SwiftUI) and Compose share the
-   signed SSE wire and surgical updates, but `window:` trimming, signal
-   `ttl:` revert, vault decrypt, and media mounting are web-only. Done =
-   per-primitive enforcement in both native runtimes with unit tests (the
-   staged "next round" from v0.12.0; modified files are already on this branch).
-4. **Observability in standard formats.** `/debug/metrics` is bespoke JSON.
+- ✅ **Native primitive parity** *(v0.13.0)* — `window:` trimming, signal
+  `ttl:` apply/revert, vault AES-GCM decrypt (device-held key), and media
+  mounting enforced in both FacetKit (SwiftUI) and the Compose client, from
+  the same manifest registry as the web runtime, with unit tests
+  (`clients/swift`, `clients/android`).
+3. **Observability in standard formats.** `/debug/metrics` is bespoke JSON.
    Done = Prometheus exposition format on `/metrics` (counters it already
    tracks: events in/out, conns, rate-limited, forbidden — plus dispatch
    latency histograms), and OpenTelemetry trace hooks around
    dispatch→render→emit so a request is traceable across the broker.
-5. **Supply-chain hardening.** Done = signed release artifacts (cosign) +
+4. **Supply-chain hardening.** Done = signed release artifacts (cosign) +
    SLSA provenance in the release workflow, SBOM per release, `govulncheck`
    + dependency scanning in CI, and a pinned reproducible-build doc. (The
    framework is dependency-free, which makes this cheap — do it while that's

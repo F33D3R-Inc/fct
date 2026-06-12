@@ -2,6 +2,44 @@
 
 All notable changes. Pre-1.0: minor versions may break.
 
+## v0.13.0
+
+### Primitive runtime semantics — native parity (FacetKit Swift + Compose)
+
+The round staged in v0.12.0: both native client runtimes now enforce the same
+per-primitive rules as the web runtime, driven by the same `/manifest.json`
+registry (keyed by facet name; `Primitives.swift` / `Primitives.kt` hold the
+shared pure logic, unit-tested):
+
+- **stream `window:`** — after an `append`/`prepend` the target node's children
+  are capped, trimming the opposite end (oldest dropped on append).
+- **signal `ttl:`** — relayed signal payloads land as `data-*` attributes plus
+  `fa-signal-live` on every node whose `data-fa-signal` matches, and revert
+  after the declared TTL; reserved keys (`action`, `fa*`) can't be hijacked.
+  A programmatic `onSignal` hook fires for non-tree consumers.
+- **vault** — `client.vaultKey(name, hexKey)` registers a device-held AES-GCM
+  key (never sent to the server); the runtime decrypts each matching node's
+  `data-fa-envelope` (base64 IV‖CT‖tag) and renders the manifest's `decrypt:`
+  body with `{plaintext}` / JSON fields, HTML-escaped. Fails closed — a wrong
+  key or bad envelope leaves the node untouched.
+- **media** — the `source:` body is filled from the node's `data-*` attributes,
+  `<hls>`/`<dash>` normalize to `<video>`, and the node renders as a real
+  player: AVKit (`VideoPlayer`) on Apple platforms; on Android a pluggable
+  `FacetKitConfig.mediaRenderer` (e.g. Media3/ExoPlayer — FacetKit itself adds
+  no player dependency), defaulting to a poster placeholder.
+
+Wire note: native SSE frames were already re-signed over the styled tree JSON,
+so the bytes each device verifies are exactly the bytes it renders; signal
+frames pass through with their payload-JSON signature intact.
+
+### Docs
+
+- `wiki/` — full user documentation (13 pages: getting started, tutorial,
+  databases, deployment, FDL reference, std, auth/forms, realtime, admin,
+  testing, native, troubleshooting), wired into mkdocs.
+- `ENTERPRISE.md` — the enterprise-readiness scorecard and prioritized
+  remaining work.
+
 ## v0.12.0
 
 ### Primitive runtime semantics (server + web runtime)
@@ -61,8 +99,9 @@ The taxonomy that compiled in v0.11.0 now *behaves*:
   fragment is the JSON payload, not HTML).
 - `codegen.GoName` (the snake_case → Go name mapping) is now exported for reuse.
 
-Native runtimes (FacetKit / Compose) get window/TTL/vault/media enforcement in
-the next round; they already receive signal events over the same signed wire.
+Native runtimes (FacetKit / Compose) got window/TTL/vault/media enforcement in
+v0.13.0; at this release they already received signal events over the same
+signed wire.
 
 ## v0.11.0
 

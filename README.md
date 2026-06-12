@@ -30,15 +30,17 @@ of the box, and the rest of the primitive taxonomy now compiles.
 | Typed codegen (`<Facet>Data` structs, idiomatic initialisms) | ✅ |
 | All 8 primitives — parser + codegen + manifest surface | ✅ |
 | Per-primitive **runtime** semantics — web (feed ranking, stream throttle/window, lifecycle transitions, signal relay + TTL, vault decrypt, media mount) | ✅ |
-| Per-primitive runtime semantics — native clients (FacetKit / Compose) | ⬜ staged |
+| Per-primitive runtime semantics — native clients (FacetKit / Compose) | ✅ |
 
-Every primitive now has runtime behavior, server-side and in the web runtime:
+Every primitive now has runtime behavior, server-side and in every runtime:
 feeds rank via `SortFeed`, stream/pipe `throttle:` is enforced in the hub
 (trailing-edge coalescing), `window:` trims the DOM, lifecycles validate
 transitions, signals relay ephemerally and expire after `ttl:`, vaults decrypt
-client-side (AES-GCM via `fa.vault.key`), and the runtime mounts media players
-from `source:`. The client-rendered kinds (`vault`/`media`/`signal`) still emit
-**zero server template** (the structural guarantee).
+client-side (AES-GCM via `fa.vault.key` on web, `client.vaultKey` on native),
+and the runtimes mount media players from `source:`. The client-rendered kinds
+(`vault`/`media`/`signal`) still emit **zero server template** (the structural
+guarantee). FacetKit (SwiftUI) and the Compose client enforce the same rules
+from the same `/manifest.json` registry the web runtime builds.
 
 Verified loop: `fct new` → `go run .` → a page with the Playground, a `Home`
 facet and a live `LikeButton`; clicking it POSTs to one `/events` endpoint, the
@@ -316,8 +318,14 @@ just the player container and the runtime owns what's inside it.
   `[data-fa-media="Clip"]` element, filling `{field}` holes from the element's
   `data-*` attributes; `<hls>`/`<dash>` normalize to `<video controls>`.
 
-Native runtimes (FacetKit / Compose) receive signal events over the same SSE
-wire today; their window/TTL/vault/media enforcement is the staged next round.
+Native runtimes (FacetKit / Compose) enforce the same semantics: each client
+fetches `/manifest.json`, builds the per-primitive registry, trims stream
+`window:` children, applies/expires signals after `ttl:`, decrypts vault
+envelopes with a device-held key (`client.vaultKey(name, hexKey)` — never sent),
+and mounts media players (AVKit on Apple; a pluggable
+`FacetKitConfig.mediaRenderer` on Android, defaulting to a placeholder).
+Native frames are re-signed over the styled tree JSON, so the bytes the device
+verifies are exactly the bytes it renders.
 
 ---
 
@@ -589,7 +597,8 @@ authenticated, and a tampered frame is dropped.
 Built and tested: the server-side neutral tree + style model (`RenderTree`,
 `ParseView`, `Style`; signed styled trees over SSE; proven on the real stdlib) and
 both client runtimes (model, SSE, HMAC verification, surgical updates, native
-renderer driven by the server style; unit tests).
+renderer driven by the server style, per-primitive semantics — stream `window:`,
+signal `ttl:`, vault decrypt, media mount; unit tests).
 
 ---
 
@@ -706,9 +715,9 @@ broken code. `fct add` also takes a URL or a local path. Editor support:
   stream `throttle` (hub coalescing) + `window` (DOM trim), lifecycle state
   transitions, signal relay + TTL expiry, `vault` client-side decrypt (AES-GCM),
   media player mounting.
-5. **Primitive runtime semantics — native** — bring window/TTL/vault/media
-   enforcement to FacetKit (SwiftUI) and the Compose client (they already share
-   the SSE wire and signed events).
+- ✅ **Primitive runtime semantics — native** — window/TTL/vault/media
+  enforcement in FacetKit (SwiftUI) and the Compose client, driven by the same
+  manifest registry as the web runtime.
 
 **Tooling / ecosystem**
 - ✅ `fct check` / `fct fmt` / `fct lsp` (editor diagnostics) / `fct add` (registry).
