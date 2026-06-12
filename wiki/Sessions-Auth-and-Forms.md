@@ -45,7 +45,7 @@ import "golang.org/x/crypto/argon2"   // or golang.org/x/crypto/bcrypt
 
 A login flow is a normal form POST: validate → look up user → compare hash →
 `sess.Save` → redirect. (OIDC/SSO guidance is tracked in
-[ENTERPRISE.md](../ENTERPRISE.md).)
+[ENTERPRISE.md](https://github.com/F33D3R-Inc/fct/blob/main/ENTERPRISE.md).)
 
 ## Authorization — three layers
 

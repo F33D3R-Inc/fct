@@ -15,3 +15,6 @@
 - [Testing](Testing.md)
 - [Native Clients](Native-Clients.md)
 - [Troubleshooting & FAQ](Troubleshooting.md)
+
+**Community**
+- [Packages & Contributing Facets](Community-Packages.md)

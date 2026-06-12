@@ -11,7 +11,7 @@ Last updated: 2026-06-11 (v0.13.0).
 
 | Area | State |
 |---|---|
-| Security (app-level) | ✅ shipped — full suite, audited (`SECURITY.md`) |
+| Security (app-level) | ✅ shipped — full suite, audited (`SECURITY_AUDIT.md`); disclosure policy in `SECURITY.md` |
 | Horizontal scale-out | ✅ shipped (Redis broker, shared key) — ⬜ unvalidated under real load |
 | Operations | ✅ shipped (health, drain, Docker, logs) |
 | Observability | 🟡 partial — JSON metrics only; no Prometheus/OTel |
@@ -22,7 +22,7 @@ Last updated: 2026-06-11 (v0.13.0).
 | Native client parity | ✅ shipped — wire, HMAC, surgical updates, and per-primitive semantics (window/ttl/vault/media) in both runtimes, unit-tested |
 | Docs | ✅ shipped — user wiki (`wiki/`), guide, ADRs, security audit |
 | Accessibility / i18n | ⬜ open |
-| Support / governance | 🟡 partial — `GOVERNANCE.md` exists; no LTS or CVE process |
+| Support / governance | ✅ shipped — `GOVERNANCE.md` + disclosure/support policy in `SECURITY.md` |
 
 ---
 
@@ -32,7 +32,7 @@ Last updated: 2026-06-11 (v0.13.0).
   `channel_auth`), `who:` structural authz (`Guard` + `RenderFor`, fail-closed
   `redact`), CSRF (conn-id + Origin), per-IP rate limit + SSE cap, CSP/secure
   headers, HMAC-signed events verified on web **and** native, compile-time
-  cycle/unknown-child/unknown-prop rejection. Audit + status: `SECURITY.md`.
+  cycle/unknown-child/unknown-prop rejection. Audit + status: `SECURITY_AUDIT.md`.
 - **Multi-instance** — pluggable `Broker` with a built-in zero-dependency Redis
   adapter (`fa/redisbroker.go`), stable shared signing key (`FA_SIGNING_KEY`),
   sticky-LB deployment shape documented (README + `wiki/Deployment.md`).
@@ -100,10 +100,10 @@ Last updated: 2026-06-11 (v0.13.0).
    across fragment swaps in the runtime (focus dies on `replace` today unless
    proven otherwise), `prefers-reduced-motion` respected, axe-core run on the
    demo recorded in CI.
-10. **CVE / disclosure process + support policy.** `SECURITY.md` is an audit,
-    not a policy. Done = a security-reporting contact + embargo process, a
-    stated supported-versions window, and an LTS statement (even if it's
-    "latest minor only" — say it).
+- ✅ **CVE / disclosure process + support policy** — `SECURITY.md` is now the
+  policy: private reporting (GitHub advisory or email), response timelines,
+  coordinated disclosure, and a stated supported-versions window (latest
+  minor, pre-1.0). The audit moved to `SECURITY_AUDIT.md`.
 
 ### P2 — competitive completeness
 

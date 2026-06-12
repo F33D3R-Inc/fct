@@ -117,8 +117,7 @@ server {
 
 ## Multiple instances
 
-Two changes from single-instance, both from the README's "Running in
-production":
+Two changes from single-instance:
 
 1. Same `FA_SIGNING_KEY` everywhere (above).
 2. A cross-instance **Broker** so a fragment pushed by instance A reaches
@@ -198,4 +197,4 @@ Anything that runs a Dockerfile runs FA. Checklist:
 - [ ] Logs: mux wrapped in `fa.LogRequests`
 - [ ] Rotation caveat: changing `FA_SIGNING_KEY` invalidates open pages until
       reload — rotate during a maintenance window (zero-downtime rotation is
-      tracked in [ENTERPRISE.md](../ENTERPRISE.md))
+      tracked in [ENTERPRISE.md](https://github.com/F33D3R-Inc/fct/blob/main/ENTERPRISE.md))

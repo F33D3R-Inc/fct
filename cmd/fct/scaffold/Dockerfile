@@ -8,7 +8,7 @@ FROM gcr.io/distroless/static-debian12
 WORKDIR /
 COPY --from=build /app /app
 COPY facets /facets
-# Required in production (see README "Running in production"):
+# Required in production (see the Deployment guide: github.com/F33D3R-Inc/fct/wiki/Deployment):
 #   FA_SIGNING_KEY  — same value on every instance (openssl rand -hex 32)
 # Run multiple instances behind a STICKY load balancer.
 ENV FA_ADDR=:7373

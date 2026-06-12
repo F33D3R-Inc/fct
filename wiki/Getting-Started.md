@@ -20,9 +20,33 @@ go install github.com/F33D3R-Inc/fct/cmd/fct@latest
 ```
 
 This puts `fct` in your Go bin directory (`go env GOBIN`, or
-`$(go env GOPATH)/bin` — make sure it's on your `PATH`). Alternatively, grab a
-prebuilt binary from the
-[Releases page](https://github.com/F33D3R-Inc/fct/releases/latest).
+`$(go env GOPATH)/bin` — make sure it's on your `PATH`).
+
+### Or: prebuilt binary
+
+Download the binary for your platform from the
+[Releases page](https://github.com/F33D3R-Inc/fct/releases/latest), then:
+
+**macOS** (Apple Silicon → `darwin-arm64`, Intel → `darwin-amd64`)
+```sh
+chmod +x fct-*-darwin-*
+sudo mv fct-*-darwin-* /usr/local/bin/fct
+xattr -d com.apple.quarantine /usr/local/bin/fct 2>/dev/null || true   # if Gatekeeper blocks it
+```
+
+**Linux** (`linux-amd64` or `linux-arm64`)
+```sh
+chmod +x fct-*-linux-*
+sudo mv fct-*-linux-* /usr/local/bin/fct
+```
+
+**Windows** (`windows-amd64.exe`) — rename to `fct.exe` and put it in a folder
+on your `PATH` (PowerShell):
+```powershell
+mkdir "$env:USERPROFILE\bin" -Force
+move .\fct-*-windows-amd64.exe "$env:USERPROFILE\bin\fct.exe"
+setx PATH "$env:PATH;$env:USERPROFILE\bin"   # reopen the terminal after this
+```
 
 Verify:
 

@@ -9,7 +9,7 @@ program; the server is the single source of truth.
 
 If you know Django: it feels like "templates + views," except the page updates
 live without reloads. If you know React: read
-[Migrating from React](../REACT_MIGRATION.md) — FA is the opposite architecture
+[Migrating from React](https://github.com/F33D3R-Inc/fct/blob/main/REACT_MIGRATION.md) — FA is the opposite architecture
 on purpose.
 
 ## Start here
@@ -39,6 +39,8 @@ on purpose.
   Android (Compose) with zero app logic on the device.
 - **[Troubleshooting & FAQ](Troubleshooting.md)** — common errors and what
   they mean.
+- **[Community Packages](Community-Packages.md)** — get help, publish
+  packages, and submit facets to the standard library (via GitHub).
 
 ## How a click works (the whole mental model)
 
@@ -58,5 +60,5 @@ loop.
 
 The core loop, security suite, router, sessions, forms, admin, std library,
 Redis scale-out, and native clients are built and tested. Pre-1.0: minor
-versions may break (see [ENTERPRISE.md](../ENTERPRISE.md) for the remaining
+versions may break (see [ENTERPRISE.md](https://github.com/F33D3R-Inc/fct/blob/main/ENTERPRISE.md) for the remaining
 path to a stability commitment).

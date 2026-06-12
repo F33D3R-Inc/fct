@@ -93,10 +93,11 @@ Scoped per-facet styles (`style:` block) are on the roadmap.
 **How big can an app get?** The std catalog covers X.com-scale surfaces;
 per-op costs are ~17–18 µs (render/dispatch). For multi-instance scale-out see
 [Deployment](Deployment.md); for honest open items see
-[ENTERPRISE.md](../ENTERPRISE.md).
+[ENTERPRISE.md](https://github.com/F33D3R-Inc/fct/blob/main/ENTERPRISE.md).
 
 **Why Go for my backend — can I use Node/Python?** Today the compiler targets
-Go only; other backend targets are roadmap item #6 in the README.
+Go only; other backend targets are on the long-term
+[roadmap](https://github.com/F33D3R-Inc/fct/blob/main/ROADMAP.md).
 
 **Where's the hot reload?** `fct dev` rebuilds on every `.fct` save.
 
