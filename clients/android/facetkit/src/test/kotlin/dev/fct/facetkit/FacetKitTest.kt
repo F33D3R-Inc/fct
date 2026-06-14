@@ -99,14 +99,34 @@ class FacetKitTest {
         assertEquals(0L, Primitives.goDurationMs("nope"))
     }
 
-    // fill substitutes only {field} holes, HTML-escaping values (vault safety:
-    // decrypted plaintext can never inject elements).
+    // fill HTML-escapes interpolated values (vault safety: decrypted plaintext can
+    // never inject elements); a missing field renders empty.
     @Test fun fillEscapes() {
-        val out = Primitives.fill(
-            "<p>{plaintext}</p>{ if x }{missing}",
-            mapOf("plaintext" to "<b>&hi'\"")
+        val out = Primitives.fill("<p>{plaintext}</p>{missing}", mapOf("plaintext" to "<b>&hi'\""))
+        assertEquals("<p>&lt;b&gt;&amp;hi&#39;&quot;</p>", out)
+    }
+
+    // Client-side if/for over structured values — must match the web runtime's
+    // fill() exactly (see runtime/fill_test.js).
+    @Test fun fillControlFlow() {
+        assertEquals("Lin", Primitives.fill("{user.name}", mapOf("user" to mapOf("name" to "Lin"))))
+        assertEquals("yes", Primitives.fill("{if admin}yes{else}no{end}", mapOf("admin" to true)))
+        assertEquals("empty", Primitives.fill("{if items}has{else}empty{end}", mapOf("items" to emptyList<Any?>())))
+        assertEquals("", Primitives.fill("{if n}nz{end}", mapOf("n" to 0)))
+        assertEquals("todo", Primitives.fill("{if !done}todo{end}", mapOf("done" to false)))
+        assertEquals("many", Primitives.fill("{if count > 2}many{end}", mapOf("count" to 5)))
+        assertEquals("A", Primitives.fill("""{if role == "admin"}A{end}""", mapOf("role" to "admin")))
+        assertEquals(
+            "<i>a</i><i>b</i>",
+            Primitives.fill("{for t in tags}<i>{t}</i>{end}", mapOf("tags" to listOf("a", "b"))),
         )
-        assertEquals("<p>&lt;b&gt;&amp;hi&#39;&quot;</p>{ if x }", out)
+        assertEquals(
+            "A ",
+            Primitives.fill(
+                "{for u in users}{if u.on}{u.name} {end}{end}",
+                mapOf("users" to listOf(mapOf("name" to "A", "on" to true), mapOf("name" to "B", "on" to false))),
+            ),
+        )
     }
 
     @Test fun normalizeMediaTags() {

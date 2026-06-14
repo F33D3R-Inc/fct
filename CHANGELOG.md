@@ -4,10 +4,59 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
-## [Unreleased] — v0.14.0
+## v0.14.0
 
 Enterprise P0 round: observability in standard formats, the API stability
 contract, and supply-chain hardening (see `ENTERPRISE.md`).
+
+### Auth (batteries-included)
+
+- **`fa.Auth`** — built-in authentication, not a bolt-on: `app.Auth(store)` ties
+  password hashing, an account store, and the app session together. `Signup`,
+  `Authenticate`, `Login`/`Logout`, `Current`, and `Identity` (an `App.Identify`
+  resolver) — a logged-in account IS the FA identity that scopes SSE delivery,
+  `App.Guard`, and `who:` policies. `auth.Guard("admin")` / `auth.Authorize("admin")`
+  gate events and the admin panel (Django-style). `auth.MountLogin` registers a
+  ready-to-use `/login` (form + POST) and `/logout`, same-origin-checked.
+- **Password hashing is dependency-free** — PBKDF2-HMAC-SHA256 (stdlib
+  `crypto/pbkdf2`, OWASP work factor) in a versioned, self-describing hash
+  string, so the cost can be raised or the algorithm swapped (argon2id) without
+  invalidating stored hashes. Constant-time verify; unknown login and wrong
+  password return the same error (no account enumeration), with timing equalized.
+- **`AuthStore`** interface with an in-memory default (`NewMemoryStore`) for
+  development; implement it over your database for production.
+
+### Language
+
+- **Named slots** — a facet can declare multiple insertion points with
+  `slot name:`, and a parent targets each with a `fill name:` block (content
+  outside any `fill` goes to the default `slot:`). Every slot may carry default
+  content shown when unfilled. Filling a slot the child does not declare is a
+  compile error. Backward compatible: the default slot is unchanged.
+- **Computed fields** — `what:` now accepts derived values: `total = price * qty`
+  or `free: bool = total >= 100` (type optional). They are resolved server-side
+  at render time and excluded from the generated `<Name>Data` struct (the caller
+  never supplies them). A computed field may use any input field and any computed
+  field declared above it; a forward/self reference is a compile error.
+- **Integer arithmetic stays integer.** `+`, `-`, `*` now return an integer when
+  both operands are integral (previously always `float64`), so results compare
+  cleanly against integer literals (e.g. `likes + 1 > 100`). `/` still yields a
+  float. Display output is unchanged for whole numbers.
+- **Client-side `if`/`for` in vault/media bodies** — `decrypt:` and `source:`
+  bodies now support `{if expr}…{else}…{end}` and `{for v in path}…{end}` over
+  the (decrypted / metadata) values, not just `{field}` interpolation. Dotted
+  paths and Go-style truthiness (empty array/string/0 are falsy). Interpolated
+  values stay HTML-escaped — the vault safety guarantee is unchanged. Implemented
+  in all three runtimes; the web runtime is node-tested (`runtime/fill_test.js`).
+- **Cross-platform `style:` block** — a facet can set its root layout/appearance
+  with design tokens (`direction`, `gap`, `pad`, `align`, `justify`, `grow`,
+  `width`/`height`, `bg`, `fg`, `radius`, `font-size`, `font-weight`). The
+  compiler resolves tokens at build time and attaches the result to the root
+  element, so the *same* declaration renders identically on web, iOS (SwiftUI)
+  and Android (Compose) via the neutral tree. Every property/token is validated
+  (a typo is a compile error). It is not arbitrary CSS — web-only effects
+  (`:hover`, `@media`, animations) remain in the global stylesheet. Server-
+  rendered primitives only.
 
 ### Observability (Prometheus + tracing)
 

@@ -15,7 +15,7 @@ import (
 const (
 	heartbeatInterval = 25 * time.Second
 	clientSendBuffer  = 64 // events buffered per client before dropping
-	maxConnsPerIP     = 16 // SSE connection cap per client IP (audit H2)
+	maxConnsPerIP     = 16 // default SSE connection cap per client IP (audit H2; fa.WithConnCap overrides)
 )
 
 // Hub is the SSE connection manager — one per process. It signs every event and
@@ -36,6 +36,7 @@ type Hub struct {
 	broker  Broker // cross-instance event fan-out
 	metrics *Metrics
 	tracer  Tracer // optional dispatch→render→emit trace hooks (see Tracer)
+	connCap int    // per-IP SSE connection cap (fa.WithConnCap)
 
 	rules map[string]facetMeta // per-primitive runtime rules (throttle enforcement)
 
@@ -89,6 +90,7 @@ func newHub(key []byte, broker Broker, rules map[string]facetMeta, tracer Tracer
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
 		ctx: ctx, cancel: cancel, key: key, broker: broker, metrics: &Metrics{}, tracer: tracer,
+		connCap: maxConnsPerIP,
 		rules:   rules,
 		clients: make(map[string]*sseClient),
 		rooms:   make(map[string]map[string]bool),
@@ -171,7 +173,7 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request, identity string) 
 func (h *Hub) register(c *sseClient) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if c.ip != "" && h.ipConns[c.ip] >= maxConnsPerIP {
+	if c.ip != "" && h.ipConns[c.ip] >= h.connCap {
 		return false
 	}
 	h.clients[c.id] = c

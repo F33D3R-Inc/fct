@@ -4,6 +4,90 @@ Newest first. Each entry: the call, the reasoning, and what would reverse it.
 
 ---
 
+## ADR-0009 — Client render bodies gain `{if}`/`{for}` (round 2)
+
+**Decision.** Vault `decrypt:` and media `source:` bodies now support
+`{if expr}…{else}…{end}` and `{for v in path}…{end}` over the client values
+(decrypted plaintext / media metadata), lifting ADR-0006 #5's "field
+interpolation only." The expression subset is intentionally small: dotted paths,
+literals (number/"string"/true/false), a leading `!`, and binary comparisons
+(`== != < <= > >=`); `&&`/`||`/grouping are not in this round (nest `{if}`).
+Truthiness mirrors Go templates (nil/false/0/""/empty list/empty map are falsy)
+so a client body behaves like a server `looks:` body. **Interpolated values stay
+HTML-escaped** — the vault guarantee (a compromised server / hostile plaintext
+cannot inject markup) is unchanged; only literal template text is trusted. The
+compiler/manifest already carried the control forms; this is a runtime change in
+all three clients (web `fa-runtime.js`, FacetKit Swift, Compose Kotlin), with the
+web runtime as the node-tested reference the native ports mirror.
+
+**Reverses if.** Bodies need richer expressions (`&&`/`||`, calls) — then the
+client gains a real expression evaluator shared with the server's grammar, rather
+than this hand-rolled subset.
+
+---
+
+## ADR-0008 — `style:` is cross-platform design tokens, not scoped CSS
+
+**Decision.** The `style:` block is a small, **token-based** vocabulary
+(`direction`/`gap`/`pad`/`align`/`justify`/`grow`/`width`/`height`/`bg`/`fg`/
+`radius`/`font-size`/`font-weight`) the compiler resolves at build time into
+concrete inline style on the facet's root element. Because the native neutral
+tree (`ParseView` → `resolveStyle`) already reads each node's inline style, the
+same resolved style lands on web, iOS and Android with no per-platform code.
+Color tokens resolve to concrete hex (not CSS vars) so all three renderers show
+the identical color. Every property and token is validated — a typo is a compile
+error. We explicitly **rejected** scoped/arbitrary CSS (the Vue/Svelte
+`<style scoped>` model).
+
+**Why.** FA's one defining invariant is "one server drives web + iOS + Android
+through a neutral tree." Arbitrary CSS is web-only; a facet that used it would
+silently become web-only or render differently on native — bolting a web feature
+onto a cross-platform framework (the runtime-CSS-in-JS mistake one layer down).
+Tokens keep appearance on the cross-platform contract. This also matches where
+the serious frontends landed — compile-time, atomic, token-based (Meta's StyleX;
+ByteDance's Lynx constraining CSS to a native-mappable subset) — rather than
+runtime CSS-in-JS. A bonus: in a node-attached neutral model there is no global
+selector namespace, so "scoping" is moot — nothing can collide.
+
+**Reverses if.** Real apps prove they need web-only effects (`:hover`, `@media`,
+keyframes). Then we add a **separate, explicitly web-scoped** block (e.g.
+`style web:`, scoped Vue-style), documented as not crossing to native — the path
+of least resistance stays cross-platform, the web escape hatch is opt-in. The
+keyword namespace is reserved for this now; build it on demand (YAGNI). Theming
+(tokens → CSS vars on web while native keeps hex) would need the manifest-based
+style channel instead of inline resolution.
+
+---
+
+## ADR-0007 — Computed `what:` fields; integer arithmetic stays integer
+
+**Decision.** `what:` accepts computed fields written with `=`
+(`total = price * qty`, optional explicit type `free: bool = total >= 100`).
+They lower to template variables (`{{$total := ...}}`) defined once at the top
+of the facet template, in declaration order, and resolve server-side at render
+time. They are excluded from the generated `<Name>Data` struct (the caller never
+supplies them) and from facet-id derivation. A computed field may reference any
+input field and any computed field declared *above* it; forward/self references
+are compile errors. Separately, the arithmetic helpers `add`/`sub`/`mul` now
+return an integer when both operands are integral (previously always
+`float64`); `/` still yields a float.
+
+**Why.** Computed fields were the remaining typed-data gap (deferred under the
+stale ADR-0003 "single primitive" freeze, now lifted). Lowering to template
+vars keeps them server-resolved with zero runtime/manifest changes and no
+client logic — consistent with the architecture. The integer-arithmetic change
+is required for them to be useful: a `float64` result compared to an integer
+literal (`total >= 100`) is a Go-template type error, and integer-in/integer-out
+is what authors expect; display output for whole numbers is unchanged.
+
+**Reverses if.** We add real type inference (making explicit types fully
+optional everywhere) or a numeric tower that unifies int/float comparison in the
+expression layer, at which point the int-preserving special-case can fold into
+it. Computed fields inside block-form slot/fill content remain unresolved (the
+aux template lacks the parent's `$vars`); revisit if that pattern is needed.
+
+---
+
 ## ADR-0006 — Primitive runtime semantics, round 1: the specific calls
 
 **Decision.** The per-kind behaviors shipped in v0.12.0 pin down five

@@ -85,9 +85,12 @@ type App struct {
 type Option func(*appConfig)
 
 type appConfig struct {
-	key    []byte
-	broker Broker
-	tracer Tracer
+	key       []byte
+	broker    Broker
+	tracer    Tracer
+	ratePer   float64
+	rateBurst float64
+	connCap   int
 }
 
 // WithSigningKey sets a STABLE event-signing key. Use this (or the FA_SIGNING_KEY
@@ -100,6 +103,20 @@ func WithSigningKey(key []byte) Option { return func(c *appConfig) { c.key = key
 // Redis/NATS-backed Broker is what makes a multi-instance deployment deliver
 // events correctly. See the Broker docs.
 func WithBroker(b Broker) Option { return func(c *appConfig) { c.broker = b } }
+
+// WithRateLimit overrides the per-IP /events rate limit (default: 20
+// events/sec, burst 40). "IP" is the connection's remote address as this
+// instance sees it — behind a reverse proxy that is the proxy's address, so
+// raise (or effectively disable) the limit there and rate-limit at the edge
+// instead.
+func WithRateLimit(perSec, burst float64) Option {
+	return func(c *appConfig) { c.ratePer, c.rateBurst = perSec, burst }
+}
+
+// WithConnCap overrides the per-IP cap on concurrent SSE connections
+// (default: 16). Same per-IP caveat as WithRateLimit: behind a proxy all
+// clients share the proxy's address, so cap at the edge and raise this.
+func WithConnCap(n int) Option { return func(c *appConfig) { c.connCap = n } }
 
 var ephemeralKeyOnce sync.Once
 
@@ -145,6 +162,13 @@ func New(manifest []byte, opts ...Option) *App {
 	}
 
 	hub := newHub(key, cfg.broker, rules, cfg.tracer)
+	if cfg.connCap > 0 {
+		hub.connCap = cfg.connCap
+	}
+	rate, burst := 20.0, 40.0 // ~20 events/sec/IP, burst 40
+	if cfg.ratePer > 0 {
+		rate, burst = cfg.ratePer, cfg.rateBurst
+	}
 	return &App{
 		hub:      hub,
 		rules:    rules,
@@ -152,7 +176,7 @@ func New(manifest []byte, opts ...Option) *App {
 		metrics:  hub.metrics,
 		handlers: make(map[string]Handler),
 		guards:   make(map[string]func(Ctx) bool),
-		limiter:  newRateLimiter(20, 40), // ~20 events/sec/IP, burst 40
+		limiter:  newRateLimiter(rate, burst),
 		key:      key,
 	}
 }

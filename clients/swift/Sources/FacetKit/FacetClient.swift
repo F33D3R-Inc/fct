@@ -319,10 +319,10 @@ public final class FacetClient: ObservableObject {
               node.attrs?["data-fa-decrypted"] != env,
               let key = vaultKeys[name],
               let plaintext = FacetPrimitives.decryptEnvelope(env, key: key) else { return nil }
-        var values = ["plaintext": plaintext]
+        var values: [String: Any] = ["plaintext": plaintext]
         if let d = plaintext.data(using: .utf8),
            let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
-            for (k, v) in obj { values[k] = "\(v)" } // JSON plaintext exposes its fields
+            for (k, v) in obj { values[k] = v } // JSON plaintext exposes its fields (structured for if/for)
         }
         var n = node
         n.children = [FacetHTMLParser.parse(FacetPrimitives.fill(body, values))]
@@ -340,7 +340,7 @@ public final class FacetClient: ObservableObject {
               let meta = registry[name], meta.kind == "media",
               let body = meta.client, !body.isEmpty,
               node.attrs?["data-fa-mounted"] == nil else { return nil }
-        var values: [String: String] = [:]
+        var values: [String: Any] = [:]
         for (k, v) in node.attrs ?? [:] where k.hasPrefix("data-") {
             let f = String(k.dropFirst("data-".count))
             if f == "action" || f.hasPrefix("fa-") { continue }

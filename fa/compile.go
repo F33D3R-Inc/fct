@@ -51,9 +51,13 @@ func Compile(src string) (*Compiled, error) {
 			}
 			return template.HTML(buf.String()), nil
 		},
-		"add": arith("add", func(a, b float64) float64 { return a + b }),
-		"sub": arith("sub", func(a, b float64) float64 { return a - b }),
-		"mul": arith("mul", func(a, b float64) float64 { return a * b }),
+		// Integer in, integer out: add/sub/mul keep int64 when both operands are
+		// integral, so results stay comparable to int literals (e.g. a computed
+		// `total = price * qty` against `total >= 100`). div stays float so integer
+		// division isn't silently truncated.
+		"add": numOp("add", func(a, b int64) int64 { return a + b }, func(a, b float64) float64 { return a + b }),
+		"sub": numOp("sub", func(a, b int64) int64 { return a - b }, func(a, b float64) float64 { return a - b }),
+		"mul": numOp("mul", func(a, b int64) int64 { return a * b }, func(a, b float64) float64 { return a * b }),
 		"div": arith("div", func(a, b float64) float64 { return a / b }),
 		"mod": func(a, b any) (any, error) {
 			x, ok1 := toFloat(a)
@@ -104,6 +108,48 @@ func Compile(src string) (*Compiled, error) {
 
 // arith adapts a float op into a template func over any numeric values. Whole
 // results render without a decimal point (float64(6) prints "6").
+// numOp builds a binary numeric op that stays in int64 when both operands are
+// integral and otherwise falls back to float64.
+func numOp(name string, fi func(a, b int64) int64, ff func(a, b float64) float64) func(a, b any) (any, error) {
+	return func(a, b any) (any, error) {
+		if ai, ok := toInt64(a); ok {
+			if bi, ok := toInt64(b); ok {
+				return fi(ai, bi), nil
+			}
+		}
+		x, ok1 := toFloat(a)
+		y, ok2 := toFloat(b)
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("%s: non-numeric operand", name)
+		}
+		return ff(x, y), nil
+	}
+}
+
+// toInt64 reports whether v is an integer kind (not a float) and its value.
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	case uint:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case uint64:
+		return int64(n), true
+	default:
+		return 0, false
+	}
+}
+
 func arith(name string, op func(a, b float64) float64) func(a, b any) (any, error) {
 	return func(a, b any) (any, error) {
 		x, ok1 := toFloat(a)

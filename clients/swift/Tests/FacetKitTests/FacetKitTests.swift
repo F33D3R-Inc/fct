@@ -90,12 +90,29 @@ final class FacetKitTests: XCTestCase {
         XCTAssertEqual(FacetPrimitives.goDurationMs("nope"), 0)
     }
 
-    // fill substitutes only {field} holes, HTML-escaping values (vault safety:
-    // decrypted plaintext can never inject elements).
+    // fill HTML-escapes interpolated values (vault safety: decrypted plaintext can
+    // never inject elements); a missing field renders empty.
     func testFillEscapes() {
-        let out = FacetPrimitives.fill("<p>{plaintext}</p>{ if x }{missing}",
-                                       ["plaintext": "<b>&hi'\""])
-        XCTAssertEqual(out, "<p>&lt;b&gt;&amp;hi&#39;&quot;</p>{ if x }")
+        let out = FacetPrimitives.fill("<p>{plaintext}</p>{missing}", ["plaintext": "<b>&hi'\""])
+        XCTAssertEqual(out, "<p>&lt;b&gt;&amp;hi&#39;&quot;</p>")
+    }
+
+    // Client-side if/for over structured values — must match the web runtime's
+    // fill() exactly (see runtime/fill_test.js).
+    func testFillControlFlow() {
+        XCTAssertEqual(FacetPrimitives.fill("{user.name}", ["user": ["name": "Lin"]]), "Lin")
+        XCTAssertEqual(FacetPrimitives.fill("{if admin}yes{else}no{end}", ["admin": true]), "yes")
+        XCTAssertEqual(FacetPrimitives.fill("{if items}has{else}empty{end}", ["items": [Any]()]), "empty")
+        XCTAssertEqual(FacetPrimitives.fill("{if n}nz{end}", ["n": 0]), "")
+        XCTAssertEqual(FacetPrimitives.fill("{if !done}todo{end}", ["done": false]), "todo")
+        XCTAssertEqual(FacetPrimitives.fill("{if count > 2}many{end}", ["count": 5]), "many")
+        XCTAssertEqual(FacetPrimitives.fill(#"{if role == "admin"}A{end}"#, ["role": "admin"]), "A")
+        XCTAssertEqual(FacetPrimitives.fill("{for t in tags}<i>{t}</i>{end}", ["tags": ["a", "b"]]),
+                       "<i>a</i><i>b</i>")
+        XCTAssertEqual(
+            FacetPrimitives.fill("{for u in users}{if u.on}{u.name} {end}{end}",
+                                 ["users": [["name": "A", "on": true], ["name": "B", "on": false]]]),
+            "A ")
     }
 
     func testNormalizeMedia() {

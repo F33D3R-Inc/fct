@@ -29,9 +29,10 @@ internal data class FacetManifest(val facets: List<FacetMeta> = emptyList())
 
 /**
  * The client side of the primitive taxonomy, mirroring fa-runtime.js: facet-id →
- * name resolution, Go duration parsing, the escaped `{field}` interpolation for
- * trusted client render bodies, vault envelope decryption, and media tag
- * normalization. Pure functions, shared by FacetClient and the tests.
+ * name resolution, Go duration parsing, the client render-body engine (escaped
+ * `{field}` interpolation plus `{if}`/`{for}`) for trusted bodies, vault envelope
+ * decryption, and media tag normalization. Pure functions, shared by FacetClient
+ * and the tests.
  */
 internal object Primitives {
     /** The facet name of a facet-id instance: "LikeButton:post:42" → "LikeButton". */
@@ -67,19 +68,175 @@ internal object Primitives {
         }
     }
 
-    private val hole = Regex("\\{\\s*([A-Za-z_]\\w*)\\s*\\}")
-
     /**
-     * Substitutes `{field}` holes in a TRUSTED body (the compiled manifest's
-     * client render body) with HTML-ESCAPED values. Field interpolation only — an
-     * unknown field renders empty; a non-field hole ({if x} …) is left literal.
-     * Exactly the web runtime's fill().
+     * Renders a TRUSTED client body (the compiled manifest's decrypt:/source:
+     * template) against UNTRUSTED values. Interpolated values are HTML-ESCAPED;
+     * literal text is not. Supports {field}/{a.b}, {if expr}…{else}…{end} and
+     * {for v in path}…{end} — the exact behavior of the web runtime's fill().
+     *
+     * Values are structured (String / Boolean / Number / List<*> / Map<*, *>),
+     * e.g. a vault's parsed JSON plaintext, so loops/conditions see real arrays
+     * and nested objects.
      */
+    @JvmName("fillAny")
+    fun fill(body: String, values: Map<String, Any?>): String {
+        val toks = tokenizeTpl(body)
+        val nodes = parseBlock(toks, intArrayOf(0), stopElse = false)
+        return renderTpl(nodes, values)
+    }
+
+    /** String-valued convenience overload (media data-* attributes are strings). */
     fun fill(body: String, values: Map<String, String>): String =
-        hole.replace(body) { m ->
-            val v = values[m.groupValues[1]]
-            if (v != null) escape(v) else ""
+        fill(body, values.mapValues { it.value as Any? })
+
+    /** A parsed client-body node. */
+    private sealed interface TplNode {
+        data class Text(val s: String) : TplNode
+        data class Interp(val e: String) : TplNode
+        data class Cond(val expr: String, val then: List<TplNode>, val els: List<TplNode>) : TplNode
+        data class Loop(val v: String, val iter: String, val body: List<TplNode>) : TplNode
+    }
+
+    private sealed interface Tok {
+        data class Text(val s: String) : Tok
+        data class Interp(val e: String) : Tok
+        data class IfTok(val e: String) : Tok
+        object ElseTok : Tok
+        object EndTok : Tok
+        data class ForTok(val v: String, val iter: String) : Tok
+    }
+
+    private val forHead = Regex("^for\\s+([A-Za-z_]\\w*)\\s+in\\s+(.+)$")
+
+    private fun tokenizeTpl(body: String): List<Tok> {
+        val toks = mutableListOf<Tok>()
+        var rest = body
+        while (true) {
+            val open = rest.indexOf('{')
+            if (open < 0) { if (rest.isNotEmpty()) toks.add(Tok.Text(rest)); break }
+            if (open > 0) toks.add(Tok.Text(rest.substring(0, open)))
+            val close = rest.indexOf('}', open + 1)
+            if (close < 0) { toks.add(Tok.Text(rest.substring(open))); break }
+            val inner = rest.substring(open + 1, close).trim()
+            when {
+                inner.startsWith("if ") -> toks.add(Tok.IfTok(inner.substring(3).trim()))
+                inner == "else" -> toks.add(Tok.ElseTok)
+                inner == "end" -> toks.add(Tok.EndTok)
+                inner.startsWith("for ") -> {
+                    val m = forHead.find(inner)
+                    if (m != null) toks.add(Tok.ForTok(m.groupValues[1], m.groupValues[2].trim()))
+                    else toks.add(Tok.Text("{$inner}"))
+                }
+                else -> toks.add(Tok.Interp(inner))
+            }
+            rest = rest.substring(close + 1)
         }
+        return toks
+    }
+
+    // i is a single-element cursor (pass-by-reference) into toks.
+    private fun parseBlock(toks: List<Tok>, i: IntArray, stopElse: Boolean): List<TplNode> {
+        val nodes = mutableListOf<TplNode>()
+        while (i[0] < toks.size) {
+            when (val tk = toks[i[0]]) {
+                is Tok.EndTok -> return nodes
+                is Tok.ElseTok -> { if (stopElse) return nodes; i[0]++ }
+                is Tok.Text -> { i[0]++; nodes.add(TplNode.Text(tk.s)) }
+                is Tok.Interp -> { i[0]++; nodes.add(TplNode.Interp(tk.e)) }
+                is Tok.IfTok -> {
+                    i[0]++
+                    val then = parseBlock(toks, i, stopElse = true)
+                    var els = emptyList<TplNode>()
+                    if (i[0] < toks.size && toks[i[0]] is Tok.ElseTok) { i[0]++; els = parseBlock(toks, i, stopElse = false) }
+                    if (i[0] < toks.size && toks[i[0]] is Tok.EndTok) i[0]++
+                    nodes.add(TplNode.Cond(tk.e, then, els))
+                }
+                is Tok.ForTok -> {
+                    i[0]++
+                    val body = parseBlock(toks, i, stopElse = false)
+                    if (i[0] < toks.size && toks[i[0]] is Tok.EndTok) i[0]++
+                    nodes.add(TplNode.Loop(tk.v, tk.iter, body))
+                }
+            }
+        }
+        return nodes
+    }
+
+    private fun renderTpl(nodes: List<TplNode>, scope: Map<String, Any?>): String = buildString {
+        for (n in nodes) when (n) {
+            is TplNode.Text -> append(n.s)
+            is TplNode.Interp -> evalExpr(n.e, scope)?.let { append(escape(stringify(it))) }
+            is TplNode.Cond -> append(renderTpl(if (truthy(evalExpr(n.expr, scope))) n.then else n.els, scope))
+            is TplNode.Loop -> (evalExpr(n.iter, scope) as? List<*>)?.forEach { item ->
+                append(renderTpl(n.body, scope + (n.v to item)))
+            }
+        }
+    }
+
+    private val ops = listOf("==", "!=", "<=", ">=", "<", ">") // two-char first
+
+    // evalExpr supports `lhs OP rhs` comparisons, a leading `!`, and bare operands
+    // (literals or dotted paths). Mirrors the web runtime.
+    fun evalExpr(expr: String, scope: Map<String, Any?>): Any? {
+        val e = expr.trim()
+        for (op in ops) {
+            val at = e.indexOf(op)
+            if (at >= 0) return compare(op, operand(e.substring(0, at), scope), operand(e.substring(at + op.length), scope))
+        }
+        if (e.startsWith("!")) return !truthy(evalExpr(e.substring(1), scope))
+        return operand(e, scope)
+    }
+
+    private fun operand(s0: String, scope: Map<String, Any?>): Any? {
+        val s = s0.trim()
+        if (s == "true") return true
+        if (s == "false") return false
+        s.toDoubleOrNull()?.let { return it }
+        if (s.length >= 2 && (s.first() == '"' || s.first() == '\'') && s.last() == s.first()) {
+            return s.substring(1, s.length - 1)
+        }
+        var cur: Any? = scope
+        for (seg in s.split('.')) {
+            cur = (cur as? Map<*, *>)?.get(seg) ?: return null
+        }
+        return cur
+    }
+
+    private fun compare(op: String, a: Any?, b: Any?): Boolean {
+        if (op == "==") return stringify(a) == stringify(b)
+        if (op == "!=") return stringify(a) != stringify(b)
+        val na = numberOf(a); val nb = numberOf(b)
+        if (na != null && nb != null) return when (op) {
+            "<" -> na < nb; "<=" -> na <= nb; ">" -> na > nb; else -> na >= nb
+        }
+        val sa = stringify(a); val sb = stringify(b)
+        return when (op) { "<" -> sa < sb; "<=" -> sa <= sb; ">" -> sa > sb; else -> sa >= sb }
+    }
+
+    // truthy mirrors Go template emptiness: null/false/0/""/[]/{} are falsy.
+    private fun truthy(v: Any?): Boolean = when (v) {
+        null -> false
+        is Boolean -> v
+        is Number -> v.toDouble() != 0.0
+        is String -> v.isNotEmpty()
+        is List<*> -> v.isNotEmpty()
+        is Map<*, *> -> v.isNotEmpty()
+        else -> true
+    }
+
+    private fun numberOf(v: Any?): Double? = when (v) {
+        is Number -> v.toDouble()
+        is String -> v.toDoubleOrNull()
+        is Boolean -> if (v) 1.0 else 0.0
+        else -> null
+    }
+
+    private fun stringify(v: Any?): String = when (v) {
+        null -> ""
+        is Boolean -> if (v) "true" else "false"
+        is Double -> if (v == Math.floor(v) && !v.isInfinite()) v.toLong().toString() else v.toString()
+        else -> v.toString()
+    }
 
     /**
      * A signal payload key that is safe to set as a data-* attribute (no

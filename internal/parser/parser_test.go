@@ -141,11 +141,28 @@ func TestForLoop(t *testing.T) {
 	}
 }
 
-func TestComputedFieldRejected(t *testing.T) {
-	src := "facet T:\n    what:\n        x = fetch()\n"
-	_, err := Parse(src)
-	if err == nil || !strings.Contains(err.Error(), "computed") {
-		t.Fatalf("expected computed-field rejection, got %v", err)
+func TestComputedField(t *testing.T) {
+	// `name = expr` (inferred type) and `name: Type = expr` (explicit), with a
+	// comparison in the expr so the assignment '=' isn't confused with '=='.
+	src := "facet T:\n    what:\n        a: int\n        b: int\n        total = a + b\n        big: bool = total >= 100\n"
+	facets, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	fields := facets[0].Fields
+	if len(fields) != 4 {
+		t.Fatalf("want 4 fields, got %d", len(fields))
+	}
+	total := fields[2]
+	if total.Name != "total" || !total.IsComputed() || total.Expr != "a + b" || total.Type != "" {
+		t.Errorf("total field wrong: %+v", total)
+	}
+	big := fields[3]
+	if big.Name != "big" || !big.IsComputed() || big.Expr != "total >= 100" || big.Type != "bool" {
+		t.Errorf("big field wrong: %+v", big)
+	}
+	if fields[0].IsComputed() {
+		t.Errorf("plain field a should not be computed: %+v", fields[0])
 	}
 }
 

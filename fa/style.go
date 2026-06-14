@@ -241,6 +241,12 @@ func applyInlineStyle(s *Style, inline string) {
 			s.Justify = mapJustify(val)
 		case "align-items":
 			s.Align = mapAlign(val)
+		case "flex", "flex-grow":
+			// `flex: 1 1 0%` / `flex-grow: 1` → grow. The first number is the grow
+			// factor; any positive value means expand.
+			if f := strings.Fields(val); len(f) > 0 && pxOf(f[0]) > 0 {
+				s.Grow = true
+			}
 		}
 	}
 }

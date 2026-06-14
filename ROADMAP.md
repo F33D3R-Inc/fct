@@ -10,8 +10,11 @@ separately in [ENTERPRISE.md](ENTERPRISE.md); release history is in
 - Full compiler pipeline for all 8 primitives (`facet`/`feed`/`stream`/
   `lifecycle`/`pipe`/`vault`/`media`/`signal`) with per-primitive runtime
   semantics on the server, the web runtime, **and** both native runtimes
-  (FacetKit SwiftUI + Compose).
-- Composition (child facets + `slot:`), rich expressions, typed codegen.
+  (FacetKit SwiftUI + Compose). Client-rendered bodies (`decrypt:`/`source:`)
+  support `{field}` interpolation **plus `{if}`/`{for}`** across all runtimes.
+- Composition (child facets, default + **named slots** via `slot name:` /
+  `fill name:`), rich expressions, **computed `what:` fields**,
+  **cross-platform `style:` tokens**, typed codegen.
 - Security suite: scoped SSE, `who:` structural authz, CSRF, rate limits,
   CSP, HMAC-signed events (see `SECURITY_AUDIT.md`).
 - App building blocks: router with reload-free navigation, sessions, forms,
@@ -21,24 +24,21 @@ separately in [ENTERPRISE.md](ENTERPRISE.md); release history is in
 
 ## Near term
 
-1. **Named slots** — `slot name:` + `fill name:` (today: one default slot).
-2. **Scoped styles** — a `style:` block, auto-scoped per facet.
-3. **Computed fields** — derived values in `what:` (the remaining typed-data
-   gap).
-4. **Client-side `if`/`for` in vault/media bodies** — round 1 is field
-   interpolation only.
+1. **Web-only style escape hatch** — a separate, explicitly web-scoped block
+   for `:hover` / `@media` / animations the cross-platform `style:` tokens
+   can't express (keyword reserved; build when a facet needs it). See ADR-0008.
 
 ## Medium term
 
-5. **Hosted registry + docs portal** — the package catalog and this wiki,
+2. **Hosted registry + docs portal** — the package catalog and this wiki,
    served publicly (see `PUBLISHING.md`). The docs site will be built **with
    FA itself**.
-6. **Community facet intake** — curated submissions into `std/` via GitHub
+3. **Community facet intake** — curated submissions into `std/` via GitHub
    (see the wiki's Community Packages page).
 
 ## Long term
 
-7. **Non-Go backend targets** — codegen for Node / Python / Rust; FA's pitch
+4. **Non-Go backend targets** — codegen for Node / Python / Rust; FA's pitch
    is language-agnostic via the compiler.
-8. **Expanded native surface** — richer input kinds and platform components
+5. **Expanded native surface** — richer input kinds and platform components
    over the same neutral-tree protocol.

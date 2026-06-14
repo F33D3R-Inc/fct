@@ -42,13 +42,122 @@
     });
   }
 
-  // fill substitutes {field} holes in a TRUSTED body (the compiled manifest's
-  // client render body) with HTML-ESCAPED values — round 1 supports plain field
-  // interpolation only (no client-side if/for).
+  // fill renders a TRUSTED client body (the compiled manifest's decrypt:/source:
+  // template) against UNTRUSTED values (decrypted plaintext / media metadata).
+  // Interpolated values are HTML-ESCAPED; literal template text is not. Supports
+  // {field} / {a.b} interpolation, {if expr}…{else}…{end} and
+  // {for v in path}…{end}. Parsed templates are cached by body string.
+  var tplCache = {};
   function fill(body, values) {
-    return String(body).replace(/\{\s*([A-Za-z_]\w*)\s*\}/g, function (_, name) {
-      return Object.prototype.hasOwnProperty.call(values, name) ? esc(values[name]) : '';
-    });
+    body = String(body);
+    var tpl = tplCache[body] || (tplCache[body] = parseTpl(tokenizeTpl(body)));
+    return renderTpl(tpl, values || {});
+  }
+
+  // tokenizeTpl splits the body into text and {…} tags. A `{` always opens a hole
+  // (the compiler reserves it), mirroring the FDL looks grammar.
+  function tokenizeTpl(body) {
+    var toks = [], re = /\{([^}]*)\}/g, last = 0, m;
+    while ((m = re.exec(body))) {
+      if (m.index > last) toks.push({ t: 'text', s: body.slice(last, m.index) });
+      var inner = m[1].trim();
+      if (/^if\s+/.test(inner)) toks.push({ t: 'if', e: inner.slice(3).trim() });
+      else if (inner === 'else') toks.push({ t: 'else' });
+      else if (inner === 'end') toks.push({ t: 'end' });
+      else if (/^for\s+/.test(inner)) {
+        var mm = /^for\s+([A-Za-z_]\w*)\s+in\s+(.+)$/.exec(inner);
+        toks.push(mm ? { t: 'for', v: mm[1], it: mm[2].trim() } : { t: 'text', s: m[0] });
+      } else toks.push({ t: 'interp', e: inner });
+      last = re.lastIndex;
+    }
+    if (last < body.length) toks.push({ t: 'text', s: body.slice(last) });
+    return toks;
+  }
+
+  // parseTpl folds the flat token stream into nested if/for nodes.
+  function parseTpl(toks) {
+    var i = 0;
+    function block(stopElse) {
+      var nodes = [];
+      while (i < toks.length) {
+        var tk = toks[i];
+        if (tk.t === 'end' || (stopElse && tk.t === 'else')) return nodes;
+        i++;
+        if (tk.t === 'text' || tk.t === 'interp') nodes.push(tk);
+        else if (tk.t === 'if') {
+          var then_ = block(true), els = [];
+          if (toks[i] && toks[i].t === 'else') { i++; els = block(false); }
+          if (toks[i] && toks[i].t === 'end') i++;
+          nodes.push({ t: 'if', e: tk.e, then: then_, els: els });
+        } else if (tk.t === 'for') {
+          var b = block(false);
+          if (toks[i] && toks[i].t === 'end') i++;
+          nodes.push({ t: 'for', v: tk.v, it: tk.it, body: b });
+        }
+      }
+      return nodes;
+    }
+    return block(false);
+  }
+
+  function renderTpl(nodes, scope) {
+    var out = '';
+    for (var k = 0; k < nodes.length; k++) {
+      var n = nodes[k];
+      if (n.t === 'text') out += n.s;
+      else if (n.t === 'interp') { var v = evalExpr(n.e, scope); if (v != null) out += esc(v); }
+      else if (n.t === 'if') out += renderTpl(truthy(evalExpr(n.e, scope)) ? n.then : n.els, scope);
+      else if (n.t === 'for') {
+        var arr = evalExpr(n.it, scope);
+        if (arr && typeof arr !== 'string' && arr.length != null) {
+          for (var j = 0; j < arr.length; j++) {
+            var s2 = Object.create(scope); s2[n.v] = arr[j];
+            out += renderTpl(n.body, s2);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // evalExpr supports `lhs OP rhs` comparisons, a leading `!`, and bare
+  // operands. Operands are literals (numbers, "strings", true/false) or dotted
+  // paths resolved against the scope.
+  function evalExpr(e, scope) {
+    e = String(e).trim();
+    var m = /^(.+?)\s*(==|!=|<=|>=|<|>)\s*(.+)$/.exec(e);
+    if (m) return compare(m[2], operand(m[1], scope), operand(m[3], scope));
+    if (e.charAt(0) === '!') return !truthy(evalExpr(e.slice(1), scope));
+    return operand(e, scope);
+  }
+  function operand(s, scope) {
+    s = s.trim();
+    if (s === 'true') return true;
+    if (s === 'false') return false;
+    if (/^-?\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+    var q = s.charAt(0);
+    if ((q === '"' || q === "'") && s.charAt(s.length - 1) === q) return s.slice(1, -1);
+    var segs = s.split('.'), v = scope;
+    for (var i = 0; i < segs.length; i++) { if (v == null) return undefined; v = v[segs[i]]; }
+    return v;
+  }
+  function compare(op, a, b) {
+    if (op === '==') return a == b;
+    if (op === '!=') return a != b;
+    var na = +a, nb = +b, num = !isNaN(na) && !isNaN(nb);
+    var x = num ? na : a, y = num ? nb : b;
+    return op === '<' ? x < y : op === '<=' ? x <= y : op === '>' ? x > y : x >= y;
+  }
+  // truthy mirrors Go template emptiness so client if/for matches server looks:
+  // null/false/0/""/[]/{} are falsy.
+  function truthy(v) {
+    if (v == null || v === false) return false;
+    if (v === true) return true;
+    if (typeof v === 'number') return v !== 0;
+    if (typeof v === 'string') return v.length > 0;
+    if (Array.isArray(v)) return v.length > 0;
+    if (typeof v === 'object') return Object.keys(v).length > 0;
+    return true;
   }
 
   function meta(name) {
@@ -400,23 +509,31 @@
       .then(function () { connectSSE(); wireActions(); wireNav(); scanSubscribes(); scanClient(); });
   }
 
-  // Public API: subscribe to a channel for topic fan-out (server authorizes),
-  // and provide a vault's decryption key (client-side only — never sent).
-  window.fa = {
-    subscribe: function (channel) {
-      subscriptions[channel] = 1;
-      if (connID) send('fa.subscribe', { channel: channel });
-    },
-    unsubscribe: function (channel) {
-      delete subscriptions[channel];
-      if (connID) send('fa.unsubscribe', { channel: channel });
-    },
-    vault: { key: provideVaultKey }
-  };
+  // Node-requireable for unit tests of the pure helpers (no DOM/network).
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { fill: fill };
+  }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
-  } else {
-    boot();
+  // Browser: expose the public API and boot. Public API: subscribe to a channel
+  // for topic fan-out (server authorizes), and provide a vault's decryption key
+  // (client-side only — never sent).
+  if (typeof window !== 'undefined') {
+    window.fa = {
+      subscribe: function (channel) {
+        subscriptions[channel] = 1;
+        if (connID) send('fa.subscribe', { channel: channel });
+      },
+      unsubscribe: function (channel) {
+        delete subscriptions[channel];
+        if (connID) send('fa.unsubscribe', { channel: channel });
+      },
+      vault: { key: provideVaultKey }
+    };
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot);
+    } else {
+      boot();
+    }
   }
 })();

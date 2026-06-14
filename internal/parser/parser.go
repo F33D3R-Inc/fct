@@ -219,8 +219,15 @@ func (p *parser) parseFacet() (*ast.Facet, error) {
 			}
 		case head == "auth:":
 			return nil, &perr{t.Line, t.Col, "`auth:` was renamed to `who:`"}
-		case head == "style:" || head == "error:":
-			return nil, &perr{t.Line, t.Col, fmt.Sprintf("`%s` is not supported in v0 (ADR-0003)", strings.TrimSuffix(head, ":"))}
+		case head == "style:":
+			if !f.ServerRendered() {
+				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`style:` is not allowed on a %s — it attaches to a server-rendered root element", f.Kind)}
+			}
+			if err := p.parseStyle(f); err != nil {
+				return nil, err
+			}
+		case head == "error:":
+			return nil, &perr{t.Line, t.Col, "`error:` is not supported in v0 (ADR-0003)"}
 		default:
 			return nil, &perr{t.Line, t.Col, fmt.Sprintf("unexpected line in facet body: %q", head)}
 		}
@@ -338,6 +345,32 @@ func (p *parser) parseWho(f *ast.Facet) error {
 
 // ── what (data) ─────────────────────────────────────────────────────────────
 
+// parseStyle reads the `style:` block — `property: value` lines of cross-platform
+// style tokens. Values may contain spaces (`pad: 2 4`) and `#` (`bg: #fff`); only
+// the first `:` separates key from value. Token validity is checked in codegen.
+func (p *parser) parseStyle(f *ast.Facet) error {
+	p.next() // consume `style:`
+	if _, err := p.expect(lexer.INDENT, "indented style block"); err != nil {
+		return err
+	}
+	for p.at(lexer.LINE) {
+		t := p.next()
+		key, val, found := strings.Cut(t.Text, ":")
+		if !found {
+			return &perr{t.Line, t.Col, fmt.Sprintf("expected `property: value` in style:, got %q", t.Text)}
+		}
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		if key == "" || val == "" {
+			return &perr{t.Line, t.Col, fmt.Sprintf("style line needs a property and a value, got %q", t.Text)}
+		}
+		f.Style = append(f.Style, ast.StyleProp{Key: key, Val: val, Pos: ast.Pos{Line: t.Line, Col: t.Col}})
+	}
+	if _, err := p.expect(lexer.DEDENT, "end of style block"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (p *parser) parseWhat(f *ast.Facet) error {
 	p.next() // consume `what:`
 	if _, err := p.expect(lexer.INDENT, "indented what block"); err != nil {
@@ -358,12 +391,32 @@ func (p *parser) parseWhat(f *ast.Facet) error {
 }
 
 func parseField(t lexer.Token) (ast.Field, error) {
-	if strings.Contains(t.Text, "=") {
-		return ast.Field{}, &perr{t.Line, t.Col, "computed fields (`=`) are not supported in v0 (ADR-0003)"}
+	pos := ast.Pos{Line: t.Line, Col: t.Col}
+	// A computed field is `<decl> = <expr>`, where the assignment '=' is the first
+	// '=' that is not part of a two-char operator (==, >=, <=, !=) in the expr.
+	if i := assignIndex(t.Text); i >= 0 {
+		decl := t.Text[:i]
+		expr := strings.TrimSpace(t.Text[i+1:])
+		if expr == "" {
+			return ast.Field{}, &perr{t.Line, t.Col, "computed field needs an expression after `=`"}
+		}
+		// The declaration is `name` or `name: Type` (type optional for computed).
+		name, typ := decl, ""
+		if n, ty, found := strings.Cut(decl, ":"); found {
+			name, typ = n, strings.TrimSpace(ty)
+		}
+		name = strings.TrimSpace(name)
+		if !isIdent(name) {
+			return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid field name %q", name)}
+		}
+		if typ != "" && !isIdent(typ) {
+			return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid type %q", typ)}
+		}
+		return ast.Field{Name: name, Type: typ, Expr: expr, Pos: pos}, nil
 	}
 	name, typ, found := strings.Cut(t.Text, ":")
 	if !found {
-		return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("expected `name: Type`, got %q", t.Text)}
+		return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("expected `name: Type` or `name = expr`, got %q", t.Text)}
 	}
 	name = strings.TrimSpace(name)
 	typ = strings.TrimSpace(typ)
@@ -373,7 +426,27 @@ func parseField(t lexer.Token) (ast.Field, error) {
 	if !isIdent(typ) {
 		return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid type %q", typ)}
 	}
-	return ast.Field{Name: name, Type: typ, Pos: ast.Pos{Line: t.Line, Col: t.Col}}, nil
+	return ast.Field{Name: name, Type: typ, Pos: pos}, nil
+}
+
+// assignIndex returns the byte index of the computed-field assignment '=', or -1
+// if the line has none. It skips '=' that forms a comparison operator (==, !=,
+// >=, <=) so `flag: bool = a == b` splits at the assignment, not the comparison.
+func assignIndex(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '=' {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '=' { // "==" → comparison, skip both
+			i++
+			continue
+		}
+		if i > 0 && (s[i-1] == '!' || s[i-1] == '<' || s[i-1] == '>') { // !=, <=, >=
+			continue
+		}
+		return i
+	}
+	return -1
 }
 
 // ── when (event handler) ────────────────────────────────────────────────────
@@ -573,11 +646,14 @@ func parseLooksBlock(lines []rawLine, i, minIndent int) ([]ast.Node, int, error)
 			nodes = append(nodes, ast.Ctrl{Op: "end"})
 			i = ni
 		case "slot":
+			if a != "" && !isIdent(a) {
+				return nil, 0, &perr{ln.line, ln.indent + 1, fmt.Sprintf("invalid slot name %q", a)}
+			}
 			body, ni, err := parseLooksBlock(lines, i+1, ln.indent+1)
 			if err != nil {
 				return nil, 0, err
 			}
-			nodes = append(nodes, ast.Slot{Default: body, Pos: ast.Pos{Line: ln.line, Col: ln.indent + 1}})
+			nodes = append(nodes, ast.Slot{Name: a, Default: body, Pos: ast.Pos{Line: ln.line, Col: ln.indent + 1}})
 			i = ni
 		case "else":
 			return nil, 0, &perr{ln.line, ln.indent + 1, "`else` without a matching `if`"}
@@ -604,6 +680,8 @@ func matchControl(text string) (op, a, b string, ok bool) {
 		return "else", "", "", true
 	case t == "slot":
 		return "slot", "", "", true
+	case strings.HasPrefix(t, "slot "):
+		return "slot", strings.TrimSpace(t[5:]), "", true
 	case strings.HasPrefix(t, "if "):
 		return "if", strings.TrimSpace(t[3:]), "", true
 	case strings.HasPrefix(t, "for "):
@@ -748,8 +826,9 @@ func matchBlockChildOpen(ln rawLine) (ast.Child, bool) {
 }
 
 // parseChildBody collects a block-form child's body — the lines indented under
-// the open tag, up to its `</Name>` close line — as the child's slot content.
-// Returns the index past the close line.
+// the open tag, up to its `</Name>` close line. Top-level `fill name:` blocks
+// become child.Fills[name] (named-slot content); everything else becomes
+// child.Children (default-slot content). Returns the index past the close line.
 func parseChildBody(lines []rawLine, i, openIndent int, child *ast.Child) (int, error) {
 	bodyStart := i
 	for i < len(lines) && lines[i].indent > openIndent {
@@ -759,15 +838,62 @@ func parseChildBody(lines []rawLine, i, openIndent int, child *ast.Child) (int, 
 	if i >= len(lines) || lines[i].indent != openIndent || strings.TrimSpace(lines[i].text) != closeTag {
 		return 0, &perr{child.Pos.Line, child.Pos.Col, fmt.Sprintf("unclosed <%s>; expected %s", child.Name, closeTag)}
 	}
-	if i > bodyStart {
-		body, _, err := parseLooksBlock(lines, bodyStart, lines[bodyStart].indent)
-		if err != nil {
-			return 0, err
+	bodyEnd := i
+	if bodyEnd > bodyStart {
+		topIndent := lines[bodyStart].indent
+		var def []ast.Node
+		for j := bodyStart; j < bodyEnd; {
+			ln := lines[j]
+			if name, ok := matchFill(ln.text); ok && ln.indent == topIndent {
+				if !isIdent(name) {
+					return 0, &perr{ln.line, ln.indent + 1, fmt.Sprintf("invalid fill name %q", name)}
+				}
+				if _, dup := child.Fills[name]; dup {
+					return 0, &perr{ln.line, ln.indent + 1, fmt.Sprintf("duplicate fill %q in <%s>", name, child.Name)}
+				}
+				fbody, nj, err := parseLooksBlock(lines[:bodyEnd], j+1, ln.indent+1)
+				if err != nil {
+					return 0, err
+				}
+				if child.Fills == nil {
+					child.Fills = map[string][]ast.Node{}
+				}
+				child.Fills[name] = fbody
+				j = nj
+				continue
+			}
+			// A maximal run of default-slot content up to the next top-level fill.
+			k := j + 1
+			for k < bodyEnd && !(lines[k].indent == topIndent && isFillLine(lines[k].text)) {
+				k++
+			}
+			run, _, err := parseLooksBlock(lines[:k], j, topIndent)
+			if err != nil {
+				return 0, err
+			}
+			def = append(def, run...)
+			j = k
 		}
-		child.Children = body
+		child.Children = def
 	}
 	return i + 1, nil // past the close line
 }
+
+// matchFill reports whether a looks line is a `fill name:` line and returns the
+// slot name. isFillLine is the boolean-only form used to bound default content.
+func matchFill(text string) (name string, ok bool) {
+	t := strings.TrimSpace(text)
+	if !strings.HasSuffix(t, ":") {
+		return "", false
+	}
+	t = strings.TrimSpace(strings.TrimSuffix(t, ":"))
+	if rest, found := strings.CutPrefix(t, "fill "); found {
+		return strings.TrimSpace(rest), true
+	}
+	return "", false
+}
+
+func isFillLine(text string) bool { _, ok := matchFill(text); return ok }
 
 // makeProp classifies an attribute value: a pure `{expr}` becomes an expression
 // prop; anything else is a literal string.

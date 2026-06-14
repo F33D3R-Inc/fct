@@ -16,7 +16,7 @@ Last updated: 2026-06-11 (v0.13.0).
 | Operations | ✅ shipped (health, drain, Docker, logs) |
 | Observability | ✅ shipped — Prometheus `/metrics` (counters + latency histograms), `fa.Tracer` OTel hooks traceable across the broker |
 | Data / persistence | ✅ documented (BYO database — see `wiki/Working-with-Databases.md`) |
-| AuthN / SSO | 🟡 partial — sessions + identity built in; no OIDC/SAML story |
+| AuthN / SSO | 🟢 mostly — built-in `fa.Auth` (PBKDF2 password hashing, account store, login flow, role guards, admin gating); OIDC/SAML still BYO (see `examples/oidc`) |
 | API stability | ✅ shipped — `STABILITY.md` (semver, 1.0 surface freeze, deprecation policy) + wire-version negotiation in all three runtimes |
 | Supply chain | ✅ shipped — cosign-signed releases, SLSA provenance, SBOM, govulncheck + dependency review in CI, reproducible builds (`docs/REPRODUCIBLE_BUILDS.md`) |
 | Native client parity | ✅ shipped — wire, HMAC, surgical updates, and per-primitive semantics (window/ttl/vault/media) in both runtimes, unit-tested |

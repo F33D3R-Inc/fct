@@ -85,6 +85,53 @@ func checkNodeRefs(facet string, nodes []ast.Node, declared map[string]bool, sco
 					return err
 				}
 			}
+			for _, name := range sortedFillNames(v.Fills) {
+				sub := append([]string(nil), scope...) // isolate fill scope
+				if err := checkNodeRefs(facet, v.Fills[name], declared, sub); err != nil {
+					return err
+				}
+			}
+		case ast.Slot:
+			// Slot default content renders in this facet's own scope.
+			if err := checkNodeRefs(facet, v.Default, declared, scope); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkComputed validates the `what:` block: no duplicate field names, and every
+// computed field's expression references only plain fields or computed fields
+// declared *before* it (a forward or self reference would emit a Go-template
+// `$var` used before definition). This is the compile-time contract for derived
+// values — a typo or bad order is an error here, not a blank at render.
+func checkComputed(facets []*ast.Facet) error {
+	for _, f := range facets {
+		plain := make(map[string]bool)
+		all := make(map[string]bool)
+		for _, fl := range f.Fields {
+			if !fl.IsComputed() {
+				plain[fl.Name] = true
+			}
+		}
+		seen := make(map[string]bool) // computed fields declared so far
+		for _, fl := range f.Fields {
+			if all[fl.Name] {
+				return fmt.Errorf("facet %s: duplicate field %q in what:", f.Name, fl.Name)
+			}
+			all[fl.Name] = true
+			if !fl.IsComputed() {
+				continue
+			}
+			for _, r := range exprRoots(fl.Expr) {
+				if plain[r] || seen[r] {
+					continue
+				}
+				return fmt.Errorf("facet %s: computed field %q references %q, which is not a field declared before it "+
+					"(declare it in what:, fix the name, or move it above %q)", f.Name, fl.Name, r, fl.Name)
+			}
+			seen[fl.Name] = true
 		}
 	}
 	return nil

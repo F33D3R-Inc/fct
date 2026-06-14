@@ -63,6 +63,22 @@ misspelled field is a compile error. `fct build` also emits a typed
 `<Name>Data` Go struct per facet (idiomatic naming: `avatar_url` → `AvatarURL`,
 `id` → `ID`).
 
+**Computed fields** are derived values written with `=`; the caller never
+supplies them (they are excluded from the generated `<Name>Data` struct) and
+they resolve server-side at render time. The type is optional.
+
+```
+    what:
+        price: int
+        qty: int
+        total = price * qty             # inferred type
+        free: bool = total >= 100       # explicit type, uses an earlier computed
+```
+
+A computed field may reference any input field and any computed field declared
+*above* it; a forward or self reference is a compile error. Integer `+`, `-`,
+`*` stay integers (so `total >= 100` compares cleanly); `/` yields a float.
+
 ### `looks:` — the template
 
 Raw HTML with three additions:
@@ -86,19 +102,75 @@ Raw HTML with three additions:
    ```
         <Avatar user="{user}" size="48"/>          # self-closing child call
         <Card title="Stats">                        # block form fills the child's
-            <Badge label="{count}"/>                # slot: with this content
+            <Badge label="{count}"/>                # default slot: with this content
         </Card>
    ```
 
    A child declares the hole with `slot:` on a line inside its `looks:`.
    Cycles, unknown children, and unknown props are compile errors.
-   (Named slots are not yet implemented — one default slot per facet.)
+
+   **Named slots.** A facet may declare more than one insertion point with
+   `slot name:`; the parent targets each with a `fill name:` block. Content not
+   inside any `fill` goes to the default `slot:`. Each `slot`/`slot name:` may
+   carry default content, shown when that slot is unfilled.
+
+   ```
+        facet Frame:                                 # the child: three slots
+            looks:
+                <header> slot header: </header>
+                <main>   slot:        </main>        # the default slot
+                <footer>
+                    slot footer:
+                        <small>© us</small>          # default if unfilled
+                </footer>
+
+        facet Page:                                  # the parent fills them
+            looks:
+                <Frame>
+                    fill header:
+                        <h1>Title</h1>
+                    <p>main body → default slot</p>
+                    fill footer:
+                        <small>© Page</small>
+                </Frame>
+   ```
+
+   Filling a slot the child does not declare (`fill typo:`) is a compile error.
 
 **Expressions** support: identifier paths (`post.author.name`),
 method/function calls (`viewer.can_view(post)`), comparisons
 (`== != < <= > >=`), boolean (`&& || !`), arithmetic (`+ - * / %`), and
 literals (`123`, `"text"`, `true`/`false`). Path segments are Title-cased to
 Go names, so backend fields/methods must be exported.
+
+### `style:` — cross-platform appearance
+
+A `style:` block sets the facet's root layout and appearance with **design
+tokens** the compiler resolves at build time. The resolved style attaches to the
+root element, so the *same* declaration renders on web (DOM), iOS (SwiftUI) and
+Android (Compose) — there is no per-platform styling code.
+
+```
+    style:
+        direction: column      # row | column (implies a flex container)
+        gap: 2                 # spacing scale: n → n×4px
+        pad: 4                 # uniform; `pad: 2 4` = vertical horizontal
+        align: center          # start | center | end | stretch
+        justify: between       # start | center | end | between
+        grow: true             # expand to fill the parent's main axis
+        width: fill            # fill | <px> | <pct>%   (also height)
+        bg: surface            # color token (or a literal #hex)
+        fg: text
+        radius: md             # none | sm | md | lg | pill
+        font-size: lg          # sm | base | lg | xl | 2xl
+        font-weight: bold      # normal | medium | bold | black
+```
+
+Color tokens: `fg`/`text`, `muted`, `border`, `bg`/`surface`, `primary`/`accent`,
+`on-primary`, `danger`, `transparent`. Every property and token is validated —
+an unknown one is a compile error. This block is **not** arbitrary CSS: web-only
+effects (`:hover`, `@media`, animations) are intentionally out of scope and
+stay in a separate global stylesheet. Only valid on server-rendered primitives.
 
 ### `when <event>:` — reactions
 
@@ -158,6 +230,25 @@ target.
 - **media `source:`** — the runtime mounts the player inside
   `[data-fa-media]`, filling `{field}` holes from `data-*` attributes;
   `<hls>`/`<dash>` normalize to `<video controls>`.
+
+Client-rendered bodies (`decrypt:` / `source:`) support the same control flow as
+`looks:` — `{if expr}…{else}…{end}` and `{for v in items}…{end}` over the
+client values (a JSON plaintext exposes its fields and arrays), with dotted
+paths and Go-style truthiness. Interpolated values are always HTML-escaped;
+the expression subset is paths, literals, `!`, and comparisons (`== != < <= > >=`).
+
+```
+vault DM:
+    what:
+        envelope: str
+    decrypt:
+        for m in messages:
+            <p class="msg">
+                if m.mine:
+                    <b>you:</b>
+                {m.text}
+            </p>
+```
 
 ## Wiring attributes (what HTML attributes mean to the runtime)
 

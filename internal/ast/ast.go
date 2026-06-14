@@ -37,12 +37,22 @@ type Facet struct {
 	Whens   []When  // the `when <event>:` handlers
 	// Per-kind declarative extras. Recorded in the manifest; runtime semantics are
 	// staged for a later round (this is the compiler-surface pass).
-	Order    string   // feed: ordering field/expression
-	Throttle string   // stream | pipe: min interval between pushes
-	Window   string   // stream: max retained items
-	TTL      string   // signal: time-to-live of the ephemeral value
-	States   []string // lifecycle: the state-machine states
+	Order    string      // feed: ordering field/expression
+	Throttle string      // stream | pipe: min interval between pushes
+	Window   string      // stream: max retained items
+	TTL      string      // signal: time-to-live of the ephemeral value
+	States   []string    // lifecycle: the state-machine states
+	Style    []StyleProp // the `style:` block — cross-platform style tokens (ordered)
 	Pos      Pos
+}
+
+// StyleProp is one `key: value` line in a facet's `style:` block — a token-based,
+// cross-platform style declaration (e.g. `gap: 2`, `bg: surface`, `radius: md`).
+// The compiler resolves it to concrete inline style on the facet's root element.
+type StyleProp struct {
+	Key string
+	Val string
+	Pos Pos
 }
 
 // KindName returns the primitive kind, normalising the zero value to "facet" (so
@@ -96,13 +106,20 @@ type Redaction struct {
 // HasWho reports whether the facet declares any authorization.
 func (f *Facet) HasWho() bool { return len(f.Who.Require) > 0 || len(f.Who.Redactions) > 0 }
 
-// Field is one entry in the `what:` block. v0 supports props only (no computed
-// `=` fields).
+// Field is one entry in the `what:` block. A plain field is an input prop
+// (`name: Type`); a computed field (`name: Type = expr` or `name = expr`)
+// carries Expr, a value derived from earlier fields and resolved at render time
+// — the caller never supplies it. For computed fields Type may be empty.
 type Field struct {
 	Name string
-	Type string // int|float|str|bool, or a custom Ident (capitalized)
+	Type string // int|float|str|bool, or a custom Ident (capitalized); "" allowed when computed
+	Expr string // computed-field expression; "" = a plain input prop
 	Pos  Pos
 }
+
+// IsComputed reports whether the field is a derived (`=`) value rather than an
+// input prop.
+func (f Field) IsComputed() bool { return f.Expr != "" }
 
 // IsCustomType reports whether Type names a backend domain type (capitalized),
 // as opposed to a builtin. Used for facet-id derivation.
@@ -122,7 +139,7 @@ func (f *Facet) DerivedFacetID() string {
 		return f.FacetID
 	}
 	for _, fld := range f.Fields {
-		if fld.IsCustomType() {
+		if fld.IsCustomType() && !fld.IsComputed() {
 			return f.Name + ":" + fld.Name + ":{" + fld.Name + ".id}"
 		}
 	}
@@ -174,19 +191,24 @@ type Ctrl struct {
 // Child is a child-facet call inside a looks body. Self-closing
 // (<Avatar user="{user}"/>) has Children == nil. Block form
 // (<Card title="x"> …content… </Card>) puts the content in Children, which the
-// child renders at its `slot:`. The compiler lowers it to a nested template
-// call, so the child's data-facet-id nests inside the parent's.
+// child renders at its default `slot:`. Content under a `fill name:` line goes
+// to Fills[name] instead, targeting the child's matching `slot name:`. The
+// compiler lowers each to a nested template call, so the child's data-facet-id
+// nests inside the parent's.
 type Child struct {
 	Name     string // the child facet's name (capitalized)
 	Props    []Prop
-	Children []Node // block-form slot content (parent scope); nil if self-closing
+	Children []Node            // default-slot content (parent scope); nil if none
+	Fills    map[string][]Node // named-slot content: slot name → nodes (parent scope)
 	Pos      Pos
 }
 
-// Slot is a `slot:` insertion point in a facet's looks where a parent's
-// block-form content is injected, with optional default content shown when the
-// facet is used self-closing / empty.
+// Slot is a `slot:` (default) or `slot name:` (named) insertion point in a
+// facet's looks where a parent's block-form content is injected, with optional
+// default content shown when the facet is used self-closing / empty or the
+// matching slot is unfilled. Name is "" for the default slot.
 type Slot struct {
+	Name    string
 	Default []Node
 	Pos     Pos
 }

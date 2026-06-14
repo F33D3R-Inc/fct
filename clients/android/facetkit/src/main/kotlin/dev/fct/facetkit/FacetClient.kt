@@ -14,6 +14,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.net.HttpURLConnection
 import java.net.URL
 import javax.crypto.Mac
@@ -358,9 +363,10 @@ class FacetClient(
         val key = vaultKeys[name] ?: return null
         val plaintext = Primitives.decryptEnvelope(env, key) ?: return null
 
-        val values = mutableMapOf("plaintext" to plaintext)
-        try { // a JSON plaintext exposes its fields to the decrypt: body too
-            for ((k, v) in json.decodeFromString<Map<String, String>>(plaintext)) values[k] = v
+        val values = mutableMapOf<String, Any?>("plaintext" to plaintext)
+        try { // a JSON plaintext exposes its fields (structured: arrays/objects for if/for)
+            val el = json.parseToJsonElement(plaintext)
+            if (el is JsonObject) for ((k, v) in el) values[k] = jsonToAny(v)
         } catch (_: Exception) {
         }
         val a = attrs.toMutableMap()
@@ -369,6 +375,20 @@ class FacetClient(
             attrs = a,
             children = listOf(FacetHtmlParser.parse(Primitives.fill(body, values))),
         )
+    }
+
+    /** Converts parsed JSON into plain Kotlin types the client-body interpreter
+     *  understands (Map / List / String / Double / Boolean / null). */
+    private fun jsonToAny(el: JsonElement): Any? = when (el) {
+        is JsonNull -> null
+        is JsonObject -> el.mapValues { jsonToAny(it.value) }
+        is JsonArray -> el.map { jsonToAny(it) }
+        is JsonPrimitive -> when {
+            el.isString -> el.content
+            el.content == "true" -> true
+            el.content == "false" -> false
+            else -> el.content.toDoubleOrNull() ?: el.content
+        }
     }
 
     /**
