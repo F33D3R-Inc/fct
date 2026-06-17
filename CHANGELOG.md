@@ -4,7 +4,7 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
-## Unreleased
+## v0.14.2
 
 Make the scaffold inert and the `when` block real, so an app's `main.go` never
 becomes the place features pile up.
