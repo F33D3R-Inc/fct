@@ -183,7 +183,7 @@ func emitComputed(fields []ast.Field) (string, []string, error) {
 func emitNodes(nodes []ast.Node, initial []string, ctx *genCtx) (string, error) {
 	var b strings.Builder
 	scope := append([]string(nil), initial...) // active $vars: computed + loop (stack)
-	var forStack []bool                         // true if the matching opener was a `for`
+	var forStack []bool                        // true if the matching opener was a `for`
 
 	for _, n := range nodes {
 		switch v := n.(type) {

@@ -18,11 +18,13 @@ import (
 // compiler for applications — they import "github.com/F33D3R-Inc/fct/fa", never the internal
 // compiler packages (Go forbids external internal imports).
 type Compiled struct {
-	root     *template.Template // all facets, one set, so child calls resolve
-	Manifest []byte
-	auth     map[string]facetAuth       // facet → who: requirements (protected facets)
-	policies map[string]func(View) bool // policy name → implementation
-	meta     map[string]facetMeta       // facet → per-kind runtime rules (primitives.go)
+	root       *template.Template // all facets, one set, so child calls resolve
+	Manifest   []byte
+	auth       map[string]facetAuth       // facet → who: requirements (protected facets)
+	policies   map[string]func(View) bool // policy name → implementation
+	meta       map[string]facetMeta       // facet → per-kind runtime rules (primitives.go)
+	whens      map[string][]mutationRule  // client event → mutations (autowire.go)
+	idPatterns map[string]string          // facet → data-facet-id pattern (autowire.go)
 }
 
 // Compile compiles FDL source (one or more facets) into renderable templates.
@@ -86,12 +88,24 @@ func Compile(src string) (*Compiled, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Index `when <event>:` blocks (and each facet's id pattern) so App.AutoWire
+	// can register handlers from them.
+	whens, err := parseWhens(out.Manifest)
+	if err != nil {
+		return nil, err
+	}
+	idPatterns, err := parseFacetIDPatterns(out.Manifest)
+	if err != nil {
+		return nil, err
+	}
 	c := &Compiled{
-		root:     root,
-		Manifest: out.Manifest,
-		auth:     make(map[string]facetAuth),
-		policies: make(map[string]func(View) bool),
-		meta:     meta,
+		root:       root,
+		Manifest:   out.Manifest,
+		auth:       make(map[string]facetAuth),
+		policies:   make(map[string]func(View) bool),
+		meta:       meta,
+		whens:      whens,
+		idPatterns: idPatterns,
 	}
 	// Record who: requirements so protected facets can only render via RenderFor.
 	for _, f := range facets {

@@ -4,6 +4,41 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
+## Unreleased
+
+Make the scaffold inert and the `when` block real, so an app's `main.go` never
+becomes the place features pile up.
+
+### Runtime
+
+- **`when <event>` blocks are now server handlers** — `app.AutoWire(c, event, reducer)`
+  registers a handler straight from a facet's compiled `when` block (ADR-0005:
+  the `when` block *is* the handler). The reducer does the one thing the language
+  can't express — mutate server state, return the data to render — and the runtime
+  builds the SSE events from the declared mutations: it renders the target/item
+  facet and derives the `data-facet-id` from that render, so it can never drift
+  from what the template emits. Supports `replace`, `append`/`prepend with <Facet>`,
+  and `remove`; rejects `replace_all` and stray `with` clauses at startup (the
+  client runtime applies no such op). Additive — `app.On` still works for anything
+  imperative. The fragment is always server-rendered, so there is no injection
+  surface (the old `with event.payload` echo is gone).
+- **`app.Serve(mux)`** — the whole server lifecycle in one call: listen on
+  `FA_ADDR` (default `localhost:7373`), block until SIGINT/SIGTERM, drain SSE, and
+  shut down. App code no longer touches `net/http`, `os/signal`, or `syscall`.
+
+### Scaffold (`fct new`)
+
+- **`main.go` is now inert** — it only calls `app.Main()`. App code lives in an
+  `app/` package, one file per feature (`app.go`, `routes.go`, `like.go`,
+  `style.go`); the like feature is the `when post.like:` block plus a toggle
+  reducer, with no hand-built facet-id strings or `fa.Event` construction. A guard
+  test (`cmd/fct/scaffold_test.go`) fails the build if the entrypoint regrows.
+
+### CI
+
+- **gofmt gate** — CI now fails on unformatted code (it had silently let an
+  unformatted file land).
+
 ## v0.14.0
 
 Enterprise P0 round: observability in standard formats, the API stability

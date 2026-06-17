@@ -1,0 +1,53 @@
+// Package app wires __MODULE__ together: it compiles the facets, builds the
+// fa.App, lets each feature register itself, and serves. main() just calls Main.
+//
+// The point of this package is that the entrypoint never grows. Every feature is
+// its own file (routes.go, like.go, …) that exposes a register* function and
+// owns its own state. Adding a feature is: add a file, add one register call in
+// Main — nothing else moves.
+package app
+
+import (
+	"html/template"
+	"log"
+	"net/http"
+
+	"github.com/F33D3R-Inc/fct/fa"
+	"github.com/F33D3R-Inc/fct/std"
+)
+
+// catalog is the compiled set of facets — yours plus the standard library
+// (Card, Badge, Button, Avatar, PostCard, …). Feature files render from it by
+// name: catalog.MustRender("LikeButton", …).
+var catalog *fa.Compiled
+
+// Main builds the app and serves it until SIGINT/SIGTERM. This is the whole
+// program. Everything app-specific is registered from the feature files in this
+// package, so this function stays short no matter how big the app gets.
+func Main() {
+	// Compile every facet in facets/ on top of the standard library. No build step.
+	c, err := std.CompileDir("facets")
+	if err != nil {
+		log.Fatal(err)
+	}
+	catalog = c
+
+	app := fa.New(c.Manifest)
+
+	// Each feature registers itself. Add a feature → add a register* call here.
+	registerLike(app)
+	registerRoutes(app)
+
+	mux := http.NewServeMux()
+	app.Mount(mux) // /sse, /events, /manifest.json, /fa-runtime.js
+	app.MountRouter(mux, fa.ShellOptions{
+		Title: "__MODULE__",
+		CSS:   template.CSS(std.CSS) + appCSS, // std theme + yours (style.go)
+	})
+
+	// fa.Serve owns the full server lifecycle: listen on FA_ADDR (default
+	// localhost:7373), block until a signal, then drain SSE and shut down.
+	if err := app.Serve(mux); err != nil {
+		log.Fatal(err)
+	}
+}
