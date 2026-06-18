@@ -1,20 +1,9 @@
 name: release
 
-# On any v* tag push: test, reproducibly cross-compile the `fct` CLI for every
-# platform, then publish a GitHub Release with the binaries plus the full
-# supply-chain artifact set:
-#
-#   - checksums.txt                      sha256 of every artifact
-#   - checksums.txt.sig / .pem           keyless cosign signature over the
-#                                        checksums (Sigstore: OIDC identity of
-#                                        THIS workflow, recorded in the public
-#                                        Rekor transparency log)
-#   - fct-<version>.sbom.spdx.json       SBOM (SPDX) for the release
-#   - SLSA build provenance              GitHub artifact attestation for every
-#                                        binary (verify: `gh attestation verify`)
-#
-# Verification commands and the reproducible-build recipe:
-# docs/REPRODUCIBLE_BUILDS.md. All third-party actions are pinned to commit SHAs.
+# On any v* tag push: run the tests, cross-compile the `facet` toolchain for
+# every platform (pure Go, no CGO — runs anywhere), publish a GitHub Release with
+# the binaries plus a sha256 checksums file. Third-party actions are pinned to
+# commit SHAs.
 on:
   push:
     tags:
@@ -22,11 +11,9 @@ on:
 
 permissions:
   contents: write
-  id-token: write # cosign keyless signing (Sigstore OIDC)
-  attestations: write # SLSA build provenance
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -38,50 +25,10 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Cross-compile (reproducible)
+      - name: Cross-compile
         run: |
-          mkdir -p dist
-          VERSION="${GITHUB_REF_NAME}"
-          targets="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
-          for t in $targets; do
-            os="${t%/*}"; arch="${t#*/}"; ext=""
-            [ "$os" = "windows" ] && ext=".exe"
-            out="fct-${VERSION}-${os}-${arch}${ext}"
-            echo "building $out"
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 GOFLAGS=-buildvcs=false \
-              go build -trimpath -ldflags="-s -w -buildid= -X main.version=${VERSION}" -o "dist/${out}" ./cmd/fct
-          done
-
-      - name: SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          path: .
-          format: spdx-json
-          output-file: dist/fct-${{ github.ref_name }}.sbom.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-
-      - name: Checksums
-        run: cd dist && sha256sum * > checksums.txt && cat checksums.txt
-
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          # Pin cosign 2.x: its sign-blob emits the separate .sig/.pem this
-          # pipeline (and REPRODUCIBLE_BUILDS.md) documents. cosign 4.x forces
-          # the new Sigstore bundle format, which ignores --output-* and breaks.
-          cosign-release: v2.2.4
-
-      - name: Sign checksums (cosign keyless)
-        run: |
-          cosign sign-blob --yes \
-            --output-signature dist/checksums.txt.sig \
-            --output-certificate dist/checksums.txt.pem \
-            dist/checksums.txt
-
-      - name: SLSA build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
-        with:
-          subject-path: dist/fct-*
+          bash scripts/build-release.sh "${GITHUB_REF_NAME}"
+          cd dist && sha256sum * > checksums.txt && cat checksums.txt
 
       - name: Publish release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
@@ -89,22 +36,23 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            ## Install
+            ## Install — prebuilt binary, nothing to compile
 
-            **Prebuilt binary (no Go needed)** — download the file for your platform
-            below, then:
+            Download the file for your platform below, then:
 
-            - **macOS / Linux:** `chmod +x fct-*` and move it onto your PATH as `fct`
-              (e.g. `sudo mv fct-* /usr/local/bin/fct`).
-            - **Windows:** rename the `.exe` to `fct.exe` and put it on your PATH.
+            - **macOS / Linux:** `chmod +x facet-*` and move it onto your PATH as
+              `facet` (e.g. `sudo mv facet-linux-amd64 /usr/local/bin/facet`).
+            - **Windows:** rename `facet-windows-amd64.exe` to `facet.exe` and put
+              it on your PATH.
 
-            **With Go:** `go install github.com/F33D3R-Inc/fct/cmd/fct@${{ github.ref_name }}`
+            ## Start building
 
-            Then: `fct new myapp && cd myapp && go run .`
+            ```
+            facet new myapp
+            cd myapp
+            export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/yourdb
+            facet run app.fct
+            ```
 
-            ## Verify (optional, recommended)
-
-            Every release ships checksums, a keyless cosign signature, an SPDX
-            SBOM, and SLSA build provenance — see
-            [docs/REPRODUCIBLE_BUILDS.md](https://github.com/F33D3R-Inc/fct/blob/main/docs/REPRODUCIBLE_BUILDS.md)
-            for the three verification commands and the bit-for-bit rebuild recipe.
+            Open http://localhost:7373. The same app is also a JSON API at `/api`.
+            Every binary is verified by `checksums.txt`.

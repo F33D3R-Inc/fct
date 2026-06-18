@@ -1,35 +1,40 @@
-# Counter — the Brick 4 reference for client reactivity (docs/REACTIVITY.md).
+# The smallest program that IS the Facet thesis.
 #
-# This is the wedge: a facet that runs FULLY CLIENT-SIDE with zero round-trip.
-# The compiler bakes the reactive graph into the output — no virtual DOM, no diff,
-# no shipped framework — so clicking the button updates the count instantly, with
-# no server involved.
+# Two state cells, two actions, one view — and NOTHING in this file says
+# "frontend" or "backend". The compiler reads the placement calculus off the
+# state lifecycle:
 #
-#   state:    local reactive values (signals), each with an initial value.
-#   actions:  named, reusable handlers that mutate signals (the "controller").
-#   on:click  on an element wires a DOM event to an action.
-#   {signal}  in looks: becomes a live binding — the compiler marks the node and
-#             the runtime patches exactly it when the signal changes.
+#   count  -> authoritative (the default)        -> lives on the SERVER
+#   bonus  -> @client (ephemeral, local)         -> lives on the CLIENT
 #
-# Persistent, shared, or authorization-gated state still belongs in what:/when:
-# (server-authoritative — the security moat). state: is for ephemeral local UI.
+# From that, action placement falls out automatically:
+#
+#   increment  writes count  -> SERVER action  -> round-trips, authoritative
+#   addBonus   writes bonus  -> CLIENT action  -> runs locally, zero network
+#
+# `total` is a derive: a named value the compiler inlines and recomputes wherever
+# it is read. It spans both domains (count is server, bonus is client), so it can
+# only be computed where every input is visible — the client, off its mirror of
+# server state — and it refreshes whenever either side changes. You never said
+# where it runs. Same syntax, two execution domains, fine-grained updates —
+# chosen by the compiler, not written by you.
 
-facet Counter:
-    state:
-        count = 0
+app Counter:
+    state count: int = 0
+    state bonus: int = 0 @client
 
-    actions:
-        increment:
-            count = count + 1
-        decrement:
-            count = count - 1
-        reset:
-            count = 0
+    derive total: int = count + bonus
 
-    looks:
-        <div class="counter">
-            <button on:click="decrement" aria-label="Decrease">−</button>
-            <output class="counter__value">{count}</output>
-            <button on:click="increment" aria-label="Increase">+</button>
-            <button on:click="reset" class="counter__reset">reset</button>
-        </div>
+    action increment:
+        count = count + 1
+
+    action addBonus:
+        bonus = bonus + 1
+
+    view Main:
+        box:
+            text "Server count: {count}"
+            text "Client bonus: {bonus}"
+            text "Total (count + bonus): {total}"
+            button "increment (server, round-trips)" -> increment
+            button "add bonus (client, no network)" -> addBonus

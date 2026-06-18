@@ -1,1183 +1,892 @@
-// Package parser turns the lexer's structural token stream into an ast.Facet.
-//
-// Two layers:
-//   - The facet-skeleton parser walks INDENT/DEDENT-delimited blocks
-//     (what / looks / when). Here the offside rule is reliable.
-//   - The looks-body parser ignores the outer INDENT/DEDENT (HTML line-wraps
-//     produce spurious ones) and instead re-derives structure from each line's
-//     own indentation, treating ONLY `if` / `for` / `else` lines as structural.
-//
-// Block keywords: `what` (data), `looks` (template), `when <event>` (handler).
-// See README.md (the language reference) and DECISIONS.md (ADR-0002/0003/0005).
+// Package parser turns the source indentation tree into an ast.App. The grammar
+// is line-oriented: a header line plus its nested children. Expressions go
+// through a precedence-climbing parser (expr.go).
 package parser
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
-	"github.com/F33D3R-Inc/fct/internal/ast"
-	"github.com/F33D3R-Inc/fct/internal/lexer"
+	"facet/internal/ast"
+	"facet/internal/source"
 )
 
-// Parse lexes and parses src into the facets it declares.
-func Parse(src string) ([]*ast.Facet, error) {
-	toks, err := lexer.Lex(src)
+// Error is a parse error with a source line.
+type Error struct {
+	Line int
+	Msg  string
+}
+
+func (e *Error) Error() string { return fmt.Sprintf("line %d: %s", e.Line, e.Msg) }
+
+// Parse compiles source text to an ast.App. Exactly one `app` per file.
+func Parse(src string) (*ast.App, error) {
+	roots, err := source.Parse(src)
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks}
-	var facets []*ast.Facet
-	for !p.eof() {
-		f, err := p.parseFacet()
+	if len(roots) == 0 {
+		return nil, &Error{0, "empty source: expected an `app Name:` definition"}
+	}
+	if len(roots) > 1 {
+		return nil, &Error{roots[1].Line.No, "only one `app` definition per file"}
+	}
+	return parseApp(roots[0])
+}
+
+func parseApp(n *source.Node) (*ast.App, error) {
+	name, ok := keyword(n.Line.Text, "app")
+	if !ok {
+		return nil, &Error{n.Line.No, "file must start with `app Name:`"}
+	}
+	name = strings.TrimSuffix(name, ":")
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid app name %q", name)}
+	}
+	app := &ast.App{Name: name, Line: n.Line.No}
+	for _, c := range n.Children {
+		var err error
+		switch {
+		case c.Line.Text == "auth" || c.Line.Text == "auth:":
+			app.Auth = true
+		case strings.HasPrefix(c.Line.Text, "entity "):
+			var e *ast.Entity
+			if e, err = parseEntity(c); err == nil {
+				app.Entities = append(app.Entities, e)
+			}
+		case strings.HasPrefix(c.Line.Text, "state "):
+			var s *ast.State
+			if s, err = parseState(c); err == nil {
+				app.States = append(app.States, s)
+			}
+		case strings.HasPrefix(c.Line.Text, "derive "):
+			var d *ast.Derive
+			if d, err = parseDerive(c); err == nil {
+				app.Derives = append(app.Derives, d)
+			}
+		case strings.HasPrefix(c.Line.Text, "policy "):
+			var p *ast.Policy
+			if p, err = parsePolicy(c); err == nil {
+				app.Policies = append(app.Policies, p)
+			}
+		case strings.HasPrefix(c.Line.Text, "action "):
+			var a *ast.Action
+			if a, err = parseAction(c); err == nil {
+				app.Actions = append(app.Actions, a)
+			}
+		case strings.HasPrefix(c.Line.Text, "job "):
+			var j *ast.Job
+			if j, err = parseJob(c); err == nil {
+				app.Jobs = append(app.Jobs, j)
+			}
+		case strings.HasPrefix(c.Line.Text, "view "):
+			var v *ast.View
+			if v, err = parseView(c); err == nil {
+				app.Views = append(app.Views, v)
+			}
+		default:
+			err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/state/derive/policy/action/job/view", firstWord(c.Line.Text))}
+		}
 		if err != nil {
 			return nil, err
 		}
-		facets = append(facets, f)
 	}
-	if len(facets) == 0 {
-		return nil, &perr{0, 0, "no facet found in source"}
-	}
-	return facets, nil
+	return app, nil
 }
 
-type parser struct {
-	toks []lexer.Token
-	pos  int
-}
-
-type perr struct {
-	line, col int
-	msg       string
-}
-
-func (e *perr) Error() string { return fmt.Sprintf("%d:%d: %s", e.line, e.col, e.msg) }
-
-// ── token cursor ────────────────────────────────────────────────────────────
-
-func (p *parser) eof() bool { return p.pos >= len(p.toks) }
-
-func (p *parser) peek() (lexer.Token, bool) {
-	if p.eof() {
-		return lexer.Token{}, false
+func parseEntity(n *source.Node) (*ast.Entity, error) {
+	name := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "entity")), ":")
+	if !isIdent(name) || !isUpper(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("entity name %q must be capitalized", name)}
 	}
-	return p.toks[p.pos], true
-}
-
-func (p *parser) next() lexer.Token {
-	t := p.toks[p.pos]
-	p.pos++
-	return t
-}
-
-func (p *parser) at(k lexer.Kind) bool {
-	t, ok := p.peek()
-	return ok && t.Kind == k
-}
-
-func (p *parser) expect(k lexer.Kind, what string) (lexer.Token, error) {
-	t, ok := p.peek()
-	if !ok {
-		return lexer.Token{}, &perr{0, 0, "unexpected end of input, expected " + what}
-	}
-	if t.Kind != k {
-		return lexer.Token{}, &perr{t.Line, t.Col, fmt.Sprintf("expected %s, got %s", what, t.Kind)}
-	}
-	return p.next(), nil
-}
-
-func (p *parser) expectLine(what string) (lexer.Token, error) {
-	return p.expect(lexer.LINE, what)
-}
-
-// ── facet skeleton ──────────────────────────────────────────────────────────
-
-func (p *parser) parseFacet() (*ast.Facet, error) {
-	hdr, err := p.expectLine("`<primitive> <Name>:`")
-	if err != nil {
-		return nil, err
-	}
-	kind, name, err := parsePrimitiveHeader(hdr)
-	if err != nil {
-		return nil, err
-	}
-	f := &ast.Facet{Kind: kind, Name: name, Pos: ast.Pos{Line: hdr.Line, Col: hdr.Col}}
-
-	if _, err := p.expect(lexer.INDENT, "indented facet body"); err != nil {
-		return nil, err
-	}
-
-	for !p.at(lexer.DEDENT) && !p.eof() {
-		t, _ := p.peek()
-		if t.Kind != lexer.LINE {
-			return nil, &perr{t.Line, t.Col, "expected a section keyword (what/looks/when)"}
+	e := &ast.Entity{Name: name, Line: n.Line.No}
+	for _, c := range n.Children {
+		colon := strings.IndexByte(c.Line.Text, ':')
+		if colon < 0 {
+			return nil, &Error{c.Line.No, "entity field must be `name: type`"}
 		}
-		head := t.Text
+		fn := strings.TrimSpace(c.Line.Text[:colon])
+		ft := strings.TrimSpace(c.Line.Text[colon+1:])
+		if !isIdent(fn) {
+			return nil, &Error{c.Line.No, fmt.Sprintf("invalid field name %q", fn)}
+		}
+		// A field type is a primitive or an entity name (a relation, stored as the
+		// referenced row's id). Entity existence is validated later, in the IR.
+		if !isType(ft) && !(isIdent(ft) && isUpper(ft)) {
+			return nil, &Error{c.Line.No, fmt.Sprintf("unknown type %q (use int, text, bool, or an entity name)", ft)}
+		}
+		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: ft, Line: c.Line.No})
+	}
+	if len(e.Fields) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("entity %q has no fields", name)}
+	}
+	return e, nil
+}
+
+// parseState: `state name: Type = default [@client|@server]`
+func parseState(n *source.Node) (*ast.State, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "state"))
+	place := ast.PlaceInfer
+	for _, ann := range []string{"@client", "@server"} {
+		if strings.HasSuffix(rest, ann) {
+			rest = strings.TrimSpace(strings.TrimSuffix(rest, ann))
+			place = strings.TrimPrefix(ann, "@")
+		}
+	}
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return nil, &Error{n.Line.No, "state needs a type: `state name: int = 0`"}
+	}
+	name := strings.TrimSpace(rest[:colon])
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid state name %q", name)}
+	}
+	after := strings.TrimSpace(rest[colon+1:])
+	var typ, defSrc string
+	if eq := strings.IndexByte(after, '='); eq >= 0 {
+		typ, defSrc = strings.TrimSpace(after[:eq]), strings.TrimSpace(after[eq+1:])
+	} else {
+		typ = after
+	}
+	if !isType(typ) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("unknown type %q (use int, text, or bool)", typ)}
+	}
+	st := &ast.State{Name: name, Type: typ, Placement: place, Line: n.Line.No}
+	if defSrc == "" {
+		st.Default = defaultFor(typ)
+	} else {
+		e, err := parseExpr(defSrc, n.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		st.Default = e
+	}
+	return st, nil
+}
+
+// parseDerive: `derive name: Type = expr`. No placement annotation — a
+// derivation's domain is computed, never authored (that is the whole point).
+func parseDerive(n *source.Node) (*ast.Derive, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "derive"))
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return nil, &Error{n.Line.No, "derive needs a type: `derive name: int = expr`"}
+	}
+	name := strings.TrimSpace(rest[:colon])
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid derive name %q", name)}
+	}
+	after := strings.TrimSpace(rest[colon+1:])
+	eq := strings.IndexByte(after, '=')
+	if eq < 0 {
+		return nil, &Error{n.Line.No, "derive needs a definition: `derive name: int = expr`"}
+	}
+	typ := strings.TrimSpace(after[:eq])
+	if !isType(typ) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("unknown type %q (use int, text, or bool)", typ)}
+	}
+	e, err := parseExpr(strings.TrimSpace(after[eq+1:]), n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	return &ast.Derive{Name: name, Type: typ, Expr: e, Line: n.Line.No}, nil
+}
+
+func parsePolicy(n *source.Node) (*ast.Policy, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "policy")), ":")
+	if !isIdent(head) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid policy name %q", head)}
+	}
+	if len(n.Children) != 1 {
+		return nil, &Error{n.Line.No, "policy must have exactly one predicate line"}
+	}
+	e, err := parseExpr(n.Children[0].Line.Text, n.Children[0].Line.No)
+	if err != nil {
+		return nil, err
+	}
+	return &ast.Policy{Name: head, Expr: e, Line: n.Line.No}, nil
+}
+
+// parseAction: `action name(params):` then `requires …` and statement lines.
+func parseAction(n *source.Node) (*ast.Action, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "action")), ":")
+	name, params, err := parseSignature(head, n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	a := &ast.Action{Name: name, Params: params, Line: n.Line.No}
+	for _, c := range n.Children {
+		t := c.Line.Text
 		switch {
-		case head == "what:":
-			if err := p.parseWhat(f); err != nil {
-				return nil, err
-			}
-		case head == "state:":
-			if !f.ServerRendered() {
-				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`state:` is not valid on a %s — client reactive state binds to a server-rendered body", f.Kind)}
-			}
-			if err := p.parseState(f); err != nil {
-				return nil, err
-			}
-		case head == "looks:":
-			if !f.ServerRendered() {
-				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`looks:` is not allowed on a %s — it renders on the client; use %s", f.Kind, clientBlockHint(f.Kind))}
-			}
-			if err := p.parseLooks(f); err != nil {
-				return nil, err
-			}
-		case head == "decrypt:":
-			if f.Kind != "vault" {
-				return nil, &perr{t.Line, t.Col, "`decrypt:` is only valid in a vault (client-side render of decrypted content)"}
-			}
-			if err := p.parseClientBody(f); err != nil {
-				return nil, err
-			}
-		case head == "source:":
-			if f.Kind != "media" {
-				return nil, &perr{t.Line, t.Col, "`source:` is only valid in a media primitive"}
-			}
-			if err := p.parseClientBody(f); err != nil {
-				return nil, err
-			}
-		case strings.HasPrefix(head, "order:"):
-			if f.Kind != "feed" {
-				return nil, &perr{t.Line, t.Col, "`order:` is only valid in a feed"}
-			}
-			v := strings.TrimSpace(strings.TrimPrefix(head, "order:"))
-			if v == "" {
-				return nil, &perr{t.Line, t.Col, "order: requires a field or expression"}
-			}
-			f.Order = v
-			p.next()
-		case strings.HasPrefix(head, "throttle:"):
-			if f.Kind != "stream" && f.Kind != "pipe" {
-				return nil, &perr{t.Line, t.Col, "`throttle:` is only valid in a stream or pipe"}
-			}
-			v := strings.TrimSpace(strings.TrimPrefix(head, "throttle:"))
-			if v == "" {
-				return nil, &perr{t.Line, t.Col, "throttle: requires a duration (e.g. 200ms)"}
-			}
-			f.Throttle = v
-			p.next()
-		case strings.HasPrefix(head, "window:"):
-			if f.Kind != "stream" {
-				return nil, &perr{t.Line, t.Col, "`window:` is only valid in a stream"}
-			}
-			v := strings.TrimSpace(strings.TrimPrefix(head, "window:"))
-			if v == "" {
-				return nil, &perr{t.Line, t.Col, "window: requires a count"}
-			}
-			f.Window = v
-			p.next()
-		case strings.HasPrefix(head, "ttl:"):
-			if f.Kind != "signal" {
-				return nil, &perr{t.Line, t.Col, "`ttl:` is only valid in a signal"}
-			}
-			v := strings.TrimSpace(strings.TrimPrefix(head, "ttl:"))
-			if v == "" {
-				return nil, &perr{t.Line, t.Col, "ttl: requires a duration (e.g. 5s)"}
-			}
-			f.TTL = v
-			p.next()
-		case strings.HasPrefix(head, "states:"):
-			if f.Kind != "lifecycle" {
-				return nil, &perr{t.Line, t.Col, "`states:` is only valid in a lifecycle"}
-			}
-			states := splitList(strings.TrimPrefix(head, "states:"))
-			if len(states) == 0 {
-				return nil, &perr{t.Line, t.Col, "states: requires at least one state name"}
-			}
-			for _, s := range states {
-				if !isIdent(s) {
-					return nil, &perr{t.Line, t.Col, fmt.Sprintf("invalid state name %q", s)}
+		case strings.HasPrefix(t, "requires "):
+			for _, p := range strings.Split(strings.TrimSpace(t[len("requires "):]), ",") {
+				p = strings.TrimSpace(p)
+				if !isIdent(p) {
+					return nil, &Error{c.Line.No, fmt.Sprintf("invalid policy name %q in requires", p)}
 				}
+				a.Requires = append(a.Requires, p)
 			}
-			f.States = states
-			p.next()
-		case head == "when" || strings.HasPrefix(head, "when "):
-			if err := p.parseWhen(f); err != nil {
-				return nil, err
-			}
-		case head == "actions:":
-			if !f.ServerRendered() {
-				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`actions:` is not valid on a %s — client actions mutate state signals on a server-rendered body", f.Kind)}
-			}
-			if err := p.parseActions(f); err != nil {
-				return nil, err
-			}
-		case head == "effects:":
-			if !f.ServerRendered() {
-				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`effects:` is not valid on a %s", f.Kind)}
-			}
-			if err := p.parseEffects(f); err != nil {
-				return nil, err
-			}
-		case head == "query:":
-			if !f.ServerRendered() {
-				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`query:` is not valid on a %s", f.Kind)}
-			}
-			if err := p.parseQueries(f); err != nil {
-				return nil, err
-			}
-		case strings.HasPrefix(head, "facet-id:"):
-			id, err := parseFacetIDLine(t)
+		case strings.HasPrefix(t, "add "):
+			s, err := parseAdd(c)
 			if err != nil {
 				return nil, err
 			}
-			f.FacetID = id
-			p.next()
-		// Helpful migration errors for renamed/removed blocks.
-		case head == "data:":
-			return nil, &perr{t.Line, t.Col, "`data:` was renamed to `what:`"}
-		case head == "render:":
-			return nil, &perr{t.Line, t.Col, "`render:` was renamed to `looks:`"}
-		case head == "subscribe:":
-			return nil, &perr{t.Line, t.Col, "`subscribe:` was removed; subscription is implied by `when <event>:`"}
-		case strings.HasPrefix(head, "update on"):
-			return nil, &perr{t.Line, t.Col, "`update on <event>:` was renamed to `when <event>:`"}
-		case head == "who:":
-			if err := p.parseWho(f); err != nil {
+			a.Body = append(a.Body, s)
+		case strings.HasPrefix(t, "set "):
+			s, err := parseSet(c)
+			if err != nil {
 				return nil, err
 			}
-		case head == "auth:":
-			return nil, &perr{t.Line, t.Col, "`auth:` was renamed to `who:`"}
-		case head == "style:":
-			if !f.ServerRendered() {
-				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`style:` is not allowed on a %s — it attaches to a server-rendered root element", f.Kind)}
-			}
-			if err := p.parseStyle(f); err != nil {
+			a.Body = append(a.Body, s)
+		case strings.HasPrefix(t, "remove "):
+			s, err := parseRemove(c)
+			if err != nil {
 				return nil, err
 			}
-		case head == "error:":
-			return nil, &perr{t.Line, t.Col, "`error:` is not supported in v0 (ADR-0003)"}
+			a.Body = append(a.Body, s)
+		case strings.HasPrefix(t, "clear "):
+			ent := strings.TrimSpace(t[len("clear "):])
+			if !isIdent(ent) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid entity %q", ent)}
+			}
+			a.Body = append(a.Body, ast.Clear{Entity: ent, Line: c.Line.No})
 		default:
-			return nil, &perr{t.Line, t.Col, fmt.Sprintf("unexpected line in facet body: %q", head)}
+			eq := strings.IndexByte(t, '=')
+			if eq < 0 {
+				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q", firstWord(t))}
+			}
+			target := strings.TrimSpace(t[:eq])
+			if !isIdent(target) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q", target)}
+			}
+			val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			a.Body = append(a.Body, ast.Assign{Target: target, Value: val, Line: c.Line.No})
 		}
 	}
+	if len(a.Body) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("action %q has no body", name)}
+	}
+	return a, nil
+}
 
-	if _, err := p.expect(lexer.DEDENT, "end of facet body"); err != nil {
+// parseJob: `job Name every 30s -> action` and/or `job Name on start -> action`.
+// The schedule clause is one of `every <N>s`, `on start`, or both
+// (`every 30s on start`). The arrow names the zero-arg action to run.
+func parseJob(n *source.Node) (*ast.Job, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "job"))
+	arrow := strings.Index(rest, "->")
+	if arrow < 0 {
+		return nil, &Error{n.Line.No, "job needs an action: `job Name every 30s -> action`"}
+	}
+	action := strings.TrimSpace(rest[arrow+2:])
+	if !isIdent(action) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid job action %q", action)}
+	}
+	head := strings.Fields(strings.TrimSpace(rest[:arrow]))
+	if len(head) == 0 {
+		return nil, &Error{n.Line.No, "job needs a name: `job Name every 30s -> action`"}
+	}
+	job := &ast.Job{Name: head[0], Action: action, Line: n.Line.No}
+	if !isIdent(job.Name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid job name %q", job.Name)}
+	}
+	for i := 1; i < len(head); i++ {
+		switch head[i] {
+		case "every":
+			if i+1 >= len(head) {
+				return nil, &Error{n.Line.No, "`every` needs a duration like `every 30s`"}
+			}
+			i++
+			secs, err := parseDuration(head[i], n.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			job.Every = secs
+		case "on":
+			if i+1 >= len(head) || head[i+1] != "start" {
+				return nil, &Error{n.Line.No, "`on` must be `on start`"}
+			}
+			i++
+			job.OnStart = true
+		default:
+			return nil, &Error{n.Line.No, fmt.Sprintf("unexpected %q in job schedule (use `every Ns` or `on start`)", head[i])}
+		}
+	}
+	if job.Every == 0 && !job.OnStart {
+		return nil, &Error{n.Line.No, "job needs a schedule: `every Ns` and/or `on start`"}
+	}
+	return job, nil
+}
+
+// parseDuration reads `30s` or `5m` or `2h` into seconds.
+func parseDuration(s string, line int) (int, error) {
+	if len(s) < 2 {
+		return 0, &Error{line, fmt.Sprintf("invalid duration %q (use 30s, 5m, 2h)", s)}
+	}
+	unit := s[len(s)-1]
+	n, err := strconv.Atoi(s[:len(s)-1])
+	if err != nil || n <= 0 {
+		return 0, &Error{line, fmt.Sprintf("invalid duration %q (use 30s, 5m, 2h)", s)}
+	}
+	switch unit {
+	case 's':
+		return n, nil
+	case 'm':
+		return n * 60, nil
+	case 'h':
+		return n * 3600, nil
+	default:
+		return 0, &Error{line, fmt.Sprintf("unknown duration unit in %q (use s, m, h)", s)}
+	}
+}
+
+func parseSignature(head string, line int) (string, []ast.Param, error) {
+	open := strings.IndexByte(head, '(')
+	if open < 0 {
+		if !isIdent(head) {
+			return "", nil, &Error{line, fmt.Sprintf("invalid action name %q", head)}
+		}
+		return head, nil, nil
+	}
+	name := strings.TrimSpace(head[:open])
+	if !isIdent(name) {
+		return "", nil, &Error{line, fmt.Sprintf("invalid action name %q", name)}
+	}
+	close := strings.LastIndexByte(head, ')')
+	if close < open {
+		return "", nil, &Error{line, "missing `)` in action signature"}
+	}
+	var params []ast.Param
+	inner := strings.TrimSpace(head[open+1 : close])
+	if inner != "" {
+		for _, p := range strings.Split(inner, ",") {
+			colon := strings.IndexByte(p, ':')
+			if colon < 0 {
+				return "", nil, &Error{line, fmt.Sprintf("parameter %q needs a type", strings.TrimSpace(p))}
+			}
+			pn := strings.TrimSpace(p[:colon])
+			pt := strings.TrimSpace(p[colon+1:])
+			if !isIdent(pn) || !isType(pt) {
+				return "", nil, &Error{line, fmt.Sprintf("invalid parameter %q", strings.TrimSpace(p))}
+			}
+			params = append(params, ast.Param{Name: pn, Type: pt})
+		}
+	}
+	return name, params, nil
+}
+
+func parseAdd(n *source.Node) (ast.Stmt, error) {
+	rest := strings.TrimSpace(n.Line.Text[len("add "):])
+	open := strings.IndexByte(rest, '{')
+	close := strings.LastIndexByte(rest, '}')
+	if open < 0 || close < open {
+		return nil, &Error{n.Line.No, "add needs a record: `add Entity { f: expr, ... }`"}
+	}
+	ent := strings.TrimSpace(rest[:open])
+	if !isIdent(ent) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid entity %q", ent)}
+	}
+	add := ast.Add{Entity: ent, Line: n.Line.No}
+	body := strings.TrimSpace(rest[open+1 : close])
+	if body != "" {
+		for _, part := range splitTop(body, ',') {
+			colon := strings.IndexByte(part, ':')
+			if colon < 0 {
+				return nil, &Error{n.Line.No, fmt.Sprintf("field init %q needs `name: expr`", part)}
+			}
+			fn := strings.TrimSpace(part[:colon])
+			e, err := parseExpr(strings.TrimSpace(part[colon+1:]), n.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			add.Fields = append(add.Fields, ast.FieldInit{Name: fn, Expr: e})
+		}
+	}
+	return add, nil
+}
+
+func parseSet(n *source.Node) (ast.Stmt, error) {
+	rest := strings.TrimSpace(n.Line.Text[len("set "):])
+	eq := strings.IndexByte(rest, '=')
+	if eq < 0 {
+		return nil, &Error{n.Line.No, "set needs `set Entity(key).field = expr`"}
+	}
+	lhs := strings.TrimSpace(rest[:eq])
+	val, err := parseExpr(strings.TrimSpace(rest[eq+1:]), n.Line.No)
+	if err != nil {
 		return nil, err
 	}
+	ent, key, field, err := parseEntityPath(lhs, n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	return ast.Set{Entity: ent, Key: key, Field: field, Value: val, Line: n.Line.No}, nil
+}
+
+func parseRemove(n *source.Node) (ast.Stmt, error) {
+	rest := strings.TrimSpace(n.Line.Text[len("remove "):])
+	open := strings.IndexByte(rest, '(')
+	close := strings.LastIndexByte(rest, ')')
+	if open < 0 || close < open {
+		return nil, &Error{n.Line.No, "remove needs `remove Entity(key)`"}
+	}
+	ent := strings.TrimSpace(rest[:open])
+	key, err := parseExpr(strings.TrimSpace(rest[open+1:close]), n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	return ast.Remove{Entity: ent, Key: key, Line: n.Line.No}, nil
+}
+
+// parseEntityPath parses `Entity(key).field`.
+func parseEntityPath(s string, line int) (string, ast.Expr, string, error) {
+	open := strings.IndexByte(s, '(')
+	close := strings.IndexByte(s, ')')
+	if open < 0 || close < open {
+		return "", nil, "", &Error{line, fmt.Sprintf("expected Entity(key).field, got %q", s)}
+	}
+	ent := strings.TrimSpace(s[:open])
+	key, err := parseExpr(strings.TrimSpace(s[open+1:close]), line)
+	if err != nil {
+		return "", nil, "", err
+	}
+	tail := strings.TrimSpace(s[close+1:])
+	if !strings.HasPrefix(tail, ".") {
+		return "", nil, "", &Error{line, fmt.Sprintf("expected .field after Entity(key), got %q", tail)}
+	}
+	field := strings.TrimSpace(tail[1:])
+	if !isIdent(field) {
+		return "", nil, "", &Error{line, fmt.Sprintf("invalid field %q", field)}
+	}
+	return ent, key, field, nil
+}
+
+// parseView: `view Name [at "/path"]:` then a node tree.
+func parseView(n *source.Node) (*ast.View, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "view")), ":")
+	name := head
+	path := ""
+	if i := strings.Index(head, " at "); i >= 0 {
+		name = strings.TrimSpace(head[:i])
+		p, err := unquote(strings.TrimSpace(head[i+len(" at "):]), n.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		path = p
+	}
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid view name %q", name)}
+	}
+	v := &ast.View{Name: name, Path: path, Line: n.Line.No}
+	nodes, err := parseNodes(n.Children)
+	if err != nil {
+		return nil, err
+	}
+	v.Root = nodes
+	return v, nil
+}
+
+func parseNodes(children []*source.Node) ([]ast.Node, error) {
+	var out []ast.Node
+	for _, c := range children {
+		t := c.Line.Text
+		switch {
+		case t == "box:" || t == "box":
+			kids, err := parseNodes(c.Children)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Box{Children: kids})
+		case strings.HasPrefix(t, "text "):
+			segs, err := parseText(strings.TrimSpace(t[len("text "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Text{Segs: segs})
+		case strings.HasPrefix(t, "button "):
+			b, err := parseButton(strings.TrimSpace(t[len("button "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, b)
+		case strings.HasPrefix(t, "for "):
+			f, err := parseFor(c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, f)
+		case strings.HasPrefix(t, "if "):
+			cond, err := parseExpr(strings.TrimSuffix(strings.TrimSpace(t[len("if "):]), ":"), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			kids, err := parseNodes(c.Children)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.If{Cond: cond, Body: kids})
+		case strings.HasPrefix(t, "input "):
+			in, err := parseInput(strings.TrimSpace(t[len("input "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, in)
+		case strings.HasPrefix(t, "link "):
+			l, err := parseLink(strings.TrimSpace(t[len("link "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, l)
+		default:
+			return nil, &Error{c.Line.No, fmt.Sprintf("unknown view node %q", firstWord(t))}
+		}
+	}
+	return out, nil
+}
+
+// parseFor: `for item in Collection [where cond] [by field desc|asc] [limit n]:`
+func parseFor(n *source.Node) (ast.Node, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("for "):]), ":")
+	fields := strings.Fields(head)
+	if len(fields) < 3 || fields[1] != "in" {
+		return nil, &Error{n.Line.No, "for needs `for item in Collection [where cond] [by field desc|asc] [limit n]:`"}
+	}
+	if !isIdent(fields[0]) || !isIdent(fields[2]) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid for clause %q", head)}
+	}
+	f := ast.For{Var: fields[0], Coll: fields[2]}
+
+	// remainder after `<var> in <Coll>`
+	rest := strings.TrimSpace(head[len(fields[0]):])
+	rest = strings.TrimSpace(rest[len("in"):])
+	rest = strings.TrimSpace(rest[len(fields[2]):])
+
+	whereS, byS, limitS, err := splitForClauses(rest, n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	if whereS != "" {
+		e, err := parseExpr(whereS, n.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		f.Where = e
+	}
+	if byS != "" {
+		bp := strings.Fields(byS)
+		if len(bp) < 1 || len(bp) > 2 || !isIdent(bp[0]) {
+			return nil, &Error{n.Line.No, "ordering is `by field [desc|asc]`"}
+		}
+		f.Order = bp[0]
+		if len(bp) == 2 {
+			switch bp[1] {
+			case "desc":
+				f.Desc = true
+			case "asc":
+				f.Desc = false
+			default:
+				return nil, &Error{n.Line.No, fmt.Sprintf("order direction must be `desc` or `asc`, got %q", bp[1])}
+			}
+		}
+	}
+	if limitS != "" {
+		nlim, err := strconv.Atoi(limitS)
+		if err != nil || nlim <= 0 {
+			return nil, &Error{n.Line.No, fmt.Sprintf("limit needs a positive integer, got %q", limitS)}
+		}
+		f.Limit = nlim
+	}
+
+	kids, err := parseNodes(n.Children)
+	if err != nil {
+		return nil, err
+	}
+	f.Body = kids
 	return f, nil
 }
 
-// primitiveKinds is the canonical taxonomy (README). The parser accepts a header
-// led by any of these; anything else is a teaching error.
-var primitiveKinds = map[string]bool{
-	"facet": true, "feed": true, "stream": true, "lifecycle": true,
-	"pipe": true, "vault": true, "media": true, "signal": true,
-}
-
-// parsePrimitiveHeader parses `<kind> <Name>:` and returns the kind and name.
-func parsePrimitiveHeader(t lexer.Token) (kind, name string, err error) {
-	s := strings.TrimSuffix(t.Text, ":")
-	if s == t.Text {
-		return "", "", &perr{t.Line, t.Col, "primitive header must end with ':'"}
+// splitForClauses splits a `for` header tail into its where/by/limit clause
+// bodies. It scans at the top level (skipping string literals and parens) so a
+// quoted value like `"stand by"` inside a `where` is never mistaken for a clause
+// keyword. The clauses, if present, must appear in where→by→limit order.
+func splitForClauses(rest string, line int) (whereS, byS, limitS string, err error) {
+	if strings.TrimSpace(rest) == "" {
+		return "", "", "", nil
 	}
-	parts := strings.Fields(s)
-	if len(parts) != 2 {
-		return "", "", &perr{t.Line, t.Col, "expected `<primitive> <Name>:` (e.g. `facet Card:`)"}
-	}
-	if !primitiveKinds[parts[0]] {
-		return "", "", &perr{t.Line, t.Col, fmt.Sprintf("unknown primitive %q; expected one of facet, feed, stream, lifecycle, pipe, vault, media, signal", parts[0])}
-	}
-	if !isIdent(parts[1]) {
-		return "", "", &perr{t.Line, t.Col, fmt.Sprintf("invalid %s name %q", parts[0], parts[1])}
-	}
-	return parts[0], parts[1], nil
-}
-
-// clientBlockHint names the render block a client-rendered kind uses instead of
-// looks:, for a helpful error.
-func clientBlockHint(kind string) string {
-	switch kind {
-	case "vault":
-		return "`decrypt:` (rendered in the browser after client-side decryption)"
-	case "media":
-		return "`source:` (the runtime owns the player)"
-	case "signal":
-		return "no render block — a signal relays its `what:` payload to peers"
-	}
-	return "the kind's client block"
-}
-
-// splitList splits a comma- or whitespace-separated list (e.g. lifecycle states).
-func splitList(s string) []string {
-	var out []string
-	for _, p := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func parseFacetIDLine(t lexer.Token) (string, error) {
-	rest := strings.TrimSpace(strings.TrimPrefix(t.Text, "facet-id:"))
-	s, ok := unquote(rest)
-	if !ok {
-		return "", &perr{t.Line, t.Col, "facet-id must be a double-quoted string"}
-	}
-	return s, nil
-}
-
-// ── who (authorization) ─────────────────────────────────────────────────────
-
-func (p *parser) parseWho(f *ast.Facet) error {
-	p.next() // consume `who:`
-	if _, err := p.expect(lexer.INDENT, "indented who block"); err != nil {
-		return err
-	}
-	for p.at(lexer.LINE) {
-		t := p.next()
+	pos := map[string]int{} // keyword -> first top-level start index
+	inStr := false
+	depth := 0
+	for i := 0; i < len(rest); {
+		c := rest[i]
 		switch {
-		case strings.HasPrefix(t.Text, "require:"):
-			pol := strings.TrimSpace(strings.TrimPrefix(t.Text, "require:"))
-			if !isIdent(pol) {
-				return &perr{t.Line, t.Col, fmt.Sprintf("require expects a policy name, got %q", pol)}
-			}
-			f.Who.Require = append(f.Who.Require, pol)
-		case strings.HasPrefix(t.Text, "redact "):
-			fields := strings.Fields(strings.TrimPrefix(t.Text, "redact "))
-			if len(fields) == 0 {
-				return &perr{t.Line, t.Col, "redact expects a field name"}
-			}
-			red := ast.Redaction{Field: fields[0]}
-			switch {
-			case len(fields) == 1, len(fields) == 2 && fields[1] == "always":
-				// unconditional
-			case len(fields) == 3 && fields[1] == "unless":
-				if !isIdent(fields[2]) {
-					return &perr{t.Line, t.Col, fmt.Sprintf("redact unless expects a policy name, got %q", fields[2])}
-				}
-				red.UnlessPolicy = fields[2]
-			default:
-				return &perr{t.Line, t.Col, fmt.Sprintf("bad redact: %q (use `redact <field>` or `redact <field> unless <policy>`)", t.Text)}
-			}
-			f.Who.Redactions = append(f.Who.Redactions, red)
-		default:
-			return &perr{t.Line, t.Col, fmt.Sprintf("unknown who directive: %q (expected `require:` or `redact …`)", t.Text)}
-		}
-	}
-	if _, err := p.expect(lexer.DEDENT, "end of who block"); err != nil {
-		return err
-	}
-	return nil
-}
-
-// ── what (data) ─────────────────────────────────────────────────────────────
-
-// parseStyle reads the `style:` block — `property: value` lines of cross-platform
-// style tokens. Values may contain spaces (`pad: 2 4`) and `#` (`bg: #fff`); only
-// the first `:` separates key from value. Token validity is checked in codegen.
-func (p *parser) parseStyle(f *ast.Facet) error {
-	p.next() // consume `style:`
-	if _, err := p.expect(lexer.INDENT, "indented style block"); err != nil {
-		return err
-	}
-	for p.at(lexer.LINE) {
-		t := p.next()
-		key, val, found := strings.Cut(t.Text, ":")
-		if !found {
-			return &perr{t.Line, t.Col, fmt.Sprintf("expected `property: value` in style:, got %q", t.Text)}
-		}
-		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
-		if key == "" || val == "" {
-			return &perr{t.Line, t.Col, fmt.Sprintf("style line needs a property and a value, got %q", t.Text)}
-		}
-		f.Style = append(f.Style, ast.StyleProp{Key: key, Val: val, Pos: ast.Pos{Line: t.Line, Col: t.Col}})
-	}
-	if _, err := p.expect(lexer.DEDENT, "end of style block"); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (p *parser) parseWhat(f *ast.Facet) error {
-	p.next() // consume `what:`
-	if _, err := p.expect(lexer.INDENT, "indented what block"); err != nil {
-		return err
-	}
-	for p.at(lexer.LINE) {
-		t := p.next()
-		fld, err := parseField(t)
-		if err != nil {
-			return err
-		}
-		f.Fields = append(f.Fields, fld)
-	}
-	if _, err := p.expect(lexer.DEDENT, "end of what block"); err != nil {
-		return err
-	}
-	return nil
-}
-
-// parseState parses a `state:` block — local client reactive values. It reuses
-// the `what:` field grammar but every field MUST carry an initial value
-// (`name: Type = <expr>` or `name = <expr>`): a signal has to start somewhere,
-// and a default-less state field is almost always a mistake. See
-// docs/REACTIVITY.md (Brick 1).
-func (p *parser) parseState(f *ast.Facet) error {
-	p.next() // consume `state:`
-	if _, err := p.expect(lexer.INDENT, "indented state block"); err != nil {
-		return err
-	}
-	for p.at(lexer.LINE) {
-		t := p.next()
-		fld, err := parseField(t)
-		if err != nil {
-			return err
-		}
-		if !fld.IsComputed() { // Expr == "" → no initial value
-			return &perr{t.Line, t.Col, fmt.Sprintf("state field %q needs an initial value (e.g. `%s = 0`)", fld.Name, fld.Name)}
-		}
-		f.State = append(f.State, fld)
-	}
-	if _, err := p.expect(lexer.DEDENT, "end of state block"); err != nil {
-		return err
-	}
-	return nil
-}
-
-func parseField(t lexer.Token) (ast.Field, error) {
-	pos := ast.Pos{Line: t.Line, Col: t.Col}
-	// A computed field is `<decl> = <expr>`, where the assignment '=' is the first
-	// '=' that is not part of a two-char operator (==, >=, <=, !=) in the expr.
-	if i := assignIndex(t.Text); i >= 0 {
-		decl := t.Text[:i]
-		expr := strings.TrimSpace(t.Text[i+1:])
-		if expr == "" {
-			return ast.Field{}, &perr{t.Line, t.Col, "computed field needs an expression after `=`"}
-		}
-		// The declaration is `name` or `name: Type` (type optional for computed).
-		name, typ := decl, ""
-		if n, ty, found := strings.Cut(decl, ":"); found {
-			name, typ = n, strings.TrimSpace(ty)
-		}
-		name = strings.TrimSpace(name)
-		if !isIdent(name) {
-			return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid field name %q", name)}
-		}
-		if typ != "" && !isIdent(typ) {
-			return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid type %q", typ)}
-		}
-		return ast.Field{Name: name, Type: typ, Expr: expr, Pos: pos}, nil
-	}
-	name, typ, found := strings.Cut(t.Text, ":")
-	if !found {
-		return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("expected `name: Type` or `name = expr`, got %q", t.Text)}
-	}
-	name = strings.TrimSpace(name)
-	typ = strings.TrimSpace(typ)
-	if !isIdent(name) {
-		return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid field name %q", name)}
-	}
-	if !isIdent(typ) {
-		return ast.Field{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid type %q", typ)}
-	}
-	return ast.Field{Name: name, Type: typ, Pos: pos}, nil
-}
-
-// assignIndex returns the byte index of the computed-field assignment '=', or -1
-// if the line has none. It skips '=' that forms a comparison operator (==, !=,
-// >=, <=) so `flag: bool = a == b` splits at the assignment, not the comparison.
-func assignIndex(s string) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] != '=' {
-			continue
-		}
-		if i+1 < len(s) && s[i+1] == '=' { // "==" → comparison, skip both
+		case c == '"':
+			inStr = !inStr
 			i++
-			continue
-		}
-		if i > 0 && (s[i-1] == '!' || s[i-1] == '<' || s[i-1] == '>') { // !=, <=, >=
-			continue
-		}
-		return i
-	}
-	return -1
-}
-
-// ── when (event handler) ────────────────────────────────────────────────────
-
-func (p *parser) parseWhen(f *ast.Facet) error {
-	hdr := p.next() // `when E1, E2:`
-	if !strings.HasSuffix(hdr.Text, ":") {
-		return &perr{hdr.Line, hdr.Col, "when header must end with ':'"}
-	}
-	body := strings.TrimSuffix(strings.TrimPrefix(hdr.Text, "when"), ":")
-	var events []string
-	for _, e := range strings.Split(body, ",") {
-		e = strings.TrimSpace(e)
-		if e == "" {
-			continue
-		}
-		events = append(events, e)
-	}
-	if len(events) == 0 {
-		return &perr{hdr.Line, hdr.Col, "when needs at least one event"}
-	}
-	w := ast.When{Events: events, Pos: ast.Pos{Line: hdr.Line, Col: hdr.Col}}
-
-	if _, err := p.expect(lexer.INDENT, "indented when block"); err != nil {
-		return err
-	}
-	for p.at(lexer.LINE) {
-		t := p.next()
-		m, err := parseMutation(t)
-		if err != nil {
-			return err
-		}
-		w.Mutations = append(w.Mutations, m)
-	}
-	if _, err := p.expect(lexer.DEDENT, "end of when block"); err != nil {
-		return err
-	}
-	f.Whens = append(f.Whens, w)
-	return nil
-}
-
-func parseMutation(t lexer.Token) (ast.Mutation, error) {
-	fields := strings.Fields(t.Text)
-	pos := ast.Pos{Line: t.Line, Col: t.Col}
-	if len(fields) == 0 {
-		return ast.Mutation{}, &perr{t.Line, t.Col, "empty mutation"}
-	}
-	op := fields[0]
-	switch op {
-	case "replace_all":
-		return ast.Mutation{Op: op, Pos: pos}, nil
-	case "replace", "append", "prepend", "remove":
-		if len(fields) < 2 {
-			return ast.Mutation{}, &perr{t.Line, t.Col, op + " requires a target facet"}
-		}
-		m := ast.Mutation{Op: op, Target: fields[1], Pos: pos}
-		if len(fields) > 2 {
-			if fields[2] != "with" {
-				return ast.Mutation{}, &perr{t.Line, t.Col, fmt.Sprintf("expected `with`, got %q", fields[2])}
+		case inStr:
+			i++
+		case c == '(' || c == '{':
+			depth++
+			i++
+		case c == ')' || c == '}':
+			depth--
+			i++
+		case depth == 0 && isIdentStart(c):
+			j := i
+			for j < len(rest) && isIdentChar(rest[j]) {
+				j++
 			}
-			m.With = strings.TrimSpace(strings.Join(fields[3:], " "))
-			if m.With == "" {
-				return ast.Mutation{}, &perr{t.Line, t.Col, "`with` requires an expression"}
+			if w := rest[i:j]; w == "where" || w == "by" || w == "limit" {
+				if _, seen := pos[w]; !seen {
+					pos[w] = i
+				}
+			}
+			i = j
+		default:
+			i++
+		}
+	}
+
+	known := []struct {
+		name string
+		klen int
+	}{{"where", 5}, {"by", 2}, {"limit", 5}}
+	// the content of a clause runs from just after its keyword to the next clause
+	// keyword that starts later in the string.
+	end := func(start int) int {
+		e := len(rest)
+		for _, k := range known {
+			if p, ok := pos[k.name]; ok && p > start && p < e {
+				e = p
 			}
 		}
-		return m, nil
-	default:
-		return ast.Mutation{}, &perr{t.Line, t.Col, fmt.Sprintf("unknown mutation %q", op)}
+		return e
 	}
-}
-
-// ── actions (client handlers) ───────────────────────────────────────────────
-
-// parseActions parses the `actions:` block (Brick 3 of docs/REACTIVITY.md). Each
-// action is a `name:` header followed by an indented body of `signal = expr`
-// assignment lines — the named, reusable client "controller method". The body
-// must be non-empty: an action with no mutation is always a mistake.
-func (p *parser) parseActions(f *ast.Facet) error {
-	p.next() // consume `actions:`
-	if _, err := p.expect(lexer.INDENT, "indented actions block"); err != nil {
-		return err
-	}
-	for p.at(lexer.LINE) {
-		hdr := p.next()
-		name := strings.TrimSpace(strings.TrimSuffix(hdr.Text, ":"))
-		if !strings.HasSuffix(hdr.Text, ":") || !isIdent(name) {
-			return &perr{hdr.Line, hdr.Col, fmt.Sprintf("expected an action header `name:`, got %q", hdr.Text)}
-		}
-		a := ast.Action{Name: name, Pos: ast.Pos{Line: hdr.Line, Col: hdr.Col}}
-		if _, err := p.expect(lexer.INDENT, fmt.Sprintf("indented body for action %q", name)); err != nil {
-			return err
-		}
-		for p.at(lexer.LINE) {
-			t := p.next()
-			as, err := parseAssign(t)
-			if err != nil {
-				return err
-			}
-			a.Mutations = append(a.Mutations, as)
-		}
-		if _, err := p.expect(lexer.DEDENT, fmt.Sprintf("end of action %q", name)); err != nil {
-			return err
-		}
-		if len(a.Mutations) == 0 {
-			return &perr{hdr.Line, hdr.Col, fmt.Sprintf("action %q has no mutations (add a `signal = expr` line)", name)}
-		}
-		f.Actions = append(f.Actions, a)
-	}
-	if _, err := p.expect(lexer.DEDENT, "end of actions block"); err != nil {
-		return err
-	}
-	return nil
-}
-
-// parseAssign parses one `signal = expr` mutation line. It reuses assignIndex so
-// `count = count == 0` splits at the assignment, not the comparison.
-func parseAssign(t lexer.Token) (ast.Assign, error) {
-	pos := ast.Pos{Line: t.Line, Col: t.Col}
-	i := assignIndex(t.Text)
-	if i < 0 {
-		return ast.Assign{}, &perr{t.Line, t.Col, fmt.Sprintf("expected `signal = expr`, got %q", t.Text)}
-	}
-	target := strings.TrimSpace(t.Text[:i])
-	expr := strings.TrimSpace(t.Text[i+1:])
-	if !isIdent(target) {
-		return ast.Assign{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid assignment target %q (must be a state signal)", target)}
-	}
-	if expr == "" {
-		return ast.Assign{}, &perr{t.Line, t.Col, fmt.Sprintf("assignment to %q needs an expression after `=`", target)}
-	}
-	return ast.Assign{Target: target, Expr: expr, Pos: pos}, nil
-}
-
-// parseEffects parses the `effects:` block (Brick 7 of docs/REACTIVITY.md). Each
-// line is `on <dep1>, <dep2>: <action>`: when any dependency signal changes, the
-// named action runs.
-func (p *parser) parseEffects(f *ast.Facet) error {
-	p.next() // consume `effects:`
-	if _, err := p.expect(lexer.INDENT, "indented effects block"); err != nil {
-		return err
-	}
-	for p.at(lexer.LINE) {
-		t := p.next()
-		body := strings.TrimSpace(t.Text)
-		if !strings.HasPrefix(body, "on ") {
-			return &perr{t.Line, t.Col, fmt.Sprintf("expected `on <signals>: <action>`, got %q", t.Text)}
-		}
-		deps, action, ok := strings.Cut(strings.TrimSpace(body[3:]), ":")
+	clause := func(name string, klen int) (string, error) {
+		p, ok := pos[name]
 		if !ok {
-			return &perr{t.Line, t.Col, fmt.Sprintf("effect needs `: <action>`, got %q", t.Text)}
+			return "", nil
 		}
-		action = strings.TrimSpace(action)
-		if !isIdent(action) {
-			return &perr{t.Line, t.Col, fmt.Sprintf("invalid effect action %q", action)}
+		body := strings.TrimSpace(rest[p+klen : end(p)])
+		if body == "" {
+			return "", &Error{line, fmt.Sprintf("`%s` needs a value", name)}
 		}
-		e := ast.Effect{Action: action, Pos: ast.Pos{Line: t.Line, Col: t.Col}}
-		for _, d := range strings.Split(deps, ",") {
-			d = strings.TrimSpace(d)
-			if !isIdent(d) {
-				return &perr{t.Line, t.Col, fmt.Sprintf("invalid effect dependency %q", d)}
-			}
-			e.Deps = append(e.Deps, d)
-		}
-		f.Effects = append(f.Effects, e)
+		return body, nil
 	}
-	if _, err := p.expect(lexer.DEDENT, "end of effects block"); err != nil {
-		return err
+	if whereS, err = clause("where", 5); err != nil {
+		return
 	}
-	return nil
+	if byS, err = clause("by", 2); err != nil {
+		return
+	}
+	if limitS, err = clause("limit", 5); err != nil {
+		return
+	}
+
+	// reject stray text before the first clause keyword.
+	first := len(rest)
+	for _, k := range known {
+		if p, ok := pos[k.name]; ok && p < first {
+			first = p
+		}
+	}
+	if leftover := strings.TrimSpace(rest[:first]); leftover != "" {
+		return "", "", "", &Error{line, fmt.Sprintf("unexpected %q in for header (clauses are where/by/limit, in that order)", leftover)}
+	}
+	return whereS, byS, limitS, nil
 }
 
-// parseQueries parses the `query:` block (Brick 11 of docs/REACTIVITY.md). Each
-// line is `name from "url"`: an async fetch the runtime exposes to the client
-// reactive layer as `name` with reactive {loading, error, data} fields.
-func (p *parser) parseQueries(f *ast.Facet) error {
-	p.next() // consume `query:`
-	if _, err := p.expect(lexer.INDENT, "indented query block"); err != nil {
-		return err
+// parseLink: `link "label" -> "/path"`
+func parseLink(s string, line int) (ast.Node, error) {
+	arrow := strings.Index(s, "->")
+	if arrow < 0 {
+		return nil, &Error{line, `link needs a destination: link "Home" -> "/"`}
 	}
-	for p.at(lexer.LINE) {
-		t := p.next()
-		name, rest, ok := strings.Cut(strings.TrimSpace(t.Text), " from ")
-		if !ok {
-			return &perr{t.Line, t.Col, fmt.Sprintf("expected `name from \"url\"`, got %q", t.Text)}
-		}
-		name = strings.TrimSpace(name)
-		if !isIdent(name) {
-			return &perr{t.Line, t.Col, fmt.Sprintf("invalid query name %q", name)}
-		}
-		url, ok := unquote(rest)
-		if !ok {
-			return &perr{t.Line, t.Col, fmt.Sprintf("query %q url must be a double-quoted string", name)}
-		}
-		if url == "" {
-			return &perr{t.Line, t.Col, fmt.Sprintf("query %q needs a url", name)}
-		}
-		f.Queries = append(f.Queries, ast.Query{Name: name, URL: url, Pos: ast.Pos{Line: t.Line, Col: t.Col}})
-	}
-	if _, err := p.expect(lexer.DEDENT, "end of query block"); err != nil {
-		return err
-	}
-	return nil
-}
-
-// ── looks (template) ────────────────────────────────────────────────────────
-
-type rawLine struct {
-	indent int
-	text   string
-	line   int
-}
-
-func (p *parser) parseLooks(f *ast.Facet) error {
-	nodes, err := p.parseRenderBody("looks")
+	label, err := unquote(strings.TrimSpace(s[:arrow]), line)
 	if err != nil {
-		return err
-	}
-	f.Looks = nodes
-	return nil
-}
-
-// parseClientBody parses a `decrypt:` (vault) or `source:` (media) block into
-// f.Client. It uses the exact same body grammar as looks: ({expr} holes, control
-// lines, child facets) — but codegen never lowers it to a server template, so the
-// content is rendered only on the client.
-func (p *parser) parseClientBody(f *ast.Facet) error {
-	nodes, err := p.parseRenderBody("client render")
-	if err != nil {
-		return err
-	}
-	f.Client = nodes
-	return nil
-}
-
-// parseRenderBody consumes the current block header (looks:/decrypt:/source:) and
-// its indented body, returning the flat render node stream. The two render blocks
-// share one grammar; only where the result lands (Looks vs Client) differs.
-func (p *parser) parseRenderBody(what string) ([]ast.Node, error) {
-	p.next() // consume the block header
-	if _, err := p.expect(lexer.INDENT, "indented "+what+" block"); err != nil {
 		return nil, err
 	}
-	// Collect raw lines until the matching DEDENT, flattening any nested
-	// INDENT/DEDENT that HTML line-wraps or control bodies produced.
-	var lines []rawLine
-	depth := 1
-	for !p.eof() && depth > 0 {
-		t := p.next()
-		switch t.Kind {
-		case lexer.INDENT:
-			depth++
-		case lexer.DEDENT:
-			depth--
-		case lexer.LINE:
-			lines = append(lines, rawLine{indent: t.Col - 1, text: t.Text, line: t.Line})
-		}
+	path, err := unquote(strings.TrimSpace(s[arrow+2:]), line)
+	if err != nil {
+		return nil, err
 	}
-	return parseLooksLines(lines)
+	return ast.Link{Label: label, Path: path}, nil
 }
 
-// parseLooksLines builds the flat node stream from collected looks lines.
-func parseLooksLines(lines []rawLine) ([]ast.Node, error) {
-	if len(lines) == 0 {
-		return nil, nil
+func parseInput(s string, line int) (ast.Node, error) {
+	// `input bind name [placeholder "text"]`
+	if !strings.HasPrefix(s, "bind ") {
+		return nil, &Error{line, `input needs a binding: input bind stateName`}
 	}
-	nodes, _, err := parseLooksBlock(lines, 0, lines[0].indent)
-	return nodes, err
+	rest := strings.TrimSpace(s[len("bind "):])
+	in := ast.Input{}
+	if ph := strings.Index(rest, "placeholder "); ph >= 0 {
+		p, err := unquote(strings.TrimSpace(rest[ph+len("placeholder "):]), line)
+		if err != nil {
+			return nil, err
+		}
+		in.Placeholder = p
+		rest = strings.TrimSpace(rest[:ph])
+	}
+	if !isIdent(rest) {
+		return nil, &Error{line, fmt.Sprintf("invalid input binding %q", rest)}
+	}
+	in.Bind = rest
+	return in, nil
 }
 
-// parseLooksBlock consumes lines whose indent >= minIndent, returning the nodes
-// and the index of the first line that fell out of the block.
-func parseLooksBlock(lines []rawLine, i, minIndent int) ([]ast.Node, int, error) {
-	var nodes []ast.Node
-	for i < len(lines) && lines[i].indent >= minIndent {
-		ln := lines[i]
-		op, a, b, isCtrl := matchControl(ln.text)
-		if !isCtrl {
-			// Block-form child facet: <Card …> on its own line, … </Card>.
-			if child, ok := matchBlockChildOpen(ln); ok {
-				ni, err := parseChildBody(lines, i+1, ln.indent, &child)
-				if err != nil {
-					return nil, 0, err
-				}
-				nodes = append(nodes, child)
-				i = ni
-				continue
-			}
-			// Raw HTML content line: reconstruct indentation, parse inline holes,
-			// keep the trailing newline so the emitted HTML stays readable.
-			inline, err := parseInline(ln)
-			if err != nil {
-				return nil, 0, err
-			}
-			nodes = append(nodes, ast.Text{S: strings.Repeat(" ", ln.indent)})
-			nodes = append(nodes, inline...)
-			nodes = append(nodes, ast.Text{S: "\n"})
-			i++
-			continue
-		}
-
-		switch op {
-		case "if":
-			nodes = append(nodes, ast.Ctrl{Op: "if", Expr: a, Pos: ast.Pos{Line: ln.line, Col: ln.indent + 1}})
-			body, ni, err := parseLooksBlock(lines, i+1, ln.indent+1)
-			if err != nil {
-				return nil, 0, err
-			}
-			nodes = append(nodes, body...)
-			i = ni
-			// optional `else:` at the same indent as the `if`
-			if i < len(lines) && lines[i].indent == ln.indent {
-				if eop, _, _, ok := matchControl(lines[i].text); ok && eop == "else" {
-					nodes = append(nodes, ast.Ctrl{Op: "else"})
-					ebody, ni2, err := parseLooksBlock(lines, i+1, lines[i].indent+1)
-					if err != nil {
-						return nil, 0, err
-					}
-					nodes = append(nodes, ebody...)
-					i = ni2
-				}
-			}
-			nodes = append(nodes, ast.Ctrl{Op: "end"})
-		case "for":
-			iter, virtual, height := parseForIter(b)
-			nodes = append(nodes, ast.Ctrl{Op: "for", Var: a, Iter: iter, Virtual: virtual, Height: height, Pos: ast.Pos{Line: ln.line, Col: ln.indent + 1}})
-			body, ni, err := parseLooksBlock(lines, i+1, ln.indent+1)
-			if err != nil {
-				return nil, 0, err
-			}
-			nodes = append(nodes, body...)
-			nodes = append(nodes, ast.Ctrl{Op: "end"})
-			i = ni
-		case "slot":
-			if a != "" && !isIdent(a) {
-				return nil, 0, &perr{ln.line, ln.indent + 1, fmt.Sprintf("invalid slot name %q", a)}
-			}
-			body, ni, err := parseLooksBlock(lines, i+1, ln.indent+1)
-			if err != nil {
-				return nil, 0, err
-			}
-			nodes = append(nodes, ast.Slot{Name: a, Default: body, Pos: ast.Pos{Line: ln.line, Col: ln.indent + 1}})
-			i = ni
-		case "else":
-			return nil, 0, &perr{ln.line, ln.indent + 1, "`else` without a matching `if`"}
-		default:
-			return nil, 0, &perr{ln.line, ln.indent + 1, "unknown control line"}
-		}
+func parseText(s string, line int) ([]ast.Seg, error) {
+	str, err := unquote(s, line)
+	if err != nil {
+		return nil, err
 	}
-	return nodes, i, nil
-}
-
-// parseForIter splits a `for` loop's iterable from an optional `virtual [<px>]`
-// modifier: `items virtual 48` → ("items", true, 48); `items virtual` → height 0
-// (the runtime falls back to a default); `items` → ("items", false, 0). The
-// modifier windows a large reactive list — only the rows in the scroll viewport
-// render. Keeping it out of Iter leaves the iterable a clean expression for the
-// field-ref and dependency checks.
-func parseForIter(iter string) (string, bool, int) {
-	i := strings.TrimSpace(iter)
-	idx := strings.LastIndex(i, " virtual")
-	if idx < 0 {
-		if i == "virtual" { // `for v in virtual` is a real iterable named virtual; leave as-is
-			return i, false, 0
-		}
-		return i, false, 0
-	}
-	rest := strings.TrimSpace(i[idx+len(" virtual"):])
-	base := strings.TrimSpace(i[:idx])
-	if base == "" {
-		return i, false, 0 // no iterable before `virtual` — treat literally
-	}
-	h := 0
-	if rest != "" {
-		n := 0
-		ok := true
-		for _, r := range rest {
-			if r < '0' || r > '9' {
-				ok = false
-				break
+	var segs []ast.Seg
+	var lit strings.Builder
+	for i := 0; i < len(str); i++ {
+		if str[i] == '{' {
+			end := strings.IndexByte(str[i:], '}')
+			if end < 0 {
+				return nil, &Error{line, "unterminated `{` in text"}
 			}
-			n = n*10 + int(r-'0')
-		}
-		if !ok {
-			return i, false, 0 // `virtual` followed by non-number → not the modifier
-		}
-		h = n
-	}
-	return base, true, h
-}
-
-// matchControl reports whether a looks line is a block control line and returns
-// its parts. Block control lines end with ':'. Returns (op, a, b, ok):
-//   - if:   a = condition
-//   - for:  a = loop var, b = iterable
-//   - else: a, b empty
-func matchControl(text string) (op, a, b string, ok bool) {
-	t := strings.TrimSpace(text)
-	if !strings.HasSuffix(t, ":") {
-		return "", "", "", false
-	}
-	t = strings.TrimSpace(strings.TrimSuffix(t, ":"))
-	switch {
-	case t == "else":
-		return "else", "", "", true
-	case t == "slot":
-		return "slot", "", "", true
-	case strings.HasPrefix(t, "slot "):
-		return "slot", strings.TrimSpace(t[5:]), "", true
-	case strings.HasPrefix(t, "if "):
-		return "if", strings.TrimSpace(t[3:]), "", true
-	case strings.HasPrefix(t, "for "):
-		rest := strings.TrimSpace(t[4:])
-		v, iter, found := strings.Cut(rest, " in ")
-		if !found {
-			return "", "", "", false
-		}
-		return "for", strings.TrimSpace(v), strings.TrimSpace(iter), true
-	}
-	return "", "", "", false
-}
-
-// parseInline splits a content line into Text / Interp / inline-Ctrl / Child
-// nodes. It scans for two things: `{…}` holes and `<Capitalized …/>` child-facet
-// calls. Lowercase tags (`<div>`) are ordinary HTML text. Braces do not nest.
-func parseInline(ln rawLine) ([]ast.Node, error) {
-	var nodes []ast.Node
-	s := ln.text
-	i, start := 0, 0
-	flush := func(end int) {
-		if end > start {
-			nodes = append(nodes, ast.Text{S: s[start:end]})
-		}
-	}
-	for i < len(s) {
-		switch {
-		case s[i] == '{':
-			flush(i)
-			closeIdx := strings.IndexByte(s[i:], '}')
-			if closeIdx < 0 {
-				return nil, &perr{ln.line, ln.indent + i + 1, "unterminated `{` interpolation"}
+			if lit.Len() > 0 {
+				segs = append(segs, ast.Seg{Lit: lit.String()})
+				lit.Reset()
 			}
-			inner := strings.TrimSpace(s[i+1 : i+closeIdx])
-			nodes = append(nodes, classifyHole(inner, ln))
-			i += closeIdx + 1
-			start = i
-		case s[i] == '<' && i+1 < len(s) && isUpperByte(s[i+1]):
-			flush(i)
-			child, next, err := parseChildTag(s, i, ln)
+			e, err := parseExpr(str[i+1:i+end], line)
 			if err != nil {
 				return nil, err
 			}
-			nodes = append(nodes, child)
-			i = next
-			start = next
-		default:
-			i++
+			segs = append(segs, ast.Seg{Expr: e})
+			i += end
+			continue
 		}
+		lit.WriteByte(str[i])
 	}
-	flush(len(s))
-	return nodes, nil
+	if lit.Len() > 0 {
+		segs = append(segs, ast.Seg{Lit: lit.String()})
+	}
+	return segs, nil
 }
 
-// parseTagOpen parses a child tag <Name attr="v" .../> or <Name ...> at
-// s[pos]=='<'. Returns the name, props, whether it self-closes, and the index
-// just past the terminating '>'.
-func parseTagOpen(s string, pos int, ln rawLine) (name string, props []ast.Prop, selfClose bool, end int, err error) {
-	fail := func(off int, msg string) (string, []ast.Prop, bool, int, error) {
-		return "", nil, false, 0, &perr{ln.line, ln.indent + off + 1, msg}
+// parseButton: `"label" -> action` or `"label" -> action(arg, ...)`
+func parseButton(s string, line int) (ast.Button, error) {
+	arrow := strings.Index(s, "->")
+	if arrow < 0 {
+		return ast.Button{}, &Error{line, `button needs an action: button "Label" -> actionName`}
 	}
-	i := pos + 1 // past '<'
-	ns := i
-	for i < len(s) && isIdentByte(s[i]) {
-		i++
-	}
-	name = s[ns:i]
-	if name == "" || !isUpperByte(name[0]) {
-		return fail(pos, "expected a capitalized facet name")
-	}
-	for {
-		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
-			i++
-		}
-		if i >= len(s) {
-			return fail(pos, fmt.Sprintf("unterminated tag <%s …>", name))
-		}
-		if s[i] == '/' {
-			if i+1 < len(s) && s[i+1] == '>' {
-				return name, props, true, i + 2, nil
-			}
-			return fail(i, "expected '/>'")
-		}
-		if s[i] == '>' {
-			return name, props, false, i + 1, nil
-		}
-		as := i
-		for i < len(s) && isAttrNameByte(s[i]) {
-			i++
-		}
-		if i == as {
-			return fail(i, fmt.Sprintf("malformed attribute in <%s …>", name))
-		}
-		attr := s[as:i]
-		if i >= len(s) || s[i] != '=' {
-			return fail(i, fmt.Sprintf("attribute %q needs a =\"value\"", attr))
-		}
-		i++ // '='
-		if i >= len(s) || s[i] != '"' {
-			return fail(i, fmt.Sprintf("attribute %q value must be double-quoted", attr))
-		}
-		i++ // opening quote
-		vs := i
-		for i < len(s) && s[i] != '"' {
-			i++
-		}
-		if i >= len(s) {
-			return fail(vs, fmt.Sprintf("unterminated value for attribute %q", attr))
-		}
-		props = append(props, makeProp(attr, s[vs:i]))
-		i++ // closing quote
-	}
-}
-
-// parseChildTag parses an inline, self-closing child call <Name .../> at s[pos].
-// Block form (<Name>…</Name>) must be alone on its line — see matchBlockChildOpen.
-func parseChildTag(s string, pos int, ln rawLine) (ast.Child, int, error) {
-	name, props, selfClose, end, err := parseTagOpen(s, pos, ln)
+	label, err := unquote(strings.TrimSpace(s[:arrow]), line)
 	if err != nil {
-		return ast.Child{}, 0, err
+		return ast.Button{}, err
 	}
-	if !selfClose {
-		return ast.Child{}, 0, &perr{ln.line, ln.indent + pos + 1,
-			fmt.Sprintf("inline child <%s> must be self-closing (<%s …/>); block form must be alone on its line", name, name)}
-	}
-	return ast.Child{Name: name, Props: props, Pos: ast.Pos{Line: ln.line, Col: ln.indent + pos + 1}}, end, nil
-}
-
-// matchBlockChildOpen reports whether a line is a lone block-form child open tag
-// (<Card …> on its own line, not self-closing). Children are filled by
-// parseChildBody.
-func matchBlockChildOpen(ln rawLine) (ast.Child, bool) {
-	t := strings.TrimSpace(ln.text)
-	if len(t) < 2 || t[0] != '<' || !isUpperByte(t[1]) {
-		return ast.Child{}, false
-	}
-	name, props, selfClose, end, err := parseTagOpen(t, 0, ln)
-	if err != nil || selfClose || end != len(t) {
-		return ast.Child{}, false // malformed, self-closing, or trailing content → not a block open
-	}
-	return ast.Child{Name: name, Props: props, Pos: ast.Pos{Line: ln.line, Col: ln.indent + 1}}, true
-}
-
-// parseChildBody collects a block-form child's body — the lines indented under
-// the open tag, up to its `</Name>` close line. Top-level `fill name:` blocks
-// become child.Fills[name] (named-slot content); everything else becomes
-// child.Children (default-slot content). Returns the index past the close line.
-func parseChildBody(lines []rawLine, i, openIndent int, child *ast.Child) (int, error) {
-	bodyStart := i
-	for i < len(lines) && lines[i].indent > openIndent {
-		i++
-	}
-	closeTag := "</" + child.Name + ">"
-	if i >= len(lines) || lines[i].indent != openIndent || strings.TrimSpace(lines[i].text) != closeTag {
-		return 0, &perr{child.Pos.Line, child.Pos.Col, fmt.Sprintf("unclosed <%s>; expected %s", child.Name, closeTag)}
-	}
-	bodyEnd := i
-	if bodyEnd > bodyStart {
-		topIndent := lines[bodyStart].indent
-		var def []ast.Node
-		for j := bodyStart; j < bodyEnd; {
-			ln := lines[j]
-			if name, ok := matchFill(ln.text); ok && ln.indent == topIndent {
-				if !isIdent(name) {
-					return 0, &perr{ln.line, ln.indent + 1, fmt.Sprintf("invalid fill name %q", name)}
-				}
-				if _, dup := child.Fills[name]; dup {
-					return 0, &perr{ln.line, ln.indent + 1, fmt.Sprintf("duplicate fill %q in <%s>", name, child.Name)}
-				}
-				fbody, nj, err := parseLooksBlock(lines[:bodyEnd], j+1, ln.indent+1)
-				if err != nil {
-					return 0, err
-				}
-				if child.Fills == nil {
-					child.Fills = map[string][]ast.Node{}
-				}
-				child.Fills[name] = fbody
-				j = nj
-				continue
-			}
-			// A maximal run of default-slot content up to the next top-level fill.
-			k := j + 1
-			for k < bodyEnd && !(lines[k].indent == topIndent && isFillLine(lines[k].text)) {
-				k++
-			}
-			run, _, err := parseLooksBlock(lines[:k], j, topIndent)
-			if err != nil {
-				return 0, err
-			}
-			def = append(def, run...)
-			j = k
+	call := strings.TrimSpace(s[arrow+2:])
+	name := call
+	var args []ast.Expr
+	if open := strings.IndexByte(call, '('); open >= 0 {
+		name = strings.TrimSpace(call[:open])
+		close := strings.LastIndexByte(call, ')')
+		if close < open {
+			return ast.Button{}, &Error{line, "missing `)` in action call"}
 		}
-		child.Children = def
+		inner := strings.TrimSpace(call[open+1 : close])
+		if inner != "" {
+			for _, a := range splitTop(inner, ',') {
+				e, err := parseExpr(strings.TrimSpace(a), line)
+				if err != nil {
+					return ast.Button{}, err
+				}
+				args = append(args, e)
+			}
+		}
 	}
-	return i + 1, nil // past the close line
+	if !isIdent(name) {
+		return ast.Button{}, &Error{line, fmt.Sprintf("invalid action reference %q", name)}
+	}
+	return ast.Button{Label: label, Action: name, Args: args}, nil
 }
 
-// matchFill reports whether a looks line is a `fill name:` line and returns the
-// slot name. isFillLine is the boolean-only form used to bound default content.
-func matchFill(text string) (name string, ok bool) {
-	t := strings.TrimSpace(text)
-	if !strings.HasSuffix(t, ":") {
-		return "", false
-	}
-	t = strings.TrimSpace(strings.TrimSuffix(t, ":"))
-	if rest, found := strings.CutPrefix(t, "fill "); found {
-		return strings.TrimSpace(rest), true
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+func keyword(s, kw string) (string, bool) {
+	if s == kw || strings.HasPrefix(s, kw+" ") {
+		return strings.TrimSpace(strings.TrimPrefix(s, kw)), true
 	}
 	return "", false
 }
 
-func isFillLine(text string) bool { _, ok := matchFill(text); return ok }
-
-// makeProp classifies an attribute value: a pure `{expr}` becomes an expression
-// prop; anything else is a literal string.
-func makeProp(name, val string) ast.Prop {
-	t := strings.TrimSpace(val)
-	if len(t) >= 2 && t[0] == '{' && t[len(t)-1] == '}' && strings.IndexByte(t[1:len(t)-1], '{') < 0 {
-		return ast.Prop{Name: name, IsExpr: true, Expr: strings.TrimSpace(t[1 : len(t)-1])}
+func firstWord(s string) string {
+	if i := strings.IndexByte(s, ' '); i >= 0 {
+		return s[:i]
 	}
-	return ast.Prop{Name: name, Literal: val}
+	return s
 }
 
-func isUpperByte(b byte) bool { return b >= 'A' && b <= 'Z' }
+func isType(s string) bool { return s == "int" || s == "text" || s == "bool" }
 
-func isIdentByte(b byte) bool {
-	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
-}
-
-func isAttrNameByte(b byte) bool { return isIdentByte(b) || b == '-' }
-
-func classifyHole(inner string, ln rawLine) ast.Node {
-	switch {
-	case inner == "end":
-		return ast.Ctrl{Op: "end"}
-	case inner == "else":
-		return ast.Ctrl{Op: "else"}
-	case strings.HasPrefix(inner, "if "):
-		return ast.Ctrl{Op: "if", Expr: strings.TrimSpace(inner[3:])}
-	default:
-		return ast.Interp{Expr: inner, Pos: ast.Pos{Line: ln.line}}
-	}
-}
-
-// ── small helpers ───────────────────────────────────────────────────────────
+func isUpper(s string) bool { return s != "" && s[0] >= 'A' && s[0] <= 'Z' }
 
 func isIdent(s string) bool {
 	if s == "" {
 		return false
 	}
 	for i, r := range s {
-		switch {
-		case r == '_':
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9' && i > 0:
-		default:
-			return false
+		if r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			continue
 		}
+		if i > 0 && r >= '0' && r <= '9' {
+			continue
+		}
+		return false
 	}
 	return true
 }
 
-// unquote strips one pair of surrounding double quotes; ok is false if the
-// string is not double-quoted.
-func unquote(s string) (string, bool) {
-	s = strings.TrimSpace(s)
-	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
-		return "", false
+// splitTop splits on sep at the top level (ignoring separators inside parens or
+// quotes), so `add Post { body: f(a, b) }` and string args survive.
+func splitTop(s string, sep byte) []string {
+	var out []string
+	depth := 0
+	inStr := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inStr = !inStr
+		case inStr:
+		case c == '(' || c == '{':
+			depth++
+		case c == ')' || c == '}':
+			depth--
+		case c == sep && depth == 0:
+			out = append(out, strings.TrimSpace(s[start:i]))
+			start = i + 1
+		}
 	}
-	return s[1 : len(s)-1], true
+	out = append(out, strings.TrimSpace(s[start:]))
+	return out
+}
+
+func defaultFor(typ string) ast.Expr {
+	switch typ {
+	case "int":
+		return ast.Lit{Kind: "int", Val: 0}
+	case "bool":
+		return ast.Lit{Kind: "bool", Val: false}
+	default:
+		return ast.Lit{Kind: "text", Val: ""}
+	}
+}
+
+func unquote(s string, line int) (string, error) {
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return "", &Error{line, fmt.Sprintf("expected a quoted string, got %q", s)}
+	}
+	v, err := strconv.Unquote(s)
+	if err != nil {
+		return "", &Error{line, fmt.Sprintf("invalid string %q", s)}
+	}
+	return v, nil
 }

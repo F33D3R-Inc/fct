@@ -1,3 +1,7 @@
-module github.com/F33D3R-Inc/fct
+module facet
 
 go 1.26
+
+require github.com/lib/pq v1.12.3
+
+require golang.org/x/crypto v0.53.0

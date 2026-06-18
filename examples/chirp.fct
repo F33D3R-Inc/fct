@@ -1,0 +1,60 @@
+# Chirp — a whole little application in one file: durable data, permissions,
+# behavior with arguments, a live list, an input, and permission-gated UI.
+# NOTHING here says "frontend" or "backend" — the compiler reads placement off
+# the shape of the declarations.
+#
+#   entity Post      durable, shared, persisted        -> the database (server)
+#   state draft      @client, ephemeral                -> the browser
+#   policy admin     a permission predicate over actor -> enforced on the server
+#   action post/like/clearAll  mutate Post (authoritative) -> server actions
+#
+# Try it signed in as different people:
+#   /          -> actor "guest"   (no clear button)
+#   /?as=admin -> actor "admin"   (clear button appears, and is server-enforced)
+
+app Chirp:
+    entity Post:
+        id: int
+        author: text
+        body: text
+        likes: int
+        created: int
+
+    state draft: text = "" @client
+
+    # Derived values over the durable Post collection. They are pure, so the
+    # compiler inlines them and recomputes them on the client from its live mirror
+    # of the entity store — and the SSE stream keeps that mirror fresh, so these
+    # counts move the instant anyone posts or likes, in every open tab.
+    derive postCount: int = count(Post)
+    derive totalLikes: int = sum(Post.likes)
+
+    policy admin:
+        actor == "admin"
+
+    # `now()` is an effectful builtin (the server clock). Using it makes `post`
+    # impure, so the compiler pins it to the server authority — every client sees
+    # one agreed timestamp, never its own wall clock. You never wrote "server".
+    action post(body: text):
+        add Post { author: actor, body: body, likes: 0, created: now() }
+
+    action like(id: int):
+        set Post(id).likes = Post(id).likes + 1
+
+    action clearAll:
+        requires admin
+        clear Post
+
+    view Main:
+        box:
+            text "signed in as {actor}"
+            text "{postCount} posts · {totalLikes} likes"
+            input bind draft placeholder "what's happening?"
+            button "post" -> post(draft)
+            for p in Post by created desc limit 50:
+                box:
+                    text "{p.author}: {p.body}"
+                    button "♥ like" -> like(p.id)
+                    text "likes: {p.likes}"
+            if admin:
+                button "clear all (admin only)" -> clearAll

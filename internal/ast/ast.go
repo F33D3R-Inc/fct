@@ -1,295 +1,299 @@
-// Package ast defines the FDL syntax tree for the whole primitive taxonomy —
-// facet/feed/stream/lifecycle/pipe (server-rendered) and vault/media/signal
-// (client-rendered), distinguished by Facet.Kind.
-//
-// Block keywords (canonical, see README.md): `who` (authorization), `what`
-// (data), `looks` (template; server-rendered kinds), `when <event>` (handler;
-// subscription is implied). Client-rendered kinds use `decrypt:`/`source:` bodies
-// (Facet.Client) and never compile to a server template.
-//
-// The looks/render body is represented as a FLAT stream of nodes (Text / Interp
-// / Ctrl) rather than a tree. This mirrors the Go html/template output it will
-// compile to ({{if}}...{{end}} is itself flat), so codegen is a straight pass
-// with no tree-walking. Block `if`/`for` and inline `{ if } ... { end }` both
-// lower to the same Ctrl markers; block control gets a synthesized "end" when
-// its indented body closes.
+// Package ast is the Facet syntax tree. An application is one declarative graph:
+// entities (durable data), state (cells), actions (the only mutators), policies
+// (permissions), and views (projections of state). There is no "frontend" or
+// "backend" node — placement is computed later (internal/ir), never authored.
 package ast
 
-import "strings"
-
-// Pos is a 1-based source position.
-type Pos struct {
-	Line int
-	Col  int
+// App is one `app Name:` definition — the whole application graph.
+type App struct {
+	Name     string
+	Auth     bool // a bare `auth` line turns on built-in users/login/logout/signup
+	Entities []*Entity
+	States   []*State
+	Derives  []*Derive
+	Policies []*Policy
+	Actions  []*Action
+	Jobs     []*Job
+	Views    []*View
+	Line     int
 }
 
-// Facet is one primitive definition — `<kind> Name:`. Despite the type name, it
-// covers the whole taxonomy: Kind distinguishes facet/feed/stream/lifecycle/pipe
-// (server-rendered) from vault/media/signal (client-rendered).
-type Facet struct {
-	Kind    string // facet (default) | feed | stream | lifecycle | pipe | vault | media | signal
-	Name    string
-	FacetID string   // explicit `facet-id:` override; "" means derive
-	Who     Who      // the `who:` authorization block (zero value = public)
-	Fields  []Field  // the `what:` block
-	State   []Field  // the `state:` block — local client reactive values (signals); each Field's Expr is its required initial value (see docs/REACTIVITY.md)
-	Looks   []Node   // the `looks:` block (server-rendered kinds), as a flat render stream
-	Client  []Node   // the `decrypt:`/`source:` body (client-rendered kinds); never lowered to a server template
-	Whens   []When   // the `when <event>:` handlers
-	Actions []Action // the `actions:` block — named client-side handlers that mutate state signals (see docs/REACTIVITY.md, Brick 3)
-	Effects []Effect // the `effects:` block — run an action when its dependency signals change (see docs/REACTIVITY.md, Brick 7)
-	Queries []Query  // the `query:` block — async server fetches exposed as reactive {loading,error,data} values (see docs/REACTIVITY.md, Brick 11)
-	// Per-kind declarative extras. Recorded in the manifest; runtime semantics are
-	// staged for a later round (this is the compiler-surface pass).
-	Order    string      // feed: ordering field/expression
-	Throttle string      // stream | pipe: min interval between pushes
-	Window   string      // stream: max retained items
-	TTL      string      // signal: time-to-live of the ephemeral value
-	States   []string    // lifecycle: the state-machine states
-	Style    []StyleProp // the `style:` block — cross-platform style tokens (ordered)
-	Pos      Pos
+// Placement annotations the author may put on state. Empty means "infer", which
+// resolves to the authoritative default (server). The compiler decides where
+// everything runs; these are only hints/overrides.
+const (
+	PlaceInfer  = ""
+	PlaceClient = "client" // @client — ephemeral, local, latency-sensitive
+	PlaceServer = "server" // @server — explicit authoritative
+)
+
+// Entity is a durable, shared, persisted record type — the database. Its rows
+// are always authoritative (server) and survive restarts.
+type Entity struct {
+	Name   string
+	Fields []EntityField
+	Line   int
 }
 
-// StyleProp is one `key: value` line in a facet's `style:` block — a token-based,
-// cross-platform style declaration (e.g. `gap: 2`, `bg: surface`, `radius: md`).
-// The compiler resolves it to concrete inline style on the facet's root element.
-type StyleProp struct {
-	Key string
-	Val string
-	Pos Pos
-}
-
-// KindName returns the primitive kind, normalising the zero value to "facet" (so
-// an AST built without an explicit Kind — e.g. in tests — behaves as a facet).
-func (f *Facet) KindName() string {
-	if f.Kind == "" {
-		return "facet"
-	}
-	return f.Kind
-}
-
-// ServerRendered reports whether this primitive renders on the server (its body
-// compiles to an html/template). The client-rendered kinds — vault, media,
-// signal — emit ZERO server template: their content is produced in the browser,
-// which is the architectural guarantee (a compromised server cannot render vault
-// plaintext). See README "primitive taxonomy".
-func (f *Facet) ServerRendered() bool {
-	switch f.Kind {
-	case "vault", "media", "signal":
-		return false
-	default: // "", facet, feed, stream, lifecycle, pipe
-		return true
-	}
-}
-
-// RenderBody returns the active render node stream for the facet — Looks for
-// server-rendered kinds, Client for client-rendered kinds. Compiler passes that
-// are render-target-agnostic (field-ref + composition checks) walk this.
-func (f *Facet) RenderBody() []Node {
-	if f.ServerRendered() {
-		return f.Looks
-	}
-	return f.Client
-}
-
-// Who is the `who:` authorization block (audit C2). v0 uses named policies the
-// app implements, not inline expressions. It is recorded in the manifest so the
-// access-control surface is auditable (`fct audit`).
-type Who struct {
-	Require    []string    // policy names that must all pass to view the facet
-	Redactions []Redaction // fields stripped from the data before render
-}
-
-// Redaction strips Field before render — unconditionally if UnlessPolicy is "",
-// otherwise unless that policy passes.
-type Redaction struct {
-	Field        string
-	UnlessPolicy string
-}
-
-// HasWho reports whether the facet declares any authorization.
-func (f *Facet) HasWho() bool { return len(f.Who.Require) > 0 || len(f.Who.Redactions) > 0 }
-
-// Field is one entry in the `what:` block. A plain field is an input prop
-// (`name: Type`); a computed field (`name: Type = expr` or `name = expr`)
-// carries Expr, a value derived from earlier fields and resolved at render time
-// — the caller never supplies it. For computed fields Type may be empty.
-type Field struct {
+// EntityField is one column of an entity.
+type EntityField struct {
 	Name string
-	Type string // int|float|str|bool, or a custom Ident (capitalized); "" allowed when computed
-	Expr string // computed-field expression; "" = a plain input prop
-	Pos  Pos
+	Type string // int | text | bool | <EntityName> (a relation, stored as the row id)
+	Line int
 }
 
-// IsComputed reports whether the field is a derived (`=`) value rather than an
-// input prop.
-func (f Field) IsComputed() bool { return f.Expr != "" }
-
-// IsCustomType reports whether Type names a backend domain type (capitalized),
-// as opposed to a builtin. Used for facet-id derivation.
-func (f Field) IsCustomType() bool {
-	if f.Type == "" {
-		return false
-	}
-	c := f.Type[0]
-	return c >= 'A' && c <= 'Z'
-}
-
-// DerivedFacetID returns the facet-id pattern. If FacetID is set it wins;
-// otherwise it derives from the first custom-typed field
-// (`Name:field:{field.id}`), falling back to a singleton id of just Name.
-func (f *Facet) DerivedFacetID() string {
-	if f.FacetID != "" {
-		return f.FacetID
-	}
-	for _, fld := range f.Fields {
-		if fld.IsCustomType() && !fld.IsComputed() {
-			return f.Name + ":" + fld.Name + ":{" + fld.Name + ".id}"
-		}
-	}
-	return f.Name
-}
-
-// When is one `when <events>:` handler block. The events it names are both the
-// subscription and the trigger; there is no separate subscribe block.
-type When struct {
-	Events    []string
-	Mutations []Mutation
-	Pos       Pos
-}
-
-// Mutation is one line inside a `when` block.
-type Mutation struct {
-	Op     string // replace|append|prepend|remove|replace_all
-	Target string // child facet name; "" for replace_all
-	With   string // expr after `with`; "" if absent
-	Pos    Pos
-}
-
-// Action is one named handler in the `actions:` block — a reactive "controller
-// method": a name plus the signal mutations it performs when an element's bound
-// DOM event fires. Actions are event-agnostic (the element's `on:<event>="name"`
-// attribute chooses the trigger), so one action is reusable across elements and
-// events. It is the client analogue of When: When maps a *server* event to data
-// mutations; Action maps a *client* event to *signal* mutations, applied locally
-// with zero round-trip (see docs/REACTIVITY.md, Brick 3).
-type Action struct {
+// State is one `state name: Type = default [@client|@server]` cell. Scalar
+// server state is per-session; client state is per-browser-instance.
+type State struct {
 	Name      string
-	Mutations []Assign
-	Pos       Pos
+	Type      string
+	Default   Expr
+	Placement string
+	Line      int
 }
 
-// Assign is one `signal = expr` line inside an action: set state signal Target to
-// the value of Expr. Target must be a declared `state:` signal — `what:` fields
-// are server-authoritative and cannot be mutated on the client.
+// Derive is a named, read-only computed value: `derive name: Type = expr` over
+// states, entities, aggregates, and earlier derives. Placement is never authored
+// — a derivation is pure, so the compiler inlines it wherever it is read and the
+// value is recomputed in whatever domain renders it (the client mirrors every
+// server cell it can see, so derivations cost zero round-trips). It is a
+// compile-time abstraction: DRY at the source, free at runtime.
+type Derive struct {
+	Name string
+	Type string
+	Expr Expr
+	Line int
+}
+
+// Policy is a named predicate over the actor, action params, and state. It gates
+// actions (`requires`) and can hide UI; it is always enforced on the server.
+type Policy struct {
+	Name string
+	Expr Expr
+	Line int
+}
+
+// Action is the only thing that may mutate state. Placement is derived from its
+// write set; `Requires` lists policies that must pass before it runs.
+type Action struct {
+	Name     string
+	Params   []Param
+	Requires []string
+	Body     []Stmt
+	Line     int
+}
+
+// Param is one typed action parameter.
+type Param struct {
+	Name string
+	Type string
+}
+
+// Job is a scheduled, server-authoritative invocation of a zero-argument action
+// — the language's background/workflow primitive. It runs on a fixed interval
+// (`every Ns`) and/or once at startup (`on start`), driven by the runtime rather
+// than a user gesture, under the synthetic `system` actor.
+type Job struct {
+	Name    string
+	Action  string
+	Every   int  // seconds between runs; 0 = no interval
+	OnStart bool // also run once when the server starts
+	Line    int
+}
+
+// ── action statements ────────────────────────────────────────────────────────
+
+// Stmt is one line in an action body.
+type Stmt interface{ stmt() }
+
+// Assign sets a state cell: `target = expr`.
 type Assign struct {
 	Target string
-	Expr   string
-	Pos    Pos
+	Value  Expr
+	Line   int
 }
 
-// Effect is one `on <deps>: <action>` line in the `effects:` block — a reactive
-// side-effect: when any dependency signal changes, the named action runs. It is
-// the imperative complement to a derived value (which is a pure function of
-// signals): an effect can accumulate history, mirror one signal into another, or
-// (later, Tier-2) drive WASM compute. To stay loop-free, effects run once per
-// event cycle and do not re-trigger one another (see docs/REACTIVITY.md, Brick 7).
-type Effect struct {
-	Deps   []string
-	Action string
-	Pos    Pos
+// Add inserts a row into an entity: `add Entity { f: expr, ... }`. The server
+// assigns the row's id.
+type Add struct {
+	Entity string
+	Fields []FieldInit
+	Line   int
 }
 
-// Query is one line in the `query:` block — `name from "url"`: an async fetch of
-// a server resource exposed to the client reactive layer as a structured value
-// `name` with fields `loading` (bool), `error` (bool) and `data` (the decoded
-// JSON body). The runtime starts the fetch on mount and flushes the bound DOM
-// when it resolves, so `{name.data.title}` / `hidden="{name.loading}"` light up
-// without a round-trip per render. It is the client analogue of a `what:` field
-// the server would otherwise have to supply (see docs/REACTIVITY.md, Brick 11).
-type Query struct {
+// FieldInit is one `name: expr` in an `add`.
+type FieldInit struct {
 	Name string
-	URL  string
-	Pos  Pos
+	Expr Expr
 }
 
-// ── Looks nodes (flat) ──────────────────────────────────────────────────────
+// Set updates one field of an entity row by id: `set Entity(key).field = expr`.
+type Set struct {
+	Entity string
+	Key    Expr
+	Field  string
+	Value  Expr
+	Line   int
+}
 
-// Node is a looks-body element.
+// Remove deletes an entity row by id: `remove Entity(key)`.
+type Remove struct {
+	Entity string
+	Key    Expr
+	Line   int
+}
+
+// Clear empties an entity: `clear Entity`.
+type Clear struct {
+	Entity string
+	Line   int
+}
+
+func (Assign) stmt() {}
+func (Add) stmt()    {}
+func (Set) stmt()    {}
+func (Remove) stmt() {}
+func (Clear) stmt()  {}
+
+// View is one `view Name [at "/path"]:` projection of state into a UI node tree.
+// A view is a page, served at its route; Path defaults are filled in by the
+// compiler (the first view answers "/").
+type View struct {
+	Name string
+	Path string // "" until resolved; URL the page is served at
+	Root []Node
+	Line int
+}
+
+// ── view nodes ──────────────────────────────────────────────────────────────
+
+// Node is a UI node. The set is small and target-neutral.
 type Node interface{ node() }
 
-// Text is literal template text (raw HTML, whitespace, indentation).
-type Text struct{ S string }
+// Box is a layout container.
+type Box struct{ Children []Node }
 
-// Interp is a `{expr}` interpolation hole.
-type Interp struct {
-	Expr string
-	Pos  Pos
+// Text is a text leaf of literal and interpolated segments.
+type Text struct{ Segs []Seg }
+
+// Seg is one piece of a Text: literal (Expr == nil) or interpolation.
+type Seg struct {
+	Lit  string
+	Expr Expr
 }
 
-// Ctrl is a control marker. Op is one of: if, for, else, end.
-//   - if:  Expr holds the condition
-//   - for: Var + Iter hold `for Var in Iter`; Virtual/Height carry an optional
-//     `virtual <px>` modifier that windows a large reactive list (render only the
-//     rows in the scroll viewport) — see docs/REACTIVITY.md.
-//   - else/end: no operands
-type Ctrl struct {
-	Op      string
-	Expr    string
-	Var     string
-	Iter    string
-	Virtual bool
-	Height  int
-	Pos     Pos
+// Button emits an action (with evaluated argument expressions) when pressed.
+type Button struct {
+	Label  string
+	Action string
+	Args   []Expr
 }
 
-// Child is a child-facet call inside a looks body. Self-closing
-// (<Avatar user="{user}"/>) has Children == nil. Block form
-// (<Card title="x"> …content… </Card>) puts the content in Children, which the
-// child renders at its default `slot:`. Content under a `fill name:` line goes
-// to Fills[name] instead, targeting the child's matching `slot name:`. The
-// compiler lowers each to a nested template call, so the child's data-facet-id
-// nests inside the parent's.
-type Child struct {
-	Name     string // the child facet's name (capitalized)
-	Props    []Prop
-	Children []Node            // default-slot content (parent scope); nil if none
-	Fills    map[string][]Node // named-slot content: slot name → nodes (parent scope)
-	Pos      Pos
+// For iterates an entity/list, rendering Body once per row with Var bound. It is
+// the query/feed primitive: an optional `where <cond>` keeps only matching rows,
+// `by <field> [desc|asc]` orders them, and `limit <n>` caps them — applied in
+// that order (filter, then sort, then cap).
+type For struct {
+	Var   string
+	Coll  string
+	Body  []Node
+	Where Expr   // optional row filter; nil = all rows
+	Order string // sort field; "" = insertion order
+	Desc  bool   // true = descending (newest/highest first)
+	Limit int    // optional max rows; 0 = unlimited
 }
 
-// Slot is a `slot:` (default) or `slot name:` (named) insertion point in a
-// facet's looks where a parent's block-form content is injected, with optional
-// default content shown when the facet is used self-closing / empty or the
-// matching slot is unfilled. Name is "" for the default slot.
-type Slot struct {
-	Name    string
-	Default []Node
-	Pos     Pos
+// If renders Body only when Cond is truthy.
+type If struct {
+	Cond Expr
+	Body []Node
 }
 
-// Prop is one attribute on a child-facet call. If IsExpr, Expr holds the FDL
-// expression from value="{expr}"; otherwise Literal holds the plain string.
-type Prop struct {
-	Name    string // the child's field name being set
-	Expr    string
-	Literal string
-	IsExpr  bool
+// Input is a text control two-way bound to a client state cell.
+type Input struct {
+	Bind        string
+	Placeholder string
 }
 
+// Link is navigation to another page: `link "label" -> "/path"`. It renders an
+// anchor; following it loads that page (server-rendered).
+type Link struct {
+	Label string
+	Path  string
+}
+
+func (Box) node()    {}
 func (Text) node()   {}
-func (Interp) node() {}
-func (Ctrl) node()   {}
-func (Child) node()  {}
-func (Slot) node()   {}
+func (Button) node() {}
+func (For) node()    {}
+func (If) node()     {}
+func (Input) node()  {}
+func (Link) node()   {}
 
-// LooksText concatenates all literal Text of a looks body — handy in tests.
-func LooksText(nodes []Node) string {
-	var b strings.Builder
-	for _, n := range nodes {
-		if t, ok := n.(Text); ok {
-			b.WriteString(t.S)
-		}
-	}
-	return b.String()
+// ── expressions ─────────────────────────────────────────────────────────────
+
+// Expr is a pure expression, evaluated identically on every executor from its
+// serialized IR form.
+type Expr interface{ expr() }
+
+// Lit is an int, text, or bool literal.
+type Lit struct {
+	Kind string
+	Val  any
 }
+
+// Ref is a reference to a state cell, param, item var, or the builtin `actor`.
+type Ref struct{ Name string }
+
+// Get is member access: `obj.field` (e.g. a list item's column).
+type Get struct {
+	Obj   Expr
+	Field string
+}
+
+// EntityGet looks up one field of an entity row by id: `Entity(key).field`.
+type EntityGet struct {
+	Entity string
+	Key    Expr
+	Field  string
+}
+
+// Agg is an aggregate over a whole entity collection: `count(Entity)` (row
+// count) or `sum(Entity.field)` (numeric total of a field). It reads the
+// collection, so it tracks a dependency on that entity.
+type Agg struct {
+	Op    string // count | sum
+	Coll  string
+	Field string // sum only
+}
+
+// Call is an effectful builtin invocation — `now()` (server clock, unix seconds)
+// or `rand(n)` (server RNG, 0..n). These are the language's "service" surface:
+// impure, so the placement calculus pins any action that uses one to the server
+// (the authority owns nondeterminism, so every client agrees). They are rejected
+// in pure contexts (derives, policies, views).
+type Call struct {
+	Name string
+	Args []Expr
+}
+
+// Bin is a binary operation.
+type Bin struct {
+	Op   string
+	L, R Expr
+}
+
+// Un is a unary operation (! or -).
+type Un struct {
+	Op string
+	X  Expr
+}
+
+func (Lit) expr()       {}
+func (Ref) expr()       {}
+func (Get) expr()       {}
+func (EntityGet) expr() {}
+func (Agg) expr()       {}
+func (Call) expr()      {}
+func (Bin) expr()       {}
+func (Un) expr()        {}

@@ -1,0 +1,56 @@
+# Inbox — one file that exercises the whole language at once:
+#
+#   relations   Message.to is a User (stored as the user's id; read back across
+#               the relation with a nested lookup, `User(m.to).name`)
+#   services    send() stamps `sent: now()` — an effectful builtin, so the
+#               compiler pins send() to the server authority automatically
+#   jobs        `job cleanup every 1h -> purge` runs a server action on a timer,
+#               with no user in the loop, under the synthetic `system` actor
+#   derives     userCount / messageCount are named aggregates over the entities
+#   API         every server action + entity is also a JSON projection, for free:
+#                 GET  /api                 the application contract
+#                 GET  /api/Message         the durable rows
+#                 POST /api/send  {"args":[1,"hi"]}
+#
+# As always, nothing here says "frontend" or "backend" — placement is computed.
+
+app Inbox:
+    entity User:
+        id: int
+        name: text
+
+    entity Message:
+        id: int
+        to: User
+        body: text
+        sent: int
+
+    state newUser: text = "" @client
+    state draft: text = "" @client
+
+    derive userCount: int = count(User)
+    derive messageCount: int = count(Message)
+
+    action addUser(name: text):
+        add User { name: name }
+
+    action send(to: int, body: text):
+        add Message { to: to, body: body, sent: now() }
+
+    action purge:
+        clear Message
+
+    job cleanup every 1h -> purge
+
+    view Main:
+        box:
+            text "{userCount} users · {messageCount} messages"
+            box:
+                input bind newUser placeholder "new user name"
+                button "add user" -> addUser(newUser)
+            box:
+                input bind draft placeholder "message to user #1"
+                button "send to #1" -> send(1, draft)
+            for m in Message where m.to == 1 by sent desc limit 20:
+                box:
+                    text "to {User(m.to).name}: {m.body}"
