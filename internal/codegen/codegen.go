@@ -176,14 +176,16 @@ func Generate(facets []*ast.Facet) (*Output, error) {
 	for _, f := range facets {
 		var bindings []bindingEntry
 		var lists []listEntry
+		var conds []condEntry
 		if f.ServerRendered() {
-			tmpl, aux, binds, ls, err := genTemplate(f)
+			tmpl, aux, binds, ls, cs, err := genTemplate(f)
 			if err != nil {
 				return nil, fmt.Errorf("%s %s: %w", f.KindName(), f.Name, err)
 			}
 			out.Templates[f.Name] = tmpl
 			bindings = binds
 			lists = ls
+			conds = cs
 			for k, v := range aux {
 				out.Aux[k] = v
 			}
@@ -195,7 +197,7 @@ func Generate(facets []*ast.Facet) (*Output, error) {
 			// produce vault plaintext — there is no template to render it).
 			return nil, fmt.Errorf("%s %s: client-rendered primitives emit no server template (unexpected looks: body)", f.KindName(), f.Name)
 		}
-		man.Facets = append(man.Facets, genManifest(f, bindings, lists))
+		man.Facets = append(man.Facets, genManifest(f, bindings, lists, conds))
 	}
 	b, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -207,7 +209,7 @@ func Generate(facets []*ast.Facet) (*Output, error) {
 
 // ── template generation ─────────────────────────────────────────────────────
 
-func genTemplate(f *ast.Facet) (string, map[string]string, []bindingEntry, []listEntry, error) {
+func genTemplate(f *ast.Facet) (string, map[string]string, []bindingEntry, []listEntry, []condEntry, error) {
 	ctx := &genCtx{facet: f.Name, aux: map[string]string{}, state: stateInit(f), derived: clientDerived(f), queries: queryNames(f)}
 	// Computed fields lower to template variables defined once at the top, in
 	// declaration order so a later one can use an earlier one. References to them
@@ -215,22 +217,23 @@ func genTemplate(f *ast.Facet) (string, map[string]string, []bindingEntry, []lis
 	// a computed expression are baked to their initial value for the first paint.
 	defs, computed, err := emitComputed(f.Fields, ctx.state)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
-	// Reactive lists are lifted out before emit: each becomes an <fa-for> host the
-	// runtime fills, with the loop body captured as a client item template.
-	looks, lists := extractLists(f.Looks, ctx.state)
+	// Reactive control flow is lifted out before emit: a reactive list becomes an
+	// <fa-for> host and a reactive `if` an <fa-if> region, each with its body
+	// captured as a client template the runtime renders/reconciles.
+	looks, lists, conds := extractRegions(f.Looks, ctx)
 	body, err := emitNodes(looks, computed, ctx)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
 	attr, err := facetIDAttr(f)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
 	css, err := resolveStyleBlock(f.Style)
 	if err != nil {
-		return "", nil, nil, nil, fmt.Errorf("facet %s: %w", f.Name, err)
+		return "", nil, nil, nil, nil, fmt.Errorf("facet %s: %w", f.Name, err)
 	}
 	// Rewrite client event wirings `on:<event>="action"` to data attributes the
 	// runtime delegates on (Brick 4); data-* is inert HTML, so html/template never
@@ -240,7 +243,7 @@ func genTemplate(f *ast.Facet) (string, map[string]string, []bindingEntry, []lis
 	body = wireBindAttrs(body)
 	// data-facet-id and the resolved style: block both attach to the root element.
 	body = injectRootStyle(injectFacetID(body, attr), css)
-	return defs + body, ctx.aux, ctx.bindings, lists, nil
+	return defs + body, ctx.aux, ctx.bindings, lists, conds, nil
 }
 
 // stateInit maps each state signal to its initial-value expression — the lookup
@@ -468,6 +471,119 @@ func emitNodes(nodes []ast.Node, initial []string, ctx *genCtx) (string, error) 
 		}
 	}
 	return b.String(), nil
+}
+
+// emitView walks the (region-lifted) looks stream and emits a fill-renderable
+// CLIENT view of the facet: the same DOM with the same reactive markers
+// (data-fa-bind / data-fa-bind-attr / on:* / bind:*) as the server template, but
+// with non-reactive interps as fill `{expr}` holes (filled from props when the
+// facet is instantiated client-side) and reactive bindings emitted EMPTY (the
+// per-instance hydrate pass fills them from the signal store). Child calls become
+// {cmp …} tokens. This is what lets a facet be instantiated in the browser inside
+// a reactive region or list item. Binding ids are assigned in the SAME order as
+// emitNodes (it walks the same nodes with the same predicates), so the view's
+// markers line up with the manifest's bindings — guarded by an alignment test.
+func emitView(nodes []ast.Node, ctx *genCtx) string {
+	var b strings.Builder
+	var pendingAttr string
+	var pendingMarkers []string
+	skipQuote := false
+	inTag := false
+	bind := 0
+	track := func(s string) {
+		for i := 0; i < len(s); i++ {
+			if s[i] == '<' {
+				inTag = true
+			} else if s[i] == '>' {
+				inTag = false
+			}
+		}
+	}
+	for i := 0; i < len(nodes); i++ {
+		switch v := nodes[i].(type) {
+		case ast.Text:
+			s := v.S
+			if skipQuote {
+				if strings.HasPrefix(s, `"`) {
+					s = s[1:]
+				}
+				skipQuote = false
+			}
+			if len(pendingMarkers) > 0 {
+				if gt := strings.IndexByte(s, '>'); gt >= 0 {
+					s = s[:gt] + ` data-fa-bind-attr="` + strings.Join(pendingMarkers, " ") + `"` + s[gt:]
+					pendingMarkers = nil
+				}
+			}
+			if attr, ok := attrBindingAt(nodes, i, ctx); ok {
+				m := attrOpenRe.FindString(s)
+				head := s[:len(s)-len(m)]
+				b.WriteString(head)
+				track(head)
+				pendingAttr = attr
+				break
+			}
+			b.WriteString(s)
+			track(s)
+
+		case ast.Interp:
+			if pendingAttr != "" {
+				attr := pendingAttr
+				pendingAttr = ""
+				pendingMarkers = append(pendingMarkers, fmt.Sprintf("b%d", bind))
+				bind++
+				skipQuote = true
+				if !isBooleanAttr(attr) {
+					b.WriteString(attr + `=""`) // neutral; the hydrate pass sets it from signals
+				}
+				break
+			}
+			if !inTag && ctx.reactiveRoots(v.Expr) {
+				b.WriteString(`<span data-fa-bind="b` + strconv.Itoa(bind) + `"></span>`)
+				bind++
+				break
+			}
+			// In-tag-but-not-pure reactive interp, or a non-reactive (prop/data)
+			// interp: a fill hole filled from the instance's prop scope. Neither
+			// consumes a binding id (emitNodes does not record one for these either),
+			// keeping ids aligned with the manifest.
+			b.WriteString("{" + v.Expr + "}")
+
+		case ast.Ctrl:
+			switch v.Op {
+			case "if":
+				b.WriteString("{if " + v.Expr + "}")
+			case "for":
+				b.WriteString("{for " + v.Var + " in " + v.Iter + "}")
+			case "else":
+				b.WriteString("{else}")
+			case "end":
+				b.WriteString("{end}")
+			}
+
+		case ast.Child:
+			b.WriteString(childCmpToken(v))
+
+		case ast.Slot:
+			// Slot content is not instantiated client-side (v1) — emit nothing.
+		}
+	}
+	return b.String()
+}
+
+// genView builds a facet's compiled client view (for client-side instantiation).
+// It mirrors genTemplate's front half (same ctx, same region lifting) so the
+// view's binding ids align with the manifest, then lowers on:/bind: wirings and
+// injects the client facet-id (its `{…}` holes stay fill holes the runtime fills
+// from props, giving each instance a stable id).
+func genView(f *ast.Facet) string {
+	ctx := &genCtx{facet: f.Name, aux: map[string]string{}, state: stateInit(f), derived: clientDerived(f), queries: queryNames(f)}
+	looks, _, _ := extractRegions(f.Looks, ctx)
+	body := emitView(looks, ctx)
+	body = wireHandlerAttrs(body)
+	body = wireBindAttrs(body)
+	body = injectFacetID(body, ` data-facet-id="`+f.DerivedFacetID()+`"`)
+	return body
 }
 
 // walkChildren visits every ast.Child in a node stream, including those nested
@@ -751,9 +867,12 @@ type facetEntry struct {
 	FacetID string `json:"facet_id"`
 	// Server-rendered kinds carry a Template (the html/template file); client-
 	// rendered kinds (vault/media/signal) carry Client (the raw render body the
-	// browser interprets) and NO template — the structural guarantee.
+	// browser interprets) and NO template — the structural guarantee. View is the
+	// fill-renderable client view used to instantiate a server-rendered facet in the
+	// browser (inside a reactive region or list item) — components in regions.
 	Template string `json:"template,omitempty"`
 	Client   string `json:"client,omitempty"`
+	View     string `json:"view,omitempty"`
 	// Per-kind declarative extras (recorded; runtime semantics staged).
 	Order    string      `json:"order,omitempty"`
 	Throttle string      `json:"throttle,omitempty"`
@@ -770,6 +889,7 @@ type facetEntry struct {
 	Derived  []derivedEntry `json:"derived,omitempty"`
 	Bindings []bindingEntry `json:"bindings,omitempty"`
 	Lists    []listEntry    `json:"lists,omitempty"`
+	Regions  []condEntry    `json:"regions,omitempty"`
 	// Brick 3 — named client actions and the DOM events wired to them. Actions are
 	// the event-agnostic signal mutations; Handlers tie an element's `on:<event>`
 	// to an action by name. The Tier-1 runtime (Brick 4) attaches each handler's
@@ -808,10 +928,23 @@ type derivedEntry struct {
 // syntax, rendered by the runtime's fill); the runtime keys items by id (else
 // index) and reconciles the <fa-for> host's children when the signal changes.
 type listEntry struct {
-	ID     string `json:"id"`
-	Signal string `json:"signal"`
-	Var    string `json:"var"`
-	Item   string `json:"item"`
+	ID      string `json:"id"`
+	Signal  string `json:"signal"`
+	Var     string `json:"var"`
+	Item    string `json:"item"`
+	Virtual bool   `json:"virtual,omitempty"`
+	Height  int    `json:"height,omitempty"`
+}
+
+// condEntry is one reactive `if` region (structural control flow): Cond is the
+// condition expression, Body the then-branch as a client template, Els the
+// optional else-branch. The runtime mounts the matching branch into the <fa-if>
+// host and unmounts the other when Cond's value changes.
+type condEntry struct {
+	ID   string `json:"id"`
+	Cond string `json:"cond"`
+	Body string `json:"body"`
+	Els  string `json:"els,omitempty"`
 }
 
 // bindingEntry is one edge of the dependency graph: an interpolation in the
@@ -1014,7 +1147,7 @@ type mutationEntry struct {
 	With   string `json:"with,omitempty"`
 }
 
-func genManifest(f *ast.Facet, bindings []bindingEntry, lists []listEntry) facetEntry {
+func genManifest(f *ast.Facet, bindings []bindingEntry, lists []listEntry, conds []condEntry) facetEntry {
 	e := facetEntry{
 		Name:     f.Name,
 		Kind:     f.KindName(),
@@ -1031,11 +1164,13 @@ func genManifest(f *ast.Facet, bindings []bindingEntry, lists []listEntry) facet
 		e.Derived = genDerived(f, clientDerived(f))
 		e.Bindings = bindings // collected during emitNodes (shared ids)
 		e.Lists = lists       // lifted out before emit
+		e.Regions = conds     // reactive if-regions lifted out before emit
 		e.Actions = genActions(f)
 		e.Handlers = scanHandlers(f)
 		e.Effects = genEffects(f)
 		e.Inputs = scanInputs(f)
 		e.Queries = genQueries(f)
+		e.View = genView(f) // fill-renderable client view for client-side instantiation
 	} else {
 		e.Client = clientBodyText(f.Client)
 	}
@@ -1110,48 +1245,95 @@ func genDerived(f *ast.Facet, derived map[string]bool) []derivedEntry {
 	return out
 }
 
-// extractLists rewrites the looks stream for reactive lists (Brick 6): each
-// `for <v> in <signal>` over a list-valued signal is replaced by an empty
-// <fa-for> host the runtime fills, and the loop body is captured as a client item
-// template. A `for` over server data (a what: field) is left as-is — it ranges on
-// the server as before. Nested control inside the body is preserved in the
-// captured template; a reactive list inside another reactive list is not unrolled
-// here (v1 renders list items with the client fill engine, which handles nested
-// plain-data {for}/{if} but not nested signals).
-func extractLists(nodes []ast.Node, state map[string]string) ([]ast.Node, []listEntry) {
+// extractRegions rewrites the looks stream for reactive control flow: a reactive
+// `for` (a list whose iterable is a signal/derived/query) becomes an empty
+// <fa-for> host (Brick 6), and a reactive `if` (a condition over reactive roots)
+// becomes an empty <fa-if> host (structural control flow) — both client-rendered
+// and reconciled by the runtime, which is what makes them *mount/unmount* rather
+// than the show-binding shape. Control over server data (a what: field) is left
+// as a server `{{if}}`/`{{range}}` as before. The lifted body is captured as a
+// client template (clientBodyText); nested control inside is rendered by the fill
+// engine — a reactive region re-renders wholesale when its deps change, so nested
+// data- AND signal-driven {if}/{for} stay correct (the top-level list still gets
+// keyed reconciliation). matchEnd/splitElse delimit the region.
+func extractRegions(nodes []ast.Node, ctx *genCtx) ([]ast.Node, []listEntry, []condEntry) {
 	var out []ast.Node
 	var lists []listEntry
+	var conds []condEntry
 	for i := 0; i < len(nodes); i++ {
 		c, ok := nodes[i].(ast.Ctrl)
-		if !ok || c.Op != "for" {
+		if !ok {
 			out = append(out, nodes[i])
 			continue
 		}
-		if _, isSignal := state[c.Iter]; !isSignal {
-			out = append(out, nodes[i]) // server-data loop — unchanged
-			continue
+		switch {
+		case c.Op == "for" && ctx.reactiveRoots(c.Iter):
+			j := matchEnd(nodes, i)
+			id := fmt.Sprintf("l%d", len(lists))
+			lists = append(lists, listEntry{ID: id, Signal: c.Iter, Var: c.Var, Item: clientBodyText(nodes[i+1 : j]), Virtual: c.Virtual, Height: c.Height})
+			style := "display:contents"
+			if c.Virtual {
+				// A windowed list is its own scroll container; it fills the height its
+				// parent gives it (the app sizes the parent), and the runtime sets a
+				// relative sizer inside so the scrollbar reflects the full list.
+				style = "display:block;overflow:auto;height:100%"
+			}
+			out = append(out, ast.Text{S: `<fa-for data-fa-list="` + id + `" style="` + style + `"></fa-for>`})
+			i = j
+		case c.Op == "if" && ctx.reactiveRoots(c.Expr):
+			j := matchEnd(nodes, i)
+			then, els := splitElse(nodes[i+1 : j])
+			id := fmt.Sprintf("r%d", len(conds))
+			conds = append(conds, condEntry{ID: id, Cond: c.Expr, Body: clientBodyText(then), Els: clientBodyText(els)})
+			out = append(out, ast.Text{S: `<fa-if data-fa-region="` + id + `" style="display:contents"></fa-if>`})
+			i = j
+		default:
+			out = append(out, nodes[i]) // server-rendered control — unchanged
 		}
-		// Reactive list: find the matching end, tracking nested if/for depth.
-		depth, j := 1, i+1
-		for ; j < len(nodes); j++ {
-			if cc, ok := nodes[j].(ast.Ctrl); ok {
-				switch cc.Op {
-				case "for", "if":
-					depth++
-				case "end":
-					depth--
+	}
+	return out, lists, conds
+}
+
+// matchEnd returns the index of the `end` Ctrl that closes the control marker at
+// nodes[i], tracking nested if/for depth.
+func matchEnd(nodes []ast.Node, i int) int {
+	depth, j := 1, i+1
+	for ; j < len(nodes); j++ {
+		if cc, ok := nodes[j].(ast.Ctrl); ok {
+			switch cc.Op {
+			case "for", "if":
+				depth++
+			case "end":
+				depth--
+			}
+		}
+		if depth == 0 {
+			break
+		}
+	}
+	return j
+}
+
+// splitElse splits an if-region body at its top-level `else` (depth 0), returning
+// the then-branch and else-branch node streams. A nested if's else (depth > 0)
+// belongs to that inner if, not this one.
+func splitElse(body []ast.Node) (then, els []ast.Node) {
+	depth := 0
+	for k, n := range body {
+		if cc, ok := n.(ast.Ctrl); ok {
+			switch cc.Op {
+			case "for", "if":
+				depth++
+			case "end":
+				depth--
+			case "else":
+				if depth == 0 {
+					return body[:k], body[k+1:]
 				}
 			}
-			if depth == 0 {
-				break // nodes[j] is the matching end
-			}
 		}
-		id := fmt.Sprintf("l%d", len(lists))
-		lists = append(lists, listEntry{ID: id, Signal: c.Iter, Var: c.Var, Item: clientBodyText(nodes[i+1 : j])})
-		out = append(out, ast.Text{S: `<fa-for data-fa-list="` + id + `" style="display:contents"></fa-for>`})
-		i = j // skip past the matching end (outer i++ advances to j+1)
 	}
-	return out, lists
+	return body, nil
 }
 
 // genState records the facet's local reactive values (signals) for the manifest.
@@ -1296,8 +1478,34 @@ func clientBodyText(nodes []ast.Node) string {
 			case "end":
 				b.WriteString("{end}")
 			}
+		case ast.Child:
+			// A child-facet call inside a client-rendered body (a reactive region or
+			// list item) becomes a {cmp …} token the runtime resolves by rendering the
+			// child facet's compiled client view with the props evaluated in this scope
+			// — client-side facet instantiation (components inside loops/conditionals).
+			b.WriteString(childCmpToken(v))
 		}
 	}
+	return b.String()
+}
+
+// childCmpToken encodes a child-facet call as a fill `{cmp Name|field=expr|…}`
+// token. Props are pipe-separated `field=expr` pairs (a literal prop is quoted, so
+// the runtime's evaluator yields the string); the runtime evaluates each expr in
+// the current scope — so an OBJECT prop (`item={item}`) passes by reference, not by
+// stringification. Block-form slot content is not rendered client-side (v1).
+func childCmpToken(c ast.Child) string {
+	var b strings.Builder
+	b.WriteString("{cmp " + c.Name)
+	for _, p := range c.Props {
+		b.WriteString("|" + p.Name + "=")
+		if p.IsExpr {
+			b.WriteString(p.Expr)
+		} else {
+			b.WriteString(strconv.Quote(p.Literal))
+		}
+	}
+	b.WriteString("}")
 	return b.String()
 }
 

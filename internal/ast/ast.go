@@ -229,14 +229,18 @@ type Interp struct {
 
 // Ctrl is a control marker. Op is one of: if, for, else, end.
 //   - if:  Expr holds the condition
-//   - for: Var + Iter hold `for Var in Iter`
+//   - for: Var + Iter hold `for Var in Iter`; Virtual/Height carry an optional
+//     `virtual <px>` modifier that windows a large reactive list (render only the
+//     rows in the scroll viewport) — see docs/REACTIVITY.md.
 //   - else/end: no operands
 type Ctrl struct {
-	Op   string
-	Expr string
-	Var  string
-	Iter string
-	Pos  Pos
+	Op      string
+	Expr    string
+	Var     string
+	Iter    string
+	Virtual bool
+	Height  int
+	Pos     Pos
 }
 
 // Child is a child-facet call inside a looks body. Self-closing

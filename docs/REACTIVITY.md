@@ -173,14 +173,52 @@ engine at once.
   just Brick-8 show bindings and a Brick-4 text binding over `name.data.…`.
   Server-authoritative by transport (a normal same-origin endpoint). AST `Query`,
   `parseQueries`, `checkQueries`, manifest `queries`. `examples/forecast.fct`.
-- **Later (separate layer, not v1):** reactive *structural* `{if}`/`{for}` over
-  signals beyond the show-binding shape; offline / local-first / CRDT conflict
-  resolution.
+## Enterprise core (done — parity with Svelte/Solid on these)
 
-## Hard parts (engineering, named honestly)
+These were the "hard parts." They are no longer aspirational; they ship and are
+tested (`runtime/reactive_test.js`, `internal/{codegen,parser}`).
 
-- The dependency-graph compiler with **correct invalidation** is the core. The
-  skeleton exists in `checkComputed`.
-- **Keyed list reconciliation** is where every fine-grained framework bleeds.
-- **Offline + server-authoritative** are in genuine tension; that's a deliberate
-  later layer, not bolted into the reactive core.
+- **Fine-grained invalidation. ✅** The dependency graph compiled into the manifest
+  now *drives dispatch*, not just records it. On an event the runtime diffs the
+  signal store once, expands the changed signals through the derived graph
+  (`dirtySet`), recomputes only the dirty derived values (cached on the instance),
+  and patches only the bindings / attributes / lists / regions / inputs whose roots
+  are dirty (`update`/`invalidate`). No more O(everything)-per-event flush — this is
+  Svelte's compiled dirty-tracking model. Writes within one event are batched (one
+  diff, one dispatch). Full paint (`update(root, null)`) is reserved for hydrate /
+  route / query resolve.
+- **Keyed list reconciliation — real, minimal-move. ✅** `reconcileChildren` keys
+  children, reuses by key (re-rendering only changed HTML), and computes a
+  longest-increasing-subsequence (`longestIncreasing`, Vue 3's `getSequence`) so a
+  reorder/insert moves only the nodes outside the stable run — O(moved), not O(n).
+- **Virtualization. ✅** `for v in list virtual <px>` windows a large list: only the
+  rows intersecting the scroll viewport (+overscan) are in the DOM (`visibleRange`,
+  `reconcileVirtual`), with an honest scrollbar via a sized spacer. A 100k-row feed
+  stays O(viewport). `examples/feed.fct`.
+- **Structural control flow. ✅** A reactive `{if}`/`{for}` (condition/iterable over
+  signals) is lifted to a client region (`<fa-if>`/`<fa-for>`) that truly
+  mounts/unmounts the active branch — not the `hidden` show-binding shape. Fully
+  nestable; an `else:` gives the alternate branch. Control over server data stays a
+  server `{{if}}`/`{{range}}`. `examples/tabs.fct`.
+
+- **Client-side facet instantiation — components inside reactive regions/lists.
+  ✅** A `<Child/>` call inside a reactive `{if}`/`{for}` now renders as a real
+  reactive instance in the browser. The compiler emits a fill-renderable client
+  `view` per facet (`emitView` / `genView` → manifest `view`) whose binding ids are
+  pinned to align with the server template's manifest bindings
+  (`TestClientViewBindingIDsAlign`); a child call captured in a region/list body
+  becomes a `{cmp Name|field=expr|…}` token (`childCmpToken`). At render time `fill`
+  resolves the token by evaluating each prop in the parent scope — so **object props
+  pass by reference, not stringified** — and recursing into the child's view; the
+  per-instance hydrate (`mountFacets`) then brings each instance to life with its
+  own signals, bindings, attribute bindings, and (globally delegated) handlers. So a
+  `<Tweet author="{t.author}"/>` lives inside a reactive — and virtualized — feed,
+  each row its own stateful component, fine-grained. `examples/timeline.fct`.
+  Limitations (honest): a client-instantiated child does not render block-form
+  **slot** content, and a binding that mixes a prop and a signal is not reactive
+  (each binding is pure-prop or pure-signal) — both are follow-ups, not silent gaps.
+
+## Still later (separate layers, not v1)
+
+- Offline / local-first / CRDT conflict resolution — in genuine tension with
+  server-authoritative state; a deliberate later layer, not bolted into the core.

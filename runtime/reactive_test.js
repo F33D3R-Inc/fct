@@ -105,4 +105,75 @@ var sig2 = { count: 5, history: [] }, before2 = { count: 5, history: [] };
 runEffects(m, sig2, before2);
 eq(sig2.history, [], 'effect does not fire when its dep is unchanged');
 
+// ── enterprise reactive engine: fine-grained invalidation + reconciler ───────
+
+var rootsOf = rt.rootsOf, tplRoots = rt.tplRoots, facetGraph = rt.facetGraph,
+  dirtySet = rt.dirtySet, changedKeys = rt.changedKeys,
+  longestIncreasing = rt.longestIncreasing, visibleRange = rt.visibleRange;
+
+// 13. rootsOf: the reactive roots an expression reads (idents not after a dot).
+eq(rootsOf('a + b * c').sort(), ['a', 'b', 'c'], 'rootsOf collects all roots');
+eq(rootsOf('user.data.name'), ['user'], 'rootsOf: path root only, not fields after dot');
+eq(rootsOf('count > 3 && liked').sort(), ['count', 'liked'], 'rootsOf across operators');
+eq(rootsOf('true || x'), ['x'], 'rootsOf drops boolean literals');
+
+// 14. tplRoots: outer deps a client template reads, excluding the loop var.
+eq(tplRoots('<li>{item.name} {q}</li>', 'item'), ['q'], 'tplRoots excludes loop var, keeps outer');
+eq(tplRoots('{if on}<b>{label}</b>{end}', null).sort(), ['label', 'on'], 'tplRoots over if + interp');
+
+// 15. dirtySet: changed signals expand through the derived graph in order.
+var g = facetGraph({
+  derived: [{ name: 'doubled', expr: 'count * 2' }, { name: 'label', expr: 'doubled + tag' }],
+  lists: [], regions: []
+});
+var d1 = dirtySet(g, ['count']);
+eq([!!d1.count, !!d1.doubled, !!d1.label], [true, true, true], 'count dirties doubled and label (chain)');
+var d2 = dirtySet(g, ['tag']);
+eq([!!d2.count, !!d2.doubled, !!d2.label], [false, false, true], 'tag dirties only label, not doubled');
+var d3 = dirtySet(g, ['unrelated']);
+eq([!!d3.doubled, !!d3.label], [false, false], 'unrelated change dirties no derived');
+
+// 16. changedKeys: which signals actually changed between snapshots.
+eq(changedKeys({ a: 1, b: 2, c: 3 }, { a: 1, b: 9, c: 3 }), ['b'], 'changedKeys finds the one changed');
+eq(changedKeys({ a: 1 }, { a: 1 }), [], 'changedKeys empty when nothing changed');
+
+// 17. longestIncreasing (LIS) — the stable run that must NOT move in reconciliation.
+eq(longestIncreasing([0, 1, 2, 3]), [0, 1, 2, 3], 'already ordered → all stable, zero moves');
+eq(longestIncreasing([3, 2, 1, 0]), [3], 'reversed → only one stable (n-1 moves)');
+eq(longestIncreasing([2, 1, 5, 3, 4]), [1, 3, 4], 'LIS picks the longest ordered run');
+eq(longestIncreasing([-1, 0, -1, 1]), [1, 3], 'new items (-1) are never stable, excluded');
+eq(longestIncreasing([]), [], 'LIS of empty');
+
+// 18. visibleRange — windowing math for virtualized lists.
+eq(visibleRange(0, 400, 40, 1000, 4), { start: 0, end: 14 }, 'top of a 1000-row list: 10 visible + overscan');
+eq(visibleRange(4000, 400, 40, 1000, 4), { start: 96, end: 114 }, 'scrolled into the middle: a tight window');
+eq(visibleRange(0, 400, 40, 3, 0), { start: 0, end: 3 }, 'list smaller than viewport: all rows');
+eq(visibleRange(0, 0, 0, 50, 4), { start: 0, end: 50 }, 'no item height → degrade to full render');
+
+// ── client-side facet instantiation: {cmp} renders a child view ──────────────
+
+// A Tweet "view" as the compiler emits it: prop holes ({author}/{text}) plus its
+// own reactive marker (data-fa-bind-attr on the like button) left neutral for
+// hydrate, and a unique data-facet-id with a {…} hole filled per instance.
+rt._register('Tweet', {
+  view: '<article data-facet-id="Tweet:t:{id}"><strong>{author}</strong>' +
+        '<button data-fa-on-click="like" aria-pressed="" data-fa-bind-attr="b0">like</button></article>'
+});
+
+// 19. {cmp} instantiates the child: props (incl. an OBJECT field) are evaluated in
+// the parent scope and passed by name; the child's markers survive for hydrate.
+var row = { id: 7, author: 'Ada', body: 'hello' };
+var out = rt.fill('{cmp Tweet|author=t.author|id=t.id}', { t: row });
+eq(/<strong>Ada<\/strong>/.test(out), true, 'cmp fills a prop from an object field');
+eq(/data-facet-id="Tweet:t:7"/.test(out), true, 'cmp gives the instance a unique id from props');
+eq(/data-fa-on-click="like"/.test(out), true, 'cmp preserves the child handler wiring');
+eq(/data-fa-bind-attr="b0"/.test(out), true, 'cmp preserves the child reactive marker for hydrate');
+
+// 20. a {cmp} inside a list item renders one child per row (the timeline shape).
+var listC = { signal: 'rows', var: 'r', item: '<li>{cmp Tweet|author=r.author|id=r.id}</li>' };
+var items = listItems(listC, { rows: [{ id: 1, author: 'A' }, { id: 2, author: 'B' }] });
+eq(items.length, 2, 'one child instance per row');
+eq(/Tweet:t:1/.test(items[0].html) && /<strong>A<\/strong>/.test(items[0].html), true, 'row 0 → child A with id 1');
+eq(/Tweet:t:2/.test(items[1].html) && /<strong>B<\/strong>/.test(items[1].html), true, 'row 1 → child B with id 2');
+
 console.log('ok - ' + pass + ' assertions passed');

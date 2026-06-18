@@ -4,6 +4,53 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
+## v0.14.4
+
+Make the reactive engine enterprise-grade — parity with Svelte/Solid on the parts
+that matter for building real apps. The four hard pieces, all shipping and tested
+(`runtime/reactive_test.js` — 51 assertions, `internal/codegen/view_test.go`):
+
+### Fine-grained invalidation
+
+- The dependency graph compiled into the manifest now **drives dispatch**, not just
+  records it. On an event the runtime diffs the signal store once, expands the
+  change through the derived graph (`dirtySet`), recomputes only the dirty derived
+  values (cached per instance), and patches only the bindings / attributes / lists /
+  regions / inputs whose roots changed (`update` / `invalidate`). No more
+  recompute-everything-per-event — this is Svelte's compiled dirty-tracking model.
+  Writes within one event are batched into a single dispatch.
+
+### Real keyed list reconciler + virtualization
+
+- `reconcileChildren` keys children, reuses by key, and computes a
+  longest-increasing-subsequence (`longestIncreasing`) so a reorder/insert moves
+  only the nodes outside the stable run — O(moved), not O(n).
+- **`for v in list virtual <px>`** windows a large list: only the rows in the scroll
+  viewport (+overscan) are in the DOM (`visibleRange` / `reconcileVirtual`), with an
+  honest scrollbar via a sized spacer. A 100k-row feed stays O(viewport).
+  `examples/feed.fct`.
+
+### Structural control flow
+
+- A reactive `{if}`/`{for}` (condition/iterable over signals) is lifted to a client
+  region that truly **mounts/unmounts** the active branch — the inactive branch is
+  not in the DOM, unlike a `hidden` show-binding. Fully nestable; `else:` gives the
+  alternate branch. Control over server data stays a server `{{if}}`/`{{range}}`.
+  `examples/tabs.fct`.
+
+### Client-side facet instantiation (components in regions/lists)
+
+- A `<Child/>` call inside a reactive `{if}`/`{for}` now renders as a real reactive
+  instance in the browser. The compiler emits a fill-renderable client `view` per
+  facet (binding ids pinned to the manifest, `TestClientViewBindingIDsAlign`); a
+  child call becomes a `{cmp Name|field=expr|…}` token the runtime resolves by
+  evaluating each prop in the parent scope (**object props pass by reference, not
+  stringified**) and recursing into the child's view, then hydrating each instance
+  (its own signals/bindings/handlers). So `<Tweet author="{t.author}"/>` lives inside
+  a reactive — and virtualized — feed, each row its own stateful component.
+  `examples/timeline.fct`. Honest limitations: a client-instantiated child does not
+  render block-form slot content, and a binding is pure-prop or pure-signal (no mix).
+
 ## v0.14.3
 
 Compiled fine-grained client reactivity — do what React does, with minimal

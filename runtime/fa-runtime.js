@@ -67,6 +67,16 @@
       else if (/^for\s+/.test(inner)) {
         var mm = /^for\s+([A-Za-z_]\w*)\s+in\s+(.+)$/.exec(inner);
         toks.push(mm ? { t: 'for', v: mm[1], it: mm[2].trim() } : { t: 'text', s: m[0] });
+      } else if (/^cmp\s+/.test(inner)) {
+        // {cmp Name|field=expr|…} — a client-instantiated child facet. Props are
+        // pipe-separated; each value is an expression evaluated in the current scope
+        // (so object props pass by reference), keyed by the child's field name.
+        var parts = inner.replace(/^cmp\s+/, '').split('|'), props = [];
+        for (var pi = 1; pi < parts.length; pi++) {
+          var eq = parts[pi].indexOf('=');
+          if (eq >= 0) props.push({ key: parts[pi].slice(0, eq).trim(), expr: parts[pi].slice(eq + 1) });
+        }
+        toks.push({ t: 'cmp', name: parts[0].trim(), props: props });
       } else toks.push({ t: 'interp', e: inner });
       last = re.lastIndex;
     }
@@ -83,7 +93,7 @@
         var tk = toks[i];
         if (tk.t === 'end' || (stopElse && tk.t === 'else')) return nodes;
         i++;
-        if (tk.t === 'text' || tk.t === 'interp') nodes.push(tk);
+        if (tk.t === 'text' || tk.t === 'interp' || tk.t === 'cmp') nodes.push(tk);
         else if (tk.t === 'if') {
           var then_ = block(true), els = [];
           if (toks[i] && toks[i].t === 'else') { i++; els = block(false); }
@@ -106,6 +116,16 @@
       var n = nodes[k];
       if (n.t === 'text') out += n.s;
       else if (n.t === 'interp') { var v = evalExpr(n.e, scope); if (v != null) out += esc(v); }
+      else if (n.t === 'cmp') {
+        // Instantiate a child facet: render its compiled client view against a scope
+        // built from the props (evaluated here, so object props pass by reference).
+        var reg = registry[n.name];
+        if (reg && reg.view) {
+          var cs = {};
+          n.props.forEach(function (p) { cs[p.key] = evalExpr(p.expr, scope); });
+          out += fill(reg.view, cs); // raw HTML (the child view), not escaped
+        }
+      }
       else if (n.t === 'if') out += renderTpl(truthy(evalExpr(n.e, scope)) ? n.then : n.els, scope);
       else if (n.t === 'for') {
         var arr = evalExpr(n.it, scope);
@@ -624,17 +644,126 @@
     return out;
   }
 
-  function flush(root) {
+  // ── fine-grained invalidation (enterprise core) ──────────────────────────────
+  // The dependency graph compiled into the manifest drives SURGICAL updates: when
+  // a signal changes we recompute only the derived values that transitively depend
+  // on it and patch only the bindings / attributes / lists / inputs whose roots are
+  // dirty — never "recompute everything" (the old O(everything)-per-event flush).
+  // `update(root, null)` is a full paint (hydrate / route / query resolve);
+  // `invalidate(root, changed)` is the per-event fine-grained path. Writes inside a
+  // single event are already batched: we diff the signal store once, after the
+  // action and its effects have run, then dispatch one update.
+
+  // rootsOf returns the reactive root identifiers an expression reads (idents not
+  // following a dot, minus booleans) — the client mirror of the compiler's
+  // exprRoots, so the graph the compiler recorded and the one we dispatch on match.
+  function rootsOf(expr) {
+    var toks = lexExpr(String(expr)), out = [], seen = {};
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (t.k !== 'ident' || (i > 0 && toks[i - 1].k === 'dot')) continue;
+      if (t.t === 'true' || t.t === 'false' || seen[t.t]) continue;
+      seen[t.t] = 1; out.push(t.t);
+    }
+    return out;
+  }
+
+  // tplRoots collects the reactive roots a client template's holes (interp/if/for)
+  // read, excluding a bound loop variable — i.e. the outer deps of a list/region.
+  function tplRoots(tpl, exclude) {
+    var out = [], seen = {};
+    tokenizeTpl(String(tpl)).forEach(function (tk) {
+      var e = (tk.t === 'interp' || tk.t === 'if') ? tk.e : (tk.t === 'for' ? tk.it : null);
+      if (e == null) return;
+      rootsOf(e).forEach(function (r) { if (r !== exclude && !seen[r]) { seen[r] = 1; out.push(r); } });
+    });
+    return out;
+  }
+
+  // facetGraph precomputes (once per manifest entry) the dependency metadata the
+  // invalidator needs: each derived value's deps and each list/region's deps.
+  function facetGraph(m) {
+    if (m._graph) return m._graph;
+    var g = { derived: [], lists: [], regions: [] };
+    (m.derived || []).forEach(function (d) { g.derived.push({ name: d.name, expr: d.expr, deps: rootsOf(d.expr) }); });
+    (m.lists || []).forEach(function (L) { g.lists.push({ entry: L, deps: tplRoots(L.item, L.var).concat([L.signal]) }); });
+    (m.regions || []).forEach(function (R) {
+      var deps = rootsOf(R.cond || '').concat(tplRoots(R.body || '', null));
+      if (R.els) deps = deps.concat(tplRoots(R.els, null));
+      g.regions.push({ entry: R, deps: deps });
+    });
+    m._graph = g;
+    return g;
+  }
+
+  function anyDirty(deps, dirty) { for (var i = 0; i < (deps || []).length; i++) if (dirty[deps[i]]) return true; return false; }
+
+  // dirtySet expands the changed signal names through the derived graph (manifest =
+  // evaluation order) so a binding on a derived value is invalidated when any
+  // upstream signal changes.
+  function dirtySet(g, changed) {
+    var dirty = {};
+    changed.forEach(function (n) { dirty[n] = true; });
+    g.derived.forEach(function (d) { if (anyDirty(d.deps, dirty)) dirty[d.name] = true; });
+    return dirty;
+  }
+
+  // buildScope layers derived values over the signal store, recomputing only the
+  // dirty ones (dirty=null → full recompute) and caching the rest on the instance
+  // so an unrelated signal change never recomputes the whole derived chain.
+  function buildScope(root, g, dirty) {
+    var signals = signalsFor(root), scope = {}, cache = root._faDerived || (root._faDerived = {});
+    for (var k in signals) scope[k] = signals[k];
+    g.derived.forEach(function (d) {
+      if (dirty === null || dirty[d.name] || !(d.name in cache)) cache[d.name] = evalExpr(d.expr, scope);
+      scope[d.name] = cache[d.name];
+    });
+    return scope;
+  }
+
+  function update(root, dirty) {
     var m = metaFor(root.getAttribute('data-facet-id'));
     if (!m) return;
-    var scope = computeScope(signalsFor(root), m.derived);
-    if (m.bindings) {
-      var text = bindingText(scope, m.bindings), nodes = bindNodes(root);
-      for (var id in text) if (nodes[id]) nodes[id].textContent = text[id];
-      applyAttrBindings(root, m.bindings, scope); // Brick 8
+    var g = facetGraph(m), scope = buildScope(root, g, dirty);
+    var hit = dirty ? function (deps) { return anyDirty(deps, dirty); } : function () { return true; };
+    if (m.bindings) applyBindings(root, m.bindings, scope, hit);
+    if (m.lists) g.lists.forEach(function (L) { if (hit(L.deps)) reconcileList(root, L.entry, scope); });
+    if (g.regions.length) g.regions.forEach(function (R) { if (hit(R.deps)) reconcileRegion(root, R.entry, scope); });
+    if (m.inputs) syncInputs(root, m, scope, hit);
+  }
+
+  function flush(root) { update(root, null); }
+
+  function invalidate(root, changed) {
+    if (!changed.length) return;
+    var m = metaFor(root.getAttribute('data-facet-id'));
+    if (m) update(root, dirtySet(facetGraph(m), changed));
+  }
+
+  function snapshot(o) { var s = {}; for (var k in o) s[k] = o[k]; return s; }
+  function changedKeys(after, before) { var out = []; for (var k in after) if (after[k] !== before[k]) out.push(k); return out; }
+
+  // applyBindings patches text + attribute bindings whose roots are dirty (hit).
+  function applyBindings(root, bindings, scope, hit) {
+    var byId = {};
+    bindings.forEach(function (b) { byId[b.id] = b; });
+    var nodes = bindNodes(root);
+    for (var id in nodes) {
+      var b = byId[id];
+      if (b && b.node === 'text' && hit(b.signals)) {
+        var v = evalExpr(b.expr, scope);
+        nodes[id].textContent = v == null ? '' : String(v);
+      }
     }
-    if (m.lists) m.lists.forEach(function (L) { reconcileList(root, L, scope); });
-    syncInputs(root, m, scope); // Brick 9
+    var all = root.querySelectorAll('[data-fa-bind-attr]');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].closest('[data-facet-id]') !== root) continue; // nested facet owns its own
+      var ids = all[i].getAttribute('data-fa-bind-attr').split(/\s+/);
+      for (var j = 0; j < ids.length; j++) {
+        var bb = byId[ids[j]];
+        if (bb && (bb.node === 'attr' || bb.node === 'boolattr') && hit(bb.signals)) applyAttr(all[i], bb, evalExpr(bb.expr, scope));
+      }
+    }
   }
 
   // ── attribute / class / show bindings (Brick 8) ──────────────────────────────
@@ -653,39 +782,27 @@
     }
   }
 
-  function applyAttrBindings(root, bindings, scope) {
-    var byId = {};
-    bindings.forEach(function (b) { if (b.node === 'attr' || b.node === 'boolattr') byId[b.id] = b; });
-    var all = root.querySelectorAll('[data-fa-bind-attr]');
-    for (var i = 0; i < all.length; i++) {
-      if (all[i].closest('[data-facet-id]') !== root) continue; // nested facet owns its own
-      var ids = all[i].getAttribute('data-fa-bind-attr').split(/\s+/);
-      for (var j = 0; j < ids.length; j++) {
-        var b = byId[ids[j]];
-        if (b) applyAttr(all[i], b, evalExpr(b.expr, scope));
-      }
-    }
-  }
-
   // ── two-way form bindings (Brick 9) ──────────────────────────────────────────
   // bind:value / bind:checked compile to data-fa-bind-value / data-fa-bind-checked
   // markers. syncInputs writes the control FROM the signal on flush (skipping a
   // focused text field so it never clobbers the caret); onInput writes the signal
   // FROM the control on every keystroke/toggle, runs effects, and re-flushes.
 
-  function syncInputs(root, m, scope) {
-    if (!m.inputs) return;
+  function syncInputs(root, m, scope, hit) {
     var els = root.querySelectorAll('[data-fa-bind-value],[data-fa-bind-checked]');
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
       if (el.closest('[data-facet-id]') !== root) continue;
-      if (el.hasAttribute('data-fa-bind-checked')) {
-        el.checked = truthy(scope[el.getAttribute('data-fa-bind-checked')]);
-      } else {
-        var v = scope[el.getAttribute('data-fa-bind-value')];
-        v = v == null ? '' : String(v);
-        if (document.activeElement !== el && el.value !== v) el.value = v;
+      var cname = el.getAttribute('data-fa-bind-checked');
+      if (cname != null) {
+        if (!hit || hit([cname])) el.checked = truthy(scope[cname]);
+        continue;
       }
+      var name = el.getAttribute('data-fa-bind-value');
+      if (hit && !hit([name])) continue;
+      var v = scope[name];
+      v = v == null ? '' : String(v);
+      if (document.activeElement !== el && el.value !== v) el.value = v;
     }
   }
 
@@ -695,8 +812,7 @@
     var root = el.closest('[data-facet-id]');
     if (!root) return;
     var m = metaFor(root.getAttribute('data-facet-id'));
-    var signals = signalsFor(root), before = {};
-    for (var k in signals) before[k] = signals[k];
+    var signals = signalsFor(root), before = snapshot(signals);
     if (el.hasAttribute('data-fa-bind-checked')) {
       signals[el.getAttribute('data-fa-bind-checked')] = !!el.checked;
     } else {
@@ -705,7 +821,7 @@
       signals[name] = (typeof cur === 'number' && raw.trim() !== '' && !isNaN(+raw)) ? +raw : raw;
     }
     runEffects(m, signals, before);
-    flush(root);
+    invalidate(root, changedKeys(signals, before));
   }
 
   function wireInputs() {
@@ -723,7 +839,7 @@
   // listItems is the DOM-free core: it computes the desired [{key, html}] for a
   // list signal in a scope. Unit-tested without a browser.
   function listItems(list, scope) {
-    var arr = scope[list.signal];
+    var arr = evalExpr(list.signal, scope); // a signal name OR a path (query.data, derived)
     if (!arr || arr.length == null) return [];
     var out = [];
     for (var i = 0; i < arr.length; i++) {
@@ -748,32 +864,163 @@
     return t.content.firstElementChild;
   }
 
+  // longestIncreasing returns the indices i (ascending) of a longest strictly
+  // increasing subsequence of arr's values, skipping entries with arr[i] < 0 (new
+  // items). It is the heart of minimal-move reconciliation: the nodes at those
+  // indices are already in relative order and must NOT be moved — only the rest
+  // are repositioned, so a reorder/insert touches O(moved) nodes, not O(n).
+  // Patience sorting with binary search + predecessor links (Vue 3's getSequence).
+  function longestIncreasing(arr) {
+    var n = arr.length, piles = [], prev = new Array(n), i;
+    for (i = 0; i < n; i++) prev[i] = -1;
+    for (i = 0; i < n; i++) {
+      if (arr[i] < 0) continue;
+      var lo = 0, hi = piles.length;
+      while (lo < hi) { var mid = (lo + hi) >> 1; if (arr[piles[mid]] < arr[i]) lo = mid + 1; else hi = mid; }
+      if (lo > 0) prev[i] = piles[lo - 1];
+      if (lo === piles.length) piles.push(i); else piles[lo] = i;
+    }
+    var res = [], k = piles.length ? piles[piles.length - 1] : -1;
+    while (k >= 0) { res.push(k); k = prev[k]; }
+    res.reverse();
+    return res;
+  }
+
+  // reconcileChildren keys host's children to `desired` ([{key, html}]) with a
+  // minimal set of DOM moves: reuse a node by key (re-rendering its HTML only when
+  // changed), create the new ones, remove the gone ones, then move only the nodes
+  // that fall outside the longest stable (already-ordered) run. `place(node, i)`
+  // lets the virtual path absolutely-position rows instead of stacking them.
+  function reconcileChildren(host, desired, place) {
+    var oldKids = Array.prototype.slice.call(host.children);
+    var oldPos = {}, i;
+    for (i = 0; i < oldKids.length; i++) { var ok = oldKids[i].getAttribute('data-fa-key'); if (ok != null) oldPos[ok] = i; }
+
+    var n = desired.length, nodes = new Array(n), source = new Array(n), want = {};
+    for (i = 0; i < n; i++) {
+      var d = desired[i]; want[d.key] = 1;
+      var oi = (d.key in oldPos) ? oldPos[d.key] : -1;
+      source[i] = oi;
+      var node;
+      if (oi >= 0) {
+        node = oldKids[oi];
+        if (node._faHtml !== d.html) { // content changed → re-render, keep the slot
+          var fresh = htmlToNode(d.html);
+          if (fresh) { fresh.setAttribute('data-fa-key', d.key); fresh._faHtml = d.html; host.replaceChild(fresh, node); oldKids[oi] = fresh; node = fresh; }
+        }
+      } else {
+        node = htmlToNode(d.html);
+        if (node) { node.setAttribute('data-fa-key', d.key); node._faHtml = d.html; }
+      }
+      nodes[i] = node || null;
+      if (nodes[i] && place) place(nodes[i], i);
+    }
+
+    for (i = 0; i < oldKids.length; i++) { var gk = oldKids[i].getAttribute('data-fa-key'); if (gk != null && !want[gk] && oldKids[i].parentNode === host) host.removeChild(oldKids[i]); }
+
+    var stable = {}; longestIncreasing(source).forEach(function (idx) { stable[idx] = 1; });
+    for (i = n - 1; i >= 0; i--) {
+      var nd = nodes[i]; if (!nd) continue;
+      var ref = (i + 1 < n) ? nodes[i + 1] : null;
+      if (source[i] === -1 || !stable[i]) host.insertBefore(nd, ref); // new or out of order → (re)insert
+    }
+  }
+
+  // visibleRange is the pure windowing math for virtualized lists: the half-open
+  // [start, end) range of rows that intersect the viewport, padded by `overscan`
+  // rows each side and clamped to [0, count]. Unit-tested without a browser.
+  function visibleRange(scrollTop, viewportH, itemH, count, overscan) {
+    if (!itemH || itemH <= 0 || count <= 0) return { start: 0, end: count };
+    var start = Math.floor(scrollTop / itemH) - overscan;
+    var end = Math.ceil((scrollTop + viewportH) / itemH) + overscan;
+    return { start: Math.max(0, start), end: Math.min(count, Math.max(0, end)) };
+  }
+
   function reconcileList(root, list, scope) {
     var host = listHost(root, list.id);
     if (!host) return;
-    var desired = listItems(list, scope), existing = {}, i;
-    var kids = Array.prototype.slice.call(host.children);
-    for (i = 0; i < kids.length; i++) {
-      var k = kids[i].getAttribute('data-fa-key');
-      if (k != null) existing[k] = kids[i];
+    if (list.virtual) { reconcileVirtual(host, list, scope); return; }
+    reconcileChildren(host, listItems(list, scope), null);
+    mountFacets(host); // hydrate any client-instantiated child facets in the items
+  }
+
+  // reconcileVirtual renders only the rows intersecting the scroll viewport. The
+  // host becomes a scroll container with one relative sizer whose height is the
+  // full list (so the scrollbar is honest); visible rows are reused/reconciled by
+  // key and absolutely positioned at their index. A one-time scroll listener
+  // re-runs this on scroll. The app sizes the host's height in CSS; rows are a
+  // fixed `virtual <height>` px. This is O(viewport), so a 100k-row list stays
+  // flat in the DOM.
+  function reconcileVirtual(host, list, scope) {
+    var arr = evalExpr(list.signal, scope);
+    if (!arr || arr.length == null) arr = [];
+    var itemH = list.height || 40, count = arr.length, overscan = 4;
+
+    if (host.style.position !== 'relative') { host.style.position = 'relative'; host.style.display = 'block'; host.style.overflow = 'auto'; }
+    var sizer = host._faSizer;
+    if (!sizer || sizer.parentNode !== host) {
+      sizer = document.createElement('div'); sizer.className = 'fa-virt-sizer'; sizer.style.position = 'relative'; sizer.style.width = '100%';
+      host.appendChild(sizer); host._faSizer = sizer;
     }
-    var prev = null;
-    for (i = 0; i < desired.length; i++) {
-      var d = desired[i], node = existing[d.key];
-      if (!node || node._faHtml !== d.html) { // new or changed → (re)render
-        var fresh = htmlToNode(d.html);
-        if (!fresh) continue;
-        fresh.setAttribute('data-fa-key', d.key);
-        fresh._faHtml = d.html;
-        if (node) host.replaceChild(fresh, node);
-        node = fresh;
-      }
-      var ref = prev ? prev.nextSibling : host.firstChild;
-      if (node !== ref) host.insertBefore(node, ref); // move into order
-      prev = node;
-      delete existing[d.key];
+    sizer.style.height = (count * itemH) + 'px';
+    host._faList = list; host._faScope = scope;
+    if (!host._faVirtBound) {
+      host._faVirtBound = true;
+      host.addEventListener('scroll', function () { if (host._faList) reconcileVirtual(host, host._faList, host._faScope); });
     }
-    for (var leftover in existing) host.removeChild(existing[leftover]); // gone → drop
+
+    var r = visibleRange(host.scrollTop || 0, host.clientHeight || 0, itemH, count, overscan);
+    var desired = [];
+    for (var i = r.start; i < r.end; i++) {
+      var item = arr[i], s2 = {}; for (var k in scope) s2[k] = scope[k]; s2[list.var] = item;
+      var key = (item != null && item.id != null) ? String(item.id) : String(i);
+      desired.push({ key: key, html: fill(list.item, s2), top: i * itemH });
+    }
+    reconcileChildren(sizer, desired, function (node, idx) {
+      node.style.position = 'absolute'; node.style.left = '0'; node.style.right = '0'; node.style.top = desired[idx].top + 'px';
+    });
+    mountFacets(sizer); // hydrate any client-instantiated child facets in the visible rows
+  }
+
+  // ── structural control flow: reactive if-regions ────────────────────────────
+  // A reactive `{if cond}` over signals compiles to an empty <fa-if> host. The
+  // runtime evaluates the condition and renders the then- or else-branch INTO the
+  // host, replacing its contents — a true mount/unmount (the inactive branch is not
+  // in the DOM at all, unlike a `hidden` show-binding). It re-renders only when the
+  // rendered HTML actually changes, and instantiates any child facets in the new
+  // subtree (mountFacets) so components work inside conditionals.
+
+  // mountFacets brings every facet instance inside a freshly-rendered container to
+  // life — initial paint from its signal store and async queries kicked off — by
+  // reusing the same per-instance machinery hydrate uses at boot. Handlers are
+  // globally delegated, so a child instance is interactive the moment it is in the
+  // DOM; this just paints and queries it.
+  function mountFacets(container) {
+    var els = container.querySelectorAll('[data-facet-id]');
+    for (var i = 0; i < els.length; i++) {
+      var m = metaFor(els[i].getAttribute('data-facet-id'));
+      if (!m) continue;
+      if (m.bindings || m.lists || m.inputs || m.queries || m.regions) flush(els[i]);
+      if (m.queries) runQueries(els[i]);
+    }
+  }
+
+  function regionHost(root, id) {
+    var all = root.querySelectorAll('[data-fa-region="' + id + '"]');
+    for (var i = 0; i < all.length; i++) if (all[i].closest('[data-facet-id]') === root) return all[i];
+    return null;
+  }
+
+  function reconcileRegion(root, region, scope) {
+    var host = regionHost(root, region.id);
+    if (!host) return;
+    var on = truthy(evalExpr(region.cond, scope));
+    var html = on ? fill(region.body, scope) : (region.els ? fill(region.els, scope) : '');
+    if (host._faHtml === html) return; // branch + content unchanged → nothing to do
+    host.innerHTML = html;
+    host._faHtml = html;
+    mountFacets(host); // client-instantiate child facets in the new subtree (Brick: components in regions)
+    scanClient();      // hydrate any vault/media inside
   }
 
   function actionByName(m, name) {
@@ -798,11 +1045,10 @@
     var m = metaFor(root.getAttribute('data-facet-id'));
     var act = actionByName(m, name);
     if (!act) return;
-    var signals = signalsFor(root), before = {};
-    for (var k in signals) before[k] = signals[k];
+    var signals = signalsFor(root), before = snapshot(signals);
     applyAction(signals, act);
     runEffects(m, signals, before);
-    flush(root);
+    invalidate(root, changedKeys(signals, before));
   }
 
   // ── async queries (Brick 11) ─────────────────────────────────────────────────
@@ -953,7 +1199,13 @@
 
   // Node-requireable for unit tests of the pure helpers (no DOM/network).
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { fill: fill, evalExpr: evalExpr, applyAction: applyAction, bindingText: bindingText, computeScope: computeScope, listItems: listItems, runEffects: runEffects };
+    module.exports = {
+      fill: fill, evalExpr: evalExpr, applyAction: applyAction, bindingText: bindingText,
+      computeScope: computeScope, listItems: listItems, runEffects: runEffects,
+      rootsOf: rootsOf, tplRoots: tplRoots, facetGraph: facetGraph, dirtySet: dirtySet,
+      changedKeys: changedKeys, longestIncreasing: longestIncreasing, visibleRange: visibleRange,
+      _register: function (name, entry) { registry[name] = entry; } // test seam: register a facet view
+    };
   }
 
   // Browser: expose the public API and boot. Public API: subscribe to a channel

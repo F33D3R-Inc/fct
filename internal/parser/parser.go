@@ -825,7 +825,8 @@ func parseLooksBlock(lines []rawLine, i, minIndent int) ([]ast.Node, int, error)
 			}
 			nodes = append(nodes, ast.Ctrl{Op: "end"})
 		case "for":
-			nodes = append(nodes, ast.Ctrl{Op: "for", Var: a, Iter: b, Pos: ast.Pos{Line: ln.line, Col: ln.indent + 1}})
+			iter, virtual, height := parseForIter(b)
+			nodes = append(nodes, ast.Ctrl{Op: "for", Var: a, Iter: iter, Virtual: virtual, Height: height, Pos: ast.Pos{Line: ln.line, Col: ln.indent + 1}})
 			body, ni, err := parseLooksBlock(lines, i+1, ln.indent+1)
 			if err != nil {
 				return nil, 0, err
@@ -850,6 +851,45 @@ func parseLooksBlock(lines []rawLine, i, minIndent int) ([]ast.Node, int, error)
 		}
 	}
 	return nodes, i, nil
+}
+
+// parseForIter splits a `for` loop's iterable from an optional `virtual [<px>]`
+// modifier: `items virtual 48` → ("items", true, 48); `items virtual` → height 0
+// (the runtime falls back to a default); `items` → ("items", false, 0). The
+// modifier windows a large reactive list — only the rows in the scroll viewport
+// render. Keeping it out of Iter leaves the iterable a clean expression for the
+// field-ref and dependency checks.
+func parseForIter(iter string) (string, bool, int) {
+	i := strings.TrimSpace(iter)
+	idx := strings.LastIndex(i, " virtual")
+	if idx < 0 {
+		if i == "virtual" { // `for v in virtual` is a real iterable named virtual; leave as-is
+			return i, false, 0
+		}
+		return i, false, 0
+	}
+	rest := strings.TrimSpace(i[idx+len(" virtual"):])
+	base := strings.TrimSpace(i[:idx])
+	if base == "" {
+		return i, false, 0 // no iterable before `virtual` — treat literally
+	}
+	h := 0
+	if rest != "" {
+		n := 0
+		ok := true
+		for _, r := range rest {
+			if r < '0' || r > '9' {
+				ok = false
+				break
+			}
+			n = n*10 + int(r-'0')
+		}
+		if !ok {
+			return i, false, 0 // `virtual` followed by non-number → not the modifier
+		}
+		h = n
+	}
+	return base, true, h
 }
 
 // matchControl reports whether a looks line is a block control line and returns
