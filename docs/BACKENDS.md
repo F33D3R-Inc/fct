@@ -70,9 +70,17 @@ The native (`FA-Native`) neutral-tree path also ships in all three: each runtime
 mirrors Go's `RenderTree = ParseView(Render(...))` (render HTML → parse to a
 ViewNode tree → serialize), so the existing iOS/Android clients (`clients/swift`,
 `clients/android`) work against Node/Python/Rust too — the emitted tree JSON is
-byte-identical to `fa.ParseView`. Remaining `fa/` surface (sessions, forms, `who:`
-authz, broker fan-out, rate limiting) is additive against the same contract. Per
-language the surface is:
+byte-identical to `fa.ParseView`.
+
+The **framework surface is uniform** — no Go-only tier. Each runtime ports
+`fa/session.go`, `fa/authz.go`, `fa/security.go`, `fa/form.go`, `fa/broker.go`:
+signed-cookie sessions (HMAC layout identical to Go — cookies are cross-readable),
+`who:` authorization (`require` gate + `redact`, enforced from the IR's `who`
+block), CSRF/same-origin, per-IP rate limiting, security headers, forms, and the
+pluggable broker (in-process default). Verified cross-runtime: identical session
+cookies, identical authz deny/redact, 403 on cross-origin, 429 over burst. Not yet
+ported (additive): admin panel, observability/tracing, a built-in password store.
+Per language the surface is:
 
 - **Render-IR interpreter** — render a facet from the neutral IR (below) instead of
   Go `html/template`. ~a few hundred lines; the browser runtime (`runtime/fa-runtime.js`)

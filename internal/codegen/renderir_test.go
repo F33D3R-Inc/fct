@@ -93,3 +93,55 @@ func TestRenderIR(t *testing.T) {
 		t.Errorf("mutations = %+v", f.When[0].Mutations)
 	}
 }
+
+func TestRenderIRWho(t *testing.T) {
+	src := "facet Secret:\n" +
+		"    who:\n" +
+		"        require: member\n" +
+		"        redact ssn always\n" +
+		"        redact note unless is_mod\n" +
+		"    what:\n" +
+		"        ssn: str\n" +
+		"        note: str\n" +
+		"    looks:\n" +
+		"        <div>{ssn}</div>\n"
+	facets, err := parser.Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := RenderIR(facets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Facets []struct {
+			Who *struct {
+				Require []string `json:"require"`
+				Redact  []struct {
+					Field  string `json:"field"`
+					Unless string `json:"unless"`
+				} `json:"redact"`
+			} `json:"who"`
+		} `json:"facets"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	w := doc.Facets[0].Who
+	if w == nil {
+		t.Fatal("who is nil")
+	}
+	if len(w.Require) != 1 || w.Require[0] != "member" {
+		t.Errorf("require = %v", w.Require)
+	}
+	if len(w.Redact) != 2 {
+		t.Fatalf("redact = %+v", w.Redact)
+	}
+	// "always" → unconditional (no unless); "unless is_mod" → conditional.
+	if w.Redact[0].Field != "ssn" || w.Redact[0].Unless != "" {
+		t.Errorf("redact[0] = %+v", w.Redact[0])
+	}
+	if w.Redact[1].Field != "note" || w.Redact[1].Unless != "is_mod" {
+		t.Errorf("redact[1] = %+v", w.Redact[1])
+	}
+}

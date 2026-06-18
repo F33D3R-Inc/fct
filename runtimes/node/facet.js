@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const native = require('./native');
+const fw = require('./framework');
 
 const WIRE_VERSION = '1';
 
@@ -134,14 +135,14 @@ function renderNodes(nodes, scope, app) {
         for (const item of list) {
           const locals = Object.assign({}, scope.locals);
           locals[n.var] = item;
-          out += renderNodes(n.body, { data: scope.data, locals: locals }, app);
+          out += renderNodes(n.body, { data: scope.data, locals: locals, view: scope.view }, app);
         }
         break;
       }
       case 'child': {
         const childData = {};
         for (const p of n.props) childData[p.name] = p.x ? evalExpr(p.x, scope) : p.lit;
-        out += app.renderFacet(n.name, childData).html;
+        out += app.renderFacet(n.name, childData, scope.view).html;
         break;
       }
     }
@@ -203,11 +204,49 @@ class App {
 
     this.handlers = {}; // event type → fn(ctx) → data
     this._root = null;  // { name, dataFn }
-    this.conns = new Map(); // conn id → { res }
+    this.conns = new Map(); // conn id → { res, native, identity }
+
+    // Framework surface (uniform with fa/): authz policies, identity resolver,
+    // sessions, broker, per-IP /events rate limit.
+    this.policies = {};       // who: policy name → fn(view) → bool
+    this._identityFn = null;  // (req) → identity string
+    this._sessions = null;    // Sessions (also the default identity resolver)
+    this.limiter = new fw.RateLimiter((opts.rateLimit || {}).perSec || 20, (opts.rateLimit || {}).burst || 40);
+    this._broker = new fw.LocalBroker();
+    this._broker.subscribe((msg) => this._deliverLocal(msg));
   }
 
   // root sets the facet rendered at GET / and its initial data.
   root(name, dataFn) { this._root = { name: name, dataFn: dataFn }; return this; }
+
+  // identify sets the resolver mapping a request to a stable identity (used for
+  // who: views and scoped SSE delivery).
+  identify(fn) { this._identityFn = fn; return this; }
+
+  // policy registers a named who: authorization policy. Chainable.
+  policy(name, fn) { this.policies[name] = fn; return this; }
+
+  // sessions returns a signed-cookie SessionManager bound to this app's key, and
+  // installs it as the default identity resolver (the "uid" value).
+  sessions(opts) {
+    this._sessions = new fw.Sessions(this.keyHex, opts);
+    if (!this._identityFn) this._identityFn = (req) => this._sessions.identity(req.headers['cookie']);
+    return this._sessions;
+  }
+
+  // broker overrides the default in-process broker (e.g. a Redis adapter) for
+  // multi-instance fan-out. The adapter implements publish(msg)/subscribe(fn).
+  broker(b) {
+    this._broker = b;
+    this._broker.subscribe((msg) => this._deliverLocal(msg));
+    return this;
+  }
+
+  // view builds the viewer context who: policies receive.
+  view(req) { return { identity: this._identityFn ? (this._identityFn(req) || '') : '', req: req }; }
+
+  // newForm parses a urlencoded body into a validating Form (mirror of fa.NewForm).
+  newForm(contentType, body) { return fw.Form.parse(contentType, body); }
 
   // on registers a when: handler. fn(ctx) returns the fresh facet data; the
   // runtime re-renders per the facet's when-mutations and pushes signed events
@@ -215,12 +254,20 @@ class App {
   on(type, fn) { this.handlers[type] = fn; return this; }
 
   // renderFacet interprets a facet's IR with data → { facet_id, html } with
-  // data-facet-id injected on the root element.
-  renderFacet(name, data) {
+  // data-facet-id injected on the root element. It ENFORCES the facet's who:
+  // block for view: a denied require → empty render; redact strips fields from a
+  // data copy. view threads to child facets so nested who: blocks are gated too.
+  renderFacet(name, data, view) {
+    const facet = this.facets[name];
     const tree = this.trees[name];
     if (!tree) throw new Error('unknown facet ' + name);
-    const html = injectFacetID(renderNodes(tree, { data: data, locals: {} }, this), resolveFacetID(this.facets[name].facet_id, data));
-    return { facet_id: resolveFacetID(this.facets[name].facet_id, data), html: html };
+    view = view || { identity: '' };
+    const auth = fw.enforceWho(facet.who, this.policies, view, data);
+    if (!auth.allowed) return { facet_id: '', html: '' };
+    data = auth.data;
+    const fid = resolveFacetID(facet.facet_id, data);
+    const html = injectFacetID(renderNodes(tree, { data: data, locals: {}, view: view }, this), fid);
+    return { facet_id: fid, html: html };
   }
 
   // ── HTTP ────────────────────────────────────────────────────────────────
@@ -247,23 +294,29 @@ class App {
   }
 
   _serveShell(req, res) {
+    const view = this.view(req);
     // A native client (FA-Native: 1) gets the neutral ViewNode tree as a
     // ScreenResponse {title, tree}; a browser gets the HTML shell.
     if (req.headers['fa-native'] === '1') {
       let tree = { kind: 'box' };
       if (this._root) {
-        const html = this.renderFacet(this._root.name, this._root.dataFn({})).html;
+        const html = this.renderFacet(this._root.name, this._root.dataFn(view), view).html;
         tree = native.nodeToJSON(native.parseView(html));
       }
       return this._json(res, { title: this.title, tree: tree });
     }
     let body = '';
-    if (this._root) body = this.renderFacet(this._root.name, this._root.dataFn({})).html;
+    if (this._root) body = this.renderFacet(this._root.name, this._root.dataFn(view), view).html;
     const html = '<!doctype html><html><head><meta charset="utf-8">' +
       '<meta name="fa-key" content="' + this.keyHex + '">' +
       '<title>' + htmlEscape(this.title) + '</title></head><body>' +
       body + '<script src="/fa-runtime.js"></script></body></html>';
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'",
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'same-origin',
+    });
     res.end(html);
   }
 
@@ -272,7 +325,7 @@ class App {
     if (v !== WIRE_VERSION) { res.writeHead(426); return res.end('fa: unsupported wire version ' + v); }
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     const id = crypto.randomBytes(16).toString('hex');
-    this.conns.set(id, { res: res, native: req.headers['fa-native'] === '1' });
+    this.conns.set(id, { res: res, native: req.headers['fa-native'] === '1', identity: this._identityFn ? (this._identityFn(req) || '') : '' });
     const hello = JSON.stringify({ op: '_conn', conn: id, key: this.keyHex, v: WIRE_VERSION });
     res.write('data: ' + hello + '\n\n');
     const hb = setInterval(() => res.write(': keepalive\n\n'), 25000);
@@ -280,6 +333,11 @@ class App {
   }
 
   _handleEvents(req, res) {
+    // CSRF defense-in-depth: reject cross-origin POSTs (on top of the unguessable
+    // conn id). Then throttle per client IP.
+    if (!fw.sameOrigin(req)) { res.writeHead(403); return res.end('cross-origin'); }
+    const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+    if (!this.limiter.allow(ip)) { res.writeHead(429); return res.end('rate limited'); }
     let buf = '';
     req.on('data', (c) => { buf += c; });
     req.on('end', () => {
@@ -288,32 +346,46 @@ class App {
       const fn = this.handlers[body.type];
       res.writeHead(204); res.end();
       if (!fn) return;
-      const ctx = { type: body.type, payload: body.payload || {}, conn: body.conn };
+      const c = this.conns.get(body.conn);
+      const ctx = { type: body.type, payload: body.payload || {}, conn: body.conn, identity: c ? c.identity : '' };
       const data = fn(ctx);
       if (data == null) return;
       this._pushReRender(body.type, body.conn, data);
     });
   }
 
-  // Map an incoming event type to the facet whose when: declares it, then apply
-  // its mutations as signed events to the acting connection.
+  // Map an incoming event type to the facet whose when: declares it, render the
+  // mutations (enforcing who: for the acting connection's viewer), and publish the
+  // signed frames through the broker — which fans out to whichever instance holds
+  // the connection (the in-process default delivers locally).
   _pushReRender(type, conn, data) {
     const c = this.conns.get(conn);
-    if (!c) return;
+    const isNative = c ? c.native : false;
+    const view = { identity: c ? c.identity : '' };
+    const frames = [];
     for (const f of this.ir.facets) {
       for (const w of f.when || []) {
         if (w.events.indexOf(type) < 0) continue;
         for (const mu of w.mutations) {
           const target = mu.target || f.name;
-          const r = this.renderFacet(target, data);
-          // A native connection receives the neutral ViewNode tree as the
-          // fragment (and signs over it); a web connection receives HTML.
-          const fragment = c.native ? native.treeJSON(r.html) : r.html;
-          const ev = signEvent(this.keyHex, { op: mu.op === 'replace_all' ? 'replace' : mu.op, facet_id: r.facet_id, fragment: fragment });
-          c.res.write('data: ' + JSON.stringify(ev) + '\n\n');
+          const r = this.renderFacet(target, data, view);
+          if (!r.facet_id && !r.html) continue; // who: denied → nothing to push
+          const fragment = isNative ? native.treeJSON(r.html) : r.html;
+          frames.push(signEvent(this.keyHex, { op: mu.op === 'replace_all' ? 'replace' : mu.op, facet_id: r.facet_id, fragment: fragment }));
         }
       }
     }
+    if (frames.length > 0) this._broker.publish(JSON.stringify({ conn: conn, frames: frames }));
+  }
+
+  // _deliverLocal applies a broker message to a locally-held connection (the
+  // subscribe side of the broker). A conn not found here lives on another instance.
+  _deliverLocal(msg) {
+    let m;
+    try { m = JSON.parse(msg); } catch (e) { return; }
+    const c = this.conns.get(m.conn);
+    if (!c) return;
+    for (const ev of m.frames) c.res.write('data: ' + JSON.stringify(ev) + '\n\n');
   }
 
   _json(res, obj) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); }

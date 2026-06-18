@@ -125,8 +125,13 @@ Last updated: 2026-06-11 (v0.13.0).
     locale-aware rendering; today it's "interpolate your own strings."
 12. **Hosted registry + public docs site** — `PUBLISHING.md` has the plan;
     the wiki + mkdocs config are ready to deploy to GitHub Pages.
-13. **Non-Go backend targets** (Node/Python/Rust codegen) — the
-    language-agnostic pitch, README roadmap #6.
+- ✅ **Non-Go backend targets** (Node/Python/Rust) — the language-agnostic pitch
+  (README roadmap #6) is delivered: pluggable `codegen.Backend` + neutral render
+  IR, runnable server runtimes for all three (live-render loop, SSE, signing,
+  native iOS/Android tree), and a **uniform** framework surface (sessions, `who:`
+  authz, CSRF, rate limiting, broker) — no Go-only tier. See `runtimes/` and
+  `docs/BACKENDS.md`. Remaining per-language gaps (admin panel, observability,
+  password store) are additive.
 14. **Multi-region / DR guidance** — broker topology across regions, what
     happens to SSE clients on regional failover.
 

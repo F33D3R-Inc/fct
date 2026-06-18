@@ -10,6 +10,7 @@
 //! minimal HTTP/1.1 + SSE server are all implemented here.
 
 pub mod app;
+pub mod framework;
 pub mod json;
 pub mod native;
 pub mod render;

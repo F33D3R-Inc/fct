@@ -35,6 +35,7 @@ func RenderIR(facets []*ast.Facet) ([]byte, error) {
 			FacetID: f.DerivedFacetID(),
 			Render:  ops,
 			When:    irWhens(f.Whens),
+			Who:     irWhoOf(f),
 		})
 	}
 	b, err := json.MarshalIndent(doc, "", "  ")
@@ -57,6 +58,32 @@ type irFacet struct {
 	FacetID string   `json:"facet_id"` // id pattern, e.g. "LikeButton:post:{post.id}" — runtime resolves {…} against data
 	Render  []irOp   `json:"render"`
 	When    []irWhen `json:"when,omitempty"`
+	Who     *irWho   `json:"who,omitempty"` // authorization surface (require + redact), enforced by the runtime
+}
+
+// irWho is a facet's authorization block: require lists policy names that must
+// all pass for a viewer to see the facet; redact strips fields before render
+// (unconditionally, or unless a named policy passes). The runtime enforces this
+// exactly as fa/authz.go RenderFor does.
+type irWho struct {
+	Require []string   `json:"require,omitempty"`
+	Redact  []irRedact `json:"redact,omitempty"`
+}
+
+type irRedact struct {
+	Field  string `json:"field"`
+	Unless string `json:"unless,omitempty"` // policy name; "" means redact unconditionally
+}
+
+func irWhoOf(f *ast.Facet) *irWho {
+	if !f.HasWho() {
+		return nil
+	}
+	w := &irWho{Require: f.Who.Require}
+	for _, r := range f.Who.Redactions {
+		w.Redact = append(w.Redact, irRedact{Field: r.Field, Unless: r.UnlessPolicy})
+	}
+	return w
 }
 
 // irOp is one render instruction. Op is one of:

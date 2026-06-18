@@ -73,11 +73,34 @@ renders the same HTML, then parses it into the tree (mirror of Go's
 that header is pushed ViewNode-tree fragments, signed identically. The emitted
 tree JSON is **byte-identical to Go's `fa.ParseView`** (verified across all three).
 
+## Framework parity (uniform with `fa/`)
+
+The "batteries" are now identical across every backend language — no Go-only
+tier. Each runtime has a `framework` module porting `fa/session.go`,
+`fa/authz.go`, `fa/security.go`, `fa/form.go`, `fa/broker.go`:
+
+- **Signed-cookie sessions** — HMAC layout matches Go byte-for-byte; a cookie
+  minted by a Go server reads on Node/Python/Rust and vice versa (verified: all
+  four mint the identical `fa_session=…` and reject tampered cookies).
+- **`who:` authorization** — `require` policy gate (denied → empty render) and
+  `redact` field stripping, enforced from the IR's `who` block, threaded through
+  child facets. (Verified: anon denied, member allowed, field redacted — same in
+  all three.)
+- **CSRF / same-origin** — cross-origin POST `/events` → 403.
+- **Per-IP rate limiting** — token bucket on `/events` → 429 over burst.
+- **Security headers** — CSP + `X-Content-Type-Options` + `Referrer-Policy` on
+  the shell.
+- **Forms** — `parse` + chainable validators (`required`/`min_len`/`email`/…).
+- **Broker** — pluggable `publish`/`subscribe`; in-process default; a Redis/NATS
+  adapter is opt-in with the same interface in every language.
+
+Register via the same shape everywhere: `app.identify(...)`, `app.policy(name,
+fn)`, `app.sessions()` (Node/Python) / `with_sessions()` (Rust), `app.broker(b)`.
+
 ## Status
 
-Core live-render loop (page, SSE, signing, `when:` re-render, render-IR
-interpretation including child facets / `if` / `for`) and the native
-neutral-tree path are implemented in all three. The remaining `fa/` surface —
-sessions, forms, structural `who:` authz, the broker for multi-instance fan-out,
-rate limiting — is not yet ported; those are additive against the same shared
-contract.
+Implemented in all three: the core live-render loop (page, SSE, signing, `when:`
+re-render, render-IR interpretation incl. child facets / `if` / `for`), the native
+neutral-tree path, and the framework surface above. Not yet ported: the admin
+panel, observability/tracing, and a built-in auth password store — additive
+against the same contract.

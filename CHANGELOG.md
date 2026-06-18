@@ -4,6 +4,36 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
+## v0.14.7
+
+Close the Go-only gap: the framework "batteries" are now **uniform across every
+backend language**, so `fct` + Node/Python/Rust is a real choice, not Go-plus-demos.
+Each runtime ports `fa/session.go`, `fa/authz.go`, `fa/security.go`, `fa/form.go`,
+`fa/broker.go`; the compiler now emits `who:` into `render.json`.
+
+### Uniform framework surface
+
+- **Signed-cookie sessions** — HMAC layout matches Go byte-for-byte: all four
+  languages mint the identical `fa_session=…` cookie and read each other's, so a
+  session established on a Go server stays valid behind a Node/Python/Rust server
+  with the same key. Tampered cookies are rejected.
+- **`who:` authorization** — `require` policy gate (denied → empty render) and
+  `redact` field stripping, enforced from the IR's new `who` block and threaded
+  through child facets.
+- **CSRF / same-origin** (cross-origin `POST /events` → 403), **per-IP rate
+  limiting** (token bucket → 429 over burst), **security headers** (CSP +
+  `X-Content-Type-Options` + `Referrer-Policy` on the shell).
+- **Forms** (parse + chainable validators) and a **pluggable broker**
+  (`publish`/`subscribe`, in-process default, Redis/NATS opt-in via the same
+  interface in every language).
+- Same API shape everywhere: `app.identify`, `app.policy`, `app.sessions` /
+  `with_sessions`, `app.broker`.
+
+Verified cross-runtime: byte-identical session cookies, identical authz
+deny/redact, 403 on cross-origin, 429 over burst. Still Go-only and additive: admin
+panel, observability/tracing, built-in password store. See `runtimes/README.md`,
+`docs/BACKENDS.md`. Closes ENTERPRISE P2 #13.
+
 ## v0.14.6
 
 The non-Go backends become **runnable**. v0.14.5 made the compiler emit for

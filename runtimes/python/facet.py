@@ -21,6 +21,7 @@ import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import framework as fw
 import native
 
 WIRE_VERSION = "1"
@@ -190,12 +191,12 @@ def render_nodes(nodes, scope, app):
             for item in items:
                 locals_ = dict(scope["locals"])
                 locals_[n["var"]] = item
-                out.append(render_nodes(n["body"], {"data": scope["data"], "locals": locals_}, app))
+                out.append(render_nodes(n["body"], {"data": scope["data"], "locals": locals_, "view": scope.get("view")}, app))
         elif t == "child":
             child_data = {}
             for p in n["props"]:
                 child_data[p["name"]] = eval_expr(p["x"], scope) if "x" in p and p["x"] else p.get("lit", "")
-            out.append(app.render_facet(n["name"], child_data)["html"])
+            out.append(app.render_facet(n["name"], child_data, scope.get("view"))["html"])
     return "".join(out)
 
 
@@ -255,8 +256,16 @@ class App:
             self.trees[fac["name"]] = build_tree(fac["render"])
         self.handlers = {}
         self._root = None
-        self.conns = {}  # conn id -> queue.Queue
+        self.conns = {}  # conn id -> {"q", "native", "identity"}
         self._lock = threading.Lock()
+
+        # Framework surface (uniform with fa/).
+        self.policies = {}
+        self._identity_fn = None
+        self._sessions = None
+        self.limiter = fw.RateLimiter(20, 40)
+        self._broker = fw.LocalBroker()
+        self._broker.subscribe(self._deliver_local)
 
     def root(self, name, data_fn):
         self._root = (name, data_fn)
@@ -266,12 +275,41 @@ class App:
         self.handlers[event_type] = fn
         return self
 
-    def render_facet(self, name, data):
+    def identify(self, fn):
+        self._identity_fn = fn
+        return self
+
+    def policy(self, name, fn):
+        self.policies[name] = fn
+        return self
+
+    def sessions(self, **opts):
+        self._sessions = fw.Sessions(self.key_hex, **opts)
+        if self._identity_fn is None:
+            self._identity_fn = lambda req: self._sessions.identity(req.get("cookie"))
+        return self._sessions
+
+    def broker(self, b):
+        self._broker = b
+        self._broker.subscribe(self._deliver_local)
+        return self
+
+    def view(self, req):
+        return {"identity": (self._identity_fn(req) if self._identity_fn else "") or "", "req": req}
+
+    def new_form(self, content_type, body):
+        return fw.Form.parse(content_type, body)
+
+    def render_facet(self, name, data, view=None):
         tree = self.trees.get(name)
         if tree is None:
             raise KeyError("unknown facet " + name)
+        view = view or {"identity": ""}
+        allowed, data = fw.enforce_who(self.facets[name].get("who"), self.policies, view, data)
+        if not allowed:
+            return {"facet_id": "", "html": ""}
         fid = resolve_facet_id(self.facets[name]["facet_id"], data)
-        body = render_nodes(tree, {"data": data, "locals": {}}, self)
+        body = render_nodes(tree, {"data": data, "locals": {}, "view": view}, self)
         return {"facet_id": fid, "html": inject_facet_id(body, fid)}
 
     def tree_fragment(self, html_str):
@@ -281,20 +319,35 @@ class App:
 
     def push_rerender(self, event_type, conn, data):
         c = self.conns.get(conn)
-        if c is None:
-            return
+        is_native = c["native"] if c else False
+        view = {"identity": c["identity"] if c else ""}
+        frames = []
         for fac in self.ir["facets"]:
             for w in fac.get("when", []):
                 if event_type not in w["events"]:
                     continue
                 for mu in w["mutations"]:
                     target = mu.get("target") or fac["name"]
-                    r = self.render_facet(target, data)
+                    r = self.render_facet(target, data, view)
+                    if not r["facet_id"] and not r["html"]:
+                        continue  # who: denied
                     op = "replace" if mu["op"] == "replace_all" else mu["op"]
-                    # Native connection → ViewNode-tree fragment; web → HTML.
-                    fragment = self.tree_fragment(r["html"]) if c["native"] else r["html"]
+                    fragment = self.tree_fragment(r["html"]) if is_native else r["html"]
                     ev = sign_event(self.key_hex, {"op": op, "facet_id": r["facet_id"], "fragment": fragment})
-                    c["q"].put("data: " + dumps(ev) + "\n\n")
+                    frames.append(ev)
+        if frames:
+            self._broker.publish(dumps({"conn": conn, "frames": frames}))
+
+    def _deliver_local(self, msg):
+        try:
+            m = json.loads(msg)
+        except ValueError:
+            return
+        c = self.conns.get(m["conn"])
+        if c is None:
+            return
+        for ev in m["frames"]:
+            c["q"].put("data: " + dumps(ev) + "\n\n")
 
     def listen(self, addr=None):
         addr = addr or os.environ.get("FA_ADDR", "localhost:7373")
@@ -338,19 +391,24 @@ class App:
         server.serve_forever()
 
     # -- handlers ------------------------------------------------------------
+    @staticmethod
+    def _req(h):
+        return {"cookie": h.headers.get("Cookie"), "origin": h.headers.get("Origin"), "host": h.headers.get("Host")}
+
     def _serve_shell(self, h):
+        view = self.view(self._req(h))
         # Native client (FA-Native: 1) → ScreenResponse {title, tree}; browser → HTML.
         if h.headers.get("FA-Native") == "1":
             tree = {"kind": "box"}
             if self._root:
                 name, data_fn = self._root
-                html_str = self.render_facet(name, data_fn({}))["html"]
+                html_str = self.render_facet(name, data_fn(view), view)["html"]
                 tree = native.node_to_json(native.parse_view(html_str))
             return self._json(h, {"title": self.title, "tree": tree})
         body = ""
         if self._root:
             name, data_fn = self._root
-            body = self.render_facet(name, data_fn({}))["html"]
+            body = self.render_facet(name, data_fn(view), view)["html"]
         page = ('<!doctype html><html><head><meta charset="utf-8">'
                 '<meta name="fa-key" content="%s"><title>%s</title></head><body>%s'
                 '<script src="/fa-runtime.js"></script></body></html>'
@@ -358,6 +416,9 @@ class App:
         data = page.encode()
         h.send_response(200)
         h.send_header("Content-Type", "text/html; charset=utf-8")
+        h.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'")
+        h.send_header("X-Content-Type-Options", "nosniff")
+        h.send_header("Referrer-Policy", "same-origin")
         h.send_header("Content-Length", str(len(data)))
         h.end_headers()
         h.wfile.write(data)
@@ -380,8 +441,9 @@ class App:
         h.end_headers()
         cid = secrets.token_hex(16)
         q = queue.Queue()
+        ident = (self._identity_fn(self._req(h)) if self._identity_fn else "") or ""
         with self._lock:
-            self.conns[cid] = {"q": q, "native": h.headers.get("FA-Native") == "1"}
+            self.conns[cid] = {"q": q, "native": h.headers.get("FA-Native") == "1", "identity": ident}
         hello = dumps({"op": "_conn", "conn": cid, "key": self.key_hex, "v": WIRE_VERSION})
         try:
             h.wfile.write(("data: %s\n\n" % hello).encode())
@@ -400,6 +462,16 @@ class App:
                 self.conns.pop(cid, None)
 
     def _handle_events(self, h):
+        # CSRF defense-in-depth (cross-origin reject) + per-IP throttle.
+        if not fw.same_origin(h.headers.get("Origin"), h.headers.get("Host")):
+            h.send_response(403)
+            h.end_headers()
+            return
+        ip = h.client_address[0] if h.client_address else ""
+        if not self.limiter.allow(ip):
+            h.send_response(429)
+            h.end_headers()
+            return
         length = int(h.headers.get("Content-Length", 0))
         raw = h.rfile.read(length) if length else b"{}"
         h.send_response(204)
@@ -411,7 +483,8 @@ class App:
         fn = self.handlers.get(body.get("type"))
         if not fn:
             return
-        ctx = {"type": body.get("type"), "payload": body.get("payload") or {}, "conn": body.get("conn")}
+        c = self.conns.get(body.get("conn"))
+        ctx = {"type": body.get("type"), "payload": body.get("payload") or {}, "conn": body.get("conn"), "identity": c["identity"] if c else ""}
         data = fn(ctx)
         if data is None:
             return
