@@ -293,8 +293,19 @@ func runBuild(path, outDir string) error {
 	}
 	fmt.Println("wrote", tf)
 
+	// Non-Go targets render by interpreting the neutral render IR (render.json)
+	// instead of compiled Go templates — emit it alongside the manifest.
 	if be.Name() != "go" {
-		fmt.Printf("note: target %q emits the neutral manifest + typed data; its server runtime (render-IR interpreter, SSE, signing) is staged — see docs/BACKENDS.md\n", be.Name())
+		ir, err := codegen.RenderIR(facets)
+		if err != nil {
+			return err
+		}
+		rf := filepath.Join(outDir, codegen.RenderIRFileName)
+		if err := os.WriteFile(rf, ir, 0o644); err != nil {
+			return err
+		}
+		fmt.Println("wrote", rf)
+		fmt.Printf("note: target %q emits manifest + render IR + typed data; run it with the %s server runtime under runtimes/%s — see docs/BACKENDS.md\n", be.Name(), be.Name(), be.Name())
 	}
 	return nil
 }

@@ -58,10 +58,21 @@ Tested in `backend_test.go` (registry, expression lowering golden cases across a
 three, error propagation, typed-data emission). `cmd/fct` reads `[compiler] target`
 and routes `runBuild` through the selected backend.
 
-### 2. Runtime track — **staged**
+### 2. Runtime track — **core shipped** (`runtimes/`)
 
 A non-Go target needs a **server runtime** equal to `fa/` — the part that turns a
-manifest + handlers into a live app. Per language:
+manifest + handlers into a live app. The core live-render loop is now implemented
+for all three targets under `runtimes/{node,python,rust}` (dependency-free in each
+language): manifest + render-IR load, render-IR interpreter + neutral expression
+evaluator, HMAC-SHA256 signing matching `fa/event.go`, an in-memory SSE hub, the
+`GET /` · `GET /sse` · `POST /events` endpoints, and `when:`-driven re-render.
+The native (`FA-Native`) neutral-tree path also ships in all three: each runtime
+mirrors Go's `RenderTree = ParseView(Render(...))` (render HTML → parse to a
+ViewNode tree → serialize), so the existing iOS/Android clients (`clients/swift`,
+`clients/android`) work against Node/Python/Rust too — the emitted tree JSON is
+byte-identical to `fa.ParseView`. Remaining `fa/` surface (sessions, forms, `who:`
+authz, broker fan-out, rate limiting) is additive against the same contract. Per
+language the surface is:
 
 - **Render-IR interpreter** — render a facet from the neutral IR (below) instead of
   Go `html/template`. ~a few hundred lines; the browser runtime (`runtime/fa-runtime.js`)

@@ -4,6 +4,43 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
+## v0.14.6
+
+The non-Go backends become **runnable**. v0.14.5 made the compiler emit for
+Node/Python/Rust; this release ports the server runtime to each, so a facet app
+actually runs on all four languages — and the existing iOS/Android clients work
+against every one of them.
+
+### Server runtimes (`runtimes/{node,python,rust}`)
+
+- The `fa/` live-render loop, ported to each language, dependency-free: manifest +
+  render-IR load, a render-IR interpreter + neutral expression evaluator with HTML
+  auto-escaping, **HMAC-SHA256 signing byte-identical to `fa/event.go`**
+  (`op\0facet_id\0fragment`), an in-memory SSE hub, the `GET /` · `GET /sse` ·
+  `POST /events` · `/manifest.json` · `/render.json` · `/fa-runtime.js` endpoints,
+  and a `when:`-driven re-render → signed push. Each ships a runnable LikeButton
+  demo. The Rust runtime hand-rolls SHA-256/HMAC, a JSON parser, and a minimal
+  HTTP/1.1+SSE server (std only).
+- **Neutral render IR** (`codegen.RenderIR` → `render.json`): a flat
+  text/expr/if/else/end/for/child op stream with expressions as a neutral JSON AST.
+  Emitted for non-Go targets; the manifest and Go path are untouched.
+
+### Mobile parity (FA-Native neutral tree)
+
+- All three runtimes implement the `FA-Native` path — render HTML, then parse it
+  into a platform-neutral ViewNode tree (mirror of Go's
+  `RenderTree = ParseView(Render(...))`; ports of `fa/view.go` + `fa/style.go`,
+  incl. the std design-system class table). `GET <route>` + `FA-Native: 1` returns
+  `{title, tree}`; a native SSE connection is pushed ViewNode-tree fragments,
+  signed identically. The emitted tree JSON is **byte-identical to `fa.ParseView`**,
+  verified across Go/Node/Python/Rust, so `clients/swift` (FacetKit) and
+  `clients/android` (facetkit) render against any of the four backends.
+
+One server, three renderers (web/iOS/Android) — now over four server languages.
+Remaining `fa/` surface (sessions, forms, `who:` authz, broker, rate limiting) is
+Go-only and additive against the shared contract. See `runtimes/README.md`,
+`docs/BACKENDS.md`.
+
 ## v0.14.5
 
 Break the Go lock — the compiler is no longer language-locked. One FDL source now
