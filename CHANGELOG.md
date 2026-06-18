@@ -4,6 +4,40 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
+## v0.14.5
+
+Break the Go lock — the compiler is no longer language-locked. One FDL source now
+compiles to **four targets** (`go` default, `node`, `python`, `rust`), selected by
+`fct.toml [compiler] target`. This is ROADMAP #4 / ENTERPRISE P2 #13 and the named
+reversal condition of ADR-0001 (now DECISIONS.md ADR-0010).
+
+### Pluggable codegen backends
+
+- New `codegen.Backend` interface (`internal/codegen/backend.go`) with a registry
+  and `BackendFor`/`BackendNames`. The compiler front end (lex → parse → AST →
+  checks → flat render stream → `manifest.json`) is target-neutral; a backend
+  supplies only `Expr` (FDL expression → target expression), `FieldName`
+  (identifier casing), `Types` (typed per-facet data declarations), and `TypesFile`.
+- Three new targets, each ~80 lines: `backend_node.go` (camelCase, TS interfaces,
+  JS infix), `backend_python.go` (snake_case, `@dataclass`, `and`/`or`/`not` +
+  `True`/`False`), `backend_rust.go` (snake_case, `pub struct`, Rust infix).
+- One neutral expression parser (`exprast.go`: `parseExpr` → `exNode` tree +
+  `renderInfix`) feeds all non-Go targets — not four hand-rolled parsers. The Go
+  path is **byte-for-byte unchanged**: `goBackend` delegates to the original
+  `goExpr`/`GoName`/`GoStructs`.
+- `fct build` reads `[compiler] target` (stdlib-only reader) and routes through the
+  selected backend. Non-Go targets emit the neutral `manifest.json` + typed data in
+  the target language; the Go `html/template` files are the Go render path and are
+  skipped. Tested in `internal/codegen/backend_test.go`.
+
+### Staged, not shipped
+
+The per-language **server runtimes** (render-IR interpreter, SSE hub, fragment
+signing, sessions, routing, authz — the `fa/` equivalent) are the remaining track.
+The neutral render IR and the runtime surface each language must implement are
+specified in `docs/BACKENDS.md`; the shared `manifest.json` + wire/signing format
+bound the work. ADR-0001 stays only in that the compiler itself remains Go-hosted.
+
 ## v0.14.4
 
 Make the reactive engine enterprise-grade — parity with Svelte/Solid on the parts

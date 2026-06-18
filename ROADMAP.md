@@ -39,6 +39,9 @@ separately in [ENTERPRISE.md](ENTERPRISE.md); release history is in
 ## Long term
 
 4. **Non-Go backend targets** — codegen for Node / Python / Rust; FA's pitch
-   is language-agnostic via the compiler.
+   is language-agnostic via the compiler. *Compiler track shipped* (pluggable
+   `codegen.Backend`, `fct.toml [compiler] target`, typed data + expression
+   lowering for all three — DECISIONS.md ADR-0010, docs/BACKENDS.md); the
+   per-language server runtimes are the remaining track.
 5. **Expanded native surface** — richer input kinds and platform components
    over the same neutral-tree protocol.

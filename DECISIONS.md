@@ -4,6 +4,42 @@ Newest first. Each entry: the call, the reasoning, and what would reverse it.
 
 ---
 
+## ADR-0010 — Pluggable codegen backends (partial reversal of ADR-0001)
+
+**Decision.** Extract a `codegen.Backend` interface and route `fct build` through
+it by `fct.toml [compiler] target`. Ship four targets: `go` (unchanged default),
+`node`, `python`, `rust`. The compiler front end (lex → parse → AST → checks →
+flat render stream → `manifest.json`) is target-neutral; a backend supplies only
+`Expr` (FDL expression → target expression), `FieldName` (identifier casing), and
+`Types` (typed per-facet data declarations). This is the ROADMAP #4 / ENTERPRISE
+P2 #13 work and the named reversal condition of ADR-0001.
+
+**Why.**
+1. ADR-0001's sole justification was "our only backend target today is Go," and it
+   pointed specifically at `go/packages`/`go/types` verification — which was never
+   actually implemented (zero imports of either). The real Go coupling was just
+   codegen emitting Go template + expression *syntax*, so the lock was cheaper to
+   break than the ADR implied.
+2. The render program is already neutral data (`manifest.json`), and the browser
+   runtime interprets it. Non-Go targets render from that same IR instead of Go
+   `html/template`, so "one portable compiler core" needs no per-language render
+   transpiler — only `Expr`/`FieldName`/`Types`.
+3. One neutral expression parser (`exprast.go`) with per-target renderers beats
+   four hand-rolled parsers — less code, and provably consistent.
+
+**Scope / not yet.** This reverses ADR-0001 only for the **compiler**. Each non-Go
+target still needs a **server runtime** equal to `fa/` (render-IR interpreter, SSE
+hub, fragment signing, sessions, routing, authz). That is the staged second track;
+the shared manifest + wire/signing format bound it. The Go path is byte-for-byte
+unchanged (`goBackend` delegates to the original functions). See docs/BACKENDS.md.
+
+**Reverses if.** The IR contract proves too costly to stabilize across runtimes, or
+the non-Go runtimes never materialize — at which point we drop the extra targets
+and the interface collapses back to the Go emitter. The interface itself is cheap
+to keep regardless (it cleanly separates the front end from lowering).
+
+---
+
 ## ADR-0009 — Client render bodies gain `{if}`/`{for}` (round 2)
 
 **Decision.** Vault `decrypt:` and media `source:` bodies now support
@@ -216,3 +252,9 @@ Rust.)
 **Reverses if.** We commit to many backend targets (Rust, Node, Swift…) and want
 one portable compiler core; at that point a language-agnostic host (Rust) with
 per-target plugins may win. Not now — YAGNI.
+
+**Update (partial reversal).** We did commit to many targets — see ADR-0010. The
+compiler stays Go-hosted, but codegen is now pluggable per target (`go`/`node`/
+`python`/`rust`). The "string-parsing Go" worry in point 1 turned out moot: the
+`go/types` verification it cited was never built, and the neutral `manifest.json`
+makes a portable core viable without rewriting the host.

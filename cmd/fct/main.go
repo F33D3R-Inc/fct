@@ -246,6 +246,15 @@ func runBuild(path, outDir string) error {
 	if err != nil {
 		return err
 	}
+	// The compiler core (parse → checks → neutral manifest) is target-independent;
+	// the [compiler] target in fct.toml selects which language the artifacts are
+	// emitted for. An absent fct.toml or target defaults to Go (v0 behavior).
+	target := compilerTarget(path)
+	be, err := codegen.BackendFor(target)
+	if err != nil {
+		return err
+	}
+
 	out, err := codegen.Generate(facets)
 	if err != nil {
 		return err
@@ -253,27 +262,82 @@ func runBuild(path, outDir string) error {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
-	for name, tmpl := range out.Templates {
-		fn := filepath.Join(outDir, codegen.TemplateFileName(name))
-		if err := os.WriteFile(fn, []byte(tmpl), 0o644); err != nil {
-			return err
+
+	// The Go html/template files are the Go target's render path. Non-Go targets
+	// render by interpreting the neutral manifest (the render IR), so they do not
+	// receive Go templates — emitting them would be dead, misleading output.
+	if be.Name() == "go" {
+		for name, tmpl := range out.Templates {
+			fn := filepath.Join(outDir, codegen.TemplateFileName(name))
+			if err := os.WriteFile(fn, []byte(tmpl), 0o644); err != nil {
+				return err
+			}
+			fmt.Println("wrote", fn)
 		}
-		fmt.Println("wrote", fn)
 	}
+
+	// The manifest is the neutral render program + routing metadata every target
+	// consumes — always emitted.
 	mf := filepath.Join(outDir, "manifest.json")
 	if err := os.WriteFile(mf, out.Manifest, 0o644); err != nil {
 		return err
 	}
 	fmt.Println("wrote", mf)
 
-	// Typed data structs (#5): renderable with compile-time-checked data.
+	// Typed per-facet data declarations in the target language (Go structs, TS
+	// interfaces, Python dataclasses, Rust structs).
 	pkg := sanitizePkg(filepath.Base(outDir))
-	tf := filepath.Join(outDir, "types.go")
-	if err := os.WriteFile(tf, []byte(codegen.GoStructs(pkg, facets)), 0o644); err != nil {
+	tf := filepath.Join(outDir, be.TypesFile())
+	if err := os.WriteFile(tf, []byte(be.Types(pkg, facets)), 0o644); err != nil {
 		return err
 	}
 	fmt.Println("wrote", tf)
+
+	if be.Name() != "go" {
+		fmt.Printf("note: target %q emits the neutral manifest + typed data; its server runtime (render-IR interpreter, SSE, signing) is staged — see docs/BACKENDS.md\n", be.Name())
+	}
 	return nil
+}
+
+// compilerTarget reads the [compiler] target from the fct.toml nearest the .fct
+// source (its directory, then the working directory). A missing file, section, or
+// key yields "" — which BackendFor resolves to the Go default. This is a minimal
+// stdlib-only reader (the project ships as a single dependency-free binary), not a
+// general TOML parser: it only needs one string under one section.
+func compilerTarget(fctPath string) string {
+	for _, dir := range []string{filepath.Dir(fctPath), "."} {
+		if t, ok := readCompilerTarget(filepath.Join(dir, "fct.toml")); ok {
+			return t
+		}
+	}
+	return ""
+}
+
+func readCompilerTarget(tomlPath string) (string, bool) {
+	data, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return "", false
+	}
+	section := ""
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		if section != "compiler" {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "target" {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(val), `"`), true
+	}
+	return "", false
 }
 
 // sanitizePkg turns a directory name into a valid Go package identifier.
