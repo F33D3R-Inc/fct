@@ -9,6 +9,7 @@
 use crate::json::{self, Json};
 use crate::sha256;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -411,5 +412,252 @@ impl Broker for LocalBroker {
     }
     fn on_message(&self, handler: Arc<dyn Fn(String) + Send + Sync>) {
         *self.handler.lock().unwrap() = Some(handler);
+    }
+}
+
+// ── standard base64 (alphabet +/, no padding) ───────────────────────────────
+
+const B64STD: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8], table: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(table[((n >> 18) & 63) as usize] as char);
+        out.push(table[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(table[((n >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(table[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+fn b64_decode(s: &str, table: &[u8]) -> Option<Vec<u8>> {
+    let mut rev = [255u8; 256];
+    for (i, &c) in table.iter().enumerate() {
+        rev[c as usize] = i as u8;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let n = bytes.len() - i;
+        if n < 2 {
+            return None;
+        }
+        let c0 = rev[bytes[i] as usize];
+        let c1 = rev[bytes[i + 1] as usize];
+        if c0 == 255 || c1 == 255 {
+            return None;
+        }
+        out.push((c0 << 2) | (c1 >> 4));
+        if n >= 3 {
+            let c2 = rev[bytes[i + 2] as usize];
+            if c2 == 255 {
+                return None;
+            }
+            out.push((c1 << 4) | (c2 >> 2));
+            if n >= 4 {
+                let c3 = rev[bytes[i + 3] as usize];
+                if c3 == 255 {
+                    return None;
+                }
+                out.push((c2 << 6) | c3);
+            }
+        }
+        i += 4;
+    }
+    Some(out)
+}
+
+// ── password hashing + accounts (mirror fa/auth.go) ─────────────────────────
+
+const PBKDF2_ITER: u32 = 600_000;
+const PBKDF2_SALT_LEN: usize = 16;
+const PBKDF2_KEY_LEN: usize = 32;
+const PBKDF2_SCHEME: &str = "pbkdf2-sha256";
+
+/// pbkdf2_hmac_sha256 derives a dklen-byte key (RFC 8018, HMAC-SHA256 PRF).
+pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iter: u32, dklen: usize) -> Vec<u8> {
+    let hlen = 32usize;
+    let blocks = dklen.div_ceil(hlen);
+    let mut out = Vec::with_capacity(blocks * hlen);
+    for block in 1..=blocks as u32 {
+        let mut msg = salt.to_vec();
+        msg.extend_from_slice(&block.to_be_bytes());
+        let mut u = sha256::hmac_sha256(password, &msg);
+        let mut t = u;
+        for _ in 1..iter {
+            u = sha256::hmac_sha256(password, &u);
+            for j in 0..hlen {
+                t[j] ^= u[j];
+            }
+        }
+        out.extend_from_slice(&t);
+    }
+    out.truncate(dklen);
+    out
+}
+
+/// hash_password returns a self-describing PBKDF2-HMAC-SHA256 hash, format
+/// "pbkdf2-sha256$<iter>$<rawstd-b64 salt>$<rawstd-b64 key>" — identical to
+/// fa/auth.go, so a hash made by a Go server verifies here and vice versa.
+pub fn hash_password(password: &str) -> String {
+    hash_password_iter(password, PBKDF2_ITER)
+}
+
+pub fn hash_password_iter(password: &str, iter: u32) -> String {
+    let salt = rand_bytes(PBKDF2_SALT_LEN);
+    let key = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iter, PBKDF2_KEY_LEN);
+    format!("{}${}${}${}", PBKDF2_SCHEME, iter, b64_encode(&salt, B64STD), b64_encode(&key, B64STD))
+}
+
+pub fn verify_password(encoded: &str, password: &str) -> bool {
+    let parts: Vec<&str> = encoded.split('$').collect();
+    if parts.len() != 4 || parts[0] != PBKDF2_SCHEME {
+        return false;
+    }
+    let iter: u32 = match parts[1].parse() {
+        Ok(n) if n >= 1 => n,
+        _ => return false,
+    };
+    let salt = match b64_decode(parts[2], B64STD) {
+        Some(s) => s,
+        None => return false,
+    };
+    let want = match b64_decode(parts[3], B64STD) {
+        Some(w) if !w.is_empty() => w,
+        _ => return false,
+    };
+    let got = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iter, want.len());
+    ct_eq(&got, &want)
+}
+
+/// rand_bytes reads cryptographic entropy from /dev/urandom, with a time+hash
+/// fallback (dependency-free; no rng crate).
+pub fn rand_bytes(n: usize) -> Vec<u8> {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let mut buf = vec![0u8; n];
+        if f.read_exact(&mut buf).is_ok() {
+            return buf;
+        }
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let mut seed = now.as_nanos().to_le_bytes().to_vec();
+    let mut out = Vec::new();
+    let mut ctr = 0u64;
+    while out.len() < n {
+        seed.extend_from_slice(&ctr.to_le_bytes());
+        out.extend_from_slice(&sha256::sha256(&seed));
+        ctr += 1;
+    }
+    out.truncate(n);
+    out
+}
+
+#[derive(Clone)]
+pub struct Account {
+    pub login: String,
+    pub hash: String,
+    pub roles: Vec<String>,
+}
+
+/// Auth is an in-memory account store with hashed passwords.
+pub struct Auth {
+    users: Mutex<HashMap<String, Account>>,
+}
+
+impl Default for Auth {
+    fn default() -> Self {
+        Auth::new()
+    }
+}
+
+impl Auth {
+    pub fn new() -> Auth {
+        Auth { users: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn signup(&self, login: &str, password: &str, roles: Vec<String>) -> Result<Account, String> {
+        if login.is_empty() {
+            return Err("fa: empty login".into());
+        }
+        if password.chars().count() < 8 {
+            return Err("fa: weak password (min 8)".into());
+        }
+        let mut users = self.users.lock().unwrap();
+        if users.contains_key(login) {
+            return Err("fa: login taken".into());
+        }
+        let acct = Account { login: login.to_string(), hash: hash_password(password), roles };
+        users.insert(login.to_string(), acct.clone());
+        Ok(acct)
+    }
+
+    pub fn login(&self, login: &str, password: &str) -> Option<Account> {
+        let users = self.users.lock().unwrap();
+        match users.get(login) {
+            Some(a) if verify_password(&a.hash, password) => Some(a.clone()),
+            _ => None,
+        }
+    }
+}
+
+// ── metrics (mirror fa/observe.go) ──────────────────────────────────────────
+
+#[derive(Default)]
+pub struct Metrics {
+    pub events_in: AtomicI64,
+    pub events_out: AtomicI64,
+    pub conns_active: AtomicI64,
+    pub conns_total: AtomicI64,
+    pub rate_limited: AtomicI64,
+    pub forbidden: AtomicI64,
+}
+
+impl Metrics {
+    pub fn new() -> Metrics {
+        Metrics::default()
+    }
+
+    pub fn inc(field: &AtomicI64) {
+        field.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_by(field: &AtomicI64, n: i64) {
+        field.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn snapshot_json(&self) -> Json {
+        Json::obj(vec![
+            ("events_in", Json::Num(self.events_in.load(Ordering::Relaxed) as f64)),
+            ("events_out", Json::Num(self.events_out.load(Ordering::Relaxed) as f64)),
+            ("conns_active", Json::Num(self.conns_active.load(Ordering::Relaxed) as f64)),
+            ("conns_total", Json::Num(self.conns_total.load(Ordering::Relaxed) as f64)),
+            ("rate_limited", Json::Num(self.rate_limited.load(Ordering::Relaxed) as f64)),
+            ("forbidden", Json::Num(self.forbidden.load(Ordering::Relaxed) as f64)),
+        ])
+    }
+
+    pub fn prometheus(&self) -> String {
+        let g = |f: &AtomicI64| f.load(Ordering::Relaxed);
+        let line = |name: &str, help: &str, typ: &str, v: i64| format!("# HELP {n} {h}\n# TYPE {n} {t}\n{n} {v}\n", n = name, h = help, t = typ, v = v);
+        format!(
+            "{}{}{}{}{}{}",
+            line("fa_events_in_total", "Client actions received at /events.", "counter", g(&self.events_in)),
+            line("fa_events_out_total", "Events published to the broker.", "counter", g(&self.events_out)),
+            line("fa_sse_connections_active", "Currently-open SSE connections.", "gauge", g(&self.conns_active)),
+            line("fa_sse_connections_total", "SSE connections ever opened.", "counter", g(&self.conns_total)),
+            line("fa_events_rate_limited_total", "Requests to /events rejected by the per-IP rate limit (429).", "counter", g(&self.rate_limited)),
+            line("fa_events_forbidden_total", "Requests to /events rejected by guard/authz/CSRF (403).", "counter", g(&self.forbidden)),
+        )
     }
 }

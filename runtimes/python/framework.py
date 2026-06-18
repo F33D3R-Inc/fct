@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import re
 import time
 from urllib.parse import unquote_plus, urlparse
@@ -228,3 +229,115 @@ class LocalBroker:
 
     def subscribe(self, fn):
         self.fns.append(fn)
+
+
+# -- password hashing + accounts (mirror fa/auth.go) -------------------------
+
+PBKDF2_ITER = 600000
+SALT_LEN = 16
+KEY_LEN = 32
+SCHEME = "pbkdf2-sha256"
+
+
+def _b64(b):
+    return base64.b64encode(b).rstrip(b"=").decode()
+
+
+def _b64d(s):
+    return base64.b64decode(s + "=" * (-len(s) % 4))
+
+
+def hash_password(pw, iterations=PBKDF2_ITER):
+    """Self-describing PBKDF2-HMAC-SHA256 hash, format
+    "pbkdf2-sha256$<iter>$<rawstd-b64 salt>$<rawstd-b64 key>" — identical to
+    fa/auth.go, so a hash made by a Go server verifies here and vice versa."""
+    salt = os.urandom(SALT_LEN)
+    key = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations, KEY_LEN)
+    return "%s$%d$%s$%s" % (SCHEME, iterations, _b64(salt), _b64(key))
+
+
+def verify_password(encoded, pw):
+    parts = (encoded or "").split("$")
+    if len(parts) != 4 or parts[0] != SCHEME:
+        return False
+    try:
+        iterations = int(parts[1])
+    except ValueError:
+        return False
+    if iterations < 1:
+        return False
+    try:
+        salt = _b64d(parts[2])
+        want = _b64d(parts[3])
+    except (ValueError, TypeError):
+        return False
+    if not want:
+        return False
+    got = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations, len(want))
+    return hmac.compare_digest(got, want)
+
+
+_DECOY = hash_password("decoy-" + os.urandom(8).hex(), 1)
+
+
+class Auth:
+    """In-memory account store with hashed passwords. Record the returned account's
+    login in the session (uid) after a successful login."""
+
+    def __init__(self):
+        self.users = {}  # login → {"login", "hash", "roles"}
+
+    def signup(self, login, password, roles=None):
+        if not login:
+            raise ValueError("fa: empty login")
+        if login in self.users:
+            raise ValueError("fa: login taken")
+        if len(password or "") < 8:
+            raise ValueError("fa: weak password (min 8)")
+        u = {"login": login, "hash": hash_password(password), "roles": roles or []}
+        self.users[login] = u
+        return u
+
+    def login(self, login, password):
+        u = self.users.get(login)
+        if u is None:
+            verify_password(_DECOY, password)  # constant-ish time
+            return None
+        return u if verify_password(u["hash"], password) else None
+
+    def get(self, login):
+        return self.users.get(login)
+
+
+# -- metrics (mirror fa/observe.go) ------------------------------------------
+
+class Metrics:
+    def __init__(self):
+        self.events_in = 0
+        self.events_out = 0
+        self.conns_active = 0
+        self.conns_total = 0
+        self.rate_limited = 0
+        self.forbidden = 0
+
+    def snapshot(self):
+        return {
+            "events_in": self.events_in, "events_out": self.events_out,
+            "conns_active": self.conns_active, "conns_total": self.conns_total,
+            "rate_limited": self.rate_limited, "forbidden": self.forbidden,
+        }
+
+    def prometheus(self):
+        m = self.snapshot()
+
+        def line(name, help_, typ, v):
+            return "# HELP %s %s\n# TYPE %s %s\n%s %d\n" % (name, help_, name, typ, name, v)
+
+        return (
+            line("fa_events_in_total", "Client actions received at /events.", "counter", m["events_in"]) +
+            line("fa_events_out_total", "Events published to the broker.", "counter", m["events_out"]) +
+            line("fa_sse_connections_active", "Currently-open SSE connections.", "gauge", m["conns_active"]) +
+            line("fa_sse_connections_total", "SSE connections ever opened.", "counter", m["conns_total"]) +
+            line("fa_events_rate_limited_total", "Requests to /events rejected by the per-IP rate limit (429).", "counter", m["rate_limited"]) +
+            line("fa_events_forbidden_total", "Requests to /events rejected by guard/authz/CSRF (403).", "counter", m["forbidden"])
+        )

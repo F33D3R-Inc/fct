@@ -36,4 +36,4 @@ app.root("LikeButton", lambda _ctx: current())
 app.on("post.like", like)
 
 if __name__ == "__main__":
-    app.listen("localhost:7373")
+    app.listen(os.environ.get("FA_ADDR", "localhost:7373"))

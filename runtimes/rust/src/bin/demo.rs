@@ -40,5 +40,6 @@ fn main() {
             Some(data(&s))
         });
 
-    app.listen("localhost:7373");
+    let addr = std::env::var("FA_ADDR").unwrap_or_else(|_| "localhost:7373".to_string());
+    app.listen(&addr);
 }

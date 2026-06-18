@@ -29,6 +29,29 @@ pub struct Ctx {
 pub type Handler = Box<dyn Fn(&Ctx) -> Option<Json> + Send + Sync>;
 pub type RootFn = Box<dyn Fn() -> Json + Send + Sync>;
 
+/// AdminRow is one row in a resource's list view.
+pub struct AdminRow {
+    pub id: String,
+    pub cells: Vec<String>,
+}
+
+/// AdminResource is one manageable model in the admin panel.
+pub struct AdminResource {
+    pub name: String,
+    pub label: String,
+    pub columns: Vec<String>,
+    pub list: Box<dyn Fn() -> Vec<AdminRow> + Send + Sync>,
+    pub get: Box<dyn Fn(&str) -> Vec<(String, String)> + Send + Sync>,
+}
+
+/// AdminCfg configures the deny-by-default admin panel. authorize receives the
+/// viewer identity; with no AdminCfg set, /admin is refused.
+pub struct AdminCfg {
+    pub title: String,
+    pub authorize: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    pub resources: Vec<AdminResource>,
+}
+
 struct FacetDef {
     facet_id: String,
     tree: Vec<Node>,
@@ -57,6 +80,9 @@ pub struct App {
     sessions: Option<Arc<framework::Sessions>>,
     limiter: framework::RateLimiter,
     broker: Arc<dyn Broker>,
+    metrics: framework::Metrics,
+    auth: Option<Arc<framework::Auth>>,
+    admin: Option<AdminCfg>,
 }
 
 /// A live SSE connection: its event channel, whether it is a native (FA-Native)
@@ -144,7 +170,27 @@ impl App {
             sessions: None,
             limiter: framework::RateLimiter::new(20.0, 40.0),
             broker: Arc::new(framework::LocalBroker::new()),
+            metrics: framework::Metrics::new(),
+            auth: None,
+            admin: None,
         }
+    }
+
+    /// with_auth installs an in-memory password-account store. Get it with
+    /// auth_store() to signup users before listen().
+    pub fn with_auth(mut self) -> App {
+        self.auth = Some(Arc::new(framework::Auth::new()));
+        self
+    }
+
+    pub fn auth_store(&self) -> Option<Arc<framework::Auth>> {
+        self.auth.clone()
+    }
+
+    /// admin enables the deny-by-default admin panel at GET /admin.
+    pub fn admin(mut self, cfg: AdminCfg) -> App {
+        self.admin = Some(cfg);
+        self
     }
 
     pub fn root<F: Fn() -> Json + Send + Sync + 'static>(mut self, name: &str, f: F) -> App {
@@ -304,6 +350,7 @@ impl App {
         if frames.is_empty() {
             return;
         }
+        framework::Metrics::inc_by(&self.metrics.events_out, frames.len() as i64);
         let msg = Json::obj(vec![("conn", Json::Str(conn.to_string())), ("frames", Json::Arr(frames))]);
         self.broker.publish(msg.to_string());
     }
@@ -365,6 +412,14 @@ impl App {
             ("POST", "/events") => self.handle_events(&mut stream, &body, origin.as_deref(), host.as_deref(), &ip),
             ("GET", "/manifest.json") => write_response(&mut stream, 200, "application/json", self.manifest_raw.as_bytes()),
             ("GET", "/render.json") => write_response(&mut stream, 200, "application/json", self.render_raw.as_bytes()),
+            ("GET", "/healthz") => write_response(&mut stream, 200, "text/plain", b"ok"),
+            ("GET", "/readyz") => write_response(&mut stream, 200, "text/plain", b"ready"),
+            ("GET", "/debug/metrics") => write_response(&mut stream, 200, "application/json", self.metrics.snapshot_json().to_string().as_bytes()),
+            ("GET", "/metrics") => write_response(&mut stream, 200, "text/plain; version=0.0.4; charset=utf-8", self.metrics.prometheus().as_bytes()),
+            ("GET", "/admin") => {
+                let identity = self.view_from_cookie(&cookie).identity;
+                self.serve_admin(&mut stream, &path, &identity);
+            }
             ("GET", "/fa-runtime.js") => match std::fs::read(&self.runtime_js) {
                 Ok(js) => write_response(&mut stream, 200, "text/javascript", &js),
                 Err(_) => write_response(&mut stream, 404, "text/plain", b"no runtime"),
@@ -421,6 +476,8 @@ impl App {
         let (tx, rx) = mpsc::channel::<String>();
         let identity = self.view_from_cookie(cookie).identity;
         self.conns.lock().unwrap().insert(cid.clone(), Conn { tx, native: is_native, identity });
+        framework::Metrics::inc(&self.metrics.conns_active);
+        framework::Metrics::inc(&self.metrics.conns_total);
 
         let hello = Json::obj(vec![
             ("op", Json::Str("_conn".into())),
@@ -430,6 +487,7 @@ impl App {
         ]);
         if stream.write_all(format!("data: {}\n\n", hello.to_string()).as_bytes()).is_err() {
             self.conns.lock().unwrap().remove(&cid);
+            framework::Metrics::inc_by(&self.metrics.conns_active, -1);
             return;
         }
         let _ = stream.flush();
@@ -445,18 +503,81 @@ impl App {
             }
         }
         self.conns.lock().unwrap().remove(&cid);
+        framework::Metrics::inc_by(&self.metrics.conns_active, -1);
+    }
+
+    fn serve_admin(&self, stream: &mut TcpStream, path: &str, identity: &str) {
+        let adm = match &self.admin {
+            Some(a) => a,
+            None => {
+                write_response(stream, 403, "text/plain", b"forbidden");
+                return;
+            }
+        };
+        if !(adm.authorize)(identity) {
+            write_response(stream, 403, "text/plain", b"forbidden");
+            return;
+        }
+        let esc = render::html_escape;
+        let mut body = format!("<h1>{}</h1>", esc(&adm.title));
+        body.push_str("<h2>Metrics</h2><ul>");
+        if let Json::Obj(pairs) = self.metrics.snapshot_json() {
+            for (k, v) in pairs {
+                body.push_str(&format!("<li>{}: <b>{}</b></li>", k, render::fmt(&v)));
+            }
+        }
+        body.push_str("</ul>");
+        body.push_str(&format!("<p>Open connections: <b>{}</b></p>", self.conns.lock().unwrap().len()));
+        let res_name = query_param(path, "resource");
+        let resource = res_name.as_ref().and_then(|n| adm.resources.iter().find(|r| &r.name == n));
+        match (resource, query_param(path, "id")) {
+            (Some(r), Some(id)) => {
+                body.push_str(&format!("<h2>{} · {}</h2><table>", esc(&r.label), esc(&id)));
+                for (label, value) in (r.get)(&id) {
+                    body.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", esc(&label), esc(&value)));
+                }
+                body.push_str("</table>");
+            }
+            (Some(r), None) => {
+                body.push_str(&format!("<h2>{}</h2><table><tr>", esc(&r.label)));
+                for c in &r.columns {
+                    body.push_str(&format!("<th>{}</th>", esc(c)));
+                }
+                body.push_str("</tr>");
+                for row in (r.list)() {
+                    body.push_str("<tr>");
+                    for c in &row.cells {
+                        body.push_str(&format!("<td>{}</td>", esc(c)));
+                    }
+                    body.push_str(&format!(" <td><a href=\"/admin?resource={}&id={}\">view</a></td></tr>", r.name, row.id));
+                }
+                body.push_str("</table>");
+            }
+            _ => {
+                body.push_str("<h2>Resources</h2><ul>");
+                for r in &adm.resources {
+                    body.push_str(&format!("<li><a href=\"/admin?resource={}\">{}</a></li>", r.name, esc(&r.label)));
+                }
+                body.push_str("</ul>");
+            }
+        }
+        let page = format!("<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body>{}</body></html>", esc(&adm.title), body);
+        write_response(stream, 200, "text/html; charset=utf-8", page.as_bytes());
     }
 
     fn handle_events(&self, stream: &mut TcpStream, body: &[u8], origin: Option<&str>, host: Option<&str>, ip: &str) {
         // CSRF defense-in-depth (cross-origin reject) + per-IP throttle.
         if !framework::same_origin(origin, host) {
+            framework::Metrics::inc(&self.metrics.forbidden);
             write_response(stream, 403, "text/plain", b"cross-origin");
             return;
         }
         if !self.limiter.allow(ip) {
+            framework::Metrics::inc(&self.metrics.rate_limited);
             write_response(stream, 429, "text/plain", b"rate limited");
             return;
         }
+        framework::Metrics::inc(&self.metrics.events_in);
         write_response(stream, 204, "text/plain", b"");
         let parsed = match json::parse(&String::from_utf8_lossy(body)) {
             Some(p) => p,

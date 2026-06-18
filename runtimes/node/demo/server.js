@@ -27,4 +27,4 @@ app.on('post.like', () => {
   return { post: state.post, count: state.count, liked: state.liked };
 });
 
-app.listen('localhost:7373');
+app.listen(process.env.FA_ADDR || 'localhost:7373');

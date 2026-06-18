@@ -185,4 +185,92 @@ class LocalBroker {
   subscribe(fn) { this.fns.push(fn); }
 }
 
-module.exports = { Sessions, parseCookie, enforceWho, deleteField, sameOrigin, RateLimiter, Form, LocalBroker };
+// ── password hashing + accounts (mirror fa/auth.go) ─────────────────────────
+
+const PBKDF2_ITER = 600000;
+const SALT_LEN = 16;
+const KEY_LEN = 32;
+const SCHEME = 'pbkdf2-sha256';
+
+// hashPassword returns a self-describing PBKDF2-HMAC-SHA256 hash, format
+// "pbkdf2-sha256$<iter>$<rawstd-b64 salt>$<rawstd-b64 key>" — identical to
+// fa/auth.go, so a hash made by a Go server verifies here and vice versa.
+function hashPassword(pw, iter) {
+  iter = iter || PBKDF2_ITER;
+  const salt = crypto.randomBytes(SALT_LEN);
+  const key = crypto.pbkdf2Sync(pw, salt, iter, KEY_LEN, 'sha256');
+  return SCHEME + '$' + iter + '$' + b64raw(salt) + '$' + b64raw(key);
+}
+
+function verifyPassword(encoded, pw) {
+  const parts = (encoded || '').split('$');
+  if (parts.length !== 4 || parts[0] !== SCHEME) return false;
+  const iter = parseInt(parts[1], 10);
+  if (!(iter >= 1)) return false;
+  let salt, want;
+  try { salt = Buffer.from(parts[2], 'base64'); want = Buffer.from(parts[3], 'base64'); } catch (e) { return false; }
+  if (want.length === 0) return false;
+  const got = crypto.pbkdf2Sync(pw, salt, iter, want.length, 'sha256');
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+
+function b64raw(buf) { return buf.toString('base64').replace(/=+$/, ''); }
+
+// A decoy hash so login() of an unknown user still spends ~one verify (mitigates
+// user-enumeration timing).
+const DECOY = hashPassword('decoy-' + crypto.randomBytes(8).toString('hex'), 1);
+
+// Auth is an in-memory account store with hashed passwords. Record the returned
+// account's login in the session (uid) after a successful login.
+class Auth {
+  constructor() { this.users = new Map(); } // login → { login, hash, roles }
+
+  signup(login, password, roles) {
+    if (!login) throw new Error('fa: empty login');
+    if (this.users.has(login)) throw new Error('fa: login taken');
+    if ((password || '').length < 8) throw new Error('fa: weak password (min 8)');
+    const u = { login: login, hash: hashPassword(password), roles: roles || [] };
+    this.users.set(login, u);
+    return u;
+  }
+
+  login(login, password) {
+    const u = this.users.get(login);
+    if (!u) { verifyPassword(DECOY, password); return null; } // constant-ish time
+    return verifyPassword(u.hash, password) ? u : null;
+  }
+
+  get(login) { return this.users.get(login) || null; }
+}
+
+// ── metrics (mirror fa/observe.go) ──────────────────────────────────────────
+
+class Metrics {
+  constructor() {
+    this.events_in = 0; this.events_out = 0;
+    this.conns_active = 0; this.conns_total = 0;
+    this.rate_limited = 0; this.forbidden = 0;
+  }
+  snapshot() {
+    return {
+      events_in: this.events_in, events_out: this.events_out,
+      conns_active: this.conns_active, conns_total: this.conns_total,
+      rate_limited: this.rate_limited, forbidden: this.forbidden,
+    };
+  }
+  prometheus() {
+    const m = this.snapshot();
+    const line = (name, help, typ, v) => '# HELP ' + name + ' ' + help + '\n# TYPE ' + name + ' ' + typ + '\n' + name + ' ' + v + '\n';
+    return line('fa_events_in_total', 'Client actions received at /events.', 'counter', m.events_in) +
+      line('fa_events_out_total', 'Events published to the broker.', 'counter', m.events_out) +
+      line('fa_sse_connections_active', 'Currently-open SSE connections.', 'gauge', m.conns_active) +
+      line('fa_sse_connections_total', 'SSE connections ever opened.', 'counter', m.conns_total) +
+      line('fa_events_rate_limited_total', 'Requests to /events rejected by the per-IP rate limit (429).', 'counter', m.rate_limited) +
+      line('fa_events_forbidden_total', 'Requests to /events rejected by guard/authz/CSRF (403).', 'counter', m.forbidden);
+  }
+}
+
+module.exports = {
+  Sessions, parseCookie, enforceWho, deleteField, sameOrigin, RateLimiter, Form, LocalBroker,
+  hashPassword, verifyPassword, Auth, Metrics,
+};

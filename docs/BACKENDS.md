@@ -76,11 +76,13 @@ The **framework surface is uniform** — no Go-only tier. Each runtime ports
 `fa/session.go`, `fa/authz.go`, `fa/security.go`, `fa/form.go`, `fa/broker.go`:
 signed-cookie sessions (HMAC layout identical to Go — cookies are cross-readable),
 `who:` authorization (`require` gate + `redact`, enforced from the IR's `who`
-block), CSRF/same-origin, per-IP rate limiting, security headers, forms, and the
-pluggable broker (in-process default). Verified cross-runtime: identical session
-cookies, identical authz deny/redact, 403 on cross-origin, 429 over burst. Not yet
-ported (additive): admin panel, observability/tracing, a built-in password store.
-Per language the surface is:
+block), CSRF/same-origin, per-IP rate limiting, security headers, forms, the
+pluggable broker (in-process default), **password hashing** (PBKDF2-HMAC-SHA256,
+hashes cross-verify with Go), **observability** (`/healthz` · `/readyz` ·
+`/debug/metrics` · `/metrics`), and a **deny-by-default admin panel**. Verified
+cross-runtime: identical session cookies, identical authz deny/redact, 403 on
+cross-origin, 429 over burst, cross-verifying password hashes, moving metrics.
+**There is no Go-only tier.** Per language the surface is:
 
 - **Render-IR interpreter** — render a facet from the neutral IR (below) instead of
   Go `html/template`. ~a few hundred lines; the browser runtime (`runtime/fa-runtime.js`)

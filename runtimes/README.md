@@ -97,10 +97,23 @@ tier. Each runtime has a `framework` module porting `fa/session.go`,
 Register via the same shape everywhere: `app.identify(...)`, `app.policy(name,
 fn)`, `app.sessions()` (Node/Python) / `with_sessions()` (Rust), `app.broker(b)`.
 
+## Observability, auth & admin (also uniform)
+
+- **Password store** — `app.auth()`: PBKDF2-HMAC-SHA256 hashing
+  (`pbkdf2-sha256$iter$salt$key`) identical to `fa/auth.go`, so a password hash
+  made by any backend verifies on the others. `signup`/`login`, min-length +
+  taken-login checks, constant-time verify. (Verified: Go↔Node↔Python↔Rust hashes
+  cross-verify.)
+- **Observability** — `GET /healthz`, `/readyz`, `/debug/metrics` (JSON), and
+  `/metrics` (Prometheus exposition) with the same counters as `fa/observe.go`
+  (`events_in`/`out`, `conns_active`/`total`, `rate_limited`, `forbidden`).
+- **Admin panel** — `app.admin(...)`: deny-by-default (no `authorize` ⇒ 403), a
+  live metrics + connections dashboard, and resource list/detail views.
+
 ## Status
 
-Implemented in all three: the core live-render loop (page, SSE, signing, `when:`
-re-render, render-IR interpretation incl. child facets / `if` / `for`), the native
-neutral-tree path, and the framework surface above. Not yet ported: the admin
-panel, observability/tracing, and a built-in auth password store — additive
-against the same contract.
+Implemented in all three, at parity with `fa/`: the core live-render loop (page,
+SSE, signing, `when:` re-render, render-IR interpretation incl. child facets /
+`if` / `for`), the native neutral-tree path, the framework surface (sessions,
+`who:`, CSRF, rate limiting, forms, broker), and observability / auth / admin.
+There is no Go-only tier.

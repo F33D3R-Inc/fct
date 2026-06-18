@@ -266,6 +266,23 @@ class App:
         self.limiter = fw.RateLimiter(20, 40)
         self._broker = fw.LocalBroker()
         self._broker.subscribe(self._deliver_local)
+        self.metrics = fw.Metrics()
+        self._auth = None
+        self._admin = None
+        self._draining = False
+
+    def auth(self):
+        if self._auth is None:
+            self._auth = fw.Auth()
+        return self._auth
+
+    def admin(self, authorize=None, title=None, resources=None):
+        self._admin = {
+            "authorize": authorize or (lambda req: False),
+            "title": title or (self.title + " · admin"),
+            "resources": resources or [],
+        }
+        return self
 
     def root(self, name, data_fn):
         self._root = (name, data_fn)
@@ -336,6 +353,7 @@ class App:
                     ev = sign_event(self.key_hex, {"op": op, "facet_id": r["facet_id"], "fragment": fragment})
                     frames.append(ev)
         if frames:
+            self.metrics.events_out += len(frames)
             self._broker.publish(dumps({"conn": conn, "frames": frames}))
 
     def _deliver_local(self, msg):
@@ -364,6 +382,16 @@ class App:
                     return app._serve_shell(self)
                 if p == "/sse":
                     return app._serve_sse(self)
+                if p == "/healthz":
+                    return app._text(self, 200, "ok")
+                if p == "/readyz":
+                    return app._text(self, 503 if app._draining else 200, "draining" if app._draining else "ready")
+                if p == "/debug/metrics":
+                    return app._json(self, app.metrics.snapshot())
+                if p == "/metrics":
+                    return app._text(self, 200, app.metrics.prometheus(), "text/plain; version=0.0.4; charset=utf-8")
+                if p == "/admin":
+                    return app._serve_admin(self)
                 if p == "/manifest.json":
                     return app._json(self, app.manifest)
                 if p == "/render.json":
@@ -444,6 +472,8 @@ class App:
         ident = (self._identity_fn(self._req(h)) if self._identity_fn else "") or ""
         with self._lock:
             self.conns[cid] = {"q": q, "native": h.headers.get("FA-Native") == "1", "identity": ident}
+            self.metrics.conns_active += 1
+            self.metrics.conns_total += 1
         hello = dumps({"op": "_conn", "conn": cid, "key": self.key_hex, "v": WIRE_VERSION})
         try:
             h.wfile.write(("data: %s\n\n" % hello).encode())
@@ -460,18 +490,22 @@ class App:
         finally:
             with self._lock:
                 self.conns.pop(cid, None)
+                self.metrics.conns_active -= 1
 
     def _handle_events(self, h):
         # CSRF defense-in-depth (cross-origin reject) + per-IP throttle.
         if not fw.same_origin(h.headers.get("Origin"), h.headers.get("Host")):
+            self.metrics.forbidden += 1
             h.send_response(403)
             h.end_headers()
             return
         ip = h.client_address[0] if h.client_address else ""
         if not self.limiter.allow(ip):
+            self.metrics.rate_limited += 1
             h.send_response(429)
             h.end_headers()
             return
+        self.metrics.events_in += 1
         length = int(h.headers.get("Content-Length", 0))
         raw = h.rfile.read(length) if length else b"{}"
         h.send_response(204)
@@ -497,3 +531,40 @@ class App:
         h.send_header("Content-Length", str(len(data)))
         h.end_headers()
         h.wfile.write(data)
+
+    def _text(self, h, status, text, content_type="text/plain; charset=utf-8"):
+        data = text.encode()
+        h.send_response(status)
+        h.send_header("Content-Type", content_type)
+        h.send_header("Content-Length", str(len(data)))
+        h.end_headers()
+        h.wfile.write(data)
+
+    def _serve_admin(self, h):
+        # Deny-by-default admin panel: live metrics, open connections, resources.
+        adm = self._admin
+        from urllib.parse import parse_qs, urlparse as _urlparse
+        if adm is None or not adm["authorize"](self._req(h)):
+            return self._text(h, 403, "forbidden")
+        params = parse_qs(_urlparse(h.path).query)
+        esc = html_escape
+        m = self.metrics.snapshot()
+        body = "<h1>%s</h1>" % esc(adm["title"])
+        body += "<h2>Metrics</h2><ul>" + "".join("<li>%s: <b>%d</b></li>" % (k, v) for k, v in m.items()) + "</ul>"
+        body += "<p>Open connections: <b>%d</b></p>" % len(self.conns)
+        res_name = params.get("resource", [None])[0]
+        resource = next((r for r in adm["resources"] if r["name"] == res_name), None)
+        if resource and params.get("id"):
+            fields = resource.get("get", lambda i: [])(params["id"][0])
+            body += "<h2>%s · %s</h2><table>" % (esc(resource["label"]), esc(params["id"][0]))
+            body += "".join("<tr><th>%s</th><td>%s</td></tr>" % (esc(f["label"]), esc(f["value"])) for f in fields) + "</table>"
+        elif resource:
+            rows = resource.get("list", lambda: [])()
+            body += "<h2>%s</h2><table><tr>%s</tr>" % (esc(resource["label"]), "".join("<th>%s</th>" % esc(c) for c in resource.get("columns", [])))
+            for row in rows:
+                cells = "".join("<td>%s</td>" % esc(c) for c in row["cells"])
+                body += '<tr>%s <td><a href="/admin?resource=%s&id=%s">view</a></td></tr>' % (cells, resource["name"], row["id"])
+            body += "</table>"
+        else:
+            body += "<h2>Resources</h2><ul>" + "".join('<li><a href="/admin?resource=%s">%s</a></li>' % (r["name"], esc(r["label"])) for r in adm["resources"]) + "</ul>"
+        self._text(h, 200, "<!doctype html><html><head><meta charset=\"utf-8\"><title>%s</title></head><body>%s</body></html>" % (esc(adm["title"]), body), "text/html; charset=utf-8")

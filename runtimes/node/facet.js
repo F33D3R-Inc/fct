@@ -214,6 +214,21 @@ class App {
     this.limiter = new fw.RateLimiter((opts.rateLimit || {}).perSec || 20, (opts.rateLimit || {}).burst || 40);
     this._broker = new fw.LocalBroker();
     this._broker.subscribe((msg) => this._deliverLocal(msg));
+    this.metrics = new fw.Metrics(); // observability counters
+    this._auth = null;               // password-account store (lazy)
+    this._admin = null;              // { authorize, title, resources }
+    this._draining = false;
+  }
+
+  // auth returns the in-memory password-account store (PBKDF2-HMAC-SHA256).
+  auth() { if (!this._auth) this._auth = new fw.Auth(); return this._auth; }
+
+  // admin enables the deny-by-default admin panel at GET /admin. opts.authorize
+  // (req) → bool gates every request; opts.resources is a list of
+  // { name, label, columns, list(): rows, get(id): fields }.
+  admin(opts) {
+    this._admin = Object.assign({ title: this.title + ' · admin', authorize: () => false, resources: [] }, opts || {});
+    return this;
   }
 
   // root sets the facet rendered at GET / and its initial data.
@@ -290,7 +305,48 @@ class App {
       res.writeHead(200, { 'Content-Type': 'text/javascript' });
       return res.end(fs.readFileSync(this.runtimeJs));
     }
+    // Observability (mirror fa/observe.go).
+    if (req.method === 'GET' && url === '/healthz') { res.writeHead(200); return res.end('ok'); }
+    if (req.method === 'GET' && url === '/readyz') {
+      if (this._draining) { res.writeHead(503); return res.end('draining'); }
+      res.writeHead(200); return res.end('ready');
+    }
+    if (req.method === 'GET' && url === '/debug/metrics') return this._json(res, this.metrics.snapshot());
+    if (req.method === 'GET' && url === '/metrics') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+      return res.end(this.metrics.prometheus());
+    }
+    if (req.method === 'GET' && url === '/admin') return this._serveAdmin(req, res);
     res.writeHead(404); res.end('not found');
+  }
+
+  // _serveAdmin renders the deny-by-default admin panel: live metrics, open
+  // connections, and registered resources (list + detail). Mirror of fa/admin.go's
+  // capability (authorize gate, metrics dashboard, resources).
+  _serveAdmin(req, res) {
+    const adm = this._admin;
+    if (!adm || !adm.authorize(req)) { res.writeHead(403); return res.end('forbidden'); }
+    const params = new URLSearchParams(req.url.split('?')[1] || '');
+    const esc = htmlEscape;
+    let body = '<h1>' + esc(adm.title) + '</h1>';
+    const m = this.metrics.snapshot();
+    body += '<h2>Metrics</h2><ul>' + Object.keys(m).map((k) => '<li>' + k + ': <b>' + m[k] + '</b></li>').join('') + '</ul>';
+    body += '<p>Open connections: <b>' + this.conns.size + '</b></p>';
+    const resName = params.get('resource');
+    const resource = (adm.resources || []).find((r) => r.name === resName);
+    if (resource && params.get('id') != null) {
+      const fields = resource.get ? resource.get(params.get('id')) : [];
+      body += '<h2>' + esc(resource.label) + ' · ' + esc(params.get('id')) + '</h2><table>' +
+        fields.map((f) => '<tr><th>' + esc(f.label) + '</th><td>' + esc(f.value) + '</td></tr>').join('') + '</table>';
+    } else if (resource) {
+      const rows = resource.list ? resource.list() : [];
+      body += '<h2>' + esc(resource.label) + '</h2><table><tr>' + (resource.columns || []).map((c) => '<th>' + esc(c) + '</th>').join('') + '</tr>' +
+        rows.map((row) => '<tr>' + row.cells.map((c) => '<td>' + esc(c) + '</td>').join('') + ' <td><a href="/admin?resource=' + encodeURIComponent(resource.name) + '&id=' + encodeURIComponent(row.id) + '">view</a></td></tr>').join('') + '</table>';
+    } else {
+      body += '<h2>Resources</h2><ul>' + (adm.resources || []).map((r) => '<li><a href="/admin?resource=' + encodeURIComponent(r.name) + '">' + esc(r.label) + '</a></li>').join('') + '</ul>';
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<!doctype html><html><head><meta charset="utf-8"><title>' + esc(adm.title) + '</title></head><body>' + body + '</body></html>');
   }
 
   _serveShell(req, res) {
@@ -326,18 +382,20 @@ class App {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     const id = crypto.randomBytes(16).toString('hex');
     this.conns.set(id, { res: res, native: req.headers['fa-native'] === '1', identity: this._identityFn ? (this._identityFn(req) || '') : '' });
+    this.metrics.conns_active++; this.metrics.conns_total++;
     const hello = JSON.stringify({ op: '_conn', conn: id, key: this.keyHex, v: WIRE_VERSION });
     res.write('data: ' + hello + '\n\n');
     const hb = setInterval(() => res.write(': keepalive\n\n'), 25000);
-    req.on('close', () => { clearInterval(hb); this.conns.delete(id); });
+    req.on('close', () => { clearInterval(hb); this.conns.delete(id); this.metrics.conns_active--; });
   }
 
   _handleEvents(req, res) {
     // CSRF defense-in-depth: reject cross-origin POSTs (on top of the unguessable
     // conn id). Then throttle per client IP.
-    if (!fw.sameOrigin(req)) { res.writeHead(403); return res.end('cross-origin'); }
+    if (!fw.sameOrigin(req)) { this.metrics.forbidden++; res.writeHead(403); return res.end('cross-origin'); }
     const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
-    if (!this.limiter.allow(ip)) { res.writeHead(429); return res.end('rate limited'); }
+    if (!this.limiter.allow(ip)) { this.metrics.rate_limited++; res.writeHead(429); return res.end('rate limited'); }
+    this.metrics.events_in++;
     let buf = '';
     req.on('data', (c) => { buf += c; });
     req.on('end', () => {
@@ -375,7 +433,7 @@ class App {
         }
       }
     }
-    if (frames.length > 0) this._broker.publish(JSON.stringify({ conn: conn, frames: frames }));
+    if (frames.length > 0) { this.metrics.events_out += frames.length; this._broker.publish(JSON.stringify({ conn: conn, frames: frames })); }
   }
 
   // _deliverLocal applies a broker message to a locally-held connection (the

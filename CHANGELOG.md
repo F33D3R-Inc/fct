@@ -4,6 +4,30 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
+## v0.14.8
+
+The last Go-only gaps are gone — **no runtime has any capability the others lack**.
+Node/Python/Rust now port the final three `fa/` subsystems:
+
+- **Password store** (`fa/auth.go`) — `app.auth()`: PBKDF2-HMAC-SHA256 hashing,
+  format `pbkdf2-sha256$<iter>$<salt>$<key>` **byte-identical to Go**, so a password
+  hash made on any backend verifies on the others. `signup`/`login` with
+  min-length + taken-login checks and constant-time verify. Rust implements PBKDF2
+  + base64 by hand (still dependency-free). Verified: Go↔Node↔Python↔Rust hashes
+  cross-verify; wrong passwords rejected.
+- **Observability** (`fa/observe.go`) — `GET /healthz`, `/readyz`, `/debug/metrics`
+  (JSON), `/metrics` (Prometheus exposition), with the same counters
+  (`events_in`/`out`, `conns_active`/`total`, `rate_limited`, `forbidden`), wired
+  into the request paths.
+- **Admin panel** (`fa/admin.go`) — `app.admin(...)`: deny-by-default (no
+  `authorize` ⇒ 403), a live metrics + connections dashboard, and resource
+  list/detail views.
+
+Also: the demos now honor `FA_ADDR`. Verified cross-runtime end-to-end (health/ready,
+metrics endpoints + moving counters, admin 403 deny / 200 authorized with
+resources). This completes the language-agnostic surface — see `runtimes/README.md`,
+`docs/BACKENDS.md`.
+
 ## v0.14.7
 
 Close the Go-only gap: the framework "batteries" are now **uniform across every
