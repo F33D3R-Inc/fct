@@ -117,6 +117,13 @@ func (p *parser) parseFacet() (*ast.Facet, error) {
 			if err := p.parseWhat(f); err != nil {
 				return nil, err
 			}
+		case head == "state:":
+			if !f.ServerRendered() {
+				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`state:` is not valid on a %s — client reactive state binds to a server-rendered body", f.Kind)}
+			}
+			if err := p.parseState(f); err != nil {
+				return nil, err
+			}
 		case head == "looks:":
 			if !f.ServerRendered() {
 				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`looks:` is not allowed on a %s — it renders on the client; use %s", f.Kind, clientBlockHint(f.Kind))}
@@ -195,6 +202,27 @@ func (p *parser) parseFacet() (*ast.Facet, error) {
 			p.next()
 		case head == "when" || strings.HasPrefix(head, "when "):
 			if err := p.parseWhen(f); err != nil {
+				return nil, err
+			}
+		case head == "actions:":
+			if !f.ServerRendered() {
+				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`actions:` is not valid on a %s — client actions mutate state signals on a server-rendered body", f.Kind)}
+			}
+			if err := p.parseActions(f); err != nil {
+				return nil, err
+			}
+		case head == "effects:":
+			if !f.ServerRendered() {
+				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`effects:` is not valid on a %s", f.Kind)}
+			}
+			if err := p.parseEffects(f); err != nil {
+				return nil, err
+			}
+		case head == "query:":
+			if !f.ServerRendered() {
+				return nil, &perr{t.Line, t.Col, fmt.Sprintf("`query:` is not valid on a %s", f.Kind)}
+			}
+			if err := p.parseQueries(f); err != nil {
 				return nil, err
 			}
 		case strings.HasPrefix(head, "facet-id:"):
@@ -390,6 +418,33 @@ func (p *parser) parseWhat(f *ast.Facet) error {
 	return nil
 }
 
+// parseState parses a `state:` block — local client reactive values. It reuses
+// the `what:` field grammar but every field MUST carry an initial value
+// (`name: Type = <expr>` or `name = <expr>`): a signal has to start somewhere,
+// and a default-less state field is almost always a mistake. See
+// docs/REACTIVITY.md (Brick 1).
+func (p *parser) parseState(f *ast.Facet) error {
+	p.next() // consume `state:`
+	if _, err := p.expect(lexer.INDENT, "indented state block"); err != nil {
+		return err
+	}
+	for p.at(lexer.LINE) {
+		t := p.next()
+		fld, err := parseField(t)
+		if err != nil {
+			return err
+		}
+		if !fld.IsComputed() { // Expr == "" → no initial value
+			return &perr{t.Line, t.Col, fmt.Sprintf("state field %q needs an initial value (e.g. `%s = 0`)", fld.Name, fld.Name)}
+		}
+		f.State = append(f.State, fld)
+	}
+	if _, err := p.expect(lexer.DEDENT, "end of state block"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func parseField(t lexer.Token) (ast.Field, error) {
 	pos := ast.Pos{Line: t.Line, Col: t.Col}
 	// A computed field is `<decl> = <expr>`, where the assignment '=' is the first
@@ -516,6 +571,139 @@ func parseMutation(t lexer.Token) (ast.Mutation, error) {
 	default:
 		return ast.Mutation{}, &perr{t.Line, t.Col, fmt.Sprintf("unknown mutation %q", op)}
 	}
+}
+
+// ── actions (client handlers) ───────────────────────────────────────────────
+
+// parseActions parses the `actions:` block (Brick 3 of docs/REACTIVITY.md). Each
+// action is a `name:` header followed by an indented body of `signal = expr`
+// assignment lines — the named, reusable client "controller method". The body
+// must be non-empty: an action with no mutation is always a mistake.
+func (p *parser) parseActions(f *ast.Facet) error {
+	p.next() // consume `actions:`
+	if _, err := p.expect(lexer.INDENT, "indented actions block"); err != nil {
+		return err
+	}
+	for p.at(lexer.LINE) {
+		hdr := p.next()
+		name := strings.TrimSpace(strings.TrimSuffix(hdr.Text, ":"))
+		if !strings.HasSuffix(hdr.Text, ":") || !isIdent(name) {
+			return &perr{hdr.Line, hdr.Col, fmt.Sprintf("expected an action header `name:`, got %q", hdr.Text)}
+		}
+		a := ast.Action{Name: name, Pos: ast.Pos{Line: hdr.Line, Col: hdr.Col}}
+		if _, err := p.expect(lexer.INDENT, fmt.Sprintf("indented body for action %q", name)); err != nil {
+			return err
+		}
+		for p.at(lexer.LINE) {
+			t := p.next()
+			as, err := parseAssign(t)
+			if err != nil {
+				return err
+			}
+			a.Mutations = append(a.Mutations, as)
+		}
+		if _, err := p.expect(lexer.DEDENT, fmt.Sprintf("end of action %q", name)); err != nil {
+			return err
+		}
+		if len(a.Mutations) == 0 {
+			return &perr{hdr.Line, hdr.Col, fmt.Sprintf("action %q has no mutations (add a `signal = expr` line)", name)}
+		}
+		f.Actions = append(f.Actions, a)
+	}
+	if _, err := p.expect(lexer.DEDENT, "end of actions block"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parseAssign parses one `signal = expr` mutation line. It reuses assignIndex so
+// `count = count == 0` splits at the assignment, not the comparison.
+func parseAssign(t lexer.Token) (ast.Assign, error) {
+	pos := ast.Pos{Line: t.Line, Col: t.Col}
+	i := assignIndex(t.Text)
+	if i < 0 {
+		return ast.Assign{}, &perr{t.Line, t.Col, fmt.Sprintf("expected `signal = expr`, got %q", t.Text)}
+	}
+	target := strings.TrimSpace(t.Text[:i])
+	expr := strings.TrimSpace(t.Text[i+1:])
+	if !isIdent(target) {
+		return ast.Assign{}, &perr{t.Line, t.Col, fmt.Sprintf("invalid assignment target %q (must be a state signal)", target)}
+	}
+	if expr == "" {
+		return ast.Assign{}, &perr{t.Line, t.Col, fmt.Sprintf("assignment to %q needs an expression after `=`", target)}
+	}
+	return ast.Assign{Target: target, Expr: expr, Pos: pos}, nil
+}
+
+// parseEffects parses the `effects:` block (Brick 7 of docs/REACTIVITY.md). Each
+// line is `on <dep1>, <dep2>: <action>`: when any dependency signal changes, the
+// named action runs.
+func (p *parser) parseEffects(f *ast.Facet) error {
+	p.next() // consume `effects:`
+	if _, err := p.expect(lexer.INDENT, "indented effects block"); err != nil {
+		return err
+	}
+	for p.at(lexer.LINE) {
+		t := p.next()
+		body := strings.TrimSpace(t.Text)
+		if !strings.HasPrefix(body, "on ") {
+			return &perr{t.Line, t.Col, fmt.Sprintf("expected `on <signals>: <action>`, got %q", t.Text)}
+		}
+		deps, action, ok := strings.Cut(strings.TrimSpace(body[3:]), ":")
+		if !ok {
+			return &perr{t.Line, t.Col, fmt.Sprintf("effect needs `: <action>`, got %q", t.Text)}
+		}
+		action = strings.TrimSpace(action)
+		if !isIdent(action) {
+			return &perr{t.Line, t.Col, fmt.Sprintf("invalid effect action %q", action)}
+		}
+		e := ast.Effect{Action: action, Pos: ast.Pos{Line: t.Line, Col: t.Col}}
+		for _, d := range strings.Split(deps, ",") {
+			d = strings.TrimSpace(d)
+			if !isIdent(d) {
+				return &perr{t.Line, t.Col, fmt.Sprintf("invalid effect dependency %q", d)}
+			}
+			e.Deps = append(e.Deps, d)
+		}
+		f.Effects = append(f.Effects, e)
+	}
+	if _, err := p.expect(lexer.DEDENT, "end of effects block"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parseQueries parses the `query:` block (Brick 11 of docs/REACTIVITY.md). Each
+// line is `name from "url"`: an async fetch the runtime exposes to the client
+// reactive layer as `name` with reactive {loading, error, data} fields.
+func (p *parser) parseQueries(f *ast.Facet) error {
+	p.next() // consume `query:`
+	if _, err := p.expect(lexer.INDENT, "indented query block"); err != nil {
+		return err
+	}
+	for p.at(lexer.LINE) {
+		t := p.next()
+		name, rest, ok := strings.Cut(strings.TrimSpace(t.Text), " from ")
+		if !ok {
+			return &perr{t.Line, t.Col, fmt.Sprintf("expected `name from \"url\"`, got %q", t.Text)}
+		}
+		name = strings.TrimSpace(name)
+		if !isIdent(name) {
+			return &perr{t.Line, t.Col, fmt.Sprintf("invalid query name %q", name)}
+		}
+		url, ok := unquote(rest)
+		if !ok {
+			return &perr{t.Line, t.Col, fmt.Sprintf("query %q url must be a double-quoted string", name)}
+		}
+		if url == "" {
+			return &perr{t.Line, t.Col, fmt.Sprintf("query %q needs a url", name)}
+		}
+		f.Queries = append(f.Queries, ast.Query{Name: name, URL: url, Pos: ast.Pos{Line: t.Line, Col: t.Col}})
+	}
+	if _, err := p.expect(lexer.DEDENT, "end of query block"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ── looks (template) ────────────────────────────────────────────────────────

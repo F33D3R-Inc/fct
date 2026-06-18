@@ -120,26 +120,135 @@
     return out;
   }
 
-  // evalExpr supports `lhs OP rhs` comparisons, a leading `!`, and bare
-  // operands. Operands are literals (numbers, "strings", true/false) or dotted
-  // paths resolved against the scope.
+  // evalExpr evaluates an FDL expression against a scope object, mirroring the
+  // compiler's grammar (internal/codegen/expr.go): || && ; comparisons ; + - ;
+  // * / % ; unary ! - ; literals, dotted paths, and parentheses. It is a small
+  // tokenizer + precedence-climbing parser — NO eval/Function, so it is CSP-safe.
+  // This is the one client evaluator shared by fill (vault/media bodies), client
+  // bindings, and actions; semantics match Go's template builtins (truthy/compare).
   function evalExpr(e, scope) {
-    e = String(e).trim();
-    var m = /^(.+?)\s*(==|!=|<=|>=|<|>)\s*(.+)$/.exec(e);
-    if (m) return compare(m[2], operand(m[1], scope), operand(m[3], scope));
-    if (e.charAt(0) === '!') return !truthy(evalExpr(e.slice(1), scope));
-    return operand(e, scope);
+    return parseOr({ toks: lexExpr(String(e)), i: 0 }, scope || {});
   }
-  function operand(s, scope) {
-    s = s.trim();
-    if (s === 'true') return true;
-    if (s === 'false') return false;
-    if (/^-?\d+(\.\d+)?$/.test(s)) return parseFloat(s);
-    var q = s.charAt(0);
-    if ((q === '"' || q === "'") && s.charAt(s.length - 1) === q) return s.slice(1, -1);
-    var segs = s.split('.'), v = scope;
+
+  function lexExpr(s) {
+    var toks = [], i = 0;
+    while (i < s.length) {
+      var c = s.charAt(i);
+      if (c === ' ' || c === '\t') { i++; continue; }
+      if (c === '(') { toks.push({ k: 'lp' }); i++; continue; }
+      if (c === ')') { toks.push({ k: 'rp' }); i++; continue; }
+      if (c === '[') { toks.push({ k: 'lb' }); i++; continue; }
+      if (c === ']') { toks.push({ k: 'rb' }); i++; continue; }
+      if (c === ',') { toks.push({ k: 'comma' }); i++; continue; }
+      if (c === '.') { toks.push({ k: 'dot' }); i++; continue; }
+      if (c === '"' || c === "'") {
+        var q = c, str = ''; i++;
+        while (i < s.length && s.charAt(i) !== q) { if (s.charAt(i) === '\\') i++; str += s.charAt(i); i++; }
+        i++; toks.push({ k: 'str', v: str }); continue;
+      }
+      if (c >= '0' && c <= '9') {
+        var j = i; while (j < s.length && /[0-9.]/.test(s.charAt(j))) j++;
+        toks.push({ k: 'num', v: parseFloat(s.slice(i, j)) }); i = j; continue;
+      }
+      if (/[A-Za-z_]/.test(c)) {
+        var j2 = i; while (j2 < s.length && /[A-Za-z0-9_]/.test(s.charAt(j2))) j2++;
+        toks.push({ k: 'ident', t: s.slice(i, j2) }); i = j2; continue;
+      }
+      var two = s.substr(i, 2);
+      if (two === '==' || two === '!=' || two === '<=' || two === '>=' || two === '&&' || two === '||') {
+        toks.push({ k: 'op', t: two }); i += 2; continue;
+      }
+      if ('<>!+-*/%'.indexOf(c) >= 0) { toks.push({ k: 'op', t: c }); i++; continue; }
+      i++; // skip anything unexpected
+    }
+    return toks;
+  }
+
+  function tk(p) { return p.i < p.toks.length ? p.toks[p.i] : null; }
+  function eatOp(p, op) { var t = tk(p); if (t && t.k === 'op' && t.t === op) { p.i++; return true; } return false; }
+
+  function parseOr(p, sc) {
+    var l = parseAnd(p, sc);
+    while (eatOp(p, '||')) { var r = parseAnd(p, sc); l = truthy(l) ? l : r; }
+    return l;
+  }
+  function parseAnd(p, sc) {
+    var l = parseCmp(p, sc);
+    while (eatOp(p, '&&')) { var r = parseCmp(p, sc); l = truthy(l) ? r : l; }
+    return l;
+  }
+  function parseCmp(p, sc) {
+    var l = parseAdd(p, sc), ops = ['==', '!=', '<=', '>=', '<', '>'];
+    for (var k = 0; k < ops.length; k++) {
+      if (eatOp(p, ops[k])) return compare(ops[k], l, parseAdd(p, sc));
+    }
+    return l;
+  }
+  function parseAdd(p, sc) {
+    var l = parseMul(p, sc);
+    for (;;) {
+      if (eatOp(p, '+')) l = add(l, parseMul(p, sc));
+      else if (eatOp(p, '-')) l = (+l) - (+parseMul(p, sc));
+      else return l;
+    }
+  }
+  function parseMul(p, sc) {
+    var l = parseUnary(p, sc);
+    for (;;) {
+      if (eatOp(p, '*')) l = (+l) * (+parseUnary(p, sc));
+      else if (eatOp(p, '/')) l = (+l) / (+parseUnary(p, sc));
+      else if (eatOp(p, '%')) l = (+l) % (+parseUnary(p, sc));
+      else return l;
+    }
+  }
+  function parseUnary(p, sc) {
+    if (eatOp(p, '!')) return !truthy(parseUnary(p, sc));
+    if (eatOp(p, '-')) return -(+parseUnary(p, sc));
+    return parsePrimary(p, sc);
+  }
+  function parsePrimary(p, sc) {
+    var t = tk(p);
+    if (!t) return undefined;
+    if (t.k === 'num') { p.i++; return t.v; }
+    if (t.k === 'str') { p.i++; return t.v; }
+    if (t.k === 'lp') { p.i++; var v = parseOr(p, sc); if (tk(p) && tk(p).k === 'rp') p.i++; return v; }
+    if (t.k === 'lb') { // array literal [a, b, c]
+      p.i++; var arr = [];
+      while (tk(p) && tk(p).k !== 'rb') {
+        arr.push(parseOr(p, sc));
+        if (tk(p) && tk(p).k === 'comma') p.i++; else break;
+      }
+      if (tk(p) && tk(p).k === 'rb') p.i++;
+      return arr;
+    }
+    if (t.k === 'ident') {
+      if (t.t === 'true') { p.i++; return true; }
+      if (t.t === 'false') { p.i++; return false; }
+      return parsePath(p, sc);
+    }
+    p.i++; return undefined;
+  }
+  function parsePath(p, sc) {
+    var segs = [tk(p).t]; p.i++;
+    while (tk(p) && tk(p).k === 'dot') { p.i++; var t = tk(p); if (t && t.k === 'ident') { segs.push(t.t); p.i++; } }
+    if (tk(p) && tk(p).k === 'lp') { // method/func call: not supported client-side
+      var depth = 0;
+      do { var x = tk(p); p.i++; if (x.k === 'lp') depth++; else if (x.k === 'rp') depth--; } while (tk(p) && depth > 0);
+      return undefined;
+    }
+    var v = sc;
     for (var i = 0; i < segs.length; i++) { if (v == null) return undefined; v = v[segs[i]]; }
     return v;
+  }
+  // add prefers numeric addition (matching the compiler's `add`); arrays concat
+  // (so `items = items + [x]` appends), and otherwise it falls back to string
+  // concatenation.
+  function add(a, b) {
+    if (Array.isArray(a)) return a.concat(b);
+    if (Array.isArray(b)) return [a].concat(b);
+    var na = +a, nb = +b;
+    if (typeof a !== 'boolean' && typeof b !== 'boolean' && !isNaN(na) && !isNaN(nb)) return na + nb;
+    return String(a) + String(b);
   }
   function compare(op, a, b) {
     if (op === '==') return a == b;
@@ -445,6 +554,334 @@
 
   function assign(dst, src) { for (var k in src) dst[k] = src[k]; return dst; }
 
+  // ── client reactivity (Brick 4, docs/REACTIVITY.md) ─────────────────────────
+  // Compiled fine-grained reactivity. The manifest carries, per facet: `state`
+  // (signals + initial values), `bindings` (the text nodes a signal feeds, marked
+  // data-fa-bind="bN"), and `actions` (named signal mutations a DOM event runs,
+  // wired via data-fa-on-<event>). On an event we run the action's assignments on
+  // THIS instance's signal store, then write each bound node directly — no virtual
+  // DOM, no diff, zero round-trip. The signal store is server-authoritative state's
+  // local, ephemeral complement; persistent changes still flow through /events.
+
+  var reactiveEvents = {}; // DOM event type → true, gathered from manifest handlers
+
+  // applyAction mutates a signal store in place by an action's assignments,
+  // left-to-right (a later assignment sees earlier ones). Pure given the store —
+  // the unit-testable core, independent of the DOM.
+  function applyAction(signals, action) {
+    if (action && action.mutations) {
+      action.mutations.forEach(function (m) { signals[m.target] = evalExpr(m.expr, signals); });
+    }
+    return signals;
+  }
+
+  // bindingText computes the string each binding renders for the given scope
+  // (signals plus any client-derived values).
+  function bindingText(scope, bindings) {
+    var out = {};
+    (bindings || []).forEach(function (b) {
+      var v = evalExpr(b.expr, scope);
+      out[b.id] = v == null ? '' : String(v);
+    });
+    return out;
+  }
+
+  // computeScope layers client-derived values (Brick 5) over the signal store,
+  // evaluating each in manifest order so a later derived value sees earlier ones.
+  // Derived values are read-only — only signals are ever assigned (by actions) —
+  // so they are recomputed fresh on every flush rather than stored.
+  function computeScope(signals, derived) {
+    var scope = {};
+    for (var k in signals) scope[k] = signals[k];
+    (derived || []).forEach(function (d) { scope[d.name] = evalExpr(d.expr, scope); });
+    return scope;
+  }
+
+  function currentPath() { return typeof location !== 'undefined' ? location.pathname : '/'; }
+
+  // signalsFor returns a facet instance's live signal store, creating it from the
+  // manifest's initial values on first touch (matching the server's first paint).
+  // Beyond declared `state:` signals it seeds the built-in `route` (Brick 10, the
+  // current client path) and each async `query:` as a reactive {loading,error,data}
+  // value (Brick 11) — both are reactive roots the runtime keeps up to date.
+  function signalsFor(root) {
+    if (root._faSignals) return root._faSignals;
+    var m = metaFor(root.getAttribute('data-facet-id')), s = {};
+    if (m && m.state) m.state.forEach(function (st) { s[st.name] = evalExpr(st.init, {}); });
+    if (m && m.queries) m.queries.forEach(function (q) { s[q.name] = { loading: true, error: false, data: null }; });
+    s.route = currentPath();
+    root._faSignals = s;
+    return s;
+  }
+
+  // bindNodes maps this instance's binding ids to their DOM nodes, excluding any
+  // that belong to a NESTED facet (which owns its own bindings of the same id).
+  function bindNodes(root) {
+    var all = root.querySelectorAll('[data-fa-bind]'), out = {};
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].closest('[data-facet-id]') === root) out[all[i].getAttribute('data-fa-bind')] = all[i];
+    }
+    return out;
+  }
+
+  function flush(root) {
+    var m = metaFor(root.getAttribute('data-facet-id'));
+    if (!m) return;
+    var scope = computeScope(signalsFor(root), m.derived);
+    if (m.bindings) {
+      var text = bindingText(scope, m.bindings), nodes = bindNodes(root);
+      for (var id in text) if (nodes[id]) nodes[id].textContent = text[id];
+      applyAttrBindings(root, m.bindings, scope); // Brick 8
+    }
+    if (m.lists) m.lists.forEach(function (L) { reconcileList(root, L, scope); });
+    syncInputs(root, m, scope); // Brick 9
+  }
+
+  // ── attribute / class / show bindings (Brick 8) ──────────────────────────────
+  // A reactive signal inside an attribute value compiles to a controlled attribute
+  // plus data-fa-bind-attr="<binding ids>" on the element. On flush the runtime
+  // re-evaluates each and writes it: a "boolattr" (disabled/hidden/checked/…) is
+  // toggled by presence (truthy → present), so `hidden="{!visible}"` shows/hides
+  // and `disabled="{busy}"` never renders the foot-gun disabled="false"; any other
+  // attr ("attr") is set to the string value (class, href, aria-*, style, …).
+
+  function applyAttr(el, b, val) {
+    if (b.node === 'boolattr') {
+      if (truthy(val)) el.setAttribute(b.attr, ''); else el.removeAttribute(b.attr);
+    } else {
+      el.setAttribute(b.attr, val == null ? '' : String(val));
+    }
+  }
+
+  function applyAttrBindings(root, bindings, scope) {
+    var byId = {};
+    bindings.forEach(function (b) { if (b.node === 'attr' || b.node === 'boolattr') byId[b.id] = b; });
+    var all = root.querySelectorAll('[data-fa-bind-attr]');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].closest('[data-facet-id]') !== root) continue; // nested facet owns its own
+      var ids = all[i].getAttribute('data-fa-bind-attr').split(/\s+/);
+      for (var j = 0; j < ids.length; j++) {
+        var b = byId[ids[j]];
+        if (b) applyAttr(all[i], b, evalExpr(b.expr, scope));
+      }
+    }
+  }
+
+  // ── two-way form bindings (Brick 9) ──────────────────────────────────────────
+  // bind:value / bind:checked compile to data-fa-bind-value / data-fa-bind-checked
+  // markers. syncInputs writes the control FROM the signal on flush (skipping a
+  // focused text field so it never clobbers the caret); onInput writes the signal
+  // FROM the control on every keystroke/toggle, runs effects, and re-flushes.
+
+  function syncInputs(root, m, scope) {
+    if (!m.inputs) return;
+    var els = root.querySelectorAll('[data-fa-bind-value],[data-fa-bind-checked]');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (el.closest('[data-facet-id]') !== root) continue;
+      if (el.hasAttribute('data-fa-bind-checked')) {
+        el.checked = truthy(scope[el.getAttribute('data-fa-bind-checked')]);
+      } else {
+        var v = scope[el.getAttribute('data-fa-bind-value')];
+        v = v == null ? '' : String(v);
+        if (document.activeElement !== el && el.value !== v) el.value = v;
+      }
+    }
+  }
+
+  function onInput(e) {
+    var el = e.target.closest && e.target.closest('[data-fa-bind-value],[data-fa-bind-checked]');
+    if (!el) return;
+    var root = el.closest('[data-facet-id]');
+    if (!root) return;
+    var m = metaFor(root.getAttribute('data-facet-id'));
+    var signals = signalsFor(root), before = {};
+    for (var k in signals) before[k] = signals[k];
+    if (el.hasAttribute('data-fa-bind-checked')) {
+      signals[el.getAttribute('data-fa-bind-checked')] = !!el.checked;
+    } else {
+      var name = el.getAttribute('data-fa-bind-value'), cur = signals[name], raw = el.value;
+      // Preserve a numeric signal's type so arithmetic on it keeps working.
+      signals[name] = (typeof cur === 'number' && raw.trim() !== '' && !isNaN(+raw)) ? +raw : raw;
+    }
+    runEffects(m, signals, before);
+    flush(root);
+  }
+
+  function wireInputs() {
+    document.addEventListener('input', onInput);
+    document.addEventListener('change', onInput);
+  }
+
+  // ── reactive lists, keyed reconciliation (Brick 6) ──────────────────────────
+  // A `for v in <signal>` over a list signal compiles to an empty <fa-for> host;
+  // the runtime renders each item with the client template engine (fill) and
+  // reconciles the host's children by key — reusing unchanged nodes, moving them
+  // into order, creating new ones, and removing the rest. Keys are item.id when
+  // present, else the index, so reorders and inserts don't rebuild the world.
+
+  // listItems is the DOM-free core: it computes the desired [{key, html}] for a
+  // list signal in a scope. Unit-tested without a browser.
+  function listItems(list, scope) {
+    var arr = scope[list.signal];
+    if (!arr || arr.length == null) return [];
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+      var item = arr[i], s2 = {};
+      for (var k in scope) s2[k] = scope[k];
+      s2[list.var] = item;
+      var key = (item != null && item.id != null) ? String(item.id) : String(i);
+      out.push({ key: key, html: fill(list.item, s2) });
+    }
+    return out;
+  }
+
+  function listHost(root, id) {
+    var all = root.querySelectorAll('[data-fa-list="' + id + '"]');
+    for (var i = 0; i < all.length; i++) if (all[i].closest('[data-facet-id]') === root) return all[i];
+    return null;
+  }
+
+  function htmlToNode(html) {
+    var t = document.createElement('template');
+    t.innerHTML = String(html).trim();
+    return t.content.firstElementChild;
+  }
+
+  function reconcileList(root, list, scope) {
+    var host = listHost(root, list.id);
+    if (!host) return;
+    var desired = listItems(list, scope), existing = {}, i;
+    var kids = Array.prototype.slice.call(host.children);
+    for (i = 0; i < kids.length; i++) {
+      var k = kids[i].getAttribute('data-fa-key');
+      if (k != null) existing[k] = kids[i];
+    }
+    var prev = null;
+    for (i = 0; i < desired.length; i++) {
+      var d = desired[i], node = existing[d.key];
+      if (!node || node._faHtml !== d.html) { // new or changed → (re)render
+        var fresh = htmlToNode(d.html);
+        if (!fresh) continue;
+        fresh.setAttribute('data-fa-key', d.key);
+        fresh._faHtml = d.html;
+        if (node) host.replaceChild(fresh, node);
+        node = fresh;
+      }
+      var ref = prev ? prev.nextSibling : host.firstChild;
+      if (node !== ref) host.insertBefore(node, ref); // move into order
+      prev = node;
+      delete existing[d.key];
+    }
+    for (var leftover in existing) host.removeChild(existing[leftover]); // gone → drop
+  }
+
+  function actionByName(m, name) {
+    if (m && m.actions) for (var i = 0; i < m.actions.length; i++) if (m.actions[i].name === name) return m.actions[i];
+    return null;
+  }
+
+  // runEffects fires every effect whose dependency signals changed between `before`
+  // and the current store (Brick 7). Effects run ONCE per cycle, in order, and do
+  // not re-trigger one another — so an effect that mutates a signal another effect
+  // watches will not loop. The (possibly further) mutations are flushed to the DOM
+  // by the caller.
+  function runEffects(m, signals, before) {
+    if (!m || !m.effects) return;
+    m.effects.forEach(function (eff) {
+      var changed = eff.deps.some(function (d) { return signals[d] !== before[d]; });
+      if (changed) applyAction(signals, actionByName(m, eff.action));
+    });
+  }
+
+  function runAction(root, name) {
+    var m = metaFor(root.getAttribute('data-facet-id'));
+    var act = actionByName(m, name);
+    if (!act) return;
+    var signals = signalsFor(root), before = {};
+    for (var k in signals) before[k] = signals[k];
+    applyAction(signals, act);
+    runEffects(m, signals, before);
+    flush(root);
+  }
+
+  // ── async queries (Brick 11) ─────────────────────────────────────────────────
+  // A `query: name from "url"` is seeded {loading:true} in the signal store, then
+  // fetched once per instance on mount. On resolve the store gets
+  // {loading:false, data:<json>} (or {error:true} on failure) and the instance is
+  // flushed — so `{name.data.title}` and `hidden="{name.loading}"` (Brick 8) light
+  // up with no per-render round-trip. Server-authoritative by transport: the URL is
+  // a normal same-origin endpoint the app's backend serves.
+  function runQueries(root) {
+    if (root._faQueried) return;
+    var m = metaFor(root.getAttribute('data-facet-id'));
+    if (!m || !m.queries || !m.queries.length) return;
+    root._faQueried = true;
+    var signals = signalsFor(root);
+    m.queries.forEach(function (q) {
+      fetch(q.url, { headers: { Accept: 'application/json' }, credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+        .then(function (data) { signals[q.name] = { loading: false, error: false, data: data }; flush(root); })
+        .catch(function () { signals[q.name] = { loading: false, error: true, data: null }; flush(root); });
+    });
+  }
+
+  // ── route signal + active links (Brick 10) ───────────────────────────────────
+  // `route` is a built-in reactive signal seeded from location.pathname. On every
+  // navigation the runtime updates each live instance's route and re-flushes, so a
+  // client router falls straight out of Brick 8: `<section hidden="{route != '/'}">`.
+  // Links marked data-nav whose href matches the current path get .fa-active +
+  // aria-current for styling, no app code.
+  function markActiveLinks() {
+    var links = document.querySelectorAll('a[data-nav]');
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i], match = false;
+      try { match = new URL(a.getAttribute('href') || '', location.href).pathname === currentPath(); } catch (_) {}
+      a.classList.toggle('fa-active', match);
+      if (match) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+    }
+  }
+
+  function updateRoute() {
+    var els = document.querySelectorAll('[data-facet-id]');
+    for (var i = 0; i < els.length; i++) {
+      var r = els[i]._faSignals;
+      if (r && 'route' in r) { r.route = currentPath(); flush(els[i]); }
+    }
+    markActiveLinks();
+  }
+
+  // hydrateReactive paints every facet instance from its signals once on load
+  // (and after navigation): it fills reactive lists the server emitted empty,
+  // reconciles any binding whose initial value the server could not pre-render
+  // (route/query-dependent), syncs form controls, and kicks off async queries.
+  function hydrateReactive() {
+    var els = document.querySelectorAll('[data-facet-id]');
+    for (var i = 0; i < els.length; i++) {
+      var m = metaFor(els[i].getAttribute('data-facet-id'));
+      if (!m) continue;
+      if (m.bindings || m.lists || m.inputs || m.queries) flush(els[i]);
+      if (m.queries) runQueries(els[i]);
+    }
+  }
+
+  // wireReactive adds one delegated listener per event type the app uses. On an
+  // event it finds the nearest element wired for that event, resolves its facet
+  // instance, and runs the named action locally.
+  function wireReactive() {
+    Object.keys(reactiveEvents).forEach(function (evt) {
+      document.addEventListener(evt, function (e) {
+        var attr = 'data-fa-on-' + evt;
+        var el = e.target.closest('[' + attr + ']');
+        if (!el) return;
+        var root = el.closest('[data-facet-id]');
+        if (!root) return;
+        e.preventDefault();
+        runAction(root, el.getAttribute(attr));
+      });
+    });
+  }
+
   // ── client-side navigation ───────────────────────────────────────────────
   // A link marked data-nav is fetched as a fragment ({title, html}) and swapped
   // into the root mount WITHOUT a page reload, so the one SSE connection and all
@@ -461,8 +898,10 @@
         if (root) root.innerHTML = data.html;
         if (data.title) document.title = data.title;
         if (push) history.pushState({ faNav: 1 }, '', url);
-        scanSubscribes(); // new content may declare channel subscriptions
-        scanClient();     // … and vault/media elements to hydrate
+        scanSubscribes();  // new content may declare channel subscriptions
+        scanClient();      // … and vault/media elements to hydrate
+        hydrateReactive(); // … and reactive facets to paint
+        updateRoute();     // … and the route signal + active links to refresh (Brick 10)
         window.scrollTo(0, 0);
       })
       .catch(function () { window.location.href = url; });
@@ -502,16 +941,19 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (m) {
         if (m && m.runtime) assign(cfg, m.runtime);
-        if (m && m.facets) m.facets.forEach(function (f) { registry[f.name] = f; });
+        if (m && m.facets) m.facets.forEach(function (f) {
+          registry[f.name] = f;
+          if (f.handlers) f.handlers.forEach(function (h) { reactiveEvents[h.event] = true; });
+        });
       })
       .catch(function () {})
       .then(initKey)
-      .then(function () { connectSSE(); wireActions(); wireNav(); scanSubscribes(); scanClient(); });
+      .then(function () { connectSSE(); wireActions(); wireNav(); wireReactive(); wireInputs(); scanSubscribes(); scanClient(); hydrateReactive(); updateRoute(); });
   }
 
   // Node-requireable for unit tests of the pure helpers (no DOM/network).
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { fill: fill };
+    module.exports = { fill: fill, evalExpr: evalExpr, applyAction: applyAction, bindingText: bindingText, computeScope: computeScope, listItems: listItems, runEffects: runEffects };
   }
 
   // Browser: expose the public API and boot. Public API: subscribe to a channel

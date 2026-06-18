@@ -12,6 +12,7 @@ package codegen
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -85,6 +86,66 @@ type genCtx struct {
 	facet string
 	aux   map[string]string
 	n     int
+	// Brick 4 (docs/REACTIVITY.md) — client reactivity collected during the single
+	// emit walk, so the template's data-fa-bind markers and the manifest's binding
+	// ids share one source of truth and cannot drift.
+	state    map[string]string // state signal name → its initial-value expression
+	derived  map[string]bool   // client-derived computed field names (Brick 5)
+	queries  map[string]bool   // async query names (Brick 11) — reactive {loading,error,data}
+	inTag    bool              // currently between `<` and `>` (attribute context)
+	bind     int               // next binding id counter
+	bindings []bindingEntry    // live reactive bindings (text + attr), in document order
+}
+
+// builtinSignals are reactive roots every facet may reference without declaring
+// them. `route` is the current client path (Brick 10), seeded by the runtime from
+// location.pathname and updated on navigation — the wedge for a client router.
+var builtinSignals = map[string]bool{"route": true}
+
+// reactiveRoots reports whether an interpolation expression is a live client
+// binding: it has at least one root and every root is a reactive value — a state
+// signal (Brick 4), a client-derived value (Brick 5), an async query (Brick 11),
+// or the built-in `route` (Brick 10) — so the runtime can recompute it from the
+// signal store. A mix with a plain `what:` input prop stays server-rendered.
+func (c *genCtx) reactiveRoots(expr string) bool {
+	roots := exprRoots(expr)
+	if len(roots) == 0 {
+		return false
+	}
+	for _, r := range roots {
+		if !c.isReactiveRoot(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isReactiveRoot reports whether r names a value the client can recompute.
+func (c *genCtx) isReactiveRoot(r string) bool {
+	if _, sig := c.state[r]; sig {
+		return true
+	}
+	return c.derived[r] || c.queries[r] || builtinSignals[r]
+}
+
+// bakeable reports whether an expression's first paint can be computed at compile
+// time: every root is a state signal (known literal initial) or a client-derived
+// field (itself baked from signals at the top of the template). Such a binding is
+// baked into the server template for a correct, flash-free first paint. A binding
+// that touches an async query (no value until it resolves) or the route (unknown
+// until load) is NOT bakeable — it is emitted neutral and corrected by the
+// runtime's hydrate pass at boot.
+func (c *genCtx) bakeable(expr string) bool {
+	for _, r := range exprRoots(expr) {
+		if _, sig := c.state[r]; sig {
+			continue
+		}
+		if c.derived[r] {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // Generate compiles facets into templates + a manifest.
@@ -95,18 +156,34 @@ func Generate(facets []*ast.Facet) (*Output, error) {
 	if err := checkComputed(facets); err != nil {
 		return nil, err
 	}
+	if err := checkState(facets); err != nil {
+		return nil, err
+	}
+	if err := checkActions(facets); err != nil {
+		return nil, err
+	}
+	if err := checkQueries(facets); err != nil {
+		return nil, err
+	}
+	if err := checkBindValues(facets); err != nil {
+		return nil, err
+	}
 	if err := checkFieldRefs(facets); err != nil {
 		return nil, err
 	}
 	out := &Output{Templates: make(map[string]string, len(facets)), Aux: map[string]string{}}
 	var man manifest
 	for _, f := range facets {
+		var bindings []bindingEntry
+		var lists []listEntry
 		if f.ServerRendered() {
-			tmpl, aux, err := genTemplate(f)
+			tmpl, aux, binds, ls, err := genTemplate(f)
 			if err != nil {
 				return nil, fmt.Errorf("%s %s: %w", f.KindName(), f.Name, err)
 			}
 			out.Templates[f.Name] = tmpl
+			bindings = binds
+			lists = ls
 			for k, v := range aux {
 				out.Aux[k] = v
 			}
@@ -118,7 +195,7 @@ func Generate(facets []*ast.Facet) (*Output, error) {
 			// produce vault plaintext — there is no template to render it).
 			return nil, fmt.Errorf("%s %s: client-rendered primitives emit no server template (unexpected looks: body)", f.KindName(), f.Name)
 		}
-		man.Facets = append(man.Facets, genManifest(f))
+		man.Facets = append(man.Facets, genManifest(f, bindings, lists))
 	}
 	b, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -130,43 +207,83 @@ func Generate(facets []*ast.Facet) (*Output, error) {
 
 // ── template generation ─────────────────────────────────────────────────────
 
-func genTemplate(f *ast.Facet) (string, map[string]string, error) {
-	ctx := &genCtx{facet: f.Name, aux: map[string]string{}}
+func genTemplate(f *ast.Facet) (string, map[string]string, []bindingEntry, []listEntry, error) {
+	ctx := &genCtx{facet: f.Name, aux: map[string]string{}, state: stateInit(f), derived: clientDerived(f), queries: queryNames(f)}
 	// Computed fields lower to template variables defined once at the top, in
 	// declaration order so a later one can use an earlier one. References to them
-	// in looks resolve to $name (they are seeded into the render scope).
-	defs, computed, err := emitComputed(f.Fields)
+	// in looks resolve to $name (they are seeded into the render scope). Signals in
+	// a computed expression are baked to their initial value for the first paint.
+	defs, computed, err := emitComputed(f.Fields, ctx.state)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, nil, err
 	}
-	body, err := emitNodes(f.Looks, computed, ctx)
+	// Reactive lists are lifted out before emit: each becomes an <fa-for> host the
+	// runtime fills, with the loop body captured as a client item template.
+	looks, lists := extractLists(f.Looks, ctx.state)
+	body, err := emitNodes(looks, computed, ctx)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, nil, err
 	}
 	attr, err := facetIDAttr(f)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, nil, err
 	}
 	css, err := resolveStyleBlock(f.Style)
 	if err != nil {
-		return "", nil, fmt.Errorf("facet %s: %w", f.Name, err)
+		return "", nil, nil, nil, fmt.Errorf("facet %s: %w", f.Name, err)
 	}
+	// Rewrite client event wirings `on:<event>="action"` to data attributes the
+	// runtime delegates on (Brick 4); data-* is inert HTML, so html/template never
+	// treats it as a JS-context handler. bind:value/bind:checked (Brick 9) lower the
+	// same way, to data-fa-bind-value / data-fa-bind-checked markers.
+	body = wireHandlerAttrs(body)
+	body = wireBindAttrs(body)
 	// data-facet-id and the resolved style: block both attach to the root element.
 	body = injectRootStyle(injectFacetID(body, attr), css)
-	return defs + body, ctx.aux, nil
+	return defs + body, ctx.aux, ctx.bindings, lists, nil
+}
+
+// stateInit maps each state signal to its initial-value expression — the lookup
+// used to bake a signal's first paint into the server template.
+func stateInit(f *ast.Facet) map[string]string {
+	if len(f.State) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(f.State))
+	for _, s := range f.State {
+		m[s.Name] = s.Expr
+	}
+	return m
+}
+
+// wireHandlerAttrs rewrites every `on:<event>="action"` (single or double quoted)
+// to `data-fa-on-<event>="action"` so the runtime can find and delegate the
+// handler. Event/action are identifiers (validated by checkActions).
+func wireHandlerAttrs(body string) string {
+	return handlerAttrRe.ReplaceAllStringFunc(body, func(m string) string {
+		g := handlerAttrRe.FindStringSubmatch(m)
+		action := g[2]
+		if action == "" {
+			action = g[3]
+		}
+		return `data-fa-on-` + g[1] + `="` + action + `"`
+	})
 }
 
 // emitComputed lowers a facet's computed fields to `{{$name := <expr>}}` actions
 // (declaration order; each may reference earlier computed fields) and returns
 // the action string plus the computed field names to seed the render scope.
-func emitComputed(fields []ast.Field) (string, []string, error) {
+func emitComputed(fields []ast.Field, state map[string]string) (string, []string, error) {
 	var b strings.Builder
 	var names []string
 	for _, fld := range fields {
 		if !fld.IsComputed() {
 			continue
 		}
-		e, err := goExpr(fld.Expr, names)
+		// Bake any state signal in the expression to its initial value so the
+		// first server paint matches what the client computes from the signals'
+		// initial values (a no-op for signal-free, server-only computed fields).
+		e, err := goExpr(substituteSignals(fld.Expr, state), names)
 		if err != nil {
 			return "", nil, err
 		}
@@ -185,12 +302,110 @@ func emitNodes(nodes []ast.Node, initial []string, ctx *genCtx) (string, error) 
 	scope := append([]string(nil), initial...) // active $vars: computed + loop (stack)
 	var forStack []bool                        // true if the matching opener was a `for`
 
-	for _, n := range nodes {
-		switch v := n.(type) {
+	// Brick 8 — attribute-context binding state. When a Text chunk ends with an
+	// attribute open (`class="`) immediately followed by a reactive interp, we strip
+	// that `attr="` and let the interp emit a controlled, marked attribute instead;
+	// skipQuote then drops the now-redundant closing `"` from the following Text, and
+	// pendingMarkers carries the binding ids to inject as data-fa-bind-attr on the
+	// element when its opening tag closes.
+	var pendingAttr string
+	var pendingMarkers []string
+	skipQuote := false
+
+	for i := 0; i < len(nodes); i++ {
+		switch v := nodes[i].(type) {
 		case ast.Text:
-			b.WriteString(v.S)
+			s := v.S
+			if skipQuote {
+				if strings.HasPrefix(s, `"`) {
+					s = s[1:]
+				}
+				skipQuote = false
+			}
+			// Inject the pending attribute markers before this tag's closing `>`.
+			if len(pendingMarkers) > 0 {
+				if gt := strings.IndexByte(s, '>'); gt >= 0 {
+					s = s[:gt] + ` data-fa-bind-attr="` + strings.Join(pendingMarkers, " ") + `"` + s[gt:]
+					pendingMarkers = nil
+				}
+			}
+			// Detect an attribute binding opening at the tail of this chunk.
+			if attr, ok := attrBindingAt(nodes, i, ctx); ok {
+				m := attrOpenRe.FindString(s)
+				head := s[:len(s)-len(m)]
+				b.WriteString(head)
+				ctx.trackTag(head)
+				pendingAttr = attr
+				break
+			}
+			b.WriteString(s)
+			ctx.trackTag(s)
 
 		case ast.Interp:
+			// Brick 8 — a reactive interp that is the whole value of an attribute:
+			// emit a controlled attribute (boolean attrs render present/absent; value
+			// attrs render `attr="…"`) and record an attr binding the runtime patches.
+			if pendingAttr != "" {
+				attr := pendingAttr
+				pendingAttr = ""
+				id := fmt.Sprintf("b%d", ctx.bind)
+				ctx.bind++
+				node := "attr"
+				if isBooleanAttr(attr) {
+					node = "boolattr"
+				}
+				ctx.bindings = append(ctx.bindings, bindingEntry{
+					ID: id, Signals: exprRoots(v.Expr), Expr: v.Expr, Node: node, Attr: attr,
+				})
+				pendingMarkers = append(pendingMarkers, id)
+				skipQuote = true // the following text's leading `"` is redundant now
+				if ctx.bakeable(v.Expr) {
+					e, err := goExpr(substituteSignals(v.Expr, ctx.state), scope)
+					if err != nil {
+						return "", err
+					}
+					if node == "boolattr" {
+						b.WriteString("{{if " + e + "}}" + attr + "{{end}}")
+					} else {
+						b.WriteString(attr + `="{{` + e + `}}"`)
+					}
+				} else if node == "attr" {
+					b.WriteString(attr + `=""`) // neutral; hydrate sets it at boot
+				}
+				break
+			}
+			// A live client text binding: a text-position interp whose every root is a
+			// reactive value — the runtime evaluates it from the signal store (Bricks
+			// 4–5/10/11). Bake the initial value when it is known at compile time,
+			// otherwise emit an empty marker the hydrate pass fills.
+			if !ctx.inTag && ctx.reactiveRoots(v.Expr) {
+				id := fmt.Sprintf("b%d", ctx.bind)
+				ctx.bind++
+				ctx.bindings = append(ctx.bindings, bindingEntry{
+					ID: id, Signals: exprRoots(v.Expr), Expr: v.Expr, Node: "text",
+				})
+				if ctx.bakeable(v.Expr) {
+					e, err := goExpr(substituteSignals(v.Expr, ctx.state), scope)
+					if err != nil {
+						return "", err
+					}
+					b.WriteString(`<span data-fa-bind="` + id + `">{{` + e + "}}</span>")
+				} else {
+					b.WriteString(`<span data-fa-bind="` + id + `"></span>`)
+				}
+				break
+			}
+			// A reactive interp inside a tag that is NOT a pure attribute value (e.g.
+			// `class="btn {active}"`): not patchable today, so bake a static initial so
+			// the first paint is valid rather than emitting a broken server reference.
+			if ctx.inTag && ctx.reactiveRoots(v.Expr) {
+				e, err := goExpr(substituteSignals(v.Expr, ctx.state), scope)
+				if err != nil {
+					return "", err
+				}
+				b.WriteString("{{" + e + "}}")
+				break
+			}
 			e, err := goExpr(v.Expr, scope)
 			if err != nil {
 				return "", err
@@ -249,7 +464,7 @@ func emitNodes(nodes []ast.Node, initial []string, ctx *genCtx) (string, error) 
 			b.WriteString(`{{if (index . "` + key + `")}}{{index . "` + key + `"}}{{else}}` + def + `{{end}}`)
 
 		default:
-			return "", fmt.Errorf("unknown render node %T", n)
+			return "", fmt.Errorf("unknown render node %T", nodes[i])
 		}
 	}
 	return b.String(), nil
@@ -547,6 +762,235 @@ type facetEntry struct {
 	States   []string    `json:"states,omitempty"`
 	Who      *whoEntry   `json:"who,omitempty"`
 	When     []whenEntry `json:"when"`
+	// Brick 2 of docs/REACTIVITY.md — the compiled client reactive graph. State
+	// lists the local signals (with initial values); Bindings records, for each
+	// `{state}` interpolation, which signals feed it. The Tier-1 updater (Brick 4)
+	// consumes these to patch exactly the bound DOM node when a signal changes.
+	State    []stateEntry   `json:"state,omitempty"`
+	Derived  []derivedEntry `json:"derived,omitempty"`
+	Bindings []bindingEntry `json:"bindings,omitempty"`
+	Lists    []listEntry    `json:"lists,omitempty"`
+	// Brick 3 — named client actions and the DOM events wired to them. Actions are
+	// the event-agnostic signal mutations; Handlers tie an element's `on:<event>`
+	// to an action by name. The Tier-1 runtime (Brick 4) attaches each handler's
+	// listener and runs its action's assignments, mutating the signals that
+	// Bindings then flush to the DOM.
+	Actions  []actionEntry  `json:"actions,omitempty"`
+	Handlers []handlerEntry `json:"handlers,omitempty"`
+	Effects  []effectEntry  `json:"effects,omitempty"`
+	// Brick 9 — two-way input bindings (bind:value / bind:checked): the events the
+	// runtime delegates to keep a signal in sync with a form control. Brick 11 —
+	// async queries: server fetches the runtime exposes as reactive {loading,error,
+	// data} values in the signal store.
+	Inputs  []inputEntry `json:"inputs,omitempty"`
+	Queries []queryEntry `json:"queries,omitempty"`
+}
+
+// stateEntry is one local reactive value (signal): its name, optional declared
+// type (inferred from Init when "") and required initial value.
+type stateEntry struct {
+	Name string `json:"name"`
+	Type string `json:"type,omitempty"`
+	Init string `json:"init"`
+}
+
+// derivedEntry is one client-derived value (Brick 5): a computed `what:` field
+// whose expression depends only on signals (and earlier derived values). The
+// runtime recomputes Expr over the signal store, in manifest order, before
+// flushing bindings.
+type derivedEntry struct {
+	Name string `json:"name"`
+	Expr string `json:"expr"`
+}
+
+// listEntry is one reactive list (Brick 6): a `for <Var> in <Signal>` loop over a
+// list-valued signal. Item is the loop body as a client template (FDL `{…}`
+// syntax, rendered by the runtime's fill); the runtime keys items by id (else
+// index) and reconciles the <fa-for> host's children when the signal changes.
+type listEntry struct {
+	ID     string `json:"id"`
+	Signal string `json:"signal"`
+	Var    string `json:"var"`
+	Item   string `json:"item"`
+}
+
+// bindingEntry is one edge of the dependency graph: an interpolation in the
+// `looks:` body and the signals that drive it. ID is a stable per-facet id in
+// document order (b0, b1, …) that marker injection reuses to anchor the DOM node.
+// Node is the update target kind: "text" patches a text node (Brick 4); "attr"
+// sets an attribute value and "boolattr" toggles a boolean attribute's presence
+// (Brick 8), with Attr naming the attribute.
+type bindingEntry struct {
+	ID      string   `json:"id"`
+	Signals []string `json:"signals"`
+	Expr    string   `json:"expr"`
+	Node    string   `json:"node"`
+	Attr    string   `json:"attr,omitempty"`
+}
+
+// actionEntry is one named client handler: its assignments (signal ← expr), in
+// source order.
+type actionEntry struct {
+	Name      string        `json:"name"`
+	Mutations []assignEntry `json:"mutations"`
+}
+
+type assignEntry struct {
+	Target string `json:"target"`
+	Expr   string `json:"expr"`
+}
+
+// handlerEntry wires a DOM event on an element to a named action. ID is a stable
+// per-facet id in document order (h0, h1, …) that Brick-4 marker injection reuses
+// to attach the listener to the right element.
+type handlerEntry struct {
+	ID     string `json:"id"`
+	Event  string `json:"event"`
+	Action string `json:"action"`
+}
+
+// effectEntry is one reactive side-effect (Brick 7): when any signal in Deps
+// changes, the runtime runs Action (once per event cycle, no re-triggering).
+type effectEntry struct {
+	Deps   []string `json:"deps"`
+	Action string   `json:"action"`
+}
+
+// inputEntry is one two-way form binding (Brick 9): a form control's value (Prop
+// "value" or "checked") kept in sync with a state Signal. Event is the DOM event
+// the runtime reads the control on ("input" for text, "change" for checkboxes).
+type inputEntry struct {
+	Signal string `json:"signal"`
+	Prop   string `json:"prop"`
+	Event  string `json:"event"`
+}
+
+// queryEntry is one async query (Brick 11): the reactive Name and the URL the
+// runtime fetches into it as {loading,error,data} on mount.
+type queryEntry struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+// handlerAttrRe matches an `on:<event>="<action>"` wiring attribute (single or
+// double quoted) in raw looks HTML. Event and action are identifiers.
+var handlerAttrRe = regexp.MustCompile(`on:([A-Za-z_]\w*)\s*=\s*(?:"([A-Za-z_]\w*)"|'([A-Za-z_]\w*)')`)
+
+// attrOpenRe matches an attribute name and its opening quote at the END of a text
+// chunk (`<button class="`) — the marker that the immediately-following interp is
+// an attribute value (Brick 8). The attribute name allows HTML's `-`/`:`/`.`.
+var attrOpenRe = regexp.MustCompile(`([A-Za-z_:][A-Za-z0-9_:.\-]*)="$`)
+
+// bindAttrRe matches a `bind:value="signal"` / `bind:checked="signal"` two-way
+// form binding (Brick 9). The prop is value|checked; the target is a state signal.
+var bindAttrRe = regexp.MustCompile(`bind:(value|checked)\s*=\s*(?:"([A-Za-z_]\w*)"|'([A-Za-z_]\w*)')`)
+
+// booleanAttrs are the HTML attributes whose presence (not value) is meaningful:
+// a reactive binding to one toggles the attribute on/off rather than setting a
+// string, so `hidden="{!visible}"` truly shows/hides and `disabled="{busy}"`
+// never renders the foot-gun `disabled="false"` (which still disables).
+var booleanAttrs = map[string]bool{
+	"disabled": true, "checked": true, "hidden": true, "readonly": true,
+	"required": true, "selected": true, "multiple": true, "open": true,
+	"autofocus": true, "novalidate": true, "formnovalidate": true, "ismap": true,
+	"loop": true, "muted": true, "controls": true, "default": true,
+	"reversed": true, "async": true, "defer": true, "inert": true,
+}
+
+func isBooleanAttr(name string) bool { return booleanAttrs[strings.ToLower(name)] }
+
+// attrBindingAt reports whether nodes[i] is a Text chunk that ends with an
+// attribute open (`class="`) whose value is a single reactive interp (nodes[i+1])
+// closed by a `"` (nodes[i+2]) — the pure-attribute-binding shape Brick 8 patches.
+// A mixed value (`class="btn {x}"`) or a non-reactive interp (`href="{post.url}"`,
+// server data) does not match and flows through the normal path.
+func attrBindingAt(nodes []ast.Node, i int, ctx *genCtx) (string, bool) {
+	t, ok := nodes[i].(ast.Text)
+	if !ok || i+2 >= len(nodes) {
+		return "", false
+	}
+	m := attrOpenRe.FindStringSubmatch(t.S)
+	if m == nil {
+		return "", false
+	}
+	interp, ok := nodes[i+1].(ast.Interp)
+	if !ok || !ctx.reactiveRoots(interp.Expr) {
+		return "", false
+	}
+	after, ok := nodes[i+2].(ast.Text)
+	if !ok || !strings.HasPrefix(after.S, `"`) {
+		return "", false
+	}
+	return m[1], true
+}
+
+// wireBindAttrs rewrites every `bind:value`/`bind:checked` to its inert data-*
+// marker the runtime delegates on (Brick 9). The initial control value is set by
+// the runtime's hydrate pass from the signal store, so no value is baked here.
+func wireBindAttrs(body string) string {
+	return bindAttrRe.ReplaceAllStringFunc(body, func(m string) string {
+		g := bindAttrRe.FindStringSubmatch(m)
+		sig := g[2]
+		if sig == "" {
+			sig = g[3]
+		}
+		return `data-fa-bind-` + g[1] + `="` + sig + `"`
+	})
+}
+
+// scanInputs records the facet's two-way form bindings (Brick 9) for the manifest,
+// in document order. A checkbox (bind:checked) is read on "change"; a text/value
+// control (bind:value) on "input" for keystroke-live sync.
+func scanInputs(f *ast.Facet) []inputEntry {
+	var out []inputEntry
+	var walk func(nodes []ast.Node)
+	walk = func(nodes []ast.Node) {
+		for _, n := range nodes {
+			switch v := n.(type) {
+			case ast.Text:
+				for _, m := range bindAttrRe.FindAllStringSubmatch(v.S, -1) {
+					sig := m[2]
+					if sig == "" {
+						sig = m[3]
+					}
+					prop, event := "value", "input"
+					if m[1] == "checked" {
+						prop, event = "checked", "change"
+					}
+					out = append(out, inputEntry{Signal: sig, Prop: prop, Event: event})
+				}
+			case ast.Slot:
+				walk(v.Default)
+			}
+		}
+	}
+	walk(f.Looks)
+	return out
+}
+
+// queryNames returns the set of async query names a facet declares (Brick 11),
+// for use as reactive roots in bindings.
+func queryNames(f *ast.Facet) map[string]bool {
+	if len(f.Queries) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(f.Queries))
+	for _, q := range f.Queries {
+		m[q.Name] = true
+	}
+	return m
+}
+
+// genQueries records the facet's async queries (Brick 11) for the manifest.
+func genQueries(f *ast.Facet) []queryEntry {
+	if len(f.Queries) == 0 {
+		return nil
+	}
+	out := make([]queryEntry, 0, len(f.Queries))
+	for _, q := range f.Queries {
+		out = append(out, queryEntry{Name: q.Name, URL: q.URL})
+	}
+	return out
 }
 
 type whoEntry struct {
@@ -570,7 +1014,7 @@ type mutationEntry struct {
 	With   string `json:"with,omitempty"`
 }
 
-func genManifest(f *ast.Facet) facetEntry {
+func genManifest(f *ast.Facet, bindings []bindingEntry, lists []listEntry) facetEntry {
 	e := facetEntry{
 		Name:     f.Name,
 		Kind:     f.KindName(),
@@ -583,6 +1027,15 @@ func genManifest(f *ast.Facet) facetEntry {
 	}
 	if f.ServerRendered() {
 		e.Template = TemplateFileName(f.Name)
+		e.State = genState(f)
+		e.Derived = genDerived(f, clientDerived(f))
+		e.Bindings = bindings // collected during emitNodes (shared ids)
+		e.Lists = lists       // lifted out before emit
+		e.Actions = genActions(f)
+		e.Handlers = scanHandlers(f)
+		e.Effects = genEffects(f)
+		e.Inputs = scanInputs(f)
+		e.Queries = genQueries(f)
 	} else {
 		e.Client = clientBodyText(f.Client)
 	}
@@ -601,6 +1054,221 @@ func genManifest(f *ast.Facet) facetEntry {
 		e.When = append(e.When, we)
 	}
 	return e
+}
+
+// clientDerived returns the set of computed `what:` fields that are client-derived
+// (Brick 5): every root of the field's expression is a state signal or an earlier
+// client-derived field, so the value can be recomputed in the browser from the
+// signal store alone. A computed field that touches a plain `what:` input prop is
+// server-only (it needs server data) and is not in the set. Declaration order is
+// honoured, so the result is a valid evaluation order.
+func clientDerived(f *ast.Facet) map[string]bool {
+	if len(f.State) == 0 {
+		return nil
+	}
+	reactive := make(map[string]bool, len(f.State))
+	for _, s := range f.State {
+		reactive[s.Name] = true
+	}
+	derived := map[string]bool{}
+	for _, fl := range f.Fields {
+		if !fl.IsComputed() {
+			continue
+		}
+		roots := exprRoots(fl.Expr)
+		if len(roots) == 0 {
+			continue // a constant computed field never changes — not reactive
+		}
+		all := true
+		for _, r := range roots {
+			if !reactive[r] {
+				all = false
+				break
+			}
+		}
+		if all {
+			derived[fl.Name] = true
+			reactive[fl.Name] = true // later fields may derive from this one
+		}
+	}
+	return derived
+}
+
+// genDerived records client-derived fields for the manifest in declaration (=
+// evaluation) order. The runtime computes each in turn over the signal store
+// before flushing bindings.
+func genDerived(f *ast.Facet, derived map[string]bool) []derivedEntry {
+	if len(derived) == 0 {
+		return nil
+	}
+	var out []derivedEntry
+	for _, fl := range f.Fields {
+		if fl.IsComputed() && derived[fl.Name] {
+			out = append(out, derivedEntry{Name: fl.Name, Expr: fl.Expr})
+		}
+	}
+	return out
+}
+
+// extractLists rewrites the looks stream for reactive lists (Brick 6): each
+// `for <v> in <signal>` over a list-valued signal is replaced by an empty
+// <fa-for> host the runtime fills, and the loop body is captured as a client item
+// template. A `for` over server data (a what: field) is left as-is — it ranges on
+// the server as before. Nested control inside the body is preserved in the
+// captured template; a reactive list inside another reactive list is not unrolled
+// here (v1 renders list items with the client fill engine, which handles nested
+// plain-data {for}/{if} but not nested signals).
+func extractLists(nodes []ast.Node, state map[string]string) ([]ast.Node, []listEntry) {
+	var out []ast.Node
+	var lists []listEntry
+	for i := 0; i < len(nodes); i++ {
+		c, ok := nodes[i].(ast.Ctrl)
+		if !ok || c.Op != "for" {
+			out = append(out, nodes[i])
+			continue
+		}
+		if _, isSignal := state[c.Iter]; !isSignal {
+			out = append(out, nodes[i]) // server-data loop — unchanged
+			continue
+		}
+		// Reactive list: find the matching end, tracking nested if/for depth.
+		depth, j := 1, i+1
+		for ; j < len(nodes); j++ {
+			if cc, ok := nodes[j].(ast.Ctrl); ok {
+				switch cc.Op {
+				case "for", "if":
+					depth++
+				case "end":
+					depth--
+				}
+			}
+			if depth == 0 {
+				break // nodes[j] is the matching end
+			}
+		}
+		id := fmt.Sprintf("l%d", len(lists))
+		lists = append(lists, listEntry{ID: id, Signal: c.Iter, Var: c.Var, Item: clientBodyText(nodes[i+1 : j])})
+		out = append(out, ast.Text{S: `<fa-for data-fa-list="` + id + `" style="display:contents"></fa-for>`})
+		i = j // skip past the matching end (outer i++ advances to j+1)
+	}
+	return out, lists
+}
+
+// genState records the facet's local reactive values (signals) for the manifest.
+// The parser guarantees every state field carries an initial value (Brick 1), so
+// Init is always present.
+func genState(f *ast.Facet) []stateEntry {
+	if len(f.State) == 0 {
+		return nil
+	}
+	out := make([]stateEntry, 0, len(f.State))
+	for _, s := range f.State {
+		out = append(out, stateEntry{Name: s.Name, Type: s.Type, Init: s.Expr})
+	}
+	return out
+}
+
+// trackTag advances the genCtx's "inside a tag" flag across a literal text chunk,
+// so the interpolation walk can tell element text content (`>{count}<`, a live
+// text binding) from attribute context (`<i class="{x}">`, not yet bindable). A
+// bare `<`/`>` scan is sufficient for the looks HTML the compiler emits.
+func (c *genCtx) trackTag(s string) {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '<':
+			c.inTag = true
+		case '>':
+			c.inTag = false
+		}
+	}
+}
+
+// substituteSignals rewrites a pure-signal expression for the *server's* first
+// paint by replacing each signal root with its initial-value expression. The
+// result contains only literals and operators, which goExpr lowers to a constant
+// Go-template pipeline — so the initial render matches what the client computes
+// from the signals' initial values, with no client round-trip and no flash.
+func substituteSignals(expr string, state map[string]string) string {
+	toks, err := exprLex(expr)
+	if err != nil {
+		return expr // goExpr will surface the precise error
+	}
+	var b strings.Builder
+	for i, t := range toks {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		if t.kind == "ident" && (i == 0 || toks[i-1].kind != "dot") {
+			if init, ok := state[t.text]; ok {
+				b.WriteString("(" + init + ")")
+				continue
+			}
+		}
+		b.WriteString(t.text)
+	}
+	return b.String()
+}
+
+// genEffects records reactive effects (Brick 7) for the manifest, in source order.
+func genEffects(f *ast.Facet) []effectEntry {
+	if len(f.Effects) == 0 {
+		return nil
+	}
+	out := make([]effectEntry, 0, len(f.Effects))
+	for _, e := range f.Effects {
+		out = append(out, effectEntry{Deps: e.Deps, Action: e.Action})
+	}
+	return out
+}
+
+// genActions records the named client actions (Brick 3) for the manifest, in
+// source order with their assignments. The parser guarantees each action has at
+// least one mutation.
+func genActions(f *ast.Facet) []actionEntry {
+	if len(f.Actions) == 0 {
+		return nil
+	}
+	out := make([]actionEntry, 0, len(f.Actions))
+	for _, a := range f.Actions {
+		muts := make([]assignEntry, 0, len(a.Mutations))
+		for _, m := range a.Mutations {
+			muts = append(muts, assignEntry{Target: m.Target, Expr: m.Expr})
+		}
+		out = append(out, actionEntry{Name: a.Name, Mutations: muts})
+	}
+	return out
+}
+
+// scanHandlers extracts `on:<event>="action"` wirings from the looks: body in
+// document order, assigning each a stable id (h0, h1, …). Wirings live as raw
+// HTML attributes on plain elements (a child-facet call is an ast.Child, not
+// Text), so the scan reads Text nodes and slot defaults — the same scope
+// genBindings uses, and it does not descend into child facets.
+func scanHandlers(f *ast.Facet) []handlerEntry {
+	var hs []handlerEntry
+	var walk func(nodes []ast.Node)
+	walk = func(nodes []ast.Node) {
+		for _, n := range nodes {
+			switch v := n.(type) {
+			case ast.Text:
+				for _, m := range handlerAttrRe.FindAllStringSubmatch(v.S, -1) {
+					action := m[2]
+					if action == "" {
+						action = m[3] // single-quoted alternation
+					}
+					hs = append(hs, handlerEntry{
+						ID:     fmt.Sprintf("h%d", len(hs)),
+						Event:  m[1],
+						Action: action,
+					})
+				}
+			case ast.Slot:
+				walk(v.Default)
+			}
+		}
+	}
+	walk(f.Looks)
+	return hs
 }
 
 // clientBodyText reconstructs a client-rendered primitive's body (decrypt:/

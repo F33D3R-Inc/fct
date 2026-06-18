@@ -29,12 +29,16 @@ type Pos struct {
 type Facet struct {
 	Kind    string // facet (default) | feed | stream | lifecycle | pipe | vault | media | signal
 	Name    string
-	FacetID string  // explicit `facet-id:` override; "" means derive
-	Who     Who     // the `who:` authorization block (zero value = public)
-	Fields  []Field // the `what:` block
-	Looks   []Node  // the `looks:` block (server-rendered kinds), as a flat render stream
-	Client  []Node  // the `decrypt:`/`source:` body (client-rendered kinds); never lowered to a server template
-	Whens   []When  // the `when <event>:` handlers
+	FacetID string   // explicit `facet-id:` override; "" means derive
+	Who     Who      // the `who:` authorization block (zero value = public)
+	Fields  []Field  // the `what:` block
+	State   []Field  // the `state:` block — local client reactive values (signals); each Field's Expr is its required initial value (see docs/REACTIVITY.md)
+	Looks   []Node   // the `looks:` block (server-rendered kinds), as a flat render stream
+	Client  []Node   // the `decrypt:`/`source:` body (client-rendered kinds); never lowered to a server template
+	Whens   []When   // the `when <event>:` handlers
+	Actions []Action // the `actions:` block — named client-side handlers that mutate state signals (see docs/REACTIVITY.md, Brick 3)
+	Effects []Effect // the `effects:` block — run an action when its dependency signals change (see docs/REACTIVITY.md, Brick 7)
+	Queries []Query  // the `query:` block — async server fetches exposed as reactive {loading,error,data} values (see docs/REACTIVITY.md, Brick 11)
 	// Per-kind declarative extras. Recorded in the manifest; runtime semantics are
 	// staged for a later round (this is the compiler-surface pass).
 	Order    string      // feed: ordering field/expression
@@ -160,6 +164,53 @@ type Mutation struct {
 	Target string // child facet name; "" for replace_all
 	With   string // expr after `with`; "" if absent
 	Pos    Pos
+}
+
+// Action is one named handler in the `actions:` block — a reactive "controller
+// method": a name plus the signal mutations it performs when an element's bound
+// DOM event fires. Actions are event-agnostic (the element's `on:<event>="name"`
+// attribute chooses the trigger), so one action is reusable across elements and
+// events. It is the client analogue of When: When maps a *server* event to data
+// mutations; Action maps a *client* event to *signal* mutations, applied locally
+// with zero round-trip (see docs/REACTIVITY.md, Brick 3).
+type Action struct {
+	Name      string
+	Mutations []Assign
+	Pos       Pos
+}
+
+// Assign is one `signal = expr` line inside an action: set state signal Target to
+// the value of Expr. Target must be a declared `state:` signal — `what:` fields
+// are server-authoritative and cannot be mutated on the client.
+type Assign struct {
+	Target string
+	Expr   string
+	Pos    Pos
+}
+
+// Effect is one `on <deps>: <action>` line in the `effects:` block — a reactive
+// side-effect: when any dependency signal changes, the named action runs. It is
+// the imperative complement to a derived value (which is a pure function of
+// signals): an effect can accumulate history, mirror one signal into another, or
+// (later, Tier-2) drive WASM compute. To stay loop-free, effects run once per
+// event cycle and do not re-trigger one another (see docs/REACTIVITY.md, Brick 7).
+type Effect struct {
+	Deps   []string
+	Action string
+	Pos    Pos
+}
+
+// Query is one line in the `query:` block — `name from "url"`: an async fetch of
+// a server resource exposed to the client reactive layer as a structured value
+// `name` with fields `loading` (bool), `error` (bool) and `data` (the decoded
+// JSON body). The runtime starts the fetch on mount and flushes the bound DOM
+// when it resolves, so `{name.data.title}` / `hidden="{name.loading}"` light up
+// without a round-trip per render. It is the client analogue of a `what:` field
+// the server would otherwise have to supply (see docs/REACTIVITY.md, Brick 11).
+type Query struct {
+	Name string
+	URL  string
+	Pos  Pos
 }
 
 // ── Looks nodes (flat) ──────────────────────────────────────────────────────

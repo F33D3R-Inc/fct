@@ -4,6 +4,58 @@ All notable changes. Versioning, the frozen 1.0 surface, and the deprecation
 policy are defined in `STABILITY.md` (pre-1.0: breaking changes land only at
 minor bumps, never at patch bumps, with migration notes here).
 
+## v0.14.3
+
+Compiled fine-grained client reactivity — do what React does, with minimal
+front-end JS and no virtual DOM, as compiler output rather than a shipped
+framework (see `docs/REACTIVITY.md`). The `fct` compiler bakes each facet's
+reactive graph into the manifest and a tiny per-instance updater; the runtime
+patches exactly the bound node when a signal changes. Server-authoritative stays
+the default — this layer owns only ephemeral client state.
+
+### Language
+
+- **`state:`** — local reactive values (signals) with required initial values.
+- **derived** — a computed `what:` field whose roots are all signals recomputes
+  client-side; its first paint is baked into the server template (no flash).
+- **`actions:`** — named, reusable client handlers (`signal = expr`), wired to an
+  element with `on:<event>="name"`; mutate signals locally with zero round-trip.
+- **`effects:`** — `on <signals>: <action>` runs an action when a dependency
+  signal changes (once per cycle, never re-triggering — loop-free).
+- **reactive lists** — `for v in <signal>` over a list signal reconciles by key.
+- **attribute / class / show bindings** — a signal inside an attribute value
+  patches that attribute: `class`/`href`/`aria-*` set the value, and boolean
+  attrs (`hidden`/`disabled`/`checked`/…) toggle by presence, so
+  `hidden="{!visible}"` is real show/hide and `disabled="false"` can never be
+  emitted.
+- **forms** — `bind:value` / `bind:checked` two-way-bind a control to a state
+  signal (reads on `input`/`change`, writes back on flush without clobbering a
+  focused field). Only a mutable `state:` signal can be a target.
+- **routing** — built-in reactive `route` signal seeded from the path and updated
+  on client navigation; a client router falls out of show bindings
+  (`<section hidden="{route != "/about"}">`), and matching `data-nav` links get
+  `.fa-active` + `aria-current`.
+- **async** — `query: name from "url"` exposes a fetch to the reactive layer as
+  `{loading, error, data}`; loading/error/data are just show bindings over a
+  query value. Server-authoritative by transport (a normal same-origin endpoint).
+
+All new blocks are additive and typed: a `bind:` to a non-signal, a reserved
+`route` name, a query-name collision, or an undeclared root is a compile error,
+not a silent blank.
+
+### Runtime (`fa-runtime.js`)
+
+- A CSP-safe expression evaluator (no `eval`/`Function`) mirroring the compiler
+  grammar drives signals, derived values, actions, effects, list reconciliation,
+  attribute bindings, form sync, the `route` signal, and async queries. The graph
+  is compiled into the manifest; only leaf expressions are evaluated — "one IR,
+  swappable executors."
+
+### Examples
+
+- `counter`, `poll`, `todo`, `tracker`, `like`, `greeter`, `site`, `forecast` —
+  one reference facet per brick.
+
 ## v0.14.2
 
 Make the scaffold inert and the `when` block real, so an app's `main.go` never
