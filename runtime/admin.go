@@ -50,7 +50,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	rest = strings.Trim(rest, "/")
 
 	switch {
-	case rest == "" :
+	case rest == "":
 		s.adminIndex(w, sid)
 	case rest == "_save":
 		s.adminSave(w, r, sid)

@@ -34,10 +34,10 @@ func GenerateMobile(graph *ir.IR, dir string) ([]string, error) {
 	acts := publicActions(graph)
 
 	files := map[string]string{
-		"Facet.swift":      swiftClient(graph, ents, acts),
-		"Facet.kt":         kotlinClient(graph, ents, acts),
-		"facetClient.ts":   tsClient(graph, ents, acts),
-		"README.md":        mobileReadme(graph),
+		"Facet.swift":    swiftClient(graph, ents, acts),
+		"Facet.kt":       kotlinClient(graph, ents, acts),
+		"facetClient.ts": tsClient(graph, ents, acts),
+		"README.md":      mobileReadme(graph),
 	}
 	var written []string
 	for name, content := range files {

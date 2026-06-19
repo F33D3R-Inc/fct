@@ -226,7 +226,8 @@ func (s *Server) handleBilling(w http.ResponseWriter, r *http.Request) {
 // subscription's status/plan/period, so the local ledger tracks the provider.
 //
 // Body: {"subscriber":"ada","tenant":0,"customer":"cus_123","plan":"pro",
-//        "status":"active","periodEnd":1750000000}
+//
+//	"status":"active","periodEnd":1750000000}
 func (s *Server) handleBillingWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
