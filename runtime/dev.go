@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -127,11 +129,7 @@ func (s *Server) Reload(graph *ir.IR) error {
 // recompiles and hot-swaps the graph (live-reloading browsers) or, on a compile
 // error, surfaces the message without taking the server down.
 func RunDev(file, addr string) error {
-	src, err := os.ReadFile(file)
-	if err != nil {
-		return err
-	}
-	graph, err := compile.String(string(src))
+	graph, err := compile.File(file)
 	if err != nil {
 		return fmt.Errorf("compile error: %w", err)
 	}
@@ -155,24 +153,21 @@ func RunDev(file, addr string) error {
 	return srv.Serve(addr)
 }
 
-// watch polls the source file's modification time and recompiles on change.
-// Polling needs no third-party file-watching dependency and is robust across
-// editors that write-then-rename.
+// watch polls modification times across the project (every `.fct` in the entry
+// file's directory) and recompiles on change, so editing an imported module
+// hot-reloads just like editing the entry file. Polling needs no third-party
+// file-watching dependency and is robust across editors that write-then-rename.
 func (s *Server) watch(file string) {
-	last := modTime(file)
+	last := projectSig(file)
 	tick := time.NewTicker(400 * time.Millisecond)
 	defer tick.Stop()
 	for range tick.C {
-		mt := modTime(file)
+		mt := projectSig(file)
 		if mt.Equal(last) {
 			continue
 		}
 		last = mt
-		src, err := os.ReadFile(file)
-		if err != nil {
-			continue
-		}
-		graph, err := compile.String(string(src))
+		graph, err := compile.File(file)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "facet dev: compile error: %v\n", err)
 			s.dev.publish("error: " + err.Error())
@@ -193,6 +188,26 @@ func modTime(file string) time.Time {
 		return fi.ModTime()
 	}
 	return time.Time{}
+}
+
+// projectSig is the latest modification time across every `.fct` file in the
+// entry file's directory, so a change to any imported module is detected too. It
+// falls back to the entry file alone if the directory cannot be read.
+func projectSig(file string) time.Time {
+	latest := modTime(file)
+	entries, err := os.ReadDir(filepath.Dir(file))
+	if err != nil {
+		return latest
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".fct") {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+	}
+	return latest
 }
 
 // devScript is injected into every page in dev mode. It subscribes to the

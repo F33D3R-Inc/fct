@@ -32,6 +32,7 @@ top to bottom you will know everything the language can do as of **v1.3.0**.
 | Page | What's in it |
 |---|---|
 | **[Language Reference](Language-Reference.md)** | Every keyword, every construct, the complete grammar. |
+| **[Modules & Imports](Modules.md)** | Split an app across files; package and reuse a "facet" with `import`. |
 | **[Data Modeling](Data-Modeling.md)** | Entities, the type system, relations, queries, indexes, migrations. |
 | **[Actions & Logic](Actions-and-Logic.md)** | Actions, statements, `derive`, validation (`check`), jobs, builtins. |
 | **[Authorization & Security](Authorization-and-Security.md)** | `auth`, policies (RBAC + row-level), sessions, CSRF, MFA, SSO, audit, encryption. |

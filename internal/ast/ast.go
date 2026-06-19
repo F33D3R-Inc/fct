@@ -6,7 +6,13 @@ package ast
 
 // App is one `app Name:` definition — the whole application graph.
 type App struct {
-	Name       string
+	Name string
+	// Imports are the paths of `import "..."` modules declared above the `app`
+	// header. The compiler (internal/compile) resolves them relative to the
+	// importing file and merges each module's declarations into this graph before
+	// placement, so a large app is many small files and a "facet" is a module
+	// another app can pull in. Empty for a single-file app.
+	Imports    []string
 	Auth       bool // a bare `auth` line turns on built-in users/login/logout/signup
 	Entities   []*Entity
 	Enums      []*Enum

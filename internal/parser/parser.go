@@ -20,19 +20,49 @@ type Error struct {
 
 func (e *Error) Error() string { return fmt.Sprintf("line %d: %s", e.Line, e.Msg) }
 
-// Parse compiles source text to an ast.App. Exactly one `app` per file.
+// Parse compiles source text to an ast.App. A file is exactly one `app`
+// definition, optionally preceded by `import "..."` lines (resolved and merged
+// by internal/compile). Imports must come before the `app` header.
 func Parse(src string) (*ast.App, error) {
 	roots, err := source.Parse(src)
 	if err != nil {
 		return nil, err
 	}
-	if len(roots) == 0 {
+	var imports []string
+	var appNode *source.Node
+	for _, r := range roots {
+		t := strings.TrimSpace(r.Line.Text)
+		if t == "import" || strings.HasPrefix(t, "import ") {
+			if appNode != nil {
+				return nil, &Error{r.Line.No, "`import` must come before the `app` definition"}
+			}
+			if len(r.Children) > 0 {
+				return nil, &Error{r.Line.No, "`import` takes no indented block"}
+			}
+			path, err := unquote(strings.TrimSpace(strings.TrimPrefix(t, "import")), r.Line.No)
+			if err != nil {
+				return nil, &Error{r.Line.No, `import needs a quoted path: import "posts.fct"`}
+			}
+			if path == "" {
+				return nil, &Error{r.Line.No, "import path is empty"}
+			}
+			imports = append(imports, path)
+			continue
+		}
+		if appNode != nil {
+			return nil, &Error{r.Line.No, "only one `app` definition per file"}
+		}
+		appNode = r
+	}
+	if appNode == nil {
 		return nil, &Error{0, "empty source: expected an `app Name:` definition"}
 	}
-	if len(roots) > 1 {
-		return nil, &Error{roots[1].Line.No, "only one `app` definition per file"}
+	app, err := parseApp(appNode)
+	if err != nil {
+		return nil, err
 	}
-	return parseApp(roots[0])
+	app.Imports = imports
+	return app, nil
 }
 
 func parseApp(n *source.Node) (*ast.App, error) {

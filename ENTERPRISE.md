@@ -176,6 +176,19 @@ threaded through the same IR + placement model.
   SDKs — **Swift** (iOS), **Kotlin** (Android), and **TypeScript** (React
   Native / web) — straight from the IR, talking to the same `/api` projection.
 
+## Beyond the roadmap — modules & imports ✅ (shipped in v1.4.0)
+
+The first capability past the original roadmap, and the foundation for a
+community ecosystem. A `.fct` file may `import "other.fct"`; the compiler
+resolves each module relative to the importing file and **merges every module's
+declarations into one graph before placement**. So a large app is many small
+files instead of one growing monolith, and a reusable **facet** — data + logic +
+UI bundled together — is simply a module another app pulls in. Because placement
+is computed over the merged graph, a module is a *vertical slice* that never has
+to declare a "layer." Imports de-duplicate, cycles are rejected, and a name
+declared twice is a compile error. (A hosted publish/fetch **registry** is the
+next, larger step; local module composition is what it will stand on.)
+
 ---
 
 Nothing here is an architectural rewrite — each item is another node kind, store

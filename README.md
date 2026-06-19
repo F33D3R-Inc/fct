@@ -98,6 +98,7 @@ app Social:
 
 | Construct | Meaning |
 |---|---|
+| `import "file.fct"` | merge another module's declarations (above the `app` header); split an app or reuse a facet |
 | `auth` | built-in users: `signup`/`login`/`logout`, `setRole`, reset, verify, MFA, OIDC SSO, `actor`/`role`/`verified` |
 | `entity Name:` | durable record type; a field may reference another entity (`f: User`); `@secret` encrypts at rest; `T?` is nullable |
 | `enum Name: a, b, c` | a closed text type, usable as a field/state/param type and in `select` |
@@ -139,6 +140,13 @@ facet run   examples/social.fct   # serve it
 ```
 
 ## Status
+
+**v1.4.0 — modules & imports.** An app no longer has to be one file: a `.fct`
+can `import "other.fct"`, and the compiler merges every module into one graph
+before placement. That keeps a large app as many small files **and** is the
+foundation for reusable "facets" (data + logic + UI bundled and pulled into any
+app). See the [Modules & Imports](wiki/Modules.md) guide and
+`examples/modular/`.
 
 **v1.3.0 — every roadmap phase is shipped.** The enterprise platform
 (ENTERPRISE.md Phase 6) lands on top of the earlier phases:

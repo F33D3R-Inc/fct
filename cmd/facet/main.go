@@ -20,7 +20,7 @@ import (
 )
 
 // version is stamped at release time with -ldflags "-X main.version=…".
-var version = "1.3.1"
+var version = "1.4.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -65,11 +65,9 @@ func main() {
 		usage()
 	}
 	cmd, file := os.Args[1], os.Args[2]
-	src, err := os.ReadFile(file)
-	if err != nil {
-		fatal(err)
-	}
-	graph, err := compile.String(string(src))
+	// compile.File resolves any `import "..."` modules relative to this file and
+	// merges them before placement, so a multi-file app compiles like a single one.
+	graph, err := compile.File(file)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "compile error: %v\n", err)
 		os.Exit(1)

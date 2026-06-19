@@ -4,6 +4,7 @@ The complete syntax of Facet as of v1.3.0. Facet is **whitespace-significant**
 (indentation defines blocks, like Python) and every file is one `app`.
 
 - [File structure](#file-structure)
+- [`import`](#import)
 - [Types](#types)
 - [`app`](#app)
 - [`auth`](#auth)
@@ -27,6 +28,7 @@ The complete syntax of Facet as of v1.3.0. Facet is **whitespace-significant**
 ## File structure
 
 ```
+import "other.fct"            # zero or more, above the app header
 app Name:
     auth                      # optional
     enum   ...                # zero or more, any order
@@ -44,6 +46,23 @@ app Name:
 
 Everything is nested under `app Name:` by indentation. Declaration order does
 not matter — the compiler resolves references in any order.
+
+## `import`
+
+```
+import "posts.fct"
+import "shared/auth-extras.fct"
+
+app MyApp:
+    ...
+```
+
+`import "path"` lines go **above** the `app` header. Each names another `.fct`
+file (resolved relative to the importing file); the compiler merges that
+module's declarations into this app before placement. This is how an app is
+split across small files and how a reusable **facet** is pulled in. Imports are
+de-duplicated, cycles are rejected, and a name declared in two modules is a
+compile error. Full details: **[Modules & Imports](Modules.md)**.
 
 ## Types
 
