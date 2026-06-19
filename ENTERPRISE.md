@@ -1,9 +1,11 @@
 # Facet — the road to enterprise
 
-Honest map of what's built and what's left to make Facet a language you can run a
-large, regulated, high-traffic product on. v1.0.0 is a real, usable foundation —
-you can build and ship a small-to-mid social site with it today. This document is
-the rest of the climb, in the order that actually unblocks production.
+Honest map of how Facet became a language you can run a large, regulated,
+high-traffic product on. As of **v1.3.0 every phase below is shipped** — from the
+v1.0.0 foundation through data-at-scale, authorization, reliability, language
+depth, delivery, and the enterprise platform. This document records the whole
+climb, in the order that actually unblocked production. For how to *use* any of
+it, see the [wiki](wiki/Home.md).
 
 ## Built in v1.0.0
 
@@ -85,45 +87,94 @@ placement model — a policy is just a node, a session is just runtime state.
 > `FACET_SECRET` in production — without it the server runs on an ephemeral key
 > that does not survive a restart (cookies, MFA secrets, encrypted columns).
 
-## Phase 3 — Reliability & operations (run it for real)
+## Phase 3 — Reliability & operations ✅ (shipped in v1.3.0)
 
-The current server is single-process: in-memory SSE fan-out and in-memory job
-tickers don't survive a second instance or a restart mid-job.
+The server is no longer single-process. SSE fan-out and job scheduling survive a
+second instance and a restart mid-job, and the process is observable and
+shutdown-safe.
 
-- **Horizontal scale** — stateless servers; shared session store and **cross-instance
-  pub/sub** for live updates (Redis/NATS).
-- **Durable jobs** — persistent queue with retries, backoff, dead-letter, cron.
-- **Observability** — structured logs, **Prometheus metrics**, **OpenTelemetry
-  tracing**, health/readiness endpoints.
-- **Resilience** — graceful shutdown, timeouts, retries, caching, backups/DR.
+- **Horizontal scale** ✅ — set `FACET_CLUSTER=1` and several stateless servers
+  cooperate. Sessions live in the shared store, and **cross-instance live
+  updates** ride **Postgres `LISTEN`/`NOTIFY`** — the database you already run is
+  the bus, so there is no Redis/NATS to operate. A single-process dev run keeps
+  the in-memory path.
+- **Durable jobs** ✅ — every scheduled `every Ns` job is a **cron entry** in a
+  **persistent queue**; on each interval exactly one instance wins the reservation
+  and enqueues a row, so a job fires once across the cluster, not once per
+  instance. A failed job is **retried with exponential backoff** and, once it
+  exhausts its attempts, **dead-lettered** (kept for inspection) rather than lost.
+- **Observability** ✅ — **structured JSON logs** (`slog`, level via
+  `FACET_LOG_LEVEL`), **Prometheus metrics** at `GET /metrics`, OTLP log export
+  (`FACET_OTLP_LOG`), and **`/healthz` (liveness) + `/readyz` (readiness)** probes
+  for an orchestrator.
+- **Resilience** ✅ — **graceful shutdown** on SIGTERM/SIGINT (in-flight requests
+  drain, workers stop, the database closes), production **timeouts**
+  (read-header / idle; the SSE stream is exempt), an optional short-TTL API
+  **micro-cache** (`FACET_API_CACHE_TTL`), and logical **backup/restore**
+  (`facet backup` / `facet restore`).
 
-## Phase 4 — Language depth & richer UI
+## Phase 4 — Language depth & richer UI ✅ (shipped in v1.3.0)
 
-- **Types** — lists, optional/nullable, decimal/money, first-class dates,
-  enums; a small standard library (string/date/math).
-- **Validation** — declarative action input constraints with friendly errors.
-- **Routing** — dynamic params (`/post/:id`), nested layouts, route guards.
-- **Components** — reusable view fragments; richer primitives (forms, selects,
-  dates, modals, keyed/virtualized lists).
-- **Frontend** — SPA navigation (no full reload), styling/theming system,
-  accessibility, optimistic updates, file/media uploads.
+The language grew the types and view primitives a real product needs — every one
+a new node kind through the same IR.
 
-## Phase 5 — Delivery, DX & supply chain
+- **Types** ✅ — **lists** (`[T]`), **optional/nullable** (`T?`), **`money`** and
+  first-class **`date`**, and **enums** (closed text types) that flow through
+  fields, state, params, and `select` options.
+- **Validation** ✅ — declarative action preconditions: `check <cond> "message"`
+  runs before the body and returns a friendly error when it fails.
+- **Routing** ✅ — **dynamic params** (`view Post at "/post/:id"`), **layouts**
+  (`view … in Layout`, a `layout` with a `slot`), and **route guards**
+  (`view … requires <policy>` — the authority refuses to render it, the client
+  hides links to it).
+- **Components** ✅ — reusable view fragments (`component Name(params):` invoked
+  with `use Name(args)`), plus richer primitives: **`select`** (with `option`s or
+  enum-defaulted), **`form`**, and **`upload`**.
+- **Frontend** ✅ — **SPA navigation** (matched links swap the page with no full
+  reload), a **theming** system (`theme:` block → CSS custom properties),
+  **optimistic** actions (`action … @optimistic`), and **file/media uploads**
+  (`POST /upload`, served from `/uploads/`, `FACET_UPLOAD_DIR`).
 
-- **Tooling** — dev server with hot reload, `facet console`, seed data, a testing
-  framework for Facet apps.
-- **Editor** — LSP (completion, go-to-def, inline errors), syntax highlighting.
-- **Deploy** — Dockerfile/image, one-command deploy, config/secret management.
-- **Supply chain** — SBOM, keyless-signed releases, SLSA provenance (the release
-  pipeline had this; re-add it).
+## Phase 5 — Delivery, DX & supply chain ✅ (shipped in v1.3.0)
 
-## Phase 6 — Enterprise platform
+The authoring loop and the release pipeline are first-class.
 
-- **Multi-tenancy** — tenant isolation, teams/orgs, invitations.
-- **Auto-admin** — a generated admin dashboard (Django-admin style).
-- **Billing** — subscriptions/usage integration.
-- **Compliance** — i18n, GDPR data export/erasure, retention policies.
-- **More targets** — native mobile (iOS/Android) reading the same IR.
+- **Tooling** ✅ — `facet dev` (a **hot-reloading** dev server that runs with no
+  database), `facet console` (an interactive REPL against the app), `facet seed`
+  (load fixture rows), and `facet test` (a **behavior-test framework** for Facet
+  apps).
+- **Editor** ✅ — an **LSP** (`facet lsp`: diagnostics, completion, hovers) and
+  **syntax highlighting** for VS Code, Vim, and Neovim (under `editors/`).
+- **Deploy** ✅ — a **Dockerfile** and **docker-compose** (app + Postgres), written
+  by `facet deploy` (and into every `facet new` project) for a one-command stack.
+- **Supply chain** ✅ — the release workflow emits a **CycloneDX SBOM**
+  (`scripts/sbom.sh`), **keyless-signs** the checksums/SBOM/provenance with cosign
+  (Sigstore, the workflow's OIDC identity — no long-lived key), and attaches a
+  **SLSA v1.0 provenance** statement (`scripts/provenance.sh`).
+
+## Phase 6 — Enterprise platform ✅ (shipped in v1.3.0)
+
+The platform layer — multi-tenancy, an admin, billing, compliance, and more
+targets — every piece a reserved table / reserved action / runtime service
+threaded through the same IR + placement model.
+
+- **Multi-tenancy** ✅ — `FACET_MULTI_TENANT=1` turns on orgs/teams, memberships,
+  and invitations, and threads the session's active **`tenant`** and the actor's
+  **`tenantRole`** into the eval scope, so an app scopes its own rows with an
+  ordinary policy (`policy sees(id): Doc(id).org == tenant`).
+- **Auto-admin** ✅ — a generated, admin-only **CRUD dashboard** over every entity
+  at **`/admin`** (Django-admin style), pure projection of the IR; on by default,
+  `FACET_ADMIN=0` removes it.
+- **Billing** ✅ — `FACET_BILLING=1` keeps an authoritative **subscription + usage
+  ledger** synced by an **HMAC-signed provider webhook** (`/billing/webhook`); an
+  app gates features on `GET /api/_billing`.
+- **Compliance** ✅ — **i18n** message catalogs (`FACET_I18N_DIR`, negotiated per
+  request, served at `/api/_i18n`), **GDPR** data **export** (`/api/_export`) and
+  **erasure** (`/api/_erase`), and declarative **retention** sweeps
+  (`FACET_RETENTION`).
+- **More targets** ✅ — `facet generate <app.fct> [dir]` emits typed native client
+  SDKs — **Swift** (iOS), **Kotlin** (Android), and **TypeScript** (React
+  Native / web) — straight from the IR, talking to the same `/api` projection.
 
 ---
 

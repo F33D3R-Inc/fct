@@ -98,14 +98,17 @@ app Social:
 
 | Construct | Meaning |
 |---|---|
-| `auth` | built-in users: `signup`/`login`/`logout`, `setRole`, reset, verify, MFA, `actor`/`role`/`verified` |
-| `entity Name:` | durable record type; a field may reference another entity; `@secret` encrypts a field at rest |
-| `state n: T = v [@client]` | a state cell; authoritative unless `@client` |
+| `auth` | built-in users: `signup`/`login`/`logout`, `setRole`, reset, verify, MFA, OIDC SSO, `actor`/`role`/`verified` |
+| `entity Name:` | durable record type; a field may reference another entity (`f: User`); `@secret` encrypts at rest; `T?` is nullable |
+| `enum Name: a, b, c` | a closed text type, usable as a field/state/param type and in `select` |
+| `state n: T = v [@client]` | a state cell; authoritative unless `@client`; `[T]` is a list, `T?` optional |
 | `derive n: T = expr` | a named computed value (inlined, reactive) |
 | `policy n[(p)]:` | a predicate over `actor`/`role`/`verified`/state; parameters make it row-level |
-| `action n(p):` | a mutation: `assign`/`add`/`set`/`remove`/`clear`, `requires n(args)` |
-| `job n every 30s -> a` | a scheduled server action |
-| `view N at "/p":` | a page: `box` · `text` · `button` · `for…where…by…limit` · `if` · `input` · `link` |
+| `action n(p) [@optimistic]:` | a mutation: `assign`/`add`/`set`/`remove`/`clear`; `requires n(args)`; `check <cond> "msg"` |
+| `job n every 30s -> a` | a scheduled server action (durable cron in a cluster) |
+| `component N(p):` / `layout N:` | a reusable fragment (invoked with `use`) / a wrapper with a `slot` |
+| `theme:` | a block of `name "value"` lines → CSS custom properties |
+| `view N at "/p/:id" [in L] [requires pol]:` | a page: `box`·`text`·`button`·`for…where…by…limit`·`if`·`input`·`select`·`form`·`upload`·`link`·`use` |
 | builtins | `count(E)` · `sum(E.f)` · `now()` · `rand(n)` |
 
 ## Projections
@@ -137,16 +140,30 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
-v1.2.0 — adds **authorization & security hardening** (ENTERPRISE.md Phase 2):
-RBAC + row-level policies · signed sessions with sliding expiry · CSRF · rate
-limiting · brute-force lockout · password reset · account verification · TOTP
-MFA · OIDC SSO · an admin audit log · `@secret` field encryption at rest. On the
-v1.1 **data-at-scale** base (typed indexed columns · relations with cascade ·
-SQL query pushdown + keyset pagination · transactions · migrations) and the v1.0
-foundation (data · queries · auth · pages · projections · packaging). See
-[ENTERPRISE.md](ENTERPRISE.md) for the rest of the roadmap. Each item is another
-node kind or runtime service through the **same IR and placement calculus** —
-the language grows by addition, never by forking into frontend and backend again.
+**v1.3.0 — every roadmap phase is shipped.** The enterprise platform
+(ENTERPRISE.md Phase 6) lands on top of the earlier phases:
+
+- **v1.3 — reliability, language depth, delivery, enterprise:** clustering over
+  Postgres `LISTEN`/`NOTIFY` · durable job queue (retries/backoff/dead-letter/
+  cron) · Prometheus `/metrics` + `/healthz`/`/readyz` · graceful shutdown ·
+  lists/optionals/`money`/`date`/enums · `check` validation · dynamic routes,
+  layouts & route guards · components · `select`/`form`/`upload` · theming ·
+  SPA navigation · hot-reload dev server · `console` · `seed` · `test` · LSP +
+  editor highlighting · Docker/compose · SBOM + cosign signing + SLSA
+  provenance · multi-tenancy · auto-admin at `/admin` · billing ledger ·
+  i18n/GDPR/retention · `facet generate` native mobile clients.
+- **v1.2 — authorization & security:** RBAC + row-level policies · signed
+  sessions · CSRF · rate limiting · brute-force lockout · password reset ·
+  verification · TOTP MFA · OIDC SSO · admin audit log · `@secret` encryption.
+- **v1.1 — data at scale:** typed indexed columns · relations with cascade · SQL
+  query pushdown + keyset pagination · transactions · migrations.
+- **v1.0 — foundation:** data · queries · auth · pages · projections · packaging.
+
+**Full guide → the [Facet wiki](wiki/Home.md)** is the single reference for
+building with the language. See [ENTERPRISE.md](ENTERPRISE.md) for the road that
+got here. Every item is another node kind or runtime service through the **same
+IR and placement calculus** — the language grows by addition, never by forking
+into frontend and backend again.
 ```sh
 go test ./...   # placement soundness, authz, security primitives, queries, auth
 ```
