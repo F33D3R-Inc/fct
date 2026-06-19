@@ -28,13 +28,15 @@ var clientJS []byte
 
 // Server serves one compiled app.
 type Server struct {
-	ir       *ir.IR
-	byAction map[string]*ir.Action
-	byBind   map[string]*ir.Binding
-	byPolicy map[string]*ir.Policy
-	store    Store
-	children map[string][]childRef // entity -> the relations that point at it (for cascade)
-	secure   bool                  // mark cookies Secure (TLS / FACET_SECURE_COOKIES=1)
+	ir          *ir.IR
+	byAction    map[string]*ir.Action
+	byBind      map[string]*ir.Binding
+	byPolicy    map[string]*ir.Policy
+	byComponent map[string]*ir.Component
+	uploadDir   string // directory uploaded files are written to and served from
+	store       Store
+	children    map[string][]childRef // entity -> the relations that point at it (for cascade)
+	secure      bool                  // mark cookies Secure (TLS / FACET_SECURE_COOKIES=1)
 
 	mu       sync.Mutex
 	entities map[string][]any         // durable, shared (the in-memory working set; the Store is the source of truth)
@@ -46,6 +48,13 @@ type Server struct {
 	lockout *lockout      // per-username brute-force login lockout
 	audit   *auditLog     // append-only record of every server action
 	oidc    *oidcProvider // optional OIDC SSO (nil unless configured)
+
+	obs      *obs         // structured logs + metrics + tracing
+	cluster  *cluster     // cross-instance pub/sub + shared sessions (nil unless FACET_CLUSTER)
+	jobs     *jobQueue    // durable job workers (nil until StartJobs)
+	apiCache *apiCache    // optional read cache for entity-list GETs (nil unless FACET_API_CACHE_TTL)
+	dev      *devHub      // live-reload hub (nil unless `facet dev`)
+	i18n     *i18nCatalog // message catalogs for localization (empty until FACET_I18N_DIR)
 
 	subsMu sync.Mutex           // guards subs
 	subs   map[chan []byte]bool // live SSE connections (shared-state fan-out)
@@ -78,18 +87,41 @@ type childRef struct {
 // (FACET_DATABASE_URL) and loading its rows into the in-memory working set. It
 // fails if the database cannot be reached — the app does not run without it.
 func New(graph *ir.IR) (*Server, error) {
+	s := newServer(graph)
+	store, err := openStore(os.Getenv("FACET_DATABASE_URL"))
+	if err != nil {
+		return nil, err
+	}
+	if err := s.attachStore(store); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// newServer builds the storeless half of a server: the lookup maps over the IR
+// and the reverse-relation graph. attachStore then wires in a backend.
+func newServer(graph *ir.IR) *Server {
+	// Phase 6: add the reserved tenancy/billing tables for the enabled enterprise
+	// features before anything reads the entity set, so they ride the same load and
+	// migration path as a declared entity.
+	injectEnterpriseEntities(graph)
 	s := &Server{
-		ir:       graph,
-		byAction: map[string]*ir.Action{},
-		byBind:   map[string]*ir.Binding{},
-		byPolicy: map[string]*ir.Policy{},
-		entities: map[string][]any{},
-		nextID:   map[string]int{},
-		sessions: map[string]*sessionState{},
-		subs:     map[chan []byte]bool{},
-		secure:   os.Getenv("FACET_SECURE_COOKIES") == "1",
-		limiter:  newRateLimiter(rateLimitFromEnv()),
-		lockout:  newLockout(),
+		ir:          graph,
+		byAction:    map[string]*ir.Action{},
+		byBind:      map[string]*ir.Binding{},
+		byPolicy:    map[string]*ir.Policy{},
+		byComponent: map[string]*ir.Component{},
+		uploadDir:   uploadDirFromEnv(),
+		entities:    map[string][]any{},
+		nextID:      map[string]int{},
+		sessions:    map[string]*sessionState{},
+		subs:        map[chan []byte]bool{},
+		secure:      os.Getenv("FACET_SECURE_COOKIES") == "1",
+		limiter:     newRateLimiter(rateLimitFromEnv()),
+		lockout:     newLockout(),
+		obs:         newObs(),
+		apiCache:    newAPICache(),
+		i18n:        newI18n(),
 	}
 	for i := range graph.Actions {
 		s.byAction[graph.Actions[i].Name] = &graph.Actions[i]
@@ -100,6 +132,9 @@ func New(graph *ir.IR) (*Server, error) {
 	for i := range graph.Policies {
 		s.byPolicy[graph.Policies[i].Name] = &graph.Policies[i]
 	}
+	for i := range graph.Components {
+		s.byComponent[graph.Components[i].Name] = &graph.Components[i]
+	}
 	// reverse-relation graph: parent entity -> children that reference it.
 	s.children = map[string][]childRef{}
 	for _, e := range graph.Entities {
@@ -109,16 +144,31 @@ func New(graph *ir.IR) (*Server, error) {
 			}
 		}
 	}
+	return s
+}
 
-	store, err := openStore(os.Getenv("FACET_DATABASE_URL"))
-	if err != nil {
+// NewInMemory builds a server backed by a volatile in-memory store — no database
+// required. It powers the developer-experience tooling (`facet test`, `facet
+// console`, `facet seed --dry`), which exercises the real runtime without
+// touching Postgres. Production traffic always goes through New (Postgres).
+func NewInMemory(graph *ir.IR) (*Server, error) {
+	s := newServer(graph)
+	if err := s.attachStore(newMemStore()); err != nil {
 		return nil, err
 	}
+	return s, nil
+}
+
+// attachStore wires a Store into a half-built server: it initializes the schema,
+// loads the working set, seeds the audit feed, and brings up optional OIDC and
+// clustering. New and NewInMemory share it so both backends behave identically.
+func (s *Server) attachStore(store Store) error {
+	graph := s.ir
 	s.store = store
 	loaded, err := store.Init(graph.Entities)
 	if err != nil {
 		store.Close()
-		return nil, fmt.Errorf("load entity data: %w", err)
+		return fmt.Errorf("load entity data: %w", err)
 	}
 	for _, e := range graph.Entities {
 		rows := loaded[e.Name]
@@ -146,7 +196,18 @@ func New(graph *ir.IR) (*Server, error) {
 
 	// Optional OIDC single sign-on, configured entirely from the environment.
 	s.oidc = newOIDCFromEnv()
-	return s, nil
+
+	// Horizontal scale (opt-in): join the cross-instance event bus and back
+	// sessions with the shared store, so many instances can run behind one LB.
+	if clusterEnabled() {
+		c, err := startCluster(s)
+		if err != nil {
+			store.Close()
+			return fmt.Errorf("start cluster: %w", err)
+		}
+		s.cluster = c
+	}
+	return nil
 }
 
 // Handler returns the HTTP routes for the app.
@@ -160,12 +221,28 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/live", s.handleLive)
 	mux.HandleFunc("/api", s.handleAPISchema)
 	mux.HandleFunc("/api/", s.handleAPI)
+	mux.HandleFunc("/upload", s.handleUpload)
+	mux.HandleFunc("/uploads/", s.handleUploads)
+	// Phase 6: the generated admin dashboard and the billing provider webhook.
+	mux.HandleFunc("/admin", s.handleAdmin)
+	mux.HandleFunc("/admin/", s.handleAdmin)
+	mux.HandleFunc("/billing/webhook", s.handleBillingWebhook)
+	if s.dev != nil {
+		mux.HandleFunc("/dev/reload", s.handleDevReload)
+	}
 	if s.oidc != nil {
 		mux.HandleFunc("/auth/oidc/login", s.handleOIDCLogin)
 		mux.HandleFunc("/auth/oidc/callback", s.handleOIDCCallback)
 	}
+	// Operations endpoints: liveness/readiness probes for orchestrators and the
+	// Prometheus scrape target. They sit outside the app's routes.
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/", s.handlePage)
-	return mux
+	// Wrap the whole mux in the observability middleware: every request becomes a
+	// span, a structured access log line, and a metrics sample.
+	return s.obs.observe(mux)
 }
 
 // handleLive is the real-time transport: one SSE stream per client. Changes to
@@ -186,10 +263,12 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 	s.subsMu.Lock()
 	s.subs[ch] = true
 	s.subsMu.Unlock()
+	s.obs.metrics.addSSE(1)
 	defer func() {
 		s.subsMu.Lock()
 		delete(s.subs, ch)
 		s.subsMu.Unlock()
+		s.obs.metrics.addSSE(-1)
 	}()
 
 	// Send a current snapshot of all entities so a client that connected after a
@@ -197,8 +276,8 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	snap := map[string]any{}
 	for ent, rows := range s.entities {
-		if ent == reservedUserEntity {
-			continue // never stream the credential store
+		if isReservedEntity(ent) {
+			continue // never stream the credential store or other runtime-managed tables
 		}
 		snap[ent] = rows
 	}
@@ -219,9 +298,30 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// broadcast pushes a deltas payload to every live client (non-blocking; a client
-// whose buffer is full is skipped — it will catch up on its next snapshot).
+// broadcast fans a deltas payload out to this instance's live clients, then —
+// when clustering is on — announces the changed entities to peer instances so
+// their clients converge too. Any entity write also invalidates the API read
+// cache, so a cached list can never outlive the data it was built from.
 func (s *Server) broadcast(deltas map[string]any) {
+	if len(deltas) == 0 {
+		return
+	}
+	s.apiCache.invalidate()
+	s.fanout(deltas)
+	if s.cluster != nil {
+		names := make([]string, 0, len(deltas))
+		for ent := range deltas {
+			names = append(names, ent)
+		}
+		s.cluster.publish(names)
+	}
+}
+
+// fanout pushes a deltas payload to every live client on this instance only
+// (non-blocking; a client whose buffer is full is skipped — it will catch up on
+// its next snapshot). The cluster receive path calls this directly to avoid
+// re-publishing a peer's change.
+func (s *Server) fanout(deltas map[string]any) {
 	if len(deltas) == 0 {
 		return
 	}
@@ -243,13 +343,30 @@ func (s *Server) broadcast(deltas map[string]any) {
 // it (first paint), and embeds that page's IR + the initial state the client
 // runtime renders from. Following a link re-enters here for the next page.
 func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
-	pg := s.pageFor(r.URL.Path)
+	pg, params := s.pageFor(r.URL.Path)
 	if pg == nil {
 		http.NotFound(w, r)
 		return
 	}
 	sid := s.session(w, r)
 	store := s.fullStore(sid)
+	// Route parameters (`/post/:id`) enter the render scope as text values, visible
+	// to both the first-paint render and the client (they ride in the state JSON).
+	for k, v := range params {
+		store[k] = v
+	}
+
+	// Route guard: a zero-arg policy the authority enforces before rendering. A
+	// failing guard refuses the page outright — the client also hides links to it,
+	// but the server is the enforcement point.
+	if pg.Requires != "" {
+		if pol := s.byPolicy[pg.Requires]; pol == nil || !truthy(eval(pol.Expr, store)) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, guardedPage, html.EscapeString(s.ir.App))
+			return
+		}
+	}
 
 	var body strings.Builder
 	for _, n := range pg.View {
@@ -257,7 +374,8 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Ship the IR with this page's view/bindings/depgraph (the client runtime
-	// reads those three fields), not every page.
+	// reads those three fields), not every page's tree. Routes (lightweight) stay,
+	// so the client can match links and hide guarded ones.
 	reqIR := *s.ir
 	reqIR.View = pg.View
 	reqIR.Bindings = pg.Bindings
@@ -267,17 +385,78 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	stateJSON, _ := json.Marshal(store)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), csrfToken(sid), body.String(), irJSON, stateJSON)
+	// Phase 6: stamp the negotiated locale so a client knows which catalog to load.
+	w.Header().Set("Content-Language", s.i18n.localeFor(r))
+	dev := ""
+	if s.dev != nil {
+		dev = devScript
+	}
+	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), themeCSS(s.ir.Theme), csrfToken(sid), body.String(), irJSON, stateJSON, dev)
 }
 
-// pageFor returns the view served at an exact path, or nil.
-func (s *Server) pageFor(path string) *ir.Page {
+// pageFor returns the page whose route matches path, plus the bound `:param`
+// values. An exact (static) route wins over a dynamic one.
+func (s *Server) pageFor(path string) (*ir.Page, map[string]string) {
 	for i := range s.ir.Pages {
 		if s.ir.Pages[i].Path == path {
-			return &s.ir.Pages[i]
+			return &s.ir.Pages[i], nil
 		}
 	}
-	return nil
+	for i := range s.ir.Pages {
+		if params, ok := matchRoute(s.ir.Pages[i].Path, path); ok {
+			return &s.ir.Pages[i], params
+		}
+	}
+	return nil, nil
+}
+
+// matchRoute matches a concrete path against a route pattern, binding each
+// `:param` segment to its concrete value. ok is false if they do not match.
+func matchRoute(pattern, path string) (map[string]string, bool) {
+	ps := strings.Split(strings.Trim(pattern, "/"), "/")
+	cs := strings.Split(strings.Trim(path, "/"), "/")
+	if len(ps) != len(cs) {
+		return nil, false
+	}
+	params := map[string]string{}
+	for i := range ps {
+		if strings.HasPrefix(ps[i], ":") {
+			if cs[i] == "" {
+				return nil, false
+			}
+			if dec, err := url.PathUnescape(cs[i]); err == nil {
+				params[ps[i][1:]] = dec
+			} else {
+				params[ps[i][1:]] = cs[i]
+			}
+			continue
+		}
+		if ps[i] != cs[i] {
+			return nil, false
+		}
+	}
+	return params, true
+}
+
+// themeCSS renders the app's theme variables as a `:root` block of CSS custom
+// properties (`--fa-<name>`), so the whole UI restyles from one declarative
+// source. Empty when no `theme:` block is declared.
+func themeCSS(theme map[string]string) string {
+	if len(theme) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(theme))
+	for k := range theme {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	b.WriteString(":root{")
+	for _, k := range names {
+		fmt.Fprintf(&b, "--fa-%s:%s;", k, strings.ReplaceAll(theme[k], "}", ""))
+	}
+	b.WriteString("}")
+	return b.String()
 }
 
 // guardMutation applies the edge defenses every state-changing request passes
@@ -341,6 +520,9 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		s.runAuth(w, r, req.Action, req.Args)
 		return
 	}
+	if s.runReserved(w, r, req.Action, req.Args) {
+		return
+	}
 	act := s.byAction[req.Action]
 	if act == nil {
 		http.Error(w, "unknown action", http.StatusNotFound)
@@ -356,6 +538,9 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	if status != http.StatusOK {
 		http.Error(w, msg, status)
 		return
+	}
+	if len(deltas) > 0 {
+		s.persistSession(sid) // the action changed per-session state; share it
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"deltas": deltas})
@@ -388,7 +573,19 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 	for _, req := range act.Requires {
 		if !s.policyPasses(req, scope) {
 			s.recordAudit(actor, act.Name, false, "denied: "+req.Name)
+			s.obs.metrics.observeAction(act.Name, "denied")
 			return nil, http.StatusForbidden, "forbidden: " + req.Name
+		}
+	}
+
+	// Input validation: each `check` is a precondition over the bound arguments and
+	// the actor. A failure aborts before any state changes and returns its friendly
+	// message, so invalid input never reaches the store.
+	for _, chk := range act.Checks {
+		if !truthy(eval(chk.Cond, scope)) {
+			s.recordAudit(actor, act.Name, false, "check failed: "+chk.Msg)
+			s.obs.metrics.observeAction(act.Name, "invalid")
+			return nil, http.StatusUnprocessableEntity, chk.Msg
 		}
 	}
 
@@ -478,6 +675,7 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 		s.broadcast(entDeltas)
 	}
 	s.recordAudit(actor, act.Name, true, "")
+	s.obs.metrics.observeAction(act.Name, "ok")
 	return deltas, http.StatusOK, ""
 }
 
@@ -589,14 +787,24 @@ func (s *Server) scope(sid string) map[string]any {
 		actor, role, verified = ses.actor, ses.role, ses.verified
 	}
 	scope := map[string]any{"actor": actor, "role": role, "verified": verified}
+	// Phase 6: the session's active tenant and the actor's role within it, exposed
+	// to the graph like `actor`/`role` so policies can scope rows by `tenant`.
+	tid := activeTenant(ses)
+	scope["tenant"] = tid
+	scope["tenantRole"] = s.tenantRoleFor(actor, tid)
 	for ent, rows := range s.entities {
-		if ent == reservedUserEntity {
-			continue // credentials never enter a render scope or reach a client
+		if isReservedEntity(ent) {
+			continue // runtime-managed tables never enter a render scope or reach a client
 		}
 		scope[ent] = rows
 	}
 	if ses != nil {
 		for k, v := range ses.state {
+			// `__`-prefixed keys are runtime-internal session state (e.g. the active
+			// tenant); they persist with the session but never enter the eval scope.
+			if strings.HasPrefix(k, "__") {
+				continue
+			}
 			scope[k] = v
 		}
 	}
@@ -641,8 +849,8 @@ func (s *Server) handleAPISchema(w http.ResponseWriter, r *http.Request) {
 	schema := map[string]any{"app": s.ir.App}
 	var ents []ir.Entity
 	for _, e := range s.ir.Entities {
-		if e.Name == reservedUserEntity {
-			continue // never expose the credential store
+		if isReservedEntity(e.Name) {
+			continue // never expose the credential store or other runtime-managed tables
 		}
 		ents = append(ents, e)
 	}
@@ -671,11 +879,24 @@ func (s *Server) handleAPISchema(w http.ResponseWriter, r *http.Request) {
 // returns its rows; a POST on an action name invokes it.
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/api/")
-	if name == "_audit" {
+	switch name {
+	case "_audit":
 		s.handleAudit(w, r)
 		return
+	case "_export":
+		s.handleGDPRExport(w, r)
+		return
+	case "_erase":
+		s.handleGDPRErase(w, r)
+		return
+	case "_i18n":
+		s.handleI18n(w, r)
+		return
+	case "_billing":
+		s.handleBilling(w, r)
+		return
 	}
-	if name == "" || strings.Contains(name, "/") || name == reservedUserEntity {
+	if name == "" || strings.Contains(name, "/") || isReservedEntity(name) {
 		http.NotFound(w, r)
 		return
 	}
@@ -696,17 +917,28 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Serve a hot list from the read cache when enabled; it is invalidated the
+		// instant any entity changes, so it never returns stale rows.
+		cacheKey := name + "?" + r.URL.RawQuery
+		if body, ok := s.apiCache.get(cacheKey); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache", "hit")
+			w.Write(body)
+			return
+		}
 		rows, next, err := s.store.Query(query)
 		if err != nil {
 			http.Error(w, "query failed", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
 		out := map[string]any{"rows": rows}
 		if next != "" {
 			out["next"] = next
 		}
-		json.NewEncoder(w).Encode(out)
+		body, _ := json.Marshal(out)
+		s.apiCache.put(cacheKey, body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
 
 	case http.MethodPost:
 		if !s.guardMutation(w, r, false) {
@@ -725,6 +957,9 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			s.runAuth(w, r, name, req.Args)
 			return
 		}
+		if s.runReserved(w, r, name, req.Args) {
+			return
+		}
 		act := s.byAction[name]
 		if act == nil {
 			http.Error(w, "unknown action", http.StatusNotFound)
@@ -739,6 +974,9 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		if status != http.StatusOK {
 			http.Error(w, msg, status)
 			return
+		}
+		if len(deltas) > 0 {
+			s.persistSession(sid)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "deltas": deltas})
@@ -848,43 +1086,6 @@ func litFor(f ir.Field, s string) *ir.Expr {
 	}
 }
 
-// ── jobs: scheduled server actions ────────────────────────────────────────────
-
-// StartJobs launches the app's scheduled actions: each `on start` job runs once
-// now, and each `every Ns` job runs on a ticker — all under a synthetic `system`
-// session/actor on the authority. Entity changes they make fan out over SSE just
-// like any other action. It returns immediately; tickers run in the background.
-func (s *Server) StartJobs() {
-	if len(s.ir.Jobs) == 0 {
-		return
-	}
-	const systemSID = "__system"
-	s.mu.Lock()
-	sys := s.newSession("system", "admin")
-	sys.verified = true
-	s.sessions[systemSID] = sys
-	s.mu.Unlock()
-
-	for _, j := range s.ir.Jobs {
-		act := s.byAction[j.Action]
-		if act == nil {
-			continue
-		}
-		if j.OnStart {
-			s.runAction(systemSID, act, nil)
-		}
-		if j.Every > 0 {
-			go func(a *ir.Action, every int) {
-				t := time.NewTicker(time.Duration(every) * time.Second)
-				defer t.Stop()
-				for range t.C {
-					s.runAction(systemSID, a, nil)
-				}
-			}(act, j.Every)
-		}
-	}
-}
-
 // ── server-side rendering (first paint) ──────────────────────────────────────
 
 func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any) {
@@ -946,6 +1147,49 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 	case "link":
 		fmt.Fprintf(b, `<a class="fa-link" href="%s">%s</a>`,
 			html.EscapeString(n.Path), html.EscapeString(n.Label))
+	case "select":
+		fmt.Fprintf(b, `<select class="fa-select" data-fa-input="%s">`, n.Bind)
+		cur := toStr(scope[n.Bind])
+		for _, o := range n.Options {
+			sel := ""
+			if o.Value == cur {
+				sel = " selected"
+			}
+			fmt.Fprintf(b, `<option value="%s"%s>%s</option>`,
+				html.EscapeString(o.Value), sel, html.EscapeString(o.Label))
+		}
+		b.WriteString(`</select>`)
+	case "form":
+		fmt.Fprintf(b, `<form class="fa-form" data-fa-form="%s">`, html.EscapeString(n.Action))
+		for _, c := range n.Children {
+			s.renderNode(b, c, scope)
+		}
+		fmt.Fprintf(b, `<button type="submit">%s</button></form>`, html.EscapeString(n.Label))
+	case "upload":
+		fmt.Fprintf(b, `<label class="fa-upload">%s<input type="file" data-fa-upload="%s"></label>`,
+			html.EscapeString(n.Label), n.Bind)
+	case "use":
+		comp := s.byComponent[n.Name]
+		if comp == nil {
+			return
+		}
+		if n.ID != "" {
+			fmt.Fprintf(b, `<div data-fa-region="%s">`, n.ID)
+		} else {
+			b.WriteString(`<div class="fa-use">`)
+		}
+		child := cloneScope(scope)
+		for i, p := range comp.Params {
+			var v any
+			if i < len(n.Args) {
+				v = eval(n.Args[i], scope)
+			}
+			child[p.Name] = coerce(v, p.Type)
+		}
+		for _, c := range comp.View {
+			s.renderNode(b, c, child)
+		}
+		b.WriteString(`</div>`)
 	}
 }
 
@@ -966,14 +1210,27 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) string {
 		if sid, ok := verifySigned(c.Value); ok {
 			s.mu.Lock()
 			ses, live := s.sessions[sid]
+			// Stateless servers: a request can land on a cold instance, so rehydrate
+			// the session from the shared store on a local cache miss.
+			if !live && s.cluster != nil {
+				if ps, found, err := s.store.LoadSession(sid); err == nil && found {
+					ses = sessionFromPersisted(ps)
+					s.sessions[sid] = ses
+					live = true
+				}
+			}
 			if live && now.Before(ses.expires) {
 				ses.expires = now.Add(sessionTTL) // slide the window forward
 				s.mu.Unlock()
+				s.persistSession(sid)
 				s.setSessionCookie(w, sid)
 				return sid
 			}
 			if live {
 				delete(s.sessions, sid) // expired — drop it
+				s.mu.Unlock()
+				s.dropSharedSession(sid)
+				s.mu.Lock()
 			}
 			s.mu.Unlock()
 		}
@@ -981,6 +1238,11 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) string {
 	s.mu.Lock()
 	s.nextSID++
 	sid := fmt.Sprintf("s%d", s.nextSID)
+	if s.cluster != nil {
+		// A process-local counter is not unique across instances; mint a globally
+		// unique id so two instances never collide on a session key.
+		sid = "s-" + s.cluster.instanceID + "-" + strconv.Itoa(s.nextSID)
+	}
 	ses := s.newSession("guest", "guest")
 	// Without auth, identity comes from `?as=` (a dev convenience). With auth, the
 	// session starts as an anonymous guest until login.
@@ -990,9 +1252,64 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) string {
 		}
 	}
 	s.sessions[sid] = ses
+	s.obs.metrics.setSessions(int64(len(s.sessions)))
 	s.mu.Unlock()
+	s.persistSession(sid)
 	s.setSessionCookie(w, sid)
 	return sid
+}
+
+// persistSession writes a session through to the shared store (no-op unless
+// clustering is on), so any instance can serve the user's next request.
+func (s *Server) persistSession(sid string) {
+	if s.cluster == nil {
+		return
+	}
+	s.mu.Lock()
+	ses := s.sessions[sid]
+	if ses == nil {
+		s.mu.Unlock()
+		return
+	}
+	ps := persistedFromSession(ses)
+	s.mu.Unlock()
+	if err := s.store.SaveSession(sid, ps); err != nil {
+		s.obs.log.Warn("save session", slog_err(err))
+	}
+}
+
+// dropSharedSession removes a session from the shared store (logout/expiry).
+func (s *Server) dropSharedSession(sid string) {
+	if s.cluster == nil {
+		return
+	}
+	if err := s.store.DeleteSession(sid); err != nil {
+		s.obs.log.Warn("delete session", slog_err(err))
+	}
+}
+
+// persistedFromSession snapshots a live session for the shared store.
+func persistedFromSession(ses *sessionState) *persistedSession {
+	state := map[string]any{}
+	for k, v := range ses.state {
+		state[k] = v
+	}
+	return &persistedSession{
+		Actor: ses.actor, Role: ses.role, Verified: ses.verified,
+		PendingMFA: ses.pendingMFA, State: state, Expires: ses.expires,
+	}
+}
+
+// sessionFromPersisted rebuilds a live session from a shared-store row.
+func sessionFromPersisted(ps *persistedSession) *sessionState {
+	state := ps.State
+	if state == nil {
+		state = map[string]any{}
+	}
+	return &sessionState{
+		state: state, actor: ps.Actor, role: ps.Role, verified: ps.Verified,
+		pendingMFA: ps.PendingMFA, expires: ps.Expires,
+	}
 }
 
 // setSessionCookie writes the signed, hardened session cookie.
@@ -1099,18 +1416,22 @@ func cloneScope(m map[string]any) map[string]any {
 
 func coerce(v any, typ string) any {
 	switch typ {
-	case "int":
+	case "int", "money", "date":
 		return toInt(v)
 	case "bool":
 		return truthy(v)
-	default:
+	case "text":
 		return toStr(v)
+	default:
+		// an enum (already text) or an entity-typed value (a row record) — pass it
+		// through untouched rather than stringifying a structured value.
+		return v
 	}
 }
 
 func zero(typ string) any {
 	switch typ {
-	case "int":
+	case "int", "money", "date":
 		return 0
 	case "bool":
 		return false
@@ -1129,17 +1450,34 @@ const page = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>%s — Facet</title>
+<style id="fa-theme">%s</style>
 <meta name="fa-csrf" content="%s">
 <style>
-  body { font: 16px/1.5 system-ui, sans-serif; margin: 2.5rem auto; max-width: 34rem; color: #111; padding: 0 1rem; }
+  :root {
+    --fa-bg: #fff; --fa-fg: #111; --fa-muted: #666; --fa-accent: #1a56db;
+    --fa-border: #888; --fa-card-border: #e3e3e3; --fa-radius: 8px;
+    --fa-font: 16px/1.5 system-ui, sans-serif; --fa-maxwidth: 34rem;
+  }
+  body { font: var(--fa-font); margin: 2.5rem auto; max-width: var(--fa-maxwidth);
+         color: var(--fa-fg); background: var(--fa-bg); padding: 0 1rem; }
   .fa-box { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
-  .fa-box .fa-box { border: 1px solid #e3e3e3; border-radius: 10px; padding: .6rem .8rem; }
+  .fa-box .fa-box { border: 1px solid var(--fa-card-border); border-radius: calc(var(--fa-radius) + 2px); padding: .6rem .8rem; }
   .fa-text { font-variant-numeric: tabular-nums; }
-  button { font: inherit; padding: .4rem .8rem; border: 1px solid #888; border-radius: 8px;
-           background: #fff; cursor: pointer; align-self: flex-start; }
+  .fa-form { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
+  .fa-use { display: contents; }
+  button { font: inherit; padding: .4rem .8rem; border: 1px solid var(--fa-border); border-radius: var(--fa-radius);
+           background: var(--fa-bg); color: var(--fa-fg); cursor: pointer; align-self: flex-start; }
+  button[type=submit] { background: var(--fa-accent); color: #fff; border-color: var(--fa-accent); }
   button:active { transform: translateY(1px); }
-  input { font: inherit; padding: .4rem .6rem; border: 1px solid #888; border-radius: 8px; }
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible {
+    outline: 2px solid var(--fa-accent); outline-offset: 2px; }
+  input, select { font: inherit; padding: .4rem .6rem; border: 1px solid var(--fa-border);
+                  border-radius: var(--fa-radius); background: var(--fa-bg); color: var(--fa-fg); }
+  .fa-upload { display: inline-flex; gap: .4rem; align-items: center; cursor: pointer; }
+  .fa-link { color: var(--fa-accent); }
+  .fa-error { color: #b00020; font-size: .9em; }
   [data-fa-bind] { font-weight: 600; }
+  [aria-busy=true] { opacity: .6; }
 </style>
 </head>
 <body>
@@ -1147,6 +1485,13 @@ const page = `<!doctype html>
 <script type="application/json" id="fa-ir">%s</script>
 <script type="application/json" id="fa-state">%s</script>
 <script src="/facet.js"></script>
-</body>
+%s</body>
 </html>
+`
+
+// guardedPage is the minimal response when a route guard denies the actor.
+const guardedPage = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>%s — Facet</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;margin:4rem auto;max-width:30rem;color:#111;padding:0 1rem}</style>
+</head><body><h1>Not available</h1><p>You don't have access to this page.</p><p><a href="/">Home</a></p></body></html>
 `

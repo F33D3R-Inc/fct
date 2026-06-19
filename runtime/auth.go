@@ -122,6 +122,7 @@ func (s *Server) authSignup(w http.ResponseWriter, sid, username, password strin
 	s.signIn(sid, row)
 	s.mu.Unlock()
 
+	s.persistSession(sid)
 	s.recordAudit(username, "signup", true, "")
 	// The verify token would be emailed in production; surfaced here for the flow.
 	writeJSON(w, map[string]any{"reload": true, "verifyToken": verifyToken})
@@ -152,6 +153,7 @@ func (s *Server) authLogin(w http.ResponseWriter, sid, username, password string
 			ses.pendingMFA = username
 		}
 		s.mu.Unlock()
+		s.persistSession(sid)
 		s.recordAudit(username, "login", true, "mfa required")
 		writeJSON(w, map[string]any{"mfa": true})
 		return
@@ -159,6 +161,7 @@ func (s *Server) authLogin(w http.ResponseWriter, sid, username, password string
 	s.mu.Lock()
 	s.signIn(sid, u)
 	s.mu.Unlock()
+	s.persistSession(sid)
 	s.recordAudit(username, "login", true, "")
 	reloadResponse(w)
 }
@@ -184,6 +187,7 @@ func (s *Server) authLoginMFA(w http.ResponseWriter, sid, username, code string)
 	s.mu.Lock()
 	s.signIn(sid, u)
 	s.mu.Unlock()
+	s.persistSession(sid)
 	s.recordAudit(username, "loginMFA", true, "")
 	reloadResponse(w)
 }
@@ -196,6 +200,7 @@ func (s *Server) authLogout(w http.ResponseWriter, sid string) {
 		ses.actor, ses.role, ses.verified, ses.pendingMFA = roleGuest, roleGuest, false, ""
 	}
 	s.mu.Unlock()
+	s.persistSession(sid)
 	s.recordAudit(actor, "logout", true, "")
 	reloadResponse(w)
 }

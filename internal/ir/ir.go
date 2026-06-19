@@ -12,15 +12,19 @@ const (
 
 // IR is one compiled application.
 type IR struct {
-	App      string   `json:"app"`
-	Auth     bool     `json:"auth,omitempty"` // built-in users/login enabled
-	Entities []Entity `json:"entities"`
-	States   []State  `json:"states"`
-	Derives  []Derive `json:"derives"`
-	Policies []Policy `json:"policies"`
-	Actions  []Action `json:"actions"`
-	Jobs     []Job    `json:"jobs"`
-	Pages    []Page   `json:"pages"` // one per view; each is a route
+	App        string            `json:"app"`
+	Auth       bool              `json:"auth,omitempty"` // built-in users/login enabled
+	Entities   []Entity          `json:"entities"`
+	Enums      []Enum            `json:"enums,omitempty"`
+	States     []State           `json:"states"`
+	Derives    []Derive          `json:"derives"`
+	Policies   []Policy          `json:"policies"`
+	Actions    []Action          `json:"actions"`
+	Jobs       []Job             `json:"jobs"`
+	Components []Component       `json:"components,omitempty"` // reusable view fragments
+	Theme      map[string]string `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
+	Routes     []Route           `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
+	Pages      []Page            `json:"pages"`                // one per view; each is a route
 	// View/Bindings/DepGraph mirror the *current* page. `facet build` shows the
 	// first page; the server swaps them per request to the matched route, so the
 	// client runtime can keep reading these three fields unchanged.
@@ -30,13 +34,41 @@ type IR struct {
 }
 
 // Page is one routed view: its URL plus its own node tree, tracked bindings, and
-// dependency graph (ids are page-local).
+// dependency graph (ids are page-local). Path may contain `:param` segments;
+// Params lists them in order. Requires names a zero-arg policy guarding the route
+// (the authority refuses to render it, the client hides links to it).
 type Page struct {
 	Name     string              `json:"name"`
 	Path     string              `json:"path"`
+	Params   []string            `json:"params,omitempty"`
+	Requires string              `json:"requires,omitempty"`
 	View     []Node              `json:"view"`
 	Bindings []Binding           `json:"bindings"`
 	DepGraph map[string][]string `json:"depGraph"`
+}
+
+// Route is the routing summary of one page: its path pattern (which may contain
+// `:param` segments) and the zero-arg policy guarding it (empty if open). It
+// carries no view tree, so the client can know every route — to match links for
+// SPA navigation and to hide links to routes the actor may not enter — without
+// shipping every page.
+type Route struct {
+	Path     string `json:"path"`
+	Requires string `json:"requires,omitempty"`
+}
+
+// Enum is a closed text type: its name and ordered member values.
+type Enum struct {
+	Name   string   `json:"name"`
+	Values []string `json:"values"`
+}
+
+// Component is a reusable view fragment: parameters plus a node tree whose
+// interpolations are rendered inline against the call-site argument scope.
+type Component struct {
+	Name   string  `json:"name"`
+	Params []Param `json:"params"`
+	View   []Node  `json:"view"`
 }
 
 // Entity is a durable, shared, persisted record type — the database. Refs lists
@@ -54,20 +86,26 @@ type Entity struct {
 // a relation — the store builds a real index for it so reads stay sub-linear as
 // the table grows past memory.
 type Field struct {
-	Name   string `json:"name"`
-	Type   string `json:"type"`
-	Ref    string `json:"ref,omitempty"`    // relation target entity, else ""
-	Index  bool   `json:"index,omitempty"`  // build a database index for this column
-	Secret bool   `json:"secret,omitempty"` // encrypt this column at rest (AES-GCM)
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Ref      string `json:"ref,omitempty"`      // relation target entity, else ""
+	Enum     string `json:"enum,omitempty"`     // enum type name when Type is text-backed enum
+	Index    bool   `json:"index,omitempty"`    // build a database index for this column
+	Secret   bool   `json:"secret,omitempty"`   // encrypt this column at rest (AES-GCM)
+	Optional bool   `json:"optional,omitempty"` // column is nullable
 }
 
 // IsRelation reports whether the field is a foreign key to another entity.
 func (f Field) IsRelation() bool { return f.Ref != "" }
 
-// State is one state cell with its resolved placement.
+// State is one state cell with its resolved placement. List/Elem describe a
+// `[T]` collection cell; Optional marks a nullable cell.
 type State struct {
 	Name      string `json:"name"`
 	Type      string `json:"type"`
+	Elem      string `json:"elem,omitempty"`
+	List      bool   `json:"list,omitempty"`
+	Optional  bool   `json:"optional,omitempty"`
 	Placement string `json:"placement"`
 	Init      *Expr  `json:"init"`
 }
@@ -97,13 +135,22 @@ type Policy struct {
 // Action is a mutation: parameters, the policy checks it requires, the
 // statements it runs, its resolved placement, and the state it reads/writes.
 type Action struct {
-	Name      string    `json:"name"`
-	Params    []Param   `json:"params"`
-	Requires  []Require `json:"requires"`
-	Placement string    `json:"placement"`
-	Writes    []string  `json:"writes"`
-	Reads     []string  `json:"reads"`
-	Body      []Stmt    `json:"body"`
+	Name       string    `json:"name"`
+	Params     []Param   `json:"params"`
+	Requires   []Require `json:"requires"`
+	Checks     []Check   `json:"checks,omitempty"`     // input validation, run before the body
+	Optimistic bool      `json:"optimistic,omitempty"` // client predicts the result pre-round-trip
+	Placement  string    `json:"placement"`
+	Writes     []string  `json:"writes"`
+	Reads      []string  `json:"reads"`
+	Body       []Stmt    `json:"body"`
+}
+
+// Check is one validation precondition: a boolean expression over the action's
+// params/actor and the message returned when it fails.
+type Check struct {
+	Cond *Expr  `json:"cond"`
+	Msg  string `json:"msg"`
 }
 
 // Require is one resolved permission check on an action: the policy name plus the
@@ -113,10 +160,11 @@ type Require struct {
 	Args []*Expr `json:"args,omitempty"`
 }
 
-// Param is a typed action parameter.
+// Param is a typed action/policy/component parameter.
 type Param struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Optional bool   `json:"optional,omitempty"`
 }
 
 // Job is a scheduled server action: the runtime invokes Action on a timer
@@ -155,14 +203,14 @@ type Binding struct {
 
 // Node is one view node in the neutral tree.
 type Node struct {
-	Kind     string `json:"kind"` // box | text | button | list | if | input
+	Kind     string `json:"kind"` // box|text|button|list|if|input|link|select|form|upload|use|slot
 	Children []Node `json:"children,omitempty"`
 
 	Segs []Seg `json:"segs,omitempty"` // text
 
-	Label  string  `json:"label,omitempty"`  // button
-	Action string  `json:"action,omitempty"` // button
-	Args   []*Expr `json:"args,omitempty"`   // button
+	Label  string  `json:"label,omitempty"`  // button/upload/form submit
+	Action string  `json:"action,omitempty"` // button/form
+	Args   []*Expr `json:"args,omitempty"`   // button/form/use
 
 	ID    string `json:"id,omitempty"`    // list/if: dynamic region id
 	Var   string `json:"var,omitempty"`   // list: item variable
@@ -173,10 +221,19 @@ type Node struct {
 	Limit int    `json:"limit,omitempty"` // list: max rows (0 = unlimited)
 	Cond  *Expr  `json:"cond,omitempty"`  // if: condition
 
-	Bind        string `json:"bind,omitempty"`        // input: state cell
+	Bind        string `json:"bind,omitempty"`        // input/select/upload: state cell
 	Placeholder string `json:"placeholder,omitempty"` // input
 
 	Path string `json:"path,omitempty"` // link: destination route
+
+	Name    string   `json:"name,omitempty"`    // use: component name
+	Options []Option `json:"options,omitempty"` // select: choices
+}
+
+// Option is one select choice (display label → stored value).
+type Option struct {
+	Label string `json:"label"`
+	Value string `json:"value"`
 }
 
 // Seg is a text segment: a literal (Lit), a tracked top-level binding (Bind id),

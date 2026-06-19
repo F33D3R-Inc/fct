@@ -6,16 +6,59 @@ package ast
 
 // App is one `app Name:` definition — the whole application graph.
 type App struct {
-	Name     string
-	Auth     bool // a bare `auth` line turns on built-in users/login/logout/signup
-	Entities []*Entity
-	States   []*State
-	Derives  []*Derive
-	Policies []*Policy
-	Actions  []*Action
-	Jobs     []*Job
-	Views    []*View
-	Line     int
+	Name       string
+	Auth       bool // a bare `auth` line turns on built-in users/login/logout/signup
+	Entities   []*Entity
+	Enums      []*Enum
+	States     []*State
+	Derives    []*Derive
+	Policies   []*Policy
+	Actions    []*Action
+	Jobs       []*Job
+	Components []*Component
+	Layouts    []*Layout
+	Views      []*View
+	Theme      []ThemeVar
+	Line       int
+}
+
+// Enum is a closed set of named text values: `enum Status: active, closed`. An
+// enum name may be used anywhere a type is expected (entity field, state, param);
+// its values are written `Status.active` and stored as their lowercase text. The
+// compiler checks every literal is a declared member, so a typo is a compile
+// error rather than a bad row.
+type Enum struct {
+	Name   string
+	Values []string
+	Line   int
+}
+
+// ThemeVar is one `name "value"` line in a `theme:` block. It becomes a CSS
+// custom property (`--fa-<name>`) on the document root, so the whole UI restyles
+// from one place without touching any view.
+type ThemeVar struct {
+	Name  string
+	Value string
+}
+
+// Component is a reusable, parameterized view fragment: `component Card(p: Post):`
+// then a node tree. It is invoked from any view with `use Card(expr)`. A
+// component is pure projection (no placement of its own) — it renders in whatever
+// domain its call site renders in, with its parameters bound for that use.
+type Component struct {
+	Name   string
+	Params []Param
+	Root   []Node
+	Line   int
+}
+
+// Layout is a page chrome wrapper: `layout Main:` then a node tree containing one
+// `slot` node where the routed view's content is injected. A view opts into a
+// layout with `view X at "/" in Main:`, so shared chrome (nav, footer) lives once.
+type Layout struct {
+	Name string
+	Root []Node
+	Line int
 }
 
 // Placement annotations the author may put on state. Empty means "infer", which
@@ -36,19 +79,24 @@ type Entity struct {
 }
 
 // EntityField is one column of an entity. A `@secret` field is encrypted at rest
-// (the database stores ciphertext; the working set holds plaintext).
+// (the database stores ciphertext; the working set holds plaintext). A type may
+// carry a trailing `?` (Optional), which permits the field to be null.
 type EntityField struct {
-	Name   string
-	Type   string // int | text | bool | <EntityName> (a relation, stored as the row id)
-	Secret bool   // @secret — encrypted at rest (AES-GCM under FACET_SECRET)
-	Line   int
+	Name     string
+	Type     string // int | text | bool | money | date | <Enum> | <EntityName>
+	Secret   bool   // @secret — encrypted at rest (AES-GCM under FACET_SECRET)
+	Optional bool   // text? — the column is nullable
+	Line     int
 }
 
 // State is one `state name: Type = default [@client|@server]` cell. Scalar
 // server state is per-session; client state is per-browser-instance.
 type State struct {
 	Name      string
-	Type      string
+	Type      string // scalar, an enum name, or `[Elem]` for a list
+	Elem      string // element type when Type is a list ("" otherwise)
+	List      bool   // true for a `[T]` list cell
+	Optional  bool   // true for a `T?` nullable cell
 	Default   Expr
 	Placement string
 	Line      int
@@ -83,11 +131,23 @@ type Policy struct {
 // Action is the only thing that may mutate state. Placement is derived from its
 // write set; `Requires` lists the policy checks that must pass before it runs.
 type Action struct {
-	Name     string
-	Params   []Param
-	Requires []Require
-	Body     []Stmt
-	Line     int
+	Name       string
+	Params     []Param
+	Requires   []Require
+	Checks     []Check // declarative input validation, run before the body
+	Optimistic bool    // @optimistic — the client predicts the result before the round-trip
+	Body       []Stmt
+	Line       int
+}
+
+// Check is one `check <expr> "message"` clause: a precondition over the action's
+// parameters (and actor) the authority evaluates before running the body. A
+// failing check aborts the action and returns its friendly message, so invalid
+// input never reaches the store.
+type Check struct {
+	Cond Expr
+	Msg  string
+	Line int
 }
 
 // Require is one `requires` clause: a policy name and the arguments passed to it
@@ -99,10 +159,11 @@ type Require struct {
 	Line int
 }
 
-// Param is one typed action parameter.
+// Param is one typed action/policy/component parameter.
 type Param struct {
-	Name string
-	Type string
+	Name     string
+	Type     string
+	Optional bool
 }
 
 // Job is a scheduled, server-authoritative invocation of a zero-argument action
@@ -175,10 +236,13 @@ func (Clear) stmt()  {}
 // A view is a page, served at its route; Path defaults are filled in by the
 // compiler (the first view answers "/").
 type View struct {
-	Name string
-	Path string // "" until resolved; URL the page is served at
-	Root []Node
-	Line int
+	Name     string
+	Path     string   // "" until resolved; URL the page is served at, may hold :params
+	Params   []string // dynamic path segments (`/post/:id` → ["id"]), bound in scope
+	Layout   string   // optional layout name to wrap this page (`in Main`)
+	Requires string   // optional zero-arg policy guarding the route ("" = open)
+	Root     []Node
+	Line     int
 }
 
 // ── view nodes ──────────────────────────────────────────────────────────────
@@ -238,6 +302,50 @@ type Link struct {
 	Path  string
 }
 
+// Select is a dropdown two-way bound to a client state cell, choosing among a
+// fixed set of options (label → value). Bound to an enum cell, its options
+// default to the enum's members.
+type Select struct {
+	Bind    string
+	Options []Option
+}
+
+// Option is one `option "Label" -> "value"` entry of a Select.
+type Option struct {
+	Label string
+	Value string
+}
+
+// Form groups inputs and submits an action when its submit control fires —
+// rendered as a real <form> so the browser's Enter-to-submit and accessibility
+// come for free. Children are ordinary nodes (inputs, text); Submit is the
+// label of the submit button and Action the server/client action it calls.
+type Form struct {
+	Action string
+	Args   []Expr
+	Submit string
+	Body   []Node
+}
+
+// Upload posts a file to the authority and binds the resulting URL to a client
+// state cell, so a view can show or store the uploaded media. The transfer and
+// storage are runtime services; the language only names the target cell.
+type Upload struct {
+	Bind  string
+	Label string
+}
+
+// Use renders a component with arguments bound to its parameters:
+// `use Card(post)`. It is the call site of a reusable view fragment.
+type Use struct {
+	Name string
+	Args []Expr
+}
+
+// Slot is the injection point inside a layout where the routed view's content is
+// rendered. A layout has exactly one.
+type Slot struct{}
+
 func (Box) node()    {}
 func (Text) node()   {}
 func (Button) node() {}
@@ -245,6 +353,11 @@ func (For) node()    {}
 func (If) node()     {}
 func (Input) node()  {}
 func (Link) node()   {}
+func (Select) node() {}
+func (Form) node()   {}
+func (Upload) node() {}
+func (Use) node()    {}
+func (Slot) node()   {}
 
 // ── expressions ─────────────────────────────────────────────────────────────
 
@@ -293,6 +406,11 @@ type Call struct {
 	Args []Expr
 }
 
+// ListLit is a list literal: `[a, b, c]`. Its elements are pure expressions.
+type ListLit struct {
+	Elems []Expr
+}
+
 // Bin is a binary operation.
 type Bin struct {
 	Op   string
@@ -306,6 +424,7 @@ type Un struct {
 }
 
 func (Lit) expr()       {}
+func (ListLit) expr()   {}
 func (Ref) expr()       {}
 func (Get) expr()       {}
 func (EntityGet) expr() {}

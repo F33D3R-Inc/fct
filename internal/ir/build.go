@@ -30,6 +30,10 @@ type env struct {
 	inline       map[string]*Expr           // zero-arg policy/derive name -> lowered expr, inlined at every use
 	policySet    map[string]bool            // policy names (gating via `requires`)
 	policyParams map[string][]Param         // policy name -> its parameters (row-level policies)
+	enums        map[string][]string        // enum name -> ordered member values
+	components   map[string][]Param         // component name -> its parameters
+	compDeps     map[string]map[string]bool // component name -> the state/entity names its body reads (for use-site refresh)
+	stateTypes   map[string]string          // state name -> its (core/element) type, for enum-defaulted selects
 }
 
 // markIndex records that entity.field is filtered, ordered, or a relation, so the
@@ -58,7 +62,26 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}}
+
+	// 0. Enums: closed text types. Collected first so field/state/param types and
+	// `Enum.member` literals resolve while everything else is built.
+	enumSeen := map[string]int{}
+	for _, en := range app.Enums {
+		if prev, ok := enumSeen[en.Name]; ok {
+			return nil, &BuildError{en.Line, fmt.Sprintf("enum %q redeclared (first at line %d)", en.Name, prev)}
+		}
+		enumSeen[en.Name] = en.Line
+		valSeen := map[string]bool{}
+		for _, v := range en.Values {
+			if valSeen[v] {
+				return nil, &BuildError{en.Line, fmt.Sprintf("enum %q has duplicate value %q", en.Name, v)}
+			}
+			valSeen[v] = true
+		}
+		e.enums[en.Name] = en.Values
+		out.Enums = append(out.Enums, Enum{Name: en.Name, Values: en.Values})
+	}
 
 	// 1. Entities.
 	entSeen := map[string]int{}
@@ -74,7 +97,14 @@ func Build(app *ast.App) (*IR, error) {
 			if f.Secret && f.Name == "id" {
 				return nil, &BuildError{f.Line, "the id field cannot be @secret"}
 			}
-			ei.Fields = append(ei.Fields, Field{Name: f.Name, Type: f.Type, Secret: f.Secret})
+			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, Optional: f.Optional}
+			// An enum-typed field is stored as text, tagged with its enum so the API and
+			// the client can validate/render the closed set.
+			if _, isEnum := e.enums[f.Type]; isEnum {
+				fld.Type = "text"
+				fld.Enum = f.Type
+			}
+			ei.Fields = append(ei.Fields, fld)
 			e.entityFields[ent.Name][f.Name] = true
 		}
 		out.Entities = append(out.Entities, ei)
@@ -115,12 +145,26 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{s.Line, fmt.Sprintf("state %q collides with an entity name", s.Name)}
 		}
 		stSeen[s.Name] = s.Line
+		// The element/core type must be a primitive or a declared enum.
+		core := s.Type
+		if s.List {
+			core = s.Elem
+		}
+		if !isPrimitive(core) {
+			if _, isEnum := e.enums[core]; !isEnum {
+				return nil, &BuildError{s.Line, fmt.Sprintf("state %q has unknown type %q", s.Name, core)}
+			}
+		}
 		p := Server
 		if s.Placement == ast.PlaceClient {
 			p = Client
 		}
+		if err := e.checkBuiltins(s.Default, s.Line); err != nil {
+			return nil, err
+		}
 		e.states[s.Name] = p
-		out.States = append(out.States, State{Name: s.Name, Type: s.Type, Placement: p, Init: lower(s.Default, nil)})
+		e.stateTypes[s.Name] = core
+		out.States = append(out.States, State{Name: s.Name, Type: s.Type, Elem: s.Elem, List: s.List, Optional: s.Optional, Placement: p, Init: e.low(s.Default)})
 	}
 
 	// 3. Policies (predicates over actor + state/entities; no params). Lowered and
@@ -148,7 +192,7 @@ func Build(app *ast.App) (*IR, error) {
 		if err := e.checkPure(p.Expr, plocals, p.Line, "a policy"); err != nil {
 			return nil, err
 		}
-		lowered := lower(p.Expr, e.inline)
+		lowered := e.low(p.Expr)
 		e.policySet[p.Name] = true
 		e.policyParams[p.Name] = irParams(p.Params)
 		// Only a zero-parameter policy resolves to a value, so only it can be inlined
@@ -177,9 +221,81 @@ func Build(app *ast.App) (*IR, error) {
 		if err := e.checkPure(d.Expr, withActor(nil), d.Line, "a derive"); err != nil {
 			return nil, err
 		}
-		lowered := lower(d.Expr, e.inline)
+		lowered := e.low(d.Expr)
 		e.inline[d.Name] = lowered
 		out.Derives = append(out.Derives, Derive{Name: d.Name, Type: d.Type, Expr: lowered, Deps: sortedKeys(e.depsIR(lowered))})
+	}
+
+	// 3c. Theme: each `name "value"` becomes a CSS custom property (--fa-<name>).
+	// Carried on the IR so first paint and the client both apply one style source.
+	if len(app.Theme) > 0 {
+		out.Theme = map[string]string{}
+		for _, tv := range app.Theme {
+			out.Theme[tv.Name] = tv.Value
+		}
+	}
+
+	// 3d. Components: reusable view fragments. Names + parameters are registered in
+	// one pass (so a component may `use` another declared later, and arity checks
+	// resolve), then each body is lowered. A component is pure projection rendered
+	// inline at its call site, so its interpolations and nested regions are inlined
+	// (no page-local binding ids); a top-level `use` is refreshed as a whole region
+	// keyed on the union of its argument deps and the globals its body reads.
+	compSeen := map[string]int{}
+	for _, cm := range app.Components {
+		if prev, ok := compSeen[cm.Name]; ok {
+			return nil, &BuildError{cm.Line, fmt.Sprintf("component %q redeclared (first at line %d)", cm.Name, prev)}
+		}
+		compSeen[cm.Name] = cm.Line
+		if e.entities[cm.Name] {
+			return nil, &BuildError{cm.Line, fmt.Sprintf("component %q collides with an entity name", cm.Name)}
+		}
+		pseen := map[string]bool{}
+		for _, p := range cm.Params {
+			if pseen[p.Name] {
+				return nil, &BuildError{cm.Line, fmt.Sprintf("component %q has duplicate parameter %q", cm.Name, p.Name)}
+			}
+			pseen[p.Name] = true
+		}
+		e.components[cm.Name] = irParams(cm.Params)
+	}
+	var compCalls []call
+	var compLinks []string
+	for _, cm := range app.Components {
+		locals := map[string]bool{}
+		for _, p := range cm.Params {
+			locals[p.Name] = true
+		}
+		cvc := &viewCtx{e: e}
+		// inRegion: a component body renders inline at the call site, so it carries no
+		// page-local binding/region ids of its own.
+		nodes, err := cvc.nodes(cm.Root, scope{locals: locals, inRegion: true})
+		if err != nil {
+			return nil, err
+		}
+		compCalls = append(compCalls, cvc.calls...)
+		compLinks = append(compLinks, cvc.links...)
+		// the globals (state/entity) the body reads, minus the bound parameters; a
+		// `use` of this component refreshes when any of these change.
+		deps := e.nodeDeps(nodes)
+		for _, p := range cm.Params {
+			delete(deps, p.Name)
+		}
+		e.compDeps[cm.Name] = deps
+		out.Components = append(out.Components, Component{Name: cm.Name, Params: irParams(cm.Params), View: nodes})
+	}
+
+	// 3e. Layouts: page chrome with one `slot` where the routed view is injected.
+	// Kept as raw node trees and inlined into each view that opts in (`in Main`),
+	// so a page compiles to a single tree and the runtimes need no layout concept.
+	layouts := map[string]*ast.Layout{}
+	laySeen := map[string]int{}
+	for _, ly := range app.Layouts {
+		if prev, ok := laySeen[ly.Name]; ok {
+			return nil, &BuildError{ly.Line, fmt.Sprintf("layout %q redeclared (first at line %d)", ly.Name, prev)}
+		}
+		laySeen[ly.Name] = ly.Line
+		layouts[ly.Name] = ly
 	}
 
 	// 4. Actions: placement (write set), read soundness, requires.
@@ -254,11 +370,38 @@ func Build(app *ast.App) (*IR, error) {
 		byAction[out.Actions[i].Name] = &out.Actions[i]
 	}
 	pathOf := map[string]string{} // path -> view name
-	var allCalls []call
-	var allLinks []string
+	allCalls := compCalls
+	allLinks := compLinks
 	for i, v := range app.Views {
+		// Route parameters (`/post/:id`) are in scope as text locals, bound from the
+		// matched URL at render time.
+		locals := map[string]bool{}
+		for _, p := range v.Params {
+			locals[p] = true
+		}
+		// A `requires` guard names a zero-argument policy the authority enforces
+		// before rendering the route (and the client uses to hide links to it).
+		if v.Requires != "" {
+			params, ok := e.policyParams[v.Requires]
+			if !ok {
+				return nil, &BuildError{v.Line, fmt.Sprintf("view %q requires unknown policy %q", v.Name, v.Requires)}
+			}
+			if len(params) != 0 {
+				return nil, &BuildError{v.Line, fmt.Sprintf("view %q route guard %q is row-level; a route guard must be a zero-argument policy", v.Name, v.Requires)}
+			}
+		}
+		// `in Layout` wraps the view in shared chrome by inlining the view's nodes at
+		// the layout's `slot`, producing one tree.
+		root := v.Root
+		if v.Layout != "" {
+			ly, ok := layouts[v.Layout]
+			if !ok {
+				return nil, &BuildError{v.Line, fmt.Sprintf("view %q uses unknown layout %q", v.Name, v.Layout)}
+			}
+			root = inlineLayout(ly.Root, v.Root)
+		}
 		pvc := &viewCtx{e: e}
-		nodes, err := pvc.nodes(v.Root, scope{})
+		nodes, err := pvc.nodes(root, scope{locals: locals})
 		if err != nil {
 			return nil, err
 		}
@@ -277,13 +420,16 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{v.Line, fmt.Sprintf("views %q and %q both map to route %q", v.Name, prev, path)}
 		}
 		pathOf[path] = v.Name
-		page := Page{Name: v.Name, Path: path, View: nodes, Bindings: pvc.bindings, DepGraph: map[string][]string{}}
+		page := Page{Name: v.Name, Path: path, Params: v.Params, Requires: v.Requires, View: nodes, Bindings: pvc.bindings, DepGraph: map[string][]string{}}
 		for dep, ids := range pvc.deps {
 			page.DepGraph[dep] = ids
 		}
 		out.Pages = append(out.Pages, page)
 		allCalls = append(allCalls, pvc.calls...)
 		allLinks = append(allLinks, pvc.links...)
+	}
+	for i := range out.Pages {
+		out.Routes = append(out.Routes, Route{Path: out.Pages[i].Path, Requires: out.Pages[i].Requires})
 	}
 	if len(out.Pages) > 0 {
 		out.View = out.Pages[0].View
@@ -301,9 +447,18 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{0, fmt.Sprintf("action %q takes %d argument(s), got %d", ref.name, len(act.Params), ref.argc)}
 		}
 	}
-	// validate every link points at a real route.
+	// validate every link points at a real route. A link may target a concrete
+	// path of a dynamic route (`/post/5` against `/post/:id`), so match against the
+	// route patterns, not just the static paths.
 	for _, p := range allLinks {
-		if _, ok := pathOf[p]; !ok {
+		matched := false
+		for i := range out.Pages {
+			if routeMatches(out.Pages[i].Path, p) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			return nil, &BuildError{0, fmt.Sprintf("link to %q, but no view serves that route", p)}
 		}
 	}
@@ -388,6 +543,52 @@ func authActions() []Action {
 	return specs
 }
 
+// inlineLayout produces a single node tree by substituting a view's nodes for
+// the `slot` marker in a layout's tree, recursing through container nodes. The
+// layout's chrome surrounds the routed view, and the result needs no runtime
+// layout concept.
+func inlineLayout(layout []ast.Node, view []ast.Node) []ast.Node {
+	var out []ast.Node
+	for _, n := range layout {
+		switch t := n.(type) {
+		case ast.Slot:
+			out = append(out, view...)
+		case ast.Box:
+			out = append(out, ast.Box{Children: inlineLayout(t.Children, view)})
+		case ast.If:
+			out = append(out, ast.If{Cond: t.Cond, Body: inlineLayout(t.Body, view)})
+		case ast.For:
+			t.Body = inlineLayout(t.Body, view)
+			out = append(out, t)
+		default:
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// routeMatches reports whether a concrete path satisfies a route pattern, where a
+// `:param` segment matches any single non-empty segment.
+func routeMatches(pattern, path string) bool {
+	ps := strings.Split(strings.Trim(pattern, "/"), "/")
+	cs := strings.Split(strings.Trim(path, "/"), "/")
+	if len(ps) != len(cs) {
+		return false
+	}
+	for i := range ps {
+		if strings.HasPrefix(ps[i], ":") {
+			if cs[i] == "" {
+				return false
+			}
+			continue
+		}
+		if ps[i] != cs[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // lowerASCII lowercases an identifier for a default route.
 func lowerASCII(s string) string {
 	b := []byte(s)
@@ -401,7 +602,7 @@ func lowerASCII(s string) string {
 
 func (e *env) action(a *ast.Action) (Action, error) {
 	act := Action{Name: a.Name}
-	loc := map[string]bool{"actor": true, "role": true, "verified": true}
+	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true}
 	for _, p := range a.Params {
 		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type})
 		loc[p.Name] = true
@@ -425,9 +626,19 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			if err := e.checkPure(arg, loc, a.Line, "a requires argument"); err != nil {
 				return Action{}, err
 			}
-			req.Args = append(req.Args, lower(arg, e.inline))
+			req.Args = append(req.Args, e.low(arg))
 		}
 		act.Requires = append(act.Requires, req)
+	}
+
+	// Input validation: each `check <cond> "message"` is a pure precondition over
+	// the action's params and the actor, evaluated on the authority before the body
+	// runs. A failing check aborts with its friendly message.
+	for _, chk := range a.Checks {
+		if err := e.checkPure(chk.Cond, loc, a.Line, "a check"); err != nil {
+			return Action{}, err
+		}
+		act.Checks = append(act.Checks, Check{Cond: e.low(chk.Cond), Msg: chk.Msg})
 	}
 
 	writes := map[string]bool{} // state names written
@@ -442,7 +653,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		if hasImpure(ex) {
 			impure = true
 		}
-		for n := range e.depsIR(lower(ex, e.inline)) {
+		for n := range e.depsIR(e.low(ex)) {
 			if _, isState := e.states[n]; isState {
 				reads[n] = true
 			}
@@ -462,7 +673,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				return Action{}, err
 			}
 			writes[st.Target] = true
-			act.Body = append(act.Body, Stmt{Op: "assign", Target: st.Target, Value: lower(st.Value, e.inline)})
+			act.Body = append(act.Body, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
 		case ast.Add:
 			if !e.entities[st.Entity] {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("add to unknown entity %q", st.Entity)}
@@ -473,7 +684,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				if err := readExpr(fi.Expr, st.Line); err != nil {
 					return Action{}, err
 				}
-				out.Fields = append(out.Fields, FieldInit{Name: fi.Name, Expr: lower(fi.Expr, e.inline)})
+				out.Fields = append(out.Fields, FieldInit{Name: fi.Name, Expr: e.low(fi.Expr)})
 			}
 			act.Body = append(act.Body, out)
 		case ast.Set:
@@ -488,7 +699,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				return Action{}, err
 			}
 			act.Body = append(act.Body, Stmt{Op: "set", Entity: st.Entity, Field: st.Field,
-				Key: lower(st.Key, e.inline), Value: lower(st.Value, e.inline)})
+				Key: e.low(st.Key), Value: e.low(st.Value)})
 		case ast.Remove:
 			if !e.entities[st.Entity] {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("remove on unknown entity %q", st.Entity)}
@@ -497,7 +708,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			if err := readExpr(st.Key, st.Line); err != nil {
 				return Action{}, err
 			}
-			act.Body = append(act.Body, Stmt{Op: "remove", Entity: st.Entity, Key: lower(st.Key, e.inline)})
+			act.Body = append(act.Body, Stmt{Op: "remove", Entity: st.Entity, Key: e.low(st.Key)})
 		case ast.Clear:
 			if !e.entities[st.Entity] {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("clear on unknown entity %q", st.Entity)}
@@ -573,12 +784,12 @@ type call struct {
 }
 
 type viewCtx struct {
-	e          *env
-	bindings   []Binding
-	deps       map[string][]string // dep -> tracked region ids
-	calls      []call
-	links      []string // link destination routes (validated against real pages)
-	nb, nl, nf int
+	e              *env
+	bindings       []Binding
+	deps           map[string][]string // dep -> tracked region ids
+	calls          []call
+	links          []string // link destination routes (validated against real pages)
+	nb, nl, nf, nu int
 }
 
 func (c *viewCtx) addDep(dep, id string) {
@@ -611,11 +822,11 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				}
 				if sc.inRegion {
 					// item-scope: rendered inline when the enclosing region renders.
-					node.Segs = append(node.Segs, Seg{Expr: lower(s.Expr, c.e.inline)})
+					node.Segs = append(node.Segs, Seg{Expr: c.e.low(s.Expr)})
 				} else {
 					id := fmt.Sprintf("b%d", c.nb)
 					c.nb++
-					le := lower(s.Expr, c.e.inline)
+					le := c.e.low(s.Expr)
 					deps := sortedKeys(c.e.depsIR(le))
 					c.bindings = append(c.bindings, Binding{ID: id, Expr: le, Deps: deps})
 					for _, d := range deps {
@@ -632,7 +843,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				if err := c.e.checkPure(arg, withActor(sc.locals), 0, "a view"); err != nil {
 					return nil, err
 				}
-				node.Args = append(node.Args, lower(arg, c.e.inline))
+				node.Args = append(node.Args, c.e.low(arg))
 			}
 			c.calls = append(c.calls, call{name: t.Action, argc: len(t.Args)})
 			out = append(out, node)
@@ -649,7 +860,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				if err := c.e.checkPure(t.Where, wlocals, 0, "a `where` filter"); err != nil {
 					return nil, err
 				}
-				node.Where = lower(t.Where, c.e.inline)
+				node.Where = c.e.low(t.Where)
 				// Any of the item's fields the filter touches becomes a candidate index
 				// — that is the column the store filters on when it pushes the query down.
 				if c.e.entities[t.Coll] {
@@ -691,7 +902,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if err := c.e.checkPure(t.Cond, withActor(sc.locals), 0, "a view"); err != nil {
 				return nil, err
 			}
-			node := Node{Kind: "if", Cond: lower(t.Cond, c.e.inline)}
+			node := Node{Kind: "if", Cond: c.e.low(t.Cond)}
 			if !sc.inRegion {
 				node.ID = fmt.Sprintf("f%d", c.nf)
 				c.nf++
@@ -725,6 +936,101 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			c.links = append(c.links, t.Path)
 			out = append(out, Node{Kind: "link", Label: t.Label, Path: t.Path})
+
+		case ast.Select:
+			p, ok := c.e.states[t.Bind]
+			if !ok {
+				return nil, &BuildError{0, fmt.Sprintf("select binds unknown state %q", t.Bind)}
+			}
+			if p != Client {
+				return nil, &BuildError{0, fmt.Sprintf("select binds %q, which is authoritative; two-way input requires a @client state", t.Bind)}
+			}
+			node := Node{Kind: "select", Bind: t.Bind}
+			for _, o := range t.Options {
+				node.Options = append(node.Options, Option{Label: o.Label, Value: o.Value})
+			}
+			// An enum-typed select with no explicit options defaults to the enum members.
+			if len(node.Options) == 0 {
+				if members, isEnum := c.e.enums[c.e.stateTypes[t.Bind]]; isEnum {
+					for _, m := range members {
+						node.Options = append(node.Options, Option{Label: m, Value: m})
+					}
+				} else {
+					return nil, &BuildError{0, fmt.Sprintf("select on %q needs options (or a `@client` enum cell to default them)", t.Bind)}
+				}
+			}
+			id := fmt.Sprintf("b%d", c.nb)
+			c.nb++
+			node.ID = id
+			c.addDep(t.Bind, id)
+			out = append(out, node)
+
+		case ast.Form:
+			node := Node{Kind: "form", Action: t.Action, Label: t.Submit}
+			for _, arg := range t.Args {
+				if err := c.e.checkPure(arg, withActor(sc.locals), 0, "a view"); err != nil {
+					return nil, err
+				}
+				node.Args = append(node.Args, c.e.low(arg))
+			}
+			c.calls = append(c.calls, call{name: t.Action, argc: len(t.Args)})
+			kids, err := c.nodes(t.Body, sc)
+			if err != nil {
+				return nil, err
+			}
+			node.Children = kids
+			out = append(out, node)
+
+		case ast.Upload:
+			p, ok := c.e.states[t.Bind]
+			if !ok {
+				return nil, &BuildError{0, fmt.Sprintf("upload binds unknown state %q", t.Bind)}
+			}
+			if p != Client {
+				return nil, &BuildError{0, fmt.Sprintf("upload binds %q, which is authoritative; it must store the URL in a @client state", t.Bind)}
+			}
+			id := fmt.Sprintf("b%d", c.nb)
+			c.nb++
+			c.addDep(t.Bind, id)
+			out = append(out, Node{Kind: "upload", Bind: t.Bind, Label: t.Label, ID: id})
+
+		case ast.Use:
+			params, ok := c.e.components[t.Name]
+			if !ok {
+				return nil, &BuildError{0, fmt.Sprintf("use of unknown component %q", t.Name)}
+			}
+			if len(t.Args) != len(params) {
+				return nil, &BuildError{0, fmt.Sprintf("component %q takes %d argument(s), got %d", t.Name, len(params), len(t.Args))}
+			}
+			node := Node{Kind: "use", Name: t.Name}
+			deps := map[string]bool{}
+			for _, arg := range t.Args {
+				if err := c.e.checkPure(arg, withActor(sc.locals), 0, "a view"); err != nil {
+					return nil, err
+				}
+				le := c.e.low(arg)
+				node.Args = append(node.Args, le)
+				for d := range c.e.depsIR(le) {
+					deps[d] = true
+				}
+			}
+			for d := range c.e.compDeps[t.Name] {
+				deps[d] = true
+			}
+			// A top-level `use` is a tracked region: it re-renders whole when any state
+			// its arguments or body reads changes. Inside another region it renders
+			// inline and refreshes with its parent.
+			if !sc.inRegion {
+				node.ID = fmt.Sprintf("u%d", c.nu)
+				c.nu++
+				for _, d := range sortedKeys(deps) {
+					c.addDep(d, node.ID)
+				}
+			}
+			out = append(out, node)
+
+		case ast.Slot:
+			return nil, &BuildError{0, "`slot` may only appear inside a layout"}
 		}
 	}
 	return out, nil
@@ -747,6 +1053,9 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 			continue
 		}
 		if e.entities[n] {
+			continue
+		}
+		if _, ok := e.enums[n]; ok { // an enum name, as the object of a `.member` access (folded by lower())
 			continue
 		}
 		if _, ok := e.inline[n]; ok { // a policy/derive name used as a value; inlined by lower()
@@ -793,14 +1102,38 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 				return &BuildError{line, "rand(n) takes exactly one argument (an exclusive upper bound)"}
 			}
 		default:
-			return &BuildError{line, fmt.Sprintf("unknown builtin %q", t.Name)}
+			// A pure standard-library builtin (string/date/math): fixed arity.
+			n, ok := pureBuiltinArity(t.Name)
+			if !ok {
+				return &BuildError{line, fmt.Sprintf("unknown builtin %q", t.Name)}
+			}
+			if len(t.Args) != n {
+				return &BuildError{line, fmt.Sprintf("%s takes %d argument(s), got %d", t.Name, n, len(t.Args))}
+			}
 		}
 		for _, a := range t.Args {
 			if err := e.checkBuiltins(a, line); err != nil {
 				return err
 			}
 		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := e.checkBuiltins(el, line); err != nil {
+				return err
+			}
+		}
 	case ast.Get:
+		// Enum member access (`Status.active`) must name a declared member.
+		if r, ok := t.Obj.(ast.Ref); ok {
+			if members, isEnum := e.enums[r.Name]; isEnum {
+				for _, m := range members {
+					if m == t.Field {
+						return nil
+					}
+				}
+				return &BuildError{line, fmt.Sprintf("enum %q has no member %q", r.Name, t.Field)}
+			}
+		}
 		return e.checkBuiltins(t.Obj, line)
 	case ast.EntityGet:
 		return e.checkBuiltins(t.Key, line)
@@ -816,15 +1149,31 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 }
 
 // hasImpure reports whether ex invokes an effectful builtin. now/rand are the
-// only calls in the language and both are impure, so any Call is impure.
+// only nondeterministic calls; the standard-library builtins (string/math/date)
+// are pure and may appear in any context.
 func hasImpure(ex ast.Expr) bool {
 	switch t := ex.(type) {
 	case ast.Call:
-		return true
+		if t.Name == "now" || t.Name == "rand" {
+			return true
+		}
+		for _, a := range t.Args {
+			if hasImpure(a) {
+				return true
+			}
+		}
+		return false
 	case ast.Get:
 		return hasImpure(t.Obj)
 	case ast.EntityGet:
 		return hasImpure(t.Key)
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if hasImpure(el) {
+				return true
+			}
+		}
+		return false
 	case ast.Bin:
 		return hasImpure(t.L) || hasImpure(t.R)
 	case ast.Un:
@@ -833,7 +1182,25 @@ func hasImpure(ex ast.Expr) bool {
 	return false
 }
 
-func isPrimitive(t string) bool { return t == "int" || t == "text" || t == "bool" }
+// pureBuiltinArity gives the fixed argument count of a pure standard-library
+// builtin, and whether the name is one.
+func pureBuiltinArity(name string) (int, bool) {
+	switch name {
+	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day":
+		return 1, true
+	case "min", "max":
+		return 2, true
+	}
+	return 0, false
+}
+
+func isPrimitive(t string) bool {
+	switch t {
+	case "int", "text", "bool", "money", "date":
+		return true
+	}
+	return false
+}
 
 // checkName rejects a policy/derive name that collides with an existing state,
 // entity, policy, or derive, so every global name resolves unambiguously.
@@ -877,7 +1244,7 @@ func (e *env) depsIR(le *Expr) map[string]bool {
 			if e.entities[x.Name] {
 				out[x.Name] = true
 			}
-		case "call":
+		case "call", "list":
 			for _, a := range x.Args {
 				walk(a)
 			}
@@ -889,6 +1256,41 @@ func (e *env) depsIR(le *Expr) map[string]bool {
 		}
 	}
 	walk(le)
+	return out
+}
+
+// nodeDeps collects every state/entity name read anywhere in a node tree (text
+// segs, conditions, filters, args). A `use` of a component refreshes when any of
+// these change, so its own body's reads matter alongside its argument deps.
+func (e *env) nodeDeps(nodes []Node) map[string]bool {
+	out := map[string]bool{}
+	add := func(x *Expr) {
+		for d := range e.depsIR(x) {
+			out[d] = true
+		}
+	}
+	var walk func(n Node)
+	walk = func(n Node) {
+		for _, s := range n.Segs {
+			if s.Expr != nil {
+				add(s.Expr)
+			}
+		}
+		add(n.Cond)
+		add(n.Where)
+		for _, a := range n.Args {
+			add(a)
+		}
+		if n.Coll != "" && (e.states[n.Coll] != "" || e.entities[n.Coll]) {
+			out[n.Coll] = true
+		}
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	for _, n := range nodes {
+		walk(n)
+	}
 	return out
 }
 
@@ -922,14 +1324,25 @@ func freeNames(ex ast.Expr) map[string]bool {
 	return out
 }
 
+// low lowers an expression with this environment's inline (policy/derive) and
+// enum tables in scope. It is the method every build site uses.
+func (e *env) low(ex ast.Expr) *Expr { return lower(ex, e.inline, e.enums) }
+
 // lower converts an ast.Expr to its serializable IR form, inlining any reference
 // to a policy or derive name with that name's lowered expression (so the same
 // value is computed identically wherever it is read — a server gate, a view
-// `if`, or another derivation).
-func lower(ex ast.Expr, inline map[string]*Expr) *Expr {
+// `if`, or another derivation) and folding enum member access (`Status.active`)
+// to its backing text literal.
+func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Expr {
 	switch t := ex.(type) {
 	case ast.Lit:
 		return &Expr{Kind: "lit", Val: t.Val, VType: t.Kind}
+	case ast.ListLit:
+		out := &Expr{Kind: "list"}
+		for _, el := range t.Elems {
+			out.Args = append(out.Args, lower(el, inline, enums))
+		}
+		return out
 	case ast.Ref:
 		if inline != nil {
 			if p, ok := inline[t.Name]; ok {
@@ -938,21 +1351,27 @@ func lower(ex ast.Expr, inline map[string]*Expr) *Expr {
 		}
 		return &Expr{Kind: "ref", Name: t.Name}
 	case ast.Get:
-		return &Expr{Kind: "get", Obj: lower(t.Obj, inline), Field: t.Field}
+		// Enum member access folds to its backing text value at compile time.
+		if r, ok := t.Obj.(ast.Ref); ok && enums != nil {
+			if _, isEnum := enums[r.Name]; isEnum {
+				return &Expr{Kind: "lit", Val: t.Field, VType: "text"}
+			}
+		}
+		return &Expr{Kind: "get", Obj: lower(t.Obj, inline, enums), Field: t.Field}
 	case ast.EntityGet:
-		return &Expr{Kind: "eget", Name: t.Entity, Key: lower(t.Key, inline), Field: t.Field}
+		return &Expr{Kind: "eget", Name: t.Entity, Key: lower(t.Key, inline, enums), Field: t.Field}
 	case ast.Agg:
 		return &Expr{Kind: "agg", Op: t.Op, Name: t.Coll, Field: t.Field}
 	case ast.Call:
 		out := &Expr{Kind: "call", Name: t.Name}
 		for _, a := range t.Args {
-			out.Args = append(out.Args, lower(a, inline))
+			out.Args = append(out.Args, lower(a, inline, enums))
 		}
 		return out
 	case ast.Bin:
-		return &Expr{Kind: "bin", Op: t.Op, L: lower(t.L, inline), R: lower(t.R, inline)}
+		return &Expr{Kind: "bin", Op: t.Op, L: lower(t.L, inline, enums), R: lower(t.R, inline, enums)}
 	case ast.Un:
-		return &Expr{Kind: "un", Op: t.Op, X: lower(t.X, inline)}
+		return &Expr{Kind: "un", Op: t.Op, X: lower(t.X, inline, enums)}
 	}
 	return nil
 }
@@ -979,12 +1398,19 @@ func locals(names ...string) map[string]bool {
 }
 
 // isBuiltinRef reports whether a name is a runtime-provided identity value: the
-// signed-in user's name (`actor`), role (`role`), or verified-email flag
-// (`verified`).
-func isBuiltinRef(n string) bool { return n == "actor" || n == "role" || n == "verified" }
+// signed-in user's name (`actor`), role (`role`), verified-email flag
+// (`verified`), the active tenant id (`tenant`), or the actor's role within it
+// (`tenantRole`). The tenant values are 0/"" unless multi-tenancy is enabled.
+func isBuiltinRef(n string) bool {
+	switch n {
+	case "actor", "role", "verified", "tenant", "tenantRole":
+		return true
+	}
+	return false
+}
 
 func withActor(locals map[string]bool) map[string]bool {
-	m := map[string]bool{"actor": true, "role": true, "verified": true}
+	m := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true}
 	for k := range locals {
 		m[k] = true
 	}

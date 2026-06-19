@@ -1,9 +1,15 @@
 name: release
 
 # On any v* tag push: run the tests, cross-compile the `facet` toolchain for
-# every platform (pure Go, no CGO — runs anywhere), publish a GitHub Release with
-# the binaries plus a sha256 checksums file. Third-party actions are pinned to
-# commit SHAs.
+# every platform (pure Go, no CGO — runs anywhere), generate a CycloneDX SBOM,
+# keyless-sign the checksums, SBOM and provenance with cosign (Sigstore), emit a
+# SLSA v1.0 provenance attestation, and publish a GitHub Release with every
+# artifact plus its signature.
+#
+# Supply chain: third-party Actions are pinned to commit SHAs; the SBOM, signing,
+# and provenance tooling is fetched by `go install`/`go run` at exact versions
+# (reproducible, no unpinned Action), and keyless signing uses the workflow's
+# OIDC identity (id-token: write) so there is no long-lived signing key.
 on:
   push:
     tags:
@@ -11,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write # keyless signing + provenance via the OIDC identity
 
 jobs:
   release:
@@ -26,9 +33,33 @@ jobs:
         run: go test ./...
 
       - name: Cross-compile
+        run: bash scripts/build-release.sh "${GITHUB_REF_NAME}"
+
+      - name: Software Bill of Materials (CycloneDX)
+        run: bash scripts/sbom.sh dist/sbom.cdx.json
+
+      - name: Checksums
         run: |
-          bash scripts/build-release.sh "${GITHUB_REF_NAME}"
-          cd dist && sha256sum * > checksums.txt && cat checksums.txt
+          cd dist
+          sha256sum facet-* sbom.cdx.json > checksums.txt
+          cat checksums.txt
+
+      - name: SLSA provenance statement
+        run: bash scripts/provenance.sh dist
+
+      - name: Install cosign
+        run: go install github.com/sigstore/cosign/v2/cmd/cosign@v2.4.1
+
+      - name: Keyless-sign checksums, SBOM and provenance
+        run: |
+          cd dist
+          for f in checksums.txt sbom.cdx.json provenance.slsa.json; do
+            cosign sign-blob --yes "$f" \
+              --bundle "${f}.cosign.bundle" \
+              --output-certificate "${f}.pem" \
+              --output-signature "${f}.sig"
+          done
+          echo "signed: $(ls *.cosign.bundle)"
 
       - name: Publish release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
@@ -50,9 +81,25 @@ jobs:
             ```
             facet new myapp
             cd myapp
-            export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/yourdb
-            facet run app.fct
+            facet dev app.fct        # hot-reload, no database needed
             ```
 
             Open http://localhost:7373. The same app is also a JSON API at `/api`.
-            Every binary is verified by `checksums.txt`.
+
+            ## Verify the download (supply chain)
+
+            Every binary is listed in `checksums.txt`, which is **keyless-signed**
+            with cosign. A CycloneDX **SBOM** (`sbom.cdx.json`) and a **SLSA v1.0
+            provenance** statement (`provenance.slsa.json`) are attached, each with
+            its own cosign bundle.
+
+            ```
+            # verify the signed checksums came from this repo's release workflow
+            cosign verify-blob checksums.txt \
+              --bundle checksums.txt.cosign.bundle \
+              --certificate-identity-regexp '^https://github.com/.+/.github/workflows/release.yml@.+' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+            # then check your download against it
+            sha256sum -c checksums.txt
+            ```

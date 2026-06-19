@@ -2,7 +2,9 @@ package runtime
 
 import (
 	"math/rand"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"facet/internal/ir"
 )
@@ -21,6 +23,12 @@ func eval(e *ir.Expr, scope map[string]any) any {
 	switch e.Kind {
 	case "lit":
 		return litValue(e)
+	case "list":
+		out := make([]any, len(e.Args))
+		for i, el := range e.Args {
+			out[i] = eval(el, scope)
+		}
+		return out
 	case "ref":
 		return scope[e.Name]
 	case "get":
@@ -54,22 +62,7 @@ func eval(e *ir.Expr, scope map[string]any) any {
 		}
 		return total
 	case "call":
-		// Effectful builtins. The placement calculus guarantees these only ever
-		// run here, on the authority — never on a client — so all clients agree.
-		switch e.Name {
-		case "now":
-			return int(time.Now().Unix())
-		case "rand":
-			n := 0
-			if len(e.Args) > 0 {
-				n = toInt(eval(e.Args[0], scope))
-			}
-			if n <= 0 {
-				return 0
-			}
-			return rand.Intn(n)
-		}
-		return nil
+		return evalCall(e, scope)
 	case "un":
 		x := eval(e.X, scope)
 		switch e.Op {
@@ -123,6 +116,87 @@ func eval(e *ir.Expr, scope map[string]any) any {
 		}
 	}
 	return nil
+}
+
+// evalCall interprets a builtin invocation. now/rand are effectful and the
+// placement calculus guarantees they only run here on the authority; the rest are
+// the pure standard library (string/date/math/money), evaluated identically here
+// and in assets/facet.js so every executor agrees.
+func evalCall(e *ir.Expr, scope map[string]any) any {
+	arg := func(i int) any {
+		if i < len(e.Args) {
+			return eval(e.Args[i], scope)
+		}
+		return nil
+	}
+	switch e.Name {
+	case "now":
+		return int(time.Now().Unix())
+	case "rand":
+		n := toInt(arg(0))
+		if n <= 0 {
+			return 0
+		}
+		return rand.Intn(n)
+	case "abs":
+		if n := toInt(arg(0)); n < 0 {
+			return -n
+		} else {
+			return n
+		}
+	case "min":
+		a, b := toInt(arg(0)), toInt(arg(1))
+		if a < b {
+			return a
+		}
+		return b
+	case "max":
+		a, b := toInt(arg(0)), toInt(arg(1))
+		if a > b {
+			return a
+		}
+		return b
+	case "floor", "round":
+		// integers only (no floats in the language), so these are identity.
+		return toInt(arg(0))
+	case "money":
+		return formatMoney(toInt(arg(0)))
+	case "len":
+		switch v := arg(0).(type) {
+		case []any:
+			return len(v)
+		default:
+			return utf8.RuneCountInString(toStr(v))
+		}
+	case "upper":
+		return strings.ToUpper(toStr(arg(0)))
+	case "lower":
+		return strings.ToLower(toStr(arg(0)))
+	case "trim":
+		return strings.TrimSpace(toStr(arg(0)))
+	case "year":
+		return int(time.Unix(int64(toInt(arg(0))), 0).UTC().Year())
+	case "month":
+		return int(time.Unix(int64(toInt(arg(0))), 0).UTC().Month())
+	case "day":
+		return time.Unix(int64(toInt(arg(0))), 0).UTC().Day()
+	}
+	return nil
+}
+
+// formatMoney renders integer minor units (cents) as a fixed two-decimal string,
+// the canonical text form of the money type. Mirrors facet.js exactly.
+func formatMoney(cents int) string {
+	neg := cents < 0
+	if neg {
+		cents = -cents
+	}
+	frac := cents % 100
+	s := itoa(cents/100) + "." + string([]byte{byte('0' + frac/10), byte('0' + frac%10)})
+	if neg {
+		s = "-" + s
+	}
+	return s
 }
 
 func litValue(e *ir.Expr) any {
@@ -184,6 +258,13 @@ func toStr(v any) string {
 			return "true"
 		}
 		return "false"
+	case []any:
+		// mirror JS `"" + array`: elements joined by commas.
+		parts := make([]string, len(t))
+		for i, el := range t {
+			parts[i] = toStr(el)
+		}
+		return strings.Join(parts, ",")
 	case nil:
 		return ""
 	}

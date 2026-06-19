@@ -1,10 +1,13 @@
 package runtime
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"facet/internal/ir"
 
@@ -54,7 +57,62 @@ type Store interface {
 	// RecentAudit returns up to limit recent audit entries, oldest first (to seed
 	// the in-memory ring at startup).
 	RecentAudit(limit int) ([]auditEntry, error)
+
+	// ── Phase 3: operations ──
+	// Ping verifies the database is reachable (the readiness probe).
+	Ping(ctx context.Context) error
+	// Load reads one entity's full table (used to refresh the working set when a
+	// peer instance announces a change over pub/sub).
+	Load(entity string) ([]any, error)
+
+	// Notify publishes a payload on the cross-instance event channel (Postgres
+	// LISTEN/NOTIFY), so every instance's live clients converge.
+	Notify(payload string) error
+
+	// Shared session store (stateless servers): a session lives in the database so
+	// any instance can serve any request.
+	LoadSession(sid string) (*persistedSession, bool, error)
+	SaveSession(sid string, ps *persistedSession) error
+	DeleteSession(sid string) error
+	PurgeExpiredSessions() error
+
+	// Durable job queue: enqueue persists a unit of work; ClaimJob atomically
+	// leases the next due job to exactly one worker (FOR UPDATE SKIP LOCKED);
+	// FinishJob records the outcome (done, retry with backoff, or dead-letter);
+	// PendingJobs reports queue depth; ReserveCron lets one instance win the right
+	// to enqueue a scheduled tick.
+	EnqueueJob(j *durableJob) error
+	ClaimJob(worker string) (*durableJob, error)
+	FinishJob(id int64, status, lastErr string, nextRun time.Time) error
+	PendingJobs() (int64, error)
+	ReserveCron(name string, next time.Time) (bool, error)
+
 	Close() error
+}
+
+// persistedSession is a session as stored in the shared session table, so any
+// stateless instance can rehydrate it.
+type persistedSession struct {
+	Actor      string         `json:"actor"`
+	Role       string         `json:"role"`
+	Verified   bool           `json:"verified"`
+	PendingMFA string         `json:"pendingMFA"`
+	State      map[string]any `json:"state"`
+	Expires    time.Time      `json:"expires"`
+}
+
+// durableJob is one persisted unit of background work, retried with backoff and
+// dead-lettered when it exhausts its attempts.
+type durableJob struct {
+	ID          int64
+	Queue       string
+	Action      string
+	Args        []any
+	RunAt       time.Time
+	Attempts    int
+	MaxAttempts int
+	Status      string // pending | running | done | dead
+	LastError   string
 }
 
 // Tx is a single atomic unit of durable writes. The runtime applies every
@@ -216,6 +274,159 @@ func (s *pgStore) Begin() (Tx, error) {
 
 func (s *pgStore) Close() error { return s.db.Close() }
 
+// ── Phase 3: operations ───────────────────────────────────────────────────────
+
+func (s *pgStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
+// Load reads one entity's full table, used to refresh the in-memory working set
+// when a peer instance announces a change.
+func (s *pgStore) Load(entity string) ([]any, error) {
+	e, ok := s.ents[entity]
+	if !ok {
+		return nil, fmt.Errorf("unknown entity %q", entity)
+	}
+	return s.loadAll(e)
+}
+
+// Notify publishes on the cross-instance event channel.
+func (s *pgStore) Notify(payload string) error {
+	_, err := s.db.Exec(`SELECT pg_notify($1, $2)`, clusterChannel, payload)
+	return err
+}
+
+// ── shared sessions ────────────────────────────────────────────────────────────
+
+func (s *pgStore) LoadSession(sid string) (*persistedSession, bool, error) {
+	var (
+		ps        persistedSession
+		stateJSON []byte
+	)
+	err := s.db.QueryRow(
+		`SELECT actor, role, verified, pending_mfa, state, expires FROM facet_sessions WHERE sid = $1`, sid).
+		Scan(&ps.Actor, &ps.Role, &ps.Verified, &ps.PendingMFA, &stateJSON, &ps.Expires)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	ps.State = map[string]any{}
+	if len(stateJSON) > 0 {
+		_ = json.Unmarshal(stateJSON, &ps.State)
+	}
+	return &ps, true, nil
+}
+
+func (s *pgStore) SaveSession(sid string, ps *persistedSession) error {
+	stateJSON, err := json.Marshal(ps.State)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO facet_sessions (sid, actor, role, verified, pending_mfa, state, expires) `+
+			`VALUES ($1, $2, $3, $4, $5, $6, $7) `+
+			`ON CONFLICT (sid) DO UPDATE SET actor = $2, role = $3, verified = $4, `+
+			`pending_mfa = $5, state = $6, expires = $7`,
+		sid, ps.Actor, ps.Role, ps.Verified, ps.PendingMFA, stateJSON, ps.Expires)
+	return err
+}
+
+func (s *pgStore) DeleteSession(sid string) error {
+	_, err := s.db.Exec(`DELETE FROM facet_sessions WHERE sid = $1`, sid)
+	return err
+}
+
+func (s *pgStore) PurgeExpiredSessions() error {
+	_, err := s.db.Exec(`DELETE FROM facet_sessions WHERE expires < now()`)
+	return err
+}
+
+// ── durable jobs ───────────────────────────────────────────────────────────────
+
+func (s *pgStore) EnqueueJob(j *durableJob) error {
+	args, err := json.Marshal(j.Args)
+	if err != nil {
+		return err
+	}
+	if j.MaxAttempts <= 0 {
+		j.MaxAttempts = 5
+	}
+	if j.Queue == "" {
+		j.Queue = "default"
+	}
+	if j.RunAt.IsZero() {
+		j.RunAt = time.Now()
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO facet_jobs (queue, action, args, run_at, max_attempts, status) `+
+			`VALUES ($1, $2, $3, $4, $5, 'pending')`,
+		j.Queue, j.Action, args, j.RunAt, j.MaxAttempts)
+	return err
+}
+
+// ClaimJob atomically leases the next due, pending job to one worker. FOR UPDATE
+// SKIP LOCKED means two instances racing for work never collide — each takes a
+// different row, or none.
+func (s *pgStore) ClaimJob(worker string) (*durableJob, error) {
+	var (
+		j    durableJob
+		args []byte
+	)
+	err := s.db.QueryRow(
+		`UPDATE facet_jobs SET status = 'running', attempts = attempts + 1, `+
+			`locked_by = $1, locked_at = now() `+
+			`WHERE id = (SELECT id FROM facet_jobs WHERE status = 'pending' AND run_at <= now() `+
+			`ORDER BY run_at FOR UPDATE SKIP LOCKED LIMIT 1) `+
+			`RETURNING id, queue, action, args, attempts, max_attempts`, worker).
+		Scan(&j.ID, &j.Queue, &j.Action, &args, &j.Attempts, &j.MaxAttempts)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(args) > 0 {
+		_ = json.Unmarshal(args, &j.Args)
+	}
+	return &j, nil
+}
+
+// FinishJob records a claimed job's outcome: done (success), pending (a retry,
+// rescheduled to nextRun), or dead (dead-lettered after exhausting attempts).
+func (s *pgStore) FinishJob(id int64, status, lastErr string, nextRun time.Time) error {
+	if status == "pending" {
+		_, err := s.db.Exec(
+			`UPDATE facet_jobs SET status = 'pending', run_at = $2, last_error = $3, `+
+				`locked_by = '', locked_at = NULL WHERE id = $1`, id, nextRun, lastErr)
+		return err
+	}
+	_, err := s.db.Exec(
+		`UPDATE facet_jobs SET status = $2, last_error = $3, locked_by = '', locked_at = NULL WHERE id = $1`,
+		id, status, lastErr)
+	return err
+}
+
+func (s *pgStore) PendingJobs() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT count(*) FROM facet_jobs WHERE status = 'pending'`).Scan(&n)
+	return n, err
+}
+
+// ReserveCron atomically claims the right to enqueue a scheduled tick: it
+// advances the job's next_run only if the row is absent or already due, and
+// reports whether this caller won. Exactly one instance wins each tick.
+func (s *pgStore) ReserveCron(name string, next time.Time) (bool, error) {
+	res, err := s.db.Exec(
+		`INSERT INTO facet_cron (name, next_run) VALUES ($1, $2) `+
+			`ON CONFLICT (name) DO UPDATE SET next_run = $2 WHERE facet_cron.next_run <= now()`,
+		name, next)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // ── audit log ─────────────────────────────────────────────────────────────────
 
 func (s *pgStore) Audit(e auditEntry) error {
@@ -292,6 +503,30 @@ func (s *pgStore) Migrate(entities []ir.Entity, apply bool) ([]string, error) {
 				`id BIGSERIAL PRIMARY KEY, at BIGINT NOT NULL, actor TEXT NOT NULL, ` +
 				`action TEXT NOT NULL, allowed BOOLEAN NOT NULL, detail TEXT NOT NULL DEFAULT '')`); err != nil {
 			return nil, fmt.Errorf("create audit table: %w", err)
+		}
+		// Phase 3 operational tables: shared sessions, the durable job queue, and the
+		// cron reservation table. All idempotent so startup and `facet migrate` agree.
+		for _, ddl := range []string{
+			`CREATE TABLE IF NOT EXISTS facet_sessions (` +
+				`sid TEXT PRIMARY KEY, actor TEXT NOT NULL DEFAULT 'guest', ` +
+				`role TEXT NOT NULL DEFAULT 'guest', verified BOOLEAN NOT NULL DEFAULT false, ` +
+				`pending_mfa TEXT NOT NULL DEFAULT '', state JSONB NOT NULL DEFAULT '{}', ` +
+				`expires TIMESTAMPTZ NOT NULL)`,
+			`CREATE INDEX IF NOT EXISTS facet_sessions_expires_idx ON facet_sessions (expires)`,
+			`CREATE TABLE IF NOT EXISTS facet_jobs (` +
+				`id BIGSERIAL PRIMARY KEY, queue TEXT NOT NULL DEFAULT 'default', ` +
+				`action TEXT NOT NULL, args JSONB NOT NULL DEFAULT '[]', ` +
+				`run_at TIMESTAMPTZ NOT NULL DEFAULT now(), attempts INT NOT NULL DEFAULT 0, ` +
+				`max_attempts INT NOT NULL DEFAULT 5, status TEXT NOT NULL DEFAULT 'pending', ` +
+				`last_error TEXT NOT NULL DEFAULT '', locked_by TEXT NOT NULL DEFAULT '', ` +
+				`locked_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+			`CREATE INDEX IF NOT EXISTS facet_jobs_due_idx ON facet_jobs (status, run_at)`,
+			`CREATE TABLE IF NOT EXISTS facet_cron (` +
+				`name TEXT PRIMARY KEY, next_run TIMESTAMPTZ NOT NULL)`,
+		} {
+			if _, err := s.db.Exec(ddl); err != nil {
+				return nil, fmt.Errorf("create operational table: %w", err)
+			}
 		}
 	}
 	sc, err := s.introspect()

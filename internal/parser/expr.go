@@ -8,6 +8,10 @@ import (
 	"facet/internal/ast"
 )
 
+// ParseExpr parses a single standalone Facet expression (for the console / test
+// runner, which evaluate ad-hoc expressions against a running app).
+func ParseExpr(src string) (ast.Expr, error) { return parseExpr(src, 1) }
+
 // parseExpr parses a Facet expression: identifiers, member access (`p.field`),
 // entity lookup (`Entity(key).field`), int/text/bool literals, unary ! and -,
 // arithmetic (+ - * / %), comparison (== != < <= > >=) and boolean (&& ||),
@@ -170,14 +174,14 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 	// so a state named `count` used as a bare value is unaffected.
 	if ref, ok := atom.(ast.Ref); ok {
 		if t, ok := p.peek(); ok && t.kind == tLParen {
-			switch ref.Name {
-			case "count", "sum":
+			switch {
+			case ref.Name == "count" || ref.Name == "sum":
 				ag, err := p.parseAgg(ref.Name)
 				if err != nil {
 					return nil, err
 				}
 				atom = ag
-			case "now", "rand":
+			case isBuiltinCall(ref.Name):
 				cl, err := p.parseCall(ref.Name)
 				if err != nil {
 					return nil, err
@@ -280,6 +284,19 @@ func (p *exprParser) parseCall(name string) (ast.Expr, error) {
 	return ast.Call{Name: name, Args: args}, nil
 }
 
+// isBuiltinCall reports whether name is an invocable builtin in call position:
+// the effectful clock/RNG plus the pure standard library (string/math/date).
+func isBuiltinCall(name string) bool {
+	switch name {
+	case "now", "rand", // effectful (pinned to the authority)
+		"abs", "min", "max", "floor", "round", "money", // math / money
+		"len", "upper", "lower", "trim", // string
+		"year", "month", "day": // date
+		return true
+	}
+	return false
+}
+
 func aggArgHint(op string) string {
 	if op == "sum" {
 		return ".field"
@@ -322,6 +339,11 @@ func (p *exprParser) parseAtom() (ast.Expr, error) {
 		}
 		p.pos++
 		return e, nil
+	case tOp:
+		if t.text == "[" {
+			return p.parseListLit()
+		}
+		return nil, &Error{p.line, fmt.Sprintf("unexpected %q in expression", t.text)}
 	case tNum:
 		p.pos++
 		if strings.Contains(t.text, ".") {
@@ -351,6 +373,36 @@ func (p *exprParser) parseAtom() (ast.Expr, error) {
 	default:
 		return nil, &Error{p.line, fmt.Sprintf("unexpected %q in expression", t.text)}
 	}
+}
+
+// parseListLit parses a `[a, b, c]` list literal; p.peek() is at the opening `[`.
+func (p *exprParser) parseListLit() (ast.Expr, error) {
+	p.pos++ // consume [
+	var elems []ast.Expr
+	if t, ok := p.peek(); ok && t.kind == tOp && t.text == "]" {
+		p.pos++
+		return ast.ListLit{}, nil
+	}
+	for {
+		e, err := p.parseBinary(0)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, e)
+		t, ok := p.peek()
+		if !ok {
+			return nil, &Error{p.line, "missing closing `]` in list"}
+		}
+		if t.kind == tOp && t.text == "]" {
+			p.pos++
+			break
+		}
+		if t.kind != tOp || t.text != "," {
+			return nil, &Error{p.line, "expected `,` or `]` in list literal"}
+		}
+		p.pos++
+	}
+	return ast.ListLit{Elems: elems}, nil
 }
 
 func isIdentStart(c byte) bool {

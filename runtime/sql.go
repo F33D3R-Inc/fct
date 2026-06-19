@@ -7,6 +7,8 @@ package runtime
 // functions produce. The Facet types map to real, indexed columns:
 //
 //	int          -> BIGINT
+//	money        -> BIGINT (integer minor units / cents)
+//	date         -> BIGINT (unix seconds)
 //	text         -> TEXT
 //	bool         -> BOOLEAN
 //	<Entity>     -> BIGINT, a foreign key to facet_<Entity>(id) ON DELETE CASCADE
@@ -35,7 +37,7 @@ func sqlType(f ir.Field) string {
 	switch {
 	case f.IsRelation():
 		return "BIGINT"
-	case f.Type == "int":
+	case f.Type == "int", f.Type == "money", f.Type == "date":
 		return "BIGINT"
 	case f.Type == "bool":
 		return "BOOLEAN"
