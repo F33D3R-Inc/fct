@@ -1,0 +1,67 @@
+# Secure — Phase 2 in one file: role-based access, row-level authorization, and
+# a field encrypted at rest. Placement is still computed; the authority enforces
+# every gate no matter what a client sends.
+#
+#   export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/db
+#   export FACET_SECRET=$(openssl rand -hex 32)   # signs cookies, encrypts @secret
+#   facet run examples/secure.fct
+#
+# The first account to sign up becomes the admin. Auth ships signup/login/logout
+# plus setRole, password reset, email verification, and TOTP MFA.
+
+app Secure:
+    auth
+
+    # `secret` is stored encrypted at rest (AES-256-GCM under FACET_SECRET).
+    entity Note:
+        id: int
+        author: text
+        body: text
+        secret: text @secret
+        created: int
+
+    state username: text = "" @client
+    state password: text = "" @client
+    state draft: text = "" @client
+    state hush: text = "" @client
+
+    derive noteCount: int = count(Note)
+
+    policy admin:
+        role == "admin"
+
+    policy mine(id: int):
+        actor == Note(id).author
+
+    action write(body: text, secret: text):
+        add Note { author: actor, body: body, secret: secret, created: now() }
+
+    action erase(id: int):
+        requires mine(id)
+        remove Note(id)
+
+    # Only an admin may wipe everything.
+    action purge:
+        requires admin
+        clear Note
+
+    view Home at "/":
+        box:
+            text "{noteCount} notes"
+            if actor == "guest":
+                input bind username placeholder "username"
+                input bind password placeholder "password"
+                button "sign up" -> signup(username, password)
+                button "log in" -> login(username, password)
+            if actor != "guest":
+                text "signed in as {actor} ({role})"
+                button "log out" -> logout
+                input bind draft placeholder "note"
+                input bind hush placeholder "secret (encrypted)"
+                button "write" -> write(draft, hush)
+            if admin:
+                button "purge all" -> purge
+            for n in Note by created desc limit 50:
+                box:
+                    text "{n.author}: {n.body}"
+                    button "erase" -> erase(n.id)

@@ -35,11 +35,13 @@ type Entity struct {
 	Line   int
 }
 
-// EntityField is one column of an entity.
+// EntityField is one column of an entity. A `@secret` field is encrypted at rest
+// (the database stores ciphertext; the working set holds plaintext).
 type EntityField struct {
-	Name string
-	Type string // int | text | bool | <EntityName> (a relation, stored as the row id)
-	Line int
+	Name   string
+	Type   string // int | text | bool | <EntityName> (a relation, stored as the row id)
+	Secret bool   // @secret — encrypted at rest (AES-GCM under FACET_SECRET)
+	Line   int
 }
 
 // State is one `state name: Type = default [@client|@server]` cell. Scalar
@@ -65,22 +67,36 @@ type Derive struct {
 	Line int
 }
 
-// Policy is a named predicate over the actor, action params, and state. It gates
-// actions (`requires`) and can hide UI; it is always enforced on the server.
+// Policy is a named predicate over the actor, its own parameters, and state. A
+// zero-parameter policy is a plain permission (`requires admin`) and can also
+// hide UI by being used as a view condition. A parameterized policy is
+// row-level authorization — `policy owns(id): actor == Post(id).author` — gated
+// by passing arguments at the call site (`requires owns(id)`). It is always
+// enforced on the server.
 type Policy struct {
-	Name string
-	Expr Expr
-	Line int
+	Name   string
+	Params []Param
+	Expr   Expr
+	Line   int
 }
 
 // Action is the only thing that may mutate state. Placement is derived from its
-// write set; `Requires` lists policies that must pass before it runs.
+// write set; `Requires` lists the policy checks that must pass before it runs.
 type Action struct {
 	Name     string
 	Params   []Param
-	Requires []string
+	Requires []Require
 	Body     []Stmt
 	Line     int
+}
+
+// Require is one `requires` clause: a policy name and the arguments passed to it
+// (empty for a zero-parameter policy). The arguments are expressions over the
+// action's parameters and the actor, evaluated when the gate runs.
+type Require struct {
+	Name string
+	Args []Expr
+	Line int
 }
 
 // Param is one typed action parameter.

@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,18 +31,47 @@ type Server struct {
 	ir       *ir.IR
 	byAction map[string]*ir.Action
 	byBind   map[string]*ir.Binding
+	byPolicy map[string]*ir.Policy
 	store    Store
+	children map[string][]childRef // entity -> the relations that point at it (for cascade)
+	secure   bool                  // mark cookies Secure (TLS / FACET_SECURE_COOKIES=1)
 
 	mu       sync.Mutex
-	entities map[string][]any          // durable, shared (the in-memory working set; the Store is the source of truth)
-	nextID   map[string]int            // per-entity id counter
-	sessions map[string]map[string]any // sid -> per-session server (scalar) state
-	actors   map[string]string         // sid -> actor identity (signed-in username, else "guest")
-	roles    map[string]string         // sid -> actor role (auth)
+	entities map[string][]any         // durable, shared (the in-memory working set; the Store is the source of truth)
+	nextID   map[string]int           // per-entity id counter
+	sessions map[string]*sessionState // sid -> session (per-session scalar state + identity + expiry)
 	nextSID  int
+
+	limiter *rateLimiter  // per-IP request throttle on state-changing endpoints
+	lockout *lockout      // per-username brute-force login lockout
+	audit   *auditLog     // append-only record of every server action
+	oidc    *oidcProvider // optional OIDC SSO (nil unless configured)
 
 	subsMu sync.Mutex           // guards subs
 	subs   map[chan []byte]bool // live SSE connections (shared-state fan-out)
+}
+
+// sessionState is one session: its per-session server (scalar) state, the signed
+// -in identity (actor/role/verified), and a sliding expiry. Client state never
+// lives here — the authority cannot see it.
+type sessionState struct {
+	state    map[string]any
+	actor    string // signed-in username, else "guest"
+	role     string // actor role: admin | member | guest
+	verified bool   // the account's email/contact is verified
+	expires  time.Time
+	// pendingMFA holds the username that passed a password check and now awaits a
+	// TOTP second factor (set by login, consumed by loginMFA).
+	pendingMFA string
+}
+
+// childRef is one reverse relation: rows of Entity reference a parent through
+// Field. When the parent is removed, the database cascades the delete down these
+// edges (ON DELETE CASCADE); the runtime mirrors the same cascade in the
+// in-memory working set so live clients converge.
+type childRef struct {
+	Entity string
+	Field  string
 }
 
 // New builds a server for a compiled IR, opening the Postgres entity store
@@ -51,18 +82,32 @@ func New(graph *ir.IR) (*Server, error) {
 		ir:       graph,
 		byAction: map[string]*ir.Action{},
 		byBind:   map[string]*ir.Binding{},
+		byPolicy: map[string]*ir.Policy{},
 		entities: map[string][]any{},
 		nextID:   map[string]int{},
-		sessions: map[string]map[string]any{},
-		actors:   map[string]string{},
-		roles:    map[string]string{},
+		sessions: map[string]*sessionState{},
 		subs:     map[chan []byte]bool{},
+		secure:   os.Getenv("FACET_SECURE_COOKIES") == "1",
+		limiter:  newRateLimiter(rateLimitFromEnv()),
+		lockout:  newLockout(),
 	}
 	for i := range graph.Actions {
 		s.byAction[graph.Actions[i].Name] = &graph.Actions[i]
 	}
 	for i := range graph.Bindings {
 		s.byBind[graph.Bindings[i].ID] = &graph.Bindings[i]
+	}
+	for i := range graph.Policies {
+		s.byPolicy[graph.Policies[i].Name] = &graph.Policies[i]
+	}
+	// reverse-relation graph: parent entity -> children that reference it.
+	s.children = map[string][]childRef{}
+	for _, e := range graph.Entities {
+		for _, f := range e.Fields {
+			if f.IsRelation() {
+				s.children[f.Ref] = append(s.children[f.Ref], childRef{Entity: e.Name, Field: f.Name})
+			}
+		}
 	}
 
 	store, err := openStore(os.Getenv("FACET_DATABASE_URL"))
@@ -91,6 +136,16 @@ func New(graph *ir.IR) (*Server, error) {
 		}
 		s.nextID[e.Name] = max
 	}
+
+	// Audit log: write through to the durable table, seeded from its recent history
+	// so the in-memory feed survives a restart.
+	s.audit = newAuditLog(func(e auditEntry) { go s.store.Audit(e) })
+	if seed, err := s.store.RecentAudit(s.audit.size); err == nil {
+		s.audit.seed(seed)
+	}
+
+	// Optional OIDC single sign-on, configured entirely from the environment.
+	s.oidc = newOIDCFromEnv()
 	return s, nil
 }
 
@@ -105,6 +160,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/live", s.handleLive)
 	mux.HandleFunc("/api", s.handleAPISchema)
 	mux.HandleFunc("/api/", s.handleAPI)
+	if s.oidc != nil {
+		mux.HandleFunc("/auth/oidc/login", s.handleOIDCLogin)
+		mux.HandleFunc("/auth/oidc/callback", s.handleOIDCCallback)
+	}
 	mux.HandleFunc("/", s.handlePage)
 	return mux
 }
@@ -208,7 +267,7 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	stateJSON, _ := json.Marshal(store)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), body.String(), irJSON, stateJSON)
+	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), csrfToken(sid), body.String(), irJSON, stateJSON)
 }
 
 // pageFor returns the view served at an exact path, or nil.
@@ -221,6 +280,43 @@ func (s *Server) pageFor(path string) *ir.Page {
 	return nil
 }
 
+// guardMutation applies the edge defenses every state-changing request passes
+// through: a per-IP rate limit (cheap flood protection) and, on the browser
+// channel, CSRF validation. It writes the error response itself and returns
+// false when the request must stop.
+//
+// CSRF is enforced on /event (the cookie-authenticated browser channel) by a
+// per-session token a cross-origin page cannot read. /api is the programmatic
+// projection and is not token-gated; its cross-site protection is SameSite=Lax
+// on the session cookie, which browsers do not send on a cross-site POST.
+func (s *Server) guardMutation(w http.ResponseWriter, r *http.Request, requireCSRF bool) bool {
+	if !s.limiter.allow(clientIP(r)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return false
+	}
+	if requireCSRF && !s.checkCSRF(r) {
+		http.Error(w, "missing or invalid CSRF token", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+// checkCSRF validates the anti-forgery token on a cookie-authenticated request.
+// A request with no (or an unsigned) session cookie has no ambient authority to
+// abuse, so it is allowed; a cookie-authenticated one must present the matching
+// per-session token in the X-Facet-CSRF header.
+func (s *Server) checkCSRF(r *http.Request) bool {
+	c, err := r.Cookie("fa_sid")
+	if err != nil {
+		return true
+	}
+	sid, ok := verifySigned(c.Value)
+	if !ok {
+		return true // a garbage cookie yields a fresh session anyway
+	}
+	return csrfValid(sid, r.Header.Get("X-Facet-CSRF"))
+}
+
 // handleEvent runs a server-placed action: binds arguments, enforces required
 // policies, executes the statements against authoritative state, persists entity
 // changes, and returns the state it changed as deltas. The client then refreshes
@@ -228,6 +324,9 @@ func (s *Server) pageFor(path string) *ir.Page {
 func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.guardMutation(w, r, true) {
 		return
 	}
 	var req struct {
@@ -282,17 +381,26 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 		}
 		scope[p.Name] = v
 	}
+	actor := toStr(scope["actor"])
 
-	// permission gate — the authority's job.
-	for _, pol := range act.Requires {
-		if !truthy(eval(s.policyExpr(pol), scope)) {
-			return nil, http.StatusForbidden, "forbidden: " + pol
+	// permission gate — the authority's job. A row-level policy is evaluated with
+	// its arguments (from the `requires` call site) bound; a denial is audited.
+	for _, req := range act.Requires {
+		if !s.policyPasses(req, scope) {
+			s.recordAudit(actor, act.Name, false, "denied: "+req.Name)
+			return nil, http.StatusForbidden, "forbidden: " + req.Name
 		}
 	}
 
 	deltas := map[string]any{}
 	entChanged := map[string]bool{}
-	sess := s.sessions[sid]
+	ses := s.sessions[sid]
+	if ses == nil {
+		ses = s.newSession("guest", "guest")
+		s.sessions[sid] = ses
+	}
+	sess := ses.state
+	var ops []durOp // durable writes, replayed in one transaction at the end
 	for _, st := range act.Body {
 		switch st.Op {
 		case "assign":
@@ -310,14 +418,14 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 			s.nextID[st.Entity]++
 			row["id"] = s.nextID[st.Entity]
 			s.entities[st.Entity] = append(s.entities[st.Entity], row)
-			s.persist(s.store.Save(st.Entity, row))
+			ops = append(ops, durOp{kind: "save", entity: st.Entity, row: row})
 			entChanged[st.Entity] = true
 		case "set":
 			key := eval(st.Key, scope)
 			for _, r := range s.entities[st.Entity] {
 				if m, ok := r.(record); ok && equal(m["id"], key) {
 					m[st.Field] = eval(st.Value, scope)
-					s.persist(s.store.Save(st.Entity, m))
+					ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
 					entChanged[st.Entity] = true
 					break
 				}
@@ -328,25 +436,40 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 			for i, r := range rows {
 				if m, ok := r.(record); ok && equal(m["id"], key) {
 					s.entities[st.Entity] = append(rows[:i], rows[i+1:]...)
-					s.persist(s.store.Delete(st.Entity, key))
+					ops = append(ops, durOp{kind: "delete", entity: st.Entity, id: key})
 					entChanged[st.Entity] = true
+					// the database cascades the delete to children; mirror it in memory.
+					s.cascadeMem(st.Entity, map[int]bool{toInt(key): true}, entChanged)
 					break
 				}
 			}
 		case "clear":
+			removed := map[int]bool{}
+			for _, r := range s.entities[st.Entity] {
+				if m, ok := r.(record); ok {
+					removed[toInt(m["id"])] = true
+				}
+			}
 			s.entities[st.Entity] = []any{}
-			s.persist(s.store.Clear(st.Entity))
+			ops = append(ops, durOp{kind: "clear", entity: st.Entity})
 			entChanged[st.Entity] = true
+			s.cascadeMem(st.Entity, removed, entChanged)
 		}
 		// keep entity collections in scope fresh for later statements.
 		for ent := range entChanged {
 			scope[ent] = s.entities[ent]
 		}
 	}
+
+	// Persist the whole action atomically: every write rides one transaction, so
+	// the database never holds a half-applied action. The in-memory working set is
+	// already updated and stays live even if the commit fails — durability is
+	// best-effort and surfaced loudly, the app does not stall on it.
+	s.commit(ops)
+
 	// Shared (entity) changes fan out to every live client over SSE — including
 	// this one — so all tabs converge with no refresh. Per-session scalar deltas
-	// stay private and ride back on this response. (Durability already happened,
-	// row by row, through the Store above.)
+	// stay private and ride back on this response.
 	if len(entChanged) > 0 {
 		entDeltas := map[string]any{}
 		for ent := range entChanged {
@@ -354,7 +477,96 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 		}
 		s.broadcast(entDeltas)
 	}
+	s.recordAudit(actor, act.Name, true, "")
 	return deltas, http.StatusOK, ""
+}
+
+// policyPasses evaluates one permission check against the action scope. A
+// zero-parameter policy is read directly; a row-level policy has its parameters
+// bound from the call-site arguments first.
+func (s *Server) policyPasses(req ir.Require, scope map[string]any) bool {
+	pol := s.byPolicy[req.Name]
+	if pol == nil {
+		return false
+	}
+	if len(pol.Params) == 0 {
+		return truthy(eval(pol.Expr, scope))
+	}
+	ps := cloneScope(scope)
+	for i, p := range pol.Params {
+		var v any
+		if i < len(req.Args) {
+			v = eval(req.Args[i], scope)
+		}
+		ps[p.Name] = coerce(v, p.Type)
+	}
+	return truthy(eval(pol.Expr, ps))
+}
+
+// durOp is one pending durable write, captured as an action runs and replayed
+// against a transaction when it finishes.
+type durOp struct {
+	kind   string // save | delete | clear
+	entity string
+	row    record // save
+	id     any    // delete
+}
+
+// commit replays an action's durable writes in a single transaction. A failure
+// rolls the whole batch back (the database stays consistent) and is logged; the
+// in-memory working set — already updated — keeps the app live.
+func (s *Server) commit(ops []durOp) {
+	if len(ops) == 0 {
+		return
+	}
+	tx, err := s.store.Begin()
+	if err != nil {
+		s.persist(fmt.Errorf("begin transaction: %w", err))
+		return
+	}
+	for _, op := range ops {
+		switch op.kind {
+		case "save":
+			err = tx.Save(op.entity, op.row)
+		case "delete":
+			err = tx.Delete(op.entity, op.id)
+		case "clear":
+			err = tx.Clear(op.entity)
+		}
+		if err != nil {
+			tx.Rollback()
+			s.persist(fmt.Errorf("action write rolled back: %w", err))
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		s.persist(fmt.Errorf("commit failed: %w", err))
+	}
+}
+
+// cascadeMem removes, from the in-memory working set, the rows that reference a
+// just-removed set of parent ids — the same cascade the database performs via ON
+// DELETE CASCADE — recursing through the reverse-relation graph and marking every
+// affected entity changed so the deletions fan out to live clients.
+func (s *Server) cascadeMem(parent string, removedIDs map[int]bool, entChanged map[string]bool) {
+	for _, ch := range s.children[parent] {
+		rows := s.entities[ch.Entity]
+		kept := rows[:0:0]
+		childRemoved := map[int]bool{}
+		for _, r := range rows {
+			m, ok := r.(record)
+			if ok && removedIDs[toInt(m[ch.Field])] {
+				childRemoved[toInt(m["id"])] = true
+				continue
+			}
+			kept = append(kept, r)
+		}
+		if len(childRemoved) > 0 {
+			s.entities[ch.Entity] = kept
+			entChanged[ch.Entity] = true
+			s.cascadeMem(ch.Entity, childRemoved, entChanged)
+		}
+	}
 }
 
 // persist logs a Store write failure without aborting the request: the in-memory
@@ -367,18 +579,26 @@ func (s *Server) persist(err error) {
 }
 
 // scope builds the evaluation scope for a session: durable entities + per-session
-// server state + the session actor. Client states are not here (the authority
-// cannot see them; the compiler guarantees server actions never read them).
+// server state + the session identity (actor/role/verified). Client states are
+// not here (the authority cannot see them; the compiler guarantees server
+// actions never read them).
 func (s *Server) scope(sid string) map[string]any {
-	scope := map[string]any{"actor": s.actors[sid], "role": s.roles[sid]}
+	ses := s.sessions[sid]
+	actor, role, verified := "guest", "guest", false
+	if ses != nil {
+		actor, role, verified = ses.actor, ses.role, ses.verified
+	}
+	scope := map[string]any{"actor": actor, "role": role, "verified": verified}
 	for ent, rows := range s.entities {
 		if ent == reservedUserEntity {
 			continue // credentials never enter a render scope or reach a client
 		}
 		scope[ent] = rows
 	}
-	for k, v := range s.sessions[sid] {
-		scope[k] = v
+	if ses != nil {
+		for k, v := range ses.state {
+			scope[k] = v
+		}
 	}
 	return scope
 }
@@ -395,15 +615,6 @@ func (s *Server) fullStore(sid string) map[string]any {
 		}
 	}
 	return store
-}
-
-func (s *Server) policyExpr(name string) *ir.Expr {
-	for i := range s.ir.Policies {
-		if s.ir.Policies[i].Name == name {
-			return s.ir.Policies[i].Expr
-		}
-	}
-	return nil
 }
 
 // ── JSON API projection ───────────────────────────────────────────────────────
@@ -442,7 +653,10 @@ func (s *Server) handleAPISchema(w http.ResponseWriter, r *http.Request) {
 		if a.Placement != ir.Server {
 			continue // client actions are not callable over the API
 		}
-		ap := apiAction{Name: a.Name, Requires: a.Requires}
+		ap := apiAction{Name: a.Name}
+		for _, req := range a.Requires {
+			ap.Requires = append(ap.Requires, req.Name)
+		}
 		for _, p := range a.Params {
 			ap.Params = append(ap.Params, apiParam{Name: p.Name, Type: p.Type})
 		}
@@ -457,6 +671,10 @@ func (s *Server) handleAPISchema(w http.ResponseWriter, r *http.Request) {
 // returns its rows; a POST on an action name invokes it.
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/api/")
+	if name == "_audit" {
+		s.handleAudit(w, r)
+		return
+	}
 	if name == "" || strings.Contains(name, "/") || name == reservedUserEntity {
 		http.NotFound(w, r)
 		return
@@ -464,18 +682,36 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		s.mu.Lock()
-		rows, ok := s.entities[name]
-		snapshot := append([]any{}, rows...)
-		s.mu.Unlock()
+		// The entity list is a true SQL pushdown: `?by=field&desc=1&limit=20` and
+		// `field=value` filters compile to an indexed, paginated SELECT, and the
+		// reply carries an opaque `next` cursor for the following page — the table is
+		// never loaded whole.
+		ent, ok := s.entityByName(name)
 		if !ok {
 			http.Error(w, "unknown entity", http.StatusNotFound)
 			return
 		}
+		query, err := buildAPIQuery(ent, r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		rows, next, err := s.store.Query(query)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"rows": snapshot})
+		out := map[string]any{"rows": rows}
+		if next != "" {
+			out["next"] = next
+		}
+		json.NewEncoder(w).Encode(out)
 
 	case http.MethodPost:
+		if !s.guardMutation(w, r, false) {
+			return
+		}
 		var req struct {
 			Args []any `json:"args"`
 		}
@@ -512,6 +748,106 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// writeJSON encodes v as a JSON response.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
+// atoiPositive parses a strictly-positive integer.
+func atoiPositive(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("not a positive integer")
+	}
+	return n, nil
+}
+
+// entityByName looks up a declared entity.
+func (s *Server) entityByName(name string) (ir.Entity, bool) {
+	for _, e := range s.ir.Entities {
+		if e.Name == name {
+			return e, true
+		}
+	}
+	return ir.Entity{}, false
+}
+
+// buildAPIQuery turns an entity-list request's query string into a pushed-down
+// Query: `by`/`desc`/`limit`/`after` set the order, direction, page size, and
+// cursor; every other parameter that names a field becomes an equality filter,
+// AND-ed together. Unknown fields are a 400 rather than a silently ignored
+// filter, so a typo can never widen a result set.
+func buildAPIQuery(e ir.Entity, vals url.Values) (Query, error) {
+	query := Query{Entity: e.Name, ItemVar: "r", After: vals.Get("after")}
+	if by := vals.Get("by"); by != "" {
+		if _, ok := fieldOf(e, by); !ok {
+			return Query{}, fmt.Errorf("unknown order field %q", by)
+		}
+		query.Order = by
+	}
+	if d := vals.Get("desc"); d == "1" || d == "true" {
+		query.Desc = true
+	}
+	if l := vals.Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil || n <= 0 {
+			return Query{}, fmt.Errorf("limit must be a positive integer")
+		}
+		query.Limit = n
+	}
+
+	reserved := map[string]bool{"by": true, "desc": true, "limit": true, "after": true}
+	var preds []*ir.Expr
+	for key, vs := range vals {
+		if reserved[key] || len(vs) == 0 {
+			continue
+		}
+		f, ok := fieldOf(e, key)
+		if !ok {
+			return Query{}, fmt.Errorf("unknown filter field %q", key)
+		}
+		preds = append(preds, &ir.Expr{Kind: "bin", Op: "==",
+			L: &ir.Expr{Kind: "get", Obj: &ir.Expr{Kind: "ref", Name: "r"}, Field: key},
+			R: litFor(f, vs[0])})
+	}
+	if len(preds) > 0 {
+		pred := preds[0]
+		for _, p := range preds[1:] {
+			pred = &ir.Expr{Kind: "bin", Op: "&&", L: pred, R: p}
+		}
+		query.Where = pred
+	}
+	return query, nil
+}
+
+// fieldOf resolves a field by name; id is an implicit int field every entity has.
+func fieldOf(e ir.Entity, name string) (ir.Field, bool) {
+	if name == "id" {
+		return ir.Field{Name: "id", Type: "int"}, true
+	}
+	for _, f := range e.Fields {
+		if f.Name == name {
+			return f, true
+		}
+	}
+	return ir.Field{}, false
+}
+
+// litFor builds a typed literal for a filter value, matching the field's type so
+// the pushed-down comparison binds the right SQL parameter type.
+func litFor(f ir.Field, s string) *ir.Expr {
+	switch {
+	case f.IsRelation() || f.Type == "int":
+		n, _ := strconv.Atoi(s)
+		return &ir.Expr{Kind: "lit", Val: n, VType: "int"}
+	case f.Type == "bool":
+		return &ir.Expr{Kind: "lit", Val: s == "true" || s == "1", VType: "bool"}
+	default:
+		return &ir.Expr{Kind: "lit", Val: s, VType: "text"}
+	}
+}
+
 // ── jobs: scheduled server actions ────────────────────────────────────────────
 
 // StartJobs launches the app's scheduled actions: each `on start` job runs once
@@ -524,8 +860,9 @@ func (s *Server) StartJobs() {
 	}
 	const systemSID = "__system"
 	s.mu.Lock()
-	s.sessions[systemSID] = s.newSessionState()
-	s.actors[systemSID] = "system"
+	sys := s.newSession("system", "admin")
+	sys.verified = true
+	s.sessions[systemSID] = sys
 	s.mu.Unlock()
 
 	for _, j := range s.ir.Jobs {
@@ -614,44 +951,74 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 
 // ── sessions + persistence ───────────────────────────────────────────────────
 
+// sessionTTL is how long a session stays valid without activity; each request
+// slides it forward (a refresh), so an active user is never logged out.
+const sessionTTL = 24 * time.Hour
+
+// session resolves (or creates) the caller's session from a signed cookie. A
+// tampered or expired cookie is rejected and a fresh guest session is minted.
+// Every call slides the expiry forward and re-stamps the cookie (sliding
+// refresh), and the cookie carries HttpOnly/SameSite/Secure hardening flags.
 func (s *Server) session(w http.ResponseWriter, r *http.Request) string {
+	now := time.Now()
 	if c, err := r.Cookie("fa_sid"); err == nil {
-		s.mu.Lock()
-		_, ok := s.sessions[c.Value]
-		s.mu.Unlock()
-		if ok {
-			return c.Value
+		// The cookie is "sid.signature"; reject anything we did not sign.
+		if sid, ok := verifySigned(c.Value); ok {
+			s.mu.Lock()
+			ses, live := s.sessions[sid]
+			if live && now.Before(ses.expires) {
+				ses.expires = now.Add(sessionTTL) // slide the window forward
+				s.mu.Unlock()
+				s.setSessionCookie(w, sid)
+				return sid
+			}
+			if live {
+				delete(s.sessions, sid) // expired — drop it
+			}
+			s.mu.Unlock()
 		}
 	}
 	s.mu.Lock()
 	s.nextSID++
 	sid := fmt.Sprintf("s%d", s.nextSID)
-	s.sessions[sid] = s.newSessionState()
+	ses := s.newSession("guest", "guest")
 	// Without auth, identity comes from `?as=` (a dev convenience). With auth, the
 	// session starts as an anonymous guest until login.
-	actor := "guest"
 	if !s.ir.Auth {
 		if as := r.URL.Query().Get("as"); as != "" {
-			actor = as
+			ses.actor = as
 		}
 	}
-	s.actors[sid] = actor
-	s.roles[sid] = "guest"
+	s.sessions[sid] = ses
 	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "fa_sid", Value: sid, Path: "/", HttpOnly: true})
+	s.setSessionCookie(w, sid)
 	return sid
 }
 
-// newSessionState is a fresh per-session map of the server-placed state cells at
-// their declared defaults.
-func (s *Server) newSessionState() map[string]any {
+// setSessionCookie writes the signed, hardened session cookie.
+func (s *Server) setSessionCookie(w http.ResponseWriter, sid string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "fa_sid",
+		Value:    signValue(sid),
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   s.secure,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  time.Now().Add(sessionTTL),
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+}
+
+// newSession is a fresh session with the given identity and the server-placed
+// state cells at their declared defaults.
+func (s *Server) newSession(actor, role string) *sessionState {
 	store := map[string]any{}
 	for _, st := range s.ir.States {
 		if st.Placement == ir.Server {
 			store[st.Name] = eval(st.Init, map[string]any{})
 		}
 	}
-	return store
+	return &sessionState{state: store, actor: actor, role: role, expires: time.Now().Add(sessionTTL)}
 }
 
 // ── value helpers ────────────────────────────────────────────────────────────
@@ -714,6 +1081,8 @@ func numeric(v any) (int, bool) {
 	switch t := v.(type) {
 	case int:
 		return t, true
+	case int64:
+		return int(t), true
 	case float64:
 		return int(t), true
 	}
@@ -760,6 +1129,7 @@ const page = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>%s — Facet</title>
+<meta name="fa-csrf" content="%s">
 <style>
   body { font: 16px/1.5 system-ui, sans-serif; margin: 2.5rem auto; max-width: 34rem; color: #111; padding: 0 1rem; }
   .fa-box { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }

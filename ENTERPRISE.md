@@ -20,30 +20,70 @@ the rest of the climb, in the order that actually unblocks production.
 - **Projections** — server-rendered web + live updates (SSE) + JSON API, one graph.
 - **Packaging** — `facet new`, `facet version`, cross-platform release binaries.
 
-## Phase 1 — Data at scale (the first real ceiling)
+## Phase 1 — Data at scale ✅ (shipped in v1.1.0)
 
-Today queries filter the in-memory working set and rows are stored as JSON
-documents. That is correct but caps you at "fits in memory, single server."
+The first ceiling is gone. Entity data is no longer a bag of JSON documents
+filtered in memory; it lives in real, typed, indexed tables and reads push down
+to SQL, so a table can grow well past what fits in one process.
 
-- **Query pushdown to SQL** — compile `where/by/limit` to indexed `SELECT`s;
-  cursor pagination; don't load whole tables.
-- **Real columns + indexes** — promote entity fields to typed columns; index
-  relations and filtered/sorted fields.
-- **Migrations** — versioned, safe, zero-downtime schema changes; `facet migrate`.
-- **Transactions** — multi-statement actions commit atomically.
-- **Relations** — reverse relations (a user's posts), joins, cascade deletes.
+- **Query pushdown to SQL** ✅ — the JSON API compiles `where`/`by`/`limit` (and
+  `field=value` filters) to indexed `SELECT`s with **keyset cursor pagination**
+  (`?after=…`, a `next` cursor in the reply); a table is never loaded whole.
+- **Real columns + indexes** ✅ — every entity field is a typed column
+  (`int`→`BIGINT`, `text`→`TEXT`, `bool`→`BOOLEAN`); the compiler flags every
+  relation, filtered, and ordered field and the store builds a database index
+  for it.
+- **Migrations** ✅ — `facet migrate <app.fct>` reconciles the schema with the
+  IR; `--plan` dry-runs it. Changes are **additive** (CREATE TABLE / ADD COLUMN
+  / ADD CONSTRAINT / CREATE INDEX) so they are safe to run with no downtime, and
+  every applied statement is versioned in `facet_migrations`. The same migration
+  runs automatically on startup.
+- **Transactions** ✅ — a multi-statement action's writes ride one transaction
+  and commit atomically; any failure rolls the whole action back, so the
+  database never holds a half-applied action.
+- **Relations** ✅ — relation fields are real foreign keys with **ON DELETE
+  CASCADE**; removing a parent cascades to its children in both the database and
+  the live in-memory working set (and fans out over SSE). Reverse lookups (a
+  user's posts) are indexed; cross-relation reads (`User(m.to).name`) are joins
+  over the graph.
 
-## Phase 2 — Authorization & security hardening
+> Upgrading from v1.0.0 (JSON-document storage)? v1.1.0 uses columnar tables.
+> Point it at a fresh database, or migrate your old rows out of the legacy
+> `data` column, then `facet migrate` to build the typed schema.
 
-Auth (who you are) exists; enterprise needs authz (what you may do) and a hardened
-edge.
+## Phase 2 — Authorization & security hardening ✅ (shipped in v1.2.0)
 
-- **Fine-grained permissions / RBAC** and **row-level authorization** (you may edit
-  *your* post, not anyone's).
-- **Session hardening** — `Secure`/`SameSite`/signed cookies, expiry + refresh,
-  **CSRF** protection, **rate limiting**, brute-force lockout.
-- **Account lifecycle** — email verification, password reset, **OAuth/SSO (OIDC/SAML)**, **MFA**.
-- **Audit log**, secrets management, field-level encryption at rest.
+Auth (who you are) is now joined by authz (what you may do) and a hardened edge.
+Every gate is enforced on the authority, threaded through the same IR and
+placement model — a policy is just a node, a session is just runtime state.
+
+- **RBAC + row-level authorization** ✅ — policies are roles (`role == "admin"`)
+  *and* per-row owner checks: a **parameterized policy** reads the specific row
+  being acted on (`policy owns(id): actor == Post(id).author`) and is passed the
+  action's arguments at the gate (`requires owns(id)`), so you may edit *your*
+  post, not anyone's. The first user is admin; an admin manages roles with the
+  built-in `setRole`.
+- **Session hardening** ✅ — session cookies are **HMAC-signed** (tamper-proof),
+  `HttpOnly` + `SameSite=Lax` + `Secure` (TLS / `FACET_SECURE_COOKIES`), with a
+  **sliding 24h expiry** that refreshes on activity. **CSRF** is blocked on the
+  browser channel by a per-session token a cross-origin page cannot read;
+  **per-IP rate limiting** (`FACET_RATE_LIMIT`) throttles floods; **brute-force
+  lockout** freezes an account after repeated bad logins.
+- **Account lifecycle** ✅ — **email/account verification** and **password reset**
+  (one-time, hashed, expiring tokens); **TOTP MFA** (RFC 6238) with enrollment
+  and a second factor at login; **OIDC single sign-on** (authorization-code +
+  PKCE), configured from the environment and auto-provisioning users.
+- **Audit log** ✅ — every server action (and its allow/deny) is recorded to an
+  append-only table and an in-memory ring, readable by an admin at
+  `GET /api/_audit`. **Secrets management** ✅ — one `FACET_SECRET` derives every
+  key (cookie/CSRF signing, encryption). **Field-level encryption at rest** ✅ —
+  a `@secret` column is **AES-256-GCM** encrypted in the database; the working
+  set holds plaintext, the disk never does.
+
+> SSO ships as OIDC, the modern standard that fronts Google/Entra/Okta/Auth0/
+> Keycloak; a SAML SP would ride the same `/auth/...` callback shape. Set
+> `FACET_SECRET` in production — without it the server runs on an ephemeral key
+> that does not survive a restart (cookies, MFA secrets, encrypted columns).
 
 ## Phase 3 — Reliability & operations (run it for real)
 

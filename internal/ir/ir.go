@@ -39,17 +39,30 @@ type Page struct {
 	DepGraph map[string][]string `json:"depGraph"`
 }
 
-// Entity is a durable, shared, persisted record type — the database.
+// Entity is a durable, shared, persisted record type — the database. Refs lists
+// the entities whose rows reference this one through a relation field (the
+// reverse-relation graph), so the runtime can cascade a delete to the children
+// the database drops via ON DELETE CASCADE.
 type Entity struct {
 	Name   string  `json:"name"`
 	Fields []Field `json:"fields"`
 }
 
-// Field is one entity column.
+// Field is one entity column. For a relation field, Ref names the entity it
+// points at (the column stores that row's id, a foreign key with ON DELETE
+// CASCADE). Index marks a field the compiler saw filtered, ordered, or used as
+// a relation — the store builds a real index for it so reads stay sub-linear as
+// the table grows past memory.
 type Field struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Ref    string `json:"ref,omitempty"`    // relation target entity, else ""
+	Index  bool   `json:"index,omitempty"`  // build a database index for this column
+	Secret bool   `json:"secret,omitempty"` // encrypt this column at rest (AES-GCM)
 }
+
+// IsRelation reports whether the field is a foreign key to another entity.
+func (f Field) IsRelation() bool { return f.Ref != "" }
 
 // State is one state cell with its resolved placement.
 type State struct {
@@ -72,22 +85,32 @@ type Derive struct {
 }
 
 // Policy is a named predicate; enforced on the server, also shipped so the UI
-// can hide what the actor may not do.
+// can hide what the actor may not do. Params are non-empty for a row-level
+// policy: the gate binds them from the `requires` call site's arguments before
+// evaluating Expr (a zero-parameter policy is a plain permission).
 type Policy struct {
-	Name string `json:"name"`
-	Expr *Expr  `json:"expr"`
+	Name   string  `json:"name"`
+	Params []Param `json:"params,omitempty"`
+	Expr   *Expr   `json:"expr"`
 }
 
-// Action is a mutation: parameters, the policies it requires, the statements it
-// runs, its resolved placement, and the state it reads/writes.
+// Action is a mutation: parameters, the policy checks it requires, the
+// statements it runs, its resolved placement, and the state it reads/writes.
 type Action struct {
-	Name      string   `json:"name"`
-	Params    []Param  `json:"params"`
-	Requires  []string `json:"requires"`
-	Placement string   `json:"placement"`
-	Writes    []string `json:"writes"`
-	Reads     []string `json:"reads"`
-	Body      []Stmt   `json:"body"`
+	Name      string    `json:"name"`
+	Params    []Param   `json:"params"`
+	Requires  []Require `json:"requires"`
+	Placement string    `json:"placement"`
+	Writes    []string  `json:"writes"`
+	Reads     []string  `json:"reads"`
+	Body      []Stmt    `json:"body"`
+}
+
+// Require is one resolved permission check on an action: the policy name plus the
+// argument expressions passed to a row-level (parameterized) policy.
+type Require struct {
+	Name string  `json:"name"`
+	Args []*Expr `json:"args,omitempty"`
 }
 
 // Param is a typed action parameter.

@@ -157,6 +157,8 @@ func toInt(v any) int {
 	switch t := v.(type) {
 	case int:
 		return t
+	case int64:
+		return int(t)
 	case float64:
 		return int(t)
 	case bool:
@@ -173,6 +175,8 @@ func toStr(v any) string {
 		return t
 	case int:
 		return itoa(t)
+	case int64:
+		return itoa(int(t))
 	case float64:
 		return itoa(int(t))
 	case bool:

@@ -581,6 +581,197 @@ app A:
 	}
 }
 
+// A relation field resolves to its target entity (Ref) and is always indexed; a
+// field the views filter or order by is indexed too. These flags are what the
+// store turns into foreign keys and database indexes.
+func TestRelationsAndIndexes(t *testing.T) {
+	g := mustCompile(t, `
+app Inbox:
+    entity User:
+        id: int
+        name: text
+    entity Message:
+        id: int
+        to: User
+        body: text
+        sent: int
+    view Main:
+        box:
+            for m in Message where m.to == 1 by sent desc limit 20:
+                box:
+                    text "{m.body}"
+`)
+	ent := func(name string) ir.Entity {
+		e, _ := find(g.Entities, func(e ir.Entity) bool { return e.Name == name })
+		return e
+	}
+	fld := func(e ir.Entity, name string) ir.Field {
+		f, _ := find(e.Fields, func(f ir.Field) bool { return f.Name == name })
+		return f
+	}
+	msg := ent("Message")
+	to := fld(msg, "to")
+	if to.Ref != "User" {
+		t.Errorf("Message.to should reference User, got Ref=%q", to.Ref)
+	}
+	if !to.IsRelation() || !to.Index {
+		t.Errorf("a relation must be a relation and indexed: %+v", to)
+	}
+	if !fld(msg, "sent").Index {
+		t.Error("a field used in `by` should be indexed")
+	}
+	if fld(msg, "body").Index {
+		t.Error("an unqueried field should not be indexed")
+	}
+}
+
+// Row-level authorization: a policy may take parameters and read the specific
+// row being acted on; `requires owns(id)` passes the action's argument to it.
+func TestRowLevelPolicy(t *testing.T) {
+	g := mustCompile(t, `
+app A:
+    entity Post:
+        id: int
+        author: text
+        body: text
+    policy owns(id: int):
+        actor == Post(id).author
+    action edit(id: int, body: text):
+        requires owns(id)
+        set Post(id).body = body
+    view M:
+        box:
+            for p in Post:
+                text "{p.body}"
+`)
+	pol, ok := find(g.Policies, func(p ir.Policy) bool { return p.Name == "owns" })
+	if !ok || len(pol.Params) != 1 || pol.Params[0].Name != "id" {
+		t.Fatalf("owns should be a one-parameter policy, got %+v", pol)
+	}
+	a, _ := find(g.Actions, func(a ir.Action) bool { return a.Name == "edit" })
+	if len(a.Requires) != 1 || a.Requires[0].Name != "owns" || len(a.Requires[0].Args) != 1 {
+		t.Fatalf("edit should require owns(id) with one argument, got %+v", a.Requires)
+	}
+	if a.Placement != ir.Server {
+		t.Errorf("a gated action must be server-placed, got %s", a.Placement)
+	}
+	// arity is checked, and a parameterized policy cannot be used as a bare value.
+	for _, src := range []string{
+		// wrong argument count
+		"app A:\n    entity Post:\n        id: int\n        author: text\n    policy owns(id: int):\n        actor == Post(id).author\n    action e(id: int):\n        requires owns\n        set Post(id).author = actor\n    view M:\n        box:\n            text \"x\"",
+		// used as a view condition (needs args, so it is not a value)
+		"app A:\n    entity Post:\n        id: int\n        author: text\n    policy owns(id: int):\n        actor == Post(id).author\n    action e(id: int):\n        set Post(id).author = actor\n    view M:\n        box:\n            if owns:\n                text \"x\"",
+	} {
+		if _, err := String(src); err == nil {
+			t.Errorf("expected a row-level-policy error for:\n%s", src)
+		}
+	}
+}
+
+// A zero-parameter policy still works as a plain permission and a view condition.
+func TestZeroArgPolicyStillWorks(t *testing.T) {
+	g := mustCompile(t, `
+app A:
+    entity Post:
+        id: int
+    policy admin:
+        role == "admin"
+    action wipe:
+        requires admin
+        clear Post
+    view M:
+        box:
+            if admin:
+                text "danger"
+`)
+	a, _ := find(g.Actions, func(a ir.Action) bool { return a.Name == "wipe" })
+	if len(a.Requires) != 1 || a.Requires[0].Name != "admin" || len(a.Requires[0].Args) != 0 {
+		t.Fatalf("wipe should require admin with no args, got %+v", a.Requires)
+	}
+}
+
+// A @secret field is flagged for encryption at rest and may not be queried
+// (a ciphertext column cannot be filtered, ordered, or a foreign key).
+func TestSecretField(t *testing.T) {
+	g := mustCompile(t, `
+app A:
+    entity Account:
+        id: int
+        owner: text
+        ssn: text @secret
+    action add1(owner: text, ssn: text):
+        add Account { owner: owner, ssn: ssn }
+    view M:
+        box:
+            for a in Account:
+                text "{a.owner}: {a.ssn}"
+`)
+	e, _ := find(g.Entities, func(e ir.Entity) bool { return e.Name == "Account" })
+	ssn, _ := find(e.Fields, func(f ir.Field) bool { return f.Name == "ssn" })
+	if !ssn.Secret {
+		t.Error("ssn should be marked @secret")
+	}
+	if ssn.Index {
+		t.Error("a @secret field must never be indexed")
+	}
+	// secret fields cannot be filtered, ordered, a relation, or the id.
+	for _, src := range []string{
+		"app A:\n    entity Account:\n        id: int\n        ssn: text @secret\n    view M:\n        box:\n            for a in Account where a.ssn == \"x\":\n                text \"{a.id}\"",
+		"app A:\n    entity Account:\n        id: int\n        ssn: text @secret\n    view M:\n        box:\n            for a in Account by ssn:\n                text \"{a.id}\"",
+		"app A:\n    entity User:\n        id: int\n    entity Account:\n        id: int\n        owner: User @secret\n    view M:\n        box:\n            text \"x\"",
+		"app A:\n    entity Account:\n        id: int @secret\n    view M:\n        box:\n            text \"x\"",
+	} {
+		if _, err := String(src); err == nil {
+			t.Errorf("expected a @secret misuse error for:\n%s", src)
+		}
+	}
+}
+
+// `auth` injects the full account-lifecycle action set (RBAC, reset, verify, MFA).
+func TestAuthLifecycleActions(t *testing.T) {
+	g := mustCompile(t, `
+app A:
+    auth
+    entity Post:
+        id: int
+    view M:
+        box:
+            text "hi {actor}"
+`)
+	for _, n := range []string{"signup", "login", "logout", "setRole", "requestReset",
+		"resetPassword", "verifyEmail", "enableMFA", "confirmMFA", "loginMFA"} {
+		if _, ok := find(g.Actions, func(a ir.Action) bool { return a.Name == n }); !ok {
+			t.Errorf("auth should inject the %q action", n)
+		}
+	}
+	// the managed user table carries the lifecycle columns, with mfaSecret encrypted.
+	u, _ := find(g.Entities, func(e ir.Entity) bool { return e.Name == "FacetUser" })
+	mfa, ok := find(u.Fields, func(f ir.Field) bool { return f.Name == "mfaSecret" })
+	if !ok || !mfa.Secret {
+		t.Error("FacetUser.mfaSecret should be a @secret column")
+	}
+}
+
+// `verified` is an identity builtin usable in policies and views.
+func TestVerifiedBuiltin(t *testing.T) {
+	mustCompile(t, `
+app A:
+    auth
+    entity Post:
+        id: int
+        body: text
+    policy trusted:
+        verified
+    action post(body: text):
+        requires trusted
+        add Post { body: body }
+    view M:
+        box:
+            if verified:
+                text "welcome"
+`)
+}
+
 func TestUnknownReferences(t *testing.T) {
 	for _, src := range []string{
 		"app A:\n    state x: int = 0\n    action go:\n        x = x + missing\n    view M:\n        box:\n            text \"{x}\"",

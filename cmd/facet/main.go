@@ -3,6 +3,7 @@
 //	facet new <name>              scaffold a new project
 //	facet build <file.fct>        compile and print the IR (the application graph)
 //	facet run   <file.fct> [addr] compile and serve the web + API projections
+//	facet migrate <file.fct>      reconcile the database schema (--plan to dry-run)
 //	facet version                 print the toolchain version
 package main
 
@@ -12,13 +13,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"facet/internal/compile"
 	"facet/runtime"
 )
 
 // version is stamped at release time with -ldflags "-X main.version=…".
-var version = "1.0.0"
+var version = "1.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -37,7 +39,7 @@ func main() {
 			fatal(err)
 		}
 		return
-	case "build", "run":
+	case "build", "run", "migrate":
 		// handled below
 	default:
 		usage()
@@ -63,7 +65,7 @@ func main() {
 		fmt.Println(string(out))
 	case "run":
 		addr := ":7373"
-		if len(os.Args) > 3 {
+		if len(os.Args) > 3 && !strings.HasPrefix(os.Args[3], "-") {
 			addr = os.Args[3]
 		}
 		srv, err := runtime.New(graph)
@@ -75,8 +77,32 @@ func main() {
 		fmt.Printf("  web projection  http://localhost%s/\n", addr)
 		fmt.Printf("  api projection  http://localhost%s/api\n", addr)
 		fmt.Printf("  data store      %s\n", runtime.StoreDescription(graph.App))
+		fmt.Printf("  security        %s\n", runtime.SecurityDescription())
 		if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 			fatal(err)
+		}
+	case "migrate":
+		apply := true
+		for _, a := range os.Args[3:] {
+			if a == "--plan" || a == "-plan" {
+				apply = false
+			}
+		}
+		plan, err := runtime.Migrate(graph, apply)
+		if err != nil {
+			fatal(err)
+		}
+		if len(plan) == 0 {
+			fmt.Println("facet: schema is up to date — nothing to migrate")
+			return
+		}
+		if apply {
+			fmt.Printf("facet: applied %d schema change(s):\n", len(plan))
+		} else {
+			fmt.Printf("facet: %d pending schema change(s) (dry run — pass without --plan to apply):\n", len(plan))
+		}
+		for _, stmt := range plan {
+			fmt.Printf("  %s\n", stmt)
 		}
 	}
 }
@@ -103,6 +129,7 @@ func scaffold(name string) error {
 	fmt.Println("next:")
 	fmt.Printf("  cd %s\n", name)
 	fmt.Println("  export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/yourdb")
+	fmt.Println("  export FACET_SECRET=$(openssl rand -hex 32)   # signs cookies, encrypts @secret fields")
 	fmt.Println("  facet run app.fct")
 	return nil
 }
@@ -112,6 +139,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  facet new <name>              scaffold a new project")
 	fmt.Fprintln(os.Stderr, "  facet build <file.fct>        compile and print the IR")
 	fmt.Fprintln(os.Stderr, "  facet run   <file.fct> [addr] serve the web + API projections")
+	fmt.Fprintln(os.Stderr, "  facet migrate <file.fct>      reconcile the database schema (--plan to dry-run)")
 	fmt.Fprintln(os.Stderr, "  facet version                 print the toolchain version")
 	os.Exit(2)
 }
@@ -126,6 +154,7 @@ const starterApp = `# Your Facet app. One declarative graph — the compiler dec
 # "frontend" or "backend".
 #
 # Run it:   export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/db
+#           export FACET_SECRET=$(openssl rand -hex 32)
 #           facet run app.fct
 # The first account you sign up becomes the admin.
 
@@ -144,9 +173,18 @@ app Starter:
 
     derive postCount: int = count(Post)
 
+    # Row-level authorization: you may delete only your own post. The authority
+    # enforces it no matter what the client sends.
+    policy mine(id: int):
+        actor == Post(id).author
+
     # now() is the server clock, so the compiler runs post() on the authority.
     action post(body: text):
         add Post { author: actor, body: body, created: now() }
+
+    action remove(id: int):
+        requires mine(id)
+        remove Post(id)
 
     view Home at "/":
         box:
@@ -164,6 +202,7 @@ app Starter:
             for p in Post by created desc limit 50:
                 box:
                     text "{p.author}: {p.body}"
+                    button "delete" -> remove(p.id)
 `
 
 const starterReadme = `# Starter

@@ -111,12 +111,18 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		if !isIdent(fn) {
 			return nil, &Error{c.Line.No, fmt.Sprintf("invalid field name %q", fn)}
 		}
+		// A trailing `@secret` marks the field encrypted at rest.
+		secret := false
+		if strings.HasSuffix(ft, "@secret") {
+			secret = true
+			ft = strings.TrimSpace(strings.TrimSuffix(ft, "@secret"))
+		}
 		// A field type is a primitive or an entity name (a relation, stored as the
 		// referenced row's id). Entity existence is validated later, in the IR.
 		if !isType(ft) && !(isIdent(ft) && isUpper(ft)) {
 			return nil, &Error{c.Line.No, fmt.Sprintf("unknown type %q (use int, text, bool, or an entity name)", ft)}
 		}
-		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: ft, Line: c.Line.No})
+		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: ft, Secret: secret, Line: c.Line.No})
 	}
 	if len(e.Fields) == 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("entity %q has no fields", name)}
@@ -195,8 +201,10 @@ func parseDerive(n *source.Node) (*ast.Derive, error) {
 
 func parsePolicy(n *source.Node) (*ast.Policy, error) {
 	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "policy")), ":")
-	if !isIdent(head) {
-		return nil, &Error{n.Line.No, fmt.Sprintf("invalid policy name %q", head)}
+	// A policy may declare parameters for row-level checks: `policy owns(id: int):`.
+	name, params, err := parseSignature(head, n.Line.No)
+	if err != nil {
+		return nil, err
 	}
 	if len(n.Children) != 1 {
 		return nil, &Error{n.Line.No, "policy must have exactly one predicate line"}
@@ -205,7 +213,7 @@ func parsePolicy(n *source.Node) (*ast.Policy, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ast.Policy{Name: head, Expr: e, Line: n.Line.No}, nil
+	return &ast.Policy{Name: name, Params: params, Expr: e, Line: n.Line.No}, nil
 }
 
 // parseAction: `action name(params):` then `requires …` and statement lines.
@@ -220,12 +228,13 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		t := c.Line.Text
 		switch {
 		case strings.HasPrefix(t, "requires "):
-			for _, p := range strings.Split(strings.TrimSpace(t[len("requires "):]), ",") {
-				p = strings.TrimSpace(p)
-				if !isIdent(p) {
-					return nil, &Error{c.Line.No, fmt.Sprintf("invalid policy name %q in requires", p)}
+			// `requires admin` or, for row-level checks, `requires owns(id), admin`.
+			for _, p := range splitTop(strings.TrimSpace(t[len("requires "):]), ',') {
+				req, err := parseRequire(strings.TrimSpace(p), c.Line.No)
+				if err != nil {
+					return nil, err
 				}
-				a.Requires = append(a.Requires, p)
+				a.Requires = append(a.Requires, req)
 			}
 		case strings.HasPrefix(t, "add "):
 			s, err := parseAdd(c)
@@ -271,6 +280,38 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("action %q has no body", name)}
 	}
 	return a, nil
+}
+
+// parseRequire parses one `requires` clause: a bare policy name (`admin`) or a
+// policy call with argument expressions (`owns(id)`).
+func parseRequire(s string, line int) (ast.Require, error) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		if !isIdent(s) {
+			return ast.Require{}, &Error{line, fmt.Sprintf("invalid policy name %q in requires", s)}
+		}
+		return ast.Require{Name: s, Line: line}, nil
+	}
+	name := strings.TrimSpace(s[:open])
+	if !isIdent(name) {
+		return ast.Require{}, &Error{line, fmt.Sprintf("invalid policy name %q in requires", name)}
+	}
+	close := strings.LastIndexByte(s, ')')
+	if close < open {
+		return ast.Require{}, &Error{line, "missing `)` in requires clause"}
+	}
+	req := ast.Require{Name: name, Line: line}
+	inner := strings.TrimSpace(s[open+1 : close])
+	if inner != "" {
+		for _, a := range splitTop(inner, ',') {
+			e, err := parseExpr(strings.TrimSpace(a), line)
+			if err != nil {
+				return ast.Require{}, err
+			}
+			req.Args = append(req.Args, e)
+		}
+	}
+	return req, nil
 }
 
 // parseJob: `job Name every 30s -> action` and/or `job Name on start -> action`.

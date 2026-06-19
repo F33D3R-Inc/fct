@@ -9,6 +9,10 @@
   const ir = JSON.parse(document.getElementById("fa-ir").textContent);
   const store = JSON.parse(document.getElementById("fa-state").textContent);
   const root = document.getElementById("fa-root");
+  // Per-session CSRF token, minted by the server and sent on every state-changing
+  // request; a cross-origin page cannot read it, so it cannot forge our calls.
+  const csrfMeta = document.querySelector('meta[name="fa-csrf"]');
+  const csrf = csrfMeta ? csrfMeta.getAttribute("content") : "";
 
   const actions = index(ir.actions, "name");
   const bindings = index(ir.bindings, "id");
@@ -238,7 +242,7 @@
       refresh(changed);
     } else {
       const res = await fetch("/event", {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: { "Content-Type": "application/json", "X-Facet-CSRF": csrf },
         body: JSON.stringify({ action, args: vals }),
       });
       if (!res.ok) return;

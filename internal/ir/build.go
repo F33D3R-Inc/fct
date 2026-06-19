@@ -26,8 +26,19 @@ type env struct {
 	states       map[string]string          // name -> placement
 	entities     map[string]bool            // entity names
 	entityFields map[string]map[string]bool // entity -> field set (incl id)
-	inline       map[string]*Expr           // policy/derive name -> lowered expr, inlined at every use
-	policySet    map[string]bool            // policy names only (gating via `requires`)
+	indexFields  map[string]map[string]bool // entity -> fields the compiler saw queried (build a DB index)
+	inline       map[string]*Expr           // zero-arg policy/derive name -> lowered expr, inlined at every use
+	policySet    map[string]bool            // policy names (gating via `requires`)
+	policyParams map[string][]Param         // policy name -> its parameters (row-level policies)
+}
+
+// markIndex records that entity.field is filtered, ordered, or a relation, so the
+// store builds an index for it.
+func (e *env) markIndex(entity, field string) {
+	if e.indexFields[entity] == nil {
+		e.indexFields[entity] = map[string]bool{}
+	}
+	e.indexFields[entity][field] = true
 }
 
 // Build lowers an ast.App to the IR. This is where the placement calculus runs:
@@ -47,7 +58,7 @@ type env struct {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}}
 
 	// 1. Entities.
 	entSeen := map[string]int{}
@@ -60,7 +71,10 @@ func Build(app *ast.App) (*IR, error) {
 		e.entityFields[ent.Name] = map[string]bool{}
 		ei := Entity{Name: ent.Name}
 		for _, f := range ent.Fields {
-			ei.Fields = append(ei.Fields, Field{Name: f.Name, Type: f.Type})
+			if f.Secret && f.Name == "id" {
+				return nil, &BuildError{f.Line, "the id field cannot be @secret"}
+			}
+			ei.Fields = append(ei.Fields, Field{Name: f.Name, Type: f.Type, Secret: f.Secret})
 			e.entityFields[ent.Name][f.Name] = true
 		}
 		out.Entities = append(out.Entities, ei)
@@ -69,12 +83,25 @@ func Build(app *ast.App) (*IR, error) {
 	// field may reference an entity declared later). A relation is stored as the
 	// referenced row's id; you read across it with a nested lookup, e.g.
 	// `User(Message(id).to).name`.
-	for _, ent := range app.Entities {
-		for _, f := range ent.Fields {
-			if !isPrimitive(f.Type) && !e.entities[f.Type] {
-				return nil, &BuildError{f.Line, fmt.Sprintf(
+	for ei := range out.Entities {
+		for fi := range out.Entities[ei].Fields {
+			f := &out.Entities[ei].Fields[fi]
+			if isPrimitive(f.Type) {
+				continue
+			}
+			if !e.entities[f.Type] {
+				return nil, &BuildError{0, fmt.Sprintf(
 					"field %q has unknown type %q (use int, text, bool, or an entity name)", f.Name, f.Type)}
 			}
+			if f.Secret {
+				return nil, &BuildError{0, fmt.Sprintf(
+					"relation field %q cannot be @secret; a foreign key stores the referenced row's id, which must be queryable", f.Name)}
+			}
+			// A relation: the column stores the referenced row's id (a foreign key).
+			// It is always indexed — reverse lookups (a user's posts) and cascade
+			// deletes both walk it.
+			f.Ref = f.Type
+			e.markIndex(out.Entities[ei].Name, f.Name)
 		}
 	}
 
@@ -107,13 +134,30 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, err
 		}
 		polSeen[p.Name] = p.Line
-		if err := e.checkPure(p.Expr, withActor(nil), p.Line, "a policy"); err != nil {
+		// The body sees the actor identity plus the policy's own parameters (for a
+		// row-level check like `actor == Post(id).author`).
+		plocals := withActor(nil)
+		pseen := map[string]bool{}
+		for _, pp := range p.Params {
+			if pseen[pp.Name] {
+				return nil, &BuildError{p.Line, fmt.Sprintf("policy %q has duplicate parameter %q", p.Name, pp.Name)}
+			}
+			pseen[pp.Name] = true
+			plocals[pp.Name] = true
+		}
+		if err := e.checkPure(p.Expr, plocals, p.Line, "a policy"); err != nil {
 			return nil, err
 		}
 		lowered := lower(p.Expr, e.inline)
-		e.inline[p.Name] = lowered
 		e.policySet[p.Name] = true
-		out.Policies = append(out.Policies, Policy{Name: p.Name, Expr: lowered})
+		e.policyParams[p.Name] = irParams(p.Params)
+		// Only a zero-parameter policy resolves to a value, so only it can be inlined
+		// (into a view `if`, or another policy/derive). A row-level policy is a gate,
+		// reachable only through `requires name(args)`.
+		if len(p.Params) == 0 {
+			e.inline[p.Name] = lowered
+		}
+		out.Policies = append(out.Policies, Policy{Name: p.Name, Params: irParams(p.Params), Expr: lowered})
 	}
 
 	// 3b. Derives (named computed values). Inlined like policies: each is lowered
@@ -185,20 +229,22 @@ func Build(app *ast.App) (*IR, error) {
 		if e.entities[reservedUserEntity] {
 			return nil, &BuildError{0, fmt.Sprintf("entity %q is reserved by `auth`", reservedUserEntity)}
 		}
-		for _, name := range authActionNames {
-			if _, ok := byActionName[name]; ok {
-				return nil, &BuildError{0, fmt.Sprintf("action %q is reserved by `auth`", name)}
+		for _, a := range authActions() {
+			if _, ok := byActionName[a.Name]; ok {
+				return nil, &BuildError{0, fmt.Sprintf("action %q is reserved by `auth`", a.Name)}
 			}
 		}
+		// The managed user table. password/tokens are stored hashed; the TOTP secret
+		// is encrypted at rest (@secret). The whole table is hidden from the API/SSE.
 		out.Entities = append(out.Entities, Entity{Name: reservedUserEntity, Fields: []Field{
 			{Name: "id", Type: "int"}, {Name: "username", Type: "text"},
 			{Name: "password", Type: "text"}, {Name: "role", Type: "text"},
+			{Name: "email", Type: "text"}, {Name: "verified", Type: "bool"},
+			{Name: "verifyToken", Type: "text"}, {Name: "resetToken", Type: "text"},
+			{Name: "resetExpires", Type: "int"},
+			{Name: "mfaSecret", Type: "text", Secret: true}, {Name: "mfaEnabled", Type: "bool"},
 		}})
-		out.Actions = append(out.Actions,
-			Action{Name: "signup", Placement: Server, Params: []Param{{Name: "username", Type: "text"}, {Name: "password", Type: "text"}}},
-			Action{Name: "login", Placement: Server, Params: []Param{{Name: "username", Type: "text"}, {Name: "password", Type: "text"}}},
-			Action{Name: "logout", Placement: Server},
-		)
+		out.Actions = append(out.Actions, authActions()...)
 	}
 
 	// 5. Views → pages. Each view compiles with its own viewCtx, so binding and
@@ -261,14 +307,86 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{0, fmt.Sprintf("link to %q, but no view serves that route", p)}
 		}
 	}
+
+	// Stamp the index flags the compiler accumulated (relations + every filtered or
+	// ordered field) onto the entity fields, so the store knows what to index.
+	for ei := range out.Entities {
+		idx := e.indexFields[out.Entities[ei].Name]
+		for fi := range out.Entities[ei].Fields {
+			f := &out.Entities[ei].Fields[fi]
+			if idx[f.Name] {
+				// An encrypted column stores ciphertext, so it cannot be filtered,
+				// ordered, or indexed in SQL — only read back into memory.
+				if f.Secret {
+					return nil, &BuildError{0, fmt.Sprintf(
+						"field %q is @secret and cannot be used in a `where`, `by`, or relation; it is encrypted at rest", f.Name)}
+				}
+				f.Index = true
+			}
+		}
+	}
 	return out, nil
+}
+
+// itemFields returns the names of the loop item's fields a lowered predicate
+// reads — every `get` whose object is the item variable (e.g. `p.likes` in a
+// `where p.likes > 0`). These are the columns a pushed-down query filters on.
+func itemFields(le *Expr, itemVar string) map[string]bool {
+	out := map[string]bool{}
+	var walk func(*Expr)
+	walk = func(x *Expr) {
+		if x == nil {
+			return
+		}
+		if x.Kind == "get" && x.Obj != nil && x.Obj.Kind == "ref" && x.Obj.Name == itemVar {
+			out[x.Field] = true
+		}
+		walk(x.Obj)
+		walk(x.Key)
+		walk(x.L)
+		walk(x.R)
+		walk(x.X)
+		for _, a := range x.Args {
+			walk(a)
+		}
+	}
+	walk(le)
+	return out
 }
 
 // reservedUserEntity is the runtime-managed users table created when `auth` is on.
 const reservedUserEntity = "FacetUser"
 
-// authActionNames are the built-in actions `auth` provides.
-var authActionNames = []string{"signup", "login", "logout"}
+// authActions are the built-in server actions `auth` provides — identity
+// (signup/login/logout), RBAC management (setRole), and account lifecycle
+// (password reset, email verification, MFA enrollment + second factor). The
+// runtime supplies their behavior (runtime/auth.go); they are injected here so
+// views can call them, the API advertises them, and their names are reserved.
+func authActions() []Action {
+	text := func(names ...string) []Param {
+		ps := make([]Param, len(names))
+		for i, n := range names {
+			ps[i] = Param{Name: n, Type: "text"}
+		}
+		return ps
+	}
+	specs := []Action{
+		{Name: "signup", Params: text("username", "password")},
+		{Name: "login", Params: text("username", "password")},
+		{Name: "logout"},
+		{Name: "setRole", Params: text("username", "role")},
+		{Name: "requestReset", Params: text("username")},
+		{Name: "resetPassword", Params: text("username", "token", "password")},
+		{Name: "verifyEmail", Params: text("token")},
+		{Name: "enableMFA"},
+		{Name: "confirmMFA", Params: text("code")},
+		{Name: "loginMFA", Params: text("username", "code")},
+	}
+	for i := range specs {
+		specs[i].Placement = Server
+	}
+	return specs
+}
 
 // lowerASCII lowercases an identifier for a default route.
 func lowerASCII(s string) string {
@@ -283,19 +401,33 @@ func lowerASCII(s string) string {
 
 func (e *env) action(a *ast.Action) (Action, error) {
 	act := Action{Name: a.Name}
-	loc := map[string]bool{"actor": true, "role": true}
+	loc := map[string]bool{"actor": true, "role": true, "verified": true}
 	for _, p := range a.Params {
 		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type})
 		loc[p.Name] = true
 	}
 	for _, r := range a.Requires {
-		if !e.policySet[r] {
-			if _, isDerive := e.inline[r]; isDerive {
-				return Action{}, &BuildError{a.Line, fmt.Sprintf("requires %q, which is a derive, not a policy", r)}
+		params, ok := e.policyParams[r.Name]
+		if !ok {
+			if _, isDerive := e.inline[r.Name]; isDerive && !e.policySet[r.Name] {
+				return Action{}, &BuildError{a.Line, fmt.Sprintf("requires %q, which is a derive, not a policy", r.Name)}
 			}
-			return Action{}, &BuildError{a.Line, fmt.Sprintf("requires unknown policy %q", r)}
+			return Action{}, &BuildError{a.Line, fmt.Sprintf("requires unknown policy %q", r.Name)}
 		}
-		act.Requires = append(act.Requires, r)
+		if len(r.Args) != len(params) {
+			return Action{}, &BuildError{a.Line, fmt.Sprintf(
+				"policy %q takes %d argument(s), got %d", r.Name, len(params), len(r.Args))}
+		}
+		req := Require{Name: r.Name}
+		for _, arg := range r.Args {
+			// A gate argument is an expression over the action's params and the actor;
+			// it must be pure (the gate runs on the authority, deterministically).
+			if err := e.checkPure(arg, loc, a.Line, "a requires argument"); err != nil {
+				return Action{}, err
+			}
+			req.Args = append(req.Args, lower(arg, e.inline))
+		}
+		act.Requires = append(act.Requires, req)
 	}
 
 	writes := map[string]bool{} // state names written
@@ -518,6 +650,15 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 					return nil, err
 				}
 				node.Where = lower(t.Where, c.e.inline)
+				// Any of the item's fields the filter touches becomes a candidate index
+				// — that is the column the store filters on when it pushes the query down.
+				if c.e.entities[t.Coll] {
+					for f := range itemFields(node.Where, t.Var) {
+						if c.e.entityFields[t.Coll][f] {
+							c.e.markIndex(t.Coll, f)
+						}
+					}
+				}
 			}
 			if t.Order != "" {
 				if !c.e.entities[t.Coll] {
@@ -526,6 +667,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				if !c.e.entityFields[t.Coll][t.Order] {
 					return nil, &BuildError{0, fmt.Sprintf("entity %q has no field %q to order by", t.Coll, t.Order)}
 				}
+				c.e.markIndex(t.Coll, t.Order)
 			}
 			if !sc.inRegion {
 				node.ID = fmt.Sprintf("l%d", c.nl)
@@ -837,15 +979,28 @@ func locals(names ...string) map[string]bool {
 }
 
 // isBuiltinRef reports whether a name is a runtime-provided identity value: the
-// signed-in user's name (`actor`) or role (`role`).
-func isBuiltinRef(n string) bool { return n == "actor" || n == "role" }
+// signed-in user's name (`actor`), role (`role`), or verified-email flag
+// (`verified`).
+func isBuiltinRef(n string) bool { return n == "actor" || n == "role" || n == "verified" }
 
 func withActor(locals map[string]bool) map[string]bool {
-	m := map[string]bool{"actor": true, "role": true}
+	m := map[string]bool{"actor": true, "role": true, "verified": true}
 	for k := range locals {
 		m[k] = true
 	}
 	return m
+}
+
+// irParams converts AST parameters to their IR form.
+func irParams(ps []ast.Param) []Param {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]Param, len(ps))
+	for i, p := range ps {
+		out[i] = Param{Name: p.Name, Type: p.Type}
+	}
+	return out
 }
 
 func sortedKeys(m map[string]bool) []string {
