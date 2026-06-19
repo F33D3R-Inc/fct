@@ -67,6 +67,26 @@ Compiles the app and prints the **IR** (the application graph) as JSON —
 including the computed `placement` of every state and action. The fastest way to
 see what the compiler decided.
 
+## facet add / get / update / why / publish / vendor
+
+The registry commands manage **remote facets** — public GitHub repos imported as
+`import "github.com/owner/repo"`. Versions live in `facet.lock` (one pin per
+repo), never in the source. Full guide: **[The Registry](Registry.md)**.
+
+```sh
+facet add github.com/acme/dislike            # resolve latest, pin in facet.lock
+facet add github.com/acme/dislike@v1.2.0     # exact tag (also @^1.2.0, @~1.2.0, @main, @<sha>)
+facet get [file.fct]                         # fetch every locked dep into the cache (fresh-clone path)
+facet update [github.com/acme/dislike]       # re-resolve all deps (or one) to latest allowed
+facet why github.com/acme/dislike [file.fct] # show the import path(s) a facet enters by
+facet publish                                # validate + build + tag + push a release (in a facet repo)
+facet vendor                                 # copy resolved facets into ./facet_modules (offline builds)
+```
+
+`add` writes the lock but does not edit your `.fct` — you add the `import` line.
+`build`/`run`/`dev` auto-fetch any locked-but-missing dependency, so a fresh
+`git clone` + `facet run` just works. **Commit `facet.lock`.**
+
 ## facet console
 
 ```sh

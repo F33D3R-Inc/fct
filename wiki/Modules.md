@@ -111,12 +111,24 @@ never thinks about server vs. client, and neither does the person using it.
 - **Hot reload** — `facet dev` watches every `.fct` in the project directory, so
   editing an imported module reloads the browser too.
 
-## Current scope
+## Local and remote
 
-This is **local** module composition — files on disk. A hosted community
-**registry** (publish a facet to the internet, pull it by name/version) is a
-separate, larger piece and is not part of this release. Local imports are the
-foundation it will stand on.
+Everything above is **local** module composition — files on disk, resolved
+relative to the importing file. The same `import` mechanism also pulls in
+**remote facets** straight from GitHub:
 
-→ Back to **[Home](Home.md)** · see also the
+```
+import "github.com/acme/dislike"      # a published facet, fetched & pinned
+import "./shared/auth.fct"            # still local, unchanged
+```
+
+A remote ref (`github.com/owner/repo[/path.fct]`) is fetched as an immutable,
+commit-pinned snapshot, cached on disk, and recorded in a committed
+`facet.lock` — then merged into your app exactly like a local module, so every
+rule above (dedup, cycles, name collisions, one placement pass) applies
+unchanged. Versions live in the lock (managed by `facet add`/`update`), never in
+the `import` string. See **[The Registry](Registry.md)** for publishing and
+consuming.
+
+→ Back to **[Home](Home.md)** · see also **[The Registry](Registry.md)** and the
 **[Language Reference](Language-Reference.md)**.

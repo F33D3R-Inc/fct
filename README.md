@@ -141,6 +141,16 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.5.0 — the registry.** Imports go remote: `import "github.com/owner/repo"`
+pulls a published **facet** straight from GitHub. The toolchain fetches it as an
+immutable, commit-pinned tarball (no `git` binary needed), caches it on disk,
+records the exact commit + integrity hash in a committed `facet.lock`, and feeds
+it into the same local-merge pipeline — so a remote facet is just files on disk,
+placed once over the merged graph. GitHub *is* the registry (no central server):
+versions are git tags, builds are reproducible and offline after first fetch.
+`facet add`/`get`/`update`/`why`/`publish`/`vendor` manage it. See
+[The Registry](wiki/Registry.md).
+
 **v1.4.0 — modules & imports.** An app no longer has to be one file: a `.fct`
 can `import "other.fct"`, and the compiler merges every module into one graph
 before placement. That keeps a large app as many small files **and** is the

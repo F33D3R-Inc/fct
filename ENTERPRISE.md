@@ -186,8 +186,24 @@ files instead of one growing monolith, and a reusable **facet** — data + logic
 UI bundled together — is simply a module another app pulls in. Because placement
 is computed over the merged graph, a module is a *vertical slice* that never has
 to declare a "layer." Imports de-duplicate, cycles are rejected, and a name
-declared twice is a compile error. (A hosted publish/fetch **registry** is the
-next, larger step; local module composition is what it will stand on.)
+declared twice is a compile error.
+
+## Beyond the roadmap — the registry ✅ (shipped in v1.5.0)
+
+The next step on top of local imports: those same `import` lines go **remote**.
+`import "github.com/owner/repo"` pulls a published facet straight from GitHub —
+there is **no central registry server**, GitHub *is* the registry (versions are
+git tags, commits are immutable). The toolchain fetches a repo as a tarball over
+HTTPS (no `git` binary — it stays a single static executable), caches it
+content-addressed by commit, and pins the exact commit + tarball integrity hash
+in a committed **`facet.lock`**. From there a remote facet is just files on disk,
+fed into the *same* merge → dedup → cycle-check → placement pipeline as a local
+module — the resolver is a thin front-end, the v1.4.0 compiler is unchanged.
+Builds are reproducible and offline after first fetch; `facet add`/`get`/
+`update`/`why`/`publish`/`vendor` drive it. And because **placement soundness
+applies to imported code too**, an imported facet's server action cannot read
+your app's `@client` state or see secrets it wasn't given — a genuine
+supply-chain advantage, though importing a facet still means trusting its author.
 
 ---
 

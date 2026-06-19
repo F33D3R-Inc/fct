@@ -11,21 +11,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"facet/internal/compile"
 	"facet/internal/lsp"
+	"facet/internal/parser"
+	"facet/internal/registry"
 	"facet/runtime"
 )
 
 // version is stamped at release time with -ldflags "-X main.version=…".
-var version = "1.4.0"
+var version = "1.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 	}
+	// The registry checks a facet's required-toolchain range against this version
+	// and stamps it into facet.lock, so it needs to know what `facet` is running.
+	registry.ToolchainVersion = version
 	// Fold a local .env into the environment (real env wins) so config/secrets can
 	// live in a file during development. Harmless when absent.
 	runtime.LoadDotEnv(".env")
@@ -54,6 +60,44 @@ func main() {
 			return
 		}
 		fmt.Print(runtime.ResolveConfig().Report())
+		return
+	case "add":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: facet add <github.com/owner/repo>[@version]")
+			os.Exit(2)
+		}
+		if err := cmdAdd(os.Args[2]); err != nil {
+			fatal(err)
+		}
+		return
+	case "get", "install":
+		if err := cmdGet(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		return
+	case "update":
+		if err := cmdUpdate(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		return
+	case "why":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: facet why <github.com/owner/repo> [entry.fct]")
+			os.Exit(2)
+		}
+		if err := cmdWhy(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		return
+	case "publish":
+		if err := cmdPublish(); err != nil {
+			fatal(err)
+		}
+		return
+	case "vendor":
+		if err := cmdVendor(); err != nil {
+			fatal(err)
+		}
 		return
 	case "build", "run", "dev", "console", "seed", "test", "migrate", "backup", "restore", "deploy", "generate":
 		// handled below
@@ -243,9 +287,11 @@ func scaffold(name string) error {
 		return err
 	}
 	files := map[string]string{
-		"app.fct":            starterApp,
-		"README.md":          starterReadme,
-		".gitignore":         "dist/\nfacet-uploads/\n.env\n",
+		"app.fct":   starterApp,
+		"README.md": starterReadme,
+		// facet.lock is intentionally NOT ignored — it must be committed so a
+		// fresh clone resolves the exact same remote facet bytes.
+		".gitignore":         "dist/\nfacet-uploads/\nfacet_modules/\n.env\n",
 		"Dockerfile":         dockerfile,
 		".dockerignore":      dockerignore,
 		"docker-compose.yml": dockerCompose,
@@ -315,6 +361,12 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  facet restore <file.fct> [in]    replay a snapshot into the database (stdin by default)")
 	fmt.Fprintln(os.Stderr, "  facet deploy <file.fct>        write Dockerfile + compose for a one-command deploy")
 	fmt.Fprintln(os.Stderr, "  facet generate <file.fct> [dir]  emit native mobile clients (Swift/Kotlin/TypeScript)")
+	fmt.Fprintln(os.Stderr, "  facet add <github.com/owner/repo>[@version]  pin a remote facet in facet.lock")
+	fmt.Fprintln(os.Stderr, "  facet get [file.fct]           fetch locked remote facets into the cache")
+	fmt.Fprintln(os.Stderr, "  facet update [<ref>]           re-resolve remote facets to their latest version")
+	fmt.Fprintln(os.Stderr, "  facet why <ref> [file.fct]     show how a remote facet enters the build")
+	fmt.Fprintln(os.Stderr, "  facet publish                  validate + tag + push a facet release (in a facet repo)")
+	fmt.Fprintln(os.Stderr, "  facet vendor                   copy remote facets into ./facet_modules (offline builds)")
 	fmt.Fprintln(os.Stderr, "  facet config [--gen-secret]    show resolved config (or mint a FACET_SECRET)")
 	fmt.Fprintln(os.Stderr, "  facet lsp                      run the editor language server (stdio)")
 	fmt.Fprintln(os.Stderr, "  facet version                  print the toolchain version")
@@ -324,6 +376,313 @@ func usage() {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "facet:", err)
 	os.Exit(1)
+}
+
+// ── registry commands ────────────────────────────────────────────────────────
+//
+// These manage remote facets — public GitHub repos imported as
+// `import "github.com/owner/repo"`. Versions live in facet.lock (one pin per
+// repo), never in the source, so a facet used by five files is updated in one
+// place. build/run/dev fetch missing-but-locked deps automatically.
+
+// cmdAdd resolves a ref (optionally @version) and writes its facet.lock entry.
+// It does not edit .fct files — the user adds the import line themselves.
+func cmdAdd(arg string) error {
+	ref, form := splitAtVersion(arg)
+	if !registry.IsRemote(ref) {
+		return fmt.Errorf("`facet add` needs a remote ref like github.com/owner/repo")
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	res, err := registry.New(dir)
+	if err != nil {
+		return err
+	}
+	if err := res.Add(ref, form); err != nil {
+		return err
+	}
+	if err := res.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("facet: added %s — now add `import %q` to your app and commit facet.lock\n", ref, ref)
+	return nil
+}
+
+// cmdGet ensures every remote import is fetched and present in the cache. With a
+// file it compiles (which resolves + pins anything missing); otherwise it just
+// re-hydrates the cache from the committed lock — the fresh-clone path.
+func cmdGet(args []string) error {
+	if file := firstNonFlag(args); file != "" {
+		if _, err := compile.File(file); err != nil {
+			return fmt.Errorf("compile error: %w", err)
+		}
+		fmt.Println("facet: dependencies resolved and cached")
+		return nil
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	res, err := registry.New(dir)
+	if err != nil {
+		return err
+	}
+	if err := res.EnsureAll(); err != nil {
+		return err
+	}
+	fmt.Printf("facet: %d module(s) present in the cache\n", len(res.Modules()))
+	return nil
+}
+
+// cmdUpdate re-resolves dependencies to their latest allowed version and
+// rewrites the lock.
+func cmdUpdate(args []string) error {
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	res, err := registry.New(dir)
+	if err != nil {
+		return err
+	}
+	if ref := firstNonFlag(args); ref != "" {
+		if err := res.Update(ref); err != nil {
+			return err
+		}
+	} else if err := res.UpdateAll(); err != nil {
+		return err
+	}
+	return res.Save()
+}
+
+// cmdWhy prints the import path(s) by which a remote facet enters the build.
+func cmdWhy(args []string) error {
+	ref := args[0]
+	key, ok := registry.RepoKey(ref)
+	if !ok {
+		return fmt.Errorf("`facet why` needs a remote ref like github.com/owner/repo")
+	}
+	entry := ""
+	if len(args) > 1 {
+		entry = args[1]
+	} else {
+		entry = soleEntry(".")
+	}
+	if entry == "" {
+		return fmt.Errorf("specify the entry file: facet why %s <app.fct>", ref)
+	}
+	abs, err := filepath.Abs(entry)
+	if err != nil {
+		return err
+	}
+	res, err := registry.New(filepath.Dir(abs))
+	if err != nil {
+		return err
+	}
+
+	var chains [][]string
+	visited := map[string]bool{}
+	var walk func(absFile string, chain []string)
+	walk = func(absFile string, chain []string) {
+		src, err := os.ReadFile(absFile)
+		if err != nil {
+			return
+		}
+		app, err := parser.Parse(string(src))
+		if err != nil {
+			return
+		}
+		dir := filepath.Dir(absFile)
+		for _, imp := range app.Imports {
+			label := imp
+			if k, ok := registry.RepoKey(imp); ok {
+				label = k
+			}
+			next := append(append([]string{}, chain...), label)
+			if label == key {
+				chains = append(chains, next)
+				continue
+			}
+			p, err := res.Resolve(imp, dir)
+			if err != nil || visited[p] {
+				continue
+			}
+			visited[p] = true
+			walk(p, next)
+		}
+	}
+	walk(abs, []string{filepath.Base(abs)})
+
+	if len(chains) == 0 {
+		fmt.Printf("facet: nothing in %s imports %s\n", filepath.Base(abs), key)
+		return nil
+	}
+	fmt.Printf("facet: %s is imported by:\n", key)
+	for _, c := range chains {
+		fmt.Printf("  %s\n", strings.Join(c, " → "))
+	}
+	return nil
+}
+
+// cmdPublish validates a facet repo's manifest, proves it compiles, ensures a
+// clean tree, then creates and pushes the v<version> tag. It is a thin helper
+// around git; the manual equivalent is `git tag vX.Y.Z && git push origin vX.Y.Z`.
+func cmdPublish() error {
+	b, err := os.ReadFile("facet.json")
+	if err != nil {
+		return fmt.Errorf("`facet publish` must run in a facet repo (no facet.json here)")
+	}
+	m, err := registry.ParseManifest(b)
+	if err != nil {
+		return err
+	}
+	if m.Name == "" {
+		return fmt.Errorf("facet.json needs a `name` (github.com/owner/repo)")
+	}
+	if m.Version == "" {
+		return fmt.Errorf("facet.json needs a `version` (e.g. 1.0.0)")
+	}
+	if origin, err := gitOutput("remote", "get-url", "origin"); err == nil {
+		if k := repoKeyFromGitURL(strings.TrimSpace(origin)); k != "" && k != m.Name {
+			return fmt.Errorf("facet.json declares name %q but git origin is %q", m.Name, k)
+		}
+	}
+	entry, err := chooseEntry(".", m)
+	if err != nil {
+		return err
+	}
+	if _, err := compile.File(entry); err != nil {
+		return fmt.Errorf("facet build failed — fix the facet before publishing: %w", err)
+	}
+	if out, err := gitOutput("status", "--porcelain"); err != nil {
+		return err
+	} else if strings.TrimSpace(out) != "" {
+		return fmt.Errorf("working tree is not clean — commit your changes before publishing")
+	}
+	tag := "v" + strings.TrimPrefix(m.Version, "v")
+	if _, err := gitOutput("rev-parse", "--verify", "--quiet", "refs/tags/"+tag); err == nil {
+		return fmt.Errorf("tag %s already exists — bump the version in facet.json", tag)
+	}
+	if err := gitRun("tag", tag); err != nil {
+		return err
+	}
+	if err := gitRun("push", "origin", tag); err != nil {
+		return err
+	}
+	fmt.Printf("facet: published %s@%s\n", m.Name, tag)
+	return nil
+}
+
+// cmdVendor copies every resolved facet into ./facet_modules for fully offline,
+// air-gapped builds (the resolver prefers the vendored copy when present).
+func cmdVendor() error {
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	res, err := registry.New(dir)
+	if err != nil {
+		return err
+	}
+	done, err := res.Vendor()
+	if err != nil {
+		return err
+	}
+	if len(done) == 0 {
+		fmt.Println("facet: no remote dependencies to vendor")
+		return nil
+	}
+	fmt.Printf("facet: vendored %d module(s) into ./facet_modules:\n", len(done))
+	for _, d := range done {
+		fmt.Printf("  %s\n", d)
+	}
+	return nil
+}
+
+// splitAtVersion splits "github.com/owner/repo@v1.2.3" into the ref and the
+// selection form (empty form means latest).
+func splitAtVersion(arg string) (ref, form string) {
+	if i := strings.IndexByte(arg, '@'); i >= 0 {
+		return arg[:i], arg[i+1:]
+	}
+	return arg, ""
+}
+
+// firstNonFlag returns the first argument that is not a -flag, or "".
+func firstNonFlag(args []string) string {
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			return a
+		}
+	}
+	return ""
+}
+
+// soleEntry guesses an app's entry file in dir: app.fct if present, else the
+// only .fct file, else "".
+func soleEntry(dir string) string {
+	if fi, err := os.Stat(filepath.Join(dir, "app.fct")); err == nil && !fi.IsDir() {
+		return filepath.Join(dir, "app.fct")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var fcts []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".fct") {
+			fcts = append(fcts, filepath.Join(dir, e.Name()))
+		}
+	}
+	if len(fcts) == 1 {
+		return fcts[0]
+	}
+	return ""
+}
+
+// chooseEntry picks a facet repo's entry file: the manifest main, else main.fct,
+// else the sole .fct in the directory.
+func chooseEntry(dir string, m *registry.Manifest) (string, error) {
+	if m.Main != "" {
+		return filepath.Join(dir, m.Main), nil
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "main.fct")); err == nil && !fi.IsDir() {
+		return filepath.Join(dir, "main.fct"), nil
+	}
+	if e := soleEntry(dir); e != "" {
+		return e, nil
+	}
+	return "", fmt.Errorf("set `main` in facet.json — the repo root has no single .fct entry file")
+}
+
+// repoKeyFromGitURL normalizes a git remote URL into a github.com/owner/repo
+// key, supporting both SSH (git@github.com:owner/repo.git) and HTTPS forms.
+func repoKeyFromGitURL(url string) string {
+	url = strings.TrimSpace(url)
+	url = strings.TrimSuffix(url, ".git")
+	switch {
+	case strings.HasPrefix(url, "git@github.com:"):
+		return "github.com/" + strings.TrimPrefix(url, "git@github.com:")
+	case strings.HasPrefix(url, "https://github.com/"):
+		return "github.com/" + strings.TrimPrefix(url, "https://github.com/")
+	case strings.HasPrefix(url, "ssh://git@github.com/"):
+		return "github.com/" + strings.TrimPrefix(url, "ssh://git@github.com/")
+	}
+	return ""
+}
+
+func gitOutput(args ...string) (string, error) {
+	out, err := exec.Command("git", args...).Output()
+	return string(out), err
+}
+
+func gitRun(args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 const starterApp = `# Your Facet app. One declarative graph — the compiler decides what runs on the

@@ -46,6 +46,11 @@ func Parse(src string) (*ast.App, error) {
 			if path == "" {
 				return nil, &Error{r.Line.No, "import path is empty"}
 			}
+			// Versions are not written in the source — one source of truth lives in
+			// facet.lock, managed by the CLI. Reject an inline @version with a pointer.
+			if strings.Contains(path, "@") {
+				return nil, &Error{r.Line.No, "remove the @version from the import; pin it with `facet add <ref>@<version>`"}
+			}
 			imports = append(imports, path)
 			continue
 		}

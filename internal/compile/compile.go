@@ -20,6 +20,7 @@ import (
 	"facet/internal/ast"
 	"facet/internal/ir"
 	"facet/internal/parser"
+	"facet/internal/registry"
 )
 
 // String compiles inline Facet source (no file context) to the IR. It is used
@@ -44,9 +45,20 @@ func File(path string) (*ir.IR, error) {
 	if err != nil {
 		return nil, err
 	}
-	visited := map[string]bool{}
-	root, err := loadModule(abs, visited, nil)
+	// The resolver turns every import — local path or remote github.com/ ref —
+	// into a file on disk, fetching and pinning remote facets in facet.lock as a
+	// side effect. It is rooted at the entry file's directory, where the lock
+	// lives. A purely local app never touches the network or writes a lock.
+	res, err := registry.New(filepath.Dir(abs))
 	if err != nil {
+		return nil, err
+	}
+	visited := map[string]bool{}
+	root, err := loadModule(abs, visited, nil, res)
+	if err != nil {
+		return nil, err
+	}
+	if err := res.Save(); err != nil {
 		return nil, err
 	}
 	if err := checkDuplicates(root); err != nil {
@@ -59,7 +71,7 @@ func File(path string) (*ir.IR, error) {
 // single ast.App. stack is the chain of files currently being resolved, used to
 // detect cycles; visited is the set of modules already merged, used to pull a
 // shared module in only once.
-func loadModule(abs string, visited map[string]bool, stack []string) (*ast.App, error) {
+func loadModule(abs string, visited map[string]bool, stack []string, res *registry.Resolver) (*ast.App, error) {
 	for _, s := range stack {
 		if s == abs {
 			return nil, fmt.Errorf("import cycle through %s", filepath.Base(abs))
@@ -75,18 +87,19 @@ func loadModule(abs string, visited map[string]bool, stack []string) (*ast.App, 
 	}
 	dir := filepath.Dir(abs)
 	for _, imp := range app.Imports {
-		impAbs := imp
-		if !filepath.IsAbs(impAbs) {
-			impAbs = filepath.Join(dir, imp)
-		}
-		if impAbs, err = filepath.Abs(impAbs); err != nil {
+		// Resolve turns the import string into an absolute local path: a local ref
+		// joins against this file's dir; a remote github.com/ ref is fetched and
+		// cached first, returning a path inside the cache. Everything below this
+		// point is identical for both — a remote facet is just files on disk.
+		impAbs, err := res.Resolve(imp, dir)
+		if err != nil {
 			return nil, err
 		}
 		if visited[impAbs] {
 			continue // already merged via another import path
 		}
 		visited[impAbs] = true
-		sub, err := loadModule(impAbs, visited, append(stack, abs))
+		sub, err := loadModule(impAbs, visited, append(stack, abs), res)
 		if err != nil {
 			return nil, err
 		}

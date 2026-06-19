@@ -15,7 +15,7 @@ calculus** computes that for you from the shape of your declarations.
 ```
 
 This wiki is the **single reference for building with Facet**. If you read it
-top to bottom you will know everything the language can do as of **v1.3.0**.
+top to bottom you will know everything the language can do as of **v1.5.0**.
 
 ---
 
@@ -33,6 +33,7 @@ top to bottom you will know everything the language can do as of **v1.3.0**.
 |---|---|
 | **[Language Reference](Language-Reference.md)** | Every keyword, every construct, the complete grammar. |
 | **[Modules & Imports](Modules.md)** | Split an app across files; package and reuse a "facet" with `import`. |
+| **[The Registry](Registry.md)** | Publish and consume remote facets from GitHub: `import "github.com/owner/repo"`, `facet add`, `facet.lock`. |
 | **[Data Modeling](Data-Modeling.md)** | Entities, the type system, relations, queries, indexes, migrations. |
 | **[Actions & Logic](Actions-and-Logic.md)** | Actions, statements, `derive`, validation (`check`), jobs, builtins. |
 | **[Authorization & Security](Authorization-and-Security.md)** | `auth`, policies (RBAC + row-level), sessions, CSRF, MFA, SSO, audit, encryption. |
