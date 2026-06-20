@@ -1510,6 +1510,10 @@ func (e *env) depsIR(le *Expr) map[string]bool {
 				out[x.Name] = true
 			}
 			walk(x.Key)
+		case "astate":
+			// pending()/failed() read per-action client status; a synthetic dep key so
+			// the dispatch loop can refresh exactly the regions that show it.
+			out["@act:"+x.Name] = true
 		case "agg":
 			if e.entities[x.Name] {
 				out[x.Name] = true
@@ -1642,6 +1646,8 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 		return &Expr{Kind: "get", Obj: lower(t.Obj, inline, enums), Field: t.Field}
 	case ast.EntityGet:
 		return &Expr{Kind: "eget", Name: t.Entity, Key: lower(t.Key, inline, enums), Field: t.Field}
+	case ast.ActState:
+		return &Expr{Kind: "astate", Op: t.Op, Name: t.Action}
 	case ast.Agg:
 		a := &Expr{Kind: "agg", Op: t.Op, Name: t.Coll, Field: t.Field, Var: t.Var}
 		if t.Where != nil {

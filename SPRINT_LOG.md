@@ -10,6 +10,32 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 7 — 2026-06-20 — item 2 closed (generics SKIPPED) + item 3: forms-with-state → released v1.14.0
+
+**Item 2 closed:** scoped generics **SKIPPED** (user agreed) — low ROI for the
+f33d3r rebuild (components already work with concrete entity types). Item 2 = `match`
++ exhaustiveness (v1.13.0) only. Revisit generics only if a real need appears.
+
+**Item 3 shipped + released v1.14.0** — forms with reactive state:
+- **`pending(action)`** → bool (in flight), **`failed(action)`** → text (last error,
+  "" on success). New `astate` expr kind; reactive via a synthetic `@act:<action>`
+  dep key the dispatch loop refreshes. Read anywhere: `if pending(post):` /
+  `text "{failed(post)}"`.
+- Dispatch wiring: setPending on start/success/fail; **submit auto-disabled while
+  in flight** (no double-submit); a `check` failure flows into `failed(...)`.
+- Server eval returns false/"" (no in-flight at SSR).
+- Surface: ast (ActState), parser (parseActState; pending/failed in call position),
+  ir (lower + depsIR `@act:` key), eval.go + facet.js (ev + actState + setPending +
+  disable). No action-existence validation yet (unknown action reads false/""; can
+  harden later). Tests: formstate_test.go (deps), verified via binary
+  (`@act:post -> [f0,b1]`).
+
+**Remaining in item 3 (lower-value, likely defer like generics):** dirty/touched
+field tracking, array/dynamic fields, error boundaries, a11y primitives. Next:
+decide whether to do a v1.14.1 for those or move to item 4 (query depth).
+
+---
+
 ## Sprint 6 — 2026-06-20 — item 2 (part 1): pattern matching → released v1.13.0
 
 **Shipped + released v1.13.0** — `match` view node with enum exhaustiveness.

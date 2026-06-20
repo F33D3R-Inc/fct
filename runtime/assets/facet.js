@@ -13,6 +13,14 @@
   // Per-page state, replaced on SPA navigation by load().
   let ir, store, actions, bindings, policies, stateType, routes;
   let regionById, inputById; // tracked dynamic regions and two-way inputs, by id
+  const actState = {}; // action name -> { pending, error }: reactive form/action status
+
+  // setPending records an action's in-flight/error status and refreshes the
+  // regions that read pending()/failed() for it.
+  function setPending(name, pending, error) {
+    actState[name] = { pending: pending, error: error || "" };
+    refresh(["@act:" + name]);
+  }
 
   function load(newIr, newState) {
     ir = newIr;
@@ -72,6 +80,10 @@
         let total = 0; // sum
         for (const r of rows) total += toInt(r[e.field]);
         return total;
+      }
+      case "astate": {
+        const s = actState[e.name] || {};
+        return e.op === "pending" ? !!s.pending : (s.error || "");
       }
       case "call":
         return evCall(e, sc);
@@ -495,7 +507,8 @@
     // action is rejected, the prediction is rolled back to the pre-dispatch state.
     let snapshot = null, predicted = null;
     if (act.optimistic) { snapshot = Object.assign({}, store); predicted = predict(act, vals); }
-    if (source) source.setAttribute("aria-busy", "true");
+    setPending(action, true, "");          // reactive: pending(action) is now true
+    if (source) { source.setAttribute("aria-busy", "true"); source.disabled = true; } // no double-submit
     let res;
     try {
       res = await fetch("/event", {
@@ -503,14 +516,16 @@
         body: JSON.stringify({ action, args: vals }),
       });
     } finally {
-      if (source) source.removeAttribute("aria-busy");
+      if (source) { source.removeAttribute("aria-busy"); source.disabled = false; }
     }
     if (!res.ok) {
       if (snapshot) { for (const k of predicted) store[k] = snapshot[k]; refresh(predicted); }
       const msg = (await res.text()).trim();
       showError(source, msg || "Something went wrong.");
+      setPending(action, false, msg || "Something went wrong."); // failed(action) now set
       return;
     }
+    setPending(action, false, "");         // success: clear pending + error
     const data = await res.json();
     if (data.reload) { location.reload(); return; } // identity changed (login/logout)
     applyDeltas(data.deltas);

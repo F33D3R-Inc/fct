@@ -181,6 +181,12 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 					return nil, err
 				}
 				atom = ag
+			case ref.Name == "pending" || ref.Name == "failed":
+				as, err := p.parseActState(ref.Name)
+				if err != nil {
+					return nil, err
+				}
+				atom = as
 			case isBuiltinCall(ref.Name):
 				cl, err := p.parseCall(ref.Name)
 				if err != nil {
@@ -280,6 +286,24 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 	}
 	p.pos++
 	return ast.Agg{Op: op, Coll: coll, Field: field, Var: itemVar, Where: where}, nil
+}
+
+// parseActState parses `pending(action)` / `failed(action)` — a bare action name
+// in parentheses. p.peek() is at the opening `(`.
+func (p *exprParser) parseActState(op string) (ast.Expr, error) {
+	p.pos++ // consume (
+	t, ok := p.peek()
+	if !ok || t.kind != tIdent {
+		return nil, &Error{p.line, fmt.Sprintf("%s needs an action name: %s(actionName)", op, op)}
+	}
+	action := t.text
+	p.pos++
+	c, ok := p.peek()
+	if !ok || c.kind != tRParen {
+		return nil, &Error{p.line, fmt.Sprintf("missing `)` in %s(...)", op)}
+	}
+	p.pos++
+	return ast.ActState{Op: op, Action: action}, nil
 }
 
 // parseCall parses a builtin call's argument list; p.peek() is at the opening

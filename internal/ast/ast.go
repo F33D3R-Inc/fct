@@ -538,6 +538,15 @@ type Lit struct {
 // Ref is a reference to a state cell, param, item var, or the builtin `actor`.
 type Ref struct{ Name string }
 
+// ActState reads the client-side status of an action: `pending(post)` (is a `post`
+// call in flight?) → bool, or `failed(post)` (the last error message, "" if none)
+// → text. It is a reactive client value, so a form can show a spinner and an
+// inline error with no wiring. On the server (first paint) it is false / "".
+type ActState struct {
+	Op     string // pending | failed
+	Action string
+}
+
 // Get is member access: `obj.field` (e.g. a list item's column).
 type Get struct {
 	Obj   Expr
@@ -596,6 +605,7 @@ type Un struct {
 func (Lit) expr()       {}
 func (ListLit) expr()   {}
 func (Ref) expr()       {}
+func (ActState) expr()  {}
 func (Get) expr()       {}
 func (EntityGet) expr() {}
 func (Agg) expr()       {}

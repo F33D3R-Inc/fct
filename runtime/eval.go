@@ -84,6 +84,13 @@ func eval(e *ir.Expr, scope map[string]any) any {
 			}
 		}
 		return total
+	case "astate":
+		// Action status is client-only runtime state; the server has none at render
+		// time, so first paint shows "not pending" / "no error".
+		if e.Op == "pending" {
+			return false
+		}
+		return ""
 	case "call":
 		return evalCall(e, scope)
 	case "un":

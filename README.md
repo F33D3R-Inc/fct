@@ -141,6 +141,14 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.14.0 — forms with reactive state (`pending` / `failed`).** Forms get
+status for free. **`pending(post)`** is true while a `post` action is in flight and
+**`failed(post)`** is its last error message ("" on success) — both reactive client
+values you read anywhere: `if pending(post): text "Posting…"` and
+`text "{failed(post)}"`. The submit control is auto-disabled while in flight (no
+double-submit), and a server-side `check` failure flows straight into `failed(...)`.
+On first paint they're false / "". This is the heart of "forms-with-state" (item 3).
+
 **v1.13.0 — pattern matching (`match`) with exhaustiveness.** The post-kind /
 notification-kind render switch, type-checked. `match post.kind:` with a
 `case "video":` per branch and an optional `else:` renders the matching arm. When
