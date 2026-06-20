@@ -356,6 +356,15 @@ type Image struct{ Segs []Seg }
 // (`icon "home"`, `icon "heart"`). The name is a literal, not interpolated.
 type Icon struct{ Name string }
 
+// Video is a `video "url"` node — a media player with controls; the URL is
+// interpolated segments like image (`video "{post.media}"`).
+type Video struct{ Segs []Seg }
+
+// Richtext is a `richtext "{expr}"` node — its interpolated text is rendered as a
+// safe subset of Markdown (headings, lists, code, bold/italic), the same algorithm
+// on the server and client. For long-form posts and articles.
+type Richtext struct{ Segs []Seg }
+
 // Badge is a `badge "label"` node — a small pill of interpolated text for counts
 // and status markers (`badge "{unread}"`, `badge "verified"`).
 type Badge struct{ Segs []Seg }
@@ -474,24 +483,26 @@ type Slot struct{}
 // Unlike a layout's single anonymous Slot, a frame has one SlotRef per socket.
 type SlotRef struct{ Name string }
 
-func (Box) node()     {}
-func (Row) node()     {}
-func (Text) node()    {}
-func (Image) node()   {}
-func (Icon) node()    {}
-func (Badge) node()   {}
-func (Tabs) node()    {}
-func (Button) node()  {}
-func (For) node()     {}
-func (If) node()      {}
-func (Input) node()   {}
-func (Link) node()    {}
-func (Select) node()  {}
-func (Form) node()    {}
-func (Upload) node()  {}
-func (Use) node()     {}
-func (Slot) node()    {}
-func (SlotRef) node() {}
+func (Box) node()      {}
+func (Row) node()      {}
+func (Text) node()     {}
+func (Image) node()    {}
+func (Icon) node()     {}
+func (Video) node()    {}
+func (Richtext) node() {}
+func (Badge) node()    {}
+func (Tabs) node()     {}
+func (Button) node()   {}
+func (For) node()      {}
+func (If) node()       {}
+func (Input) node()    {}
+func (Link) node()     {}
+func (Select) node()   {}
+func (Form) node()     {}
+func (Upload) node()   {}
+func (Use) node()      {}
+func (Slot) node()     {}
+func (SlotRef) node()  {}
 
 // ── expressions ─────────────────────────────────────────────────────────────
 

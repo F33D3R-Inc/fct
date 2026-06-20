@@ -10,6 +10,33 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 4 — 2026-06-20 — Tier 3 (part 2): post-content primitives `richtext` + `video` → released v1.11.0
+
+**Shipped + RELEASED (the new cadence: every tested section ships immediately —
+`always-release-each-section`):**
+- **`video "{url}"`** — media player with controls; interpolated like `image`.
+- **`richtext "{expr}"`** — renders a safe Markdown subset (headings, `- ` lists,
+  ```` ``` ```` fenced code, inline code/`**bold**`/`*italic*`). Input is fully
+  HTML-escaped first (XSS-safe), then a fixed tag set is emitted. The renderer is
+  duplicated **byte-identically** in Go (`runtime/richtext.go`) and JS
+  (`assets/facet.js` `markdownHtml`) so SSR first paint == client hydration.
+
+**Surface:** ast (Video/Richtext), parser, ir, server.go (render + CSS), facet.js
+(render + the mirrored md functions). Tests: `runtime/richtext_test.go` (8 cases
+incl. XSS escaping + code-fence escaping), `internal/compile/content_test.go`.
+go build/vet/test green, gofmt clean. **Released v1.10.0 then v1.11.0** (main +
+tags pushed; Actions builds binaries).
+
+**v1.10.0 was the catch-up release** bundling the previously-local Sprint 2+3 work
+(after the user flagged "I don't see anything for 8 hours" — local-only work is
+invisible to investors/devs). Cadence now locked.
+
+**Next (Tier 3 remainder + beyond):** infinite-scroll list + search input, then
+sum types + pattern matching, scoped generics, forms-with-state, query depth —
+toward language "done", then the 250+ facet library phase.
+
+---
+
 ## Sprint 3 — 2026-06-20 — Tier 3 (part 1): view primitives `icon` · `badge` · `tabs`
 
 **Context shift:** the target is finishing the LANGUAGE so the real f33d3r.com can be

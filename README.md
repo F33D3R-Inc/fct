@@ -141,6 +141,14 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.11.0 — post-content primitives: `richtext` + `video`.** Posts can hold real
+content now. **`richtext "{post.body}"`** renders a safe subset of Markdown
+(headings, lists, fenced code, inline code/bold/italic) — input is HTML-escaped
+first, and the *same* renderer runs on the server and client so first paint and
+hydration match. **`video "{post.media}"`** is a media player with controls,
+interpolated like `image`. Together with v1.10's primitives, the feed can render
+long-form posts, code, and video — the f33d3r.com content surface.
+
 **v1.10.0 — the social-data spine + view primitives.** The pieces a real social
 site (X, f33d3r) needs. **Filtered aggregates** `count(l in Like where l.tweet ==
 t.id)` give per-row counts (likes/replies); **`exists(l in Like where …)`** gives

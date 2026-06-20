@@ -914,6 +914,20 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 		case ast.Icon:
 			out = append(out, Node{Kind: "icon", Name: t.Name})
 
+		case ast.Video:
+			segs, err := c.lowerSegs(t.Segs, sc)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "video", Segs: segs})
+
+		case ast.Richtext:
+			segs, err := c.lowerSegs(t.Segs, sc)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "richtext", Segs: segs})
+
 		case ast.Badge:
 			segs, err := c.lowerSegs(t.Segs, sc)
 			if err != nil {

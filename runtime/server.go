@@ -1244,6 +1244,11 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 		fmt.Fprintf(b, `<img class="fa-image" src="%s" alt="">`, html.EscapeString(s.segsToString(n.Segs, scope)))
 	case "icon":
 		fmt.Fprintf(b, `<span class="fa-icon" data-fa-icon="%s" aria-hidden="true"></span>`, html.EscapeString(n.Name))
+	case "video":
+		fmt.Fprintf(b, `<video class="fa-video" controls src="%s"></video>`, html.EscapeString(s.segsToString(n.Segs, scope)))
+	case "richtext":
+		// markdownHTML escapes its input and emits only a fixed safe tag set.
+		fmt.Fprintf(b, `<div class="fa-richtext">%s</div>`, markdownHTML(s.segsToString(n.Segs, scope)))
 	case "badge":
 		b.WriteString(`<span class="fa-badge">`)
 		s.renderSegs(b, n.Segs, scope)
@@ -1646,6 +1651,15 @@ const page = `<!doctype html>
   .fa-text { font-variant-numeric: tabular-nums; }
   .fa-icon { display: inline-block; width: 1.15em; height: 1.15em; vertical-align: -.18em;
              background: var(--fa-icon-bg, none) center/contain no-repeat; }
+  .fa-video { max-width: 100%%; border-radius: var(--fa-radius); background: #000; }
+  .fa-richtext { line-height: 1.6; }
+  .fa-richtext h1, .fa-richtext h2, .fa-richtext h3 { margin: .6em 0 .3em; line-height: 1.25; }
+  .fa-richtext h1 { font-size: 1.5rem; } .fa-richtext h2 { font-size: 1.25rem; } .fa-richtext h3 { font-size: 1.1rem; }
+  .fa-richtext p { margin: .5em 0; } .fa-richtext ul { margin: .5em 0; padding-left: 1.25rem; }
+  .fa-richtext code { font-family: ui-monospace, monospace; font-size: .9em;
+                      background: var(--fa-card-border); padding: .1em .3em; border-radius: 4px; }
+  .fa-richtext pre { background: var(--fa-card-border); padding: .7rem .9rem; border-radius: var(--fa-radius); overflow:auto; }
+  .fa-richtext pre code { background: none; padding: 0; }
   .fa-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 1.2rem; padding: 0 .4rem;
               font-size: .72rem; font-weight: 700; line-height: 1.5; border-radius: 999px;
               background: var(--fa-accent); color: #fff; }

@@ -1184,6 +1184,18 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, ast.Icon{Name: name})
+		case strings.HasPrefix(t, "video "):
+			segs, err := parseText(strings.TrimSpace(t[len("video "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Video{Segs: segs})
+		case strings.HasPrefix(t, "richtext "):
+			segs, err := parseText(strings.TrimSpace(t[len("richtext "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Richtext{Segs: segs})
 		case strings.HasPrefix(t, "badge "):
 			segs, err := parseText(strings.TrimSpace(t[len("badge "):]), c.Line.No)
 			if err != nil {

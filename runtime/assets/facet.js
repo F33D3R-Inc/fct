@@ -170,6 +170,50 @@
     return out;
   }
 
+  // ── Markdown (mirrors runtime/richtext.go exactly) ──────────────────────────
+  function mdEscape(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&#34;").replace(/'/g, "&#39;");
+  }
+  function mdInline(s) {
+    s = mdEscape(s);
+    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    return s;
+  }
+  function mdBlockStart(line) {
+    return line.startsWith("```") || line.startsWith("# ") || line.startsWith("## ") ||
+      line.startsWith("### ") || line.startsWith("- ");
+  }
+  function markdownHtml(src) {
+    const lines = String(src).split("\n");
+    let out = "", i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (line.startsWith("```")) {
+        i++;
+        const code = [];
+        while (i < lines.length && !lines[i].startsWith("```")) { code.push(lines[i]); i++; }
+        if (i < lines.length) i++;
+        out += "<pre><code>" + mdEscape(code.join("\n")) + "</code></pre>";
+      } else if (line.startsWith("### ")) { out += "<h3>" + mdInline(line.slice(4)) + "</h3>"; i++; }
+      else if (line.startsWith("## ")) { out += "<h2>" + mdInline(line.slice(3)) + "</h2>"; i++; }
+      else if (line.startsWith("# ")) { out += "<h1>" + mdInline(line.slice(2)) + "</h1>"; i++; }
+      else if (line.startsWith("- ")) {
+        out += "<ul>";
+        while (i < lines.length && lines[i].startsWith("- ")) { out += "<li>" + mdInline(lines[i].slice(2)) + "</li>"; i++; }
+        out += "</ul>";
+      } else if (line.trim() === "") { i++; }
+      else {
+        const para = [];
+        while (i < lines.length && lines[i].trim() !== "" && !mdBlockStart(lines[i])) { para.push(mdInline(lines[i])); i++; }
+        out += "<p>" + para.join("<br>") + "</p>";
+      }
+    }
+    return out;
+  }
+
   function render(node, sc) {
     switch (node.kind) {
       case "box": {
@@ -198,6 +242,17 @@
         i.setAttribute("data-fa-icon", node.name || "");
         i.setAttribute("aria-hidden", "true");
         return i;
+      }
+      case "video": {
+        const v = el("video", "fa-video");
+        v.controls = true;
+        v.src = segsToStr(node.segs, sc);
+        return v;
+      }
+      case "richtext": {
+        const d = el("div", "fa-richtext");
+        d.innerHTML = markdownHtml(segsToStr(node.segs, sc)); // markdownHtml escapes + emits a fixed safe tag set
+        return d;
       }
       case "badge": {
         const s = el("span", "fa-badge");
