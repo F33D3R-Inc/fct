@@ -22,15 +22,16 @@ func isLayered(facets []*ast.App) bool {
 }
 
 // compose snaps a set of typed bricks into one flat application graph. The shape
-// is fixed by the architecture: a single `playground` baseplate mounts one
-// `wireframe`; the wireframe exposes typed `socket`s; `ui` and `data` facets snap
-// into sockets whose declared kind matches. The compiler then composites every
-// brick's content into the wireframe frame and merges all data and logic into one
-// graph — so the layering is how the app is built, and the output is a single
-// surface placement runs over exactly once.
+// is fixed by the architecture: a `playground` baseplate mounts one or more
+// `wireframe`s as screens; each wireframe exposes typed `socket`s; `ui` and
+// `data` facets snap into sockets whose declared kind matches. The compiler
+// composites every brick's content into its wireframe frame — one screen per
+// mount — and merges all data and logic into one graph. So the layering is how
+// the app is built; each mount is a surface placement runs over, and the runtime
+// routes between screens by their guards.
 func compose(facets []*ast.App) (*ast.App, error) {
 	// 1. Partition the bricks by kind and enforce one baseplate.
-	var playground, frame *ast.App
+	var playground *ast.App
 	var wireframes, bricks []*ast.App
 	for _, f := range facets {
 		switch f.Kind {
@@ -51,57 +52,57 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		return nil, fmt.Errorf("a layered app needs a `playground` baseplate to build from")
 	}
 
-	// 2. The playground mounts exactly one wireframe (and accepts nothing else).
-	for _, w := range wireframes {
-		if w.Name == playground.Mount {
-			frame = w
-			break
-		}
-	}
-	if frame == nil {
-		return nil, fmt.Errorf("playground %q mounts wireframe %q, which was not found (did you import it?)", playground.Name, playground.Mount)
-	}
-
-	// 3. Index the wireframe's typed sockets.
-	sockets := map[string]string{} // name -> accepted kind
+	// 2. Index every wireframe and build one global socket table. Socket names are
+	//    unique across the whole app, so a brick's `in <socket>` names exactly one
+	//    region without having to say which wireframe.
+	byWireframe := map[string]*ast.App{}
+	socketOwner := map[string]*ast.App{} // socket name -> wireframe that declares it
+	socketAccept := map[string]string{}  // socket name -> accepted kind
 	var socketOrder []string
-	for _, s := range frame.Sockets {
-		if _, dup := sockets[s.Name]; dup {
-			return nil, fmt.Errorf("wireframe %q declares socket %q twice", frame.Name, s.Name)
+	for _, w := range wireframes {
+		if _, dup := byWireframe[w.Name]; dup {
+			return nil, fmt.Errorf("two wireframes are both named %q", w.Name)
 		}
-		sockets[s.Name] = s.Accept
-		socketOrder = append(socketOrder, s.Name)
+		byWireframe[w.Name] = w
+		for _, s := range w.Sockets {
+			if owner, dup := socketOwner[s.Name]; dup {
+				return nil, fmt.Errorf("socket %q is declared by both wireframe %q and %q — socket names must be unique", s.Name, owner.Name, w.Name)
+			}
+			socketOwner[s.Name] = w
+			socketAccept[s.Name] = s.Accept
+			socketOrder = append(socketOrder, s.Name)
+		}
 	}
 
-	// 4. Snap each brick into its socket, checking the studs line up.
-	fill := map[string][]ast.Node{}
+	// 3. Snap each brick into its socket, checking the studs line up. Content is
+	//    accumulated per wireframe so each screen fills its own frame.
+	fill := map[*ast.App]map[string][]ast.Node{} // wireframe -> socket -> content
 	for _, b := range bricks {
-		accept, ok := sockets[b.Into]
+		owner, ok := socketOwner[b.Into]
 		if !ok {
-			return nil, fmt.Errorf("%s facet %q snaps into socket %q, but wireframe %q has no such socket%s",
-				b.Kind, b.Name, b.Into, frame.Name, socketHint(socketOrder))
+			return nil, fmt.Errorf("%s facet %q snaps into socket %q, but no wireframe declares it%s",
+				b.Kind, b.Name, b.Into, socketHint(socketOrder))
 		}
-		if accept != b.Kind {
+		if socketAccept[b.Into] != b.Kind {
 			return nil, fmt.Errorf("socket %q accepts `%s` facets, but %q is a `%s` facet — the bricks don't fit",
-				b.Into, accept, b.Name, b.Kind)
+				b.Into, socketAccept[b.Into], b.Name, b.Kind)
 		}
-		fill[b.Into] = append(fill[b.Into], b.Content...)
+		if fill[owner] == nil {
+			fill[owner] = map[string][]ast.Node{}
+		}
+		fill[owner][b.Into] = append(fill[owner][b.Into], b.Content...)
 	}
 
-	// 5. Composite the surface: the wireframe frame with each `slot <name>`
-	//    replaced by the content of the bricks snapped into that socket.
-	root, err := resolveFrame(frame.Frame, fill)
-	if err != nil {
-		return nil, err
-	}
-
-	// 6. Flatten every brick's data and logic into one graph. The playground's
-	//    theme is the base; the wireframe and then the bricks layer on top (later
-	//    entries win per key), so skin composes the same way structure does.
+	// 4. Flatten every brick's data and logic into one graph. The playground's
+	//    theme is the base; wireframes and then bricks layer on top (later entries
+	//    win per key), so skin composes the same way structure does.
 	app := &ast.App{Name: playground.Name, Kind: "app", Line: playground.Line}
 	app.Auth = playground.Auth
 	app.Theme = append(app.Theme, playground.Theme...)
-	app.Theme = append(app.Theme, frame.Theme...)
+	knownPolicy := map[string]int{} // policy name -> param count, for guard checks
+	for _, w := range wireframes {
+		app.Theme = append(app.Theme, w.Theme...)
+	}
 	for _, b := range bricks {
 		app.Auth = app.Auth || b.Auth
 		app.Entities = append(app.Entities, b.Entities...)
@@ -114,10 +115,49 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.Components = append(app.Components, b.Components...)
 		app.Layouts = append(app.Layouts, b.Layouts...)
 		app.Theme = append(app.Theme, b.Theme...)
+		for _, p := range b.Policies {
+			knownPolicy[p.Name] = len(p.Params)
+		}
 	}
 
-	// 7. The composited frame is the single surface, served at "/".
-	app.Views = []*ast.View{{Name: "Surface", Path: "/", Root: root, Line: frame.Line}}
+	// 5. Each playground mount becomes one screen: its wireframe's frame composited
+	//    with the bricks snapped into it, served at the mount's route behind its
+	//    guard. The runtime redirects a failed guard to the first enterable screen.
+	if len(playground.Mounts) == 0 {
+		return nil, fmt.Errorf("playground %q mounts no wireframe", playground.Name)
+	}
+	seenPath := map[string]string{}
+	for _, m := range playground.Mounts {
+		w, ok := byWireframe[m.Wireframe]
+		if !ok {
+			return nil, fmt.Errorf("playground %q mounts wireframe %q, which was not found (did you import it?)", playground.Name, m.Wireframe)
+		}
+		if m.Requires != "" {
+			n, ok := knownPolicy[m.Requires]
+			if !ok {
+				return nil, fmt.Errorf("screen %q (at %q) requires policy %q, which is not defined in any data facet", m.Wireframe, m.Path, m.Requires)
+			}
+			if n != 0 {
+				return nil, fmt.Errorf("screen guard %q must be a zero-argument policy", m.Requires)
+			}
+		}
+		if prev, dup := seenPath[m.Path]; dup {
+			return nil, fmt.Errorf("two screens mount at %q (%q and %q)", m.Path, prev, m.Wireframe)
+		}
+		seenPath[m.Path] = m.Wireframe
+		root, err := resolveFrame(w.Frame, fill[w])
+		if err != nil {
+			return nil, err
+		}
+		app.Views = append(app.Views, &ast.View{
+			Name:     m.Wireframe,
+			Path:     m.Path,
+			Requires: m.Requires,
+			Screen:   true,
+			Root:     root,
+			Line:     w.Line,
+		})
+	}
 	return app, nil
 }
 

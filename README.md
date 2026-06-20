@@ -141,6 +141,15 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.7.0 — screens.** A playground now mounts several guarded surfaces, not one:
+`mount Auth at "/login" requires guest` / `mount Shell at "/" requires member`.
+A failing screen guard redirects to the first screen the actor may enter, so the
+auth state routes between login and home with no redirect code in the app —
+login/logout just reload. Socket names are unique across wireframes so a brick's
+`in <socket>` is unambiguous across screens; all data still merges into one graph
+shared by every screen. (Also fixes a latent single-page assumption in the
+renderer's binding index.) See [Layered Facets → Screens](wiki/Layered-Facets.md).
+
 **v1.6.0 — typed bricks (layered facets).** Facets now have *kinds* that compose
 like Lego: a `playground` baseplate `mount`s a `wireframe`, the wireframe exposes
 typed `socket`s, and `ui`/`data` facets snap into sockets whose declared kind

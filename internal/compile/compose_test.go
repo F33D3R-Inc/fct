@@ -138,7 +138,7 @@ func TestSnapUnknownSocket(t *testing.T) {
 `
 	entry := writeProject(t, files, "playground.fct")
 	_, err := File(entry)
-	if err == nil || !strings.Contains(err.Error(), "no such socket") {
+	if err == nil || !strings.Contains(err.Error(), "no wireframe declares it") {
 		t.Fatalf("want an unknown-socket error, got %v", err)
 	}
 }
@@ -200,6 +200,105 @@ app Blog:
 	}
 	if !hasPost {
 		t.Error("imported entity Post did not flat-merge")
+	}
+}
+
+// a two-screen layered app: a guest-only login screen and a member-only home,
+// each its own wireframe, guarded by policies a data facet defines.
+func screensFiles() map[string]string {
+	return map[string]string{
+		"playground.fct": `import "login.fct"
+import "home.fct"
+
+playground X:
+    auth
+    mount Auth at "/login" requires guest
+    mount Home at "/" requires member
+`,
+		"login.fct": `import "loginform.fct"
+
+wireframe Auth:
+    socket form: ui
+    frame:
+        box:
+            slot form
+`,
+		"loginform.fct": `ui LoginForm in form:
+    state username: text = "" @client
+    content:
+        text "Sign in"
+        button "log in" -> login(username, username)
+`,
+		"home.fct": `import "feed.fct"
+
+wireframe Home:
+    socket main: data
+    frame:
+        box:
+            slot main
+`,
+		"feed.fct": `data Feed in main:
+    entity Tweet:
+        id: int
+        body: text
+    policy guest:
+        actor == "guest"
+    policy member:
+        actor != "guest"
+    content:
+        text "home feed"
+`,
+	}
+}
+
+func TestScreensCompose(t *testing.T) {
+	entry := writeProject(t, screensFiles(), "playground.fct")
+	ir, err := File(entry)
+	if err != nil {
+		t.Fatalf("screens compose failed: %v", err)
+	}
+	if len(ir.Pages) != 2 {
+		t.Fatalf("want 2 screens, got %d", len(ir.Pages))
+	}
+	want := map[string]string{"/login": "guest", "/": "member"}
+	for _, p := range ir.Pages {
+		guard, ok := want[p.Path]
+		if !ok {
+			t.Errorf("unexpected screen path %q", p.Path)
+			continue
+		}
+		if p.Requires != guard {
+			t.Errorf("screen %q guard = %q, want %q", p.Path, p.Requires, guard)
+		}
+		if !p.Screen {
+			t.Errorf("screen %q not marked as a screen", p.Path)
+		}
+		delete(want, p.Path)
+	}
+	if len(want) != 0 {
+		t.Errorf("missing screens: %v", want)
+	}
+}
+
+func TestScreenGuardUnknownPolicy(t *testing.T) {
+	files := screensFiles()
+	files["playground.fct"] = strings.Replace(files["playground.fct"], "requires member", "requires nobody", 1)
+	entry := writeProject(t, files, "playground.fct")
+	_, err := File(entry)
+	if err == nil || !strings.Contains(err.Error(), "not defined in any data facet") {
+		t.Fatalf("want an unknown-guard-policy error, got %v", err)
+	}
+}
+
+func TestSocketNamesUniqueAcrossWireframes(t *testing.T) {
+	files := screensFiles()
+	// Make both wireframes declare a socket named "main" → collision.
+	files["login.fct"] = strings.Replace(files["login.fct"], "socket form: ui", "socket main: ui", 1)
+	files["loginform.fct"] = strings.Replace(files["loginform.fct"], "in form", "in main", 1)
+	entry := writeProject(t, files, "playground.fct")
+	_, err := File(entry)
+	if err == nil || !strings.Contains(err.Error(), "must be unique") {
+		t.Fatalf("want a duplicate-socket error, got %v", err)
 	}
 }
 

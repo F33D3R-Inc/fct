@@ -132,6 +132,33 @@ compiles, the bricks fit.
 
 ---
 
+## Screens — many surfaces, routed by guards
+
+A playground can `mount` more than one wireframe, each at its own route with a
+guard — these are **screens**. The classic case is splitting the login screen
+from the app:
+
+```
+playground X:
+    auth
+    mount Auth  at "/login" requires guest
+    mount Shell at "/"      requires member
+```
+
+- `mount <Wireframe> [at "/path"] [requires <policy>]` — a missing path defaults
+  to `/`. The guard is a zero-arg policy (defined in any data facet — policies are
+  global once merged).
+- A **failing screen guard redirects to the first screen the actor may enter**, so
+  the auth state does the routing for you: a guest hitting `/` (fails `member`) is
+  bounced to `/login`; a member hitting `/login` (fails `guest`) is bounced to `/`.
+- `login`/`signup`/`logout` already `reload`; combined with the guards, login lands
+  you on home and logout lands you back on login — with no redirect code in the app.
+
+Socket names are **unique across the whole app**, so a brick's `in <socket>` names
+exactly one region no matter how many wireframes there are. Each mount composites
+its own wireframe's frame into its own screen; all data and logic still merge into
+one graph (one database, one set of actions) shared across every screen.
+
 ## It renders as one surface
 
 The output of composition is a single page at `/`: the wireframe frame with every

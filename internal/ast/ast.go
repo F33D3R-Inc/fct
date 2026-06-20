@@ -18,9 +18,12 @@ type App struct {
 	// "ui" or "data" (content that snaps into a socket). Only the typed kinds take
 	// part in layered composition; a plain app keeps the original flat-merge model.
 	Kind string
-	// Mount (playground only) names the wireframe that snaps onto this baseplate.
-	// A playground accepts a wireframe and nothing else.
-	Mount string
+	// Mounts (playground only) are the screens the baseplate mounts — each binds a
+	// wireframe to a route with an optional guard. A playground accepts wireframes
+	// and nothing else. One unguarded mount at "/" is the common single-screen app;
+	// several guarded mounts make distinct screens (login vs home) the runtime
+	// routes between.
+	Mounts []Mount
 	// Into (ui/data only) names the wireframe socket this facet snaps into,
 	// written `ui Nav in nav:` / `data Feed in feed:`. The socket's declared kind
 	// must match this facet's kind, or the bricks don't fit.
@@ -60,6 +63,17 @@ type Socket struct {
 	Name   string
 	Accept string // "ui" | "data"
 	Line   int
+}
+
+// Mount is one screen a playground mounts: a wireframe bound to a route, with an
+// optional zero-arg guard policy. `mount Shell at "/" requires member`. A failing
+// guard at runtime redirects to the first screen the actor may enter, so login
+// and home are separate surfaces the auth state routes between.
+type Mount struct {
+	Wireframe string
+	Path      string // "" defaults to "/"
+	Requires  string // zero-arg guard policy; "" = open
+	Line      int
 }
 
 // Enum is a closed set of named text values: `enum Status: active, closed`. An
@@ -281,8 +295,10 @@ type View struct {
 	Params   []string // dynamic path segments (`/post/:id` → ["id"]), bound in scope
 	Layout   string   // optional layout name to wrap this page (`in Main`)
 	Requires string   // optional zero-arg policy guarding the route ("" = open)
-	Root     []Node
-	Line     int
+	Screen   bool     // true for a composed playground screen — a failing guard
+	// redirects to the first screen the actor may enter, instead of a dead end.
+	Root []Node
+	Line int
 }
 
 // ── view nodes ──────────────────────────────────────────────────────────────

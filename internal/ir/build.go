@@ -420,7 +420,7 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{v.Line, fmt.Sprintf("views %q and %q both map to route %q", v.Name, prev, path)}
 		}
 		pathOf[path] = v.Name
-		page := Page{Name: v.Name, Path: path, Params: v.Params, Requires: v.Requires, View: nodes, Bindings: pvc.bindings, DepGraph: map[string][]string{}}
+		page := Page{Name: v.Name, Path: path, Params: v.Params, Requires: v.Requires, Screen: v.Screen, View: nodes, Bindings: pvc.bindings, DepGraph: map[string][]string{}}
 		for dep, ids := range pvc.deps {
 			page.DepGraph[dep] = ids
 		}

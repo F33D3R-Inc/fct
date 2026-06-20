@@ -198,22 +198,52 @@ func parsePlayground(n *source.Node) (*ast.App, error) {
 			}
 			app.Theme = append(app.Theme, tv...)
 		case strings.HasPrefix(t, "mount "):
-			if app.Mount != "" {
-				return nil, &Error{c.Line.No, "a playground mounts exactly one wireframe"}
+			m, err := parseMount(t, c.Line.No)
+			if err != nil {
+				return nil, err
 			}
-			w := strings.TrimSuffix(strings.TrimSpace(t[len("mount "):]), ":")
-			if !isIdent(w) {
-				return nil, &Error{c.Line.No, fmt.Sprintf("invalid wireframe name %q after `mount`", w)}
-			}
-			app.Mount = w
+			app.Mounts = append(app.Mounts, m)
 		default:
-			return nil, &Error{c.Line.No, fmt.Sprintf("unexpected %q in playground; a playground takes `auth`, `theme`, and `mount <Wireframe>`", firstWord(t))}
+			return nil, &Error{c.Line.No, fmt.Sprintf("unexpected %q in playground; a playground takes `auth`, `theme`, and `mount <Wireframe> [at \"/path\"] [requires <policy>]`", firstWord(t))}
 		}
 	}
-	if app.Mount == "" {
+	if len(app.Mounts) == 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("playground %q must `mount <Wireframe>`", name)}
 	}
 	return app, nil
+}
+
+// parseMount parses one screen the playground mounts:
+//
+//	mount Shell                         # one screen at "/"
+//	mount Auth  at "/login"             # at a route
+//	mount Shell at "/" requires member  # at a route, behind a guard
+//
+// `at` (if present) precedes `requires`. A missing path defaults to "/".
+func parseMount(t string, line int) (ast.Mount, error) {
+	rest := strings.TrimSpace(t[len("mount "):])
+	requires := ""
+	if i := strings.Index(rest, " requires "); i >= 0 {
+		requires = strings.TrimSuffix(strings.TrimSpace(rest[i+len(" requires "):]), ":")
+		rest = strings.TrimSpace(rest[:i])
+		if !isIdent(requires) {
+			return ast.Mount{}, &Error{line, fmt.Sprintf("invalid guard policy %q after `requires`", requires)}
+		}
+	}
+	path := "/"
+	if i := strings.Index(rest, " at "); i >= 0 {
+		p, err := unquote(strings.TrimSpace(rest[i+len(" at "):]), line)
+		if err != nil || p == "" {
+			return ast.Mount{}, &Error{line, "mount route must be a quoted path: `mount W at \"/path\"`"}
+		}
+		path = p
+		rest = strings.TrimSpace(rest[:i])
+	}
+	w := strings.TrimSuffix(strings.TrimSpace(rest), ":")
+	if !isIdent(w) {
+		return ast.Mount{}, &Error{line, fmt.Sprintf("invalid wireframe name %q after `mount`", w)}
+	}
+	return ast.Mount{Wireframe: w, Path: path, Requires: requires, Line: line}, nil
 }
 
 // parseWireframe parses `wireframe Name:` — the structural brick. It declares

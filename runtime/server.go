@@ -126,8 +126,13 @@ func newServer(graph *ir.IR) *Server {
 	for i := range graph.Actions {
 		s.byAction[graph.Actions[i].Name] = &graph.Actions[i]
 	}
-	for i := range graph.Bindings {
-		s.byBind[graph.Bindings[i].ID] = &graph.Bindings[i]
+	// Index every page's bindings, not just the entry page's — a multi-screen app
+	// renders binds that live on whichever screen the request hit, so server-side
+	// rendering needs the union across all pages.
+	for pi := range graph.Pages {
+		for i := range graph.Pages[pi].Bindings {
+			s.byBind[graph.Pages[pi].Bindings[i].ID] = &graph.Pages[pi].Bindings[i]
+		}
 	}
 	for i := range graph.Policies {
 		s.byPolicy[graph.Policies[i].Name] = &graph.Policies[i]
@@ -357,15 +362,22 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Route guard: a zero-arg policy the authority enforces before rendering. A
-	// failing guard refuses the page outright — the client also hides links to it,
-	// but the server is the enforcement point.
-	if pg.Requires != "" {
-		if pol := s.byPolicy[pg.Requires]; pol == nil || !truthy(eval(pol.Expr, store)) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusForbidden)
-			fmt.Fprintf(w, guardedPage, html.EscapeString(s.ir.App))
-			return
+	// failing guard refuses the page — the client also hides links to it, but the
+	// server is the enforcement point. For a composed screen, a failure isn't a
+	// dead end: the actor is redirected to the first screen they may enter (a guest
+	// at "/" lands on the login screen; a member at "/login" lands on home), so the
+	// auth state routes between screens without any redirect code in the app.
+	if pg.Requires != "" && !s.guardOK(pg.Requires, store) {
+		if pg.Screen {
+			if to := s.firstEnterableScreen(pg.Path, store); to != "" {
+				http.Redirect(w, r, to, http.StatusFound)
+				return
+			}
 		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, guardedPage, html.EscapeString(s.ir.App))
+		return
 	}
 
 	var body strings.Builder
@@ -392,6 +404,28 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 		dev = devScript
 	}
 	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), csrfToken(sid), themeCSS(s.ir.Theme), body.String(), irJSON, stateJSON, dev)
+}
+
+// guardOK evaluates a zero-arg guard policy against the current store.
+func (s *Server) guardOK(policy string, store map[string]any) bool {
+	pol := s.byPolicy[policy]
+	return pol != nil && truthy(eval(pol.Expr, store))
+}
+
+// firstEnterableScreen returns the path of the first composed screen (other than
+// exceptPath) whose guard the current actor satisfies, or "" if none. It is how a
+// failed screen guard finds where to send the actor instead of a dead end.
+func (s *Server) firstEnterableScreen(exceptPath string, store map[string]any) string {
+	for i := range s.ir.Pages {
+		p := &s.ir.Pages[i]
+		if !p.Screen || p.Path == exceptPath {
+			continue
+		}
+		if p.Requires == "" || s.guardOK(p.Requires, store) {
+			return p.Path
+		}
+	}
+	return ""
 }
 
 // pageFor returns the page whose route matches path, plus the bound `:param`

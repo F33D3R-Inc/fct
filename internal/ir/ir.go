@@ -42,6 +42,7 @@ type Page struct {
 	Path     string              `json:"path"`
 	Params   []string            `json:"params,omitempty"`
 	Requires string              `json:"requires,omitempty"`
+	Screen   bool                `json:"screen,omitempty"` // a composed playground screen: a failing guard redirects to the first enterable screen, not a dead end
 	View     []Node              `json:"view"`
 	Bindings []Binding           `json:"bindings"`
 	DepGraph map[string][]string `json:"depGraph"`
