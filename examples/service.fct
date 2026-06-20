@@ -1,12 +1,38 @@
+# Services — fct as the edge brain that talks to the mesh. Two call forms:
+#   - fire-and-forget: `call Moderation.review(body)` (a side effect, no result)
+#   - request→response: `let v = call Moderation.score(body)` binds the brain's
+#     typed answer back into the action, where it's assigned into authoritative
+#     state and so reaches the client. Both are egress, so both run on the server.
+#
+# Run a mock brain alongside it: `python3 examples/services/mock_brain.py`
+# then `facet dev examples/service.fct` and click Refresh / post a note.
 app SvcDemo:
+    auth
     entity Note:
         id: int
         body: text
+        score: int
     service Moderation at "http://localhost:9099":
         review(body: text)
+        score(body: text) -> int
+    service Wallet at "http://localhost:9099":
+        balance(user: text) -> int
+
+    state balance: int = 0
+
     action post(body: text):
-        add Note { body: body }
+        let s = call Moderation.score(body)
+        add Note { body: body, score: s }
         call Moderation.review(body)
+    action refresh():
+        let b = call Wallet.balance(actor)
+        balance = b
+
     view Home at "/":
         box:
-            text "service demo"
+            text "Balance: {balance} µAET"
+            button "Refresh balance" -> refresh
+            for n in Note by id desc limit 20:
+                row:
+                    text "{n.body}"
+                    badge "score {n.score}"

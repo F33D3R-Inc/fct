@@ -35,7 +35,14 @@ type env struct {
 	compDeps     map[string]map[string]bool   // component name -> the state/entity names its body reads (for use-site refresh)
 	stateTypes   map[string]string            // state name -> its (core/element) type, for enum-defaulted selects
 	services     map[string]map[string]int    // service name -> op name -> parameter count, for checking `call`
+	serviceRets  map[string]map[string]opRet  // service name -> op name -> return type, for binding `let x = call …`
 	entFieldEnum map[string]map[string]string // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
+}
+
+// opRet is a service operation's declared return type ("" core = no return).
+type opRet struct {
+	ret  string
+	list bool
 }
 
 // markIndex records that entity.field is filtered, ordered, or a relation, so the
@@ -64,7 +71,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}, entFieldEnum: map[string]map[string]string{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, entFieldEnum: map[string]map[string]string{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -300,19 +307,22 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{sv.Line, fmt.Sprintf("service %q redeclared", sv.Name)}
 		}
 		ops := map[string]int{}
+		rets := map[string]opRet{}
 		irsv := Service{Name: sv.Name, URL: sv.URL}
 		for _, op := range sv.Ops {
 			if _, dup := ops[op.Name]; dup {
 				return nil, &BuildError{op.Line, fmt.Sprintf("service %q declares operation %q twice", sv.Name, op.Name)}
 			}
 			ops[op.Name] = len(op.Params)
+			rets[op.Name] = opRet{ret: op.Ret, list: op.RetList}
 			var pnames []string
 			for _, p := range op.Params {
 				pnames = append(pnames, p.Name)
 			}
-			irsv.Ops = append(irsv.Ops, ServiceOp{Name: op.Name, Params: pnames})
+			irsv.Ops = append(irsv.Ops, ServiceOp{Name: op.Name, Params: pnames, Ret: op.Ret, RetList: op.RetList})
 		}
 		e.services[sv.Name] = ops
+		e.serviceRets[sv.Name] = rets
 		out.Services = append(out.Services, irsv)
 	}
 
@@ -787,6 +797,21 @@ func (e *env) action(a *ast.Action) (Action, error) {
 					return Action{}, err
 				}
 				cs.Args = append(cs.Args, e.low(arg))
+			}
+			// Request→response: `let x = call …` binds the typed result into a local
+			// so the rest of the body can use it (e.g. assign it into a state cell).
+			if st.Bind != "" {
+				ret := e.serviceRets[st.Service][st.Op]
+				if ret.ret == "" {
+					return Action{}, &BuildError{st.Line, fmt.Sprintf("%s.%s returns nothing — declare a return type (`%s(…) -> Type`) to bind it", st.Service, st.Op, st.Op)}
+				}
+				if loc[st.Bind] {
+					return Action{}, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
+				}
+				loc[st.Bind] = true // visible to the rest of the action body
+				cs.Bind = st.Bind
+				cs.Ret = ret.ret
+				cs.RetList = ret.list
 			}
 			act.Body = append(act.Body, cs)
 		}

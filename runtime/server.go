@@ -435,6 +435,61 @@ func (s *Server) callService(baseURL, op string, body map[string]any) {
 	}()
 }
 
+// callServiceSync is the request→response form behind `let x = call …`: it posts
+// the arguments and waits for the brain's typed answer, decoding the JSON reply.
+// The reply may be a bare JSON value (`[1,2,3]`, `42`) or an object wrapping it in
+// a `result` field (`{"result": …}`); both are accepted. A non-2xx or transport
+// failure is an error, which aborts the action. (The action holds the store lock
+// for the round-trip, so a bound brain should answer fast — it is the authority's
+// egress, on localhost in the mesh.)
+func (s *Server) callServiceSync(baseURL, op string, body map[string]any) (any, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := strings.TrimRight(baseURL, "/") + "/" + op
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(endpoint, "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("%s returned %d", endpoint, resp.StatusCode)
+	}
+	var decoded any
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, err
+	}
+	// Unwrap a {"result": …} envelope if present; otherwise use the value as-is.
+	if obj, ok := decoded.(map[string]any); ok {
+		if v, has := obj["result"]; has {
+			return v, nil
+		}
+	}
+	return decoded, nil
+}
+
+// coerceRet coerces a decoded service result to its declared return type — a
+// scalar via coerce, or each element of a list.
+func coerceRet(v any, ret string, list bool) any {
+	if !list {
+		return coerce(v, ret)
+	}
+	items, ok := v.([]any)
+	if !ok {
+		if v == nil {
+			return []any{}
+		}
+		items = []any{v} // a lone value where a list was declared — wrap it
+	}
+	out := make([]any, len(items))
+	for i, it := range items {
+		out[i] = coerce(it, ret)
+	}
+	return out
+}
+
 // guardOK evaluates a zero-arg guard policy against the current store.
 func (s *Server) guardOK(policy string, store map[string]any) bool {
 	pol := s.byPolicy[policy]
@@ -751,7 +806,7 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 		case "call":
 			// An external-service effect. The compiler proved this action is
 			// server-placed, so we are on the authority — post the named arguments
-			// to the brain, fire-and-forget.
+			// to the brain.
 			if sv := s.byService[st.Service]; sv != nil {
 				var params []string
 				for _, op := range sv.Ops {
@@ -768,7 +823,19 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 					}
 					body[key] = eval(arg, scope)
 				}
-				s.callService(sv.URL, st.Field, body)
+				if st.Bind != "" {
+					// Request→response: wait for the brain's typed answer and bind it
+					// into scope so the rest of the body can use it. A failed call
+					// aborts the action (surfaces via failed(<action>)).
+					res, err := s.callServiceSync(sv.URL, st.Field, body)
+					if err != nil {
+						s.obs.metrics.observeAction(act.Name, "service_error")
+						return nil, http.StatusBadGateway, fmt.Sprintf("%s.%s unavailable", st.Service, st.Field)
+					}
+					scope[st.Bind] = coerceRet(res, st.Ret, st.RetList)
+				} else {
+					s.callService(sv.URL, st.Field, body) // fire-and-forget
+				}
 			}
 		}
 		// keep entity collections in scope fresh for later statements.

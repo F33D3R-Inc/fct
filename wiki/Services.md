@@ -38,23 +38,58 @@ POST http://moderation:8090/review
 {"id": 42, "body": "…"}
 ```
 
-The call is **fire-and-forget**: a side effect that never blocks the action's
-response. If the service is down, the action still succeeds; the failure is
-logged, not surfaced. (Request→response calls that bind a result into the graph
-are the next step.)
+A plain `call` is **fire-and-forget**: a side effect that never blocks the
+action's response. If the service is down, the action still succeeds; the failure
+is logged, not surfaced.
+
+## Request → response — binding the answer back
+
+Declare a typed **return** on an operation and bind its result with `let`:
+
+```
+service AethyrRank at "http://aethyrrank:8080":
+    rank(viewer: text, posts: [int]) -> [int]   # a list return
+service Wallet at "http://ain-soph:8089":
+    balance(user: text) -> int                  # a scalar return
+
+state balance: int = 0
+
+action refresh():
+    let b = call Wallet.balance(actor)          # wait for the brain's answer
+    balance = b                                 # …and surface it as authoritative state
+```
+
+The bound name (`b`) is a local the rest of the action body can use — assign it
+into a **server** state cell (it reaches every client as a delta), store it in an
+entity field, or feed it to a `check`. Because the result is the authority's, it
+must land in authoritative (server) state, never `@client`.
+
+The brain replies with JSON: either a bare value (`42`, `[3,1,2]`) or a
+`{"result": …}` envelope — both are decoded and coerced to the declared return
+type. A transport error or non-2xx **aborts the action** (surfaced via
+`failed(<action>)`), so a down brain fails the action instead of lying. The call
+is synchronous, so keep bound brains fast — it's the authority's egress, on the
+mesh.
+
+A list operation parameter (`posts: [int]`) is allowed on services (unlike action
+params), so the keystone shapes — rank a batch of ids, price a cart — are
+expressible.
 
 ## Grammar
 
 ```
 service <Name> at "<http(s)-url>":
-    <op>(<param>: <Type>, …)
+    <op>(<param>: <Type>, …)            # fire-and-forget
+    <op>(<param>: <Type>, …) -> <Type>  # request→response (bind with `let`)
     …
 ```
 
 - `<Name>` is referenced as `call <Name>.<op>(args)` inside an action body.
+- `let <name> = call <Name>.<op>(args)` binds an op's typed return.
 - The URL must be `http://` or `https://`.
-- Operations are typed signatures, like an action's — the parameter names become
-  the JSON keys sent.
+- Operations are typed signatures — the parameter names become the JSON keys
+  sent; a param may be a list (`[T]`); the optional `-> Type` (or `-> [Type]`) is
+  the bound return.
 
 A runnable demo is in `examples/service.fct`.
 

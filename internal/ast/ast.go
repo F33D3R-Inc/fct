@@ -205,21 +205,29 @@ type Service struct {
 	Line int
 }
 
-// ServiceOp is one operation a service exposes — a name and typed parameters,
-// forming the contract the compiler checks each `call` against.
+// ServiceOp is one operation a service exposes — a name, typed parameters, and an
+// optional typed return (`rank(posts: [int]) -> [int]`). Together they form the
+// contract the compiler checks each `call` against. An op with no `-> T` is
+// fire-and-forget; one with a return can be bound back with `let x = call …`.
 type ServiceOp struct {
-	Name   string
-	Params []Param
-	Line   int
+	Name    string
+	Params  []Param
+	Ret     string // return type core ("" = no return; fire-and-forget only)
+	RetList bool   // the return is a list of Ret (`-> [T]`)
+	Line    int
 }
 
-// ServiceCall invokes a service operation from an action: `call Zodacare.report(
-// id, body)`. It is fire-and-forget — a side effect, no return value — and
-// effectful, so it pins its action to the server authority.
+// ServiceCall invokes a service operation from an action. Two forms, both
+// effectful (egress) so both pin the action to the server authority:
+//   - fire-and-forget: `call Zodacare.report(id, body)` — a side effect, no result.
+//   - request→response: `let verdict = call Verity.check(id)` — Bind names the local
+//     the typed result lands in, usable by the rest of the action body (e.g. assign
+//     it into a state cell so it reaches the client).
 type ServiceCall struct {
 	Service string
 	Op      string
 	Args    []Expr
+	Bind    string // request→response: local the result binds to ("" = fire-and-forget)
 	Line    int
 }
 
@@ -246,6 +254,7 @@ type Require struct {
 type Param struct {
 	Name     string
 	Type     string
+	List     bool // a `[T]` parameter (service operations only)
 	Optional bool
 }
 

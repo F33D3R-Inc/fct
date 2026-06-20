@@ -10,6 +10,52 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 12 — 2026-06-20 — F33D3R depth #1: request→response service calls → released v1.18.0
+
+**Direction shift (with the user):** forget the X-clone as driver — the real target
+is rebuilding **f33d3r.com**, a multi-brain platform (~18 Rust/Go/Python services:
+AethyrRank, Vovin, Ain Soph, Verity, Thessalon, Caeor, …). Key reframe: **fct is
+Nantar** — the sole edge brain that serves HTML and proxies to the mesh. fct does
+NOT reimplement the brains; it must be a typed, leak-proof **client** of them. So
+the 18 brains collapse to one language feature used 18 times: *call a brain and bind
+its typed answer back.* That's roadmap Next #1, and the keystone for the rebuild.
+(E2E messaging decided separately: fct will own a typed `@e2e` sealed-field
+**dataflow** contract — plaintext/keys never cross to the server — and delegate the
+actual ratchet/AES to the audited Vovin/libsignal SDK. CIA triad + "don't roll your
+own crypto" all point to delegation. That's phase 5, not now.)
+
+**Shipped + released v1.18.0 — request→response service calls:**
+- **Typed returns** on ops: `rank(viewer: text, posts: [int]) -> [int]`, `balance(user: text) -> int`. List params now allowed on service ops (not actions) for the keystone batch shapes.
+- **Bind:** `let x = call Service.op(args)` binds the typed answer into a local the
+  rest of the action body uses — assign into **server** state (→ delta to every
+  client), into an entity field, or a `check`. (Assigning a brain answer into
+  `@client` is a soundness error — the answer is authoritative, lives on the server.)
+- **Placement unchanged:** a bound call is still egress → server-placed; only
+  explicitly-assigned values cross back, so soundness holds across the brain boundary.
+- **Runtime:** synchronous POST → decode JSON (`{"result": …}` envelope OR bare
+  value) → coerce to the declared type → bind. Transport/non-2xx **aborts the action**
+  (502 → surfaces via `failed(<action>)`), so a down brain fails honestly.
+- Surface: ast (ServiceOp.Ret/RetList, ServiceCall.Bind, Param.List), parser
+  (`-> Type` on ops, `let x = call …`, parseSignature allowList for service list
+  params), ir (ServiceOp.Ret/RetList, Stmt.Bind/Ret/RetList, opRet lookup + bind
+  scope), runtime (callServiceSync + coerceRet + the bound `call` case).
+- Tests: `internal/compile/service_test.go` (typed-return IR + bind stmt + placement
+  + bind/let errors), `runtime/service_test.go` (full round-trip vs a fake brain:
+  21→42 into state, 500→502 abort, coerceRet scalar/list/wrap/null).
+- Verified e2e through the rebuilt binary: `examples/service.fct` +
+  `examples/services/mock_brain.py` — `refresh` binds Wallet.balance → `balance:
+  1500000`; `post` binds Moderation.score("hello brain")=11 into the new row.
+- Docs: ROADMAP (request→response ✅), wiki/Services.md (the new form). version -> **1.18.0**.
+
+**Next F33D3R depth (ordered):** (2) pluggable identity / PIAL — custom auth provider
++ server-only/non-renderable value placement (UUID uncompilable to render); mostly
+#1 + two things. (3) webhooks/non-cron triggers. (4) media handoff: signed/expiring
+URLs + HLS + chunked upload. (5) design-system control + page metadata + field-level
+authz + overlays/typeahead. (phase) `@e2e` crypto capability. Typed **records** for
+structured brain payloads is the fast-follow to #1.
+
+---
+
 ## Sprint 11 — 2026-06-20 — item 6 finished: two language gaps closed + the f33d3r core library → released v1.17.0
 
 **The cycle, end to end:** the library (Sprint 10) surfaced two language walls; this

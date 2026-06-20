@@ -462,7 +462,7 @@ func parseEnum(n *source.Node) (*ast.Enum, error) {
 // parseComponent: `component Name(params):` then a node tree.
 func parseComponent(n *source.Node) (*ast.Component, error) {
 	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "component")), ":")
-	name, params, err := parseSignature(head, n.Line.No)
+	name, params, err := parseSignature(head, n.Line.No, false)
 	if err != nil {
 		return nil, err
 	}
@@ -648,7 +648,7 @@ func parseDerive(n *source.Node) (*ast.Derive, error) {
 func parsePolicy(n *source.Node) (*ast.Policy, error) {
 	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "policy")), ":")
 	// A policy may declare parameters for row-level checks: `policy owns(id: int):`.
-	name, params, err := parseSignature(head, n.Line.No)
+	name, params, err := parseSignature(head, n.Line.No, false)
 	if err != nil {
 		return nil, err
 	}
@@ -671,7 +671,7 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		optimistic = true
 		head = strings.TrimSpace(strings.TrimSuffix(head, "@optimistic"))
 	}
-	name, params, err := parseSignature(head, n.Line.No)
+	name, params, err := parseSignature(head, n.Line.No, false)
 	if err != nil {
 		return nil, err
 	}
@@ -724,6 +724,27 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 				return nil, err
 			}
 			a.Body = append(a.Body, cl)
+		case strings.HasPrefix(t, "let "):
+			// Request→response bind: `let name = call Service.op(args)`.
+			rest := strings.TrimSpace(t[len("let "):])
+			eq := strings.IndexByte(rest, '=')
+			if eq < 0 {
+				return nil, &Error{c.Line.No, "let needs `let name = call Service.op(args)`"}
+			}
+			name := strings.TrimSpace(rest[:eq])
+			if !isIdent(name) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid let binding %q", name)}
+			}
+			rhs := strings.TrimSpace(rest[eq+1:])
+			if !strings.HasPrefix(rhs, "call ") {
+				return nil, &Error{c.Line.No, "let binds a service call: `let name = call Service.op(args)`"}
+			}
+			cl, err := parseCall(strings.TrimSpace(rhs[len("call "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			cl.Bind = name
+			a.Body = append(a.Body, cl)
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {
@@ -767,11 +788,24 @@ func parseService(n *source.Node) (*ast.Service, error) {
 	}
 	sv := &ast.Service{Name: name, URL: url, Line: n.Line.No}
 	for _, c := range n.Children {
-		opName, params, err := parseSignature(strings.TrimSpace(c.Line.Text), c.Line.No)
+		// An op may declare a typed return: `op(params) -> Type` or `-> [Type]`.
+		head := strings.TrimSpace(c.Line.Text)
+		var ret string
+		var retList bool
+		if arrow := strings.Index(head, "->"); arrow >= 0 {
+			rt := strings.TrimSpace(head[arrow+2:])
+			head = strings.TrimSpace(head[:arrow])
+			core, list, optional := splitType(rt)
+			if optional || !isTypeName(core) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid return type %q", rt)}
+			}
+			ret, retList = core, list
+		}
+		opName, params, err := parseSignature(head, c.Line.No, true)
 		if err != nil {
 			return nil, err
 		}
-		sv.Ops = append(sv.Ops, ast.ServiceOp{Name: opName, Params: params, Line: c.Line.No})
+		sv.Ops = append(sv.Ops, ast.ServiceOp{Name: opName, Params: params, Ret: ret, RetList: retList, Line: c.Line.No})
 	}
 	if len(sv.Ops) == 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("service %q declares no operations", name)}
@@ -948,7 +982,10 @@ func parseDuration(s string, line int) (int, error) {
 	}
 }
 
-func parseSignature(head string, line int) (string, []ast.Param, error) {
+// parseSignature parses `name(p: T, ...)`. allowList permits list-typed params
+// (`p: [T]`) — used for service operations, whose ops genuinely take collections
+// (`rank(posts: [int])`); action/component/policy params stay scalar.
+func parseSignature(head string, line int, allowList bool) (string, []ast.Param, error) {
 	open := strings.IndexByte(head, '(')
 	if open < 0 {
 		if !isIdent(head) {
@@ -975,13 +1012,13 @@ func parseSignature(head string, line int) (string, []ast.Param, error) {
 			pn := strings.TrimSpace(p[:colon])
 			pt := strings.TrimSpace(p[colon+1:])
 			core, list, optional := splitType(pt)
-			if list {
+			if list && !allowList {
 				return "", nil, &Error{line, fmt.Sprintf("parameter %q cannot be a list", pn)}
 			}
 			if !isIdent(pn) || !isTypeName(core) {
 				return "", nil, &Error{line, fmt.Sprintf("invalid parameter %q", strings.TrimSpace(p))}
 			}
-			params = append(params, ast.Param{Name: pn, Type: core, Optional: optional})
+			params = append(params, ast.Param{Name: pn, Type: core, List: list, Optional: optional})
 		}
 	}
 	return name, params, nil

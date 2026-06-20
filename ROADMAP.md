@@ -194,8 +194,8 @@ deliberately decided against it — the goal is to build a site, not a language.
 | `requires` policies, `check` preconditions | ✅ | |
 | `@optimistic` | ✅ | |
 | jobs: cron + on-start, durable queue, retry/backoff/dead-letter | ✅ | |
-| service calls (external "brains" over HTTP, typed contract) | 🟡 | **fire-and-forget only** |
-| **request→response service calls** (bind a result back) | ⬜ | **Next, #1** — the identified next wall |
+| service calls (external "brains" over HTTP, typed contract) | ✅ | fire-and-forget **and** request→response |
+| **request→response service calls** (bind a result back) | ✅ | **shipped v1.18.0** — `op(...) -> T`; `let x = call S.op(...)` binds the typed answer (scalar or list) into the action; list params allowed; failure aborts via `failed(...)` |
 | **first-class typed effects / capability system** | ⬜ | **Next, keystone** — see below |
 | idempotency keys / replay protection | ⬜ | Next |
 | compensation / saga / multi-step workflows | ⬜ | Later |
@@ -327,7 +327,7 @@ as queries/jobs, streaming-output UI primitives.
 ## The rings, in order
 
 ### Next (v2) — the smallest set that makes Facet "express any app"
-1. **Request→response service calls** — bind a brain's result back into an action (the current wall).
+1. ✅ **Request→response service calls** — bind a brain's result back into an action (shipped v1.18.0). This is the keystone for the F33D3R rebuild: fct is the edge brain (Nantar), a typed client of the mesh (AethyrRank/Ain Soph/Verity/Astraon/…). Next: typed records for structured payloads (today: scalars + lists).
 2. **The effects/capability system** — the keystone; generalizes services/jobs/impurity; unlocks email/push/queue.
 3. **Sum types + pattern matching + scoped generics** — variants, state machines, typed errors, generic components.
 4. **Typed error hierarchy** (rides #3).

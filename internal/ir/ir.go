@@ -187,11 +187,13 @@ type Service struct {
 	Ops  []ServiceOp `json:"ops"`
 }
 
-// ServiceOp is one operation: its name and parameter names (the JSON keys a call
-// sends).
+// ServiceOp is one operation: its name, parameter names (the JSON keys a call
+// sends), and an optional typed return (decoded back when a `let` binds it).
 type ServiceOp struct {
-	Name   string   `json:"name"`
-	Params []string `json:"params,omitempty"`
+	Name    string   `json:"name"`
+	Params  []string `json:"params,omitempty"`
+	Ret     string   `json:"ret,omitempty"`     // return type core ("" = no return)
+	RetList bool     `json:"retList,omitempty"` // the return is a list of Ret
 }
 
 // Stmt is one action statement. Op ∈ assign | add | set | remove | clear | call.
@@ -207,6 +209,9 @@ type Stmt struct {
 	Args    []*Expr     `json:"args,omitempty"`    // call: the operation arguments
 	Var     string      `json:"var,omitempty"`     // remove (filtered): item variable
 	Where   *Expr       `json:"where,omitempty"`   // remove (filtered): predicate (nil = by-id)
+	Bind    string      `json:"bind,omitempty"`    // call (request→response): local the result binds to
+	Ret     string      `json:"ret,omitempty"`     // call (request→response): result type core, for decode/coerce
+	RetList bool        `json:"retList,omitempty"` // call (request→response): result is a list of Ret
 }
 
 // FieldInit is a `name: expr` in an `add`.
