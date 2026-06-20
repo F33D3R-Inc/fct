@@ -141,6 +141,15 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.9.0 — services (external brains).** An action can `call` an external service
+over HTTP with a compiler-checked contract: `service Moderation at "…": review(id:
+int, body: text)` then `call Moderation.review(id, body)`. A call is an *effect*,
+so it pins the action to the server authority — a client can never reach a brain
+directly — and unknown service/op/arg-count are compile errors (a schema registry
+in the language). Fire-and-forget for now; request→response is next. This is the
+first of the F33D3R "pillars" the language needs. See [Services](wiki/Services.md)
+and `examples/service.fct`.
+
 **v1.8.0 — interpolated labels + `image`.** Button labels now interpolate
 (`button "♥ {t.likes}" -> like(t.id)`), so a count sits in the control, and a new
 `image "…/avatar?seed={t.author}"` node renders media/avatars — both fell out of

@@ -34,6 +34,7 @@ type env struct {
 	components   map[string][]Param         // component name -> its parameters
 	compDeps     map[string]map[string]bool // component name -> the state/entity names its body reads (for use-site refresh)
 	stateTypes   map[string]string          // state name -> its (core/element) type, for enum-defaulted selects
+	services     map[string]map[string]int  // service name -> op name -> parameter count, for checking `call`
 }
 
 // markIndex records that entity.field is filtered, ordered, or a relation, so the
@@ -62,7 +63,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -283,6 +284,31 @@ func Build(app *ast.App) (*IR, error) {
 		}
 		e.compDeps[cm.Name] = deps
 		out.Components = append(out.Components, Component{Name: cm.Name, Params: irParams(cm.Params), View: nodes})
+	}
+
+	// 3d′. Services: external brains an action may `call`. Each op's parameter
+	// count is recorded so a call site is checked at compile time; the URL + param
+	// names flow to the runtime, which posts to them. A call is an effect, so it
+	// pins its action to the server — never reachable directly from a client.
+	for _, sv := range app.Services {
+		if _, dup := e.services[sv.Name]; dup {
+			return nil, &BuildError{sv.Line, fmt.Sprintf("service %q redeclared", sv.Name)}
+		}
+		ops := map[string]int{}
+		irsv := Service{Name: sv.Name, URL: sv.URL}
+		for _, op := range sv.Ops {
+			if _, dup := ops[op.Name]; dup {
+				return nil, &BuildError{op.Line, fmt.Sprintf("service %q declares operation %q twice", sv.Name, op.Name)}
+			}
+			ops[op.Name] = len(op.Params)
+			var pnames []string
+			for _, p := range op.Params {
+				pnames = append(pnames, p.Name)
+			}
+			irsv.Ops = append(irsv.Ops, ServiceOp{Name: op.Name, Params: pnames})
+		}
+		e.services[sv.Name] = ops
+		out.Services = append(out.Services, irsv)
 	}
 
 	// 3e. Layouts: page chrome with one `slot` where the routed view is injected.
@@ -647,6 +673,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	entWrite := false           // any entity mutation
 	reads := map[string]bool{}  // state names read (for soundness)
 	impure := false             // uses an effectful builtin (now/rand)
+	callsService := false       // calls an external service (an effect)
 
 	readExpr := func(ex ast.Expr, line int) error {
 		if err := e.check(ex, loc, line); err != nil {
@@ -717,6 +744,27 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			}
 			entWrite = true
 			act.Body = append(act.Body, Stmt{Op: "clear", Entity: st.Entity})
+		case ast.ServiceCall:
+			ops, ok := e.services[st.Service]
+			if !ok {
+				return Action{}, &BuildError{st.Line, fmt.Sprintf("call to unknown service %q", st.Service)}
+			}
+			argc, ok := ops[st.Op]
+			if !ok {
+				return Action{}, &BuildError{st.Line, fmt.Sprintf("service %q has no operation %q", st.Service, st.Op)}
+			}
+			if len(st.Args) != argc {
+				return Action{}, &BuildError{st.Line, fmt.Sprintf("%s.%s expects %d argument(s), got %d", st.Service, st.Op, argc, len(st.Args))}
+			}
+			callsService = true
+			cs := Stmt{Op: "call", Service: st.Service, Field: st.Op}
+			for _, arg := range st.Args {
+				if err := readExpr(arg, st.Line); err != nil {
+					return Action{}, err
+				}
+				cs.Args = append(cs.Args, e.low(arg))
+			}
+			act.Body = append(act.Body, cs)
 		}
 	}
 
@@ -724,7 +772,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	// effectful builtin (now/rand) is nondeterministic, so the authority must run
 	// it — that way every client sees one agreed result, not its own.
 	act.Placement = Client
-	if entWrite || impure {
+	if entWrite || impure || callsService {
 		act.Placement = Server
 	}
 	for w := range writes {

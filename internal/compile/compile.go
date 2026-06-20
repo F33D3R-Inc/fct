@@ -144,6 +144,7 @@ func mergeInto(dst, src *ast.App) {
 	dst.Components = append(dst.Components, src.Components...)
 	dst.Layouts = append(dst.Layouts, src.Layouts...)
 	dst.Views = append(dst.Views, src.Views...)
+	dst.Services = append(dst.Services, src.Services...)
 	dst.Theme = append(dst.Theme, src.Theme...)
 }
 

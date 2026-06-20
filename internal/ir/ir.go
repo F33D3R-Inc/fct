@@ -22,6 +22,7 @@ type IR struct {
 	Actions    []Action          `json:"actions"`
 	Jobs       []Job             `json:"jobs"`
 	Components []Component       `json:"components,omitempty"` // reusable view fragments
+	Services   []Service         `json:"services,omitempty"`   // external services (brains) actions may call
 	Theme      map[string]string `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
 	Routes     []Route           `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
 	Pages      []Page            `json:"pages"`                // one per view; each is a route
@@ -177,15 +178,32 @@ type Job struct {
 	OnStart bool   `json:"onStart,omitempty"`
 }
 
-// Stmt is one action statement. Op ∈ assign | add | set | remove | clear.
+// Service is an external service the runtime may call: a base URL and its typed
+// operations. A `call` statement posts to URL + "/" + op with the named arguments.
+type Service struct {
+	Name string      `json:"name"`
+	URL  string      `json:"url"`
+	Ops  []ServiceOp `json:"ops"`
+}
+
+// ServiceOp is one operation: its name and parameter names (the JSON keys a call
+// sends).
+type ServiceOp struct {
+	Name   string   `json:"name"`
+	Params []string `json:"params,omitempty"`
+}
+
+// Stmt is one action statement. Op ∈ assign | add | set | remove | clear | call.
 type Stmt struct {
-	Op     string      `json:"op"`
-	Target string      `json:"target,omitempty"` // assign
-	Entity string      `json:"entity,omitempty"` // add/set/remove/clear
-	Field  string      `json:"field,omitempty"`  // set
-	Key    *Expr       `json:"key,omitempty"`    // set/remove
-	Value  *Expr       `json:"value,omitempty"`  // assign/set
-	Fields []FieldInit `json:"fields,omitempty"` // add
+	Op      string      `json:"op"`
+	Target  string      `json:"target,omitempty"`  // assign
+	Entity  string      `json:"entity,omitempty"`  // add/set/remove/clear
+	Field   string      `json:"field,omitempty"`   // set; for a call, the operation name
+	Key     *Expr       `json:"key,omitempty"`     // set/remove
+	Value   *Expr       `json:"value,omitempty"`   // assign/set
+	Fields  []FieldInit `json:"fields,omitempty"`  // add
+	Service string      `json:"service,omitempty"` // call: the service name
+	Args    []*Expr     `json:"args,omitempty"`    // call: the operation arguments
 }
 
 // FieldInit is a `name: expr` in an `add`.

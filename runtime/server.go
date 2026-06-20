@@ -33,6 +33,7 @@ type Server struct {
 	byBind      map[string]*ir.Binding
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
+	byService   map[string]*ir.Service
 	uploadDir   string // directory uploaded files are written to and served from
 	store       Store
 	children    map[string][]childRef // entity -> the relations that point at it (for cascade)
@@ -111,6 +112,7 @@ func newServer(graph *ir.IR) *Server {
 		byBind:      map[string]*ir.Binding{},
 		byPolicy:    map[string]*ir.Policy{},
 		byComponent: map[string]*ir.Component{},
+		byService:   map[string]*ir.Service{},
 		uploadDir:   uploadDirFromEnv(),
 		entities:    map[string][]any{},
 		nextID:      map[string]int{},
@@ -136,6 +138,9 @@ func newServer(graph *ir.IR) *Server {
 	}
 	for i := range graph.Policies {
 		s.byPolicy[graph.Policies[i].Name] = &graph.Policies[i]
+	}
+	for i := range graph.Services {
+		s.byService[graph.Services[i].Name] = &graph.Services[i]
 	}
 	for i := range graph.Components {
 		s.byComponent[graph.Components[i].Name] = &graph.Components[i]
@@ -404,6 +409,30 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 		dev = devScript
 	}
 	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), csrfToken(sid), themeCSS(s.ir.Theme), body.String(), irJSON, stateJSON, dev)
+}
+
+// callService posts a service operation's arguments as JSON to an external brain,
+// fire-and-forget: a `call` is a side effect, so it never blocks the action's
+// response. Failures are logged, not surfaced — the authority did its part. The
+// only egress is to the URLs declared in `service` blocks.
+func (s *Server) callService(baseURL, op string, body map[string]any) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return
+	}
+	endpoint := strings.TrimRight(baseURL, "/") + "/" + op
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Post(endpoint, "application/json", strings.NewReader(string(payload)))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "facet: service call %s failed: %v\n", endpoint, err)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			fmt.Fprintf(os.Stderr, "facet: service call %s returned %d\n", endpoint, resp.StatusCode)
+		}
+	}()
 }
 
 // guardOK evaluates a zero-arg guard policy against the current store.
@@ -685,6 +714,28 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 			ops = append(ops, durOp{kind: "clear", entity: st.Entity})
 			entChanged[st.Entity] = true
 			s.cascadeMem(st.Entity, removed, entChanged)
+		case "call":
+			// An external-service effect. The compiler proved this action is
+			// server-placed, so we are on the authority — post the named arguments
+			// to the brain, fire-and-forget.
+			if sv := s.byService[st.Service]; sv != nil {
+				var params []string
+				for _, op := range sv.Ops {
+					if op.Name == st.Field {
+						params = op.Params
+						break
+					}
+				}
+				body := map[string]any{}
+				for i, arg := range st.Args {
+					key := fmt.Sprintf("arg%d", i)
+					if i < len(params) {
+						key = params[i]
+					}
+					body[key] = eval(arg, scope)
+				}
+				s.callService(sv.URL, st.Field, body)
+			}
 		}
 		// keep entity collections in scope fresh for later statements.
 		for ent := range entChanged {

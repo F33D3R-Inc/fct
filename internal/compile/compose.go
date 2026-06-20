@@ -114,6 +114,7 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.Jobs = append(app.Jobs, b.Jobs...)
 		app.Components = append(app.Components, b.Components...)
 		app.Layouts = append(app.Layouts, b.Layouts...)
+		app.Services = append(app.Services, b.Services...)
 		app.Theme = append(app.Theme, b.Theme...)
 		for _, p := range b.Policies {
 			knownPolicy[p.Name] = len(p.Params)

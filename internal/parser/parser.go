@@ -166,6 +166,11 @@ func parseDecl(app *ast.App, c *source.Node) error {
 		if j, err = parseJob(c); err == nil {
 			app.Jobs = append(app.Jobs, j)
 		}
+	case strings.HasPrefix(c.Line.Text, "service "):
+		var sv *ast.Service
+		if sv, err = parseService(c); err == nil {
+			app.Services = append(app.Services, sv)
+		}
 	case strings.HasPrefix(c.Line.Text, "view "):
 		var v *ast.View
 		if v, err = parseView(c); err == nil {
@@ -713,6 +718,12 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 				return nil, &Error{c.Line.No, fmt.Sprintf("invalid entity %q", ent)}
 			}
 			a.Body = append(a.Body, ast.Clear{Entity: ent, Line: c.Line.No})
+		case strings.HasPrefix(t, "call "):
+			cl, err := parseCall(strings.TrimSpace(t[len("call "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			a.Body = append(a.Body, cl)
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {
@@ -733,6 +744,71 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("action %q has no body", name)}
 	}
 	return a, nil
+}
+
+// parseService parses `service Name at "url":` plus a block of typed operation
+// signatures `op(param: Type, ...)`. It is the contract for an external brain.
+func parseService(n *source.Node) (*ast.Service, error) {
+	rest := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "service")), ":")
+	i := strings.Index(rest, " at ")
+	if i < 0 {
+		return nil, &Error{n.Line.No, `service needs a base URL: service Name at "http://host:port"`}
+	}
+	name := strings.TrimSpace(rest[:i])
+	url, err := unquote(strings.TrimSpace(rest[i+len(" at "):]), n.Line.No)
+	if err != nil || url == "" {
+		return nil, &Error{n.Line.No, `service needs a base URL: service Name at "http://host:port"`}
+	}
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid service name %q", name)}
+	}
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return nil, &Error{n.Line.No, fmt.Sprintf("service %q url must start with http:// or https://", name)}
+	}
+	sv := &ast.Service{Name: name, URL: url, Line: n.Line.No}
+	for _, c := range n.Children {
+		opName, params, err := parseSignature(strings.TrimSpace(c.Line.Text), c.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		sv.Ops = append(sv.Ops, ast.ServiceOp{Name: opName, Params: params, Line: c.Line.No})
+	}
+	if len(sv.Ops) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("service %q declares no operations", name)}
+	}
+	return sv, nil
+}
+
+// parseCall parses `Service.op(arg, ...)` — a service call statement in an action.
+func parseCall(s string, line int) (ast.ServiceCall, error) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return ast.ServiceCall{}, &Error{line, "call needs arguments: call Service.op(args)"}
+	}
+	target := strings.TrimSpace(s[:open])
+	dot := strings.IndexByte(target, '.')
+	if dot < 0 {
+		return ast.ServiceCall{}, &Error{line, "call must name a service operation: call Service.op(args)"}
+	}
+	svc, op := strings.TrimSpace(target[:dot]), strings.TrimSpace(target[dot+1:])
+	if !isIdent(svc) || !isIdent(op) {
+		return ast.ServiceCall{}, &Error{line, fmt.Sprintf("invalid service call %q", target)}
+	}
+	closeP := strings.LastIndexByte(s, ')')
+	if closeP < open {
+		return ast.ServiceCall{}, &Error{line, "missing `)` in call"}
+	}
+	cl := ast.ServiceCall{Service: svc, Op: op, Line: line}
+	if inner := strings.TrimSpace(s[open+1 : closeP]); inner != "" {
+		for _, a := range splitTop(inner, ',') {
+			e, err := parseExpr(strings.TrimSpace(a), line)
+			if err != nil {
+				return ast.ServiceCall{}, err
+			}
+			cl.Args = append(cl.Args, e)
+		}
+	}
+	return cl, nil
 }
 
 // parseCheck parses a `check <expr> "message"` clause: a boolean precondition

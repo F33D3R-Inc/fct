@@ -52,6 +52,7 @@ type App struct {
 	Components []*Component
 	Layouts    []*Layout
 	Views      []*View
+	Services   []*Service
 	Theme      []ThemeVar
 	Line       int
 }
@@ -194,6 +195,34 @@ type Action struct {
 	Line       int
 }
 
+// Service is an external service (a "brain") fct can call over HTTP: a base URL
+// and a set of typed operations. Calling one is a server-placed effect, so a
+// client can never reach a service directly — it routes through the authority.
+type Service struct {
+	Name string
+	URL  string
+	Ops  []ServiceOp
+	Line int
+}
+
+// ServiceOp is one operation a service exposes — a name and typed parameters,
+// forming the contract the compiler checks each `call` against.
+type ServiceOp struct {
+	Name   string
+	Params []Param
+	Line   int
+}
+
+// ServiceCall invokes a service operation from an action: `call Zodacare.report(
+// id, body)`. It is fire-and-forget — a side effect, no return value — and
+// effectful, so it pins its action to the server authority.
+type ServiceCall struct {
+	Service string
+	Op      string
+	Args    []Expr
+	Line    int
+}
+
 // Check is one `check <expr> "message"` clause: a precondition over the action's
 // parameters (and actor) the authority evaluates before running the body. A
 // failing check aborts the action and returns its friendly message, so invalid
@@ -280,11 +309,12 @@ type Clear struct {
 	Line   int
 }
 
-func (Assign) stmt() {}
-func (Add) stmt()    {}
-func (Set) stmt()    {}
-func (Remove) stmt() {}
-func (Clear) stmt()  {}
+func (Assign) stmt()      {}
+func (ServiceCall) stmt() {}
+func (Add) stmt()         {}
+func (Set) stmt()         {}
+func (Remove) stmt()      {}
+func (Clear) stmt()       {}
 
 // View is one `view Name [at "/path"]:` projection of state into a UI node tree.
 // A view is a page, served at its route; Path defaults are filled in by the
