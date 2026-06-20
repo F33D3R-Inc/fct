@@ -1527,8 +1527,10 @@ func selectRows(rows []any, n ir.Node, scope map[string]any) []any {
 		}
 	}
 	out := sortRows(filtered, n.Order, n.Desc)
-	if n.Limit > 0 && len(out) > n.Limit {
-		out = out[:n.Limit]
+	if n.Limit != nil {
+		if lim := toInt(eval(n.Limit, scope)); lim > 0 && len(out) > lim {
+			out = out[:lim]
+		}
 	}
 	return out
 }

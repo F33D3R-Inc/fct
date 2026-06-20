@@ -10,6 +10,30 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 5 — 2026-06-20 — item 1 done: search + pagination → released v1.12.0
+
+**Versioning policy (user directive):** one MINOR per roadmap item; splits within an
+item use the PATCH digit. So the 250+ facet library (item 6) stays pinned at
+**v1.17.0** regardless of splits. Map: 1 Tier-3-finish=1.12 · 2 type-system=1.13 ·
+3 forms=1.14 · 4 query-depth=1.15 · 5 DX=1.16 · 6 library=1.17. (See
+`always-release-each-section` memory.)
+
+**Shipped + released v1.12.0 (item 1 of the remaining roadmap):**
+- **`contains(s, sub)`** — pure substring builtin → live search via
+  `where contains(lower(p.body), lower(q))` (case-fold composes with `lower`).
+- **Dynamic `limit`** — `limit` now takes an expression, not just a literal:
+  `limit shown` with `state shown: int = 20 @client` + `action more: shown =
+  shown + 20` = load-more / infinite scroll, zero round-trips (`more` is
+  client-placed). List region refreshes on query OR page-size change.
+
+**Surface:** parser (isBuiltinCall, parseFor limit→expr), ir (pureBuiltinArity,
+For.Limit Expr, Node.Limit *Expr, lower+checkPure+region deps), runtime eval.go +
+facet.js (`contains`, selectRows limit eval). Fixed 2 existing tests for the
+int→*Expr limit change. Tests: eval `contains`, compile search+dynamic-limit deps.
+Verified via binary: `limit shown` is a ref expr, `more` placed client. All green.
+
+---
+
 ## Sprint 4 — 2026-06-20 — Tier 3 (part 2): post-content primitives `richtext` + `video` → released v1.11.0
 
 **Shipped + RELEASED (the new cadence: every tested section ships immediately —

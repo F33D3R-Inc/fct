@@ -464,8 +464,8 @@ app Feed:
 	if list.Where == nil || list.Where.Kind != "bin" || list.Where.Op != ">=" {
 		t.Errorf("where should lower to a >= comparison, got %+v", list.Where)
 	}
-	if list.Order != "likes" || !list.Desc || list.Limit != 2 {
-		t.Errorf("order/desc/limit wrong: order=%q desc=%v limit=%d", list.Order, list.Desc, list.Limit)
+	if list.Order != "likes" || !list.Desc || list.Limit == nil || list.Limit.Kind != "lit" {
+		t.Errorf("order/desc/limit wrong: order=%q desc=%v limit=%+v", list.Order, list.Desc, list.Limit)
 	}
 	// the filter reads minLikes, so changing it must refresh the list region.
 	if len(g.DepGraph["minLikes"]) == 0 {

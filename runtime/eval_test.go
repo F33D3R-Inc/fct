@@ -121,6 +121,21 @@ func TestEvalFilteredAggregates(t *testing.T) {
 	}
 }
 
+// contains(s, sub) is the substring predicate behind search; it must match the JS
+// String.includes in assets/facet.js. Case folding composes via lower().
+func TestEvalContains(t *testing.T) {
+	lit := func(s string) *ir.Expr { return &ir.Expr{Kind: "lit", Val: s, VType: "text"} }
+	call := func(s, sub string) any {
+		return eval(&ir.Expr{Kind: "call", Name: "contains", Args: []*ir.Expr{lit(s), lit(sub)}}, map[string]any{})
+	}
+	if call("hello world", "world") != true {
+		t.Error(`contains("hello world","world") should be true`)
+	}
+	if call("hello", "xyz") != false {
+		t.Error(`contains("hello","xyz") should be false`)
+	}
+}
+
 // The effectful builtins evaluate on the server: now() is a positive unix time,
 // rand(n) is bounded to [0, n).
 func TestEvalBuiltins(t *testing.T) {
@@ -153,7 +168,8 @@ func TestSelectRows(t *testing.T) {
 	}
 	// where likes > 0, by likes desc, limit 2  ->  [7, 5]
 	node := ir.Node{
-		Kind: "list", Var: "p", Coll: "Post", Order: "likes", Desc: true, Limit: 2,
+		Kind: "list", Var: "p", Coll: "Post", Order: "likes", Desc: true,
+		Limit: &ir.Expr{Kind: "lit", Val: 2, VType: "int"},
 		Where: &ir.Expr{Kind: "bin", Op: ">",
 			L: &ir.Expr{Kind: "get", Obj: &ir.Expr{Kind: "ref", Name: "p"}, Field: "likes"},
 			R: &ir.Expr{Kind: "lit", Val: 0, VType: "int"}},

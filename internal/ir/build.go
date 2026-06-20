@@ -983,7 +983,15 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if !c.e.entities[t.Coll] && c.e.states[t.Coll] == "" {
 				return nil, &BuildError{0, fmt.Sprintf("`for` over unknown collection %q", t.Coll)}
 			}
-			node := Node{Kind: "list", Var: t.Var, Coll: t.Coll, Order: t.Order, Desc: t.Desc, Limit: t.Limit}
+			node := Node{Kind: "list", Var: t.Var, Coll: t.Coll, Order: t.Order, Desc: t.Desc}
+			// `limit` may be a literal or a pure expr (e.g. a @client page size for
+			// load-more / infinite scroll); evaluated per render, not per row.
+			if t.Limit != nil {
+				if err := c.e.checkPure(t.Limit, withActor(sc.locals), 0, "a `limit`"); err != nil {
+					return nil, err
+				}
+				node.Limit = c.e.low(t.Limit)
+			}
 			// `where` filter: a pure predicate over the item var + outer scope.
 			if t.Where != nil {
 				wlocals := withActor(sc.locals)
@@ -1018,6 +1026,12 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				// a state the filter reads must also refresh the list when it changes.
 				if node.Where != nil {
 					for _, d := range sortedKeys(c.e.depsIR(node.Where)) {
+						c.addDep(d, node.ID)
+					}
+				}
+				// a dynamic limit (load-more page size) refreshes the list when it grows.
+				if node.Limit != nil {
+					for _, d := range sortedKeys(c.e.depsIR(node.Limit)) {
 						c.addDep(d, node.ID)
 					}
 				}
@@ -1339,7 +1353,7 @@ func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day":
 		return 1, true
-	case "min", "max":
+	case "min", "max", "contains":
 		return 2, true
 	}
 	return 0, false

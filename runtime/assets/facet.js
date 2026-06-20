@@ -120,6 +120,7 @@
       case "upper": return toStr(a(0)).toUpperCase();
       case "lower": return toStr(a(0)).toLowerCase();
       case "trim": return toStr(a(0)).trim();
+      case "contains": return toStr(a(0)).includes(toStr(a(1)));
       case "year": return new Date(toInt(a(0)) * 1000).getUTCFullYear();
       case "month": return new Date(toInt(a(0)) * 1000).getUTCMonth() + 1;
       case "day": return new Date(toInt(a(0)) * 1000).getUTCDate();
@@ -402,7 +403,7 @@
         return node.desc ? -c : c;
       });
     }
-    if (node.limit && out.length > node.limit) out = out.slice(0, node.limit);
+    if (node.limit) { const lim = toInt(ev(node.limit, sc)); if (lim > 0 && out.length > lim) out = out.slice(0, lim); }
     return out;
   }
   function cmpVal(a, b) {

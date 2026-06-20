@@ -1321,11 +1321,11 @@ func parseFor(n *source.Node) (ast.Node, error) {
 		}
 	}
 	if limitS != "" {
-		nlim, err := strconv.Atoi(limitS)
-		if err != nil || nlim <= 0 {
-			return nil, &Error{n.Line.No, fmt.Sprintf("limit needs a positive integer, got %q", limitS)}
+		e, err := parseExpr(limitS, n.Line.No)
+		if err != nil {
+			return nil, &Error{n.Line.No, fmt.Sprintf("limit needs an integer or expression, got %q", limitS)}
 		}
-		f.Limit = nlim
+		f.Limit = e
 	}
 
 	kids, err := parseNodes(n.Children)

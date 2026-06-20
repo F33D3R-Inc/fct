@@ -197,6 +197,8 @@ func evalCall(e *ir.Expr, scope map[string]any) any {
 		return strings.ToLower(toStr(arg(0)))
 	case "trim":
 		return strings.TrimSpace(toStr(arg(0)))
+	case "contains":
+		return strings.Contains(toStr(arg(0)), toStr(arg(1)))
 	case "year":
 		return int(time.Unix(int64(toInt(arg(0))), 0).UTC().Year())
 	case "month":

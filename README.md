@@ -141,6 +141,15 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.12.0 — search + pagination (Tier 3 finish).** Two query affordances real
+feeds need. **`contains(s, sub)`** is a pure substring builtin — `for p in Post
+where contains(lower(p.body), lower(q))` is a live search box (bind `q` to a
+`@client` input). And **`limit` now takes an expression**, not just a literal:
+`for p in Post by created desc limit shown` with `state shown: int = 20 @client`
+and an action `more: shown = shown + 20` gives **load-more / infinite scroll** with
+zero round-trips (the `more` action is client-placed; the list re-queries its live
+mirror). The list refreshes when the query or page size changes.
+
 **v1.11.0 — post-content primitives: `richtext` + `video`.** Posts can hold real
 content now. **`richtext "{post.body}"`** renders a safe subset of Markdown
 (headings, lists, fenced code, inline code/bold/italic) — input is HTML-escaped

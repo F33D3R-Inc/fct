@@ -25,3 +25,27 @@ func TestContentPrimitives(t *testing.T) {
 		}
 	}
 }
+
+// Search (contains in a where) + a dynamic limit (a @client page size for
+// load-more / infinite scroll). The list refreshes when either the query or the
+// page size changes.
+func TestSearchAndDynamicLimit(t *testing.T) {
+	g := mustCompile(t, `app S:
+    state q: text = "" @client
+    state shown: int = 20 @client
+    entity Post:
+        id: int
+        body: text
+    view Home at "/":
+        box:
+            input bind q placeholder "search"
+            for p in Post where contains(lower(p.body), lower(q)) limit shown:
+                text "{p.body}"
+`)
+	if len(g.DepGraph["q"]) == 0 {
+		t.Errorf("list should refresh on search query q, deps=%v", g.DepGraph)
+	}
+	if len(g.DepGraph["shown"]) == 0 {
+		t.Errorf("list should refresh on dynamic limit shown, deps=%v", g.DepGraph)
+	}
+}

@@ -412,7 +412,7 @@ type For struct {
 	Where Expr   // optional row filter; nil = all rows
 	Order string // sort field; "" = insertion order
 	Desc  bool   // true = descending (newest/highest first)
-	Limit int    // optional max rows; 0 = unlimited
+	Limit Expr   // optional max rows: an int literal or an expr (e.g. a @client page size for load-more); nil = unlimited
 }
 
 // If renders Body only when Cond is truthy.

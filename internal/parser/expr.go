@@ -319,7 +319,7 @@ func isBuiltinCall(name string) bool {
 	switch name {
 	case "now", "rand", // effectful (pinned to the authority)
 		"abs", "min", "max", "floor", "round", "money", // math / money
-		"len", "upper", "lower", "trim", // string
+		"len", "upper", "lower", "trim", "contains", // string
 		"year", "month", "day": // date
 		return true
 	}

@@ -237,7 +237,7 @@ type Node struct {
 	Where *Expr  `json:"where,omitempty"` // list: row filter (nil = all)
 	Order string `json:"order,omitempty"` // list: sort field
 	Desc  bool   `json:"desc,omitempty"`  // list: descending
-	Limit int    `json:"limit,omitempty"` // list: max rows (0 = unlimited)
+	Limit *Expr  `json:"limit,omitempty"` // list: max rows (nil = unlimited); int literal or a dynamic page-size expr
 	Cond  *Expr  `json:"cond,omitempty"`  // if: condition
 
 	Bind        string `json:"bind,omitempty"`        // input/select/upload: state cell
