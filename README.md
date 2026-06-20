@@ -141,6 +141,16 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.6.0 — typed bricks (layered facets).** Facets now have *kinds* that compose
+like Lego: a `playground` baseplate `mount`s a `wireframe`, the wireframe exposes
+typed `socket`s, and `ui`/`data` facets snap into sockets whose declared kind
+matches — a mismatch is a compile error, not a broken page. The compiler
+composites every brick into the wireframe frame and flattens the stack into one
+graph placement runs over once, so the layering is how an app is *built*, never
+how it *renders*: the output is a single surface. A new `row` container makes
+those layouts responsive (multi-column on a wide window, one column on a narrow
+one). See [Layered Facets](wiki/Layered-Facets.md) and `examples/layered/`.
+
 **v1.5.0 — the registry.** Imports go remote: `import "github.com/owner/repo"`
 pulls a published **facet** straight from GitHub. The toolchain fetches it as an
 immutable, commit-pinned tarball (no `git` binary needed), caches it on disk,

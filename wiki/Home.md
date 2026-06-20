@@ -33,6 +33,7 @@ top to bottom you will know everything the language can do as of **v1.5.0**.
 |---|---|
 | **[Language Reference](Language-Reference.md)** | Every keyword, every construct, the complete grammar. |
 | **[Modules & Imports](Modules.md)** | Split an app across files; package and reuse a "facet" with `import`. |
+| **[Layered Facets](Layered-Facets.md)** | Typed bricks — `playground`/`wireframe`/`ui`/`data` facets that snap together by socket and composite into one surface. |
 | **[The Registry](Registry.md)** | Publish and consume remote facets from GitHub: `import "github.com/owner/repo"`, `facet add`, `facet.lock`. |
 | **[Data Modeling](Data-Modeling.md)** | Entities, the type system, relations, queries, indexes, migrations. |
 | **[Actions & Logic](Actions-and-Logic.md)** | Actions, statements, `derive`, validation (`check`), jobs, builtins. |

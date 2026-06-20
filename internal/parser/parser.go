@@ -55,19 +55,38 @@ func Parse(src string) (*ast.App, error) {
 			continue
 		}
 		if appNode != nil {
-			return nil, &Error{r.Line.No, "only one `app` definition per file"}
+			return nil, &Error{r.Line.No, "only one facet definition per file (app/playground/wireframe/ui/data)"}
 		}
 		appNode = r
 	}
 	if appNode == nil {
-		return nil, &Error{0, "empty source: expected an `app Name:` definition"}
+		return nil, &Error{0, "empty source: expected a facet definition (app/playground/wireframe/ui/data)"}
 	}
-	app, err := parseApp(appNode)
+	app, err := parseFacet(appNode)
 	if err != nil {
 		return nil, err
 	}
 	app.Imports = imports
 	return app, nil
+}
+
+// parseFacet dispatches on the facet kind keyword that opens a file. A plain
+// `app` is the original self-contained graph; the typed kinds compose as bricks.
+func parseFacet(n *source.Node) (*ast.App, error) {
+	switch firstWord(n.Line.Text) {
+	case "app":
+		return parseApp(n)
+	case "playground":
+		return parsePlayground(n)
+	case "wireframe":
+		return parseWireframe(n)
+	case "ui":
+		return parseUIData(n, "ui")
+	case "data":
+		return parseUIData(n, "data")
+	default:
+		return nil, &Error{n.Line.No, "file must start with `app`, `playground`, `wireframe`, `ui`, or `data`"}
+	}
 }
 
 func parseApp(n *source.Node) (*ast.App, error) {
@@ -79,75 +98,245 @@ func parseApp(n *source.Node) (*ast.App, error) {
 	if !isIdent(name) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("invalid app name %q", name)}
 	}
-	app := &ast.App{Name: name, Line: n.Line.No}
+	app := &ast.App{Name: name, Kind: "app", Line: n.Line.No}
 	for _, c := range n.Children {
-		var err error
-		switch {
-		case c.Line.Text == "auth" || c.Line.Text == "auth:":
-			app.Auth = true
-		case strings.HasPrefix(c.Line.Text, "entity "):
-			var e *ast.Entity
-			if e, err = parseEntity(c); err == nil {
-				app.Entities = append(app.Entities, e)
-			}
-		case strings.HasPrefix(c.Line.Text, "enum "):
-			var en *ast.Enum
-			if en, err = parseEnum(c); err == nil {
-				app.Enums = append(app.Enums, en)
-			}
-		case strings.HasPrefix(c.Line.Text, "component "):
-			var cm *ast.Component
-			if cm, err = parseComponent(c); err == nil {
-				app.Components = append(app.Components, cm)
-			}
-		case strings.HasPrefix(c.Line.Text, "layout "):
-			var ly *ast.Layout
-			if ly, err = parseLayout(c); err == nil {
-				app.Layouts = append(app.Layouts, ly)
-			}
-		case c.Line.Text == "theme:" || c.Line.Text == "theme":
-			var tv []ast.ThemeVar
-			if tv, err = parseTheme(c); err == nil {
-				app.Theme = append(app.Theme, tv...)
-			}
-		case strings.HasPrefix(c.Line.Text, "state "):
-			var s *ast.State
-			if s, err = parseState(c); err == nil {
-				app.States = append(app.States, s)
-			}
-		case strings.HasPrefix(c.Line.Text, "derive "):
-			var d *ast.Derive
-			if d, err = parseDerive(c); err == nil {
-				app.Derives = append(app.Derives, d)
-			}
-		case strings.HasPrefix(c.Line.Text, "policy "):
-			var p *ast.Policy
-			if p, err = parsePolicy(c); err == nil {
-				app.Policies = append(app.Policies, p)
-			}
-		case strings.HasPrefix(c.Line.Text, "action "):
-			var a *ast.Action
-			if a, err = parseAction(c); err == nil {
-				app.Actions = append(app.Actions, a)
-			}
-		case strings.HasPrefix(c.Line.Text, "job "):
-			var j *ast.Job
-			if j, err = parseJob(c); err == nil {
-				app.Jobs = append(app.Jobs, j)
-			}
-		case strings.HasPrefix(c.Line.Text, "view "):
-			var v *ast.View
-			if v, err = parseView(c); err == nil {
-				app.Views = append(app.Views, v)
-			}
-		default:
-			err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/enum/state/derive/policy/action/job/component/layout/theme/view", firstWord(c.Line.Text))}
-		}
-		if err != nil {
+		if err := parseDecl(app, c); err != nil {
 			return nil, err
 		}
 	}
 	return app, nil
+}
+
+// parseDecl parses one body item shared by `app`, `ui`, and `data` facets — the
+// full vocabulary of entities, state, logic, and UI. Kind-specific guards (e.g.
+// a `ui` facet may not declare an entity) are applied by the caller via the
+// returned facet's contents; here we only parse what is structurally a member.
+func parseDecl(app *ast.App, c *source.Node) error {
+	var err error
+	switch {
+	case c.Line.Text == "auth" || c.Line.Text == "auth:":
+		app.Auth = true
+	case strings.HasPrefix(c.Line.Text, "entity "):
+		var e *ast.Entity
+		if e, err = parseEntity(c); err == nil {
+			app.Entities = append(app.Entities, e)
+		}
+	case strings.HasPrefix(c.Line.Text, "enum "):
+		var en *ast.Enum
+		if en, err = parseEnum(c); err == nil {
+			app.Enums = append(app.Enums, en)
+		}
+	case strings.HasPrefix(c.Line.Text, "component "):
+		var cm *ast.Component
+		if cm, err = parseComponent(c); err == nil {
+			app.Components = append(app.Components, cm)
+		}
+	case strings.HasPrefix(c.Line.Text, "layout "):
+		var ly *ast.Layout
+		if ly, err = parseLayout(c); err == nil {
+			app.Layouts = append(app.Layouts, ly)
+		}
+	case c.Line.Text == "theme:" || c.Line.Text == "theme":
+		var tv []ast.ThemeVar
+		if tv, err = parseTheme(c); err == nil {
+			app.Theme = append(app.Theme, tv...)
+		}
+	case strings.HasPrefix(c.Line.Text, "state "):
+		var s *ast.State
+		if s, err = parseState(c); err == nil {
+			app.States = append(app.States, s)
+		}
+	case strings.HasPrefix(c.Line.Text, "derive "):
+		var d *ast.Derive
+		if d, err = parseDerive(c); err == nil {
+			app.Derives = append(app.Derives, d)
+		}
+	case strings.HasPrefix(c.Line.Text, "policy "):
+		var p *ast.Policy
+		if p, err = parsePolicy(c); err == nil {
+			app.Policies = append(app.Policies, p)
+		}
+	case strings.HasPrefix(c.Line.Text, "action "):
+		var a *ast.Action
+		if a, err = parseAction(c); err == nil {
+			app.Actions = append(app.Actions, a)
+		}
+	case strings.HasPrefix(c.Line.Text, "job "):
+		var j *ast.Job
+		if j, err = parseJob(c); err == nil {
+			app.Jobs = append(app.Jobs, j)
+		}
+	case strings.HasPrefix(c.Line.Text, "view "):
+		var v *ast.View
+		if v, err = parseView(c); err == nil {
+			app.Views = append(app.Views, v)
+		}
+	default:
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/enum/state/derive/policy/action/job/component/layout/theme/view", firstWord(c.Line.Text))}
+	}
+	return err
+}
+
+// parsePlayground parses `playground Name:` — the baseplate. It holds global
+// concerns (auth, theme) and mounts exactly one wireframe; it accepts nothing
+// else, because a playground only takes a wireframe.
+func parsePlayground(n *source.Node) (*ast.App, error) {
+	name := strings.TrimSuffix(keywordRest(n.Line.Text, "playground"), ":")
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid playground name %q", name)}
+	}
+	app := &ast.App{Name: name, Kind: "playground", Line: n.Line.No}
+	for _, c := range n.Children {
+		t := strings.TrimSpace(c.Line.Text)
+		switch {
+		case t == "auth" || t == "auth:":
+			app.Auth = true
+		case t == "theme:" || t == "theme":
+			tv, err := parseTheme(c)
+			if err != nil {
+				return nil, err
+			}
+			app.Theme = append(app.Theme, tv...)
+		case strings.HasPrefix(t, "mount "):
+			if app.Mount != "" {
+				return nil, &Error{c.Line.No, "a playground mounts exactly one wireframe"}
+			}
+			w := strings.TrimSuffix(strings.TrimSpace(t[len("mount "):]), ":")
+			if !isIdent(w) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid wireframe name %q after `mount`", w)}
+			}
+			app.Mount = w
+		default:
+			return nil, &Error{c.Line.No, fmt.Sprintf("unexpected %q in playground; a playground takes `auth`, `theme`, and `mount <Wireframe>`", firstWord(t))}
+		}
+	}
+	if app.Mount == "" {
+		return nil, &Error{n.Line.No, fmt.Sprintf("playground %q must `mount <Wireframe>`", name)}
+	}
+	return app, nil
+}
+
+// parseWireframe parses `wireframe Name:` — the structural brick. It declares
+// typed `socket`s and a `frame:` layout that places each socket with `slot
+// <name>`. It is pure structure: no data, no behavior.
+func parseWireframe(n *source.Node) (*ast.App, error) {
+	name := strings.TrimSuffix(keywordRest(n.Line.Text, "wireframe"), ":")
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid wireframe name %q", name)}
+	}
+	app := &ast.App{Name: name, Kind: "wireframe", Line: n.Line.No}
+	for _, c := range n.Children {
+		t := strings.TrimSpace(c.Line.Text)
+		switch {
+		case t == "theme:" || t == "theme":
+			tv, err := parseTheme(c)
+			if err != nil {
+				return nil, err
+			}
+			app.Theme = append(app.Theme, tv...)
+		case strings.HasPrefix(t, "socket "):
+			sock, err := parseSocket(c)
+			if err != nil {
+				return nil, err
+			}
+			app.Sockets = append(app.Sockets, sock)
+		case t == "frame:" || t == "frame":
+			if app.Frame != nil {
+				return nil, &Error{c.Line.No, "a wireframe has one `frame`"}
+			}
+			nodes, err := parseNodes(c.Children)
+			if err != nil {
+				return nil, err
+			}
+			if nodes == nil {
+				nodes = []ast.Node{}
+			}
+			app.Frame = nodes
+		default:
+			return nil, &Error{c.Line.No, fmt.Sprintf("unexpected %q in wireframe; a wireframe takes `socket <name>: <ui|data>`, `frame:`, and `theme:`", firstWord(t))}
+		}
+	}
+	if app.Frame == nil {
+		return nil, &Error{n.Line.No, fmt.Sprintf("wireframe %q needs a `frame:` block", name)}
+	}
+	return app, nil
+}
+
+// parseSocket parses `socket feed: data` — a typed slot. Accept is the facet
+// kind (`ui` or `data`) the socket admits.
+func parseSocket(n *source.Node) (ast.Socket, error) {
+	rest := strings.TrimSpace(n.Line.Text[len("socket "):])
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return ast.Socket{}, &Error{n.Line.No, "socket needs a kind: `socket <name>: <ui|data>`"}
+	}
+	sname := strings.TrimSpace(rest[:colon])
+	accept := strings.TrimSpace(rest[colon+1:])
+	if !isIdent(sname) {
+		return ast.Socket{}, &Error{n.Line.No, fmt.Sprintf("invalid socket name %q", sname)}
+	}
+	if accept != "ui" && accept != "data" {
+		return ast.Socket{}, &Error{n.Line.No, fmt.Sprintf("socket %q must accept `ui` or `data`, got %q", sname, accept)}
+	}
+	return ast.Socket{Name: sname, Accept: accept, Line: n.Line.No}, nil
+}
+
+// parseUIData parses `ui Name in socket:` / `data Name in socket:` — a content
+// brick that snaps into a wireframe socket. A `ui` facet carries skin and
+// presentation; a `data` facet carries entities, logic, and its own content.
+// Both contribute a `content:` node tree placed at the socket.
+func parseUIData(n *source.Node, kind string) (*ast.App, error) {
+	rest := keywordRest(n.Line.Text, kind)
+	rest = strings.TrimSuffix(strings.TrimSpace(rest), ":")
+	// `Name in socket`
+	parts := strings.Fields(rest)
+	if len(parts) != 3 || parts[1] != "in" {
+		return nil, &Error{n.Line.No, fmt.Sprintf("%s facet header must read `%s Name in <socket>:`", kind, kind)}
+	}
+	name, socket := parts[0], parts[2]
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid %s facet name %q", kind, name)}
+	}
+	if !isIdent(socket) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid socket name %q", socket)}
+	}
+	app := &ast.App{Name: name, Kind: kind, Into: socket, Line: n.Line.No}
+	for _, c := range n.Children {
+		t := strings.TrimSpace(c.Line.Text)
+		if t == "content:" || t == "content" {
+			if app.Content != nil {
+				return nil, &Error{c.Line.No, fmt.Sprintf("%s facet %q has one `content` block", kind, name)}
+			}
+			nodes, err := parseNodes(c.Children)
+			if err != nil {
+				return nil, err
+			}
+			if nodes == nil {
+				nodes = []ast.Node{}
+			}
+			app.Content = nodes
+			continue
+		}
+		if err := parseDecl(app, c); err != nil {
+			return nil, err
+		}
+	}
+	if app.Content == nil {
+		return nil, &Error{n.Line.No, fmt.Sprintf("%s facet %q needs a `content:` block to fill socket %q", kind, name, socket)}
+	}
+	if kind == "ui" && len(app.Entities) > 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("ui facet %q may not declare an entity — move durable data into a `data` facet", name)}
+	}
+	if len(app.Views) > 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("%s facet %q provides `content` for a socket, not routed `view`s", kind, name)}
+	}
+	return app, nil
+}
+
+// keywordRest returns the text after a leading keyword (the keyword is assumed
+// present; parseFacet has already matched it).
+func keywordRest(s, kw string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), kw))
 }
 
 func parseEntity(n *source.Node) (*ast.Entity, error) {
@@ -280,6 +469,10 @@ func hasSlot(nodes []ast.Node) bool {
 			if hasSlot(t.Children) {
 				return true
 			}
+		case ast.Row:
+			if hasSlot(t.Children) {
+				return true
+			}
 		case ast.If:
 			if hasSlot(t.Body) {
 				return true
@@ -298,7 +491,7 @@ func parseTheme(n *source.Node) ([]ast.ThemeVar, error) {
 		if len(fields) != 2 {
 			return nil, &Error{c.Line.No, "theme entry must be `name \"value\"`"}
 		}
-		if !isIdent(fields[0]) {
+		if !isThemeKey(fields[0]) {
 			return nil, &Error{c.Line.No, fmt.Sprintf("invalid theme name %q", fields[0])}
 		}
 		val, err := unquote(strings.TrimSpace(fields[1]), c.Line.No)
@@ -855,6 +1048,12 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, ast.Box{Children: kids})
+		case t == "row:" || t == "row":
+			kids, err := parseNodes(c.Children)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Row{Children: kids})
 		case strings.HasPrefix(t, "text "):
 			segs, err := parseText(strings.TrimSpace(t[len("text "):]), c.Line.No)
 			if err != nil {
@@ -921,6 +1120,12 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 			out = append(out, u)
 		case t == "slot" || t == "slot:":
 			out = append(out, ast.Slot{})
+		case strings.HasPrefix(t, "slot "):
+			name := strings.TrimSuffix(strings.TrimSpace(t[len("slot "):]), ":")
+			if !isIdent(name) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid socket name %q after `slot`", name)}
+			}
+			out = append(out, ast.SlotRef{Name: name})
 		default:
 			return nil, &Error{c.Line.No, fmt.Sprintf("unknown view node %q", firstWord(t))}
 		}
@@ -1352,6 +1557,15 @@ func isIdent(s string) bool {
 		return false
 	}
 	return true
+}
+
+// isThemeKey allows the interior hyphens that CSS custom-property names use
+// (e.g. `card-border` → `--fa-card-border`), which a plain identifier forbids.
+func isThemeKey(s string) bool {
+	if s == "" || s[0] == '-' || s[len(s)-1] == '-' {
+		return false
+	}
+	return isIdent(strings.ReplaceAll(s, "-", "_"))
 }
 
 // splitTop splits on sep at the top level (ignoring separators inside parens or

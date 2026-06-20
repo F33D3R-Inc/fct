@@ -37,9 +37,15 @@ func String(src string) (*ir.IR, error) {
 	return ir.Build(app)
 }
 
-// File compiles a Facet app from a path, resolving and merging every imported
-// module first. Imports are de-duplicated (a module pulled in by two files is
-// merged once) and import cycles are reported rather than looped.
+// File compiles a Facet app from a path, resolving every imported module first.
+// Imports are de-duplicated (a module pulled in by two files is loaded once) and
+// import cycles are reported rather than looped.
+//
+// Two composition models share this entry point. A plain `app` (with optional
+// `app` imports) is flat-merged into one graph, the original behavior. A layered
+// build — a `playground` baseplate that mounts a `wireframe` and snaps `ui`/`data`
+// facets into its typed sockets — is composited by `compose`. Both produce one
+// ast.App that placement runs over exactly once.
 func File(path string) (*ir.IR, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -54,12 +60,26 @@ func File(path string) (*ir.IR, error) {
 		return nil, err
 	}
 	visited := map[string]bool{}
-	root, err := loadModule(abs, visited, nil, res)
+	facets, err := collectModules(abs, visited, nil, res)
 	if err != nil {
 		return nil, err
 	}
 	if err := res.Save(); err != nil {
 		return nil, err
+	}
+
+	var root *ast.App
+	if isLayered(facets) {
+		// Typed bricks: snap them together into one surface.
+		if root, err = compose(facets); err != nil {
+			return nil, err
+		}
+	} else {
+		// Plain apps: flat-merge every module's declarations into the entry graph.
+		root = facets[0]
+		for _, m := range facets[1:] {
+			mergeInto(root, m)
+		}
 	}
 	if err := checkDuplicates(root); err != nil {
 		return nil, err
@@ -67,11 +87,11 @@ func File(path string) (*ir.IR, error) {
 	return ir.Build(root)
 }
 
-// loadModule reads, parses, and recursively merges a file and its imports into a
-// single ast.App. stack is the chain of files currently being resolved, used to
-// detect cycles; visited is the set of modules already merged, used to pull a
-// shared module in only once.
-func loadModule(abs string, visited map[string]bool, stack []string, res *registry.Resolver) (*ast.App, error) {
+// collectModules reads, parses, and recursively gathers a file and its imports
+// into a flat, de-duplicated list with the entry file first (the same depth-first
+// order the legacy merge used). stack is the chain of files currently being
+// resolved, used to detect cycles; visited pulls a shared module in only once.
+func collectModules(abs string, visited map[string]bool, stack []string, res *registry.Resolver) ([]*ast.App, error) {
 	for _, s := range stack {
 		if s == abs {
 			return nil, fmt.Errorf("import cycle through %s", filepath.Base(abs))
@@ -85,6 +105,7 @@ func loadModule(abs string, visited map[string]bool, stack []string, res *regist
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", filepath.Base(abs), err)
 	}
+	list := []*ast.App{app}
 	dir := filepath.Dir(abs)
 	for _, imp := range app.Imports {
 		// Resolve turns the import string into an absolute local path: a local ref
@@ -96,16 +117,16 @@ func loadModule(abs string, visited map[string]bool, stack []string, res *regist
 			return nil, err
 		}
 		if visited[impAbs] {
-			continue // already merged via another import path
+			continue // already collected via another import path
 		}
 		visited[impAbs] = true
-		sub, err := loadModule(impAbs, visited, append(stack, abs), res)
+		sub, err := collectModules(impAbs, visited, append(stack, abs), res)
 		if err != nil {
 			return nil, err
 		}
-		mergeInto(app, sub)
+		list = append(list, sub...)
 	}
-	return app, nil
+	return list, nil
 }
 
 // mergeInto folds an imported module's declarations into dst, after dst's own

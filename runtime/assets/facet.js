@@ -143,6 +143,11 @@
         for (const c of node.children || []) d.appendChild(render(c, sc));
         return d;
       }
+      case "row": {
+        const d = el("div", "fa-row");
+        for (const c of node.children || []) d.appendChild(render(c, sc));
+        return d;
+      }
       case "text": {
         const span = el("span", "fa-text");
         for (const seg of node.segs || []) {

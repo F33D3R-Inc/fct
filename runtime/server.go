@@ -391,7 +391,7 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	if s.dev != nil {
 		dev = devScript
 	}
-	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), themeCSS(s.ir.Theme), csrfToken(sid), body.String(), irJSON, stateJSON, dev)
+	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), csrfToken(sid), themeCSS(s.ir.Theme), body.String(), irJSON, stateJSON, dev)
 }
 
 // pageFor returns the page whose route matches path, plus the bound `:param`
@@ -1096,6 +1096,12 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 			s.renderNode(b, c, scope)
 		}
 		b.WriteString(`</div>`)
+	case "row":
+		b.WriteString(`<div class="fa-row">`)
+		for _, c := range n.Children {
+			s.renderNode(b, c, scope)
+		}
+		b.WriteString(`</div>`)
 	case "text":
 		b.WriteString(`<span class="fa-text">`)
 		for _, seg := range n.Segs {
@@ -1450,7 +1456,6 @@ const page = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>%s — Facet</title>
-<style id="fa-theme">%s</style>
 <meta name="fa-csrf" content="%s">
 <style>
   :root {
@@ -1462,6 +1467,15 @@ const page = `<!doctype html>
          color: var(--fa-fg); background: var(--fa-bg); padding: 0 1rem; }
   .fa-box { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
   .fa-box .fa-box { border: 1px solid var(--fa-card-border); border-radius: calc(var(--fa-radius) + 2px); padding: .6rem .8rem; }
+  /* A row lays its children out horizontally and wraps; on a narrow viewport it
+     collapses to a vertical stack, so multi-column layouts reflow with the window. */
+  .fa-row { display: flex; flex-direction: row; gap: 1.25rem; align-items: flex-start; flex-wrap: wrap; }
+  .fa-row > * { flex: 1 1 0; min-width: 0; }
+  /* A box directly inside a row is a structural column (a wireframe region), not a
+     card — it stays transparent and borderless so the layers composite into one
+     surface rather than reading as stacked panels. */
+  .fa-row > .fa-box { border: none; background: transparent; padding: 0; }
+  @media (max-width: 720px) { .fa-row { flex-direction: column; } .fa-row > * { width: 100%%; } }
   .fa-text { font-variant-numeric: tabular-nums; }
   .fa-form { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
   .fa-use { display: contents; }
@@ -1479,6 +1493,7 @@ const page = `<!doctype html>
   [data-fa-bind] { font-weight: 600; }
   [aria-busy=true] { opacity: .6; }
 </style>
+<style id="fa-theme">%s</style>
 </head>
 <body>
 <div id="fa-root" data-fa-mount>%s</div>

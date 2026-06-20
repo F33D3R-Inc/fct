@@ -555,6 +555,8 @@ func inlineLayout(layout []ast.Node, view []ast.Node) []ast.Node {
 			out = append(out, view...)
 		case ast.Box:
 			out = append(out, ast.Box{Children: inlineLayout(t.Children, view)})
+		case ast.Row:
+			out = append(out, ast.Row{Children: inlineLayout(t.Children, view)})
 		case ast.If:
 			out = append(out, ast.If{Cond: t.Cond, Body: inlineLayout(t.Body, view)})
 		case ast.For:
@@ -810,6 +812,13 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			out = append(out, Node{Kind: "box", Children: kids})
 
+		case ast.Row:
+			kids, err := c.nodes(t.Children, sc)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "row", Children: kids})
+
 		case ast.Text:
 			node := Node{Kind: "text"}
 			for _, s := range t.Segs {
@@ -1031,6 +1040,8 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 
 		case ast.Slot:
 			return nil, &BuildError{0, "`slot` may only appear inside a layout"}
+		case ast.SlotRef:
+			return nil, &BuildError{0, fmt.Sprintf("`slot %s` may only appear inside a wireframe frame", t.Name)}
 		}
 	}
 	return out, nil

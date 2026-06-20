@@ -1,0 +1,60 @@
+# A data facet. It snaps into the `feed` socket (declared `data`) and brings the
+# durable data, the server actions, the authorization — and its own `content` for
+# the socket. Placement is still computed over the whole composited graph: `tweet`
+# uses now() so it pins to the authority; the `member`/`mine` policies are enforced
+# there too. The brick carries its data and its UI together; the wireframe decides
+# where that UI lands.
+data Feed in feed:
+    entity Tweet:
+        id: int
+        author: text
+        body: text
+        likes: int
+        created: int
+
+    state username: text = "" @client
+    state password: text = "" @client
+    state draft: text = "" @client
+
+    derive tweetCount: int = count(Tweet)
+    derive totalLikes: int = sum(Tweet.likes)
+
+    policy member:
+        actor != "guest"
+
+    policy mine(id: int):
+        actor == Tweet(id).author
+
+    action tweet(body: text):
+        requires member
+        add Tweet { author: actor, body: body, likes: 0, created: now() }
+
+    action like(id: int):
+        requires member
+        set Tweet(id).likes = Tweet(id).likes + 1
+
+    action delete(id: int):
+        requires mine(id)
+        remove Tweet(id)
+
+    content:
+        text "Home · {tweetCount} tweets · {totalLikes} likes"
+        if actor == "guest":
+            box:
+                text "Join X"
+                input bind username placeholder "username"
+                input bind password placeholder "password"
+                button "sign up" -> signup(username, password)
+                button "log in" -> login(username, password)
+        if actor != "guest":
+            box:
+                input bind draft placeholder "what's happening?"
+                button "post" -> tweet(draft)
+        for t in Tweet by created desc limit 50:
+            box:
+                text "{t.author} · {t.body}"
+                row:
+                    button "like" -> like(t.id)
+                    text "{t.likes} likes"
+                if actor == t.author:
+                    button "delete" -> delete(t.id)

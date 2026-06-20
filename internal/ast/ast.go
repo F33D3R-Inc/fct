@@ -4,14 +4,39 @@
 // "backend" node — placement is computed later (internal/ir), never authored.
 package ast
 
-// App is one `app Name:` definition — the whole application graph.
+// App is one facet definition — the whole graph contributed by a single `.fct`
+// file. A plain `app Name:` is a self-contained facet (its own data + UI). The
+// typed kinds compose like Lego bricks: a `playground` is the baseplate, a
+// `wireframe` carves the surface into typed sockets, and `ui`/`data` facets snap
+// into those sockets. The compiler (internal/compile) flattens the stack into one
+// graph before placement, so layering is how an app is *built*, never how it
+// *renders* — the result is a single surface.
 type App struct {
 	Name string
-	// Imports are the paths of `import "..."` modules declared above the `app`
-	// header. The compiler (internal/compile) resolves them relative to the
-	// importing file and merges each module's declarations into this graph before
-	// placement, so a large app is many small files and a "facet" is a module
-	// another app can pull in. Empty for a single-file app.
+	// Kind is the facet kind: "" / "app" (self-contained), "playground" (the
+	// baseplate that mounts a wireframe), "wireframe" (typed sockets + a frame),
+	// "ui" or "data" (content that snaps into a socket). Only the typed kinds take
+	// part in layered composition; a plain app keeps the original flat-merge model.
+	Kind string
+	// Mount (playground only) names the wireframe that snaps onto this baseplate.
+	// A playground accepts a wireframe and nothing else.
+	Mount string
+	// Into (ui/data only) names the wireframe socket this facet snaps into,
+	// written `ui Nav in nav:` / `data Feed in feed:`. The socket's declared kind
+	// must match this facet's kind, or the bricks don't fit.
+	Into string
+	// Sockets (wireframe only) are the typed slots that upper-layer facets snap
+	// into — each names a region and the facet kind it accepts.
+	Sockets []Socket
+	// Frame (wireframe only) is the layout tree for the surface; a `slot <name>`
+	// (SlotRef) node marks where a socket's composited content lands.
+	Frame []Node
+	// Content (ui/data only) is the node tree this facet contributes to its socket.
+	Content []Node
+	// Imports are the paths of `import "..."` modules declared above the facet
+	// header. The compiler resolves them relative to the importing file. For plain
+	// apps each module's declarations are merged into this graph; for a layered
+	// stack the imports pull every brick into the pool the playground composes.
 	Imports    []string
 	Auth       bool // a bare `auth` line turns on built-in users/login/logout/signup
 	Entities   []*Entity
@@ -26,6 +51,15 @@ type App struct {
 	Views      []*View
 	Theme      []ThemeVar
 	Line       int
+}
+
+// Socket is one typed slot declared by a wireframe: `socket feed: data`. Accept
+// is the facet kind ("ui" or "data") allowed to snap in; a mismatch is a compile
+// error — the studs don't line up.
+type Socket struct {
+	Name   string
+	Accept string // "ui" | "data"
+	Line   int
 }
 
 // Enum is a closed set of named text values: `enum Status: active, closed`. An
@@ -256,8 +290,14 @@ type View struct {
 // Node is a UI node. The set is small and target-neutral.
 type Node interface{ node() }
 
-// Box is a layout container.
+// Box is a layout container — its children stack vertically.
 type Box struct{ Children []Node }
+
+// Row is a horizontal layout container — its children sit side by side and wrap,
+// collapsing to a vertical stack on narrow viewports. It is the seam for
+// responsive multi-column layouts (e.g. a nav rail beside a feed beside an
+// aside) that reflow with the window.
+type Row struct{ Children []Node }
 
 // Text is a text leaf of literal and interpolated segments.
 type Text struct{ Segs []Seg }
@@ -352,18 +392,25 @@ type Use struct {
 // rendered. A layout has exactly one.
 type Slot struct{}
 
-func (Box) node()    {}
-func (Text) node()   {}
-func (Button) node() {}
-func (For) node()    {}
-func (If) node()     {}
-func (Input) node()  {}
-func (Link) node()   {}
-func (Select) node() {}
-func (Form) node()   {}
-func (Upload) node() {}
-func (Use) node()    {}
-func (Slot) node()   {}
+// SlotRef is a named injection point inside a wireframe frame: `slot feed`. The
+// compiler composites the content of the facet(s) snapped into that socket here.
+// Unlike a layout's single anonymous Slot, a frame has one SlotRef per socket.
+type SlotRef struct{ Name string }
+
+func (Box) node()     {}
+func (Row) node()     {}
+func (Text) node()    {}
+func (Button) node()  {}
+func (For) node()     {}
+func (If) node()      {}
+func (Input) node()   {}
+func (Link) node()    {}
+func (Select) node()  {}
+func (Form) node()    {}
+func (Upload) node()  {}
+func (Use) node()     {}
+func (Slot) node()    {}
+func (SlotRef) node() {}
 
 // ── expressions ─────────────────────────────────────────────────────────────
 

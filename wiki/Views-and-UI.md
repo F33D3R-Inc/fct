@@ -20,7 +20,8 @@ view Name [at "/path"] [in Layout] [requires policy]:
 
 | Node | Syntax |
 |---|---|
-| **box** | `box:` then indented children — a container |
+| **box** | `box:` then indented children — a vertical container |
+| **row** | `row:` then indented children — a horizontal container that wraps and collapses to a column on a narrow viewport (responsive multi-column) |
 | **text** | `text "literal and {expr}"` |
 | **button** | `button "label" -> action(args)` |
 | **input** | `input bind cell [placeholder "…"]` |
@@ -31,7 +32,7 @@ view Name [at "/path"] [in Layout] [requires policy]:
 | **if** | `if <cond>:` then children |
 | **for** | `for x in Coll [where c] [by f desc\|asc] [limit n]:` then children |
 | **use** | `use Component(args)` |
-| **slot** | `slot` (layouts only) |
+| **slot** | `slot` (layouts) — where the routed view renders; `slot <name>` in a [wireframe frame](Layered-Facets.md) — where a socket's content composites in |
 
 ### text & interpolation
 
