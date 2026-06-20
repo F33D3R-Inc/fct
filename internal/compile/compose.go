@@ -21,6 +21,20 @@ func isLayered(facets []*ast.App) bool {
 	return false
 }
 
+// isComponentOnly reports whether a plain module is purely presentational: it
+// declares at least one component and nothing that needs placement or a socket —
+// no entities, enums, state, derives, policies, actions, jobs, services, views,
+// mounts, sockets, frame, or auth. Such a module is a shareable atom set that a
+// layered build can pull in alongside its bricks (its components serve them all),
+// so a single PostCard/Avatar file works in both the plain-app and layered tracks.
+func isComponentOnly(f *ast.App) bool {
+	return len(f.Components) > 0 &&
+		len(f.Entities) == 0 && len(f.Enums) == 0 && len(f.States) == 0 &&
+		len(f.Derives) == 0 && len(f.Policies) == 0 && len(f.Actions) == 0 &&
+		len(f.Jobs) == 0 && len(f.Services) == 0 && len(f.Views) == 0 &&
+		len(f.Mounts) == 0 && len(f.Sockets) == 0 && len(f.Frame) == 0 && !f.Auth
+}
+
 // compose snaps a set of typed bricks into one flat application graph. The shape
 // is fixed by the architecture: a `playground` baseplate mounts one or more
 // `wireframe`s as screens; each wireframe exposes typed `socket`s; `ui` and
@@ -30,9 +44,14 @@ func isLayered(facets []*ast.App) bool {
 // the app is built; each mount is a surface placement runs over, and the runtime
 // routes between screens by their guards.
 func compose(facets []*ast.App) (*ast.App, error) {
-	// 1. Partition the bricks by kind and enforce one baseplate.
+	// 1. Partition the bricks by kind and enforce one baseplate. A plain module
+	//    that is *purely presentational* (only components/layouts/theme) is a
+	//    shareable atom set — it carries no data or logic to place, so it's pulled
+	//    into the layered graph like a brick's components, letting one PostCard/
+	//    Avatar serve both a plain app and a layered build. A plain module with any
+	//    data, logic, or views is still rejected — it would need a socket to live in.
 	var playground *ast.App
-	var wireframes, bricks []*ast.App
+	var wireframes, bricks, atoms []*ast.App
 	for _, f := range facets {
 		switch f.Kind {
 		case "playground":
@@ -45,7 +64,11 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		case "ui", "data":
 			bricks = append(bricks, f)
 		case "", "app":
-			return nil, fmt.Errorf("plain `app` %q cannot be mixed into a layered build — make it a `ui`/`data` facet, or build from a playground", f.Name)
+			if isComponentOnly(f) {
+				atoms = append(atoms, f)
+				continue
+			}
+			return nil, fmt.Errorf("plain `app` %q cannot be mixed into a layered build — make it a `ui`/`data` facet (or strip it to components only), or build from a playground", f.Name)
 		}
 	}
 	if playground == nil {
@@ -119,6 +142,13 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		for _, p := range b.Policies {
 			knownPolicy[p.Name] = len(p.Params)
 		}
+	}
+	// Shareable atom modules contribute only their components/layouts/theme — the
+	// presentational vocabulary every brick can `use`.
+	for _, a := range atoms {
+		app.Components = append(app.Components, a.Components...)
+		app.Layouts = append(app.Layouts, a.Layouts...)
+		app.Theme = append(app.Theme, a.Theme...)
 	}
 
 	// 5. Each playground mount becomes one screen: its wireframe's frame composited

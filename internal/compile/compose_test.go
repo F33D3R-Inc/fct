@@ -302,6 +302,42 @@ func TestSocketNamesUniqueAcrossWireframes(t *testing.T) {
 	}
 }
 
+func TestLayeredComponentOnlyAtomMerges(t *testing.T) {
+	files := layeredFiles()
+	// A shareable atom: a plain, component-only module — no data/logic/views. The
+	// data brick imports it and `use`s its component, the same file a plain app
+	// would import.
+	files["card.fct"] = `app Atoms:
+    component Card(label: text):
+        box:
+            text "{label}"
+`
+	files["feed.fct"] = `import "card.fct"
+data Feed in feed:
+    entity Tweet:
+        id: int
+        author: text
+        body: text
+    content:
+        for t in Tweet limit 50:
+            use Card(t.body)
+`
+	entry := writeProject(t, files, "playground.fct")
+	ir, err := File(entry)
+	if err != nil {
+		t.Fatalf("a component-only atom should merge into a layered build, got: %v", err)
+	}
+	var hasCard bool
+	for _, c := range ir.Components {
+		if c.Name == "Card" {
+			hasCard = true
+		}
+	}
+	if !hasCard {
+		t.Error("the atom's Card component did not merge into the layered graph")
+	}
+}
+
 func TestLayeredErrorOnPlainAppMixedIn(t *testing.T) {
 	files := layeredFiles()
 	// Replace a ui brick with a plain app — it can't be mixed into a layered build.

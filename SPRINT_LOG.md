@@ -10,6 +10,47 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 11 — 2026-06-20 — item 6 finished: two language gaps closed + the f33d3r core library → released v1.17.0
+
+**The cycle, end to end:** the library (Sprint 10) surfaced two language walls; this
+sprint fixed the language, finished the library on top, released v1.17.0, and
+verified the new behavior end to end.
+
+**Two language fixes (the gaps Sprint 10 surfaced):**
+1. **`remove … where` — filtered delete (unblocks unfollow).** `remove item in
+   Entity where <cond>` deletes every matching row (delete-by-non-id-key), beside
+   the existing by-id `remove Entity(key)`. Surface: ast.Remove (Var/Where), parser
+   (`remove item in Entity where cond`), ir.Stmt (Var/Where) + build lowering (the
+   `where` is checkPure'd over {item var + action locals}; state reads tracked for
+   soundness), runtime **server.go** (filtered fold: bind item var, delete + cascade)
+   and **facet.js** (mirror). Verified e2e on the dev server: follow grace+alan →
+   unfollow grace → only alan remains.
+2. **Shareable components cross into layered builds.** A plain, *component-only*
+   module (only components/layouts/theme — no data/logic/views/auth) is now pulled
+   into a layered (`playground`) build like a brick's components, so one
+   PostCard/Avatar/ComposeBox file serves **both** the plain-app and the typed-brick
+   tracks. Surface: compose.go `isComponentOnly` + atom merge. A plain app with any
+   data/logic/views is still rejected (it needs a socket).
+
+**Library finished (the f33d3r core batch, v0.1.0 in `library/facet.json`):**
+- **Un-inlined** PostCard — the `data Feed` facet now imports the SAME shared atoms
+  (PostCard/ComposeBox/SearchBox/WhoToFollow) the plain `home.fct` uses (gap #2).
+- **unfollow** wired into both tracks via `remove … where` (gap #1); FollowButton now
+  offers Follow ⇄ Unfollow.
+- New atoms: **SearchBox** (forms), **UnreadBadge** + **NotificationItem** (notify),
+  **WhoToFollow** (social), **ProfileHeader** (profile); **Nav** is now an icon rail.
+- Added `library/facet.json` (`github.com/F33D3R-Inc/facets` v0.1.0, `facet >=1.16.0`)
+  + `library/README.md`.
+- Both tracks build green (`facet build library/home.fct` and `…/f33d3r.fct`); the
+  layered IR merges the shared atoms and lowers unfollow to a filtered remove.
+
+**Tests:** `internal/compile/remove_test.go` (filtered-remove lowering + impure-where
+rejection + by-id still works), `internal/compile/compose_test.go`
+(`TestLayeredComponentOnlyAtomMerges`). go build/vet/test green, gofmt clean.
+version -> **1.17.0**. Released to main + tag.
+
+---
+
 ## Sprint 10 — 2026-06-20 — item 6: facet library core batch (local) + local machine updated
 
 **Language milestone:** items 1–5 done (v1.12–v1.16). `facet` on the machine

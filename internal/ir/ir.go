@@ -205,6 +205,8 @@ type Stmt struct {
 	Fields  []FieldInit `json:"fields,omitempty"`  // add
 	Service string      `json:"service,omitempty"` // call: the service name
 	Args    []*Expr     `json:"args,omitempty"`    // call: the operation arguments
+	Var     string      `json:"var,omitempty"`     // remove (filtered): item variable
+	Where   *Expr       `json:"where,omitempty"`   // remove (filtered): predicate (nil = by-id)
 }
 
 // FieldInit is a `name: expr` in an `add`.

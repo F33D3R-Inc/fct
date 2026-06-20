@@ -739,10 +739,29 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("remove on unknown entity %q", st.Entity)}
 			}
 			entWrite = true
-			if err := readExpr(st.Key, st.Line); err != nil {
-				return Action{}, err
+			if st.Where != nil {
+				// Filtered delete: a pure predicate over the item var + action scope.
+				wl := map[string]bool{st.Var: true}
+				for k := range loc {
+					wl[k] = true
+				}
+				if err := e.checkPure(st.Where, wl, st.Line, "a `remove … where` filter"); err != nil {
+					return Action{}, err
+				}
+				lw := e.low(st.Where)
+				// track state reads for soundness (the authority can't read @client state)
+				for n := range e.depsIR(lw) {
+					if _, isState := e.states[n]; isState {
+						reads[n] = true
+					}
+				}
+				act.Body = append(act.Body, Stmt{Op: "remove", Entity: st.Entity, Var: st.Var, Where: lw})
+			} else {
+				if err := readExpr(st.Key, st.Line); err != nil {
+					return Action{}, err
+				}
+				act.Body = append(act.Body, Stmt{Op: "remove", Entity: st.Entity, Key: e.low(st.Key)})
 			}
-			act.Body = append(act.Body, Stmt{Op: "remove", Entity: st.Entity, Key: e.low(st.Key)})
 		case ast.Clear:
 			if !e.entities[st.Entity] {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("clear on unknown entity %q", st.Entity)}

@@ -1,9 +1,15 @@
 # Feed — a `data` facet: a whole vertical slice (durable data + server logic +
-# authorization + its own components + content) that snaps into the `feed` socket.
-# Self-contained (a layered build can't import plain-app component modules — see
-# SPRINT_LOG finding), so its PostCard lives here. Exercises the v1.16 language end
-# to end: filtered count/exists, tabs, match, richtext/video, pending/failed,
-# contains/search, components, image/badge.
+# authorization + content) that snaps into the `feed` socket. Its presentation is
+# composed from the SHARED component atoms (PostCard / ComposeBox / SearchBox /
+# WhoToFollow) — the same files the plain-app track imports — now that a layered
+# build can pull in component-only modules (the shareable-component gap, closed in
+# v1.17.0). Exercises the v1.16 language end to end: filtered count/exists, tabs,
+# match, richtext/video, pending/failed, contains/search, components, image/badge,
+# and `remove … where` (unfollow).
+import "../social/postcard.fct"
+import "../social/composebox.fct"
+import "../social/whotofollow.fct"
+import "../forms/searchbox.fct"
 data Feed in feed:
     enum Kind: text, richtext, video
 
@@ -56,42 +62,20 @@ data Feed in feed:
     action follow(handle: text):
         requires member
         add Follow { follower: actor, followee: handle }
-
-    component PostCard(id: int, author: text, handle: text, verified: bool, kind: text, body: text, media: text, likes: int, reposts: int):
-        box:
-            row:
-                image "https://api.dicebear.com/7.x/thumbs/svg?seed={author}"
-                box:
-                    row:
-                        text "{author}"
-                        if verified:
-                            badge "✓"
-                    text "@{handle}"
-            match kind:
-                case "richtext":
-                    richtext "{body}"
-                case "video":
-                    video "{media}"
-                else:
-                    text "{body}"
-            row:
-                button "🔁 {reposts}" -> repost(id)
-                button "♥ {likes}" -> like(id)
-                button "🔖" -> bookmark(id)
+    action unfollow(handle: text):
+        requires member
+        remove f in Follow where f.follower == actor && f.followee == handle
 
     content:
-        box:
-            input bind draft placeholder "What's happening?"
-            row:
-                if pending(post):
-                    text "Posting…"
-                button "Post" -> post(draft)
-            text "{failed(post)}"
-        input bind q placeholder "Search"
+        use ComposeBox()
+        use SearchBox()
         tabs bind feedTab:
             tab "For you" -> "foryou":
                 for t in Tweet where contains(lower(t.body), lower(q)) by created desc limit shown:
-                    use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), count(r in Repost where r.tweet == t.id))
+                    use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), 0, count(r in Repost where r.tweet == t.id))
             tab "Following" -> "following":
                 for t in Tweet where exists(f in Follow where f.follower == actor && f.followee == t.author) by created desc limit shown:
-                    use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), count(r in Repost where r.tweet == t.id))
+                    use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), 0, count(r in Repost where r.tweet == t.id))
+        text "Who to follow"
+        use WhoToFollow("Grace Hopper", "grace", true, exists(f in Follow where f.follower == actor && f.followee == "grace"))
+        use WhoToFollow("Alan Turing", "alan", false, exists(f in Follow where f.follower == actor && f.followee == "alan"))

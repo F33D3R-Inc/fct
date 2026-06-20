@@ -566,8 +566,18 @@
           eq(r.id, key) ? Object.assign({}, r, { [st.field]: ev(st.value, scope) }) : r);
         scope[st.entity] = store[st.entity]; changed.push(st.entity);
       } else if (st.op === "remove") {
-        const key = ev(st.key, scope);
-        store[st.entity] = (store[st.entity] || []).filter((r) => !eq(r.id, key));
+        if (st.where) {
+          // Filtered delete: drop every row the predicate accepts, item var bound.
+          const had = Object.prototype.hasOwnProperty.call(scope, st.var);
+          const prev = scope[st.var];
+          store[st.entity] = (store[st.entity] || []).filter((r) => {
+            scope[st.var] = r; return !truthy(ev(st.where, scope));
+          });
+          if (had) scope[st.var] = prev; else delete scope[st.var];
+        } else {
+          const key = ev(st.key, scope);
+          store[st.entity] = (store[st.entity] || []).filter((r) => !eq(r.id, key));
+        }
         scope[st.entity] = store[st.entity]; changed.push(st.entity);
       } else if (st.op === "clear") {
         store[st.entity] = []; scope[st.entity] = store[st.entity]; changed.push(st.entity);

@@ -1037,10 +1037,23 @@ func parseSet(n *source.Node) (ast.Stmt, error) {
 
 func parseRemove(n *source.Node) (ast.Stmt, error) {
 	rest := strings.TrimSpace(n.Line.Text[len("remove "):])
+	// Filtered form: `remove <item> in <Entity> where <cond>` — delete all matches.
+	if wi := strings.Index(rest, " where "); wi >= 0 && strings.Contains(rest[:wi], " in ") {
+		hf := strings.Fields(strings.TrimSpace(rest[:wi]))
+		if len(hf) != 3 || hf[1] != "in" || !isIdent(hf[0]) || !isIdent(hf[2]) {
+			return nil, &Error{n.Line.No, "remove filter is `remove item in Entity where cond`"}
+		}
+		cond, err := parseExpr(strings.TrimSpace(rest[wi+len(" where "):]), n.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		return ast.Remove{Entity: hf[2], Var: hf[0], Where: cond, Line: n.Line.No}, nil
+	}
+	// By-id form: `remove Entity(key)`.
 	open := strings.IndexByte(rest, '(')
 	close := strings.LastIndexByte(rest, ')')
 	if open < 0 || close < open {
-		return nil, &Error{n.Line.No, "remove needs `remove Entity(key)`"}
+		return nil, &Error{n.Line.No, "remove needs `remove Entity(key)` or `remove item in Entity where cond`"}
 	}
 	ent := strings.TrimSpace(rest[:open])
 	key, err := parseExpr(strings.TrimSpace(rest[open+1:close]), n.Line.No)

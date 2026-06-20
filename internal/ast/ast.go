@@ -296,10 +296,14 @@ type Set struct {
 	Line   int
 }
 
-// Remove deletes an entity row by id: `remove Entity(key)`.
+// Remove deletes entity rows: by id (`remove Entity(key)`) or, in its filtered
+// form, every row matching a predicate (`remove m in Entity where <cond>`) — the
+// delete-by-key needed for things like unfollow.
 type Remove struct {
 	Entity string
-	Key    Expr
+	Key    Expr   // by-id form (nil in the filtered form)
+	Var    string // filtered form: item variable
+	Where  Expr   // filtered form: predicate (nil = by-id form)
 	Line   int
 }
 

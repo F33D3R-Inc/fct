@@ -691,6 +691,40 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 				}
 			}
 		case "remove":
+			if st.Where != nil {
+				// Filtered delete: remove every row the predicate accepts, with the
+				// item variable bound to each row (mirrors the filtered-agg fold).
+				rows := s.entities[st.Entity]
+				prev, had := scope[st.Var]
+				kept := make([]any, 0, len(rows))
+				removed := map[int]bool{}
+				for _, r := range rows {
+					m, ok := r.(record)
+					if !ok {
+						kept = append(kept, r)
+						continue
+					}
+					scope[st.Var] = m
+					if truthy(eval(st.Where, scope)) {
+						id := m["id"]
+						ops = append(ops, durOp{kind: "delete", entity: st.Entity, id: id})
+						removed[toInt(id)] = true
+					} else {
+						kept = append(kept, r)
+					}
+				}
+				if had {
+					scope[st.Var] = prev
+				} else {
+					delete(scope, st.Var)
+				}
+				if len(removed) > 0 {
+					s.entities[st.Entity] = kept
+					entChanged[st.Entity] = true
+					s.cascadeMem(st.Entity, removed, entChanged)
+				}
+				break
+			}
 			key := eval(st.Key, scope)
 			rows := s.entities[st.Entity]
 			for i, r := range rows {
