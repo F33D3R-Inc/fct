@@ -110,6 +110,7 @@
           case "<=": return toInt(l) <= toInt(r);
           case ">": return toInt(l) > toInt(r);
           case ">=": return toInt(l) >= toInt(r);
+          case "in": return Array.isArray(r) && r.some((x) => eq(l, x));
         }
       }
     }

@@ -143,6 +143,14 @@ func eval(e *ir.Expr, scope map[string]any) any {
 			return toInt(l) > toInt(r)
 		case ">=":
 			return toInt(l) >= toInt(r)
+		case "in":
+			items, _ := r.([]any)
+			for _, el := range items {
+				if equal(l, el) {
+					return true
+				}
+			}
+			return false
 		}
 	}
 	return nil

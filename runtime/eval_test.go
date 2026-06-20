@@ -136,6 +136,25 @@ func TestEvalContains(t *testing.T) {
 	}
 }
 
+// `in` tests membership of a value in a list (a list literal or a list value).
+// The JS mirror is Array.some(eq) in assets/facet.js.
+func TestEvalIn(t *testing.T) {
+	list := &ir.Expr{Kind: "list", Args: []*ir.Expr{
+		{Kind: "lit", Val: "video", VType: "text"},
+		{Kind: "lit", Val: "image", VType: "text"},
+	}}
+	in := func(v string) any {
+		return eval(&ir.Expr{Kind: "bin", Op: "in",
+			L: &ir.Expr{Kind: "lit", Val: v, VType: "text"}, R: list}, map[string]any{})
+	}
+	if in("image") != true {
+		t.Error(`"image" in ["video","image"] should be true`)
+	}
+	if in("text") != false {
+		t.Error(`"text" in ["video","image"] should be false`)
+	}
+}
+
 // The effectful builtins evaluate on the server: now() is a positive unix time,
 // rand(n) is bounded to [0, n).
 func TestEvalBuiltins(t *testing.T) {

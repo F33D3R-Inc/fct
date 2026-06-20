@@ -10,6 +10,27 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 8 — 2026-06-20 — item 4: query depth (`in` + joins) → released v1.15.0
+
+**Shipped + released v1.15.0:**
+- **`in` membership operator** — `where p.kind in ["video","image"]` (list literal
+  or list value). Added as the one word-operator in the expr precedence parser
+  (parseBinary now accepts the `in` ident; binPrec "in":3, comparison level).
+  Eval: Go loop with equal(); JS Array.some(eq). Flows through bin generically
+  (lower/check/deps/hasImpure unchanged). SQL pushdown falls back (view lists are
+  in-memory; fine).
+- **Multi-hop joins** — confirmed already working: nested entity lookups compose
+  (`User(Post(c.post).author).name`). No code needed; documented + noted.
+- **group-by** — deferred (lower value): ranking/leaderboards are expressible with
+  Tier-1 filtered counts; true group-by (row→group reshape) not needed yet. A
+  `by <expr>` ranking sort could be a later v1.15.1 if the leaderboard needs it.
+
+Surface: parser (binPrec + parseBinary `in`), eval.go + facet.js (bin `in`). Tests:
+eval `in` (TestEvalIn). Verified via binary (in-where builds; nested join builds).
+go build/vet/test green, gofmt clean. version -> 1.15.0.
+
+---
+
 ## Sprint 7 — 2026-06-20 — item 2 closed (generics SKIPPED) + item 3: forms-with-state → released v1.14.0
 
 **Item 2 closed:** scoped generics **SKIPPED** (user agreed) — low ROI for the

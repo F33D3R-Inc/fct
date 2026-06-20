@@ -113,7 +113,7 @@ type exprParser struct {
 
 var binPrec = map[string]int{
 	"||": 1, "&&": 2,
-	"==": 3, "!=": 3, "<": 3, "<=": 3, ">": 3, ">=": 3,
+	"==": 3, "!=": 3, "<": 3, "<=": 3, ">": 3, ">=": 3, "in": 3,
 	"+": 4, "-": 4,
 	"*": 5, "/": 5, "%": 5,
 }
@@ -132,10 +132,19 @@ func (p *exprParser) parseBinary(minPrec int) (ast.Expr, error) {
 	}
 	for {
 		t, ok := p.peek()
-		if !ok || t.kind != tOp {
+		if !ok {
 			break
 		}
-		prec, isBin := binPrec[t.text]
+		// Operators are symbols (tOp); `in` (membership) is the one word operator.
+		op := ""
+		if t.kind == tOp {
+			op = t.text
+		} else if t.kind == tIdent && t.text == "in" {
+			op = "in"
+		} else {
+			break
+		}
+		prec, isBin := binPrec[op]
 		if !isBin || prec < minPrec {
 			break
 		}
@@ -144,7 +153,7 @@ func (p *exprParser) parseBinary(minPrec int) (ast.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		left = ast.Bin{Op: t.text, L: left, R: right}
+		left = ast.Bin{Op: op, L: left, R: right}
 	}
 	return left, nil
 }

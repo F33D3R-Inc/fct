@@ -141,6 +141,13 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.15.0 — query depth: `in` + joins.** The `in` membership operator tests a
+value against a list — `for p in Post where p.kind in ["video", "image"]` or against
+a `@client` list cell. And **multi-hop joins already work**: nested entity lookups
+compose, so `User(Post(c.post).author).name` reads across two relations in one
+expression. (`exists(...)` from v1.10 covers correlated "people I follow" feeds;
+true SQL group-by is deferred — ranking is expressible with filtered counts.) Item 4.
+
 **v1.14.0 — forms with reactive state (`pending` / `failed`).** Forms get
 status for free. **`pending(post)`** is true while a `post` action is in flight and
 **`failed(post)`** is its last error message ("" on success) — both reactive client
