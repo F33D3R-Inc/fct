@@ -10,6 +10,26 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 6 — 2026-06-20 — item 2 (part 1): pattern matching → released v1.13.0
+
+**Shipped + released v1.13.0** — `match` view node with enum exhaustiveness.
+- `match <expr>:` + `case "value":` arms + optional `else:`; renders the matching
+  arm, reactive region on the subject's deps + body deps.
+- **Exhaustiveness**: added lightweight type resolution — `env.entFieldEnum`
+  (entity→field→enum) + `scope.itemTypes` (loop var→entity), so `matchEnum`
+  resolves the subject's enum type for a state ref (`match mode:`) or an entity
+  item field (`match p.kind:`). Enum subject ⇒ all members required (or `else`);
+  unknown member / duplicate case / open-type-without-else are compile errors.
+- Surface: ast (Match/MatchCase), parser (parseMatch), ir (matchEnum, entFieldEnum,
+  scope.itemTypes threaded through `for`, exhaustiveness check, region+deps),
+  server.go (renderMatch) + facet.js (fillMatch, region register + refresh route).
+  Tests: match_test.go (exhaustive enum, else, 4 error cases). Verified via binary:
+  exhaustive builds; non-exhaustive errors naming the missing members.
+
+**Remaining in item 2 → v1.13.1:** scoped generics (reusable typed components).
+
+---
+
 ## Sprint 5 — 2026-06-20 — item 1 done: search + pagination → released v1.12.0
 
 **Versioning policy (user directive):** one MINOR per roadmap item; splits within an

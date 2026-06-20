@@ -23,18 +23,19 @@ func (e *BuildError) Error() string {
 
 // env is the name environment used to validate references and compute deps.
 type env struct {
-	states       map[string]string          // name -> placement
-	entities     map[string]bool            // entity names
-	entityFields map[string]map[string]bool // entity -> field set (incl id)
-	indexFields  map[string]map[string]bool // entity -> fields the compiler saw queried (build a DB index)
-	inline       map[string]*Expr           // zero-arg policy/derive name -> lowered expr, inlined at every use
-	policySet    map[string]bool            // policy names (gating via `requires`)
-	policyParams map[string][]Param         // policy name -> its parameters (row-level policies)
-	enums        map[string][]string        // enum name -> ordered member values
-	components   map[string][]Param         // component name -> its parameters
-	compDeps     map[string]map[string]bool // component name -> the state/entity names its body reads (for use-site refresh)
-	stateTypes   map[string]string          // state name -> its (core/element) type, for enum-defaulted selects
-	services     map[string]map[string]int  // service name -> op name -> parameter count, for checking `call`
+	states       map[string]string            // name -> placement
+	entities     map[string]bool              // entity names
+	entityFields map[string]map[string]bool   // entity -> field set (incl id)
+	indexFields  map[string]map[string]bool   // entity -> fields the compiler saw queried (build a DB index)
+	inline       map[string]*Expr             // zero-arg policy/derive name -> lowered expr, inlined at every use
+	policySet    map[string]bool              // policy names (gating via `requires`)
+	policyParams map[string][]Param           // policy name -> its parameters (row-level policies)
+	enums        map[string][]string          // enum name -> ordered member values
+	components   map[string][]Param           // component name -> its parameters
+	compDeps     map[string]map[string]bool   // component name -> the state/entity names its body reads (for use-site refresh)
+	stateTypes   map[string]string            // state name -> its (core/element) type, for enum-defaulted selects
+	services     map[string]map[string]int    // service name -> op name -> parameter count, for checking `call`
+	entFieldEnum map[string]map[string]string // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
 }
 
 // markIndex records that entity.field is filtered, ordered, or a relation, so the
@@ -63,7 +64,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}, entFieldEnum: map[string]map[string]string{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -104,6 +105,10 @@ func Build(app *ast.App) (*IR, error) {
 			if _, isEnum := e.enums[f.Type]; isEnum {
 				fld.Type = "text"
 				fld.Enum = f.Type
+				if e.entFieldEnum[ent.Name] == nil {
+					e.entFieldEnum[ent.Name] = map[string]string{}
+				}
+				e.entFieldEnum[ent.Name][f.Name] = f.Type
 			}
 			ei.Fields = append(ei.Fields, fld)
 			e.entityFields[ent.Name][f.Name] = true
@@ -815,8 +820,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 // whether we are inside a dynamic region (a for/if), where interpolations are
 // rendered inline rather than tracked as top-level bindings.
 type scope struct {
-	locals   map[string]bool
-	inRegion bool
+	locals    map[string]bool
+	inRegion  bool
+	itemTypes map[string]string // loop/item variable -> the entity it ranges over (for `match` enum resolution)
 }
 
 func (s scope) with(v string) scope {
@@ -825,7 +831,43 @@ func (s scope) with(v string) scope {
 		m[k] = true
 	}
 	m[v] = true
-	return scope{locals: m, inRegion: true}
+	it := map[string]string{}
+	for k, val := range s.itemTypes {
+		it[k] = val
+	}
+	return scope{locals: m, inRegion: true, itemTypes: it}
+}
+
+// matchEnum resolves the enum type of a `match` subject, for exhaustiveness — a
+// state cell (`match mode:`) or an entity item field (`match post.kind:`). Returns
+// "" when the subject is not enum-typed (then the match must have an `else`).
+func (c *viewCtx) matchEnum(e ast.Expr, sc scope) string {
+	switch t := e.(type) {
+	case ast.Ref:
+		if typ := c.e.stateTypes[t.Name]; typ != "" {
+			if _, ok := c.e.enums[typ]; ok {
+				return typ
+			}
+		}
+	case ast.Get:
+		if r, ok := t.Obj.(ast.Ref); ok {
+			if ent, ok := sc.itemTypes[r.Name]; ok {
+				if fields, ok := c.e.entFieldEnum[ent]; ok {
+					return fields[t.Field] // "" if not an enum field
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func enumHas(members []string, v string) bool {
+	for _, m := range members {
+		if m == v {
+			return true
+		}
+	}
+	return false
 }
 
 type call struct {
@@ -964,6 +1006,65 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			out = append(out, node)
 
+		case ast.Match:
+			if err := c.e.checkPure(t.Expr, withActor(sc.locals), t.Line, "a `match`"); err != nil {
+				return nil, err
+			}
+			enumName := c.matchEnum(t.Expr, sc)
+			node := Node{Kind: "match", Cond: c.e.low(t.Expr)}
+			seen := map[string]bool{}
+			for _, cs := range t.Cases {
+				if seen[cs.Value] {
+					return nil, &BuildError{t.Line, fmt.Sprintf("duplicate match case %q", cs.Value)}
+				}
+				seen[cs.Value] = true
+				if enumName != "" && !enumHas(c.e.enums[enumName], cs.Value) {
+					return nil, &BuildError{t.Line, fmt.Sprintf("enum %q has no member %q", enumName, cs.Value)}
+				}
+				kids, err := c.nodes(cs.Body, scope{locals: sc.locals, inRegion: true, itemTypes: sc.itemTypes})
+				if err != nil {
+					return nil, err
+				}
+				node.Children = append(node.Children, Node{Kind: "case", Value: cs.Value, Children: kids})
+			}
+			if t.Else != nil {
+				kids, err := c.nodes(t.Else, scope{locals: sc.locals, inRegion: true, itemTypes: sc.itemTypes})
+				if err != nil {
+					return nil, err
+				}
+				node.Children = append(node.Children, Node{Kind: "else", Children: kids})
+			}
+			// Exhaustiveness: an enum-typed match must cover every member or have an
+			// `else`; an open-typed match must have an `else` (we can't prove coverage).
+			if t.Else == nil {
+				if enumName != "" {
+					var missing []string
+					for _, m := range c.e.enums[enumName] {
+						if !seen[m] {
+							missing = append(missing, m)
+						}
+					}
+					if len(missing) > 0 {
+						return nil, &BuildError{t.Line, fmt.Sprintf(
+							"match on enum %q is not exhaustive: missing %s (add the case(s) or an `else`)", enumName, strings.Join(missing, ", "))}
+					}
+				} else {
+					return nil, &BuildError{t.Line,
+						"match must be exhaustive: add an `else` branch (the matched value's type is open, so coverage can't be proven)"}
+				}
+			}
+			if !sc.inRegion {
+				node.ID = fmt.Sprintf("m%d", c.nf)
+				c.nf++
+				for _, d := range sortedKeys(c.e.depsIR(node.Cond)) {
+					c.addDep(d, node.ID)
+				}
+				for _, d := range sortedKeys(c.e.nodeDeps(node.Children)) {
+					c.addDep(d, node.ID)
+				}
+			}
+			out = append(out, node)
+
 		case ast.Button:
 			segs, err := c.lowerSegs(t.Label, sc)
 			if err != nil {
@@ -1036,7 +1137,11 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 					}
 				}
 			}
-			kids, err := c.nodes(t.Body, sc.with(t.Var))
+			child := sc.with(t.Var)
+			if c.e.entities[t.Coll] {
+				child.itemTypes[t.Var] = t.Coll // so `match item.field` can resolve an enum field
+			}
+			kids, err := c.nodes(t.Body, child)
 			if err != nil {
 				return nil, err
 			}

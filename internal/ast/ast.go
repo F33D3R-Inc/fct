@@ -386,6 +386,24 @@ type Tab struct {
 	Body  []Node
 }
 
+// Match is a `match <expr>:` node — pattern matching over a value, with one
+// `case "value":` branch per match and an optional `else:`. When the matched
+// expression is enum-typed (a state cell or an entity field), the compiler
+// enforces exhaustiveness: every member must have a case, or there must be an
+// `else`. It is the post-kind / notification-kind render switch.
+type Match struct {
+	Expr  Expr
+	Cases []MatchCase
+	Else  []Node // nil = no else branch
+	Line  int
+}
+
+// MatchCase is one `case "value":` arm of a Match.
+type MatchCase struct {
+	Value string
+	Body  []Node
+}
+
 // Seg is one piece of a Text: literal (Expr == nil) or interpolation.
 type Seg struct {
 	Lit  string
@@ -492,6 +510,7 @@ func (Video) node()    {}
 func (Richtext) node() {}
 func (Badge) node()    {}
 func (Tabs) node()     {}
+func (Match) node()    {}
 func (Button) node()   {}
 func (For) node()      {}
 func (If) node()       {}

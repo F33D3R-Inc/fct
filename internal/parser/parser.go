@@ -1208,6 +1208,12 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, tb)
+		case strings.HasPrefix(t, "match "):
+			m, err := parseMatch(c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, m)
 		case strings.HasPrefix(t, "for "):
 			f, err := parseFor(c)
 			if err != nil {
@@ -1541,6 +1547,47 @@ func parseTabs(n *source.Node) (ast.Node, error) {
 		return nil, &Error{n.Line.No, "tabs needs at least one `tab`"}
 	}
 	return tabs, nil
+}
+
+// parseMatch: `match <expr>:` with `case "value":` arms and an optional `else:`,
+// each holding a node body.
+func parseMatch(n *source.Node) (ast.Node, error) {
+	exprS := strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("match "):]), ":")
+	if exprS == "" {
+		return nil, &Error{n.Line.No, "match needs a value: match <expr>:"}
+	}
+	e, err := parseExpr(exprS, n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	m := ast.Match{Expr: e, Line: n.Line.No}
+	for _, c := range n.Children {
+		ct := strings.TrimSpace(c.Line.Text)
+		switch {
+		case strings.HasPrefix(ct, "case "):
+			val, err := unquote(strings.TrimSuffix(strings.TrimSpace(ct[len("case "):]), ":"), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body, err := parseNodes(c.Children)
+			if err != nil {
+				return nil, err
+			}
+			m.Cases = append(m.Cases, ast.MatchCase{Value: val, Body: body})
+		case ct == "else:" || ct == "else":
+			body, err := parseNodes(c.Children)
+			if err != nil {
+				return nil, err
+			}
+			m.Else = body
+		default:
+			return nil, &Error{c.Line.No, `match children must be cases: case "value": (or else:)`}
+		}
+	}
+	if len(m.Cases) == 0 {
+		return nil, &Error{n.Line.No, "match needs at least one `case`"}
+	}
+	return m, nil
 }
 
 // parseForm: `form "Submit" -> action(args):` then child nodes (inputs, text).

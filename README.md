@@ -141,6 +141,16 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.13.0 — pattern matching (`match`) with exhaustiveness.** The post-kind /
+notification-kind render switch, type-checked. `match post.kind:` with a
+`case "video":` per branch and an optional `else:` renders the matching arm. When
+the subject is **enum-typed** (a state cell or an entity field), the compiler
+**enforces exhaustiveness** — every member must have a case or there must be an
+`else`, and an unknown member is a compile error (so adding an enum value flags
+every `match` that forgot it). It's a reactive region: re-renders when the matched
+value changes. First half of the type-system core (item 2); scoped generics next
+(v1.13.1).
+
 **v1.12.0 — search + pagination (Tier 3 finish).** Two query affordances real
 feeds need. **`contains(s, sub)`** is a pure substring builtin — `for p in Post
 where contains(lower(p.body), lower(q))` is a live search box (bind `q` to a

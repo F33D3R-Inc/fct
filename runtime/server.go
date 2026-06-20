@@ -1222,6 +1222,28 @@ func activeTab(n ir.Node, scope map[string]any) string {
 	return cur
 }
 
+// renderMatch renders the body of the `case` matching the subject value, or the
+// `else` case if none matches.
+func (s *Server) renderMatch(b *strings.Builder, n ir.Node, scope map[string]any) {
+	val := toStr(eval(n.Cond, scope))
+	for _, cs := range n.Children {
+		if cs.Kind == "case" && cs.Value == val {
+			for _, c := range cs.Children {
+				s.renderNode(b, c, scope)
+			}
+			return
+		}
+	}
+	for _, cs := range n.Children {
+		if cs.Kind == "else" {
+			for _, c := range cs.Children {
+				s.renderNode(b, c, scope)
+			}
+			return
+		}
+	}
+}
+
 func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any) {
 	switch n.Kind {
 	case "box":
@@ -1308,6 +1330,14 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 				s.renderNode(b, c, scope)
 			}
 		}
+		b.WriteString(`</div>`)
+	case "match":
+		if n.ID != "" {
+			fmt.Fprintf(b, `<div data-fa-region="%s">`, n.ID)
+		} else {
+			b.WriteString(`<div>`)
+		}
+		s.renderMatch(b, n, scope)
 		b.WriteString(`</div>`)
 	case "input":
 		val := html.EscapeString(toStr(scope[n.Bind]))

@@ -27,7 +27,7 @@
     inputById = {};
     (function collect(nodes) {
       for (const n of nodes) {
-        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs") && n.id) regionById[n.id] = n;
+        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs" || n.kind === "match") && n.id) regionById[n.id] = n;
         if ((n.kind === "input" || n.kind === "select" || n.kind === "upload") && n.id) inputById[n.id] = n;
         if (n.children) collect(n.children);
       }
@@ -285,6 +285,12 @@
         fillIf(d, node, sc);
         return d;
       }
+      case "match": {
+        const d = el("div");
+        if (node.id) d.setAttribute("data-fa-region", node.id);
+        fillMatch(d, node, sc);
+        return d;
+      }
       case "use": {
         const d = el("div", node.id ? null : "fa-use");
         if (node.id) d.setAttribute("data-fa-region", node.id);
@@ -351,6 +357,13 @@
     if (truthy(ev(node.cond, sc))) {
       for (const c of node.children || []) container.appendChild(render(c, sc));
     }
+  }
+  function fillMatch(container, node, sc) {
+    container.textContent = "";
+    const val = toStr(ev(node.cond, sc));
+    let arm = (node.children || []).find((c) => c.kind === "case" && c.value === val);
+    if (!arm) arm = (node.children || []).find((c) => c.kind === "else");
+    if (arm) for (const c of arm.children || []) container.appendChild(render(c, sc));
   }
   function activeTabValue(node, sc) {
     const tabs = node.children || [];
@@ -458,7 +471,7 @@
       } else if (regionById[id]) {
         const node = regionById[id];
         const c = root.querySelector('[data-fa-region="' + id + '"]');
-        if (c) (node.kind === "list" ? fillList : node.kind === "use" ? fillUse : node.kind === "tabs" ? fillTabs : fillIf)(c, node, store);
+        if (c) (node.kind === "list" ? fillList : node.kind === "use" ? fillUse : node.kind === "tabs" ? fillTabs : node.kind === "match" ? fillMatch : fillIf)(c, node, store);
       } else if (inputById[id]) {
         const node = inputById[id];
         const e = root.querySelector('[data-fa-input="' + node.bind + '"]');
