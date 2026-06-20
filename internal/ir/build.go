@@ -801,6 +801,36 @@ func (c *viewCtx) addDep(dep, id string) {
 	c.deps[dep] = append(c.deps[dep], id)
 }
 
+// lowerSegs lowers interpolated segments shared by text, button labels, and image
+// URLs. A pure expression segment renders inline inside a region (a `for` row) or,
+// at the top level, becomes a reactive binding the client recomputes on change.
+func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope) ([]Seg, error) {
+	var out []Seg
+	for _, s := range segs {
+		if s.Expr == nil {
+			out = append(out, Seg{Lit: s.Lit})
+			continue
+		}
+		if err := c.e.checkPure(s.Expr, withActor(sc.locals), 0, "a view"); err != nil {
+			return nil, err
+		}
+		if sc.inRegion {
+			out = append(out, Seg{Expr: c.e.low(s.Expr)})
+		} else {
+			id := fmt.Sprintf("b%d", c.nb)
+			c.nb++
+			le := c.e.low(s.Expr)
+			deps := sortedKeys(c.e.depsIR(le))
+			c.bindings = append(c.bindings, Binding{ID: id, Expr: le, Deps: deps})
+			for _, d := range deps {
+				c.addDep(d, id)
+			}
+			out = append(out, Seg{Bind: id})
+		}
+	}
+	return out, nil
+}
+
 func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 	var out []Node
 	for _, n := range in {
@@ -820,34 +850,25 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, Node{Kind: "row", Children: kids})
 
 		case ast.Text:
-			node := Node{Kind: "text"}
-			for _, s := range t.Segs {
-				if s.Expr == nil {
-					node.Segs = append(node.Segs, Seg{Lit: s.Lit})
-					continue
-				}
-				if err := c.e.checkPure(s.Expr, withActor(sc.locals), 0, "a view"); err != nil {
-					return nil, err
-				}
-				if sc.inRegion {
-					// item-scope: rendered inline when the enclosing region renders.
-					node.Segs = append(node.Segs, Seg{Expr: c.e.low(s.Expr)})
-				} else {
-					id := fmt.Sprintf("b%d", c.nb)
-					c.nb++
-					le := c.e.low(s.Expr)
-					deps := sortedKeys(c.e.depsIR(le))
-					c.bindings = append(c.bindings, Binding{ID: id, Expr: le, Deps: deps})
-					for _, d := range deps {
-						c.addDep(d, id)
-					}
-					node.Segs = append(node.Segs, Seg{Bind: id})
-				}
+			segs, err := c.lowerSegs(t.Segs, sc)
+			if err != nil {
+				return nil, err
 			}
-			out = append(out, node)
+			out = append(out, Node{Kind: "text", Segs: segs})
+
+		case ast.Image:
+			segs, err := c.lowerSegs(t.Segs, sc)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "image", Segs: segs})
 
 		case ast.Button:
-			node := Node{Kind: "button", Label: t.Label, Action: t.Action}
+			segs, err := c.lowerSegs(t.Label, sc)
+			if err != nil {
+				return nil, err
+			}
+			node := Node{Kind: "button", Segs: segs, Action: t.Action}
 			for _, arg := range t.Args {
 				if err := c.e.checkPure(arg, withActor(sc.locals), 0, "a view"); err != nil {
 					return nil, err

@@ -25,7 +25,7 @@ import (
 // ToolchainVersion is the running `facet` version, used to check a facet's
 // `facet` manifest range and to stamp facet.lock. cmd/facet/main sets it from
 // its own version var at startup; the default keeps tests self-contained.
-var ToolchainVersion = "1.7.0"
+var ToolchainVersion = "1.8.0"
 
 // host is the only registry host this build understands. Adding another (e.g.
 // gitlab.com) is a new prefix + a new client, not a rewrite — IsRemote and

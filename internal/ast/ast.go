@@ -318,15 +318,21 @@ type Row struct{ Children []Node }
 // Text is a text leaf of literal and interpolated segments.
 type Text struct{ Segs []Seg }
 
+// Image is an `image "url"` node — its URL is interpolated segments like text, so
+// `image "…/avatar?seed={t.author}"` yields a per-row avatar.
+type Image struct{ Segs []Seg }
+
 // Seg is one piece of a Text: literal (Expr == nil) or interpolation.
 type Seg struct {
 	Lit  string
 	Expr Expr
 }
 
-// Button emits an action (with evaluated argument expressions) when pressed.
+// Button emits an action (with evaluated argument expressions) when pressed. Its
+// label is interpolated segments like text, so a count can sit in the label —
+// `button "♥ {t.likes}" -> like(t.id)`.
 type Button struct {
-	Label  string
+	Label  []Seg
 	Action string
 	Args   []Expr
 }
@@ -416,6 +422,7 @@ type SlotRef struct{ Name string }
 func (Box) node()     {}
 func (Row) node()     {}
 func (Text) node()    {}
+func (Image) node()   {}
 func (Button) node()  {}
 func (For) node()     {}
 func (If) node()      {}

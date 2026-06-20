@@ -1090,6 +1090,12 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, ast.Text{Segs: segs})
+		case strings.HasPrefix(t, "image "):
+			segs, err := parseText(strings.TrimSpace(t[len("image "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Image{Segs: segs})
 		case strings.HasPrefix(t, "button "):
 			b, err := parseButton(strings.TrimSpace(t[len("button "):]), c.Line.No)
 			if err != nil {
@@ -1401,7 +1407,17 @@ func parseForm(n *source.Node) (ast.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ast.Form{Action: btn.Action, Args: btn.Args, Submit: btn.Label, Body: kids}, nil
+	return ast.Form{Action: btn.Action, Args: btn.Args, Submit: litString(btn.Label), Body: kids}, nil
+}
+
+// litString flattens label segments to their literal text — used where a label is
+// plain (a form's submit button), so interpolation isn't meaningful.
+func litString(segs []ast.Seg) string {
+	var sb strings.Builder
+	for _, s := range segs {
+		sb.WriteString(s.Lit)
+	}
+	return sb.String()
 }
 
 // parseUpload: `upload bind url [label "text"]`.
@@ -1492,7 +1508,7 @@ func parseButton(s string, line int) (ast.Button, error) {
 	if arrow < 0 {
 		return ast.Button{}, &Error{line, `button needs an action: button "Label" -> actionName`}
 	}
-	label, err := unquote(strings.TrimSpace(s[:arrow]), line)
+	label, err := parseText(strings.TrimSpace(s[:arrow]), line)
 	if err != nil {
 		return ast.Button{}, err
 	}

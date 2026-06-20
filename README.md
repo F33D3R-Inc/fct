@@ -141,6 +141,12 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.8.0 — interpolated labels + `image`.** Button labels now interpolate
+(`button "♥ {t.likes}" -> like(t.id)`), so a count sits in the control, and a new
+`image "…/avatar?seed={t.author}"` node renders media/avatars — both fell out of
+building a real X-style action bar in the clone. `row` now serves both structural
+columns (which stack on mobile) and compact action bars (which don't).
+
 **v1.7.0 — screens.** A playground now mounts several guarded surfaces, not one:
 `mount Auth at "/login" requires guest` / `mount Shell at "/" requires member`.
 A failing screen guard redirects to the first screen the actor may enter, so the

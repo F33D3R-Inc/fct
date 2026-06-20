@@ -136,6 +136,32 @@
   // ── rendering ───────────────────────────────────────────────────────────────
   function el(tag, cls) { const e = document.createElement(tag); if (cls) e.className = cls; return e; }
 
+  // appendSegs renders interpolated segments (text, button labels) into a parent:
+  // literals as text, top-level binds as live-updating spans, in-region exprs inline.
+  function appendSegs(parent, segs, sc) {
+    for (const seg of segs || []) {
+      if (seg.lit != null) parent.appendChild(document.createTextNode(seg.lit));
+      else if (seg.bind) {
+        const b = el("span"); b.setAttribute("data-fa-bind", seg.bind);
+        b.textContent = toStr(ev(bindings[seg.bind].expr, sc));
+        parent.appendChild(b);
+      } else if (seg.expr) {
+        parent.appendChild(document.createTextNode(toStr(ev(seg.expr, sc))));
+      }
+    }
+  }
+
+  // segsToStr flattens segments to a plain string for an attribute (an image src).
+  function segsToStr(segs, sc) {
+    let out = "";
+    for (const seg of segs || []) {
+      if (seg.lit != null) out += seg.lit;
+      else if (seg.bind) out += toStr(ev(bindings[seg.bind].expr, sc));
+      else if (seg.expr) out += toStr(ev(seg.expr, sc));
+    }
+    return out;
+  }
+
   function render(node, sc) {
     switch (node.kind) {
       case "box": {
@@ -150,21 +176,18 @@
       }
       case "text": {
         const span = el("span", "fa-text");
-        for (const seg of node.segs || []) {
-          if (seg.lit != null) span.appendChild(document.createTextNode(seg.lit));
-          else if (seg.bind) {
-            const b = el("span"); b.setAttribute("data-fa-bind", seg.bind);
-            b.textContent = toStr(ev(bindings[seg.bind].expr, sc));
-            span.appendChild(b);
-          } else if (seg.expr) {
-            span.appendChild(document.createTextNode(toStr(ev(seg.expr, sc))));
-          }
-        }
+        appendSegs(span, node.segs, sc);
         return span;
+      }
+      case "image": {
+        const img = el("img", "fa-image");
+        img.src = segsToStr(node.segs, sc);
+        img.alt = "";
+        return img;
       }
       case "button": {
         const b = el("button");
-        b.textContent = node.label;
+        appendSegs(b, node.segs, sc);
         b.setAttribute("data-fa-action", node.action);
         b.__fa = { action: node.action, args: node.args || [], scope: sc };
         return b;

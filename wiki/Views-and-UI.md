@@ -23,7 +23,8 @@ view Name [at "/path"] [in Layout] [requires policy]:
 | **box** | `box:` then indented children — a vertical container |
 | **row** | `row:` then indented children — a horizontal container that wraps and collapses to a column on a narrow viewport (responsive multi-column) |
 | **text** | `text "literal and {expr}"` |
-| **button** | `button "label" -> action(args)` |
+| **image** | `image "url"` — URL interpolates, e.g. `image "…/avatar?seed={t.author}"` (renders a rounded avatar by default) |
+| **button** | `button "label" -> action(args)` — the label interpolates too: `button "♥ {t.likes}" -> like(t.id)` |
 | **input** | `input bind cell [placeholder "…"]` |
 | **select** | `select bind cell:` then `option "Label" -> "value"` lines |
 | **form** | `form "Submit" -> action(args):` then children |

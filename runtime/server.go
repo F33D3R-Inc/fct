@@ -1122,6 +1122,40 @@ func litFor(f ir.Field, s string) *ir.Expr {
 
 // ── server-side rendering (first paint) ──────────────────────────────────────
 
+// renderSegs writes interpolated segments as HTML — literals escaped, top-level
+// binds wrapped in a data-fa-bind span the client live-updates, in-region exprs
+// evaluated inline. Shared by text leaves and button labels.
+func (s *Server) renderSegs(b *strings.Builder, segs []ir.Seg, scope map[string]any) {
+	for _, seg := range segs {
+		switch {
+		case seg.Lit != "":
+			b.WriteString(html.EscapeString(seg.Lit))
+		case seg.Bind != "":
+			val := toStr(eval(s.byBind[seg.Bind].Expr, scope))
+			fmt.Fprintf(b, `<span data-fa-bind="%s">%s</span>`, seg.Bind, html.EscapeString(val))
+		case seg.Expr != nil:
+			b.WriteString(html.EscapeString(toStr(eval(seg.Expr, scope))))
+		}
+	}
+}
+
+// segsToString flattens interpolated segments to a plain string — used where the
+// value goes into an attribute (an image `src`), not displayed markup.
+func (s *Server) segsToString(segs []ir.Seg, scope map[string]any) string {
+	var sb strings.Builder
+	for _, seg := range segs {
+		switch {
+		case seg.Lit != "":
+			sb.WriteString(seg.Lit)
+		case seg.Bind != "":
+			sb.WriteString(toStr(eval(s.byBind[seg.Bind].Expr, scope)))
+		case seg.Expr != nil:
+			sb.WriteString(toStr(eval(seg.Expr, scope)))
+		}
+	}
+	return sb.String()
+}
+
 func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any) {
 	switch n.Kind {
 	case "box":
@@ -1138,21 +1172,14 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 		b.WriteString(`</div>`)
 	case "text":
 		b.WriteString(`<span class="fa-text">`)
-		for _, seg := range n.Segs {
-			switch {
-			case seg.Lit != "":
-				b.WriteString(html.EscapeString(seg.Lit))
-			case seg.Bind != "":
-				val := toStr(eval(s.byBind[seg.Bind].Expr, scope))
-				fmt.Fprintf(b, `<span data-fa-bind="%s">%s</span>`, seg.Bind, html.EscapeString(val))
-			case seg.Expr != nil:
-				b.WriteString(html.EscapeString(toStr(eval(seg.Expr, scope))))
-			}
-		}
+		s.renderSegs(b, n.Segs, scope)
 		b.WriteString(`</span>`)
+	case "image":
+		fmt.Fprintf(b, `<img class="fa-image" src="%s" alt="">`, html.EscapeString(s.segsToString(n.Segs, scope)))
 	case "button":
-		fmt.Fprintf(b, `<button data-fa-action="%s">%s</button>`,
-			html.EscapeString(n.Action), html.EscapeString(n.Label))
+		fmt.Fprintf(b, `<button data-fa-action="%s">`, html.EscapeString(n.Action))
+		s.renderSegs(b, n.Segs, scope)
+		b.WriteString(`</button>`)
 	case "list":
 		if n.ID != "" {
 			fmt.Fprintf(b, `<div data-fa-region="%s">`, n.ID)
@@ -1501,15 +1528,24 @@ const page = `<!doctype html>
          color: var(--fa-fg); background: var(--fa-bg); padding: 0 1rem; }
   .fa-box { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
   .fa-box .fa-box { border: 1px solid var(--fa-card-border); border-radius: calc(var(--fa-radius) + 2px); padding: .6rem .8rem; }
-  /* A row lays its children out horizontally and wraps; on a narrow viewport it
-     collapses to a vertical stack, so multi-column layouts reflow with the window. */
-  .fa-row { display: flex; flex-direction: row; gap: 1.25rem; align-items: flex-start; flex-wrap: wrap; }
-  .fa-row > * { flex: 1 1 0; min-width: 0; }
-  /* A box directly inside a row is a structural column (a wireframe region), not a
-     card — it stays transparent and borderless so the layers composite into one
-     surface rather than reading as stacked panels. */
-  .fa-row > .fa-box { border: none; background: transparent; padding: 0; }
-  @media (max-width: 720px) { .fa-row { flex-direction: column; } .fa-row > * { width: 100%%; } }
+  /* A row lays its children out horizontally. A box directly inside a row is a
+     structural column (a wireframe region) and stretches; inline items (buttons,
+     text, images — e.g. an action bar) stay compact. */
+  .fa-row { display: flex; flex-direction: row; gap: .75rem; align-items: flex-start; flex-wrap: wrap; }
+  .fa-row > * { min-width: 0; }
+  .fa-row > .fa-box { flex: 1 1 0; border: none; background: transparent; padding: 0; }
+  .fa-row > button, .fa-row > .fa-text, .fa-row > .fa-image { flex: 0 0 auto; }
+  /* Action-bar buttons: muted, borderless, highlight on hover — X-style. */
+  .fa-row > button { background: transparent; border: none; color: var(--fa-muted); padding: .25rem .5rem; align-self: center; }
+  .fa-row > button:hover { color: var(--fa-accent); }
+  /* Only a row of structural columns collapses to a stack on a narrow viewport; an
+     action bar (no box children) stays horizontal. */
+  @media (max-width: 720px) {
+    .fa-row:has(> .fa-box) { flex-direction: column; }
+    .fa-row:has(> .fa-box) > .fa-box { width: 100%%; flex-basis: 100%%; }
+  }
+  /* image: avatars by default — a rounded, fixed square that sits inline. */
+  .fa-image { width: 44px; height: 44px; border-radius: 50%%; object-fit: cover; background: var(--fa-card-border); }
   .fa-text { font-variant-numeric: tabular-nums; }
   .fa-form { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
   .fa-use { display: contents; }
