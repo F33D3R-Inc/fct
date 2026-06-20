@@ -141,6 +141,15 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.10.0 — the social-data spine + view primitives.** The pieces a real social
+site (X, f33d3r) needs. **Filtered aggregates** `count(l in Like where l.tweet ==
+t.id)` give per-row counts (likes/replies); **`exists(l in Like where …)`** gives
+per-viewer state ("have I liked this?") and, inside `for … where exists(…)`, a
+**Following feed**; **self-referential relations** (`parent: Tweet?`) give reply
+threads. New view primitives: **`icon`**, **`badge`**, and **`tabs`/`tab`** (a
+client-state tabbed feed, Following/Trending/…). Server + client renderers stay in
+lockstep; lists now refresh when entities read in their body change.
+
 **v1.9.0 — services (external brains).** An action can `call` an external service
 over HTTP with a compiler-checked contract: `service Moderation at "…": review(id:
 int, body: text)` then `call Moderation.review(id, body)`. A call is an *effect*,

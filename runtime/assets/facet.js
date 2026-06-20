@@ -27,7 +27,7 @@
     inputById = {};
     (function collect(nodes) {
       for (const n of nodes) {
-        if ((n.kind === "list" || n.kind === "if" || n.kind === "use") && n.id) regionById[n.id] = n;
+        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs") && n.id) regionById[n.id] = n;
         if ((n.kind === "input" || n.kind === "select" || n.kind === "upload") && n.id) inputById[n.id] = n;
         if (n.children) collect(n.children);
       }
@@ -59,7 +59,15 @@
         return null;
       }
       case "agg": {
-        const rows = sc[e.name] || [];
+        let rows = sc[e.name] || [];
+        // Filtered form: keep rows the predicate accepts, item var bound per row.
+        if (e.where) {
+          const had = Object.prototype.hasOwnProperty.call(sc, e.var);
+          const prev = sc[e.var];
+          rows = rows.filter((r) => { sc[e.var] = r; return truthy(ev(e.where, sc)); });
+          if (had) sc[e.var] = prev; else delete sc[e.var];
+        }
+        if (e.op === "exists") return rows.length > 0;
         if (e.op === "count") return rows.length;
         let total = 0; // sum
         for (const r of rows) total += toInt(r[e.field]);
@@ -185,6 +193,23 @@
         img.alt = "";
         return img;
       }
+      case "icon": {
+        const i = el("span", "fa-icon");
+        i.setAttribute("data-fa-icon", node.name || "");
+        i.setAttribute("aria-hidden", "true");
+        return i;
+      }
+      case "badge": {
+        const s = el("span", "fa-badge");
+        appendSegs(s, node.segs, sc);
+        return s;
+      }
+      case "tabs": {
+        const d = el("div", "fa-tabs");
+        if (node.id) d.setAttribute("data-fa-region", node.id);
+        fillTabs(d, node, sc);
+        return d;
+      }
       case "button": {
         const b = el("button");
         appendSegs(b, node.segs, sc);
@@ -271,6 +296,31 @@
       for (const c of node.children || []) container.appendChild(render(c, sc));
     }
   }
+  function activeTabValue(node, sc) {
+    const tabs = node.children || [];
+    const cur = toStr(sc[node.bind]);
+    if (tabs.some((t) => t.value === cur)) return cur;
+    return tabs.length ? tabs[0].value : cur;
+  }
+  function fillTabs(container, node, sc) {
+    container.textContent = "";
+    const tabs = node.children || [];
+    const active = activeTabValue(node, sc);
+    const strip = el("div", "fa-tabstrip");
+    strip.setAttribute("role", "tablist");
+    for (const t of tabs) {
+      const b = el("button", "fa-tab");
+      b.setAttribute("role", "tab");
+      b.textContent = t.label;
+      b.setAttribute("data-fa-tab", t.value);
+      b.setAttribute("data-fa-tab-bind", node.bind);
+      if (t.value === active) b.setAttribute("aria-selected", "true");
+      strip.appendChild(b);
+    }
+    container.appendChild(strip);
+    const cur = tabs.find((t) => t.value === active);
+    if (cur) for (const c of cur.children || []) container.appendChild(render(c, sc));
+  }
   function fillUse(container, node, sc) {
     container.textContent = "";
     const comp = components[node.name];
@@ -352,7 +402,7 @@
       } else if (regionById[id]) {
         const node = regionById[id];
         const c = root.querySelector('[data-fa-region="' + id + '"]');
-        if (c) (node.kind === "list" ? fillList : node.kind === "use" ? fillUse : fillIf)(c, node, store);
+        if (c) (node.kind === "list" ? fillList : node.kind === "use" ? fillUse : node.kind === "tabs" ? fillTabs : fillIf)(c, node, store);
       } else if (inputById[id]) {
         const node = inputById[id];
         const e = root.querySelector('[data-fa-input="' + node.bind + '"]');
@@ -522,6 +572,14 @@
       if (href && href[0] === "/" && isAppRoute(href) && !e.metaKey && !e.ctrlKey) {
         e.preventDefault(); navigate(href, true);
       }
+      return;
+    }
+    const tab = e.target.closest("[data-fa-tab]");
+    if (tab) {
+      e.preventDefault();
+      const bind = tab.getAttribute("data-fa-tab-bind");
+      store[bind] = tab.getAttribute("data-fa-tab");
+      refresh([bind]);
       return;
     }
     const t = e.target.closest("[data-fa-action]");

@@ -1207,6 +1207,21 @@ func (s *Server) segsToString(segs []ir.Seg, scope map[string]any) string {
 	return sb.String()
 }
 
+// activeTab returns the value of the selected tab: the bound cell's value when it
+// matches a tab, otherwise the first tab (so a fresh/unmatched cell shows tab one).
+func activeTab(n ir.Node, scope map[string]any) string {
+	cur := toStr(scope[n.Bind])
+	for _, tb := range n.Children {
+		if tb.Value == cur {
+			return cur
+		}
+	}
+	if len(n.Children) > 0 {
+		return n.Children[0].Value
+	}
+	return cur
+}
+
 func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any) {
 	switch n.Kind {
 	case "box":
@@ -1227,6 +1242,37 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 		b.WriteString(`</span>`)
 	case "image":
 		fmt.Fprintf(b, `<img class="fa-image" src="%s" alt="">`, html.EscapeString(s.segsToString(n.Segs, scope)))
+	case "icon":
+		fmt.Fprintf(b, `<span class="fa-icon" data-fa-icon="%s" aria-hidden="true"></span>`, html.EscapeString(n.Name))
+	case "badge":
+		b.WriteString(`<span class="fa-badge">`)
+		s.renderSegs(b, n.Segs, scope)
+		b.WriteString(`</span>`)
+	case "tabs":
+		active := activeTab(n, scope)
+		if n.ID != "" {
+			fmt.Fprintf(b, `<div data-fa-region="%s" class="fa-tabs">`, n.ID)
+		} else {
+			b.WriteString(`<div class="fa-tabs">`)
+		}
+		b.WriteString(`<div class="fa-tabstrip" role="tablist">`)
+		for _, tb := range n.Children {
+			sel := ""
+			if tb.Value == active {
+				sel = ` aria-selected="true"`
+			}
+			fmt.Fprintf(b, `<button class="fa-tab" role="tab"%s data-fa-tab="%s" data-fa-tab-bind="%s">%s</button>`,
+				sel, html.EscapeString(tb.Value), html.EscapeString(n.Bind), html.EscapeString(tb.Label))
+		}
+		b.WriteString(`</div>`)
+		for _, tb := range n.Children {
+			if tb.Value == active {
+				for _, c := range tb.Children {
+					s.renderNode(b, c, scope)
+				}
+			}
+		}
+		b.WriteString(`</div>`)
 	case "button":
 		fmt.Fprintf(b, `<button data-fa-action="%s">`, html.EscapeString(n.Action))
 		s.renderSegs(b, n.Segs, scope)
@@ -1598,6 +1644,17 @@ const page = `<!doctype html>
   /* image: avatars by default — a rounded, fixed square that sits inline. */
   .fa-image { width: 44px; height: 44px; border-radius: 50%%; object-fit: cover; background: var(--fa-card-border); }
   .fa-text { font-variant-numeric: tabular-nums; }
+  .fa-icon { display: inline-block; width: 1.15em; height: 1.15em; vertical-align: -.18em;
+             background: var(--fa-icon-bg, none) center/contain no-repeat; }
+  .fa-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 1.2rem; padding: 0 .4rem;
+              font-size: .72rem; font-weight: 700; line-height: 1.5; border-radius: 999px;
+              background: var(--fa-accent); color: #fff; }
+  .fa-tabs { display: flex; flex-direction: column; gap: .6rem; }
+  .fa-tabstrip { display: flex; flex-direction: row; gap: .25rem; border-bottom: 1px solid var(--fa-border); }
+  .fa-tab { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+            color: var(--fa-muted); padding: .5rem .9rem; cursor: pointer; align-self: auto; font-weight: 600; }
+  .fa-tab:hover { color: var(--fa-fg); }
+  .fa-tab[aria-selected=true] { color: var(--fa-fg); border-bottom-color: var(--fa-accent); }
   .fa-form { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
   .fa-use { display: contents; }
   button { font: inherit; padding: .4rem .8rem; border: 1px solid var(--fa-border); border-radius: var(--fa-radius);

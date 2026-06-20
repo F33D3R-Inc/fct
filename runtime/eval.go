@@ -51,7 +51,30 @@ func eval(e *ir.Expr, scope map[string]any) any {
 		return nil
 	case "agg":
 		rows, _ := scope[e.Name].([]any)
-		if e.Op == "count" {
+		// Filtered form: keep only rows the predicate accepts, with the item
+		// variable bound to each row. Mutate-and-restore keeps eval allocation-free.
+		if e.Where != nil {
+			prev, had := scope[e.Var]
+			kept := make([]any, 0, len(rows))
+			for _, r := range rows {
+				if m, ok := r.(record); ok {
+					scope[e.Var] = m
+					if truthy(eval(e.Where, scope)) {
+						kept = append(kept, r)
+					}
+				}
+			}
+			if had {
+				scope[e.Var] = prev
+			} else {
+				delete(scope, e.Var)
+			}
+			rows = kept
+		}
+		switch e.Op {
+		case "exists":
+			return len(rows) > 0
+		case "count":
 			return len(rows)
 		}
 		total := 0 // sum

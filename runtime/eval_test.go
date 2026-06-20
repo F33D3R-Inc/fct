@@ -76,6 +76,51 @@ func TestEvalAggregates(t *testing.T) {
 	}
 }
 
+// Filtered aggregates scope a count/exists to the rows a predicate accepts, with
+// the item variable bound to each row. This is what powers per-tweet like counts
+// and the per-viewer "have I liked this?" check. The Go fold must match facet.js.
+func TestEvalFilteredAggregates(t *testing.T) {
+	likes := []any{
+		record{"id": 1, "tweet": 10, "user": "ada"},
+		record{"id": 2, "tweet": 10, "user": "bob"},
+		record{"id": 3, "tweet": 20, "user": "ada"},
+	}
+	// item var `l` bound per row; outer `t` (the current tweet) read from scope.
+	scope := map[string]any{"Like": likes, "t": record{"id": 10}}
+
+	// count(l in Like where l.tweet == t.id) == 2
+	lTweet := &ir.Expr{Kind: "get", Obj: &ir.Expr{Kind: "ref", Name: "l"}, Field: "tweet"}
+	tID := &ir.Expr{Kind: "get", Obj: &ir.Expr{Kind: "ref", Name: "t"}, Field: "id"}
+	whereTweet := &ir.Expr{Kind: "bin", Op: "==", L: lTweet, R: tID}
+	count := &ir.Expr{Kind: "agg", Op: "count", Name: "Like", Var: "l", Where: whereTweet}
+	if got := eval(count, scope); got != 2 {
+		t.Errorf("count(l in Like where l.tweet == t.id): got %v want 2", got)
+	}
+
+	// exists(l in Like where l.tweet == t.id && l.user == "ada") == true
+	lUser := &ir.Expr{Kind: "get", Obj: &ir.Expr{Kind: "ref", Name: "l"}, Field: "user"}
+	mine := &ir.Expr{Kind: "bin", Op: "&&", L: whereTweet,
+		R: &ir.Expr{Kind: "bin", Op: "==", L: lUser, R: &ir.Expr{Kind: "lit", Val: "ada", VType: "text"}}}
+	exists := &ir.Expr{Kind: "agg", Op: "exists", Name: "Like", Var: "l", Where: mine}
+	if got := eval(exists, scope); got != true {
+		t.Errorf("exists(... && l.user == ada): got %v want true", got)
+	}
+
+	// no match -> exists false, count 0
+	scope["t"] = record{"id": 99}
+	if got := eval(exists, scope); got != false {
+		t.Errorf("exists with no match: got %v want false", got)
+	}
+	if got := eval(count, scope); got != 0 {
+		t.Errorf("count with no match: got %v want 0", got)
+	}
+
+	// the item variable must not leak into the outer scope after evaluation.
+	if _, leaked := scope["l"]; leaked {
+		t.Errorf("item var l leaked into scope after agg eval")
+	}
+}
+
 // The effectful builtins evaluate on the server: now() is a positive unix time,
 // rand(n) is bounded to [0, n).
 func TestEvalBuiltins(t *testing.T) {

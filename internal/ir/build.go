@@ -911,6 +911,45 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			out = append(out, Node{Kind: "image", Segs: segs})
 
+		case ast.Icon:
+			out = append(out, Node{Kind: "icon", Name: t.Name})
+
+		case ast.Badge:
+			segs, err := c.lowerSegs(t.Segs, sc)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "badge", Segs: segs})
+
+		case ast.Tabs:
+			p, ok := c.e.states[t.Bind]
+			if !ok {
+				return nil, &BuildError{t.Line, fmt.Sprintf("tabs binds unknown state %q", t.Bind)}
+			}
+			if p != Client {
+				return nil, &BuildError{t.Line, fmt.Sprintf("tabs binds %q, which is authoritative; switching tabs is local, so it requires a @client state", t.Bind)}
+			}
+			node := Node{Kind: "tabs", Bind: t.Bind}
+			if !sc.inRegion {
+				node.ID = fmt.Sprintf("t%d", c.nf)
+				c.nf++
+				c.addDep(t.Bind, node.ID)
+			}
+			for _, tb := range t.Tabs {
+				kids, err := c.nodes(tb.Body, scope{locals: sc.locals, inRegion: true})
+				if err != nil {
+					return nil, err
+				}
+				node.Children = append(node.Children, Node{Kind: "tab", Label: tb.Label, Value: tb.Value, Children: kids})
+			}
+			// A tab body's reads (its feed list, counts) refresh the whole control too.
+			if node.ID != "" {
+				for _, d := range sortedKeys(c.e.nodeDeps(node.Children)) {
+					c.addDep(d, node.ID)
+				}
+			}
+			out = append(out, node)
+
 		case ast.Button:
 			segs, err := c.lowerSegs(t.Label, sc)
 			if err != nil {
@@ -974,6 +1013,14 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				return nil, err
 			}
 			node.Children = kids
+			// Reads inside the body — interpolated counts, cross-entity lookups
+			// (`User(m.to).name`), per-row `count(...)`/`exists(...)` — refresh the
+			// whole list region too, so e.g. a new like updates a per-row count live.
+			if node.ID != "" {
+				for _, d := range sortedKeys(c.e.nodeDeps(kids)) {
+					c.addDep(d, node.ID)
+				}
+			}
 			out = append(out, node)
 
 		case ast.If:
@@ -1171,6 +1218,14 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		if t.Op == "sum" && !e.entityFields[t.Coll][t.Field] {
 			return &BuildError{line, fmt.Sprintf("entity %q has no field %q to sum", t.Coll, t.Field)}
 		}
+		if t.Op == "exists" && t.Var == "" {
+			return &BuildError{line, fmt.Sprintf("exists needs a filtered form: exists(x in %s where <cond>)", t.Coll)}
+		}
+		if t.Where != nil {
+			if err := e.checkBuiltins(t.Where, line); err != nil {
+				return err
+			}
+		}
 	case ast.Call:
 		switch t.Name {
 		case "now":
@@ -1258,6 +1313,8 @@ func hasImpure(ex ast.Expr) bool {
 		return hasImpure(t.L) || hasImpure(t.R)
 	case ast.Un:
 		return hasImpure(t.X)
+	case ast.Agg:
+		return t.Where != nil && hasImpure(t.Where)
 	}
 	return false
 }
@@ -1324,6 +1381,9 @@ func (e *env) depsIR(le *Expr) map[string]bool {
 			if e.entities[x.Name] {
 				out[x.Name] = true
 			}
+			// The filter may read outer state/entities (e.g. `actor`, another entity);
+			// the item variable is a bare ref to neither, so it is ignored naturally.
+			walk(x.Where)
 		case "call", "list":
 			for _, a := range x.Args {
 				walk(a)
@@ -1389,6 +1449,15 @@ func freeNames(ex ast.Expr) map[string]bool {
 			walk(t.Key)
 		case ast.Agg:
 			out[t.Coll] = true
+			// The filter's references are free names too — except the item variable,
+			// which the aggregate itself binds.
+			if t.Where != nil {
+				for n := range freeNames(t.Where) {
+					if n != t.Var {
+						out[n] = true
+					}
+				}
+			}
 		case ast.Call:
 			for _, a := range t.Args {
 				walk(a)
@@ -1441,7 +1510,11 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 	case ast.EntityGet:
 		return &Expr{Kind: "eget", Name: t.Entity, Key: lower(t.Key, inline, enums), Field: t.Field}
 	case ast.Agg:
-		return &Expr{Kind: "agg", Op: t.Op, Name: t.Coll, Field: t.Field}
+		a := &Expr{Kind: "agg", Op: t.Op, Name: t.Coll, Field: t.Field, Var: t.Var}
+		if t.Where != nil {
+			a.Where = lower(t.Where, inline, enums)
+		}
+		return a
 	case ast.Call:
 		out := &Expr{Kind: "call", Name: t.Name}
 		for _, a := range t.Args {
@@ -1466,6 +1539,13 @@ func cloneExpr(e *Expr) *Expr {
 	c.X = cloneExpr(e.X)
 	c.Obj = cloneExpr(e.Obj)
 	c.Key = cloneExpr(e.Key)
+	c.Where = cloneExpr(e.Where)
+	if e.Args != nil {
+		c.Args = make([]*Expr, len(e.Args))
+		for i, a := range e.Args {
+			c.Args[i] = cloneExpr(a)
+		}
+	}
 	return &c
 }
 

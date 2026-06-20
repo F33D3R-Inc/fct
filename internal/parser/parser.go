@@ -1178,6 +1178,24 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, b)
+		case strings.HasPrefix(t, "icon "):
+			name, err := unquote(strings.TrimSpace(t[len("icon "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Icon{Name: name})
+		case strings.HasPrefix(t, "badge "):
+			segs, err := parseText(strings.TrimSpace(t[len("badge "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Badge{Segs: segs})
+		case strings.HasPrefix(t, "tabs "):
+			tb, err := parseTabs(c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, tb)
 		case strings.HasPrefix(t, "for "):
 			f, err := parseFor(c)
 			if err != nil {
@@ -1470,6 +1488,47 @@ func parseSelect(n *source.Node) (ast.Node, error) {
 		sel.Options = append(sel.Options, ast.Option{Label: label, Value: value})
 	}
 	return sel, nil
+}
+
+// parseTabs: `tabs bind cell:` with `tab "Label" -> "value":` children, each
+// holding the nodes shown when the bound cell equals that value.
+func parseTabs(n *source.Node) (ast.Node, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("tabs "):]), ":")
+	if !strings.HasPrefix(head, "bind ") {
+		return nil, &Error{n.Line.No, "tabs needs a binding: tabs bind cell"}
+	}
+	bind := strings.TrimSpace(head[len("bind "):])
+	if !isIdent(bind) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid tabs binding %q", bind)}
+	}
+	tabs := ast.Tabs{Bind: bind, Line: n.Line.No}
+	for _, c := range n.Children {
+		if !strings.HasPrefix(c.Line.Text, "tab ") {
+			return nil, &Error{c.Line.No, `tabs children must be tabs: tab "Label" -> "value":`}
+		}
+		rest := strings.TrimSuffix(strings.TrimSpace(c.Line.Text[len("tab "):]), ":")
+		arrow := strings.Index(rest, "->")
+		if arrow < 0 {
+			return nil, &Error{c.Line.No, `tab needs a value: tab "Label" -> "value":`}
+		}
+		label, err := unquote(strings.TrimSpace(rest[:arrow]), c.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		value, err := unquote(strings.TrimSpace(rest[arrow+2:]), c.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		body, err := parseNodes(c.Children)
+		if err != nil {
+			return nil, err
+		}
+		tabs.Tabs = append(tabs.Tabs, ast.Tab{Label: label, Value: value, Body: body})
+	}
+	if len(tabs.Tabs) == 0 {
+		return nil, &Error{n.Line.No, "tabs needs at least one `tab`"}
+	}
+	return tabs, nil
 }
 
 // parseForm: `form "Submit" -> action(args):` then child nodes (inputs, text).

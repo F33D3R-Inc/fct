@@ -222,7 +222,7 @@ type Binding struct {
 
 // Node is one view node in the neutral tree.
 type Node struct {
-	Kind     string `json:"kind"` // box|row|text|button|list|if|input|link|select|form|upload|use|slot
+	Kind     string `json:"kind"` // box|row|text|image|icon|badge|button|list|if|input|link|select|form|upload|use|slot|tabs|tab
 	Children []Node `json:"children,omitempty"`
 
 	Segs []Seg `json:"segs,omitempty"` // text
@@ -245,8 +245,9 @@ type Node struct {
 
 	Path string `json:"path,omitempty"` // link: destination route
 
-	Name    string   `json:"name,omitempty"`    // use: component name
+	Name    string   `json:"name,omitempty"`    // use: component name / icon: glyph name
 	Options []Option `json:"options,omitempty"` // select: choices
+	Value   string   `json:"value,omitempty"`   // tab: the value its bound cell takes when active
 }
 
 // Option is one select choice (display label → stored value).
@@ -272,9 +273,11 @@ type Expr struct {
 	Field string  `json:"field,omitempty"` // get / eget / agg (sum)
 	Obj   *Expr   `json:"obj,omitempty"`   // get
 	Key   *Expr   `json:"key,omitempty"`   // eget
-	Op    string  `json:"op,omitempty"`    // bin / un / agg (count|sum)
+	Op    string  `json:"op,omitempty"`    // bin / un / agg (count|sum|exists)
 	Args  []*Expr `json:"args,omitempty"`  // call
 	L     *Expr   `json:"l,omitempty"`
 	R     *Expr   `json:"r,omitempty"`
 	X     *Expr   `json:"x,omitempty"`
+	Var   string  `json:"var,omitempty"`   // agg: item variable for the filtered form
+	Where *Expr   `json:"where,omitempty"` // agg: filter predicate (nil = whole collection)
 }

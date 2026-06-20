@@ -175,7 +175,7 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 	if ref, ok := atom.(ast.Ref); ok {
 		if t, ok := p.peek(); ok && t.kind == tLParen {
 			switch {
-			case ref.Name == "count" || ref.Name == "sum":
+			case ref.Name == "count" || ref.Name == "sum" || ref.Name == "exists":
 				ag, err := p.parseAgg(ref.Name)
 				if err != nil {
 					return nil, err
@@ -222,18 +222,36 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 }
 
 // parseAgg parses the argument list of an aggregate builtin; p.peek() is at the
-// opening `(`. `count(Coll)` takes a bare collection; `sum(Coll.field)` takes a
-// collection field.
+// opening `(`. Whole-collection forms: `count(Coll)`, `sum(Coll.field)`. Filtered
+// forms (an item variable + predicate): `count(x in Coll where <cond>)` and
+// `exists(x in Coll where <cond>)`.
 func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 	p.pos++ // consume (
 	t, ok := p.peek()
 	if !ok || t.kind != tIdent {
 		return nil, &Error{p.line, fmt.Sprintf("%s needs a collection: %s(Entity%s)", op, op, aggArgHint(op))}
 	}
-	coll := t.text
+	name := t.text
 	p.pos++
+
+	// Filtered form: `<var> in <Coll> [where <cond>]`. We detect it by a following
+	// `in` identifier; otherwise `name` is the collection (whole-collection form).
+	itemVar, coll := "", name
+	if n, ok := p.peek(); ok && n.kind == tIdent && n.text == "in" {
+		p.pos++ // consume `in`
+		c, ok := p.peek()
+		if !ok || c.kind != tIdent {
+			return nil, &Error{p.line, fmt.Sprintf("%s(%s in ...) needs a collection after `in`", op, name)}
+		}
+		itemVar, coll = name, c.text
+		p.pos++
+	}
+
 	field := ""
 	if op == "sum" {
+		if itemVar != "" {
+			return nil, &Error{p.line, "filtered sum is not supported yet; use sum(Entity.field) over the whole collection"}
+		}
 		d, ok := p.peek()
 		if !ok || d.kind != tOp || d.text != "." {
 			return nil, &Error{p.line, "sum needs a field: sum(Entity.field)"}
@@ -245,12 +263,23 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 		}
 		field = f
 	}
+
+	var where ast.Expr
+	if w, ok := p.peek(); ok && w.kind == tIdent && w.text == "where" {
+		p.pos++ // consume `where`
+		cond, err := p.parseBinary(0)
+		if err != nil {
+			return nil, err
+		}
+		where = cond
+	}
+
 	c, ok := p.peek()
 	if !ok || c.kind != tRParen {
 		return nil, &Error{p.line, fmt.Sprintf("missing `)` in %s(...)", op)}
 	}
 	p.pos++
-	return ast.Agg{Op: op, Coll: coll, Field: field}, nil
+	return ast.Agg{Op: op, Coll: coll, Field: field, Var: itemVar, Where: where}, nil
 }
 
 // parseCall parses a builtin call's argument list; p.peek() is at the opening

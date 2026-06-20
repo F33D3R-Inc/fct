@@ -352,6 +352,31 @@ type Text struct{ Segs []Seg }
 // `image "…/avatar?seed={t.author}"` yields a per-row avatar.
 type Image struct{ Segs []Seg }
 
+// Icon is an `icon "name"` node — a named glyph the page's CSS/icon font renders
+// (`icon "home"`, `icon "heart"`). The name is a literal, not interpolated.
+type Icon struct{ Name string }
+
+// Badge is a `badge "label"` node — a small pill of interpolated text for counts
+// and status markers (`badge "{unread}"`, `badge "verified"`).
+type Badge struct{ Segs []Seg }
+
+// Tabs is a `tabs bind cell:` node — a segmented control whose selected tab is a
+// `@client` state cell; each `tab "Label" -> "value":` holds the content shown
+// when the cell equals that value. Switching tabs is local (no round-trip), so the
+// binding must be client state — the classic Following/Trending/New feed switch.
+type Tabs struct {
+	Bind string
+	Tabs []Tab
+	Line int
+}
+
+// Tab is one `tab "Label" -> "value":` within a Tabs node.
+type Tab struct {
+	Label string
+	Value string
+	Body  []Node
+}
+
 // Seg is one piece of a Text: literal (Expr == nil) or interpolation.
 type Seg struct {
 	Lit  string
@@ -453,6 +478,9 @@ func (Box) node()     {}
 func (Row) node()     {}
 func (Text) node()    {}
 func (Image) node()   {}
+func (Icon) node()    {}
+func (Badge) node()   {}
+func (Tabs) node()    {}
 func (Button) node()  {}
 func (For) node()     {}
 func (If) node()      {}
@@ -493,13 +521,19 @@ type EntityGet struct {
 	Field  string
 }
 
-// Agg is an aggregate over a whole entity collection: `count(Entity)` (row
-// count) or `sum(Entity.field)` (numeric total of a field). It reads the
-// collection, so it tracks a dependency on that entity.
+// Agg is an aggregate over an entity collection. In its whole-collection form it
+// is `count(Entity)` (row count) or `sum(Entity.field)` (numeric total). In its
+// filtered form it ranges with an item variable and a predicate —
+// `count(x in Entity where <cond>)` and `exists(x in Entity where <cond>)` (does
+// any row match) — so a count/exists can be scoped to one row's relations (e.g.
+// likes of a tweet, or whether the actor has liked it). It reads the collection,
+// so it tracks a dependency on that entity (plus any state the filter reads).
 type Agg struct {
-	Op    string // count | sum
+	Op    string // count | sum | exists
 	Coll  string
 	Field string // sum only
+	Var   string // item variable for the filtered form ("" = whole collection)
+	Where Expr   // filter predicate over the item var + outer scope (nil = whole collection)
 }
 
 // Call is an effectful builtin invocation — `now()` (server clock, unix seconds)
