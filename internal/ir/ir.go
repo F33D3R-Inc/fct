@@ -143,6 +143,7 @@ type Action struct {
 	Checks     []Check   `json:"checks,omitempty"`     // input validation, run before the body
 	Optimistic bool      `json:"optimistic,omitempty"` // client predicts the result pre-round-trip
 	Placement  string    `json:"placement"`
+	Reason     string    `json:"reason,omitempty"` // why the compiler placed it here (for `facet explain`)
 	Writes     []string  `json:"writes"`
 	Reads      []string  `json:"reads"`
 	Body       []Stmt    `json:"body"`

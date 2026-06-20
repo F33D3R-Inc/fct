@@ -23,7 +23,7 @@ import (
 )
 
 // version is stamped at release time with -ldflags "-X main.version=…".
-var version = "1.15.0"
+var version = "1.16.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -99,7 +99,7 @@ func main() {
 			fatal(err)
 		}
 		return
-	case "build", "run", "dev", "console", "seed", "test", "migrate", "backup", "restore", "deploy", "generate":
+	case "build", "explain", "run", "dev", "console", "seed", "test", "migrate", "backup", "restore", "deploy", "generate":
 		// handled below
 	default:
 		usage()
@@ -121,6 +121,22 @@ func main() {
 	case "build":
 		out, _ := json.MarshalIndent(graph, "", "  ")
 		fmt.Println(string(out))
+	case "explain":
+		fmt.Printf("Placement for %s — where each piece runs, and why.\n", graph.App)
+		fmt.Println("Computed by the compiler from each declaration's shape; never authored.")
+		fmt.Println()
+		fmt.Println("STATE")
+		for _, s := range graph.States {
+			where, why := "SERVER", "authoritative — per-session state the authority owns"
+			if s.Placement == "client" {
+				where, why = "CLIENT", "@client — ephemeral, browser-local; never reaches the authority"
+			}
+			fmt.Printf("  %-18s %-7s %s\n", s.Name, where, why)
+		}
+		fmt.Println("\nACTIONS")
+		for _, a := range graph.Actions {
+			fmt.Printf("  %-18s %-7s %s\n", a.Name, strings.ToUpper(a.Placement), a.Reason)
+		}
 	case "run":
 		addr := ":7373"
 		if len(os.Args) > 3 && !strings.HasPrefix(os.Args[3], "-") {

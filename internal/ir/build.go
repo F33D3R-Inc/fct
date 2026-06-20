@@ -777,12 +777,25 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	// effectful builtin (now/rand) is nondeterministic, so the authority must run
 	// it — that way every client sees one agreed result, not its own.
 	act.Placement = Client
-	if entWrite || impure || callsService {
+	act.Reason = "only touches @client state, so it runs in the browser with no round-trip"
+	switch {
+	case entWrite:
 		act.Placement = Server
+		act.Reason = "writes durable entity data — the authority owns the database"
+	case impure:
+		act.Placement = Server
+		act.Reason = "uses an effectful builtin (now/rand) — the authority owns nondeterminism, so every client sees one agreed result"
+	case callsService:
+		act.Placement = Server
+		act.Reason = "calls an external service — egress routes through the authority, never the client"
 	}
-	for w := range writes {
-		if e.states[w] == Server {
-			act.Placement = Server
+	if act.Placement == Client {
+		for _, w := range sortedKeys(writes) {
+			if e.states[w] == Server {
+				act.Placement = Server
+				act.Reason = fmt.Sprintf("writes authoritative state %q — only the authority may change it", w)
+				break
+			}
 		}
 	}
 	if act.Placement == Server {

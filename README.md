@@ -141,6 +141,13 @@ facet run   examples/social.fct   # serve it
 
 ## Status
 
+**v1.16.0 — `facet explain` (the placement calculus, visible).** The one idea
+Facet is built on, now inspectable: `facet explain app.fct` prints where every
+state and action runs and **why** — `increment SERVER writes authoritative state
+"count"`, `addBonus CLIENT only touches @client state, no round-trip`. Each action
+carries its computed `reason` in the IR too. The compiler always knew; now it tells
+you. (Item 5, DX; OpenAPI export + typed config to follow.)
+
 **v1.15.0 — query depth: `in` + joins.** The `in` membership operator tests a
 value against a list — `for p in Post where p.kind in ["video", "image"]` or against
 a `@client` list cell. And **multi-hop joins already work**: nested entity lookups

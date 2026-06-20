@@ -10,6 +10,25 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 9 — 2026-06-20 — item 5 (part 1): `facet explain` placement diagnostic → released v1.16.0
+
+**Shipped + released v1.16.0** — the placement-explanation diagnostic (the headline
+DX feature; the placement calculus made visible).
+- Each action now carries a computed `Reason` (ir.Action.Reason): the placement
+  logic captures *why* it's server/client (writes entity data / impure builtin /
+  calls a service / writes authoritative state X / only @client).
+- `facet explain <app.fct>` — new CLI command (inlined; no new import) printing
+  STATE + ACTIONS with placement + reason. Verified on counter.fct.
+- Surface: ir.Action.Reason, build.go placement block (capture reason, deterministic
+  via sortedKeys(writes)), cmd/facet/main.go (explain command). Test: dx_test.go.
+  go build/vet/test green, gofmt clean. version -> 1.16.0.
+
+**Remaining in item 5 → v1.16.1+ (lower urgency):** OpenAPI/JSON-schema export from
+the IR, typed config + feature flags. After item 5, language hits its v1.16 "done"
+milestone → then item 6, the 250+ facet library (v1.17.0).
+
+---
+
 ## Sprint 8 — 2026-06-20 — item 4: query depth (`in` + joins) → released v1.15.0
 
 **Shipped + released v1.15.0:**
