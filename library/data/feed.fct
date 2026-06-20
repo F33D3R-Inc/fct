@@ -1,0 +1,97 @@
+# Feed — a `data` facet: a whole vertical slice (durable data + server logic +
+# authorization + its own components + content) that snaps into the `feed` socket.
+# Self-contained (a layered build can't import plain-app component modules — see
+# SPRINT_LOG finding), so its PostCard lives here. Exercises the v1.16 language end
+# to end: filtered count/exists, tabs, match, richtext/video, pending/failed,
+# contains/search, components, image/badge.
+data Feed in feed:
+    enum Kind: text, richtext, video
+
+    entity Tweet:
+        id: int
+        author: text
+        handle: text
+        verified: bool
+        kind: Kind
+        body: text
+        media: text
+        created: int
+    entity Like:
+        id: int
+        tweet: Tweet
+        user: text
+    entity Repost:
+        id: int
+        tweet: Tweet
+        user: text
+    entity Bookmark:
+        id: int
+        tweet: Tweet
+        user: text
+    entity Follow:
+        id: int
+        follower: text
+        followee: text
+
+    state draft: text = "" @client
+    state feedTab: text = "foryou" @client
+    state q: text = "" @client
+    state shown: int = 20 @client
+
+    policy member:
+        actor != "guest"
+
+    action post(body: text):
+        requires member
+        add Tweet { author: actor, handle: actor, verified: false, kind: Kind.text, body: body, media: "", created: now() }
+    action like(id: int):
+        requires member
+        add Like { tweet: id, user: actor }
+    action repost(id: int):
+        requires member
+        add Repost { tweet: id, user: actor }
+    action bookmark(id: int):
+        requires member
+        add Bookmark { tweet: id, user: actor }
+    action follow(handle: text):
+        requires member
+        add Follow { follower: actor, followee: handle }
+
+    component PostCard(id: int, author: text, handle: text, verified: bool, kind: text, body: text, media: text, likes: int, reposts: int):
+        box:
+            row:
+                image "https://api.dicebear.com/7.x/thumbs/svg?seed={author}"
+                box:
+                    row:
+                        text "{author}"
+                        if verified:
+                            badge "✓"
+                    text "@{handle}"
+            match kind:
+                case "richtext":
+                    richtext "{body}"
+                case "video":
+                    video "{media}"
+                else:
+                    text "{body}"
+            row:
+                button "🔁 {reposts}" -> repost(id)
+                button "♥ {likes}" -> like(id)
+                button "🔖" -> bookmark(id)
+
+    content:
+        box:
+            input bind draft placeholder "What's happening?"
+            row:
+                if pending(post):
+                    text "Posting…"
+                button "Post" -> post(draft)
+            text "{failed(post)}"
+        input bind q placeholder "Search"
+        tabs bind feedTab:
+            tab "For you" -> "foryou":
+                for t in Tweet where contains(lower(t.body), lower(q)) by created desc limit shown:
+                    use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), count(r in Repost where r.tweet == t.id))
+            tab "Following" -> "following":
+                for t in Tweet where exists(f in Follow where f.follower == actor && f.followee == t.author) by created desc limit shown:
+                    use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), count(r in Repost where r.tweet == t.id))

@@ -1,0 +1,100 @@
+# f33d3r home (plain-app composition track) — assembles the reusable component
+# atoms (Avatar/VerifiedBadge/UserChip/PostCard/ComposeBox/FollowButton/Trend) into
+# a home screen. Demonstrates the *component* facet type, vs the typed-brick stack
+# in f33d3r.fct (playground/wireframe/ui/data).
+#
+# NOTE: component modules compose into a PLAIN app like this, but cannot be imported
+# into a LAYERED (playground) build — see SPRINT_LOG (the shareable-component gap).
+#
+#   facet dev library/home.fct
+import "social/postcard.fct"
+import "social/composebox.fct"
+import "social/followbutton.fct"
+import "ui/trend.fct"
+
+app F33D3RHome:
+    auth
+    theme:
+        bg "#15202b"
+        fg "#f7f9f9"
+        muted "#8b98a5"
+        accent "#1d9bf0"
+        border "#38444d"
+        card-border "#38444d"
+        radius "16px"
+        maxwidth "1100px"
+
+    enum Kind: text, richtext, video
+
+    entity Tweet:
+        id: int
+        author: text
+        handle: text
+        verified: bool
+        kind: Kind
+        body: text
+        media: text
+        created: int
+    entity Like:
+        id: int
+        tweet: Tweet
+        user: text
+    entity Repost:
+        id: int
+        tweet: Tweet
+        user: text
+    entity Bookmark:
+        id: int
+        tweet: Tweet
+        user: text
+    entity Follow:
+        id: int
+        follower: text
+        followee: text
+
+    state draft: text = "" @client
+    state feedTab: text = "foryou" @client
+    state q: text = "" @client
+    state shown: int = 20 @client
+
+    policy member:
+        actor != "guest"
+
+    action post(body: text):
+        requires member
+        add Tweet { author: actor, handle: actor, verified: false, kind: Kind.text, body: body, media: "", created: now() }
+    action like(id: int):
+        requires member
+        add Like { tweet: id, user: actor }
+    action repost(id: int):
+        requires member
+        add Repost { tweet: id, user: actor }
+    action bookmark(id: int):
+        requires member
+        add Bookmark { tweet: id, user: actor }
+    action follow(handle: text):
+        requires member
+        add Follow { follower: actor, followee: handle }
+
+    view Home at "/":
+        row:
+            box:
+                text "𝕏 · F33D3R"
+                text "signed in as {actor}"
+                button "log out" -> logout
+            box:
+                use ComposeBox()
+                input bind q placeholder "Search"
+                tabs bind feedTab:
+                    tab "For you" -> "foryou":
+                        for t in Tweet where contains(lower(t.body), lower(q)) by created desc limit shown:
+                            use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), 0, count(r in Repost where r.tweet == t.id))
+                    tab "Following" -> "following":
+                        for t in Tweet where exists(f in Follow where f.follower == actor && f.followee == t.author) by created desc limit shown:
+                            use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), 0, count(r in Repost where r.tweet == t.id))
+            box:
+                text "What's happening"
+                use Trend("Tech", "#FacetLang", "1,234 posts")
+                use Trend("News", "#Facet", "987 posts")
+                text "Who to follow"
+                use FollowButton("grace", exists(f in Follow where f.follower == actor && f.followee == "grace"))

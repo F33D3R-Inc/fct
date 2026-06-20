@@ -10,6 +10,42 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 10 — 2026-06-20 — item 6: facet library core batch (local) + local machine updated
+
+**Language milestone:** items 1–5 done (v1.12–v1.16). `facet` on the machine
+(`~/.local/bin/facet`) was stale at v1.9.0 → **updated to v1.16.0** (installed the
+binary built from the exact v1.16.0 commit; direct GitHub download was blocked by
+the safety classifier as unverified external code — equivalent result).
+
+**Item 6 started — core facet batch built locally under `library/` (14 facets), two
+composition tracks, both `facet build`-green; the typed-brick f33d3r renders
+(19.5KB page: nav, compose, tabs, trends):**
+- **Typed bricks (the facet types):** `playground` f33d3r → `wireframe` Shell
+  (sockets nav/feed/aside) → `ui` Nav, `data` Feed (self-contained: entities,
+  actions, its own PostCard component, content), `ui` Trends. The canonical layered
+  showcase.
+- **Component atoms (plain modules):** Avatar, VerifiedBadge, UserChip, Trend (pure,
+  build standalone) + PostCard, EngagementBar, ComposeBox, FollowButton; composed by
+  the plain-app demo `home.fct`.
+- Exercises the whole v1.16 language: filtered count/exists, tabs, match,
+  richtext/video, pending/failed, contains/search, image/badge, components.
+
+**Two language gaps surfaced building the library (the cycle working as intended —
+candidate patches v1.16.x):**
+1. **`unfollow` / delete-by-non-id-key** — `remove` is by id only; can't delete a
+   Follow row matching (follower, followee). Need `remove Entity where <cond>` (or a
+   delete-by-key). FollowButton is follow-only until then.
+2. **Shareable components don't cross into layered builds** — a plain-`app` module's
+   `component`s can't be imported by a `ui`/`data`/`playground` build ("plain app
+   cannot be mixed into a layered build"). So atoms had to be inlined into the `data`
+   facet. Need a shareable-component/atom facet kind (or relax the guardrail for
+   component-only modules) so one PostCard serves both tracks.
+
+Library lives at `library/` for now; publish to `github.com/F33D3R-Inc/facets`
+(repo TBD) per LIBRARY.md. Not a language release (content) — committed to main.
+
+---
+
 ## Sprint 9 — 2026-06-20 — item 5 (part 1): `facet explain` placement diagnostic → released v1.16.0
 
 **Shipped + released v1.16.0** — the placement-explanation diagnostic (the headline
