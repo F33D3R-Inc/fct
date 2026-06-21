@@ -190,10 +190,12 @@ type Action struct {
 	Name       string
 	Params     []Param
 	Requires   []Require
-	Checks     []Check // declarative input validation, run before the body
-	Optimistic bool    // @optimistic — the client predicts the result before the round-trip
-	Body       []Stmt
-	Line       int
+	Optimistic bool // @optimistic — the client predicts the result before the round-trip
+	// Body holds every statement in source order, including `check` validations —
+	// so a check may run after a `let` bind and validate the bound result. Checks
+	// (and lets) must precede any mutation, so a failed check rolls back nothing.
+	Body []Stmt
+	Line int
 }
 
 // Service is an external service (a "brain") fct can call over HTTP: a base URL
@@ -253,6 +255,8 @@ type Check struct {
 	Msg  string
 	Line int
 }
+
+func (Check) stmt() {}
 
 // Require is one `requires` clause: a policy name and the arguments passed to it
 // (empty for a zero-parameter policy). The arguments are expressions over the

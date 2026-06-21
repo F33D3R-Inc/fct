@@ -680,11 +680,13 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		t := c.Line.Text
 		switch {
 		case strings.HasPrefix(t, "check "):
+			// A check is a body statement in source order, so it can validate a value
+			// bound earlier by `let` (e.g. a request→response result).
 			chk, err := parseCheck(strings.TrimSpace(t[len("check "):]), c.Line.No)
 			if err != nil {
 				return nil, err
 			}
-			a.Checks = append(a.Checks, chk)
+			a.Body = append(a.Body, chk)
 		case strings.HasPrefix(t, "requires "):
 			// `requires admin` or, for row-level checks, `requires owns(id), admin`.
 			for _, p := range splitTop(strings.TrimSpace(t[len("requires "):]), ',') {

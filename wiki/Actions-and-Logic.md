@@ -38,18 +38,28 @@ A multi-statement server action is **one transaction** — all or nothing
 
 ### Validation with `check`
 
-`check` runs **before** the body and rejects bad input with a friendly message.
-Zero or more per action.
+`check` rejects bad input with a friendly message. It runs **in source order**, so
+a check may sit after a `let` and validate a bound result — including a brain's
+answer from a [request→response](Services.md) call:
 
 ```
 action transfer(to: int, cents: money):
     check cents > 0 "amount must be positive"
     check to != actor "you cannot transfer to yourself"
     ...
+
+action enroll(handle: text, sig: text):
+    let uuid = call Verity.verify(handle, sig)
+    check uuid != "" "device verification failed"   # validates the bound result
+    add Account { handle: handle, pid: uuid }
 ```
 
 A failed check aborts the action and returns its message to the caller (HTTP and
-UI alike).
+UI alike — it also surfaces via `failed(<action>)`).
+
+**Checks (and `let` binds) must come before any mutation** (add/set/remove/clear/
+assign/establish). That guarantees a failed check — or a failed brain call — aborts
+with nothing written and nothing to roll back. Put validation first, then mutate.
 
 ### Permissions with `requires`
 

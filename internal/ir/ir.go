@@ -141,20 +141,12 @@ type Action struct {
 	Name       string    `json:"name"`
 	Params     []Param   `json:"params"`
 	Requires   []Require `json:"requires"`
-	Checks     []Check   `json:"checks,omitempty"`     // input validation, run before the body
 	Optimistic bool      `json:"optimistic,omitempty"` // client predicts the result pre-round-trip
 	Placement  string    `json:"placement"`
 	Reason     string    `json:"reason,omitempty"` // why the compiler placed it here (for `facet explain`)
 	Writes     []string  `json:"writes"`
 	Reads      []string  `json:"reads"`
-	Body       []Stmt    `json:"body"`
-}
-
-// Check is one validation precondition: a boolean expression over the action's
-// params/actor and the message returned when it fails.
-type Check struct {
-	Cond *Expr  `json:"cond"`
-	Msg  string `json:"msg"`
+	Body       []Stmt    `json:"body"` // statements in source order, including `check` validations
 }
 
 // Require is one resolved permission check on an action: the policy name plus the
@@ -214,6 +206,7 @@ type Stmt struct {
 	Ret     string      `json:"ret,omitempty"`     // call (request→response): result type core, for decode/coerce
 	RetList bool        `json:"retList,omitempty"` // call (request→response): result is a list of Ret
 	Role    *Expr       `json:"role,omitempty"`    // establish: optional new session role (Value holds the new actor)
+	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
 }
 
 // FieldInit is a `name: expr` in an `add`.

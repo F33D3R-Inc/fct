@@ -682,22 +682,13 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		act.Requires = append(act.Requires, req)
 	}
 
-	// Input validation: each `check <cond> "message"` is a pure precondition over
-	// the action's params and the actor, evaluated on the authority before the body
-	// runs. A failing check aborts with its friendly message.
-	for _, chk := range a.Checks {
-		if err := e.checkPure(chk.Cond, loc, a.Line, "a check"); err != nil {
-			return Action{}, err
-		}
-		act.Checks = append(act.Checks, Check{Cond: e.low(chk.Cond), Msg: chk.Msg})
-	}
-
 	writes := map[string]bool{} // state names written
 	entWrite := false           // any entity mutation
 	reads := map[string]bool{}  // state names read (for soundness)
 	impure := false             // uses an effectful builtin (now/rand)
 	callsService := false       // calls an external service (an effect)
 	establishesID := false      // sets the session identity (`establish`)
+	mutated := false            // a state/entity mutation has run — checks/lets must precede it
 
 	readExpr := func(ex ast.Expr, line int) error {
 		if err := e.check(ex, loc, line); err != nil {
@@ -714,8 +705,26 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		return nil
 	}
 
+	// Validation (`check`) and request→response binds (`let`) must come before any
+	// mutation, so a failed check or a brain error aborts with nothing committed and
+	// no partial in-memory write to unwind.
+	mustValidateFirst := func(kind string, line int) error {
+		if mutated {
+			return &BuildError{line, fmt.Sprintf("%s must come before any mutation (add/set/remove/clear/assign/establish), so a failure rolls back nothing — move it above the first mutation", kind)}
+		}
+		return nil
+	}
+
 	for _, s := range a.Body {
 		switch st := s.(type) {
+		case ast.Check:
+			if err := mustValidateFirst("a check", st.Line); err != nil {
+				return Action{}, err
+			}
+			if err := e.checkPure(st.Cond, loc, st.Line, "a check"); err != nil {
+				return Action{}, err
+			}
+			act.Body = append(act.Body, Stmt{Op: "check", Value: e.low(st.Cond), Msg: st.Msg})
 		case ast.Assign:
 			p, ok := e.states[st.Target]
 			if !ok {
@@ -726,12 +735,14 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				return Action{}, err
 			}
 			writes[st.Target] = true
+			mutated = true
 			act.Body = append(act.Body, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
 		case ast.Add:
 			if !e.entities[st.Entity] {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("add to unknown entity %q", st.Entity)}
 			}
 			entWrite = true
+			mutated = true
 			out := Stmt{Op: "add", Entity: st.Entity}
 			for _, fi := range st.Fields {
 				if err := readExpr(fi.Expr, st.Line); err != nil {
@@ -745,6 +756,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("set on unknown entity %q", st.Entity)}
 			}
 			entWrite = true
+			mutated = true
 			if err := readExpr(st.Key, st.Line); err != nil {
 				return Action{}, err
 			}
@@ -758,6 +770,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("remove on unknown entity %q", st.Entity)}
 			}
 			entWrite = true
+			mutated = true
 			if st.Where != nil {
 				// Filtered delete: a pure predicate over the item var + action scope.
 				wl := map[string]bool{st.Var: true}
@@ -786,6 +799,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				return Action{}, &BuildError{st.Line, fmt.Sprintf("clear on unknown entity %q", st.Entity)}
 			}
 			entWrite = true
+			mutated = true
 			act.Body = append(act.Body, Stmt{Op: "clear", Entity: st.Entity})
 		case ast.ServiceCall:
 			ops, ok := e.services[st.Service]
@@ -810,6 +824,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			// Request→response: `let x = call …` binds the typed result into a local
 			// so the rest of the body can use it (e.g. assign it into a state cell).
 			if st.Bind != "" {
+				if err := mustValidateFirst("a `let` bind", st.Line); err != nil {
+					return Action{}, err
+				}
 				ret := e.serviceRets[st.Service][st.Op]
 				if ret.ret == "" {
 					return Action{}, &BuildError{st.Line, fmt.Sprintf("%s.%s returns nothing — declare a return type (`%s(…) -> Type`) to bind it", st.Service, st.Op, st.Op)}
@@ -827,6 +844,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			// Adopt a custom session identity. Setting who you are is the authority's
 			// job, so it forces server placement; the actor/role exprs are reads.
 			establishesID = true
+			mutated = true
 			if err := readExpr(st.Actor, st.Line); err != nil {
 				return Action{}, err
 			}

@@ -10,6 +10,37 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 14 — 2026-06-20 — post-bind validation: `check` runs in body order → released v1.20.0
+
+**Closed the gap Sprint 13 surfaced.** Previously `check` was a pre-body precondition
+(params/actor only), so it couldn't validate a `let`-bound brain result — PIAL had to
+lean on the brain returning non-2xx. Now **`check` is a body statement that runs in
+source order**, so it can validate anything bound earlier:
+
+```
+let uuid = call Verity.verify(handle, sig)
+check uuid != "" "device verification failed"   # validates the bound result
+add Account { handle: handle, pid: uuid }
+```
+
+**Soundness via an ordering rule:** `check` and `let` must come **before any mutation**
+(add/set/remove/clear/assign/establish) — a compile error otherwise. So a failed check
+(or a failed brain call) aborts with nothing committed and no partial in-memory write
+to unwind. (Existing apps put checks at the top, so none break.)
+
+- Surface: ast (Check is now a Stmt; Action.Checks field removed — all in Body),
+  parser (`check` → body in order), ir (Stmt.Msg + op "check"; removed ir.Action.Checks
+  / ir.Check), build (body `check` case + `mutated` tracking + `mustValidateFirst`
+  guard on check & let), runtime (removed the pre-body check loop; body "check" case
+  returns 422+msg). 
+- Tests: `internal/compile/check_test.go` (body op order call→check→add; check-after-
+  mutation and let-after-mutation errors); `runtime/check_test.go` (full flow vs a
+  fake brain: rejected enroll → 422 + message + zero rows; accepted → 200 + one row).
+- Verified e2e via `examples/identity.fct` (now with `check uuid != ""`): empty handle
+  → 422, real handle → 200. Docs: wiki/Actions-and-Logic.md. version -> **1.20.0**.
+
+---
+
 ## Sprint 13 — 2026-06-20 — F33D3R depth #2: custom identity (PIAL) → released v1.19.0
 
 **Shipped + released v1.19.0 — pluggable identity, the PIAL pillar.** Design chosen
@@ -46,9 +77,8 @@ guarantees the key is uncompilable to render and never crosses to the client.
   the UUID "PIAL-ada-uuid" appears 0× in the page. Docs: ROADMAP (server-only values
   ✅, custom identity provider ✅), wiki/Identity.md. version -> **1.19.0**.
 
-**Note (gap surfaced, deferred):** a `check` runs before the body, so it can't
-validate a `let`-bound brain result. PIAL handles rejection via the brain returning
-non-2xx (which aborts). Post-bind validation / in-body guards is a future item.
+**Note (gap surfaced):** a `check` runs before the body, so it can't validate a
+`let`-bound brain result. → **Fixed in v1.20.0 (Sprint 14).**
 
 **Next F33D3R depth:** (3) webhooks + non-cron triggers · (4) media handoff
 (signed/expiring URLs + HLS + chunked upload) · (5) design-system control + page

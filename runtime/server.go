@@ -705,17 +705,6 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 		}
 	}
 
-	// Input validation: each `check` is a precondition over the bound arguments and
-	// the actor. A failure aborts before any state changes and returns its friendly
-	// message, so invalid input never reaches the store.
-	for _, chk := range act.Checks {
-		if !truthy(eval(chk.Cond, scope)) {
-			s.recordAudit(actor, act.Name, false, "check failed: "+chk.Msg)
-			s.obs.metrics.observeAction(act.Name, "invalid")
-			return nil, http.StatusUnprocessableEntity, chk.Msg
-		}
-	}
-
 	deltas := map[string]any{}
 	entChanged := map[string]bool{}
 	ses := s.sessions[sid]
@@ -727,6 +716,15 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 	var ops []durOp // durable writes, replayed in one transaction at the end
 	for _, st := range act.Body {
 		switch st.Op {
+		case "check":
+			// Validation in body order — runs after any earlier `let` bind so it can
+			// validate a brain result. The compiler guarantees checks precede every
+			// mutation, so a failure here has applied nothing to roll back.
+			if !truthy(eval(st.Value, scope)) {
+				s.recordAudit(actor, act.Name, false, "check failed: "+st.Msg)
+				s.obs.metrics.observeAction(act.Name, "invalid")
+				return nil, http.StatusUnprocessableEntity, st.Msg
+			}
 		case "assign":
 			v := eval(st.Value, scope)
 			if !sameValue(sess[st.Target], v) {

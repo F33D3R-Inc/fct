@@ -23,7 +23,7 @@ import (
 )
 
 // version is stamped at release time with -ldflags "-X main.version=…".
-var version = "1.19.0"
+var version = "1.20.0"
 
 func main() {
 	if len(os.Args) < 2 {
