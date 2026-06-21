@@ -19,6 +19,10 @@ class Brain(BaseHTTPRequestHandler):
             result = 1_500_000          # µAET
         elif op == "score":
             result = len(body.get("body", "")) % 100   # a toy "risk" score
+        elif op == "verify":
+            # a toy identity brain: any non-empty handle "verifies" to a UUID
+            h = body.get("handle", "")
+            result = ("PIAL-" + h + "-uuid") if h else ""
         else:
             result = None               # review() is fire-and-forget
         self.send_response(200)

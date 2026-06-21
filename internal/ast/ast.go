@@ -120,9 +120,10 @@ type Layout struct {
 // resolves to the authoritative default (server). The compiler decides where
 // everything runs; these are only hints/overrides.
 const (
-	PlaceInfer  = ""
-	PlaceClient = "client" // @client — ephemeral, local, latency-sensitive
-	PlaceServer = "server" // @server — explicit authoritative
+	PlaceInfer   = ""
+	PlaceClient  = "client"  // @client — ephemeral, local, latency-sensitive
+	PlaceServer  = "server"  // @server — explicit authoritative
+	PlacePrivate = "private" // @private — authoritative AND server-only: never shipped to a client, never renderable (a compile error to interpolate). For secrets/identity keys (e.g. a PIAL UUID).
 )
 
 // Entity is a durable, shared, persisted record type — the database. Its rows
@@ -231,6 +232,18 @@ type ServiceCall struct {
 	Line    int
 }
 
+// Establish adopts a custom session identity from app-computed values — the hook
+// for PIAL-style auth: a verify-action calls an identity brain (request→response)
+// and promotes the verified result into the session with `establish actor handle`
+// (optionally `role <expr>`). Setting who you are is the authority's job, so it
+// pins the action to the server. `actor` becomes the renderable display identity;
+// keep the opaque key (a UUID) in a `@private` cell, which can never be rendered.
+type Establish struct {
+	Actor Expr
+	Role  Expr // optional (nil = leave the session role unchanged)
+	Line  int
+}
+
 // Check is one `check <expr> "message"` clause: a precondition over the action's
 // parameters (and actor) the authority evaluates before running the body. A
 // failing check aborts the action and returns its friendly message, so invalid
@@ -324,6 +337,7 @@ type Clear struct {
 
 func (Assign) stmt()      {}
 func (ServiceCall) stmt() {}
+func (Establish) stmt()   {}
 func (Add) stmt()         {}
 func (Set) stmt()         {}
 func (Remove) stmt()      {}

@@ -34,7 +34,8 @@ type Server struct {
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
 	byService   map[string]*ir.Service
-	uploadDir   string // directory uploaded files are written to and served from
+	privateNm   map[string]bool // @private state names — never shipped to a client
+	uploadDir   string          // directory uploaded files are written to and served from
 	store       Store
 	children    map[string][]childRef // entity -> the relations that point at it (for cascade)
 	secure      bool                  // mark cookies Secure (TLS / FACET_SECURE_COOKIES=1)
@@ -113,6 +114,7 @@ func newServer(graph *ir.IR) *Server {
 		byPolicy:    map[string]*ir.Policy{},
 		byComponent: map[string]*ir.Component{},
 		byService:   map[string]*ir.Service{},
+		privateNm:   map[string]bool{},
 		uploadDir:   uploadDirFromEnv(),
 		entities:    map[string][]any{},
 		nextID:      map[string]int{},
@@ -127,6 +129,11 @@ func newServer(graph *ir.IR) *Server {
 	}
 	for i := range graph.Actions {
 		s.byAction[graph.Actions[i].Name] = &graph.Actions[i]
+	}
+	for _, st := range graph.States {
+		if st.Private {
+			s.privateNm[st.Name] = true // server-only: stripped from every client payload
+		}
 	}
 	// Index every page's bindings, not just the entry page's — a multi-screen app
 	// renders binds that live on whichever screen the request hit, so server-side
@@ -399,7 +406,9 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	reqIR.DepGraph = pg.DepGraph
 	reqIR.Pages = nil
 	irJSON, _ := json.Marshal(&reqIR)
-	stateJSON, _ := json.Marshal(store)
+	// The server-render store (above) holds @private values for server-side logic,
+	// but the client bootstrap must never carry them — strip before shipping.
+	stateJSON, _ := json.Marshal(s.clientSafe(store))
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// Phase 6: stamp the negotiated locale so a client knows which catalog to load.
@@ -723,7 +732,23 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 			if !sameValue(sess[st.Target], v) {
 				sess[st.Target] = v
 				scope[st.Target] = v
-				deltas[st.Target] = v
+				if !s.privateNm[st.Target] {
+					deltas[st.Target] = v // a @private cell is server-only — never shipped
+				}
+			}
+		case "establish":
+			// Adopt a custom session identity (PIAL): set the session actor (and
+			// optionally role) in place — effective for every later request — and
+			// echo it as a delta so a reactive {actor} updates and clustering syncs.
+			na := toStr(eval(st.Value, scope))
+			ses.actor = na
+			scope["actor"] = na
+			deltas["actor"] = na
+			if st.Role != nil {
+				nr := toStr(eval(st.Role, scope))
+				ses.role = nr
+				scope["role"] = nr
+				deltas["role"] = nr
 			}
 		case "add":
 			row := record{}
@@ -995,6 +1020,22 @@ func (s *Server) scope(sid string) map[string]any {
 		}
 	}
 	return scope
+}
+
+// clientSafe returns a copy of a store with every @private cell removed, so a
+// server-only value (a PIAL UUID, a secret) never crosses to the client. The
+// compiler already bars rendering one; this stops it riding the state bootstrap.
+func (s *Server) clientSafe(store map[string]any) map[string]any {
+	if len(s.privateNm) == 0 {
+		return store
+	}
+	out := make(map[string]any, len(store))
+	for k, v := range store {
+		if !s.privateNm[k] {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // fullStore is the scope plus client-state defaults — the complete snapshot the

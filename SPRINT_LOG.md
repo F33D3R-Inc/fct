@@ -10,6 +10,53 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 13 — 2026-06-20 — F33D3R depth #2: custom identity (PIAL) → released v1.19.0
+
+**Shipped + released v1.19.0 — pluggable identity, the PIAL pillar.** Design chosen
+with the user (option A: a verify-action + `establish`, no auth-provider magic). Two
+orthogonal, composable primitives:
+
+- **`establish actor <expr> [role <expr>]`** — an action adopts a custom session
+  identity from app-computed values (the result of a request→response verify call).
+  Setting who you are is the authority's job → server-placed. `actor` becomes the
+  renderable identity; echoed as a delta so a reactive `{actor}` updates and
+  clustering syncs the session.
+- **`@private` state** — authoritative (server) AND server-only: never shipped to a
+  client (stripped from the state bootstrap AND from deltas) and a **compile error to
+  render** (interpolating it in any text/label/badge/… node). It CAN key policies,
+  gate logic, and feed service calls. The PIAL UUID lives here. Guard: `establish
+  actor <private>` is also a compile error (can't copy the key into a renderable
+  slot).
+
+**The PIAL pattern:** the opaque UUID lives in `@private pid` and authorizes
+(`policy member: pid != ""`); the handle is `actor` and renders. The compiler
+guarantees the key is uncompilable to render and never crosses to the client.
+
+- Surface: ast (PlacePrivate, Establish stmt, Param already done), parser (@private
+  annotation, `establish actor … [role …]`), ir (State.Private, Stmt.Role, op
+  establish), build (private set + `checkNoPrivate` at the lowerSegs render choke
+  point + establish placement/guards), runtime (privateNm set, `clientSafe` strips
+  private from the page bootstrap, deltas skip private targets, the `establish` case
+  sets ses.actor/role in place + echoes deltas).
+- Tests: `internal/compile/identity_test.go` (private IR + establish placement +
+  render-leak error + establish-from-private error + private-OK-in-policy);
+  `runtime/identity_test.go` (full flow vs a fake brain: login → @private UUID →
+  establish actor=ada; asserts the secret UUID appears NOWHERE in the client page).
+- Verified e2e via `examples/identity.fct` + mock brain: login renders handle "ada",
+  the UUID "PIAL-ada-uuid" appears 0× in the page. Docs: ROADMAP (server-only values
+  ✅, custom identity provider ✅), wiki/Identity.md. version -> **1.19.0**.
+
+**Note (gap surfaced, deferred):** a `check` runs before the body, so it can't
+validate a `let`-bound brain result. PIAL handles rejection via the brain returning
+non-2xx (which aborts). Post-bind validation / in-body guards is a future item.
+
+**Next F33D3R depth:** (3) webhooks + non-cron triggers · (4) media handoff
+(signed/expiring URLs + HLS + chunked upload) · (5) design-system control + page
+metadata + field-level authz + overlays/typeahead · (phase) `@e2e` crypto. Typed
+**records** for structured brain payloads remains the fast-follow to #1.
+
+---
+
 ## Sprint 12 — 2026-06-20 — F33D3R depth #1: request→response service calls → released v1.18.0
 
 **Direction shift (with the user):** forget the X-clone as driver — the real target

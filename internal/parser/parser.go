@@ -541,11 +541,11 @@ func parseTheme(n *source.Node) ([]ast.ThemeVar, error) {
 	return out, nil
 }
 
-// parseState: `state name: Type = default [@client|@server]`
+// parseState: `state name: Type = default [@client|@server|@private]`
 func parseState(n *source.Node) (*ast.State, error) {
 	rest := strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "state"))
 	place := ast.PlaceInfer
-	for _, ann := range []string{"@client", "@server"} {
+	for _, ann := range []string{"@client", "@server", "@private"} {
 		if strings.HasSuffix(rest, ann) {
 			rest = strings.TrimSpace(strings.TrimSuffix(rest, ann))
 			place = strings.TrimPrefix(ann, "@")
@@ -745,6 +745,31 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 			}
 			cl.Bind = name
 			a.Body = append(a.Body, cl)
+		case strings.HasPrefix(t, "establish "):
+			// `establish actor <expr> [role <expr>]` — adopt a custom session identity.
+			rest := strings.TrimSpace(t[len("establish "):])
+			if !strings.HasPrefix(rest, "actor ") {
+				return nil, &Error{c.Line.No, "establish needs `establish actor <expr> [role <expr>]`"}
+			}
+			rest = strings.TrimSpace(rest[len("actor "):])
+			var roleSrc string
+			if i := strings.Index(rest, " role "); i >= 0 {
+				roleSrc = strings.TrimSpace(rest[i+len(" role "):])
+				rest = strings.TrimSpace(rest[:i])
+			}
+			actorExpr, err := parseExpr(rest, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			est := ast.Establish{Actor: actorExpr, Line: c.Line.No}
+			if roleSrc != "" {
+				roleExpr, err := parseExpr(roleSrc, c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				est.Role = roleExpr
+			}
+			a.Body = append(a.Body, est)
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {

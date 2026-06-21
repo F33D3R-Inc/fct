@@ -109,6 +109,7 @@ type State struct {
 	List      bool   `json:"list,omitempty"`
 	Optional  bool   `json:"optional,omitempty"`
 	Placement string `json:"placement"`
+	Private   bool   `json:"private,omitempty"` // @private: authoritative but server-only — never shipped to a client, never rendered
 	Init      *Expr  `json:"init"`
 }
 
@@ -212,6 +213,7 @@ type Stmt struct {
 	Bind    string      `json:"bind,omitempty"`    // call (request→response): local the result binds to
 	Ret     string      `json:"ret,omitempty"`     // call (request→response): result type core, for decode/coerce
 	RetList bool        `json:"retList,omitempty"` // call (request→response): result is a list of Ret
+	Role    *Expr       `json:"role,omitempty"`    // establish: optional new session role (Value holds the new actor)
 }
 
 // FieldInit is a `name: expr` in an `add`.

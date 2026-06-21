@@ -1,0 +1,40 @@
+# Custom identity (PIAL-style) — fct owns the UI + session, an identity brain owns
+# verification. The flow: a verify-action calls the brain (request→response) for an
+# opaque UUID, keeps it in a @private cell (server-only — never shipped, a compile
+# error to render), and `establish`es the session as the handle (the renderable
+# identity). Authorization keys on the @private UUID; the page only ever shows the
+# handle. There is no built-in `auth` here — identity is sourced entirely from the
+# app + brain.
+#
+#   python3 examples/services/mock_brain.py      # the identity brain on :9099
+#   facet dev examples/identity.fct
+app Identity:
+    service Elohim at "http://localhost:9099":
+        verify(handle: text, sig: text) -> text
+
+    # pid is the PIAL UUID — @private: server-only, never shipped, never rendered.
+    state pid: text @private
+    state handleInput: text = "" @client
+
+    policy member:
+        pid != ""
+
+    # Verify the device signature with the brain, keep the key private, and adopt
+    # the session as the handle (the renderable identity).
+    action login(handle: text, sig: text):
+        let uuid = call Elohim.verify(handle, sig)
+        pid = uuid
+        establish actor handle
+    action logout():
+        pid = ""
+        establish actor "guest"
+
+    view Home at "/":
+        box:
+            text "signed in as {actor}"
+            if actor == "guest":
+                input bind handleInput placeholder "your handle"
+                button "Verify device & sign in" -> login(handleInput, "device-sig-abc")
+            if actor != "guest":
+                text "You can now do member-only things (gated on the @private UUID)."
+                button "log out" -> logout

@@ -135,7 +135,7 @@ deliberately decided against it — the goal is to build a site, not a language.
 | authoritative vs ephemeral (`@client`) | ✅ | |
 | impurity ⇒ server, `requires` ⇒ server | ✅ | |
 | soundness: server action can't read/write `@client` | ✅ | symmetric, compile-enforced |
-| secret / server-only values | 🟡 | `@secret` (encryption) + credentials never shipped; no general `@secret`-typed *values* with leak diagnostics |
+| secret / server-only values | ✅ | `@private` state (v1.19.0): authoritative but never shipped to a client and a **compile error to render** (leak diagnostic) — keys policies/feeds services; plus `@secret` (encryption) + credentials never shipped |
 | edge placement | ⬜ | **Later** — third placement target |
 | replicated / offline-capable / latency-sensitive annotations | ⬜ | **Later** — feeds local-first (§15) |
 | materialization policies (cacheable/prefetch/subscribable/resumable) | 🟡 | live subscribe ✅, API micro-cache ✅; not declarable per-value |
@@ -246,6 +246,7 @@ is the most important thing on this roadmap after request→response calls.
 | Capability | Status | Notes |
 |---|---|---|
 | auth builtin (signup/login/logout/setRole, reset, verify) | ✅ | first user = admin |
+| **custom identity provider** (source `actor` from an app/service-verified flow) | ✅ | `establish actor <handle> [role …]` (v1.19.0) — a verify-action calls an identity brain (request→response) and adopts the session; the opaque key lives in `@private` state. The PIAL hook. |
 | RBAC + row-level + parameterized policies | ✅ | enforced on authority, shipped to hide UI |
 | sessions (HMAC, HttpOnly/SameSite/Secure, sliding expiry) | ✅ | |
 | CSRF, rate limit, brute-force lockout | ✅ | |

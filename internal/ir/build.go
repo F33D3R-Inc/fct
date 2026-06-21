@@ -36,6 +36,7 @@ type env struct {
 	stateTypes   map[string]string            // state name -> its (core/element) type, for enum-defaulted selects
 	services     map[string]map[string]int    // service name -> op name -> parameter count, for checking `call`
 	serviceRets  map[string]map[string]opRet  // service name -> op name -> return type, for binding `let x = call …`
+	private      map[string]bool              // @private state names — server-only, non-renderable
 	entFieldEnum map[string]map[string]string // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
 }
 
@@ -71,7 +72,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, entFieldEnum: map[string]map[string]string{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -172,12 +173,19 @@ func Build(app *ast.App) (*IR, error) {
 		if s.Placement == ast.PlaceClient {
 			p = Client
 		}
+		// @private is authoritative (server) for placement, plus server-only: it is
+		// never shipped to a client and never renderable. Tracked so the view checker
+		// rejects interpolating it and the runtime strips it from client payloads.
+		private := s.Placement == ast.PlacePrivate
+		if private {
+			e.private[s.Name] = true
+		}
 		if err := e.checkBuiltins(s.Default, s.Line); err != nil {
 			return nil, err
 		}
 		e.states[s.Name] = p
 		e.stateTypes[s.Name] = core
-		out.States = append(out.States, State{Name: s.Name, Type: s.Type, Elem: s.Elem, List: s.List, Optional: s.Optional, Placement: p, Init: e.low(s.Default)})
+		out.States = append(out.States, State{Name: s.Name, Type: s.Type, Elem: s.Elem, List: s.List, Optional: s.Optional, Placement: p, Private: private, Init: e.low(s.Default)})
 	}
 
 	// 3. Policies (predicates over actor + state/entities; no params). Lowered and
@@ -689,6 +697,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	reads := map[string]bool{}  // state names read (for soundness)
 	impure := false             // uses an effectful builtin (now/rand)
 	callsService := false       // calls an external service (an effect)
+	establishesID := false      // sets the session identity (`establish`)
 
 	readExpr := func(ex ast.Expr, line int) error {
 		if err := e.check(ex, loc, line); err != nil {
@@ -814,6 +823,29 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				cs.RetList = ret.list
 			}
 			act.Body = append(act.Body, cs)
+		case ast.Establish:
+			// Adopt a custom session identity. Setting who you are is the authority's
+			// job, so it forces server placement; the actor/role exprs are reads.
+			establishesID = true
+			if err := readExpr(st.Actor, st.Line); err != nil {
+				return Action{}, err
+			}
+			// actor/role become the renderable session identity, so they cannot be a
+			// @private value — that would copy the secret key into a renderable slot.
+			if err := e.checkNoPrivate(st.Actor); err != nil {
+				return Action{}, &BuildError{st.Line, "establish actor sets the renderable identity, so it cannot be a @private value — establish the handle and key policies on the @private UUID instead"}
+			}
+			es := Stmt{Op: "establish", Value: e.low(st.Actor)}
+			if st.Role != nil {
+				if err := readExpr(st.Role, st.Line); err != nil {
+					return Action{}, err
+				}
+				if err := e.checkNoPrivate(st.Role); err != nil {
+					return Action{}, &BuildError{st.Line, "establish role cannot be a @private value"}
+				}
+				es.Role = e.low(st.Role)
+			}
+			act.Body = append(act.Body, es)
 		}
 	}
 
@@ -832,6 +864,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	case callsService:
 		act.Placement = Server
 		act.Reason = "calls an external service — egress routes through the authority, never the client"
+	case establishesID:
+		act.Placement = Server
+		act.Reason = "establishes the session identity — only the authority may set who you are"
 	}
 	if act.Placement == Client {
 		for _, w := range sortedKeys(writes) {
@@ -959,6 +994,9 @@ func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope) ([]Seg, error) {
 			continue
 		}
 		if err := c.e.checkPure(s.Expr, withActor(sc.locals), 0, "a view"); err != nil {
+			return nil, err
+		}
+		if err := c.e.checkNoPrivate(s.Expr); err != nil {
 			return nil, err
 		}
 		if sc.inRegion {
@@ -1386,6 +1424,23 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 // checkPure is check plus the guarantee that ex is side-effect-free: it rejects
 // the effectful builtins (now/rand). Pure contexts — derives, policies, views —
 // may run on any client, so they must be deterministic.
+// checkNoPrivate rejects an expression that reads a @private state cell from a
+// render position. A @private value is server-only — never shipped, never
+// renderable — so interpolating it (text/label/url/badge/richtext/video) would
+// leak it into output. It stays available to policies, checks, and action logic.
+func (e *env) checkNoPrivate(ex ast.Expr) error {
+	if len(e.private) == 0 {
+		return nil
+	}
+	for n := range e.depsIR(e.low(ex)) {
+		if e.private[n] {
+			return &BuildError{0, fmt.Sprintf(
+				"%q is @private (server-only) and cannot be rendered — it can gate logic, key policies, and feed services, but interpolating it would leak it to the client. Render a non-private value (e.g. the handle) instead", n)}
+		}
+	}
+	return nil
+}
+
 func (e *env) checkPure(ex ast.Expr, locals map[string]bool, line int, ctx string) error {
 	if err := e.check(ex, locals, line); err != nil {
 		return err
