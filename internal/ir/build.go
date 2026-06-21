@@ -369,6 +369,20 @@ func Build(app *ast.App) (*IR, error) {
 	// hatch for layout the token system can't express (pinned rails, breakpoints).
 	out.CSS = app.CSS
 
+	// Pre-register action names so a component body's pending()/failed() resolves an
+	// action declared later in source order — components are lowered (3d) before the
+	// action pass (4) that normally registers these. Full validation still runs in 4;
+	// this only makes the names visible early. Critical for shared component facets
+	// (e.g. a ComposeBox whose `pending(post)` names the host's action).
+	for _, a := range app.Actions {
+		e.actionSet[a.Name] = true
+	}
+	if app.Auth {
+		for _, a := range authActions() {
+			e.actionSet[a.Name] = true
+		}
+	}
+
 	// 3d. Components: reusable view fragments. Names + parameters are registered in
 	// one pass (so a component may `use` another declared later, and arity checks
 	// resolve), then each body is lowered. A component is pure projection rendered
