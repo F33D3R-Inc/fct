@@ -34,6 +34,7 @@ type env struct {
 	components   map[string][]Param             // component name -> its parameters
 	compDeps     map[string]map[string]bool     // component name -> the state/entity names its body reads (for use-site refresh)
 	stateTypes   map[string]string              // state name -> its (core/element) type, for enum-defaulted selects
+	stateList    map[string]bool                // state names that are `[T]` list cells, for `for x in <list>`
 	services     map[string]map[string]int      // service name -> op name -> parameter count, for checking `call`
 	serviceRets  map[string]map[string]opRet    // service name -> op name -> return type, for binding `let x = call …`
 	private      map[string]bool                // @private state names — server-only, non-renderable
@@ -41,6 +42,7 @@ type env struct {
 	records      map[string]map[string]recField // record name -> field name -> its type, for `let`-bound field access
 	entE2E       map[string]map[string]bool     // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
 	locRecords   map[string]recBind             // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
+	actionSet    map[string]bool                // action names, for validating pending()/failed() targets
 }
 
 // opRet is a service operation's declared return type ("" core = no return).
@@ -88,7 +90,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, records: map[string]map[string]recField{}, entE2E: map[string]map[string]bool{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, records: map[string]map[string]recField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -151,12 +153,16 @@ func Build(app *ast.App) (*IR, error) {
 		entSeen[ent.Name] = ent.Line
 		e.entities[ent.Name] = true
 		e.entityFields[ent.Name] = map[string]bool{}
-		ei := Entity{Name: ent.Name}
+		ei := Entity{Name: ent.Name, SoftDelete: ent.SoftDelete}
 		for _, f := range ent.Fields {
 			if f.Secret && f.Name == "id" {
 				return nil, &BuildError{f.Line, "the id field cannot be @secret"}
 			}
-			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, E2E: f.E2E, ReadPolicy: f.ReadPolicy, Optional: f.Optional}
+			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, E2E: f.E2E, ReadPolicy: f.ReadPolicy, Optional: f.Optional,
+				Unique: f.Unique, Required: f.Required, Min: f.Min, Max: f.Max, Matches: f.Matches}
+			if f.Unique {
+				e.markIndex(ent.Name, f.Name) // a uniqueness check reads by value; index it
+			}
 			if f.E2E {
 				if e.entE2E[ent.Name] == nil {
 					e.entE2E[ent.Name] = map[string]bool{}
@@ -175,6 +181,16 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			ei.Fields = append(ei.Fields, fld)
 			e.entityFields[ent.Name][f.Name] = true
+		}
+		// Soft-delete needs a durable `archived` flag to persist the hidden state. The
+		// compiler injects it (reserved), so the author never models it by hand. It is
+		// indexed — the load path filters archived rows out of the live working set.
+		if ent.SoftDelete {
+			if e.entityFields[ent.Name]["archived"] {
+				return nil, &BuildError{ent.Line, fmt.Sprintf("entity %q is @softdelete, so `archived` is reserved — rename your field", ent.Name)}
+			}
+			ei.Fields = append(ei.Fields, Field{Name: "archived", Type: "bool", Index: true})
+			e.entityFields[ent.Name]["archived"] = true
 		}
 		out.Entities = append(out.Entities, ei)
 	}
@@ -240,6 +256,9 @@ func Build(app *ast.App) (*IR, error) {
 		}
 		e.states[s.Name] = p
 		e.stateTypes[s.Name] = core
+		if s.List {
+			e.stateList[s.Name] = true
+		}
 		out.States = append(out.States, State{Name: s.Name, Type: s.Type, Elem: s.Elem, List: s.List, Optional: s.Optional, Placement: p, Private: private, Init: e.low(s.Default)})
 	}
 
@@ -431,6 +450,14 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, err
 		}
 		out.Actions = append(out.Actions, act)
+		e.actionSet[a.Name] = true // for pending()/failed() target validation in views
+	}
+	// Built-in auth adds its own actions (login/logout/signup/…); register their
+	// names too so a view may read pending()/failed() on them.
+	if app.Auth {
+		for _, a := range authActions() {
+			e.actionSet[a.Name] = true
+		}
 	}
 
 	// 4b. Jobs: each schedules a zero-argument, server-placed action. Validated
@@ -1511,8 +1538,15 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, node)
 
 		case ast.For:
-			if !c.e.entities[t.Coll] && c.e.states[t.Coll] == "" {
-				return nil, &BuildError{0, fmt.Sprintf("`for` over unknown collection %q", t.Coll)}
+			// A `for` ranges over an entity (rows) or a `[T]` list state cell (its
+			// elements). A scalar state cell is not iterable.
+			if !c.e.entities[t.Coll] {
+				if c.e.states[t.Coll] == "" {
+					return nil, &BuildError{0, fmt.Sprintf("`for` over unknown collection %q (an entity or a list state)", t.Coll)}
+				}
+				if !c.e.stateList[t.Coll] {
+					return nil, &BuildError{0, fmt.Sprintf("`for x in %s` needs a list — %q is a scalar state, not a `[T]` collection", t.Coll, t.Coll)}
+				}
 			}
 			node := Node{Kind: "list", Var: t.Var, Coll: t.Coll, Order: t.Order, Desc: t.Desc}
 			// `limit` may be a literal or a pure expr (e.g. a @client page size for
@@ -1841,8 +1875,8 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		if !e.entities[t.Coll] {
 			return &BuildError{line, fmt.Sprintf("%s(...) needs an entity collection; %q is not an entity", t.Op, t.Coll)}
 		}
-		if t.Op == "sum" && !e.entityFields[t.Coll][t.Field] {
-			return &BuildError{line, fmt.Sprintf("entity %q has no field %q to sum", t.Coll, t.Field)}
+		if isFieldAgg(t.Op) && !e.entityFields[t.Coll][t.Field] {
+			return &BuildError{line, fmt.Sprintf("entity %q has no field %q to %s", t.Coll, t.Field, t.Op)}
 		}
 		if t.Op == "exists" && t.Var == "" {
 			return &BuildError{line, fmt.Sprintf("exists needs a filtered form: exists(x in %s where <cond>)", t.Coll)}
@@ -1850,6 +1884,18 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		if t.Where != nil {
 			if err := e.checkBuiltins(t.Where, line); err != nil {
 				return err
+			}
+		}
+	case ast.ActState:
+		// pending()/failed() name an action; dirty()/touched() name a state cell.
+		// Validate the target so a typo is a compile error, not a silent false.
+		if t.Op == "pending" || t.Op == "failed" {
+			if !e.actionSet[t.Action] {
+				return &BuildError{line, fmt.Sprintf("%s(%s) names an unknown action %q", t.Op, t.Action, t.Action)}
+			}
+		} else { // dirty | touched
+			if _, ok := e.states[t.Action]; !ok {
+				return &BuildError{line, fmt.Sprintf("%s(%s) names an unknown state cell %q", t.Op, t.Action, t.Action)}
 			}
 		}
 	case ast.Call:
@@ -1976,6 +2022,16 @@ func isPrimitive(t string) bool {
 	return false
 }
 
+// isFieldAgg reports whether an aggregate op reduces a numeric field (and so
+// needs one): sum, avg, min, max. count/exists range over rows.
+func isFieldAgg(op string) bool {
+	switch op {
+	case "sum", "avg", "min", "max":
+		return true
+	}
+	return false
+}
+
 // checkName rejects a policy/derive name that collides with an existing state,
 // entity, policy, or derive, so every global name resolves unambiguously.
 func (e *env) checkName(name string, line int, kind string) error {
@@ -2016,8 +2072,14 @@ func (e *env) depsIR(le *Expr) map[string]bool {
 			walk(x.Key)
 		case "astate":
 			// pending()/failed() read per-action client status; a synthetic dep key so
-			// the dispatch loop can refresh exactly the regions that show it.
-			out["@act:"+x.Name] = true
+			// the dispatch loop can refresh exactly the regions that show it. dirty()/
+			// touched() read form-field status keyed on the cell itself, so editing the
+			// input (which refreshes that cell) also refreshes what reads them.
+			if x.Op == "dirty" || x.Op == "touched" {
+				out[x.Name] = true
+			} else {
+				out["@act:"+x.Name] = true
+			}
 		case "agg":
 			if e.entities[x.Name] {
 				out[x.Name] = true

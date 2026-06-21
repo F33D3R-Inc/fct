@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +47,9 @@ type Server struct {
 
 	idemMu sync.Mutex             // guards idem
 	idem   map[string]*idemRecord // webhook idempotency: dedup key -> the once-processed outcome (or an in-flight marker)
+
+	fieldRE map[string]*regexp.Regexp // compiled @matches patterns, keyed by entity.field
+	softDel map[string]bool           // entity names that soft-delete (archive) on remove
 
 	store    Store
 	children map[string][]childRef // entity -> the relations that point at it (for cascade)
@@ -133,6 +137,8 @@ func newServer(graph *ir.IR) *Server {
 
 		uploadSessions: map[string]*uploadSession{},
 		idem:           map[string]*idemRecord{},
+		fieldRE:        map[string]*regexp.Regexp{},
+		softDel:        map[string]bool{},
 		entities:       map[string][]any{},
 		nextID:         map[string]int{},
 		sessions:       map[string]*sessionState{},
@@ -168,6 +174,22 @@ func newServer(graph *ir.IR) *Server {
 	}
 	for i := range graph.Records {
 		s.byRecord[graph.Records[i].Name] = &graph.Records[i]
+	}
+	// Precompile @matches patterns (full-match anchored) so add/set validation is a
+	// cheap lookup. An unparsable pattern is skipped (the field just isn't pattern-
+	// constrained) rather than crashing the server.
+	for _, ent := range graph.Entities {
+		if ent.SoftDelete {
+			s.softDel[ent.Name] = true
+		}
+		for _, f := range ent.Fields {
+			if f.Matches == "" {
+				continue
+			}
+			if re, err := regexp.Compile("^(?:" + f.Matches + ")$"); err == nil {
+				s.fieldRE[ent.Name+"."+f.Name] = re
+			}
+		}
 	}
 	// Index event triggers by their source action, so a successful action can fan
 	// out to its reactions in O(1). The compiler proved this graph acyclic.
@@ -218,7 +240,8 @@ func (s *Server) attachStore(store Store) error {
 		if rows == nil {
 			rows = []any{}
 		}
-		s.entities[e.Name] = rows
+		// nextID tracks the high-water id across ALL rows (archived included) so a new
+		// row never reuses a soft-deleted row's id; the live set excludes archived rows.
 		max := 0
 		for _, r := range rows {
 			if m, ok := r.(record); ok {
@@ -228,6 +251,7 @@ func (s *Server) attachStore(store Store) error {
 			}
 		}
 		s.nextID[e.Name] = max
+		s.entities[e.Name] = liveRows(rows, e.SoftDelete)
 	}
 
 	// Audit log: write through to the durable table, seeded from its recent history
@@ -915,6 +939,13 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 			for _, fi := range st.Fields {
 				row[fi.Name] = eval(fi.Expr, scope)
 			}
+			// Declarative constraints (@required/@unique/@min/@max/@matches) are
+			// enforced before the row lands, so invalid data never reaches the store.
+			if msg := s.constraintError(st.Entity, row, "", nil); msg != "" {
+				s.recordAudit(actor, act.Name, false, "constraint: "+msg)
+				s.obs.metrics.observeAction(act.Name, "invalid")
+				return nil, http.StatusUnprocessableEntity, msg
+			}
 			s.nextID[st.Entity]++
 			row["id"] = s.nextID[st.Entity]
 			s.entities[st.Entity] = append(s.entities[st.Entity], row)
@@ -924,16 +955,31 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 			key := eval(st.Key, scope)
 			for _, r := range s.entities[st.Entity] {
 				if m, ok := r.(record); ok && equal(m["id"], key) {
-					m[st.Field] = eval(st.Value, scope)
+					nv := eval(st.Value, scope)
+					// Validate the proposed value (a @unique scan ignores this row).
+					cand := record{}
+					for k, v := range m {
+						cand[k] = v
+					}
+					cand[st.Field] = nv
+					if msg := s.constraintError(st.Entity, cand, st.Field, m["id"]); msg != "" {
+						s.recordAudit(actor, act.Name, false, "constraint: "+msg)
+						s.obs.metrics.observeAction(act.Name, "invalid")
+						return nil, http.StatusUnprocessableEntity, msg
+					}
+					m[st.Field] = nv
 					ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
 					entChanged[st.Entity] = true
 					break
 				}
 			}
 		case "remove":
+			soft := s.softDel[st.Entity]
 			if st.Where != nil {
 				// Filtered delete: remove every row the predicate accepts, with the
-				// item variable bound to each row (mirrors the filtered-agg fold).
+				// item variable bound to each row (mirrors the filtered-agg fold). For a
+				// @softdelete entity a match is archived (flagged + persisted) rather than
+				// dropped, and is hidden from the live set either way.
 				rows := s.entities[st.Entity]
 				prev, had := scope[st.Var]
 				kept := make([]any, 0, len(rows))
@@ -947,7 +993,12 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 					scope[st.Var] = m
 					if truthy(eval(st.Where, scope)) {
 						id := m["id"]
-						ops = append(ops, durOp{kind: "delete", entity: st.Entity, id: id})
+						if soft {
+							m["archived"] = true
+							ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
+						} else {
+							ops = append(ops, durOp{kind: "delete", entity: st.Entity, id: id})
+						}
 						removed[toInt(id)] = true
 					} else {
 						kept = append(kept, r)
@@ -961,7 +1012,11 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 				if len(removed) > 0 {
 					s.entities[st.Entity] = kept
 					entChanged[st.Entity] = true
-					s.cascadeMem(st.Entity, removed, entChanged)
+					// A hard delete cascades to children; an archive leaves the row (and so
+					// its children's foreign keys) intact, so it does not.
+					if !soft {
+						s.cascadeMem(st.Entity, removed, entChanged)
+					}
 				}
 				break
 			}
@@ -969,11 +1024,16 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 			rows := s.entities[st.Entity]
 			for i, r := range rows {
 				if m, ok := r.(record); ok && equal(m["id"], key) {
-					s.entities[st.Entity] = append(rows[:i], rows[i+1:]...)
-					ops = append(ops, durOp{kind: "delete", entity: st.Entity, id: key})
+					s.entities[st.Entity] = append(rows[:i:i], rows[i+1:]...)
+					if soft {
+						m["archived"] = true
+						ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
+					} else {
+						ops = append(ops, durOp{kind: "delete", entity: st.Entity, id: key})
+						// the database cascades the delete to children; mirror it in memory.
+						s.cascadeMem(st.Entity, map[int]bool{toInt(key): true}, entChanged)
+					}
 					entChanged[st.Entity] = true
-					// the database cascades the delete to children; mirror it in memory.
-					s.cascadeMem(st.Entity, map[int]bool{toInt(key): true}, entChanged)
 					break
 				}
 			}
@@ -2024,6 +2084,88 @@ func coerce(v any, typ string) any {
 		// through untouched rather than stringifying a structured value.
 		return v
 	}
+}
+
+// constraintError validates a proposed row against its entity's declarative field
+// constraints, returning a friendly message (or "" if all pass). For a `set`,
+// changedField names the single field being written and excludeID is the row being
+// updated (so a @unique scan ignores it); for an `add`, changedField is "" (check
+// every field) and excludeID is nil.
+func (s *Server) constraintError(entity string, row record, changedField string, excludeID any) string {
+	def, ok := s.entityByName(entity)
+	if !ok {
+		return ""
+	}
+	for i := range def.Fields {
+		f := &def.Fields[i]
+		if changedField != "" && f.Name != changedField {
+			continue
+		}
+		if !f.Required && !f.Unique && f.Min == nil && f.Max == nil && f.Matches == "" {
+			continue
+		}
+		val, present := row[f.Name]
+		if f.Required && (!present || val == nil || toStr(val) == "") {
+			return f.Name + " is required"
+		}
+		if !present || val == nil {
+			continue // an absent optional value skips the value-shape checks
+		}
+		if f.Min != nil || f.Max != nil {
+			if f.Type == "text" {
+				n := len([]rune(toStr(val)))
+				if f.Min != nil && n < *f.Min {
+					return fmt.Sprintf("%s must be at least %d characters", f.Name, *f.Min)
+				}
+				if f.Max != nil && n > *f.Max {
+					return fmt.Sprintf("%s must be at most %d characters", f.Name, *f.Max)
+				}
+			} else {
+				n := toInt(val)
+				if f.Min != nil && n < *f.Min {
+					return fmt.Sprintf("%s must be at least %d", f.Name, *f.Min)
+				}
+				if f.Max != nil && n > *f.Max {
+					return fmt.Sprintf("%s must be at most %d", f.Name, *f.Max)
+				}
+			}
+		}
+		if re := s.fieldRE[entity+"."+f.Name]; re != nil && !re.MatchString(toStr(val)) {
+			return f.Name + " is not in the required format"
+		}
+		if f.Unique {
+			for _, r := range s.entities[entity] {
+				m, ok := r.(record)
+				if !ok {
+					continue
+				}
+				if excludeID != nil && equal(m["id"], excludeID) {
+					continue
+				}
+				if equal(m[f.Name], val) {
+					return fmt.Sprintf("%s must be unique", f.Name)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// liveRows returns the rows that belong in the in-memory working set: all of them
+// for a normal entity, or only the non-archived ones for a @softdelete entity (its
+// archived rows persist in the store but are hidden from every read).
+func liveRows(rows []any, softDelete bool) []any {
+	if !softDelete {
+		return rows
+	}
+	out := make([]any, 0, len(rows))
+	for _, r := range rows {
+		if m, ok := r.(record); ok && truthy(m["archived"]) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 func zero(typ string) any {

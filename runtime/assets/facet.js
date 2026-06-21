@@ -75,6 +75,8 @@
   // Per-page state, replaced on SPA navigation by load().
   let ir, store, actions, bindings, policies, stateType, routes;
   let regionById, inputById; // tracked dynamic regions and two-way inputs, by id
+  let initialStore = {}; // snapshot of state at page load — dirty(cell) compares against it
+  let touched = {}; // cell -> true once the user has edited its input — touched(cell)
   const actState = {}; // action name -> { pending, error }: reactive form/action status
 
   // setPending records an action's in-flight/error status and refreshes the
@@ -87,6 +89,8 @@
   function load(newIr, newState) {
     ir = newIr;
     store = newState;
+    initialStore = Object.assign({}, newState); // baseline for dirty(); reset per page
+    touched = {};
     actions = index(ir.actions, "name");
     bindings = index(ir.bindings, "id");
     policies = index(ir.policies, "name");
@@ -139,11 +143,21 @@
         }
         if (e.op === "exists") return rows.length > 0;
         if (e.op === "count") return rows.length;
-        let total = 0; // sum
-        for (const r of rows) total += toInt(r[e.field]);
-        return total;
+        // sum/avg/min/max reduce a numeric field over the (filtered) rows.
+        let total = 0, n = 0, lo = 0, hi = 0;
+        for (const r of rows) {
+          const v = toInt(r[e.field]);
+          if (n === 0) { lo = v; hi = v; } else { if (v < lo) lo = v; if (v > hi) hi = v; }
+          total += v; n++;
+        }
+        if (e.op === "avg") return n === 0 ? 0 : (total / n) | 0;
+        if (e.op === "min") return lo;
+        if (e.op === "max") return hi;
+        return total; // sum
       }
       case "astate": {
+        if (e.op === "dirty") return !eq(store[e.name], initialStore[e.name]);
+        if (e.op === "touched") return !!touched[e.name];
         const s = actState[e.name] || {};
         return e.op === "pending" ? !!s.pending : (s.error || "");
       }
@@ -862,6 +876,7 @@
     if (!t) return;
     const name = t.getAttribute("data-fa-input");
     store[name] = (stateType[name] === "int" || stateType[name] === "money" || stateType[name] === "date") ? toInt(t.value) : t.value;
+    touched[name] = true; // touched(name) is now true; dirty(name) tracks the value
     refresh([name]);
   });
   root.addEventListener("change", function (e) {

@@ -104,6 +104,10 @@ func (s *Server) Reload(graph *ir.IR) error {
 	s.byBind = ns.byBind
 	s.byPolicy = ns.byPolicy
 	s.byComponent = ns.byComponent
+	s.byService = ns.byService
+	s.byRecord = ns.byRecord
+	s.fieldRE = ns.fieldRE
+	s.softDel = ns.softDel
 	s.children = ns.children
 
 	for _, e := range graph.Entities {
@@ -111,7 +115,6 @@ func (s *Server) Reload(graph *ir.IR) error {
 		if rows == nil {
 			rows = []any{}
 		}
-		s.entities[e.Name] = rows
 		max := 0
 		for _, r := range rows {
 			if m, ok := r.(record); ok {
@@ -121,6 +124,7 @@ func (s *Server) Reload(graph *ir.IR) error {
 			}
 		}
 		s.nextID[e.Name] = max
+		s.entities[e.Name] = liveRows(rows, e.SoftDelete)
 	}
 	return nil
 }

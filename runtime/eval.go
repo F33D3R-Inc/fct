@@ -77,20 +77,49 @@ func eval(e *ir.Expr, scope map[string]any) any {
 		case "count":
 			return len(rows)
 		}
-		total := 0 // sum
+		// sum/avg/min/max reduce a numeric field over the (filtered) rows.
+		total, n := 0, 0
+		var lo, hi int
 		for _, r := range rows {
-			if m, ok := r.(record); ok {
-				total += toInt(m[e.Field])
+			m, ok := r.(record)
+			if !ok {
+				continue
 			}
+			v := toInt(m[e.Field])
+			if n == 0 {
+				lo, hi = v, v
+			} else {
+				if v < lo {
+					lo = v
+				}
+				if v > hi {
+					hi = v
+				}
+			}
+			total += v
+			n++
 		}
-		return total
+		switch e.Op {
+		case "avg":
+			if n == 0 {
+				return 0
+			}
+			return total / n
+		case "min":
+			return lo // 0 over an empty range
+		case "max":
+			return hi
+		default: // sum
+			return total
+		}
 	case "astate":
-		// Action status is client-only runtime state; the server has none at render
-		// time, so first paint shows "not pending" / "no error".
-		if e.Op == "pending" {
-			return false
+		// Action status and form-field status are client-only runtime state; the
+		// server has none at render time, so first paint shows "not pending" / "no
+		// error" / "not dirty" / "not touched".
+		if e.Op == "failed" {
+			return ""
 		}
-		return ""
+		return false // pending | dirty | touched
 	case "call":
 		return evalCall(e, scope)
 	case "un":

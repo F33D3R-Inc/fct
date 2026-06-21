@@ -104,8 +104,9 @@ type Component struct {
 // reverse-relation graph), so the runtime can cascade a delete to the children
 // the database drops via ON DELETE CASCADE.
 type Entity struct {
-	Name   string  `json:"name"`
-	Fields []Field `json:"fields"`
+	Name       string  `json:"name"`
+	SoftDelete bool    `json:"softDelete,omitempty"` // remove archives (flags + hides) instead of dropping; the row survives
+	Fields     []Field `json:"fields"`
 }
 
 // Field is one entity column. For a relation field, Ref names the entity it
@@ -123,6 +124,12 @@ type Field struct {
 	E2E        bool   `json:"e2e,omitempty"`        // end-to-end sealed: stored/served as client-sealed ciphertext; the authority never holds plaintext and never renders it
 	ReadPolicy string `json:"readPolicy,omitempty"` // @requires(policy): served only to admitted actors, never over SSE
 	Optional   bool   `json:"optional,omitempty"`   // column is nullable
+	// Declarative constraints — the authority validates them on every add/set.
+	Unique   bool   `json:"unique,omitempty"`   // @unique: no two rows share this value
+	Required bool   `json:"required,omitempty"` // @required: present and non-empty
+	Min      *int   `json:"min,omitempty"`      // @min(n): numeric value ≥ n, or text length ≥ n
+	Max      *int   `json:"max,omitempty"`      // @max(n): numeric value ≤ n, or text length ≤ n
+	Matches  string `json:"matches,omitempty"`  // @matches("re"): text matches this pattern
 }
 
 // IsRelation reports whether the field is a foreign key to another entity.

@@ -408,10 +408,16 @@ func keywordRest(s, kw string) string {
 
 func parseEntity(n *source.Node) (*ast.Entity, error) {
 	name := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "entity")), ":")
+	// `entity Post @softdelete:` — a `remove` archives instead of dropping.
+	softDelete := false
+	if strings.HasSuffix(name, "@softdelete") {
+		softDelete = true
+		name = strings.TrimSpace(strings.TrimSuffix(name, "@softdelete"))
+	}
 	if !isIdent(name) || !isUpper(name) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("entity name %q must be capitalized", name)}
 	}
-	e := &ast.Entity{Name: name, Line: n.Line.No}
+	e := &ast.Entity{Name: name, SoftDelete: softDelete, Line: n.Line.No}
 	for _, c := range n.Children {
 		colon := strings.IndexByte(c.Line.Text, ':')
 		if colon < 0 {
@@ -422,38 +428,73 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		if !isIdent(fn) {
 			return nil, &Error{c.Line.No, fmt.Sprintf("invalid field name %q", fn)}
 		}
-		// Trailing crypto markers, in any order: `@secret` encrypts at rest (the
-		// authority holds plaintext), `@e2e` seals end-to-end (the client seals before
-		// sending; the authority only ever holds ciphertext and never renders it).
-		secret, e2e := false, false
-		for {
-			switch {
-			case strings.HasSuffix(ft, "@secret"):
-				secret = true
-				ft = strings.TrimSpace(strings.TrimSuffix(ft, "@secret"))
-			case strings.HasSuffix(ft, "@e2e"):
-				e2e = true
-				ft = strings.TrimSpace(strings.TrimSuffix(ft, "@e2e"))
-			default:
-				goto markersDone
+		// Field modifiers, in any order. Crypto: `@secret` (at-rest), `@e2e` (sealed).
+		// Projection: `@requires(policy)`. Declarative constraints, enforced by the
+		// authority on every write: `@unique`, `@required`, `@min(n)`, `@max(n)`,
+		// `@matches("regex")`. They are stripped from the type token wherever they sit.
+		secret, e2e, unique, required := false, false, false, false
+		var fmin, fmax *int
+		matches, readPolicy := "", ""
+		// `@matches("…")` first — its argument is a quoted string that may hold parens.
+		if i := strings.Index(ft, "@matches("); i >= 0 {
+			rest := ft[i+len("@matches("):]
+			open := strings.IndexByte(rest, '"')
+			if open < 0 {
+				return nil, &Error{c.Line.No, `@matches needs a quoted pattern: @matches("^[a-z]+$")`}
+			}
+			closeQ := strings.IndexByte(rest[open+1:], '"')
+			if closeQ < 0 {
+				return nil, &Error{c.Line.No, `@matches pattern is not closed: @matches("…")`}
+			}
+			matches = rest[open+1 : open+1+closeQ]
+			after := rest[open+1+closeQ+1:]
+			if p := strings.IndexByte(after, ')'); p >= 0 {
+				after = after[p+1:]
+			}
+			ft = strings.TrimSpace(ft[:i] + " " + after)
+		}
+		// `@min(n)` / `@max(n)` — integer bounds.
+		for _, m := range []struct {
+			name string
+			dst  **int
+		}{{"@min(", &fmin}, {"@max(", &fmax}} {
+			if i := strings.Index(ft, m.name); i >= 0 {
+				rest := ft[i+len(m.name):]
+				closeP := strings.IndexByte(rest, ')')
+				if closeP < 0 {
+					return nil, &Error{c.Line.No, fmt.Sprintf("%sn) is not closed", m.name)}
+				}
+				n, err := strconv.Atoi(strings.TrimSpace(rest[:closeP]))
+				if err != nil {
+					return nil, &Error{c.Line.No, fmt.Sprintf("%sn) needs an integer", m.name)}
+				}
+				v := n
+				*m.dst = &v
+				ft = strings.TrimSpace(ft[:i] + " " + rest[closeP+1:])
 			}
 		}
-	markersDone:
-		// A trailing `@requires(policy)` gates the field on the data projections: the
-		// API serves it only to an actor the policy admits, and it never travels over
-		// SSE. `email: text @requires(admin)`.
-		readPolicy := ""
+		// `@requires(policy)` — the field read-gate.
 		if i := strings.Index(ft, "@requires("); i >= 0 {
 			rest := ft[i+len("@requires("):]
-			close := strings.IndexByte(rest, ')')
-			if close < 0 {
+			closeP := strings.IndexByte(rest, ')')
+			if closeP < 0 {
 				return nil, &Error{c.Line.No, "field @requires needs a policy: @requires(policyName)"}
 			}
-			readPolicy = strings.TrimSpace(rest[:close])
+			readPolicy = strings.TrimSpace(rest[:closeP])
 			if !isIdent(readPolicy) {
 				return nil, &Error{c.Line.No, fmt.Sprintf("invalid field policy %q in @requires(...)", readPolicy)}
 			}
-			ft = strings.TrimSpace(ft[:i] + ft[i+len("@requires(")+close+1:])
+			ft = strings.TrimSpace(ft[:i] + " " + rest[closeP+1:])
+		}
+		// Bare flag markers, any order.
+		for _, m := range []struct {
+			name string
+			dst  *bool
+		}{{"@secret", &secret}, {"@e2e", &e2e}, {"@unique", &unique}, {"@required", &required}} {
+			if i := strings.Index(ft, m.name); i >= 0 {
+				*m.dst = true
+				ft = strings.TrimSpace(ft[:i] + " " + ft[i+len(m.name):])
+			}
 		}
 		// A trailing `?` makes the column nullable; a `[T]` list is not a column type.
 		core, list, optional := splitType(ft)
@@ -471,7 +512,11 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		if e2e && core != "text" {
 			return nil, &Error{c.Line.No, fmt.Sprintf("@e2e field %q must be text — a sealed value is opaque ciphertext, so it can't be a typed/queryable column", fn)}
 		}
-		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: core, Secret: secret, E2E: e2e, ReadPolicy: readPolicy, Optional: optional, Line: c.Line.No})
+		if matches != "" && core != "text" {
+			return nil, &Error{c.Line.No, fmt.Sprintf("@matches on field %q applies to text, not %s", fn, core)}
+		}
+		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: core, Secret: secret, E2E: e2e, ReadPolicy: readPolicy, Optional: optional,
+			Unique: unique, Required: required, Min: fmin, Max: fmax, Matches: matches, Line: c.Line.No})
 	}
 	if len(e.Fields) == 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("entity %q has no fields", name)}

@@ -10,6 +10,53 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 22 — 2026-06-21 — close every open scope-note → v1.28.0 (the ledger is empty)
+
+**The point of this pass:** the sprint log was littered with "deferred", "next",
+"likely defer", scope notes. The user (rightly) wanted them all closed so we can
+leave the language and build f33d3r.com. Read the whole log + the audit, pulled the
+full ledger, and closed every item. Coded across every layer (no `check`-piecemeal),
+build/vet/gofmt clean, `facet.js` syntax-checked, CLI-built an example exercising all
+of it.
+
+- **A · Filtered `sum`** — `sum(o.amount in Order where …)`. The field rides the item
+  var; whole form `sum(Order.amount)` unchanged. (Sprint-2 deferral, closed.)
+- **B · Richer aggregates** — `avg` / `min` / `max`, whole and filtered. `min`/`max`
+  stay scalar builtins too: disambiguated by a top-level comma (`min(a,b)` scalar vs
+  `min(Order.amount)` aggregate). (group-by reshape stays out — expressible via
+  filtered counts; this is the practical stats set.) (Sprint-8 deferral, closed.)
+- **C · Form-state `dirty(cell)` / `touched(cell)`** — reactive client builtins:
+  dirty = value differs from page-load snapshot, touched = the input was edited.
+  Server renders false (no client state at SSR). (Sprint-7 deferral, closed.)
+- **D · Action-existence validation** — `pending`/`failed` now compile-error on an
+  unknown action; `dirty`/`touched` on an unknown state cell. (Sprint-7 note, closed.)
+- **F · Declarative field constraints** — `@unique`, `@required`, `@min(n)`,
+  `@max(n)`, `@matches("re")`. The authority validates every add/set and returns a
+  friendly 422 before the row lands; `@unique` indexes the column; `@matches`
+  compiled once (full-match anchored). (Audit item, closed.)
+- **G · Soft-delete** — `entity Post @softdelete:`. `remove` flags a reserved,
+  compiler-injected `archived` column and persists it instead of dropping; the row
+  is hidden from the live working set (filtered at load), no cascade (the row + its
+  children's FKs survive). (Audit item, closed.)
+- **I · `for x in <list>`** — a `for` may now range a `[T]` list state cell, not only
+  an entity (a scalar state is a compile error). Both renderers already iterated
+  `scope[coll]` generically, so this was a validation + list-tracking add. (Closed.)
+- **E · LICENSE** — MIT (F33D3R, Inc.), flagged since Sprint 0. (Closed.)
+- **ROADMAP** — de-staled: records, pattern-matching, idempotency, @e2e (v1.27.0)
+  plus filtered sum / avg-min-max / constraints / soft-delete / dirty-touched /
+  for-over-list (v1.28.0) all marked shipped.
+
+Surface: parser (expr.go aggregates + `argListHasComma`; parser.go field-constraint
+markers, `@softdelete`, `dirty`/`touched`), ast (EntityField constraints, Entity
+SoftDelete, ActState ops, ActState doc), ir (Field constraints, Entity.SoftDelete +
+archived injection, env stateList/actionSet, agg field-check, ActState validation,
+astate dep keys), runtime (server.go constraintError + add/set enforcement, soft
+remove + liveRows + seed filter, dev.go reload; eval.go avg/min/max + astate),
+facet.js (avg/min/max, dirty/touched tracking + initialStore/touched, sealed unchanged).
+version -> **1.28.0**.
+
+---
+
 ## Sprint 21 — 2026-06-21 — depth #6: typed records + webhook idempotency + @e2e sealed fields → released v1.27.0
 
 **The three real holes the audit found, closed in one pass.** Coded across every

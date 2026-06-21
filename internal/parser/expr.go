@@ -184,13 +184,18 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 	if ref, ok := atom.(ast.Ref); ok {
 		if t, ok := p.peek(); ok && t.kind == tLParen {
 			switch {
-			case ref.Name == "count" || ref.Name == "sum" || ref.Name == "exists":
+			case ref.Name == "count" || ref.Name == "sum" || ref.Name == "exists" || ref.Name == "avg" ||
+				((ref.Name == "min" || ref.Name == "max") && !p.argListHasComma()):
+				// count/sum/exists/avg are always aggregates. `min`/`max` are also scalar
+				// builtins (`min(a, b)`) — they are an aggregate only in the single-argument
+				// collection form (`min(Order.amount)`), told apart by the absence of a
+				// top-level comma in the argument list.
 				ag, err := p.parseAgg(ref.Name)
 				if err != nil {
 					return nil, err
 				}
 				atom = ag
-			case ref.Name == "pending" || ref.Name == "failed":
+			case ref.Name == "pending" || ref.Name == "failed" || ref.Name == "dirty" || ref.Name == "touched":
 				as, err := p.parseActState(ref.Name)
 				if err != nil {
 					return nil, err
@@ -236,10 +241,40 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 	return atom, nil
 }
 
+// argListHasComma reports whether the parenthesised argument list starting at
+// p.pos (which is on the opening `(`) contains a top-level comma. It is how a
+// `min`/`max` call is disambiguated: the scalar builtin `min(a, b)` has a comma,
+// the aggregate `min(Order.amount)` does not. It does not advance the parser.
+func (p *exprParser) argListHasComma() bool {
+	depth := 0
+	for i := p.pos; i < len(p.toks); i++ {
+		switch t := p.toks[i]; {
+		case t.kind == tLParen:
+			depth++
+		case t.kind == tRParen:
+			depth--
+			if depth == 0 {
+				return false
+			}
+		case depth == 1 && t.kind == tOp && t.text == ",":
+			return true
+		}
+	}
+	return false
+}
+
+// numericAgg reports whether an aggregate op sums/averages/extremes a field (and
+// so requires one): sum, avg, min, max. count/exists range over rows, no field.
+func numericAgg(op string) bool {
+	return op == "sum" || op == "avg" || op == "min" || op == "max"
+}
+
 // parseAgg parses the argument list of an aggregate builtin; p.peek() is at the
-// opening `(`. Whole-collection forms: `count(Coll)`, `sum(Coll.field)`. Filtered
-// forms (an item variable + predicate): `count(x in Coll where <cond>)` and
-// `exists(x in Coll where <cond>)`.
+// opening `(`. Whole-collection forms: `count(Coll)`, `sum(Coll.field)`,
+// `avg(Coll.field)`, `min(Coll.field)`, `max(Coll.field)`. Filtered forms (an item
+// variable + predicate): `count(x in Coll where <cond>)`,
+// `exists(x in Coll where <cond>)`, and `sum(x.field in Coll where <cond>)` (the
+// field-bearing aggregates carry the summed field on the item variable).
 func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 	p.pos++ // consume (
 	t, ok := p.peek()
@@ -249,34 +284,42 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 	name := t.text
 	p.pos++
 
-	// Filtered form: `<var> in <Coll> [where <cond>]`. We detect it by a following
-	// `in` identifier; otherwise `name` is the collection (whole-collection form).
-	itemVar, coll := "", name
+	// An optional leading `.field` binds the aggregated field — either on the
+	// collection (`sum(Order.amount)`) or on the item variable (`sum(o.amount in …)`).
+	leadField := ""
+	if d, ok := p.peek(); ok && d.kind == tOp && d.text == "." {
+		p.pos++
+		f, err := p.fieldName()
+		if err != nil {
+			return nil, err
+		}
+		leadField = f
+	}
+
+	// Filtered form: `<var> in <Coll> [where <cond>]`. Detected by a following `in`.
+	itemVar, coll, field := "", name, ""
 	if n, ok := p.peek(); ok && n.kind == tIdent && n.text == "in" {
 		p.pos++ // consume `in`
 		c, ok := p.peek()
 		if !ok || c.kind != tIdent {
 			return nil, &Error{p.line, fmt.Sprintf("%s(%s in ...) needs a collection after `in`", op, name)}
 		}
-		itemVar, coll = name, c.text
+		// Filtered: the leading `.field` (if any) is the summed field on the item var.
+		itemVar, coll, field = name, c.text, leadField
 		p.pos++
+	} else {
+		// Whole-collection: a leading `.field` is the collection's summed field.
+		field = leadField
 	}
 
-	field := ""
-	if op == "sum" {
+	if numericAgg(op) && field == "" {
 		if itemVar != "" {
-			return nil, &Error{p.line, "filtered sum is not supported yet; use sum(Entity.field) over the whole collection"}
+			return nil, &Error{p.line, fmt.Sprintf("%s needs a field: %s(%s.field in %s where …)", op, op, name, coll)}
 		}
-		d, ok := p.peek()
-		if !ok || d.kind != tOp || d.text != "." {
-			return nil, &Error{p.line, "sum needs a field: sum(Entity.field)"}
-		}
-		p.pos++
-		f, err := p.fieldName()
-		if err != nil {
-			return nil, err
-		}
-		field = f
+		return nil, &Error{p.line, fmt.Sprintf("%s needs a field: %s(%s.field)", op, op, coll)}
+	}
+	if !numericAgg(op) && field != "" {
+		return nil, &Error{p.line, fmt.Sprintf("%s ranges over rows, not a field — drop the `.%s`", op, field)}
 	}
 
 	var where ast.Expr
@@ -303,7 +346,12 @@ func (p *exprParser) parseActState(op string) (ast.Expr, error) {
 	p.pos++ // consume (
 	t, ok := p.peek()
 	if !ok || t.kind != tIdent {
-		return nil, &Error{p.line, fmt.Sprintf("%s needs an action name: %s(actionName)", op, op)}
+		// pending/failed name an action; dirty/touched name a form (state) cell.
+		noun := "an action name"
+		if op == "dirty" || op == "touched" {
+			noun = "a state cell"
+		}
+		return nil, &Error{p.line, fmt.Sprintf("%s needs %s: %s(name)", op, noun, op)}
 	}
 	action := t.text
 	p.pos++
@@ -360,7 +408,7 @@ func isBuiltinCall(name string) bool {
 }
 
 func aggArgHint(op string) string {
-	if op == "sum" {
+	if numericAgg(op) {
 		return ".field"
 	}
 	return ""

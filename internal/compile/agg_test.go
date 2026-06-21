@@ -80,6 +80,16 @@ func TestFilteredAggregatesAndSelfRelation(t *testing.T) {
 		t.Fatalf("exists lowered wrong: %+v", ex2)
 	}
 
+	// A filtered sum (item A) carries the summed field on the item var alongside the
+	// filter predicate: sum(t.created in Tweet where t.author == actor).
+	ex3, err := ir.CompileExpr(graph, "sum(t.created in Tweet where t.author == actor)")
+	if err != nil {
+		t.Fatalf("compile filtered sum: %v", err)
+	}
+	if ex3.Op != "sum" || ex3.Var != "t" || ex3.Field != "created" || ex3.Where == nil {
+		t.Fatalf("filtered sum lowered wrong: %+v", ex3)
+	}
+
 	// The feed (a list whose `where` reads Follow, whose body reads Like) refreshes
 	// when any of those entities change — that is what keeps counts/feeds live.
 	for _, ent := range []string{"Tweet", "Follow", "Like"} {
@@ -96,7 +106,7 @@ func TestAggregateErrors(t *testing.T) {
 	}
 	cases := []struct{ name, expr, want string }{
 		{"exists needs a filter", "exists(Like)", "filtered form"},
-		{"filtered sum unsupported", "sum(l in Like where l.user == actor)", "filtered sum"},
+		{"filtered sum needs a field", "sum(l in Like where l.user == actor)", "needs a field"},
 		{"unknown entity", "count(x in Nope where x.id == 1)", "not an entity"},
 	}
 	for _, c := range cases {

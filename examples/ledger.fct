@@ -1,0 +1,62 @@
+# Ledger — exercises every scope-note closed in v1.28.0 (Sprint 22):
+#   A filtered sum · B avg/min/max · C dirty/touched · D action-existence
+#   F declarative field constraints · G soft-delete · I for over a list cell
+#
+#   facet build examples/ledger.fct
+#
+# One file, every closed item, so the ledger is demonstrably empty.
+
+app Ledger:
+    auth
+
+    # G — soft-delete: `remove` archives instead of dropping.
+    # F — declarative constraints validated by the authority before the row lands.
+    entity Order @softdelete:
+        id: int
+        ref: text @unique @required @matches("^[A-Z0-9-]+$")
+        amount: int @min(1) @max(1000000)
+        buyer: text
+
+    # I — a `[T]` list state cell, rangeable by `for`.
+    state tags: [text] = [] @client
+    state draft: text = "" @client
+
+    # A — filtered sum: the summed field rides the item var.
+    derive bigTotal: int = sum(o.amount in Order where o.amount > 100)
+    # B — richer aggregates, whole-collection and filtered.
+    derive avgAmount: int = avg(Order.amount)
+    derive minBig: int = min(o.amount in Order where o.amount > 100)
+    derive maxAmount: int = max(Order.amount)
+
+    action place(ref: text, amount: int):
+        add Order { ref: ref, amount: amount, buyer: actor }
+
+    action drop(id: int):
+        remove Order(id)
+
+    view Home at "/":
+        box:
+            text "{bigTotal} big-order total"
+            text "avg {avgAmount} · min-big {minBig} · max {maxAmount}"
+
+            # I — iterate a list cell, not just an entity.
+            for tag in tags:
+                badge "{tag}"
+
+            input bind draft placeholder "order ref"
+            # C — reactive form state: dirty since load / edited at all.
+            if dirty(draft):
+                text "unsaved changes"
+            if touched(draft):
+                text "you typed something"
+            button "place" -> place(draft, 100)
+
+            # D — pending/failed name a real action (compile-checked).
+            if pending(place):
+                text "placing…"
+            text "{failed(place)}"
+
+            for o in Order by amount desc limit 50:
+                box:
+                    text "{o.ref}: {o.amount}"
+                    button "drop" -> drop(o.id)

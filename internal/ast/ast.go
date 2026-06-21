@@ -180,9 +180,14 @@ const (
 // Entity is a durable, shared, persisted record type — the database. Its rows
 // are always authoritative (server) and survive restarts.
 type Entity struct {
-	Name   string
-	Fields []EntityField
-	Line   int
+	Name string
+	// SoftDelete (`entity Post @softdelete:`) makes `remove` archive a row instead
+	// of dropping it: the authority flags it and hides it from every read, but the
+	// data survives. An audit/restore story without an imperative `archived` flag in
+	// every query.
+	SoftDelete bool
+	Fields     []EntityField
+	Line       int
 }
 
 // EntityField is one column of an entity. A `@secret` field is encrypted at rest
@@ -195,7 +200,14 @@ type EntityField struct {
 	E2E        bool   // @e2e — end-to-end sealed: the client seals before sending and opens on read; the authority only ever holds ciphertext (never plaintext, never renders it)
 	ReadPolicy string // @requires(policy) — field served only to actors the policy admits; never sent over SSE
 	Optional   bool   // text? — the column is nullable
-	Line       int
+	// Declarative constraints — enforced by the authority on every add/set, so
+	// invalid data can never reach the store (no imperative `check` needed).
+	Unique   bool   // @unique — no two rows may share this value
+	Required bool   // @required — must be present and non-empty
+	Min      *int   // @min(n) — numeric: value ≥ n; text: length ≥ n (nil = unset)
+	Max      *int   // @max(n) — numeric: value ≤ n; text: length ≤ n (nil = unset)
+	Matches  string // @matches("regex") — text must match this anchored pattern ("" = unset)
+	Line     int
 }
 
 // State is one `state name: Type = default [@client|@server]` cell. Scalar
@@ -646,12 +658,16 @@ type Lit struct {
 // Ref is a reference to a state cell, param, item var, or the builtin `actor`.
 type Ref struct{ Name string }
 
-// ActState reads the client-side status of an action: `pending(post)` (is a `post`
-// call in flight?) → bool, or `failed(post)` (the last error message, "" if none)
-// → text. It is a reactive client value, so a form can show a spinner and an
-// inline error with no wiring. On the server (first paint) it is false / "".
+// ActState reads client-side reactive status. For an action: `pending(post)` (is a
+// `post` call in flight?) → bool, `failed(post)` (the last error message, "" if
+// none) → text. For a form (state) cell: `dirty(cell)` (does the cell differ from
+// its value at page load?) → bool, `touched(cell)` (has the user edited its input
+// yet?) → bool. All are reactive client values — a form shows a spinner, an inline
+// error, or a "save" button only once something changed, with no wiring. On the
+// server (first paint) they are false / "". The Action field holds the action name
+// (pending/failed) or the cell name (dirty/touched).
 type ActState struct {
-	Op     string // pending | failed
+	Op     string // pending | failed | dirty | touched
 	Action string
 }
 
