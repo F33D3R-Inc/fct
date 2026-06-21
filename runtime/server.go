@@ -429,6 +429,18 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	for k, v := range params {
 		store[k] = v
 	}
+	// Active theme for first paint: the client persists the chosen palette in the
+	// `fa_theme` cookie, so the server can stamp `data-theme` on <html> and seed the
+	// `theme` state before any JS runs — no flash of the base palette on reload.
+	themeAttr := ""
+	if _, switchable := store["theme"]; switchable {
+		if c, err := r.Cookie("fa_theme"); err == nil && validThemeName(c.Value) {
+			store["theme"] = c.Value
+			if c.Value != "" {
+				themeAttr = ` data-theme="` + c.Value + `"`
+			}
+		}
+	}
 
 	// Route guard: a zero-arg policy the authority enforces before rendering. A
 	// failing guard refuses the page — the client also hides links to it, but the
@@ -474,7 +486,7 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	if s.dev != nil {
 		dev = devScript
 	}
-	fmt.Fprintf(w, page, s.headMeta(pg, store), csrfToken(sid), themeCSS(s.ir.Theme, s.ir.ThemeDark), body.String(), irJSON, stateJSON, dev)
+	fmt.Fprintf(w, page, themeAttr, s.headMeta(pg, store), csrfToken(sid), themeCSS(s.ir.Theme, s.ir.ThemeDark, s.ir.Themes), safeStyleBody(s.ir.CSS), body.String(), irJSON, stateJSON, dev)
 }
 
 // headMeta renders a page's <head> metadata: the <title> (the page's `meta title`
@@ -686,8 +698,8 @@ func matchRoute(pattern, path string) (map[string]string, bool) {
 // themeCSS renders the app's theme variables as a `:root` block of CSS custom
 // properties (`--fa-<name>`), so the whole UI restyles from one declarative
 // source. Empty when no `theme:` block is declared.
-func themeCSS(theme, dark map[string]string) string {
-	if len(theme) == 0 && len(dark) == 0 {
+func themeCSS(theme, dark map[string]string, named map[string]map[string]string) string {
+	if len(theme) == 0 && len(dark) == 0 && len(named) == 0 {
 		return ""
 	}
 	var b strings.Builder
@@ -698,10 +710,83 @@ func themeCSS(theme, dark map[string]string) string {
 	}
 	// The dark palette overrides the same tokens when the OS asks for dark mode, so
 	// one declarative `theme dark:` block restyles the whole UI for both schemes.
+	// It is *also* emitted under `[data-theme="dark"]` so a runtime switch can force
+	// dark independent of the OS (and `[data-theme="light"]` can force the base).
 	if len(dark) > 0 {
 		b.WriteString("@media(prefers-color-scheme:dark){:root{")
 		writeThemeVars(&b, dark)
 		b.WriteString("}}")
+		b.WriteString(`[data-theme="dark"]{`)
+		writeThemeVars(&b, dark)
+		b.WriteString("}")
+	}
+	// Each named palette becomes a `[data-theme="<name>"]` block, selected when the
+	// `theme` state holds its name. Stable name order keeps the output deterministic.
+	if len(named) > 0 {
+		names := make([]string, 0, len(named))
+		for n := range named {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			fmt.Fprintf(&b, `[data-theme="%s"]{`, n)
+			writeThemeVars(&b, named[n])
+			b.WriteString("}")
+		}
+	}
+	return b.String()
+}
+
+// validThemeName guards a theme name read from the (untrusted) `fa_theme` cookie
+// before it is interpolated into an HTML attribute and a CSS selector. It admits
+// only the same shape the parser accepts for a palette name — lowercase letters,
+// digits, and interior hyphens — plus the empty string (the base palette). Any
+// stray quote, angle bracket, or space is rejected, so the cookie cannot break out.
+func validThemeName(s string) bool {
+	if s == "" {
+		return true
+	}
+	if len(s) > 64 || s[0] == '-' || s[len(s)-1] == '-' {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// safeStyleBody emits author CSS into a <style> element verbatim, neutralising only
+// the one sequence that could break out of the element — a literal `</style` — by
+// escaping the slash (valid inside a CSS string, the only place it could legitimately
+// appear). The author owns this CSS, so nothing else is sanitised.
+func safeStyleBody(css string) string {
+	if css == "" {
+		return ""
+	}
+	r := strings.NewReplacer("</style", `<\/style`, "</STYLE", `<\/STYLE`)
+	return r.Replace(css)
+}
+
+// nodeAttrs renders an element's class/style attributes for the CSS escape hatch.
+// The author's `class "..."` is appended after the built-in `fa-*` class so both
+// apply, and `style "..."` becomes an inline style attribute. Both are escaped.
+// Returns "" when there is no base class and the author supplied neither.
+func nodeAttrs(base string, n ir.Node) string {
+	cls := base
+	if n.Class != "" {
+		if cls != "" {
+			cls += " "
+		}
+		cls += n.Class
+	}
+	var b strings.Builder
+	if cls != "" {
+		fmt.Fprintf(&b, ` class="%s"`, html.EscapeString(cls))
+	}
+	if n.Style != "" {
+		fmt.Fprintf(&b, ` style="%s"`, html.EscapeString(n.Style))
 	}
 	return b.String()
 }
@@ -1684,32 +1769,32 @@ func distinctFieldValues(rows any, field string) []string {
 func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any) {
 	switch n.Kind {
 	case "box":
-		b.WriteString(`<div class="fa-box">`)
+		fmt.Fprintf(b, `<div%s>`, nodeAttrs("fa-box", n))
 		for _, c := range n.Children {
 			s.renderNode(b, c, scope)
 		}
 		b.WriteString(`</div>`)
 	case "row":
-		b.WriteString(`<div class="fa-row">`)
+		fmt.Fprintf(b, `<div%s>`, nodeAttrs("fa-row", n))
 		for _, c := range n.Children {
 			s.renderNode(b, c, scope)
 		}
 		b.WriteString(`</div>`)
 	case "text":
-		b.WriteString(`<span class="fa-text">`)
+		fmt.Fprintf(b, `<span%s>`, nodeAttrs("fa-text", n))
 		s.renderSegs(b, n.Segs, scope)
 		b.WriteString(`</span>`)
 	case "image":
-		fmt.Fprintf(b, `<img class="fa-image" src="%s" alt="">`, html.EscapeString(s.segsToString(n.Segs, scope)))
+		fmt.Fprintf(b, `<img%s src="%s" alt="">`, nodeAttrs("fa-image", n), html.EscapeString(s.segsToString(n.Segs, scope)))
 	case "icon":
-		fmt.Fprintf(b, `<span class="fa-icon" data-fa-icon="%s" aria-hidden="true"></span>`, html.EscapeString(n.Name))
+		fmt.Fprintf(b, `<span%s data-fa-icon="%s" aria-hidden="true"></span>`, nodeAttrs("fa-icon", n), html.EscapeString(n.Name))
 	case "video":
-		fmt.Fprintf(b, `<video class="fa-video" controls src="%s"></video>`, html.EscapeString(s.segsToString(n.Segs, scope)))
+		fmt.Fprintf(b, `<video%s controls src="%s"></video>`, nodeAttrs("fa-video", n), html.EscapeString(s.segsToString(n.Segs, scope)))
 	case "richtext":
 		// markdownHTML escapes its input and emits only a fixed safe tag set.
-		fmt.Fprintf(b, `<div class="fa-richtext">%s</div>`, markdownHTML(s.segsToString(n.Segs, scope)))
+		fmt.Fprintf(b, `<div%s>%s</div>`, nodeAttrs("fa-richtext", n), markdownHTML(s.segsToString(n.Segs, scope)))
 	case "badge":
-		b.WriteString(`<span class="fa-badge">`)
+		fmt.Fprintf(b, `<span%s>`, nodeAttrs("fa-badge", n))
 		s.renderSegs(b, n.Segs, scope)
 		b.WriteString(`</span>`)
 	case "tabs":
@@ -1738,7 +1823,7 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 		}
 		b.WriteString(`</div>`)
 	case "button":
-		fmt.Fprintf(b, `<button data-fa-action="%s">`, html.EscapeString(n.Action))
+		fmt.Fprintf(b, `<button%s data-fa-action="%s">`, nodeAttrs("", n), html.EscapeString(n.Action))
 		s.renderSegs(b, n.Segs, scope)
 		b.WriteString(`</button>`)
 	case "list":
@@ -1778,8 +1863,8 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 		b.WriteString(`</div>`)
 	case "input":
 		val := html.EscapeString(toStr(scope[n.Bind]))
-		fmt.Fprintf(b, `<input data-fa-input="%s" value="%s" placeholder="%s">`,
-			n.Bind, val, html.EscapeString(n.Placeholder))
+		fmt.Fprintf(b, `<input%s data-fa-input="%s" value="%s" placeholder="%s">`,
+			nodeAttrs("", n), n.Bind, val, html.EscapeString(n.Placeholder))
 	case "overlay":
 		if n.ID != "" {
 			fmt.Fprintf(b, `<div data-fa-region="%s">`, n.ID)
@@ -1800,10 +1885,10 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 		}
 		b.WriteString(`</datalist>`)
 	case "link":
-		fmt.Fprintf(b, `<a class="fa-link" href="%s">%s</a>`,
-			html.EscapeString(n.Path), html.EscapeString(n.Label))
+		fmt.Fprintf(b, `<a%s href="%s">%s</a>`,
+			nodeAttrs("fa-link", n), html.EscapeString(n.Path), html.EscapeString(n.Label))
 	case "select":
-		fmt.Fprintf(b, `<select class="fa-select" data-fa-input="%s">`, n.Bind)
+		fmt.Fprintf(b, `<select%s data-fa-input="%s">`, nodeAttrs("fa-select", n), n.Bind)
 		cur := toStr(scope[n.Bind])
 		for _, o := range n.Options {
 			sel := ""
@@ -2184,7 +2269,7 @@ func sameValue(a, b any) bool {
 }
 
 const page = `<!doctype html>
-<html lang="en">
+<html lang="en"%s>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -2263,6 +2348,7 @@ const page = `<!doctype html>
   [aria-busy=true] { opacity: .6; }
 </style>
 <style id="fa-theme">%s</style>
+<style id="fa-css">%s</style>
 </head>
 <body>
 <div id="fa-root" data-fa-mount>%s</div>

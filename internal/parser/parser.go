@@ -151,6 +151,16 @@ func parseDecl(app *ast.App, c *source.Node) error {
 		if tv, err = parseTheme(c); err == nil {
 			app.Theme = append(app.Theme, tv...)
 		}
+	case strings.HasPrefix(c.Line.Text, "theme "):
+		var nt ast.NamedTheme
+		if nt, err = parseNamedTheme(c); err == nil {
+			app.Themes = append(app.Themes, nt)
+		}
+	case c.Line.Text == "css:" || c.Line.Text == "css":
+		var css string
+		if css, err = parseCSS(c); err == nil {
+			app.CSS = joinCSS(app.CSS, css)
+		}
 	case strings.HasPrefix(c.Line.Text, "state "):
 		var s *ast.State
 		if s, err = parseState(c); err == nil {
@@ -228,6 +238,18 @@ func parsePlayground(n *source.Node) (*ast.App, error) {
 				return nil, err
 			}
 			app.Theme = append(app.Theme, tv...)
+		case strings.HasPrefix(t, "theme "):
+			nt, err := parseNamedTheme(c)
+			if err != nil {
+				return nil, err
+			}
+			app.Themes = append(app.Themes, nt)
+		case t == "css:" || t == "css":
+			css, err := parseCSS(c)
+			if err != nil {
+				return nil, err
+			}
+			app.CSS = joinCSS(app.CSS, css)
 		case strings.HasPrefix(t, "mount "):
 			m, err := parseMount(t, c.Line.No)
 			if err != nil {
@@ -301,6 +323,18 @@ func parseWireframe(n *source.Node) (*ast.App, error) {
 				return nil, err
 			}
 			app.Theme = append(app.Theme, tv...)
+		case strings.HasPrefix(t, "theme "):
+			nt, err := parseNamedTheme(c)
+			if err != nil {
+				return nil, err
+			}
+			app.Themes = append(app.Themes, nt)
+		case t == "css:" || t == "css":
+			css, err := parseCSS(c)
+			if err != nil {
+				return nil, err
+			}
+			app.CSS = joinCSS(app.CSS, css)
 		case strings.HasPrefix(t, "socket "):
 			sock, err := parseSocket(c)
 			if err != nil {
@@ -665,6 +699,10 @@ func hasSlot(nodes []ast.Node) bool {
 		switch t := n.(type) {
 		case ast.Slot:
 			return true
+		case ast.Styled:
+			if hasSlot([]ast.Node{t.Inner}) {
+				return true
+			}
 		case ast.Box:
 			if hasSlot(t.Children) {
 				return true
@@ -704,6 +742,52 @@ func parseTheme(n *source.Node) ([]ast.ThemeVar, error) {
 		return nil, &Error{n.Line.No, "theme block is empty"}
 	}
 	return out, nil
+}
+
+// parseNamedTheme parses a `theme <name>:` block — an alternate palette (any name
+// other than the base `theme:` or the reserved `theme dark:`). Its tokens become
+// a `[data-theme="<name>"]` palette the app can switch to at runtime by setting
+// the built-in `theme` state.
+func parseNamedTheme(n *source.Node) (ast.NamedTheme, error) {
+	head := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(n.Line.Text), "theme"))
+	name := strings.TrimSpace(strings.TrimSuffix(head, ":"))
+	if !isThemeKey(name) {
+		return ast.NamedTheme{}, &Error{n.Line.No, fmt.Sprintf("invalid theme name %q", name)}
+	}
+	tv, err := parseTheme(n)
+	if err != nil {
+		return ast.NamedTheme{}, err
+	}
+	return ast.NamedTheme{Name: name, Vars: tv, Line: n.Line.No}, nil
+}
+
+// parseCSS reconstructs a raw stylesheet from a `css:` block, joining every nested
+// source line in order. The offside tokenizer already dropped blank lines and
+// `#`-prefixed lines (its comment marker), so author CSS should target `.classes`
+// (the `class "..."` node hook) and attribute selectors rather than `#id`.
+func parseCSS(n *source.Node) (string, error) {
+	var lines []string
+	var walk func(ns []*source.Node)
+	walk = func(ns []*source.Node) {
+		for _, c := range ns {
+			lines = append(lines, c.Line.Text)
+			walk(c.Children)
+		}
+	}
+	walk(n.Children)
+	if len(lines) == 0 {
+		return "", &Error{n.Line.No, "css block is empty"}
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+// joinCSS concatenates stylesheet fragments (one per `css:` block, across the
+// playground and every facet it composes) with a newline between them.
+func joinCSS(a, b string) string {
+	if a == "" {
+		return b
+	}
+	return a + "\n" + b
 }
 
 // parseState: `state name: Type = default [@client|@server|@private]`
@@ -1472,7 +1556,12 @@ func pathParams(path string, line int) ([]string, error) {
 func parseNodes(children []*source.Node) ([]ast.Node, error) {
 	var out []ast.Node
 	for _, c := range children {
+		// Pull any trailing `class "..."` / `style "..."` CSS escape-hatch modifiers
+		// off the line first (mutating c so block parsers that re-read it see the clean
+		// line), then wrap the parsed node once it lands.
+		class, style := stripStyleMods(c)
 		t := c.Line.Text
+		before := len(out)
 		switch {
 		case t == "box:" || t == "box":
 			kids, err := parseNodes(c.Children)
@@ -1615,8 +1704,70 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 		default:
 			return nil, &Error{c.Line.No, fmt.Sprintf("unknown view node %q", firstWord(t))}
 		}
+		// A node carrying class/style is decorated in place. The cases above each emit
+		// exactly one node, so wrapping the just-appended one is unambiguous.
+		if (class != "" || style != "") && len(out) == before+1 {
+			out[before] = ast.Styled{Class: class, Style: style, Inner: out[before]}
+		}
 	}
 	return out, nil
+}
+
+// stripStyleMods removes trailing `class "..."` and `style "..."` modifiers from a
+// view node's line (in any order, e.g. `box class "rail" style "top:0"`), rewriting
+// the node's line text to the clean base and returning the captured values. A bare
+// `class`/`style` word that is part of a quoted literal (e.g. `text "my style"`) is
+// left alone — only a `<keyword> "<value>"` pair at the very end of the line is taken.
+func stripStyleMods(c *source.Node) (class, style string) {
+	line := c.Line.Text
+	for {
+		kw, val, rest, ok := trailingStyleMod(line)
+		if !ok {
+			break
+		}
+		switch kw {
+		case "class":
+			if class == "" {
+				class = val
+			}
+		case "style":
+			if style == "" {
+				style = val
+			}
+		}
+		line = rest
+	}
+	c.Line.Text = line
+	return class, style
+}
+
+// trailingStyleMod matches a `class "..."` or `style "..."` pair at the end of line.
+// On success it returns the keyword, the unquoted value, and the line with that pair
+// removed. The value may not contain a double quote (keeps the scan unambiguous).
+func trailingStyleMod(line string) (kw, val, rest string, ok bool) {
+	s := strings.TrimRight(line, " ")
+	if !strings.HasSuffix(s, `"`) {
+		return "", "", "", false
+	}
+	open := strings.LastIndexByte(s[:len(s)-1], '"')
+	if open < 0 {
+		return "", "", "", false
+	}
+	prefix := strings.TrimRight(s[:open], " ")
+	for _, k := range []string{"class", "style"} {
+		if strings.HasSuffix(prefix, k) {
+			base := prefix[:len(prefix)-len(k)]
+			// the keyword must stand as its own word (start of line or space before it)
+			if base == "" {
+				continue // a node line is never just `class "..."` with no node before it
+			}
+			if !strings.HasSuffix(base, " ") {
+				continue
+			}
+			return k, s[open+1 : len(s)-1], strings.TrimRight(base, " "), true
+		}
+	}
+	return "", "", "", false
 }
 
 // parseFor: `for item in Collection [where cond] [by field desc|asc] [limit n]:`

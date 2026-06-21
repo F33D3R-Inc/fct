@@ -89,6 +89,12 @@
   function load(newIr, newState) {
     ir = newIr;
     store = newState;
+    // Restore a saved palette the server's cookie didn't carry (e.g. cookies off):
+    // the localStorage mirror is the fallback source of truth for the `theme` state.
+    if ("theme" in store && !store.theme) {
+      try { const ls = localStorage.getItem("fa-theme"); if (ls) store.theme = ls; } catch (e) {}
+    }
+    lastTheme = undefined; // re-evaluate data-theme against this page's store
     initialStore = Object.assign({}, newState); // baseline for dirty(); reset per page
     touched = {};
     actions = index(ir.actions, "name");
@@ -106,6 +112,7 @@
         if (n.children) collect(n.children);
       }
     })(ir.view);
+    syncTheme(); // apply (and persist) the active palette for this page
   }
 
   const components = {}; // name -> component, stable across the whole app
@@ -313,7 +320,19 @@
     return out;
   }
 
+  // render builds the DOM element for a node, then stamps the CSS escape-hatch
+  // class/style onto it (mirroring the server's nodeAttrs) so a region re-rendered
+  // on the client matches first paint. Fragments (typeahead) carry no attributes.
   function render(node, sc) {
+    const e = render0(node, sc);
+    if (e && e.nodeType === 1) {
+      if (node.class) e.className = (e.className ? e.className + " " : "") + node.class;
+      if (node.style) e.setAttribute("style", node.style);
+    }
+    return e;
+  }
+
+  function render0(node, sc) {
     switch (node.kind) {
       case "box": {
         const d = el("div", "fa-box");
@@ -598,7 +617,25 @@
   function trimSlash(s) { return s.replace(/^\/+|\/+$/g, ""); }
 
   // ── fine-grained refresh: only regions a changed state feeds ────────────────
+  // syncTheme mirrors the built-in `theme` state to <html data-theme> and persists
+  // the choice (cookie + localStorage), so an action like `theme = "dark"` flips
+  // the palette instantly with no round-trip, and a reload restores it — the server
+  // reads the same cookie for first paint. Only apps with an alternate palette carry
+  // a `theme` state; everything else is a no-op.
+  let lastTheme;
+  function syncTheme() {
+    if (!("theme" in store)) return;
+    const t = toStr(store.theme || "");
+    if (t === lastTheme) return;
+    lastTheme = t;
+    if (t) document.documentElement.setAttribute("data-theme", t);
+    else document.documentElement.removeAttribute("data-theme");
+    try { localStorage.setItem("fa-theme", t); } catch (e) {}
+    document.cookie = "fa_theme=" + encodeURIComponent(t) + ";path=/;max-age=31536000;samesite=lax";
+  }
+
   function refresh(changed) {
+    syncTheme();
     const ids = new Set();
     for (const name of changed) for (const id of (ir.depGraph[name] || [])) ids.add(id);
     for (const id of ids) {

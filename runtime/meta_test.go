@@ -51,15 +51,19 @@ func TestSSRHeadMetadata(t *testing.T) {
 
 func TestThemeCSSVariants(t *testing.T) {
 	// light only
-	if got := themeCSS(map[string]string{"bg": "#fff"}, nil); got != ":root{--fa-bg:#fff;}" {
+	if got := themeCSS(map[string]string{"bg": "#fff"}, nil, nil); got != ":root{--fa-bg:#fff;}" {
 		t.Errorf("light-only: %q", got)
 	}
-	// dark only
-	if got := themeCSS(nil, map[string]string{"bg": "#000"}); !strings.Contains(got, "@media(prefers-color-scheme:dark)") {
-		t.Errorf("dark-only should emit a media query: %q", got)
+	// dark only: emits both the OS media query and a forceable [data-theme=dark] block
+	if got := themeCSS(nil, map[string]string{"bg": "#000"}, nil); !strings.Contains(got, "@media(prefers-color-scheme:dark)") || !strings.Contains(got, `[data-theme="dark"]{`) {
+		t.Errorf("dark-only should emit a media query and a forceable selector: %q", got)
+	}
+	// a named palette emits a [data-theme="<name>"] block selected at runtime
+	if got := themeCSS(nil, nil, map[string]map[string]string{"pride": {"accent": "#ff0080"}}); got != `[data-theme="pride"]{--fa-accent:#ff0080;}` {
+		t.Errorf("named theme: %q", got)
 	}
 	// neither
-	if got := themeCSS(nil, nil); got != "" {
+	if got := themeCSS(nil, nil, nil); got != "" {
 		t.Errorf("no theme should be empty: %q", got)
 	}
 }

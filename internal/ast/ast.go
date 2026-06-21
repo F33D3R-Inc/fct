@@ -56,8 +56,10 @@ type App struct {
 	Services   []*Service
 	Webhooks   []*Webhook
 	Triggers   []*Trigger
-	Theme      []ThemeVar // base design tokens (the light palette)
-	DarkTheme  []ThemeVar // `theme dark:` — token overrides applied under prefers-color-scheme: dark
+	Theme      []ThemeVar   // base design tokens (the light palette)
+	DarkTheme  []ThemeVar   // `theme dark:` — token overrides applied under prefers-color-scheme: dark
+	Themes     []NamedTheme // `theme <name>:` — alternate palettes selectable at runtime
+	CSS        string       // raw stylesheet from `css:` blocks, emitted verbatim into the page
 	Line       int
 }
 
@@ -145,6 +147,18 @@ type Enum struct {
 type ThemeVar struct {
 	Name  string
 	Value string
+}
+
+// NamedTheme is a `theme <name>:` block — an alternate palette (e.g. `pride`,
+// `high-contrast`) the app can switch to at runtime by setting the built-in
+// `theme` state. Its tokens emit under a `[data-theme="<name>"]` selector rather
+// than `:root`, so selecting it overrides the base palette with no custom CSS.
+// The reserved name `dark` is not a NamedTheme — it stays the auto-OS palette
+// (and is additionally forceable via the same `theme` state).
+type NamedTheme struct {
+	Name string
+	Vars []ThemeVar
+	Line int
 }
 
 // Component is a reusable, parameterized view fragment: `component Card(p: Post):`
@@ -436,6 +450,17 @@ type View struct {
 // Node is a UI node. The set is small and target-neutral.
 type Node interface{ node() }
 
+// Styled wraps any node with the CSS escape-hatch attributes from a trailing
+// `class "..."` and/or `style "..."` modifier on the node's line. It is a pure
+// decorator: lowering unwraps it, stamping Class/Style onto the inner node's IR so
+// the rendered element carries them alongside its built-in `fa-*` class. This is
+// how a `css:` stylesheet hooks onto specific nodes (`box class "rail"`).
+type Styled struct {
+	Class string
+	Style string
+	Inner Node
+}
+
 // Box is a layout container — its children stack vertically.
 type Box struct{ Children []Node }
 
@@ -619,6 +644,7 @@ type Slot struct{}
 // Unlike a layout's single anonymous Slot, a frame has one SlotRef per socket.
 type SlotRef struct{ Name string }
 
+func (Styled) node()    {}
 func (Box) node()       {}
 func (Row) node()       {}
 func (Text) node()      {}

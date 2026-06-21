@@ -262,6 +262,18 @@ func Build(app *ast.App) (*IR, error) {
 		out.States = append(out.States, State{Name: s.Name, Type: s.Type, Elem: s.Elem, List: s.List, Optional: s.Optional, Placement: p, Private: private, Init: e.low(s.Default)})
 	}
 
+	// Built-in theme switch. When the app declares any alternate palette (`theme
+	// dark:` or a named `theme <name>:`), inject a `@client` text state named
+	// `theme` holding the active palette name (""=base/OS). An action assigning it
+	// (`theme = "dark"`) is therefore client-placed — the browser flips the
+	// `data-theme` attribute with no round-trip — and a view may read `{theme}`. If
+	// the author declared their own `theme` state, theirs stands.
+	if _, declared := e.states["theme"]; !declared && (len(app.DarkTheme) > 0 || len(app.Themes) > 0) {
+		e.states["theme"] = Client
+		e.stateTypes["theme"] = "text"
+		out.States = append(out.States, State{Name: "theme", Type: "text", Placement: Client, Init: e.low(ast.Lit{Kind: "text", Val: ""})})
+	}
+
 	// 3. Policies (predicates over actor + state/entities; no params). Lowered and
 	// stored for inlining into `requires` and view `if` conditions.
 	polSeen := map[string]int{}
@@ -336,6 +348,26 @@ func Build(app *ast.App) (*IR, error) {
 			out.ThemeDark[tv.Name] = tv.Value
 		}
 	}
+	// `theme <name>:` blocks are alternate palettes, each emitted under a
+	// `[data-theme="<name>"]` selector. The app switches between them at runtime by
+	// assigning the built-in `theme` state, injected below.
+	if len(app.Themes) > 0 {
+		out.Themes = map[string]map[string]string{}
+		for _, nt := range app.Themes {
+			tokens, ok := out.Themes[nt.Name]
+			if !ok {
+				tokens = map[string]string{}
+				out.Themes[nt.Name] = tokens
+			}
+			for _, tv := range nt.Vars {
+				tokens[tv.Name] = tv.Value
+			}
+		}
+	}
+	// Raw author stylesheet (`css:` blocks). Emitted verbatim into the page after the
+	// built-in and theme CSS, so author rules win on equal specificity — the escape
+	// hatch for layout the token system can't express (pinned rails, breakpoints).
+	out.CSS = app.CSS
 
 	// 3d. Components: reusable view fragments. Names + parameters are registered in
 	// one pass (so a component may `use` another declared later, and arity checks
@@ -784,6 +816,16 @@ func inlineLayout(layout []ast.Node, view []ast.Node) []ast.Node {
 		switch t := n.(type) {
 		case ast.Slot:
 			out = append(out, view...)
+		case ast.Styled:
+			// Recurse through the decorator so a slot inside `box class "x":` still
+			// receives the view; a bare styled slot drops the wrapper and splices.
+			inner := inlineLayout([]ast.Node{t.Inner}, view)
+			if len(inner) == 1 {
+				t.Inner = inner[0]
+				out = append(out, t)
+			} else {
+				out = append(out, inner...)
+			}
 		case ast.Box:
 			out = append(out, ast.Box{Children: inlineLayout(t.Children, view)})
 		case ast.Row:
@@ -1382,6 +1424,23 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 	var out []Node
 	for _, n := range in {
 		switch t := n.(type) {
+		case ast.Styled:
+			// Lower the wrapped node, then stamp the author's class/style onto the
+			// single IR node it produced so the rendered element carries both the
+			// built-in `fa-*` class and the escape-hatch attributes.
+			inner, err := c.nodes([]ast.Node{t.Inner}, sc)
+			if err != nil {
+				return nil, err
+			}
+			for i := range inner {
+				if t.Class != "" {
+					inner[i].Class = t.Class
+				}
+				if t.Style != "" {
+					inner[i].Style = t.Style
+				}
+			}
+			out = append(out, inner...)
 		case ast.Box:
 			kids, err := c.nodes(t.Children, sc)
 			if err != nil {

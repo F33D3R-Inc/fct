@@ -11,6 +11,18 @@ import (
 // isLayered reports whether a collected facet set uses the typed-brick model
 // (any facet declares a kind beyond a plain `app`). The entry facet of a layered
 // build is always the `playground` baseplate.
+// joinCSS concatenates stylesheet fragments (the playground's plus every facet's
+// `css:` block) with a newline between them, so composed skin layers like structure.
+func joinCSS(a, b string) string {
+	if a == "" {
+		return b
+	}
+	if b == "" {
+		return a
+	}
+	return a + "\n" + b
+}
+
 func isLayered(facets []*ast.App) bool {
 	for _, f := range facets {
 		switch f.Kind {
@@ -122,9 +134,15 @@ func compose(facets []*ast.App) (*ast.App, error) {
 	app := &ast.App{Name: playground.Name, Kind: "app", Line: playground.Line}
 	app.Auth = playground.Auth
 	app.Theme = append(app.Theme, playground.Theme...)
+	app.DarkTheme = append(app.DarkTheme, playground.DarkTheme...)
+	app.Themes = append(app.Themes, playground.Themes...)
+	app.CSS = joinCSS(app.CSS, playground.CSS)
 	knownPolicy := map[string]int{} // policy name -> param count, for guard checks
 	for _, w := range wireframes {
 		app.Theme = append(app.Theme, w.Theme...)
+		app.DarkTheme = append(app.DarkTheme, w.DarkTheme...)
+		app.Themes = append(app.Themes, w.Themes...)
+		app.CSS = joinCSS(app.CSS, w.CSS)
 	}
 	for _, b := range bricks {
 		app.Auth = app.Auth || b.Auth
@@ -139,6 +157,9 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.Layouts = append(app.Layouts, b.Layouts...)
 		app.Services = append(app.Services, b.Services...)
 		app.Theme = append(app.Theme, b.Theme...)
+		app.DarkTheme = append(app.DarkTheme, b.DarkTheme...)
+		app.Themes = append(app.Themes, b.Themes...)
+		app.CSS = joinCSS(app.CSS, b.CSS)
 		for _, p := range b.Policies {
 			knownPolicy[p.Name] = len(p.Params)
 		}
@@ -149,6 +170,9 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.Components = append(app.Components, a.Components...)
 		app.Layouts = append(app.Layouts, a.Layouts...)
 		app.Theme = append(app.Theme, a.Theme...)
+		app.DarkTheme = append(app.DarkTheme, a.DarkTheme...)
+		app.Themes = append(app.Themes, a.Themes...)
+		app.CSS = joinCSS(app.CSS, a.CSS)
 	}
 
 	// 5. Each playground mount becomes one screen: its wireframe's frame composited
@@ -201,6 +225,19 @@ func resolveFrame(nodes []ast.Node, fill map[string][]ast.Node) ([]ast.Node, err
 		switch t := n.(type) {
 		case ast.SlotRef:
 			out = append(out, fill[t.Name]...) // an unfilled socket renders nothing
+		case ast.Styled:
+			// Recurse through the decorator so a `slot` inside `box class "rail":`
+			// still resolves against the socket fill.
+			inner, err := resolveFrame([]ast.Node{t.Inner}, fill)
+			if err != nil {
+				return nil, err
+			}
+			if len(inner) == 1 {
+				t.Inner = inner[0]
+				out = append(out, t)
+			} else {
+				out = append(out, inner...)
+			}
 		case ast.Box:
 			kids, err := resolveFrame(t.Children, fill)
 			if err != nil {

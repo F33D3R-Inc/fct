@@ -12,24 +12,26 @@ const (
 
 // IR is one compiled application.
 type IR struct {
-	App        string            `json:"app"`
-	Auth       bool              `json:"auth,omitempty"` // built-in users/login enabled
-	Entities   []Entity          `json:"entities"`
-	Records    []Record          `json:"records,omitempty"` // value-object types: the typed shape of a service (brain) return
-	Enums      []Enum            `json:"enums,omitempty"`
-	States     []State           `json:"states"`
-	Derives    []Derive          `json:"derives"`
-	Policies   []Policy          `json:"policies"`
-	Actions    []Action          `json:"actions"`
-	Jobs       []Job             `json:"jobs"`
-	Components []Component       `json:"components,omitempty"` // reusable view fragments
-	Services   []Service         `json:"services,omitempty"`   // external services (brains) actions may call
-	Webhooks   []Webhook         `json:"webhooks,omitempty"`   // inbound endpoints external systems POST to
-	Triggers   []Trigger         `json:"triggers,omitempty"`   // event reactions: an action's success runs another action
-	Theme      map[string]string `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
-	ThemeDark  map[string]string `json:"themeDark,omitempty"`  // dark-mode token overrides (prefers-color-scheme: dark)
-	Routes     []Route           `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
-	Pages      []Page            `json:"pages"`                // one per view; each is a route
+	App        string                       `json:"app"`
+	Auth       bool                         `json:"auth,omitempty"` // built-in users/login enabled
+	Entities   []Entity                     `json:"entities"`
+	Records    []Record                     `json:"records,omitempty"` // value-object types: the typed shape of a service (brain) return
+	Enums      []Enum                       `json:"enums,omitempty"`
+	States     []State                      `json:"states"`
+	Derives    []Derive                     `json:"derives"`
+	Policies   []Policy                     `json:"policies"`
+	Actions    []Action                     `json:"actions"`
+	Jobs       []Job                        `json:"jobs"`
+	Components []Component                  `json:"components,omitempty"` // reusable view fragments
+	Services   []Service                    `json:"services,omitempty"`   // external services (brains) actions may call
+	Webhooks   []Webhook                    `json:"webhooks,omitempty"`   // inbound endpoints external systems POST to
+	Triggers   []Trigger                    `json:"triggers,omitempty"`   // event reactions: an action's success runs another action
+	Theme      map[string]string            `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
+	ThemeDark  map[string]string            `json:"themeDark,omitempty"`  // dark-mode token overrides (prefers-color-scheme: dark)
+	Themes     map[string]map[string]string `json:"themes,omitempty"`     // named alternate palettes (name -> tokens), selected at runtime via the `theme` state
+	CSS        string                       `json:"css,omitempty"`        // raw author stylesheet from `css:` blocks, emitted verbatim into the page <head>
+	Routes     []Route                      `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
+	Pages      []Page                       `json:"pages"`                // one per view; each is a route
 	// View/Bindings/DepGraph mirror the *current* page. `facet build` shows the
 	// first page; the server swaps them per request to the matched route, so the
 	// client runtime can keep reading these three fields unchanged.
@@ -306,6 +308,12 @@ type Node struct {
 	Name    string   `json:"name,omitempty"`    // use: component name / icon: glyph name
 	Options []Option `json:"options,omitempty"` // select: choices
 	Value   string   `json:"value,omitempty"`   // tab: the value its bound cell takes when active
+
+	// CSS escape hatch: author-supplied class/style from a trailing `class "..."` /
+	// `style "..."` modifier, appended to the element's built-in `fa-*` class so a
+	// `css:` stylesheet can target it. Applied identically on the server and client.
+	Class string `json:"class,omitempty"`
+	Style string `json:"style,omitempty"`
 }
 
 // Option is one select choice (display label → stored value).
