@@ -18,10 +18,6 @@ import (
 // client stores and can then show or submit through an action. Files are served
 // back read-only from /uploads/.
 
-// maxUploadBytes caps a single upload (10 MiB) so the endpoint cannot be used to
-// exhaust disk with one request.
-const maxUploadBytes = 10 << 20
-
 // uploadDirFromEnv resolves where uploaded files are written (and served from),
 // defaulting to ./facet-uploads beside the running server.
 func uploadDirFromEnv() string {
@@ -43,8 +39,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if !s.guardMutation(w, r, true) {
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+	cap := singleUploadCap()
+	r.Body = http.MaxBytesReader(w, r.Body, cap)
+	if err := r.ParseMultipartForm(cap); err != nil {
 		http.Error(w, "upload too large or malformed", http.StatusBadRequest)
 		return
 	}
@@ -70,18 +67,36 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "write failed", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]any{"url": "/uploads/" + name})
+	// mediaURL is a bare public path by default, or a signed, expiring link when
+	// FACET_MEDIA_TTL is set — the client stores whichever it gets.
+	writeJSON(w, map[string]any{"url": mediaURL(name)})
 }
 
 // handleUploads serves a stored upload by name, read-only. It refuses any name
-// with a path separator so a request can never escape the upload directory.
+// with a path separator so a request can never escape the upload directory. When
+// signed media is enabled it requires a valid, unexpired signature. HLS parts are
+// served with their stream MIME types; an .m3u8 playlist is rewritten so each
+// segment URI carries its own signature.
 func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/uploads/")
 	if name == "" || strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
 		http.NotFound(w, r)
 		return
 	}
-	http.ServeFile(w, r, filepath.Join(s.uploadDir, name))
+	if !mediaAccessOK(name, r.URL.Query()) {
+		http.Error(w, "expired or invalid media link", http.StatusForbidden)
+		return
+	}
+	full := filepath.Join(s.uploadDir, name)
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext == ".m3u8" {
+		s.serveHLSPlaylist(w, full)
+		return
+	}
+	if ct := hlsContentType(ext); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	http.ServeFile(w, r, full) // ServeFile handles Range, so segments seek cleanly
 }
 
 // randomName mints a 16-byte hex token for a stored file.

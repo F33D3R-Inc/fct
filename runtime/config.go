@@ -118,6 +118,11 @@ func (c Config) Report() string {
 	set("FACET_OIDC_ISSUER", os.Getenv("FACET_OIDC_ISSUER"))
 	set("FACET_UPLOAD_DIR", c.UploadDir)
 	fmt.Fprintf(&b, "  %-26s %d req/s\n", "FACET_RATE_LIMIT", c.RateLimit)
+	if signedMedia() {
+		fmt.Fprintf(&b, "  %-26s signed, %ds TTL\n", "FACET_MEDIA_TTL", mediaTTL())
+	} else {
+		set("FACET_MEDIA_TTL", "(public links)")
+	}
 
 	w := c.Warnings()
 	if len(w) == 0 {

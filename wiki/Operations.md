@@ -86,6 +86,31 @@ Point Prometheus at `/metrics` and your orchestrator's probes at
 - **API micro-cache** — set `FACET_API_CACHE_TTL` for a short-TTL cache in front
   of read endpoints under load.
 
+## Media handoff
+
+The `upload` node names a runtime media service configured from the environment.
+By default a stored file is served from an unguessable public path under
+`/uploads/`. Three operational capabilities build on that:
+
+- **Signed, expiring URLs** — set `FACET_MEDIA_TTL=<seconds>` and every stored
+  file is served from a signed, time-limited link (an HMAC over name + expiry,
+  keyed by the master secret). An unsigned, tampered, or expired link is **403**,
+  so media is access-controlled, not permanently public. With the TTL unset,
+  links stay public (backward compatible).
+- **Resumable chunked upload** — a file bigger than one request
+  (`FACET_MAX_UPLOAD_MB`, default 10) is sent in pieces (`/upload/init` →
+  `/upload/chunk` → `/upload/finish`) and reassembled server-side, up to
+  `FACET_MAX_MEDIA_MB` (default 200). The browser `upload` node switches to this
+  automatically for large files; small ones still go in a single POST.
+- **HLS delivery** — `.m3u8`/`.ts`/`.m4s`/`.mpd` are served with their stream MIME
+  types and byte ranges (so a player seeks cleanly). When signing is on, an
+  `.m3u8` playlist is rewritten on the fly so each segment URI carries its own
+  signature, so a protected stream still plays. Segments are flat siblings of the
+  playlist in the upload dir; transcoding/segmenting is done outside fct (e.g.
+  ffmpeg) and the resulting bundle is uploaded.
+
+`facet config` reports the media mode. A runnable demo is in `examples/media.fct`.
+
 ## Backup & restore
 
 Logical snapshots, independent of `pg_dump`:

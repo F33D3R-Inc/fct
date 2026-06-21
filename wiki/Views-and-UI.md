@@ -83,7 +83,11 @@ form "Save profile" -> saveProfile(name, bio):
 ```
 
 Uploads are served from `/uploads/`; set the storage dir with
-`FACET_UPLOAD_DIR`. See [Configuration](Configuration.md).
+`FACET_UPLOAD_DIR`. A **large file uploads in resumable chunks automatically** —
+the `upload` node POSTs a small file once but sends a big one in pieces that the
+server reassembles, so a transfer larger than one request limit still completes.
+See [Operations → Media handoff](Operations.md#media-handoff) for signed URLs,
+size limits, and HLS, and [Configuration](Configuration.md).
 
 ### if & for
 

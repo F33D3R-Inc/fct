@@ -1,0 +1,37 @@
+# Media handoff — moving large files in and out. The language only names `upload`;
+# the runtime supplies three operational capabilities, all env-configured:
+#
+#   - Signed, expiring URLs: set FACET_MEDIA_TTL=<seconds> and every stored file is
+#     served from a signed, time-limited link (HMAC over name+expiry). An unsigned
+#     or expired link is 403 — media is access-controlled, not permanently public.
+#   - Resumable chunked upload: a file larger than one request (FACET_MAX_UPLOAD_MB,
+#     default 10) is sent in pieces and reassembled server-side, up to
+#     FACET_MAX_MEDIA_MB (default 200). The `upload` node does this automatically
+#     for big files; small ones still go in a single POST.
+#   - HLS delivery: .m3u8/.ts/.m4s are served with their stream MIME types and byte
+#     ranges, and a signed playlist is rewritten so each segment carries its own
+#     signature — so a protected stream still plays.
+#
+# Run it:  FACET_MEDIA_TTL=300 facet dev examples/media.fct
+# Pick a file; small files POST once, large files upload in chunks; the bound URL
+# is a signed link the view shows and the action stores.
+app Media:
+    state draft: text = "" @client
+
+    entity Doc:
+        id: int
+        name: text
+        url: text
+
+    action save(name: text, url: text):
+        check url != "" "upload a file first"
+        add Doc { name: name, url: url }
+
+    view Home at "/":
+        box:
+            upload bind draft label "Choose a file"
+            button "Save" -> save("doc", draft)
+            for d in Doc by id desc limit 20:
+                row:
+                    text "{d.name}"
+                    text "{d.url}"

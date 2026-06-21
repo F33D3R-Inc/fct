@@ -38,9 +38,13 @@ type Server struct {
 	triggers    map[string][]ir.Trigger // source action name -> reactions to run on its success
 	privateNm   map[string]bool         // @private state names — never shipped to a client
 	uploadDir   string                  // directory uploaded files are written to and served from
-	store       Store
-	children    map[string][]childRef // entity -> the relations that point at it (for cascade)
-	secure      bool                  // mark cookies Secure (TLS / FACET_SECURE_COOKIES=1)
+
+	uploadMu       sync.Mutex                // guards uploadSessions
+	uploadSessions map[string]*uploadSession // in-flight resumable uploads, keyed by session id
+
+	store    Store
+	children map[string][]childRef // entity -> the relations that point at it (for cascade)
+	secure   bool                  // mark cookies Secure (TLS / FACET_SECURE_COOKIES=1)
 
 	mu       sync.Mutex
 	entities map[string][]any         // durable, shared (the in-memory working set; the Store is the source of truth)
@@ -119,16 +123,18 @@ func newServer(graph *ir.IR) *Server {
 		triggers:    map[string][]ir.Trigger{},
 		privateNm:   map[string]bool{},
 		uploadDir:   uploadDirFromEnv(),
-		entities:    map[string][]any{},
-		nextID:      map[string]int{},
-		sessions:    map[string]*sessionState{},
-		subs:        map[chan []byte]bool{},
-		secure:      os.Getenv("FACET_SECURE_COOKIES") == "1",
-		limiter:     newRateLimiter(rateLimitFromEnv()),
-		lockout:     newLockout(),
-		obs:         newObs(),
-		apiCache:    newAPICache(),
-		i18n:        newI18n(),
+
+		uploadSessions: map[string]*uploadSession{},
+		entities:       map[string][]any{},
+		nextID:         map[string]int{},
+		sessions:       map[string]*sessionState{},
+		subs:           map[chan []byte]bool{},
+		secure:         os.Getenv("FACET_SECURE_COOKIES") == "1",
+		limiter:        newRateLimiter(rateLimitFromEnv()),
+		lockout:        newLockout(),
+		obs:            newObs(),
+		apiCache:       newAPICache(),
+		i18n:           newI18n(),
 	}
 	for i := range graph.Actions {
 		s.byAction[graph.Actions[i].Name] = &graph.Actions[i]
@@ -247,6 +253,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api", s.handleAPISchema)
 	mux.HandleFunc("/api/", s.handleAPI)
 	mux.HandleFunc("/upload", s.handleUpload)
+	mux.HandleFunc("/upload/", s.handleUploadChunked) // resumable: init/chunk/finish/abort
 	mux.HandleFunc("/uploads/", s.handleUploads)
 	// Phase 6: the generated admin dashboard and the billing provider webhook.
 	mux.HandleFunc("/admin", s.handleAdmin)

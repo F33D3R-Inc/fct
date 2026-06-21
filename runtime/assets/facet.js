@@ -609,22 +609,51 @@
   }
 
   // ── file upload ──────────────────────────────────────────────────────────────
+  // A small file goes in one multipart POST; a large one is sent in resumable
+  // chunks (init → chunk* → finish), so a transfer bigger than one request limit
+  // still completes. Either way the server returns the URL we store and bind.
+  const CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB — switch to chunked above this size
+
   async function upload(input) {
     const bind = input.getAttribute("data-fa-upload");
     const file = input.files && input.files[0];
     if (!file) return;
-    const body = new FormData(); body.append("file", file);
-    input.closest("label") && input.closest("label").setAttribute("aria-busy", "true");
-    let res;
+    const label = input.closest("label");
+    label && label.setAttribute("aria-busy", "true");
     try {
-      res = await fetch("/upload", { method: "POST", headers: { "X-Facet-CSRF": csrf }, body });
+      const url = file.size > CHUNK_BYTES ? await uploadChunked(file) : await uploadSingle(file);
+      if (!url) { showError(input, "Upload failed."); return; }
+      store[bind] = url;
+      refresh([bind]);
     } finally {
-      input.closest("label") && input.closest("label").removeAttribute("aria-busy");
+      label && label.removeAttribute("aria-busy");
     }
-    if (!res.ok) { showError(input, "Upload failed."); return; }
-    const data = await res.json();
-    store[bind] = data.url;
-    refresh([bind]);
+  }
+
+  async function uploadSingle(file) {
+    const body = new FormData(); body.append("file", file);
+    const res = await fetch("/upload", { method: "POST", headers: { "X-Facet-CSRF": csrf }, body });
+    if (!res.ok) return null;
+    return (await res.json()).url;
+  }
+
+  async function uploadChunked(file) {
+    const csrfHdr = { "X-Facet-CSRF": csrf };
+    let res = await fetch("/upload/init", {
+      method: "POST", headers: { ...csrfHdr, "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name }),
+    });
+    if (!res.ok) return null;
+    const id = (await res.json()).id;
+    for (let off = 0; off < file.size; off += CHUNK_BYTES) {
+      res = await fetch("/upload/chunk?id=" + encodeURIComponent(id), {
+        method: "POST", headers: csrfHdr, body: file.slice(off, off + CHUNK_BYTES),
+      });
+      if (!res.ok) { fetch("/upload/abort?id=" + encodeURIComponent(id), { method: "POST", headers: csrfHdr }); return null; }
+    }
+    res = await fetch("/upload/finish?id=" + encodeURIComponent(id), { method: "POST", headers: csrfHdr });
+    if (!res.ok) return null;
+    return (await res.json()).url;
   }
 
   // ── SPA navigation: follow internal links without a full reload ───────────────

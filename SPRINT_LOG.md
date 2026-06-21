@@ -10,6 +10,39 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 17 — 2026-06-20 — F33D3R depth #4: media handoff → released v1.23.0
+
+**Shipped media handoff — signed URLs + chunked upload + HLS.** The language only
+names `upload`; the runtime supplies three env-configured capabilities (consistent
+with how billing/OIDC/clustering are operational, not syntactic):
+
+- **Signed, expiring URLs** — `FACET_MEDIA_TTL=<s>` makes every stored file serve
+  from a signed, time-limited link (HMAC over name+expiry, master-keyed). Unsigned/
+  tampered/expired → **403**. TTL unset = public, backward compatible.
+- **Resumable chunked upload** — a file past `FACET_MAX_UPLOAD_MB` (10) is sent in
+  pieces (`/upload/init` → `/upload/chunk` → `/upload/finish`/`abort`) and
+  reassembled server-side, up to `FACET_MAX_MEDIA_MB` (200). The browser `upload`
+  node switches to chunking automatically above 4 MiB; small files still single-POST.
+- **HLS delivery** — `.m3u8/.ts/.m4s/.mpd` get stream MIME types + byte ranges; a
+  signed `.m3u8` is rewritten so each segment URI carries its own signature, so a
+  protected stream plays. Transcoding stays external (ffmpeg) — fct hosts the bundle.
+
+- Surface (runtime-only, no compiler change): `runtime/media.go` (mediaURL/mediaSig/
+  mediaAccessOK signing; uploadInit/Chunk/Finish/Abort session protocol; serveHLS
+  PlaylistRewrite + hlsContentType), `upload.go` (handleUpload returns mediaURL +
+  singleUploadCap; handleUploads enforces access + HLS types), `server.go` (uploadMu/
+  uploadSessions + `/upload/` route), `assets/facet.js` (upload() chunks large files),
+  `config.go` (`facet config` reports media mode).
+- Tests: `runtime/media_test.go` — signed mint/verify (tampered + expired rejected),
+  public mode, chunked init→chunk→finish assembles exact bytes, HLS MIME map, signed
+  m3u8 segment-rewrite verifies.
+- Verified e2e (live server, FACET_MEDIA_TTL=60): chunked 100k+50k → signed URL →
+  fetch WITH sig 200/150000 bytes, WITHOUT sig 403, tampered 403. Example:
+  `examples/media.fct`. Docs: wiki/Operations.md "Media handoff", wiki/Views-and-UI.md.
+  version -> **1.23.0**.
+
+---
+
 ## Sprint 16 — 2026-06-20 — F33D3R depth #3 closed: event triggers → released v1.22.0
 
 **Finished the non-cron half of depth #3.** v1.21.0 shipped inbound webhooks (the
@@ -169,9 +202,10 @@ guarantees the key is uncompilable to render and never crosses to the client.
 
 **Next F33D3R depth:** (3) webhooks + non-cron triggers → **DONE**: inbound webhooks
 v1.21.0 (Sprint 15) + event triggers v1.22.0 (Sprint 16) · (4) media handoff
-(signed/expiring URLs + HLS + chunked upload) · (5) design-system control + page
-metadata + field-level authz + overlays/typeahead · (phase) `@e2e` crypto. Typed
-**records** for structured brain payloads remains the fast-follow to #1.
+(signed/expiring URLs + HLS + chunked upload) → **DONE** v1.23.0 (Sprint 17) · (5)
+design-system control + page metadata + field-level authz + overlays/typeahead ·
+(phase) `@e2e` crypto. Typed **records** for structured brain payloads remains the
+fast-follow to #1.
 
 ---
 
