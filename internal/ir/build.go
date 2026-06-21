@@ -418,6 +418,25 @@ func Build(app *ast.App) (*IR, error) {
 	for i := range out.Actions {
 		byAction[out.Actions[i].Name] = &out.Actions[i]
 	}
+	// 4d. Webhooks: inbound endpoints external systems POST to. Each names an
+	// existing action the runtime runs (with system authority) after verifying an
+	// HMAC over the raw body. The path must be unique and must not collide with a
+	// route the runtime already owns, so a webhook can never shadow the app's API.
+	hookSeen := map[string]int{}
+	for _, wh := range app.Webhooks {
+		if _, ok := byAction[wh.Action]; !ok {
+			return nil, &BuildError{wh.Line, fmt.Sprintf("webhook %q targets unknown action %q", wh.Path, wh.Action)}
+		}
+		if prev, ok := hookSeen[wh.Path]; ok {
+			return nil, &BuildError{wh.Line, fmt.Sprintf("webhook path %q redeclared (first at line %d)", wh.Path, prev)}
+		}
+		if reservedWebhookPath(wh.Path) {
+			return nil, &BuildError{wh.Line, fmt.Sprintf("webhook path %q collides with a route the runtime reserves", wh.Path)}
+		}
+		hookSeen[wh.Path] = wh.Line
+		out.Webhooks = append(out.Webhooks, Webhook{Path: wh.Path, Action: wh.Action, Secret: wh.Secret})
+	}
+
 	pathOf := map[string]string{} // path -> view name
 	allCalls := compCalls
 	allLinks := compLinks
@@ -1856,6 +1875,24 @@ func irParams(ps []ast.Param) []Param {
 		out[i] = Param{Name: p.Name, Type: p.Type}
 	}
 	return out
+}
+
+// reservedWebhookPath reports whether a webhook path would shadow a route the
+// runtime owns (its API, admin, uploads, auth, ops probes, and the built-in
+// billing webhook). Keeping these off-limits means a declared webhook can never
+// intercept the app's own traffic.
+func reservedWebhookPath(p string) bool {
+	switch p {
+	case "/", "/event", "/live", "/api", "/upload", "/admin", "/facet.js",
+		"/healthz", "/readyz", "/metrics", "/billing/webhook":
+		return true
+	}
+	for _, pre := range []string{"/api/", "/uploads/", "/admin/", "/auth/", "/dev/"} {
+		if strings.HasPrefix(p, pre) {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys(m map[string]bool) []string {

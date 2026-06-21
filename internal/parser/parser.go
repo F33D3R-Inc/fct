@@ -171,13 +171,18 @@ func parseDecl(app *ast.App, c *source.Node) error {
 		if sv, err = parseService(c); err == nil {
 			app.Services = append(app.Services, sv)
 		}
+	case strings.HasPrefix(c.Line.Text, "webhook "):
+		var wh *ast.Webhook
+		if wh, err = parseWebhook(c.Line.Text, c.Line.No); err == nil {
+			app.Webhooks = append(app.Webhooks, wh)
+		}
 	case strings.HasPrefix(c.Line.Text, "view "):
 		var v *ast.View
 		if v, err = parseView(c); err == nil {
 			app.Views = append(app.Views, v)
 		}
 	default:
-		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/enum/state/derive/policy/action/job/component/layout/theme/view", firstWord(c.Line.Text))}
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/enum/state/derive/policy/action/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
 	}
 	return err
 }
@@ -838,6 +843,42 @@ func parseService(n *source.Node) (*ast.Service, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("service %q declares no operations", name)}
 	}
 	return sv, nil
+}
+
+// parseWebhook parses a one-line inbound endpoint:
+//
+//	webhook "/hooks/pay" -> confirmPaid secret PAY_KEY
+//
+// The quoted path is the route an external system POSTs to, the arrow names the
+// action the runtime runs with the JSON body decoded into its parameters, and the
+// optional `secret <ENV>` names the env var holding the HMAC key (empty derives a
+// key from the master secret). It is the inbound counterpart of a `service` call.
+func parseWebhook(line string, no int) (*ast.Webhook, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "webhook"))
+	arrow := strings.Index(rest, "->")
+	if arrow < 0 {
+		return nil, &Error{no, `webhook needs a target action: webhook "/path" -> actionName`}
+	}
+	path, err := unquote(strings.TrimSpace(rest[:arrow]), no)
+	if err != nil || path == "" {
+		return nil, &Error{no, `webhook needs a quoted path: webhook "/path" -> actionName`}
+	}
+	if !strings.HasPrefix(path, "/") {
+		return nil, &Error{no, fmt.Sprintf("webhook path %q must start with /", path)}
+	}
+	target := strings.TrimSpace(rest[arrow+2:])
+	var secret string
+	if i := strings.Index(target, " secret "); i >= 0 {
+		secret = strings.TrimSpace(target[i+len(" secret "):])
+		target = strings.TrimSpace(target[:i])
+		if !isIdent(secret) {
+			return nil, &Error{no, fmt.Sprintf("webhook secret %q must be an env-var name", secret)}
+		}
+	}
+	if !isIdent(target) {
+		return nil, &Error{no, fmt.Sprintf("webhook target %q must be an action name", target)}
+	}
+	return &ast.Webhook{Path: path, Action: target, Secret: secret, Line: no}, nil
 }
 
 // parseCall parses `Service.op(arg, ...)` — a service call statement in an action.

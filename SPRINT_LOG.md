@@ -10,6 +10,43 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 15 — 2026-06-20 — F33D3R depth #3: inbound webhooks → released v1.21.0
+
+**Shipped the inbound twin of `service`.** A `service` lets an action call *out* to
+a brain; a `webhook` lets the mesh call *into* the app. An external system POSTs to a
+declared path, the runtime verifies an HMAC over the raw body, then runs the named
+action with the JSON body decoded into its parameters by name:
+
+```
+action confirm(ref: text, cents: int):
+    check cents > 0 "amount must be positive"
+    add Payment { ref: ref, cents: cents }
+
+webhook "/hooks/pay" -> confirm secret PAY_SECRET
+```
+
+**Authenticated, not open.** A missing/mismatched `X-Facet-Signature` (hex SHA-256
+HMAC) is 403 *before* the action runs. `secret <ENV>` names the HMAC key's env var;
+omit it and the key derives from the master secret. The action runs with **system
+authority** (like a job), so policies pass as a trusted internal caller — validate
+the payload with `check` (a failure → 422, nothing written). Reuses the billing
+webhook's HMAC machinery (refactored `verifyWebhook` → shared `verifyWebhookKey`).
+
+- Surface: ast (`Webhook{Path,Action,Secret}` + `File.Webhooks`), parser
+  (`parseWebhook`: `webhook "/p" -> action [secret ENV]`), ir (`ir.Webhook` +
+  `IR.Webhooks`), build (4d: target-action-exists + unique-path + `reservedWebhookPath`
+  collision guard), runtime (`runtime/webhook.go`: per-webhook handler verifies HMAC,
+  decodes body → params, runs with `systemSID`; registered in `Handler()`).
+- Tests: `internal/compile/webhook_test.go` (lowers; unknown-action / duplicate-path /
+  reserved-path errors); `runtime/webhook_test.go` (full flow: unsigned→403, mis-signed
+  →403 + zero rows, signed→200 + one row).
+- Verified e2e via `examples/webhook.fct` against a live dev server: unsigned 403,
+  bad-sig 403, signed 200, failing-check 422, exactly one row written. Also confirms
+  the v1.20.0 post-bind `check` composes inside a webhook action. Docs:
+  wiki/Services.md (new "Webhooks — the inbound twin"). version -> **1.21.0**.
+
+---
+
 ## Sprint 14 — 2026-06-20 — post-bind validation: `check` runs in body order → released v1.20.0
 
 **Closed the gap Sprint 13 surfaced.** Previously `check` was a pre-body precondition
@@ -80,7 +117,8 @@ guarantees the key is uncompilable to render and never crosses to the client.
 **Note (gap surfaced):** a `check` runs before the body, so it can't validate a
 `let`-bound brain result. → **Fixed in v1.20.0 (Sprint 14).**
 
-**Next F33D3R depth:** (3) webhooks + non-cron triggers · (4) media handoff
+**Next F33D3R depth:** (3) webhooks + non-cron triggers → **inbound webhooks done in
+v1.21.0 (Sprint 15)**; non-cron/event triggers still open · (4) media handoff
 (signed/expiring URLs + HLS + chunked upload) · (5) design-system control + page
 metadata + field-level authz + overlays/typeahead · (phase) `@e2e` crypto. Typed
 **records** for structured brain payloads remains the fast-follow to #1.

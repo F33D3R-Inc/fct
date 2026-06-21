@@ -53,8 +53,22 @@ type App struct {
 	Layouts    []*Layout
 	Views      []*View
 	Services   []*Service
+	Webhooks   []*Webhook
 	Theme      []ThemeVar
 	Line       int
+}
+
+// Webhook is a typed inbound endpoint: an external system POSTs to Path, the
+// runtime verifies an HMAC signature, and runs the named Action with parameters
+// decoded from the JSON body. `webhook "/hooks/pay" -> confirmPaid secret PAY_KEY`.
+// It is how a payment processor, a transcode worker, or any brain calls *into* the
+// app — the inbound counterpart of a `service` call. Secret names an env var
+// holding the HMAC key ("" derives one from the master secret).
+type Webhook struct {
+	Path   string
+	Action string
+	Secret string
+	Line   int
 }
 
 // Socket is one typed slot declared by a wireframe: `socket feed: data`. Accept

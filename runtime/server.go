@@ -244,6 +244,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin", s.handleAdmin)
 	mux.HandleFunc("/admin/", s.handleAdmin)
 	mux.HandleFunc("/billing/webhook", s.handleBillingWebhook)
+	// User-declared inbound webhooks: each authenticates with its own HMAC secret
+	// and runs the named action with system authority. The compiler guarantees the
+	// paths are unique and never collide with a route registered above.
+	for i := range s.ir.Webhooks {
+		mux.HandleFunc(s.ir.Webhooks[i].Path, s.webhookHandler(s.ir.Webhooks[i]))
+	}
 	if s.dev != nil {
 		mux.HandleFunc("/dev/reload", s.handleDevReload)
 	}

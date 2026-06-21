@@ -93,5 +93,45 @@ service <Name> at "<http(s)-url>":
 
 A runnable demo is in `examples/service.fct`.
 
+## Webhooks — the inbound twin
+
+A `service` calls *out*; a `webhook` lets the mesh call *in*. An external system
+(a payment processor, a transcode worker, any brain) POSTs to a declared path, the
+runtime **verifies an HMAC over the raw body**, then runs the named action with the
+JSON body decoded into its parameters by name.
+
+```
+entity Payment:
+    id: int
+    ref: text
+    cents: int
+
+action confirm(ref: text, cents: int):
+    check cents > 0 "amount must be positive"
+    add Payment { ref: ref, cents: cents }
+
+webhook "/hooks/pay" -> confirm secret PAY_SECRET
+```
+
+- The signature is a hex SHA-256 HMAC over the exact request body, sent in the
+  `X-Facet-Signature` header. A missing or mismatched signature is rejected with
+  **403** before the action runs — so a webhook is authenticated, not open.
+- `secret <ENV>` names the env var holding the HMAC key. Omit it and the key is
+  derived from the master secret, so a deployment always has a usable key.
+- The action runs with **system authority** (like a job), so it passes policies
+  the way a trusted internal caller would. Validate the payload with `check` —
+  a failed check returns its message with **422**, and nothing is written.
+- Paths must be unique and may not shadow a route the runtime owns (`/api`,
+  `/admin`, `/auth/…`, the ops probes, the built-in billing webhook); the
+  compiler rejects a collision.
+
+### Grammar
+
+```
+webhook "<path>" -> <action> [secret <ENV_VAR>]
+```
+
+A runnable demo is in `examples/webhook.fct`.
+
 → Back to **[Home](Home.md)** · see also **[Actions & Logic](Actions-and-Logic.md)**
 and **[Layered Facets](Layered-Facets.md)**.

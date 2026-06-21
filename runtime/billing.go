@@ -16,10 +16,6 @@ package runtime
 // which an app can gate features on.
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -292,15 +288,9 @@ func (s *Server) handleBillingWebhook(w http.ResponseWriter, r *http.Request) {
 // is FACET_BILLING_WEBHOOK_SECRET when set, otherwise a key derived from the
 // master secret, so a deployment always has a usable webhook key.
 func verifyWebhook(body []byte, presented string) bool {
-	if presented == "" {
-		return false
-	}
 	key := []byte(os.Getenv("FACET_BILLING_WEBHOOK_SECRET"))
 	if len(key) == 0 {
 		key = ring().signKey
 	}
-	mac := hmac.New(sha256.New, key)
-	mac.Write(body)
-	want := hex.EncodeToString(mac.Sum(nil))
-	return subtle.ConstantTimeCompare([]byte(presented), []byte(want)) == 1
+	return verifyWebhookKey(body, presented, key)
 }

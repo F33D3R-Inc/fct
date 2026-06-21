@@ -23,6 +23,7 @@ type IR struct {
 	Jobs       []Job             `json:"jobs"`
 	Components []Component       `json:"components,omitempty"` // reusable view fragments
 	Services   []Service         `json:"services,omitempty"`   // external services (brains) actions may call
+	Webhooks   []Webhook         `json:"webhooks,omitempty"`   // inbound endpoints external systems POST to
 	Theme      map[string]string `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
 	Routes     []Route           `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
 	Pages      []Page            `json:"pages"`                // one per view; each is a route
@@ -187,6 +188,16 @@ type ServiceOp struct {
 	Params  []string `json:"params,omitempty"`
 	Ret     string   `json:"ret,omitempty"`     // return type core ("" = no return)
 	RetList bool     `json:"retList,omitempty"` // the return is a list of Ret
+}
+
+// Webhook is a resolved inbound endpoint: an external system POSTs to Path, the
+// runtime verifies an HMAC over the raw body, and runs Action with the JSON body
+// decoded into its parameters by name. Secret names the env var holding the HMAC
+// key (empty → derived from the master secret). The inbound twin of a Service.
+type Webhook struct {
+	Path   string `json:"path"`
+	Action string `json:"action"`
+	Secret string `json:"secret,omitempty"`
 }
 
 // Stmt is one action statement. Op ∈ assign | add | set | remove | clear | call.

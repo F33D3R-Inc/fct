@@ -1,0 +1,37 @@
+# Webhooks — fct as the edge brain the mesh calls *into*. A `webhook` is the
+# inbound twin of a `service` call: an external system (a payment processor, a
+# transcode worker, any brain) POSTs to a path, the runtime verifies an HMAC over
+# the raw body, then runs the named action with the JSON body decoded into its
+# parameters. The action runs with system authority — egress trust, inbound.
+#
+# Try it: `facet dev examples/webhook.fct`, then POST a signed body. The HMAC key
+# is PAY_SECRET when set, else derived from the master secret. Compute the hex
+# SHA-256 HMAC over the exact bytes you send and pass it as X-Facet-Signature:
+#
+#   body='{"ref":"inv_42","cents":4200}'
+#   sig=$(printf %s "$body" | openssl dgst -sha256 -hmac "$PAY_SECRET" -hex | sed 's/.* //')
+#   curl -X POST localhost:8080/hooks/pay -H "X-Facet-Signature: $sig" -d "$body"
+app PayHook:
+    entity Payment:
+        id: int
+        ref: text
+        cents: int
+        status: text
+
+    # The action a verified webhook runs. It's an ordinary server action — a check
+    # validates the payload, then the row is written. A bad signature never reaches
+    # it (the runtime rejects with 403 first); a failed check returns 422.
+    action confirm(ref: text, cents: int):
+        check cents > 0 "amount must be positive"
+        add Payment { ref: ref, cents: cents, status: "paid" }
+
+    # The inbound endpoint: path -> action, signed with the PAY_SECRET HMAC key.
+    webhook "/hooks/pay" -> confirm secret PAY_SECRET
+
+    view Home at "/":
+        box:
+            text "Payments confirmed: {count(Payment)}"
+            for p in Payment by id desc limit 20:
+                row:
+                    text "{p.ref}"
+                    badge "{p.cents} ¢ · {p.status}"
