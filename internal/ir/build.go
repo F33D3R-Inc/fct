@@ -437,6 +437,41 @@ func Build(app *ast.App) (*IR, error) {
 		out.Webhooks = append(out.Webhooks, Webhook{Path: wh.Path, Action: wh.Action, Secret: wh.Secret})
 	}
 
+	// 4e. Triggers: `on <action> -> <reaction>`. When the source action completes,
+	// the runtime runs the reaction — a zero-arg, server-placed action, like a job's
+	// target. The reaction must exist and be authoritative; an edge whose source is
+	// unknown can never fire. The trigger graph must be acyclic so reactions always
+	// terminate — a cycle is a compile error naming the loop.
+	trigEdges := map[string][]string{} // source action -> reaction actions
+	trigSeen := map[string]bool{}
+	for _, tr := range app.Triggers {
+		src, ok := byAction[tr.On]
+		if !ok {
+			return nil, &BuildError{tr.Line, fmt.Sprintf("trigger `on %s` names unknown action %q", tr.On, tr.On)}
+		}
+		_ = src
+		react, ok := byAction[tr.Action]
+		if !ok {
+			return nil, &BuildError{tr.Line, fmt.Sprintf("trigger reaction %q is not a defined action", tr.Action)}
+		}
+		if react.Placement != Server {
+			return nil, &BuildError{tr.Line, fmt.Sprintf("trigger reaction %q is client-placed; a reaction runs on the server authority, so it must be authoritative", tr.Action)}
+		}
+		if len(react.Params) != 0 {
+			return nil, &BuildError{tr.Line, fmt.Sprintf("trigger reaction %q takes arguments; a reaction runs a zero-argument action", tr.Action)}
+		}
+		key := tr.On + " -> " + tr.Action
+		if trigSeen[key] {
+			return nil, &BuildError{tr.Line, fmt.Sprintf("trigger `on %s -> %s` redeclared", tr.On, tr.Action)}
+		}
+		trigSeen[key] = true
+		trigEdges[tr.On] = append(trigEdges[tr.On], tr.Action)
+		out.Triggers = append(out.Triggers, Trigger{On: tr.On, Action: tr.Action})
+	}
+	if cyc := triggerCycle(trigEdges); cyc != "" {
+		return nil, &BuildError{app.Line, fmt.Sprintf("trigger cycle: %s — reactions would never terminate", cyc)}
+	}
+
 	pathOf := map[string]string{} // path -> view name
 	allCalls := compCalls
 	allLinks := compLinks
@@ -1893,6 +1928,64 @@ func reservedWebhookPath(p string) bool {
 		}
 	}
 	return false
+}
+
+// triggerCycle reports the first cycle in the trigger graph (edges: source action
+// -> reaction) as a readable path like "a -> b -> a", or "" when the graph is
+// acyclic. A cycle would let reactions re-fire forever, so the compiler rejects it.
+func triggerCycle(edges map[string][]string) string {
+	const (
+		white = 0 // unvisited
+		gray  = 1 // on the current DFS stack
+		black = 2 // fully explored
+	)
+	color := map[string]int{}
+	var stack []string
+	var dfs func(n string) string
+	dfs = func(n string) string {
+		color[n] = gray
+		stack = append(stack, n)
+		for _, m := range edges[n] {
+			switch color[m] {
+			case gray:
+				// Found a back-edge: the cycle is the stack from m's first appearance.
+				start := 0
+				for i, s := range stack {
+					if s == m {
+						start = i
+						break
+					}
+				}
+				return strings.Join(append(append([]string{}, stack[start:]...), m), " -> ")
+			case white:
+				if c := dfs(m); c != "" {
+					return c
+				}
+			}
+		}
+		stack = stack[:len(stack)-1]
+		color[n] = black
+		return ""
+	}
+	for _, n := range sortedEdgeKeys(edges) {
+		if color[n] == white {
+			if c := dfs(n); c != "" {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+// sortedEdgeKeys returns the source nodes of an edge map in a stable order, so
+// cycle detection reports the same cycle across runs.
+func sortedEdgeKeys(m map[string][]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func sortedKeys(m map[string]bool) []string {

@@ -48,11 +48,7 @@ type jobQueue struct {
 // background.
 func (s *Server) StartJobs() {
 	s.mu.Lock()
-	if s.sessions[systemSID] == nil {
-		sys := s.newSession("system", roleAdmin)
-		sys.verified = true
-		s.sessions[systemSID] = sys
-	}
+	s.ensureSession(systemSID)
 	s.mu.Unlock()
 
 	// Phase 6: the declarative retention sweep (no-op unless FACET_RETENTION is set)

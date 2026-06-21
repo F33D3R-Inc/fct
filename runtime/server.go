@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,8 +35,9 @@ type Server struct {
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
 	byService   map[string]*ir.Service
-	privateNm   map[string]bool // @private state names — never shipped to a client
-	uploadDir   string          // directory uploaded files are written to and served from
+	triggers    map[string][]ir.Trigger // source action name -> reactions to run on its success
+	privateNm   map[string]bool         // @private state names — never shipped to a client
+	uploadDir   string                  // directory uploaded files are written to and served from
 	store       Store
 	children    map[string][]childRef // entity -> the relations that point at it (for cascade)
 	secure      bool                  // mark cookies Secure (TLS / FACET_SECURE_COOKIES=1)
@@ -114,6 +116,7 @@ func newServer(graph *ir.IR) *Server {
 		byPolicy:    map[string]*ir.Policy{},
 		byComponent: map[string]*ir.Component{},
 		byService:   map[string]*ir.Service{},
+		triggers:    map[string][]ir.Trigger{},
 		privateNm:   map[string]bool{},
 		uploadDir:   uploadDirFromEnv(),
 		entities:    map[string][]any{},
@@ -148,6 +151,11 @@ func newServer(graph *ir.IR) *Server {
 	}
 	for i := range graph.Services {
 		s.byService[graph.Services[i].Name] = &graph.Services[i]
+	}
+	// Index event triggers by their source action, so a successful action can fan
+	// out to its reactions in O(1). The compiler proved this graph acyclic.
+	for _, tr := range graph.Triggers {
+		s.triggers[tr.On] = append(s.triggers[tr.On], tr)
 	}
 	for i := range graph.Components {
 		s.byComponent[graph.Components[i].Name] = &graph.Components[i]
@@ -679,16 +687,74 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"deltas": deltas})
 }
 
-// runAction is the one authoritative execution of a server-placed action, shared
-// by every projection that can trigger one — the web event channel, the JSON
-// API, and scheduled jobs. It binds arguments, enforces required policies,
-// applies the statements to authoritative state under the lock, persists and
-// fans out entity changes, and returns the per-session scalar deltas (plus an
-// HTTP-shaped status so each caller can report failures in its own idiom).
+// maxTriggerDepth bounds reaction chains as a defense in depth: the compiler
+// already proves the trigger graph acyclic, so a well-formed app never approaches
+// this — it only stops a runaway if that proof is ever bypassed.
+const maxTriggerDepth = 64
+
+// runAction is the public entry point every projection calls to run a server
+// action — the web event channel, the JSON API, scheduled jobs, and webhooks. It
+// runs the action, then, on success, fires any event triggers the action's
+// completion registers (`on <action> -> <reaction>`). The trigger fan-out lives
+// outside the action lock (it re-enters runAction for each reaction), so the lock
+// is never held re-entrantly.
 func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]any, int, string) {
+	return s.runActionDepth(sid, act, args, 0)
+}
+
+func (s *Server) runActionDepth(sid string, act *ir.Action, args []any, depth int) (map[string]any, int, string) {
+	deltas, status, msg := s.runActionLocked(sid, act, args)
+	if status == http.StatusOK {
+		s.fireTriggers(act.Name, depth)
+	}
+	return deltas, status, msg
+}
+
+// fireTriggers runs the reactions registered for a just-completed action, each as
+// its own server action under system authority, synchronously. Reactions may chain
+// (a reaction's success fires its own triggers); the depth cap is a backstop to the
+// compiler's acyclicity proof.
+func (s *Server) fireTriggers(actName string, depth int) {
+	if depth >= maxTriggerDepth {
+		s.obs.log.Warn("trigger depth cap hit", slog.String("action", actName))
+		return
+	}
+	for _, tr := range s.triggers[actName] {
+		if react := s.byAction[tr.Action]; react != nil {
+			s.runActionDepth(systemSID, react, nil, depth+1)
+		}
+	}
+}
+
+// runActionLocked is the one authoritative execution of a server-placed action. It
+// binds arguments, enforces required policies, applies the statements to
+// authoritative state under the lock, persists and fans out entity changes, and
+// returns the per-session scalar deltas (plus an HTTP-shaped status so each caller
+// can report failures in its own idiom). Trigger fan-out is the caller's job.
+// ensureSession guarantees a session exists for sid before an action reads scope.
+// The system session (jobs, triggers, webhooks) is a verified admin so its actions
+// pass policies as a trusted internal caller; any other missing session starts as
+// a guest. Callers hold s.mu.
+func (s *Server) ensureSession(sid string) *sessionState {
+	if ses := s.sessions[sid]; ses != nil {
+		return ses
+	}
+	var ses *sessionState
+	if sid == systemSID {
+		ses = s.newSession("system", roleAdmin)
+		ses.verified = true
+	} else {
+		ses = s.newSession("guest", "guest")
+	}
+	s.sessions[sid] = ses
+	return ses
+}
+
+func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[string]any, int, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.ensureSession(sid) // so scope() and policies see the right actor (system → admin)
 	scope := s.scope(sid)
 	for i, p := range act.Params {
 		var v any
@@ -713,11 +779,7 @@ func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]a
 
 	deltas := map[string]any{}
 	entChanged := map[string]bool{}
-	ses := s.sessions[sid]
-	if ses == nil {
-		ses = s.newSession("guest", "guest")
-		s.sessions[sid] = ses
-	}
+	ses := s.sessions[sid] // ensureSession guaranteed it exists, with the right actor
 	sess := ses.state
 	var ops []durOp // durable writes, replayed in one transaction at the end
 	for _, st := range act.Body {

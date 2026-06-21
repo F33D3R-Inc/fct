@@ -1,0 +1,55 @@
+# Triggers — event reactions, the non-cron sibling of a `job`. A `job` is driven
+# by a clock; a `trigger` is driven by a domain event: `on <action> -> <reaction>`
+# runs the reaction whenever the source action completes successfully.
+#
+# The reaction runs synchronously after the source action commits, under the system
+# (admin) identity — so it passes policies a trusted internal caller would, and its
+# effects fan out to live clients in the same request. Reactions chain (post →
+# fanout → tally below), and the compiler proves the trigger graph is acyclic, so
+# reactions always terminate.
+#
+# Run it: `facet dev examples/trigger.fct`, post a message, and watch the notice
+# feed and the running tally update with no extra wiring.
+app Triggers:
+    auth
+
+    entity Post:
+        id: int
+        author: text
+        body: text
+    entity Notice:
+        id: int
+        msg: text
+    state posts: int = 0
+
+    # An ordinary user action. Posting is the domain event the reactions hang off.
+    action post(body: text):
+        requires member
+        check body != "" "say something"
+        add Post { author: actor, body: body }
+
+    # Reaction #1: fan a notice out to the feed. Zero-arg, server, system authority.
+    action fanout:
+        add Notice { msg: "new post in the timeline" }
+
+    # Reaction #2 (chained off fanout): keep a running count of posts.
+    action tally:
+        posts = count(Post)
+
+    policy member:
+        verified
+
+    # When a post lands, announce it; once announced, retally. The chain runs
+    # post → fanout → tally, all synchronously after `post` commits.
+    on post -> fanout
+    on fanout -> tally
+
+    view Home at "/":
+        box:
+            text "Posts: {posts}"
+            for n in Notice by id desc limit 10:
+                row:
+                    text "{n.msg}"
+            for p in Post by id desc limit 20:
+                row:
+                    text "{p.author}: {p.body}"

@@ -121,6 +121,41 @@ In a cluster, the durable queue guarantees the job fires **once across all
 instances**, with retries/backoff/dead-letter on failure. See
 [Operations → Durable jobs](Operations.md#durable-jobs).
 
+## Triggers
+
+A `job` is driven by a clock; a **trigger** is driven by a domain event. `on
+<action> -> <reaction>` runs a reaction whenever the source action completes
+successfully — the non-cron sibling of a job.
+
+```
+action post(body: text):
+    add Post { author: actor, body: body }
+action fanout:
+    add Notice { msg: "new post" }
+
+on post -> fanout      # when `post` succeeds, run `fanout`
+```
+
+- The reaction runs **synchronously after the source action commits**, so its
+  effects fan out in the same request. It runs under the `system` actor (admin
+  authority), like a job — so it passes policies a trusted internal caller would.
+- A reaction is a **zero-argument server action** (same rule as a job target). It
+  reads state and entities to do its work.
+- Triggers **chain**: a reaction's own success fires its triggers, so `on a -> b`
+  and `on b -> c` runs `a → b → c`. The compiler proves the trigger graph is
+  **acyclic** — a cycle (`on a -> b`, `on b -> a`) is a compile error, so reactions
+  always terminate.
+- Only a **successful** action fires its triggers; a denied or failed action fires
+  nothing.
+
+### Grammar
+
+```
+on <action> -> <reaction>
+```
+
+A runnable demo is in `examples/trigger.fct`.
+
 ## Expressions and builtins
 
 Expressions appear in derives, policies, checks, `where`/`if` conditions,

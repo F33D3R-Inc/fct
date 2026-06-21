@@ -176,6 +176,11 @@ func parseDecl(app *ast.App, c *source.Node) error {
 		if wh, err = parseWebhook(c.Line.Text, c.Line.No); err == nil {
 			app.Webhooks = append(app.Webhooks, wh)
 		}
+	case strings.HasPrefix(c.Line.Text, "on "):
+		var tr *ast.Trigger
+		if tr, err = parseTrigger(c.Line.Text, c.Line.No); err == nil {
+			app.Triggers = append(app.Triggers, tr)
+		}
 	case strings.HasPrefix(c.Line.Text, "view "):
 		var v *ast.View
 		if v, err = parseView(c); err == nil {
@@ -879,6 +884,30 @@ func parseWebhook(line string, no int) (*ast.Webhook, error) {
 		return nil, &Error{no, fmt.Sprintf("webhook target %q must be an action name", target)}
 	}
 	return &ast.Webhook{Path: path, Action: target, Secret: secret, Line: no}, nil
+}
+
+// parseTrigger parses a one-line event reaction:
+//
+//	on post -> notifyFollowers
+//
+// "when the `post` action completes, run `notifyFollowers`". Both sides are action
+// names; the reaction is the non-cron sibling of a `job`, fired by a domain event
+// instead of a clock.
+func parseTrigger(line string, no int) (*ast.Trigger, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "on"))
+	arrow := strings.Index(rest, "->")
+	if arrow < 0 {
+		return nil, &Error{no, "trigger needs a reaction: `on <action> -> <reaction>`"}
+	}
+	on := strings.TrimSpace(rest[:arrow])
+	react := strings.TrimSpace(rest[arrow+2:])
+	if !isIdent(on) {
+		return nil, &Error{no, fmt.Sprintf("trigger source %q must be an action name", on)}
+	}
+	if !isIdent(react) {
+		return nil, &Error{no, fmt.Sprintf("trigger reaction %q must be an action name", react)}
+	}
+	return &ast.Trigger{On: on, Action: react, Line: no}, nil
 }
 
 // parseCall parses `Service.op(arg, ...)` — a service call statement in an action.

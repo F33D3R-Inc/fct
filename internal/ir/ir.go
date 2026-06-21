@@ -24,6 +24,7 @@ type IR struct {
 	Components []Component       `json:"components,omitempty"` // reusable view fragments
 	Services   []Service         `json:"services,omitempty"`   // external services (brains) actions may call
 	Webhooks   []Webhook         `json:"webhooks,omitempty"`   // inbound endpoints external systems POST to
+	Triggers   []Trigger         `json:"triggers,omitempty"`   // event reactions: an action's success runs another action
 	Theme      map[string]string `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
 	Routes     []Route           `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
 	Pages      []Page            `json:"pages"`                // one per view; each is a route
@@ -198,6 +199,15 @@ type Webhook struct {
 	Path   string `json:"path"`
 	Action string `json:"action"`
 	Secret string `json:"secret,omitempty"`
+}
+
+// Trigger is a resolved event reaction: when the action named On completes
+// successfully, the runtime runs Action (a zero-arg server action, system
+// authority). The non-cron sibling of a Job; the compiler proves the trigger graph
+// is acyclic so reactions always terminate.
+type Trigger struct {
+	On     string `json:"on"`
+	Action string `json:"action"`
 }
 
 // Stmt is one action statement. Op ∈ assign | add | set | remove | clear | call.

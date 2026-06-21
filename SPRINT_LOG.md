@@ -10,6 +10,56 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 16 — 2026-06-20 — F33D3R depth #3 closed: event triggers → released v1.22.0
+
+**Finished the non-cron half of depth #3.** v1.21.0 shipped inbound webhooks (the
+mesh calls *in*); this adds **programmatic event triggers** — the non-cron sibling of
+a `job`. A job is driven by a clock; a trigger is driven by a domain event:
+
+```
+action post(body: text):
+    add Post { author: actor, body: body }
+action fanout:
+    add Notice { msg: "new post" }
+
+on post -> fanout      # when `post` succeeds, run `fanout`
+```
+
+**Semantics.** A reaction runs **synchronously after the source action commits**,
+under the `system` actor (admin authority) like a job — so it passes policies a
+trusted internal caller would, and its entity changes fan out to live clients in the
+same request. A reaction is a **zero-arg server action** (same rule as a job target).
+Triggers **chain** (`on a -> b`, `on b -> c` runs a→b→c). Only a *successful* action
+fires its triggers.
+
+**Soundness (compiler-first).** The trigger graph (source action → reaction) must be
+**acyclic** — `triggerCycle` does a DFS and rejects a cycle at compile time, naming
+the loop (`a -> b -> a`). So reactions always terminate; a runtime depth cap (64) is
+a defensive backstop, never hit by a well-formed app.
+
+- Why sync, not the durable job queue: that queue needs Postgres and is skipped in
+  single-process `facet dev`, so enqueued reactions would silently never fire.
+  Synchronous firing works in every mode and is deterministic.
+- Surface: ast (`Trigger{On,Action}` + `File.Triggers`), parser (`parseTrigger`:
+  `on <action> -> <reaction>`), ir (`ir.Trigger` + `IR.Triggers`), build (4e:
+  source/reaction exist + reaction server-placed + zero-arg + no-duplicate +
+  `triggerCycle` acyclicity), runtime: **refactored `runAction` → public wrapper
+  (`runActionDepth` + `fireTriggers`) over the lock-held core `runActionLocked`**, so
+  a reaction re-enters runAction without holding the action lock twice; new
+  `ensureSession` gives system reactions admin authority before `scope()` reads the
+  actor; triggers indexed by source action in `newServer`.
+- Tests: `internal/compile/trigger_test.go` (lowers; unknown-source/unknown-reaction/
+  args/direct-cycle/indirect-cycle errors); `runtime/trigger_test.go` (chain
+  post→fanout→tally fires; reaction passes an admin-gated policy under system identity).
+- Verified e2e: `examples/trigger.fct` compiles (post→fanout→tally), plus a live HTTP
+  run where a **signed webhook's action fires a trigger** — one POST wrote one Hit
+  (webhook action) and one Echo (reaction). Inline trailing comments aren't supported
+  language-wide (only full-line `#`); left as-is (mid-line `#` stripping would break
+  string/theme `#hex` contents). Docs: wiki/Actions-and-Logic.md ("Triggers").
+  version -> **1.22.0**.
+
+---
+
 ## Sprint 15 — 2026-06-20 — F33D3R depth #3: inbound webhooks → released v1.21.0
 
 **Shipped the inbound twin of `service`.** A `service` lets an action call *out* to
@@ -117,8 +167,8 @@ guarantees the key is uncompilable to render and never crosses to the client.
 **Note (gap surfaced):** a `check` runs before the body, so it can't validate a
 `let`-bound brain result. → **Fixed in v1.20.0 (Sprint 14).**
 
-**Next F33D3R depth:** (3) webhooks + non-cron triggers → **inbound webhooks done in
-v1.21.0 (Sprint 15)**; non-cron/event triggers still open · (4) media handoff
+**Next F33D3R depth:** (3) webhooks + non-cron triggers → **DONE**: inbound webhooks
+v1.21.0 (Sprint 15) + event triggers v1.22.0 (Sprint 16) · (4) media handoff
 (signed/expiring URLs + HLS + chunked upload) · (5) design-system control + page
 metadata + field-level authz + overlays/typeahead · (phase) `@e2e` crypto. Typed
 **records** for structured brain payloads remains the fast-follow to #1.

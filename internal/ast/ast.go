@@ -54,8 +54,20 @@ type App struct {
 	Views      []*View
 	Services   []*Service
 	Webhooks   []*Webhook
+	Triggers   []*Trigger
 	Theme      []ThemeVar
 	Line       int
+}
+
+// Trigger is a programmatic event reaction: when the action named On completes
+// successfully, the runtime runs Action. `on post -> notifyFollowers`. It is the
+// non-cron sibling of a `job` — a domain event (an action finishing), not a clock,
+// fires the work. Reactions are zero-argument server actions run with system
+// authority, synchronously after the triggering action commits.
+type Trigger struct {
+	On     string // the action whose success fires the reaction
+	Action string // the reaction to run
+	Line   int
 }
 
 // Webhook is a typed inbound endpoint: an external system POSTs to Path, the
