@@ -1515,6 +1515,40 @@ func (s *Server) renderMatch(b *strings.Builder, n ir.Node, scope map[string]any
 	}
 }
 
+// renderOverlay writes a modal layer: a backdrop (tagged with the bound cell so a
+// click closes it) wrapping a centered panel of the overlay's children.
+func (s *Server) renderOverlay(b *strings.Builder, n ir.Node, scope map[string]any) {
+	fmt.Fprintf(b, `<div class="fa-overlay-backdrop" data-fa-close="%s"><div class="fa-overlay-panel">`,
+		html.EscapeString(n.Bind))
+	for _, c := range n.Children {
+		s.renderNode(b, c, scope)
+	}
+	b.WriteString(`</div></div>`)
+}
+
+// distinctFieldValues collects the unique, non-empty string values of one field
+// across an entity's rows — the suggestion set a typeahead offers.
+func distinctFieldValues(rows any, field string) []string {
+	list, ok := rows.([]any)
+	if !ok {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range list {
+		rec, ok := r.(record)
+		if !ok {
+			continue
+		}
+		if v := toStr(rec[field]); v != "" && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any) {
 	switch n.Kind {
 	case "box":
@@ -1614,6 +1648,25 @@ func (s *Server) renderNode(b *strings.Builder, n ir.Node, scope map[string]any)
 		val := html.EscapeString(toStr(scope[n.Bind]))
 		fmt.Fprintf(b, `<input data-fa-input="%s" value="%s" placeholder="%s">`,
 			n.Bind, val, html.EscapeString(n.Placeholder))
+	case "overlay":
+		if n.ID != "" {
+			fmt.Fprintf(b, `<div data-fa-region="%s">`, n.ID)
+		} else {
+			b.WriteString(`<div>`)
+		}
+		if truthy(scope[n.Bind]) {
+			s.renderOverlay(b, n, scope)
+		}
+		b.WriteString(`</div>`)
+	case "typeahead":
+		listID := "ta-" + n.ID
+		fmt.Fprintf(b, `<input class="fa-typeahead" data-fa-input="%s" list="%s" value="%s" placeholder="%s">`,
+			n.Bind, listID, html.EscapeString(toStr(scope[n.Bind])), html.EscapeString(n.Placeholder))
+		fmt.Fprintf(b, `<datalist id="%s">`, listID)
+		for _, v := range distinctFieldValues(scope[n.Coll], n.Value) {
+			fmt.Fprintf(b, `<option value="%s">`, html.EscapeString(v))
+		}
+		b.WriteString(`</datalist>`)
 	case "link":
 		fmt.Fprintf(b, `<a class="fa-link" href="%s">%s</a>`,
 			html.EscapeString(n.Path), html.EscapeString(n.Label))
@@ -1974,6 +2027,13 @@ const page = `<!doctype html>
   .fa-tab[aria-selected=true] { color: var(--fa-fg); border-bottom-color: var(--fa-accent); }
   .fa-form { display: flex; flex-direction: column; gap: .5rem; align-items: stretch; }
   .fa-use { display: contents; }
+  /* overlay: a dimmed backdrop centering a card panel. */
+  .fa-overlay-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45);
+    display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 50; }
+  .fa-overlay-panel { background: var(--fa-bg); color: var(--fa-fg); border-radius: calc(var(--fa-radius) + 4px);
+    border: 1px solid var(--fa-card-border); padding: 1.1rem 1.25rem; max-width: 32rem; width: 100%%;
+    max-height: 85vh; overflow: auto; box-shadow: 0 12px 40px rgba(0,0,0,.3); }
+  .fa-typeahead { width: 100%%; }
   button { font: inherit; padding: .4rem .8rem; border: 1px solid var(--fa-border); border-radius: var(--fa-radius);
            background: var(--fa-bg); color: var(--fa-fg); cursor: pointer; align-self: flex-start; }
   button[type=submit] { background: var(--fa-accent); color: #fff; border-color: var(--fa-accent); }

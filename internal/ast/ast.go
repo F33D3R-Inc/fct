@@ -508,6 +508,24 @@ type Input struct {
 	Placeholder string
 }
 
+// Overlay is a modal layer shown while its bound boolean client cell is truthy:
+// `overlay bind menuOpen:`. A backdrop dims the page; clicking it (or Escape) sets
+// the cell false. Open it by setting the cell true from a client action.
+type Overlay struct {
+	Bind string
+	Body []Node
+}
+
+// Typeahead is a text input that suggests existing values of an entity field as
+// the actor types: `typeahead bind q from Tag.name`. It binds the chosen text to a
+// client cell and offers a native completion list drawn from the collection.
+type Typeahead struct {
+	Bind        string
+	Entity      string
+	Field       string
+	Placeholder string
+}
+
 // Link is navigation to another page: `link "label" -> "/path"`. It renders an
 // anchor; following it loads that page (server-rendered).
 type Link struct {
@@ -564,27 +582,29 @@ type Slot struct{}
 // Unlike a layout's single anonymous Slot, a frame has one SlotRef per socket.
 type SlotRef struct{ Name string }
 
-func (Box) node()      {}
-func (Row) node()      {}
-func (Text) node()     {}
-func (Image) node()    {}
-func (Icon) node()     {}
-func (Video) node()    {}
-func (Richtext) node() {}
-func (Badge) node()    {}
-func (Tabs) node()     {}
-func (Match) node()    {}
-func (Button) node()   {}
-func (For) node()      {}
-func (If) node()       {}
-func (Input) node()    {}
-func (Link) node()     {}
-func (Select) node()   {}
-func (Form) node()     {}
-func (Upload) node()   {}
-func (Use) node()      {}
-func (Slot) node()     {}
-func (SlotRef) node()  {}
+func (Box) node()       {}
+func (Row) node()       {}
+func (Text) node()      {}
+func (Image) node()     {}
+func (Icon) node()      {}
+func (Video) node()     {}
+func (Richtext) node()  {}
+func (Badge) node()     {}
+func (Tabs) node()      {}
+func (Match) node()     {}
+func (Button) node()    {}
+func (For) node()       {}
+func (If) node()        {}
+func (Input) node()     {}
+func (Overlay) node()   {}
+func (Typeahead) node() {}
+func (Link) node()      {}
+func (Select) node()    {}
+func (Form) node()      {}
+func (Upload) node()    {}
+func (Use) node()       {}
+func (Slot) node()      {}
+func (SlotRef) node()   {}
 
 // ── expressions ─────────────────────────────────────────────────────────────
 

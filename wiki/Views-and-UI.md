@@ -29,6 +29,8 @@ view Name [at "/path"] [in Layout] [requires policy]:
 | **select** | `select bind cell:` then `option "Label" -> "value"` lines |
 | **form** | `form "Submit" -> action(args):` then children |
 | **upload** | `upload bind urlCell [label "…"]` |
+| **overlay** | `overlay bind boolCell:` then children — a modal layer shown while the cell is true |
+| **typeahead** | `typeahead bind textCell from Entity.field [placeholder "…"]` — input with a native suggestion list |
 | **link** | `link "label" -> "/path"` |
 | **if** | `if <cond>:` then children |
 | **for** | `for x in Coll [where c] [by f desc\|asc] [limit n]:` then children |
@@ -88,6 +90,35 @@ the `upload` node POSTs a small file once but sends a big one in pieces that the
 server reassembles, so a transfer larger than one request limit still completes.
 See [Operations → Media handoff](Operations.md#media-handoff) for signed URLs,
 size limits, and HLS, and [Configuration](Configuration.md).
+
+### overlay & typeahead
+
+`overlay` is a modal layer shown while a bound `@client` **bool** cell is true. A
+dimmed backdrop centers a panel of the children; clicking the backdrop (or pressing
+nothing — just the backdrop) sets the cell false. Open it from a client action that
+sets the cell true:
+
+```
+state composing: bool = false @client
+action openComposer():
+    composing = true
+
+overlay bind composing:
+    box:
+        text "New note"
+        button "Save" -> save(draft)
+```
+
+`typeahead` is a text input wired to a native completion list of an entity field's
+existing values — suggestions as the actor types. The chosen text binds to a
+`@client` text cell like any input:
+
+```
+typeahead bind tagQuery from Tag.name placeholder "tag"
+```
+
+Suggestions reflect the collection at render time. A runnable demo combining both
+is in `examples/overlay.fct`.
 
 ### if & for
 

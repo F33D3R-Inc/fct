@@ -252,7 +252,7 @@ type Binding struct {
 
 // Node is one view node in the neutral tree.
 type Node struct {
-	Kind     string `json:"kind"` // box|row|text|image|icon|video|richtext|badge|button|list|if|match|case|else|input|link|select|form|upload|use|slot|tabs|tab
+	Kind     string `json:"kind"` // box|row|text|image|icon|video|richtext|badge|button|list|if|match|case|else|input|link|select|form|upload|use|slot|tabs|tab|overlay|typeahead
 	Children []Node `json:"children,omitempty"`
 
 	Segs []Seg `json:"segs,omitempty"` // text

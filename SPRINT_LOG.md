@@ -10,6 +10,40 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 20 — 2026-06-20 — F33D3R depth #5c: overlays + typeahead → released v1.26.0 (#5 COMPLETE)
+
+**Closed depth #5.** Two interactive view nodes finish the presentation cluster
+(metadata + dark mode in #5a, field authz in #5b).
+
+- **`overlay bind <boolCell>:`** — a modal layer shown while a `@client` bool is
+  true. A dimmed backdrop centers a panel of the children; a backdrop click sets the
+  cell false. Opened by a client action setting the cell true. Reuses the reactive
+  region machinery (lowered like `if`, keyed on the bool cell) — no new control flow.
+- **`typeahead bind <textCell> from <Entity>.<field>`** — a text input wired to a
+  **native `<datalist>`** of the field's existing values, so suggestions need almost
+  no JS. Binds the chosen text like any input; suggestions reflect the collection at
+  render time.
+
+- Surface: ast (Overlay{Bind,Body}, Typeahead{Bind,Entity,Field,Placeholder} +
+  node() markers), parser (parseOverlay, parseTypeahead), ir (Kind overlay/typeahead),
+  build (overlay → region like if, bool/@client checks; typeahead → input id, text/
+  @client + entity/field existence checks), runtime (renderOverlay backdrop+panel,
+  typeahead input+datalist via distinctFieldValues; facet.js render cases, fillOverlay,
+  typeaheadValues, regionById/inputById indexing, refresh dispatch, backdrop-close click
+  handler; overlay/panel CSS).
+- Tests: `internal/compile/overlay_test.go` (both lower; overlay-non-bool, typeahead
+  unknown-entity/unknown-field/non-text errors); `runtime/overlay_test.go` (closed
+  overlay renders no backdrop; open overlay renders backdrop+contents; typeahead
+  input+datalist carries the seeded value).
+- Verified live SSR: typeahead datalist lists a seeded tag; overlay region empty when
+  closed. Example `examples/overlay.fct`. Docs: wiki/Views-and-UI.md (nodes table +
+  overlay & typeahead section). version -> **1.26.0**.
+
+**F33D3R depth #3, #4, #5 all complete.** Remaining roadmap: `@e2e` crypto (phase),
+typed **records** for structured brain payloads (fast-follow to #1).
+
+---
+
 ## Sprint 19 — 2026-06-20 — F33D3R depth #5b: field-level authz → released v1.25.0
 
 **Continued depth #5.** An entity field marked `@requires(policy)` is gated on the
@@ -272,9 +306,9 @@ guarantees the key is uncompilable to render and never crosses to the client.
 **Next F33D3R depth:** (3) webhooks + non-cron triggers → **DONE**: inbound webhooks
 v1.21.0 (Sprint 15) + event triggers v1.22.0 (Sprint 16) · (4) media handoff
 (signed/expiring URLs + HLS + chunked upload) → **DONE** v1.23.0 (Sprint 17) · (5)
-design-system control + page metadata + field-level authz + overlays/typeahead ·
-(phase) `@e2e` crypto. Typed **records** for structured brain payloads remains the
-fast-follow to #1.
+design-system control + page metadata + field-level authz + overlays/typeahead →
+**DONE** v1.24.0–v1.26.0 (Sprints 18–20) · (phase) `@e2e` crypto. Typed **records**
+for structured brain payloads remains the fast-follow to #1.
 
 ---
 

@@ -1434,6 +1434,18 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, ast.If{Cond: cond, Body: kids})
+		case strings.HasPrefix(t, "overlay "):
+			ov, err := parseOverlay(c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ov)
+		case strings.HasPrefix(t, "typeahead "):
+			ta, err := parseTypeahead(strings.TrimSpace(t[len("typeahead "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ta)
 		case strings.HasPrefix(t, "input "):
 			in, err := parseInput(strings.TrimSpace(t[len("input "):]), c.Line.No)
 			if err != nil {
@@ -1673,6 +1685,57 @@ func parseInput(s string, line int) (ast.Node, error) {
 	}
 	in.Bind = rest
 	return in, nil
+}
+
+// parseOverlay: `overlay bind <cell>:` with a child node tree shown while the cell
+// is truthy.
+func parseOverlay(n *source.Node) (ast.Node, error) {
+	head := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("overlay"):]), ":"))
+	if !strings.HasPrefix(head, "bind ") {
+		return nil, &Error{n.Line.No, "overlay needs a bound cell: overlay bind <cell>:"}
+	}
+	bind := strings.TrimSpace(head[len("bind "):])
+	if !isIdent(bind) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid overlay binding %q", bind)}
+	}
+	kids, err := parseNodes(n.Children)
+	if err != nil {
+		return nil, err
+	}
+	return ast.Overlay{Bind: bind, Body: kids}, nil
+}
+
+// parseTypeahead: `typeahead bind <cell> from <Entity>.<field> [placeholder "…"]`.
+func parseTypeahead(s string, line int) (ast.Node, error) {
+	ph := ""
+	if i := strings.Index(s, "placeholder "); i >= 0 {
+		p, err := unquote(strings.TrimSpace(s[i+len("placeholder "):]), line)
+		if err != nil {
+			return nil, err
+		}
+		ph = p
+		s = strings.TrimSpace(s[:i])
+	}
+	if !strings.HasPrefix(s, "bind ") {
+		return nil, &Error{line, "typeahead needs: typeahead bind <cell> from <Entity>.<field>"}
+	}
+	rest := strings.TrimSpace(s[len("bind "):])
+	fi := strings.Index(rest, " from ")
+	if fi < 0 {
+		return nil, &Error{line, "typeahead needs a source: typeahead bind <cell> from <Entity>.<field>"}
+	}
+	bind := strings.TrimSpace(rest[:fi])
+	src := strings.TrimSpace(rest[fi+len(" from "):])
+	dot := strings.IndexByte(src, '.')
+	if dot < 0 {
+		return nil, &Error{line, "typeahead source must be <Entity>.<field>"}
+	}
+	ent := strings.TrimSpace(src[:dot])
+	field := strings.TrimSpace(src[dot+1:])
+	if !isIdent(bind) || !isIdent(ent) || !isIdent(field) {
+		return nil, &Error{line, "typeahead needs identifiers: bind <cell> from <Entity>.<field>"}
+	}
+	return ast.Typeahead{Bind: bind, Entity: ent, Field: field, Placeholder: ph}, nil
 }
 
 // parseSelect: `select bind state:` with `option "Label" -> "value"` children,

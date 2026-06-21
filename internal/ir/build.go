@@ -1391,6 +1391,52 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			c.addDep(t.Bind, id)
 			out = append(out, Node{Kind: "input", Bind: t.Bind, Placeholder: t.Placeholder, ID: id})
 
+		case ast.Overlay:
+			p, ok := c.e.states[t.Bind]
+			if !ok {
+				return nil, &BuildError{0, fmt.Sprintf("overlay binds unknown state %q", t.Bind)}
+			}
+			if p != Client {
+				return nil, &BuildError{0, fmt.Sprintf("overlay binds %q, which is authoritative; a modal toggles client-side, so it needs a @client state", t.Bind)}
+			}
+			if c.e.stateTypes[t.Bind] != "bool" {
+				return nil, &BuildError{0, fmt.Sprintf("overlay binds %q, which is not a bool; an overlay is shown while a bool cell is true", t.Bind)}
+			}
+			node := Node{Kind: "overlay", Bind: t.Bind}
+			if !sc.inRegion {
+				node.ID = fmt.Sprintf("f%d", c.nf)
+				c.nf++
+				c.addDep(t.Bind, node.ID)
+			}
+			kids, err := c.nodes(t.Body, scope{locals: sc.locals, inRegion: true})
+			if err != nil {
+				return nil, err
+			}
+			node.Children = kids
+			out = append(out, node)
+
+		case ast.Typeahead:
+			p, ok := c.e.states[t.Bind]
+			if !ok {
+				return nil, &BuildError{0, fmt.Sprintf("typeahead binds unknown state %q", t.Bind)}
+			}
+			if p != Client {
+				return nil, &BuildError{0, fmt.Sprintf("typeahead binds %q, which is authoritative; it needs a @client text state", t.Bind)}
+			}
+			if c.e.stateTypes[t.Bind] != "text" {
+				return nil, &BuildError{0, fmt.Sprintf("typeahead binds %q, which is not text", t.Bind)}
+			}
+			if !c.e.entities[t.Entity] {
+				return nil, &BuildError{0, fmt.Sprintf("typeahead reads unknown entity %q", t.Entity)}
+			}
+			if !c.e.entityFields[t.Entity][t.Field] {
+				return nil, &BuildError{0, fmt.Sprintf("entity %q has no field %q for typeahead", t.Entity, t.Field)}
+			}
+			id := fmt.Sprintf("b%d", c.nb)
+			c.nb++
+			c.addDep(t.Bind, id)
+			out = append(out, Node{Kind: "typeahead", Bind: t.Bind, Coll: t.Entity, Value: t.Field, Placeholder: t.Placeholder, ID: id})
+
 		case ast.Link:
 			if t.Path == "" || !strings.HasPrefix(t.Path, "/") {
 				return nil, &BuildError{0, fmt.Sprintf("link path %q must start with `/`", t.Path)}

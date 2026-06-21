@@ -35,8 +35,8 @@
     inputById = {};
     (function collect(nodes) {
       for (const n of nodes) {
-        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs" || n.kind === "match") && n.id) regionById[n.id] = n;
-        if ((n.kind === "input" || n.kind === "select" || n.kind === "upload") && n.id) inputById[n.id] = n;
+        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs" || n.kind === "match" || n.kind === "overlay") && n.id) regionById[n.id] = n;
+        if ((n.kind === "input" || n.kind === "select" || n.kind === "upload" || n.kind === "typeahead") && n.id) inputById[n.id] = n;
         if (n.children) collect(n.children);
       }
     })(ir.view);
@@ -329,6 +329,25 @@
         }
         return s;
       }
+      case "overlay": {
+        const d = el("div");
+        if (node.id) d.setAttribute("data-fa-region", node.id);
+        fillOverlay(d, node, sc);
+        return d;
+      }
+      case "typeahead": {
+        const frag = document.createDocumentFragment();
+        const i = el("input", "fa-typeahead");
+        i.setAttribute("data-fa-input", node.bind);
+        if (node.placeholder) i.placeholder = node.placeholder;
+        i.value = toStr(sc[node.bind]);
+        const listId = "ta-" + node.id;
+        i.setAttribute("list", listId);
+        const dl = el("datalist"); dl.id = listId;
+        for (const v of typeaheadValues(node, sc)) { const o = el("option"); o.value = v; dl.appendChild(o); }
+        frag.appendChild(i); frag.appendChild(dl);
+        return frag;
+      }
       case "form": {
         const f = el("form", "fa-form");
         f.setAttribute("data-fa-form", node.action);
@@ -370,6 +389,27 @@
     if (truthy(ev(node.cond, sc))) {
       for (const c of node.children || []) container.appendChild(render(c, sc));
     }
+  }
+  // An overlay shows a modal layer while its bound cell is truthy: a backdrop (a
+  // click on which closes it) wrapping a centered panel of the children.
+  function fillOverlay(container, node, sc) {
+    container.textContent = "";
+    if (!truthy(sc[node.bind])) return;
+    const backdrop = el("div", "fa-overlay-backdrop");
+    backdrop.setAttribute("data-fa-close", node.bind);
+    const panel = el("div", "fa-overlay-panel");
+    for (const c of node.children || []) panel.appendChild(render(c, sc));
+    backdrop.appendChild(panel);
+    container.appendChild(backdrop);
+  }
+  // typeaheadValues are the unique, non-empty values of the source field across the
+  // bound collection — the native completion list the input offers.
+  function typeaheadValues(node, sc) {
+    const rows = sc[node.coll] || store[node.coll] || [];
+    const seen = new Set(); const out = [];
+    for (const r of rows) { const v = toStr(r[node.value]); if (v && !seen.has(v)) { seen.add(v); out.push(v); } }
+    out.sort();
+    return out;
   }
   function fillMatch(container, node, sc) {
     container.textContent = "";
@@ -484,7 +524,7 @@
       } else if (regionById[id]) {
         const node = regionById[id];
         const c = root.querySelector('[data-fa-region="' + id + '"]');
-        if (c) (node.kind === "list" ? fillList : node.kind === "use" ? fillUse : node.kind === "tabs" ? fillTabs : node.kind === "match" ? fillMatch : fillIf)(c, node, store);
+        if (c) (node.kind === "list" ? fillList : node.kind === "use" ? fillUse : node.kind === "tabs" ? fillTabs : node.kind === "match" ? fillMatch : node.kind === "overlay" ? fillOverlay : fillIf)(c, node, store);
       } else if (inputById[id]) {
         const node = inputById[id];
         const e = root.querySelector('[data-fa-input="' + node.bind + '"]');
@@ -710,6 +750,15 @@
       e.preventDefault();
       const bind = tab.getAttribute("data-fa-tab-bind");
       store[bind] = tab.getAttribute("data-fa-tab");
+      refresh([bind]);
+      return;
+    }
+    // A click on the overlay backdrop itself (not its panel) closes the overlay.
+    const closer = e.target.closest("[data-fa-close]");
+    if (closer && e.target === closer) {
+      e.preventDefault();
+      const bind = closer.getAttribute("data-fa-close");
+      store[bind] = false;
       refresh([bind]);
       return;
     }
