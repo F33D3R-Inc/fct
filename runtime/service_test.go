@@ -114,8 +114,9 @@ func TestCoerceRet(t *testing.T) {
 		{float64(7), "int", true, []any{7}}, // a lone value where a list was declared
 		{nil, "int", true, []any{}},         // a null list
 	}
+	srv := &Server{} // scalar/list coercion consults no records, so a zero server suffices
 	for i, c := range cases {
-		if got := coerceRet(c.v, c.ret, c.list); !reflect.DeepEqual(got, c.want) {
+		if got := srv.coerceRet(c.v, c.ret, c.list); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("case %d: coerceRet(%v,%q,%v) = %#v, want %#v", i, c.v, c.ret, c.list, got, c.want)
 		}
 	}

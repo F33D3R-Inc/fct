@@ -10,6 +10,73 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 21 — 2026-06-21 — depth #6: typed records + webhook idempotency + @e2e sealed fields → released v1.27.0
+
+**The three real holes the audit found, closed in one pass.** Coded across every
+layer first, then tested (full suite green, `go vet` clean, `facet.js` syntax-checked,
+live SSR smoke-tested via a rebuilt binary).
+
+**1 · Typed records (`record`) — the fast-follow to request→response calls.** A
+brain returns structured JSON; before this, `let x = call Brain.op()` could bind
+only a scalar or a list of scalars, so `{score, reasons[], ok}` was inexpressible.
+- `record Verdict: score: int, reasons: [text], ok: bool` — a flat value-object
+  type (no storage/identity). Fields are a primitive, an enum, or a list of those;
+  **no nested records** (keeps `v.field` single-level and fully checkable).
+- A service op may return one: `moderate(body: text) -> Verdict` (or `-> [Verdict]`).
+- `let v = call Brain.moderate(body)` binds the record; `v.score`/`v.reasons` are
+  compile-checked against the record's fields (unknown field → error; field access
+  on a list-of-record bind → "iterate first" error).
+- Runtime decodes a record reply field-by-field against its schema (`coerceOne`):
+  each field coerced to its declared type, lists element-wise, undeclared keys
+  dropped, missing keys zero-filled.
+- Surface: ast (Record/RecordField + `App.Records`), parser (parseRecord, inline &
+  indented forms), ir (Record/RecordField + `IR.Records`; return-type validation;
+  `env.records`/`locRecords` + `recBind`; Get-access check), runtime (`byRecord`,
+  `s.coerceRet`/`coerceOne`/`coerceRetScalarList`).
+
+**2 · Webhook idempotency — the commerce-correctness fix.** A retried `confirmPaid`
+used to re-run and double-charge/double-grant.
+- A delivery is keyed by its `Idempotency-Key` header, else by its HMAC signature
+  (a stable per-payload hash, so byte-identical retries collapse with no header).
+- First delivery runs the action; every retry **replays the recorded outcome**
+  (status + body, with `X-Facet-Idempotent-Replay: 1`) and never touches the store.
+  A concurrent in-flight retry gets `409`. A malformed/forbidden delivery is not
+  remembered, so a corrected retry still runs. 24h TTL (`FACET_WEBHOOK_IDEM_TTL`),
+  swept lazily.
+- Surface: runtime (`idemRecord`, `Server.idem`/`idemMu`, `idemBegin`/`idemFinish`/
+  `idemDrop`, rewired `webhookHandler`).
+
+**3 · `@e2e` sealed fields — the end-to-end pillar (fct owns the dataflow, the
+cipher is pluggable).** Distinct from `@secret` (server-side at-rest crypto where
+the authority holds plaintext): an `@e2e` value is sealed on the client before it
+is ever sent, the authority only ever holds/serves ciphertext, and a reader opens
+it on the client.
+- `body: text @e2e` on an entity field (text-only; mutually exclusive with `@secret`).
+- **Dataflow guarantee (the language's job):** an `@e2e` field can be written only
+  straight from an action parameter (the value the client seals); that param may be
+  used **nowhere else** in the action (a check/policy/other write runs on the
+  server, which never holds its plaintext) — both are compile errors. The compiler
+  publishes `Action.Seal` (param names) so the client encrypts exactly those args
+  before POSTing. Rendering: a sealed read must stand alone in a text/badge node
+  (not an attribute, button label, richtext, or page metadata, and not concatenated)
+  → `Seg.E2E`. The server renders a 🔒 placeholder with the ciphertext in
+  `data-fa-e2e`; `facet.js` opens it after hydration.
+- **Cipher (delegated):** `window.facetE2E` is a pluggable provider (the Vovin seam);
+  the built-in default is real Web-Crypto AES-GCM under a per-app localStorage key —
+  enough to demonstrate seal→store-ciphertext→open with zero server involvement.
+- Surface: ast (`EntityField.E2E`), parser (order-independent `@secret`/`@e2e`
+  stripping; text-only + conflict checks), ir (`Field.E2E`, `Seg.E2E`, `Action.Seal`;
+  `env.entE2E`; `e2eWrite` dataflow; `e2eFieldRead`/`containsE2E` + `openable`
+  lowering), runtime (renderSegs placeholder + `e2ePlaceholder`), facet.js
+  (`defaultE2E` provider, `openE2E`, appendSegs/refresh sealed-span handling,
+  dispatch arg-sealing).
+
+- Tests: `internal/compile/record_test.go`, `internal/compile/e2e_test.go`,
+  `runtime/record_runtime_test.go`, `runtime/webhook_idem_test.go`,
+  `runtime/e2e_runtime_test.go`. version -> **1.27.0**.
+
+---
+
 ## Sprint 20 — 2026-06-20 — F33D3R depth #5c: overlays + typeahead → released v1.26.0 (#5 COMPLETE)
 
 **Closed depth #5.** Two interactive view nodes finish the presentation cluster

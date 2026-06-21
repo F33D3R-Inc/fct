@@ -121,6 +121,11 @@ func parseDecl(app *ast.App, c *source.Node) error {
 		if e, err = parseEntity(c); err == nil {
 			app.Entities = append(app.Entities, e)
 		}
+	case strings.HasPrefix(c.Line.Text, "record "):
+		var rc *ast.Record
+		if rc, err = parseRecord(c); err == nil {
+			app.Records = append(app.Records, rc)
+		}
 	case strings.HasPrefix(c.Line.Text, "enum "):
 		var en *ast.Enum
 		if en, err = parseEnum(c); err == nil {
@@ -192,7 +197,7 @@ func parseDecl(app *ast.App, c *source.Node) error {
 			app.Views = append(app.Views, v)
 		}
 	default:
-		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/enum/state/derive/policy/action/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/enum/state/derive/policy/action/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
 	}
 	return err
 }
@@ -417,12 +422,23 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		if !isIdent(fn) {
 			return nil, &Error{c.Line.No, fmt.Sprintf("invalid field name %q", fn)}
 		}
-		// A trailing `@secret` marks the field encrypted at rest.
-		secret := false
-		if strings.HasSuffix(ft, "@secret") {
-			secret = true
-			ft = strings.TrimSpace(strings.TrimSuffix(ft, "@secret"))
+		// Trailing crypto markers, in any order: `@secret` encrypts at rest (the
+		// authority holds plaintext), `@e2e` seals end-to-end (the client seals before
+		// sending; the authority only ever holds ciphertext and never renders it).
+		secret, e2e := false, false
+		for {
+			switch {
+			case strings.HasSuffix(ft, "@secret"):
+				secret = true
+				ft = strings.TrimSpace(strings.TrimSuffix(ft, "@secret"))
+			case strings.HasSuffix(ft, "@e2e"):
+				e2e = true
+				ft = strings.TrimSpace(strings.TrimSuffix(ft, "@e2e"))
+			default:
+				goto markersDone
+			}
 		}
+	markersDone:
 		// A trailing `@requires(policy)` gates the field on the data projections: the
 		// API serves it only to an actor the policy admits, and it never travels over
 		// SSE. `email: text @requires(admin)`.
@@ -449,7 +465,13 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		if !isTypeName(core) {
 			return nil, &Error{c.Line.No, fmt.Sprintf("unknown type %q (use int, text, bool, money, date, an enum, or an entity name)", core)}
 		}
-		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: core, Secret: secret, ReadPolicy: readPolicy, Optional: optional, Line: c.Line.No})
+		if e2e && secret {
+			return nil, &Error{c.Line.No, fmt.Sprintf("field %q cannot be both @secret and @e2e — @secret is server-side at-rest encryption (the authority holds plaintext), @e2e is end-to-end (the authority never sees plaintext); pick one", fn)}
+		}
+		if e2e && core != "text" {
+			return nil, &Error{c.Line.No, fmt.Sprintf("@e2e field %q must be text — a sealed value is opaque ciphertext, so it can't be a typed/queryable column", fn)}
+		}
+		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: core, Secret: secret, E2E: e2e, ReadPolicy: readPolicy, Optional: optional, Line: c.Line.No})
 	}
 	if len(e.Fields) == 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("entity %q has no fields", name)}
@@ -500,6 +522,61 @@ func parseEnum(n *source.Node) (*ast.Enum, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("enum %q has no values", name)}
 	}
 	return en, nil
+}
+
+// parseRecord: `record Verdict: score: int, reasons: [text], ok: bool` (fields on
+// the header) or each `name: type` on its own indented line. A field type may be a
+// list (`[T]`) or optional (`T?`) — unlike an entity column, a record field can be
+// a list, since a record is in-flight data, not a stored row.
+func parseRecord(n *source.Node) (*ast.Record, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "record")), ":")
+	name := head
+	var inline string
+	if colon := strings.IndexByte(head, ':'); colon >= 0 {
+		name = strings.TrimSpace(head[:colon])
+		inline = strings.TrimSpace(head[colon+1:])
+	}
+	if !isIdent(name) || !isUpper(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("record name %q must be capitalized", name)}
+	}
+	r := &ast.Record{Name: name, Line: n.Line.No}
+	add := func(spec string, line int) error {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			return nil
+		}
+		colon := strings.IndexByte(spec, ':')
+		if colon < 0 {
+			return &Error{line, fmt.Sprintf("record field %q must be `name: type`", spec)}
+		}
+		fn := strings.TrimSpace(spec[:colon])
+		ft := strings.TrimSpace(spec[colon+1:])
+		if !isIdent(fn) {
+			return &Error{line, fmt.Sprintf("invalid record field name %q", fn)}
+		}
+		core, list, optional := splitType(ft)
+		if !isTypeName(core) {
+			return &Error{line, fmt.Sprintf("unknown type %q in record field %q (use a primitive, an enum, or a list of those)", core, fn)}
+		}
+		r.Fields = append(r.Fields, ast.RecordField{Name: fn, Type: core, List: list, Optional: optional, Line: line})
+		return nil
+	}
+	if inline != "" {
+		for _, f := range strings.Split(inline, ",") {
+			if err := add(f, n.Line.No); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, c := range n.Children {
+		if err := add(c.Line.Text, c.Line.No); err != nil {
+			return nil, err
+		}
+	}
+	if len(r.Fields) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("record %q has no fields", name)}
+	}
+	return r, nil
 }
 
 // parseComponent: `component Name(params):` then a node tree.

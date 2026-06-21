@@ -38,11 +38,27 @@ type env struct {
 	serviceRets  map[string]map[string]opRet  // service name -> op name -> return type, for binding `let x = call …`
 	private      map[string]bool              // @private state names — server-only, non-renderable
 	entFieldEnum map[string]map[string]string // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
+	records      map[string]map[string]recField // record name -> field name -> its type, for `let`-bound field access
+	entE2E       map[string]map[string]bool   // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
+	locRecords   map[string]recBind           // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
 }
 
 // opRet is a service operation's declared return type ("" core = no return).
 type opRet struct {
 	ret  string
+	list bool
+}
+
+// recField is one record field's resolved type, for checking a `v.field` access.
+type recField struct {
+	typ  string
+	list bool
+}
+
+// recBind is what a record-typed local (`let v = call …`) is bound to: a record
+// name and whether the bind is a list of that record.
+type recBind struct {
+	rec  string
 	list bool
 }
 
@@ -72,7 +88,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, records: map[string]map[string]recField{}, entE2E: map[string]map[string]bool{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -93,6 +109,39 @@ func Build(app *ast.App) (*IR, error) {
 		out.Enums = append(out.Enums, Enum{Name: en.Name, Values: en.Values})
 	}
 
+	// 0b. Records: flat value-object types (the typed shape of a brain's reply).
+	// Collected after enums so a record field may be enum-typed. A record is pure
+	// data — it can't be named where an entity is expected, only as a service-op
+	// return type or the type of a `let`-bound result.
+	recSeen := map[string]int{}
+	for _, rc := range app.Records {
+		if prev, ok := recSeen[rc.Name]; ok {
+			return nil, &BuildError{rc.Line, fmt.Sprintf("record %q redeclared (first at line %d)", rc.Name, prev)}
+		}
+		if _, clash := e.enums[rc.Name]; clash {
+			return nil, &BuildError{rc.Line, fmt.Sprintf("record %q clashes with an enum of the same name", rc.Name)}
+		}
+		recSeen[rc.Name] = rc.Line
+		fields := map[string]recField{}
+		var irFields []RecordField
+		for _, f := range rc.Fields {
+			if _, dup := fields[f.Name]; dup {
+				return nil, &BuildError{f.Line, fmt.Sprintf("record %q has duplicate field %q", rc.Name, f.Name)}
+			}
+			// A record is flat: its field is a primitive or an enum, never another
+			// record or an entity — so `v.field` is always a single-level, typed read.
+			if !isPrimitive(f.Type) {
+				if _, isEnum := e.enums[f.Type]; !isEnum {
+					return nil, &BuildError{f.Line, fmt.Sprintf("record field %q has type %q — a record field must be a primitive, an enum, or a list of those (records are flat: no nested records or entities)", f.Name, f.Type)}
+				}
+			}
+			fields[f.Name] = recField{typ: f.Type, list: f.List}
+			irFields = append(irFields, RecordField{Name: f.Name, Type: f.Type, List: f.List, Optional: f.Optional})
+		}
+		e.records[rc.Name] = fields
+		out.Records = append(out.Records, Record{Name: rc.Name, Fields: irFields})
+	}
+
 	// 1. Entities.
 	entSeen := map[string]int{}
 	for _, ent := range app.Entities {
@@ -107,7 +156,13 @@ func Build(app *ast.App) (*IR, error) {
 			if f.Secret && f.Name == "id" {
 				return nil, &BuildError{f.Line, "the id field cannot be @secret"}
 			}
-			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, ReadPolicy: f.ReadPolicy, Optional: f.Optional}
+			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, E2E: f.E2E, ReadPolicy: f.ReadPolicy, Optional: f.Optional}
+			if f.E2E {
+				if e.entE2E[ent.Name] == nil {
+					e.entE2E[ent.Name] = map[string]bool{}
+				}
+				e.entE2E[ent.Name][f.Name] = true
+			}
 			// An enum-typed field is stored as text, tagged with its enum so the API and
 			// the client can validate/render the closed set.
 			if _, isEnum := e.enums[f.Type]; isEnum {
@@ -327,6 +382,16 @@ func Build(app *ast.App) (*IR, error) {
 		for _, op := range sv.Ops {
 			if _, dup := ops[op.Name]; dup {
 				return nil, &BuildError{op.Line, fmt.Sprintf("service %q declares operation %q twice", sv.Name, op.Name)}
+			}
+			// A declared return type must resolve: a primitive, an enum, or a record
+			// (the structured-reply case). A bare capitalized name the parser accepted
+			// is only valid here if it names a real record/enum.
+			if op.Ret != "" && !isPrimitive(op.Ret) {
+				_, isEnum := e.enums[op.Ret]
+				_, isRec := e.records[op.Ret]
+				if !isEnum && !isRec {
+					return nil, &BuildError{op.Line, fmt.Sprintf("%s.%s returns unknown type %q — declare a `record %s: …` for a structured reply, or use a primitive/enum", sv.Name, op.Name, op.Ret, op.Ret)}
+				}
 			}
 			ops[op.Name] = len(op.Params)
 			rets[op.Name] = opRet{ret: op.Ret, list: op.RetList}
@@ -551,11 +616,11 @@ func Build(app *ast.App) (*IR, error) {
 		// Page metadata is rendered once, server-side, so lower it as region (Expr)
 		// segments — evaluated against the route scope, never a reactive client bind.
 		metaScope := scope{locals: locals, inRegion: true}
-		title, err := pvc.lowerSegs(v.TitleSegs, metaScope)
+		title, err := pvc.lowerSegs(v.TitleSegs, metaScope, false)
 		if err != nil {
 			return nil, err
 		}
-		desc, err := pvc.lowerSegs(v.DescSegs, metaScope)
+		desc, err := pvc.lowerSegs(v.DescSegs, metaScope, false)
 		if err != nil {
 			return nil, err
 		}
@@ -743,10 +808,36 @@ func lowerASCII(s string) string {
 
 func (e *env) action(a *ast.Action) (Action, error) {
 	act := Action{Name: a.Name}
+	// Record-typed locals (a `let v = call …` whose op returns a record) live for the
+	// span of this action build, so a later `v.field` resolves against the record.
+	e.locRecords = map[string]recBind{}
+	defer func() { e.locRecords = nil }()
+	sealParams := map[string]bool{} // params whose value flows into an @e2e field (the client seals them before sending)
+	paramSet := map[string]bool{}   // this action's parameter names
 	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true}
 	for _, p := range a.Params {
 		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type})
 		loc[p.Name] = true
+		paramSet[p.Name] = true
+	}
+	// e2eWrite enforces the sealed-field dataflow at a `field: value` write: an @e2e
+	// field can only be written from a bare action parameter, because that is the
+	// value the client seals (encrypts) before the request is sent. Anything else
+	// would be an expression the authority computes and therefore sees in plaintext,
+	// breaking the end-to-end guarantee. It returns whether the field is @e2e.
+	e2eWrite := func(entity, field string, val ast.Expr, line int) (bool, error) {
+		if !e.entE2E[entity][field] {
+			return false, nil
+		}
+		r, ok := val.(ast.Ref)
+		if !ok {
+			return true, &BuildError{line, fmt.Sprintf("@e2e field %s.%s must be written straight from an action parameter (the value the client seals); an expression here would be computed by the authority in plaintext", entity, field)}
+		}
+		if !paramSet[r.Name] {
+			return true, &BuildError{line, fmt.Sprintf("@e2e field %s.%s must be written from an action parameter; %q is not one (only a parameter can be sealed on the client before sending)", entity, field, r.Name)}
+		}
+		sealParams[r.Name] = true
+		return true, nil
 	}
 	for _, r := range a.Requires {
 		params, ok := e.policyParams[r.Name]
@@ -835,8 +926,16 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			mutated = true
 			out := Stmt{Op: "add", Entity: st.Entity}
 			for _, fi := range st.Fields {
-				if err := readExpr(fi.Expr, st.Line); err != nil {
+				isE2E, err := e2eWrite(st.Entity, fi.Name, fi.Expr, st.Line)
+				if err != nil {
 					return Action{}, err
+				}
+				// A sealed value is opaque ciphertext to the authority: don't read it (it
+				// is a validated parameter), just carry the ref so the row stores it.
+				if !isE2E {
+					if err := readExpr(fi.Expr, st.Line); err != nil {
+						return Action{}, err
+					}
 				}
 				out.Fields = append(out.Fields, FieldInit{Name: fi.Name, Expr: e.low(fi.Expr)})
 			}
@@ -850,8 +949,14 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			if err := readExpr(st.Key, st.Line); err != nil {
 				return Action{}, err
 			}
-			if err := readExpr(st.Value, st.Line); err != nil {
+			isE2E, err := e2eWrite(st.Entity, st.Field, st.Value, st.Line)
+			if err != nil {
 				return Action{}, err
+			}
+			if !isE2E {
+				if err := readExpr(st.Value, st.Line); err != nil {
+					return Action{}, err
+				}
 			}
 			act.Body = append(act.Body, Stmt{Op: "set", Entity: st.Entity, Field: st.Field,
 				Key: e.low(st.Key), Value: e.low(st.Value)})
@@ -928,6 +1033,12 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				cs.Bind = st.Bind
 				cs.Ret = ret.ret
 				cs.RetList = ret.list
+				// If the op returns a record, remember the bind's record type so a later
+				// `v.field` is checked (and a list-of-record bind reports that you must
+				// iterate it before a field access).
+				if _, isRec := e.records[ret.ret]; isRec {
+					e.locRecords[st.Bind] = recBind{rec: ret.ret, list: ret.list}
+				}
 			}
 			act.Body = append(act.Body, cs)
 		case ast.Establish:
@@ -955,6 +1066,62 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			}
 			act.Body = append(act.Body, es)
 		}
+	}
+
+	// @e2e dataflow guarantee: a parameter that seals into an @e2e field is
+	// ciphertext to the authority. It may therefore appear ONLY as that sealed
+	// write — never in a check, policy argument, other field, or service call, all
+	// of which the server evaluates and would only see ciphertext. Walk the body
+	// once more and reject any other use, then publish the seal set so the client
+	// knows which arguments to encrypt before POSTing.
+	if len(sealParams) > 0 {
+		used := map[string]bool{}
+		collect := func(ex ast.Expr) {
+			for n := range freeNames(ex) {
+				used[n] = true
+			}
+		}
+		for _, s := range a.Body {
+			switch st := s.(type) {
+			case ast.Check:
+				collect(st.Cond)
+			case ast.Assign:
+				collect(st.Value)
+			case ast.Add:
+				for _, fi := range st.Fields {
+					if e.entE2E[st.Entity][fi.Name] {
+						continue // the sealed write itself is allowed
+					}
+					collect(fi.Expr)
+				}
+			case ast.Set:
+				collect(st.Key)
+				if !e.entE2E[st.Entity][st.Field] {
+					collect(st.Value)
+				}
+			case ast.Remove:
+				collect(st.Key)
+				collect(st.Where)
+			case ast.ServiceCall:
+				for _, arg := range st.Args {
+					collect(arg)
+				}
+			case ast.Establish:
+				collect(st.Actor)
+				collect(st.Role)
+			}
+		}
+		for _, r := range a.Requires {
+			for _, arg := range r.Args {
+				collect(arg)
+			}
+		}
+		for p := range sealParams {
+			if used[p] {
+				return Action{}, &BuildError{a.Line, fmt.Sprintf("parameter %q seals into an @e2e field, so the authority only ever holds its ciphertext — it cannot also be read elsewhere in %q (a check, policy, or another write all run on the server). Validate it on the client or model the readable part as a separate parameter", p, a.Name)}
+			}
+		}
+		act.Seal = sortedKeys(sealParams)
 	}
 
 	// placement: server iff it writes any authoritative cell OR is impure. An
@@ -1091,10 +1258,61 @@ func (c *viewCtx) addDep(dep, id string) {
 	c.deps[dep] = append(c.deps[dep], id)
 }
 
+// e2eFieldRead reports whether ex is exactly a read of an @e2e (sealed) entity
+// field — either `Entity(key).field` or `item.field` for an item ranging over an
+// entity. Such a value is ciphertext; it is opened on the client, never here.
+func (c *viewCtx) e2eFieldRead(ex ast.Expr, sc scope) bool {
+	switch t := ex.(type) {
+	case ast.EntityGet:
+		return c.e.entE2E[t.Entity][t.Field]
+	case ast.Get:
+		if r, ok := t.Obj.(ast.Ref); ok {
+			if ent, ok := sc.itemTypes[r.Name]; ok {
+				return c.e.entE2E[ent][t.Field]
+			}
+		}
+	}
+	return false
+}
+
+// containsE2E reports whether any subexpression of ex reads an @e2e field, so a
+// sealed value buried inside a larger expression (a concatenation, a comparison)
+// can be rejected: it must stand alone to be opened on the client.
+func (c *viewCtx) containsE2E(ex ast.Expr, sc scope) bool {
+	if c.e2eFieldRead(ex, sc) {
+		return true
+	}
+	switch t := ex.(type) {
+	case ast.Get:
+		return c.containsE2E(t.Obj, sc)
+	case ast.EntityGet:
+		return c.containsE2E(t.Key, sc)
+	case ast.Bin:
+		return c.containsE2E(t.L, sc) || c.containsE2E(t.R, sc)
+	case ast.Un:
+		return c.containsE2E(t.X, sc)
+	case ast.Call:
+		for _, a := range t.Args {
+			if c.containsE2E(a, sc) {
+				return true
+			}
+		}
+	case ast.Agg:
+		if t.Where != nil {
+			return c.containsE2E(t.Where, sc)
+		}
+	}
+	return false
+}
+
 // lowerSegs lowers interpolated segments shared by text, button labels, and image
 // URLs. A pure expression segment renders inline inside a region (a `for` row) or,
 // at the top level, becomes a reactive binding the client recomputes on change.
-func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope) ([]Seg, error) {
+// openable says whether this context can hold an @e2e value: text/badge/richtext
+// render it as a client-opened placeholder; an attribute (image/video src), a
+// button label, or server-only page metadata cannot open it, so a sealed read
+// there is a compile error.
+func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope, openable bool) ([]Seg, error) {
 	var out []Seg
 	for _, s := range segs {
 		if s.Expr == nil {
@@ -1107,8 +1325,17 @@ func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope) ([]Seg, error) {
 		if err := c.e.checkNoPrivate(s.Expr); err != nil {
 			return nil, err
 		}
+		e2e := c.containsE2E(s.Expr, sc)
+		if e2e {
+			if !openable {
+				return nil, &BuildError{0, "an @e2e (sealed) value can only be rendered as a text or badge node — it is opened on the client and cannot fill an attribute, a button label, richtext, or page metadata"}
+			}
+			if !c.e2eFieldRead(s.Expr, sc) {
+				return nil, &BuildError{0, "an @e2e value must stand alone in its interpolation (e.g. `{dm.body}`) — it can't be combined with other text or expressions, since the whole ciphertext is opened on the client at once"}
+			}
+		}
 		if sc.inRegion {
-			out = append(out, Seg{Expr: c.e.low(s.Expr)})
+			out = append(out, Seg{Expr: c.e.low(s.Expr), E2E: e2e})
 		} else {
 			id := fmt.Sprintf("b%d", c.nb)
 			c.nb++
@@ -1118,7 +1345,7 @@ func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope) ([]Seg, error) {
 			for _, d := range deps {
 				c.addDep(d, id)
 			}
-			out = append(out, Seg{Bind: id})
+			out = append(out, Seg{Bind: id, E2E: e2e})
 		}
 	}
 	return out, nil
@@ -1143,14 +1370,14 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, Node{Kind: "row", Children: kids})
 
 		case ast.Text:
-			segs, err := c.lowerSegs(t.Segs, sc)
+			segs, err := c.lowerSegs(t.Segs, sc, true)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, Node{Kind: "text", Segs: segs})
 
 		case ast.Image:
-			segs, err := c.lowerSegs(t.Segs, sc)
+			segs, err := c.lowerSegs(t.Segs, sc, false)
 			if err != nil {
 				return nil, err
 			}
@@ -1160,21 +1387,21 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, Node{Kind: "icon", Name: t.Name})
 
 		case ast.Video:
-			segs, err := c.lowerSegs(t.Segs, sc)
+			segs, err := c.lowerSegs(t.Segs, sc, false)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, Node{Kind: "video", Segs: segs})
 
 		case ast.Richtext:
-			segs, err := c.lowerSegs(t.Segs, sc)
+			segs, err := c.lowerSegs(t.Segs, sc, false)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, Node{Kind: "richtext", Segs: segs})
 
 		case ast.Badge:
-			segs, err := c.lowerSegs(t.Segs, sc)
+			segs, err := c.lowerSegs(t.Segs, sc, true)
 			if err != nil {
 				return nil, err
 			}
@@ -1269,7 +1496,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, node)
 
 		case ast.Button:
-			segs, err := c.lowerSegs(t.Label, sc)
+			segs, err := c.lowerSegs(t.Label, sc, false)
 			if err != nil {
 				return nil, err
 			}
@@ -1666,6 +1893,17 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 					}
 				}
 				return &BuildError{line, fmt.Sprintf("enum %q has no member %q", r.Name, t.Field)}
+			}
+			// Record field access on a `let`-bound local (`v.score`): the field must
+			// exist on the bound record, and the bind must not be a list (iterate first).
+			if rb, isRec := e.locRecords[r.Name]; isRec {
+				if rb.list {
+					return &BuildError{line, fmt.Sprintf("%q is a list of %s — access a field on one element, not the whole list", r.Name, rb.rec)}
+				}
+				if _, ok := e.records[rb.rec][t.Field]; !ok {
+					return &BuildError{line, fmt.Sprintf("record %s has no field %q", rb.rec, t.Field)}
+				}
+				return nil
 			}
 		}
 		return e.checkBuiltins(t.Obj, line)

@@ -43,6 +43,7 @@ type App struct {
 	Imports    []string
 	Auth       bool // a bare `auth` line turns on built-in users/login/logout/signup
 	Entities   []*Entity
+	Records    []*Record
 	Enums      []*Enum
 	States     []*State
 	Derives    []*Derive
@@ -102,6 +103,29 @@ type Mount struct {
 	Path      string // "" defaults to "/"
 	Requires  string // zero-arg guard policy; "" = open
 	Line      int
+}
+
+// Record is a named value-object type: `record Verdict: score: int, reasons: [text]`.
+// Unlike an entity it has no storage, id, or persistence — it is a pure in-flight
+// shape. Its reason to exist: a brain (a `service`) returns structured JSON, and a
+// record lets a `let v = call Brain.op()` bind the whole object and read its typed
+// fields (`v.score`, `v.reasons`) instead of only a scalar. Records are flat — a
+// field is a primitive, an enum, or a list of those, never another record — so a
+// `v.field` access is always single-level and fully checkable.
+type Record struct {
+	Name   string
+	Fields []RecordField
+	Line   int
+}
+
+// RecordField is one typed field of a record: a name and a type that may be a
+// list (`[T]`) and/or optional (`T?`). The type core is a primitive or an enum.
+type RecordField struct {
+	Name     string
+	Type     string
+	List     bool
+	Optional bool
+	Line     int
 }
 
 // Enum is a closed set of named text values: `enum Status: active, closed`. An
@@ -168,6 +192,7 @@ type EntityField struct {
 	Name       string
 	Type       string // int | text | bool | money | date | <Enum> | <EntityName>
 	Secret     bool   // @secret — encrypted at rest (AES-GCM under FACET_SECRET)
+	E2E        bool   // @e2e — end-to-end sealed: the client seals before sending and opens on read; the authority only ever holds ciphertext (never plaintext, never renders it)
 	ReadPolicy string // @requires(policy) — field served only to actors the policy admits; never sent over SSE
 	Optional   bool   // text? — the column is nullable
 	Line       int

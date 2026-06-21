@@ -10,6 +10,68 @@
   const csrfMeta = document.querySelector('meta[name="fa-csrf"]');
   let csrf = csrfMeta ? csrfMeta.getAttribute("content") : "";
 
+  // ── @e2e sealed fields ───────────────────────────────────────────────────────
+  // The dataflow guarantee is the language's: a sealed value is encrypted on this
+  // client before it is ever sent (dispatch seals the flagged args), the authority
+  // only ever stores/serves ciphertext, and a reader opens it here. fct owns *that*
+  // — the cipher itself is delegated to a provider an app can replace (set
+  // window.facetE2E before this script to plug in real per-recipient keys, e.g.
+  // Vovin). The built-in default is real AES-GCM (Web Crypto) under a per-app key
+  // kept in localStorage — enough to demonstrate seal→store-ciphertext→open with no
+  // server involvement; swap it for true multi-party key exchange in production.
+  const E2E_PLACEHOLDER = "🔒";
+  const facetE2E = window.facetE2E || (window.facetE2E = defaultE2E());
+
+  function defaultE2E() {
+    const subtle = window.crypto && window.crypto.subtle;
+    const b64 = (buf) => btoa(String.fromCharCode.apply(null, new Uint8Array(buf)));
+    const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+    let keyPromise = null;
+    function getKey() {
+      if (keyPromise) return keyPromise;
+      keyPromise = (async () => {
+        let raw = localStorage.getItem("fa-e2e-key");
+        if (raw) return subtle.importKey("raw", unb64(raw), "AES-GCM", false, ["encrypt", "decrypt"]);
+        const k = await subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+        localStorage.setItem("fa-e2e-key", b64(await subtle.exportKey("raw", k)));
+        return k;
+      })();
+      return keyPromise;
+    }
+    return {
+      async seal(plaintext) {
+        if (!subtle) { console.warn("facet @e2e: Web Crypto unavailable; value sent unsealed"); return toStr(plaintext); }
+        const key = await getKey();
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+        const ct = await subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(toStr(plaintext)));
+        return "fae2e1:" + b64(iv) + "." + b64(ct);
+      },
+      async open(ciphertext) {
+        const s = toStr(ciphertext);
+        if (!subtle || s.indexOf("fae2e1:") !== 0) return s; // not sealed / can't open: show as-is
+        try {
+          const [ivb, ctb] = s.slice(7).split(".");
+          const pt = await subtle.decrypt({ name: "AES-GCM", iv: unb64(ivb) }, await getKey(), unb64(ctb));
+          return new TextDecoder().decode(pt);
+        } catch (_) { return "🔒"; } // wrong key (not the intended recipient): stays sealed
+      },
+    };
+  }
+
+  // openE2E opens every sealed placeholder under scope (default: the whole root):
+  // it reads the stashed ciphertext, asks the provider to open it, and swaps the
+  // lock glyph for the plaintext. Idempotent — a span already opened for its
+  // current ciphertext is skipped, so repeated refreshes don't re-decrypt.
+  function openE2E(scope) {
+    const host = scope || root;
+    for (const span of host.querySelectorAll("[data-fa-e2e]")) {
+      const ciph = span.getAttribute("data-fa-e2e");
+      if (span.__faOpened === ciph) continue;
+      span.__faOpened = ciph;
+      facetE2E.open(ciph).then((pt) => { if (span.__faOpened === ciph) span.textContent = pt; });
+    }
+  }
+
   // Per-page state, replaced on SPA navigation by load().
   let ir, store, actions, bindings, policies, stateType, routes;
   let regionById, inputById; // tracked dynamic regions and two-way inputs, by id
@@ -163,7 +225,16 @@
   function appendSegs(parent, segs, sc) {
     for (const seg of segs || []) {
       if (seg.lit != null) parent.appendChild(document.createTextNode(seg.lit));
-      else if (seg.bind) {
+      else if (seg.e2e) {
+        // A sealed (@e2e) value: ev() yields ciphertext. Render the lock placeholder
+        // and stash the ciphertext; openE2E() opens it (async) into the plaintext.
+        const s = el("span", "fa-e2e");
+        const ciph = toStr(ev(seg.bind ? bindings[seg.bind].expr : seg.expr, sc));
+        s.setAttribute("data-fa-e2e", ciph);
+        if (seg.bind) s.setAttribute("data-fa-bind", seg.bind);
+        s.textContent = E2E_PLACEHOLDER;
+        parent.appendChild(s);
+      } else if (seg.bind) {
         const b = el("span"); b.setAttribute("data-fa-bind", seg.bind);
         b.textContent = toStr(ev(bindings[seg.bind].expr, sc));
         parent.appendChild(b);
@@ -519,7 +590,14 @@
     for (const id of ids) {
       if (bindings[id]) {
         for (const e of root.querySelectorAll('[data-fa-bind="' + id + '"]')) {
-          e.textContent = toStr(ev(bindings[id].expr, store));
+          const v = toStr(ev(bindings[id].expr, store));
+          if (e.hasAttribute("data-fa-e2e")) {
+            // A sealed bind got a new ciphertext: restash it and let openE2E reopen.
+            e.setAttribute("data-fa-e2e", v);
+            e.textContent = E2E_PLACEHOLDER;
+          } else {
+            e.textContent = v;
+          }
         }
       } else if (regionById[id]) {
         const node = regionById[id];
@@ -531,6 +609,7 @@
         if (e && e !== document.activeElement) e.value = toStr(store[node.bind]);
       }
     }
+    openE2E(); // open any sealed placeholders the refresh (re)rendered
   }
 
   // ── dispatch: the compiler already chose where each action runs ──────────────
@@ -539,6 +618,14 @@
     const act = actions[action];
     if (!act) return;
     const vals = (args || []).map((a) => ev(a, sc));
+    // @e2e: seal the flagged arguments on this client before anything leaves it, so
+    // the authority only ever receives ciphertext. The compiler proved each sealed
+    // param flows solely into its @e2e field, so sealing here is sound.
+    if (act.seal && act.seal.length) {
+      for (let i = 0; i < act.params.length; i++) {
+        if (act.seal.indexOf(act.params[i].name) >= 0) vals[i] = await facetE2E.seal(vals[i]);
+      }
+    }
     if (act.placement === "client") {
       runClient(act, vals);
       return;
@@ -724,6 +811,7 @@
   function mount() {
     root.textContent = "";
     for (const n of ir.view) root.appendChild(render(n, store));
+    openE2E(); // open the sealed values the first render placed
   }
 
   // ── wire it up (once) ─────────────────────────────────────────────────────────

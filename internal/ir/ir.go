@@ -15,6 +15,7 @@ type IR struct {
 	App        string            `json:"app"`
 	Auth       bool              `json:"auth,omitempty"` // built-in users/login enabled
 	Entities   []Entity          `json:"entities"`
+	Records    []Record          `json:"records,omitempty"` // value-object types: the typed shape of a service (brain) return
 	Enums      []Enum            `json:"enums,omitempty"`
 	States     []State           `json:"states"`
 	Derives    []Derive          `json:"derives"`
@@ -72,6 +73,24 @@ type Enum struct {
 	Values []string `json:"values"`
 }
 
+// Record is a value-object type: a flat set of typed fields with no storage or
+// identity. It exists so a `let x = call Brain.op()` can bind the structured JSON
+// a brain returns and read its fields by name with their declared types. The
+// runtime uses Fields to coerce each member of a decoded reply.
+type Record struct {
+	Name   string        `json:"name"`
+	Fields []RecordField `json:"fields"`
+}
+
+// RecordField is one typed field of a record: its name, type core (a primitive or
+// enum), and whether it is a list and/or optional.
+type RecordField struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	List     bool   `json:"list,omitempty"`
+	Optional bool   `json:"optional,omitempty"`
+}
+
 // Component is a reusable view fragment: parameters plus a node tree whose
 // interpolations are rendered inline against the call-site argument scope.
 type Component struct {
@@ -101,6 +120,7 @@ type Field struct {
 	Enum       string `json:"enum,omitempty"`       // enum type name when Type is text-backed enum
 	Index      bool   `json:"index,omitempty"`      // build a database index for this column
 	Secret     bool   `json:"secret,omitempty"`     // encrypt this column at rest (AES-GCM)
+	E2E        bool   `json:"e2e,omitempty"`        // end-to-end sealed: stored/served as client-sealed ciphertext; the authority never holds plaintext and never renders it
 	ReadPolicy string `json:"readPolicy,omitempty"` // @requires(policy): served only to admitted actors, never over SSE
 	Optional   bool   `json:"optional,omitempty"`   // column is nullable
 }
@@ -154,6 +174,7 @@ type Action struct {
 	Reason     string    `json:"reason,omitempty"` // why the compiler placed it here (for `facet explain`)
 	Writes     []string  `json:"writes"`
 	Reads      []string  `json:"reads"`
+	Seal       []string  `json:"seal,omitempty"` // @e2e: param names the client must seal (encrypt) before POSTing, so the authority only ever receives ciphertext
 	Body       []Stmt    `json:"body"` // statements in source order, including `check` validations
 }
 
@@ -292,6 +313,7 @@ type Seg struct {
 	Lit  string `json:"lit,omitempty"`
 	Bind string `json:"bind,omitempty"`
 	Expr *Expr  `json:"expr,omitempty"`
+	E2E  bool   `json:"e2e,omitempty"` // this interpolation reads an @e2e field: the value is ciphertext, rendered as a placeholder and opened on the client
 }
 
 // Expr is the serialized expression form interpreted identically by Go and JS.

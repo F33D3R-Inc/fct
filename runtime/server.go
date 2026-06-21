@@ -35,6 +35,7 @@ type Server struct {
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
 	byService   map[string]*ir.Service
+	byRecord    map[string]*ir.Record // record name -> its field schema, for decoding a structured service reply
 	triggers    map[string][]ir.Trigger // source action name -> reactions to run on its success
 	gated       map[string][]gatedField // entity -> @requires-gated fields (API per-actor, never SSE)
 	privateNm   map[string]bool         // @private state names — never shipped to a client
@@ -42,6 +43,9 @@ type Server struct {
 
 	uploadMu       sync.Mutex                // guards uploadSessions
 	uploadSessions map[string]*uploadSession // in-flight resumable uploads, keyed by session id
+
+	idemMu sync.Mutex             // guards idem
+	idem   map[string]*idemRecord // webhook idempotency: dedup key -> the once-processed outcome (or an in-flight marker)
 
 	store    Store
 	children map[string][]childRef // entity -> the relations that point at it (for cascade)
@@ -121,12 +125,14 @@ func newServer(graph *ir.IR) *Server {
 		byPolicy:    map[string]*ir.Policy{},
 		byComponent: map[string]*ir.Component{},
 		byService:   map[string]*ir.Service{},
+		byRecord:    map[string]*ir.Record{},
 		triggers:    map[string][]ir.Trigger{},
 		gated:       map[string][]gatedField{},
 		privateNm:   map[string]bool{},
 		uploadDir:   uploadDirFromEnv(),
 
 		uploadSessions: map[string]*uploadSession{},
+		idem:           map[string]*idemRecord{},
 		entities:       map[string][]any{},
 		nextID:         map[string]int{},
 		sessions:       map[string]*sessionState{},
@@ -159,6 +165,9 @@ func newServer(graph *ir.IR) *Server {
 	}
 	for i := range graph.Services {
 		s.byService[graph.Services[i].Name] = &graph.Services[i]
+	}
+	for i := range graph.Records {
+		s.byRecord[graph.Records[i].Name] = &graph.Records[i]
 	}
 	// Index event triggers by their source action, so a successful action can fan
 	// out to its reactions in O(1). The compiler proved this graph acyclic.
@@ -526,9 +535,9 @@ func (s *Server) callServiceSync(baseURL, op string, body map[string]any) (any, 
 
 // coerceRet coerces a decoded service result to its declared return type — a
 // scalar via coerce, or each element of a list.
-func coerceRet(v any, ret string, list bool) any {
+func (s *Server) coerceRet(v any, ret string, list bool) any {
 	if !list {
-		return coerce(v, ret)
+		return s.coerceOne(v, ret)
 	}
 	items, ok := v.([]any)
 	if !ok {
@@ -539,7 +548,47 @@ func coerceRet(v any, ret string, list bool) any {
 	}
 	out := make([]any, len(items))
 	for i, it := range items {
-		out[i] = coerce(it, ret)
+		out[i] = s.coerceOne(it, ret)
+	}
+	return out
+}
+
+// coerceOne coerces one returned value to its declared type. A record return is
+// decoded field-by-field against the record's schema — each field coerced to its
+// own declared type (and lists of fields handled element-wise) — so `v.score` is
+// an int and `v.reasons` a list of text, regardless of how loosely the brain typed
+// its JSON. An unknown type, or a non-record, falls back to scalar coercion.
+func (s *Server) coerceOne(v any, typ string) any {
+	rec := s.byRecord[typ]
+	if rec == nil {
+		return coerce(v, typ)
+	}
+	obj, _ := v.(map[string]any)
+	out := record{}
+	for _, f := range rec.Fields {
+		fv := obj[f.Name] // nil when the reply omitted it
+		if f.List {
+			out[f.Name] = coerceRetScalarList(fv, f.Type)
+		} else {
+			out[f.Name] = coerce(fv, f.Type)
+		}
+	}
+	return out
+}
+
+// coerceRetScalarList coerces a decoded value to a list of a scalar type — each
+// element coerced, a lone value wrapped, a nil treated as the empty list.
+func coerceRetScalarList(v any, typ string) any {
+	items, ok := v.([]any)
+	if !ok {
+		if v == nil {
+			return []any{}
+		}
+		items = []any{v}
+	}
+	out := make([]any, len(items))
+	for i, it := range items {
+		out[i] = coerce(it, typ)
 	}
 	return out
 }
@@ -968,7 +1017,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 						s.obs.metrics.observeAction(act.Name, "service_error")
 						return nil, http.StatusBadGateway, fmt.Sprintf("%s.%s unavailable", st.Service, st.Field)
 					}
-					scope[st.Bind] = coerceRet(res, st.Ret, st.RetList)
+					scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
 				} else {
 					s.callService(sv.URL, st.Field, body) // fire-and-forget
 				}
@@ -1452,6 +1501,24 @@ func (s *Server) renderSegs(b *strings.Builder, segs []ir.Seg, scope map[string]
 		switch {
 		case seg.Lit != "":
 			b.WriteString(html.EscapeString(seg.Lit))
+		case seg.E2E:
+			// A sealed (@e2e) value: the authority only holds ciphertext and cannot
+			// open it. Emit the ciphertext in a data attribute behind a lock
+			// placeholder; the client opens it after hydration (see facet.js openE2E).
+			// A bound seg keeps its data-fa-bind so a live ciphertext update still
+			// lands here and is re-opened.
+			var ciph string
+			if seg.Bind != "" {
+				ciph = toStr(eval(s.byBind[seg.Bind].Expr, scope))
+			} else {
+				ciph = toStr(eval(seg.Expr, scope))
+			}
+			bindAttr := ""
+			if seg.Bind != "" {
+				bindAttr = fmt.Sprintf(` data-fa-bind="%s"`, seg.Bind)
+			}
+			fmt.Fprintf(b, `<span class="fa-e2e" data-fa-e2e="%s"%s>%s</span>`,
+				html.EscapeString(ciph), bindAttr, e2ePlaceholder)
 		case seg.Bind != "":
 			val := toStr(eval(s.byBind[seg.Bind].Expr, scope))
 			fmt.Fprintf(b, `<span data-fa-bind="%s">%s</span>`, seg.Bind, html.EscapeString(val))
@@ -1460,6 +1527,11 @@ func (s *Server) renderSegs(b *strings.Builder, segs []ir.Seg, scope map[string]
 		}
 	}
 }
+
+// e2ePlaceholder is what the server renders in place of a sealed value — a lock
+// glyph the client replaces with the opened plaintext. The server never has the
+// plaintext, so this is all it can ever show.
+const e2ePlaceholder = "🔒"
 
 // segsToString flattens interpolated segments to a plain string — used where the
 // value goes into an attribute (an image `src`), not displayed markup.

@@ -110,9 +110,9 @@ avatar/badge) — Tier 2 (notifications, feeds) is already expressible on Tier 1
 | Enums (closed text types) | ✅ | flow through fields/state/params/`select` |
 | Optionals `T?`, lists `[T]` | ✅ | |
 | Relations (entity-typed fields) | ✅ | FK + cascade |
-| Records / structs (beyond `entity`) | ⬜ | no value objects / inline record types |
+| Records / structs (beyond `entity`) | ✅ | `record` value-objects (v1.27.0): flat typed fields, the shape of a brain's structured reply — `op(…) -> Verdict`, `let v = call …`, checked `v.field` |
 | Tagged unions / sum types | ⬜ | **Next** — the missing piece for state machines & typed errors |
-| Pattern matching / exhaustiveness | ⬜ | **Next** — pairs with sum types |
+| Pattern matching / exhaustiveness | ✅ | `match … case/else` over enum-typed subjects, exhaustiveness enforced |
 | Generics / parametric polymorphism | 🟡→⬜ | **Next, scoped**: generic *components* & *collections* only |
 | Type inference | 🟡 | placement is inferred; value types are mostly annotated |
 | Branded IDs / newtypes | ⬜ | Later |
@@ -135,7 +135,8 @@ deliberately decided against it — the goal is to build a site, not a language.
 | authoritative vs ephemeral (`@client`) | ✅ | |
 | impurity ⇒ server, `requires` ⇒ server | ✅ | |
 | soundness: server action can't read/write `@client` | ✅ | symmetric, compile-enforced |
-| secret / server-only values | ✅ | `@private` state (v1.19.0): authoritative but never shipped to a client and a **compile error to render** (leak diagnostic) — keys policies/feeds services; plus `@secret` (encryption) + credentials never shipped |
+| secret / server-only values | ✅ | `@private` state (v1.19.0): authoritative but never shipped to a client and a **compile error to render** (leak diagnostic) — keys policies/feeds services; plus `@secret` (at-rest encryption) + credentials never shipped |
+| end-to-end sealed fields | ✅ | `@e2e` entity field (v1.27.0): the client seals before sending, the authority only ever holds/serves ciphertext (never plaintext, never renders it — 🔒 placeholder, opened on the client). Compiler owns the dataflow; the cipher is a pluggable provider |
 | edge placement | ⬜ | **Later** — third placement target |
 | replicated / offline-capable / latency-sensitive annotations | ⬜ | **Later** — feeds local-first (§15) |
 | materialization policies (cacheable/prefetch/subscribable/resumable) | 🟡 | live subscribe ✅, API micro-cache ✅; not declarable per-value |
@@ -197,7 +198,7 @@ deliberately decided against it — the goal is to build a site, not a language.
 | service calls (external "brains" over HTTP, typed contract) | ✅ | fire-and-forget **and** request→response |
 | **request→response service calls** (bind a result back) | ✅ | **shipped v1.18.0** — `op(...) -> T`; `let x = call S.op(...)` binds the typed answer (scalar or list) into the action; list params allowed; failure aborts via `failed(...)` |
 | **first-class typed effects / capability system** | ⬜ | **Next, keystone** — see below |
-| idempotency keys / replay protection | ⬜ | Next |
+| idempotency keys / replay protection | ✅ | webhook deliveries (v1.27.0): dedup by `Idempotency-Key` or payload signature; retries replay the recorded outcome, never re-run — the double-charge fix |
 | compensation / saga / multi-step workflows | ⬜ | Later |
 | human-approval / long-running state machines | ⬜ | Later |
 
