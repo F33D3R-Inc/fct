@@ -36,6 +36,7 @@ type Server struct {
 	byComponent map[string]*ir.Component
 	byService   map[string]*ir.Service
 	triggers    map[string][]ir.Trigger // source action name -> reactions to run on its success
+	gated       map[string][]gatedField // entity -> @requires-gated fields (API per-actor, never SSE)
 	privateNm   map[string]bool         // @private state names — never shipped to a client
 	uploadDir   string                  // directory uploaded files are written to and served from
 
@@ -121,6 +122,7 @@ func newServer(graph *ir.IR) *Server {
 		byComponent: map[string]*ir.Component{},
 		byService:   map[string]*ir.Service{},
 		triggers:    map[string][]ir.Trigger{},
+		gated:       map[string][]gatedField{},
 		privateNm:   map[string]bool{},
 		uploadDir:   uploadDirFromEnv(),
 
@@ -163,6 +165,7 @@ func newServer(graph *ir.IR) *Server {
 	for _, tr := range graph.Triggers {
 		s.triggers[tr.On] = append(s.triggers[tr.On], tr)
 	}
+	s.indexGatedFields() // entity fields gated by @requires, for projection-time stripping
 	for i := range graph.Components {
 		s.byComponent[graph.Components[i].Name] = &graph.Components[i]
 	}
@@ -320,7 +323,7 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 		snap[ent] = rows
 	}
 	s.mu.Unlock()
-	if data, err := json.Marshal(map[string]any{"deltas": snap}); err == nil {
+	if data, err := json.Marshal(map[string]any{"deltas": s.sseSafe(snap)}); err == nil {
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 	}
@@ -345,7 +348,7 @@ func (s *Server) broadcast(deltas map[string]any) {
 		return
 	}
 	s.apiCache.invalidate()
-	s.fanout(deltas)
+	s.fanout(s.sseSafe(deltas)) // gated fields never travel over the shared stream
 	if s.cluster != nil {
 		names := make([]string, 0, len(deltas))
 		for ent := range deltas {
@@ -1252,26 +1255,44 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// Serve a hot list from the read cache when enabled; it is invalidated the
-		// instant any entity changes, so it never returns stale rows.
+		// An entity with @requires-gated fields serves an actor-dependent response, so
+		// it bypasses the shared read cache (which is keyed only by query, not actor).
+		gatedEntity := len(s.gated[name]) > 0
 		cacheKey := name + "?" + r.URL.RawQuery
-		if body, ok := s.apiCache.get(cacheKey); ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Cache", "hit")
-			w.Write(body)
-			return
+		if !gatedEntity {
+			// Serve a hot list from the read cache when enabled; it is invalidated the
+			// instant any entity changes, so it never returns stale rows.
+			if body, ok := s.apiCache.get(cacheKey); ok {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Cache", "hit")
+				w.Write(body)
+				return
+			}
 		}
 		rows, next, err := s.store.Query(query)
 		if err != nil {
 			http.Error(w, "query failed", http.StatusInternalServerError)
 			return
 		}
-		out := map[string]any{"rows": rows}
+		var out map[string]any
+		if gatedEntity {
+			// Drop the gated fields this actor's policy denies, per request. scope()
+			// reads shared maps, so evaluate the gate under the lock.
+			sid := s.session(w, r)
+			s.mu.Lock()
+			drop := s.gateForActor(name, s.scope(sid))
+			s.mu.Unlock()
+			out = map[string]any{"rows": stripFields(rows, drop)}
+		} else {
+			out = map[string]any{"rows": rows}
+		}
 		if next != "" {
 			out["next"] = next
 		}
 		body, _ := json.Marshal(out)
-		s.apiCache.put(cacheKey, body)
+		if !gatedEntity {
+			s.apiCache.put(cacheKey, body)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(body)
 

@@ -423,6 +423,22 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 			secret = true
 			ft = strings.TrimSpace(strings.TrimSuffix(ft, "@secret"))
 		}
+		// A trailing `@requires(policy)` gates the field on the data projections: the
+		// API serves it only to an actor the policy admits, and it never travels over
+		// SSE. `email: text @requires(admin)`.
+		readPolicy := ""
+		if i := strings.Index(ft, "@requires("); i >= 0 {
+			rest := ft[i+len("@requires("):]
+			close := strings.IndexByte(rest, ')')
+			if close < 0 {
+				return nil, &Error{c.Line.No, "field @requires needs a policy: @requires(policyName)"}
+			}
+			readPolicy = strings.TrimSpace(rest[:close])
+			if !isIdent(readPolicy) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid field policy %q in @requires(...)", readPolicy)}
+			}
+			ft = strings.TrimSpace(ft[:i] + ft[i+len("@requires(")+close+1:])
+		}
 		// A trailing `?` makes the column nullable; a `[T]` list is not a column type.
 		core, list, optional := splitType(ft)
 		if list {
@@ -433,7 +449,7 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		if !isTypeName(core) {
 			return nil, &Error{c.Line.No, fmt.Sprintf("unknown type %q (use int, text, bool, money, date, an enum, or an entity name)", core)}
 		}
-		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: core, Secret: secret, Optional: optional, Line: c.Line.No})
+		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: core, Secret: secret, ReadPolicy: readPolicy, Optional: optional, Line: c.Line.No})
 	}
 	if len(e.Fields) == 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("entity %q has no fields", name)}

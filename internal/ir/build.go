@@ -107,7 +107,7 @@ func Build(app *ast.App) (*IR, error) {
 			if f.Secret && f.Name == "id" {
 				return nil, &BuildError{f.Line, "the id field cannot be @secret"}
 			}
-			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, Optional: f.Optional}
+			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, ReadPolicy: f.ReadPolicy, Optional: f.Optional}
 			// An enum-typed field is stored as text, tagged with its enum so the API and
 			// the client can validate/render the closed set.
 			if _, isEnum := e.enums[f.Type]; isEnum {
@@ -477,6 +477,24 @@ func Build(app *ast.App) (*IR, error) {
 	}
 	if cyc := triggerCycle(trigEdges); cyc != "" {
 		return nil, &BuildError{app.Line, fmt.Sprintf("trigger cycle: %s — reactions would never terminate", cyc)}
+	}
+
+	// Field-level authz: a `@requires(policy)` gate names a zero-argument policy the
+	// API evaluates per actor. Validate the policy exists and is parameterless (a
+	// row-level policy would need an argument the projection layer can't supply).
+	for ei := range out.Entities {
+		for _, f := range out.Entities[ei].Fields {
+			if f.ReadPolicy == "" {
+				continue
+			}
+			params, ok := e.policyParams[f.ReadPolicy]
+			if !ok {
+				return nil, &BuildError{0, fmt.Sprintf("field %s.%s @requires unknown policy %q", out.Entities[ei].Name, f.Name, f.ReadPolicy)}
+			}
+			if len(params) != 0 {
+				return nil, &BuildError{0, fmt.Sprintf("field %s.%s @requires row-level policy %q; a field gate must be a zero-argument policy", out.Entities[ei].Name, f.Name, f.ReadPolicy)}
+			}
+		}
 	}
 
 	pathOf := map[string]string{} // path -> view name

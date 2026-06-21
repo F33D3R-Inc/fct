@@ -105,6 +105,28 @@ entity Note:
     secret: text @secret      # ciphertext on disk
 ```
 
+## `@requires` field-level authorization
+
+A field marked `@requires(policy)` is **gated on the data projections** a client
+consumes: the JSON API serves it only to an actor the (zero-argument) policy
+admits, and it **never travels over the shared SSE stream**. A gated field reaches
+a client only through the per-actor API.
+
+```
+entity Person:
+    id: int
+    name: text
+    salary: money @requires(admins)   # only an admin's /api/Person carries salary
+```
+
+- A guest's `/api/Person` simply omits `salary`; an admin's includes it. Responses
+  for a gated entity bypass the read cache (they are actor-dependent).
+- The gate must be a **zero-argument policy** (role/identity based, not row-level).
+- The **server is the authority**: actions, policies, and server-side rendering
+  see full rows. To hide a field in a *server-rendered* view, guard the route or
+  region — `@requires` governs the API and SSE, the channels clients pull data
+  through. (Pair with `@secret` to also encrypt the column at rest.)
+
 ## Secrets management
 
 One environment variable, **`FACET_SECRET`**, derives every key — cookie/CSRF

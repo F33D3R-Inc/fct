@@ -95,13 +95,14 @@ type Entity struct {
 // a relation — the store builds a real index for it so reads stay sub-linear as
 // the table grows past memory.
 type Field struct {
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Ref      string `json:"ref,omitempty"`      // relation target entity, else ""
-	Enum     string `json:"enum,omitempty"`     // enum type name when Type is text-backed enum
-	Index    bool   `json:"index,omitempty"`    // build a database index for this column
-	Secret   bool   `json:"secret,omitempty"`   // encrypt this column at rest (AES-GCM)
-	Optional bool   `json:"optional,omitempty"` // column is nullable
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Ref        string `json:"ref,omitempty"`        // relation target entity, else ""
+	Enum       string `json:"enum,omitempty"`       // enum type name when Type is text-backed enum
+	Index      bool   `json:"index,omitempty"`      // build a database index for this column
+	Secret     bool   `json:"secret,omitempty"`     // encrypt this column at rest (AES-GCM)
+	ReadPolicy string `json:"readPolicy,omitempty"` // @requires(policy): served only to admitted actors, never over SSE
+	Optional   bool   `json:"optional,omitempty"`   // column is nullable
 }
 
 // IsRelation reports whether the field is a foreign key to another entity.

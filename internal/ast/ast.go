@@ -165,11 +165,12 @@ type Entity struct {
 // (the database stores ciphertext; the working set holds plaintext). A type may
 // carry a trailing `?` (Optional), which permits the field to be null.
 type EntityField struct {
-	Name     string
-	Type     string // int | text | bool | money | date | <Enum> | <EntityName>
-	Secret   bool   // @secret — encrypted at rest (AES-GCM under FACET_SECRET)
-	Optional bool   // text? — the column is nullable
-	Line     int
+	Name       string
+	Type       string // int | text | bool | money | date | <Enum> | <EntityName>
+	Secret     bool   // @secret — encrypted at rest (AES-GCM under FACET_SECRET)
+	ReadPolicy string // @requires(policy) — field served only to actors the policy admits; never sent over SSE
+	Optional   bool   // text? — the column is nullable
+	Line       int
 }
 
 // State is one `state name: Type = default [@client|@server]` cell. Scalar

@@ -1,0 +1,37 @@
+# Field-level authorization. A field marked `@requires(policy)` is gated on the
+# data projections a client consumes:
+#
+#   - the JSON API (/api/Person) serves the field only to an actor the policy
+#     admits — a guest's response simply omits it;
+#   - it never travels over the shared SSE stream (no actor to authorize there),
+#     so it reaches a client only through the per-actor API.
+#
+# The server itself — actions, policies, server-side rendering — always sees full
+# rows; the server is the authority. To hide a field in a server-rendered view,
+# guard the route or region. The gate must be a zero-argument policy.
+#
+# Run it:  facet dev examples/fieldauth.fct
+#   curl localhost:8080/api/Person        # salary is absent for an anonymous caller
+app Directory:
+    auth
+
+    policy admins:
+        role == "admin"
+
+    entity Person:
+        id: int
+        name: text
+        title: text
+        # salary is served only to admins over the API, and never over SSE
+        salary: money @requires(admins)
+
+    action hire(name: text, title: text, salary: money):
+        requires admins
+        add Person { name: name, title: title, salary: salary }
+
+    view Home at "/":
+        box:
+            for p in Person by id desc:
+                row:
+                    text "{p.name}"
+                    text "{p.title}"

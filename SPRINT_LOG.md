@@ -10,6 +10,45 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 19 — 2026-06-20 — F33D3R depth #5b: field-level authz → released v1.25.0
+
+**Continued depth #5.** An entity field marked `@requires(policy)` is gated on the
+**data projections** clients consume:
+
+```
+entity Person:
+    id: int
+    name: text
+    salary: money @requires(admins)
+```
+
+- **API (per actor):** `/api/Person` serves `salary` only to an actor the
+  zero-arg policy admits; a guest's response omits it. Gated entities **bypass the
+  read cache** (responses are actor-dependent).
+- **SSE (always stripped):** the broadcast reaches all subscribers with no actor to
+  authorize against, so a gated field **never streams** — it reaches a client only
+  through the per-actor API. Applied to both the initial snapshot and live deltas.
+- **Server is the authority:** actions, policies, and server-side rendering see
+  full rows. A documented boundary — `@requires` governs the API + SSE (the channels
+  clients pull data through); guard a route/region to hide a field in a rendered
+  view. Chosen over per-subscriber SSE filtering, which the shared-broadcast
+  architecture can't do cheaply.
+
+- Surface: ast (EntityField.ReadPolicy), parser (`@requires(policy)` suffix), ir
+  (Field.ReadPolicy), build (validate policy exists + is zero-arg), runtime
+  (`runtime/fieldauth.go`: indexGatedFields, stripFields copy-on-strip, sseSafe
+  always-strip, gateForActor per-actor; wired into broadcast, the /live snapshot,
+  and the API GET with cache bypass; gate eval under s.mu since scope() reads shared
+  maps).
+- Tests: `internal/compile/fieldauth_test.go` (lowers; unknown-policy + row-level
+  errors); `runtime/fieldauth_test.go` (admin sees / guest denied; API strips for
+  guest; **SSE never streams the field**; stripping never mutates the working set).
+- Example `examples/fieldauth.fct`. Docs: wiki/Authorization-and-Security.md
+  (`@requires` field-level authorization). version -> **1.25.0**. Overlays/typeahead
+  (the last #5 piece) follow in #5c.
+
+---
+
 ## Sprint 18 — 2026-06-20 — F33D3R depth #5a: page metadata + design-system (dark mode) → released v1.24.0
 
 **Started depth #5 (the presentation cluster).** This release ships the two
