@@ -136,6 +136,11 @@ func parseDecl(app *ast.App, c *source.Node) error {
 		if ly, err = parseLayout(c); err == nil {
 			app.Layouts = append(app.Layouts, ly)
 		}
+	case c.Line.Text == "theme dark:" || c.Line.Text == "theme dark":
+		var tv []ast.ThemeVar
+		if tv, err = parseTheme(c); err == nil {
+			app.DarkTheme = append(app.DarkTheme, tv...)
+		}
 	case c.Line.Text == "theme:" || c.Line.Text == "theme":
 		var tv []ast.ThemeVar
 		if tv, err = parseTheme(c); err == nil {
@@ -206,6 +211,12 @@ func parsePlayground(n *source.Node) (*ast.App, error) {
 		switch {
 		case t == "auth" || t == "auth:":
 			app.Auth = true
+		case t == "theme dark:" || t == "theme dark":
+			tv, err := parseTheme(c)
+			if err != nil {
+				return nil, err
+			}
+			app.DarkTheme = append(app.DarkTheme, tv...)
 		case t == "theme:" || t == "theme":
 			tv, err := parseTheme(c)
 			if err != nil {
@@ -273,6 +284,12 @@ func parseWireframe(n *source.Node) (*ast.App, error) {
 	for _, c := range n.Children {
 		t := strings.TrimSpace(c.Line.Text)
 		switch {
+		case t == "theme dark:" || t == "theme dark":
+			tv, err := parseTheme(c)
+			if err != nil {
+				return nil, err
+			}
+			app.DarkTheme = append(app.DarkTheme, tv...)
 		case t == "theme:" || t == "theme":
 			tv, err := parseTheme(c)
 			if err != nil {
@@ -1260,7 +1277,31 @@ func parseView(n *source.Node) (*ast.View, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("invalid view name %q", name)}
 	}
 	v.Name = name
-	nodes, err := parseNodes(n.Children)
+	// `meta title "…"` / `meta description "…"` are page-metadata directives, not
+	// view nodes — pull them off before parsing the node tree.
+	var body []*source.Node
+	for _, c := range n.Children {
+		t := strings.TrimSpace(c.Line.Text)
+		switch {
+		case strings.HasPrefix(t, "meta title "):
+			segs, err := parseText(strings.TrimSpace(t[len("meta title "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			v.TitleSegs = segs
+		case strings.HasPrefix(t, "meta description "):
+			segs, err := parseText(strings.TrimSpace(t[len("meta description "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			v.DescSegs = segs
+		case t == "meta" || strings.HasPrefix(t, "meta "):
+			return nil, &Error{c.Line.No, `meta takes title or description: meta title "…"`}
+		default:
+			body = append(body, c)
+		}
+	}
+	nodes, err := parseNodes(body)
 	if err != nil {
 		return nil, err
 	}

@@ -55,7 +55,8 @@ type App struct {
 	Services   []*Service
 	Webhooks   []*Webhook
 	Triggers   []*Trigger
-	Theme      []ThemeVar
+	Theme      []ThemeVar // base design tokens (the light palette)
+	DarkTheme  []ThemeVar // `theme dark:` — token overrides applied under prefers-color-scheme: dark
 	Line       int
 }
 
@@ -385,7 +386,11 @@ type View struct {
 	Screen   bool     // true for a composed playground screen — a failing guard
 	// redirects to the first screen the actor may enter, instead of a dead end.
 	Root []Node
-	Line int
+	// Page metadata: `meta title "…"` / `meta description "…"`, interpolated and
+	// rendered server-side into <title>, <meta description>, and OpenGraph tags.
+	TitleSegs []Seg
+	DescSegs  []Seg
+	Line      int
 }
 
 // ── view nodes ──────────────────────────────────────────────────────────────

@@ -26,6 +26,7 @@ type IR struct {
 	Webhooks   []Webhook         `json:"webhooks,omitempty"`   // inbound endpoints external systems POST to
 	Triggers   []Trigger         `json:"triggers,omitempty"`   // event reactions: an action's success runs another action
 	Theme      map[string]string `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
+	ThemeDark  map[string]string `json:"themeDark,omitempty"`  // dark-mode token overrides (prefers-color-scheme: dark)
 	Routes     []Route           `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
 	Pages      []Page            `json:"pages"`                // one per view; each is a route
 	// View/Bindings/DepGraph mirror the *current* page. `facet build` shows the
@@ -49,6 +50,10 @@ type Page struct {
 	View     []Node              `json:"view"`
 	Bindings []Binding           `json:"bindings"`
 	DepGraph map[string][]string `json:"depGraph"`
+	// Page metadata, evaluated server-side at render: <title> and <meta
+	// description>/OpenGraph. Interpolated against the route scope (params, entities).
+	Title []Seg `json:"title,omitempty"`
+	Desc  []Seg `json:"desc,omitempty"`
 }
 
 // Route is the routing summary of one page: its path pattern (which may contain

@@ -668,6 +668,13 @@
     const meta = doc.querySelector('meta[name="fa-csrf"]');
     if (meta) csrf = meta.getAttribute("content");
     if (doc.title) document.title = doc.title;
+    // keep the description in sync so per-route metadata survives SPA navigation
+    const newDesc = doc.querySelector('meta[name="description"]');
+    if (newDesc) {
+      let cur = document.querySelector('meta[name="description"]');
+      if (!cur) { cur = document.createElement("meta"); cur.setAttribute("name", "description"); document.head.appendChild(cur); }
+      cur.setAttribute("content", newDesc.getAttribute("content") || "");
+    }
     load(JSON.parse(irEl.textContent), JSON.parse(stateEl.textContent));
     mount();
     if (push) history.pushState({ fa: true }, "", path);

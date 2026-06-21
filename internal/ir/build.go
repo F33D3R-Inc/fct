@@ -255,6 +255,13 @@ func Build(app *ast.App) (*IR, error) {
 			out.Theme[tv.Name] = tv.Value
 		}
 	}
+	// `theme dark:` overrides the same tokens under prefers-color-scheme: dark.
+	if len(app.DarkTheme) > 0 {
+		out.ThemeDark = map[string]string{}
+		for _, tv := range app.DarkTheme {
+			out.ThemeDark[tv.Name] = tv.Value
+		}
+	}
 
 	// 3d. Components: reusable view fragments. Names + parameters are registered in
 	// one pass (so a component may `use` another declared later, and arity checks
@@ -523,7 +530,18 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{v.Line, fmt.Sprintf("views %q and %q both map to route %q", v.Name, prev, path)}
 		}
 		pathOf[path] = v.Name
-		page := Page{Name: v.Name, Path: path, Params: v.Params, Requires: v.Requires, Screen: v.Screen, View: nodes, Bindings: pvc.bindings, DepGraph: map[string][]string{}}
+		// Page metadata is rendered once, server-side, so lower it as region (Expr)
+		// segments — evaluated against the route scope, never a reactive client bind.
+		metaScope := scope{locals: locals, inRegion: true}
+		title, err := pvc.lowerSegs(v.TitleSegs, metaScope)
+		if err != nil {
+			return nil, err
+		}
+		desc, err := pvc.lowerSegs(v.DescSegs, metaScope)
+		if err != nil {
+			return nil, err
+		}
+		page := Page{Name: v.Name, Path: path, Params: v.Params, Requires: v.Requires, Screen: v.Screen, View: nodes, Bindings: pvc.bindings, DepGraph: map[string][]string{}, Title: title, Desc: desc}
 		for dep, ids := range pvc.deps {
 			page.DepGraph[dep] = ids
 		}

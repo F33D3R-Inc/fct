@@ -158,4 +158,37 @@ theme:
     radius "8px"
 ```
 
+### Dark mode
+
+A `theme dark:` block overrides the same tokens under the OS dark scheme
+(`@media (prefers-color-scheme: dark)`) — one declarative source styles both
+schemes, no extra CSS:
+
+```
+theme:
+    bg "#ffffff"
+    fg "#16181c"
+theme dark:
+    bg "#000000"
+    fg "#e7e9ea"
+```
+
+## Page metadata
+
+A view may declare `meta title` and `meta description`. They render server-side
+into `<title>`, `<meta name="description">`, and OpenGraph tags (`og:title`,
+`og:description`) — and both **interpolate**, so a dynamic route gets a per-record
+title for search engines and link previews:
+
+```
+view Read at "/post/:id":
+    meta title "{Post(id).title} — The Blog"
+    meta description "{Post(id).body}"
+    box:
+        text "{Post(id).body}"
+```
+
+Metadata is evaluated once per render (not a reactive client binding) and stays
+correct across SPA navigation. With no `meta title`, the title is the app name.
+
 → Next: **[Projections & the API](Projections-and-API.md)**.

@@ -438,7 +438,28 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	if s.dev != nil {
 		dev = devScript
 	}
-	fmt.Fprintf(w, page, html.EscapeString(s.ir.App), csrfToken(sid), themeCSS(s.ir.Theme), body.String(), irJSON, stateJSON, dev)
+	fmt.Fprintf(w, page, s.headMeta(pg, store), csrfToken(sid), themeCSS(s.ir.Theme, s.ir.ThemeDark), body.String(), irJSON, stateJSON, dev)
+}
+
+// headMeta renders a page's <head> metadata: the <title> (the page's `meta title`
+// if set, else the app name), plus <meta description> and OpenGraph tags when a
+// `meta description` is given. Both are interpolated against the route scope, so a
+// dynamic route (`/post/:id`) gets a per-record title for SEO and link previews.
+func (s *Server) headMeta(pg *ir.Page, store map[string]any) string {
+	title := s.ir.App + " — Facet"
+	if len(pg.Title) > 0 {
+		title = s.segsToString(pg.Title, store)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "<title>%s</title>", html.EscapeString(title))
+	fmt.Fprintf(&b, "\n<meta property=\"og:title\" content=\"%s\">", html.EscapeString(title))
+	if len(pg.Desc) > 0 {
+		desc := s.segsToString(pg.Desc, store)
+		fmt.Fprintf(&b, "\n<meta name=\"description\" content=\"%s\">", html.EscapeString(desc))
+		fmt.Fprintf(&b, "\n<meta property=\"og:description\" content=\"%s\">", html.EscapeString(desc))
+		b.WriteString("\n<meta property=\"og:type\" content=\"website\">")
+	}
+	return b.String()
 }
 
 // callService posts a service operation's arguments as JSON to an external brain,
@@ -589,22 +610,36 @@ func matchRoute(pattern, path string) (map[string]string, bool) {
 // themeCSS renders the app's theme variables as a `:root` block of CSS custom
 // properties (`--fa-<name>`), so the whole UI restyles from one declarative
 // source. Empty when no `theme:` block is declared.
-func themeCSS(theme map[string]string) string {
-	if len(theme) == 0 {
+func themeCSS(theme, dark map[string]string) string {
+	if len(theme) == 0 && len(dark) == 0 {
 		return ""
 	}
+	var b strings.Builder
+	if len(theme) > 0 {
+		b.WriteString(":root{")
+		writeThemeVars(&b, theme)
+		b.WriteString("}")
+	}
+	// The dark palette overrides the same tokens when the OS asks for dark mode, so
+	// one declarative `theme dark:` block restyles the whole UI for both schemes.
+	if len(dark) > 0 {
+		b.WriteString("@media(prefers-color-scheme:dark){:root{")
+		writeThemeVars(&b, dark)
+		b.WriteString("}}")
+	}
+	return b.String()
+}
+
+// writeThemeVars emits `--fa-<name>:<value>;` for each token, in a stable order.
+func writeThemeVars(b *strings.Builder, theme map[string]string) {
 	names := make([]string, 0, len(theme))
 	for k := range theme {
 		names = append(names, k)
 	}
 	sort.Strings(names)
-	var b strings.Builder
-	b.WriteString(":root{")
 	for _, k := range names {
-		fmt.Fprintf(&b, "--fa-%s:%s;", k, strings.ReplaceAll(theme[k], "}", ""))
+		fmt.Fprintf(b, "--fa-%s:%s;", k, strings.ReplaceAll(theme[k], "}", ""))
 	}
-	b.WriteString("}")
-	return b.String()
 }
 
 // guardMutation applies the edge defenses every state-changing request passes
@@ -1865,7 +1900,7 @@ const page = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>%s — Facet</title>
+%s
 <meta name="fa-csrf" content="%s">
 <style>
   :root {

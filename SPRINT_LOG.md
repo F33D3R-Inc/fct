@@ -10,6 +10,36 @@ lives at `examples/layered/playground.fct`. Newest entries on top.
 
 ---
 
+## Sprint 18 — 2026-06-20 — F33D3R depth #5a: page metadata + design-system (dark mode) → released v1.24.0
+
+**Started depth #5 (the presentation cluster).** This release ships the two
+page-shell features; field-level authz + overlays/typeahead follow in #5b.
+
+- **Page metadata** — a view declares `meta title "…"` / `meta description "…"`,
+  rendered server-side into `<title>`, `<meta description>`, and OpenGraph
+  (og:title/description). Both **interpolate**, so a dynamic route (`/post/:id`)
+  gets a per-record title for SEO + link previews. Lowered as **region (Expr)
+  segments** — evaluated once per render against the route scope, never a reactive
+  client bind (proven by a test: a metadata-only page has zero bindings). The
+  client syncs title + description across SPA navigation.
+- **Design-system control: dark mode** — `theme dark:` overrides the same `--fa-*`
+  tokens under `@media (prefers-color-scheme: dark)`. One declarative source styles
+  both schemes; `themeCSS` emits `:root{…}` + the dark media block.
+
+- Surface: ast (View.TitleSegs/DescSegs; App.DarkTheme), parser (parseView pulls
+  `meta` directives via the existing parseText seg parser; `theme dark:` in all 3
+  theme dispatch sites), ir (Page.Title/Desc []Seg; IR.ThemeDark), build (lower
+  meta segs with inRegion scope; copy DarkTheme), runtime (headMeta + template head
+  block; themeCSS light+dark; facet.js description sync on nav).
+- Tests: `internal/compile/meta_test.go` (meta+dark lower; dynamic title → Expr seg;
+  no client binds; bad `meta` directive errors); `runtime/meta_test.go` (SSR renders
+  title/og/description; dark media query; themeCSS variants).
+- Verified e2e live: `/` head shows title+og+description; dark tokens emit under the
+  media query. Example: `examples/metadata.fct`. Docs: wiki/Views-and-UI.md
+  (Dark mode + Page metadata). version -> **1.24.0**.
+
+---
+
 ## Sprint 17 — 2026-06-20 — F33D3R depth #4: media handoff → released v1.23.0
 
 **Shipped media handoff — signed URLs + chunked upload + HLS.** The language only
