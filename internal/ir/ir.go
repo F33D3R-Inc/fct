@@ -175,7 +175,7 @@ type Action struct {
 	Writes     []string  `json:"writes"`
 	Reads      []string  `json:"reads"`
 	Seal       []string  `json:"seal,omitempty"` // @e2e: param names the client must seal (encrypt) before POSTing, so the authority only ever receives ciphertext
-	Body       []Stmt    `json:"body"` // statements in source order, including `check` validations
+	Body       []Stmt    `json:"body"`           // statements in source order, including `check` validations
 }
 
 // Require is one resolved permission check on an action: the policy name plus the

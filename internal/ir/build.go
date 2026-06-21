@@ -23,24 +23,24 @@ func (e *BuildError) Error() string {
 
 // env is the name environment used to validate references and compute deps.
 type env struct {
-	states       map[string]string            // name -> placement
-	entities     map[string]bool              // entity names
-	entityFields map[string]map[string]bool   // entity -> field set (incl id)
-	indexFields  map[string]map[string]bool   // entity -> fields the compiler saw queried (build a DB index)
-	inline       map[string]*Expr             // zero-arg policy/derive name -> lowered expr, inlined at every use
-	policySet    map[string]bool              // policy names (gating via `requires`)
-	policyParams map[string][]Param           // policy name -> its parameters (row-level policies)
-	enums        map[string][]string          // enum name -> ordered member values
-	components   map[string][]Param           // component name -> its parameters
-	compDeps     map[string]map[string]bool   // component name -> the state/entity names its body reads (for use-site refresh)
-	stateTypes   map[string]string            // state name -> its (core/element) type, for enum-defaulted selects
-	services     map[string]map[string]int    // service name -> op name -> parameter count, for checking `call`
-	serviceRets  map[string]map[string]opRet  // service name -> op name -> return type, for binding `let x = call …`
-	private      map[string]bool              // @private state names — server-only, non-renderable
-	entFieldEnum map[string]map[string]string // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
+	states       map[string]string              // name -> placement
+	entities     map[string]bool                // entity names
+	entityFields map[string]map[string]bool     // entity -> field set (incl id)
+	indexFields  map[string]map[string]bool     // entity -> fields the compiler saw queried (build a DB index)
+	inline       map[string]*Expr               // zero-arg policy/derive name -> lowered expr, inlined at every use
+	policySet    map[string]bool                // policy names (gating via `requires`)
+	policyParams map[string][]Param             // policy name -> its parameters (row-level policies)
+	enums        map[string][]string            // enum name -> ordered member values
+	components   map[string][]Param             // component name -> its parameters
+	compDeps     map[string]map[string]bool     // component name -> the state/entity names its body reads (for use-site refresh)
+	stateTypes   map[string]string              // state name -> its (core/element) type, for enum-defaulted selects
+	services     map[string]map[string]int      // service name -> op name -> parameter count, for checking `call`
+	serviceRets  map[string]map[string]opRet    // service name -> op name -> return type, for binding `let x = call …`
+	private      map[string]bool                // @private state names — server-only, non-renderable
+	entFieldEnum map[string]map[string]string   // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
 	records      map[string]map[string]recField // record name -> field name -> its type, for `let`-bound field access
-	entE2E       map[string]map[string]bool   // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
-	locRecords   map[string]recBind           // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
+	entE2E       map[string]map[string]bool     // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
+	locRecords   map[string]recBind             // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
 }
 
 // opRet is a service operation's declared return type ("" core = no return).

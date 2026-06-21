@@ -35,7 +35,7 @@ type Server struct {
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
 	byService   map[string]*ir.Service
-	byRecord    map[string]*ir.Record // record name -> its field schema, for decoding a structured service reply
+	byRecord    map[string]*ir.Record   // record name -> its field schema, for decoding a structured service reply
 	triggers    map[string][]ir.Trigger // source action name -> reactions to run on its success
 	gated       map[string][]gatedField // entity -> @requires-gated fields (API per-actor, never SSE)
 	privateNm   map[string]bool         // @private state names — never shipped to a client
