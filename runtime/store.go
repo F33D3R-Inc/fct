@@ -17,7 +17,11 @@ import (
 // StoreDescription summarizes where this app's data will live, for the startup
 // banner — read from FACET_DATABASE_URL.
 func StoreDescription(app string) string {
-	if url := os.Getenv("FACET_DATABASE_URL"); strings.HasPrefix(url, "postgres") {
+	url := os.Getenv("FACET_DATABASE_URL")
+	switch {
+	case strings.HasPrefix(url, "facetql://"):
+		return "facetql"
+	case strings.HasPrefix(url, "postgres"):
 		return "postgres"
 	}
 	return "postgres (FACET_DATABASE_URL not set)"
@@ -133,10 +137,14 @@ type Tx interface {
 //	FACET_DATABASE_URL=postgres://user:pw@host:5432/dbname
 func openStore(url string) (Store, error) {
 	if url == "" {
-		return nil, fmt.Errorf("FACET_DATABASE_URL is not set; point it at Postgres, e.g. postgres://user:pw@localhost:5432/dbname")
+		return nil, fmt.Errorf("FACET_DATABASE_URL is not set; point it at FacetQL (facetql://[token@]host:port) or Postgres (postgres://user:pw@host:5432/db)")
+	}
+	// Native FacetQL backend — the replacement for Postgres (AGENT_LOG §2).
+	if strings.HasPrefix(url, "facetql://") {
+		return openFacetQL(url)
 	}
 	if !strings.HasPrefix(url, "postgres://") && !strings.HasPrefix(url, "postgresql://") {
-		return nil, fmt.Errorf("FACET_DATABASE_URL %q is not a Postgres URL (expected postgres://…)", url)
+		return nil, fmt.Errorf("FACET_DATABASE_URL %q is not a FacetQL (facetql://…) or Postgres (postgres://…) URL", url)
 	}
 	return openPostgres(url)
 }
