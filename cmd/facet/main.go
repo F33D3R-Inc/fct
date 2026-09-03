@@ -99,6 +99,12 @@ func main() {
 			fatal(err)
 		}
 		return
+	case "check":
+		os.Exit(cmdCheck(os.Args[2:]))
+	case "ir":
+		os.Exit(cmdIR(os.Args[2:]))
+	case "inspect":
+		os.Exit(cmdInspect(os.Args[2:]))
 	case "build", "explain", "run", "dev", "console", "seed", "test", "migrate", "backup", "restore", "deploy", "generate":
 		// handled below
 	default:
@@ -113,7 +119,14 @@ func main() {
 	// merges them before placement, so a multi-file app compiles like a single one.
 	graph, err := compile.File(file)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "compile error: %v\n", err)
+		// Editors/automation can ask for the error as structured JSON (source
+		// location + message) with --json; humans get the one-line form.
+		if hasFlag(os.Args[3:], "--json", "-json") {
+			out, _ := json.MarshalIndent(diagnosticsFor(file, err), "", "  ")
+			fmt.Fprintln(os.Stderr, string(out))
+		} else {
+			fmt.Fprintf(os.Stderr, "compile error: %v\n", err)
+		}
 		os.Exit(1)
 	}
 
@@ -363,12 +376,124 @@ func scaffoldDeploy(app string) error {
 	return nil
 }
 
+// ── read-only inspection commands ─────────────────────────────────────────────
+//
+// check/ir/inspect each compile the app (the only real capability they need) and
+// project the resulting IR. They never serve, never touch the database, never
+// write files. Each returns a process exit code so main can `os.Exit` it.
+
+// CheckResult is the machine-readable result of `facet check --json`.
+type CheckResult struct {
+	OK          bool         `json:"ok"`
+	File        string       `json:"file"`
+	Diagnostics []Diagnostic `json:"diagnostics"`
+}
+
+// cmdCheck compiles the app and reports success or diagnostics, without running
+// it — the fast "does this build?" command for CI and editors. With --json it
+// emits a stable {ok, file, diagnostics} object; otherwise a one-line summary.
+func cmdCheck(args []string) int {
+	file := firstNonFlag(args)
+	if file == "" {
+		fmt.Fprintln(os.Stderr, "usage: facet check <file.fct> [--json]")
+		return 2
+	}
+	jsonOut := hasFlag(args, "--json", "-json")
+	graph, err := compile.File(file)
+	if err != nil {
+		if jsonOut {
+			out, _ := json.MarshalIndent(CheckResult{OK: false, File: file, Diagnostics: diagnosticsFor(file, err)}, "", "  ")
+			fmt.Println(string(out))
+		} else {
+			fmt.Fprintf(os.Stderr, "facet: %s\n", err)
+		}
+		return 1
+	}
+	if jsonOut {
+		out, _ := json.MarshalIndent(CheckResult{OK: true, File: file, Diagnostics: []Diagnostic{}}, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		fmt.Printf("facet: %s — ok (%d entities, %d actions, %d views)\n",
+			graph.App, len(graph.Entities), len(graph.Actions), len(graph.Pages))
+	}
+	return 0
+}
+
+// cmdIR dumps the compiled IR — the compiler's terminal artifact — as JSON, so
+// editors and tooling can consume the application graph directly. Indented by
+// default; --compact emits single-line JSON for piping. On a compile error it
+// writes structured diagnostics to stderr so stdout stays clean.
+func cmdIR(args []string) int {
+	file := firstNonFlag(args)
+	if file == "" {
+		fmt.Fprintln(os.Stderr, "usage: facet ir <file.fct> [--compact]")
+		return 2
+	}
+	graph, err := compile.File(file)
+	if err != nil {
+		out, _ := json.MarshalIndent(diagnosticsFor(file, err), "", "  ")
+		fmt.Fprintln(os.Stderr, string(out))
+		return 1
+	}
+	out, err := marshalIR(graph, hasFlag(args, "--compact", "-compact"))
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Println(string(out))
+	return 0
+}
+
+// cmdInspect prints a structured summary of what the app compiles to — entities,
+// state placement, action placement + reasons, views/routes, services, jobs —
+// derived entirely from the IR. Human-readable by default; --json for tooling.
+func cmdInspect(args []string) int {
+	file := firstNonFlag(args)
+	if file == "" {
+		fmt.Fprintln(os.Stderr, "usage: facet inspect <file.fct> [--json]")
+		return 2
+	}
+	jsonOut := hasFlag(args, "--json", "-json")
+	graph, err := compile.File(file)
+	if err != nil {
+		if jsonOut {
+			out, _ := json.MarshalIndent(diagnosticsFor(file, err), "", "  ")
+			fmt.Fprintln(os.Stderr, string(out))
+		} else {
+			fmt.Fprintf(os.Stderr, "facet: %s\n", err)
+		}
+		return 1
+	}
+	report := buildInspect(graph)
+	if jsonOut {
+		out, _ := json.MarshalIndent(report, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		writeInspectText(os.Stdout, report)
+	}
+	return 0
+}
+
+// hasFlag reports whether any of names appears verbatim in args.
+func hasFlag(args []string, names ...string) bool {
+	for _, a := range args {
+		for _, n := range names {
+			if a == n {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  facet new <name>               scaffold a new project")
 	fmt.Fprintln(os.Stderr, "  facet dev <file.fct> [addr]    run with hot reload (in-memory if no DB)")
 	fmt.Fprintln(os.Stderr, "  facet run <file.fct> [addr]    serve the web + API projections")
-	fmt.Fprintln(os.Stderr, "  facet build <file.fct>         compile and print the IR")
+	fmt.Fprintln(os.Stderr, "  facet check <file.fct> [--json] compile-only; report ok or diagnostics")
+	fmt.Fprintln(os.Stderr, "  facet build <file.fct> [--json] compile and print the IR (--json for error diagnostics)")
+	fmt.Fprintln(os.Stderr, "  facet ir <file.fct> [--compact] dump the compiled IR as JSON for tooling")
+	fmt.Fprintln(os.Stderr, "  facet inspect <file.fct> [--json] structured summary of what the app compiles to")
 	fmt.Fprintln(os.Stderr, "  facet console <file.fct>       interactive REPL against the app")
 	fmt.Fprintln(os.Stderr, "  facet test <file.fct> [tests]  run the app's behavior tests")
 	fmt.Fprintln(os.Stderr, "  facet seed <file.fct> [data]   load fixture rows (--dry for in-memory)")
