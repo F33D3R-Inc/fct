@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"facet/internal/ir"
@@ -296,70 +297,360 @@ func (t *fqTx) Rollback() error {
 	return nil
 }
 
-// ── stubs (AGENT_LOG §3 gap list — not implemented yet) ─────────────────────
+// ── query / audit / sessions / jobs ─────────────────────────────────────────
 
-// errFQTODO builds the standard "not implemented yet" error for a stubbed method.
+// errFQTODO builds the standard "not implemented yet" error for a method that is
+// intentionally deferred pending a facetql-side primitive (currently only
+// ReserveCron — see its doc comment).
 func errFQTODO(method string) error {
 	return fmt.Errorf("fqStore.%s: not implemented yet (native FacetQL backend in progress — see AGENT_LOG §3)", method)
 }
 
-// Query — keyset-cursor paginated read.
+// ── reserved-kind helpers ───────────────────────────────────────────────────
 //
-// TODO(fqStore) [AGENT_LOG §3 gap 1]: blocked on the facetql predicate-pushdown /
-// keyset-cursor work (POST /nodes/query) being built in parallel. That endpoint
-// must translate ir.Expr predicates and return an opaque keyset cursor (After ->
-// next-cursor), not offset paging. Wire this to it once it lands.
+// Audit/session/job/cron records are stored as FacetQL nodes of a reserved kind
+// (__audit / __session / __job / __cron) whose opaque `data` holds the record's
+// JSON. These do NOT go through rowNode/nodeRecord (those need an entity
+// definition); they marshal a value directly, since the adapter fully owns these
+// kinds. Nodes are owned by the fct token identity, so reads (same identity) pass
+// FacetQL's ownership check.
+
+// reservedUpsert stores v as the `data` JSON of a reserved-kind node.
+func (s *fqStore) reservedUpsert(ctx context.Context, kind, address string, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("encode %s node: %w", kind, err)
+	}
+	return s.c.upsert(ctx, fqNode{Address: address, Kind: kind, Data: string(data)})
+}
+
+// fqIDCounter backs nextFQID; it makes reserved-record ids strictly increasing
+// within a process even if two calls land in the same nanosecond, so a record's
+// address (which embeds the id) is unique and chronologically sortable.
+var fqIDCounter int64
+
+func nextFQID() int64 {
+	for {
+		n := time.Now().UnixNano()
+		cur := atomic.LoadInt64(&fqIDCounter)
+		if n <= cur {
+			n = cur + 1
+		}
+		if atomic.CompareAndSwapInt64(&fqIDCounter, cur, n) {
+			return n
+		}
+	}
+}
+
+// ── predicate builders (for pushed-down __session/__job queries) ─────────────
+//
+// These construct the ir.Expr subset FacetQL can push down. The item variable is
+// always "item" — matching FacetQL's fixed delete_where item var and the ItemVar
+// we send on /nodes/query, so `get(item.field)` resolves the same on both paths.
+
+func fqRef() *ir.Expr             { return &ir.Expr{Kind: "ref", Name: "item"} }
+func fqGet(field string) *ir.Expr { return &ir.Expr{Kind: "get", Obj: fqRef(), Field: field} }
+func fqLitInt(v int64) *ir.Expr   { return &ir.Expr{Kind: "lit", Val: v, VType: "int"} }
+func fqLitText(v string) *ir.Expr { return &ir.Expr{Kind: "lit", Val: v, VType: "text"} }
+func fqBin(op string, l, r *ir.Expr) *ir.Expr {
+	return &ir.Expr{Kind: "bin", Op: op, L: l, R: r}
+}
+
+// Query is a predicate-pushdown, keyset-paginated read against FacetQL's
+// POST /nodes/query (AGENT_LOG §3 gap 1, §4b). The whole filter — the pushed-down
+// ir.Expr predicate, ordering, page size, and the opaque cursor — is sent to the
+// engine, which evaluates it over each node's `data` JSON and returns one page of
+// nodes plus the cursor for the next page. The incoming After is passed through
+// and the server's next is returned unchanged: the cursor is opaque, never parsed
+// or reconstructed here. An unpushable predicate is an error from the engine, not
+// a silently wrong or empty page. Nodes are decoded back into rows the same way
+// Load does, via nodeRecord (colValue/normalize + entity definition).
 func (s *fqStore) Query(query Query) ([]any, string, error) {
-	return nil, "", errFQTODO("Query")
+	e, ok := s.ents[query.Entity]
+	if !ok {
+		return nil, "", fmt.Errorf("fqStore.Query: unknown entity %q", query.Entity)
+	}
+	limit := query.Limit
+	if limit <= 0 {
+		limit = defaultPageSize
+	}
+	nodes, next, err := s.c.query(context.Background(), fqQueryRequest{
+		Kind:    query.Entity,
+		Where:   query.Where,
+		ItemVar: query.ItemVar,
+		Order:   query.Order,
+		Desc:    query.Desc,
+		Limit:   limit,
+		After:   query.After, // opaque cursor, passed through untouched
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("fqStore.Query: %w", err)
+	}
+	out := make([]any, 0, len(nodes))
+	for _, n := range nodes {
+		rec, err := nodeRecord(e, n)
+		if err != nil {
+			return nil, "", fmt.Errorf("fqStore.Query: %w", err)
+		}
+		out = append(out, rec)
+	}
+	return out, next, nil // server's next returned opaque; "" = last page
 }
 
-// Audit / RecentAudit — durable append-only audit log.
-//
-// TODO(fqStore) [AGENT_LOG §3 gap 4]: store as nodes of a reserved kind
-// "__audit"; RecentAudit needs an ordered, limited read (blocked on the same
-// query path as Query).
-func (s *fqStore) Audit(e auditEntry) error { return errFQTODO("Audit") }
+// ── audit log (reserved kind "__audit") ──────────────────────────────────────
 
+// Audit appends one entry as an immutable __audit node. The address embeds a
+// strictly-increasing id (nextFQID) so entries sort chronologically by address —
+// the base order the query path uses when no data field is named.
+func (s *fqStore) Audit(e auditEntry) error {
+	addr := fmt.Sprintf("__audit:%019d", nextFQID())
+	return s.reservedUpsert(context.Background(), "__audit", addr, e)
+}
+
+// RecentAudit returns up to limit entries, oldest-first (to seed the in-memory
+// ring chronologically), matching pgStore. It pages POST /nodes/query ordered by
+// address descending (newest first) via the opaque cursor until it has limit
+// entries, then reverses to oldest-first.
 func (s *fqStore) RecentAudit(limit int) ([]auditEntry, error) {
-	return nil, errFQTODO("RecentAudit")
+	if limit <= 0 {
+		limit = 1000
+	}
+	ctx := context.Background()
+	newestFirst := make([]auditEntry, 0, limit)
+	after := ""
+	for len(newestFirst) < limit {
+		page := limit - len(newestFirst)
+		if page > 500 {
+			page = 500
+		}
+		// Order "id" => base (address) order; Desc => newest (highest id) first.
+		nodes, next, err := s.c.query(ctx, fqQueryRequest{
+			Kind: "__audit", ItemVar: "item", Order: "id", Desc: true, Limit: page, After: after,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fqStore.RecentAudit: %w", err)
+		}
+		for _, n := range nodes {
+			var e auditEntry
+			if n.Data != "" {
+				if err := json.Unmarshal([]byte(n.Data), &e); err != nil {
+					return nil, fmt.Errorf("fqStore.RecentAudit: decode %q: %w", n.Address, err)
+				}
+			}
+			newestFirst = append(newestFirst, e)
+		}
+		if next == "" || len(nodes) == 0 {
+			break
+		}
+		after = next
+	}
+	// reverse to oldest-first
+	for i, j := 0, len(newestFirst)-1; i < j; i, j = i+1, j-1 {
+		newestFirst[i], newestFirst[j] = newestFirst[j], newestFirst[i]
+	}
+	return newestFirst, nil
 }
 
-// Shared sessions — reserved kind "__session".
-//
-// TODO(fqStore) [AGENT_LOG §3 gap 4]: LoadSession/SaveSession/DeleteSession map to
-// GET/POST/DELETE on a "__session:<sid>" node; PurgeExpiredSessions needs a
-// conditional/bulk delete (expires < now) to avoid N round-trips.
+// ── shared sessions (reserved kind "__session") ──────────────────────────────
+
+// fqSessionData is a session's stored form: the whole persistedSession plus a
+// numeric _expires_unix so PurgeExpiredSessions can compare expiry with a pushed-
+// down predicate (numeric comparison, unambiguous — unlike an RFC3339 string).
+type fqSessionData struct {
+	persistedSession
+	ExpiresUnix int64 `json:"_expires_unix"`
+}
+
+func fqSessionAddr(sid string) string { return "__session:" + sid }
+
 func (s *fqStore) LoadSession(sid string) (*persistedSession, bool, error) {
-	return nil, false, errFQTODO("LoadSession")
+	n, found, err := s.c.getNode(context.Background(), fqSessionAddr(sid))
+	if err != nil {
+		return nil, false, fmt.Errorf("fqStore.LoadSession: %w", err)
+	}
+	if !found {
+		return nil, false, nil
+	}
+	var d fqSessionData
+	if n.Data != "" {
+		if err := json.Unmarshal([]byte(n.Data), &d); err != nil {
+			return nil, false, fmt.Errorf("fqStore.LoadSession: decode %q: %w", sid, err)
+		}
+	}
+	if d.State == nil {
+		d.State = map[string]any{}
+	}
+	ps := d.persistedSession
+	return &ps, true, nil
 }
 
 func (s *fqStore) SaveSession(sid string, ps *persistedSession) error {
-	return errFQTODO("SaveSession")
+	d := fqSessionData{persistedSession: *ps, ExpiresUnix: ps.Expires.Unix()}
+	return s.reservedUpsert(context.Background(), "__session", fqSessionAddr(sid), d)
 }
 
-func (s *fqStore) DeleteSession(sid string) error { return errFQTODO("DeleteSession") }
+func (s *fqStore) DeleteSession(sid string) error {
+	return s.c.deleteNode(context.Background(), fqSessionAddr(sid))
+}
 
-func (s *fqStore) PurgeExpiredSessions() error { return errFQTODO("PurgeExpiredSessions") }
+// PurgeExpiredSessions removes every expired session in ONE native delete_where
+// op (AGENT_LOG §4b): the engine evaluates `item._expires_unix < now` over each
+// __session node's data and tombstones the matches atomically — no N round-trips.
+func (s *fqStore) PurgeExpiredSessions() error {
+	pred := fqBin("<", fqGet("_expires_unix"), fqLitInt(time.Now().Unix()))
+	return s.c.transaction(context.Background(), []fqTxOp{
+		{Type: "delete_where", Kind: "__session", Where: pred},
+	})
+}
 
-// Durable job queue — reserved kinds "__job" / "__cron".
-//
-// TODO(fqStore) [AGENT_LOG §3 gap 4]: ClaimJob maps to the verified atomic
-// POST /node/:address/claim primitive (the FOR UPDATE SKIP LOCKED equivalent);
-// ReserveCron to a conditional claim on a "__cron:<name>" node. EnqueueJob/
-// FinishJob/PendingJobs are node writes/reads once reserved-kind conventions and
-// the ordered query path exist.
-func (s *fqStore) EnqueueJob(j *durableJob) error { return errFQTODO("EnqueueJob") }
+// ── durable job queue (reserved kinds "__job" / "__cron") ─────────────────────
 
+// fqJobData is a job's stored form. run_at is kept as a unix int so ClaimJob can
+// push down `run_at_unix <= now` and order by it.
+type fqJobData struct {
+	ID          int64  `json:"id"`
+	Queue       string `json:"queue"`
+	Action      string `json:"action"`
+	Args        []any  `json:"args"`
+	RunAtUnix   int64  `json:"run_at_unix"`
+	Attempts    int    `json:"attempts"`
+	MaxAttempts int    `json:"max_attempts"`
+	Status      string `json:"status"` // pending | running | done | dead
+	LastError   string `json:"last_error"`
+}
+
+func fqJobAddr(id int64) string { return fmt.Sprintf("__job:%019d", id) }
+
+func jobFromData(d fqJobData) *durableJob {
+	return &durableJob{
+		ID: d.ID, Queue: d.Queue, Action: d.Action, Args: d.Args,
+		RunAt: time.Unix(d.RunAtUnix, 0), Attempts: d.Attempts,
+		MaxAttempts: d.MaxAttempts, Status: d.Status, LastError: d.LastError,
+	}
+}
+
+func (s *fqStore) EnqueueJob(j *durableJob) error {
+	if j.MaxAttempts <= 0 {
+		j.MaxAttempts = 5
+	}
+	if j.Queue == "" {
+		j.Queue = "default"
+	}
+	if j.RunAt.IsZero() {
+		j.RunAt = time.Now()
+	}
+	id := nextFQID()
+	d := fqJobData{
+		ID: id, Queue: j.Queue, Action: j.Action, Args: j.Args,
+		RunAtUnix: j.RunAt.Unix(), Attempts: 0, MaxAttempts: j.MaxAttempts, Status: "pending",
+	}
+	return s.reservedUpsert(context.Background(), "__job", fqJobAddr(id), d)
+}
+
+// ClaimJob leases the next due, pending job to exactly one worker. It queries the
+// due-and-pending jobs oldest-first, then atomically claims candidates via the
+// verified POST /node/:address/claim primitive (the FOR-UPDATE-SKIP-LOCKED
+// equivalent): the first candidate we win is ours; a candidate already leased by
+// a racing worker returns won=false and we try the next. The claim (claimed_by)
+// IS the lease — we deliberately do NOT upsert the node here, since upsert would
+// replace it and clear the lease. Attempts are incremented on retry in FinishJob.
 func (s *fqStore) ClaimJob(worker string) (*durableJob, error) {
-	return nil, errFQTODO("ClaimJob")
+	ctx := context.Background()
+	now := time.Now().Unix()
+	pred := fqBin("&&", fqBin("==", fqGet("status"), fqLitText("pending")),
+		fqBin("<=", fqGet("run_at_unix"), fqLitInt(now)))
+	nodes, _, err := s.c.query(ctx, fqQueryRequest{
+		Kind: "__job", ItemVar: "item", Where: pred, Order: "run_at_unix", Desc: false, Limit: 50,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fqStore.ClaimJob: %w", err)
+	}
+	for _, n := range nodes {
+		won, err := s.c.claim(ctx, n.Address)
+		if err != nil {
+			return nil, fmt.Errorf("fqStore.ClaimJob: %w", err)
+		}
+		if !won {
+			continue // leased by another worker, or already gone
+		}
+		var d fqJobData
+		if err := json.Unmarshal([]byte(n.Data), &d); err != nil {
+			return nil, fmt.Errorf("fqStore.ClaimJob: decode %q: %w", n.Address, err)
+		}
+		return jobFromData(d), nil
+	}
+	return nil, nil // nothing due to claim
 }
 
+// FinishJob records a claimed job's outcome. done => the node is deleted; dead =>
+// marked (kept as a dead-letter, status "dead" so it is never re-claimed);
+// pending (a retry) => re-enqueued via upsert, which replaces the node and thereby
+// RELEASES the lease (clears claimed_by), so the rescheduled job is claimable
+// again. Attempts is incremented on each retry.
 func (s *fqStore) FinishJob(id int64, status, lastErr string, nextRun time.Time) error {
-	return errFQTODO("FinishJob")
+	ctx := context.Background()
+	addr := fqJobAddr(id)
+	if status == "done" {
+		return s.c.deleteNode(ctx, addr)
+	}
+	n, found, err := s.c.getNode(ctx, addr)
+	if err != nil {
+		return fmt.Errorf("fqStore.FinishJob: %w", err)
+	}
+	if !found {
+		return nil // already gone; nothing to record
+	}
+	var d fqJobData
+	if err := json.Unmarshal([]byte(n.Data), &d); err != nil {
+		return fmt.Errorf("fqStore.FinishJob: decode %q: %w", addr, err)
+	}
+	d.LastError = lastErr
+	if status == "pending" {
+		d.Status = "pending"
+		d.RunAtUnix = nextRun.Unix()
+		d.Attempts++
+	} else {
+		d.Status = status // "dead"
+	}
+	return s.reservedUpsert(ctx, "__job", addr, d)
 }
 
-func (s *fqStore) PendingJobs() (int64, error) { return 0, errFQTODO("PendingJobs") }
+// PendingJobs reports queue depth (count of pending __job nodes). This is a linear
+// scan over the pending set for v1.
+// TODO(fqStore): a native COUNT primitive on facetql would avoid paging all rows.
+func (s *fqStore) PendingJobs() (int64, error) {
+	ctx := context.Background()
+	pred := fqBin("==", fqGet("status"), fqLitText("pending"))
+	var total int64
+	after := ""
+	for {
+		nodes, next, err := s.c.query(ctx, fqQueryRequest{
+			Kind: "__job", ItemVar: "item", Where: pred, Order: "id", Desc: false, Limit: 500, After: after,
+		})
+		if err != nil {
+			return 0, fmt.Errorf("fqStore.PendingJobs: %w", err)
+		}
+		total += int64(len(nodes))
+		if next == "" || len(nodes) == 0 {
+			break
+		}
+		after = next
+	}
+	return total, nil
+}
 
+// ReserveCron needs "advance a __cron:<name> node's next_run ONLY if it is absent
+// or already due, and report whether this caller won" — an atomic conditional
+// compare-and-set on a field value. FacetQL has no such primitive today: `claim`
+// is claim-once (not conditional on a field, and not re-armable each tick), and
+// upsert is an unconditional whole-node replace. Faking it with read-then-write
+// would be a race (two instances both reading "due" and both winning the tick),
+// which the no-racy-hacks rule forbids.
+//
+// TODO(fqStore) [AGENT_LOG §28]: needs a native facetql conditional-update / CAS
+// tx op, e.g. `set_if { address, field, expect_le: <now>, set: {next_run} }`
+// returning whether it applied. Deferred pending that primitive — coordinate the
+// facetql work rather than shipping a racy cron.
 func (s *fqStore) ReserveCron(name string, next time.Time) (bool, error) {
 	return false, errFQTODO("ReserveCron")
 }

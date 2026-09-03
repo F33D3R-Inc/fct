@@ -24,7 +24,7 @@ func StoreDescription(app string) string {
 	case strings.HasPrefix(url, "postgres"):
 		return "postgres"
 	}
-	return "postgres (FACET_DATABASE_URL not set)"
+	return "facetql (default: facetql://localhost:8080)"
 }
 
 // Store is the durable home of an app's entity data — the database. The runtime
@@ -136,8 +136,11 @@ type Tx interface {
 //
 //	FACET_DATABASE_URL=postgres://user:pw@host:5432/dbname
 func openStore(url string) (Store, error) {
+	// FacetQL is the default backend: an unset FACET_DATABASE_URL points at a local
+	// FacetQL instead of erroring. Postgres remains reachable only via an explicit
+	// postgres:// URL.
 	if url == "" {
-		return nil, fmt.Errorf("FACET_DATABASE_URL is not set; point it at FacetQL (facetql://[token@]host:port) or Postgres (postgres://user:pw@host:5432/db)")
+		url = "facetql://localhost:8080"
 	}
 	// Native FacetQL backend — the replacement for Postgres (AGENT_LOG §2).
 	if strings.HasPrefix(url, "facetql://") {

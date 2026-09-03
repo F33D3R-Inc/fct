@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"facet/internal/ir"
 )
 
 // fqClient is a thin HTTP wrapper around a FacetQL instance.
@@ -59,6 +61,7 @@ type fqNode struct {
 //	{ "type":"insert_node", "address":…, "kind":…, "x":0,"y":0,"z":0,"q":0, "data":…, "public":false }
 //	{ "type":"delete_node", "address":… }
 //	{ "type":"clear_kind",  "kind":… }
+//	{ "type":"delete_where", "kind":…, "where":<Expr|omitted> }
 //
 // MarshalJSON emits the exact per-type shape (no stray zero fields on delete/clear),
 // so the body matches the contract byte-for-byte.
@@ -72,6 +75,7 @@ type fqTxOp struct {
 	Q       uint8
 	Data    string
 	Public  bool
+	Where   *ir.Expr // delete_where predicate; nil = unconditional (like clear_kind)
 }
 
 func (o fqTxOp) MarshalJSON() ([]byte, error) {
@@ -98,6 +102,13 @@ func (o fqTxOp) MarshalJSON() ([]byte, error) {
 			Type string `json:"type"`
 			Kind string `json:"kind"`
 		}{o.Type, o.Kind})
+	case "delete_where":
+		// Predicate under JSON key "where"; omitted when nil (== clear_kind).
+		return json.Marshal(struct {
+			Type  string   `json:"type"`
+			Kind  string   `json:"kind"`
+			Where *ir.Expr `json:"where,omitempty"`
+		}{o.Type, o.Kind, o.Where})
 	default:
 		return nil, fmt.Errorf("facetql: unknown transaction op type %q", o.Type)
 	}
@@ -203,6 +214,40 @@ func (c *fqClient) deleteNode(ctx context.Context, address string) error {
 	return err
 }
 
+// getNode fetches a single node by address (GET /node/:address). A missing node
+// is a benign (found=false) result, not an error — the caller decides.
+func (c *fqClient) getNode(ctx context.Context, address string) (fqNode, bool, error) {
+	data, status, err := c.do(ctx, http.MethodGet, "/node/"+url.PathEscape(address), nil)
+	if status == http.StatusNotFound {
+		return fqNode{}, false, nil
+	}
+	if err != nil {
+		return fqNode{}, false, err
+	}
+	var n fqNode
+	if err := json.Unmarshal(data, &n); err != nil {
+		return fqNode{}, false, fmt.Errorf("facetql decode node %q: %w", address, err)
+	}
+	return n, true, nil
+}
+
+// claim atomically leases a node to the caller (POST /node/:address/claim). The
+// claimer identity is the request's token owner (server-side), so this is the
+// FOR-UPDATE-SKIP-LOCKED equivalent: exactly one caller wins an unclaimed node.
+// Returns won=true on success, won=false if it is already claimed (409) or gone
+// (404) — both are normal "someone else got it / nothing to lease" outcomes.
+func (c *fqClient) claim(ctx context.Context, address string) (won bool, err error) {
+	_, status, err := c.do(ctx, http.MethodPost, "/node/"+url.PathEscape(address)+"/claim", nil)
+	switch status {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusConflict, http.StatusNotFound:
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // listKind fetches one page of nodes of a kind (GET /nodes?kind&limit&offset).
 // FacetQL may answer with a bare array or a {"nodes":[...]} envelope; both are
 // accepted.
@@ -239,6 +284,47 @@ func decodeNodes(data []byte) ([]fqNode, error) {
 		return nil, fmt.Errorf("facetql decode nodes envelope: %w", err)
 	}
 	return env.Nodes, nil
+}
+
+// fqQueryRequest is the POST /nodes/query body: the pushed-down read filter
+// (AGENT_LOG §4b). `where` is the ir.Expr predicate — its JSON tags already mirror
+// FacetQL's Rust predicate.rs field-for-field, so it serializes without any
+// translation. `after` is the opaque keyset cursor from the previous page; it is
+// omitted on the first page (empty = first page).
+type fqQueryRequest struct {
+	Kind    string   `json:"kind"`
+	Where   *ir.Expr `json:"where,omitempty"`
+	ItemVar string   `json:"item_var"`
+	Order   string   `json:"order"`
+	Desc    bool     `json:"desc"`
+	Limit   int      `json:"limit"`
+	After   string   `json:"after,omitempty"`
+}
+
+// query runs a predicate-pushdown, keyset-paginated read (POST /nodes/query) and
+// returns one page of nodes plus the opaque cursor for the next page ("" on the
+// last page). An unpushable predicate is a 400 from FacetQL, which do surfaces as
+// an error — never a silently wrong or empty page.
+func (c *fqClient) query(ctx context.Context, req fqQueryRequest) ([]fqNode, string, error) {
+	data, _, err := c.do(ctx, http.MethodPost, "/nodes/query", req)
+	if err != nil {
+		return nil, "", err
+	}
+	return decodeQueryPage(data)
+}
+
+// decodeQueryPage parses a POST /nodes/query response — {"nodes":[...],"next":""}
+// (AGENT_LOG §4b) — into a page of nodes and the opaque next cursor, returned
+// unchanged (`next":""` = last page).
+func decodeQueryPage(data []byte) ([]fqNode, string, error) {
+	var resp struct {
+		Nodes []fqNode `json:"nodes"`
+		Next  string   `json:"next"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, "", fmt.Errorf("facetql decode query response: %w", err)
+	}
+	return resp.Nodes, resp.Next, nil
 }
 
 // transaction submits a batch of ops atomically (POST /transaction).
