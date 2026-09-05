@@ -28,6 +28,7 @@ func Parse(src string) (*ast.App, error) {
 	if err != nil {
 		return nil, err
 	}
+	comments := source.Comments(src)
 	var imports []string
 	var appNode *source.Node
 	for _, r := range roots {
@@ -62,7 +63,7 @@ func Parse(src string) (*ast.App, error) {
 	if appNode == nil {
 		return nil, &Error{0, "empty source: expected a facet definition (app/playground/wireframe/ui/data)"}
 	}
-	app, err := parseFacet(appNode)
+	app, err := parseFacet(appNode, comments)
 	if err != nil {
 		return nil, err
 	}
@@ -72,24 +73,24 @@ func Parse(src string) (*ast.App, error) {
 
 // parseFacet dispatches on the facet kind keyword that opens a file. A plain
 // `app` is the original self-contained graph; the typed kinds compose as bricks.
-func parseFacet(n *source.Node) (*ast.App, error) {
+func parseFacet(n *source.Node, comments []source.Line) (*ast.App, error) {
 	switch firstWord(n.Line.Text) {
 	case "app":
-		return parseApp(n)
+		return parseApp(n, comments)
 	case "playground":
-		return parsePlayground(n)
+		return parsePlayground(n, comments)
 	case "wireframe":
-		return parseWireframe(n)
+		return parseWireframe(n, comments)
 	case "ui":
-		return parseUIData(n, "ui")
+		return parseUIData(n, "ui", comments)
 	case "data":
-		return parseUIData(n, "data")
+		return parseUIData(n, "data", comments)
 	default:
 		return nil, &Error{n.Line.No, "file must start with `app`, `playground`, `wireframe`, `ui`, or `data`"}
 	}
 }
 
-func parseApp(n *source.Node) (*ast.App, error) {
+func parseApp(n *source.Node, comments []source.Line) (*ast.App, error) {
 	name, ok := keyword(n.Line.Text, "app")
 	if !ok {
 		return nil, &Error{n.Line.No, "file must start with `app Name:`"}
@@ -100,7 +101,7 @@ func parseApp(n *source.Node) (*ast.App, error) {
 	}
 	app := &ast.App{Name: name, Kind: "app", Line: n.Line.No}
 	for _, c := range n.Children {
-		if err := parseDecl(app, c); err != nil {
+		if err := parseDecl(app, c, comments); err != nil {
 			return nil, err
 		}
 	}
@@ -111,7 +112,7 @@ func parseApp(n *source.Node) (*ast.App, error) {
 // full vocabulary of entities, state, logic, and UI. Kind-specific guards (e.g.
 // a `ui` facet may not declare an entity) are applied by the caller via the
 // returned facet's contents; here we only parse what is structurally a member.
-func parseDecl(app *ast.App, c *source.Node) error {
+func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 	var err error
 	switch {
 	case c.Line.Text == "auth" || c.Line.Text == "auth:":
@@ -158,7 +159,7 @@ func parseDecl(app *ast.App, c *source.Node) error {
 		}
 	case c.Line.Text == "css:" || c.Line.Text == "css":
 		var css string
-		if css, err = parseCSS(c); err == nil {
+		if css, err = parseCSS(c, comments); err == nil {
 			app.CSS = joinCSS(app.CSS, css)
 		}
 	case strings.HasPrefix(c.Line.Text, "state "):
@@ -215,7 +216,7 @@ func parseDecl(app *ast.App, c *source.Node) error {
 // parsePlayground parses `playground Name:` — the baseplate. It holds global
 // concerns (auth, theme) and mounts exactly one wireframe; it accepts nothing
 // else, because a playground only takes a wireframe.
-func parsePlayground(n *source.Node) (*ast.App, error) {
+func parsePlayground(n *source.Node, comments []source.Line) (*ast.App, error) {
 	name := strings.TrimSuffix(keywordRest(n.Line.Text, "playground"), ":")
 	if !isIdent(name) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("invalid playground name %q", name)}
@@ -245,7 +246,7 @@ func parsePlayground(n *source.Node) (*ast.App, error) {
 			}
 			app.Themes = append(app.Themes, nt)
 		case t == "css:" || t == "css":
-			css, err := parseCSS(c)
+			css, err := parseCSS(c, comments)
 			if err != nil {
 				return nil, err
 			}
@@ -302,7 +303,7 @@ func parseMount(t string, line int) (ast.Mount, error) {
 // parseWireframe parses `wireframe Name:` — the structural brick. It declares
 // typed `socket`s and a `frame:` layout that places each socket with `slot
 // <name>`. It is pure structure: no data, no behavior.
-func parseWireframe(n *source.Node) (*ast.App, error) {
+func parseWireframe(n *source.Node, comments []source.Line) (*ast.App, error) {
 	name := strings.TrimSuffix(keywordRest(n.Line.Text, "wireframe"), ":")
 	if !isIdent(name) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("invalid wireframe name %q", name)}
@@ -330,7 +331,7 @@ func parseWireframe(n *source.Node) (*ast.App, error) {
 			}
 			app.Themes = append(app.Themes, nt)
 		case t == "css:" || t == "css":
-			css, err := parseCSS(c)
+			css, err := parseCSS(c, comments)
 			if err != nil {
 				return nil, err
 			}
@@ -385,8 +386,10 @@ func parseSocket(n *source.Node) (ast.Socket, error) {
 // parseUIData parses `ui Name in socket:` / `data Name in socket:` — a content
 // brick that snaps into a wireframe socket. A `ui` facet carries skin and
 // presentation; a `data` facet carries entities, logic, and its own content.
-// Both contribute a `content:` node tree placed at the socket.
-func parseUIData(n *source.Node, kind string) (*ast.App, error) {
+// Both contribute a `content:` node tree placed at the socket, and may declare
+// routed `view`s — the other screens their slice serves, each rendered in the
+// same wireframe with this socket holding the view.
+func parseUIData(n *source.Node, kind string, comments []source.Line) (*ast.App, error) {
 	rest := keywordRest(n.Line.Text, kind)
 	rest = strings.TrimSuffix(strings.TrimSpace(rest), ":")
 	// `Name in socket`
@@ -418,7 +421,7 @@ func parseUIData(n *source.Node, kind string) (*ast.App, error) {
 			app.Content = nodes
 			continue
 		}
-		if err := parseDecl(app, c); err != nil {
+		if err := parseDecl(app, c, comments); err != nil {
 			return nil, err
 		}
 	}
@@ -428,8 +431,19 @@ func parseUIData(n *source.Node, kind string) (*ast.App, error) {
 	if kind == "ui" && len(app.Entities) > 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("ui facet %q may not declare an entity — move durable data into a `data` facet", name)}
 	}
-	if len(app.Views) > 0 {
-		return nil, &Error{n.Line.No, fmt.Sprintf("%s facet %q provides `content` for a socket, not routed `view`s", kind, name)}
+	// A brick's `view`s are the other routes its slice serves. `content:` is what
+	// the socket holds on every screen; a `view` is one more screen of the same
+	// wireframe, with this socket holding the view instead. That is the layered
+	// spelling of the plain track's `view X in Shell` — the wireframe is the
+	// chrome, so a brick view names no layout and needs an explicit route (the
+	// playground's mounts already own the defaulted ones).
+	for _, v := range app.Views {
+		if v.Layout != "" {
+			return nil, &Error{v.Line, fmt.Sprintf("%s facet %q: view %q may not name a layout — the wireframe that owns socket %q is this screen's chrome", kind, name, v.Name, socket)}
+		}
+		if v.Path == "" {
+			return nil, &Error{v.Line, fmt.Sprintf("%s facet %q: view %q needs an explicit route — write `view %s at \"/path\":`", kind, name, v.Name, v.Name)}
+		}
 	}
 	return app, nil
 }
@@ -661,7 +675,10 @@ func parseRecord(n *source.Node) (*ast.Record, error) {
 // parseComponent: `component Name(params):` then a node tree.
 func parseComponent(n *source.Node) (*ast.Component, error) {
 	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "component")), ":")
-	name, params, err := parseSignature(head, n.Line.No, false)
+	// allowRef: a component is the only declaration whose parameters may be
+	// references (`cell T` / `action`), because it is the only one that renders
+	// controls the caller owns.
+	name, params, err := parseSignature(head, n.Line.No, false, true)
 	if err != nil {
 		return nil, err
 	}
@@ -688,36 +705,16 @@ func parseLayout(n *source.Node) (*ast.Layout, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !hasSlot(nodes) {
-		return nil, &Error{n.Line.No, fmt.Sprintf("layout %q must contain a `slot`", name)}
+	// A layout is valid exactly when the splice that inlines a view into it is
+	// well-defined, so the check *is* that splice, run here against no view.
+	// ast.SpliceLayout is the same call internal/ir makes to perform it — one
+	// traversal deciding where a `slot` may appear, rather than a validator and a
+	// splicer each holding an opinion and drifting apart (they did: this check
+	// used not to look inside `for`, while the splicer did).
+	if _, err := ast.SpliceLayout(name, nodes, nil); err != nil {
+		return nil, &Error{n.Line.No, err.Error()}
 	}
 	return &ast.Layout{Name: name, Root: nodes, Line: n.Line.No}, nil
-}
-
-func hasSlot(nodes []ast.Node) bool {
-	for _, n := range nodes {
-		switch t := n.(type) {
-		case ast.Slot:
-			return true
-		case ast.Styled:
-			if hasSlot([]ast.Node{t.Inner}) {
-				return true
-			}
-		case ast.Box:
-			if hasSlot(t.Children) {
-				return true
-			}
-		case ast.Row:
-			if hasSlot(t.Children) {
-				return true
-			}
-		case ast.If:
-			if hasSlot(t.Body) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // parseTheme: a `theme:` block of `name "value"` lines, each becoming a CSS
@@ -736,7 +733,7 @@ func parseTheme(n *source.Node) ([]ast.ThemeVar, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, ast.ThemeVar{Name: fields[0], Value: val})
+		out = append(out, ast.ThemeVar{Name: fields[0], Value: val, Line: c.Line.No})
 	}
 	if len(out) == 0 {
 		return nil, &Error{n.Line.No, "theme block is empty"}
@@ -765,20 +762,68 @@ func parseNamedTheme(n *source.Node) (ast.NamedTheme, error) {
 // source line in order. The offside tokenizer already dropped blank lines and
 // `#`-prefixed lines (its comment marker), so author CSS should target `.classes`
 // (the `class "..."` node hook) and attribute selectors rather than `#id`.
-func parseCSS(n *source.Node) (string, error) {
+func parseCSS(n *source.Node, comments []source.Line) (string, error) {
 	var lines []string
+	last := n.Line.No
+
 	var walk func(ns []*source.Node)
 	walk = func(ns []*source.Node) {
 		for _, c := range ns {
 			lines = append(lines, c.Line.Text)
+			if c.Line.No > last {
+				last = c.Line.No
+			}
 			walk(c.Children)
 		}
 	}
 	walk(n.Children)
+
 	if len(lines) == 0 {
 		return "", &Error{n.Line.No, "css block is empty"}
 	}
+
+	if err := checkCSSComments(n.Line.No, last, comments); err != nil {
+		return "", err
+	}
+
 	return strings.Join(lines, "\n"), nil
+}
+
+// checkCSSComments refuses a `#`-anchored CSS rule inside a `css:` block
+// instead of silently dropping it.
+//
+// `#` opens a comment in this language and names an id in CSS, so
+// `#fa-root .fa-box { border: none }` is discarded by the scanner before any
+// parser sees it: the stylesheet compiles, the page renders, and the rule is
+// simply not there. That is the worst shape a diagnostic can have — nothing to
+// read, and a symptom (a border that will not go away) that points at CSS
+// specificity rather than at a missing line.
+//
+// The heuristic is deliberately narrow. A comment is only reported when it
+// contains a `{`, which no prose comment in this codebase does and every CSS
+// rule does. A comment that merely starts with `#` inside a `css:` block — the
+// section headers this project writes constantly — is left alone.
+func checkCSSComments(from, to int, comments []source.Line) error {
+	for _, c := range comments {
+		if c.No <= from || c.No > to {
+			continue
+		}
+
+		if !strings.Contains(c.Text, "{") {
+			continue
+		}
+
+		return &Error{c.No, fmt.Sprintf(
+			"this looks like a CSS rule, but `#` starts a comment in this "+
+				"language, so the line is discarded and the rule never reaches "+
+				"the page: %s\n"+
+				"      Anchor the selector on something other than an id — "+
+				"`[data-fa-mount]` is the app root and is worth the same as a "+
+				"class — or drop the anchor entirely.",
+			c.Text)}
+	}
+
+	return nil
 }
 
 // joinCSS concatenates stylesheet fragments (one per `css:` block, across the
@@ -897,7 +942,7 @@ func parseDerive(n *source.Node) (*ast.Derive, error) {
 func parsePolicy(n *source.Node) (*ast.Policy, error) {
 	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "policy")), ":")
 	// A policy may declare parameters for row-level checks: `policy owns(id: int):`.
-	name, params, err := parseSignature(head, n.Line.No, false)
+	name, params, err := parseSignature(head, n.Line.No, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -920,7 +965,7 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		optimistic = true
 		head = strings.TrimSpace(strings.TrimSuffix(head, "@optimistic"))
 	}
-	name, params, err := parseSignature(head, n.Line.No, false)
+	name, params, err := parseSignature(head, n.Line.No, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1077,7 +1122,7 @@ func parseService(n *source.Node) (*ast.Service, error) {
 			}
 			ret, retList = core, list
 		}
-		opName, params, err := parseSignature(head, c.Line.No, true)
+		opName, params, err := parseSignature(head, c.Line.No, true, false)
 		if err != nil {
 			return nil, err
 		}
@@ -1321,7 +1366,11 @@ func parseDuration(s string, line int) (int, error) {
 // parseSignature parses `name(p: T, ...)`. allowList permits list-typed params
 // (`p: [T]`) — used for service operations, whose ops genuinely take collections
 // (`rank(posts: [int])`); action/component/policy params stay scalar.
-func parseSignature(head string, line int, allowList bool) (string, []ast.Param, error) {
+// parseSignature parses `name(p: T, ...)`. allowList admits `[T]` parameters
+// (service operations only). allowRef admits the by-reference parameter forms a
+// component may declare — `p: cell T` (a state cell) and `p: action` (an action)
+// — which bind to a NAME at the call site rather than to a value.
+func parseSignature(head string, line int, allowList, allowRef bool) (string, []ast.Param, error) {
 	open := strings.IndexByte(head, '(')
 	if open < 0 {
 		if !isIdent(head) {
@@ -1347,14 +1396,36 @@ func parseSignature(head string, line int, allowList bool) (string, []ast.Param,
 			}
 			pn := strings.TrimSpace(p[:colon])
 			pt := strings.TrimSpace(p[colon+1:])
-			core, list, optional := splitType(pt)
-			if list && !allowList {
-				return "", nil, &Error{line, fmt.Sprintf("parameter %q cannot be a list", pn)}
-			}
-			if !isIdent(pn) || !isTypeName(core) {
+			if !isIdent(pn) {
 				return "", nil, &Error{line, fmt.Sprintf("invalid parameter %q", strings.TrimSpace(p))}
 			}
-			params = append(params, ast.Param{Name: pn, Type: core, List: list, Optional: optional})
+			ref := ast.RefValue
+			if allowRef {
+				switch {
+				case pt == "action":
+					ref = ast.RefAction
+				case strings.HasPrefix(pt, "cell "):
+					ref, pt = ast.RefCell, strings.TrimSpace(pt[len("cell "):])
+				}
+			}
+			if ref == ast.RefAction {
+				params = append(params, ast.Param{Name: pn, Ref: ref})
+				continue
+			}
+			core, list, optional := splitType(pt)
+			// A reference parameter names a declaration, so the two modifiers a value
+			// parameter carries do not apply: a cell is or is not a list because the
+			// cell it names is, and there is no such thing as an absent name.
+			if ref == ast.RefCell && optional {
+				return "", nil, &Error{line, fmt.Sprintf("cell parameter %q cannot be optional — it names a state cell, which either exists or does not", pn)}
+			}
+			if list && !allowList && ref != ast.RefCell {
+				return "", nil, &Error{line, fmt.Sprintf("parameter %q cannot be a list", pn)}
+			}
+			if !isTypeName(core) {
+				return "", nil, &Error{line, fmt.Sprintf("invalid parameter %q", strings.TrimSpace(p))}
+			}
+			params = append(params, ast.Param{Name: pn, Type: core, List: list, Optional: optional, Ref: ref})
 		}
 	}
 	return name, params, nil
@@ -1556,10 +1627,13 @@ func pathParams(path string, line int) ([]string, error) {
 func parseNodes(children []*source.Node) ([]ast.Node, error) {
 	var out []ast.Node
 	for _, c := range children {
-		// Pull any trailing `class "..."` / `style "..."` CSS escape-hatch modifiers
+		// Pull any trailing `class "..."` / `style "..."` / `anchor "..."` modifiers
 		// off the line first (mutating c so block parsers that re-read it see the clean
 		// line), then wrap the parsed node once it lands.
-		class, style := stripStyleMods(c)
+		class, style, anchor, err := stripNodeMods(c)
+		if err != nil {
+			return nil, err
+		}
 		t := c.Line.Text
 		before := len(out)
 		switch {
@@ -1581,12 +1655,18 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, ast.Text{Segs: segs})
-		case strings.HasPrefix(t, "image "):
-			segs, err := parseText(strings.TrimSpace(t[len("image "):]), c.Line.No)
+		case strings.HasPrefix(t, "heading "):
+			h, err := parseHeading(strings.TrimSpace(t[len("heading "):]), c.Line.No)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, ast.Image{Segs: segs})
+			out = append(out, h)
+		case strings.HasPrefix(t, "image "):
+			segs, alt, altSet, err := parseMedia(strings.TrimSpace(t[len("image "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ast.Image{Segs: segs, Alt: alt, AltSet: altSet, Line: c.Line.No})
 		case strings.HasPrefix(t, "button "):
 			b, err := parseButton(strings.TrimSpace(t[len("button "):]), c.Line.No)
 			if err != nil {
@@ -1594,17 +1674,17 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 			}
 			out = append(out, b)
 		case strings.HasPrefix(t, "icon "):
-			name, err := unquote(strings.TrimSpace(t[len("icon "):]), c.Line.No)
+			segs, err := parseText(strings.TrimSpace(t[len("icon "):]), c.Line.No)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, ast.Icon{Name: name})
+			out = append(out, ast.Icon{Segs: segs})
 		case strings.HasPrefix(t, "video "):
-			segs, err := parseText(strings.TrimSpace(t[len("video "):]), c.Line.No)
+			segs, alt, altSet, err := parseMedia(strings.TrimSpace(t[len("video "):]), c.Line.No)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, ast.Video{Segs: segs})
+			out = append(out, ast.Video{Segs: segs, Alt: alt, AltSet: altSet, Line: c.Line.No})
 		case strings.HasPrefix(t, "richtext "):
 			segs, err := parseText(strings.TrimSpace(t[len("richtext "):]), c.Line.No)
 			if err != nil {
@@ -1657,6 +1737,12 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, ta)
+		case ast.Controls[firstWord(t)].IRKind != "":
+			ctl, err := parseControl(firstWord(t), c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ctl)
 		case strings.HasPrefix(t, "input "):
 			in, err := parseInput(strings.TrimSpace(t[len("input "):]), c.Line.No)
 			if err != nil {
@@ -1688,7 +1774,7 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 			}
 			out = append(out, u)
 		case strings.HasPrefix(t, "use "):
-			u, err := parseUse(strings.TrimSpace(t[len("use "):]), c.Line.No)
+			u, err := parseUse(strings.TrimSpace(t[len("use "):]), c.Line.No, c.Children)
 			if err != nil {
 				return nil, err
 			}
@@ -1704,57 +1790,135 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 		default:
 			return nil, &Error{c.Line.No, fmt.Sprintf("unknown view node %q", firstWord(t))}
 		}
-		// A node carrying class/style is decorated in place. The cases above each emit
+		// A node carrying a modifier is decorated in place. The cases above each emit
 		// exactly one node, so wrapping the just-appended one is unambiguous.
-		if (class != "" || style != "") && len(out) == before+1 {
-			out[before] = ast.Styled{Class: class, Style: style, Inner: out[before]}
+		if (len(class) > 0 || style != "" || anchor != "") && len(out) == before+1 {
+			out[before] = ast.Modified{Class: class, Style: style, Anchor: anchor, Inner: out[before], Line: c.Line.No}
 		}
 	}
 	return out, nil
 }
 
-// stripStyleMods removes trailing `class "..."` and `style "..."` modifiers from a
-// view node's line (in any order, e.g. `box class "rail" style "top:0"`), rewriting
-// the node's line text to the clean base and returning the captured values. A bare
-// `class`/`style` word that is part of a quoted literal (e.g. `text "my style"`) is
-// left alone — only a `<keyword> "<value>"` pair at the very end of the line is taken.
-func stripStyleMods(c *source.Node) (class, style string) {
+// stripNodeMods removes the trailing `class "..."`, `style "..."` and
+// `anchor "..."` modifiers from a view node's line (in any order, e.g.
+// `box class "rail" anchor "install"`), rewriting the node's line text to the
+// clean base and returning the captured values. A bare `class`/`style`/`anchor`
+// word that is part of a quoted literal (e.g. `text "my style"`) is left alone —
+// only a `<keyword> "<value>"` pair at the very end of the line is taken.
+func stripNodeMods(c *source.Node) (class []ast.Seg, style, anchor string, err error) {
 	line := c.Line.Text
+
+	// A block node's line ends in a colon — `box:`, `row:`, `for t in Tweet:` —
+	// so on those the modifier is not at the end of the text at all, it is at the
+	// end of the *head*. Without this split the escape hatch reached only leaf
+	// nodes, which is close to useless: the nodes that need a class are the ones
+	// that lay something out, and every one of those opens a block. Writing
+	// `box class "rail":` did not style a box, it failed to parse as one.
+	//
+	// The colon is put back on the rewritten line so the block parsers that
+	// re-read it are unaffected.
+	head, colon := line, ""
+	if trimmed := strings.TrimRight(line, " "); strings.HasSuffix(trimmed, ":") {
+		head, colon = trimmed[:len(trimmed)-1], ":"
+	}
+
+	line = head
+
 	for {
-		kw, val, rest, ok := trailingStyleMod(line)
+		kw, val, rest, ok := trailingNodeMod(line)
 		if !ok {
 			break
 		}
 		switch kw {
 		case "class":
-			if class == "" {
-				class = val
+			// A class value interpolates like any other author-visible text; only
+			// `style` stays literal. See ast.Modified.
+			if len(class) == 0 {
+				segs, perr := parseTextBody(val, c.Line.No)
+				if perr != nil {
+					return nil, "", "", perr
+				}
+				class = segs
 			}
 		case "style":
 			if style == "" {
 				style = val
 			}
+		case "anchor":
+			// An anchor is a name a link spells back as `#name`, so it is checked
+			// here rather than left to render as a fragment nothing can reach. The
+			// character set is the one that survives a URL fragment, an HTML `id` and
+			// a CSS selector unescaped, so there is exactly one spelling of it.
+			if !isAnchorName(val) {
+				return nil, "", "", &Error{c.Line.No, fmt.Sprintf(
+					"invalid anchor %q: an anchor name is letters, digits, `-` and `_` — it is what a link spells back as `#name`", val)}
+			}
+			if anchor == "" {
+				anchor = val
+			}
 		}
 		line = rest
 	}
-	c.Line.Text = line
-	return class, style
+
+	c.Line.Text = line + colon
+
+	return class, style, anchor, nil
 }
 
-// trailingStyleMod matches a `class "..."` or `style "..."` pair at the end of line.
-// On success it returns the keyword, the unquoted value, and the line with that pair
-// removed. The value may not contain a double quote (keeps the scan unambiguous).
-func trailingStyleMod(line string) (kw, val, rest string, ok bool) {
+// isAnchorName reports whether s is usable as an author-chosen anchor id.
+func isAnchorName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			c == '-' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// trailingNodeMod matches a `class "..."`, `style "..."` or `anchor "..."` pair at
+// the end of line.
+// On success it returns the keyword, the raw value, and the line with that pair
+// removed.
+//
+// The opening quote is found by scanning the line forward — the first string
+// literal whose *close* is the line's last byte — rather than by taking the last
+// quote before it. Backwards, the last quote in
+// `box class "x-avi-c{contains(name, "e")}"` is the one before `e`: the prefix
+// then read `box class "x-avi-c{contains(name, ` , matched no keyword, no
+// modifier was stripped, and the whole line fell through to
+// `unknown view node "box"`. Forward, endOfQuoted knows the inner quote belongs
+// to the interpolation's expression.
+func trailingNodeMod(line string) (kw, val, rest string, ok bool) {
 	s := strings.TrimRight(line, " ")
 	if !strings.HasSuffix(s, `"`) {
 		return "", "", "", false
 	}
-	open := strings.LastIndexByte(s[:len(s)-1], '"')
+	open := -1
+	for i := 0; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		e := endOfQuoted(s, i)
+		if e < 0 {
+			return "", "", "", false // an unterminated string is not a modifier
+		}
+		if e == len(s)-1 {
+			open = i
+			break
+		}
+		i = e
+	}
 	if open < 0 {
 		return "", "", "", false
 	}
 	prefix := strings.TrimRight(s[:open], " ")
-	for _, k := range []string{"class", "style"} {
+	for _, k := range []string{"class", "style", "anchor"} {
 		if strings.HasSuffix(prefix, k) {
 			base := prefix[:len(prefix)-len(k)]
 			// the keyword must stand as its own word (start of line or space before it)
@@ -1772,63 +1936,77 @@ func trailingStyleMod(line string) (kw, val, rest string, ok bool) {
 
 // parseFor: `for item in Collection [where cond] [by field desc|asc] [limit n]:`
 func parseFor(n *source.Node) (ast.Node, error) {
-	head := strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("for "):]), ":")
+	rg, err := parseRange(strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("for "):]), ":"), n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	kids, err := parseNodes(n.Children)
+	if err != nil {
+		return nil, err
+	}
+	return ast.For{Range: rg, Body: kids}, nil
+}
+
+// parseRange parses the header every repeating construct shares —
+// `item in Collection [where cond] [by field desc|asc] [limit n]` — with the
+// leading keyword and the trailing colon already stripped.
+//
+// It is one function because there is now more than one thing that repeats: a
+// `for` node and the `for` inside a select's or a radio group's option list are
+// the same query over the same collections, and a second hand-written header
+// parser is how one of them ends up without `limit`.
+func parseRange(head string, line int) (ast.Range, error) {
+	var rg ast.Range
 	fields := strings.Fields(head)
 	if len(fields) < 3 || fields[1] != "in" {
-		return nil, &Error{n.Line.No, "for needs `for item in Collection [where cond] [by field desc|asc] [limit n]:`"}
+		return rg, &Error{line, "for needs `for item in Collection [where cond] [by field desc|asc] [limit n]:`"}
 	}
 	if !isIdent(fields[0]) || !isIdent(fields[2]) {
-		return nil, &Error{n.Line.No, fmt.Sprintf("invalid for clause %q", head)}
+		return rg, &Error{line, fmt.Sprintf("invalid for clause %q", head)}
 	}
-	f := ast.For{Var: fields[0], Coll: fields[2]}
+	rg.Var, rg.Coll = fields[0], fields[2]
 
 	// remainder after `<var> in <Coll>`
 	rest := strings.TrimSpace(head[len(fields[0]):])
 	rest = strings.TrimSpace(rest[len("in"):])
 	rest = strings.TrimSpace(rest[len(fields[2]):])
 
-	whereS, byS, limitS, err := splitForClauses(rest, n.Line.No)
+	whereS, byS, limitS, err := splitForClauses(rest, line)
 	if err != nil {
-		return nil, err
+		return rg, err
 	}
 	if whereS != "" {
-		e, err := parseExpr(whereS, n.Line.No)
+		e, err := parseExpr(whereS, line)
 		if err != nil {
-			return nil, err
+			return rg, err
 		}
-		f.Where = e
+		rg.Where = e
 	}
 	if byS != "" {
 		bp := strings.Fields(byS)
 		if len(bp) < 1 || len(bp) > 2 || !isIdent(bp[0]) {
-			return nil, &Error{n.Line.No, "ordering is `by field [desc|asc]`"}
+			return rg, &Error{line, "ordering is `by field [desc|asc]`"}
 		}
-		f.Order = bp[0]
+		rg.Order = bp[0]
 		if len(bp) == 2 {
 			switch bp[1] {
 			case "desc":
-				f.Desc = true
+				rg.Desc = true
 			case "asc":
-				f.Desc = false
+				rg.Desc = false
 			default:
-				return nil, &Error{n.Line.No, fmt.Sprintf("order direction must be `desc` or `asc`, got %q", bp[1])}
+				return rg, &Error{line, fmt.Sprintf("order direction must be `desc` or `asc`, got %q", bp[1])}
 			}
 		}
 	}
 	if limitS != "" {
-		e, err := parseExpr(limitS, n.Line.No)
+		e, err := parseExpr(limitS, line)
 		if err != nil {
-			return nil, &Error{n.Line.No, fmt.Sprintf("limit needs an integer or expression, got %q", limitS)}
+			return rg, &Error{line, fmt.Sprintf("limit needs an integer or expression, got %q", limitS)}
 		}
-		f.Limit = e
+		rg.Limit = e
 	}
-
-	kids, err := parseNodes(n.Children)
-	if err != nil {
-		return nil, err
-	}
-	f.Body = kids
-	return f, nil
+	return rg, nil
 }
 
 // splitForClauses splits a `for` header tail into its where/by/limit clause
@@ -1923,19 +2101,19 @@ func splitForClauses(rest string, line int) (whereS, byS, limitS string, err err
 
 // parseLink: `link "label" -> "/path"`
 func parseLink(s string, line int) (ast.Node, error) {
-	arrow := strings.Index(s, "->")
+	arrow := indexTop(s, "->")
 	if arrow < 0 {
 		return nil, &Error{line, `link needs a destination: link "Home" -> "/"`}
 	}
-	label, err := unquote(strings.TrimSpace(s[:arrow]), line)
+	label, err := parseText(strings.TrimSpace(s[:arrow]), line)
 	if err != nil {
 		return nil, err
 	}
-	path, err := unquote(strings.TrimSpace(s[arrow+2:]), line)
+	path, err := parseText(strings.TrimSpace(s[arrow+2:]), line)
 	if err != nil {
 		return nil, err
 	}
-	return ast.Link{Label: label, Path: path}, nil
+	return ast.Link{LabelSegs: label, PathSegs: path}, nil
 }
 
 func parseInput(s string, line int) (ast.Node, error) {
@@ -1945,8 +2123,8 @@ func parseInput(s string, line int) (ast.Node, error) {
 	}
 	rest := strings.TrimSpace(s[len("bind "):])
 	in := ast.Input{}
-	if ph := strings.Index(rest, "placeholder "); ph >= 0 {
-		p, err := unquote(strings.TrimSpace(rest[ph+len("placeholder "):]), line)
+	if ph := indexTop(rest, "placeholder "); ph >= 0 {
+		p, err := parseText(strings.TrimSpace(rest[ph+len("placeholder "):]), line)
 		if err != nil {
 			return nil, err
 		}
@@ -1980,9 +2158,9 @@ func parseOverlay(n *source.Node) (ast.Node, error) {
 
 // parseTypeahead: `typeahead bind <cell> from <Entity>.<field> [placeholder "…"]`.
 func parseTypeahead(s string, line int) (ast.Node, error) {
-	ph := ""
-	if i := strings.Index(s, "placeholder "); i >= 0 {
-		p, err := unquote(strings.TrimSpace(s[i+len("placeholder "):]), line)
+	var ph []ast.Seg
+	if i := indexTop(s, "placeholder "); i >= 0 {
+		p, err := parseText(strings.TrimSpace(s[i+len("placeholder "):]), line)
 		if err != nil {
 			return nil, err
 		}
@@ -2022,30 +2200,243 @@ func parseSelect(n *source.Node) (ast.Node, error) {
 	if !isIdent(bind) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("invalid select binding %q", bind)}
 	}
-	sel := ast.Select{Bind: bind}
-	for _, c := range n.Children {
-		if !strings.HasPrefix(c.Line.Text, "option ") {
-			return nil, &Error{c.Line.No, `select children must be options: option "Label" -> "value"`}
-		}
-		rest := strings.TrimSpace(c.Line.Text[len("option "):])
-		arrow := strings.Index(rest, "->")
-		var label, value string
-		var err error
-		if arrow < 0 {
-			label, err = unquote(rest, c.Line.No)
-			value = label
-		} else {
-			label, err = unquote(strings.TrimSpace(rest[:arrow]), c.Line.No)
-			if err == nil {
-				value, err = unquote(strings.TrimSpace(rest[arrow+2:]), c.Line.No)
+	opts, err := parseOptions("select", n.Children)
+	if err != nil {
+		return nil, err
+	}
+	return ast.Select{Bind: bind, Options: opts, Line: n.Line.No}, nil
+}
+
+// parseOptions parses the choice list shared by every node that offers one — a
+// `select` and a `radio` group are the same choice written two ways, so they
+// read their options with one parser and cannot drift on what an option means.
+//
+// A choice list holds two kinds of entry, in any order:
+//
+//	option "Draft" -> "draft"        one fixed choice
+//	for c in Category by name:       one choice per row of a collection
+//	    option "{c.name}" -> c.id
+//
+// The repeating entry is written with the language's existing repeating header,
+// not a keyword of its own, because it *is* that header: a data-driven option
+// list wants the same `where`/`by`/`limit` a feed does, and inventing a second
+// spelling of them would be a second thing to keep in step.
+func parseOptions(kw string, kids []*source.Node) ([]ast.Option, error) {
+	var out []ast.Option
+	for _, c := range kids {
+		switch {
+		case strings.HasPrefix(c.Line.Text, "option "):
+			o, err := parseOption(strings.TrimSpace(c.Line.Text[len("option "):]), c.Line.No)
+			if err != nil {
+				return nil, err
 			}
+			out = append(out, o)
+
+		case strings.HasPrefix(c.Line.Text, "for "):
+			rg, err := parseRange(strings.TrimSuffix(strings.TrimSpace(c.Line.Text[len("for "):]), ":"), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			// One option per row, so the loop body is one option. Several would mean
+			// rows × options, which is not a thing a choice list can mean.
+			if len(c.Children) != 1 || !strings.HasPrefix(c.Children[0].Line.Text, "option ") {
+				return nil, &Error{c.Line.No, fmt.Sprintf(
+					"a `for` in a %s renders one option per row, so it holds exactly one `option \"Label\" -> value` line", kw)}
+			}
+			o, err := parseOption(strings.TrimSpace(c.Children[0].Line.Text[len("option "):]), c.Children[0].Line.No)
+			if err != nil {
+				return nil, err
+			}
+			o.From = &rg
+			out = append(out, o)
+
+		case firstWord(c.Line.Text) == "slot":
+			// A `slot` here is refused with its own reason, because it is the one
+			// thing an author reaches for next and the generic message does not
+			// explain why it cannot work.
+			//
+			// An option is not a view node. It is an entry in this list — a label
+			// plus the identity it stores — and the value half is a compile-time
+			// constant, which is what enum defaulting and the "no such member" check
+			// rest on. A `use` block, by contrast, is parsed by parseNodes as view
+			// nodes: `option "A" -> "a"` written under a `use` is not a mis-typed
+			// option, it is `unknown view node "option"`, because at that point in
+			// the parse nothing knows which component is being called, let alone that
+			// its slot wants options. Knowing would mean resolving component
+			// signatures — across imports, registry fetches and layered composition —
+			// during parsing, which is a whole-program dependency the parser does not
+			// have and should not grow for one node's children.
+			//
+			// So the two ways to let a caller decide the choices are the two the
+			// language already has, and both keep the value half provable.
+			return nil, &Error{c.Line.No, "a `slot` cannot stand in a " + kw + "'s choice list: an option is not a view node (a `use` block holds view nodes, so the caller cannot write `option` lines into one), and its value half is a compile-time constant. " +
+				"Let the caller supply the choices as data — `for item in Collection:` with one `option` line, over a collection the caller fills — or let the caller own the " + kw + " itself and give the component the chrome around it, with the `slot` outside"}
+
+		default:
+			return nil, &Error{c.Line.No, kw + ` children must be options: option "Label" -> "value", or a ` +
+				"`for item in Collection:` holding one such line"}
 		}
+	}
+	return out, nil
+}
+
+// parseOption parses one `option "Label" -> value` line, with the keyword already
+// stripped.
+//
+// The value half is a quoted literal or a bare expression, and which one it is
+// decides what the compiler can still prove about it: a literal is a compile-time
+// identity (what enum defaulting and the typo check rest on), an expression is a
+// value that does not exist until the render. Every option written before this
+// distinction existed is quoted, so every one of them keeps the literal reading.
+func parseOption(rest string, line int) (ast.Option, error) {
+	o := ast.Option{Line: line}
+	arrow := indexTop(rest, "->")
+	if arrow < 0 {
+		// `option "Draft"` — one literal standing for both halves. The shorthand is
+		// only available to a label that is a literal too; otherwise the author must
+		// say what is stored.
+		v, err := unquote(rest, line)
+		if err != nil {
+			return o, err
+		}
+		if strings.Contains(v, "{") {
+			return o, &Error{line, fmt.Sprintf(
+				"option %q interpolates, so it needs the value it stores: option %s -> \"value\"", v, rest)}
+		}
+		o.Label, o.Value = []ast.Seg{{Lit: v}}, v
+		return o, nil
+	}
+	label, err := parseText(strings.TrimSpace(rest[:arrow]), line)
+	if err != nil {
+		return o, err
+	}
+	o.Label = label
+	val := strings.TrimSpace(rest[arrow+2:])
+	if strings.HasPrefix(val, `"`) {
+		o.Value, err = unquote(val, line)
+		return o, err
+	}
+	if val == "" {
+		return o, &Error{line, `option needs the value it stores: option "Label" -> "value"`}
+	}
+	e, err := parseExpr(val, line)
+	if err != nil {
+		return o, err
+	}
+	o.Val = e
+	return o, nil
+}
+
+// parseControl parses every control in ast.Controls from one grammar:
+//
+//	<keyword> bind <cell> [placeholder "..."] [label "..."]
+//	<keyword> bind <cell>:            with `option` children (radio)
+//
+// One parser, because a control is one idea — a cell with a way to write it —
+// and which modifiers a given control accepts is a fact stated once, in its
+// ast.Controls row, rather than in a fourth hand-written parse function that
+// spells `bind` slightly differently.
+// parseMedia splits a media line into its source and its `alt` — the one
+// grammar `image` and `video` share, parsed once so the two cannot drift.
+//
+// `alt` is pulled off with indexTop, which skips over quoted strings, so the
+// separator is found after the URL rather than inside it: `image "/a?x=alt "` is
+// one URL and not a URL with an empty description. That is the same mechanism a
+// control's `placeholder` and `label` are found by.
+//
+// The bool is the point of the function. `alt ""` and no `alt` at all produce the
+// same empty segment list and render the same markup, but they are different
+// statements by the author — decorative on purpose, versus undecided — and only
+// the second is worth telling anyone about. See ast.Image and ast.Advise.
+func parseMedia(rest string, line int) (segs, alt []ast.Seg, altSet bool, err error) {
+	if i := indexTop(rest, "alt "); i >= 0 {
+		alt, err = parseText(strings.TrimSpace(rest[i+len("alt "):]), line)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		altSet, rest = true, strings.TrimSpace(rest[:i])
+	}
+	segs, err = parseText(rest, line)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return segs, alt, altSet, nil
+}
+
+// parseHeading: `heading <level> "Title"` — a level expression, then the words.
+//
+// THE SPLIT IS THE FIRST TOP-LEVEL QUOTE, and that is a rule rather than a
+// guess: the level is a number and the text is a string, so the first `"` on the
+// line is where one ends and the other begins. Trailing `class`/`style`/`anchor`
+// modifiers are already off the line by the time this runs (parseNodes strips
+// them first), so what is left is exactly the two halves.
+//
+// Both halves are required, and each missing half has its own message, because
+// `heading "Title"` (no level) and `heading 2` (no text) are different mistakes:
+// the first is a `text` node the author reached for the wrong keyword for, and
+// the second is an unfinished line.
+func parseHeading(rest string, line int) (ast.Node, error) {
+	q := strings.IndexByte(rest, '"')
+	switch {
+	case q < 0:
+		return nil, &Error{line, `heading needs text: heading 2 "Title"`}
+	case strings.TrimSpace(rest[:q]) == "":
+		return nil, &Error{line, `heading needs a level: heading 2 "Title"`}
+	}
+	lvl, err := parseExpr(strings.TrimSpace(rest[:q]), line)
+	if err != nil {
+		return nil, err
+	}
+	segs, err := parseText(strings.TrimSpace(rest[q:]), line)
+	if err != nil {
+		return nil, err
+	}
+	return ast.Heading{Level: lvl, Segs: segs, Line: line}, nil
+}
+
+func parseControl(kw string, n *source.Node) (ast.Node, error) {
+	spec := ast.Controls[kw]
+	line := n.Line.No
+	head := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len(kw):]), ":"))
+	ctl := ast.Control{Kind: kw, Line: line}
+	if spec.Hint {
+		if i := indexTop(head, "placeholder "); i >= 0 {
+			p, err := parseText(strings.TrimSpace(head[i+len("placeholder "):]), line)
+			if err != nil {
+				return nil, err
+			}
+			ctl.Placeholder = p
+			head = strings.TrimSpace(head[:i])
+		}
+	}
+	if spec.Labeled {
+		if i := indexTop(head, "label "); i >= 0 {
+			l, err := parseText(strings.TrimSpace(head[i+len("label "):]), line)
+			if err != nil {
+				return nil, err
+			}
+			ctl.Label = l
+			head = strings.TrimSpace(head[:i])
+		}
+	}
+	if !strings.HasPrefix(head, "bind ") {
+		return nil, &Error{line, fmt.Sprintf("%s needs a binding: %s bind <cell>", kw, kw)}
+	}
+	bind := strings.TrimSpace(head[len("bind "):])
+	if !isIdent(bind) {
+		return nil, &Error{line, fmt.Sprintf("invalid %s binding %q", kw, bind)}
+	}
+	ctl.Bind = bind
+	if spec.Options {
+		opts, err := parseOptions(kw, n.Children)
 		if err != nil {
 			return nil, err
 		}
-		sel.Options = append(sel.Options, ast.Option{Label: label, Value: value})
+		ctl.Options = opts
+	} else if len(n.Children) > 0 {
+		return nil, &Error{line, fmt.Sprintf("%s takes no children — it is one control, not a container", kw)}
 	}
-	return sel, nil
+	return ctl, nil
 }
 
 // parseTabs: `tabs bind cell:` with `tab "Label" -> "value":` children, each
@@ -2065,11 +2456,11 @@ func parseTabs(n *source.Node) (ast.Node, error) {
 			return nil, &Error{c.Line.No, `tabs children must be tabs: tab "Label" -> "value":`}
 		}
 		rest := strings.TrimSuffix(strings.TrimSpace(c.Line.Text[len("tab "):]), ":")
-		arrow := strings.Index(rest, "->")
+		arrow := indexTop(rest, "->")
 		if arrow < 0 {
 			return nil, &Error{c.Line.No, `tab needs a value: tab "Label" -> "value":`}
 		}
-		label, err := unquote(strings.TrimSpace(rest[:arrow]), c.Line.No)
+		label, err := parseText(strings.TrimSpace(rest[:arrow]), c.Line.No)
 		if err != nil {
 			return nil, err
 		}
@@ -2105,7 +2496,7 @@ func parseMatch(n *source.Node) (ast.Node, error) {
 		ct := strings.TrimSpace(c.Line.Text)
 		switch {
 		case strings.HasPrefix(ct, "case "):
-			val, err := unquote(strings.TrimSuffix(strings.TrimSpace(ct[len("case "):]), ":"), c.Line.No)
+			val, err := caseValue(strings.TrimSuffix(strings.TrimSpace(ct[len("case "):]), ":"), c.Line.No)
 			if err != nil {
 				return nil, err
 			}
@@ -2130,6 +2521,35 @@ func parseMatch(n *source.Node) (ast.Node, error) {
 	return m, nil
 }
 
+// caseValue reads the constant one `case` compares against: a quoted string, or
+// an integer literal.
+//
+// Both spellings produce the same thing — the decimal text of the value — because
+// that is what the comparison is. Every renderer stringifies the match subject and
+// compares it to the case's text, so `case 1:` and `case "1":` are the same case
+// (writing both is a duplicate), and a number needs no coercion in the head:
+// `match "" + month(at):` was a workaround for a message, not for a mechanism.
+//
+// A number does not weaken enum exhaustiveness, which is the property `match`
+// exists to prove. Exhaustiveness has exactly two sources and this adds neither:
+// an enum subject, whose members are all known, or an `else`. An int has no finite
+// member list — there is no set of `case`s that covers it — so an int-subject
+// match falls under the rule an open type already fell under, that it must carry
+// an `else`, and a numeric case on an *enum* subject is still rejected as a member
+// that enum does not have. `case 1:` is a spelling, not a new kind of proof.
+func caseValue(s string, line int) (string, error) {
+	if strings.HasPrefix(s, `"`) {
+		return unquote(s, line)
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		// Canonical decimal, because that is what the subject stringifies to:
+		// `case 007:` has to match the number 7 or it is a case that never runs.
+		return strconv.Itoa(n), nil
+	}
+	return "", &Error{line, fmt.Sprintf(
+		`a case value is a compile-time constant: a quoted string (case "draft":) or a whole number (case 1:) — got %s`, s)}
+}
+
 // parseForm: `form "Submit" -> action(args):` then child nodes (inputs, text).
 func parseForm(n *source.Node) (ast.Node, error) {
 	head := strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("form "):]), ":")
@@ -2141,17 +2561,7 @@ func parseForm(n *source.Node) (ast.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ast.Form{Action: btn.Action, Args: btn.Args, Submit: litString(btn.Label), Body: kids}, nil
-}
-
-// litString flattens label segments to their literal text — used where a label is
-// plain (a form's submit button), so interpolation isn't meaningful.
-func litString(segs []ast.Seg) string {
-	var sb strings.Builder
-	for _, s := range segs {
-		sb.WriteString(s.Lit)
-	}
-	return sb.String()
+	return ast.Form{Action: btn.Action, Args: btn.Args, Submit: btn.Label, Body: kids, Line: n.Line.No}, nil
 }
 
 // parseUpload: `upload bind url [label "text"]`.
@@ -2160,9 +2570,9 @@ func parseUpload(s string, line int) (ast.Node, error) {
 		return nil, &Error{line, "upload needs a binding: upload bind avatarUrl"}
 	}
 	rest := strings.TrimSpace(s[len("bind "):])
-	up := ast.Upload{Label: "Upload"}
-	if lp := strings.Index(rest, "label "); lp >= 0 {
-		l, err := unquote(strings.TrimSpace(rest[lp+len("label "):]), line)
+	up := ast.Upload{Label: []ast.Seg{{Lit: "Upload"}}}
+	if lp := indexTop(rest, "label "); lp >= 0 {
+		l, err := parseText(strings.TrimSpace(rest[lp+len("label "):]), line)
 		if err != nil {
 			return nil, err
 		}
@@ -2176,8 +2586,14 @@ func parseUpload(s string, line int) (ast.Node, error) {
 	return up, nil
 }
 
-// parseUse: `use Component(arg, ...)` — invoke a reusable view fragment.
-func parseUse(s string, line int) (ast.Node, error) {
+// parseUse: `use Component(arg, ...)` — invoke a reusable view fragment,
+// optionally with an indented block of children that fill the component's `slot`.
+//
+// kids used to be dropped on the floor here: a block written under a `use` parsed
+// fine and then rendered nothing at all. It is carried now, and a block handed to
+// a component with no `slot` is rejected in the IR builder rather than silently
+// discarded.
+func parseUse(s string, line int, kids []*source.Node) (ast.Node, error) {
 	name := s
 	var args []ast.Expr
 	if open := strings.IndexByte(s, '('); open >= 0 {
@@ -2200,19 +2616,37 @@ func parseUse(s string, line int) (ast.Node, error) {
 	if !isIdent(name) || !isUpper(name) {
 		return nil, &Error{line, fmt.Sprintf("invalid component name %q", name)}
 	}
-	return ast.Use{Name: name, Args: args}, nil
-}
-
-func parseText(s string, line int) ([]ast.Seg, error) {
-	str, err := unquote(s, line)
+	body, err := parseNodes(kids)
 	if err != nil {
 		return nil, err
 	}
+	return ast.Use{Name: name, Args: args, Body: body, Line: line}, nil
+}
+
+func parseText(s string, line int) ([]ast.Seg, error) {
+	str, err := unquoteText(s, line)
+	if err != nil {
+		return nil, err
+	}
+	return parseTextBody(str, line)
+}
+
+// parseTextBody splits already-unquoted text into literal and `{expr}` segments.
+//
+// Split out from parseText because a trailing `class "..."` modifier arrives at
+// stripNodeMods already unquoted — it had to be, to find where the line's base
+// text ends. Re-quoting it to hand back to parseText would put the value through
+// unquote a second time, so `\n` in a class would become a newline on that path
+// and two characters on every other. One splitter, one meaning of a brace.
+func parseTextBody(str string, line int) ([]ast.Seg, error) {
 	var segs []ast.Seg
 	var lit strings.Builder
 	for i := 0; i < len(str); i++ {
 		if str[i] == '{' {
-			end := strings.IndexByte(str[i:], '}')
+			// Balanced, string-aware: the `}` that closes this interpolation is not
+			// necessarily the next one in the value, because the expression between
+			// them may hold a string literal containing a brace.
+			end := endOfInterp(str, i)
 			if end < 0 {
 				return nil, &Error{line, "unterminated `{` in text"}
 			}
@@ -2220,12 +2654,13 @@ func parseText(s string, line int) ([]ast.Seg, error) {
 				segs = append(segs, ast.Seg{Lit: lit.String()})
 				lit.Reset()
 			}
-			e, err := parseExpr(str[i+1:i+end], line)
+			inner := str[i+1 : end]
+			e, err := parseExpr(inner, line)
 			if err != nil {
-				return nil, err
+				return nil, interpErr(err, inner, line)
 			}
 			segs = append(segs, ast.Seg{Expr: e})
-			i += end
+			i = end
 			continue
 		}
 		lit.WriteByte(str[i])
@@ -2236,9 +2671,28 @@ func parseText(s string, line int) ([]ast.Seg, error) {
 	return segs, nil
 }
 
+// interpErr names the one way an interpolation can now fail that the author has
+// no reason to guess at: a nested string written `\"e\"` in a value that is not
+// escape-decoded.
+//
+// The two interpolating paths differ in exactly this, deliberately. A `text`,
+// label or link destination is decoded as a Go string literal first, so both `"e"`
+// and `\"e\"` arrive here as `"e"`. A `class` value is never decoded — that is why
+// a CSS class may hold a backslash (`w-1\/2`) at all — so in a class a `\` is a
+// literal backslash and the expression parser is right to refuse it. Plain quotes
+// are the spelling that works in every interpolating position, so the message says
+// to write those rather than explaining the asymmetry at the point of failure.
+func interpErr(err error, inner string, line int) error {
+	if strings.Contains(inner, `\"`) {
+		return &Error{line, fmt.Sprintf(
+			"cannot parse `{%s}`: inside `{…}` the text is an expression, so a nested string is written with plain quotes and no backslashes — `{contains(name, \"e\")}`", inner)}
+	}
+	return err
+}
+
 // parseButton: `"label" -> action` or `"label" -> action(arg, ...)`
 func parseButton(s string, line int) (ast.Button, error) {
-	arrow := strings.Index(s, "->")
+	arrow := indexTop(s, "->")
 	if arrow < 0 {
 		return ast.Button{}, &Error{line, `button needs an action: button "Label" -> actionName`}
 	}
@@ -2269,7 +2723,7 @@ func parseButton(s string, line int) (ast.Button, error) {
 	if !isIdent(name) {
 		return ast.Button{}, &Error{line, fmt.Sprintf("invalid action reference %q", name)}
 	}
-	return ast.Button{Label: label, Action: name, Args: args}, nil
+	return ast.Button{Label: label, Action: name, Args: args, Line: line}, nil
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -2383,6 +2837,226 @@ func defaultFor(typ string) ast.Expr {
 	default:
 		return ast.Lit{Kind: "text", Val: ""}
 	}
+}
+
+// endOfQuoted returns the index of the `"` that closes the string literal opening
+// at s[i] (which must be a `"`), or -1 if the string never closes.
+//
+// It is the one place the language decides where a quoted value stops, and it
+// stops later than "at the next quote" for exactly one reason: a `{…}`
+// interpolation holds an *expression*, and an expression may contain a string
+// literal of its own. `class "x-avi-c{contains(name, "e")}"` is one attribute
+// with one interpolation in it, not an attribute that ended at `x-avi-c{contains(name, `.
+// Before this scan the inner quote ended the attribute, the rest of the line
+// became an unparsable tail, and the node reported as `unknown view node "box"`
+// — which is how a library component ended up hashing a name with `len()` and a
+// ladder of `if` probes instead of one expression.
+//
+// A `\` escapes the byte after it, so `"he said \"hi\""` still closes where it
+// always did. An unterminated `{` is not an interpolation: the scan falls back to
+// treating it as an ordinary character so the string closes at the next quote and
+// parseTextBody gets to report the unterminated brace against the real value.
+func endOfQuoted(s string, i int) int {
+	for j := i + 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			j++
+		case '"':
+			return j
+		case '{':
+			if end := endOfInterp(s, j); end >= 0 {
+				j = end
+			}
+		}
+	}
+	return -1
+}
+
+// endOfInterp returns the index of the `}` closing the interpolation opening at
+// s[i] (which must be a `{`), or -1 if it never closes. Braces nest and a string
+// literal inside is opaque, so `{f("}")}` ends where the author meant it to.
+func endOfInterp(s string, i int) int {
+	depth := 0
+	for j := i; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			// A backslash escapes the byte after it here too, so `\"` inside an
+			// interpolation does not open a nested string. The interpolation then
+			// ends where the author meant, and the expression parser gets to say
+			// what is actually wrong with `contains(name, \"e\")` — see interpErr.
+			j++
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		case '"':
+			e := endOfQuoted(s, j)
+			if e < 0 {
+				return -1
+			}
+			j = e
+		}
+	}
+	return -1
+}
+
+// indexTop returns the index of the first occurrence of sep in s that is outside
+// every quoted string, or -1.
+//
+// Every `"label" -> value` line splits on the first arrow the author wrote
+// outside a string — which is not the first arrow in the line once a label may
+// hold a string of its own: `link "A -> B" -> "/ab"` split at the wrong one, and
+// so would a `->` inside an interpolation's nested literal. The same helper finds
+// the `placeholder`/`label` keywords, for the same reason.
+func indexTop(s, sep string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			e := endOfQuoted(s, i)
+			if e < 0 {
+				return -1
+			}
+			i = e
+			continue
+		}
+		if strings.HasPrefix(s[i:], sep) {
+			return i
+		}
+	}
+	return -1
+}
+
+// matchParen returns the index of the `)` that closes the `(` at s[i] (which
+// must be a `(`), or -1 if it never closes.
+//
+// It is endOfQuoted's rule applied to parentheses: nesting counts, and a quoted
+// string inside is opaque. It exists because `parseEntityPath` split its target
+// on the FIRST `)` in the line, which made `set Product(CartLine(lid).product)
+// .stock = 0` a parse error against the same text `check` accepts one line up —
+// the expression parser has always balanced its parentheses, and the statement
+// scanner in front of it had not.
+func matchParen(s string, i int) int {
+	depth := 0
+	for j := i; j < len(s); j++ {
+		switch s[j] {
+		case '"':
+			e := endOfQuoted(s, j)
+			if e < 0 {
+				return -1
+			}
+			j = e
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
+}
+
+// indexAssign returns the index of the `=` that separates an assignment's target
+// from its value: the first `=` outside every quoted string and every bracket
+// that is not part of a comparison operator (`==`, `!=`, `<=`, `>=`).
+//
+// `set` used to take the first `=` in the line, which is the assignment only
+// until a key expression contains one — `set Product(p == q).x = 1`, or a
+// string key holding an `=`. The same scan serves the filtered form's field
+// assignments, so a bulk update and a by-id one agree about where the value
+// starts.
+func indexAssign(s string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			e := endOfQuoted(s, i)
+			if e < 0 {
+				return -1
+			}
+			i = e
+		case c == '(' || c == '[' || c == '{':
+			depth++
+		case c == ')' || c == ']' || c == '}':
+			depth--
+		case c == '=' && depth == 0:
+			if i+1 < len(s) && s[i+1] == '=' {
+				i++ // `==` is a comparison, not the assignment
+				continue
+			}
+			if i > 0 && (s[i-1] == '!' || s[i-1] == '<' || s[i-1] == '>') {
+				continue // the tail of `!=` / `<=` / `>=`
+			}
+			return i
+		}
+	}
+	return -1
+}
+
+// unquoteText decodes a quoted value written in an interpolating position — node
+// text, a label, a placeholder, a link destination, `meta`.
+//
+// It is unquote plus one allowance: the value may hold a `{…}` whose expression
+// contains a string literal, which Go's own unquoter reads as the end of the
+// value. Those inner quotes are re-escaped before the decode, so the decode is
+// still exactly Go's — one pass of `\n`, `\t`, `\"` over the whole value, nothing
+// invented — and the two spellings `{contains(n, "e")}` and `{contains(n, \"e\")}`
+// reach the expression parser as the same characters.
+func unquoteText(s string, line int) (string, error) {
+	if len(s) < 2 || s[0] != '"' || endOfQuoted(s, 0) != len(s)-1 {
+		return "", &Error{line, fmt.Sprintf("expected a quoted string, got %q", s)}
+	}
+	v, err := strconv.Unquote(`"` + escapeInterpQuotes(s[1:len(s)-1]) + `"`)
+	if err != nil {
+		return "", &Error{line, fmt.Sprintf("invalid string %q", s)}
+	}
+	return v, nil
+}
+
+// escapeInterpQuotes rewrites the bare `"` characters inside a `{…}` as `\"`, so
+// that a value the scanner accepted is a string literal Go can decode. Outside
+// the braces nothing is touched, and an already-escaped byte is copied as the
+// pair it is — that is what makes the two spellings converge instead of one of
+// them losing a backslash.
+func escapeInterpQuotes(body string) string {
+	if !strings.ContainsRune(body, '{') {
+		return body
+	}
+	var b strings.Builder
+	for i := 0; i < len(body); i++ {
+		switch {
+		case body[i] == '\\' && i+1 < len(body):
+			b.WriteByte(body[i])
+			i++
+			b.WriteByte(body[i])
+		case body[i] == '{':
+			end := endOfInterp(body, i)
+			if end < 0 {
+				b.WriteByte(body[i])
+				continue
+			}
+			for j := i; j <= end; j++ {
+				switch {
+				case body[j] == '\\' && j+1 <= end:
+					b.WriteByte(body[j])
+					j++
+					b.WriteByte(body[j])
+				case body[j] == '"':
+					b.WriteString(`\"`)
+				default:
+					b.WriteByte(body[j])
+				}
+			}
+			i = end
+		default:
+			b.WriteByte(body[i])
+		}
+	}
+	return b.String()
 }
 
 func unquote(s string, line int) (string, error) {

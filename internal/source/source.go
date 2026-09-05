@@ -22,6 +22,36 @@ type Node struct {
 	Children []*Node
 }
 
+// Comments returns the full-line comments Parse discards, with their line
+// numbers.
+//
+// Dropping comments is right for every FDL construct and wrong for exactly one:
+// a `css:` block's body is a stylesheet, not FDL, and `#` opens a comment here
+// while it names an id there. So `#fa-root .fa-box { border: none }` is not a
+// rule the compiler rejects, it is a rule that never existed — the stylesheet
+// compiles, the page renders, and four of its declarations are simply absent.
+//
+// The scanner cannot tell the two apart, because it has no idea which block it
+// is inside. The parser does, so it asks — see `checkCSSComments`. Re-scanning
+// the text is cheap next to compiling it, and keeps `Parse` returning the two
+// values every caller wants.
+func Comments(src string) []Line {
+	var out []Line
+
+	for i, raw := range strings.Split(src, "\n") {
+		text := strings.TrimSpace(raw)
+		if strings.HasPrefix(text, "#") {
+			out = append(out, Line{
+				Indent: len(raw) - len(strings.TrimLeft(raw, " ")),
+				Text:   text,
+				No:     i + 1,
+			})
+		}
+	}
+
+	return out
+}
+
 // Parse reads source text into a forest of indentation nodes (the indent-0
 // lines, each carrying its nested children). Tabs are rejected: indentation
 // must be spaces so columns are unambiguous.

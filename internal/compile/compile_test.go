@@ -1,6 +1,8 @@
 package compile
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -625,6 +627,33 @@ app Inbox:
 	}
 }
 
+// A row's `id` is never indexed, however the app queries it: identity is already
+// the store's primary order (a Postgres primary key, a FacetQL address), so a
+// secondary index over it costs writes and buys no read. ir.Indexes is the same
+// set addressed as (entity, field) pairs, for a store that reconciles them.
+func TestIdIsNeverIndexed(t *testing.T) {
+	g := mustCompile(t, `
+app A:
+    entity Post:
+        id: int
+        body: text
+    view M:
+        box:
+            for p in Post where p.id > 0 by id desc:
+                text "{p.body}"
+`)
+	e, _ := find(g.Entities, func(e ir.Entity) bool { return e.Name == "Post" })
+	id, _ := find(e.Fields, func(f ir.Field) bool { return f.Name == "id" })
+	if id.Index {
+		t.Error("a field named `id` must never be indexed")
+	}
+	for _, ix := range ir.Indexes(g.Entities) {
+		if ix.Field == "id" {
+			t.Errorf("ir.Indexes must not carry an id index: %+v", ix)
+		}
+	}
+}
+
 // Row-level authorization: a policy may take parameters and read the specific
 // row being acted on; `requires owns(id)` passes the action's argument to it.
 func TestRowLevelPolicy(t *testing.T) {
@@ -781,5 +810,246 @@ func TestUnknownReferences(t *testing.T) {
 		if _, err := String(src); err == nil {
 			t.Errorf("expected error for:\n%s", src)
 		}
+	}
+}
+
+// A field earns an index by how it is used, not by being mentioned.
+//
+// These two used to be one bit, and conflating them shipped an index nobody
+// could use over a free-text column. On FacetQL, whose index keys are bounded,
+// that index is refused as soon as one row exceeds the bound — and because the
+// store reconciles its indexes at startup, a single long post stopped the app
+// from booting at all. Reproduced before the fix: one 600-byte `body` and
+// `facet run` died with `cannot index Tweet.body: … over the 512-byte maximum`.
+func TestOnlyComparedFieldsAreIndexed(t *testing.T) {
+	g := mustCompile(t, `
+app A:
+    state q: text = "" @client
+    entity Post:
+        id: int
+        author: text
+        body: text
+        score: int
+    view M:
+        box:
+            for p in Post where contains(lower(p.body), lower(q)):
+                text "{p.body}"
+            for p in Post where p.author == q:
+                text "{p.author}"
+            for p in Post where p.score > 0 && !(p.author == "x"):
+                text "{p.score}"
+`)
+	e, _ := find(g.Entities, func(e ir.Entity) bool { return e.Name == "Post" })
+
+	indexed := map[string]bool{}
+	for _, f := range e.Fields {
+		if f.Index {
+			indexed[f.Name] = true
+		}
+	}
+
+	// Compared directly — an index can seek to these.
+	for _, want := range []string{"author", "score"} {
+		if !indexed[want] {
+			t.Errorf("field %q is compared in a `where` and should be indexed", want)
+		}
+	}
+
+	// Read only as an argument to a call. No ordered index answers a substring
+	// search, so this index would be pure write cost — and, on a bounded-key
+	// store, a boot failure waiting for a long row.
+	if indexed["body"] {
+		t.Error("`body` is only read inside contains(lower(...)) — it must not be indexed")
+	}
+}
+
+// Narrowing what gets indexed must not narrow what @secret refuses. A secret
+// column stores ciphertext, so *reading* it in a query is the error whether or
+// not the read is one an index could have served — the two questions are asked
+// of two different sets now, and this is the one that must stay wide.
+func TestSecretIsRefusedEvenWhereNoIndexWouldBeBuilt(t *testing.T) {
+	for _, src := range []string{
+		// Buried in a call: not indexable, still forbidden.
+		`
+app A:
+    state q: text = "" @client
+    entity Post:
+        id: int
+        token: text @secret
+    view M:
+        box:
+            for p in Post where contains(p.token, q):
+                text "x"
+`,
+		// Compared directly: not indexable either, and still forbidden.
+		`
+app A:
+    state q: text = "" @client
+    entity Post:
+        id: int
+        token: text @secret
+    view M:
+        box:
+            for p in Post where p.token == q:
+                text "x"
+`,
+	} {
+		if _, err := String(src); err == nil {
+			t.Error("a @secret field used in a `where` must be a compile error")
+		} else if !strings.Contains(err.Error(), "@secret") {
+			t.Errorf("expected a @secret diagnostic, got: %v", err)
+		}
+	}
+}
+
+// The CSS escape hatch must reach the nodes that actually lay something out.
+//
+// `class "..."` / `style "..."` are matched at the end of a node's line, and a
+// block node's line ends in a colon — `box:`, `row:`, `for t in Tweet:`. So the
+// hatch reached leaf nodes only, and `box class "rail":` did not style a box, it
+// failed to parse as one ("unknown view node \"box\""). That is close to useless:
+// every node worth giving a class to opens a block, which is why F33D3R's shell
+// was three flexed boxes with the runtime's default card border on each and no
+// way to say otherwise.
+func TestClassAndStyleReachBlockNodes(t *testing.T) {
+	g := mustCompile(t, `
+app Styled:
+    entity Item:
+        id: int
+        label: text
+    view Home at "/":
+        box class "shell":
+            row class "line" style "gap:8px":
+                text "leaf" class "leafy"
+            for i in Item by id desc limit 5 class "feed":
+                text "{i.label}"
+`)
+
+	// Walk the view for the node carrying each class, so the test does not depend
+	// on the exact tree shape.
+	found := map[string]string{}
+
+	var walk func(ns []ir.Node)
+	walk = func(ns []ir.Node) {
+		for _, n := range ns {
+			if n.Class != "" {
+				found[n.Class] = n.Kind
+			}
+			if n.Style != "" {
+				found["style:"+n.Style] = n.Kind
+			}
+			walk(n.Children)
+		}
+	}
+	walk(g.View)
+
+	for class, wantKind := range map[string]string{
+		"shell":         "box",
+		"line":          "row",
+		"leafy":         "text",
+		"feed":          "list",
+		"style:gap:8px": "row",
+	} {
+		got, ok := found[class]
+		if !ok {
+			t.Errorf("no node carries %q — the modifier was dropped", class)
+			continue
+		}
+		if got != wantKind {
+			t.Errorf("%q landed on a %q node, want %q", class, got, wantKind)
+		}
+	}
+}
+
+// Stripping the modifier must leave the rest of the line intact for the block
+// parsers that re-read it — a `for` keeps its collection, ordering and limit.
+func TestStrippingAModifierLeavesTheNodeIntact(t *testing.T) {
+	g := mustCompile(t, `
+app Styled:
+    entity Item:
+        id: int
+        label: text
+    view Home at "/":
+        box:
+            for i in Item by label desc limit 7 class "feed":
+                text "{i.label}"
+`)
+
+	var list *ir.Node
+
+	var walk func(ns []ir.Node)
+	walk = func(ns []ir.Node) {
+		for i := range ns {
+			if ns[i].Kind == "list" {
+				list = &ns[i]
+			}
+			walk(ns[i].Children)
+		}
+	}
+	walk(g.View)
+
+	if list == nil {
+		t.Fatal("the styled `for` did not lower to a list node")
+	}
+	if list.Coll != "Item" {
+		t.Errorf("collection = %q, want Item", list.Coll)
+	}
+	if list.Order != "label" || !list.Desc {
+		t.Errorf("ordering = %q desc=%v, want label desc", list.Order, list.Desc)
+	}
+	if list.Class != "feed" {
+		t.Errorf("class = %q, want feed", list.Class)
+	}
+}
+
+// An imported facet's stylesheet must reach the page.
+//
+// `mergeInto` carried every other declaration an import can bring — entities,
+// actions, components, theme variables — and silently dropped `CSS`. So a
+// component could declare the layout rules for its own markup, compile, pass
+// every check, and render unstyled: the rules were parsed and then discarded at
+// the module boundary. It presented as a specificity problem rather than as a
+// missing file, which is why it survived a design pass.
+//
+// The consequence is what makes it worth a test rather than a one-line fix: a
+// facet with any layout of its own was not distributable. It rendered correctly
+// only in whichever host app happened to carry a copy of its rules, which is
+// the opposite of what an atom is for.
+func TestAnImportedFacetsStylesheetReachesTheApp(t *testing.T) {
+	dir := t.TempDir()
+
+	atom := filepath.Join(dir, "atom.fct")
+	if err := os.WriteFile(atom, []byte(`app Atom:
+    css:
+        .atom-rule { display: grid }
+    component Atom():
+        box class "atom-rule":
+            text "in the atom"
+`), 0o600); err != nil {
+		t.Fatalf("writing the atom: %v", err)
+	}
+
+	host := filepath.Join(dir, "host.fct")
+	if err := os.WriteFile(host, []byte(`import "atom.fct"
+app Host:
+    css:
+        .host-rule { color: red }
+    view Home at "/":
+        box:
+            use Atom()
+`), 0o600); err != nil {
+		t.Fatalf("writing the host: %v", err)
+	}
+
+	g, err := File(host)
+	if err != nil {
+		t.Fatalf("compiling the host: %v", err)
+	}
+
+	if !strings.Contains(g.CSS, ".host-rule") {
+		t.Error("the host's own stylesheet is missing")
+	}
+	if !strings.Contains(g.CSS, ".atom-rule") {
+		t.Error("the imported facet's stylesheet was dropped at the module boundary")
 	}
 }

@@ -48,6 +48,9 @@ func TestPostBindCheckAbortsCleanly(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.Services[0].URL = brain.URL
+	// The JSON API publishes an entity only when the app says so — the default is
+	// closed (runtime/apiread.go). This test reads Account over it, so it says so.
+	t.Setenv(apiReadEnv, "Account")
 	srv, err := NewInMemory(g)
 	if err != nil {
 		t.Fatal(err)

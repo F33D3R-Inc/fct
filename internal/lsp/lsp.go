@@ -182,16 +182,57 @@ func (s *server) publishDiagnostics(uri string) {
 }
 
 // diagnose compiles the document and returns the compiler's error (if any) as a
-// single diagnostic on its reported line — the same error `facet build` prints.
+// single diagnostic on its reported line — the same error `facet build` prints —
+// plus the advice the file earns whether or not it builds.
+//
+// THE ADVICE COMES FIRST, AND FROM THE PARSE ALONE. It is the only warning
+// channel this toolchain has: ir.Build returns one error or none, so there is
+// nowhere else for a rule that should not stop a build to be heard, and a
+// missing `alt` is exactly such a rule — making it fatal would stop four
+// repositories compiling on the day the attribute was introduced (see
+// ast.Advise). Deriving it from the parse rather than from a successful build
+// matters as much: most of a component library is fragments that do not compile
+// on their own, and fragments are where the undescribed pictures live.
 func diagnose(text string) []diagnostic {
 	app, err := parser.Parse(text)
 	if err != nil {
 		return []diagnostic{errToDiagnostic(text, err)}
 	}
+	diags := adviceDiagnostics(text, ast.Advise(app))
 	if _, err := ir.Build(app); err != nil {
-		return []diagnostic{errToDiagnostic(text, err)}
+		diags = append(diags, errToDiagnostic(text, err))
 	}
-	return nil
+	return diags
+}
+
+// adviceDiagnostics renders advice as Warning-severity diagnostics on their own
+// lines, underlined the way an error is.
+func adviceDiagnostics(text string, advice []ast.Advice) []diagnostic {
+	if len(advice) == 0 {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]diagnostic, 0, len(advice))
+	for _, a := range advice {
+		idx := a.Line - 1
+		if idx < 0 {
+			idx = 0
+		}
+		lineText := ""
+		if idx < len(lines) {
+			lineText = lines[idx]
+		}
+		out = append(out, diagnostic{
+			Range: lspRange{
+				Start: position{Line: idx, Character: 0},
+				End:   position{Line: idx, Character: len(lineText)},
+			},
+			Severity: 2, // Warning
+			Source:   "facet",
+			Message:  a.Msg,
+		})
+	}
+	return out
 }
 
 func errToDiagnostic(text string, err error) diagnostic {
@@ -417,7 +458,8 @@ func isIdentByte(c byte) bool {
 var keywords = []string{
 	"app", "auth", "entity", "enum", "state", "derive", "policy", "action", "job",
 	"component", "layout", "theme", "view", "for", "in", "where", "by", "limit",
-	"if", "box", "text", "button", "input", "select", "option", "form", "upload",
+	"if", "box", "text", "button", "input", "textarea", "checkbox", "toggle", "radio",
+	"select", "option", "form", "upload",
 	"use", "slot", "link", "add", "set", "remove", "clear", "requires", "check",
 	"at", "desc", "asc", "on", "start", "every",
 }
@@ -427,6 +469,7 @@ var typeNames = []string{"int", "text", "bool", "money", "date"}
 var builtins = []string{
 	"now", "rand", "count", "sum", "abs", "min", "max", "floor", "round", "money",
 	"len", "upper", "lower", "trim", "year", "month", "day", "actor", "role", "verified",
+	"route",
 }
 
 func builtinDoc(name string) string {
@@ -448,6 +491,7 @@ func builtinDoc(name string) string {
 		"day":   "`day(t)` → int — UTC day of month.",
 		"actor": "`actor` — the signed-in username (or `\"guest\"`).",
 		"role":  "`role` — the actor's role (admin | member | guest).",
+		"route": "`route` — the path being rendered (e.g. `/post/7`). Readable in a view only; a nav compares it to a destination to mark itself active.",
 	}
 	return docs[name]
 }

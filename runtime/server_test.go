@@ -64,6 +64,11 @@ func requirePostgres(t *testing.T) {
 // the web channel), and GET lists an entity's durable rows.
 func TestAPIProjection(t *testing.T) {
 	requirePostgres(t)
+	// GET /api/<Entity> is closed unless the app publishes the entity — the
+	// framework default is to refuse rather than serve every row to every
+	// caller (runtime/apiread.go). These projection tests read entity lists,
+	// so they publish everything they declare.
+	t.Setenv(apiReadEnv, "*")
 	g, err := compile.String(`
 app ApiApp:
     entity User:
@@ -167,6 +172,7 @@ func getJSON(t *testing.T, url string) map[string]any {
 // atomically.
 func TestCascadeAndTransaction(t *testing.T) {
 	requirePostgres(t)
+	t.Setenv(apiReadEnv, "*") // see TestAPIProjection: entity lists are published, not default-open
 	g, err := compile.String(`
 app Rel:
     entity User:
@@ -227,6 +233,7 @@ app Rel:
 // paginates with an opaque keyset cursor.
 func TestQueryPushdownPagination(t *testing.T) {
 	requirePostgres(t)
+	t.Setenv(apiReadEnv, "*") // see TestAPIProjection: entity lists are published, not default-open
 	g, err := compile.String(`
 app Feed:
     entity Post:
@@ -349,6 +356,7 @@ app JobApp:
 // specific row's owner, so a user may edit only their own post.
 func TestRowLevelAuthorization(t *testing.T) {
 	requirePostgres(t)
+	t.Setenv(apiReadEnv, "*") // see TestAPIProjection: entity lists are published, not default-open
 	g, err := compile.String(`
 app Own:
     auth

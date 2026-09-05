@@ -205,6 +205,10 @@ func (s *Server) adminSave(w http.ResponseWriter, r *http.Request, sid string) {
 	id := toInt(r.FormValue("_id"))
 
 	s.mu.Lock()
+	// The admin editor writes through the same store as an action, so it gets the
+	// same guarantee: a refused write is undone here and reported, never redirected
+	// to a listing that shows an edit nothing stored.
+	undo := newUndoLog(nil)
 	var row record
 	if id > 0 {
 		for _, rr := range s.entities[entity] {
@@ -216,6 +220,7 @@ func (s *Server) adminSave(w http.ResponseWriter, r *http.Request, sid string) {
 	}
 	isNew := row == nil
 	if isNew {
+		undo.entity(s, entity)
 		s.nextID[entity]++
 		id = s.nextID[entity]
 		row = record{"id": id}
@@ -226,6 +231,7 @@ func (s *Server) adminSave(w http.ResponseWriter, r *http.Request, sid string) {
 			continue
 		}
 		if f.Type == "bool" {
+			undo.field(row, f.Name)
 			row[f.Name] = r.FormValue(f.Name) != ""
 			continue
 		}
@@ -234,9 +240,16 @@ func (s *Server) adminSave(w http.ResponseWriter, r *http.Request, sid string) {
 		if f.Name == "password" && !isNew && r.FormValue(f.Name) == "" {
 			continue
 		}
+		undo.field(row, f.Name)
 		row[f.Name] = coerce(r.FormValue(f.Name), f.Type)
 	}
-	s.commit([]durOp{{kind: "save", entity: entity, row: row}})
+	if err := s.commit([]durOp{{kind: "save", entity: entity, row: row}}); err != nil {
+		undo.rollback(s, nil, nil)
+		s.mu.Unlock()
+		s.recordAudit(s.actorName(sid), "admin:save", false, entity+": "+err.Error())
+		http.Error(w, "the write could not be stored and was rolled back", http.StatusInternalServerError)
+		return
+	}
 	notReserved := !isReservedEntity(entity)
 	snapshot := append([]any{}, s.entities[entity]...)
 	s.mu.Unlock()
@@ -268,14 +281,22 @@ func (s *Server) adminDelete(w http.ResponseWriter, r *http.Request, sid string)
 	id := toInt(r.FormValue("_id"))
 
 	s.mu.Lock()
+	undo := newUndoLog(nil)
 	entChanged := map[string]bool{}
 	rows := s.entities[entity]
 	for i, rr := range rows {
 		if m, ok := rr.(record); ok && toInt(m["id"]) == id {
-			s.entities[entity] = append(rows[:i], rows[i+1:]...)
-			s.commit([]durOp{{kind: "delete", entity: entity, id: id}})
+			undo.entity(s, entity)
+			s.entities[entity] = append(rows[:i:i], rows[i+1:]...)
+			if err := s.commit([]durOp{{kind: "delete", entity: entity, id: id}}); err != nil {
+				undo.rollback(s, nil, nil)
+				s.mu.Unlock()
+				s.recordAudit(s.actorName(sid), "admin:delete", false, entity+": "+err.Error())
+				http.Error(w, "the delete could not be stored and was rolled back", http.StatusInternalServerError)
+				return
+			}
 			entChanged[entity] = true
-			s.cascadeMem(entity, map[int]bool{id: true}, entChanged)
+			s.cascadeMem(entity, map[int]bool{id: true}, entChanged, undo)
 			break
 		}
 	}

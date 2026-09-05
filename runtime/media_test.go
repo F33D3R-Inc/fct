@@ -3,6 +3,8 @@ package runtime
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -197,4 +199,144 @@ func httpGetBytes(t *testing.T, u string) []byte {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return b
+}
+
+// A signature is a grant with a deadline; a column is forever. Minting the
+// signature at upload and storing the result put the first inside the second, so
+// `Product.cover` held a URL that was 200 on upload and 403 a minute later —
+// permanently — and every cover stored before signing was switched on was on 403s
+// from the moment it was.
+//
+// The fix is that the row holds a durable reference and the `image` node mints the
+// signature per render. This pins all four halves of it:
+//
+//   - a durable reference renders as a signed, valid src;
+//   - a row that already holds a fully-signed URL — every row written by the old
+//     code, expired or not — renders as a FRESH valid src, so upgrading does not
+//     break the data that is already there;
+//   - an external https:// cover is rendered exactly as stored, never signed;
+//   - the signatures the client needs travel to it as data (@media), keyed by the
+//     value the row holds, because facet.js must never hold the signing key.
+//
+// Without the fix the first two render the stored value verbatim: the durable
+// reference has no signature at all (403) and the stale one keeps the expired one
+// (403), which is exactly what the storefront saw.
+func TestImageSrcIsSignedPerRender(t *testing.T) {
+	t.Setenv("FACET_MEDIA_TTL", "60")
+	g, err := compile.String(`app Shop:
+    entity Product:
+        id: int
+        cover: text
+    action addProduct(cover: text):
+        add Product { cover: cover }
+    view Home at "/":
+        box:
+            for p in Product:
+                image "{p.cover}"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A signature minted long ago and stored in the row, the way the old upload
+	// path did it: expired, and a 403 forever.
+	stalePast := time.Now().Add(-time.Hour).Unix()
+	stale := fmt.Sprintf("/uploads/old.png?exp=%d&sig=%s", stalePast, mediaSig("old.png", stalePast))
+	external := "https://cdn.example.com/other.png"
+	for _, cover := range []string{"/uploads/new.png", stale, external} {
+		if _, status, msg := srv.runAction(systemSID, srv.byAction["addProduct"], []any{cover}); status != http.StatusOK {
+			t.Fatalf("seed %q: %d %s", cover, status, msg)
+		}
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	page := string(httpGetBytes(t, ts.URL+"/"))
+
+	srcs := imageSrcs(page)
+	if len(srcs) != 3 {
+		t.Fatalf("expected 3 rendered images, got %d:\n%s", len(srcs), page)
+	}
+	for i, want := range []string{"new.png", "old.png"} {
+		u, err := url.Parse(srcs[i])
+		if err != nil {
+			t.Fatalf("src %q: %v", srcs[i], err)
+		}
+		if !mediaAccessOK(want, u.Query()) {
+			t.Errorf("rendered src for %s does not verify: %q", want, srcs[i])
+		}
+	}
+	if got := srcs[1]; strings.Contains(got, strconv.FormatInt(stalePast, 10)) {
+		t.Errorf("a row holding an already-signed URL must be re-signed, not replayed: %q", got)
+	}
+	if srcs[2] != external {
+		t.Errorf("an external cover must be rendered untouched, got %q want %q", srcs[2], external)
+	}
+
+	// The client renders the same three images and holds no signing key, so the
+	// signatures reach it as data — keyed by the value the row holds, which is what
+	// its own evaluator will produce.
+	var state map[string]any
+	if err := json.Unmarshal([]byte(embeddedJSON(t, page, "fa-state")), &state); err != nil {
+		t.Fatal(err)
+	}
+	grants, _ := state["@media"].(map[string]any)
+	if len(grants) != 2 {
+		t.Fatalf("@media should carry a grant for each of this app's media values, got %v", state["@media"])
+	}
+	for _, stored := range []string{"/uploads/new.png", stale} {
+		got := toStr(grants[stored])
+		u, err := url.Parse(got)
+		if err != nil || got == "" {
+			t.Fatalf("no usable grant for %q: %q", stored, got)
+		}
+		name := strings.TrimPrefix(u.Path, "/uploads/")
+		if !mediaAccessOK(name, u.Query()) {
+			t.Errorf("the grant handed to the client for %q does not verify: %q", stored, got)
+		}
+	}
+	if _, signed := grants[external]; signed {
+		t.Error("an external URL must never be given a grant")
+	}
+}
+
+// imageSrcs pulls the src of every rendered <img>, in document order, decoded the
+// way a browser would (a signed URL carries `&` between exp and sig, which the
+// renderer escapes).
+func imageSrcs(page string) []string {
+	var out []string
+	for _, part := range strings.Split(page, `<img`)[1:] {
+		i := strings.Index(part, ` src="`)
+		if i < 0 {
+			continue
+		}
+		rest := part[i+len(` src="`):]
+		j := strings.Index(rest, `"`)
+		if j < 0 {
+			continue
+		}
+		out = append(out, html.UnescapeString(rest[:j]))
+	}
+	return out
+}
+
+// embeddedJSON returns the text of one of the page's bootstrap <script> blocks.
+func embeddedJSON(t *testing.T, page, id string) string {
+	t.Helper()
+	open := `id="` + id + `"`
+	i := strings.Index(page, open)
+	if i < 0 {
+		t.Fatalf("page carries no #%s block", id)
+	}
+	rest := page[i:]
+	start := strings.Index(rest, ">")
+	end := strings.Index(rest, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatalf("#%s block is malformed", id)
+	}
+	return html.UnescapeString(rest[start+1 : end])
 }

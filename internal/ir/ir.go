@@ -137,6 +137,71 @@ type Field struct {
 // IsRelation reports whether the field is a foreign key to another entity.
 func (f Field) IsRelation() bool { return f.Ref != "" }
 
+// Index is one secondary access path the compiler derived: the entity and the
+// field it saw ordered, filtered, or used as a relation. It is Field.Index
+// addressed as an (entity, field) pair, so a store can reconcile the indexes it
+// already has against the ones the app needs without walking every field of
+// every entity.
+type Index struct {
+	Entity string `json:"entity"`
+	Field  string `json:"field"`
+}
+
+// Indexes is an app's whole derived index set, in entity then field declaration
+// order, deduplicated by (entity, field). A row's `id` is never in it: identity
+// is already the store's primary order (a Postgres primary key, a FacetQL
+// address), which a secondary index cannot improve.
+func Indexes(entities []Entity) []Index {
+	var out []Index
+	seen := map[Index]bool{}
+	for _, e := range entities {
+		for _, f := range e.Fields {
+			ix := Index{Entity: e.Name, Field: f.Name}
+			if !f.Index || seen[ix] {
+				continue
+			}
+			seen[ix] = true
+			out = append(out, ix)
+		}
+	}
+	return out
+}
+
+// Reference is one relation addressed as a rule rather than as a column: rows of
+// Entity point at a row of Parent through Field, which holds that row's id.
+//
+// It is Field.Ref addressed as a triple, for the same reason Index is Field.Index
+// addressed as a pair — so a store can reconcile the referential rules it already
+// enforces against the ones the app needs, and the runtime can walk the reverse
+// graph (parent -> the children that point at it), without every caller
+// re-deriving the graph by walking every field of every entity.
+//
+// The deletion rule itself is not encoded here because there is only one: a
+// relation is a foreign key with ON DELETE CASCADE (Field's doc), and every
+// backend implements exactly that — pgStore as an FK constraint, fqStore as a
+// declared FacetQL reference, memStore in its own map.
+type Reference struct {
+	Entity string `json:"entity"` // the child: the entity whose row holds the reference
+	Field  string `json:"field"`  // the relation field on it, holding the parent row's id
+	Parent string `json:"parent"` // the entity being referenced
+}
+
+// References is an app's whole relation graph, in entity then field declaration
+// order. It is the single derivation of that graph: the reverse edges the
+// runtime cascades along and the rules a store declares to its engine are the
+// same set read in two directions, and deriving them twice is how the two drift.
+func References(entities []Entity) []Reference {
+	var out []Reference
+	for _, e := range entities {
+		for _, f := range e.Fields {
+			if f.IsRelation() {
+				out = append(out, Reference{Entity: e.Name, Field: f.Name, Parent: f.Ref})
+			}
+		}
+	}
+	return out
+}
+
 // State is one state cell with its resolved placement. List/Elem describe a
 // `[T]` collection cell; Optional marks a nullable cell.
 type State struct {
@@ -282,12 +347,23 @@ type Binding struct {
 
 // Node is one view node in the neutral tree.
 type Node struct {
-	Kind     string `json:"kind"` // box|row|text|image|icon|video|richtext|badge|button|list|if|match|case|else|input|link|select|form|upload|use|slot|tabs|tab|overlay|typeahead
+	Kind     string `json:"kind"` // box|row|text|heading|image|icon|video|richtext|badge|button|list|if|match|case|else|input|textarea|checkbox|radio|link|select|form|upload|use|slot|tabs|tab|overlay|typeahead|option|options
 	Children []Node `json:"children,omitempty"`
 
-	Segs []Seg `json:"segs,omitempty"` // text
+	// Segs is the node's own interpolated value: a text/badge leaf's words, an
+	// image or video URL, richtext's markdown source, an icon's glyph name.
+	Segs []Seg `json:"segs,omitempty"`
 
-	Label  string  `json:"label,omitempty"`  // button/upload/form submit
+	// Label is an interpolated value a node shows *beside* its own content: a
+	// form's submit button, an upload control, a tab, a link.
+	//
+	// Every one of these is segments rather than a string, for the reason node
+	// text is: a component that cannot parameterize the words it renders is not
+	// reusable. They were plain strings, so `placeholder "{hint}"` rendered the
+	// literal `{hint}` and a form's `"Send {hint}"` silently lost the
+	// interpolation entirely. One representation, one flattening, one escaper —
+	// see Server.attrText / facet.js segsToStr.
+	Label  []Seg   `json:"label,omitempty"`  // upload/form submit/tab/link/checkbox
 	Action string  `json:"action,omitempty"` // button/form
 	Args   []*Expr `json:"args,omitempty"`   // button/form/use
 
@@ -300,25 +376,177 @@ type Node struct {
 	Limit *Expr  `json:"limit,omitempty"` // list: max rows (nil = unlimited); int literal or a dynamic page-size expr
 	Cond  *Expr  `json:"cond,omitempty"`  // if: condition
 
-	Bind        string `json:"bind,omitempty"`        // input/select/upload: state cell
-	Placeholder string `json:"placeholder,omitempty"` // input
+	// Level is a heading's document level, 1..6 — an expression, because the
+	// depth a header renders at belongs to the page that uses it and not to the
+	// component that draws it (see ast.Heading). It is evaluated per render and
+	// turned into the element name by headingLevel, which clamps; the compiler
+	// refuses the levels it can prove wrong before it ever gets there.
+	//
+	// It is deliberately absent from every dependency walk (nodeDeps,
+	// region.go's aggIndex / walkNodeExprs / rowAggregates, and their mirrors in
+	// assets/facet.js), and the lowering is what makes that safe: a level whose
+	// deps are non-empty is a compile error, so this expression provably contains
+	// no aggregate, no entity lookup and no state read. Relax that check and
+	// every one of those walks has to learn about this field on the same day.
+	Level *Expr `json:"level,omitempty"`
 
-	Path string `json:"path,omitempty"` // link: destination route
+	Bind        string `json:"bind,omitempty"`        // input/textarea/checkbox/radio/select/upload: the state cell this control reads and writes
+	Placeholder []Seg  `json:"placeholder,omitempty"` // input/textarea/typeahead
 
-	Name    string   `json:"name,omitempty"`    // use: component name / icon: glyph name
-	Options []Option `json:"options,omitempty"` // select: choices
-	Value   string   `json:"value,omitempty"`   // tab: the value its bound cell takes when active
+	// Alt is the words that stand in for a picture or a player when it cannot be
+	// seen: an `<img alt="…">` and, for a video, the `aria-label` a <video> reads
+	// instead (HTML gives <video> no `alt`). One authored value, two attributes,
+	// for the reason `toggle` and `checkbox` are one node kind — they differ in
+	// what a renderer writes and in nothing else, so neither side holds a mapping
+	// the other could disagree with.
+	//
+	// It is segments, like every other author-visible value, because a picture in
+	// a `for` is a picture PER ROW and a description that cannot mention the row
+	// describes the wrong thing. It is therefore in SegLists, which is what makes
+	// it visible to the dependency walks; an interpolated attribute that is not
+	// there is one that never refreshes (see the note on SegLists).
+	Alt []Seg `json:"alt,omitempty"`
+
+	Path string `json:"path,omitempty"` // link: destination route, when it is a literal
+
+	// PathSegs carries a link whose destination interpolates the surrounding
+	// scope. `Path` stays for a purely literal destination so that the common
+	// case reads as one string on the wire and in `facet ir`, and so a consumer
+	// that only understands literals still resolves every static link correctly.
+	//
+	// A link's *label* has no such second field: it is `Label`, like every other
+	// node's, because a label is only ever displayed — there is nothing for a
+	// literals-only consumer to resolve, and one field is one rule.
+	PathSegs []Seg `json:"pathSegs,omitempty"`
+
+	// Route marks a link whose destination IS an interpolated value rather than a
+	// path the author wrote around interpolated values — `link "{label}" -> "{to}"`,
+	// the shape a reusable nav/breadcrumb/pagination component needs.
+	//
+	// The two are rendered differently and checked differently, and both follow
+	// from the same fact: in a path template the interpolations are *data* landing
+	// in slots of a known path, and here the interpolation is the *path*. So a
+	// template's values are percent-escaped (a handle containing `/` must not
+	// become two segments) and its shape is route-checked at compile time; a route
+	// expression is written through unescaped (escaping its `/`s would destroy it)
+	// and cannot be route-checked at compile time, because its value does not
+	// exist yet. The renderers resolve it against Routes instead and refuse to
+	// make an anchor of anything that is not a route of this app.
+	Route bool `json:"route,omitempty"`
+
+	// External marks a link whose destination leaves this app: an author-written
+	// absolute URL (`https://…`, `http://…`, `mailto:…`). It is set only from a
+	// destination whose scheme and authority the AUTHOR wrote as literal text —
+	// never from a value that arrives at render — which is the whole safety
+	// argument. A `Route` destination is a runtime value and stays confined to
+	// this app's routes; anything else it names renders as inert text, so a
+	// `javascript:` payload sitting in a database row can no more become an
+	// anchor now than it could before external links existed.
+	//
+	// Interpolation is still allowed *after* the authority (`https://api.x/{id}`)
+	// and is percent-escaped exactly as a path template's is, so a value can fill
+	// a segment but can never move the origin.
+	//
+	// The renderers re-check the scheme at render time anyway (safeExternalHref,
+	// mirrored in assets/facet.js). That check is redundant against the compiler
+	// and is meant to be: it is what makes "an anchor to somewhere off-site" a
+	// property of the rendered href rather than of a boolean nobody re-reads.
+	External bool `json:"external,omitempty"`
+
+	Name string `json:"name,omitempty"` // use: component name
+	// Options is a select's or a radio group's choices when every one of them is
+	// fixed — the whole world before a choice list could be drawn from data, and
+	// the shape it keeps. A control whose list contains anything dynamic (a
+	// computed value, or a `for` over a collection) carries its whole list as
+	// `option`/`options` Children instead, in source order.
+	//
+	// The two are exclusive, which is what makes rendering them one rule with no
+	// second ordering question: render Options, then render Children, and only one
+	// of the two is ever non-empty. It is the same split `Path`/`PathSegs` and
+	// `Class`/`ClassSegs` make, for the same reason — the purely literal case
+	// stays one flat list on the wire, and a consumer that only understands fixed
+	// choices still reads every fixed-choice control exactly as it always did.
+	Options []Option `json:"options,omitempty"`
+	// Value is an identity the runtime resolves, never a displayed string, so it
+	// is not interpolated: a tab's is the value its bound cell takes when active
+	// and the key that picks the rendered branch; a typeahead's is the entity
+	// field its suggestions are drawn from, a name the compiler checked; a
+	// checkbox's is its presentation variant ("switch" — the control the author
+	// spelled `toggle`), which is why `toggle` needs no node kind of its own; an
+	// `option` node's is the literal it stores.
+	Value string `json:"value,omitempty"`
+
+	// Val is a Value the render computes rather than one the author wrote — an
+	// `option`/`options` node whose stored identity is `c.id` rather than "draft".
+	// It stands beside Value exactly as PathSegs stands beside Path: the literal
+	// field survives untouched so everything that could already resolve a fixed
+	// identity still can, and the computed one exists only where there was no
+	// identity to write down.
+	//
+	// This is the one thing a data-driven choice necessarily gives up. A literal
+	// option's value is checked against the enum it belongs to at compile time;
+	// this one cannot be, because the rows it comes from do not exist yet. What
+	// the compiler still proves about it is written at lowerOptions.
+	Val *Expr `json:"val,omitempty"`
 
 	// CSS escape hatch: author-supplied class/style from a trailing `class "..."` /
 	// `style "..."` modifier, appended to the element's built-in `fa-*` class so a
 	// `css:` stylesheet can target it. Applied identically on the server and client.
 	Class string `json:"class,omitempty"`
 	Style string `json:"style,omitempty"`
+
+	// ClassSegs carries a class value that interpolates the surrounding scope
+	// (`class "x-rung-c-{tone}"`). `Class` stays for a purely literal one, exactly
+	// as `Path` stays beside `PathSegs`: the common case reads as one string on the
+	// wire and in `facet ir`, and a consumer that only understands literals still
+	// resolves every static class correctly.
+	//
+	// An interpolated run is filtered to the characters a class token may contain
+	// before it is joined — see escapeClassToken, mirrored in assets/facet.js. A
+	// class attribute is a whitespace-separated token LIST, so an unfiltered value
+	// could add classes it was never given a slot for; filtering makes the value
+	// fill its token and nothing more, the same way linkHref's escaping makes a
+	// value fill its path segment and nothing more.
+	//
+	// There is deliberately no `StyleSegs`. See ast.Modified.
+	ClassSegs []Seg `json:"classSegs,omitempty"`
+
+	// Anchor is an author-chosen name for this node as a position in the page —
+	// what `anchor "install"` writes and what `link "…" -> "#install"` scrolls to.
+	// It is rendered as the element's `id`.
+	//
+	// It is a separate field from ID, and must stay one. ID is the runtime's own
+	// region address: the compiler allocates it, the client re-renders a region by
+	// it, and nothing about it is the author's to choose or to read. Anchor is the
+	// author's name for a place in the document. They answer different questions
+	// and a node can want both — a `for` region the reader can also link to — so
+	// merging them would mean either the addressing or the anchor losing its name.
+	Anchor string `json:"anchor,omitempty"`
 }
 
-// Option is one select choice (display label → stored value).
+// SegLists is every interpolated value hanging off this node: its own segments
+// and each attribute's. It exists because a node no longer has one list — the
+// walks that ask "what does this node read?" (dependency edges, which aggregates
+// to materialize, which collections the client still needs) would each have to
+// remember every attribute, and the three that only remembered `Segs` are why a
+// link's interpolated label and path were invisible to all of them. One method,
+// so adding an interpolated attribute reaches every walk at once.
+func (n Node) SegLists() [][]Seg {
+	out := [][]Seg{n.Segs, n.Label, n.Placeholder, n.PathSegs, n.ClassSegs, n.Alt}
+	for _, o := range n.Options {
+		out = append(out, o.Label)
+	}
+	return out
+}
+
+// Option is one fixed select/radio choice (display label → stored value). The
+// label is interpolated segments like every other label; the value is not — it
+// is a compile-time identity: what the bound cell stores, what the current
+// selection is compared against, and what an enum's exhaustiveness is proven
+// over. A choice whose value is not known until the render is not one of these;
+// it is an `option`/`options` Node (see Node.Options).
 type Option struct {
-	Label string `json:"label"`
+	Label []Seg  `json:"label"`
 	Value string `json:"value"`
 }
 

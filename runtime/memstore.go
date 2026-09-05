@@ -17,8 +17,12 @@ import (
 // Postgres. Every method mirrors the Postgres backend's contract closely enough
 // that the runtime above it cannot tell the difference.
 type memStore struct {
-	mu       sync.Mutex
-	ents     map[string]ir.Entity
+	mu   sync.Mutex
+	ents map[string]ir.Entity
+	// children is the reverse-relation graph, parent entity -> the relations that
+	// point at it, rebuilt by Init from ir.References. It is the same derivation
+	// the runtime and fqStore use, so all three cascade along exactly one graph.
+	children map[string][]ir.Reference
 	rows     map[string][]any // entity -> rows (records)
 	sessions map[string]*persistedSession
 	audit    []auditEntry
@@ -30,6 +34,7 @@ type memStore struct {
 func newMemStore() *memStore {
 	return &memStore{
 		ents:     map[string]ir.Entity{},
+		children: map[string][]ir.Reference{},
 		rows:     map[string][]any{},
 		sessions: map[string]*persistedSession{},
 		crons:    map[string]time.Time{},
@@ -44,6 +49,12 @@ func (s *memStore) Init(entities []ir.Entity) (map[string][]any, error) {
 		if s.rows[e.Name] == nil {
 			s.rows[e.Name] = []any{}
 		}
+	}
+	// Init may be called more than once (the dev reload re-enters it), so the
+	// graph is rebuilt from every entity known so far rather than appended to.
+	s.children = map[string][]ir.Reference{}
+	for _, r := range ir.References(sortedEntities(s.ents)) {
+		s.children[r.Parent] = append(s.children[r.Parent], r)
 	}
 	out := map[string][]any{}
 	for name, rs := range s.rows {
@@ -87,22 +98,32 @@ func (s *memStore) deleteCascade(entity string, ids map[int]bool) {
 		kept = append(kept, r)
 	}
 	s.rows[entity] = kept
-	for childName, child := range s.ents {
-		for _, f := range child.Fields {
-			if f.Ref != entity {
-				continue
-			}
-			childIDs := map[int]bool{}
-			for _, r := range s.rows[childName] {
-				if m, ok := r.(record); ok && ids[toInt(m[f.Name])] {
-					childIDs[toInt(m["id"])] = true
-				}
-			}
-			if len(childIDs) > 0 {
-				s.deleteCascade(childName, childIDs)
+	for _, ch := range s.children[entity] {
+		childIDs := map[int]bool{}
+		for _, r := range s.rows[ch.Entity] {
+			if m, ok := r.(record); ok && ids[toInt(m[ch.Field])] {
+				childIDs[toInt(m["id"])] = true
 			}
 		}
+		if len(childIDs) > 0 {
+			s.deleteCascade(ch.Entity, childIDs)
+		}
 	}
+}
+
+// sortedEntities is the entity map as a slice in name order, so a derivation over
+// it (ir.References) does not depend on Go's randomized map iteration.
+func sortedEntities(ents map[string]ir.Entity) []ir.Entity {
+	names := make([]string, 0, len(ents))
+	for name := range ents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]ir.Entity, 0, len(names))
+	for _, name := range names {
+		out = append(out, ents[name])
+	}
+	return out
 }
 
 func (s *memStore) Clear(entity string) error {
@@ -191,6 +212,65 @@ func (s *memStore) Query(query Query) ([]any, string, error) {
 		}
 	}
 	return filtered, next, nil
+}
+
+// Count and CountBy are the in-memory answers to the same questions the durable
+// stores push down. memStore *is* the working set, so "without materializing the
+// rows" costs nothing here — but the semantics must match exactly, because a
+// test that runs in memory and an app that runs on FacetQL have to agree.
+
+func (s *memStore) Count(query Query) (int, error) {
+	rows, err := s.matching(query)
+	return len(rows), err
+}
+
+func (s *memStore) CountBy(query Query, groupBy string, values []any) (map[string]int, error) {
+	rows, err := s.matching(query)
+	if err != nil {
+		return nil, err
+	}
+	want := map[string]bool{}
+	out := map[string]int{}
+	for _, v := range values {
+		want[toStr(v)] = true
+		out[toStr(v)] = 0 // every value asked about comes back, zero included
+	}
+	for _, r := range rows {
+		m, ok := r.(record)
+		if !ok {
+			continue
+		}
+		key := toStr(m[groupBy])
+		if len(values) > 0 && !want[key] {
+			continue
+		}
+		out[key]++
+	}
+	return out, nil
+}
+
+// matching returns the rows of an entity a predicate accepts, with the item
+// variable bound per row — the selection half of Query, without the paging.
+func (s *memStore) matching(query Query) ([]any, error) {
+	s.mu.Lock()
+	scope := map[string]any{}
+	for k, v := range s.rows {
+		scope[k] = append([]any{}, v...)
+	}
+	src := append([]any{}, s.rows[query.Entity]...)
+	s.mu.Unlock()
+
+	if query.Where == nil {
+		return src, nil
+	}
+	var out []any
+	for _, r := range src {
+		scope[query.ItemVar] = r
+		if truthy(eval(query.Where, scope)) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 func equalVals(a, b any) bool { return toStr(a) == toStr(b) && lessVal(a, b) == lessVal(b, a) }

@@ -16,7 +16,8 @@ var (
 )
 
 // markdownHTML renders a safe subset of Markdown to HTML: ``` code fences,
-// `#`/`##`/`###` headings, `- ` lists, paragraphs, and inline code/bold/italic.
+// `#`/`##`/`###` headings, `- ` lists, `> ` quotations, paragraphs, and inline
+// code/bold/italic.
 // The input is fully HTML-escaped first, so no raw HTML survives. The identical
 // algorithm runs in assets/facet.js, so server-rendered first paint and client
 // hydration produce the same markup.
@@ -48,6 +49,18 @@ func markdownHTML(src string) string {
 		case strings.HasPrefix(line, "# "):
 			b.WriteString("<h1>" + mdInline(line[2:]) + "</h1>")
 			i++
+		case strings.HasPrefix(line, "> "):
+			// A quotation: the same shape as the list arm below — a run of prefixed
+			// lines collected into one wrapper. Its body is a paragraph, joined the
+			// way the paragraph arm joins its lines, so the inside of a quote is made
+			// of the same thing as the prose around it and <blockquote> gets the flow
+			// content it is meant to hold rather than bare inline text.
+			var quote []string
+			for i < len(lines) && strings.HasPrefix(lines[i], "> ") {
+				quote = append(quote, mdInline(lines[i][2:]))
+				i++
+			}
+			b.WriteString("<blockquote><p>" + strings.Join(quote, "<br>") + "</p></blockquote>")
 		case strings.HasPrefix(line, "- "):
 			b.WriteString("<ul>")
 			for i < len(lines) && strings.HasPrefix(lines[i], "- ") {
@@ -76,6 +89,7 @@ func mdBlockStart(line string) bool {
 		strings.HasPrefix(line, "# ") ||
 		strings.HasPrefix(line, "## ") ||
 		strings.HasPrefix(line, "### ") ||
+		strings.HasPrefix(line, "> ") ||
 		strings.HasPrefix(line, "- ")
 }
 

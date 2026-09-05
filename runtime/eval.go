@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"math/rand"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -40,6 +42,34 @@ func eval(e *ir.Expr, scope map[string]any) any {
 			return m[e.Field]
 		}
 		return nil
+	case "eget", "agg":
+		// A collection read. During a page render these are materialized: the
+		// browser will re-evaluate this very expression with no collection to scan
+		// (see runtime/region.go), so the render records what it computed, keyed by
+		// where it computed it. The lookup doubles as memoization — the same
+		// aggregate at the same render path is the same question — and everything
+		// that evaluates without a collector (actions, policies, the API) is
+		// unaffected.
+		m := materializerOf(scope)
+		if v, hit := m.lookup(e); hit {
+			return v
+		}
+		// A count/exists the database can answer is asked of the database: that is
+		// what stops the in-memory mirror from being the only thing that can answer
+		// it. Anything else — a sum, an unpushable predicate, an aggregate a list
+		// could not batch — is counted here, over the working set, as before.
+		if v, ok := m.resolveAgg(e, scope); ok {
+			return m.record(e, v)
+		}
+		return m.record(e, evalColl(e, scope))
+	}
+	return evalRest(e, scope)
+}
+
+// evalColl evaluates the two forms that read a whole collection: an
+// `Entity(id).field` lookup and an aggregate over (optionally filtered) rows.
+func evalColl(e *ir.Expr, scope map[string]any) any {
+	switch e.Kind {
 	case "eget":
 		rows, _ := scope[e.Name].([]any)
 		key := eval(e.Key, scope)
@@ -49,17 +79,23 @@ func eval(e *ir.Expr, scope map[string]any) any {
 			}
 		}
 		return nil
-	case "agg":
+	}
+	{
 		rows, _ := scope[e.Name].([]any)
 		// Filtered form: keep only rows the predicate accepts, with the item
 		// variable bound to each row. Mutate-and-restore keeps eval allocation-free.
+		//
+		// evalRowPredicate, not eval: this predicate is answered once per row while
+		// the render path stands still, so a nested aggregate inside it has no
+		// address of its own and must be computed for the row that is bound rather
+		// than read back from the one the first row wrote.
 		if e.Where != nil {
 			prev, had := scope[e.Var]
 			kept := make([]any, 0, len(rows))
 			for _, r := range rows {
 				if m, ok := r.(record); ok {
 					scope[e.Var] = m
-					if truthy(eval(e.Where, scope)) {
+					if evalRowPredicate(e.Where, scope) {
 						kept = append(kept, r)
 					}
 				}
@@ -112,6 +148,13 @@ func eval(e *ir.Expr, scope map[string]any) any {
 		default: // sum
 			return total
 		}
+	}
+}
+
+// evalRest is the remainder of the interpreter: everything that does not read a
+// collection, split out so eval's collection cases stay legible.
+func evalRest(e *ir.Expr, scope map[string]any) any {
+	switch e.Kind {
 	case "astate":
 		// Action status and form-field status are client-only runtime state; the
 		// server has none at render time, so first paint shows "not pending" / "no
@@ -288,12 +331,44 @@ func truthy(v any) bool {
 		return t != 0
 	case string:
 		return t != ""
+	// Text from a driver — empty is empty, however it arrived. See toStr.
+	case []byte:
+		return len(t) != 0
 	case []any:
 		return len(t) > 0
 	case nil:
 		return false
 	}
 	return true
+}
+
+// numericText is what both interpreters accept as "a number written as text":
+// optional sign, digits with an optional fractional part, optional exponent.
+//
+// It is deliberately narrower than either language's built-in parser. Go's
+// strconv.ParseFloat also accepts "inf", "nan" and "0x1p-2"; JavaScript's Number
+// also accepts "0x10", "Infinity" and "" (as 0). Leaning on the built-ins would
+// make the two halves of this runtime disagree about the same input, which is
+// the one thing eval.go and facet.js must never do — a value would then render
+// one way on first paint and another after the client took over.
+var numericText = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
+
+// parseNumericText reports the value of a number written as text, and whether
+// it was one at all. Truncation is toward zero, matching the float64 case below
+// and Go's own float→int conversion.
+func parseNumericText(s string) (int, bool) {
+	t := strings.TrimSpace(s)
+	if !numericText.MatchString(t) {
+		return 0, false
+	}
+	if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+		return int(n), true
+	}
+	f, err := strconv.ParseFloat(t, 64)
+	if err != nil {
+		return 0, false
+	}
+	return int(f), true
 }
 
 func toInt(v any) int {
@@ -308,14 +383,52 @@ func toInt(v any) int {
 		if t {
 			return 1
 		}
+	// A number that arrived as text.
+	//
+	// Every value that crosses a boundary into this runtime is text: a route
+	// parameter (`/post/:id`), an HTML form field, a `<input>`'s .value on the
+	// client. Returning 0 for all of them was not a conservative default, it was
+	// a silent wrong answer — `reply("1", ...)` wrote `tweet: 0` and orphaned the
+	// row with `{"ok":true}` and no diagnostic, and every `int`-typed input on
+	// the client stored 0 no matter what was typed into it.
+	//
+	// A string that is not a number still yields 0 here, because this function is
+	// total and is called from rendering and comparison paths that have nowhere
+	// to report a failure. Rejecting bad input is the job of the boundary that
+	// has somewhere to put the error — see `coerceParam` in server.go.
+	case string:
+		n, _ := parseNumericText(t)
+		return n
+	// The same number, still text, in the shape a driver hands back — see toStr.
+	case []byte:
+		n, _ := parseNumericText(string(t))
+		return n
 	}
 	return 0
 }
 
+// toStr renders a runtime value as text.
+//
+// The []byte case is not decoration: it is the shape a database driver hands
+// back for a text column. `database/sql` fills a `Scan(&v)` into `any` with the
+// driver's own type, and lib/pq gives TEXT/VARCHAR (and NUMERIC, and BYTEA) as
+// []byte rather than string — pgStore.CountBy scans a group key exactly that
+// way. Without this case every such key converted to "" and every group in a
+// hoisted per-row count collapsed onto that one key, so `count(f in Follow
+// where f.handle == u.handle)` rendered 0 for every row, with no error to see.
+// Only the columns lib/pq happens to convert for us (BIGINT, BOOLEAN) worked.
+//
+// The typed scan path already knew this — `normalize` in store.go has carried a
+// []byte case since it was written — but the total conversions here, which are
+// where a value with no declared column type ends up, did not. So toInt and
+// truthy read it as text too: bytes-of-text must convert exactly as the string
+// they hold, or the three would disagree about the same value.
 func toStr(v any) string {
 	switch t := v.(type) {
 	case string:
 		return t
+	case []byte:
+		return string(t)
 	case int:
 		return itoa(t)
 	case int64:
@@ -341,6 +454,16 @@ func toStr(v any) string {
 }
 
 func equal(a, b any) bool {
+	// Read a driver's []byte as the string it holds before dispatching, so it
+	// takes the text branch below rather than falling through to the numeric one
+	// — where two different non-numeric byte strings would both convert to 0 and
+	// compare equal. See toStr.
+	if ab, ok := a.([]byte); ok {
+		a = string(ab)
+	}
+	if bb, ok := b.([]byte); ok {
+		b = string(bb)
+	}
 	if as, ok := a.(string); ok {
 		return as == toStr(b)
 	}

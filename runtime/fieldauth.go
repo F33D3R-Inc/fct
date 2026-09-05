@@ -58,21 +58,18 @@ func stripFields(rows any, drop map[string]bool) any {
 // sseSafe strips every gated field from a delta map. The SSE broadcast reaches all
 // subscribers with no actor to authorize against, so gated fields are never
 // streamed — clients receive them only over the per-actor API.
+//
+// It is `visibleRows` with no actor rather than a rule of its own: "what may
+// this actor receive of this entity" has one implementation, and an empty scope
+// fails every gate, which is the right answer for a payload that cannot name
+// who is reading it.
 func (s *Server) sseSafe(deltas map[string]any) map[string]any {
 	if len(s.gated) == 0 {
 		return deltas
 	}
 	out := make(map[string]any, len(deltas))
 	for ent, rows := range deltas {
-		if g := s.gated[ent]; len(g) > 0 {
-			drop := make(map[string]bool, len(g))
-			for _, gf := range g {
-				drop[gf.name] = true
-			}
-			out[ent] = stripFields(rows, drop)
-		} else {
-			out[ent] = rows
-		}
+		out[ent] = s.visibleRows(ent, rows, nil)
 	}
 	return out
 }

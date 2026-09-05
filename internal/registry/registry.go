@@ -22,10 +22,72 @@ import (
 	"time"
 )
 
-// ToolchainVersion is the running `facet` version, used to check a facet's
-// `facet` manifest range and to stamp facet.lock. cmd/facet/main sets it from
-// its own version var at startup; the default keeps tests self-contained.
-var ToolchainVersion = "1.9.0"
+// ToolchainVersion is the running `facet` version: printed by `facet version`,
+// sent as the registry client's User-Agent, stamped into facet.lock, and
+// compared against every `facet` manifest range (a remote import's in
+// fetchValidate, the entry project's own in CheckToolchain).
+//
+// This is the one definition of "what version is this". It used to be a
+// second, hand-copied literal (cmd/facet/main kept its own version var and
+// assigned it here at startup) — the two drifted, main's climbed release over
+// release while this one sat still, so anything that compiled in-process
+// without going through main() (every Go test, the LSP) silently checked
+// against a version 20-odd releases stale. A release binary still gets its
+// real version stamped in, just directly: -ldflags
+// "-X facet/internal/registry.ToolchainVersion=…".
+var ToolchainVersion = "1.31.0"
+
+// CheckToolchainRange reports whether the running ToolchainVersion satisfies a
+// `facet` manifest range, returning a clear "upgrade the toolchain" error when
+// it does not. subject names what declared the range (a repo key, or the local
+// project) for the error message. An empty range, or a ToolchainVersion that
+// does not parse (a dev build like "(devel)"), skips the check — the same
+// leniency the registry has always applied to a remote facet's manifest.
+//
+// This is the one place a `facet` range is ever compared to the toolchain, so a
+// local project's own facet.json (see (*Resolver).CheckToolchain) and a remote
+// import's manifest (see fetchValidate) agree by construction rather than by
+// two copies of the same three lines staying in sync.
+func CheckToolchainRange(rng, subject string) error {
+	if rng == "" {
+		return nil
+	}
+	tv, ok := parseSemver(ToolchainVersion)
+	if !ok {
+		return nil
+	}
+	sat, err := satisfiesRange(rng, tv)
+	if err != nil {
+		return fmt.Errorf("%s has an invalid `facet` range %q: %w", subject, rng, err)
+	}
+	if !sat {
+		return fmt.Errorf("facet %s requires facet %s — upgrade the toolchain (have %s)", subject, rng, ToolchainVersion)
+	}
+	return nil
+}
+
+// CheckToolchain validates the project's own facet.json (if the entry file's
+// directory has one) against the running toolchain, the same range check every
+// remote import gets in fetchValidate.
+//
+// Before this, a project's own `facet` pin was pure documentation: nothing
+// compared it to the running toolchain, so an out-of-date `facet` fell straight
+// into parsing syntax it had never heard of and failed with a cascade of
+// confusing parse errors instead of the one-line "upgrade the toolchain"
+// message a remote import already gets. compile.File calls this before parsing
+// anything, so the version mismatch — when there is one — is the first and
+// only error.
+func (r *Resolver) CheckToolchain() error {
+	manifest, err := readManifest(r.projectDir)
+	if err != nil || manifest == nil {
+		return err
+	}
+	subject := manifest.Name
+	if subject == "" {
+		subject = "this project"
+	}
+	return CheckToolchainRange(manifest.Facet, subject)
+}
 
 // host is the only registry host this build understands. Adding another (e.g.
 // gitlab.com) is a new prefix + a new client, not a rewrite — IsRemote and
@@ -327,17 +389,8 @@ func (r *Resolver) fetchValidate(key, owner, repo, commit string) (integrity, ma
 		if manifest.Name != "" && manifest.Name != key {
 			return "", "", fmt.Errorf("%s declares name %q (expected %q)", key, manifest.Name, key)
 		}
-		if manifest.Facet != "" {
-			tv, ok := parseSemver(ToolchainVersion)
-			if ok {
-				sat, rerr := satisfiesRange(manifest.Facet, tv)
-				if rerr != nil {
-					return "", "", fmt.Errorf("%s has an invalid `facet` range %q: %w", key, manifest.Facet, rerr)
-				}
-				if !sat {
-					return "", "", fmt.Errorf("facet %s requires facet %s — upgrade the toolchain (have %s)", key, manifest.Facet, ToolchainVersion)
-				}
-			}
+		if err := CheckToolchainRange(manifest.Facet, key); err != nil {
+			return "", "", err
 		}
 	}
 	main, err = resolveMain(cacheDir, manifest)

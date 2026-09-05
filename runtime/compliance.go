@@ -389,6 +389,8 @@ func (s *Server) sweepRetention(rules []retentionRule) {
 		}
 		entChanged := map[string]bool{}
 		if len(removedIDs) > 0 {
+			undo := newUndoLog(nil)
+			undo.entity(s, rule.Entity)
 			s.entities[rule.Entity] = kept
 			entChanged[rule.Entity] = true
 			removedSet := map[int]bool{}
@@ -397,8 +399,17 @@ func (s *Server) sweepRetention(rules []retentionRule) {
 				removedSet[id] = true
 				ops = append(ops, durOp{kind: "delete", entity: rule.Entity, id: id})
 			}
-			s.cascadeMem(rule.Entity, removedSet, entChanged)
-			s.commit(ops)
+			s.cascadeMem(rule.Entity, removedSet, entChanged, undo)
+			// A sweep the store refused did not happen. Putting the rows back is the
+			// only reading that stays true: the alternative is a working set that has
+			// forgotten rows the database still holds, which come back at the next
+			// restart having been reported deleted.
+			if err := s.commit(ops); err != nil {
+				undo.rollback(s, nil, nil)
+				entChanged = map[string]bool{}
+				s.obs.log.Error("retention sweep rolled back: the store refused the delete",
+					slog.String("entity", rule.Entity), slog_err(err))
+			}
 		}
 		s.mu.Unlock()
 		if len(entChanged) > 0 {

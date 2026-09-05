@@ -18,6 +18,12 @@ type App struct {
 	// "ui" or "data" (content that snaps into a socket). Only the typed kinds take
 	// part in layered composition; a plain app keeps the original flat-merge model.
 	Kind string
+	// Composed is set on the single flattened graph a layered build produces (and
+	// never on an authored file). Downstream passes read it only to phrase a
+	// diagnostic in the vocabulary the author actually wrote in: a route is
+	// declared by a playground `mount` or a brick `view` there, not by a top-level
+	// `view`. It changes no compilation behavior.
+	Composed bool
 	// Mounts (playground only) are the screens the baseplate mounts — each binds a
 	// wireframe to a route with an optional guard. A playground accepts wireframes
 	// and nothing else. One unguarded mount at "/" is the common single-screen app;
@@ -147,6 +153,7 @@ type Enum struct {
 type ThemeVar struct {
 	Name  string
 	Value string
+	Line  int // source line, so a diagnostic about the value can point at it
 }
 
 // NamedTheme is a `theme <name>:` block — an alternate palette (e.g. `pride`,
@@ -352,7 +359,29 @@ type Param struct {
 	Type     string
 	List     bool // a `[T]` parameter (service operations only)
 	Optional bool
+	// Ref makes the parameter a *reference* rather than a value: it is bound at
+	// the call site to the NAME of a declaration, not to the result of an
+	// expression. RefValue ("") is an ordinary value parameter.
+	//
+	// This is what a reusable component is made of. A value parameter can carry
+	// what a control *shows*; it cannot carry what a control *writes to* or what a
+	// button *calls*, because those are identities the compiler must resolve —
+	// `bind` names a state cell, `->` names an action. Without a reference
+	// parameter a text field, a select, a submit button and a pending/failed
+	// wrapper can only ever be written against one hard-coded cell or action,
+	// which is why a component library could not have fields in it at all.
+	//
+	// Only a component may declare one, and a reference argument must be a bare
+	// name (`use Field("Email", email)`), never an expression.
+	Ref string
 }
+
+// The reference kinds a component parameter may declare.
+const (
+	RefValue  = ""       // an ordinary value parameter: `label: text`
+	RefCell   = "cell"   // a reference to a state cell of type Type: `value: cell text`
+	RefAction = "action" // a reference to an action (Type is empty): `submit: action`
+)
 
 // Job is a scheduled, server-authoritative invocation of a zero-argument action
 // — the language's background/workflow primitive. It runs on a fixed interval
@@ -450,15 +479,44 @@ type View struct {
 // Node is a UI node. The set is small and target-neutral.
 type Node interface{ node() }
 
-// Styled wraps any node with the CSS escape-hatch attributes from a trailing
-// `class "..."` and/or `style "..."` modifier on the node's line. It is a pure
-// decorator: lowering unwraps it, stamping Class/Style onto the inner node's IR so
-// the rendered element carries them alongside its built-in `fa-*` class. This is
-// how a `css:` stylesheet hooks onto specific nodes (`box class "rail"`).
-type Styled struct {
-	Class string
-	Style string
-	Inner Node
+// Modified wraps any node with the trailing `keyword "value"` modifiers written
+// at the end of its line: `class "..."`, `style "..."` and `anchor "..."`. It is
+// a pure decorator — lowering unwraps it and stamps the values onto the inner
+// node's IR — so the modifier set is one concept with one parse and one lowering
+// rather than a special case per keyword.
+//
+// `class`/`style` are the CSS escape hatch: they ride alongside the element's
+// built-in `fa-*` class so a `css:` stylesheet can hook onto specific nodes
+// (`box class "rail"`).
+//
+// `anchor` is an author-chosen name for a position in the page, the thing a
+// `#install` link scrolls to. It is deliberately NOT the same concept as
+// ir.Node.ID, which is the runtime's own region address — allocated by the
+// compiler, meaningless to the author, and what the client uses to re-render a
+// region in place. Two names for two jobs: reusing the region id would put an
+// author's spelling on the wire where the addressing expects the compiler's, and
+// a node can perfectly well need both.
+type Modified struct {
+	// Class is interpolated segments, not a string, for the reason every other
+	// author-visible value is: a component that cannot vary the class it applies
+	// cannot vary its appearance, so `class "x-rung-c-{tone}"` emitted the literal
+	// braces and the only way to get a tone-dependent style was to write the
+	// variants out by hand and pick between them with an `if`.
+	//
+	// `Style` stays a plain string. A class value is a token list — the safe set is
+	// stateable in one line and a value outside it means nothing — whereas a style
+	// value is a stylesheet fragment, where what an interpolated value may safely
+	// be is a real question with no one-line answer. One of these has a validating
+	// rule available and the other does not, so only one of them interpolates.
+	Class  []Seg
+	Style  string
+	Anchor string
+	Inner  Node
+	// Line is the modifier's own source line. A decorator had no position of its
+	// own until `style` gained a diagnostic, and an error about a `style` value
+	// that cannot say which line it is on is most of the way back to saying
+	// nothing at all.
+	Line int
 }
 
 // Box is a layout container — its children stack vertically.
@@ -473,17 +531,105 @@ type Row struct{ Children []Node }
 // Text is a text leaf of literal and interpolated segments.
 type Text struct{ Segs []Seg }
 
-// Image is an `image "url"` node — its URL is interpolated segments like text, so
-// `image "…/avatar?seed={t.author}"` yields a per-row avatar.
-type Image struct{ Segs []Seg }
+// Heading is a `heading <level> "Title"` node: a text leaf that is a heading of
+// the document rather than a span that has been styled to look like one. It is
+// the node that gives a page an outline — the thing a screen reader navigates by
+// and a search engine reads a structure out of, and which nothing in this
+// language could express before it, so every page this stack has rendered was a
+// flat run of spans.
+//
+// # Why the level is an EXPRESSION and not part of the keyword
+//
+// The obvious spelling is six node keywords (`h1` … `h6`), and it is wrong for
+// one reason that is fatal in a component library: the same header component
+// appears at different depths on different pages, so the level belongs to the
+// CALL SITE, not to the component. With six keywords a `SectionHeader` that
+// wanted to be an h2 on one page and an h3 on another would have to branch on a
+// level it was handed — and `match` cases are compile-time literals, so it could
+// not even do that. The level has to be something a parameter can carry, and the
+// only thing a parameter carries is a value. So the level is an expression:
+//
+//	component SectionHeader(title: text, level: int):
+//	    heading level "{title}"
+//
+//	use SectionHeader("Replies", 3)
+//
+// # Why it is not a modifier on `text`
+//
+// `text "…" heading 2` would make the level a Modified field, and Modified is
+// deliberately a *pure decorator*: it applies to every node (so `box … heading 2`
+// would parse and mean nothing), its values are literal strings rather than
+// expressions, and it stamps attributes onto whatever it wraps rather than
+// choosing what element that is. A heading level chooses the element. It is the
+// node, not a decoration on one.
+//
+// # What the compiler proves about Level, and what it cannot
+//
+// See the lowering in internal/ir (case ast.Heading). In short: an int literal
+// outside 1..6 is an error, a level whose type is known and is not a number is
+// an error, and a level that reads state or a collection directly is an error
+// (a leaf has no region of its own to re-render, so such a level could go stale
+// in place). Whether a document has exactly one h1 and skips no levels is NOT
+// checkable here and is not claimed: the level may be a value, a component is
+// composed into pages it cannot see, and only one arm of an `if`/`match` renders.
+type Heading struct {
+	Level Expr
+	Segs  []Seg
+	Line  int
+}
+
+// Image is an `image "url" [alt "…"]` node — its URL is interpolated segments
+// like text, so `image "…/avatar?seed={t.author}"` yields a per-row avatar.
+//
+// # `alt`, and why absence is not the same as empty
+//
+// `alt` is the words that stand in for the picture. It is interpolated segments
+// for the same reason the URL is: a component is handed a picture per row, so it
+// must be handed the description per row too — `image "{p.cover}" alt "{p.alt}"`.
+//
+// The renderers write `alt=""` when there is nothing to say, and that is correct
+// markup: an empty alt tells a screen reader the image is decorative and may be
+// skipped, which is a real and useful statement. It is not, however, a statement
+// the AUTHOR made when the attribute is simply absent — those are two different
+// facts wearing the same output, so the syntax tree keeps them apart:
+//
+//	image "/logo.svg"              nobody decided        → advised (see Advise)
+//	image "/rule.svg" alt ""       decorative, on purpose → silent
+//	image "/chart.png" alt "…"     described             → silent
+//
+// AltSet is what makes the middle line sayable. Without it there is no spelling
+// of "this picture is decorative and I know it", so the advice could only ever
+// be noise an author has no way to answer.
+type Image struct {
+	Segs   []Seg
+	Alt    []Seg
+	AltSet bool // the author wrote `alt`, even if what they wrote was empty
+	Line   int
+}
 
 // Icon is an `icon "name"` node — a named glyph the page's CSS/icon font renders
-// (`icon "home"`, `icon "heart"`). The name is a literal, not interpolated.
-type Icon struct{ Name string }
+// (`icon "home"`, `icon "heart"`). The glyph name is interpolated segments like
+// image's URL, so a reusable control can be handed the glyph it shows.
+type Icon struct{ Segs []Seg }
 
-// Video is a `video "url"` node — a media player with controls; the URL is
-// interpolated segments like image (`video "{post.media}"`).
-type Video struct{ Segs []Seg }
+// Video is a `video "url" [alt "…"]` node — a media player with controls; the
+// URL is interpolated segments like image (`video "{post.media}"`).
+//
+// It takes `alt` from the same keyword and the same lowering as `image`, and the
+// renderers write it as `aria-label`, because `<video>` has no `alt` attribute
+// and an accessible name is what it reads instead. That is the `toggle`/
+// `checkbox` argument exactly: one thing the author states, two attributes the
+// renderers write, and no mapping either side could hold a different copy of.
+//
+// The one place it differs from an image is the empty case. `alt=""` on an image
+// MEANS decorative; `aria-label=""` on a video means nothing at all, so an empty
+// or absent alt writes no attribute rather than an empty one.
+type Video struct {
+	Segs   []Seg
+	Alt    []Seg
+	AltSet bool
+	Line   int
+}
 
 // Richtext is a `richtext "{expr}"` node — its interpolated text is rendered as a
 // safe subset of Markdown (headings, lists, code, bold/italic), the same algorithm
@@ -504,9 +650,11 @@ type Tabs struct {
 	Line int
 }
 
-// Tab is one `tab "Label" -> "value":` within a Tabs node.
+// Tab is one `tab "Label" -> "value":` within a Tabs node. The label is
+// interpolated segments; the value is not — it is the identity the bound cell
+// takes and the key the active branch is chosen by, not something displayed.
 type Tab struct {
-	Label string
+	Label []Seg
 	Value string
 	Body  []Node
 }
@@ -542,20 +690,34 @@ type Button struct {
 	Label  []Seg
 	Action string
 	Args   []Expr
+	Line   int // source line, so a diagnostic about an argument can point at it
 }
 
-// For iterates an entity/list, rendering Body once per row with Var bound. It is
-// the query/feed primitive: an optional `where <cond>` keeps only matching rows,
-// `by <field> [desc|asc]` orders them, and `limit <n>` caps them — applied in
-// that order (filter, then sort, then cap).
-type For struct {
+// Range is the header every repeating construct shares: the collection walked,
+// the item variable each row binds to, and the clauses that narrow it — an
+// optional `where <cond>` keeps only matching rows, `by <field> [desc|asc]`
+// orders them, and `limit <n>` caps them, applied in that order (filter, then
+// sort, then cap).
+//
+// It is one type rather than one copy of these six fields per repeating node,
+// because the second repeating node is exactly where the two drift: a `for` that
+// grew `limit` beside an option list that did not would be the same question
+// answered two ways. One type, parsed by one function (parseRange) and lowered
+// by one method (lowerRange), so every construct that repeats repeats the same.
+type Range struct {
 	Var   string
 	Coll  string
-	Body  []Node
 	Where Expr   // optional row filter; nil = all rows
 	Order string // sort field; "" = insertion order
 	Desc  bool   // true = descending (newest/highest first)
 	Limit Expr   // optional max rows: an int literal or an expr (e.g. a @client page size for load-more); nil = unlimited
+}
+
+// For iterates an entity/list, rendering Body once per row with Var bound. It is
+// the query/feed primitive; its header is the shared Range.
+type For struct {
+	Range
+	Body []Node
 }
 
 // If renders Body only when Cond is truthy.
@@ -564,10 +726,11 @@ type If struct {
 	Body []Node
 }
 
-// Input is a text control two-way bound to a client state cell.
+// Input is a text control two-way bound to a client state cell. The placeholder
+// is interpolated segments, so a reusable field component can be handed its hint.
 type Input struct {
 	Bind        string
-	Placeholder string
+	Placeholder []Seg
 }
 
 // Overlay is a modal layer shown while its bound boolean client cell is truthy:
@@ -585,14 +748,116 @@ type Typeahead struct {
 	Bind        string
 	Entity      string
 	Field       string
-	Placeholder string
+	Placeholder []Seg
 }
 
 // Link is navigation to another page: `link "label" -> "/path"`. It renders an
 // anchor; following it loads that page (server-rendered).
+// Link is `link "Label" -> "/path"`. Both halves are interpolated segments, for
+// the same reason `image` is: a link inside a `for` is a link *per row*, and a
+// destination that cannot mention the row is a destination that can only ever be
+// a fixed page. `link "{t.author}" -> "/profile/{t.handle}"` is what makes a feed
+// navigable at all.
 type Link struct {
-	Label string
-	Path  string
+	LabelSegs []Seg
+	PathSegs  []Seg
+}
+
+// ── controls ─────────────────────────────────────────────────────────────────
+//
+// A control is the only thing in the language that may *write* a `@client` cell.
+// That rule is deliberate: state has exactly one writer, and every other way to
+// change a cell is an action the compiler placed. So the way to make a menu, a
+// disclosure, a modal or a settings row expressible is not a new statement that
+// assigns state — it is more controls, because a control bound to a bool cell is
+// by definition a thing that flips it.
+//
+// Control is that one node. Every control travels the same path — parse, bind
+// resolution, the `@client` placement rule, the cell-type check, the dependency
+// edge that refreshes it, both renderers — and differs only in the row it has in
+// the Controls table below. Adding the fifth control is adding a row and one
+// rendering arm on each side; it is not adding a node type.
+type Control struct {
+	Kind        string   // the keyword the author wrote: textarea|checkbox|toggle|radio|password|newpassword
+	Bind        string   // the @client cell this control reads and writes
+	Label       []Seg    // checkbox/toggle: the words beside the box
+	Placeholder []Seg    // textarea: the hint shown while it is empty
+	Options     []Option // radio: the choices, exactly one of which the cell holds
+	Line        int
+}
+
+func (Control) node() {}
+
+// ControlSpec is one control's row: what it lowers to, what it may be bound to,
+// and which parts of the control syntax it accepts.
+type ControlSpec struct {
+	IRKind  string // the IR node kind the renderers switch on
+	Variant string // Node.Value: the variant within that kind ("switch"; a password's autocomplete token)
+	Cell    string // the state type it must be bound to; "" = decided by its options
+	Rule    string // how a wrong cell type is explained, in the author's words
+	Options bool   // takes `option "Label" -> "value"` children
+	Hint    bool   // takes a `placeholder "..."` modifier
+	Labeled bool   // takes a `label "..."` modifier
+}
+
+// Controls is the whole set of two-way controls the language has beyond the two
+// that predate this table (`input`, `select`, `typeahead`, `upload`). It is the
+// single place a control is declared: the parser dispatches on it, the lowering
+// checks against it, and both renderers key off the IRKind it names.
+//
+// `toggle` is deliberately NOT its own IR kind. A toggle and a checkbox have the
+// same cell contract (a bool), the same event, the same hydration and the same
+// refresh; they differ in a CSS class and an ARIA role, which is presentation.
+// Shipping it as a second node kind would duplicate every one of those paths so
+// that a stylesheet could tell them apart — so it is a variant of `checkbox`,
+// carried as data, and the two renderers read that data in one place each.
+var Controls = map[string]ControlSpec{
+	"textarea": {
+		IRKind: "textarea", Cell: "text", Hint: true,
+		Rule: "a textarea edits a text cell",
+	},
+	"checkbox": {
+		IRKind: "checkbox", Cell: "bool", Labeled: true,
+		Rule: "a checkbox toggles a bool cell",
+	},
+	"toggle": {
+		IRKind: "checkbox", Variant: "switch", Cell: "bool", Labeled: true,
+		Rule: "a toggle flips a bool cell",
+	},
+	"radio": {
+		IRKind: "radio", Options: true,
+		Rule: "a radio group stores one of its option values, so it needs a text or enum cell",
+	},
+	// A password box is an `input` and nothing else: the same `text` cell, the
+	// same `input` event, the same hydration and the same refresh. What it adds
+	// is the two attributes the browser reads — `type="password"`, which is what
+	// masks the characters and what makes the browser offer its own reveal, and
+	// `autocomplete`, which is what a password manager reads to decide whether to
+	// fill an existing secret or offer to generate a new one.
+	//
+	// Until this row there was no way to write either. `input` renders `<input>`
+	// with no type, and a node has no attribute escape hatch, so the library's
+	// PasswordField masked with `-webkit-text-security` — paint, not a password
+	// input: no manager fill or save, no `autocomplete`, no browser reveal. Both
+	// real apps rendered sign-in passwords through it.
+	//
+	// TWO KEYWORDS, ONE KIND, for the reason `toggle` and `checkbox` are two
+	// keywords over one kind: they differ in one attribute the renderers write
+	// and in nothing else. The attribute is the autocomplete token, and it cannot
+	// be inferred — `current-password` on a sign-up box makes a manager fill the
+	// account's existing password into a field for a new one and never offer to
+	// generate, and `new-password` on a sign-in box stops it filling the saved
+	// one. Which of the two a field is is the author's fact, so the author says
+	// it by choosing the word, and the token itself is what travels to both
+	// renderers, so neither holds a mapping the other could disagree with.
+	"password": {
+		IRKind: "input", Variant: "current-password", Cell: "text", Hint: true,
+		Rule: "a password box edits a text cell",
+	},
+	"newpassword": {
+		IRKind: "input", Variant: "new-password", Cell: "text", Hint: true,
+		Rule: "a password box edits a text cell",
+	},
 }
 
 // Select is a dropdown two-way bound to a client state cell, choosing among a
@@ -601,12 +866,33 @@ type Link struct {
 type Select struct {
 	Bind    string
 	Options []Option
+	Line    int
 }
 
-// Option is one `option "Label" -> "value"` entry of a Select.
+// Option is one entry of a select's or a radio group's choice list.
+//
+// Its two halves are checked differently, on purpose. The label is interpolated
+// segments, like every other label in the language. The value is the identity the
+// bound cell stores, and it is written one of two ways:
+//
+//	option "Draft" -> "draft"        Value: a literal, a compile-time identity
+//	option "{c.name}" -> c.id        Val:   an expression, evaluated per render
+//
+// The literal form is what enum defaulting and the typo check rest on, and it
+// keeps every guarantee it has always had. The expression form is what a choice
+// list drawn from data needs, and its identity cannot exist until the render.
+//
+// From is what makes an entry repeat. With a range, the entry is not one option
+// but one option per row of that collection, with Label and Val evaluated against
+// the row — `for c in Category by name: option "{c.name}" -> c.id`. It is the
+// same Range a `for` node carries, parsed by the same function, so a data-driven
+// option list filters, orders and caps exactly the way a feed does.
 type Option struct {
-	Label string
+	Label []Seg
 	Value string
+	Val   Expr   // computed value; nil = the Value literal
+	From  *Range // nil = one option; non-nil = one option per row of this range
+	Line  int
 }
 
 // Form groups inputs and submits an action when its submit control fires —
@@ -616,8 +902,9 @@ type Option struct {
 type Form struct {
 	Action string
 	Args   []Expr
-	Submit string
+	Submit []Seg
 	Body   []Node
+	Line   int // source line, so a diagnostic about an argument can point at it
 }
 
 // Upload posts a file to the authority and binds the resulting URL to a client
@@ -625,18 +912,27 @@ type Form struct {
 // storage are runtime services; the language only names the target cell.
 type Upload struct {
 	Bind  string
-	Label string
+	Label []Seg
 }
 
 // Use renders a component with arguments bound to its parameters:
 // `use Card(post)`. It is the call site of a reusable view fragment.
+//
+// Body is the indented block written under the call — the children handed to the
+// component, rendered where its `slot` sits. That is what makes a wrapper
+// (a card, a panel, a stack) expressible as a component instead of as loose CSS
+// a call site has to remember to apply. Passing a block to a component that has
+// no `slot` is a compile error; it used to be silently discarded.
 type Use struct {
 	Name string
 	Args []Expr
+	Body []Node
+	Line int
 }
 
-// Slot is the injection point inside a layout where the routed view's content is
-// rendered. A layout has exactly one.
+// Slot is the injection point where content from outside is rendered: the routed
+// view's content inside a layout, or the caller's children inside a component. A
+// layout has exactly one; a component has at most one.
 type Slot struct{}
 
 // SlotRef is a named injection point inside a wireframe frame: `slot feed`. The
@@ -644,10 +940,11 @@ type Slot struct{}
 // Unlike a layout's single anonymous Slot, a frame has one SlotRef per socket.
 type SlotRef struct{ Name string }
 
-func (Styled) node()    {}
+func (Modified) node()  {}
 func (Box) node()       {}
 func (Row) node()       {}
 func (Text) node()      {}
+func (Heading) node()   {}
 func (Image) node()     {}
 func (Icon) node()      {}
 func (Video) node()     {}

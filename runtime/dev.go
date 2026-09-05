@@ -101,7 +101,6 @@ func (s *Server) Reload(graph *ir.IR) error {
 	}
 	s.ir = graph
 	s.byAction = ns.byAction
-	s.byBind = ns.byBind
 	s.byPolicy = ns.byPolicy
 	s.byComponent = ns.byComponent
 	s.byService = ns.byService
@@ -153,7 +152,7 @@ func RunDev(file, addr string) error {
 
 	go srv.watch(file)
 
-	fmt.Printf("facet dev: %s on http://localhost%s — watching %s (edit & save to hot-reload)\n", graph.App, addr, file)
+	fmt.Printf("facet dev: %s on %s — watching %s (edit & save to hot-reload)\n", graph.App, BrowseURL(addr), file)
 	return srv.Serve(addr)
 }
 

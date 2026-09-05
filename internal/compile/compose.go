@@ -33,17 +33,28 @@ func isLayered(facets []*ast.App) bool {
 	return false
 }
 
-// isComponentOnly reports whether a plain module is purely presentational: it
-// declares at least one component and nothing that needs placement or a socket —
-// no entities, enums, state, derives, policies, actions, jobs, services, views,
-// mounts, sockets, frame, or auth. Such a module is a shareable atom set that a
-// layered build can pull in alongside its bricks (its components serve them all),
-// so a single PostCard/Avatar file works in both the plain-app and layered tracks.
-func isComponentOnly(f *ast.App) bool {
-	return len(f.Components) > 0 &&
-		len(f.Entities) == 0 && len(f.Enums) == 0 && len(f.States) == 0 &&
-		len(f.Derives) == 0 && len(f.Policies) == 0 && len(f.Actions) == 0 &&
-		len(f.Jobs) == 0 && len(f.Services) == 0 && len(f.Views) == 0 &&
+// isPresentational reports whether a plain module contributes nothing but
+// presentation — the vocabulary a layered build merges wholesale — and so can be
+// pulled in alongside the bricks without a socket to live in.
+//
+// "Presentational" is defined by what the atom merge in compose actually carries:
+// components, layouts, themes and a stylesheet. Requiring a *component* was too
+// narrow and rejected modules whose whole contribution is one of the other three
+// — a layout vocabulary that ships as CSS rules, a shared layout wrapper, a
+// palette — even though a layered build merges all four identically. That is why
+// a stylesheet could not be split out of a wireframe.
+//
+// The negative half must stay exhaustive over ast.App, because anything a module
+// declares that this merge does not carry would be silently dropped rather than
+// rejected. Records, webhooks and triggers were missing from it.
+func isPresentational(f *ast.App) bool {
+	contributes := len(f.Components) > 0 || len(f.Layouts) > 0 || f.CSS != "" ||
+		len(f.Theme) > 0 || len(f.DarkTheme) > 0 || len(f.Themes) > 0
+	return contributes &&
+		len(f.Entities) == 0 && len(f.Records) == 0 && len(f.Enums) == 0 &&
+		len(f.States) == 0 && len(f.Derives) == 0 && len(f.Policies) == 0 &&
+		len(f.Actions) == 0 && len(f.Jobs) == 0 && len(f.Services) == 0 &&
+		len(f.Webhooks) == 0 && len(f.Triggers) == 0 && len(f.Views) == 0 &&
 		len(f.Mounts) == 0 && len(f.Sockets) == 0 && len(f.Frame) == 0 && !f.Auth
 }
 
@@ -55,13 +66,29 @@ func isComponentOnly(f *ast.App) bool {
 // mount — and merges all data and logic into one graph. So the layering is how
 // the app is built; each mount is a surface placement runs over, and the runtime
 // routes between screens by their guards.
+//
+// A screen comes from one of two places, and those two are the whole answer to
+// "who may declare a route in a layered build":
+//
+//   - a playground `mount`, which places a wireframe at a route. The baseplate
+//     decides the app's shape.
+//   - a brick `view`, which places one more screen of the wireframe that owns
+//     the brick's socket, with that socket holding the view. The slice decides
+//     the routes onto its own data.
+//
+// Without the second, the layered track could not express an app whose
+// components link anywhere: a `data` facet could serve a timeline of PostCards
+// but nothing could serve the `/post/:id` each card links to, and the link check
+// in internal/ir rejected the build — correctly, since the route really was
+// unserved. The gap was that there was no way to say otherwise.
 func compose(facets []*ast.App) (*ast.App, error) {
 	// 1. Partition the bricks by kind and enforce one baseplate. A plain module
-	//    that is *purely presentational* (only components/layouts/theme) is a
+	//    that is *purely presentational* (only components/layouts/theme/css) is a
 	//    shareable atom set — it carries no data or logic to place, so it's pulled
 	//    into the layered graph like a brick's components, letting one PostCard/
-	//    Avatar serve both a plain app and a layered build. A plain module with any
-	//    data, logic, or views is still rejected — it would need a socket to live in.
+	//    Avatar or one stylesheet serve both a plain app and a layered build. A
+	//    plain module with any data, logic, or views is still rejected — it would
+	//    need a socket to live in.
 	var playground *ast.App
 	var wireframes, bricks, atoms []*ast.App
 	for _, f := range facets {
@@ -76,11 +103,11 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		case "ui", "data":
 			bricks = append(bricks, f)
 		case "", "app":
-			if isComponentOnly(f) {
+			if isPresentational(f) {
 				atoms = append(atoms, f)
 				continue
 			}
-			return nil, fmt.Errorf("plain `app` %q cannot be mixed into a layered build — make it a `ui`/`data` facet (or strip it to components only), or build from a playground", f.Name)
+			return nil, fmt.Errorf("plain `app` %q cannot be mixed into a layered build — make it a `ui`/`data` facet (or strip it to presentation: components, layouts, theme, css), or build from a playground", f.Name)
 		}
 	}
 	if playground == nil {
@@ -200,7 +227,10 @@ func compose(facets []*ast.App) (*ast.App, error) {
 			return nil, fmt.Errorf("two screens mount at %q (%q and %q)", m.Path, prev, m.Wireframe)
 		}
 		seenPath[m.Path] = m.Wireframe
-		root, err := resolveFrame(w.Frame, fill[w])
+		// The frame splice shares one traversal with the layout splice
+		// (ast.SpliceLayout), so both answer "where may a slot appear" the same
+		// way and neither can land a foreign tree in a repeating context.
+		root, err := ast.SpliceFrame(w.Frame, fill[w])
 		if err != nil {
 			return nil, err
 		}
@@ -213,63 +243,68 @@ func compose(facets []*ast.App) (*ast.App, error) {
 			Line:     w.Line,
 		})
 	}
-	return app, nil
-}
 
-// resolveFrame returns a plain node tree: a copy of the wireframe frame with each
-// SlotRef replaced by its socket's composited content. It recurses through the
-// layout containers so a `slot` may sit at any depth.
-func resolveFrame(nodes []ast.Node, fill map[string][]ast.Node) ([]ast.Node, error) {
-	var out []ast.Node
-	for _, n := range nodes {
-		switch t := n.(type) {
-		case ast.SlotRef:
-			out = append(out, fill[t.Name]...) // an unfilled socket renders nothing
-		case ast.Styled:
-			// Recurse through the decorator so a `slot` inside `box class "rail":`
-			// still resolves against the socket fill.
-			inner, err := resolveFrame([]ast.Node{t.Inner}, fill)
+	// 6. Each routed `view` a brick declares becomes one more screen — the same
+	//    wireframe, with the brick's socket holding that view instead of the
+	//    brick's `content`.
+	//
+	//    This is the answer to "who may declare a route in a layered build". It
+	//    is the brick, because the brick is the vertical slice: `data Feed`
+	//    owns the Tweet entity, the actions over it, and therefore every surface
+	//    onto it — the timeline it puts in its socket and the single post at
+	//    `/post/:id`. A component snapped in below (a PostCard linking to
+	//    `/post/{id}`) is validated against those routes with every other link.
+	//
+	//    The alternative — the playground declaring the routes — was rejected:
+	//    it makes the baseplate know every route of every brick it composes, so
+	//    a brick stops being droppable (adding a data facet would mean editing
+	//    the playground), and a `mount` takes a wireframe, so each detail route
+	//    would need a whole wireframe of its own to hold content that belongs to
+	//    a slice already present.
+	//
+	//    The shape mirrors the plain track exactly: `view X in Shell` wraps a
+	//    routed view in a shared *layout*; a brick view is wrapped in the shared
+	//    *wireframe*. Same chrome-plus-one-tree relation, one layer up.
+	for _, b := range bricks {
+		if len(b.Views) == 0 {
+			continue
+		}
+		owner := socketOwner[b.Into] // step 3 already proved this resolves
+		for _, v := range b.Views {
+			if prev, dup := seenPath[v.Path]; dup {
+				return nil, fmt.Errorf("two screens mount at %q (%q and %q)", v.Path, prev, v.Name)
+			}
+			seenPath[v.Path] = v.Name
+			// The other sockets of this wireframe keep their fills — the screen
+			// is the whole surface, not the view alone — so this is the frame's
+			// fill map with one entry swapped. Copied rather than mutated: the
+			// map is the mounted screen's too.
+			swapped := make(map[string][]ast.Node, len(fill[owner])+1)
+			for name, content := range fill[owner] {
+				swapped[name] = content
+			}
+			swapped[b.Into] = v.Root
+			root, err := ast.SpliceFrame(owner.Frame, swapped)
 			if err != nil {
 				return nil, err
 			}
-			if len(inner) == 1 {
-				t.Inner = inner[0]
-				out = append(out, t)
-			} else {
-				out = append(out, inner...)
-			}
-		case ast.Box:
-			kids, err := resolveFrame(t.Children, fill)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, ast.Box{Children: kids})
-		case ast.Row:
-			kids, err := resolveFrame(t.Children, fill)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, ast.Row{Children: kids})
-		case ast.If:
-			body, err := resolveFrame(t.Body, fill)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, ast.If{Cond: t.Cond, Body: body})
-		case ast.For:
-			body, err := resolveFrame(t.Body, fill)
-			if err != nil {
-				return nil, err
-			}
-			t.Body = body
-			out = append(out, t)
-		case ast.Slot:
-			return nil, fmt.Errorf("a wireframe frame uses `slot <name>`, not a bare `slot`")
-		default:
-			out = append(out, n)
+			app.Views = append(app.Views, &ast.View{
+				Name:      v.Name,
+				Path:      v.Path,
+				Params:    v.Params,
+				Requires:  v.Requires,
+				Screen:    true,
+				Root:      root,
+				TitleSegs: v.TitleSegs,
+				DescSegs:  v.DescSegs,
+				Line:      v.Line,
+			})
 		}
 	}
-	return out, nil
+	// Composed marks this graph as the output of a layered build, so a route
+	// diagnostic downstream can name the mechanism that declares one here.
+	app.Composed = true
+	return app, nil
 }
 
 // socketHint lists the available socket names for a "no such socket" error.

@@ -34,6 +34,9 @@ func idemServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The JSON API publishes an entity only when the app says so — the default is
+	// closed (runtime/apiread.go). This test reads Payment over it, so it says so.
+	t.Setenv(apiReadEnv, "Payment")
 	srv, err := NewInMemory(g)
 	if err != nil {
 		t.Fatal(err)

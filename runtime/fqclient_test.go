@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -130,5 +131,67 @@ func TestFQSessionDataRoundTrip(t *testing.T) {
 	}
 	if out.Actor != "ada" || !out.Verified || out.ExpiresUnix != exp.Unix() {
 		t.Errorf("round-trip = %#v, want actor=ada verified=true expUnix=%d", out, exp.Unix())
+	}
+}
+
+// A FacetQL index name becomes a filename on the engine, which admits at most 64
+// bytes of [A-Za-z0-9_-]. It must also be a pure function of (entity, field), or
+// a second boot would declare a second index instead of re-declaring the same one.
+func TestFQIndexName(t *testing.T) {
+	if got := fqIndexName("Tweet", "created"); got != "idx_Tweet_created" {
+		t.Errorf("fqIndexName(Tweet, created) = %q, want the pgStore base name idx_Tweet_created", got)
+	}
+	long := strings.Repeat("Entity", 12) // 72 bytes before the field is even added
+	for _, name := range []string{
+		fqIndexName("Tweet", "created"), fqIndexName(long, "created"), fqIndexName("Odd.Name", "a b"),
+	} {
+		if len(name) == 0 || len(name) > fqMaxIndexName {
+			t.Errorf("index name %q is %d bytes; the engine admits 1..%d", name, len(name), fqMaxIndexName)
+		}
+		for _, b := range []byte(name) {
+			if !(b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '-') {
+				t.Errorf("index name %q contains %q, outside the engine's alphabet", name, b)
+			}
+		}
+	}
+	if fqIndexName(long, "created") == fqIndexName(long, "updated") {
+		t.Error("two fields of one entity must not collide onto one index name")
+	}
+	if fqIndexName("Tweet", "created") != fqIndexName("Tweet", "created") {
+		t.Error("the name must be a pure function of (entity, field)")
+	}
+}
+
+// Clear must be one native `clear_kind` op, not N deletes.
+//
+// The engine has had this primitive all along and `fqTx.Clear` always used it;
+// `fqStore.Clear` paged the kind and issued a DELETE per node, so "clear a kind"
+// meant two different things — atomic inside a transaction, N non-atomic round
+// trips outside one — depending on nothing the caller could see.
+func TestFQClearEmitsOneNativeOp(t *testing.T) {
+	got, err := json.Marshal(fqTxOp{Type: "clear_kind", Kind: "Tweet"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// The contract (AGENT_LOG §4b) is exactly these two keys: a delete or clear
+	// op that carried stray zero-valued node fields would not match it.
+	if want := `{"type":"clear_kind","kind":"Tweet"}`; string(got) != want {
+		t.Errorf("clear_kind op = %s, want %s", got, want)
+	}
+}
+
+// The offset-paged kind listing is gone, and must stay gone: it was the last way
+// this client could ask for a deep offset, which FacetQL refuses past
+// FACETQL_MAX_QUERY_OFFSET — a refusal that used to stop an app booting at 10k
+// rows. Both former callers now use primitives that cost the same at any depth.
+func TestFQClientHasNoOffsetPagedListing(t *testing.T) {
+	src, err := os.ReadFile("fqclient.go")
+	if err != nil {
+		t.Fatalf("reading the client: %v", err)
+	}
+	for _, gone := range []string{"listKind", `q.Set("offset"`} {
+		if strings.Contains(string(src), gone) {
+			t.Errorf("fqclient.go still contains %q — the deep-offset path is back", gone)
+		}
 	}
 }

@@ -1,10 +1,21 @@
 // facet — the Facet toolchain. One application graph in, every target out.
 //
-//	facet new <name>              scaffold a new project
+//	facet new <name>|. [-t app|site|lib]  scaffold a new project (see new.go)
 //	facet build <file.fct>        compile and print the IR (the application graph)
+//	facet build --release <file>  package the app as one self-contained binary (see release.go)
 //	facet run   <file.fct> [addr] compile and serve the web + API projections
+//	facet serve <file.fct>        the production server: no watcher, $PORT, preflight (see serve.go)
+//	facet routes <file.fct>       every route the app serves (see routes.go)
+//	facet doctor [file.fct]       is this project set up correctly? (see doctor.go)
+//	facet lang                    the language's node kinds/controls/builtins/modifiers, derived live (see lang.go)
 //	facet migrate <file.fct>      reconcile the database schema (--plan to dry-run)
+//	facet deploy <file.fct>       container + systemd config (--production, see new.go)
 //	facet version                 print the toolchain version
+//
+// One binary is two programs. A copy of this executable with an application
+// bundle appended to it IS that application — it serves the app it carries and
+// nothing else (release.go). embeddedApp is therefore the first question main
+// asks, before any argument is looked at.
 package main
 
 import (
@@ -22,29 +33,28 @@ import (
 	"facet/runtime"
 )
 
-// version is stamped at release time with -ldflags "-X main.version=…".
-var version = "1.30.0"
-
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-	}
-	// The registry checks a facet's required-toolchain range against this version
-	// and stamps it into facet.lock, so it needs to know what `facet` is running.
-	registry.ToolchainVersion = version
 	// Fold a local .env into the environment (real env wins) so config/secrets can
 	// live in a file during development. Harmless when absent.
 	runtime.LoadDotEnv(".env")
+
+	// Is this the toolchain, or an app built with it? A release binary is this
+	// same executable with an application bundle appended, and it must behave as
+	// that application — `./blog` serves Blog, it does not offer to scaffold a
+	// project.
+	if app, ok := embeddedApp(); ok {
+		os.Exit(runApp(app, os.Args[1:]))
+	}
+
+	if len(os.Args) < 2 {
+		usage()
+	}
 	switch os.Args[1] {
 	case "version", "-v", "--version":
-		fmt.Printf("facet %s\n", version)
+		fmt.Printf("facet %s\n", registry.ToolchainVersion)
 		return
 	case "new":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: facet new <name>")
-			os.Exit(2)
-		}
-		if err := scaffold(os.Args[2]); err != nil {
+		if err := cmdNew(os.Args[2:]); err != nil {
 			fatal(err)
 		}
 		return
@@ -105,6 +115,16 @@ func main() {
 		os.Exit(cmdIR(os.Args[2:]))
 	case "inspect":
 		os.Exit(cmdInspect(os.Args[2:]))
+	case "routes":
+		os.Exit(cmdRoutes(os.Args[2:]))
+	case "doctor":
+		os.Exit(cmdDoctor(os.Args[2:]))
+	case "lang":
+		os.Exit(cmdLang(os.Args[2:]))
+	case "serve":
+		// serve resolves its own input: source to compile, or a compiled graph to
+		// load as-is, so it never requires the compile the generic path below does.
+		os.Exit(cmdServe(os.Args[2:]))
 	case "build", "explain", "run", "dev", "console", "seed", "test", "migrate", "backup", "restore", "deploy", "generate":
 		// handled below
 	default:
@@ -115,6 +135,13 @@ func main() {
 		usage()
 	}
 	cmd, file := os.Args[1], os.Args[2]
+	// A flag may come before the file (`facet build --release app.fct`), so the
+	// file is the first argument that is not one.
+	if strings.HasPrefix(file, "-") {
+		if file = firstOperand(os.Args[2:]); file == "" {
+			usage()
+		}
+	}
 	// compile.File resolves any `import "..."` modules relative to this file and
 	// merges them before placement, so a multi-file app compiles like a single one.
 	graph, err := compile.File(file)
@@ -132,6 +159,13 @@ func main() {
 
 	switch cmd {
 	case "build":
+		// The IR is what `build` has always emitted, and it is genuinely
+		// deployable — `facet serve graph.json` needs no compiler. --release goes
+		// one step further and packages that same IR into an executable that
+		// needs no facet either.
+		if hasFlag(os.Args[2:], "--release", "-release") {
+			os.Exit(cmdRelease(graph, file, os.Args[2:]))
+		}
 		out, _ := json.MarshalIndent(graph, "", "  ")
 		fmt.Println(string(out))
 	case "explain":
@@ -160,15 +194,16 @@ func main() {
 			fatal(err)
 		}
 		srv.StartJobs()
-		fmt.Printf("facet %s: %s running at http://localhost%s\n", version, graph.App, addr)
-		fmt.Printf("  web projection  http://localhost%s/\n", addr)
-		fmt.Printf("  api projection  http://localhost%s/api\n", addr)
+		url := runtime.BrowseURL(addr)
+		fmt.Printf("facet %s: %s running at %s\n", registry.ToolchainVersion, graph.App, url)
+		fmt.Printf("  web projection  %s/\n", url)
+		fmt.Printf("  api projection  %s/api\n", url)
 		fmt.Printf("  data store      %s\n", runtime.StoreDescription(graph.App))
 		fmt.Printf("  security        %s\n", runtime.SecurityDescription())
 		fmt.Printf("  operations      %s\n", runtime.OpsDescription())
 		fmt.Printf("  enterprise      %s\n", runtime.EnterpriseDescription())
 		if runtime.AdminEnabled() {
-			fmt.Printf("  admin console   http://localhost%s/admin\n", addr)
+			fmt.Printf("  admin console   %s/admin\n", url)
 		}
 		// Serve blocks until SIGINT/SIGTERM, then drains in-flight requests, stops
 		// the job workers, and closes the database — a deploy-safe shutdown.
@@ -230,6 +265,12 @@ func main() {
 			os.Exit(1)
 		}
 	case "deploy":
+		if hasFlag(os.Args[2:], "--production", "-production", "--prod") {
+			if err := scaffoldProduction(graph, file); err != nil {
+				fatal(err)
+			}
+			return
+		}
 		if err := scaffoldDeploy(graph.App); err != nil {
 			fatal(err)
 		}
@@ -307,73 +348,10 @@ func main() {
 	}
 }
 
-// scaffold writes a new starter project into ./<name>.
-func scaffold(name string) error {
-	if _, err := os.Stat(name); err == nil {
-		return fmt.Errorf("%q already exists", name)
-	}
-	if err := os.MkdirAll(name, 0o755); err != nil {
-		return err
-	}
-	files := map[string]string{
-		"app.fct":   starterApp,
-		"README.md": starterReadme,
-		// facet.lock is intentionally NOT ignored — it must be committed so a
-		// fresh clone resolves the exact same remote facet bytes.
-		".gitignore":         "dist/\nfacet-uploads/\nfacet_modules/\n.env\n",
-		"Dockerfile":         dockerfile,
-		".dockerignore":      dockerignore,
-		"docker-compose.yml": dockerCompose,
-		".env.example":       envExample,
-		"app.seed.json":      starterSeed,
-		"app.test.json":      starterTest,
-	}
-	for fname, content := range files {
-		if err := os.WriteFile(filepath.Join(name, fname), []byte(content), 0o644); err != nil {
-			return err
-		}
-	}
-	fmt.Printf("created %s/\n\n", name)
-	fmt.Println("next:")
-	fmt.Printf("  cd %s\n", name)
-	fmt.Println("  facet dev app.fct          # run with hot reload (no database needed)")
-	fmt.Println("  facet test app.fct         # run the behavior tests")
-	fmt.Println("  docker compose up          # or run the whole stack (app + Postgres)")
-	return nil
-}
-
 // sidecar turns app.fct into app<suffix> (e.g. app.seed.json), the conventional
 // default location for an app's seed/test file.
 func sidecar(file, suffix string) string {
 	return strings.TrimSuffix(file, filepath.Ext(file)) + suffix
-}
-
-// scaffoldDeploy writes the container/deploy assets into the current directory
-// for a one-command deploy. Existing files are left untouched.
-func scaffoldDeploy(app string) error {
-	files := map[string]string{
-		"Dockerfile":         dockerfile,
-		".dockerignore":      dockerignore,
-		"docker-compose.yml": dockerCompose,
-		".env.example":       envExample,
-	}
-	wrote := 0
-	for fname, content := range files {
-		if _, err := os.Stat(fname); err == nil {
-			fmt.Printf("  kept     %s (already present)\n", fname)
-			continue
-		}
-		if err := os.WriteFile(fname, []byte(content), 0o644); err != nil {
-			return err
-		}
-		fmt.Printf("  wrote    %s\n", fname)
-		wrote++
-	}
-	fmt.Printf("\nfacet: deploy assets ready for %s.\n", app)
-	fmt.Println("one command (app + Postgres):")
-	fmt.Println("  cp .env.example .env   # set FACET_SECRET (facet config --gen-secret)")
-	fmt.Println("  docker compose up --build")
-	return nil
 }
 
 // ── read-only inspection commands ─────────────────────────────────────────────
@@ -487,20 +465,25 @@ func hasFlag(args []string, names ...string) bool {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  facet new <name>               scaffold a new project")
+	fmt.Fprintln(os.Stderr, "  facet new <name>|. [-t app|site|lib] scaffold a new project (\".\" = here; --list for the templates)")
 	fmt.Fprintln(os.Stderr, "  facet dev <file.fct> [addr]    run with hot reload (in-memory if no DB)")
 	fmt.Fprintln(os.Stderr, "  facet run <file.fct> [addr]    serve the web + API projections")
+	fmt.Fprintln(os.Stderr, "  facet serve [file] [--port N]  production server: no watcher, $PORT, preflight checks")
 	fmt.Fprintln(os.Stderr, "  facet check <file.fct> [--json] compile-only; report ok or diagnostics")
 	fmt.Fprintln(os.Stderr, "  facet build <file.fct> [--json] compile and print the IR (--json for error diagnostics)")
+	fmt.Fprintln(os.Stderr, "  facet build --release <file.fct> package the app as one self-contained binary (-o, --base)")
 	fmt.Fprintln(os.Stderr, "  facet ir <file.fct> [--compact] dump the compiled IR as JSON for tooling")
 	fmt.Fprintln(os.Stderr, "  facet inspect <file.fct> [--json] structured summary of what the app compiles to")
+	fmt.Fprintln(os.Stderr, "  facet routes <file.fct> [--json] every route the app serves (web, API, webhooks)")
+	fmt.Fprintln(os.Stderr, "  facet doctor [file.fct] [--production]  the toolchain, the manifest pin, the datastore, the config")
+	fmt.Fprintln(os.Stderr, "  facet lang                     the language's node kinds, controls, builtins and modifiers, derived live")
 	fmt.Fprintln(os.Stderr, "  facet console <file.fct>       interactive REPL against the app")
 	fmt.Fprintln(os.Stderr, "  facet test <file.fct> [tests]  run the app's behavior tests")
 	fmt.Fprintln(os.Stderr, "  facet seed <file.fct> [data]   load fixture rows (--dry for in-memory)")
 	fmt.Fprintln(os.Stderr, "  facet migrate <file.fct>       reconcile the database schema (--plan to dry-run)")
 	fmt.Fprintln(os.Stderr, "  facet backup  <file.fct> [out]   write a logical snapshot (stdout by default)")
 	fmt.Fprintln(os.Stderr, "  facet restore <file.fct> [in]    replay a snapshot into the database (stdin by default)")
-	fmt.Fprintln(os.Stderr, "  facet deploy <file.fct>        write Dockerfile + compose for a one-command deploy")
+	fmt.Fprintln(os.Stderr, "  facet deploy <file.fct> [--production]  Dockerfile + compose (--production: release image, facetql, systemd)")
 	fmt.Fprintln(os.Stderr, "  facet generate <file.fct> [dir]  emit native mobile clients (Swift/Kotlin/TypeScript)")
 	fmt.Fprintln(os.Stderr, "  facet add <github.com/owner/repo>[@version]  pin a remote facet in facet.lock")
 	fmt.Fprintln(os.Stderr, "  facet get [file.fct]           fetch locked remote facets into the cache")
@@ -761,6 +744,32 @@ func firstNonFlag(args []string) string {
 	return ""
 }
 
+// valueFlags are the flags that consume the argument after them. A flag's value
+// is not an operand, and reading it as one is how `facet serve --port 8080`
+// comes to look for an app called "8080".
+var valueFlags = map[string]bool{
+	"-o": true, "--out": true, "--base": true,
+	"-p": true, "--port": true, "-port": true,
+	"--addr": true, "-addr": true,
+	"-t": true, "--template": true, "-template": true,
+}
+
+// firstOperand returns the first argument that is neither a flag nor a flag's
+// value — the file a command is about, whichever side of the flags it is written
+// on. `--flag=value` carries its value inside itself and consumes nothing.
+func firstOperand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			return a
+		}
+		if valueFlags[a] {
+			i++ // skip the value this flag takes
+		}
+	}
+	return ""
+}
+
 // soleEntry guesses an app's entry file in dir: app.fct if present, else the
 // only .fct file, else "".
 func soleEntry(dir string) string {
@@ -825,184 +834,3 @@ func gitRun(args ...string) error {
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
-
-const starterApp = `# Your Facet app. One declarative graph — the compiler decides what runs on the
-# server (the authority) and what runs in the browser. Nothing here says
-# "frontend" or "backend".
-#
-# Run it:   export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/db
-#           export FACET_SECRET=$(openssl rand -hex 32)
-#           facet run app.fct
-# The first account you sign up becomes the admin.
-
-app Starter:
-    auth
-
-    entity Post:
-        id: int
-        author: text
-        body: text
-        created: int
-
-    state username: text = "" @client
-    state password: text = "" @client
-    state draft: text = "" @client
-
-    derive postCount: int = count(Post)
-
-    # Row-level authorization: you may delete only your own post. The authority
-    # enforces it no matter what the client sends.
-    policy mine(id: int):
-        actor == Post(id).author
-
-    # now() is the server clock, so the compiler runs post() on the authority.
-    action post(body: text):
-        add Post { author: actor, body: body, created: now() }
-
-    action remove(id: int):
-        requires mine(id)
-        remove Post(id)
-
-    view Home at "/":
-        box:
-            text "{postCount} posts"
-            if actor == "guest":
-                input bind username placeholder "username"
-                input bind password placeholder "password"
-                button "sign up" -> signup(username, password)
-                button "log in" -> login(username, password)
-            if actor != "guest":
-                text "signed in as {actor} ({role})"
-                button "log out" -> logout
-                input bind draft placeholder "what's happening?"
-                button "post" -> post(draft)
-            for p in Post by created desc limit 50:
-                box:
-                    text "{p.author}: {p.body}"
-                    button "delete" -> remove(p.id)
-`
-
-const starterReadme = `# Starter
-
-A Facet application. The whole app is in ` + "`app.fct`" + `.
-
-## Run
-
-Facet stores data in Postgres. Point it at your database, then run:
-
-    export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/yourdb
-    facet run app.fct
-
-Open http://localhost:7373. The same graph is also a JSON API at
-http://localhost:7373/api. The first account you sign up becomes the admin.
-
-## What's here
-
-- ` + "`auth`" + ` — built-in users, signup/login/logout, ` + "`actor`" + ` and ` + "`role`" + `.
-- ` + "`entity`" + ` — durable data (a Postgres table).
-- ` + "`action`" + ` — the only thing that changes data; placement is inferred.
-- ` + "`view ... at \"/\"`" + ` — a page; add more views at more routes.
-- ` + "`for ... where ... by ... limit`" + ` — query/feed.
-`
-
-// ── deploy + DX scaffolding ──────────────────────────────────────────────────
-
-const dockerfile = `# Container image for this Facet app. It runs on the published facet toolchain
-# image — set it to your organization's image, or build one from the facet repo
-# (the repo ships its own Dockerfile that produces this base).
-FROM ghcr.io/your-org/facet:latest
-
-# The whole app is one declarative graph.
-COPY app.fct /app/app.fct
-
-# Behind TLS, only send the session cookie over HTTPS.
-ENV FACET_SECURE_COOKIES=1
-EXPOSE 7373
-
-# FACET_DATABASE_URL and FACET_SECRET are supplied by the environment (compose).
-ENTRYPOINT ["facet", "run", "/app/app.fct", "0.0.0.0:7373"]
-`
-
-const dockerignore = `.git
-dist
-facet-uploads
-*.seed.json
-*.test.json
-.env
-`
-
-const dockerCompose = `# One-command stack: the app plus its Postgres.
-#   cp .env.example .env          # then set FACET_SECRET (facet config --gen-secret)
-#   docker compose up --build
-services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: facet
-      POSTGRES_PASSWORD: facet
-      POSTGRES_DB: facet
-    volumes:
-      - facet-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U facet"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-
-  app:
-    build: .
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      FACET_DATABASE_URL: postgres://facet:facet@db:5432/facet?sslmode=disable
-      FACET_SECRET: ${FACET_SECRET:?set FACET_SECRET in .env — run: facet config --gen-secret}
-      FACET_SECURE_COOKIES: "0"
-    ports:
-      - "7373:7373"
-
-volumes:
-  facet-data:
-`
-
-const envExample = `# Copy to .env (git-ignored). Real environment variables always override these.
-# Mint a strong secret:  facet config --gen-secret
-FACET_SECRET=
-
-# Local Postgres (matches docker-compose.yml):
-FACET_DATABASE_URL=postgres://facet:facet@localhost:5432/facet?sslmode=disable
-
-# Set to 1 behind TLS in production so session cookies are HTTPS-only:
-FACET_SECURE_COOKIES=0
-`
-
-const starterSeed = `{
-  "Post": [
-    { "author": "ada",   "body": "first post",   "created": 1718800000 },
-    { "author": "grace", "body": "hello, facet", "created": 1718800100 }
-  ]
-}
-`
-
-const starterTest = `{
-  "tests": [
-    {
-      "name": "a user can post",
-      "as": { "actor": "ada", "role": "member" },
-      "steps": [
-        { "run": "post", "args": ["hello world"] },
-        { "expect": "count(Post)", "equals": 1 }
-      ]
-    },
-    {
-      "name": "you may delete only your own post",
-      "steps": [
-        { "as": { "actor": "ada" }, "run": "post", "args": ["mine"] },
-        { "as": { "actor": "bob" }, "run": "remove", "args": [1], "fails": "forbidden" },
-        { "as": { "actor": "ada" }, "run": "remove", "args": [1] },
-        { "expect": "count(Post)", "equals": 0 }
-      ]
-    }
-  ]
-}
-`

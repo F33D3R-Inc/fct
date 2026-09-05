@@ -59,6 +59,13 @@ func File(path string) (*ir.IR, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Check the entry project's own facet.json — if its `facet` range is not
+	// met, fail now with one clear message rather than falling into parsing
+	// syntax this toolchain predates and failing with a cascade of confusing
+	// parse errors instead.
+	if err := res.CheckToolchain(); err != nil {
+		return nil, err
+	}
 	visited := map[string]bool{}
 	facets, err := collectModules(abs, visited, nil, res)
 	if err != nil {
@@ -146,6 +153,32 @@ func mergeInto(dst, src *ast.App) {
 	dst.Views = append(dst.Views, src.Views...)
 	dst.Services = append(dst.Services, src.Services...)
 	dst.Theme = append(dst.Theme, src.Theme...)
+
+	// A facet's stylesheet ships with the facet, exactly like its theme
+	// variables directly above. Without this an imported atom could declare a
+	// `css:` block that compiled, validated, and then never reached the page —
+	// silently, because a missing rule looks like a specificity problem rather
+	// than a missing file. That made a component with any layout of its own
+	// undistributable: it rendered correctly only in whichever host app happened
+	// to carry a copy of its rules.
+	dst.CSS = joinStylesheets(dst.CSS, src.CSS)
+}
+
+// joinStylesheets concatenates two stylesheet fragments. Mirrors the parser's
+// own joiner, which is unexported; the rule it encodes — a newline between
+// fragments, and no leading newline when the first is empty — has to hold here
+// too, because these fragments are concatenated across module boundaries where
+// a stray blank line is the only thing distinguishing one facet's rules from
+// another's in a diagnostic.
+func joinStylesheets(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "\n" + b
+	}
 }
 
 // checkDuplicates reports the first declaration name that appears twice within a

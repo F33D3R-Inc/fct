@@ -1,6 +1,9 @@
 package ir
 
-import "facet/internal/parser"
+import (
+	"facet/internal/ast"
+	"facet/internal/parser"
+)
 
 // CompileExpr compiles a single standalone expression against an already-built
 // application graph, returning its lowered, validated IR form. It is the bridge
@@ -35,7 +38,7 @@ func envFromIR(graph *IR) *env {
 		policySet:    map[string]bool{},
 		policyParams: map[string][]Param{},
 		enums:        map[string][]string{},
-		components:   map[string][]Param{},
+		components:   map[string][]ast.Param{},
 		compDeps:     map[string]map[string]bool{},
 		stateTypes:   map[string]string{},
 	}

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"facet/internal/ir"
 )
 
 // writeProject drops a set of .fct files into a fresh dir and returns the path of
@@ -351,4 +353,92 @@ func TestLayeredErrorOnPlainAppMixedIn(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "cannot be mixed") {
 		t.Fatalf("want a mixed-app error, got %v", err)
 	}
+}
+
+// TestLayeredBrickViewServesARoute is the composition-model check: a brick may
+// declare a routed `view`, that view becomes a screen of the wireframe owning
+// its socket (so the other sockets' content is still around it), and a link into
+// that route — written inside a shared component, several files down — validates
+// against it.
+//
+// Before this the layered track had no way to declare a route at all, so a
+// component that linked anywhere could not be composed into a playground build.
+func TestLayeredBrickViewServesARoute(t *testing.T) {
+	files := layeredFiles()
+	files["feed.fct"] = strings.Replace(files["feed.fct"],
+		`    content:
+        text "Home · {tweetCount} tweets"`,
+		`    component Row(id: int, body: text):
+        link "{body}" -> "/post/{id}"
+    view Post at "/post/:id":
+        for t in Tweet where t.id == id by id desc limit 1:
+            text "{t.body}"
+    content:
+        text "Home · {tweetCount} tweets"
+        for t in Tweet by id desc limit 5:
+            use Row(t.id, t.body)`, 1)
+
+	built, err := File(writeProject(t, files, "playground.fct"))
+	if err != nil {
+		t.Fatalf("a brick view should serve the route its component links to, got: %v", err)
+	}
+
+	var page *ir.Page
+	for i := range built.Pages {
+		if built.Pages[i].Path == "/post/:id" {
+			page = &built.Pages[i]
+		}
+	}
+	if page == nil {
+		t.Fatal("the brick's view did not become a routed screen")
+	}
+	if !page.Screen || len(page.Params) != 1 || page.Params[0] != "id" {
+		t.Errorf("want a composed screen with the `id` route parameter bound, got screen=%v params=%v", page.Screen, page.Params)
+	}
+	// The view takes its own socket's place; every other socket keeps its
+	// content, because a screen is the whole surface and not the view alone.
+	if !rendersLiteral(page.View, "F33D3R") || !rendersLiteral(page.View, "What's happening") {
+		t.Error("the brick view's screen lost the wireframe's other sockets")
+	}
+	if rendersLiteral(page.View, "Home · ") {
+		t.Error("the brick view's screen still shows the socket's default `content`")
+	}
+}
+
+// TestLayeredUnservedRouteIsStillAnError pins the half of the guarantee the
+// model must not weaken: declaring routes is now possible, so a link to one
+// nobody declared is a hard failure, and the message names what wanted it.
+func TestLayeredUnservedRouteIsStillAnError(t *testing.T) {
+	files := layeredFiles()
+	files["nav.fct"] = `ui Nav in nav:
+    component Crumb():
+        link "gone" -> "/nowhere"
+    content:
+        use Crumb()
+`
+	_, err := File(writeProject(t, files, "playground.fct"))
+	if err == nil {
+		t.Fatal("a link to a route nothing serves must not compile")
+	}
+	for _, want := range []string{"no view serves that route", `component "Crumb"`, "`ui`/`data` facet"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+}
+
+// rendersLiteral reports whether any node in the tree renders the given literal
+// text, so a test can ask what a composed screen actually shows.
+func rendersLiteral(nodes []ir.Node, lit string) bool {
+	for _, n := range nodes {
+		for _, s := range n.Segs {
+			if strings.Contains(s.Lit, lit) {
+				return true
+			}
+		}
+		if rendersLiteral(n.Children, lit) {
+			return true
+		}
+	}
+	return false
 }

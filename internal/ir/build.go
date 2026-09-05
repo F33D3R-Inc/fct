@@ -23,26 +23,37 @@ func (e *BuildError) Error() string {
 
 // env is the name environment used to validate references and compute deps.
 type env struct {
-	states       map[string]string              // name -> placement
-	entities     map[string]bool                // entity names
-	entityFields map[string]map[string]bool     // entity -> field set (incl id)
-	indexFields  map[string]map[string]bool     // entity -> fields the compiler saw queried (build a DB index)
-	inline       map[string]*Expr               // zero-arg policy/derive name -> lowered expr, inlined at every use
-	policySet    map[string]bool                // policy names (gating via `requires`)
-	policyParams map[string][]Param             // policy name -> its parameters (row-level policies)
-	enums        map[string][]string            // enum name -> ordered member values
-	components   map[string][]Param             // component name -> its parameters
-	compDeps     map[string]map[string]bool     // component name -> the state/entity names its body reads (for use-site refresh)
-	stateTypes   map[string]string              // state name -> its (core/element) type, for enum-defaulted selects
-	stateList    map[string]bool                // state names that are `[T]` list cells, for `for x in <list>`
-	services     map[string]map[string]int      // service name -> op name -> parameter count, for checking `call`
-	serviceRets  map[string]map[string]opRet    // service name -> op name -> return type, for binding `let x = call …`
-	private      map[string]bool                // @private state names — server-only, non-renderable
-	entFieldEnum map[string]map[string]string   // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
-	records      map[string]map[string]recField // record name -> field name -> its type, for `let`-bound field access
-	entE2E       map[string]map[string]bool     // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
-	locRecords   map[string]recBind             // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
-	actionSet    map[string]bool                // action names, for validating pending()/failed() targets
+	states        map[string]string              // name -> placement
+	entities      map[string]bool                // entity names
+	entityFields  map[string]map[string]bool     // entity -> field set (incl id)
+	queriedFields map[string]map[string]bool     // entity -> fields a `where`/`by`/relation reads at all
+	indexFields   map[string]map[string]bool     // entity -> fields whose use an index can actually serve
+	inline        map[string]*Expr               // zero-arg policy/derive name -> lowered expr, inlined at every use
+	inlineType    map[string]vtype               // the same names -> the type they resolve to (a derive's declared type, a policy's bool)
+	policySet     map[string]bool                // policy names (gating via `requires`)
+	policyParams  map[string][]Param             // policy name -> its parameters (row-level policies)
+	enums         map[string][]string            // enum name -> ordered member values
+	components    map[string][]ast.Param         // component name -> its parameters (a reference parameter carries its Ref kind)
+	compAST       map[string]*ast.Component      // component name -> its source, for call-site expansion of templates
+	compSlot      map[string]bool                // component names whose body contains a `slot` (so a `use` may pass children)
+	compDeps      map[string]map[string]bool     // component name -> the state/entity names its body reads (for use-site refresh)
+	compRegions   map[string]map[string][]string // component name -> the dependency edges its own regions/inputs need, folded into every page that uses it
+	special       []Component                    // per-call-site expansions of template components, appended to the IR
+	specialCalls  []call                         // action references made inside expansions, validated with the rest
+	specialLinks  []linkRef                      // link destinations inside expansions, route-checked with the rest
+	specStack     []string                       // components currently being expanded, to refuse recursion
+	nspec         int                            // expansions minted so far; names them and namespaces their region ids
+	stateTypes    map[string]string              // state name -> its (core/element) type, for enum-defaulted selects
+	stateList     map[string]bool                // state names that are `[T]` list cells, for `for x in <list>`
+	services      map[string]map[string]int      // service name -> op name -> parameter count, for checking `call`
+	serviceRets   map[string]map[string]opRet    // service name -> op name -> return type, for binding `let x = call …`
+	private       map[string]bool                // @private state names — server-only, non-renderable
+	entFieldEnum  map[string]map[string]string   // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
+	entFieldType  map[string]map[string]string   // entity -> field -> stored type core (enum fields read as "text"), for typing a data-driven option's value
+	records       map[string]map[string]recField // record name -> field name -> its type, for `let`-bound field access
+	entE2E        map[string]map[string]bool     // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
+	locRecords    map[string]recBind             // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
+	actionSet     map[string]bool                // action names, for validating pending()/failed() targets
 }
 
 // opRet is a service operation's declared return type ("" core = no return).
@@ -64,9 +75,43 @@ type recBind struct {
 	list bool
 }
 
-// markIndex records that entity.field is filtered, ordered, or a relation, so the
-// store builds an index for it.
+// markQueried records that a `where`, `by`, or relation reads entity.field at
+// all — anywhere, at any depth, including buried inside a call.
+//
+// This is the set the @secret check runs against, and it has to stay this wide:
+// an encrypted column stores ciphertext, so *reading* it in a query is the error,
+// regardless of whether the read is one an index could have served.
+func (e *env) markQueried(entity, field string) {
+	if e.queriedFields[entity] == nil {
+		e.queriedFields[entity] = map[string]bool{}
+	}
+	e.queriedFields[entity][field] = true
+}
+
+// markIndex records that entity.field is used in a way an index can serve, so
+// the store builds one for it. `id` is never marked: a row's identity is already
+// the store's primary order (a Postgres primary key, a FacetQL address), so a
+// secondary index over it costs writes and buys no read.
+//
+// # Why this is a different set from markQueried
+//
+// They were one map, and conflating them shipped an index nobody could use and
+// that a large enough row made fatal. `where contains(lower(t.body), q)` reads
+// `body`, so `body` was marked and an index was built over it — but a substring
+// search cannot be answered by an ordered index in any store, so the index only
+// ever cost writes. On FacetQL it did worse: an index key is bounded, so the
+// first post longer than that bound made `create index on Tweet.body` fail, and
+// because the store reconciles its indexes at startup, the app stopped booting.
+// One ordinary long post permanently took the site down.
+//
+// So a field earns an index by *how* it is used, not by being mentioned. See
+// comparedItemFields.
 func (e *env) markIndex(entity, field string) {
+	e.markQueried(entity, field)
+
+	if field == "id" {
+		return
+	}
 	if e.indexFields[entity] == nil {
 		e.indexFields[entity] = map[string]bool{}
 	}
@@ -90,7 +135,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]Param{}, compDeps: map[string]map[string]bool{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, records: map[string]map[string]recField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -153,6 +198,11 @@ func Build(app *ast.App) (*IR, error) {
 		entSeen[ent.Name] = ent.Line
 		e.entities[ent.Name] = true
 		e.entityFields[ent.Name] = map[string]bool{}
+		// Every row has an `id` nobody declares: the store's own identity, an int
+		// (runtime/sql.go and Server.entityField spell the same thing). It is the
+		// value a data-driven option almost always stores, so the type table has to
+		// know it or `option "{c.name}" -> c.id` could not be typed at all.
+		e.entFieldType[ent.Name] = map[string]string{"id": "int"}
 		ei := Entity{Name: ent.Name, SoftDelete: ent.SoftDelete}
 		for _, f := range ent.Fields {
 			if f.Secret && f.Name == "id" {
@@ -181,6 +231,7 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			ei.Fields = append(ei.Fields, fld)
 			e.entityFields[ent.Name][f.Name] = true
+			e.entFieldType[ent.Name][f.Name] = fld.Type
 		}
 		// Soft-delete needs a durable `archived` flag to persist the hidden state. The
 		// compiler injects it (reserved), so the author never models it by hand. It is
@@ -191,6 +242,7 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			ei.Fields = append(ei.Fields, Field{Name: "archived", Type: "bool", Index: true})
 			e.entityFields[ent.Name]["archived"] = true
+			e.entFieldType[ent.Name]["archived"] = "bool"
 		}
 		out.Entities = append(out.Entities, ei)
 	}
@@ -229,6 +281,14 @@ func Build(app *ast.App) (*IR, error) {
 		if e.entities[s.Name] {
 			return nil, &BuildError{s.Line, fmt.Sprintf("state %q collides with an entity name", s.Name)}
 		}
+		// A state cell and the render scope share one namespace, so a cell named
+		// `route` would be silently overwritten by the path every time a page
+		// rendered — the cell would read correctly on the client and wrongly on the
+		// server. A local (a `for` variable, a component parameter) named `route`
+		// is fine: it shadows, in both renderers, the way any local does.
+		if s.Name == "route" {
+			return nil, &BuildError{s.Line, "state \"route\" collides with the built-in `route` (the path being rendered) — rename the cell"}
+		}
 		stSeen[s.Name] = s.Line
 		// The element/core type must be a primitive or a declared enum.
 		core := s.Type
@@ -252,6 +312,11 @@ func Build(app *ast.App) (*IR, error) {
 			e.private[s.Name] = true
 		}
 		if err := e.checkBuiltins(s.Default, s.Line); err != nil {
+			return nil, err
+		}
+		// A default is evaluated before any page exists, so it interpolates against
+		// nothing at all.
+		if err := e.checkLiteralExpr(s.Default, nil, s.Line); err != nil {
 			return nil, err
 		}
 		e.states[s.Name] = p
@@ -307,6 +372,7 @@ func Build(app *ast.App) (*IR, error) {
 		// reachable only through `requires name(args)`.
 		if len(p.Params) == 0 {
 			e.inline[p.Name] = lowered
+			e.inlineType[p.Name] = vtype{core: "bool"} // a policy is a predicate
 		}
 		out.Policies = append(out.Policies, Policy{Name: p.Name, Params: irParams(p.Params), Expr: lowered})
 	}
@@ -330,6 +396,7 @@ func Build(app *ast.App) (*IR, error) {
 		}
 		lowered := e.low(d.Expr)
 		e.inline[d.Name] = lowered
+		e.inlineType[d.Name] = vtype{core: d.Type}
 		out.Derives = append(out.Derives, Derive{Name: d.Name, Type: d.Type, Expr: lowered, Deps: sortedKeys(e.depsIR(lowered))})
 	}
 
@@ -338,6 +405,9 @@ func Build(app *ast.App) (*IR, error) {
 	if len(app.Theme) > 0 {
 		out.Theme = map[string]string{}
 		for _, tv := range app.Theme {
+			if err := e.checkThemeVar(tv); err != nil {
+				return nil, err
+			}
 			out.Theme[tv.Name] = tv.Value
 		}
 	}
@@ -345,6 +415,9 @@ func Build(app *ast.App) (*IR, error) {
 	if len(app.DarkTheme) > 0 {
 		out.ThemeDark = map[string]string{}
 		for _, tv := range app.DarkTheme {
+			if err := e.checkThemeVar(tv); err != nil {
+				return nil, err
+			}
 			out.ThemeDark[tv.Name] = tv.Value
 		}
 	}
@@ -360,6 +433,9 @@ func Build(app *ast.App) (*IR, error) {
 				out.Themes[nt.Name] = tokens
 			}
 			for _, tv := range nt.Vars {
+				if err := e.checkThemeVar(tv); err != nil {
+					return nil, err
+				}
 				tokens[tv.Name] = tv.Value
 			}
 		}
@@ -404,23 +480,53 @@ func Build(app *ast.App) (*IR, error) {
 				return nil, &BuildError{cm.Line, fmt.Sprintf("component %q has duplicate parameter %q", cm.Name, p.Name)}
 			}
 			pseen[p.Name] = true
+			// A cell parameter names a state cell, so its declared type is the cell's
+			// type and must be one the language has.
+			if p.Ref == ast.RefCell && !isPrimitive(p.Type) {
+				if _, isEnum := e.enums[p.Type]; !isEnum {
+					return nil, &BuildError{cm.Line, fmt.Sprintf("component %q parameter %q is `cell %s`, but %q is not a state type (a primitive or an enum)", cm.Name, p.Name, p.Type, p.Type)}
+				}
+			}
 		}
-		e.components[cm.Name] = irParams(cm.Params)
+		// A component has at most one `slot`: its children are one tree, and two
+		// slots would silently render them twice.
+		if n := countSlots(cm.Root); n > 1 {
+			return nil, &BuildError{cm.Line, fmt.Sprintf("component %q has %d `slot`s; a component has at most one, since its children are one tree", cm.Name, n)}
+		} else if n == 1 {
+			e.compSlot[cm.Name] = true
+		}
+		e.components[cm.Name] = cm.Params
+		e.compAST[cm.Name] = cm
 	}
 	var compCalls []call
-	var compLinks []string
+	var compLinks []linkRef
 	for _, cm := range app.Components {
+		// A template — one with a reference parameter or a `slot` — is not lowered
+		// here at all: it has no meaning until a call site says which cell, which
+		// action, which children. It is expanded per `use` instead. It is still
+		// checked once, against synthetic references, so an unused one is not
+		// unexamined.
+		if e.isTemplate(cm.Name) {
+			if err := e.checkTemplate(cm); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		locals := map[string]bool{}
 		for _, p := range cm.Params {
 			locals[p.Name] = true
 		}
-		cvc := &viewCtx{e: e}
 		// inRegion: a component body renders inline at the call site, so it carries no
-		// page-local binding/region ids of its own.
-		nodes, err := cvc.nodes(cm.Root, scope{locals: locals, inRegion: true})
+		// page-local *binding* ids of its own. It does still mint region and input
+		// ids, and those are addresses on whatever page renders it — so they are
+		// namespaced per component (they used to duplicate the page's own `b0`/`l0`)
+		// and the edges that reach them are folded into each page that uses it.
+		cvc := &viewCtx{e: e, pfx: fmt.Sprintf("k%d.", len(e.compRegions)), origin: fmt.Sprintf("component %q", cm.Name)}
+		nodes, err := cvc.nodes(cm.Root, scope{locals: locals, inRegion: true, varTypes: e.paramTypes(cm.Params)})
 		if err != nil {
 			return nil, err
 		}
+		e.compRegions[cm.Name] = cvc.deps
 		compCalls = append(compCalls, cvc.calls...)
 		compLinks = append(compLinks, cvc.links...)
 		// the globals (state/entity) the body reads, minus the bound parameters; a
@@ -443,6 +549,10 @@ func Build(app *ast.App) (*IR, error) {
 		}
 		ops := map[string]int{}
 		rets := map[string]opRet{}
+		if err := e.checkLiteral(sv.URL, nil, sv.Line, fmt.Sprintf("service %q's base URL", sv.Name),
+			"a service's base URL is fixed at compile time — it is where the authority connects, not something a render decides; put the varying part in the operation's arguments"); err != nil {
+			return nil, err
+		}
 		irsv := Service{Name: sv.Name, URL: sv.URL}
 		for _, op := range sv.Ops {
 			if _, dup := ops[op.Name]; dup {
@@ -578,6 +688,10 @@ func Build(app *ast.App) (*IR, error) {
 		if reservedWebhookPath(wh.Path) {
 			return nil, &BuildError{wh.Line, fmt.Sprintf("webhook path %q collides with a route the runtime reserves", wh.Path)}
 		}
+		if err := e.checkLiteral(wh.Path, nil, wh.Line, fmt.Sprintf("webhook path %q", wh.Path),
+			"a webhook path is a fixed endpoint an external system POSTs to, so it is literal — read the varying part out of the body in the action it targets"); err != nil {
+			return nil, err
+		}
 		hookSeen[wh.Path] = wh.Line
 		out.Webhooks = append(out.Webhooks, Webhook{Path: wh.Path, Action: wh.Action, Secret: wh.Secret})
 	}
@@ -642,8 +756,10 @@ func Build(app *ast.App) (*IR, error) {
 		// Route parameters (`/post/:id`) are in scope as text locals, bound from the
 		// matched URL at render time.
 		locals := map[string]bool{}
+		rparams := map[string]vtype{}
 		for _, p := range v.Params {
 			locals[p] = true
+			rparams[p] = vtype{core: "text"} // a matched URL segment is text
 		}
 		// A `requires` guard names a zero-argument policy the authority enforces
 		// before rendering the route (and the client uses to hide links to it).
@@ -664,10 +780,18 @@ func Build(app *ast.App) (*IR, error) {
 			if !ok {
 				return nil, &BuildError{v.Line, fmt.Sprintf("view %q uses unknown layout %q", v.Name, v.Layout)}
 			}
-			root = inlineLayout(ly.Root, v.Root)
+			// ast.SpliceLayout is the same call the parser makes to validate a
+			// layout, so the tree spliced here is by construction the one the
+			// parser accepted — the splicer cannot reach a slot the check did not
+			// see, or refuse one it did.
+			spliced, err := ast.SpliceLayout(v.Layout, ly.Root, v.Root)
+			if err != nil {
+				return nil, &BuildError{v.Line, err.Error()}
+			}
+			root = spliced
 		}
-		pvc := &viewCtx{e: e}
-		nodes, err := pvc.nodes(root, scope{locals: locals})
+		pvc := &viewCtx{e: e, origin: fmt.Sprintf("view %q", v.Name)}
+		nodes, err := pvc.nodes(root, scope{locals: locals, varTypes: rparams})
 		if err != nil {
 			return nil, err
 		}
@@ -682,13 +806,20 @@ func Build(app *ast.App) (*IR, error) {
 		if !strings.HasPrefix(path, "/") {
 			return nil, &BuildError{v.Line, fmt.Sprintf("view %q route %q must start with `/`", v.Name, path)}
 		}
+		// A route is declared, not rendered: its dynamic segments are written `:name`
+		// and are what *binds* the scope, so a `{…}` here is a segment that will only
+		// ever match itself.
+		if err := e.checkLiteral(path, locals, v.Line, fmt.Sprintf("view %q's route", v.Name),
+			"a route's dynamic segment is written `:name` — `view "+v.Name+" at \"/post/:id\"` — and binds `id` into the page's scope, which is where `{id}` then interpolates"); err != nil {
+			return nil, err
+		}
 		if prev, ok := pathOf[path]; ok {
 			return nil, &BuildError{v.Line, fmt.Sprintf("views %q and %q both map to route %q", v.Name, prev, path)}
 		}
 		pathOf[path] = v.Name
 		// Page metadata is rendered once, server-side, so lower it as region (Expr)
 		// segments — evaluated against the route scope, never a reactive client bind.
-		metaScope := scope{locals: locals, inRegion: true}
+		metaScope := scope{locals: locals, inRegion: true, varTypes: rparams}
 		title, err := pvc.lowerSegs(v.TitleSegs, metaScope, false)
 		if err != nil {
 			return nil, err
@@ -714,6 +845,13 @@ func Build(app *ast.App) (*IR, error) {
 		out.DepGraph = out.Pages[0].DepGraph
 	}
 
+	// Every component expansion's action references and link destinations are
+	// validated with the rest: an expansion is ordinary view content, and the
+	// point of resolving its names at the call site is that the same checks apply.
+	allCalls = append(allCalls, e.specialCalls...)
+	allLinks = append(allLinks, e.specialLinks...)
+	out.Components = append(out.Components, e.special...)
+
 	// validate every action a button calls exists and is arity-correct.
 	for _, ref := range allCalls {
 		act, ok := byAction[ref.name]
@@ -727,32 +865,100 @@ func Build(app *ast.App) (*IR, error) {
 	// validate every link points at a real route. A link may target a concrete
 	// path of a dynamic route (`/post/5` against `/post/:id`), so match against the
 	// route patterns, not just the static paths.
-	for _, p := range allLinks {
+	for _, ref := range allLinks {
 		matched := false
 		for i := range out.Pages {
-			if routeMatches(out.Pages[i].Path, p) {
+			if routeMatches(out.Pages[i].Path, ref.path) {
 				matched = true
 				break
 			}
 		}
 		if !matched {
-			return nil, &BuildError{0, fmt.Sprintf("link to %q, but no view serves that route", p)}
+			// The shape carries a NUL sentinel where an interpolation was, which
+			// is unreadable and unquotable; show the `{…}` the author wrote.
+			where := ""
+			if ref.origin != "" {
+				where = " in " + ref.origin
+			}
+			// A layered build has no top-level `view` to add, so the bare message
+			// would name a declaration its author cannot write. Name where a route
+			// comes from in the track actually being compiled.
+			hint := ""
+			if app.Composed {
+				hint = " — declare it as a `view` on the `ui`/`data` facet that owns the route, or `mount` a wireframe at it"
+			}
+			return nil, &BuildError{0, fmt.Sprintf("link to %q%s, but no view serves that route%s",
+				strings.ReplaceAll(ref.path, dynamicSegment, "{…}"), where, hint)}
 		}
+	}
+
+	// validate every `#anchor` destination names an anchor some node declares.
+	//
+	// This is the fragment half of the guarantee the route check gives the path
+	// half, and it exists for the same reason: a link to a place that is not there
+	// fails silently. A mistyped route is a page that does not exist and at least
+	// 404s; a mistyped fragment is a link that loads the right page and then simply
+	// does not move, which is indistinguishable from a working table of contents
+	// until someone notices the page never scrolled.
+	//
+	// Anchors are collected from every page AND every component, whether or not the
+	// component is used, because a component is a definition and the check is over
+	// what the program declares — the same standard the route check applies. An
+	// external destination's fragment belongs to somebody else's document and is
+	// not checked.
+	anchors := map[string]bool{}
+	declared := func(n Node) {
+		if n.Anchor != "" {
+			anchors[n.Anchor] = true
+		}
+	}
+	for i := range out.Pages {
+		walkNodes(out.Pages[i].View, declared)
+	}
+	for i := range out.Components {
+		walkNodes(out.Components[i].View, declared)
+	}
+
+	missing := ""
+	referenced := func(n Node) {
+		if n.Kind != "link" || n.External || missing != "" {
+			return
+		}
+		shape := n.Path
+		if len(n.PathSegs) > 0 {
+			shape = linkShape(n.PathSegs)
+		}
+		if _, frag := splitFragment(shape); frag != "" && !anchors[frag] {
+			missing = frag
+		}
+	}
+	for i := range out.Pages {
+		walkNodes(out.Pages[i].View, referenced)
+	}
+	for i := range out.Components {
+		walkNodes(out.Components[i].View, referenced)
+	}
+	if missing != "" {
+		return nil, &BuildError{0, fmt.Sprintf(
+			"link to %q, but no node declares that anchor: write `anchor %q` on the node it should scroll to",
+			"#"+missing, missing)}
 	}
 
 	// Stamp the index flags the compiler accumulated (relations + every filtered or
 	// ordered field) onto the entity fields, so the store knows what to index.
 	for ei := range out.Entities {
+		queried := e.queriedFields[out.Entities[ei].Name]
 		idx := e.indexFields[out.Entities[ei].Name]
 		for fi := range out.Entities[ei].Fields {
 			f := &out.Entities[ei].Fields[fi]
+			// An encrypted column stores ciphertext, so it cannot be filtered,
+			// ordered, or indexed — only read back into memory. Any read at all
+			// is the error, which is why this asks the wider set.
+			if queried[f.Name] && f.Secret {
+				return nil, &BuildError{0, fmt.Sprintf(
+					"field %q is @secret and cannot be used in a `where`, `by`, or relation; it is encrypted at rest", f.Name)}
+			}
 			if idx[f.Name] {
-				// An encrypted column stores ciphertext, so it cannot be filtered,
-				// ordered, or indexed in SQL — only read back into memory.
-				if f.Secret {
-					return nil, &BuildError{0, fmt.Sprintf(
-						"field %q is @secret and cannot be used in a `where`, `by`, or relation; it is encrypted at rest", f.Name)}
-				}
 				f.Index = true
 			}
 		}
@@ -762,7 +968,7 @@ func Build(app *ast.App) (*IR, error) {
 
 // itemFields returns the names of the loop item's fields a lowered predicate
 // reads — every `get` whose object is the item variable (e.g. `p.likes` in a
-// `where p.likes > 0`). These are the columns a pushed-down query filters on.
+// `where p.likes > 0`), at any depth and inside any call.
 func itemFields(le *Expr, itemVar string) map[string]bool {
 	out := map[string]bool{}
 	var walk func(*Expr)
@@ -782,6 +988,66 @@ func itemFields(le *Expr, itemVar string) map[string]bool {
 			walk(a)
 		}
 	}
+	walk(le)
+	return out
+}
+
+// comparedItemFields returns the loop item's fields the predicate uses in a way
+// an ordered index can serve: as a direct operand of a comparison.
+//
+// The distinction against itemFields is the whole point. `t.author == q` names a
+// value the store can seek to. `contains(lower(t.body), q)` also *reads*
+// `t.body`, but no ordered index answers a substring search — the store would
+// have to decode and test every row either way, so the index is pure write cost.
+// FacetQL makes that cost concrete: an index key is bounded, so an index over a
+// free-text field is refused the moment one row exceeds the bound, and since
+// indexes are reconciled at startup, the app stops booting. Marking only what an
+// index can serve is what keeps a large ordinary value from being fatal.
+//
+// The walk descends through the boolean connectives (`&&`, `||`, `!`) because a
+// comparison under any of them is still a comparison the store can seek on — an
+// index here is a candidate access path, not a promise that the planner will
+// narrow to it. It does not descend into call arguments, which is exactly the
+// case above: passing a field to a function makes its value an input to
+// arbitrary computation, not a key to look up.
+func comparedItemFields(le *Expr, itemVar string) map[string]bool {
+	out := map[string]bool{}
+
+	isItemField := func(x *Expr) string {
+		if x != nil && x.Kind == "get" && x.Obj != nil &&
+			x.Obj.Kind == "ref" && x.Obj.Name == itemVar {
+			return x.Field
+		}
+		return ""
+	}
+
+	var walk func(*Expr)
+	walk = func(x *Expr) {
+		if x == nil {
+			return
+		}
+
+		switch x.Kind {
+		case "bin":
+			switch x.Op {
+			case "&&", "||":
+				walk(x.L)
+				walk(x.R)
+			case "==", "!=", "<", "<=", ">", ">=":
+				if f := isItemField(x.L); f != "" {
+					out[f] = true
+				}
+				if f := isItemField(x.R); f != "" {
+					out[f] = true
+				}
+			}
+		case "un":
+			if x.Op == "!" {
+				walk(x.X)
+			}
+		}
+	}
+
 	walk(le)
 	return out
 }
@@ -820,44 +1086,224 @@ func authActions() []Action {
 	return specs
 }
 
-// inlineLayout produces a single node tree by substituting a view's nodes for
-// the `slot` marker in a layout's tree, recursing through container nodes. The
-// layout's chrome surrounds the routed view, and the result needs no runtime
-// layout concept.
-func inlineLayout(layout []ast.Node, view []ast.Node) []ast.Node {
-	var out []ast.Node
-	for _, n := range layout {
-		switch t := n.(type) {
-		case ast.Slot:
-			out = append(out, view...)
-		case ast.Styled:
-			// Recurse through the decorator so a slot inside `box class "x":` still
-			// receives the view; a bare styled slot drops the wrapper and splices.
-			inner := inlineLayout([]ast.Node{t.Inner}, view)
-			if len(inner) == 1 {
-				t.Inner = inner[0]
-				out = append(out, t)
-			} else {
-				out = append(out, inner...)
-			}
-		case ast.Box:
-			out = append(out, ast.Box{Children: inlineLayout(t.Children, view)})
-		case ast.Row:
-			out = append(out, ast.Row{Children: inlineLayout(t.Children, view)})
-		case ast.If:
-			out = append(out, ast.If{Cond: t.Cond, Body: inlineLayout(t.Body, view)})
-		case ast.For:
-			t.Body = inlineLayout(t.Body, view)
-			out = append(out, t)
-		default:
-			out = append(out, n)
-		}
+// walkNodes visits every node of a view tree — each node, then its children.
+func walkNodes(nodes []Node, fn func(Node)) {
+	for i := range nodes {
+		fn(nodes[i])
+		walkNodes(nodes[i].Children, fn)
 	}
-	return out
+}
+
+// dynamicSegment stands for an interpolated path segment during route checking.
+// A byte no URL path can contain, so it cannot be confused with a literal.
+const dynamicSegment = "\x00"
+
+// interpolated reports whether a segment renders something other than its own
+// literal text.
+//
+// A segment is dynamic in two ways, not one: an `Expr` (an expression over the
+// surrounding scope) or a `Bind` (a top-level state cell, which the client
+// re-renders in place when the cell changes). Checking only `Expr` treated
+// `{actor}` as empty literal text, so `/profile/{actor}` reduced to `/profile/`
+// and failed route validation with a message about a route nobody wrote.
+func interpolated(s Seg) bool { return s.Expr != nil || s.Bind != "" }
+
+// literalSegs returns the concatenated text when every segment is a literal.
+func literalSegs(segs []Seg) (string, bool) {
+	var b strings.Builder
+
+	for _, s := range segs {
+		if interpolated(s) {
+			return "", false
+		}
+		b.WriteString(s.Lit)
+	}
+
+	return b.String(), true
+}
+
+// isRouteExpr reports whether a destination is a single interpolation and
+// nothing else — the whole route supplied as a value.
+//
+// "Nothing else" is strict on purpose. A destination with literal text around an
+// interpolation is a path template with a hole in it, and a template's holes are
+// escaped as data; treating `"{base}/edit"` as a route would silently stop
+// escaping the value in the first half. So exactly one dynamic segment, no
+// literal text, is the route form, and everything else is a template.
+func isRouteExpr(segs []Seg) bool {
+	seen := false
+	for _, s := range segs {
+		if !interpolated(s) {
+			if s.Lit != "" {
+				return false
+			}
+			continue
+		}
+		if seen {
+			return false
+		}
+		seen = true
+	}
+	return seen
+}
+
+// renderShape renders a destination back the way the author roughly wrote it,
+// for an error message — `{…}` where an interpolation stands.
+func renderShape(segs []Seg) string {
+	var b strings.Builder
+	for _, s := range segs {
+		if interpolated(s) {
+			b.WriteString("{…}")
+			continue
+		}
+		b.WriteString(s.Lit)
+	}
+	return b.String()
+}
+
+// linkShape renders a link's destination for route checking, with every
+// interpolated run collapsed to one wildcard token.
+//
+// Checking the shape rather than the text is what keeps the check meaningful
+// once destinations can interpolate. Before this, `link "open" -> "/post/{p.id}"`
+// was *accepted* — the literal string `{p.id}` matched the `:id` slot as "any
+// non-empty segment" — and then shipped verbatim as an href pointing at a page
+// that does not exist. It validated precisely because it was broken.
+func linkShape(segs []Seg) string {
+	var b strings.Builder
+
+	for _, s := range segs {
+		if interpolated(s) {
+			b.WriteString(dynamicSegment)
+			continue
+		}
+		b.WriteString(s.Lit)
+	}
+
+	return b.String()
+}
+
+// externalSchemes is the closed set of URI schemes a link destination may name.
+//
+// It is an allowlist, not a denylist, and that is the entire security argument.
+// A denylist of `javascript:` and `data:` is a list of the payloads someone
+// already thought of — `vbscript:`, `jar:`, a scheme invented next year, or the
+// same word spelled with a stray case or an embedded newline all walk past it.
+// Naming the three that navigate somewhere means everything else, known or not,
+// is a build failure.
+//
+// `https` and `http` are the web; `mailto` is here because a contact link is the
+// other destination a site actually needs and it cannot be spelled as a path.
+var externalSchemes = map[string]bool{"https": true, "http": true, "mailto": true}
+
+// destScheme returns the URI scheme a destination shape begins with, lowercased,
+// and whether it has one at all.
+//
+// RFC 3986 spells a scheme `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"` and
+// nothing else is one: `/docs`, `#top` and `a/b` have no scheme; `https://x`,
+// `mailto:a@b` and `javascript:alert(1)` do. Recognising a scheme the language
+// does not accept is the point — it is what turns `javascript:` into an error
+// that says so rather than the generic "must start with `/`".
+func destScheme(shape string) (string, bool) {
+	for i := 0; i < len(shape); i++ {
+		c := shape[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+			continue
+		case i > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+			continue
+		case c == ':' && i > 0:
+			return strings.ToLower(shape[:i]), true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// checkExternalDest reports why an external destination is not one the compiler
+// will accept, or nil.
+//
+// The rule it enforces is that the ORIGIN is the author's and only the author's.
+// An interpolation may fill part of the path, the query or the fragment — those
+// are percent-escaped like any other template hole, so a value cannot climb out
+// of the segment it lands in — but the scheme and the authority must be literal
+// text in the source. Without that rule `https://{host}/x` would let a row in a
+// database choose where the reader's browser goes, which is the same hole the
+// route-expression form exists to keep shut, reopened one level up.
+func checkExternalDest(scheme, shape string, segs []Seg) *BuildError {
+	if scheme == "mailto" {
+		if strings.Contains(shape, dynamicSegment) {
+			return &BuildError{0, fmt.Sprintf(
+				"link path %q interpolates a `mailto:` address: an address is not a path, so there is no segment for a value to be escaped into — write the address literally",
+				renderShape(segs))}
+		}
+		if strings.TrimSpace(shape[len("mailto:"):]) == "" {
+			return &BuildError{0, "link path \"mailto:\" has no address"}
+		}
+		return nil
+	}
+
+	rest, ok := strings.CutPrefix(shape, scheme+"://")
+	if !ok {
+		return &BuildError{0, fmt.Sprintf(
+			"link path %q is missing `//` after the scheme: an %s destination is %s://host/path",
+			renderShape(segs), scheme, scheme)}
+	}
+
+	authority := rest
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		authority = rest[:i]
+	}
+	if authority == "" {
+		return &BuildError{0, fmt.Sprintf("link path %q has no host", renderShape(segs))}
+	}
+	if strings.Contains(authority, dynamicSegment) {
+		return &BuildError{0, fmt.Sprintf(
+			"link path %q interpolates its host: an external destination's scheme and host must be literal text the author wrote, so a value can never decide where a reader is sent — interpolate the path instead (e.g. \"%s://%s/{id}\")",
+			renderShape(segs), scheme, strings.ReplaceAll(authority, dynamicSegment, "host"))}
+	}
+	return nil
+}
+
+// splitFragment splits a destination into its path and its `#fragment`.
+//
+// A fragment is a position inside a page, not part of the route, so it comes off
+// before the route check — `/docs#install` is a link to `/docs`, and asking the
+// route table about `docs#install` finds nothing and reports a route nobody wrote.
+func splitFragment(shape string) (path, frag string) {
+	if i := strings.IndexByte(shape, '#'); i >= 0 {
+		return shape[:i], shape[i+1:]
+	}
+	return shape, ""
+}
+
+// validAnchorName reports whether s is usable as an author-chosen anchor id.
+//
+// Restricted to the characters an id can carry through a URL fragment, an HTML
+// `id` attribute and a CSS selector without any of the three needing to escape
+// it. That keeps one spelling of an anchor everywhere it appears, which is what
+// makes `#install` in a link and `anchor "install"` on a heading provably the
+// same name rather than two strings that usually agree.
+func validAnchorName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			c == '-' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // routeMatches reports whether a concrete path satisfies a route pattern, where a
 // `:param` segment matches any single non-empty segment.
+//
+// A path segment containing an interpolation matches any pattern segment: its
+// value is not known until render, so structure is all that can be checked here.
 func routeMatches(pattern, path string) bool {
 	ps := strings.Split(strings.Trim(pattern, "/"), "/")
 	cs := strings.Split(strings.Trim(path, "/"), "/")
@@ -865,6 +1311,11 @@ func routeMatches(pattern, path string) bool {
 		return false
 	}
 	for i := range ps {
+		// An interpolated segment could render as anything, so it satisfies
+		// either a parameter slot or a literal one.
+		if strings.Contains(cs[i], dynamicSegment) {
+			continue
+		}
 		if strings.HasPrefix(ps[i], ":") {
 			if cs[i] == "" {
 				return false
@@ -986,6 +1437,11 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				return Action{}, err
 			}
 			if err := e.checkPure(st.Cond, loc, st.Line, "a check"); err != nil {
+				return Action{}, err
+			}
+			if err := e.checkLiteral(st.Msg, loc, st.Line, "a check message",
+				"a check message is literal text the authority sends back when the guard fails — it has no scope to interpolate against, because it is written before the values it would read are known to be valid; "+
+					"state the rule instead of the value"); err != nil {
 				return Action{}, err
 			}
 			act.Body = append(act.Body, Stmt{Op: "check", Value: e.low(st.Cond), Msg: st.Msg})
@@ -1266,13 +1722,20 @@ func (e *env) action(a *ast.Action) (Action, error) {
 
 // ── view lowering ────────────────────────────────────────────────────────────
 
-// scope tracks the local item variables in effect (from enclosing `for`s) and
-// whether we are inside a dynamic region (a for/if), where interpolations are
-// rendered inline rather than tracked as top-level bindings.
+// scope tracks the locals in effect (route parameters, component parameters, and
+// the item variables of enclosing `for`s and repeating options), what each one's
+// type is, and whether we are inside a dynamic region (a for/if), where
+// interpolations are rendered inline rather than tracked as top-level bindings.
+//
+// locals and varTypes answer two different questions and both are needed:
+// `locals` is "does this name resolve here?", which every name must, and
+// `varTypes` is "to what type?", which only the locals whose type the builder can
+// prove carry an entry for. A local with no entry is a name that resolves to a
+// value of an unknown type — accepted everywhere, like any unknown.
 type scope struct {
-	locals    map[string]bool
-	inRegion  bool
-	itemTypes map[string]string // loop/item variable -> the entity it ranges over (for `match` enum resolution)
+	locals   map[string]bool
+	inRegion bool
+	varTypes map[string]vtype // local -> its type (an entity core means a row of that entity)
 }
 
 func (s scope) with(v string) scope {
@@ -1281,11 +1744,51 @@ func (s scope) with(v string) scope {
 		m[k] = true
 	}
 	m[v] = true
-	it := map[string]string{}
-	for k, val := range s.itemTypes {
-		it[k] = val
+	vt := map[string]vtype{}
+	for k, val := range s.varTypes {
+		vt[k] = val
 	}
-	return scope{locals: m, inRegion: true, itemTypes: it}
+	// The new binder shadows whatever it is named after until its own type is
+	// recorded, so a stale outer entry can never be read for it.
+	delete(vt, v)
+	return scope{locals: m, inRegion: true, varTypes: vt}
+}
+
+// region is the scope a nested body renders in: the same names and the same
+// types, inside a dynamic region.
+//
+// Every construct that lowers a child body needs exactly this, and each of them
+// used to build the literal by hand — which is how `if`, `overlay` and `tabs`
+// came to drop the type map while `for` and `match` kept it, so `match p.kind`
+// resolved its enum in one nesting and not in another, and an argument read off
+// a row was typed at the top of a loop and untyped one `if` deeper. Stating it
+// once is what keeps them from drifting apart again.
+func (s scope) region() scope {
+	return scope{locals: s.locals, inRegion: true, varTypes: s.varTypes}
+}
+
+// rowEntity reports the entity a local ranges over, when it is a row of one.
+// `match p.kind`, an @e2e field read and a data-driven option's value all ask
+// this same question of the same map.
+func (c *viewCtx) rowEntity(sc scope, name string) (string, bool) {
+	t, ok := sc.varTypes[name]
+	if !ok || t.list || !c.e.entities[t.core] {
+		return "", false
+	}
+	return t.core, true
+}
+
+// bindRange records the type of the item variable a range binds: a row of the
+// entity walked, or an element of the `[T]` list state walked.
+func (c *viewCtx) bindRange(sc scope, rg ast.Range) scope {
+	child := sc.with(rg.Var)
+	switch {
+	case c.e.entities[rg.Coll]:
+		child.varTypes[rg.Var] = vtype{core: rg.Coll}
+	case c.e.stateList[rg.Coll]:
+		child.varTypes[rg.Var] = vtype{core: c.e.stateTypes[rg.Coll]}
+	}
+	return child
 }
 
 // matchEnum resolves the enum type of a `match` subject, for exhaustiveness — a
@@ -1301,7 +1804,7 @@ func (c *viewCtx) matchEnum(e ast.Expr, sc scope) string {
 		}
 	case ast.Get:
 		if r, ok := t.Obj.(ast.Ref); ok {
-			if ent, ok := sc.itemTypes[r.Name]; ok {
+			if ent, ok := c.rowEntity(sc, r.Name); ok {
 				if fields, ok := c.e.entFieldEnum[ent]; ok {
 					return fields[t.Field] // "" if not an enum field
 				}
@@ -1325,14 +1828,39 @@ type call struct {
 	argc int
 }
 
+// linkRef is one internal link destination awaiting route validation: the
+// destination's *shape* (interpolated runs already collapsed to a wildcard) and
+// the declaration it was written in.
+type linkRef struct {
+	path   string
+	origin string
+}
+
 type viewCtx struct {
-	e              *env
-	bindings       []Binding
-	deps           map[string][]string // dep -> tracked region ids
-	calls          []call
-	links          []string // link destination routes (validated against real pages)
+	e        *env
+	bindings []Binding
+	deps     map[string][]string // dep -> tracked region ids
+	calls    []call
+	links    []linkRef // link destination routes (validated against real pages)
+	// origin names what the author wrote that holds these links — `view "Home"`,
+	// `component "PostCard"` — so an unserved route can say which one wanted it.
+	// A link is checked after every page is lowered, by which point the tree it
+	// came from is gone, so the answer has to be carried rather than recovered.
+	origin string
+	// pfx namespaces every region/input id this context mints. A page uses none;
+	// each component expansion uses its own, because those ids are addresses on
+	// the page that renders it and two expansions must not collide.
+	pfx string
+	// slot holds the already-lowered children a `use` handed this component, and
+	// slotOK says a `slot` is legal here at all (a component body or a layout —
+	// never a view).
+	slot           []Node
+	slotOK         bool
 	nb, nl, nf, nu int
 }
+
+// id mints a namespaced region/binding identifier.
+func (c *viewCtx) id(kind string, n int) string { return fmt.Sprintf("%s%s%d", c.pfx, kind, n) }
 
 func (c *viewCtx) addDep(dep, id string) {
 	if c.deps == nil {
@@ -1350,7 +1878,7 @@ func (c *viewCtx) e2eFieldRead(ex ast.Expr, sc scope) bool {
 		return c.e.entE2E[t.Entity][t.Field]
 	case ast.Get:
 		if r, ok := t.Obj.(ast.Ref); ok {
-			if ent, ok := sc.itemTypes[r.Name]; ok {
+			if ent, ok := c.rowEntity(sc, r.Name); ok {
 				return c.e.entE2E[ent][t.Field]
 			}
 		}
@@ -1402,7 +1930,7 @@ func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope, openable bool) ([]Seg, err
 			out = append(out, Seg{Lit: s.Lit})
 			continue
 		}
-		if err := c.e.checkPure(s.Expr, withActor(sc.locals), 0, "a view"); err != nil {
+		if err := c.e.checkPure(s.Expr, viewScope(sc.locals), 0, "a view"); err != nil {
 			return nil, err
 		}
 		if err := c.e.checkNoPrivate(s.Expr); err != nil {
@@ -1420,7 +1948,7 @@ func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope, openable bool) ([]Seg, err
 		if sc.inRegion {
 			out = append(out, Seg{Expr: c.e.low(s.Expr), E2E: e2e})
 		} else {
-			id := fmt.Sprintf("b%d", c.nb)
+			id := c.id("b", c.nb)
 			c.nb++
 			le := c.e.low(s.Expr)
 			deps := sortedKeys(c.e.depsIR(le))
@@ -1434,24 +1962,283 @@ func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope, openable bool) ([]Seg, err
 	return out, nil
 }
 
+// dynamicOptions reports whether a choice list holds anything the compiler cannot
+// reduce to a fixed value — a computed value, or a `for` over a collection. It is
+// the one test that decides which of the two shapes in Node.Options a control
+// lowers into, so both callers ask it rather than each deciding for itself.
+func dynamicOptions(opts []ast.Option) bool {
+	for _, o := range opts {
+		if o.Val != nil || o.From != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// lowerRange lowers the header every repeating construct shares onto the node
+// that repeats over it: which collection, the item variable, and the
+// where/by/limit clauses that narrow it.
+//
+// It is one method for the same reason ast.Range is one type. A `for` node and
+// the `for` inside a select's or a radio group's choice list are the same query
+// — the same iterable collections, the same pure predicate over the item
+// variable, the same @secret and index bookkeeping the store depends on — and a
+// second copy of these checks is a second place for `by` to quietly stop marking
+// an index, or for a filter to stop being checked for purity.
+//
+// `line` is where to report a failure; a `for` node passes 0 because ast.For does
+// not carry one, an option's range passes the option's own line.
+func (c *viewCtx) lowerRange(rg ast.Range, node *Node, sc scope, line int) error {
+	// A range walks an entity (rows) or a `[T]` list state cell (its elements).
+	// A scalar state cell is not iterable.
+	if !c.e.entities[rg.Coll] {
+		if c.e.states[rg.Coll] == "" {
+			return &BuildError{line, fmt.Sprintf("`for` over unknown collection %q (an entity or a list state)", rg.Coll)}
+		}
+		if !c.e.stateList[rg.Coll] {
+			return &BuildError{line, fmt.Sprintf("`for x in %s` needs a list — %q is a scalar state, not a `[T]` collection", rg.Coll, rg.Coll)}
+		}
+	}
+	node.Var, node.Coll, node.Order, node.Desc = rg.Var, rg.Coll, rg.Order, rg.Desc
+	// `limit` may be a literal or a pure expr (e.g. a @client page size for
+	// load-more / infinite scroll); evaluated per render, not per row.
+	if rg.Limit != nil {
+		if err := c.e.checkPure(rg.Limit, viewScope(sc.locals), line, "a `limit`"); err != nil {
+			return err
+		}
+		node.Limit = c.e.low(rg.Limit)
+	}
+	// `where` filter: a pure predicate over the item var + outer scope.
+	if rg.Where != nil {
+		wlocals := viewScope(sc.locals)
+		wlocals[rg.Var] = true
+		if err := c.e.checkPure(rg.Where, wlocals, line, "a `where` filter"); err != nil {
+			return err
+		}
+		node.Where = c.e.low(rg.Where)
+		// Two different questions about the same predicate. Every field it reads is
+		// a field a @secret column may not appear in. Only the fields it *compares*
+		// are ones an index can serve.
+		if c.e.entities[rg.Coll] {
+			for f := range itemFields(node.Where, rg.Var) {
+				if c.e.entityFields[rg.Coll][f] {
+					c.e.markQueried(rg.Coll, f)
+				}
+			}
+			for f := range comparedItemFields(node.Where, rg.Var) {
+				if c.e.entityFields[rg.Coll][f] {
+					c.e.markIndex(rg.Coll, f)
+				}
+			}
+		}
+	}
+	if rg.Order != "" {
+		if !c.e.entities[rg.Coll] {
+			return &BuildError{line, fmt.Sprintf("ordering `by %s` requires %q to be an entity", rg.Order, rg.Coll)}
+		}
+		if !c.e.entityFields[rg.Coll][rg.Order] {
+			return &BuildError{line, fmt.Sprintf("entity %q has no field %q to order by", rg.Coll, rg.Order)}
+		}
+		c.e.markIndex(rg.Coll, rg.Order)
+	}
+	return nil
+}
+
+// lowerOptions lowers the choice list of a select or a radio group — the one
+// place either of them learns what its choices are.
+//
+// A choice list is fixed or it is drawn from data, and the difference is what the
+// compiler can still prove about the *value* half of a choice.
+//
+// A fixed list is unchanged, down to the field it lowers into (Node.Options).
+// Every option's value is a literal the compiler holds: an enum-typed cell with
+// no options still defaults to that enum's members, a value the author writes is
+// still one the enum has, and nothing about that path moved.
+//
+// A list drawn from data cannot have that. `option "{c.name}" -> c.id` is one
+// choice per row of a table nobody has inserted into yet, so its identity does
+// not exist at compile time and no amount of checking will make it exist. What
+// the compiler still proves is everything *around* the identity:
+//
+//   - the collection is real and iterable, and its where/by/limit are checked
+//     exactly as a `for`'s are (lowerRange) — including that `by <field>` names a
+//     field the entity has;
+//   - a value written as `c.field` names a field the entity actually has. That is
+//     the typo check a literal option gets, kept: a misspelled field would
+//     otherwise store the empty string in every row, silently;
+//   - that field's declared type is the bound cell's type, so a `text` cell is
+//     never quietly filled with row ids;
+//   - the value expression is pure, reads no @private cell, and is not a sealed
+//     (@e2e) field, whose plaintext this side never holds;
+//   - the bound cell is `@client`, is not a list, and is text or int — never an
+//     enum, because an enum cell's choices ARE its members and a computed value
+//     cannot be proven to be one. Making that a compile error is what keeps enum
+//     exhaustiveness sound instead of merely usually true.
+//
+// What genuinely moves to runtime is one thing: whether the value a row supplies
+// is a member of anything. The cell holds what the chosen row stored, and a row
+// that disappears leaves a cell holding a value no option offers — the same
+// position an `input` bound to a text cell has always been in.
+func (c *viewCtx) lowerOptions(kw, bind string, opts []ast.Option, sc scope, line int) ([]Option, []Node, error) {
+	cell := c.e.stateTypes[bind]
+	members, isEnum := c.e.enums[cell]
+
+	if !dynamicOptions(opts) {
+		var flat []Option
+		for _, o := range opts {
+			label, err := c.lowerSegs(o.Label, sc, false)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := c.checkOptionLit(o, sc); err != nil {
+				return nil, nil, err
+			}
+			flat = append(flat, Option{Label: label, Value: o.Value})
+		}
+		if len(flat) == 0 {
+			// An enum cell already names its own choices, so writing them out again
+			// is the thing that drifts.
+			if !isEnum {
+				return nil, nil, &BuildError{line, fmt.Sprintf("%s on %q needs options (or a `@client` enum cell to default them)", kw, bind)}
+			}
+			for _, m := range members {
+				flat = append(flat, Option{Label: []Seg{{Lit: m}}, Value: m})
+			}
+		}
+		return flat, nil, nil
+	}
+
+	if isEnum {
+		return nil, nil, &BuildError{line, fmt.Sprintf(
+			"%s binds %q, whose type is the enum %q — its choices are that enum's members, and a value computed from data cannot be proven to be one of them "+
+				"(that proof is what makes a `match` on %q exhaustive). Bind a text or int cell to draw choices from a collection.",
+			kw, bind, cell, bind)}
+	}
+	if cell != "text" && cell != "int" {
+		return nil, nil, &BuildError{line, fmt.Sprintf(
+			"%s binds %q, which is %s; a choice drawn from data stores whatever its value expression evaluates to, so the cell must be text or int",
+			kw, bind, typeLabel(cell, c.e.stateList[bind]))}
+	}
+
+	var kids []Node
+	for _, o := range opts {
+		n := Node{Kind: "option"}
+		osc := sc
+		if o.From != nil {
+			n.Kind = "options"
+			if err := c.lowerRange(*o.From, &n, sc, o.Line); err != nil {
+				return nil, nil, err
+			}
+			osc = c.bindRange(sc, *o.From)
+		}
+		label, err := c.lowerSegs(o.Label, osc, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		n.Label = label
+		if o.Val == nil {
+			if err := c.checkOptionLit(o, osc); err != nil {
+				return nil, nil, err
+			}
+			n.Value = o.Value
+		} else {
+			if err := c.e.checkPure(o.Val, viewScope(osc.locals), o.Line, "an option value"); err != nil {
+				return nil, nil, err
+			}
+			if err := c.e.checkNoPrivate(o.Val); err != nil {
+				return nil, nil, err
+			}
+			if c.containsE2E(o.Val, osc) {
+				return nil, nil, &BuildError{o.Line,
+					"an @e2e (sealed) value cannot be an option's value — the authority holds only its ciphertext, so it is not an identity anything can be selected by"}
+			}
+			if err := c.checkOptionValue(kw, bind, cell, o, osc); err != nil {
+				return nil, nil, err
+			}
+			n.Val = c.e.low(o.Val)
+		}
+		kids = append(kids, n)
+	}
+	return nil, kids, nil
+}
+
+// checkOptionValue types a computed option value against the cell it is stored
+// in, as far as a language with no general expression typing can.
+//
+// Two shapes cover what an author writes, and they are exactly the two worth
+// checking: a row's field, and a literal. Anything else is left to the render's
+// own coercion — it was never a compile-time identity to begin with, and
+// pretending to check it would be worse than saying so.
+func (c *viewCtx) checkOptionValue(kw, bind, cell string, o ast.Option, sc scope) error {
+	switch t := o.Val.(type) {
+	case ast.Get:
+		r, ok := t.Obj.(ast.Ref)
+		if !ok {
+			return nil
+		}
+		ent, ok := c.rowEntity(sc, r.Name)
+		if !ok {
+			return nil // not a row of a known entity: nothing to resolve the field against
+		}
+		got, known := c.e.entFieldType[ent][t.Field]
+		if !known {
+			return &BuildError{o.Line, fmt.Sprintf(
+				"entity %q has no field %q, so `option ... -> %s.%s` has nothing to store", ent, t.Field, r.Name, t.Field)}
+		}
+		if got != cell {
+			return &BuildError{o.Line, fmt.Sprintf(
+				"%s binds %q, which is %s, but the option value `%s.%s` is %s", kw, bind, cell, r.Name, t.Field, got)}
+		}
+	case ast.Lit:
+		if t.Kind != cell {
+			return &BuildError{o.Line, fmt.Sprintf(
+				"%s binds %q, which is %s, but the option value is %s", kw, bind, cell, t.Kind)}
+		}
+	}
+	return nil
+}
+
 func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 	var out []Node
 	for _, n := range in {
 		switch t := n.(type) {
-		case ast.Styled:
-			// Lower the wrapped node, then stamp the author's class/style onto the
+		case ast.Modified:
+			// Lower the wrapped node, then stamp the author's modifiers onto the
 			// single IR node it produced so the rendered element carries both the
 			// built-in `fa-*` class and the escape-hatch attributes.
 			inner, err := c.nodes([]ast.Node{t.Inner}, sc)
 			if err != nil {
 				return nil, err
 			}
+			classSegs, err := c.lowerSegs(t.Class, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			// `class` interpolates and `style` does not, on purpose (see ast.Modified),
+			// so a `{…}` written in a `style` is a value that never arrives. It used to
+			// arrive as five characters of CSS the browser discarded; now it is an
+			// error that names the class-per-value it should have been.
+			if err := c.e.checkLiteral(t.Style, viewScope(sc.locals), t.Line, "`style`",
+				"`style` is a stylesheet fragment and stays literal, because there is no one-line rule for what a value may safely put in one (`class` has such a rule, which is why `class` interpolates) — "+
+					"carry the varying part in a class instead: `class \"…-{expr}\"` plus a `css:` rule per value"); err != nil {
+				return nil, err
+			}
+			// A purely literal class keeps the flat `Class` field — the same split
+			// `Path`/`PathSegs` makes, and for the same reason.
+			classLit, classIsLit := literalSegs(classSegs)
 			for i := range inner {
-				if t.Class != "" {
-					inner[i].Class = t.Class
+				switch {
+				case len(classSegs) == 0:
+				case classIsLit:
+					inner[i].Class = classLit
+				default:
+					inner[i].ClassSegs = classSegs
 				}
 				if t.Style != "" {
 					inner[i].Style = t.Style
+				}
+				if t.Anchor != "" {
+					inner[i].Anchor = t.Anchor
 				}
 			}
 			out = append(out, inner...)
@@ -1476,22 +2263,48 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			out = append(out, Node{Kind: "text", Segs: segs})
 
+		case ast.Heading:
+			// A heading's words are a text leaf's words — same lowering, same
+			// bindings, same @e2e allowance. Only the element it lands in differs,
+			// and that is what Level carries.
+			lvl, err := c.headingLevel(t, sc)
+			if err != nil {
+				return nil, err
+			}
+			segs, err := c.lowerSegs(t.Segs, sc, true)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "heading", Level: lvl, Segs: segs})
+
 		case ast.Image:
 			segs, err := c.lowerSegs(t.Segs, sc, false)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, Node{Kind: "image", Segs: segs})
+			alt, err := c.lowerSegs(t.Alt, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "image", Segs: segs, Alt: alt})
 
 		case ast.Icon:
-			out = append(out, Node{Kind: "icon", Name: t.Name})
+			segs, err := c.lowerSegs(t.Segs, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "icon", Segs: segs})
 
 		case ast.Video:
 			segs, err := c.lowerSegs(t.Segs, sc, false)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, Node{Kind: "video", Segs: segs})
+			alt, err := c.lowerSegs(t.Alt, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "video", Segs: segs, Alt: alt})
 
 		case ast.Richtext:
 			segs, err := c.lowerSegs(t.Segs, sc, false)
@@ -1517,16 +2330,24 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			node := Node{Kind: "tabs", Bind: t.Bind}
 			if !sc.inRegion {
-				node.ID = fmt.Sprintf("t%d", c.nf)
+				node.ID = c.id("t", c.nf)
 				c.nf++
 				c.addDep(t.Bind, node.ID)
 			}
 			for _, tb := range t.Tabs {
-				kids, err := c.nodes(tb.Body, scope{locals: sc.locals, inRegion: true})
+				if err := c.e.checkLiteral(tb.Value, viewScope(sc.locals), t.Line, "a tab value",
+					"a tab's value is the identity its bound cell takes when that tab is active, so it is a literal the compiler compares — name the constant the cell holds, and put the varying text in the tab's label, which does interpolate"); err != nil {
+					return nil, err
+				}
+				kids, err := c.nodes(tb.Body, sc.region())
 				if err != nil {
 					return nil, err
 				}
-				node.Children = append(node.Children, Node{Kind: "tab", Label: tb.Label, Value: tb.Value, Children: kids})
+				label, err := c.lowerSegs(tb.Label, sc.region(), false)
+				if err != nil {
+					return nil, err
+				}
+				node.Children = append(node.Children, Node{Kind: "tab", Label: label, Value: tb.Value, Children: kids})
 			}
 			// A tab body's reads (its feed list, counts) refresh the whole control too.
 			if node.ID != "" {
@@ -1537,7 +2358,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, node)
 
 		case ast.Match:
-			if err := c.e.checkPure(t.Expr, withActor(sc.locals), t.Line, "a `match`"); err != nil {
+			if err := c.e.checkPure(t.Expr, viewScope(sc.locals), t.Line, "a `match`"); err != nil {
 				return nil, err
 			}
 			enumName := c.matchEnum(t.Expr, sc)
@@ -1548,17 +2369,22 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 					return nil, &BuildError{t.Line, fmt.Sprintf("duplicate match case %q", cs.Value)}
 				}
 				seen[cs.Value] = true
+				if err := c.e.checkLiteral(cs.Value, viewScope(sc.locals), t.Line, "a `case` value",
+					"a case value is a compile-time constant compared against the matched value — it is what enum exhaustiveness is proved against, so it can never be computed at render time; "+
+						"put the computed value in the `match` head (`match "+concatForm(cs.Value)+":`) and write the constants in the cases, or branch with `if`"); err != nil {
+					return nil, err
+				}
 				if enumName != "" && !enumHas(c.e.enums[enumName], cs.Value) {
 					return nil, &BuildError{t.Line, fmt.Sprintf("enum %q has no member %q", enumName, cs.Value)}
 				}
-				kids, err := c.nodes(cs.Body, scope{locals: sc.locals, inRegion: true, itemTypes: sc.itemTypes})
+				kids, err := c.nodes(cs.Body, sc.region())
 				if err != nil {
 					return nil, err
 				}
 				node.Children = append(node.Children, Node{Kind: "case", Value: cs.Value, Children: kids})
 			}
 			if t.Else != nil {
-				kids, err := c.nodes(t.Else, scope{locals: sc.locals, inRegion: true, itemTypes: sc.itemTypes})
+				kids, err := c.nodes(t.Else, sc.region())
 				if err != nil {
 					return nil, err
 				}
@@ -1584,7 +2410,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				}
 			}
 			if !sc.inRegion {
-				node.ID = fmt.Sprintf("m%d", c.nf)
+				node.ID = c.id("m", c.nf)
 				c.nf++
 				for _, d := range sortedKeys(c.e.depsIR(node.Cond)) {
 					c.addDep(d, node.ID)
@@ -1602,7 +2428,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			node := Node{Kind: "button", Segs: segs, Action: t.Action}
 			for _, arg := range t.Args {
-				if err := c.e.checkPure(arg, withActor(sc.locals), 0, "a view"); err != nil {
+				if err := c.e.checkPure(arg, viewScope(sc.locals), t.Line, "a view"); err != nil {
 					return nil, err
 				}
 				node.Args = append(node.Args, c.e.low(arg))
@@ -1611,54 +2437,12 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, node)
 
 		case ast.For:
-			// A `for` ranges over an entity (rows) or a `[T]` list state cell (its
-			// elements). A scalar state cell is not iterable.
-			if !c.e.entities[t.Coll] {
-				if c.e.states[t.Coll] == "" {
-					return nil, &BuildError{0, fmt.Sprintf("`for` over unknown collection %q (an entity or a list state)", t.Coll)}
-				}
-				if !c.e.stateList[t.Coll] {
-					return nil, &BuildError{0, fmt.Sprintf("`for x in %s` needs a list — %q is a scalar state, not a `[T]` collection", t.Coll, t.Coll)}
-				}
-			}
-			node := Node{Kind: "list", Var: t.Var, Coll: t.Coll, Order: t.Order, Desc: t.Desc}
-			// `limit` may be a literal or a pure expr (e.g. a @client page size for
-			// load-more / infinite scroll); evaluated per render, not per row.
-			if t.Limit != nil {
-				if err := c.e.checkPure(t.Limit, withActor(sc.locals), 0, "a `limit`"); err != nil {
-					return nil, err
-				}
-				node.Limit = c.e.low(t.Limit)
-			}
-			// `where` filter: a pure predicate over the item var + outer scope.
-			if t.Where != nil {
-				wlocals := withActor(sc.locals)
-				wlocals[t.Var] = true
-				if err := c.e.checkPure(t.Where, wlocals, 0, "a `where` filter"); err != nil {
-					return nil, err
-				}
-				node.Where = c.e.low(t.Where)
-				// Any of the item's fields the filter touches becomes a candidate index
-				// — that is the column the store filters on when it pushes the query down.
-				if c.e.entities[t.Coll] {
-					for f := range itemFields(node.Where, t.Var) {
-						if c.e.entityFields[t.Coll][f] {
-							c.e.markIndex(t.Coll, f)
-						}
-					}
-				}
-			}
-			if t.Order != "" {
-				if !c.e.entities[t.Coll] {
-					return nil, &BuildError{0, fmt.Sprintf("ordering `by %s` requires %q to be an entity", t.Order, t.Coll)}
-				}
-				if !c.e.entityFields[t.Coll][t.Order] {
-					return nil, &BuildError{0, fmt.Sprintf("entity %q has no field %q to order by", t.Coll, t.Order)}
-				}
-				c.e.markIndex(t.Coll, t.Order)
+			node := Node{Kind: "list"}
+			if err := c.lowerRange(t.Range, &node, sc, 0); err != nil {
+				return nil, err
 			}
 			if !sc.inRegion {
-				node.ID = fmt.Sprintf("l%d", c.nl)
+				node.ID = c.id("l", c.nl)
 				c.nl++
 				c.addDep(t.Coll, node.ID)
 				// a state the filter reads must also refresh the list when it changes.
@@ -1674,10 +2458,9 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 					}
 				}
 			}
-			child := sc.with(t.Var)
-			if c.e.entities[t.Coll] {
-				child.itemTypes[t.Var] = t.Coll // so `match item.field` can resolve an enum field
-			}
+			// so `match item.field` can resolve an enum field, and so an argument
+			// read off the row can be typed against the parameter it is passed to
+			child := c.bindRange(sc, t.Range)
 			kids, err := c.nodes(t.Body, child)
 			if err != nil {
 				return nil, err
@@ -1694,18 +2477,18 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, node)
 
 		case ast.If:
-			if err := c.e.checkPure(t.Cond, withActor(sc.locals), 0, "a view"); err != nil {
+			if err := c.e.checkPure(t.Cond, viewScope(sc.locals), 0, "a view"); err != nil {
 				return nil, err
 			}
 			node := Node{Kind: "if", Cond: c.e.low(t.Cond)}
 			if !sc.inRegion {
-				node.ID = fmt.Sprintf("f%d", c.nf)
+				node.ID = c.id("f", c.nf)
 				c.nf++
 				for _, d := range sortedKeys(c.e.depsIR(node.Cond)) {
 					c.addDep(d, node.ID)
 				}
 			}
-			kids, err := c.nodes(t.Body, scope{locals: sc.locals, inRegion: true})
+			kids, err := c.nodes(t.Body, sc.region())
 			if err != nil {
 				return nil, err
 			}
@@ -1720,10 +2503,76 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if p != Client {
 				return nil, &BuildError{0, fmt.Sprintf("input binds %q, which is authoritative; two-way input requires a @client state", t.Bind)}
 			}
-			id := fmt.Sprintf("b%d", c.nb)
+			id := c.id("b", c.nb)
 			c.nb++
 			c.addDep(t.Bind, id)
-			out = append(out, Node{Kind: "input", Bind: t.Bind, Placeholder: t.Placeholder, ID: id})
+			ph, err := c.lowerSegs(t.Placeholder, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "input", Bind: t.Bind, Placeholder: ph, ID: id})
+
+		// Every control in ast.Controls lowers here, once. A control is a cell
+		// plus a way to write it, so what the compiler has to establish is the
+		// same four things for all of them — the cell exists, it is `@client`
+		// (only a control may write one, and only a client cell may be written
+		// without asking the authority), it is not a list, and it holds the type
+		// this control can actually produce. The differences between a textarea,
+		// a checkbox, a toggle and a radio group are rows in the table, not
+		// branches here.
+		case ast.Control:
+			spec := ast.Controls[t.Kind]
+			p, ok := c.e.states[t.Bind]
+			if !ok {
+				return nil, &BuildError{t.Line, fmt.Sprintf("%s binds unknown state %q", t.Kind, t.Bind)}
+			}
+			if p != Client {
+				return nil, &BuildError{t.Line, fmt.Sprintf("%s binds %q, which is authoritative; two-way input requires a @client state", t.Kind, t.Bind)}
+			}
+			got, isList := c.e.stateTypes[t.Bind], c.e.stateList[t.Bind]
+			_, isEnum := c.e.enums[got]
+			// A control writes one value, so it cannot be pointed at a list cell —
+			// checked before the type rule below, which would otherwise report
+			// `[text]` against `text` as if the element type were the problem.
+			if isList {
+				return nil, &BuildError{t.Line, fmt.Sprintf("%s binds %q, which is %s; a control writes one value, not a list", t.Kind, t.Bind, typeLabel(got, isList))}
+			}
+			switch {
+			case spec.Cell != "" && got != spec.Cell:
+				return nil, &BuildError{t.Line, fmt.Sprintf("%s binds %q, which is %s, but %s", t.Kind, t.Bind, typeLabel(got, isList), spec.Rule)}
+			case spec.Cell == "" && dynamicOptions(t.Options):
+				// A choice drawn from data stores what its rows store, not text the
+				// author wrote, so which cells it may be pointed at is lowerOptions'
+				// question — it is the half that knows what the values are.
+			case spec.Cell == "" && got != "text" && !isEnum:
+				// A control whose value set is its options stores whatever an option
+				// says it stores, and an option's value is written as text.
+				return nil, &BuildError{t.Line, fmt.Sprintf("%s binds %q, which is %s, but %s", t.Kind, t.Bind, typeLabel(got, isList), spec.Rule)}
+			}
+			node := Node{Kind: spec.IRKind, Bind: t.Bind, Value: spec.Variant}
+			label, err := c.lowerSegs(t.Label, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			hint, err := c.lowerSegs(t.Placeholder, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			node.Label, node.Placeholder = label, hint
+			if spec.Options {
+				// Same rule, same function, same errors a `select` gets: a radio group
+				// and a dropdown are one choice written two ways.
+				flat, kids, err := c.lowerOptions(t.Kind, t.Bind, t.Options, sc, t.Line)
+				if err != nil {
+					return nil, err
+				}
+				node.Options, node.Children = flat, kids
+			}
+			node.ID = c.id("b", c.nb)
+			c.nb++
+			c.addDep(t.Bind, node.ID)
+			c.optionDeps(node, node.Children, sc)
+			out = append(out, node)
 
 		case ast.Overlay:
 			p, ok := c.e.states[t.Bind]
@@ -1738,11 +2587,11 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			node := Node{Kind: "overlay", Bind: t.Bind}
 			if !sc.inRegion {
-				node.ID = fmt.Sprintf("f%d", c.nf)
+				node.ID = c.id("f", c.nf)
 				c.nf++
 				c.addDep(t.Bind, node.ID)
 			}
-			kids, err := c.nodes(t.Body, scope{locals: sc.locals, inRegion: true})
+			kids, err := c.nodes(t.Body, sc.region())
 			if err != nil {
 				return nil, err
 			}
@@ -1766,50 +2615,163 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if !c.e.entityFields[t.Entity][t.Field] {
 				return nil, &BuildError{0, fmt.Sprintf("entity %q has no field %q for typeahead", t.Entity, t.Field)}
 			}
-			id := fmt.Sprintf("b%d", c.nb)
+			id := c.id("b", c.nb)
 			c.nb++
 			c.addDep(t.Bind, id)
-			out = append(out, Node{Kind: "typeahead", Bind: t.Bind, Coll: t.Entity, Value: t.Field, Placeholder: t.Placeholder, ID: id})
+			ph, err := c.lowerSegs(t.Placeholder, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "typeahead", Bind: t.Bind, Coll: t.Entity, Value: t.Field, Placeholder: ph, ID: id})
 
 		case ast.Link:
-			if t.Path == "" || !strings.HasPrefix(t.Path, "/") {
-				return nil, &BuildError{0, fmt.Sprintf("link path %q must start with `/`", t.Path)}
+			labelSegs, err := c.lowerSegs(t.LabelSegs, sc, false)
+			if err != nil {
+				return nil, err
 			}
-			c.links = append(c.links, t.Path)
-			out = append(out, Node{Kind: "link", Label: t.Label, Path: t.Path})
+
+			pathSegs, err := c.lowerSegs(t.PathSegs, sc, false)
+			if err != nil {
+				return nil, err
+			}
+
+			// A destination is one of exactly four things, and which one is decided
+			// by what the author wrote — never by what a value turns out to be.
+			//
+			// A *path template* starts with a literal `/`: the author wrote the
+			// route's shape and interpolations fill segments of it. Its shape is
+			// known here, so it is checked here, exactly as before — a link to a
+			// route no view serves is still a compile error.
+			//
+			// A *route expression* is one interpolation and nothing else: the
+			// destination is computed, and no amount of static analysis can say what
+			// it will be. That is the form a `link`/breadcrumb/pagination component
+			// needs, and refusing it is what made the whole navigation category
+			// unwritable. The compiler checks what it still can (the expression is
+			// pure, non-private and renders as text — already done above) and stops;
+			// the obligation moves to the renderers, which resolve the value against
+			// this app's routes and render nothing navigable when it is not one.
+			// A parameterized destination can therefore still only ever reach a page
+			// this app serves, which is the guarantee the static check was giving.
+			//
+			// An *external URL* is an absolute destination the author wrote whole:
+			// `https://github.com/F33D3R-Inc/fct`. Its scheme comes from a closed
+			// allowlist, and its scheme and host must be literal source text, so the
+			// origin is always something a reader can find by reading the program.
+			// Interpolation after the host is a path template like any other and is
+			// escaped like one. This deliberately does NOT extend to a route
+			// expression: a destination that arrives as data still may only name a
+			// route of this app, because the day a runtime value can become an
+			// arbitrary anchor is the day a `javascript:` payload in a database row
+			// becomes a link. The literal/value split is the whole safety property.
+			//
+			// An *anchor* is `#install` or `/docs#install`: a position within a page,
+			// declared with `anchor "install"` on the node it scrolls to. The path
+			// half is route-checked exactly as above and the fragment is checked
+			// against the anchors the app declares.
+			//
+			// Anything in between — a leading interpolation with more path after it —
+			// is none of them, and is refused rather than guessed at.
+			node := Node{Kind: "link"}
+
+			shape := linkShape(pathSegs)
+			scheme, hasScheme := destScheme(shape)
+
+			switch {
+			case isRouteExpr(pathSegs):
+				node.Route = true
+
+			case hasScheme:
+				// An ABSOLUTE URL leaves this app. It is accepted only as text the
+				// author wrote — see checkExternalDest — and only for a scheme in the
+				// allowlist, so `javascript:` and `data:` are a build failure with
+				// their own name in the message rather than the generic path error.
+				if !externalSchemes[scheme] {
+					return nil, &BuildError{0, fmt.Sprintf(
+						"link path %q uses the %q scheme, which is not a destination: a link goes to a path of this app (\"/docs\"), an anchor on a page (\"#install\"), or an external https/http/mailto URL",
+						renderShape(pathSegs), scheme)}
+				}
+				if err := checkExternalDest(scheme, shape, pathSegs); err != nil {
+					return nil, err
+				}
+				node.External = true
+
+			case strings.HasPrefix(shape, "//"):
+				// `//host/path` is an absolute URL that inherits the current scheme —
+				// it leaves the app while looking exactly like a path, and the route
+				// check would read `host` as the first segment of a local route.
+				return nil, &BuildError{0, fmt.Sprintf(
+					"link path %q is protocol-relative, which leaves this app while looking like a path: write the scheme (\"https:%s\") or a single leading `/`",
+					shape, shape)}
+
+			case strings.HasPrefix(shape, "#"), strings.HasPrefix(shape, "/"):
+				// A path template, optionally ending at an anchor on the page it names.
+				// A bare `#install` is an anchor on the page the link is already on, so
+				// there is no path to route-check.
+				path, frag := splitFragment(shape)
+				if strings.Contains(shape, "#") && !validAnchorName(frag) {
+					return nil, &BuildError{0, fmt.Sprintf(
+						"link path %q names %q, which is not an anchor name: an anchor is literal text of letters, digits, `-` and `_`, written as `anchor \"install\"` on the node it scrolls to and spelled `#install` here",
+						renderShape(pathSegs), strings.ReplaceAll(frag, dynamicSegment, "{…}"))}
+				}
+				if path != "" {
+					c.links = append(c.links, linkRef{path: path, origin: c.origin})
+				}
+
+			case strings.HasPrefix(shape, dynamicSegment):
+				return nil, &BuildError{0, fmt.Sprintf(
+					"link path %q starts with an interpolation but is not one: a destination either starts with a literal `/` (a path the compiler can check, e.g. \"/post/{p.id}\") or is a single interpolation supplying the whole route (e.g. \"{href}\")",
+					renderShape(pathSegs))}
+
+			default:
+				return nil, &BuildError{0, fmt.Sprintf(
+					"link path %q must start with `/`", shape)}
+			}
+
+			// A label is only ever displayed, so it is segments like every other
+			// node's label — there is no literal form for a consumer to resolve.
+			node.Label = labelSegs
+
+			// A link whose *destination* is a pure literal keeps the flat `Path`
+			// field. That is not just economy on the wire: it is the whole contract
+			// for every consumer that predates interpolation, and a static link
+			// must keep resolving for them.
+			if lit, ok := literalSegs(pathSegs); ok {
+				node.Path = lit
+			} else {
+				node.PathSegs = pathSegs
+			}
+
+			out = append(out, node)
 
 		case ast.Select:
 			p, ok := c.e.states[t.Bind]
 			if !ok {
-				return nil, &BuildError{0, fmt.Sprintf("select binds unknown state %q", t.Bind)}
+				return nil, &BuildError{t.Line, fmt.Sprintf("select binds unknown state %q", t.Bind)}
 			}
 			if p != Client {
-				return nil, &BuildError{0, fmt.Sprintf("select binds %q, which is authoritative; two-way input requires a @client state", t.Bind)}
+				return nil, &BuildError{t.Line, fmt.Sprintf("select binds %q, which is authoritative; two-way input requires a @client state", t.Bind)}
 			}
 			node := Node{Kind: "select", Bind: t.Bind}
-			for _, o := range t.Options {
-				node.Options = append(node.Options, Option{Label: o.Label, Value: o.Value})
+			flat, kids, err := c.lowerOptions("select", t.Bind, t.Options, sc, t.Line)
+			if err != nil {
+				return nil, err
 			}
-			// An enum-typed select with no explicit options defaults to the enum members.
-			if len(node.Options) == 0 {
-				if members, isEnum := c.e.enums[c.e.stateTypes[t.Bind]]; isEnum {
-					for _, m := range members {
-						node.Options = append(node.Options, Option{Label: m, Value: m})
-					}
-				} else {
-					return nil, &BuildError{0, fmt.Sprintf("select on %q needs options (or a `@client` enum cell to default them)", t.Bind)}
-				}
-			}
-			id := fmt.Sprintf("b%d", c.nb)
+			node.Options, node.Children = flat, kids
+			node.ID = c.id("b", c.nb)
 			c.nb++
-			node.ID = id
-			c.addDep(t.Bind, id)
+			c.addDep(t.Bind, node.ID)
+			c.optionDeps(node, kids, sc)
 			out = append(out, node)
 
 		case ast.Form:
-			node := Node{Kind: "form", Action: t.Action, Label: t.Submit}
+			submit, err := c.lowerSegs(t.Submit, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			node := Node{Kind: "form", Action: t.Action, Label: submit}
 			for _, arg := range t.Args {
-				if err := c.e.checkPure(arg, withActor(sc.locals), 0, "a view"); err != nil {
+				if err := c.e.checkPure(arg, viewScope(sc.locals), t.Line, "a view"); err != nil {
 					return nil, err
 				}
 				node.Args = append(node.Args, c.e.low(arg))
@@ -1830,23 +2792,101 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if p != Client {
 				return nil, &BuildError{0, fmt.Sprintf("upload binds %q, which is authoritative; it must store the URL in a @client state", t.Bind)}
 			}
-			id := fmt.Sprintf("b%d", c.nb)
+			id := c.id("b", c.nb)
 			c.nb++
 			c.addDep(t.Bind, id)
-			out = append(out, Node{Kind: "upload", Bind: t.Bind, Label: t.Label, ID: id})
+			label, err := c.lowerSegs(t.Label, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Node{Kind: "upload", Bind: t.Bind, Label: label, ID: id})
 
 		case ast.Use:
 			params, ok := c.e.components[t.Name]
 			if !ok {
-				return nil, &BuildError{0, fmt.Sprintf("use of unknown component %q", t.Name)}
+				return nil, &BuildError{t.Line, fmt.Sprintf("use of unknown component %q", t.Name)}
 			}
 			if len(t.Args) != len(params) {
-				return nil, &BuildError{0, fmt.Sprintf("component %q takes %d argument(s), got %d", t.Name, len(params), len(t.Args))}
+				return nil, &BuildError{t.Line, fmt.Sprintf("component %q takes %d argument(s), got %d", t.Name, len(params), len(t.Args))}
 			}
-			node := Node{Kind: "use", Name: t.Name}
+			// Children. A block under a `use` used to be parsed and then dropped, so
+			// a wrapper that quietly rendered nothing looked like a working one; it is
+			// a compile error now unless the component has a `slot` to put it in.
+			if len(t.Body) > 0 && !c.e.compSlot[t.Name] {
+				return nil, &BuildError{t.Line, fmt.Sprintf("component %q takes no children — it has no `slot`. Add a `slot` to %s where the block should render, or remove the block", t.Name, t.Name)}
+			}
+			// Reference arguments name a declaration; value arguments are evaluated.
+			// The two are separated here, because only the values survive into the IR
+			// — a reference is substituted into the expansion's body.
+			subst := map[string]string{}
+			var valArgs []ast.Expr
+			for i, p := range params {
+				if p.Ref == ast.RefValue {
+					// A value argument is an expression, so what is checked is its
+					// type — the counterpart of the two checks below, which ask what
+					// declaration a reference argument names.
+					if err := c.e.checkArgType(t, i, p, sc); err != nil {
+						return nil, err
+					}
+					valArgs = append(valArgs, t.Args[i])
+					continue
+				}
+				name, isName := bareRef(t.Args[i])
+				if !isName {
+					return nil, &BuildError{t.Line, fmt.Sprintf("component %q parameter %q is a reference — pass the name of a %s, not an expression", t.Name, p.Name, refNoun(p.Ref))}
+				}
+				switch p.Ref {
+				case ast.RefCell:
+					if _, declared := c.e.states[name]; !declared {
+						return nil, &BuildError{t.Line, fmt.Sprintf("component %q parameter %q needs a state cell; %q is not one", t.Name, p.Name, name)}
+					}
+					if got := c.e.stateTypes[name]; got != p.Type || c.e.stateList[name] != p.List {
+						return nil, &BuildError{t.Line, fmt.Sprintf("component %q parameter %q is `cell %s`, but %q is %s", t.Name, p.Name, typeLabel(p.Type, p.List), name, typeLabel(got, c.e.stateList[name]))}
+					}
+				case ast.RefAction:
+					if !c.e.actionSet[name] {
+						return nil, &BuildError{t.Line, fmt.Sprintf("component %q parameter %q needs an action; %q is not one", t.Name, p.Name, name)}
+					}
+				}
+				subst[p.Name] = name
+			}
+			useName := t.Name
+			if c.e.isTemplate(t.Name) {
+				// The caller's children are lowered in the caller's scope — they are the
+				// caller's nodes, and the row variable they read is the caller's — and
+				// spliced at the slot as IR. inRegion: they render inside this `use`.
+				var kids []Node
+				if len(t.Body) > 0 {
+					k, err := c.nodes(t.Body, sc.region())
+					if err != nil {
+						return nil, err
+					}
+					kids = k
+				}
+				name, err := c.e.specialize(c.e.compAST[t.Name], subst, kids, t.Line)
+				if err != nil {
+					return nil, err
+				}
+				useName = name
+			}
+			// A component's own regions and two-way inputs are addressed on the page
+			// that renders it, so the edges that reach them belong in this page's
+			// graph — the component was lowered elsewhere, but it refreshes here.
+			for dep, ids := range c.e.compRegions[useName] {
+				for _, id := range ids {
+					c.addDep(dep, id)
+				}
+			}
+			node := Node{Kind: "use", Name: useName}
 			deps := map[string]bool{}
-			for _, arg := range t.Args {
-				if err := c.e.checkPure(arg, withActor(sc.locals), 0, "a view"); err != nil {
+			// A component argument is an expression, not a template — so it is the
+			// position this bug class was found in, and the one that can say the most
+			// about the fix: it knows the component, the parameter, and the line.
+			if err := c.e.checkUseArgs(t, params, viewScope(sc.locals)); err != nil {
+				return nil, err
+			}
+			for _, arg := range valArgs {
+				if err := c.e.checkPure(arg, viewScope(sc.locals), t.Line, "a view"); err != nil {
 					return nil, err
 				}
 				le := c.e.low(arg)
@@ -1855,14 +2895,14 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 					deps[d] = true
 				}
 			}
-			for d := range c.e.compDeps[t.Name] {
+			for d := range c.e.compDeps[useName] {
 				deps[d] = true
 			}
 			// A top-level `use` is a tracked region: it re-renders whole when any state
 			// its arguments or body reads changes. Inside another region it renders
 			// inline and refreshes with its parent.
 			if !sc.inRegion {
-				node.ID = fmt.Sprintf("u%d", c.nu)
+				node.ID = c.id("u", c.nu)
 				c.nu++
 				for _, d := range sortedKeys(deps) {
 					c.addDep(d, node.ID)
@@ -1871,7 +2911,10 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, node)
 
 		case ast.Slot:
-			return nil, &BuildError{0, "`slot` may only appear inside a layout"}
+			if !c.slotOK {
+				return nil, &BuildError{0, "`slot` may only appear inside a layout or a component"}
+			}
+			out = append(out, c.slot...)
 		case ast.SlotRef:
 			return nil, &BuildError{0, fmt.Sprintf("`slot %s` may only appear inside a wireframe frame", t.Name)}
 		}
@@ -1881,32 +2924,47 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 
 // ── reference checking + free names ──────────────────────────────────────────
 
+// resolves reports whether name is one the surrounding scope defines: a local, a
+// builtin, a state cell, an entity, an enum, or an inlinable policy/derive.
+//
+// It is stated once because two questions rest on it and they must never give
+// different answers: "is this reference valid?" (check, below) and "would these
+// braces have rendered a value?" (litInterp, in braces.go). A name that resolves
+// is a name an interpolation would have printed.
+func (e *env) resolves(name string, locals map[string]bool) bool {
+	if locals[name] || isBuiltinRef(name) {
+		return true
+	}
+	if _, ok := e.states[name]; ok {
+		return true
+	}
+	if e.entities[name] {
+		return true
+	}
+	if _, ok := e.enums[name]; ok { // an enum name, as the object of a `.member` access (folded by lower())
+		return true
+	}
+	if _, ok := e.inline[name]; ok { // a policy/derive name used as a value; inlined by lower()
+		return true
+	}
+	return false
+}
+
 // check validates that every free name in ex is a known state, entity, local,
-// or the builtin `actor`, and that every aggregate and builtin call is
-// well-formed.
+// or the builtin `actor`, that every aggregate and builtin call is well-formed,
+// and that no text literal inside it is a dropped interpolation (see braces.go —
+// this is the funnel every expression in the language passes through with its
+// scope, so one call covers every expression position at once).
 func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 	if err := e.checkBuiltins(ex, line); err != nil {
 		return err
 	}
 	for n := range freeNames(ex) {
-		if locals[n] || isBuiltinRef(n) {
-			continue
+		if !e.resolves(n, locals) {
+			return &BuildError{line, fmt.Sprintf("unknown reference %q", n)}
 		}
-		if _, ok := e.states[n]; ok {
-			continue
-		}
-		if e.entities[n] {
-			continue
-		}
-		if _, ok := e.enums[n]; ok { // an enum name, as the object of a `.member` access (folded by lower())
-			continue
-		}
-		if _, ok := e.inline[n]; ok { // a policy/derive name used as a value; inlined by lower()
-			continue
-		}
-		return &BuildError{line, fmt.Sprintf("unknown reference %q", n)}
 	}
-	return nil
+	return e.checkLiteralExpr(ex, locals, line)
 }
 
 // checkPure is check plus the guarantee that ex is side-effect-free: it rejects
@@ -2187,13 +3245,19 @@ func (e *env) nodeDeps(nodes []Node) map[string]bool {
 	}
 	var walk func(n Node)
 	walk = func(n Node) {
-		for _, s := range n.Segs {
-			if s.Expr != nil {
-				add(s.Expr)
+		for _, segs := range n.SegLists() {
+			for _, sg := range segs {
+				if sg.Expr != nil {
+					add(sg.Expr)
+				}
 			}
 		}
 		add(n.Cond)
 		add(n.Where)
+		// A dynamic limit (a load-more page size) and a computed option value are
+		// reads like any other: what they read must refresh what renders them.
+		add(n.Limit)
+		add(n.Val)
 		for _, a := range n.Args {
 			add(a)
 		}
@@ -2208,6 +3272,29 @@ func (e *env) nodeDeps(nodes []Node) map[string]bool {
 		walk(n)
 	}
 	return out
+}
+
+// optionDeps registers the refresh edges a control whose choices come from data
+// needs.
+//
+// This is the half of the feature that is silently broken when it is left out: a
+// dropdown paints correctly and then never changes again, which looks exactly
+// like a dropdown that works. A `for` region earns edges from the collection it
+// walks and from everything its filter, its limit and its body read; a choice
+// list walks a collection for the same reason and reads the same things, so it
+// earns exactly the same edges — pointed at the control's own id, because the
+// control IS the region its options live in.
+//
+// Only at the top level, and for the reason a `for` mints a region id only there:
+// inside another region there is no single element to re-fill, and that region's
+// own refresh already rebuilds this control along with the rest of its row.
+func (c *viewCtx) optionDeps(node Node, kids []Node, sc scope) {
+	if len(kids) == 0 || sc.inRegion {
+		return
+	}
+	for _, d := range sortedKeys(c.e.nodeDeps(kids)) {
+		c.addDep(d, node.ID)
+	}
 }
 
 // freeNames returns every root name an expression references.
@@ -2345,6 +3432,21 @@ func isBuiltinRef(n string) bool {
 		return true
 	}
 	return false
+}
+
+// viewScope is withActor plus the names a *render* binds, as opposed to the ones
+// the session binds. There is exactly one so far — `route`, the path being
+// rendered — and it lives here rather than in isBuiltinRef for a reason worth
+// stating: `actor` and `role` are answerable anywhere, including inside an action
+// the authority runs with no page in sight, but `route` has an answer only while
+// a page is being rendered. Reading it from a policy, a derive or an action body
+// would be asking a question that has no answer yet, and would silently produce
+// an empty string rather than say so — so those contexts keep withActor and this
+// one name is refused there by name resolution, like any other unknown.
+func viewScope(locals map[string]bool) map[string]bool {
+	m := withActor(locals)
+	m["route"] = true
+	return m
 }
 
 func withActor(locals map[string]bool) map[string]bool {

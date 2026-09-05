@@ -29,8 +29,9 @@ func uploadDirFromEnv() string {
 
 // handleUpload accepts one multipart file field named "file", stores it under a
 // random, collision-free name (keeping the original extension), and returns its
-// public URL as JSON: {"url":"/uploads/<name>"}. It is rate-limited and CSRF-
-// guarded like every other browser mutation.
+// durable reference as JSON: {"url":"/uploads/<name>"} — plus, when media signing
+// is on, {"media":{...}} carrying the signature to preview it by. It is
+// rate-limited and CSRF-guarded like every other browser mutation.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -67,9 +68,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "write failed", http.StatusInternalServerError)
 		return
 	}
-	// mediaURL is a bare public path by default, or a signed, expiring link when
-	// FACET_MEDIA_TTL is set — the client stores whichever it gets.
-	writeJSON(w, map[string]any{"url": mediaURL(name)})
+	// The client stores the durable reference and previews through the grant
+	// beside it; a signature is never what lands in a row (see writeUploaded).
+	writeUploaded(w, name)
 }
 
 // handleUploads serves a stored upload by name, read-only. It refuses any name

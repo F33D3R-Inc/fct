@@ -119,6 +119,14 @@ func (s *Server) authSignup(w http.ResponseWriter, sid, username, password strin
 	}
 	s.entities[reservedUserEntity] = append(s.entities[reservedUserEntity], row)
 	s.persist(s.store.Save(reservedUserEntity, row))
+	s.mu.Unlock()
+
+	// A new identifier for the new privilege — see rotateSession. The account
+	// exists either way; what must not survive is the identifier a visitor
+	// arrived with.
+	sid = s.rotateSession(w, sid)
+
+	s.mu.Lock()
 	s.signIn(sid, row)
 	s.mu.Unlock()
 
@@ -158,6 +166,8 @@ func (s *Server) authLogin(w http.ResponseWriter, sid, username, password string
 		writeJSON(w, map[string]any{"mfa": true})
 		return
 	}
+	sid = s.rotateSession(w, sid)
+
 	s.mu.Lock()
 	s.signIn(sid, u)
 	s.mu.Unlock()
@@ -184,6 +194,12 @@ func (s *Server) authLoginMFA(w http.ResponseWriter, sid, username, code string)
 		return
 	}
 	s.lockout.reset(username)
+
+	// The second factor is where the session actually gains its identity: the
+	// password step only recorded `pendingMFA`, so this is the privilege change
+	// and this is what rotates.
+	sid = s.rotateSession(w, sid)
+
 	s.mu.Lock()
 	s.signIn(sid, u)
 	s.mu.Unlock()
@@ -200,6 +216,14 @@ func (s *Server) authLogout(w http.ResponseWriter, sid string) {
 		ses.actor, ses.role, ses.verified, ses.pendingMFA = roleGuest, roleGuest, false, ""
 	}
 	s.mu.Unlock()
+
+	// Logging out is a privilege change like any other, so the identifier goes
+	// too. Clearing the identity and keeping the identifier would mean an
+	// identifier captured while the user was signed in is still a session this
+	// server accepts — the user did the one thing available to them to end it,
+	// and it would not have ended.
+	sid = s.rotateSession(w, sid)
+
 	s.persistSession(sid)
 	s.recordAudit(actor, "logout", true, "")
 	reloadResponse(w)

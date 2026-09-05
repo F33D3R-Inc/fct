@@ -116,6 +116,8 @@ func (s *Server) AddRow(entity string, fields map[string]any) (int, error) {
 	for k, v := range fields {
 		row[k] = v
 	}
+	undo := newUndoLog(nil)
+	undo.entity(s, entity) // before the id counter moves, so a refused write returns it too
 	id := toInt(row["id"])
 	if id <= 0 {
 		s.nextID[entity]++
@@ -125,7 +127,10 @@ func (s *Server) AddRow(entity string, fields map[string]any) (int, error) {
 	}
 	row["id"] = id
 	s.entities[entity] = append(s.entities[entity], row)
-	s.commit([]durOp{{kind: "save", entity: entity, row: row}})
+	if err := s.commit([]durOp{{kind: "save", entity: entity, row: row}}); err != nil {
+		undo.rollback(s, nil, nil)
+		return 0, err
+	}
 	return id, nil
 }
 
