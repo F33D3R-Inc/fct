@@ -1312,6 +1312,75 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 			ops = append(ops, durOp{kind: "save", entity: st.Entity, row: row})
 			entChanged[st.Entity] = true
 		case "set":
+			if st.Where != nil {
+				// Filtered update: apply the block of assignments to every row the
+				// predicate accepts, with the item variable bound to each row (the same
+				// traversal `remove … where` makes, writing instead of deleting).
+				//
+				// It is N row updates, and it says so: there is no engine primitive for
+				// a predicated update behind `Tx.Save`, so the honest lowering is one
+				// save per matching row. What makes it a single change rather than a
+				// loop that pretends to be one is `ops` — every save lands in the one
+				// transaction `commit` replays at the end of the action, so either all
+				// the rows move or none of them do, and a constraint violation on row
+				// nine returns the action's error with rows one through eight unwritten.
+				prev, had := scope[st.Var]
+				matched := false
+				for _, r := range s.entities[st.Entity] {
+					m, ok := r.(record)
+					if !ok {
+						continue
+					}
+					scope[st.Var] = m
+					if !truthy(eval(st.Where, scope)) {
+						continue
+					}
+					// Every assignment is evaluated against the row as it was *before* this
+					// statement, so the block reads one consistent row: `stock = p.stock - 1`
+					// and `low = p.stock - 1 < 5` see the same `p.stock`.
+					cand := record{}
+					for k, v := range m {
+						cand[k] = v
+					}
+					for _, fi := range st.Fields {
+						cand[fi.Name] = eval(fi.Expr, scope)
+					}
+					// Every field this statement writes is validated, not just the last
+					// one: constraintError narrows to the column it is handed, so a block
+					// that moves three columns asks three questions.
+					bad := ""
+					for _, fi := range st.Fields {
+						if bad = s.constraintError(st.Entity, cand, fi.Name, m["id"]); bad != "" {
+							break
+						}
+					}
+					if bad != "" {
+						if had {
+							scope[st.Var] = prev
+						} else {
+							delete(scope, st.Var)
+						}
+						s.recordAudit(actor, act.Name, false, "constraint: "+bad)
+						s.obs.metrics.observeAction(act.Name, "invalid")
+						return nil, http.StatusUnprocessableEntity, bad
+					}
+					for _, fi := range st.Fields {
+						undo.field(m, fi.Name)
+						m[fi.Name] = cand[fi.Name]
+					}
+					ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
+					matched = true
+				}
+				if had {
+					scope[st.Var] = prev
+				} else {
+					delete(scope, st.Var)
+				}
+				if matched {
+					entChanged[st.Entity] = true
+				}
+				break
+			}
 			key := eval(st.Key, scope)
 			for _, r := range s.entities[st.Entity] {
 				if m, ok := r.(record); ok && equal(m["id"], key) {

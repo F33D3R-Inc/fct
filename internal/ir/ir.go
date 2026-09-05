@@ -575,4 +575,27 @@ type Expr struct {
 	X     *Expr   `json:"x,omitempty"`
 	Var   string  `json:"var,omitempty"`   // agg: item variable for the filtered form
 	Where *Expr   `json:"where,omitempty"` // agg: filter predicate (nil = whole collection)
+	Sel   *Expr   `json:"sel,omitempty"`   // agg: the value reduced over each row (nil = the bare Field)
+}
+
+// Kids is every sub-expression hanging off this one, in the order both renderers
+// walk them.
+//
+// It exists for the reason Node.SegLists does, and the same thing went wrong
+// first: the walk `e.L, e.R, e.X, e.Obj, e.Key, e.Where` was written out by hand
+// in six places (four in runtime/region.go alone) plus assets/facet.js, so a new
+// child field reached whichever of them somebody remembered. That order is also
+// load-bearing — the server and the client address a page's aggregates by their
+// position in this very walk, so a field one side descends into and the other
+// skips renumbers every aggregate after it and each one starts resolving to
+// another's value. One method, so a child added here is a child everywhere.
+//
+// Entries may be nil; every walker over it is nil-tolerant, which keeps callers
+// from having to filter what they are about to nil-check anyway.
+func (e *Expr) Kids() []*Expr {
+	if e == nil {
+		return nil
+	}
+	kids := []*Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where, e.Sel}
+	return append(kids, e.Args...)
 }

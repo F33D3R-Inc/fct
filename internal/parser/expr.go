@@ -269,57 +269,102 @@ func numericAgg(op string) bool {
 	return op == "sum" || op == "avg" || op == "min" || op == "max"
 }
 
+// precArith is the precedence floor an aggregate's reduced value is parsed at:
+// high enough that `+ - * / %` and everything tighter bind into it, low enough
+// that `in` — which is the token separating the value from the collection it
+// ranges over — is left for parseAgg to see. Without the floor,
+// `sum(l.qty * l.unitPrice in CartLine …)` would parse as one `in` expression and
+// the aggregate would have no collection.
+const precArith = 4
+
 // parseAgg parses the argument list of an aggregate builtin; p.peek() is at the
 // opening `(`. Whole-collection forms: `count(Coll)`, `sum(Coll.field)`,
 // `avg(Coll.field)`, `min(Coll.field)`, `max(Coll.field)`. Filtered forms (an item
 // variable + predicate): `count(x in Coll where <cond>)`,
-// `exists(x in Coll where <cond>)`, and `sum(x.field in Coll where <cond>)` (the
-// field-bearing aggregates carry the summed field on the item variable).
+// `exists(x in Coll where <cond>)`, `sum(x.field in Coll where <cond>)`, and —
+// the general case the other three are special shapes of —
+// `sum(<expr over x> in Coll where <cond>)`, e.g.
+// `sum(l.qty * l.unitPrice in CartLine where l.owner == actor)`.
+//
+// The reduced value is parsed as an expression rather than scanned as a name and
+// an optional `.field`, so the three forms are one grammar and the shapes are
+// told apart afterwards by what the expression turned out to be. A bare
+// `x.field` keeps its old lowering (Field, no Sel), which is what makes the
+// generalization free for every program written before it.
 func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 	p.pos++ // consume (
-	t, ok := p.peek()
-	if !ok || t.kind != tIdent {
+	if t, ok := p.peek(); !ok || t.kind == tRParen {
 		return nil, &Error{p.line, fmt.Sprintf("%s needs a collection: %s(Entity%s)", op, op, aggArgHint(op))}
 	}
-	name := t.text
-	p.pos++
-
-	// An optional leading `.field` binds the aggregated field — either on the
-	// collection (`sum(Order.amount)`) or on the item variable (`sum(o.amount in …)`).
-	leadField := ""
-	if d, ok := p.peek(); ok && d.kind == tOp && d.text == "." {
-		p.pos++
-		f, err := p.fieldName()
-		if err != nil {
-			return nil, err
-		}
-		leadField = f
+	head, err := p.parseBinary(precArith)
+	if err != nil {
+		return nil, err
 	}
 
-	// Filtered form: `<var> in <Coll> [where <cond>]`. Detected by a following `in`.
-	itemVar, coll, field := "", name, ""
+	itemVar, coll, field := "", "", ""
+	var sel ast.Expr
+
+	// Filtered form: `<value> in <Coll> [where <cond>]`, detected by a following `in`.
 	if n, ok := p.peek(); ok && n.kind == tIdent && n.text == "in" {
 		p.pos++ // consume `in`
 		c, ok := p.peek()
 		if !ok || c.kind != tIdent {
-			return nil, &Error{p.line, fmt.Sprintf("%s(%s in ...) needs a collection after `in`", op, name)}
+			return nil, &Error{p.line, fmt.Sprintf("%s(%s in ...) needs a collection after `in`", op, exprSrc(head))}
 		}
-		// Filtered: the leading `.field` (if any) is the summed field on the item var.
-		itemVar, coll, field = name, c.text, leadField
+		coll = c.text
 		p.pos++
+		switch h := head.(type) {
+		case ast.Ref:
+			// `count(x in Coll …)` / `exists(x in Coll …)`: the value is the row itself.
+			itemVar = h.Name
+		case ast.Get:
+			if r, isRef := h.Obj.(ast.Ref); isRef {
+				itemVar, field = r.Name, h.Field // `sum(x.field in Coll …)`
+			}
+		}
+		if itemVar == "" {
+			// An expression over the row. The item variable is the root of the
+			// leftmost `x.field` in it — the same place the `x.field` form has always
+			// taken it from, read out of a bigger expression. Every other name in the
+			// value has to resolve in the enclosing scope, and the builder says so by
+			// name if it does not, so a wrong guess is a compile error rather than a
+			// wrong answer.
+			itemVar = aggRowVar(head)
+			if itemVar == "" {
+				return nil, &Error{p.line, fmt.Sprintf(
+					"%s(... in %s ...) reduces a value read off each row, so the value must read one: %s(x.field * x.other in %s where …)", op, coll, op, coll)}
+			}
+			sel = head
+		}
 	} else {
-		// Whole-collection: a leading `.field` is the collection's summed field.
-		field = leadField
+		// Whole-collection form: `count(Coll)` / `sum(Coll.field)`.
+		switch h := head.(type) {
+		case ast.Ref:
+			coll = h.Name
+		case ast.Get:
+			if r, isRef := h.Obj.(ast.Ref); isRef {
+				coll, field = r.Name, h.Field
+			}
+		}
+		if coll == "" {
+			return nil, &Error{p.line, fmt.Sprintf(
+				"%s over an expression needs an item variable to read the row: %s(x.a * x.b in Entity where …)", op, op)}
+		}
 	}
 
-	if numericAgg(op) && field == "" {
+	if numericAgg(op) && field == "" && sel == nil {
 		if itemVar != "" {
-			return nil, &Error{p.line, fmt.Sprintf("%s needs a field: %s(%s.field in %s where …)", op, op, name, coll)}
+			return nil, &Error{p.line, fmt.Sprintf("%s needs a field: %s(%s.field in %s where …)", op, op, itemVar, coll)}
 		}
 		return nil, &Error{p.line, fmt.Sprintf("%s needs a field: %s(%s.field)", op, op, coll)}
 	}
-	if !numericAgg(op) && field != "" {
-		return nil, &Error{p.line, fmt.Sprintf("%s ranges over rows, not a field — drop the `.%s`", op, field)}
+	if !numericAgg(op) {
+		if field != "" {
+			return nil, &Error{p.line, fmt.Sprintf("%s ranges over rows, not a field — drop the `.%s`", op, field)}
+		}
+		if sel != nil {
+			return nil, &Error{p.line, fmt.Sprintf("%s ranges over rows, not a value — it counts the rows the filter accepts, so it takes `%s(x in %s where …)`", op, op, coll)}
+		}
 	}
 
 	var where ast.Expr
@@ -337,7 +382,57 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 		return nil, &Error{p.line, fmt.Sprintf("missing `)` in %s(...)", op)}
 	}
 	p.pos++
-	return ast.Agg{Op: op, Coll: coll, Field: field, Var: itemVar, Where: where}, nil
+	return ast.Agg{Op: op, Coll: coll, Field: field, Var: itemVar, Where: where, Sel: sel}, nil
+}
+
+// aggRowVar reports the name an aggregate's reduced value reads its row through:
+// the object of the leftmost member access in it, in source order. It is a
+// pre-order walk because "leftmost" has to mean the same thing to a reader as it
+// does here — `l.qty * l.unitPrice` reads its row through `l`, and so does
+// `abs(l.delta)` and `Product(l.product).price`.
+func aggRowVar(ex ast.Expr) string {
+	switch t := ex.(type) {
+	case ast.Get:
+		if r, ok := t.Obj.(ast.Ref); ok {
+			return r.Name
+		}
+		return aggRowVar(t.Obj)
+	case ast.EntityGet:
+		return aggRowVar(t.Key)
+	case ast.Bin:
+		if v := aggRowVar(t.L); v != "" {
+			return v
+		}
+		return aggRowVar(t.R)
+	case ast.Un:
+		return aggRowVar(t.X)
+	case ast.Call:
+		for _, a := range t.Args {
+			if v := aggRowVar(a); v != "" {
+				return v
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if v := aggRowVar(el); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// exprSrc names an expression well enough for a diagnostic to point at it. Only
+// the shapes that can head an aggregate need a name; anything else is described
+// rather than spelled.
+func exprSrc(ex ast.Expr) string {
+	switch t := ex.(type) {
+	case ast.Ref:
+		return t.Name
+	case ast.Get:
+		return exprSrc(t.Obj) + "." + t.Field
+	}
+	return "that value"
 }
 
 // parseActState parses `pending(action)` / `failed(action)` — a bare action name

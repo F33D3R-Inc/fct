@@ -1474,9 +1474,26 @@
         store[st.entity] = (store[st.entity] || []).concat([row]);
         scope[st.entity] = store[st.entity]; changed.push(st.entity);
       } else if (st.op === "set") {
-        const key = ev(st.key, scope);
-        store[st.entity] = (store[st.entity] || []).map((r) =>
-          eq(r.id, key) ? Object.assign({}, r, { [st.field]: ev(st.value, scope) }) : r);
+        if (st.where) {
+          // Filtered update: apply the block to every row the predicate accepts,
+          // item var bound — runtime/server.go's "set" with st.Where, same order.
+          const had = Object.prototype.hasOwnProperty.call(scope, st.var);
+          const prev = scope[st.var];
+          store[st.entity] = (store[st.entity] || []).map((r) => {
+            scope[st.var] = r;
+            if (!truthy(ev(st.where, scope))) return r;
+            const next = Object.assign({}, r);
+            // Every assignment reads the row as it was before this statement, so
+            // the block sees one consistent row (the authority does the same).
+            for (const fi of list(st.fields)) next[fi.name] = ev(fi.expr, scope);
+            return next;
+          });
+          if (had) scope[st.var] = prev; else delete scope[st.var];
+        } else {
+          const key = ev(st.key, scope);
+          store[st.entity] = (store[st.entity] || []).map((r) =>
+            eq(r.id, key) ? Object.assign({}, r, { [st.field]: ev(st.value, scope) }) : r);
+        }
         scope[st.entity] = store[st.entity]; changed.push(st.entity);
       } else if (st.op === "remove") {
         if (st.where) {

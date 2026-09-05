@@ -291,13 +291,8 @@ func mentions(e *ir.Expr, name string) bool {
 	if e.Name == name && (e.Kind == "agg" || e.Kind == "eget") {
 		return true // the collection itself is named — treat as a read of it
 	}
-	for _, sub := range []*ir.Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where} {
+	for _, sub := range e.Kids() {
 		if mentions(sub, name) {
-			return true
-		}
-	}
-	for _, a := range e.Args {
-		if mentions(a, name) {
 			return true
 		}
 	}
@@ -556,14 +551,8 @@ func (s *Server) aggIndex(pg *ir.Page) map[*ir.Expr]int {
 			idx[e] = n
 			n++
 		}
-		expr(e.L)
-		expr(e.R)
-		expr(e.X)
-		expr(e.Obj)
-		expr(e.Key)
-		expr(e.Where)
-		for _, a := range e.Args {
-			expr(a)
+		for _, k := range e.Kids() {
+			expr(k)
 		}
 	}
 	var nodes func([]ir.Node)
@@ -962,11 +951,8 @@ func collectBareRefs(e *ir.Expr, isEnt map[string]bool, out map[string]*collRead
 	if e.Kind == "ref" && isEnt[e.Name] {
 		readOf(out, e.Name).all = true
 	}
-	for _, sub := range []*ir.Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where} {
+	for _, sub := range e.Kids() {
 		collectBareRefs(sub, isEnt, out)
-	}
-	for _, a := range e.Args {
-		collectBareRefs(a, isEnt, out)
 	}
 }
 
@@ -981,7 +967,13 @@ func collectReads(e *ir.Expr, isEnt map[string]bool, out map[string]*collRead) {
 	case "agg":
 		if isEnt[e.Name] {
 			c := readOf(out, e.Name)
-			c.field(e.Field) // sum/avg/min/max reduce a named field
+			c.field(e.Field) // sum/avg/min/max over a bare column read that column
+			// …and over an expression read whatever that expression reads off the
+			// row, exactly as the filter does. Missing these would ship the rows with
+			// the summed columns projected away, and the client would total zeros.
+			for _, f := range itemFieldsOf(e.Sel, e.Var) {
+				c.field(f)
+			}
 			for _, f := range itemFieldsOf(e.Where, e.Var) {
 				c.field(f)
 			}
@@ -997,11 +989,8 @@ func collectReads(e *ir.Expr, isEnt map[string]bool, out map[string]*collRead) {
 			readOf(out, e.Name).all = true
 		}
 	}
-	for _, sub := range []*ir.Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where} {
+	for _, sub := range e.Kids() {
 		collectReads(sub, isEnt, out)
-	}
-	for _, a := range e.Args {
-		collectReads(a, isEnt, out)
 	}
 }
 
@@ -1018,11 +1007,8 @@ func itemFieldsOf(e *ir.Expr, itemVar string) []string {
 		if e.Kind == "get" && e.Obj != nil && e.Obj.Kind == "ref" && e.Obj.Name == itemVar {
 			out = append(out, e.Field)
 		}
-		for _, sub := range []*ir.Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where} {
+		for _, sub := range e.Kids() {
 			walk(sub)
-		}
-		for _, a := range e.Args {
-			walk(a)
 		}
 	}
 	walk(e)
@@ -1227,11 +1213,8 @@ func exprAggregates(e *ir.Expr, rowVar string) []*ir.Expr {
 	if e.Kind == "agg" && (e.Op == "count" || e.Op == "exists") && mentions(e.Where, rowVar) {
 		out = append(out, e)
 	}
-	for _, sub := range []*ir.Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where} {
+	for _, sub := range e.Kids() {
 		out = append(out, exprAggregates(sub, rowVar)...)
-	}
-	for _, a := range e.Args {
-		out = append(out, exprAggregates(a, rowVar)...)
 	}
 	return out
 }

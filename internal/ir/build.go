@@ -1405,8 +1405,14 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	establishesID := false      // sets the session identity (`establish`)
 	mutated := false            // a state/entity mutation has run — checks/lets must precede it
 
-	readExpr := func(ex ast.Expr, line int) error {
-		if err := e.check(ex, loc, line); err != nil {
+	// readExprIn validates an expression against a named scope and records what it
+	// reads: the state cells (for placement soundness) and whether it reached an
+	// effectful builtin. Every value an action evaluates goes through it, so the
+	// bookkeeping cannot be forgotten at one statement and remembered at another.
+	// `locals` is the action's own scope, widened by whatever the statement binds —
+	// a filtered write binds its item variable, and nothing else does.
+	readExprIn := func(ex ast.Expr, locals map[string]bool, line int) error {
+		if err := e.check(ex, locals, line); err != nil {
 			return err
 		}
 		if hasImpure(ex) {
@@ -1419,6 +1425,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		}
 		return nil
 	}
+	readExpr := func(ex ast.Expr, line int) error { return readExprIn(ex, loc, line) }
 
 	// Validation (`check`) and request→response binds (`let`) must come before any
 	// mutation, so a failed check or a brain error aborts with nothing committed and
@@ -1485,6 +1492,51 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			}
 			entWrite = true
 			mutated = true
+			if st.Where != nil {
+				// Filtered update: a pure predicate over the item var + action scope,
+				// and a block of assignments evaluated against the row it matched. The
+				// same shape as `remove … where`, which is why it reuses `Op: "set"`
+				// with Where set rather than becoming an opcode of its own — one
+				// statement, two addressing modes, exactly as remove has.
+				wl := map[string]bool{st.Var: true}
+				for k := range loc {
+					wl[k] = true
+				}
+				if err := e.checkPure(st.Where, wl, st.Line, "a `set … where` filter"); err != nil {
+					return Action{}, err
+				}
+				lw := e.low(st.Where)
+				for n := range e.depsIR(lw) {
+					if _, isState := e.states[n]; isState {
+						reads[n] = true
+					}
+				}
+				out := Stmt{Op: "set", Entity: st.Entity, Var: st.Var, Where: lw}
+
+				for _, fi := range st.Fields {
+					if !e.entityFields[st.Entity][fi.Name] {
+						return Action{}, &BuildError{st.Line, fmt.Sprintf(
+							"entity %q has no field %q to set", st.Entity, fi.Name)}
+					}
+					if e.entE2E[st.Entity][fi.Name] {
+						// An @e2e field is sealed on the client from one action parameter, so
+						// it has exactly one writable shape and a bulk update is not it: the
+						// same ciphertext across every matching row is not the same value.
+						return Action{}, &BuildError{st.Line, fmt.Sprintf(
+							"@e2e field %s.%s cannot be written by a filtered set — a sealed value is encrypted per row on the client, so it can only be written straight from an action parameter to one row", st.Entity, fi.Name)}
+					}
+					// The assignment itself is an ordinary action value: it may read the
+					// row, the action's parameters and the clock, exactly as the by-id
+					// `set` may. Only the *predicate* has to be pure — it is what decides
+					// which rows are touched, and a store has to be able to agree.
+					if err := readExprIn(fi.Expr, wl, st.Line); err != nil {
+						return Action{}, err
+					}
+					out.Fields = append(out.Fields, FieldInit{Name: fi.Name, Expr: e.low(fi.Expr)})
+				}
+				act.Body = append(act.Body, out)
+				break
+			}
 			if err := readExpr(st.Key, st.Line); err != nil {
 				return Action{}, err
 			}
@@ -1637,6 +1689,10 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				collect(st.Key)
 				if !e.entE2E[st.Entity][st.Field] {
 					collect(st.Value)
+				}
+				collect(st.Where)
+				for _, fi := range st.Fields {
+					collect(fi.Expr)
 				}
 			case ast.Remove:
 				collect(st.Key)

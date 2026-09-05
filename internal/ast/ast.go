@@ -1029,11 +1029,27 @@ type EntityGet struct {
 // likes of a tweet, or whether the actor has liked it). It reads the collection,
 // so it tracks a dependency on that entity (plus any state the filter reads).
 type Agg struct {
-	Op    string // count | sum | exists
+	Op    string // count | sum | exists | avg | min | max
 	Coll  string
-	Field string // sum only
+	Field string // sum/avg/min/max, when the reduced value is a bare field of the row
 	Var   string // item variable for the filtered form ("" = whole collection)
 	Where Expr   // filter predicate over the item var + outer scope (nil = whole collection)
+
+	// Sel is the value reduced over each row when it is more than one of its
+	// columns: `sum(l.qty * l.unitPrice in CartLine where l.owner == actor)`.
+	//
+	// A cart subtotal is Σ qty × price, and until this field existed the language
+	// could only sum a stored column — so the only subtotal a program could write
+	// was one over a `lineTotal` column somebody had to remember to keep in step
+	// with `qty` and `unitPrice`. That is the denormalisation this field exists to
+	// delete: the total is computed from the two values it is a function of, every
+	// time it is read.
+	//
+	// Field and Sel are exclusive: a bare field keeps Field so the reduce stays a
+	// column read (and every program written before this stays byte-identical
+	// through the compiler), and anything else lands here and is evaluated once
+	// per row with Var bound to it.
+	Sel Expr
 }
 
 // Call is an effectful builtin invocation — `now()` (server clock, unix seconds)
