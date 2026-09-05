@@ -170,9 +170,10 @@ statement values, action arguments, and `{…}` interpolation.
 | aggregates | `count(Entity)`, `sum(Entity.field)` | pure |
 | effectful | `now()`, `rand(n)` | **→ server** |
 | math | `abs`, `min`, `max`, `floor`, `round` | pure |
-| string | `len`, `upper`, `lower`, `trim` | pure |
+| string | `len`, `upper`, `lower`, `trim`, `take`, `contains` | pure |
 | money | `money(cents)` → `"19.99"` | pure |
 | date | `year`, `month`, `day` | pure |
+| formatting | `ago(ts)` → `"20h"`, `compact(n)` → `"1.3K"`, `commas(n)` → `"1,352"` | pure (render-time) |
 
 The full list with arities is in the
 [Language Reference](Language-Reference.md#builtins).

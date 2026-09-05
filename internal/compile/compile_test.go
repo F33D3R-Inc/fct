@@ -390,10 +390,16 @@ app Clock:
 // Soundness is symmetric: a server action (here forced server by now()) cannot
 // write ephemeral client-only state.
 func TestServerActionCannotWriteClientState(t *testing.T) {
+	// The soundness rule: an action the authority must run cannot write state the
+	// authority cannot reach. Here the entity write is what pins it to the server.
 	_, err := String(`
 app A:
+    entity Log:
+        id: int
+        at: int
     state t: int = 0 @client
     action stamp:
+        add Log { at: 1 }
         t = now()
     view M:
         box:
@@ -401,6 +407,39 @@ app A:
 `)
 	if err == nil || !strings.Contains(err.Error(), "client-only state") {
 		t.Fatalf("expected server-writes-client soundness error, got: %v", err)
+	}
+}
+
+// An impure action that writes ONLY client state runs on the client.
+//
+// This used to be refused from both directions at once — the authority had to
+// run it because `now()` is nondeterministic, and the authority cannot write
+// client state — so "mark what I have already seen" could not be placed
+// anywhere. "Every client sees one agreed result" is a rule about a shared
+// result, and `@client` state has none: per-browser and ephemeral is what it
+// means. The clock exists on both sides, so the browser runs it.
+func TestImpureClientOnlyActionStaysOnTheClient(t *testing.T) {
+	g := mustCompile(t, `
+app A:
+    state seenAt: int = now() @client
+    action catchUp:
+        seenAt = now()
+    view M:
+        box:
+            text "{seenAt}"
+`)
+	var act *ir.Action
+	for i := range g.Actions {
+		if g.Actions[i].Name == "catchUp" {
+			act = &g.Actions[i]
+		}
+	}
+	if act == nil {
+		t.Fatal("catchUp did not compile")
+	}
+	if act.Placement != ir.Client {
+		t.Errorf("catchUp is %s (%s), want client — it writes only @client state",
+			act.Placement, act.Reason)
 	}
 }
 

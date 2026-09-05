@@ -72,8 +72,9 @@ func TestSegListsHasTheSameShapeOnBothSides(t *testing.T) {
 		PathSegs:    []ir.Seg{{Lit: "pathSegs"}},
 		ClassSegs:   []ir.Seg{{Lit: "classSegs"}},
 		Alt:         []ir.Seg{{Lit: "alt"}},
+		Poster:      []ir.Seg{{Lit: "poster"}},
 	}
-	want := []string{"segs", "label", "placeholder", "pathSegs", "classSegs", "alt"}
+	want := []string{"segs", "label", "placeholder", "pathSegs", "classSegs", "alt", "poster"}
 	got := n.SegLists()
 	if len(got) != len(want) {
 		t.Fatalf("SegLists returned %d lists, want %d", len(got), len(want))
@@ -88,7 +89,7 @@ func TestSegListsHasTheSameShapeOnBothSides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the shipped client: %v", err)
 	}
-	mirror := "const out = [nd.segs, nd.label, nd.placeholder, nd.pathSegs, nd.classSegs, nd.alt];"
+	mirror := "const out = [nd.segs, nd.label, nd.placeholder, nd.pathSegs, nd.classSegs, nd.alt, nd.poster];"
 	if !strings.Contains(string(raw), mirror) {
 		t.Errorf("assets/facet.js's segLists is no longer %q — it and ir.Node.SegLists\n"+
 			"must list the same attributes in the same order", mirror)

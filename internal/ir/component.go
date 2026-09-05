@@ -548,7 +548,7 @@ func mentionedNames(in []Node, out map[string]bool) {
 		for _, a := range n.Args {
 			mentionedExpr(a, out)
 		}
-		for _, name := range []string{n.Coll, n.Bind, n.Action, n.Var} {
+		for _, name := range []string{n.Coll, n.Bind, n.Action, n.More, n.Var} {
 			if name != "" {
 				out[name] = true
 			}

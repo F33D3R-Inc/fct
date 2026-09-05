@@ -18,18 +18,27 @@ import "github.com/F33D3R-Inc/facets/social/postcard.fct"
 
 Locally (this repo) the same files live under `library/` and build with `facet build`.
 
-## What's in v0.1.0
+## What's in v0.2.0
+
+The **look** ships as facets. Import `ui/look.fct` and `ui/icons.fct` and every
+atom renders like a 2026 social app with no CSS of your own; a host can still
+override any theme variable or use the same `x-` classes on its own nodes.
 
 | Category | Facets |
 |---|---|
-| `ui/` | Avatar · VerifiedBadge · UserChip · Trend · Trends (ui) · Nav (icon rail, ui) |
-| `social/` | PostCard · EngagementBar · ComposeBox · FollowButton · WhoToFollow |
+| `ui/` | **Look** (theme + layout vocabulary) · **Icons** (30 glyphs: `icon "heart"`, or `class "x-glyph-heart"` on a button) · Avatar · VerifiedBadge · **AuthorRow** · UserChip · **MediaCard** (16:9 frame, LIVE pill, view count) · **NavItem** · **NavRail** · **TopBar** (sticky, blurred) · **SignUpCard** · **GuestBanner** · Trend · Trends (ui) · Nav (ui) |
+| `social/` | **PostCard** (pinned line, avatar column, author line, body / media, bar) · **QuoteCard** · **EngagementBar** (reply · repost · like · views · bookmark) · ComposeBox · FollowButton (pill) · WhoToFollow |
 | `forms/` | SearchBox |
 | `notify/` | UnreadBadge · NotificationItem |
-| `profile/` | ProfileHeader |
-| `data/` | Feed (a full vertical slice: entities + actions + policy + content) |
-| `wireframes/` | Shell (the 3-column app skeleton) |
-| — | f33d3r (playground baseplate) |
+| `profile/` | **ProfileHeader** (banner, overlapping avatar, Follow pill, stats) |
+| `data/` | Feed (a full vertical slice: entities + actions + policy + content, infinite scroll) |
+| `wireframes/` | Shell (the 3-column app skeleton, sticky rail and aside) |
+| — | f33d3r (playground baseplate) · home (the reference app: home feed, `/u/:handle` profile, `/login`) |
+
+Bold = new or rebuilt in v0.2.0. A component takes a row — `component
+PostCard(t: Tweet, …)` — so a card is `use PostCard(t, replies, reposts, likes,
+views)`; the counts are the host's aggregates. Times render with `ago(t.created)`
+("20h"), counts with `compact(n)` ("1.3K") and `commas(n)` ("1,352").
 
 ## Two composition tracks, one set of atoms
 

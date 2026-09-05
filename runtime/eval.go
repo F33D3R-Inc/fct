@@ -360,6 +360,22 @@ func evalCall(e *ir.Expr, scope map[string]any) any {
 		return strings.TrimSpace(toStr(arg(0)))
 	case "contains":
 		return strings.Contains(toStr(arg(0)), toStr(arg(1)))
+	case "ago":
+		return ago(toInt(arg(0)), int(clock().Unix()))
+	case "compact":
+		return compact(toInt(arg(0)))
+	case "commas":
+		return commas(toInt(arg(0)))
+	case "take":
+		r := []rune(toStr(arg(0)))
+		n := toInt(arg(1))
+		if n < 0 {
+			n = 0
+		}
+		if n > len(r) {
+			n = len(r)
+		}
+		return string(r[:n])
 	case "year":
 		return int(time.Unix(int64(toInt(arg(0))), 0).UTC().Year())
 	case "month":

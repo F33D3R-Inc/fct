@@ -200,6 +200,9 @@ class Node {
   attrDump() {
     const out = [];
     for (const k of Object.keys(this.attrs)) out.push([this.tagName, k, this.attrs[k]]);
+    // The class list lives apart from the attribute map (the client writes it
+    // through className), so it is reported here as the attribute it renders as.
+    if (this.classList._s.size) out.push([this.tagName, "class", this.className]);
     if (this.placeholder != null) out.push([this.tagName, "placeholder", String(this.placeholder)]);
     if (["OPTION", "BUTTON", "LABEL", "A"].includes(this.tagName)) {
       out.push([this.tagName, "text", this.textContent]);
@@ -380,6 +383,9 @@ async function main() {
     if (step.do === "type") {
       el.value = String(step.value);
       dispatch(el, "input");
+    } else if (step.do === "click") {
+      // A button: the client's root click handler is what acts on it.
+      dispatch(el, "click");
     } else {
       if (type === "checkbox") el.checked = !el.checked;
       else if (type === "radio") el.checked = true;
@@ -388,6 +394,9 @@ async function main() {
       dispatch(el, "input");
       dispatch(el, "change");
     }
+    // Each step acts on the page the previous one produced — including what
+    // the authority answered — not on the page as it was before the script.
+    await settle();
   }
   await settle();
   console.log("=== after script ===");

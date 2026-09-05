@@ -374,7 +374,16 @@ type Node struct {
 	Order string `json:"order,omitempty"` // list: sort field
 	Desc  bool   `json:"desc,omitempty"`  // list: descending
 	Limit *Expr  `json:"limit,omitempty"` // list: max rows (nil = unlimited); int literal or a dynamic page-size expr
-	Cond  *Expr  `json:"cond,omitempty"`  // if: condition
+	// More is the zero-argument action a list fires to load its next page — the
+	// infinite-scroll clause (`for … limit shown more loadMore:`). While the
+	// render cut rows off at `limit`, a "More" control follows the last row; the
+	// client fires the action as that control scrolls into view, and a click on
+	// it does the same. Whether rows WERE cut off is a fact only the render
+	// knows (the store answers `limit` rows and no more), so the renderer asks
+	// for one row past the limit and records the answer per region path —
+	// runtime/region.go listRowsMore, carried to the client as `@more`/`more`.
+	More string `json:"more,omitempty"`
+	Cond *Expr  `json:"cond,omitempty"` // if: condition
 
 	// Level is a heading's document level, 1..6 — an expression, because the
 	// depth a header renders at belongs to the page that uses it and not to the
@@ -406,6 +415,14 @@ type Node struct {
 	// it visible to the dependency walks; an interpolated attribute that is not
 	// there is one that never refreshes (see the note on SegLists).
 	Alt []Seg `json:"alt,omitempty"`
+
+	// Poster is a video's still before playback — interpolated, and in SegLists,
+	// for exactly the reasons Alt is. Autoplay/Loop/Muted are its playback
+	// flags; autoplay implies muted in both renderers (see ast.Video).
+	Poster   []Seg `json:"poster,omitempty"`
+	Autoplay bool  `json:"autoplay,omitempty"`
+	Loop     bool  `json:"loop,omitempty"`
+	Muted    bool  `json:"muted,omitempty"`
 
 	Path string `json:"path,omitempty"` // link: destination route, when it is a literal
 
@@ -532,7 +549,7 @@ type Node struct {
 // link's interpolated label and path were invisible to all of them. One method,
 // so adding an interpolated attribute reaches every walk at once.
 func (n Node) SegLists() [][]Seg {
-	out := [][]Seg{n.Segs, n.Label, n.Placeholder, n.PathSegs, n.ClassSegs, n.Alt}
+	out := [][]Seg{n.Segs, n.Label, n.Placeholder, n.PathSegs, n.ClassSegs, n.Alt, n.Poster}
 	for _, o := range n.Options {
 		out = append(out, o.Label)
 	}

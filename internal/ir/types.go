@@ -254,7 +254,7 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 
 	case ast.Call:
 		switch t.Name {
-		case "upper", "lower", "trim":
+		case "upper", "lower", "trim", "ago", "compact", "commas", "take":
 			return vtype{core: "text"}
 		case "money":
 			// money() is the *formatter*: it renders int cents as text. The `money`
@@ -400,10 +400,62 @@ func (e *env) paramTypes(ps []ast.Param) map[string]vtype {
 func (e *env) checkArgType(u ast.Use, i int, p ast.Param, sc scope) error {
 	want := e.declType(p.Type, p.List)
 	got := e.exprType(u.Args[i], sc)
-	if e.assignable(got, want) {
-		return nil
+	if !e.assignable(got, want) {
+		return &BuildError{u.Line, fmt.Sprintf(
+			"component %q parameter %q is %s, but argument %d is %s",
+			u.Name, p.Name, want.label(), i+1, got.label())}
 	}
-	return &BuildError{u.Line, fmt.Sprintf(
-		"component %q parameter %q is %s, but argument %d is %s",
-		u.Name, p.Name, want.label(), i+1, got.label())}
+	// An entity-typed parameter is a ROW — `component PostCard(t: Tweet)` reads
+	// `t.body` — and unify() cannot see that: it collapses an entity core to the
+	// int id a relation column stores, so an id (`p.id`, a relation field `p.by`,
+	// or a bare `5`) unifies with the row it is not. Handed one, the component
+	// would render every field as nothing, with no diagnostic anywhere. So the
+	// argument has to *be* a row: the variable a `for` binds, or an enclosing
+	// component's own entity parameter. Nothing else in the language produces one
+	// (`Post(id)` always takes a `.field`).
+	if want.known() && !want.list && e.entities[want.core] && !isRowRef(u.Args[i], sc, want.core) {
+		return &BuildError{u.Line, fmt.Sprintf(
+			"component %q parameter %q is a %s row, but argument %d (%s) is not one — pass the row itself, the variable a `for x in %s` binds, not its id",
+			u.Name, p.Name, want.core, i+1, describeArg(u.Args[i], got), want.core)}
+	}
+	return nil
+}
+
+// isRowRef reports whether ex names a row of the given entity in this scope: a
+// `for` item variable over it, or an entity-typed component parameter.
+func isRowRef(ex ast.Expr, sc scope, entity string) bool {
+	r, ok := ex.(ast.Ref)
+	if !ok {
+		return false
+	}
+	t, ok := sc.varTypes[r.Name]
+	return ok && !t.list && t.core == entity
+}
+
+// describeArg names an argument for the row diagnostic: what it is, then its type.
+func describeArg(ex ast.Expr, got vtype) string {
+	switch t := ex.(type) {
+	case ast.Get:
+		if r, ok := t.Obj.(ast.Ref); ok {
+			if got.known() {
+				return fmt.Sprintf("`%s.%s`, %s", r.Name, t.Field, idOrType(got))
+			}
+			return fmt.Sprintf("`%s.%s`", r.Name, t.Field)
+		}
+	case ast.Lit:
+		return fmt.Sprintf("the literal %v", t.Val)
+	case ast.Ref:
+		return fmt.Sprintf("`%s`, %s", t.Name, idOrType(got))
+	}
+	if got.known() {
+		return got.label()
+	}
+	return "an expression"
+}
+
+func idOrType(got vtype) string {
+	if got.core == "int" {
+		return "an int"
+	}
+	return "a " + got.label()
 }

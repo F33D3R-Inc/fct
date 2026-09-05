@@ -1,31 +1,27 @@
-# f33d3r home (plain-app composition track) — assembles the reusable component
-# atoms (Avatar/VerifiedBadge/UserChip/PostCard/ComposeBox/FollowButton/Trend) into
-# a home screen. Demonstrates the *component* facet type, vs the typed-brick stack
-# in f33d3r.fct (playground/wireframe/ui/data).
-#
-# The SAME component atoms also compose into the LAYERED (playground) build via the
-# data facet — one atom set, both tracks (v1.17.0 closed the shareable-component gap).
+# f33d3r home (plain-app composition track) — the reference app assembled from the
+# library's atoms: the look, the rail, post cards with media and an engagement
+# bar, infinite scroll, a profile page, and the sign-in surfaces a visitor sees.
+# Demonstrates the *component* facet type, vs the typed-brick stack in f33d3r.fct
+# (playground/wireframe/ui/data).
 #
 #   facet dev library/home.fct
+import "ui/look.fct"
+import "ui/navrail.fct"
+import "ui/signupcard.fct"
+import "ui/guestbanner.fct"
+import "ui/topbar.fct"
+import "ui/trend.fct"
 import "social/postcard.fct"
+import "social/quotecard.fct"
 import "social/composebox.fct"
 import "social/whotofollow.fct"
+import "profile/profileheader.fct"
 import "forms/searchbox.fct"
-import "ui/trend.fct"
 
 app F33D3RHome:
     auth
-    theme:
-        bg "#15202b"
-        fg "#f7f9f9"
-        muted "#8b98a5"
-        accent "#1d9bf0"
-        border "#38444d"
-        card-border "#38444d"
-        radius "16px"
-        maxwidth "1100px"
 
-    enum Kind: text, richtext, video
+    enum Kind: text, richtext, video, image
 
     entity Tweet:
         id: int
@@ -35,6 +31,8 @@ app F33D3RHome:
         kind: Kind
         body: text
         media: text
+        quoted: int
+        pinned: bool
         created: int
     entity Like:
         id: int
@@ -55,15 +53,21 @@ app F33D3RHome:
 
     state draft: text = "" @client
     state feedTab: text = "foryou" @client
+    state profileTab: text = "posts" @client
     state q: text = "" @client
     state shown: int = 20 @client
+    state username: text = "" @client
+    state password: text = "" @client
 
     policy member:
         actor != "guest"
 
     action post(body: text):
         requires member
-        add Tweet { author: actor, handle: actor, verified: false, kind: Kind.text, body: body, media: "", created: now() }
+        add Tweet { author: actor, handle: actor, verified: false, kind: Kind.text, body: body, media: "", quoted: 0, pinned: false, created: now() }
+    action postVideo(body: text, media: text):
+        requires member
+        add Tweet { author: actor, handle: actor, verified: true, kind: Kind.video, body: body, media: media, quoted: 0, pinned: true, created: now() }
     action like(id: int):
         requires member
         add Like { tweet: id, user: actor }
@@ -79,27 +83,66 @@ app F33D3RHome:
     action unfollow(handle: text):
         requires member
         remove f in Follow where f.follower == actor && f.followee == handle
+    action loadMore:
+        shown = shown + 20
 
     view Home at "/":
-        row:
-            box:
-                text "𝕏 · F33D3R"
-                text "signed in as {actor}"
-                button "log out" -> logout
-            box:
-                use ComposeBox()
+        row class "x-shell":
+            box class "x-rail":
+                use NavRail(actor, actor, false, "/")
+            box class "x-main":
+                use TopBar("Home", "")
+                if actor != "guest":
+                    use ComposeBox()
                 use SearchBox()
                 tabs bind feedTab:
                     tab "For you" -> "foryou":
-                        for t in Tweet where contains(lower(t.body), lower(q)) by created desc limit shown:
-                            use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), 0, count(r in Repost where r.tweet == t.id))
+                        for t in Tweet where contains(lower(t.body), lower(q)) by created desc limit shown more loadMore:
+                            use PostCard(t, 0, count(r in Repost where r.tweet == t.id), count(l in Like where l.tweet == t.id), 0)
                     tab "Following" -> "following":
-                        for t in Tweet where exists(f in Follow where f.follower == actor && f.followee == t.author) by created desc limit shown:
-                            use PostCard(t.id, t.author, t.handle, t.verified, t.kind, t.body, t.media, count(l in Like where l.tweet == t.id), 0, count(r in Repost where r.tweet == t.id))
-            box:
-                text "What's happening"
-                use Trend("Tech", "#FacetLang", "1,234 posts")
-                use Trend("News", "#Facet", "987 posts")
-                text "Who to follow"
-                use WhoToFollow("Grace Hopper", "grace", true, exists(f in Follow where f.follower == actor && f.followee == "grace"))
-                use WhoToFollow("Alan Turing", "alan", false, exists(f in Follow where f.follower == actor && f.followee == "alan"))
+                        for t in Tweet where exists(f in Follow where f.follower == actor && f.followee == t.author) by created desc limit shown more loadMore:
+                            use PostCard(t, 0, count(r in Repost where r.tweet == t.id), count(l in Like where l.tweet == t.id), 0)
+            box class "x-aside":
+                if actor == "guest":
+                    use SignUpCard("New to F33D3R?", "/login")
+                box class "x-card":
+                    heading 2 "What's happening"
+                    use Trend("Tech", "#FacetLang", "1,234 posts")
+                    use Trend("News", "#Facet", "987 posts")
+                box class "x-card":
+                    heading 2 "Who to follow"
+                    use WhoToFollow("Grace Hopper", "grace", true, exists(f in Follow where f.follower == actor && f.followee == "grace"))
+                    use WhoToFollow("Alan Turing", "alan", false, exists(f in Follow where f.follower == actor && f.followee == "alan"))
+        if actor == "guest":
+            use GuestBanner("/login")
+
+    view Profile at "/u/:handle":
+        row class "x-shell":
+            box class "x-rail":
+                use NavRail(actor, actor, false, "/")
+            box class "x-main":
+                use TopBar(handle, count(t in Tweet where t.handle == handle) + " posts")
+                use ProfileHeader(handle, handle, false, "", "https://picsum.photos/seed/" + handle + "/1200/400", "June 2026", exists(f in Follow where f.follower == actor && f.followee == handle), count(f in Follow where f.follower == handle), count(f in Follow where f.followee == handle))
+                box class "x-profile":
+                    tabs bind profileTab:
+                        tab "Posts" -> "posts":
+                            for t in Tweet where t.handle == handle by created desc limit shown more loadMore:
+                                use PostCard(t, 0, count(r in Repost where r.tweet == t.id), count(l in Like where l.tweet == t.id), 0)
+                        tab "Media" -> "media":
+                            for t in Tweet where t.handle == handle && t.media != "" by created desc limit shown more loadMore:
+                                use PostCard(t, 0, count(r in Repost where r.tweet == t.id), count(l in Like where l.tweet == t.id), 0)
+            box class "x-aside":
+                if actor == "guest":
+                    use SignUpCard("New to F33D3R?", "/login")
+        if actor == "guest":
+            use GuestBanner("/login")
+
+    view Login at "/login":
+        box class "x-card" style "max-width: 400px; margin: 10vh auto;":
+            icon "logo" class "x-logo"
+            heading 2 "Happening now"
+            input bind username placeholder "Username"
+            input bind password placeholder "Password"
+            button "Create account" -> signup(username, password) class "x-pill x-light x-wide"
+            button "Log in" -> login(username, password) class "x-pill x-wide"
+            richtext "By signing up, you agree to the [Terms of Service](/terms) and [Privacy Policy](/privacy)." class "x-fine"

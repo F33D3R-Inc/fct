@@ -487,6 +487,16 @@ func Build(app *ast.App) (*IR, error) {
 					return nil, &BuildError{cm.Line, fmt.Sprintf("component %q parameter %q is `cell %s`, but %q is not a state type (a primitive or an enum)", cm.Name, p.Name, p.Type, p.Type)}
 				}
 			}
+			// A value parameter's type is a primitive, an enum, or an entity (a row
+			// of it: `component PostCard(t: Tweet)`). A name that is none of those
+			// used to be accepted as "unknown" and checked nowhere — so `t: Tweeet`
+			// compiled, and every `t.field` inside rendered as nothing.
+			if p.Ref == ast.RefValue && !isPrimitive(p.Type) {
+				_, isEnum := e.enums[p.Type]
+				if !isEnum && !e.entities[p.Type] {
+					return nil, &BuildError{cm.Line, fmt.Sprintf("component %q parameter %q has unknown type %q — a parameter is a primitive (int/text/bool/money/date), an enum, or an entity (a row: `%s: Post`)", cm.Name, p.Name, p.Type, p.Name)}
+				}
+			}
 		}
 		// A component has at most one `slot`: its children are one tree, and two
 		// slots would silently render them twice.
@@ -856,9 +866,12 @@ func Build(app *ast.App) (*IR, error) {
 	for _, ref := range allCalls {
 		act, ok := byAction[ref.name]
 		if !ok {
-			return nil, &BuildError{0, fmt.Sprintf("button references unknown action %q", ref.name)}
+			return nil, &BuildError{0, fmt.Sprintf("%s references unknown action %q", ref.source(), ref.name)}
 		}
 		if len(act.Params) != ref.argc {
+			if ref.via != "" {
+				return nil, &BuildError{0, fmt.Sprintf("%s names action %q, which takes %d argument(s); loading the next page invokes a zero-argument action", ref.source(), ref.name, len(act.Params))}
+			}
 			return nil, &BuildError{0, fmt.Sprintf("action %q takes %d argument(s), got %d", ref.name, len(act.Params), ref.argc)}
 		}
 	}
@@ -1722,13 +1735,32 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	// placement: server iff it writes any authoritative cell OR is impure. An
 	// effectful builtin (now/rand) is nondeterministic, so the authority must run
 	// it — that way every client sees one agreed result, not its own.
+	//
+	// …with one exception, and it is the reason the condition is not simply
+	// `impure`. "Every client sees one agreed result" is a rule about a SHARED
+	// result. An action whose every write lands in `@client` state has no shared
+	// result to agree on: that state is per-browser and ephemeral by definition,
+	// so two browsers holding different values is not a disagreement, it is what
+	// `@client` means.
+	//
+	// Without the exception a whole category of ordinary UI is unwritable. "Mark
+	// what I have already seen" is `seenAt = now()` into a client cell, and it
+	// was refused from both directions at once: the authority must run it because
+	// it is impure, and the authority cannot write client state — so the action
+	// could not be placed anywhere. The clock is available on both sides
+	// (assets/facet.js implements `now` and `rand` in evCall), so the client can
+	// simply run it.
+	//
+	// Anything genuinely shared still goes to the authority: an entity write is
+	// caught above, a write to a `@server` cell below, and a service call or an
+	// identity change in their own arms here.
 	act.Placement = Client
 	act.Reason = "only touches @client state, so it runs in the browser with no round-trip"
 	switch {
 	case entWrite:
 		act.Placement = Server
 		act.Reason = "writes durable entity data — the authority owns the database"
-	case impure:
+	case impure && !writesOnlyClientState(writes, e.states):
 		act.Placement = Server
 		act.Reason = "uses an effectful builtin (now/rand) — the authority owns nondeterminism, so every client sees one agreed result"
 	case callsService:
@@ -1882,6 +1914,14 @@ func enumHas(members []string, v string) bool {
 type call struct {
 	name string
 	argc int
+	via  string // what named it, for the diagnostic: "button" (the default) or "`more`"
+}
+
+func (c call) source() string {
+	if c.via == "" {
+		return "button"
+	}
+	return c.via
 }
 
 // linkRef is one internal link destination awaiting route validation: the
@@ -1989,7 +2029,7 @@ func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope, openable bool) ([]Seg, err
 			out = append(out, Seg{Lit: s.Lit})
 			continue
 		}
-		if err := c.e.checkPure(s.Expr, viewScope(sc.locals), 0, "a view"); err != nil {
+		if err := c.checkView(s.Expr, sc, 0, "a view"); err != nil {
 			return nil, err
 		}
 		if err := c.e.checkNoPrivate(s.Expr); err != nil {
@@ -2062,16 +2102,31 @@ func (c *viewCtx) lowerRange(rg ast.Range, node *Node, sc scope, line int) error
 	// `limit` may be a literal or a pure expr (e.g. a @client page size for
 	// load-more / infinite scroll); evaluated per render, not per row.
 	if rg.Limit != nil {
-		if err := c.e.checkPure(rg.Limit, viewScope(sc.locals), line, "a `limit`"); err != nil {
+		if err := c.checkView(rg.Limit, sc, line, "a `limit`"); err != nil {
 			return err
 		}
 		node.Limit = c.e.low(rg.Limit)
+	}
+	// `more` names the action that loads the next page. The parser has already
+	// insisted on a `limit`; the action is validated with every other action a
+	// view calls (exists, zero arguments) — see the `calls` pass in Build. A
+	// choice list (a select's or radio group's `for`) has no next page: it is
+	// the control's options, which render whole.
+	if rg.More != "" {
+		if node.Kind != "list" {
+			return &BuildError{line, "`more` belongs to a `for` list; a choice list renders every option and has no next page"}
+		}
+		node.More = rg.More
+		c.calls = append(c.calls, call{name: rg.More, argc: 0, via: "`more`"})
 	}
 	// `where` filter: a pure predicate over the item var + outer scope.
 	if rg.Where != nil {
 		wlocals := viewScope(sc.locals)
 		wlocals[rg.Var] = true
 		if err := c.e.checkPure(rg.Where, wlocals, line, "a `where` filter"); err != nil {
+			return err
+		}
+		if err := c.checkRowFields(rg.Where, c.bindRange(sc, rg), line); err != nil {
 			return err
 		}
 		node.Where = c.e.low(rg.Where)
@@ -2363,7 +2418,15 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, Node{Kind: "video", Segs: segs, Alt: alt})
+			poster, err := c.lowerSegs(t.Poster, sc, false)
+			if err != nil {
+				return nil, err
+			}
+			// `autoplay` implies `muted` here, once, so neither renderer decides it:
+			// no browser starts a clip with sound on its own, and a player that
+			// never starts is worse than one that starts silent (see ast.Video).
+			out = append(out, Node{Kind: "video", Segs: segs, Alt: alt, Poster: poster,
+				Autoplay: t.Autoplay, Loop: t.Loop, Muted: t.Muted || t.Autoplay})
 
 		case ast.Richtext:
 			segs, err := c.lowerSegs(t.Segs, sc, false)
@@ -2417,7 +2480,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, node)
 
 		case ast.Match:
-			if err := c.e.checkPure(t.Expr, viewScope(sc.locals), t.Line, "a `match`"); err != nil {
+			if err := c.checkView(t.Expr, sc, t.Line, "a `match`"); err != nil {
 				return nil, err
 			}
 			enumName := c.matchEnum(t.Expr, sc)
@@ -2487,7 +2550,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			node := Node{Kind: "button", Segs: segs, Action: t.Action}
 			for _, arg := range t.Args {
-				if err := c.e.checkPure(arg, viewScope(sc.locals), t.Line, "a view"); err != nil {
+				if err := c.checkView(arg, sc, t.Line, "a view"); err != nil {
 					return nil, err
 				}
 				node.Args = append(node.Args, c.e.low(arg))
@@ -2536,7 +2599,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			out = append(out, node)
 
 		case ast.If:
-			if err := c.e.checkPure(t.Cond, viewScope(sc.locals), 0, "a view"); err != nil {
+			if err := c.checkView(t.Cond, sc, 0, "a view"); err != nil {
 				return nil, err
 			}
 			node := Node{Kind: "if", Cond: c.e.low(t.Cond)}
@@ -2830,7 +2893,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			}
 			node := Node{Kind: "form", Action: t.Action, Label: submit}
 			for _, arg := range t.Args {
-				if err := c.e.checkPure(arg, viewScope(sc.locals), t.Line, "a view"); err != nil {
+				if err := c.checkView(arg, sc, t.Line, "a view"); err != nil {
 					return nil, err
 				}
 				node.Args = append(node.Args, c.e.low(arg))
@@ -2945,7 +3008,7 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				return nil, err
 			}
 			for _, arg := range valArgs {
-				if err := c.e.checkPure(arg, viewScope(sc.locals), t.Line, "a view"); err != nil {
+				if err := c.checkView(arg, sc, t.Line, "a view"); err != nil {
 					return nil, err
 				}
 				le := c.e.low(arg)
@@ -3053,6 +3116,70 @@ func (e *env) checkPure(ex ast.Expr, locals map[string]bool, line int, ctx strin
 	if hasImpure(ex) {
 		return &BuildError{line, fmt.Sprintf(
 			"%s cannot use an effectful builtin (now/rand); it must be pure so it can run on any client. Compute it in an action instead", ctx)}
+	}
+	return nil
+}
+
+// checkView is what every expression written in a view goes through: the
+// purity and name checks of checkPure, then checkRowFields, which needs the
+// scope's TYPES and not only its names — which is why it is a viewCtx method
+// and checkPure is not.
+func (c *viewCtx) checkView(ex ast.Expr, sc scope, line int, ctx string) error {
+	if err := c.e.checkPure(ex, viewScope(sc.locals), line, ctx); err != nil {
+		return err
+	}
+	return c.checkRowFields(ex, sc, line)
+}
+
+// checkRowFields refuses `x.field` when x is a row (a `for` variable or an
+// entity-typed component parameter) and the entity has no such field.
+//
+// It used to be accepted: a row local resolved, the field was looked up at
+// render time, missed, and rendered as nothing — the same nothing an empty
+// column renders, so a typo in `{p.bdoy}` was a blank post and not an error.
+// The types to refuse it were already in scope (rowEntity); nothing asked. An
+// aggregate's item variable is typed the way exprType types it, so a filtered
+// count's predicate is checked too.
+func (c *viewCtx) checkRowFields(ex ast.Expr, sc scope, line int) error {
+	switch t := ex.(type) {
+	case ast.Get:
+		if r, ok := t.Obj.(ast.Ref); ok {
+			if ent, isRow := c.rowEntity(sc, r.Name); isRow && t.Field != "id" && !c.e.entityFields[ent][t.Field] {
+				return &BuildError{line, fmt.Sprintf("entity %q has no field %q (in `%s.%s`)", ent, t.Field, r.Name, t.Field)}
+			}
+		}
+		return c.checkRowFields(t.Obj, sc, line)
+	case ast.EntityGet:
+		return c.checkRowFields(t.Key, sc, line)
+	case ast.Call:
+		for _, a := range t.Args {
+			if err := c.checkRowFields(a, sc, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := c.checkRowFields(el, sc, line); err != nil {
+				return err
+			}
+		}
+	case ast.Bin:
+		if err := c.checkRowFields(t.L, sc, line); err != nil {
+			return err
+		}
+		return c.checkRowFields(t.R, sc, line)
+	case ast.Un:
+		return c.checkRowFields(t.X, sc, line)
+	case ast.Agg:
+		inner := sc
+		if t.Var != "" {
+			inner = sc.with(t.Var)
+			inner.varTypes[t.Var] = vtype{core: t.Coll}
+		}
+		if err := c.checkRowFields(t.Where, inner, line); err != nil {
+			return err
+		}
+		return c.checkRowFields(t.Sel, inner, line)
 	}
 	return nil
 }
@@ -3210,9 +3337,10 @@ func hasImpure(ex ast.Expr) bool {
 // builtin, and whether the name is one.
 func pureBuiltinArity(name string) (int, bool) {
 	switch name {
-	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day":
+	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
+		"ago", "compact", "commas":
 		return 1, true
-	case "min", "max", "contains":
+	case "min", "max", "contains", "take":
 		return 2, true
 	}
 	return 0, false
@@ -3224,6 +3352,26 @@ func isPrimitive(t string) bool {
 		return true
 	}
 	return false
+}
+
+// writesOnlyClientState reports whether an action writes at least one state cell
+// and every cell it writes is `@client`.
+//
+// "At least one" is load-bearing. An impure action that writes nothing shares no
+// result either, but it also has nothing to run FOR — and one of them can carry a
+// `requires`, which must be authoritative. Keeping those on the server preserves
+// every placement this compiler made before the exception existed; the only
+// behaviour that changes is the case the exception was written for.
+func writesOnlyClientState(writes map[string]bool, states map[string]string) bool {
+	if len(writes) == 0 {
+		return false
+	}
+	for name := range writes {
+		if states[name] != Client {
+			return false
+		}
+	}
+	return true
 }
 
 // isFieldAgg reports whether an aggregate op reduces a numeric field (and so

@@ -97,6 +97,7 @@ func TestSessionIdentifiersAreNotSequential(t *testing.T) {
 	a := startApp(t, e, notesApp)
 
 	seen := map[string]bool{}
+	var ids []string
 	for i := 0; i < 5; i++ {
 		a.newSession()
 		if code, _ := a.get("/"); code != 200 {
@@ -118,35 +119,73 @@ func TestSessionIdentifiersAreNotSequential(t *testing.T) {
 		}
 
 		seen[sid] = true
-
-		// A counter is the failure this looks for: `s1`, `s2`, `s-<instance>-3`.
-		trimmed := strings.TrimPrefix(sid, "s")
-		if idx := strings.LastIndex(trimmed, "-"); idx >= 0 {
-			trimmed = trimmed[idx+1:]
-		}
-		if isAllDigits(trimmed) && len(trimmed) < 12 {
-			t.Errorf("session id %q is a small integer — identifiers are minted "+
-				"from a counter, so every id the server has issued is known by "+
-				"construction and only the cookie signature prevents a hijack", sid)
-			return
-		}
+		ids = append(ids, sid)
 	}
 
 	if len(seen) != 5 {
 		t.Errorf("5 fresh visitors produced %d distinct session ids", len(seen))
 	}
-}
 
-func isAllDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
+	// A counter is the failure this looks for: `s1`, `s2`, `s-<instance>-3`. It
+	// has two signatures and this asserts both, because either one alone can be
+	// dodged: a short id could still be random, and a long one could still be a
+	// counter behind a fixed prefix.
+	//
+	// ── length ──
+	// An identifier minted from a counter is as long as the number. 24 random
+	// bytes are 32 base64url characters, so anything materially shorter is not
+	// random — and `s1` and `s-node-3` both fail here.
+	for _, id := range ids {
+		if len(id) < minSessionIDLen {
+			t.Errorf("session id %q is %d characters — too few to be random, so "+
+				"identifiers are minted from a counter and every id the server has "+
+				"issued is known by construction; only the cookie signature would "+
+				"prevent a hijack", id, len(id))
+			return
 		}
 	}
-	return true
+
+	// ── independence ──
+	// Two random 32-character ids share a leading character with probability
+	// 1/64, so five of them sharing eight is not something that happens. A
+	// counter behind a prefix — `sess-00001`, `sess-00002` — shares the whole
+	// prefix, every time.
+	//
+	// This is what the check used to be reaching for by pattern-matching the tail
+	// after the last `-`, and could not reach: base64url's own alphabet contains
+	// `-`, so roughly one random id in three hundred ends in a hyphen followed by
+	// digits and was reported as a counter. That is a test that fails ~1.5% of
+	// runs on correct code, which teaches everyone to re-run it.
+	if n := commonPrefixLen(ids); n >= maxSessionIDPrefix {
+		t.Errorf("5 session ids share a %d-character prefix (%q) — random "+
+			"identifiers do not, so these are minted from a counter behind a "+
+			"fixed prefix and every id the server has issued is predictable",
+			n, ids[0][:n])
+	}
+}
+
+// 24 random bytes render as 32 base64url characters; the bound is below that so
+// the check is about the ORDER of magnitude, not the exact encoding.
+const minSessionIDLen = 24
+
+// Five independent random ids agreeing on eight characters has probability
+// around 64^-8. A prefixed counter agrees on all of them.
+const maxSessionIDPrefix = 8
+
+// commonPrefixLen is the length of the longest prefix every string shares.
+func commonPrefixLen(ss []string) int {
+	if len(ss) == 0 {
+		return 0
+	}
+	n := len(ss[0])
+	for _, s := range ss[1:] {
+		i := 0
+		for i < n && i < len(s) && s[i] == ss[0][i] {
+			i++
+		}
+		n = i
+	}
+	return n
 }
 
 var _ = http.StatusOK

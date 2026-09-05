@@ -23,7 +23,12 @@ view Name [at "/path"] [in Layout] [requires policy]:
 | **box** | `box:` then indented children — a vertical container |
 | **row** | `row:` then indented children — a horizontal container that wraps and collapses to a column on a narrow viewport (responsive multi-column) |
 | **text** | `text "literal and {expr}"` |
-| **image** | `image "url"` — URL interpolates, e.g. `image "…/avatar?seed={t.author}"` (renders a rounded avatar by default) |
+| **image** | `image "url" [alt "…"]` — URL interpolates, e.g. `image "…/avatar?seed={t.author}"` (renders a rounded avatar by default) |
+| **video** | `video "url" [poster "url"] [alt "…"] [autoplay] [loop] [muted]` — a player with controls; `poster` is the still before playback; `autoplay` implies `muted` (no browser autoplays with sound) |
+| **richtext** | `richtext "{p.body}"` — renders a safe Markdown subset: `#`/`##`/`###` headings, `- ` and `1. ` lists, `> ` quotes, ```` ``` ```` code, `---` rules, `[text](url)` links (http/https/mailto/relative only), `**bold**` `*italic*` `~~struck~~` `` `code` ``. Input is HTML-escaped first; the same renderer runs on server and client |
+| **icon** | `icon "name"` — a named glyph the theme's CSS fills |
+| **badge** | `badge "{unread}"` — a small pill for counts and status |
+| **tabs** | `tabs bind cell:` then `tab "Label" -> "value":` blocks — a segmented control over a `@client` cell |
 | **button** | `button "label" -> action(args)` — the label interpolates too: `button "♥ {t.likes}" -> like(t.id)` |
 | **input** | `input bind cell [placeholder "…"]` |
 | **select** | `select bind cell:` then `option "Label" -> "value"` lines |
@@ -33,9 +38,32 @@ view Name [at "/path"] [in Layout] [requires policy]:
 | **typeahead** | `typeahead bind textCell from Entity.field [placeholder "…"]` — input with a native suggestion list |
 | **link** | `link "label" -> "/path"` |
 | **if** | `if <cond>:` then children |
-| **for** | `for x in Coll [where c] [by f desc\|asc] [limit n]:` then children |
+| **for** | `for x in Coll [where c] [by f desc\|asc] [limit n] [more action]:` then children — `more` makes it an infinite scroll (see below) |
 | **use** | `use Component(args)` |
 | **slot** | `slot` (layouts) — where the routed view renders; `slot <name>` in a [wireframe frame](Layered-Facets.md) — where a socket's content composites in |
+
+### for … more — infinite scroll
+
+`limit` may be a `@client` cell, and `more` names the zero-argument action that
+grows it. While the limit holds rows back, a **More** control follows the last
+row; the browser fires the action as that control scrolls into view (an
+`IntersectionObserver`), and a click or Enter on it does the same, so it works
+with no observer and from the keyboard. The control disappears when the last row
+is on the page — the server asks the store for one row past the limit, so it
+knows.
+
+```
+state shown: int = 20 @client
+action loadMore:
+    shown = shown + 20
+
+for p in Post by created desc limit shown more loadMore:
+    use PostCard(p)
+```
+
+`loadMore` writes only client state, so the compiler places it on the client:
+growing the page is a local write, and the rows come from the authority in one
+`/region` request.
 
 ### text & interpolation
 
@@ -137,7 +165,10 @@ for p in Post by created desc limit 50:
 
 ## Components
 
-A reusable fragment with parameters, invoked with `use`:
+A reusable fragment with parameters, invoked with `use`. A parameter may be an
+entity: `component PostCard(t: Post)` takes the row a `for` binds — `use
+PostCard(p)` — and reads `t.body`, `t.author` with every field checked against
+the entity. See [Language Reference → component](Language-Reference.md#component-and-layout).
 
 ```
 component Avatar(name: text):

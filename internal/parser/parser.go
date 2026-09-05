@@ -1742,11 +1742,11 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 			}
 			out = append(out, ast.Icon{Segs: segs})
 		case strings.HasPrefix(t, "video "):
-			segs, alt, altSet, err := parseMedia(strings.TrimSpace(t[len("video "):]), c.Line.No)
+			v, err := parseVideo(strings.TrimSpace(t[len("video "):]), c.Line.No)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, ast.Video{Segs: segs, Alt: alt, AltSet: altSet, Line: c.Line.No})
+			out = append(out, v)
 		case strings.HasPrefix(t, "richtext "):
 			segs, err := parseText(strings.TrimSpace(t[len("richtext "):]), c.Line.No)
 			if err != nil {
@@ -1996,7 +1996,7 @@ func trailingNodeMod(line string) (kw, val, rest string, ok bool) {
 	return "", "", "", false
 }
 
-// parseFor: `for item in Collection [where cond] [by field desc|asc] [limit n]:`
+// parseFor: `for item in Collection [where cond] [by field desc|asc] [limit n] [more action]:`
 func parseFor(n *source.Node) (ast.Node, error) {
 	rg, err := parseRange(strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("for "):]), ":"), n.Line.No)
 	if err != nil {
@@ -2033,7 +2033,7 @@ func parseRange(head string, line int) (ast.Range, error) {
 	rest = strings.TrimSpace(rest[len("in"):])
 	rest = strings.TrimSpace(rest[len(fields[2]):])
 
-	whereS, byS, limitS, err := splitForClauses(rest, line)
+	whereS, byS, limitS, moreS, err := splitForClauses(rest, line)
 	if err != nil {
 		return rg, err
 	}
@@ -2068,16 +2068,26 @@ func parseRange(head string, line int) (ast.Range, error) {
 		}
 		rg.Limit = e
 	}
+	if moreS != "" {
+		if !isIdent(moreS) {
+			return rg, &Error{line, fmt.Sprintf("`more` names the action that loads the next page — `more loadMore` — got %q", moreS)}
+		}
+		if rg.Limit == nil {
+			return rg, &Error{line, "`more` needs a `limit`: nothing is held back from an unbounded list, so there is no next page to load"}
+		}
+		rg.More = moreS
+	}
 	return rg, nil
 }
 
-// splitForClauses splits a `for` header tail into its where/by/limit clause
-// bodies. It scans at the top level (skipping string literals and parens) so a
-// quoted value like `"stand by"` inside a `where` is never mistaken for a clause
-// keyword. The clauses, if present, must appear in where→by→limit order.
-func splitForClauses(rest string, line int) (whereS, byS, limitS string, err error) {
+// splitForClauses splits a `for` header tail into its where/by/limit/more
+// clause bodies. It scans at the top level (skipping string literals and parens)
+// so a quoted value like `"stand by"` inside a `where` is never mistaken for a
+// clause keyword. The clauses, if present, must appear in where→by→limit→more
+// order.
+func splitForClauses(rest string, line int) (whereS, byS, limitS, moreS string, err error) {
 	if strings.TrimSpace(rest) == "" {
-		return "", "", "", nil
+		return "", "", "", "", nil
 	}
 	pos := map[string]int{} // keyword -> first top-level start index
 	inStr := false
@@ -2101,7 +2111,7 @@ func splitForClauses(rest string, line int) (whereS, byS, limitS string, err err
 			for j < len(rest) && isIdentChar(rest[j]) {
 				j++
 			}
-			if w := rest[i:j]; w == "where" || w == "by" || w == "limit" {
+			if w := rest[i:j]; w == "where" || w == "by" || w == "limit" || w == "more" {
 				if _, seen := pos[w]; !seen {
 					pos[w] = i
 				}
@@ -2115,7 +2125,7 @@ func splitForClauses(rest string, line int) (whereS, byS, limitS string, err err
 	known := []struct {
 		name string
 		klen int
-	}{{"where", 5}, {"by", 2}, {"limit", 5}}
+	}{{"where", 5}, {"by", 2}, {"limit", 5}, {"more", 4}}
 	// the content of a clause runs from just after its keyword to the next clause
 	// keyword that starts later in the string.
 	end := func(start int) int {
@@ -2147,6 +2157,9 @@ func splitForClauses(rest string, line int) (whereS, byS, limitS string, err err
 	if limitS, err = clause("limit", 5); err != nil {
 		return
 	}
+	if moreS, err = clause("more", 4); err != nil {
+		return
+	}
 
 	// reject stray text before the first clause keyword.
 	first := len(rest)
@@ -2156,9 +2169,9 @@ func splitForClauses(rest string, line int) (whereS, byS, limitS string, err err
 		}
 	}
 	if leftover := strings.TrimSpace(rest[:first]); leftover != "" {
-		return "", "", "", &Error{line, fmt.Sprintf("unexpected %q in for header (clauses are where/by/limit, in that order)", leftover)}
+		return "", "", "", "", &Error{line, fmt.Sprintf("unexpected %q in for header (clauses are where/by/limit/more, in that order)", leftover)}
 	}
-	return whereS, byS, limitS, nil
+	return whereS, byS, limitS, moreS, nil
 }
 
 // parseLink: `link "label" -> "/path"`
@@ -2411,18 +2424,94 @@ func parseOption(rest string, line int) (ast.Option, error) {
 // statements by the author — decorative on purpose, versus undecided — and only
 // the second is worth telling anyone about. See ast.Image and ast.Advise.
 func parseMedia(rest string, line int) (segs, alt []ast.Seg, altSet bool, err error) {
-	if i := indexTop(rest, "alt "); i >= 0 {
-		alt, err = parseText(strings.TrimSpace(rest[i+len("alt "):]), line)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		altSet, rest = true, strings.TrimSpace(rest[:i])
+	rest, alt, altSet, err = mediaClause(rest, "alt", line)
+	if err != nil {
+		return nil, nil, false, err
 	}
 	segs, err = parseText(rest, line)
 	if err != nil {
 		return nil, nil, false, err
 	}
 	return segs, alt, altSet, nil
+}
+
+// mediaClause pulls one trailing `<kw> "…"` clause off a media line: the words
+// after the keyword, parsed as interpolated text, and the line with the clause
+// removed. The keyword is found with indexTop so a URL containing it is left
+// alone (see parseMedia). Absent, the line comes back untouched and set is false.
+func mediaClause(rest, kw string, line int) (remain string, segs []ast.Seg, set bool, err error) {
+	i := indexTop(rest, kw+" ")
+	if i < 0 {
+		return rest, nil, false, nil
+	}
+	segs, err = parseText(strings.TrimSpace(rest[i+len(kw)+1:]), line)
+	if err != nil {
+		return "", nil, false, err
+	}
+	return strings.TrimSpace(rest[:i]), segs, true, nil
+}
+
+// parseVideo: `video "src" [poster "url"] [alt "…"] [autoplay] [loop] [muted]`.
+//
+// The source and `alt` are the grammar `image` has (parseMedia), so the two
+// cannot drift on what they share. A video has two things a picture does not:
+// a `poster` — the still shown before playback, interpolated like the source —
+// and playback flags, which are bare words at the end of the line. The flags
+// are peeled off the tail first, then `alt`, then `poster`, so each clause runs
+// from its keyword to what was the end of the line when it was parsed and no
+// clause has to know which others exist. `alt` must therefore follow `poster`;
+// that is the order the words are read in aloud ("this clip, its poster, its
+// description, how it plays"), and the diagnostic says so if they are swapped.
+func parseVideo(rest string, line int) (ast.Video, error) {
+	v := ast.Video{Line: line}
+	for {
+		i := strings.LastIndexByte(rest, ' ')
+		if i < 0 {
+			break
+		}
+		word := strings.TrimSpace(rest[i+1:])
+		// A bare word after the closing quote is a flag; the same word inside a
+		// string literal is a URL or a description and is left where it is.
+		if strings.Count(rest[:i], `"`)%2 != 0 {
+			break
+		}
+		switch word {
+		case "autoplay":
+			v.Autoplay = true
+		case "loop":
+			v.Loop = true
+		case "muted":
+			v.Muted = true
+		default:
+			if word != "" && word[0] != '"' && isIdent(word) && strings.HasSuffix(strings.TrimSpace(rest[:i]), `"`) {
+				return v, &Error{line, fmt.Sprintf("video: unknown flag %q (the playback flags are autoplay, loop, muted)", word)}
+			}
+			goto flagsDone
+		}
+		rest = strings.TrimSpace(rest[:i])
+	}
+flagsDone:
+	// Each clause runs to the end of what is left, so they are peeled in reverse
+	// order of the grammar; `alt` written before `poster` would swallow it.
+	if a, p := indexTop(rest, "alt "), indexTop(rest, "poster "); a >= 0 && p > a {
+		return v, &Error{line, `video clauses are ordered: video "src" [poster "…"] [alt "…"] [autoplay] [loop] [muted]`}
+	}
+	var err error
+	rest, v.Alt, v.AltSet, err = mediaClause(rest, "alt", line)
+	if err != nil {
+		return v, err
+	}
+	rest, v.Poster, _, err = mediaClause(rest, "poster", line)
+	if err != nil {
+		return v, err
+	}
+	if strings.TrimSpace(rest) == "" {
+		return v, &Error{line, `video needs a source: video "{p.media}" [poster "…"] [alt "…"] [autoplay] [loop] [muted]`}
+	}
+	if v.Segs, err = parseText(rest, line); err != nil {
+		return v, err
+	}
+	return v, nil
 }
 
 // parseHeading: `heading <level> "Title"` — a level expression, then the words.

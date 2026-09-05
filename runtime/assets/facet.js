@@ -92,6 +92,7 @@
   // regionFP records the dependency fingerprint each region's rows were resolved
   // under; when it stops matching, the region re-asks the authority.
   let regionRows = {}; // region path -> the rows the authority resolved
+  let regionMore = {}; // region path -> true while that list's `limit` held rows back (a `more` list only)
   let regionFP = {};   // region path -> the fingerprint those rows were resolved under
   let regionCtx = {};  // region path -> { el, node, sc }: where to re-render it in place
   let regionPending = {}; // region path -> the fingerprint currently in flight
@@ -170,6 +171,7 @@
     // cells. Lift them out so `store` stays what it has always been — state, and
     // the few collections the client's own aggregates still need.
     regionRows = newState["@regions"] || {};
+    regionMore = newState["@more"] || {};
     aggValues = newState["@aggs"] || {};
     dataSeq = newState["@seq"] || 0;
     // Grants are per page: a fresh page brings its own, and carrying the previous
@@ -179,6 +181,7 @@
     mediaMap = {};
     mergeMedia(newState["@media"]);
     delete newState["@regions"];
+    delete newState["@more"];
     delete newState["@aggs"];
     delete newState["@seq"];
     delete newState["@media"];
@@ -225,7 +228,7 @@
   // so a list one side reads and the other skips shifts every number after it, and
   // every aggregate from there on resolves to another one's value.
   function segLists(nd) {
-    const out = [nd.segs, nd.label, nd.placeholder, nd.pathSegs, nd.classSegs, nd.alt];
+    const out = [nd.segs, nd.label, nd.placeholder, nd.pathSegs, nd.classSegs, nd.alt, nd.poster];
     for (const o of list(nd.options)) out.push(o.label);
     return out;
   }
@@ -454,11 +457,53 @@
       case "lower": return toStr(a(0)).toLowerCase();
       case "trim": return toStr(a(0)).trim();
       case "contains": return toStr(a(0)).includes(toStr(a(1)));
+      case "ago": return ago(toInt(a(0)), Math.floor(Date.now() / 1000));
+      case "compact": return compact(toInt(a(0)));
+      case "commas": return commas(toInt(a(0)));
+      case "take": { const r = Array.from(toStr(a(0))); let n = toInt(a(1)); if (n < 0) n = 0; return r.slice(0, n).join(""); }
       case "year": return new Date(toInt(a(0)) * 1000).getUTCFullYear();
       case "month": return new Date(toInt(a(0)) * 1000).getUTCMonth() + 1;
       case "day": return new Date(toInt(a(0)) * 1000).getUTCDate();
     }
     return null;
+  }
+  // ── formatting (mirrors runtime/format.go exactly; integer arithmetic only) ──
+  function ago(ts, now) {
+    const d = now - ts;
+    if (d < 60) return "now";
+    if (d < 3600) return ((d / 60) | 0) + "m";
+    if (d < 86400) return ((d / 3600) | 0) + "h";
+    const t = new Date(ts * 1000), n = new Date(now * 1000);
+    const mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let s = mon[t.getUTCMonth()] + " " + t.getUTCDate();
+    if (t.getUTCFullYear() !== n.getUTCFullYear()) s += ", " + t.getUTCFullYear();
+    return s;
+  }
+  function compact(n) {
+    const neg = n < 0; if (neg) n = -n;
+    let unit = 1, suffix = "";
+    if (n >= 1000000000) { unit = 1000000000; suffix = "B"; }
+    else if (n >= 1000000) { unit = 1000000; suffix = "M"; }
+    else if (n >= 1000) { unit = 1000; suffix = "K"; }
+    let s;
+    if (unit === 1) s = "" + n;
+    else {
+      const tenths = (n / (unit / 10)) | 0;
+      s = "" + ((tenths / 10) | 0);
+      if (tenths % 10 !== 0) s += "." + (tenths % 10);
+      s += suffix;
+    }
+    return neg ? "-" + s : s;
+  }
+  function commas(n) {
+    const neg = n < 0; if (neg) n = -n;
+    const digits = "" + n;
+    let out = "";
+    for (let i = 0; i < digits.length; i++) {
+      if (i > 0 && (digits.length - i) % 3 === 0) out += ",";
+      out += digits[i];
+    }
+    return neg ? "-" + out : out;
   }
   function money(cents) {
     let neg = cents < 0; if (neg) cents = -cents;
@@ -629,13 +674,18 @@
   function mdInline(s) {
     s = mdEscape(s);
     s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    // A link is admitted by scheme (http(s), mailto, a site-relative path) — the
+    // rule runtime/richtext.go states; anything else stays literal text.
+    s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:|\/)[^\s)]*)\)/g, '<a href="$2" rel="noopener">$1</a>');
     s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
     return s;
   }
   function mdBlockStart(line) {
     return line.startsWith("```") || line.startsWith("# ") || line.startsWith("## ") ||
-      line.startsWith("### ") || line.startsWith("> ") || line.startsWith("- ");
+      line.startsWith("### ") || line.startsWith("> ") || line.startsWith("- ") ||
+      /^\d+\. /.test(line) || line.trim() === "---";
   }
   function markdownHtml(src) {
     const lines = String(src).split("\n");
@@ -662,7 +712,13 @@
         out += "<ul>";
         while (i < lines.length && lines[i].startsWith("- ")) { out += "<li>" + mdInline(lines[i].slice(2)) + "</li>"; i++; }
         out += "</ul>";
-      } else if (line.trim() === "") { i++; }
+      } else if (/^\d+\. /.test(line)) {
+        // Mirrors runtime/richtext.go: the author's numbers are dropped, <ol> counts.
+        out += "<ol>";
+        while (i < lines.length && /^\d+\. /.test(lines[i])) { out += "<li>" + mdInline(lines[i].replace(/^\d+\. /, "")) + "</li>"; i++; }
+        out += "</ol>";
+      } else if (line.trim() === "---") { out += "<hr>"; i++; }
+      else if (line.trim() === "") { i++; }
       else {
         const para = [];
         while (i < lines.length && lines[i].trim() !== "" && !mdBlockStart(lines[i])) { para.push(mdInline(lines[i])); i++; }
@@ -768,6 +824,13 @@
         const v = el("video", "fa-video");
         v.controls = true;
         v.src = mediaSrc(attrText(node.segs, sc));
+        // Mirrors runtime/server.go: poster is a media value like the source; the
+        // flags are the IR's (autoplay ⇒ muted was folded by the compiler), and
+        // playsinline rides with autoplay so iOS keeps the clip in the feed.
+        if (node.poster) { const p = attrText(node.poster, sc); if (p) v.setAttribute("poster", mediaSrc(p)); }
+        if (node.autoplay) { v.setAttribute("autoplay", ""); v.setAttribute("playsinline", ""); }
+        if (node.loop) v.setAttribute("loop", "");
+        if (node.muted) v.setAttribute("muted", "");
         // A <video> has no alt; its accessible name is aria-label, and an empty
         // one names nothing — so it is written only when there is a name.
         const name = attrText(node.alt, sc);
@@ -1015,6 +1078,40 @@
       const childScope = Object.assign({}, sc); childScope[node.var] = row;
       renderKids(container, node.children, childScope, rowPathFor(node, path, i++, row));
     }
+    // The infinite-scroll control, exactly as the server paints it: a real button
+    // after the last row while rows were held back. What the client adds is the
+    // trigger — the next page loads as the control scrolls into view.
+    if (moreFor(node, sc, path)) {
+      const b = el("button", "fa-more");
+      b.type = "button";
+      b.setAttribute("data-fa-more", node.more);
+      b.textContent = "More";
+      container.appendChild(b);
+      observeMore(b);
+    }
+  }
+
+  // observeMore fires a list's `more` action when its control enters the
+  // viewport. One observer for the page; a control is observed once, when it is
+  // made, and a re-fill makes a new one — so a page that grows keeps loading
+  // until the authority stops painting the control (regionMore false), and a
+  // control that was replaced before its callback ran is ignored. Without an
+  // IntersectionObserver (an old browser, a test shim) the button is still a
+  // button: the click handler below loads the page.
+  let moreObserver = null;
+  function observeMore(b) {
+    if (typeof IntersectionObserver === "undefined") return;
+    if (!moreObserver) {
+      moreObserver = new IntersectionObserver(function (entries) {
+        for (const en of entries) {
+          if (!en.isIntersecting) continue;
+          moreObserver.unobserve(en.target);
+          if (en.target.isConnected === false) continue;
+          dispatch(en.target.getAttribute("data-fa-more"), [], store, en.target);
+        }
+      }, { rootMargin: "200px" });
+    }
+    moreObserver.observe(b);
   }
 
   // optionsRegionId is the region address of a control whose choices come from
@@ -1152,7 +1249,12 @@
     let data;
     try { data = await res.json(); } catch (_) { return; }
     if (seq !== pageDataSeq) return;
-    for (const k in (data.regions || {})) regionRows[k] = data.regions[k] || [];
+    for (const k in (data.regions || {})) {
+      regionRows[k] = data.regions[k] || [];
+      // The flag travels with the rows it describes: a region whose rows this
+      // answer carries has its cut-off state re-answered too, true or false.
+      regionMore[k] = !!(data.more && data.more[k]);
+    }
     aggValues = data.aggs || {};
     mergeMedia(data.media); // fresh rows arrive with the signatures to render them by
     regionFP = {}; // these rows answer the state the request carried; re-adopted on fill
@@ -1310,6 +1412,20 @@
     }
     if (node.limit) { const lim = toInt(ev(node.limit, sc)); if (lim > 0 && out.length > lim) out = out.slice(0, lim); }
     return out;
+  }
+  // moreFor answers whether a `more` list's `limit` held rows back. A `[T]` state
+  // cell is the client's to filter, so the answer is computed here the way
+  // runtime/region.go's listRowsMore computes it — one past the limit. A table's
+  // rows came from the authority, and so did the flag (regionMore).
+  function moreFor(node, sc, path) {
+    if (!node.more || !node.limit) return false;
+    if (node.coll in stateType) {
+      const lim = toInt(ev(node.limit, sc));
+      if (lim <= 0) return false;
+      const probe = Object.assign({}, node, { limit: null });
+      return selectRows(sc[node.coll] || [], probe, sc).length > lim;
+    }
+    return !!regionMore[path];
   }
   function cmpVal(a, b) {
     if (typeof a === "number" && typeof b === "number") return a - b;
@@ -1756,6 +1872,15 @@
       const bind = tab.getAttribute("data-fa-tab-bind");
       store[bind] = tab.getAttribute("data-fa-tab");
       refresh([bind]);
+      return;
+    }
+    // The infinite-scroll control: a click loads the next page. The same thing
+    // its observer does when it scrolls into view — and all it can do where
+    // there is no observer.
+    const more = e.target.closest("[data-fa-more]");
+    if (more) {
+      e.preventDefault();
+      dispatch(more.getAttribute("data-fa-more"), [], store, more);
       return;
     }
     // A click on the overlay backdrop itself (not its panel) closes the overlay.

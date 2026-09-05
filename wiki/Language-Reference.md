@@ -283,6 +283,28 @@ view Home at "/":
         use Avatar("ada", 48)
 ```
 
+A parameter is a primitive, an enum, or **an entity — a row of it**. Inside the
+component the row's fields are typed, so `t.body` is checked against the entity
+and `match t.kind` knows the enum. The argument must be a row: the variable a
+`for` binds, or an enclosing component's own entity parameter. An id (`p.id`, a
+relation field `p.by`, a literal) is refused, because a row and its id unify in
+storage but not in a component that reads `t.body`.
+
+```
+component PostCard(t: Post, likes: int):
+    box:
+        text "{t.author} · {ago(t.created)}"
+        text "{t.body}"
+        button "♥ {compact(likes)}" -> like(t.id)
+
+for p in Post by created desc limit 20:
+    use PostCard(p, count(l in Like where l.post == p.id))
+```
+
+`x.field` on any row — a `for` variable or an entity parameter — is a compile
+error when the entity has no such field, wherever it appears (text, `where`, `if`,
+an aggregate's predicate).
+
 A **layout** wraps pages around a `slot`. A view opts in with `in Layout`:
 
 ```
@@ -340,12 +362,19 @@ The body of a `view`, `component`, or `layout` is a tree of nodes:
 | `upload` | `upload bind urlCell [label "…"]` | file/media upload; stores the URL in the cell |
 | `link` | `link "label" -> "/path"` | SPA navigation to a route |
 | `if` | `if <cond>:` + children | conditional region (reactive) |
-| `for` | `for x in Coll [where c] [by f desc\|asc] [limit n]:` + children | a query/list region |
+| `image` | `image "url" [alt "…"]` | a picture; URL and alt interpolate |
+| `video` | `video "url" [poster "url"] [alt "…"] [autoplay] [loop] [muted]` | a player; `autoplay` implies `muted` |
+| `richtext` | `richtext "{expr}"` | a safe Markdown subset, escaped first |
+| `icon` / `badge` | `icon "name"` · `badge "{n}"` | a glyph · a pill |
+| `tabs` | `tabs bind cell:` + `tab "Label" -> "value":` blocks | a segmented control over a `@client` cell |
+| `for` | `for x in Coll [where c] [by f desc\|asc] [limit n] [more action]:` + children | a query/list region; `more` = infinite scroll |
 | `use` | `use Component(args)` | render a component |
 | `slot` | `slot` | in a layout: where the page renders |
 
-**`for`** is the query primitive — filter (`where`), sort (`by … asc|desc`), and
-paginate (`limit`). In the JSON API the same clauses push down to indexed SQL.
+**`for`** is the query primitive — filter (`where`), sort (`by … asc|desc`),
+paginate (`limit`), and load the next page (`more <action>`, a zero-argument
+action fired as the list's tail scrolls into view). In the JSON API the same
+query clauses push down to indexed SQL.
 See **[Data Modeling → Queries](Data-Modeling.md#queries)**.
 
 ```
@@ -396,7 +425,18 @@ client runtime, so all executors agree.
 (integers only, so `floor`/`round` are identity).
 
 **String** (pure): `len(s)` (rune count, or list length) · `upper(s)` ·
-`lower(s)` · `trim(s)`.
+`lower(s)` · `trim(s)` · `take(s, n)` (the first n characters) · `contains(s, sub)`.
+
+**Formatting** (pure, render-time text — the same characters on the server and
+the client):
+
+| Builtin | Result |
+|---|---|
+| `ago(ts)` | relative time: `now` · `5m` · `20h` · then a date, `Jun 3` (`Jun 3, 2025` outside this year). Reads the clock at render; a view may use it |
+| `compact(n)` | `1.3K` · `79.8K` · `604K` · `240.1M` · `2B` — one decimal, dropped when zero, truncated not rounded |
+| `commas(n)` | `1,352` |
+
+**Date** (pure): `year(ts)` · `month(ts)` · `day(ts)` (UTC).
 
 **Money** (pure): `money(cents)` → the canonical two-decimal string
 (`money(1999)` → `"19.99"`). Store `money` as integer minor units; use this to

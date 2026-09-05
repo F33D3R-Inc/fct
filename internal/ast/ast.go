@@ -642,7 +642,18 @@ type Video struct {
 	Segs   []Seg
 	Alt    []Seg
 	AltSet bool
-	Line   int
+	// Poster is the still shown before playback (`poster "{p.thumb}"`) —
+	// interpolated like the source, because a thumbnail in a `for` is one PER
+	// ROW. Absent, the browser shows the first frame once it has it.
+	Poster []Seg
+	// The playback flags a feed needs: `autoplay` starts the clip as it scrolls
+	// into view — and implies `muted`, because every browser refuses to autoplay
+	// with sound, so writing one without the other produces a player that never
+	// starts; `loop` restarts it at the end; `muted` silences it.
+	Autoplay bool
+	Loop     bool
+	Muted    bool
+	Line     int
 }
 
 // Richtext is a `richtext "{expr}"` node — its interpolated text is rendered as a
@@ -725,6 +736,13 @@ type Range struct {
 	Order string // sort field; "" = insertion order
 	Desc  bool   // true = descending (newest/highest first)
 	Limit Expr   // optional max rows: an int literal or an expr (e.g. a @client page size for load-more); nil = unlimited
+	// More names the zero-argument action that loads the next page — `for … limit
+	// shown more loadMore:`. It makes the list an infinite scroll: while rows were
+	// cut off by `limit`, a "More" control follows the last row, and the client
+	// fires the action as that control scrolls into view (a click does the same,
+	// so the control works with no observer and from the keyboard). It requires
+	// `limit`: without one nothing was held back, so there is nothing to load.
+	More string
 }
 
 // For iterates an entity/list, rendering Body once per row with Var bound. It is

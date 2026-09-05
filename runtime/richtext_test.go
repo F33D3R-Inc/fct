@@ -29,6 +29,28 @@ var markdownCases = []struct{ name, in, want string }{
 	{"blockquote inline + escaping", "> **x** & <y>", "<blockquote><p><strong>x</strong> &amp; &lt;y&gt;</p></blockquote>"},
 	{"blockquote ends a paragraph", "body\n> q", "<p>body</p><blockquote><p>q</p></blockquote>"},
 	{"a bare angle bracket is prose", ">notaquote", "<p>&gt;notaquote</p>"},
+	// The long-form subset a creator platform's posts need beyond the first cut:
+	// links, numbered steps, a rule between sections, and struck text.
+	{"link https", "see [the docs](https://example.com/a?b=1&c=2)",
+		`<p>see <a href="https://example.com/a?b=1&amp;c=2" rel="noopener">the docs</a></p>`},
+	{"link relative + mailto", "[home](/) · [mail](mailto:a@b.co)",
+		`<p><a href="/" rel="noopener">home</a> · <a href="mailto:a@b.co" rel="noopener">mail</a></p>`},
+	// The scheme is the gate: a destination that is not http(s), mailto or a
+	// site-relative path is not a link, and the text stays exactly as typed.
+	{"link javascript refused", "[x](javascript:alert(1))", "<p>[x](javascript:alert(1))</p>"},
+	{"link data refused", "[x](data:text/html,hi)", "<p>[x](data:text/html,hi)</p>"},
+	{"link text escaped", `[<b>](https://x.y)`, `<p><a href="https://x.y" rel="noopener">&lt;b&gt;</a></p>`},
+	// The destination runs to the first `)`, and the quote inside it arrives
+	// escaped — so it cannot close the attribute whatever follows it.
+	{"link quote cannot close href", `[x](https://x.y/"onmouseover=alert(1))`,
+		`<p><a href="https://x.y/&#34;onmouseover=alert(1" rel="noopener">x</a>)</p>`},
+	{"ordered list", "1. one\n2. two\n3. three", "<ol><li>one</li><li>two</li><li>three</li></ol>"},
+	{"ordered list numbers are the browser's", "1. a\n1. b", "<ol><li>a</li><li>b</li></ol>"},
+	{"ordered list ends a paragraph", "intro\n1. a", "<p>intro</p><ol><li>a</li></ol>"},
+	{"a number in prose is prose", "in 1999. it rained", "<p>in 1999. it rained</p>"},
+	{"rule", "above\n---\nbelow", "<p>above</p><hr><p>below</p>"},
+	{"strike", "~~old~~ new", "<p><del>old</del> new</p>"},
+	{"strike inside bold", "**~~a~~**", "<p><strong><del>a</del></strong></p>"},
 }
 
 func TestMarkdownHTML(t *testing.T) {

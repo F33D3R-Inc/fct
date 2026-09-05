@@ -89,6 +89,30 @@ const listPageSize = 2000
 //
 // A `for` over a `[T]` state cell is not a table; it has no store to ask, so it
 // keeps the in-memory path (`selectRows`) it always had.
+// listRowsMore is listRows for a list that declares `more`: the rows, and
+// whether the `limit` cut any off. The store answers `limit` rows and cannot
+// say whether an eleventh existed, so the question is asked as `limit + 1`
+// rows and the answer read off the count — the same pushdown, one row wider,
+// which is the whole cost of knowing. The extra row is dropped before it can
+// render. A list with no `more` (or no `limit`) is never cut off in a way
+// anyone acts on, so it takes the plain path.
+func (s *Server) listRowsMore(n ir.Node, scope map[string]any) ([]any, bool) {
+	if n.More == "" || n.Limit == nil {
+		return s.listRows(n, scope), false
+	}
+	limit := toInt(eval(n.Limit, scope))
+	if limit <= 0 {
+		return nil, false
+	}
+	probe := n
+	probe.Limit = &ir.Expr{Kind: "lit", Val: limit + 1, VType: "int"}
+	rows := s.listRows(probe, scope)
+	if len(rows) > limit {
+		return rows[:limit], true
+	}
+	return rows, false
+}
+
 func (s *Server) listRows(n ir.Node, scope map[string]any) []any {
 	ent, isEntity := s.entityByName(n.Coll)
 	if !isEntity || s.store == nil {
@@ -678,7 +702,12 @@ func (s *Server) aggIndex(pg *ir.Page) map[*ir.Expr]int {
 type renderer struct {
 	s       *Server
 	regions map[string][]any
-	mat     *materializer // collects the aggregate values the client cannot recompute
+	// more records, per region path, that a `for … more <action>` list had rows
+	// held back by its `limit` — the one fact about a page the client cannot
+	// recompute from the rows it was handed, and the fact its "More" control
+	// exists on. Only lists that declare `more` have an entry.
+	more map[string]bool
+	mat  *materializer // collects the aggregate values the client cannot recompute
 }
 
 // newRenderer starts a render pass for one page and installs its aggregate
@@ -687,7 +716,7 @@ func (s *Server) newRenderer(pg *ir.Page, scope map[string]any) *renderer {
 	mat := &materializer{s: s, index: s.aggIndex(pg), out: map[string]any{}, counts: map[string]int{}}
 	scope[materializerKey] = mat
 	scope[bindingsKey] = pageBindings(pg)
-	return &renderer{s: s, regions: map[string][]any{}, mat: mat}
+	return &renderer{s: s, regions: map[string][]any{}, more: map[string]bool{}, mat: mat}
 }
 
 // Render paths address what was rendered, not what exists.
@@ -850,7 +879,7 @@ func (s *Server) handleRegion(w http.ResponseWriter, r *http.Request) {
 	for i, n := range pg.View {
 		rd.node(&discard, n, store, childPath("", i))
 	}
-	out := map[string]any{"regions": rd.regions, "aggs": rd.mat.out}
+	out := map[string]any{"regions": rd.regions, "more": rd.more, "aggs": rd.mat.out}
 	// `rows` answers the region that was named; `regions` and `aggs` carry
 	// everything else this render resolved, so a state change that feeds several
 	// regions — or that moves a count outside them — costs one round trip. A

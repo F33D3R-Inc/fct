@@ -78,7 +78,8 @@ for m in Message where m.to == 1 by sent desc limit 20:
 |---|---|
 | `where <cond>` | row filter; `field == value` and comparisons |
 | `by <field> [asc\|desc]` | sort (default ascending) |
-| `limit <n>` | maximum rows |
+| `limit <n>` | maximum rows — a literal or a `@client` cell (a page size) |
+| `more <action>` | infinite scroll: a zero-arg action that grows the page size, fired as the list's tail scrolls into view (requires `limit`) |
 
 In the JSON API these compile to **indexed `SELECT`s with keyset cursor
 pagination** — a large table is never loaded whole. See

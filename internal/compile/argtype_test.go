@@ -196,17 +196,9 @@ func TestWideningIntoTextStaysLegal(t *testing.T) {
             use C(p.author)
 `,
 	}, {
-		// The check's job is to catch a wrong argument, not to be the place a
-		// parameter's own unresolvable type is finally noticed.
-		name: "a parameter whose declared type the language does not have constrains nothing",
-		src: `app A:
-    state q: text = "" @client
-    component C(w: Widget):
-        text "{w}"
-    view V at "/":
-        use C(q)
-`,
-	}, {
+		// A parameter whose declared type the language does not have is refused
+		// where it is declared (entityparam_test.go), not here — the check's job
+		// is to catch a wrong argument.
 		name: "concatenation is text",
 		src: `app A:
     entity Post:

@@ -1834,6 +1834,7 @@ func (s *Server) clientState(pg *ir.Page, store map[string]any, rd *renderer) ma
 		regions = map[string][]any{}
 	}
 	out["@regions"] = regions
+	out["@more"] = rd.more
 	out["@aggs"] = rd.mat.out
 	out["@seq"] = s.writeSeq.Load()
 	// The client renders an `image` from a durable reference it cannot sign, so
@@ -2320,9 +2321,13 @@ func (rd *renderer) rows(n ir.Node, scope map[string]any, path string) []any {
 	// that same gated result set is what the HTML is built from and what the
 	// client receives — so the first paint and the hydrated render can never
 	// disagree about which fields this actor may see.
-	rows := s.visibleRowList(n.Coll, s.listRows(n, scope), scope)
+	all, more := s.listRowsMore(n, scope)
+	rows := s.visibleRowList(n.Coll, all, scope)
 	if rows == nil {
 		rows = []any{}
+	}
+	if n.More != "" {
+		rd.more[path] = more
 	}
 	if _, isEntity := s.entityByName(n.Coll); isEntity {
 		// A repeat over a `[T]` state cell is not recorded: that cell already
@@ -2490,8 +2495,27 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 		if name := s.attrText(n.Alt, scope); name != "" {
 			aria = fmt.Sprintf(` aria-label="%s"`, name)
 		}
-		fmt.Fprintf(b, `<video%s controls src="%s"%s></video>`, nodeAttrs("fa-video", n),
-			html.EscapeString(mediaSrc(s.segsToString(n.Segs, scope))), aria)
+		// Poster is a media value like the source; the flags are the IR's — the
+		// compiler already folded `autoplay ⇒ muted`, so this writes what it is
+		// told. `playsinline` rides with autoplay because iOS otherwise takes an
+		// autoplaying clip fullscreen, which is not what a feed asked for.
+		extra := ""
+		if len(n.Poster) > 0 {
+			if p := s.segsToString(n.Poster, scope); p != "" {
+				extra += fmt.Sprintf(` poster="%s"`, html.EscapeString(mediaSrc(p)))
+			}
+		}
+		if n.Autoplay {
+			extra += " autoplay playsinline"
+		}
+		if n.Loop {
+			extra += " loop"
+		}
+		if n.Muted {
+			extra += " muted"
+		}
+		fmt.Fprintf(b, `<video%s controls src="%s"%s%s></video>`, nodeAttrs("fa-video", n),
+			html.EscapeString(mediaSrc(s.segsToString(n.Segs, scope))), extra, aria)
 	case "richtext":
 		// markdownHTML escapes its input and emits only a fixed safe tag set.
 		fmt.Fprintf(b, `<div%s>%s</div>`, nodeAttrs("fa-richtext", n), markdownHTML(s.segsToString(n.Segs, scope)))
@@ -2546,6 +2570,13 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 			rd.mat.path = path // the children moved it; the next row starts from here
 		}
 		rd.mat.fanout = fanout
+		// The infinite-scroll control: present exactly while `limit` held rows
+		// back. It is a real button, not a bare sentinel, so the next page is one
+		// click (or one Enter) away with no observer at all; the client adds the
+		// scroll-into-view trigger on top (assets/facet.js observeMore).
+		if n.More != "" && rd.more[path] {
+			fmt.Fprintf(b, `<button type="button" class="fa-more" data-fa-more="%s">More</button>`, html.EscapeString(n.More))
+		}
 		b.WriteString(`</div>`)
 	case "if":
 		// `if` is control flow, not a box. The IR says so — internal/ir/build.go's
@@ -3317,6 +3348,16 @@ const baseCSS = `
   .fa-richtext pre code { background: none; padding: 0; }
   .fa-richtext blockquote { margin: .5em 0; padding: .1em 0 .1em .9rem;
                             border-left: 3px solid var(--fa-border); color: var(--fa-muted); }
+  .fa-richtext ol { margin: .5em 0; padding-left: 1.5rem; }
+  .fa-richtext hr { border: none; border-top: 1px solid var(--fa-border); margin: 1em 0; }
+  .fa-richtext a { color: var(--fa-accent); }
+  .fa-richtext del { color: var(--fa-muted); }
+  /* more: the infinite-scroll control after a cut-off list. A quiet, full-width
+     row — it is mostly scrolled past, and only read when the observer is off. */
+  .fa-more { display: block; width: 100%; margin: .5rem 0 0; padding: .6rem; background: transparent;
+             border: 1px solid var(--fa-border); border-radius: var(--fa-radius); color: var(--fa-muted);
+             cursor: pointer; align-self: stretch; }
+  .fa-more:hover { color: var(--fa-fg); }
   /* heading: the browser's own scale per level IS the semantics, so nothing is
      imposed on it; only the margin, which a flex box/row would read as a gap. */
   .fa-heading { margin: 0; }

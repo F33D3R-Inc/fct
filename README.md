@@ -51,7 +51,7 @@ You declare **what** each thing is; the compiler infers **where** it lives.
 | `state draft: text = "" @client` | ephemeral/local → **client** |
 | `action like(id)` (mutates an entity) | authoritative → **server** |
 | `action addBonus` (mutates only client state) | → **client** (zero network) |
-| `now()` / `rand()` in an action | impure → **server** (the authority owns it) |
+| `now()` / `rand()` in an action | impure → **server** (the authority owns it) — unless the action writes only `@client` state, which has no shared result to agree on, so it stays on the client |
 
 Placement is **sound**, checked at compile time: a server action can neither read
 nor write client-only state; `requires <policy>` forces server placement; a

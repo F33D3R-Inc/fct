@@ -78,7 +78,7 @@ notifications. Translated into **language** features (visual polish is secondary
 6. **Ranking** — sort a feed by a computed engagement score.
 
 **Tier 3 — UI primitives so it looks 2026 (in progress)**
-7. ✅ `icon`, `badge`, `tabs`/segmented control (Sprint 3) · `avatar` = `image` ✅ · ⬜ `richtext`/markdown, `video`, infinite-scroll, search input + a real styling story.
+7. ✅ `icon`, `badge`, `tabs`/segmented control (Sprint 3) · `avatar` = `image` ✅ · ✅ `richtext`/markdown (headings, lists, quotes, code, rules, links, bold/italic/strike) · ✅ `video` (`poster`, `autoplay`/`loop`/`muted`) · ✅ infinite scroll (`for … limit shown more loadMore`) · ✅ search input (`contains` + `typeahead`) · ⬜ a real styling story.
 
 **Tier 4 — platform breadth (FB / YouTube)**
 8. **Video** primitive + multi-image + upload→attach.
@@ -114,7 +114,7 @@ avatar/badge) — Tier 2 (notifications, feeds) is already expressible on Tier 1
 | Tagged unions / sum types | ⬜ | **Next** — the missing piece for state machines & typed errors |
 | Pattern matching / exhaustiveness | ✅ | `match … case/else` over enum-typed subjects, exhaustiveness enforced |
 | Generics / parametric polymorphism | 🟡→⬜ | **Next, scoped**: generic *components* & *collections* only |
-| Type inference | 🟡 | placement is inferred; value types are mostly annotated |
+| Type inference | 🟡 | placement is inferred; value types are mostly annotated. Rows are typed through `for` variables and entity-typed component params (`component PostCard(t: Tweet)`), so `t.field` is checked and an id cannot stand in for a row |
 | Branded IDs / newtypes | ⬜ | Later |
 | First-class functions / closures | 🚫 | a general-purpose-language feature; fights the declaration-first model |
 | `async`/await | 🚫 | **subsumed by placement** — the compiler decides round-trips; there is no async to write |
@@ -133,7 +133,7 @@ deliberately decided against it — the goal is to build a site, not a language.
 |---|---|---|
 | server / client placement + inference | ✅ | the spine |
 | authoritative vs ephemeral (`@client`) | ✅ | |
-| impurity ⇒ server, `requires` ⇒ server | ✅ | |
+| impurity ⇒ server, `requires` ⇒ server | ✅ | one exception: an impure action whose every write lands in `@client` state runs on the client (`seenAt = now()`) — per-browser state has no shared result for the authority to own |
 | soundness: server action can't read/write `@client` | ✅ | symmetric, compile-enforced |
 | secret / server-only values | ✅ | `@private` state (v1.19.0): authoritative but never shipped to a client and a **compile error to render** (leak diagnostic) — keys policies/feeds services; plus `@secret` (at-rest encryption) + credentials never shipped |
 | end-to-end sealed fields | ✅ | `@e2e` entity field (v1.27.0): the client seals before sending, the authority only ever holds/serves ciphertext (never plaintext, never renders it — 🔒 placeholder, opened on the client). Compiler owns the dataflow; the cipher is a pluggable provider |

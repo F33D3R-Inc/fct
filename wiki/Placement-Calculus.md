@@ -40,6 +40,14 @@ sound**:
 4. **Impurity forces the server.** Calling an effectful builtin (`now()`,
    `rand()`) makes an action impure, so it is pinned to the authority — every
    client sees one agreed timestamp, not its own wall clock.
+   - **Exception:** an impure action that writes *only* `@client` state runs on
+     the client. "One agreed result" is a rule about a shared result, and
+     per-browser state has none — `seenAt = now()` into a client cell is
+     exactly the "mark what I have already seen" pattern, and without the
+     exception it could be placed nowhere (the authority must run it, and the
+     authority cannot write client state). Anything shared — an entity write,
+     a `@server` cell, a service call, `requires` — still pins the action to
+     the authority.
 5. **`requires <policy>` forces the server.** A permission check is only
    meaningful where it can be trusted, so any action with a `requires` clause
    runs on the authority.
