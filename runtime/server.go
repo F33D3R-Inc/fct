@@ -87,6 +87,14 @@ type Server struct {
 	aggMu  sync.Mutex
 	aggIdx map[string]map[*ir.Expr]int
 
+	// pageComps is the components each route can actually render — the closure of
+	// what its view names with `use`. Also a pure function of the page, and kept
+	// beside aggIdx because the two must agree: the client numbers aggregates by
+	// walking the components it was shipped, so the server has to number the same
+	// list in the same order.
+	compMu    sync.Mutex
+	pageComps map[string][]ir.Component
+
 	// writeSeq counts entity changes. A page carries the value it was rendered at
 	// and the live stream carries the current one, so a client can tell that the
 	// authority has written since its page was built — the race the old
@@ -700,6 +708,16 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	reqIR.Bindings = pg.Bindings
 	reqIR.DepGraph = pg.DepGraph
 	reqIR.Pages = nil
+	// …and with the components this page can reach, not every component the app
+	// defines. An app assembled from a facet library defines hundreds; a page
+	// renders a handful. Shipping all of them made the library, not the page, the
+	// size of the download: on f33d3r.com it was 323 KB of the 368 KB IR — 88% of
+	// every page — to render views the route cannot reach.
+	reqIR.Components = s.pageComponents(pg)
+	// The stylesheet is already in <style id="fa-css"> above; the client renderer
+	// never reads it off the IR. Shipping it in both places sent every visitor the
+	// same 67 KB twice.
+	reqIR.CSS = ""
 	irJSON, _ := json.Marshal(&reqIR)
 	// The server-render store (above) holds @private values and whole entity
 	// collections for server-side logic; the client bootstrap carries neither.

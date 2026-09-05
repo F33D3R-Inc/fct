@@ -547,6 +547,69 @@ func materializerOf(scope map[string]any) *materializer {
 // assets/facet.js walks the identical structure in the identical order.
 //
 // It is a pure function of the page, so it is computed once and cached.
+// pageComponents is the set of components this page can actually render: the
+// ones its view names with `use`, plus the ones those name, transitively.
+//
+// It exists because an app assembled from a facet library defines far more
+// components than any one route renders. f33d3r.com defines 607 and its home
+// page reaches a few dozen; shipping all of them put 323 KB of component trees
+// in front of every visitor to render 21 KB of page. A component the route
+// cannot reach is not a smaller download, it is a download of somebody else's
+// page.
+//
+// The closure is exact rather than conservative because `use` is the only way a
+// component is instantiated and it names its target statically — there is no
+// dynamic dispatch to be unable to see through. A `use`'s own children are the
+// slot content the caller passed, so they are walked too: that is where a card
+// wrapping a button reaches the button.
+//
+// The order is the app's, and that matters more than the saving: assets/facet.js
+// numbers a page's aggregates by walking the components it was shipped, and
+// [Server.aggIndex] numbers them by walking this. Two walks over two different
+// lists would hand the client an address for every aggregate after the first
+// component, which is a wrong number rather than a missing one.
+func (s *Server) pageComponents(pg *ir.Page) []ir.Component {
+	s.compMu.Lock()
+	defer s.compMu.Unlock()
+
+	if cs, ok := s.pageComps[pg.Path]; ok {
+		return cs
+	}
+
+	used := map[string]bool{}
+
+	var nodes func([]ir.Node)
+	nodes = func(list []ir.Node) {
+		for i := range list {
+			nd := &list[i]
+			// Marked before the walk, not after: the compiler proves component use
+			// acyclic, and this holds even if that ever stops being true.
+			if nd.Kind == "use" && !used[nd.Name] {
+				if c := s.byComponent[nd.Name]; c != nil {
+					used[nd.Name] = true
+					nodes(c.View)
+				}
+			}
+			nodes(nd.Children)
+		}
+	}
+	nodes(pg.View)
+
+	out := make([]ir.Component, 0, len(used))
+	for i := range s.ir.Components {
+		if used[s.ir.Components[i].Name] {
+			out = append(out, s.ir.Components[i])
+		}
+	}
+
+	if s.pageComps == nil {
+		s.pageComps = map[string][]ir.Component{}
+	}
+	s.pageComps[pg.Path] = out
+
+	return out
+}
+
 func (s *Server) aggIndex(pg *ir.Page) map[*ir.Expr]int {
 	s.aggMu.Lock()
 	defer s.aggMu.Unlock()
@@ -597,8 +660,8 @@ func (s *Server) aggIndex(pg *ir.Page) map[*ir.Expr]int {
 	for i := range pg.Bindings {
 		expr(pg.Bindings[i].Expr)
 	}
-	for i := range s.ir.Components {
-		nodes(s.ir.Components[i].View)
+	for _, c := range s.pageComponents(pg) {
+		nodes(c.View)
 	}
 	if s.aggIdx == nil {
 		s.aggIdx = map[string]map[*ir.Expr]int{}

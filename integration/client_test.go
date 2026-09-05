@@ -127,6 +127,24 @@ type driveStep struct {
 // writing a `@client` cell and everything bound to that cell re-rendering, and
 // no amount of looking at first paint can see it happen.
 func runClient(t *testing.T, html string, steps []driveStep) (clientRun, clientRun) {
+	return runClientAgainst(t, nil, html, steps)
+}
+
+// runClientAgainst also lets the client talk to the app that served the page.
+//
+// Without it every request the client makes throws on its relative URL and is
+// swallowed, which is the shape every other test here runs in — first paint,
+// then interactions, all answered from what the page shipped. That is the right
+// default: it keeps those tests hermetic and fast.
+//
+// It is not enough for the half of the client that asks the authority a
+// question. A region whose rows the render did not carry and an aggregate whose
+// value it did not materialize are both answered by a round trip to `/region`,
+// and a shim with no network cannot tell "asked and was answered" from "assumed
+// the table was empty" — the two look identical on the page. Passing the app
+// here lets the request actually happen, with this session's cookie, against the
+// same server that rendered the page.
+func runClientAgainst(t *testing.T, a *app, html string, steps []driveStep) (clientRun, clientRun) {
 	t.Helper()
 
 	node, err := exec.LookPath("node")
@@ -146,12 +164,22 @@ func runClient(t *testing.T, html string, steps []driveStep) (clientRun, clientR
 	}
 
 	args := []string{"testdata/domshim.js", page, client}
-	if len(steps) > 0 {
+	if len(steps) > 0 || a != nil {
 		script, err := json.Marshal(steps)
 		if err != nil {
 			t.Fatalf("encoding the interaction script: %v", err)
 		}
 		args = append(args, string(script))
+	}
+	if a != nil {
+		authority, err := json.Marshal(map[string]string{
+			"base":   a.url(""),
+			"cookie": "fa_sid=" + a.sessionCookie(),
+		})
+		if err != nil {
+			t.Fatalf("encoding the authority: %v", err)
+		}
+		args = append(args, string(authority))
 	}
 
 	out, err := exec.Command(node, args...).CombinedOutput()
@@ -159,6 +187,9 @@ func runClient(t *testing.T, html string, steps []driveStep) (clientRun, clientR
 		t.Fatalf("the client failed to render the page the server sent:\n%s", out)
 	}
 
+	if os.Getenv("FACET_SHIM_DEBUG") != "" {
+		t.Logf("shim output:\n%s", out)
+	}
 	first := parseClientRun(t, string(out), "root nodes: ", "all text: ", "hrefs: ", "attrs: ", "controls: ")
 	if first.Nodes < 0 {
 		t.Fatalf("the client produced no node count:\n%s", out)

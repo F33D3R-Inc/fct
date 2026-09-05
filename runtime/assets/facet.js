@@ -369,12 +369,52 @@
   function collRows(e, sc) {
     const rows = sc[e.name];
     if (rows === undefined) {
-      console.error("facet: " + (e.kind === "agg" ? e.op + "(...)" : "lookup") +
-        " over " + e.name + " has no rows on the client and no value from the render — " +
-        "clientColls (runtime/region.go) did not ship it. Treating it as empty, which is probably wrong.");
+      if (askedForAnswers()) {
+        // Already asked under this state and the answer still does not carry
+        // this one. THAT is a hole in clientColls, and it is said out loud
+        // rather than hidden behind an empty table.
+        console.error("facet: " + (e.kind === "agg" ? e.op + "(...)" : "lookup") +
+          " over " + e.name + " has no rows on the client, no value from the render, " +
+          "and the authority did not answer it either — clientColls " +
+          "(runtime/region.go) did not ship it and the render did not materialize " +
+          "it. Treating it as empty, which is probably wrong.");
+      }
       return [];
     }
     return rows;
+  }
+
+  // askedForAnswers asks the authority for this page's data under the client's
+  // current state, unless that question has already been asked, and reports
+  // whether it had already been asked.
+  //
+  // It is the aggregate half of what `rowsFor` does for a region, and it exists
+  // because the two used to answer "I have no answer for this" differently. A
+  // region with no rows asks — the authority renders the page under the client's
+  // state and sends back what it resolved. An aggregate with no value used to
+  // scan an empty array instead, which is not an absence of an answer, it is the
+  // answer zero. So a `count(...)` inside a branch the server never rendered —
+  // an `if` on a `@client` cell, revealed by the actor ticking a box — rendered
+  // 0, confidently, forever. The render could not have materialized it: it never
+  // rendered that branch. Nobody shipped the rows: clientColls deliberately does
+  // not ship an aggregate's source, because the render is supposed to ship its
+  // answer. Both halves are right; what was missing is the third case, where the
+  // render has not seen this state yet and the authority has to be asked.
+  //
+  // The answer that comes back carries every aggregate that render resolved
+  // (handleRegion returns `aggs` alongside `regions`), so one request answers
+  // every revealed value at once, and applyPageData re-renders with them.
+  //
+  // Asked once per state, for the reason a region is: this runs inside a render,
+  // and a render that re-asked every time it found a missing value would ask once
+  // per aggregate per paint, forever.
+  let answersAskedFP = null;
+  function askedForAnswers() {
+    const fp = JSON.stringify([dataSeq, store]);
+    if (answersAskedFP === fp) return true;
+    answersAskedFP = fp;
+    askPageData("");
+    return false;
   }
 
   // materialized returns the value the authority computed for this aggregate at

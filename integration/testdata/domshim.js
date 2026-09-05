@@ -6,6 +6,14 @@ const fs = require("fs");
 const pageHtml = fs.readFileSync(process.argv[2], "utf8");
 const clientJs = fs.readFileSync(process.argv[3], "utf8");
 
+// The page's own CSRF token, when it carried one. A canned value is enough while
+// nothing leaves the process, and wrong the moment something does: the authority
+// checks the token against the session, so a request made with a stand-in comes
+// back 403 and the client — which treats any failed answer as "no answer" —
+// silently keeps whatever it had.
+const pageCsrf =
+  (pageHtml.match(/name="fa-csrf" content="([^"]*)"/) || [null, "test-csrf"])[1];
+
 function scriptById(id) {
   const m = pageHtml.match(
     new RegExp('<script[^>]*id="' + id + '"[^>]*>([\\s\\S]*?)</script>')
@@ -234,7 +242,7 @@ global.document = {
   createComment: (t) => Object.assign(new Text(t), { tagName: "#comment", nodeType: 8 }),
   querySelector: (sel) =>
     sel === 'meta[name="fa-csrf"]'
-      ? Object.assign(new Node("meta"), { attrs: { content: "test-csrf" } })
+      ? Object.assign(new Node("meta"), { attrs: { content: pageCsrf } })
       : null,
   querySelectorAll: () => [],
   addEventListener: () => {},
@@ -247,8 +255,56 @@ global.window = {
   localStorage: global.localStorage,
   crypto: require("crypto").webcrypto,
   matchMedia: () => ({ matches: false, addEventListener: () => {} }),
-  // EventSource / fetch deliberately absent: boot must not depend on them.
+  // EventSource deliberately absent: boot must not depend on it.
 };
+
+// ── talking to the authority ────────────────────────────────────────────────
+//
+// argv[5], when given, is {"base": "http://127.0.0.1:PORT", "cookie": "fa_sid=…"}
+// and turns on a real `fetch` pointed at the app the test is running.
+//
+// Boot must not depend on it, and does not: without this argument every request
+// the client makes throws on the relative URL and the client swallows it, which
+// is the shape every test written before this one runs in. With it, the half of
+// the client that asks the authority a question — a region whose rows the render
+// did not carry, an aggregate whose value it did not materialize — can be
+// observed doing so, and answered.
+const authority = process.argv[5] ? JSON.parse(process.argv[5]) : null;
+const nodeFetch = global.fetch;
+let pendingRequests = 0;
+if (authority) {
+  global.fetch = (url, opts) => {
+    const full = String(url).startsWith("http") ? String(url) : authority.base + url;
+    const headers = Object.assign({}, (opts && opts.headers) || {});
+    if (authority.cookie) headers["Cookie"] = authority.cookie;
+    pendingRequests++;
+    return nodeFetch(full, Object.assign({}, opts || {}, { headers }))
+      .then((r) => {
+        // The client treats any failed answer as "no answer" and silently keeps
+        // what it had, which is right in a browser and invisible in a test. Say
+        // it here instead.
+        if (!r.ok) console.log("REQUEST REFUSED", full, r.status);
+        return r;
+      })
+      .catch((e) => { console.log("REQUEST FAILED", full, String(e)); throw e; })
+      .finally(() => { pendingRequests--; });
+  };
+}
+
+// settle waits for the client's own requests to land and for what they trigger
+// to render. A round trip is the point of the test that turns `authority` on, so
+// reporting before it returns would measure the wait rather than the answer.
+async function settle() {
+  if (!authority) return;
+  for (let i = 0; i < 100; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+    if (pendingRequests === 0) {
+      // One more turn, so the .then that applies the answer has run.
+      await new Promise((r) => setTimeout(r, 10));
+      if (pendingRequests === 0) return;
+    }
+  }
+}
 global.location = global.window.location;
 global.history = global.window.history;
 global.navigator = { language: "en-US" };
@@ -308,7 +364,12 @@ function dispatch(target, type) {
 }
 
 const script = process.argv[4] ? JSON.parse(process.argv[4]) : null;
-if (script) {
+main();
+
+async function main() {
+  // The first paint may itself have asked the authority a question.
+  await settle();
+  if (!script) return;
   for (const step of script) {
     const el = root.querySelector(step.sel);
     if (!el) {
@@ -328,6 +389,7 @@ if (script) {
       dispatch(el, "change");
     }
   }
+  await settle();
   console.log("=== after script ===");
   report("after ");
 }

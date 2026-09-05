@@ -100,6 +100,15 @@ func (s *Server) Reload(graph *ir.IR) error {
 		return err
 	}
 	s.ir = graph
+	// The per-page caches are keyed by route and hold pointers into the graph
+	// that was just replaced. Kept, they would answer a reload with the previous
+	// build's components and the previous build's aggregate addresses.
+	s.aggMu.Lock()
+	s.aggIdx = nil
+	s.aggMu.Unlock()
+	s.compMu.Lock()
+	s.pageComps = nil
+	s.compMu.Unlock()
 	s.byAction = ns.byAction
 	s.byPolicy = ns.byPolicy
 	s.byComponent = ns.byComponent
