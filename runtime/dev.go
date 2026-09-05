@@ -109,6 +109,9 @@ func (s *Server) Reload(graph *ir.IR) error {
 	s.compMu.Lock()
 	s.pageComps = nil
 	s.compMu.Unlock()
+	s.cssMu.Lock()
+	s.cssBody, s.cssVer = nil, ""
+	s.cssMu.Unlock()
 	s.byAction = ns.byAction
 	s.byPolicy = ns.byPolicy
 	s.byComponent = ns.byComponent

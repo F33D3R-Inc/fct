@@ -7,7 +7,9 @@
 package runtime
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -94,6 +96,15 @@ type Server struct {
 	// list in the same order.
 	compMu    sync.Mutex
 	pageComps map[string][]ir.Component
+
+	// The whole stylesheet — the runtime's own, the app's theme, and the app's
+	// CSS — built once and served as one cacheable file. It used to be three
+	// <style> blocks inlined into every page: on f33d3r.com that was 958 of the
+	// page's 1001 lines, re-sent on every navigation, and the reason the source
+	// of a small site read as enormous.
+	cssMu   sync.Mutex
+	cssBody []byte
+	cssVer  string
 
 	// writeSeq counts entity changes. A page carries the value it was rendered at
 	// and the live stream carries the current one, so a client can tell that the
@@ -336,7 +347,55 @@ type BuiltinRoute struct {
 	Always bool `json:"always"`
 }
 
+// stylesheet returns the app's whole stylesheet and a version string derived
+// from its content.
+//
+// The version is what makes the file cacheable forever without ever being stale:
+// the URL changes when the bytes change, so the browser may keep it under
+// `immutable` and a rebuild invalidates it by asking for a different URL. That is
+// the same trick a hashed asset filename plays, done without a build step.
+//
+// Built once and kept. It is a pure function of the graph, and the graph only
+// changes on a hot reload, which clears this.
+func (s *Server) stylesheet() ([]byte, string) {
+	s.cssMu.Lock()
+	defer s.cssMu.Unlock()
+
+	if s.cssBody != nil {
+		return s.cssBody, s.cssVer
+	}
+
+	var b strings.Builder
+	b.WriteString(baseCSS)
+	b.WriteString("\n")
+	b.WriteString(themeCSS(s.ir.Theme, s.ir.ThemeDark, s.ir.Themes))
+	b.WriteString("\n")
+	b.WriteString(safeStyleBody(s.ir.CSS))
+
+	sum := sha256.Sum256([]byte(b.String()))
+
+	s.cssBody = []byte(b.String())
+	s.cssVer = hex.EncodeToString(sum[:6])
+
+	return s.cssBody, s.cssVer
+}
+
 var builtins = []builtinRoute{
+	{BuiltinRoute{"/facet.css", "the app stylesheet", true}, func(s *Server) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			body, version := s.stylesheet()
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+			// Addressed by content, so it can be kept for as long as the browser
+			// likes. A page always asks for the version it was built against.
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			w.Header().Set("ETag", `"`+version+`"`)
+			if match := r.Header.Get("If-None-Match"); match == `"`+version+`"` {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Write(body)
+		}
+	}},
 	{BuiltinRoute{"/facet.js", "the client runtime script", true}, func(s *Server) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/javascript")
@@ -730,7 +789,8 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	if s.dev != nil {
 		dev = devScript
 	}
-	fmt.Fprintf(w, page, themeAttr, s.headMeta(pg, store), csrfToken(sid), themeCSS(s.ir.Theme, s.ir.ThemeDark, s.ir.Themes), safeStyleBody(s.ir.CSS), body.String(), irJSON, stateJSON, dev)
+	_, cssVersion := s.stylesheet()
+	fmt.Fprintf(w, page, themeAttr, s.headMeta(pg, store), csrfToken(sid), cssVersion, body.String(), irJSON, stateJSON, dev)
 }
 
 // headMeta renders a page's <head> metadata: the <title> (the page's `meta title`
@@ -2660,14 +2720,18 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 		if comp == nil {
 			return
 		}
-		// "fa-use" is the default only when there is no region id, mirroring the
-		// client's `el("div", node.id ? null : "fa-use")` — a `use` that is its own
-		// addressable region is styled by the caller, not by this default.
-		useBase := "fa-use"
-		if n.ID != "" {
-			useBase = ""
+		// Most `use` nodes render no element of their own — see useNeedsElement.
+		// "fa-use" is the class the ones that DO get, and only when they are not
+		// their own addressable region: a `use` with a region id is styled by the
+		// caller, not by this default.
+		wrap := useNeedsElement(n)
+		if wrap {
+			useBase := "fa-use"
+			if n.ID != "" {
+				useBase = ""
+			}
+			fmt.Fprintf(b, `<div%s>`, regionAttrs(useBase, n.ID, n))
 		}
-		fmt.Fprintf(b, `<div%s>`, regionAttrs(useBase, n.ID, n))
 		child := cloneScope(scope)
 		for i, p := range comp.Params {
 			var v any
@@ -2680,8 +2744,39 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 		// addressed under this `use` node's path — one component used twice gets
 		// two distinct sets of region keys, which is what makes them addresses.
 		rd.children(b, comp.View, child, path)
-		b.WriteString(`</div>`)
+		if wrap {
+			b.WriteString(`</div>`)
+		}
 	}
+}
+
+// useNeedsElement reports whether a `use` has to render an element of its own.
+//
+// It usually does not, and for a while it always did — every component call
+// emitted a `<div class="fa-use">` whose only rule was `display: contents`, an
+// element declaring that it has no effect on layout. Components calling
+// components stacked them: a nav link three facets deep arrived wrapped in three
+// of them, and an author reading the page source found five nested divs around
+// one `<a>`. Library CSS had started compensating (`.x-byline > .fa-use
+// { display: contents }`), which is the point at which a wrapper has stopped
+// being invisible.
+//
+// It is needed in exactly four cases, and each is an attribute that has to live
+// somewhere:
+//
+//   - a region id — the client re-renders this `use` on its own, so it needs one
+//     element to clear and refill;
+//   - a class, literal or interpolated — the author put it on the `use`;
+//   - a style, likewise;
+//   - an anchor — the author named this position for a `#fragment` link.
+//
+// Without any of them there is nothing to hang on an element and nothing that
+// re-renders it, so the component's children are written straight into the
+// parent. assets/facet.js answers this question identically, and must: the
+// server's markup and the client's first re-render have to be the same tree, or
+// the page shifts under the reader on hydration.
+func useNeedsElement(n ir.Node) bool {
+	return n.ID != "" || n.Class != "" || len(n.ClassSegs) > 0 || n.Style != "" || n.Anchor != ""
 }
 
 // ── sessions + persistence ───────────────────────────────────────────────────
@@ -3177,14 +3272,10 @@ func sameValue(a, b any) bool {
 	return toStr(a) == toStr(b) && fmt.Sprintf("%T", a) == fmt.Sprintf("%T", b)
 }
 
-const page = `<!doctype html>
-<html lang="en"%s>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-%s
-<meta name="fa-csrf" content="%s">
-<style>
+// baseCSS is the runtime's own stylesheet: the one that makes any app render
+// legibly with no design work. It used to live inside the page template and was
+// therefore re-sent, uncompressed and uncacheable, with every page.
+const baseCSS = `
   :root {
     --fa-bg: #fff; --fa-fg: #111; --fa-muted: #666; --fa-accent: #1a56db;
     --fa-border: #888; --fa-card-border: #e3e3e3; --fa-radius: 8px;
@@ -3208,14 +3299,14 @@ const page = `<!doctype html>
      action bar (no box children) stays horizontal. */
   @media (max-width: 720px) {
     .fa-row:has(> .fa-box) { flex-direction: column; }
-    .fa-row:has(> .fa-box) > .fa-box { width: 100%%; flex-basis: 100%%; }
+    .fa-row:has(> .fa-box) > .fa-box { width: 100%; flex-basis: 100%; }
   }
   /* image: avatars by default — a rounded, fixed square that sits inline. */
-  .fa-image { width: 44px; height: 44px; border-radius: 50%%; object-fit: cover; background: var(--fa-card-border); }
+  .fa-image { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; background: var(--fa-card-border); }
   .fa-text { font-variant-numeric: tabular-nums; }
   .fa-icon { display: inline-block; width: 1.15em; height: 1.15em; vertical-align: -.18em;
              background: var(--fa-icon-bg, none) center/contain no-repeat; }
-  .fa-video { max-width: 100%%; border-radius: var(--fa-radius); background: #000; }
+  .fa-video { max-width: 100%; border-radius: var(--fa-radius); background: #000; }
   .fa-richtext { line-height: 1.6; }
   .fa-richtext h1, .fa-richtext h2, .fa-richtext h3 { margin: .6em 0 .3em; line-height: 1.25; }
   .fa-richtext h1 { font-size: 1.5rem; } .fa-richtext h2 { font-size: 1.25rem; } .fa-richtext h3 { font-size: 1.1rem; }
@@ -3244,12 +3335,12 @@ const page = `<!doctype html>
   .fa-overlay-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45);
     display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 50; }
   .fa-overlay-panel { background: var(--fa-bg); color: var(--fa-fg); border-radius: calc(var(--fa-radius) + 4px);
-    border: 1px solid var(--fa-card-border); padding: 1.1rem 1.25rem; max-width: 32rem; width: 100%%;
+    border: 1px solid var(--fa-card-border); padding: 1.1rem 1.25rem; max-width: 32rem; width: 100%;
     max-height: 85vh; overflow: auto; box-shadow: 0 12px 40px rgba(0,0,0,.3); }
-  .fa-typeahead { width: 100%%; }
+  .fa-typeahead { width: 100%; }
   /* controls: a textarea fills its row; a checkbox/toggle/radio option is a
      clickable label whose box sits before its words. */
-  .fa-textarea { font: inherit; width: 100%%; min-height: 5rem; resize: vertical;
+  .fa-textarea { font: inherit; width: 100%; min-height: 5rem; resize: vertical;
                  padding: .4rem .6rem; border: 1px solid var(--fa-border);
                  border-radius: var(--fa-radius); background: var(--fa-bg); color: var(--fa-fg); }
   .fa-checkbox, .fa-toggle, .fa-radio-option { display: inline-flex; gap: .45rem; align-items: center; cursor: pointer; }
@@ -3269,9 +3360,16 @@ const page = `<!doctype html>
   .fa-error { color: #b00020; font-size: .9em; }
   [data-fa-bind] { font-weight: 600; }
   [aria-busy=true] { opacity: .6; }
-</style>
-<style id="fa-theme">%s</style>
-<style id="fa-css">%s</style>
+`
+
+const page = `<!doctype html>
+<html lang="en"%s>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+%s
+<meta name="fa-csrf" content="%s">
+<link rel="stylesheet" href="/facet.css?v=%s">
 </head>
 <body>
 <div id="fa-root" data-fa-mount>%s</div>

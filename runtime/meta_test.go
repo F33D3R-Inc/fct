@@ -40,12 +40,20 @@ func TestSSRHeadMetadata(t *testing.T) {
 		`<meta property="og:title" content="Home — Site">`,
 		`<meta name="description" content="the landing page">`,
 		`<meta property="og:description" content="the landing page">`,
-		// dark-mode tokens override under the media query
-		"@media(prefers-color-scheme:dark){:root{--fa-bg:#000;}}",
+		// The stylesheet is linked, not inlined, so the page carries its address.
+		`<link rel="stylesheet" href="/facet.css?v=`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("rendered page missing %q", want)
 		}
+	}
+
+	// The theme still reaches the browser — through the stylesheet the page just
+	// linked, which is where it moved to when it stopped being re-sent with every
+	// page.
+	css := string(httpGetBytes(t, ts.URL+"/facet.css"))
+	if want := "@media(prefers-color-scheme:dark){:root{--fa-bg:#000;}}"; !strings.Contains(css, want) {
+		t.Errorf("stylesheet missing the dark-mode tokens %q", want)
 	}
 }
 

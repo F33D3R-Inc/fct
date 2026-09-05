@@ -830,6 +830,15 @@
         return d;
       }
       case "use": {
+        // No element of its own unless something has to hang on one — the same
+        // four cases runtime/server.go's useNeedsElement lists, answered here in
+        // the same order. A fragment appends its children and disappears, which
+        // is precisely what the `display: contents` wrapper was pretending to be.
+        if (!useNeedsElement(node)) {
+          const f = document.createDocumentFragment();
+          fillUse(f, node, sc, path);
+          return f;
+        }
         const d = el("div", node.id ? null : "fa-use");
         if (node.id) d.setAttribute("data-fa-region", node.id);
         fillUse(d, node, sc, path);
@@ -1261,6 +1270,14 @@
     const i = tabs.findIndex((t) => t.value === active);
     if (i >= 0) renderKids(container, tabs[i].children, sc, childPath(path, i));
   }
+  // useNeedsElement is runtime/server.go's function of the same name. Both sides
+  // must answer identically or the server's markup and the client's re-render
+  // are different trees, and the page moves when it hydrates.
+  function useNeedsElement(node) {
+    return !!(node.id || node.class || (node.classSegs && node.classSegs.length) ||
+              node.style || node.anchor);
+  }
+
   function fillUse(container, node, sc, path) {
     container.textContent = "";
     curPath = path; // this region's own expressions are addressed from here
@@ -1796,8 +1813,40 @@
       // now and cannot be recomputed here. One request brings the whole page back
       // consistent. This is also what closes the page-load → stream-open race the
       // old whole-database opening snapshot used to cover.
-      if (msg.seq != null && msg.seq !== dataSeq) { dataSeq = msg.seq; askPageData(""); }
+      if (msg.seq != null && msg.seq !== dataSeq) {
+        dataSeq = msg.seq;
+        if (pageReads(msg.changed)) askPageData("");
+      }
     };
+  }
+
+  // pageReads answers whether a write to these entities can change anything THIS
+  // page renders.
+  //
+  // Every write by every actor reaches every connected client, and the client
+  // used to answer all of them the same way: re-ask the authority for this
+  // page's data. That is correct and it does not scale — one post on a busy app
+  // became one full page render per connected browser, for pages that do not
+  // show posts at all. A reader sitting on /settings paid for every message sent
+  // anywhere in the product.
+  //
+  // The page already ships the answer. `depGraph` maps each entity and state
+  // name to the regions and bindings that read it, which is the same map the
+  // reactive engine uses to decide what to re-render; an entity absent from it
+  // is one this page does not read. So the test costs nothing and needs no new
+  // wire format.
+  //
+  // An empty or absent list means the sender could not say — the opening
+  // snapshot, whose job is precisely to catch a page that was rendered before a
+  // write it never saw — and that is answered the old way, by asking.
+  function pageReads(changed) {
+    if (!changed || !changed.length) return true;
+    const dg = (ir && ir.depGraph) || {};
+    for (const name of changed) {
+      const readers = dg[name];
+      if (readers && readers.length) return true;
+    }
+    return false;
   }
 
   function index(arr, key) { const m = Object.create(null); for (const x of arr || []) m[x[key]] = x; return m; }
