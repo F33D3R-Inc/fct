@@ -113,41 +113,115 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 		case "count":
 			return len(rows)
 		}
-		// sum/avg/min/max reduce a numeric field over the (filtered) rows.
-		total, n := 0, 0
-		var lo, hi int
-		for _, r := range rows {
+		// sum/avg/min/max reduce a numeric value over the (filtered) rows: a
+		// bare column, or an expression evaluated once per row.
+		if e.Sel == nil {
+			return reduceAgg(e.Op, rows, fieldValue(e.Field))
+		}
+		prev, had := scope[e.Var]
+		defer func() {
+			if had {
+				scope[e.Var] = prev
+			} else {
+				delete(scope, e.Var)
+			}
+		}()
+		return reduceAgg(e.Op, rows, func(r any) (int, bool) {
 			m, ok := r.(record)
 			if !ok {
-				continue
+				return 0, false
 			}
-			v := toInt(m[e.Field])
-			if n == 0 {
-				lo, hi = v, v
-			} else {
-				if v < lo {
-					lo = v
-				}
-				if v > hi {
-					hi = v
-				}
-			}
-			total += v
-			n++
+			scope[e.Var] = m
+			// evalPerRow, not eval, for the reason the filter uses it: this
+			// value is computed once per row while the render path stands
+			// still, so a nested aggregate or lookup inside it has no address
+			// of its own and must be computed for the row that is bound rather
+			// than read back from the one the first row wrote.
+			return toInt(evalPerRow(e.Sel, scope)), true
+		})
+	}
+}
+
+// fieldValue reads one column off a row — the reduced value of the bare form,
+// `sum(x.amount in …)`.
+//
+// A row that is not a record contributes nothing and is not counted, which is
+// what keeps `avg`'s divisor honest when a collection holds something that is
+// not a row at all.
+func fieldValue(field string) func(row any) (int, bool) {
+	return func(r any) (int, bool) {
+		m, ok := r.(record)
+		if !ok {
+			return 0, false
 		}
-		switch e.Op {
-		case "avg":
-			if n == 0 {
-				return 0
-			}
-			return total / n
-		case "min":
-			return lo // 0 over an empty range
-		case "max":
-			return hi
-		default: // sum
-			return total
+		return toInt(m[field]), true
+	}
+}
+
+// reduceAgg folds rows to the value `sum`/`avg`/`min`/`max` reduces them to.
+//
+// This is **the** definition of what those four mean in this language, and it is
+// a function rather than a block inside the interpreter because three separate
+// things have to produce the same number for the same rows: the interpreter
+// reading the in-memory working set, `memStore` answering the same question as a
+// store, and — through the values the durable stores are made to return — a
+// pushed-down `sum(...)` that never brings a row into this process at all. A
+// rendered page can resolve one aggregate through the database and the next
+// through the mirror, and a viewer must not be able to tell which.
+//
+// The rules that are easy to get wrong, stated once:
+//
+//   - **The empty reduction is 0, for every one of the four.** Not an error and
+//     not a null: the language types these as the field's own numeric type, and
+//     there is no hole in an `int`. `max(Order.amount)` over no orders is 0.
+//   - **`avg` is integer division**, because the language has no float. It
+//     divides by the rows that matched, not by the rows that carried a value.
+//   - A row that holds nothing at the field contributes `toInt(nil)`, which is
+//     0 — it is not skipped. Reachable only for a column added by a migration to
+//     rows that predate it, since every declared field is written on every
+//     insert.
+//
+// `value` is what one row contributes, and it is a function rather than a field
+// name because the language has two forms: a bare column (`sum(x.amount in …)`,
+// see [fieldValue]) and an expression reduced over each row
+// (`sum(l.qty * l.unitPrice in …)`). Both fold identically once the number is in
+// hand, which is the point of taking it this way — the store, which can only
+// reduce a stored column, hands in the first and never has to know about the
+// second. Returning false means the row contributes nothing AND is not counted,
+// so it stays out of `avg`'s divisor.
+func reduceAgg(op string, rows []any, value func(row any) (int, bool)) int {
+	total, n := 0, 0
+	var lo, hi int
+	for _, r := range rows {
+		v, ok := value(r)
+		if !ok {
+			continue
 		}
+		if n == 0 {
+			lo, hi = v, v
+		} else {
+			if v < lo {
+				lo = v
+			}
+			if v > hi {
+				hi = v
+			}
+		}
+		total += v
+		n++
+	}
+	switch op {
+	case "avg":
+		if n == 0 {
+			return 0
+		}
+		return total / n
+	case "min":
+		return lo // 0 over an empty range
+	case "max":
+		return hi
+	default: // sum
+		return total
 	}
 }
 

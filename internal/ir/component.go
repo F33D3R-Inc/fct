@@ -138,6 +138,9 @@ func componentBinders(cm *ast.Component) map[string]bool {
 			if t.Where != nil {
 				expr(t.Where)
 			}
+			if t.Sel != nil {
+				expr(t.Sel)
+			}
 		case ast.Call:
 			for _, a := range t.Args {
 				expr(a)
@@ -497,6 +500,7 @@ func substExpr(ex ast.Expr, m map[string]string) ast.Expr {
 		t.Var = rename(t.Var, m)
 		t.Coll = rename(t.Coll, m)
 		t.Where = substExpr(t.Where, m)
+		t.Sel = substExpr(t.Sel, m)
 		return t
 	case ast.Call:
 		t.Args = substExprs(t.Args, m)

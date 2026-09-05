@@ -27,6 +27,39 @@ func StoreDescription(app string) string {
 	return "facetql (default: facetql://localhost:8080)"
 }
 
+// AggSpec names the reduction a store is being asked for: the function, and the
+// column it reduces.
+//
+// Only the three irreducible functions appear here. `count` has its own typed
+// call (it reduces rows, not a column, and is by far the most asked), and `avg`
+// is composed from `sum` and `count` above the store so that its integer
+// division has exactly one implementation.
+//
+// Field is always a declared numeric column — `int` or `money`. Pushdown is
+// refused for anything else rather than guessed at, because the language's
+// reducer is integer arithmetic and a text or date column has no meaning under
+// it that a database would agree with.
+type AggSpec struct {
+	Func  string // sum | min | max
+	Field string
+}
+
+// pushableAgg reports whether an aggregate op is one a store can be asked for
+// directly. `avg` is absent on purpose: it is composed, not pushed.
+func pushableAgg(op string) bool {
+	switch op {
+	case "sum", "min", "max":
+		return true
+	}
+	return false
+}
+
+// numericField reports whether a column is one the language's reducer can fold —
+// integer arithmetic, so `int` and `money` and nothing else.
+func numericField(f ir.Field) bool {
+	return f.Type == "int" || f.Type == "money"
+}
+
 // Store is the durable home of an app's entity data — the database. The runtime
 // keeps the live working set in memory (so rendering and the reactive engine
 // stay fast) and writes every change through to the Store, which is the source
@@ -73,6 +106,27 @@ type Store interface {
 	// still (measured: 20 counts 13.7 ms, whole-kind grouping 153 ms, pinned
 	// values 0.93 ms).
 	CountBy(query Query, groupBy string, values []any) (map[string]int, error)
+	// Aggregate reduces one numeric column over the rows a predicate selects —
+	// `sum(o.amount in Order where o.seller == actor)` — without any of them
+	// crossing the wire. It is Count's sibling for the other three reductions,
+	// and it exists for the same reason: the alternative is paging the rows into
+	// this process to add them up, which costs a table to learn one integer and
+	// is wrong the moment the rows outgrow a page.
+	//
+	// `avg` is deliberately NOT one of the functions a store implements. It is
+	// defined by the language as sum ÷ count in integer arithmetic (see
+	// reduceAgg), so it is composed from those two above the store — where the
+	// rounding is written once instead of once per backend.
+	//
+	// The empty reduction is 0, never an error and never a null. Every store
+	// must return the same number reduceAgg would over the same rows, because a
+	// page can resolve one aggregate here and the next on the mirror.
+	Aggregate(query Query, spec AggSpec) (int, error)
+	// AggregateBy is to Aggregate what CountBy is to Count: one predicate
+	// reduced for many pinned values of a field, so a page showing a total per
+	// row costs one request rather than one per row. Every requested value comes
+	// back, 0 included.
+	AggregateBy(query Query, spec AggSpec, groupBy string, values []any) (map[string]int, error)
 	// Begin starts a transaction so a multi-statement action's writes commit
 	// atomically (all or nothing).
 	Begin() (Tx, error)
@@ -307,6 +361,56 @@ func (s *pgStore) CountBy(query Query, groupBy string, values []any) (map[string
 			return nil, err
 		}
 		out[toStr(key)] = n
+	}
+	return out, rows.Err()
+}
+
+// Aggregate compiles the reduction to SQL and lets the database do it, so no row
+// crosses the wire. COALESCE is what makes the empty reduction 0 rather than
+// NULL — the language types these as the column's own numeric type, and has no
+// hole to put a NULL in.
+//
+// The result is scanned into `any` rather than an int: `sum` over a bigint
+// column is NUMERIC in Postgres and arrives as []byte, which is exactly the
+// conversion `toInt` was fixed to handle.
+func (s *pgStore) Aggregate(query Query, spec AggSpec) (int, error) {
+	e := s.ents[query.Entity]
+	sqlText, args, err := aggregateSQL(query, e, spec)
+	if err != nil {
+		return 0, err
+	}
+	var v any
+	if err := s.db.QueryRow(sqlText, args...).Scan(&v); err != nil {
+		return 0, err
+	}
+	return toInt(v), nil
+}
+
+// AggregateBy is the grouped form: one GROUP BY over the rows whose grouped
+// column is in the requested set. Values absent from the result are filled in as
+// 0, because the caller asked about them and "no rows" is an answer — the same
+// contract CountBy holds.
+func (s *pgStore) AggregateBy(query Query, spec AggSpec, groupBy string, values []any) (map[string]int, error) {
+	e := s.ents[query.Entity]
+	sqlText, args, err := aggregateBySQL(query, e, spec, groupBy, values)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int, len(values))
+	for _, v := range values {
+		out[toStr(v)] = 0
+	}
+	rows, err := s.db.Query(sqlText, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, v any
+		if err := rows.Scan(&key, &v); err != nil {
+			return nil, err
+		}
+		out[toStr(key)] = toInt(v)
 	}
 	return out, rows.Err()
 }

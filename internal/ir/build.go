@@ -1965,8 +1965,11 @@ func (c *viewCtx) containsE2E(ex ast.Expr, sc scope) bool {
 			}
 		}
 	case ast.Agg:
-		if t.Where != nil {
-			return c.containsE2E(t.Where, sc)
+		if t.Where != nil && c.containsE2E(t.Where, sc) {
+			return true
+		}
+		if t.Sel != nil {
+			return c.containsE2E(t.Sel, sc)
 		}
 	}
 	return false
@@ -3062,8 +3065,22 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		if !e.entities[t.Coll] {
 			return &BuildError{line, fmt.Sprintf("%s(...) needs an entity collection; %q is not an entity", t.Op, t.Coll)}
 		}
-		if isFieldAgg(t.Op) && !e.entityFields[t.Coll][t.Field] {
+		if isFieldAgg(t.Op) && t.Sel == nil && !e.entityFields[t.Coll][t.Field] {
+			// The message names the two shapes, because the most likely way to
+			// arrive here is a reduced expression the parser could not attach a
+			// row variable to — which leaves Field empty and would otherwise
+			// report that the entity has no field "".
+			if t.Field == "" {
+				return &BuildError{line, fmt.Sprintf(
+					"%s needs a field of %s to reduce, or an expression over each row: %s(x.field in %s where …)",
+					t.Op, t.Coll, t.Op, t.Coll)}
+			}
 			return &BuildError{line, fmt.Sprintf("entity %q has no field %q to %s", t.Coll, t.Field, t.Op)}
+		}
+		if t.Sel != nil {
+			if err := e.checkBuiltins(t.Sel, line); err != nil {
+				return err
+			}
 		}
 		if t.Op == "exists" && t.Var == "" {
 			return &BuildError{line, fmt.Sprintf("exists needs a filtered form: exists(x in %s where <cond>)", t.Coll)}
@@ -3184,7 +3201,7 @@ func hasImpure(ex ast.Expr) bool {
 	case ast.Un:
 		return hasImpure(t.X)
 	case ast.Agg:
-		return t.Where != nil && hasImpure(t.Where)
+		return (t.Where != nil && hasImpure(t.Where)) || (t.Sel != nil && hasImpure(t.Sel))
 	}
 	return false
 }
@@ -3369,9 +3386,16 @@ func freeNames(ex ast.Expr) map[string]bool {
 		case ast.Agg:
 			out[t.Coll] = true
 			// The filter's references are free names too — except the item variable,
-			// which the aggregate itself binds.
-			if t.Where != nil {
-				for n := range freeNames(t.Where) {
+			// which the aggregate itself binds. The reduced value reads the row
+			// through that same variable, so it is bound there for exactly the same
+			// reason; every OTHER name in it has to resolve in the enclosing scope,
+			// which is what makes a typo in `sum(l.qty * unitPrice in …)` a compile
+			// error naming `unitPrice` rather than a silent zero.
+			for _, sub := range [2]ast.Expr{t.Where, t.Sel} {
+				if sub == nil {
+					continue
+				}
+				for n := range freeNames(sub) {
 					if n != t.Var {
 						out[n] = true
 					}
@@ -3434,6 +3458,13 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 		a := &Expr{Kind: "agg", Op: t.Op, Name: t.Coll, Field: t.Field, Var: t.Var}
 		if t.Where != nil {
 			a.Where = lower(t.Where, inline, enums)
+		}
+		if t.Sel != nil {
+			// The reduced value, when it is more than one of the row's columns.
+			// Exclusive with Field (the parser guarantees it), so a bare
+			// `sum(x.amount in …)` lowers exactly as it always did and every
+			// program written before this is byte-identical through the compiler.
+			a.Sel = lower(t.Sel, inline, enums)
 		}
 		return a
 	case ast.Call:

@@ -249,6 +249,49 @@ func (s *memStore) CountBy(query Query, groupBy string, values []any) (map[strin
 	return out, nil
 }
 
+// Aggregate and AggregateBy reduce through reduceAgg — the same function the
+// interpreter folds the mirror with. memStore *is* the working set, so there is
+// nothing to push down here; what matters is that it answers identically to the
+// stores that do, which sharing the reducer makes true by construction rather
+// than by two implementations agreeing.
+
+func (s *memStore) Aggregate(query Query, spec AggSpec) (int, error) {
+	rows, err := s.matching(query)
+	if err != nil {
+		return 0, err
+	}
+	return reduceAgg(spec.Func, rows, fieldValue(spec.Field)), nil
+}
+
+func (s *memStore) AggregateBy(query Query, spec AggSpec, groupBy string, values []any) (map[string]int, error) {
+	rows, err := s.matching(query)
+	if err != nil {
+		return nil, err
+	}
+	want := map[string]bool{}
+	grouped := map[string][]any{}
+	out := map[string]int{}
+	for _, v := range values {
+		want[toStr(v)] = true
+		out[toStr(v)] = 0 // every value asked about comes back, zero included
+	}
+	for _, r := range rows {
+		m, ok := r.(record)
+		if !ok {
+			continue
+		}
+		key := toStr(m[groupBy])
+		if len(values) > 0 && !want[key] {
+			continue
+		}
+		grouped[key] = append(grouped[key], r)
+	}
+	for key, rs := range grouped {
+		out[key] = reduceAgg(spec.Func, rs, fieldValue(spec.Field))
+	}
+	return out, nil
+}
+
 // matching returns the rows of an entity a predicate accepts, with the item
 // variable bound per row — the selection half of Query, without the paging.
 func (s *memStore) matching(query Query) ([]any, error) {

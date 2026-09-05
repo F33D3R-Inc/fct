@@ -1045,6 +1045,83 @@ func (s *fqStore) CountBy(query Query, groupBy string, values []any) (map[string
 	return out, nil
 }
 
+// Aggregate reduces one numeric column over the rows a predicate selects, in the
+// engine — no row crosses the wire, whatever the reduction visits.
+//
+// Like Count it is not bounded by FACETQL_MAX_SCAN_ROWS: the answer is one
+// integer however many rows it folds. Unlike Count it always reads the records,
+// because the number it needs lives in each one — a reduction has no index-only
+// path the way a bare count of a kind does.
+func (s *fqStore) Aggregate(query Query, spec AggSpec) (int, error) {
+	e, ok := s.ents[query.Entity]
+	if !ok {
+		return 0, fmt.Errorf("fqStore.Aggregate: unknown entity %q", query.Entity)
+	}
+	if err := checkAggField(e, spec); err != nil {
+		return 0, fmt.Errorf("fqStore.Aggregate: %w", err)
+	}
+	n, err := s.c.aggregate(context.Background(), fqAggregateRequest{
+		Kind:    query.Entity,
+		Where:   query.Where,
+		ItemVar: query.ItemVar,
+		Func:    spec.Func,
+		Field:   spec.Field,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("fqStore.Aggregate: %w", err)
+	}
+	return n, nil
+}
+
+// AggregateBy reduces one column for many pinned values of another in a single
+// request — the shape a page showing a total per row needs, for the reason
+// CountBy documents at length.
+func (s *fqStore) AggregateBy(query Query, spec AggSpec, groupBy string, values []any) (map[string]int, error) {
+	e, ok := s.ents[query.Entity]
+	if !ok {
+		return nil, fmt.Errorf("fqStore.AggregateBy: unknown entity %q", query.Entity)
+	}
+	if err := checkAggField(e, spec); err != nil {
+		return nil, fmt.Errorf("fqStore.AggregateBy: %w", err)
+	}
+	out, err := s.c.aggregateBy(context.Background(), fqAggregateByRequest{
+		Kind:    query.Entity,
+		Where:   query.Where,
+		ItemVar: query.ItemVar,
+		GroupBy: groupBy,
+		Values:  values,
+		Func:    spec.Func,
+		Field:   spec.Field,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fqStore.AggregateBy: %w", err)
+	}
+	return out, nil
+}
+
+// checkAggField refuses a reduction the schema cannot support before it becomes
+// a request.
+//
+// pgStore gets this check for free — an undeclared column is a SQL error the
+// database raises. FacetQL's `data` is schemaless from the engine's side, so a
+// misspelled field there would not fail: every row would simply hold nothing at
+// that name, every row would be skipped, and the answer would come back 0. That
+// is the silent-wrong-answer shape, and this is where it is closed.
+func checkAggField(e ir.Entity, spec AggSpec) error {
+	if !pushableAgg(spec.Func) {
+		return fmt.Errorf("cannot push down aggregate %q", spec.Func)
+	}
+	f, ok := fieldOf(e, spec.Field)
+	if !ok {
+		return fmt.Errorf("cannot %s unknown field %q of %s", spec.Func, spec.Field, e.Name)
+	}
+	if !numericField(f) {
+		return fmt.Errorf("cannot %s %s.%s: %s is not a numeric column",
+			spec.Func, e.Name, spec.Field, f.Type)
+	}
+	return nil
+}
+
 // ── identity is the address, not a data field ───────────────────────────────
 //
 // A row's `id` is not a column here. fct writes each row as a node whose

@@ -239,7 +239,16 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			return vtype{core: "int"}
 		case "exists":
 			return vtype{core: "bool"}
-		default: // sum | avg | min | max reduce one numeric field
+		default: // sum | avg | min | max reduce one numeric value per row
+			if t.Sel != nil {
+				// The reduced value is an expression over the row, so the
+				// aggregate's type is that expression's — read with the item
+				// variable bound to a row of the collection, which is what makes
+				// `sum(l.qty * l.unitPrice in …)` money rather than untyped.
+				inner := sc.with(t.Var)
+				inner.varTypes[t.Var] = vtype{core: t.Coll}
+				return e.exprType(t.Sel, inner)
+			}
 			return vtype{core: e.entFieldType[t.Coll][t.Field]}
 		}
 

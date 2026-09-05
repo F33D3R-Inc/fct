@@ -170,7 +170,7 @@ func (s *Server) hoistResidual(m *materializer, rowVar string, residual *ir.Expr
 		return // one row asks one question; there is nothing to batch
 	}
 	for _, agg := range exprAggregates(residual, rowVar) {
-		s.hoistCount(m, agg, rowVar, rows, scope)
+		s.hoistAgg(m, agg, rowVar, rows, scope)
 	}
 }
 
@@ -515,8 +515,21 @@ func (m *materializer) lookup(e *ir.Expr) (any, bool) {
 // residual and `selectRows` over a `[T]` cell — so the rule about what an
 // aggregate address means lives in one place.
 func evalRowPredicate(pred *ir.Expr, scope map[string]any) bool {
+	return truthy(evalPerRow(pred, scope))
+}
+
+// evalPerRow evaluates an expression for one row of a set the surrounding render
+// path does not distinguish — a filter's predicate, or the value an aggregate
+// reduces over each row.
+//
+// The two used to be one call because a predicate was the only thing answered
+// per row. A reduced expression is the second, and it needs exactly the same
+// suppression: an aggregate or lookup nested inside it has no address of its
+// own, so recording one would memoize the first row's answer and hand it to
+// every row after it.
+func evalPerRow(e *ir.Expr, scope map[string]any) any {
 	m := materializerOf(scope)
-	return truthy(m.perRow(func() any { return eval(pred, scope) }))
+	return m.perRow(func() any { return eval(e, scope) })
 }
 
 // materializerOf pulls the render pass's collector out of a scope. Actions,
@@ -1117,11 +1130,14 @@ func entityKeys(m map[string]any) []string {
 // the canonical key that identifies the question. A predicate the store cannot
 // push down has no query — the caller then falls back rather than guessing.
 func (s *Server) aggQuery(e *ir.Expr, scope map[string]any) (Query, string, bool) {
-	if e.Kind != "agg" || (e.Op != "count" && e.Op != "exists") || s.store == nil {
+	if e.Kind != "agg" || s.store == nil {
 		return Query{}, "", false
 	}
 	ent, ok := s.entityByName(e.Name)
 	if !ok {
+		return Query{}, "", false
+	}
+	if !storeAnswers(e, ent) {
 		return Query{}, "", false
 	}
 	itemVar := e.Var
@@ -1147,6 +1163,40 @@ func (s *Server) aggQuery(e *ir.Expr, scope map[string]any) (Query, string, bool
 	return q, queryKey(q), true
 }
 
+// storeAnswers reports whether the store can answer this aggregate at all.
+//
+// `count`/`exists` reduce rows and need nothing from the schema. The other four
+// reduce a column, so the column has to exist and has to be one the language's
+// reducer folds — integer arithmetic, meaning `int` or `money`. A `min` over a
+// text column is not refused here so much as left where it already is: the
+// interpreter reduces it with toInt, which is not what any database would do,
+// so pushing it down would make the answer depend on which path served it.
+//
+// Sel is the general reduced expression — `sum(l.qty * l.unitPrice in ...)`.
+// That is a value computed per row, not a stored column, so there is nothing for
+// a store to reduce and the mirror keeps it.
+func storeAnswers(e *ir.Expr, ent ir.Entity) bool {
+	switch e.Op {
+	case "count", "exists":
+		return true
+	case "sum", "avg", "min", "max":
+		if e.Sel != nil || e.Field == "" {
+			return false
+		}
+		f, ok := fieldOf(ent, e.Field)
+		return ok && numericField(f)
+	}
+	return false
+}
+
+// aggCacheKey identifies one answer in the materializer's cache: the question
+// (the canonical pushed-down predicate) plus the reduction asked of it. The
+// reduction is part of the key because a `sum` and the `count` beside it share a
+// predicate and must not share a slot — and because `avg` reads both of them.
+func aggCacheKey(question string, spec AggSpec) string {
+	return question + "|" + spec.Func + "|" + spec.Field
+}
+
 // queryKey identifies a cardinality question. It is a canonical serialization of
 // the pushed-down read, so two aggregates that ask the same thing — the same
 // predicate reached from different rows, or the same count evaluated twice in one
@@ -1161,6 +1211,11 @@ func queryKey(q Query) string {
 
 // resolveAgg answers an aggregate from the database rather than from the mirror,
 // when it can do so without turning one aggregate into a round trip per row.
+//
+// `avg` is composed here rather than asked of the store, because the language
+// defines it as sum ÷ count in integer arithmetic (reduceAgg) and that division
+// must have exactly one implementation. Composing it costs a second cached
+// lookup, not a second round trip per row: the hoist fills both slots.
 func (m *materializer) resolveAgg(e *ir.Expr, scope map[string]any) (any, bool) {
 	if m == nil || m.s == nil {
 		return nil, false
@@ -1169,24 +1224,65 @@ func (m *materializer) resolveAgg(e *ir.Expr, scope map[string]any) (any, bool) 
 	if !ok {
 		return nil, false
 	}
-	n, cached := m.counts[key]
-	if !cached {
-		// Not in the batch a list hoisted. Asking now is one request; inside a
-		// multi-row list that is one request per row, so the mirror answers instead.
-		if m.fanout > 1 {
+	switch e.Op {
+	case "count", "exists":
+		n, ok := m.answer(q, key, AggSpec{})
+		if !ok {
 			return nil, false
 		}
-		var err error
-		if n, err = m.s.store.Count(q); err != nil {
-			m.s.obs.log.Error("count failed; falling back to the in-memory working set",
-				"entity", e.Name, "error", err)
+		if e.Op == "exists" {
+			return n > 0, true
+		}
+		return n, true
+
+	case "avg":
+		total, ok := m.answer(q, key, AggSpec{Func: "sum", Field: e.Field})
+		if !ok {
 			return nil, false
 		}
-		m.counts[key] = n
+		n, ok := m.answer(q, key, AggSpec{})
+		if !ok {
+			return nil, false
+		}
+		if n == 0 {
+			return 0, true // the empty average, exactly as reduceAgg has it
+		}
+		return total / n, true
+
+	default: // sum | min | max
+		return m.answer(q, key, AggSpec{Func: e.Op, Field: e.Field})
 	}
-	if e.Op == "exists" {
-		return n > 0, true
+}
+
+// answer reads one reduction out of the cache, asking the store when the cache
+// does not hold it and asking is not an N+1.
+//
+// An empty spec means the row count, which has its own typed call; anything else
+// is a column reduction. Both go through here so the cache, the fan-out guard
+// and the fall-back-to-the-mirror rule are written once.
+func (m *materializer) answer(q Query, question string, spec AggSpec) (int, bool) {
+	key := aggCacheKey(question, spec)
+	if n, cached := m.counts[key]; cached {
+		return n, true
 	}
+	// Not in the batch a list hoisted. Asking now is one request; inside a
+	// multi-row list that is one request per row, so the mirror answers instead.
+	if m.fanout > 1 {
+		return 0, false
+	}
+	var n int
+	var err error
+	if spec.Func == "" {
+		n, err = m.s.store.Count(q)
+	} else {
+		n, err = m.s.store.Aggregate(q, spec)
+	}
+	if err != nil {
+		m.s.obs.log.Error("aggregate failed; falling back to the in-memory working set",
+			"entity", q.Entity, "func", spec.Func, "field", spec.Field, "error", err)
+		return 0, false
+	}
+	m.counts[key] = n
 	return n, true
 }
 
@@ -1197,20 +1293,23 @@ func (rd *renderer) prefetchCounts(n ir.Node, rows []any, scope map[string]any) 
 		return // one row asks one question; there is nothing to batch
 	}
 	for _, agg := range rd.s.rowAggregates(n) {
-		rd.s.hoistCount(rd.mat, agg, n.Var, rows, scope)
+		rd.s.hoistAgg(rd.mat, agg, n.Var, rows, scope)
 	}
 }
 
-// exprAggregates collects the count/exists aggregates inside one expression
-// whose predicate reads the named row variable — the ones whose answer changes
-// with the outer row, and so the ones a batch can hoist. It is the one walk both
-// the render's per-row counts and a residual predicate's are found by.
+// exprAggregates collects the aggregates inside one expression whose predicate
+// reads the named row variable — the ones whose answer changes with the outer
+// row, and so the ones a batch can hoist. It is the one walk both the render's
+// per-row aggregates and a residual predicate's are found by.
+//
+// Whether the store can actually answer a given one is decided later, in
+// aggQuery: this walk only has the expression, not the entity it ranges over.
 func exprAggregates(e *ir.Expr, rowVar string) []*ir.Expr {
 	if e == nil {
 		return nil
 	}
 	var out []*ir.Expr
-	if e.Kind == "agg" && (e.Op == "count" || e.Op == "exists") && mentions(e.Where, rowVar) {
+	if e.Kind == "agg" && isAggOp(e.Op) && mentions(e.Where, rowVar) {
 		out = append(out, e)
 	}
 	for _, sub := range e.Kids() {
@@ -1219,8 +1318,17 @@ func exprAggregates(e *ir.Expr, rowVar string) []*ir.Expr {
 	return out
 }
 
-// rowAggregates collects the count/exists aggregates under a list node whose
-// predicate reads the row — the ones that would otherwise be asked once per row.
+// isAggOp reports whether an op names one of the language's aggregates.
+func isAggOp(op string) bool {
+	switch op {
+	case "count", "exists", "sum", "avg", "min", "max":
+		return true
+	}
+	return false
+}
+
+// rowAggregates collects the aggregates under a list node whose predicate reads
+// the row — the ones that would otherwise be asked once per row.
 // It descends into the components the body uses, because that is where a feed's
 // per-row counts actually live (`use PostCard(..., count(...), ...)`).
 func (s *Server) rowAggregates(n ir.Node) []*ir.Expr {
@@ -1260,7 +1368,7 @@ func (s *Server) rowAggregates(n ir.Node) []*ir.Expr {
 	return out
 }
 
-// hoistCount turns one aggregate's per-row questions into one grouped request.
+// hoistAgg turns one aggregate's per-row questions into one grouped request.
 //
 // It works from the concrete predicates rather than symbolically: each row's
 // predicate is compiled exactly as `resolveAgg` would compile it, and the column
@@ -1268,7 +1376,7 @@ func (s *Server) rowAggregates(n ir.Node) []*ir.Expr {
 // Deriving the group that way is what guarantees the cached answers land under
 // the keys the render will actually look up — a symbolic reconstruction could
 // drift from the real compilation and quietly cache nothing.
-func (s *Server) hoistCount(m *materializer, e *ir.Expr, rowVar string, rows []any, scope map[string]any) {
+func (s *Server) hoistAgg(m *materializer, e *ir.Expr, rowVar string, rows []any, scope map[string]any) {
 	child := cloneScope(scope)
 	preds := make([]*ir.Expr, 0, len(rows))
 	keys := make([]string, 0, len(rows))
@@ -1290,17 +1398,45 @@ func (s *Server) hoistCount(m *materializer, e *ir.Expr, rowVar string, rows []a
 		if !ok {
 			continue
 		}
-		counts, err := s.store.CountBy(
-			Query{Entity: e.Name, Where: rest, ItemVar: itemVar}, field, distinct(values))
-		if err != nil {
-			s.obs.log.Error("grouped count failed; falling back to the in-memory working set",
-				"entity", e.Name, "group", field, "error", err)
-			return
-		}
-		for i, key := range keys {
-			m.counts[key] = counts[toStr(values[i])]
+		q := Query{Entity: e.Name, Where: rest, ItemVar: itemVar}
+		// The reductions this aggregate's answers are read from — exactly the
+		// slots resolveAgg will look in, derived the same way, so the batch
+		// cannot fill a key nothing reads. `avg` needs two, being sum ÷ count.
+		for _, spec := range aggSpecs(e) {
+			var grouped map[string]int
+			var err error
+			if spec.Func == "" {
+				grouped, err = s.store.CountBy(q, field, distinct(values))
+			} else {
+				grouped, err = s.store.AggregateBy(q, spec, field, distinct(values))
+			}
+			if err != nil {
+				s.obs.log.Error("grouped aggregate failed; falling back to the in-memory working set",
+					"entity", e.Name, "group", field, "func", spec.Func, "error", err)
+				return
+			}
+			for i, key := range keys {
+				m.counts[aggCacheKey(key, spec)] = grouped[toStr(values[i])]
+			}
 		}
 		return
+	}
+}
+
+// aggSpecs lists the store reductions one aggregate's answer is composed from.
+//
+// One for `count`/`exists` (the empty spec, meaning the row count) and one for
+// `sum`/`min`/`max`. `avg` is two, because the language defines it as sum ÷
+// count — and the pair is listed here rather than assembled at each call site so
+// that the hoist and resolveAgg cannot disagree about which slots exist.
+func aggSpecs(e *ir.Expr) []AggSpec {
+	switch e.Op {
+	case "avg":
+		return []AggSpec{{Func: "sum", Field: e.Field}, {}}
+	case "sum", "min", "max":
+		return []AggSpec{{Func: e.Op, Field: e.Field}}
+	default: // count | exists
+		return []AggSpec{{}}
 	}
 }
 

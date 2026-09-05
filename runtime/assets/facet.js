@@ -242,7 +242,7 @@
     function expr(e) {
       if (!e) return;
       if (e.kind === "agg" || e.kind === "eget") e.__faAgg = n++;
-      expr(e.l); expr(e.r); expr(e.x); expr(e.obj); expr(e.key); expr(e.where);
+      expr(e.l); expr(e.r); expr(e.x); expr(e.obj); expr(e.key); expr(e.where); expr(e.sel);
       for (const a of list(e.args)) expr(a);
     }
     function nodes(ns) {
@@ -297,13 +297,22 @@
         }
         if (e.op === "exists") return rows.length > 0;
         if (e.op === "count") return rows.length;
-        // sum/avg/min/max reduce a numeric field over the (filtered) rows.
+        // sum/avg/min/max reduce a numeric value over the (filtered) rows: a bare
+        // column, or — `sum(l.qty * l.unitPrice in CartLine …)` — an expression
+        // evaluated once per row with the item var bound to it, exactly as
+        // reduceAgg does it in runtime/eval.go. evRow, not ev, for the reason the
+        // filter above uses it: a nested aggregate has no address of its own here.
         let total = 0, n = 0, lo = 0, hi = 0;
+        const selHad = e.sel && Object.prototype.hasOwnProperty.call(sc, e.var);
+        const selPrev = e.sel ? sc[e.var] : undefined;
         for (const r of rows) {
-          const v = toInt(r[e.field]);
+          let v;
+          if (e.sel) { sc[e.var] = r; v = toInt(evRow(e.sel, sc)); }
+          else v = toInt(r[e.field]);
           if (n === 0) { lo = v; hi = v; } else { if (v < lo) lo = v; if (v > hi) hi = v; }
           total += v; n++;
         }
+        if (e.sel) { if (selHad) sc[e.var] = selPrev; else delete sc[e.var]; }
         if (e.op === "avg") return n === 0 ? 0 : (total / n) | 0;
         if (e.op === "min") return lo;
         if (e.op === "max") return hi;

@@ -189,6 +189,9 @@ func textLits(ex ast.Expr) []string {
 			if t.Where != nil {
 				walk(t.Where)
 			}
+			if t.Sel != nil {
+				walk(t.Sel)
+			}
 		case ast.Call:
 			for _, a := range t.Args {
 				walk(a)

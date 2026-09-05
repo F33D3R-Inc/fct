@@ -539,6 +539,81 @@ func (c *fqClient) countBy(ctx context.Context, req fqCountByRequest) (map[strin
 	return out, nil
 }
 
+// fqAggregateRequest is the POST /nodes/aggregate body: the same selection a
+// count takes, plus which reduction to perform over which `data` field. The
+// engine refuses a function/field pair it cannot answer — a `sum` with no field,
+// or a `count` with one — before it reads a row, so a malformed ask is a 400
+// rather than a number that looks plausible.
+type fqAggregateRequest struct {
+	Kind    string   `json:"kind"`
+	Where   *ir.Expr `json:"where,omitempty"`
+	ItemVar string   `json:"item_var"`
+	Func    string   `json:"func"`
+	Field   string   `json:"field,omitempty"`
+}
+
+// fqAggregateByRequest is the POST /nodes/aggregate_by body — the grouped form,
+// with the same `values` shortcut fqCountByRequest documents.
+type fqAggregateByRequest struct {
+	Kind    string   `json:"kind"`
+	Where   *ir.Expr `json:"where,omitempty"`
+	ItemVar string   `json:"item_var"`
+	GroupBy string   `json:"group_by"`
+	Values  []any    `json:"values,omitempty"`
+	Func    string   `json:"func"`
+	Field   string   `json:"field,omitempty"`
+}
+
+// aggregate runs a pushed-down reduction (POST /nodes/aggregate).
+//
+// FacetQL answers `null` for a `min`/`max` over no rows, because at that layer
+// there genuinely is no smallest value. This language has no such hole — its
+// reducer returns 0 for every empty reduction — so the null is converted here,
+// at the seam that owns the difference. `toInt(nil)` is 0, which is why the
+// conversion is the same call the rest of the runtime already makes rather than
+// a special case.
+func (c *fqClient) aggregate(ctx context.Context, req fqAggregateRequest) (int, error) {
+	data, _, err := c.do(ctx, http.MethodPost, "/nodes/aggregate", req)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		Result any `json:"result"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, fmt.Errorf("facetql decode aggregate response: %w", err)
+	}
+	return toInt(resp.Result), nil
+}
+
+// aggregateBy runs a grouped reduction (POST /nodes/aggregate_by) and returns one
+// value per requested key. The engine answers every value that was asked about;
+// the map is pre-filled with zeroes anyway so a caller can never read an absent
+// key as "the store forgot".
+func (c *fqClient) aggregateBy(ctx context.Context, req fqAggregateByRequest) (map[string]int, error) {
+	data, _, err := c.do(ctx, http.MethodPost, "/nodes/aggregate_by", req)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Groups []struct {
+			Value  any `json:"value"`
+			Result any `json:"result"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("facetql decode aggregate_by response: %w", err)
+	}
+	out := make(map[string]int, len(req.Values))
+	for _, v := range req.Values {
+		out[toStr(v)] = 0
+	}
+	for _, g := range resp.Groups {
+		out[toStr(g.Value)] = toInt(g.Result)
+	}
+	return out, nil
+}
+
 // decodeQueryPage parses a POST /nodes/query response — {"nodes":[...],"next":""}
 // (AGENT_LOG §4b) — into a page of nodes and the opaque next cursor, returned
 // unchanged (`next":""` = last page).
