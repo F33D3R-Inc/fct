@@ -421,12 +421,26 @@ type FieldInit struct {
 	Expr Expr
 }
 
-// Set updates one field of an entity row by id: `set Entity(key).field = expr`.
+// Set writes stored rows. In its by-id form it updates one field of one row —
+// `set Entity(key).field = expr` — and in its filtered form it applies a block of
+// field assignments to every row a predicate accepts:
+//
+//	set p in Product where p.stock > 0:
+//	    stock = p.stock - 1
+//
+// The filtered form is `Remove`'s filtered shape carrying assignments instead of
+// a deletion, and it carries them in Fields for the same reason `Add` does: a
+// bulk update usually moves more than one column, and one traversal should move
+// all of them together. Key/Field/Value describe the by-id form; Var/Where/Fields
+// describe the filtered one, and exactly one of the two sets is populated.
 type Set struct {
 	Entity string
 	Key    Expr
 	Field  string
 	Value  Expr
+	Var    string      // filtered form: the item variable each row binds to
+	Where  Expr        // filtered form: the predicate (nil = by-id)
+	Fields []FieldInit // filtered form: the assignments applied to every match
 	Line   int
 }
 

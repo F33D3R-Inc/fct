@@ -1461,11 +1461,26 @@ func parseAdd(n *source.Node) (ast.Stmt, error) {
 	return add, nil
 }
 
+// parseSet parses the two forms of a write to stored rows:
+//
+//	set Entity(key).field = expr          one row, addressed by id
+//	set item in Entity where cond:        every row the predicate accepts
+//	    field = expr
+//	    ...
+//
+// The filtered form is `remove item in Entity where cond`'s shape carrying
+// assignments instead of a deletion, and it is detected the same way — an ` in `
+// ahead of a ` where ` — so the two bulk statements are told apart by their
+// keyword alone. Its body is a block because a bulk update usually touches more
+// than one column and one traversal should do all of them.
 func parseSet(n *source.Node) (ast.Stmt, error) {
 	rest := strings.TrimSpace(n.Line.Text[len("set "):])
-	eq := strings.IndexByte(rest, '=')
+	if wi := indexOutside(rest, " where "); wi >= 0 && indexOutside(rest[:wi], " in ") >= 0 {
+		return parseSetWhere(n, rest, wi)
+	}
+	eq := indexAssign(rest)
 	if eq < 0 {
-		return nil, &Error{n.Line.No, "set needs `set Entity(key).field = expr`"}
+		return nil, &Error{n.Line.No, "set needs `set Entity(key).field = expr` or `set item in Entity where cond:`"}
 	}
 	lhs := strings.TrimSpace(rest[:eq])
 	val, err := parseExpr(strings.TrimSpace(rest[eq+1:]), n.Line.No)
@@ -1479,10 +1494,50 @@ func parseSet(n *source.Node) (ast.Stmt, error) {
 	return ast.Set{Entity: ent, Key: key, Field: field, Value: val, Line: n.Line.No}, nil
 }
 
+// parseSetWhere parses `set item in Entity where cond:` plus its block of
+// `field = expr` assignments. wi is the index of the ` where ` that separates the
+// header from the predicate.
+func parseSetWhere(n *source.Node, rest string, wi int) (ast.Stmt, error) {
+	head := strings.TrimSpace(rest[:wi])
+	cond := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(rest[wi+len(" where "):]), ":"))
+	hf := strings.Fields(head)
+	if len(hf) != 3 || hf[1] != "in" || !isIdent(hf[0]) || !isIdent(hf[2]) {
+		return nil, &Error{n.Line.No, "set filter is `set item in Entity where cond:`"}
+	}
+	if !strings.HasSuffix(strings.TrimSpace(n.Line.Text), ":") {
+		return nil, &Error{n.Line.No, "a filtered set takes a block of assignments: end the line with `:` and indent `field = expr` under it"}
+	}
+	where, err := parseExpr(cond, n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	st := ast.Set{Entity: hf[2], Var: hf[0], Where: where, Line: n.Line.No}
+	for _, c := range n.Children {
+		t := strings.TrimSpace(c.Line.Text)
+		eq := indexAssign(t)
+		if eq < 0 {
+			return nil, &Error{c.Line.No, fmt.Sprintf("a filtered set's body is `field = expr`, got %q", t)}
+		}
+		name := strings.TrimSpace(t[:eq])
+		if !isIdent(name) {
+			return nil, &Error{c.Line.No, fmt.Sprintf("invalid field %q in a filtered set", name)}
+		}
+		val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		st.Fields = append(st.Fields, ast.FieldInit{Name: name, Expr: val})
+	}
+	if len(st.Fields) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("`set %s in %s where …` has no assignments — indent `field = expr` under it", hf[0], hf[2])}
+	}
+	return st, nil
+}
+
 func parseRemove(n *source.Node) (ast.Stmt, error) {
 	rest := strings.TrimSpace(n.Line.Text[len("remove "):])
 	// Filtered form: `remove <item> in <Entity> where <cond>` — delete all matches.
-	if wi := strings.Index(rest, " where "); wi >= 0 && strings.Contains(rest[:wi], " in ") {
+	if wi := indexOutside(rest, " where "); wi >= 0 && indexOutside(rest[:wi], " in ") >= 0 {
 		hf := strings.Fields(strings.TrimSpace(rest[:wi]))
 		if len(hf) != 3 || hf[1] != "in" || !isIdent(hf[0]) || !isIdent(hf[2]) {
 			return nil, &Error{n.Line.No, "remove filter is `remove item in Entity where cond`"}
@@ -1508,9 +1563,16 @@ func parseRemove(n *source.Node) (ast.Stmt, error) {
 }
 
 // parseEntityPath parses `Entity(key).field`.
+//
+// The key is a whole expression, so its parentheses are matched rather than
+// counted to the first `)` — `Product(CartLine(lid).product).stock` is one
+// lookup inside another, exactly as the expression parser reads it in a `check`.
 func parseEntityPath(s string, line int) (string, ast.Expr, string, error) {
 	open := strings.IndexByte(s, '(')
-	close := strings.IndexByte(s, ')')
+	close := -1
+	if open >= 0 {
+		close = matchParen(s, open)
+	}
 	if open < 0 || close < open {
 		return "", nil, "", &Error{line, fmt.Sprintf("expected Entity(key).field, got %q", s)}
 	}
@@ -2954,6 +3016,41 @@ func matchParen(s string, i int) int {
 			if depth == 0 {
 				return j
 			}
+		}
+	}
+	return -1
+}
+
+// indexOutside returns the index of the first occurrence of sep in s that is
+// outside every quoted string AND every bracket, or -1.
+//
+// It is indexTop's question asked of a *statement* rather than a view node: the
+// clause keywords that shape a bulk write (` in `, ` where `) are the statement's
+// own only at the top level, and a nested aggregate carries the identical words
+// inside its parentheses — `set Product(id).stock = count(l in Line where …)` is
+// a by-id write, not a filtered one, and the words that would say otherwise
+// belong to the count.
+func indexOutside(s, sep string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			e := endOfQuoted(s, i)
+			if e < 0 {
+				return -1
+			}
+			i = e
+			continue
+		case c == '(' || c == '[' || c == '{':
+			depth++
+			continue
+		case c == ')' || c == ']' || c == '}':
+			depth--
+			continue
+		}
+		if depth == 0 && strings.HasPrefix(s[i:], sep) {
+			return i
 		}
 	}
 	return -1
