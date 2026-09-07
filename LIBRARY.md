@@ -1,5 +1,13 @@
 # The Facet Library — plan (item 6, the v1.17 milestone)
 
+> **Where it lives now.** The library is the sibling repo `../facets`
+> (`github.com/F33D3R-Inc/facets`), v0.5.0 and up. The `library/` tree this plan
+> describes building locally was merged into it on 2026-09-05 — the chat, graph
+> and live categories, the look, and the three reference apps (`timeline.fct`,
+> `live.fct`, `messages.fct`) — and removed from this repo. The integration tests
+> in `integration/` start those apps from `../../facets/` and skip when that
+> checkout is absent.
+
 The old project shipped **250+ reusable facets**; the restarted FA has the
 *mechanism* (the registry, layered facets, `component`/`layout`) but none of the
 *content*. This is the plan to (re)build the library **on top of the now-complete

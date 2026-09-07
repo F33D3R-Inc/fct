@@ -17,9 +17,17 @@ import (
 // a link and stays the literal text the author typed. The text is already
 // escaped, so `&` in a query string arrives as `&amp;`, which is the correct
 // spelling inside an attribute; quotes arrived as `&#34;` and cannot close it.
+//
+// A `#tag` or `@handle` is a link too — to `/tag/<tag>` and `/u/<handle>`, the
+// routes the library's reference app serves. It counts only at a word boundary
+// (the start, a space, or an open paren): `a@b.co` stays an address, a URL's
+// `/#frag` stays a fragment, and the `&#34;` the escaper just wrote for a quote
+// is preceded by `&` and so is never a tag.
 var (
 	mdCode   = regexp.MustCompile("`([^`]+)`")
 	mdLink   = regexp.MustCompile(`\[([^\]]+)\]\(((?:https?://|mailto:|/)[^\s)]*)\)`)
+	mdTag    = regexp.MustCompile(`(^|[ \t(])#([A-Za-z0-9_]+)`)
+	mdHandle = regexp.MustCompile(`(^|[ \t(])@([A-Za-z0-9_]+)`)
 	mdBold   = regexp.MustCompile(`\*\*([^*]+)\*\*`)
 	mdItalic = regexp.MustCompile(`\*([^*]+)\*`)
 	mdStrike = regexp.MustCompile(`~~([^~]+)~~`)
@@ -28,7 +36,8 @@ var (
 
 // markdownHTML renders a safe subset of Markdown to HTML: ``` code fences,
 // `#`/`##`/`###` headings, `- ` and `1. ` lists, `> ` quotations, `---` rules,
-// paragraphs, and inline code/links/bold/italic/strikethrough.
+// paragraphs, and inline code/links/bold/italic/strikethrough, with `#tag` and
+// `@handle` autolinked.
 // The input is fully HTML-escaped first, so no raw HTML survives. The identical
 // algorithm runs in assets/facet.js, so server-rendered first paint and client
 // hydration produce the same markup.
@@ -125,6 +134,8 @@ func mdInline(s string) string {
 	// rel=noopener: an article's links point off-site as often as not, and a page
 	// a reader lands on from here must not be handed a window back into this one.
 	s = mdLink.ReplaceAllString(s, `<a href="$2" rel="noopener">$1</a>`)
+	s = mdTag.ReplaceAllString(s, `$1<a href="/tag/$2">#$2</a>`)
+	s = mdHandle.ReplaceAllString(s, `$1<a href="/u/$2">@$2</a>`)
 	s = mdBold.ReplaceAllString(s, "<strong>$1</strong>")
 	s = mdItalic.ReplaceAllString(s, "<em>$1</em>")
 	s = mdStrike.ReplaceAllString(s, "<del>$1</del>")

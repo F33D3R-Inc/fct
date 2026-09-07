@@ -503,6 +503,24 @@ func (m *materializer) perRow(f func() any) any {
 	return f()
 }
 
+// gateRow strips the fields this actor may not read from one looked-up row —
+// visibleRows for a single record. Outside a page render (an action, a policy)
+// there is no materializer and the authority sees the full row, as it does for
+// every other read.
+func (m *materializer) gateRow(entity string, row any, scope map[string]any) any {
+	if m == nil || m.s == nil {
+		return row
+	}
+	if _, ok := row.(record); !ok {
+		return row
+	}
+	out := m.s.visibleRowList(entity, []any{row}, scope)
+	if len(out) == 1 {
+		return out[0]
+	}
+	return row
+}
+
 // record notes an aggregate's value if this expression is one the client will
 // re-evaluate. It returns the value unchanged so eval can tail into it.
 func (m *materializer) record(e *ir.Expr, v any) any {
@@ -1085,7 +1103,11 @@ func collectReads(e *ir.Expr, isEnt map[string]bool, out map[string]*collRead) {
 		}
 	case "eget":
 		if isEnt[e.Name] {
-			readOf(out, e.Name).field(e.Field)
+			if e.Field == "" {
+				readOf(out, e.Name).all = true // `Post(id)`: the whole row is read
+			} else {
+				readOf(out, e.Name).field(e.Field)
+			}
 		}
 	case "ref":
 		if isEnt[e.Name] {

@@ -61,7 +61,16 @@ func eval(e *ir.Expr, scope map[string]any) any {
 		if v, ok := m.resolveAgg(e, scope); ok {
 			return m.record(e, v)
 		}
-		return m.record(e, evalColl(e, scope))
+		v := evalColl(e, scope)
+		if e.Kind == "eget" && e.Field == "" {
+			// A whole row is about to be recorded for the client, which re-renders
+			// this lookup from the recorded value. A field this actor may not read
+			// (`@requires`) leaves here the way it leaves every other projection —
+			// stripped by visibleRows — so the row a component is handed is the
+			// same row on both sides, and nothing gated rides along in `@aggs`.
+			v = m.gateRow(e.Name, v, scope)
+		}
+		return m.record(e, v)
 	}
 	return evalRest(e, scope)
 }
@@ -75,6 +84,9 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 		key := eval(e.Key, scope)
 		for _, r := range rows {
 			if m, ok := r.(record); ok && equal(m["id"], key) {
+				if e.Field == "" {
+					return m // `Post(id)`: the row itself
+				}
 				return m[e.Field]
 			}
 		}

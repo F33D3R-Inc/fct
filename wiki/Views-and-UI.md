@@ -25,7 +25,7 @@ view Name [at "/path"] [in Layout] [requires policy]:
 | **text** | `text "literal and {expr}"` |
 | **image** | `image "url" [alt "…"]` — URL interpolates, e.g. `image "…/avatar?seed={t.author}"` (renders a rounded avatar by default) |
 | **video** | `video "url" [poster "url"] [alt "…"] [autoplay] [loop] [muted]` — a player with controls; `poster` is the still before playback; `autoplay` implies `muted` (no browser autoplays with sound) |
-| **richtext** | `richtext "{p.body}"` — renders a safe Markdown subset: `#`/`##`/`###` headings, `- ` and `1. ` lists, `> ` quotes, ```` ``` ```` code, `---` rules, `[text](url)` links (http/https/mailto/relative only), `**bold**` `*italic*` `~~struck~~` `` `code` ``. Input is HTML-escaped first; the same renderer runs on server and client |
+| **richtext** | `richtext "{p.body}"` — renders a safe Markdown subset: `#`/`##`/`###` headings, `- ` and `1. ` lists, `> ` quotes, ```` ``` ```` code, `---` rules, `[text](url)` links (http/https/mailto/relative only), `#tag` → `/tag/tag` and `@handle` → `/u/handle` autolinks, `**bold**` `*italic*` `~~struck~~` `` `code` ``. Input is HTML-escaped first; the same renderer runs on server and client |
 | **icon** | `icon "name"` — a named glyph the theme's CSS fills |
 | **badge** | `badge "{unread}"` — a small pill for counts and status |
 | **tabs** | `tabs bind cell:` then `tab "Label" -> "value":` blocks — a segmented control over a `@client` cell |

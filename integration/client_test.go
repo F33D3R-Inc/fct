@@ -254,6 +254,15 @@ var (
 	whitespace    = regexp.MustCompile(`\s+`)
 )
 
+// visibleClientText is the client's rendered text with the same normalization
+// serverText applies to the page. The shim reports a `richtext` body as the HTML
+// it was given — the autolink inside a post is only visible to a test that way
+// (see library_test.go) — so a page with a richtext node on it can never match
+// the server's tag-stripped text until the tags are stripped here too.
+func visibleClientText(text string) string {
+	return whitespace.ReplaceAllString(unescapeEntities(anyTag.ReplaceAllString(text, " ")), "")
+}
+
 // serverText is the visible text of the page the server sent, normalized the
 // same way the shim normalizes the client's — so the two are comparable without
 // depending on how either splits its nodes.
@@ -376,6 +385,7 @@ func TestTheRealAppRendersOnEveryRoute(t *testing.T) {
 			// The real assertion: the client must render the same page the
 			// server already rendered, character for character.
 			want := serverText(html)
+			clientText = visibleClientText(clientText)
 			if clientText != want {
 				serverWindow, clientWindow := firstDifference(want, clientText)
 				t.Errorf("%s: the client rendered different text than the server sent.\n"+
@@ -465,6 +475,7 @@ func TestTheClientCountsFromTheNodeThatEvaluatedTheCount(t *testing.T) {
 	}
 
 	want := serverText(html)
+	clientText = visibleClientText(clientText)
 	if clientText != want {
 		serverWindow, clientWindow := firstDifference(want, clientText)
 		t.Errorf("the client renumbered an aggregate the server had already computed.\n"+

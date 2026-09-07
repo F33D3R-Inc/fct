@@ -2032,6 +2032,11 @@ func (c *viewCtx) lowerSegs(segs []ast.Seg, sc scope, openable bool) ([]Seg, err
 		if err := c.checkView(s.Expr, sc, 0, "a view"); err != nil {
 			return nil, err
 		}
+		// A row has no text. `{p}` or `{Post(id)}` would stringify a record — a
+		// different string on each side, and never what anyone meant.
+		if isRowExpr(s.Expr, sc, "") {
+			return nil, &BuildError{0, fmt.Sprintf("%s is a whole row and cannot be rendered as text — interpolate one of its fields (`%s.body`), or pass it to a component", rowName(s.Expr), rowName(s.Expr))}
+		}
 		if err := c.e.checkNoPrivate(s.Expr); err != nil {
 			return nil, err
 		}
@@ -3120,6 +3125,17 @@ func (e *env) checkPure(ex ast.Expr, locals map[string]bool, line int, ctx strin
 	return nil
 }
 
+// rowName spells a row expression the way the author wrote it, for a diagnostic.
+func rowName(ex ast.Expr) string {
+	switch t := ex.(type) {
+	case ast.Ref:
+		return "`" + t.Name + "`"
+	case ast.EntityGet:
+		return "`" + t.Entity + "(…)`"
+	}
+	return "this"
+}
+
 // checkView is what every expression written in a view goes through: the
 // purity and name checks of checkPure, then checkRowFields, which needs the
 // scope's TYPES and not only its names — which is why it is a viewCtx method
@@ -3285,6 +3301,12 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		}
 		return e.checkBuiltins(t.Obj, line)
 	case ast.EntityGet:
+		// `Post(id).field` names a field the entity has (or `id`); `Post(id)` alone
+		// is the row and names none. Checked only for an entity whose fields the
+		// builder recorded, so a managed entity it did not is not refused.
+		if fields := e.entityFields[t.Entity]; t.Field != "" && t.Field != "id" && fields != nil && !fields[t.Field] {
+			return &BuildError{line, fmt.Sprintf("entity %q has no field %q (in `%s(…).%s`)", t.Entity, t.Field, t.Entity, t.Field)}
+		}
 		return e.checkBuiltins(t.Key, line)
 	case ast.Bin:
 		if err := e.checkBuiltins(t.L, line); err != nil {

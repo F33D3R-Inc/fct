@@ -217,9 +217,17 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 					return nil, &Error{p.line, "missing `)` in entity lookup"}
 				}
 				p.pos++
-				field, err := p.expectDotField()
-				if err != nil {
-					return nil, err
+				// `Post(id).field` reads one field; `Post(id)` alone is the row — the
+				// value an entity-typed component parameter takes (`use QuoteCard(
+				// Tweet(t.quoted))`). It cannot be rendered as text; the builder says
+				// so if it is asked to.
+				field := ""
+				if nt, ok := p.peek(); ok && nt.kind == tOp && nt.text == "." {
+					f, err := p.expectDotField()
+					if err != nil {
+						return nil, err
+					}
+					field = f
 				}
 				atom = ast.EntityGet{Entity: ref.Name, Key: key, Field: field}
 			}

@@ -364,7 +364,7 @@ The body of a `view`, `component`, or `layout` is a tree of nodes:
 | `if` | `if <cond>:` + children | conditional region (reactive) |
 | `image` | `image "url" [alt "…"]` | a picture; URL and alt interpolate |
 | `video` | `video "url" [poster "url"] [alt "…"] [autoplay] [loop] [muted]` | a player; `autoplay` implies `muted` |
-| `richtext` | `richtext "{expr}"` | a safe Markdown subset, escaped first |
+| `richtext` | `richtext "{expr}"` | a safe Markdown subset, escaped first; `#tag` and `@handle` autolink to `/tag/…` and `/u/…` |
 | `icon` / `badge` | `icon "name"` · `badge "{n}"` | a glyph · a pill |
 | `tabs` | `tabs bind cell:` + `tab "Label" -> "value":` blocks | a segmented control over a `@client` cell |
 | `for` | `for x in Coll [where c] [by f desc\|asc] [limit n] [more action]:` + children | a query/list region; `more` = infinite scroll |
@@ -394,8 +394,10 @@ arguments, and `{…}` interpolation.
   variable, an action/policy parameter, and (under multi-tenancy) `tenant` /
   `tenantRole`.
 - **Field access** — `p.body`, `m.to`.
-- **Entity lookup** — `Post(id)` (a row by id), `Post(id).author` (a field of
-  it), `User(m.to).name` (across a relation).
+- **Entity lookup** — `Post(id).author` (a field of the row with that id),
+  `User(m.to).name` (across a relation). `Post(id)` alone is **the row**: it can be
+  handed to an entity-typed component parameter (`use QuoteCard(Tweet(t.quoted))`)
+  but not rendered as text. A field the entity does not have is a compile error.
 - **Operators** — `+ - * /`, comparison `== != < <= > >=`, boolean `&& || !`.
 - **Calls** — the [builtins](#builtins) below.
 

@@ -51,6 +51,16 @@ var markdownCases = []struct{ name, in, want string }{
 	{"rule", "above\n---\nbelow", "<p>above</p><hr><p>below</p>"},
 	{"strike", "~~old~~ new", "<p><del>old</del> new</p>"},
 	{"strike inside bold", "**~~a~~**", "<p><strong><del>a</del></strong></p>"},
+	// #tag and @handle autolink at a word boundary; an address, a fragment, and
+	// the escaper's own `&#34;` do not.
+	{"hashtag", "go #PSG go", `<p>go <a href="/tag/PSG">#PSG</a> go</p>`},
+	{"hashtag at start + paren", "#a (#b_2)", `<p><a href="/tag/a">#a</a> (<a href="/tag/b_2">#b_2</a>)</p>`},
+	{"handle", "cc @ada", `<p>cc <a href="/u/ada">@ada</a></p>`},
+	{"email is not a handle", "mail a@b.co", "<p>mail a@b.co</p>"},
+	{"escaped quote is not a tag", `say "hi"`, "<p>say &#34;hi&#34;</p>"},
+	{"fragment is not a tag", "[x](https://x.y/#frag) ok", `<p><a href="https://x.y/#frag" rel="noopener">x</a> ok</p>`},
+	{"heading is not a tag", "# Title", "<h1>Title</h1>"},
+	{"hashtag inside bold", "**#hot**", `<p><strong>#hot</strong></p>`},
 }
 
 func TestMarkdownHTML(t *testing.T) {

@@ -284,7 +284,7 @@
         if (mat !== undefined) return mat;
         const rows = collRows(e, sc);
         const key = ev(e.key, sc);
-        for (const r of rows) if (r && eq(r.id, key)) return r[e.field];
+        for (const r of rows) if (r && eq(r.id, key)) return e.field ? r[e.field] : r; // `Post(id)` alone is the row
         return null;
       }
       case "agg": {
@@ -677,6 +677,9 @@
     // A link is admitted by scheme (http(s), mailto, a site-relative path) — the
     // rule runtime/richtext.go states; anything else stays literal text.
     s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:|\/)[^\s)]*)\)/g, '<a href="$2" rel="noopener">$1</a>');
+    // #tag and @handle at a word boundary, the same boundary runtime/richtext.go draws.
+    s = s.replace(/(^|[ \t(])#([A-Za-z0-9_]+)/g, '$1<a href="/tag/$2">#$2</a>');
+    s = s.replace(/(^|[ \t(])@([A-Za-z0-9_]+)/g, '$1<a href="/u/$2">@$2</a>');
     s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
     s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");

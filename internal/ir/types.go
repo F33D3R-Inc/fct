@@ -231,6 +231,9 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 		}
 
 	case ast.EntityGet:
+		if t.Field == "" { // `Post(id)`: the row itself
+			return vtype{core: t.Entity}
+		}
 		return vtype{core: e.entFieldType[t.Entity][t.Field]}
 
 	case ast.Agg:
@@ -411,9 +414,8 @@ func (e *env) checkArgType(u ast.Use, i int, p ast.Param, sc scope) error {
 	// or a bare `5`) unifies with the row it is not. Handed one, the component
 	// would render every field as nothing, with no diagnostic anywhere. So the
 	// argument has to *be* a row: the variable a `for` binds, or an enclosing
-	// component's own entity parameter. Nothing else in the language produces one
-	// (`Post(id)` always takes a `.field`).
-	if want.known() && !want.list && e.entities[want.core] && !isRowRef(u.Args[i], sc, want.core) {
+	// component's own entity parameter, or a bare lookup `Post(id)`.
+	if want.known() && !want.list && e.entities[want.core] && !isRowExpr(u.Args[i], sc, want.core) {
 		return &BuildError{u.Line, fmt.Sprintf(
 			"component %q parameter %q is a %s row, but argument %d (%s) is not one — pass the row itself, the variable a `for x in %s` binds, not its id",
 			u.Name, p.Name, want.core, i+1, describeArg(u.Args[i], got), want.core)}
@@ -421,15 +423,18 @@ func (e *env) checkArgType(u ast.Use, i int, p ast.Param, sc scope) error {
 	return nil
 }
 
-// isRowRef reports whether ex names a row of the given entity in this scope: a
-// `for` item variable over it, or an entity-typed component parameter.
-func isRowRef(ex ast.Expr, sc scope, entity string) bool {
-	r, ok := ex.(ast.Ref)
-	if !ok {
-		return false
+// isRowExpr reports whether ex is a row of the given entity in this scope: a
+// `for` item variable over it, an entity-typed component parameter, or a bare
+// lookup `Entity(key)`. An empty entity accepts a row of any entity.
+func isRowExpr(ex ast.Expr, sc scope, entity string) bool {
+	switch t := ex.(type) {
+	case ast.Ref:
+		vt, ok := sc.varTypes[t.Name]
+		return ok && !vt.list && vt.core != "" && (entity == "" || vt.core == entity) && !isPrimitive(vt.core)
+	case ast.EntityGet:
+		return t.Field == "" && (entity == "" || t.Entity == entity)
 	}
-	t, ok := sc.varTypes[r.Name]
-	return ok && !t.list && t.core == entity
+	return false
 }
 
 // describeArg names an argument for the row diagnostic: what it is, then its type.
@@ -446,6 +451,8 @@ func describeArg(ex ast.Expr, got vtype) string {
 		return fmt.Sprintf("the literal %v", t.Val)
 	case ast.Ref:
 		return fmt.Sprintf("`%s`, %s", t.Name, idOrType(got))
+	case ast.EntityGet:
+		return fmt.Sprintf("`%s(…).%s`, %s", t.Entity, t.Field, idOrType(got))
 	}
 	if got.known() {
 		return got.label()
