@@ -51,6 +51,8 @@ type App struct {
 	Entities   []*Entity
 	Records    []*Record
 	Enums      []*Enum
+	Types      []*Type
+	Messages   []*Message
 	States     []*State
 	Derives    []*Derive
 	Policies   []*Policy
@@ -133,7 +135,17 @@ type RecordField struct {
 	Type     string
 	List     bool
 	Optional bool
-	Line     int
+	// Default is wire-schema-only (Type/Message fields, not Record/entity
+	// fields, which never set it): the raw literal text of a `= value`
+	// clause, e.g. `count: int = 1` or `item_var: text = "item"` — mirrors a
+	// real hand-written `#[serde(default = "fn")]` field (facetql's
+	// SequenceRequest.count, several query types' item_var) that has an
+	// actual non-zero default, not just "may be absent." Never combined with
+	// Optional: a defaulted field always resolves to a real value one way or
+	// another, whereas Optional means the value may genuinely stay absent.
+	// nil means no default was declared.
+	Default *string
+	Line    int
 }
 
 // Enum is a closed set of named text values: `enum Status: active, closed`. An
@@ -141,9 +153,76 @@ type RecordField struct {
 // its values are written `Status.active` and stored as their lowercase text. The
 // compiler checks every literal is a declared member, so a typo is a compile
 // error rather than a bad row.
+//
+// WireNames is the wire-schema escape hatch (SCHEMA_IDL_SCOPE.md Tier C): a
+// value may declare `private as "Private"` to fix codegen's serialized form
+// to something other than the value's own lowercase text, for the rare case
+// where an already-shipped hand-written type's wire form doesn't match FCT's
+// default lowercase convention (facetql::core::node::Visibility's real JSON
+// form is "Private"/"Public", not "private"/"public", and cannot be changed
+// without breaking fabric's independent wire.rs mirror — see the wire schema
+// file's own header for the full story). WireNames is always the same length
+// as Values, parallel index-for-index; WireNames[i] == Values[i] whenever no
+// `as` clause was given, so a plain enum has an identical default wire form
+// with no special-casing needed by a codegen backend. Every other use of an
+// Enum in the language (entity fields, `match`, `Status.active` literals)
+// only ever reads Values/Name — WireNames is inert outside wire codegen.
 type Enum struct {
+	Name      string
+	Values    []string
+	WireNames []string
+	Line      int
+}
+
+// Type and Message exist for exactly one purpose: describing the FacetQL wire
+// protocol as FCT source (Tier C of SCHEMA_IDL_SCOPE.md), so the Rust server,
+// the Go client, and any TS client are generated from one schema instead of
+// hand-copied three times — the root cause behind a recurring class of wire
+// drift bugs (an auth-header mismatch, a dropped `channel` field, a stale
+// `fa/facetql.go` fourth hand-copy). They deliberately do NOT reuse Record:
+// Record's fields are "a primitive, an enum, or a list of those, never another
+// record" by design, so a Record access from host code is always single-level
+// and checkable. A wire message has no such constraint — Node nests Coordinate,
+// Expr nests Expr recursively — so relaxing Record's flatness for this purpose
+// would weaken a guarantee its existing callers (service/action bindings) rely
+// on. Type/Message take no part in entity storage, actions, derives, policies,
+// or UI binding; they exist solely for codegen.
+//
+// Type is a plain wire value type: a flat-looking but potentially
+// self-referential/mutually-referential record. A field naming another
+// Type/Message (including itself) is valid; codegen boxes/points at it.
+//
+// Query marks a `type Name query:` declaration — bound from a GET request's
+// URL query string (axum's `Query<T>` extractor, e.g. facetql's real,
+// already-shipped QueryParams), never sent or received as a JSON body. The
+// wire shape codegen emits is unchanged (still a plain struct/interface with
+// the same fields) — SCHEMA_IDL_SCOPE.md's own scoping note is explicit that
+// the schema's job is to say how a type is bound, not to reshape it; the
+// generated code's consumer decides how to actually bind it (an axum
+// extractor, a manual url.Values build, ...). Query is inert for a Message —
+// a query-string type is never a tagged union in the real surface, and nothing
+// stops a future one from being added the same way if that ever changes.
+type Type struct {
 	Name   string
-	Values []string
+	Query  bool
+	Fields []RecordField
+	Line   int
+}
+
+// Message is a wire tagged union: a closed set of named variants, each with
+// its own typed fields. The variant's own name (already snake_case) is used
+// directly as the wire discriminant — `{"type": "insert_node", ...}` — with no
+// separate rename step, unlike Rust's `#[serde(rename_all = "snake_case")]`.
+type Message struct {
+	Name     string
+	Variants []MessageVariant
+	Line     int
+}
+
+// MessageVariant is one `| variant_name(field: type, ...)` arm of a Message.
+type MessageVariant struct {
+	Name   string
+	Fields []RecordField
 	Line   int
 }
 
@@ -207,8 +286,48 @@ type Entity struct {
 	// data survives. An audit/restore story without an imperative `archived` flag in
 	// every query.
 	SoftDelete bool
-	Fields     []EntityField
-	Line       int
+	// Ephemeral (`entity Position @ephemeral:`) marks an entity that is real to
+	// every query/action path (`for`, `where`, `set`, `add`, `remove`, `check`,
+	// `policy`, `read:` — all unchanged) but never durable: the runtime keeps its
+	// rows only in the in-memory working set and never replays a write for it
+	// through the Store (see runtime/server.go commit and attachStore). For
+	// high-frequency, low-value-per-row data — a player's live position, not
+	// their inventory — where one durable write per tick would be write
+	// amplification the store was never asked to absorb, and where losing the
+	// row on restart is not a bug (a movement snaps back to wherever it's read
+	// from next, there is no "last known position" to recover). Row-scoped live
+	// delivery (e.g. only viewers in the same zone) is not a separate mechanism —
+	// it composes with a normal `read:` policy exactly as it would for a durable
+	// entity (see fanout's existing per-identity grouping).
+	Ephemeral bool
+	Fields    []EntityField
+	// Read is the entity's row-level read policy: `read: <bool expr>` over the
+	// entity's own fields plus `actor` (and the other identity builtins
+	// `withActor` admits — role/verified/tenant/tenantRole). nil means what it
+	// always meant before this field existed: no entity-level read rule, so
+	// row-level authorization is the `where` clause or it is nothing.
+	//
+	// The parser resolves every bare reference to one of this entity's own
+	// field names into `Get{Ref{"$row"}, name}` (see parseEntity) before this is
+	// set, so by the time anything downstream sees a non-nil Read, it is already
+	// shaped exactly like a hand-written `where p.field` clause would be — over
+	// the reserved row variable "$row" rather than an author-chosen one. That
+	// reserved name is what a query site (a `for`, a filtered `count`/`exists`,
+	// the JSON API) renames to its own row variable before folding this in (see
+	// runtime/region.go renameRowVar), the same way `p.published || p.author ==
+	// actor` would already have been written for that one query. `$row` cannot
+	// collide with an author's identifier: isIdent admits no `$`.
+	//
+	// Read is deliberately NOT consulted for an `Entity(key).field` lookup
+	// (EntityGet), for an action's own reads, or for a policy's — an entity's
+	// read rule governs what an outside party may list or fetch, not what the
+	// authority itself may consult while deciding who is allowed to do
+	// something. `policy owns(id): actor == Post(id).author` has to see a
+	// draft's author to decide whether its own author owns it; gating that read
+	// by the very rule it helps enforce would make an author unable to manage
+	// their own drafts.
+	Read Expr
+	Line int
 }
 
 // EntityField is one column of an entity. A `@secret` field is encrypted at rest
@@ -752,6 +871,37 @@ type For struct {
 	Body []Node
 }
 
+// Stage is a `stage width <int> height <int>:` node — a canvas-rendered scene:
+// an optional background tile source and one or more `sprite` layers. Unlike
+// every other node with structure, a Stage binds no single cell of its own —
+// its reactivity comes from the entities/lists its `tiles` and `sprite`
+// children reference directly, the same way a `for`'s reactivity comes from
+// the collection it walks. It exists for the game-engine work tracked in
+// F33D3R's `apps/<game>` plan: a tile map and its moving sprites drawn on an
+// actual canvas, not a grid of boxes.
+type Stage struct {
+	Width   int
+	Height  int
+	Tiles   Expr // optional; nil = no tile background
+	Sprites []Sprite
+	Line    int
+}
+
+// Sprite is one `sprite for <var> in <Coll> [where cond] at (x, y) [facing f]
+// image <expr> [label "…"]` layer within a Stage — one drawn icon per row of
+// its Range, which is parsed and lowered exactly as a `for`'s is (parseRange,
+// lowerRange): a sprite is a `for` whose body is "draw a mark", not a node
+// tree, so it carries draw parameters instead of Body.
+type Sprite struct {
+	Range
+	X      Expr
+	Y      Expr
+	Facing Expr // optional; nil = no facing
+	Image  Expr
+	Label  []Seg // optional; nil = no on-canvas label
+	Line   int
+}
+
 // If renders Body only when Cond is truthy.
 type If struct {
 	Cond Expr
@@ -986,6 +1136,7 @@ func (Tabs) node()      {}
 func (Match) node()     {}
 func (Button) node()    {}
 func (For) node()       {}
+func (Stage) node()     {}
 func (If) node()        {}
 func (Input) node()     {}
 func (Overlay) node()   {}

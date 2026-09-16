@@ -830,7 +830,7 @@ func TestLiveStreamAnnouncesRatherThanPushingRows(t *testing.T) {
 	}
 	ch := make(chan []byte, 4)
 	srv.subsMu.Lock()
-	srv.subs[ch] = true
+	srv.subs[ch] = map[string]any{"actor": "guest", "role": "guest", "verified": false}
 	srv.subsMu.Unlock()
 
 	srv.broadcast(map[string]any{"Person": srv.entities["Person"]})

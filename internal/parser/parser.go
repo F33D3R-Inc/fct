@@ -5,6 +5,11 @@ package parser
 
 import (
 	"fmt"
+	goast "go/ast"
+	goparser "go/parser"
+	gotoken "go/token"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -132,6 +137,16 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 		if en, err = parseEnum(c); err == nil {
 			app.Enums = append(app.Enums, en)
 		}
+	case strings.HasPrefix(c.Line.Text, "type "):
+		var ty *ast.Type
+		if ty, err = parseType(c); err == nil {
+			app.Types = append(app.Types, ty)
+		}
+	case strings.HasPrefix(c.Line.Text, "message "):
+		var ms *ast.Message
+		if ms, err = parseMessage(c); err == nil {
+			app.Messages = append(app.Messages, ms)
+		}
 	case strings.HasPrefix(c.Line.Text, "component "):
 		var cm *ast.Component
 		if cm, err = parseComponent(c); err == nil {
@@ -208,7 +223,7 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 			app.Views = append(app.Views, v)
 		}
 	default:
-		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/enum/state/derive/policy/action/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/enum/type/message/state/derive/policy/action/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
 	}
 	return err
 }
@@ -462,10 +477,28 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		softDelete = true
 		name = strings.TrimSpace(strings.TrimSuffix(name, "@softdelete"))
 	}
+	// `entity Position @ephemeral:` — never durable; see ast.Entity.Ephemeral.
+	// Checked independently of @softdelete (not else-if) so either can precede
+	// the other in source, though combining them has no real use.
+	ephemeral := false
+	if strings.HasSuffix(name, "@ephemeral") {
+		ephemeral = true
+		name = strings.TrimSpace(strings.TrimSuffix(name, "@ephemeral"))
+	}
 	if !isIdent(name) || !isUpper(name) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("entity name %q must be capitalized", name)}
 	}
-	e := &ast.Entity{Name: name, SoftDelete: softDelete, Line: n.Line.No}
+	e := &ast.Entity{Name: name, SoftDelete: softDelete, Ephemeral: ephemeral, Line: n.Line.No}
+	// A `read:` line is the entity's row-level read policy, not a field — but it
+	// is written exactly like one (`read: <expr>`), so it is told apart the same
+	// way a real `read: bool` field (facets/home.fct's Notification.read, a
+	// "has this been seen" flag) is kept a field: `ft` is tried as a type first,
+	// and only a value that fails as a type name — "published || author ==
+	// actor" is never a legal type token — falls through to expression parsing.
+	// One `read:` per entity; collected here and resolved after the field loop
+	// so it may appear before the fields it references.
+	var readRaw ast.Expr
+	var readLine int
 	for _, c := range n.Children {
 		colon := strings.IndexByte(c.Line.Text, ':')
 		if colon < 0 {
@@ -552,6 +585,17 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		// A field type is a primitive, an enum, or an entity name (a relation, stored
 		// as the referenced row's id). Enum/entity existence is validated in the IR.
 		if !isTypeName(core) {
+			if fn == "read" {
+				if readRaw != nil {
+					return nil, &Error{c.Line.No, fmt.Sprintf("entity %q already has a read: clause (first at line %d)", name, readLine)}
+				}
+				expr, err := parseExpr(ft, c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				readRaw, readLine = expr, c.Line.No
+				continue
+			}
 			return nil, &Error{c.Line.No, fmt.Sprintf("unknown type %q (use int, text, bool, money, date, an enum, or an entity name)", core)}
 		}
 		if e2e && secret {
@@ -569,7 +613,64 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 	if len(e.Fields) == 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("entity %q has no fields", name)}
 	}
+	if readRaw != nil {
+		fields := make(map[string]bool, len(e.Fields))
+		for _, f := range e.Fields {
+			fields[f.Name] = true
+		}
+		e.Read = qualifyRowRefs(readRaw, fields)
+	}
 	return e, nil
+}
+
+// qualifyRowRefs rewrites every bare `ast.Ref` in ex that names one of this
+// entity's own fields into `Get{Ref{"$row"}, name}` — the shape a `where`
+// clause's `p.name` already has, over the reserved row variable a `read:`
+// clause implies rather than spells (see ast.Entity.Read). Anything else (most
+// importantly `Ref{"actor"}`) is left alone: `actor` is not a field, so it
+// never matches, and stays a bare reference exactly as a hand-written `where
+// p.author == actor` already treats it.
+//
+// This runs once, at parse time, on the raw expression `read:` parsed — before
+// anything downstream (the IR builder, the query sites that fold this in) ever
+// sees it, so every one of them can treat a non-nil Entity.Read as an ordinary
+// row predicate and needs no special case for the fact that its author wrote
+// it with no row variable at all.
+func qualifyRowRefs(ex ast.Expr, fields map[string]bool) ast.Expr {
+	switch t := ex.(type) {
+	case ast.Ref:
+		if fields[t.Name] {
+			return ast.Get{Obj: ast.Ref{Name: "$row"}, Field: t.Name}
+		}
+		return t
+	case ast.Get:
+		return ast.Get{Obj: qualifyRowRefs(t.Obj, fields), Field: t.Field}
+	case ast.EntityGet:
+		return ast.EntityGet{Entity: t.Entity, Key: qualifyRowRefs(t.Key, fields), Field: t.Field}
+	case ast.Agg:
+		t.Where = qualifyRowRefs(t.Where, fields)
+		t.Sel = qualifyRowRefs(t.Sel, fields)
+		return t
+	case ast.Call:
+		args := make([]ast.Expr, len(t.Args))
+		for i, a := range t.Args {
+			args[i] = qualifyRowRefs(a, fields)
+		}
+		return ast.Call{Name: t.Name, Args: args}
+	case ast.ListLit:
+		elems := make([]ast.Expr, len(t.Elems))
+		for i, el := range t.Elems {
+			elems[i] = qualifyRowRefs(el, fields)
+		}
+		return ast.ListLit{Elems: elems}
+	case ast.Bin:
+		return ast.Bin{Op: t.Op, L: qualifyRowRefs(t.L, fields), R: qualifyRowRefs(t.R, fields)}
+	case ast.Un:
+		return ast.Un{Op: t.Op, X: qualifyRowRefs(t.X, fields)}
+	default:
+		// Lit, ActState, nil: nothing to qualify.
+		return ex
+	}
 }
 
 // parseEnum: `enum Name: a, b, c` (members on the header) or each member on its
@@ -591,10 +692,30 @@ func parseEnum(n *source.Node) (*ast.Enum, error) {
 		if v == "" {
 			return nil
 		}
+		// Optional wire-rename escape hatch: `private as "Private"` fixes
+		// codegen's serialized form without touching the value's own
+		// lowercase identity used everywhere else in the language (see
+		// ast.Enum.WireNames's doc comment for why this exists).
+		wire := ""
+		if idx := strings.Index(v, " as "); idx >= 0 {
+			wire = strings.TrimSpace(v[idx+len(" as "):])
+			v = strings.TrimSpace(v[:idx])
+			if len(wire) < 2 || wire[0] != '"' || wire[len(wire)-1] != '"' {
+				return &Error{n.Line.No, fmt.Sprintf("enum value %q's wire name must be a quoted string, e.g. %s as \"Wire\"", v, v)}
+			}
+			wire = wire[1 : len(wire)-1]
+			if wire == "" {
+				return &Error{n.Line.No, fmt.Sprintf("enum value %q's wire name must not be empty", v)}
+			}
+		}
 		if !isIdent(v) {
 			return &Error{n.Line.No, fmt.Sprintf("enum value %q must be an identifier", v)}
 		}
+		if wire == "" {
+			wire = v
+		}
 		en.Values = append(en.Values, v)
+		en.WireNames = append(en.WireNames, wire)
 		return nil
 	}
 	if inline != "" {
@@ -670,6 +791,195 @@ func parseRecord(n *source.Node) (*ast.Record, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("record %q has no fields", name)}
 	}
 	return r, nil
+}
+
+// isWireTypeName is isTypeName plus two wire-only primitives with no
+// equivalent in the entity/record/action type system: `json` (an opaque
+// value, for genuinely untyped payloads like a predicate literal or a Node's
+// opaque `data`) and `number` (a float, for a real wire field FCT's `int`
+// cannot represent without losing precision — e.g. TxOp.set_if's `expect_le`,
+// which is `Option<f64>` in the real hand-written type because a lease
+// deadline is a Unix-seconds float, not necessarily whole). Scoped to
+// `type`/`message` fields only, deliberately not folded into isTypeName: the
+// rest of the language has no entity/action use for either.
+func isWireTypeName(s string) bool { return s == "json" || s == "number" || isTypeName(s) }
+
+// splitWireDefault splits a wire-schema field's type text on a trailing
+// `= literal` clause (`count: int = 1`, `item_var: text = "item"`,
+// `edges: [EdgeSpec] = []`, `set: json = {}`) — the default-value escape
+// hatch for the rare real field that has an actual non-zero-or-nontrivial
+// default (facetql's SequenceRequest.count, several query types' item_var,
+// CreateNodeRequest's `#[serde(default)]` empty edges list, TxOp.set_if's
+// `#[serde(default)]` empty data map), not just "may be absent" (which `?`
+// already covers — a defaulted field always resolves to a real value, an
+// optional one may genuinely stay unset). The literal must be a
+// double-quoted string, a bare integer, true/false, `[]`, or `{}` — anything
+// else is almost certainly a typo, not a real schema, so it is rejected at
+// parse time rather than silently accepted as opaque text. Whether `[]`/`{}`
+// is actually legal for the field's declared type (list vs. json vs.
+// scalar) is checked later, in ir/build.go, once the type is fully resolved.
+func splitWireDefault(ft string, line int) (rest string, def *string, err error) {
+	idx := strings.Index(ft, " = ")
+	if idx < 0 {
+		return ft, nil, nil
+	}
+	rest = strings.TrimSpace(ft[:idx])
+	lit := strings.TrimSpace(ft[idx+len(" = "):])
+	valid := lit == "true" || lit == "false" || lit == "[]" || lit == "{}"
+	if !valid && lit != "" {
+		if lit[0] == '"' && len(lit) >= 2 && lit[len(lit)-1] == '"' {
+			valid = true
+		} else if _, convErr := strconv.ParseInt(lit, 10, 64); convErr == nil {
+			valid = true
+		}
+	}
+	if !valid {
+		return "", nil, &Error{line, fmt.Sprintf("default %q must be a quoted string, an integer, true/false, [], or {}", lit)}
+	}
+	return rest, &lit, nil
+}
+
+// parseType: `type Name:` then `field: type` lines (inline and/or one per
+// child), exactly like parseRecord's field grammar — except a field's type
+// may name another `type`/`message` (including itself), which parseRecord's
+// fields may not. See ast.Type's doc comment for why this isn't just Record.
+func parseType(n *source.Node) (*ast.Type, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "type")), ":")
+	name := head
+	var inline string
+	if colon := strings.IndexByte(head, ':'); colon >= 0 {
+		name = strings.TrimSpace(head[:colon])
+		inline = strings.TrimSpace(head[colon+1:])
+	}
+	// `type Name query:` — bound from a URL query string, never a JSON body
+	// (see ast.Type.Query's doc comment). The marker sits between the name
+	// and the colon, so it must be stripped before the identifier check.
+	isQuery := false
+	if trimmed := strings.TrimSuffix(name, " query"); trimmed != name {
+		isQuery = true
+		name = strings.TrimSpace(trimmed)
+	}
+	if !isIdent(name) || !isUpper(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("type name %q must be capitalized", name)}
+	}
+	t := &ast.Type{Name: name, Query: isQuery, Line: n.Line.No}
+	add := func(spec string, line int) error {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			return nil
+		}
+		colon := strings.IndexByte(spec, ':')
+		if colon < 0 {
+			return &Error{line, fmt.Sprintf("type field %q must be `name: type`", spec)}
+		}
+		fn := strings.TrimSpace(spec[:colon])
+		ft := strings.TrimSpace(spec[colon+1:])
+		if !isIdent(fn) {
+			return &Error{line, fmt.Sprintf("invalid type field name %q", fn)}
+		}
+		ft, def, err := splitWireDefault(ft, line)
+		if err != nil {
+			return err
+		}
+		core, list, optional := splitType(ft)
+		if !isWireTypeName(core) {
+			return &Error{line, fmt.Sprintf("unknown type %q in field %q (use a primitive, `json`, `number`, an enum, another type/message, or a list of those)", core, fn)}
+		}
+		if optional && def != nil {
+			return &Error{line, fmt.Sprintf("field %q cannot be both optional (?) and have a default (=) — pick one", fn)}
+		}
+		t.Fields = append(t.Fields, ast.RecordField{Name: fn, Type: core, List: list, Optional: optional, Default: def, Line: line})
+		return nil
+	}
+	if inline != "" {
+		for _, f := range strings.Split(inline, ",") {
+			if err := add(f, n.Line.No); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, c := range n.Children {
+		if err := add(c.Line.Text, c.Line.No); err != nil {
+			return nil, err
+		}
+	}
+	if len(t.Fields) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("type %q has no fields", name)}
+	}
+	return t, nil
+}
+
+// parseMessage: `message Name:` then one `| variant_name(field: type, ...)`
+// line per child — a tagged union. The variant name is the wire discriminant
+// directly (it's already snake_case), so there is no separate rename step.
+func parseMessage(n *source.Node) (*ast.Message, error) {
+	name := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "message")), ":")
+	if !isIdent(name) || !isUpper(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("message name %q must be capitalized", name)}
+	}
+	m := &ast.Message{Name: name, Line: n.Line.No}
+	seen := map[string]bool{}
+	for _, c := range n.Children {
+		line := strings.TrimSpace(c.Line.Text)
+		if !strings.HasPrefix(line, "|") {
+			return nil, &Error{c.Line.No, fmt.Sprintf("message variant %q must start with `|`", line)}
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "|"))
+		open := strings.IndexByte(line, '(')
+		var vname, inner string
+		if open < 0 {
+			vname = line
+		} else {
+			close := strings.LastIndexByte(line, ')')
+			if close < open {
+				return nil, &Error{c.Line.No, fmt.Sprintf("message variant %q is missing `)`", line)}
+			}
+			vname = strings.TrimSpace(line[:open])
+			inner = strings.TrimSpace(line[open+1 : close])
+		}
+		if !isIdent(vname) || isUpper(vname) {
+			return nil, &Error{c.Line.No, fmt.Sprintf("message variant %q must be a lowercase identifier (it is the wire discriminant, written as-is)", vname)}
+		}
+		if seen[vname] {
+			return nil, &Error{c.Line.No, fmt.Sprintf("message %q has two variants named %q", name, vname)}
+		}
+		seen[vname] = true
+		v := ast.MessageVariant{Name: vname, Line: c.Line.No}
+		if inner != "" {
+			for _, spec := range strings.Split(inner, ",") {
+				spec = strings.TrimSpace(spec)
+				if spec == "" {
+					continue
+				}
+				colon := strings.IndexByte(spec, ':')
+				if colon < 0 {
+					return nil, &Error{c.Line.No, fmt.Sprintf("field %q in variant %q must be `name: type`", spec, vname)}
+				}
+				fn := strings.TrimSpace(spec[:colon])
+				ft := strings.TrimSpace(spec[colon+1:])
+				if !isIdent(fn) {
+					return nil, &Error{c.Line.No, fmt.Sprintf("invalid field name %q in variant %q", fn, vname)}
+				}
+				ft, def, err := splitWireDefault(ft, c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				core, list, optional := splitType(ft)
+				if !isWireTypeName(core) {
+					return nil, &Error{c.Line.No, fmt.Sprintf("unknown type %q in variant %q field %q", core, vname, fn)}
+				}
+				if optional && def != nil {
+					return nil, &Error{c.Line.No, fmt.Sprintf("field %q in variant %q cannot be both optional (?) and have a default (=) — pick one", fn, vname)}
+				}
+				v.Fields = append(v.Fields, ast.RecordField{Name: fn, Type: core, List: list, Optional: optional, Default: def, Line: c.Line.No})
+			}
+		}
+		m.Variants = append(m.Variants, v)
+	}
+	if len(m.Variants) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("message %q has no variants", name)}
+	}
+	return m, nil
 }
 
 // parseComponent: `component Name(params):` then a node tree.
@@ -1069,7 +1379,7 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {
-				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q", firstWord(t))}
+				return nil, unknownActionStatementError(c.Line.No, firstWord(t))
 			}
 			target := strings.TrimSpace(t[:eq])
 			if !isIdent(target) {
@@ -1086,6 +1396,20 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("action %q has no body", name)}
 	}
 	return a, nil
+}
+
+// unknownActionStatementError builds the diagnostic for an action-body line
+// that is neither one of the recognized statement keywords nor an
+// `name = expr` assignment. As with unknownViewNodeError, the "expected one
+// of" list is read live off this file's own parseAction switch via
+// switchCaseKeywords rather than retyped, so it cannot drift from what the
+// switch actually accepts.
+func unknownActionStatementError(line int, word string) *Error {
+	kws, ok := switchCaseKeywords("parseAction")
+	if !ok || len(kws) == 0 {
+		return &Error{line, fmt.Sprintf("unknown statement %q", word)}
+	}
+	return &Error{line, fmt.Sprintf("unknown statement %q — expected one of: %s, or an assignment (`name = expr`)", word, strings.Join(kws, ", "))}
 }
 
 // parseService parses `service Name at "url":` plus a block of typed operation
@@ -1777,6 +2101,12 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, f)
+		case strings.HasPrefix(t, "stage "):
+			st, err := parseStage(c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, st)
 		case strings.HasPrefix(t, "if "):
 			cond, err := parseExpr(strings.TrimSuffix(strings.TrimSpace(t[len("if "):]), ":"), c.Line.No)
 			if err != nil {
@@ -1850,7 +2180,7 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 			}
 			out = append(out, ast.SlotRef{Name: name})
 		default:
-			return nil, &Error{c.Line.No, fmt.Sprintf("unknown view node %q", firstWord(t))}
+			return nil, unknownViewNodeError(c.Line.No, firstWord(t))
 		}
 		// A node carrying a modifier is decorated in place. The cases above each emit
 		// exactly one node, so wrapping the just-appended one is unambiguous.
@@ -1859,6 +2189,138 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 		}
 	}
 	return out, nil
+}
+
+// unknownViewNodeError builds the diagnostic for a view-tree line whose
+// leading word matched none of parseNodes' cases. `unknown view node "box"`
+// on its own says only what was rejected, not what would have been valid —
+// close to useless when the real cause is e.g. a stale toolchain missing a
+// node the source file assumes exists. The "expected one of" list appended
+// here is never hand-typed (a hand-typed copy is exactly how the bare message
+// above went stale in the first place): it is read live off
+// viewNodeKeywords, the same technique `facet lang` (cmd/facet/lang.go) uses
+// to keep its own reference tables from drifting out of sync with the
+// compiler.
+func unknownViewNodeError(line int, word string) *Error {
+	kws := viewNodeKeywords()
+	if len(kws) == 0 {
+		return &Error{line, fmt.Sprintf("unknown view node %q — not a recognized node, control, or block keyword (run `facet lang` to list them)", word)}
+	}
+	return &Error{line, fmt.Sprintf("unknown view node %q — expected one of: %s, or a component name (see `use`)", word, strings.Join(kws, ", "))}
+}
+
+// viewNodeKeywords returns every leading word parseNodes' switch above
+// recognizes as a view node, control, or block keyword: the control keywords
+// come straight from ast.Controls, the same live map the switch dispatches on
+// via `ast.Controls[firstWord(t)].IRKind != ""`; the rest (box, row, text, ...)
+// are read out of this file's own parseNodes switch by
+// switchCaseKeywords("parseNodes"). Deriving both sets from the code that
+// actually decides, instead of retyping them, is what keeps this list from
+// silently falling behind as node kinds are added or renamed.
+func viewNodeKeywords() []string {
+	nodeKws, ok := switchCaseKeywords("parseNodes")
+	if !ok {
+		// Half a list is worse than none: ast.Controls alone would look like
+		// a complete "expected one of" answer while silently missing every
+		// plain node keyword (box, row, text, link, ...). See
+		// switchCaseKeywords' doc comment — this is the exact case it warns
+		// about, and it is the normal case for every binary this project
+		// ships (scripts/build.sh always passes -trimpath).
+		return nil
+	}
+	seen := make(map[string]bool)
+	for k := range ast.Controls {
+		seen[k] = true
+	}
+	for _, k := range nodeKws {
+		seen[k] = true
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// switchCaseKeywords derives the leading keywords a line-dispatch switch of
+// the shape used throughout this file (`switch { case strings.HasPrefix(t,
+// "word "): ... case t == "word" || t == "word:": ... }`) branches on, by
+// parsing this very source file and reading the string literals compared
+// against the switch's dispatch variable inside the named function.
+//
+// This mirrors `facet lang` (cmd/facet/lang.go's nodeKinds/builtinNames):
+// rather than hand-listing the keywords a second time — a copy that could
+// silently drift from the switch as cases are added, renamed or removed, the
+// way `unknown view node %q` already had — it reads the literals the code
+// actually branches on. Like `facet lang`, it degrades gracefully: if the
+// source is not available (e.g. a `facet` binary run somewhere its checkout's
+// internal/parser is not, per runtime.Caller(0)'s documented caveats), it
+// returns nil rather than a possibly-stale guess, and callers fall back to a
+// shorter message.
+//
+// The second return is false whenever the source could not be read at all —
+// distinct from "this function's switch genuinely dispatches on nothing,"
+// which cannot happen for parseNodes/parseAction. Callers with a second,
+// always-available source of keywords (viewNodeKeywords' ast.Controls) MUST
+// check it before merging: `-trimpath` (scripts/build.sh's own flag, used for
+// every binary this project ships) records this file's path as
+// "facet/internal/parser/parser.go" rather than a real filesystem path, so
+// ParseFile fails on every shipped release binary — and merging ast.Controls'
+// keys in unconditionally there would silently print a partial "expected one
+// of" list that OMITS every plain node keyword (box, row, text, link, ...)
+// while looking complete, which is worse than the bare message this replaced.
+// Confirmed by building with `-trimpath -ldflags="-s -w"` (scripts/build.sh's
+// exact invocation) and observing exactly that silent truncation before this
+// two-value return existed.
+func switchCaseKeywords(funcName string) (kws []string, ok bool) {
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		return nil, false
+	}
+	fset := gotoken.NewFileSet()
+	f, err := goparser.ParseFile(fset, self, nil, 0)
+	if err != nil {
+		return nil, false
+	}
+	seen := make(map[string]bool)
+	var out []string
+	record := func(lit string) {
+		s := strings.TrimSuffix(strings.TrimSpace(lit), ":")
+		word, _, _ := strings.Cut(s, " ")
+		if word != "" && !seen[word] {
+			seen[word] = true
+			out = append(out, word)
+		}
+	}
+	goast.Inspect(f, func(n goast.Node) bool {
+		fd, ok := n.(*goast.FuncDecl)
+		if !ok || fd.Name.Name != funcName {
+			return true
+		}
+		goast.Inspect(fd.Body, func(n goast.Node) bool {
+			cc, ok := n.(*goast.CaseClause)
+			if !ok {
+				return true
+			}
+			for _, expr := range cc.List {
+				goast.Inspect(expr, func(n goast.Node) bool {
+					bl, ok := n.(*goast.BasicLit)
+					if !ok || bl.Kind != gotoken.STRING {
+						return true
+					}
+					if s, err := strconv.Unquote(bl.Value); err == nil && s != "" {
+						record(s)
+					}
+					return true
+				})
+			}
+			return true
+		})
+		return false
+	})
+	sort.Strings(out)
+	return out, true
 }
 
 // stripNodeMods removes the trailing `class "..."`, `style "..."` and
@@ -2007,6 +2469,151 @@ func parseFor(n *source.Node) (ast.Node, error) {
 		return nil, err
 	}
 	return ast.For{Range: rg, Body: kids}, nil
+}
+
+// parseStage: `stage width <int> height <int>:` with an optional `tiles from
+// <expr>` line and one or more `sprite for …` layers as children — the
+// canvas-rendered scene node (see ast.Stage).
+func parseStage(n *source.Node) (ast.Node, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("stage "):]), ":")
+	w, h, err := parseStageSize(head, n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	st := ast.Stage{Width: w, Height: h, Line: n.Line.No}
+	for _, c := range n.Children {
+		t := strings.TrimSpace(c.Line.Text)
+		if len(c.Children) > 0 {
+			return nil, &Error{c.Line.No, "a stage's `tiles`/`sprite` lines take no children — they are draw parameters, not a body"}
+		}
+		switch {
+		case strings.HasPrefix(t, "tiles from "):
+			if st.Tiles != nil {
+				return nil, &Error{c.Line.No, "stage takes at most one `tiles from …`"}
+			}
+			e, err := parseExpr(strings.TrimSpace(t[len("tiles from "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			st.Tiles = e
+		case strings.HasPrefix(t, "sprite "):
+			sp, err := parseSprite(c)
+			if err != nil {
+				return nil, err
+			}
+			st.Sprites = append(st.Sprites, sp)
+		default:
+			return nil, &Error{c.Line.No, "stage children must be `tiles from <expr>` or `sprite for …`"}
+		}
+	}
+	if st.Tiles == nil && len(st.Sprites) == 0 {
+		return nil, &Error{n.Line.No, "stage needs at least a `tiles from …` or one `sprite for …`"}
+	}
+	return st, nil
+}
+
+// parseStageSize parses a stage's `width <int> height <int>` header, with the
+// leading `stage ` keyword and trailing colon already stripped.
+func parseStageSize(head string, line int) (int, int, error) {
+	fields := strings.Fields(head)
+	if len(fields) != 4 || fields[0] != "width" || fields[2] != "height" {
+		return 0, 0, &Error{line, "stage needs `stage width <int> height <int>:`"}
+	}
+	w, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, 0, &Error{line, fmt.Sprintf("stage width must be an integer, got %q", fields[1])}
+	}
+	h, err := strconv.Atoi(fields[3])
+	if err != nil {
+		return 0, 0, &Error{line, fmt.Sprintf("stage height must be an integer, got %q", fields[3])}
+	}
+	if w <= 0 || h <= 0 {
+		return 0, 0, &Error{line, "stage width/height must be positive"}
+	}
+	return w, h, nil
+}
+
+// parseSprite: `sprite for <var> in <Coll> [where cond] [by field [desc|asc]]
+// [limit n] at (x, y) [facing <expr>] image <expr> [label "…"]`.
+//
+// The range half (`for <var> in <Coll> …`) parses exactly as a `for`'s does —
+// parseRange — because it is the same query over the same collections; only
+// the tail differs, since a sprite draws a mark per row instead of rendering
+// a node body.
+func parseSprite(n *source.Node) (ast.Sprite, error) {
+	line := n.Line.No
+	rest := strings.TrimSpace(n.Line.Text[len("sprite "):])
+	at := indexTop(rest, " at (")
+	if at < 0 {
+		return ast.Sprite{}, &Error{line, "sprite needs a position: sprite for x in Coll at (x, y) image <expr>"}
+	}
+	rangeHead := strings.TrimSpace(rest[:at])
+	tail := strings.TrimSpace(rest[at+1:]) // "at (...) [facing ...] image ... [label ...]"
+	if !strings.HasPrefix(rangeHead, "for ") {
+		return ast.Sprite{}, &Error{line, "sprite needs `sprite for <var> in <Coll> …`"}
+	}
+	rg, err := parseRange(strings.TrimSpace(rangeHead[len("for "):]), line)
+	if err != nil {
+		return ast.Sprite{}, err
+	}
+
+	coordPart := tail[len("at "):] // "(x, y) [facing ...] image ... [label ...]"
+	if len(coordPart) == 0 || coordPart[0] != '(' {
+		return ast.Sprite{}, &Error{line, "sprite position must be `at (x, y)`"}
+	}
+	closeParen := matchParen(coordPart, 0)
+	if closeParen < 0 {
+		return ast.Sprite{}, &Error{line, "unclosed `(` in sprite position"}
+	}
+	coords := coordPart[1:closeParen]
+	comma := indexTop(coords, ",")
+	if comma < 0 {
+		return ast.Sprite{}, &Error{line, "sprite position needs both coordinates: at (x, y)"}
+	}
+	xExpr, err := parseExpr(strings.TrimSpace(coords[:comma]), line)
+	if err != nil {
+		return ast.Sprite{}, err
+	}
+	yExpr, err := parseExpr(strings.TrimSpace(coords[comma+1:]), line)
+	if err != nil {
+		return ast.Sprite{}, err
+	}
+
+	after := strings.TrimSpace(coordPart[closeParen+1:]) // "[facing ...] image ... [label ...]"
+	imgIdx := indexTop(after, "image ")
+	if imgIdx < 0 {
+		return ast.Sprite{}, &Error{line, "sprite needs an image: image <expr>"}
+	}
+	var facingExpr ast.Expr
+	if facingPart := strings.TrimSpace(after[:imgIdx]); facingPart != "" {
+		if !strings.HasPrefix(facingPart, "facing ") {
+			return ast.Sprite{}, &Error{line, "sprite's only modifier before `image` is `facing <expr>`"}
+		}
+		facingExpr, err = parseExpr(strings.TrimSpace(facingPart[len("facing "):]), line)
+		if err != nil {
+			return ast.Sprite{}, err
+		}
+	}
+
+	imageTail := strings.TrimSpace(after[imgIdx+len("image "):]) // "<expr> [label \"...\"]"
+	var imageExpr ast.Expr
+	var label []ast.Seg
+	if li := indexTop(imageTail, "label "); li >= 0 {
+		imageExpr, err = parseExpr(strings.TrimSpace(imageTail[:li]), line)
+		if err != nil {
+			return ast.Sprite{}, err
+		}
+		label, err = parseText(strings.TrimSpace(imageTail[li+len("label "):]), line)
+		if err != nil {
+			return ast.Sprite{}, err
+		}
+	} else {
+		imageExpr, err = parseExpr(imageTail, line)
+		if err != nil {
+			return ast.Sprite{}, err
+		}
+	}
+	return ast.Sprite{Range: rg, X: xExpr, Y: yExpr, Facing: facingExpr, Image: imageExpr, Label: label, Line: line}, nil
 }
 
 // parseRange parses the header every repeating construct shares —

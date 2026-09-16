@@ -51,8 +51,9 @@ type Server struct {
 	idemMu sync.Mutex             // guards idem
 	idem   map[string]*idemRecord // webhook idempotency: dedup key -> the once-processed outcome (or an in-flight marker)
 
-	fieldRE map[string]*regexp.Regexp // compiled @matches patterns, keyed by entity.field
-	softDel map[string]bool           // entity names that soft-delete (archive) on remove
+	fieldRE   map[string]*regexp.Regexp // compiled @matches patterns, keyed by entity.field
+	softDel   map[string]bool           // entity names that soft-delete (archive) on remove
+	ephemeral map[string]bool           // entity names that never reach the durable store (see commit, attachStore)
 
 	store    Store
 	children map[string][]ir.Reference // entity -> the relations that point at it (for cascade)
@@ -75,8 +76,18 @@ type Server struct {
 	dev      *devHub      // live-reload hub (nil unless `facet dev`)
 	i18n     *i18nCatalog // message catalogs for localization (empty until FACET_I18N_DIR)
 
-	subsMu sync.Mutex           // guards subs
-	subs   map[chan []byte]bool // live SSE connections (shared-state fan-out)
+	subsMu sync.Mutex // guards subs
+	// subs is every live SSE connection (shared-state fan-out), each keyed by its
+	// channel and holding the identity (see identityScope) captured when it
+	// subscribed — actor plus the other builtins a `read:` clause may reach
+	// (role/verified/tenant/tenantRole). A stream has no per-message request to
+	// resolve that identity fresh from the way apiQueryRows/listRows do, so it is
+	// resolved once, at connect (handleLive), the same read-only way apiScope
+	// resolves it for a request (sidForRequest) — and kept for fanout to filter a
+	// `read:`-gated entity's rows per distinct subscriber before it sends them
+	// (see fanout's own doc for why that entity's rows cannot be computed once
+	// and shared the way every other entity's can).
+	subs map[chan []byte]map[string]any
 
 	// streamEnts is the set of entities the live stream may carry as rows — a
 	// pure function of the IR (see streamEntities), computed once.
@@ -165,10 +176,11 @@ func newServer(graph *ir.IR) *Server {
 		idem:           map[string]*idemRecord{},
 		fieldRE:        map[string]*regexp.Regexp{},
 		softDel:        map[string]bool{},
+		ephemeral:      map[string]bool{},
 		entities:       map[string][]any{},
 		nextID:         map[string]int{},
 		sessions:       map[string]*sessionState{},
-		subs:           map[chan []byte]bool{},
+		subs:           map[chan []byte]map[string]any{},
 		secure:         os.Getenv("FACET_SECURE_COOKIES") == "1",
 		limiter:        newRateLimiter(rateLimitFromEnv()),
 		lockout:        newLockout(),
@@ -199,6 +211,9 @@ func newServer(graph *ir.IR) *Server {
 	for _, ent := range graph.Entities {
 		if ent.SoftDelete {
 			s.softDel[ent.Name] = true
+		}
+		if ent.Ephemeral {
+			s.ephemeral[ent.Name] = true
 		}
 		for _, f := range ent.Fields {
 			if f.Matches == "" {
@@ -260,7 +275,16 @@ func NewInMemory(graph *ir.IR) (*Server, error) {
 func (s *Server) attachStore(store Store) error {
 	graph := s.ir
 	s.store = store
-	loaded, err := store.Init(graph.Entities)
+	// @ephemeral entities never reach the store: not the schema/migration (no
+	// table for a row that outlives nothing), and not Init's load. They start
+	// empty every process start, by design — see ast.Entity.Ephemeral.
+	durable := make([]ir.Entity, 0, len(graph.Entities))
+	for _, e := range graph.Entities {
+		if !e.Ephemeral {
+			durable = append(durable, e)
+		}
+	}
+	loaded, err := store.Init(durable)
 	if err != nil {
 		store.Close()
 		return fmt.Errorf("load entity data: %w", err)
@@ -584,9 +608,21 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	// Who is asking, resolved the same read-only way the JSON API resolves it
+	// (sidForRequest/apiScope): from the signed session cookie already on this
+	// request, never minted here. It is captured once, for the life of this
+	// connection — see identityScope's own doc on why that is the right call for
+	// a stream, not a shortcut — and is what lets a `read:`-gated entity's rows
+	// be filtered per subscriber below and in fanout, instead of reaching every
+	// subscriber exactly alike regardless of who they are.
+	sid := s.sidForRequest(r)
+
 	ch := make(chan []byte, 16)
+	s.mu.Lock()
+	scope := s.identityScope(sid)
+	s.mu.Unlock()
 	s.subsMu.Lock()
-	s.subs[ch] = true
+	s.subs[ch] = scope
 	s.subsMu.Unlock()
 	s.obs.metrics.addSSE(1)
 	defer func() {
@@ -601,12 +637,21 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 	// client's own evaluator still reads as collections travel — everything else
 	// reaches a client as a region's result set, which the stream cannot know the
 	// shape of because it has no page and no actor.
+	//
+	// An entity with a `read:` policy gets it applied here exactly as it would at
+	// any other query site (applyReadPolicy/withEntityReadPolicy), against the
+	// identity just resolved above — this snapshot is the one row-bearing frame
+	// that always reaches exactly one subscriber, so unlike fanout there is no
+	// group to compute it for; it is already per-subscriber by construction.
 	s.mu.Lock()
 	snap := map[string]any{}
 	for ent, rows := range s.entities {
 		c := s.streamEntities()[ent]
 		if isReservedEntity(ent) || c == nil {
 			continue // never stream the credential store, runtime tables, or a table nothing reads whole
+		}
+		if e, ok := s.entityByName(ent); ok && e.Read != nil {
+			rows = s.filterByReadPolicy(e, rows, scope)
 		}
 		snap[ent] = projectRows(rows, c.keepFields(), nil)
 	}
@@ -664,36 +709,140 @@ func (s *Server) broadcast(deltas map[string]any) {
 // client re-asks the authority for the regions that read it and gets one page
 // of rows back, which is why a fifty-thousand-row table no longer crosses this
 // wire on every write.
+//
+// A row-streamed entity that ALSO carries a `read:` policy breaks the "compute
+// once, send to everyone" shape those rows otherwise get: different subscribers
+// may be allowed different rows of the very same write, the same way two
+// callers of `GET /api/<Entity>` can see different pages of it. Sending rows
+// only the LEAST-privileged subscriber may see would under-serve everyone else;
+// sending the union would leak to whoever the policy excludes — the actual gap
+// this closes (a subscriber `read:` would exclude from an entity's own list view
+// or the JSON API still received its rows live, because a subscriber channel had
+// no actor at all to check the policy against). There is no third payload that
+// is simultaneously correct for two different identities, so a gated entity's
+// rows are computed per distinct identity among the current subscribers
+// (grouped, so two connections sharing an identity cost one evaluation, not
+// one each) rather than once — everything else in the frame is still computed
+// once and shared, exactly as before.
+//
+// Going the other way — dropping such an entity out of the row-streaming set
+// entirely and letting its name-only announcement force a client re-fetch, the
+// way the majority of entities already work — was the simpler option and was
+// rejected on evidence, not by default: the client's own evaluator resolves a
+// bare collection reference (a button/form dispatch argument, a typeahead's
+// completion list, a route guard's aggregate — see collectBareRefs/collectReads
+// in region.go) straight out of its local `store[entity]`, with no request
+// involved and therefore no place a re-fetch could land. Those are exactly the
+// reads that put an entity in `streamEntities` to begin with (a `for` region or
+// a rendered aggregate never needs this: both already refresh over `/region`
+// off the entity's bare name-only announcement, `read:` folded in there by
+// applyReadPolicy/withEntityReadPolicy same as any other query). Sending only
+// the name for a gated, row-streamed entity would leave those specific reads
+// silently stale — not merely late, but never updated again — for the rest of
+// the connection's life, which is a correctness regression this feature must
+// not trade the security fix for.
 func (s *Server) fanout(deltas map[string]any) {
 	if len(deltas) == 0 {
 		return
 	}
 	stream := s.streamEntities()
 	rows := map[string]any{}
+	var gated []string // row-streamed entities whose rows a `read:` clause must filter per subscriber
 	changed := entityKeys(deltas)
 	sort.Strings(changed) // a stable payload, so an identical change is an identical frame
 	for _, ent := range changed {
-		if c := stream[ent]; c != nil {
-			rows[ent] = projectRows(deltas[ent], c.keepFields(), nil)
+		c := stream[ent]
+		if c == nil {
+			continue
 		}
+		if e, ok := s.entityByName(ent); ok && e.Read != nil {
+			gated = append(gated, ent)
+			continue
+		}
+		rows[ent] = projectRows(deltas[ent], c.keepFields(), nil)
 	}
-	// The stream reaches every subscriber with no actor to authorize against, so
-	// gated fields are stripped unconditionally (sseSafe); clients receive them
-	// only over the per-actor API.
-	safe := s.sseSafe(rows)
-	data, err := json.Marshal(map[string]any{
-		"deltas": safe, "media": mediaGrants(safe), "changed": changed, "seq": s.writeSeq.Load()})
-	if err != nil {
+	seq := s.writeSeq.Load()
+
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+
+	if len(gated) == 0 {
+		// The common case, unchanged: nothing in this change needs a per-subscriber
+		// answer, so one frame is computed and reaches every subscriber alike.
+		//
+		// The stream reaches every subscriber with no *field-level* @requires gate
+		// to authorize against even now that a subscriber's identity is known
+		// (sseSafe), because that gate is a deliberate, permanent design choice
+		// unrelated to `read:` — a @requires field is never sent over SSE at all,
+		// to any subscriber, full stop (see fieldauth.go); only the per-actor API
+		// serves it.
+		safe := s.sseSafe(rows)
+		data, err := json.Marshal(map[string]any{
+			"deltas": safe, "media": mediaGrants(safe), "changed": changed, "seq": seq})
+		if err != nil {
+			return
+		}
+		for ch := range s.subs {
+			select {
+			case ch <- data:
+			default:
+			}
+		}
 		return
 	}
-	s.subsMu.Lock()
-	for ch := range s.subs {
-		select {
-		case ch <- data:
-		default:
+
+	// At least one changed, row-streamed entity is `read:`-gated: group the
+	// current subscribers by the identity captured when each connected (see
+	// identityScope/handleLive), so the predicate is evaluated once per distinct
+	// identity rather than once per connection sharing it, then ship each group
+	// its own frame.
+	type group struct {
+		scope map[string]any
+		chans []chan []byte
+	}
+	groups := map[string]*group{}
+	for ch, scope := range s.subs {
+		key := identityKey(scope)
+		g := groups[key]
+		if g == nil {
+			g = &group{scope: scope}
+			groups[key] = g
+		}
+		g.chans = append(g.chans, ch)
+	}
+	for _, g := range groups {
+		merged := make(map[string]any, len(rows)+len(gated))
+		for k, v := range rows {
+			merged[k] = v
+		}
+		for _, ent := range gated {
+			e, _ := s.entityByName(ent)
+			list, _ := deltas[ent].([]any)
+			merged[ent] = projectRows(s.filterByReadPolicy(e, list, g.scope), stream[ent].keepFields(), nil)
+		}
+		safe := s.sseSafe(merged)
+		data, err := json.Marshal(map[string]any{
+			"deltas": safe, "media": mediaGrants(safe), "changed": changed, "seq": seq})
+		if err != nil {
+			continue
+		}
+		for _, ch := range g.chans {
+			select {
+			case ch <- data:
+			default:
+			}
 		}
 	}
-	s.subsMu.Unlock()
+}
+
+// identityKey is a stable grouping key over the identity fields a `read:` clause
+// can reach (see identityScope) — not `actor` alone, because two connections
+// from the very same actor can still disagree about the fields a policy reads:
+// `tenant`/`tenantRole` are per-session (the active tenant), so the same person
+// switched into two different tenants in two tabs must be evaluated separately.
+func identityKey(scope map[string]any) string {
+	return fmt.Sprintf("%v\x00%v\x00%v\x00%v\x00%v",
+		scope["actor"], scope["role"], scope["verified"], scope["tenant"], scope["tenantRole"])
 }
 
 // handlePage routes the request to the view whose path matches, server-renders
@@ -1677,6 +1826,22 @@ type durOp struct {
 // say so, and every caller assumed success because success was the only thing it
 // was ever told. A store write is not best-effort — it is the write.
 func (s *Server) commit(ops []durOp) error {
+	// @ephemeral entities already landed in the in-memory working set at the
+	// point their op was appended (add/set/remove above) — that's what makes
+	// them live and queryable. What they must never do is reach here: no row
+	// for them is ever replayed into the store, which is the whole point (see
+	// ast.Entity.Ephemeral). Filtered here, not at each append site, so this
+	// stays the one door onto durability, same reasoning as fanout being the
+	// one door onto the live stream.
+	if len(s.ephemeral) > 0 {
+		filtered := ops[:0:0]
+		for _, op := range ops {
+			if !s.ephemeral[op.entity] {
+				filtered = append(filtered, op)
+			}
+		}
+		ops = filtered
+	}
 	if len(ops) == 0 {
 		return nil
 	}
@@ -1968,11 +2133,16 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// An entity with @requires-gated fields serves an actor-dependent response, so
-		// it bypasses the shared read cache (which is keyed only by query, not actor).
-		gatedEntity := len(s.gated[name]) > 0
+		// An entity with @requires-gated fields, or a `read:` clause, serves an
+		// actor-dependent response, so it bypasses the shared read cache (which is
+		// keyed only by query, not actor). Before `read:` existed, an unguarded
+		// FACET_API_READ entry (no ":policy") meant the response was the same for
+		// everyone and the cache was sound; now it can mean "the same rows an
+		// entity's row-read rule admits for THIS actor", which is exactly the
+		// per-actor case @requires-gated fields already forced this cache to skip.
+		actorDependent := len(s.gated[name]) > 0 || ent.Read != nil
 		cacheKey := name + "?" + r.URL.RawQuery
-		if !gatedEntity {
+		if !actorDependent {
 			// Serve a hot list from the read cache when enabled; it is invalidated the
 			// instant any entity changes, so it never returns stale rows. Reached only
 			// by a caller the read rule already admitted.
@@ -1983,7 +2153,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		rows, next, err := s.store.Query(query)
+		rows, next, err := s.apiQueryRows(ent, query, scope)
 		if err != nil {
 			http.Error(w, "query failed", http.StatusInternalServerError)
 			return
@@ -1995,7 +2165,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			out["next"] = next
 		}
 		body, _ := json.Marshal(out)
-		if !gatedEntity {
+		if !actorDependent {
 			s.apiCache.put(cacheKey, body)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -2118,6 +2288,59 @@ func buildAPIQuery(e ir.Entity, vals url.Values) (Query, error) {
 		query.Where = pred
 	}
 	return query, nil
+}
+
+// apiQueryRows executes an entity-list query, folding in the entity's `read:`
+// clause when it has one. Every predicate buildAPIQuery can produce is a bare
+// `r.field == literal`, always pushable — so before `read:` existed, `GET
+// /api/<Entity>` never needed anything more than one direct s.store.Query
+// call, and had no residual-paging loop the way listRows does for a `for`
+// region. A `read:` clause almost always mentions `actor`, which no store can
+// evaluate, so this is that loop's counterpart for the API's own query shape.
+//
+// It cannot reuse listRows: that function is built around an ir.Node (a
+// render's `for`), returns a plain row slice, and exists to feed one render —
+// it was never asked to hand a caller a cursor they replay in a LATER,
+// separate request. This has to get that cursor right, which is the one place
+// this is NOT a copy of listRows's loop: a residual predicate can reject rows
+// from the middle of a page, and returning a cursor mid-page — "resume after
+// row 6 of this page" — is not a boundary the store's own cursor can name, so
+// jumping to it would silently skip rows 7..N of that same page on the next
+// call, which is exactly the kind of gap this feature exists to close, not
+// reopen. So a page is always read to the end before its rows are counted
+// against `limit`: the response may fall short of `limit` (rare — the store
+// only cursors on a full page), but the `next` it hands back is always the
+// store's own page boundary, one this function has already resolved every row
+// up to. A caller that pages to the end sees every row it should and no
+// fewer, never a gap.
+func (s *Server) apiQueryRows(ent ir.Entity, query Query, scope map[string]any) (rows []any, next string, err error) {
+	if ent.Read == nil {
+		return s.store.Query(query)
+	}
+	residual := renameRowVar(ent.Read, query.ItemVar)
+	limit := query.Limit
+	query.Limit = listPageSize
+	row := cloneScope(scope)
+	var out []any
+	for {
+		page, pageNext, err := s.store.Query(query)
+		if err != nil {
+			return nil, "", err
+		}
+		for _, r := range page {
+			row[query.ItemVar] = r
+			if evalRowPredicate(residual, row) {
+				out = append(out, r)
+			}
+		}
+		if limit > 0 && len(out) >= limit {
+			return out[:limit], pageNext, nil
+		}
+		if pageNext == "" {
+			return out, "", nil
+		}
+		query.After = pageNext
+	}
 }
 
 // fieldOf resolves a field by name; id is an implicit int field every entity has.
@@ -2578,6 +2801,18 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 			fmt.Fprintf(b, `<button type="button" class="fa-more" data-fa-more="%s">More</button>`, html.EscapeString(n.More))
 		}
 		b.WriteString(`</div>`)
+	case "stage":
+		// A canvas has nothing to paint without JavaScript — unlike a `list`,
+		// there is no meaningful no-JS first paint to give it — so the server's
+		// whole job is the element itself, at the size the author asked for, plus
+		// making sure every sprite layer's rows are pulled into this render's row
+		// set exactly as a `list`'s are (rd.rows). That is what puts them in the
+		// state the client hydrates from, so the very first client-side draw has
+		// real rows to draw and does not wait on a round trip.
+		fmt.Fprintf(b, `<canvas%s width="%d" height="%d"></canvas>`, regionAttrs("fa-stage", n.ID, n), n.Width, n.Height)
+		for i, sp := range n.Children {
+			rd.rows(sp, scope, childPath(path, i))
+		}
 	case "if":
 		// `if` is control flow, not a box. The IR says so — internal/ir/build.go's
 		// `case ast.If` emits a node holding children and no element — and this

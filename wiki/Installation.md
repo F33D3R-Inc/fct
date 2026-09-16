@@ -34,19 +34,20 @@ go build -o facet ./cmd/facet
 
 ## A database (for `facet run`)
 
-Facet persists entity data in **Postgres**. Point `FACET_DATABASE_URL` at your
-database:
+Facet persists entity data in **FacetQL**, its native database. An unset
+`FACET_DATABASE_URL` already points at `facetql://localhost:8080`, so a local
+FacetQL install needs no further configuration. To point at one explicitly:
 
 ```sh
-export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/yourdb
+export FACET_DATABASE_URL=facetql://[token@]host:port
 ```
 
 You do **not** need a database to learn the language: `facet dev` runs entirely
 in memory with hot reload, and `facet build` / `facet test` / `facet console`
-work without one too. You only need Postgres for `facet run` (production) and
-`facet migrate`.
+work without one too. You only need a running FacetQL for `facet run`
+(production) and `facet migrate`.
 
-The fastest way to a full stack is the bundled compose file (app + Postgres):
+The fastest way to a full stack is the bundled compose file (app + FacetQL):
 
 ```sh
 facet new myapp && cd myapp

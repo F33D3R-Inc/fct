@@ -35,7 +35,17 @@ import (
 // against a version 20-odd releases stale. A release binary still gets its
 // real version stamped in, just directly: -ldflags
 // "-X facet/internal/registry.ToolchainVersion=…".
-var ToolchainVersion = "1.31.0"
+//
+// Bumped 1.31.0 → 1.32.0 here for the same reason it drifted before: it was
+// last set the commit it shipped `ago`/`compact`/`commas`, and every control
+// keyword added after that commit (`password`, `newpassword` — see
+// ast.Controls) landed without a matching bump, so a manifest's `"facet":
+// ">=1.31.0"` was satisfied by a toolchain that could not parse them. Bump
+// this every time ast.Controls (or another registered-keyword table) gains a
+// row — TestToolchainVersionCoversControls in this package fails the build
+// the day that's forgotten again, though it only catches Controls, not every
+// way the language can grow.
+var ToolchainVersion = "1.32.0"
 
 // CheckToolchainRange reports whether the running ToolchainVersion satisfies a
 // `facet` manifest range, returning a clear "upgrade the toolchain" error when

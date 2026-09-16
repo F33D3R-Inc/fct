@@ -43,15 +43,21 @@ import (
 //	FACET_API_READ=*                       every declared entity, unconditionally
 //
 // A guard names a ZERO-ARGUMENT policy — the same shape a route guard and a
-// field gate take, and the same shape this language can express. What it cannot
-// yet express is the rule the leak actually calls for, which is per-ROW: "an
-// actor may read this Post if it is published or they wrote it". That needs
-// language surface (see the note on entityRead below); until it exists the
-// entity is a whole, and this setting decides whether the whole of it is
-// published. It is deliberately configuration rather than a naming convention
-// over policies: a convention that silently publishes an entity because someone
-// named a policy a certain way would be the same class of accident as the
-// default this replaces.
+// field gate take: "may this actor query this collection at all". It composes
+// with, and is orthogonal to, the entity's own `read:` clause (ast.Entity.Read)
+// when it declares one: `read:` is the per-ROW rule the leak actually called
+// for — "an actor may read this Post if it is published or they wrote it" —
+// applied to every row a query would otherwise have returned (see
+// Server.apiQueryRows). An entity published here with no `read:` clause still
+// means what it always meant: the whole of it, unconditionally (or gated by
+// `guard` alone). This setting is deliberately configuration rather than a
+// naming convention over policies: a convention that silently publishes an
+// entity because someone named a policy a certain way would be the same class
+// of accident as the default this replaces. And it stays a required,
+// deliberate step even for an entity with `read:` declared — the language can
+// express the per-row rule now, but whether a collection is reachable over
+// `/api` AT ALL is still this file's question to answer, not something a
+// `read:` clause implies on its own.
 //
 // Publishing an entity does not undo any other gate. The rows still pass through
 // `visibleRows`, so a `@requires` field is stripped for an actor its policy
@@ -65,14 +71,14 @@ const apiReadEnv = "FACET_API_READ"
 // served, and — when guard is non-empty — only to an actor that zero-argument
 // policy admits.
 //
-// The field that is missing here is the one the language cannot yet declare: a
-// row-level read policy, `policy readable(id: int)`-shaped, evaluated per row so
-// the API can filter a collection the way a view's `where` does. The runtime
-// side of that is small (bind the row, evaluate, drop the row it rejects, keep
-// pulling store pages until `limit` is met — precisely what listRows already
-// does for a `for` region with a residual predicate); what does not exist is any
-// way for an author to write it down. Adding a `read` clause to `entity` is the
-// missing surface, and this struct is where it lands.
+// The per-row filter this struct used to have no way to express now lives on
+// the entity itself: ir.Entity.Read, an app's `read:` clause, evaluated per row
+// exactly the way a view's `where` already is (Server.apiQueryRows binds the
+// row, evaluates it, drops the row it rejects, and keeps pulling store pages
+// until `limit` is met — precisely what listRows does for a `for` region with a
+// residual predicate). This struct still only says whether the collection may
+// be asked about at all, and by whom; the per-row question, when the entity
+// declares one, is answered downstream of here, at query time.
 type entityRead struct {
 	guard string // zero-argument policy the actor must pass, or "" for public
 }
@@ -175,6 +181,46 @@ func (s *Server) apiPublished() []string {
 	return out
 }
 
+// sidForRequest resolves a request's signed session cookie to a live session id,
+// read-only: a missing, unsigned, garbage, or expired session resolves to "",
+// which every caller here treats as the guest identity. Unlike `session` it
+// never mints one — right for any channel with no honest place to set a cookie
+// from (a machine-facing GET, or a long-lived SSE response), where minting would
+// turn an unauthenticated read into a memory write anyone could repeat just by
+// asking.
+//
+// apiScope and handleLive both resolve "who is asking" through this one
+// function — the API's per-request read and the live stream's per-connection
+// read must agree on what a session cookie means, or a subscriber and the same
+// person's own `GET /api/<Entity>` could end up authorized differently for
+// identical identities.
+func (s *Server) sidForRequest(r *http.Request) string {
+	c, err := r.Cookie("fa_sid")
+	if err != nil {
+		return ""
+	}
+	sid, ok := verifySigned(c.Value)
+	if !ok {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ses, live := s.sessions[sid]
+	// Stateless servers: a request can land on a cold instance, so rehydrate the
+	// session from the shared store on a local cache miss (as `session` does).
+	if !live && s.cluster != nil {
+		if ps, found, err := s.store.LoadSession(sid); err == nil && found {
+			ses = sessionFromPersisted(ps)
+			s.sessions[sid] = ses
+			live = true
+		}
+	}
+	if live && time.Now().Before(ses.expires) {
+		return sid
+	}
+	return ""
+}
+
 // apiScope resolves the JSON API's caller to an evaluation scope, from the same
 // signed session cookie the web channel reads — the API is a projection of one
 // application, not a second application with its own idea of who is asking.
@@ -187,33 +233,12 @@ func (s *Server) apiPublished() []string {
 // valid session is a guest, and a guest scope is what the policies are then
 // evaluated against.
 func (s *Server) apiScope(r *http.Request) map[string]any {
-	sid := ""
-	if c, err := r.Cookie("fa_sid"); err == nil {
-		if v, ok := verifySigned(c.Value); ok {
-			sid = v
-		}
-	}
-
+	sid := s.sidForRequest(r)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if sid != "" {
-		ses, live := s.sessions[sid]
-		// Stateless servers: a request can land on a cold instance, so rehydrate the
-		// session from the shared store on a local cache miss (as `session` does).
-		if !live && s.cluster != nil {
-			if ps, found, err := s.store.LoadSession(sid); err == nil && found {
-				ses = sessionFromPersisted(ps)
-				s.sessions[sid] = ses
-				live = true
-			}
-		}
-		if live && time.Now().Before(ses.expires) {
-			return s.scope(sid)
-		}
-	}
-	// No session, or an expired one: scope("") finds no sessionState and so builds
-	// the guest identity, over the same entity set.
-	return s.scope("")
+	// sid == "" finds no sessionState and so builds the guest identity, over the
+	// same entity set — the same fallback `sidForRequest`'s own doc describes.
+	return s.scope(sid)
 }
 
 // apiReadEnvValue is the raw setting, read once at construction.

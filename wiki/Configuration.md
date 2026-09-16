@@ -9,7 +9,7 @@ and `facet config --gen-secret` to mint a secret.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FACET_DATABASE_URL` | — | Postgres connection (`postgres://…`). Required for `facet run`/`migrate`; dev tools work without it. |
+| `FACET_DATABASE_URL` | `facetql://localhost:8080` | FacetQL connection (`facetql://[token@]host:port`). Required only if you're not using the default; dev tools work without it. |
 | `FACET_SECRET` | ephemeral | Master secret — derives cookie/CSRF signing, token hashing, and `@secret` encryption. **Set it in production** (≥32 bytes); without it keys do not survive a restart. |
 | `FACET_SECURE_COOKIES` | `0` | `1` behind TLS so session cookies are HTTPS-only. |
 
@@ -29,7 +29,7 @@ See [Authorization & Security](Authorization-and-Security.md).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FACET_CLUSTER` | `0` | `1` to run multiple instances cooperating over Postgres `LISTEN`/`NOTIFY` + a durable job queue. |
+| `FACET_CLUSTER` | `0` | `1` to run multiple instances cooperating over FacetQL's live event feed + a durable job queue. Requires a `facetql://` `FACET_DATABASE_URL` — there is no shared bus over the in-memory store. |
 | `FACET_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. |
 | `FACET_OTLP_LOG` | — | export structured logs over OTLP. |
 | `FACET_API_CACHE_TTL` | off | short-TTL micro-cache in front of read endpoints. |
@@ -60,7 +60,7 @@ exactly `0`**.
 ## Example production `.env`
 
 ```sh
-FACET_DATABASE_URL=postgres://facet:facet@db:5432/facet?sslmode=require
+FACET_DATABASE_URL=facetql://facet-prod-token@db:8080?tls=1
 FACET_SECRET=<facet config --gen-secret>
 FACET_SECURE_COOKIES=1
 FACET_CLUSTER=1

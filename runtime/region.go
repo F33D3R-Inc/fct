@@ -115,7 +115,23 @@ func (s *Server) listRowsMore(n ir.Node, scope map[string]any) ([]any, bool) {
 
 func (s *Server) listRows(n ir.Node, scope map[string]any) []any {
 	ent, isEntity := s.entityByName(n.Coll)
-	if !isEntity || s.store == nil {
+	if isEntity {
+		// Folded in before the store/in-memory branch splits below, so both
+		// paths — the pushdown+residual path a real store takes, and the
+		// selectRows path a `facet dev` in-memory app or an unconfigured store
+		// takes — enforce it identically, the same way every other query-shaping
+		// step here (SoftDelete's `archived` conjunct in splitPredicate) applies
+		// to both rather than to whichever path someone remembered.
+		n.Where = applyReadPolicy(ent, n.Var, n.Where)
+	}
+	// An @ephemeral entity has no row in any store — not because the store is
+	// unconfigured (that's the s.store == nil case above), but because this
+	// specific entity was deliberately kept out of it (see attachStore, commit).
+	// Asking the store would not error, it would silently answer "no rows"
+	// (the store has genuinely never heard of it), which is a worse failure
+	// than never routing the question there — so this takes the same
+	// in-memory-mirror path an unconfigured store takes, for this entity only.
+	if !isEntity || s.store == nil || s.ephemeral[n.Coll] {
 		rows, _ := scope[n.Coll].([]any)
 		return selectRows(rows, n, scope)
 	}
@@ -277,6 +293,149 @@ func andExpr(a, b *ir.Expr) *ir.Expr {
 		return a
 	}
 	return &ir.Expr{Kind: "bin", Op: "&&", L: a, R: b}
+}
+
+// renameRowVar copies an entity's `read:` predicate (ir.Entity.Read, always
+// rooted at the reserved row variable "$row" — see its own doc) with every
+// reference to "$row" renamed to the variable that actually binds the row
+// being tested at one query site. It never mutates the shared, compiled
+// predicate: every node on the path to a renamed ref is copied, nothing else
+// is, and a nil predicate copies to nil.
+//
+// This is what lets a `read:` clause be folded into a `for`'s or a filtered
+// `count`/`exists`'s own predicate as if the app had hand-written `p.field`
+// for that query's own row variable — every existing piece of query-shaping
+// machinery (splitPredicate, foldOuter, pushable, the residual-paging loop in
+// listRows) then treats it exactly as it would that hand-written clause,
+// because after this call it is indistinguishable from one.
+func renameRowVar(e *ir.Expr, to string) *ir.Expr {
+	if e == nil {
+		return nil
+	}
+	ee := *e
+	switch e.Kind {
+	case "ref":
+		if e.Name == "$row" {
+			ee.Name = to
+		}
+	case "get":
+		ee.Obj = renameRowVar(e.Obj, to)
+	case "eget":
+		ee.Key = renameRowVar(e.Key, to)
+	case "agg":
+		ee.Where = renameRowVar(e.Where, to)
+		ee.Sel = renameRowVar(e.Sel, to)
+	case "call", "list":
+		args := make([]*ir.Expr, len(e.Args))
+		for i, a := range e.Args {
+			args[i] = renameRowVar(a, to)
+		}
+		ee.Args = args
+	case "bin":
+		ee.L = renameRowVar(e.L, to)
+		ee.R = renameRowVar(e.R, to)
+	case "un":
+		ee.X = renameRowVar(e.X, to)
+	}
+	return &ee
+}
+
+// applyReadPolicy folds an entity's `read:` clause into a query's own
+// predicate, scoped to the row variable that query binds. An entity with no
+// `read:` clause is returned unchanged — additive over every app that
+// predates this feature, and over every entity that never declares one.
+//
+// It is deliberately blind to what `where` already carries: the two are
+// conjoined, never deduplicated or simplified, for the same reason
+// splitPredicate treats every `&&` conjunct independently — a `read:` clause
+// that duplicates part of a hand-written `where` (during a migration to it,
+// say) costs a redundant comparison, not a wrong answer.
+func applyReadPolicy(ent ir.Entity, rowVar string, where *ir.Expr) *ir.Expr {
+	if ent.Read == nil {
+		return where
+	}
+	return andExpr(renameRowVar(ent.Read, rowVar), where)
+}
+
+// withEntityReadPolicy is applyReadPolicy for an aggregate (`count`/`exists`/
+// `sum`/`avg`/`min`/`max`), called from eval's "agg" case before the
+// aggregate is resolved (store pushdown or the in-memory fallback).
+//
+// It returns a LOCAL COPY, never e itself: e is a pointer into the app's
+// compiled, shared IR, and eval's caller keys memoization
+// (materializer.lookup/record) on that exact pointer — mutating it, or
+// returning a different node for the memo to key on, would be a data race
+// across concurrent requests and would break the client/server addressing
+// scheme both sides walk in lockstep (see ir.Expr.Kids's own doc). Only the
+// copy returned here is handed to resolveAgg/evalColl; the original e is what
+// still gets recorded.
+//
+// A whole-collection aggregate (`count(Post)`, Var == "") has no row variable
+// of its own to fold the clause into, so one is synthesized: "$row", the same
+// reserved name `read:` is already rooted at, so no rename is even needed for
+// that case — `count(Post)` becomes, in effect, `count($row in Post where
+// <read:>)`.
+//
+// nil (returns e unchanged) when there is no materializer — an action or a
+// policy evaluates with none, and, exactly like EntityGet, an aggregate
+// computed there is the authority's own reasoning and not a projection to an
+// outside party (see ast.Entity.Read's own doc on why EntityGet is exempt).
+func withEntityReadPolicy(m *materializer, e *ir.Expr) *ir.Expr {
+	if m == nil || m.s == nil {
+		return e
+	}
+	ent, ok := m.s.entityByName(e.Name)
+	if !ok || ent.Read == nil {
+		return e
+	}
+	ee := *e
+	if ee.Var == "" {
+		ee.Var = "$row"
+	}
+	ee.Where = andExpr(renameRowVar(ent.Read, ee.Var), ee.Where)
+	return &ee
+}
+
+// filterByReadPolicy is applyReadPolicy for rows that are already resolved in
+// memory rather than being shaped as a query for the store to push a predicate
+// into — the live stream's case: `fanout`/`handleLive` already hold the exact
+// rows a write produced (or the working set holds at connect time), so there is
+// no query to fold the clause into, only rows to test it against directly.
+//
+// It binds each row to "$row" — the reserved variable ir.Entity.Read is already
+// rooted at (see its own doc) — so, unlike applyReadPolicy/withEntityReadPolicy,
+// no renameRowVar is needed: there is no query-site row variable of the caller's
+// choosing to rename it to.
+func (s *Server) filterByReadPolicy(ent ir.Entity, rows []any, scope map[string]any) []any {
+	if ent.Read == nil || len(rows) == 0 {
+		return rows
+	}
+	row := cloneScope(scope)
+	out := make([]any, 0, len(rows))
+	for _, r := range rows {
+		row["$row"] = r
+		if evalRowPredicate(ent.Read, row) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// identityScope is the subset of a full render scope (s.scope) an entity's
+// `read:` clause can actually evaluate: `actor` plus the other identity builtins
+// `withActor` admits — role, verified, tenant, tenantRole. It deliberately
+// leaves out everything else s.scope builds, in particular the whole entity
+// working set, because a live SSE subscriber (see handleLive) keeps this for the
+// life of its connection: the rows a `read:` clause is tested against always
+// arrive fresh with each broadcast, so pinning stale (or, worse, growing)
+// references to every entity's rows for as long as the connection stays open
+// would be pure waste, not correctness. Callers hold s.mu (s.scope does).
+func (s *Server) identityScope(sid string) map[string]any {
+	full := s.scope(sid)
+	return map[string]any{
+		"actor": full["actor"], "role": full["role"], "verified": full["verified"],
+		"tenant": full["tenant"], "tenantRole": full["tenantRole"],
+	}
 }
 
 // foldOuter replaces every subexpression that does not mention the item
@@ -1249,6 +1408,12 @@ func (s *Server) aggQuery(e *ir.Expr, scope map[string]any) (Query, string, bool
 	}
 	ent, ok := s.entityByName(e.Name)
 	if !ok {
+		return Query{}, "", false
+	}
+	// Same reasoning as listRows: the store has never heard of an @ephemeral
+	// entity, so it would silently answer 0 rather than erroring — refusing the
+	// push here sends this through the in-memory mirror fallback instead.
+	if s.ephemeral[e.Name] {
 		return Query{}, "", false
 	}
 	if !storeAnswers(e, ent) {

@@ -76,8 +76,8 @@ func (s *Server) Serve(addr string) error {
 // listener, and the database. Safe to call once after Serve returns.
 func (s *Server) Shutdown() {
 	s.jobs.stopAll()
-	if s.cluster != nil && s.cluster.listener != nil {
-		s.cluster.listener.Close()
+	if s.cluster != nil && s.cluster.cancel != nil {
+		s.cluster.cancel()
 	}
 	if s.store != nil {
 		s.store.Close()

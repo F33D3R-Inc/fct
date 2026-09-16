@@ -205,7 +205,7 @@
     inputById = {};
     function collect(nodes) {
       for (const n of list(nodes)) {
-        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs" || n.kind === "match" || n.kind === "overlay") && n.id) regionById[n.id] = n;
+        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs" || n.kind === "match" || n.kind === "overlay" || n.kind === "stage") && n.id) regionById[n.id] = n;
         // A control whose choices come from data is a region too, under the id it
         // already has: the collection behind it changes, so its options must.
         if (optionsRegionId(n)) regionById[n.id] = n;
@@ -869,6 +869,20 @@
         fillList(d, node, sc, path);
         return d;
       }
+      case "stage": {
+        // A canvas scene (ast.Stage): a tile background plus one or more
+        // `sprite` layers, each a `for`-shaped range that draws a mark per row
+        // instead of rendering a node body. Mirrors runtime/server.go's
+        // `case "stage"` — the server paints an empty canvas (there is no
+        // meaningful no-JS first paint for one), and this is what actually
+        // draws it, on first mount and on every later refresh alike.
+        const c = el("canvas", "fa-stage");
+        c.width = node.width;
+        c.height = node.height;
+        if (node.id) c.setAttribute("data-fa-region", node.id);
+        fillStage(c, node, sc, path);
+        return c;
+      }
       case "if": {
         // The mirror of runtime/server.go's `case "if"`, and for the same reason:
         // `if` is control flow, not a box, so one that is not a region has no
@@ -1094,6 +1108,83 @@
     }
   }
 
+  // fillStage (re)draws a `stage` canvas: the optional tile background, then
+  // every `sprite` layer's rows, each drawn as one mark. Called on first mount
+  // (render0's "stage" case) and again on every later refresh (fillFor), so a
+  // full redraw is the whole strategy — no dirty-rect tracking, no persisted
+  // per-sprite DOM, just "recompute the scene, repaint it," which is enough to
+  // prove the node works. rowsFor is exactly what fillList uses for its own
+  // rows, so a sprite's collection changing invalidates and refetches through
+  // the same fingerprint/`/region` path a list's rows do.
+  function fillStage(canvas, node, sc, path) {
+    if (canvas.width !== node.width) canvas.width = node.width;
+    if (canvas.height !== node.height) canvas.height = node.height;
+    const ctx = canvas.getContext && canvas.getContext("2d");
+    if (!ctx) return; // no 2d context (e.g. a headless test DOM) — nothing to draw
+    ctx.clearRect(0, 0, node.width, node.height);
+    if (node.tiles) drawTiles(ctx, ev(node.tiles, sc), node.width, node.height);
+    let i = 0;
+    for (const sp of list(node.children)) {
+      const spPath = childPath(path, i++);
+      for (const row of rowsFor(sp, sc, spPath)) {
+        const childScope = Object.assign({}, sc); childScope[sp.var] = row;
+        curPath = spPath; // a sprite's x/y/facing/image may read an aggregate, addressed from here
+        drawSprite(ctx, sp, childScope);
+      }
+    }
+    curPath = path;
+  }
+
+  // drawTiles paints a placeholder tile background: `tiles` is a comma-
+  // separated row of tile ids — the simplest shape a `text` field (fct's
+  // existing scalar types; there is no array/JSON field type yet) can hold —
+  // and each id becomes a flat colored rect across evenly-sized columns. A
+  // real tileset image is future work; this is enough to prove data reaching
+  // the canvas.
+  const STAGE_TILE_COLORS = ["#3a6b52", "#4f7a3d", "#3d5a73", "#7a6a3d", "#5a4f73", "#7a3d5a"];
+  function stageTileColor(id) {
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    return STAGE_TILE_COLORS[h % STAGE_TILE_COLORS.length];
+  }
+  function drawTiles(ctx, tiles, w, h) {
+    const ids = toStr(tiles).split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    if (!ids.length) return;
+    const cw = w / ids.length;
+    for (let i = 0; i < ids.length; i++) {
+      ctx.fillStyle = stageTileColor(ids[i] || String(i));
+      ctx.fillRect(i * cw, 0, Math.ceil(cw), h);
+    }
+  }
+
+  // drawSprite paints one row of one sprite layer: a mark at (x, y), an
+  // optional short facing tick (degrees, drawn from center outward), and an
+  // optional caption underneath. Real sprite images (node.image, already
+  // resolved per row) are future work — see fillStage's note — this proves
+  // the position/facing/label data is flowing and redrawing live.
+  function drawSprite(ctx, node, sc) {
+    const x = Number(ev(node.x, sc)) || 0;
+    const y = Number(ev(node.y, sc)) || 0;
+    ctx.beginPath();
+    ctx.fillStyle = "#e33b3b";
+    ctx.arc(x, y, 8, 0, Math.PI * 2);
+    ctx.fill();
+    if (node.facing) {
+      const rad = ((Number(ev(node.facing, sc)) || 0) * Math.PI) / 180;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + Math.cos(rad) * 14, y + Math.sin(rad) * 14);
+      ctx.strokeStyle = "#1a1a1a";
+      ctx.stroke();
+    }
+    if (node.label && node.label.length) {
+      ctx.fillStyle = "#111";
+      ctx.font = "11px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(segsToStr(node.label, sc), x, y + 20);
+    }
+  }
+
   // observeMore fires a list's `more` action when its control enters the
   // viewport. One observer for the page; a control is observed once, when it is
   // made, and a re-fill makes a new one — so a page that grows keeps loading
@@ -1291,6 +1382,7 @@
   function fillFor(kind) {
     return kind === "list" ? fillList : kind === "use" ? fillUse : kind === "tabs" ? fillTabs
       : kind === "match" ? fillMatch : kind === "overlay" ? fillOverlay
+      : kind === "stage" ? fillStage
       : kind === "select" || kind === "radio" ? fillOptions : fillIf;
   }
 

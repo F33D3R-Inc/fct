@@ -1,0 +1,57 @@
+# Zones — @ephemeral entities (ast.Entity.Ephemeral) composed with the stage
+# node (see examples/stage.fct) and an ordinary `read:` policy: together this
+# is the F33D3R game-engine's real-time layer. A Position write never reaches
+# the durable store (runtime/server.go commit skips it), and a viewer only
+# ever receives Position rows for their OWN current zone — not a new
+# broadcast mechanism, just `read:` (the exact shape already proven in
+# apps/journal/data.fct's `Post(post).author == actor`) applied to an
+# @ephemeral entity, with the existing per-identity fanout grouping doing
+# what it already does for any other `read:`-gated entity.
+#
+#   facet dev examples/zones.fct :PORT
+#
+# (in-memory is enough to prove this — Position is in-memory even under
+# `facet run` against a real facetql, since @ephemeral never touches it)
+
+app ZonesDemo:
+    auth
+
+    entity Player:
+        id: int
+        handle: text @unique
+        currentZone: int
+
+    entity Position @ephemeral:
+        id: int
+        owner: text
+        zone: int
+        x: int
+        y: int
+        read: exists(p in Player where p.handle == actor && p.currentZone == zone)
+
+    # Upsert-by-natural-key, the same remove-then-add pattern journal's
+    # saveProfile uses — sidesteps the "no id back from add" gap, and is also
+    # just the right shape: entering a zone replaces where you are, it doesn't
+    # accumulate rows.
+    action enterZone(z: int):
+        remove p in Player where p.handle == actor
+        add Player { handle: actor, currentZone: z }
+        remove q in Position where q.owner == actor
+        add Position { owner: actor, zone: z, x: 40, y: 40 }
+
+    # Filtered `set ... where` (parseSetWhere) reads own-row-by-natural-key
+    # too, for the same reason — no id round-trip needed to move yourself.
+    action move(dx: int, dy: int):
+        set p in Position where p.owner == actor:
+            x = p.x + dx
+            y = p.y + dy
+
+    view Main at "/":
+        box:
+            text "signed in as {actor}"
+            stage width 300 height 300:
+                sprite for q in Position at (q.x, q.y) image "dot" label "{q.owner}"
+            button "enter zone 1" -> enterZone(1)
+            button "enter zone 2" -> enterZone(2)
+            button "move right" -> move(10, 0)
+            button "move down" -> move(0, 10)

@@ -119,7 +119,7 @@ func fqAddress(entity string, id any) string {
 // is written into the opaque `data` JSON using the same at-rest coercion pgStore
 // applies to a column (int/relation -> int64, bool -> bool, text -> string with
 // @secret encryption), so the two backends store equivalent values.
-func rowNode(e ir.Entity, row map[string]any) (fqNode, error) {
+func rowNode(e ir.Entity, row map[string]any) (fqNodeWrite, error) {
 	fb := fieldByName(e)
 	m := make(map[string]any, len(row))
 	for _, c := range columns(e) {
@@ -127,15 +127,11 @@ func rowNode(e ir.Entity, row map[string]any) (fqNode, error) {
 	}
 	data, err := json.Marshal(m)
 	if err != nil {
-		return fqNode{}, fmt.Errorf("encode %s row: %w", e.Name, err)
+		return fqNodeWrite{}, fmt.Errorf("encode %s row: %w", e.Name, err)
 	}
-	return fqNode{
-		Address: fqAddress(e.Name, row["id"]),
-		Kind:    e.Name,
-		Data:    string(data),
-		// X/Y/Z/Q coordinate axes and Public are left at their zero values for v1
-		// (see risk notes). Owner-scoping/visibility is a later concern.
-	}, nil
+	// X/Y/Z/Q coordinate axes and Public are left at their zero values for v1
+	// (see risk notes). Owner-scoping/visibility is a later concern.
+	return newFQNodeWrite(fqAddress(e.Name, row["id"]), e.Name, string(data)), nil
 }
 
 // nodeRecord decodes a FacetQL node back into a runtime record, normalizing each
@@ -911,7 +907,7 @@ func (s *fqStore) reservedUpsert(ctx context.Context, kind, address string, v an
 	if err != nil {
 		return fmt.Errorf("encode %s node: %w", kind, err)
 	}
-	return s.c.upsert(ctx, fqNode{Address: address, Kind: kind, Data: string(data)})
+	return s.c.upsert(ctx, newFQNodeWrite(address, kind, string(data)))
 }
 
 // fqIDCounter backs nextFQID; it makes reserved-record ids strictly increasing
@@ -1392,28 +1388,18 @@ func (s *fqStore) FinishJob(id int64, status, lastErr string, nextRun time.Time)
 	return s.reservedUpsert(ctx, "__job", addr, d)
 }
 
-// PendingJobs reports queue depth (count of pending __job nodes). This is a linear
-// scan over the pending set for v1.
-// TODO(fqStore): a native COUNT primitive on facetql would avoid paging all rows.
+// PendingJobs reports queue depth (count of pending __job nodes) via FacetQL's
+// native POST /nodes/count — one round trip regardless of queue depth. This
+// used to page every pending row 500 at a time to count them (the TODO next
+// to it asked for exactly the primitive this now uses, which landed since —
+// AGENT_LOG §3).
 func (s *fqStore) PendingJobs() (int64, error) {
-	ctx := context.Background()
 	pred := fqBin("==", fqGet("status"), fqLitText("pending"))
-	var total int64
-	after := ""
-	for {
-		nodes, next, err := s.c.query(ctx, fqQueryRequest{
-			Kind: "__job", ItemVar: "item", Where: pred, Order: "id", Desc: false, Limit: 500, After: after,
-		})
-		if err != nil {
-			return 0, fmt.Errorf("fqStore.PendingJobs: %w", err)
-		}
-		total += int64(len(nodes))
-		if next == "" || len(nodes) == 0 {
-			break
-		}
-		after = next
+	n, err := s.c.count(context.Background(), fqCountRequest{Kind: "__job", Where: pred, ItemVar: "item"})
+	if err != nil {
+		return 0, fmt.Errorf("fqStore.PendingJobs: %w", err)
 	}
-	return total, nil
+	return int64(n), nil
 }
 
 // fqCronData is a `__cron` node's data: the schedule's name (the address carries
@@ -1479,9 +1465,7 @@ func (s *fqStore) ReserveCron(name string, next time.Time) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("fqStore.ReserveCron %q: encode __cron node: %w", name, err)
 	}
-	created, err := s.c.createIfAbsent(ctx, fqNode{
-		Address: addr, Kind: "__cron", Data: string(data),
-	})
+	created, err := s.c.createIfAbsent(ctx, newFQNodeWrite(addr, "__cron", string(data)))
 	if err != nil {
 		return false, fmt.Errorf("fqStore.ReserveCron %q: %w", name, err)
 	}

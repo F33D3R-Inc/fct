@@ -43,10 +43,18 @@ import (
 // facetqlBinary locates the engine. The harness skips rather than fails when it
 // is absent: a checkout without a built engine should not report a red suite for
 // something it never had.
+//
+// It does NOT skip a binary that exists but predates the engine source it's
+// meant to be proving — that already happened once (AGENT_LOG.md, "Changelog —
+// 2026-09-06"): every "integration suite green" claim after 2026-09-04 20:40
+// was run against a facetql built before ten `src` files it should have been
+// exercising. A stale binary here is a false positive, not a missing one, so
+// checkNotStale fails the suite instead.
 func facetqlBinary(t *testing.T) string {
 	t.Helper()
 
 	if p := os.Getenv("FACETQL_BIN"); p != "" {
+		checkNotStale(t, p)
 		return p
 	}
 
@@ -56,6 +64,7 @@ func facetqlBinary(t *testing.T) string {
 	} {
 		if abs, err := filepath.Abs(p); err == nil {
 			if _, err := os.Stat(abs); err == nil {
+				checkNotStale(t, abs)
 				return abs
 			}
 		}
@@ -63,6 +72,58 @@ func facetqlBinary(t *testing.T) string {
 
 	t.Skip("no facetql binary; set FACETQL_BIN or build ../facetql")
 	return ""
+}
+
+// checkNotStale refuses (t.Fatal, not t.Skip) a facetql binary that is older
+// than the newest file under its own engine's src/ — the exact condition that
+// let a two-day-stale binary pass as "integration green" on 09-04/09-06. It
+// looks for src/ next to the binary's own facetql checkout (three directories
+// up from target/{release,debug}/facetql, or ../../facetql/src as a fallback
+// for a binary named directly by FACETQL_BIN); when neither exists — a binary
+// built from a checkout this harness can't see, e.g. a CI artifact — it has no
+// source to compare against and does not fail, since it cannot know.
+func checkNotStale(t *testing.T, bin string) {
+	t.Helper()
+
+	binInfo, err := os.Stat(bin)
+	if err != nil {
+		return // facetqlBinary's own os.Stat already gated this path existing
+	}
+
+	src := filepath.Join(filepath.Dir(bin), "..", "..", "src") // target/{release,debug}/facetql -> facetql/src
+	if _, err := os.Stat(src); err != nil {
+		if abs, err2 := filepath.Abs("../../facetql/src"); err2 == nil {
+			if _, err3 := os.Stat(abs); err3 == nil {
+				src = abs
+			} else {
+				return // no src tree reachable — nothing to compare against
+			}
+		} else {
+			return
+		}
+	}
+
+	var newest string
+	var newestTime time.Time
+	_ = filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".rs") {
+			return nil
+		}
+		if info.ModTime().After(newestTime) {
+			newestTime, newest = info.ModTime(), path
+		}
+		return nil
+	})
+	if newest == "" {
+		return
+	}
+	if newestTime.After(binInfo.ModTime()) {
+		t.Fatalf("facetql binary %s (built %s) is older than %s (modified %s) — "+
+			"rebuild it first: cd facetql && cargo build --release. "+
+			"An integration run against a stale engine is a false positive, not a pass.",
+			bin, binInfo.ModTime().Format(time.RFC3339),
+			newest, newestTime.Format(time.RFC3339))
+	}
 }
 
 // freePort asks the kernel for a port and immediately releases it. Racy in

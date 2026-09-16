@@ -9,6 +9,7 @@ package runtime
 //	GET    /nodes?kind&limit&offset   list a kind, paged
 //	POST   /transaction        all-or-nothing batch of ops
 //	POST   /publish            cross-instance event fan-out
+//	GET    /events             cross-instance event fan-in (SSE; ?after= resumes)
 //	GET    /admin/indexes      the declared secondary indexes
 //	POST   /admin/indexes      declare one
 //	DELETE /admin/indexes/:name  drop one
@@ -33,6 +34,7 @@ import (
 	"time"
 
 	"facet/internal/ir"
+	wire "facet/schema/generated"
 )
 
 // fqClient is a thin HTTP wrapper around a FacetQL instance.
@@ -42,43 +44,48 @@ type fqClient struct {
 	http    *http.Client
 }
 
-// fqNode is the wire representation of a FacetQL node. `data` is opaque JSON text
-// owned by the adapter: every fct row field (including relation ids) is encoded
-// there. The four coordinate axes default to 0 for v1 (see fqStore risk notes).
-type fqNode struct {
-	Address   string `json:"address"`
-	Kind      string `json:"kind"`
-	X         uint8  `json:"x"`
-	Y         uint8  `json:"y"`
-	Z         uint8  `json:"z"`
-	Q         uint8  `json:"q"`
-	Data      string `json:"data"`
-	Public    bool   `json:"public"`
-	Owner     string `json:"owner,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+// fqNode used to be a single hand-written struct wearing two different real
+// shapes: a write body (POST /node's flat x/y/z/q/public, always zero for v1)
+// and a read/decode target (GET /node's real nested `coordinate`/`visibility`
+// response). Only .Data/.Address were ever actually read back from a decoded
+// node (traced every caller: byIdentity, LoadSession, FinishJob, RecentAudit,
+// nodeRecord) — so the mismatch was never a live bug, but it meant fqNode was
+// never really "the wire type for Node," just two informally different
+// shapes sharing a name. Split for real, per the generated schema
+// (schema/facetql_wire.fct):
+//
+//   - fqNodeWrite = the generated CreateNodeRequest (POST /node's real body
+//     shape: flat x/y/z/q, public, edges, if_absent).
+//   - fqNode = the generated wire.Node (GET /node's real nested response
+//     shape) — used only as a decode target now.
+type fqNodeWrite = wire.CreateNodeRequest
+type fqNode = wire.Node
+
+// newFQNodeWrite builds a write-shape request with every optional field at
+// its safe, always-omitted-on-the-wire default — the same defaults rowNode's
+// callers have always gotten (coordinates 0, not public, no edges), just
+// spelled as real zero values of the generated type instead of an implicit
+// struct literal.
+func newFQNodeWrite(address, kind, data string) fqNodeWrite {
+	return fqNodeWrite{Address: address, Kind: kind, Data: data, Edges: []wire.EdgeSpec{}}
 }
 
-// fqTxOp is one operation inside a POST /transaction batch. It serializes to the
-// canonical wire contract (AGENT_LOG §4b): a serde-tagged object with key "type"
-// and snake_case values, where each op type carries exactly its own fields:
-//
-//	{ "type":"insert_node", "address":…, "kind":…, "x":0,"y":0,"z":0,"q":0, "data":…, "public":false }
-//	{ "type":"delete_node", "address":… }
-//	{ "type":"clear_kind",  "kind":… }
-//	{ "type":"delete_where", "kind":…, "where":<Expr|omitted> }
-//	{ "type":"set_if", "address":…, "field":…, <one expectation>, "set":{…} }
-//
-// MarshalJSON emits the exact per-type shape (no stray zero fields on delete/clear),
-// so the body matches the contract byte-for-byte.
+// fqTxOp is one operation inside a POST /transaction batch: the fields fct's
+// own callers actually construct (5 of the schema's 7 real TxOp variants —
+// insert_edge/delete_edge have no caller here yet). Its shape used to be
+// mirrored by hand into a per-variant anonymous struct inside MarshalJSON
+// below; that marshaling is now delegated to the generated wire.TxOp (see
+// toWire), which is itself generated from schema/facetql_wire.fct — so the
+// wire contract this actually produces can no longer drift from the schema
+// silently the way AGENT_LOG's §4b prose once did.
 type fqTxOp struct {
 	Type    string
 	Address string
 	Kind    string
-	X       uint8
-	Y       uint8
-	Z       uint8
-	Q       uint8
+	X       int64
+	Y       int64
+	Z       int64
+	Q       int64
 	Data    string
 	Public  bool
 	Where   *ir.Expr // delete_where predicate; nil = unconditional (like clear_kind)
@@ -121,62 +128,66 @@ const (
 // would hand the same slot to every caller.
 func fqExpectLE(bound float64) fqExpect { return fqExpect{kind: fqExpectAtMost, bound: bound} }
 
-func (o fqTxOp) MarshalJSON() ([]byte, error) {
-	switch o.Type {
-	case "insert_node":
-		return json.Marshal(struct {
-			Type    string `json:"type"`
-			Address string `json:"address"`
-			Kind    string `json:"kind"`
-			X       uint8  `json:"x"`
-			Y       uint8  `json:"y"`
-			Z       uint8  `json:"z"`
-			Q       uint8  `json:"q"`
-			Data    string `json:"data"`
-			Public  bool   `json:"public"`
-		}{o.Type, o.Address, o.Kind, o.X, o.Y, o.Z, o.Q, o.Data, o.Public})
-	case "delete_node":
-		return json.Marshal(struct {
-			Type    string `json:"type"`
-			Address string `json:"address"`
-		}{o.Type, o.Address})
-	case "clear_kind":
-		return json.Marshal(struct {
-			Type string `json:"type"`
-			Kind string `json:"kind"`
-		}{o.Type, o.Kind})
-	case "delete_where":
-		// Predicate under JSON key "where"; omitted when nil (== clear_kind).
-		return json.Marshal(struct {
-			Type  string   `json:"type"`
-			Kind  string   `json:"kind"`
-			Where *ir.Expr `json:"where,omitempty"`
-		}{o.Type, o.Kind, o.Where})
-	case "set_if":
-		// Exactly one expectation key, chosen by the constructor that built it.
-		// `set` is merged into the node's data by the engine, never a
-		// replacement, so an unrelated field on the node is not clobbered.
+// toWire converts to the generated wire.TxOp, routing Where through the
+// ir.Expr<->wire.Expr seam (wireseam.go) instead of relying on ir.Expr's own
+// tags to happen to match, and Set through a plain json.Marshal (the
+// generated type carries it as json.RawMessage, since a set_if's merged
+// fields are arbitrary node data, not a typed shape the schema can name).
+func (o fqTxOp) toWire() (wire.TxOp, error) {
+	w := wire.TxOp{
+		Type:    o.Type,
+		Address: o.Address,
+		Kind:    o.Kind,
+		X:       o.X,
+		Y:       o.Y,
+		Z:       o.Z,
+		Q:       o.Q,
+		Data:    o.Data,
+		Public:  o.Public,
+		Field:   o.Field,
+	}
+	if o.Where != nil {
+		we, err := wireExprFromIR(o.Where)
+		if err != nil {
+			return wire.TxOp{}, fmt.Errorf("facetql: %s on kind %q: %w", o.Type, o.Kind, err)
+		}
+		w.Where = we
+	}
+	if o.Type == "set_if" {
+		if o.Expect.kind != fqExpectAtMost {
+			return wire.TxOp{}, fmt.Errorf("facetql: set_if on %s.%s carries no expectation", o.Address, o.Field)
+		}
+		w.ExpectLe = o.Expect.bound
+		// An assert-only compare-and-set is `{}`, never `null`: the engine's
+		// field defaults to an empty map and would refuse a null.
 		set := o.Set
 		if set == nil {
-			// An assert-only compare-and-set is `{}`, never `null`: the engine's
-			// field defaults to an empty map and would refuse a null.
 			set = map[string]any{}
 		}
-		switch o.Expect.kind {
-		case fqExpectAtMost:
-			return json.Marshal(struct {
-				Type     string         `json:"type"`
-				Address  string         `json:"address"`
-				Field    string         `json:"field"`
-				ExpectLE float64        `json:"expect_le"`
-				Set      map[string]any `json:"set"`
-			}{o.Type, o.Address, o.Field, o.Expect.bound, set})
-		default:
-			return nil, fmt.Errorf("facetql: set_if on %s.%s carries no expectation", o.Address, o.Field)
+		b, err := json.Marshal(set)
+		if err != nil {
+			return wire.TxOp{}, fmt.Errorf("facetql: encode set_if.set for %s.%s: %w", o.Address, o.Field, err)
 		}
-	default:
-		return nil, fmt.Errorf("facetql: unknown transaction op type %q", o.Type)
+		w.Set = b
 	}
+	return w, nil
+}
+
+// MarshalJSON delegates the actual wire encoding to the generated
+// wire.TxOp's own MarshalJSON (which emits the exact per-type shape — no
+// stray zero fields on delete/clear — matching schema/facetql_wire.fct's
+// `message TxOp`), after routing this op's fields through toWire. The only
+// thing fqTxOp still owns is which of the schema's 7 variants fct's own
+// callers actually use (5 today) and the client-side "set_if must carry
+// exactly one expectation" guarantee, which the generated marshal has no way
+// to know is a requirement (a body with none would otherwise decode as a
+// silently-wrong 400 from the server instead of failing at construction).
+func (o fqTxOp) MarshalJSON() ([]byte, error) {
+	w, err := o.toWire()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(w)
 }
 
 // fqTxRequest is the POST /transaction body: { "operations": [ <op>, … ] }.
@@ -184,41 +195,47 @@ type fqTxRequest struct {
 	Operations []fqTxOp `json:"operations"`
 }
 
-// fqIndexDef is one declared secondary index over a `data` field — the wire shape
-// of both /admin/indexes bodies. Name is the index's identity and also its
-// filename on the engine, which is why it has a restricted alphabet (see
-// fqIndexName); Kind is the node kind it covers and Field the top-level `data`
-// field it orders by.
-type fqIndexDef struct {
-	Name  string `json:"name"`
-	Kind  string `json:"kind"`
-	Field string `json:"field"`
-	// Unique refuses a write that would give two nodes of the kind the same
-	// value for the field. It is declared on the index because it *is* the
-	// index — the check is a prefix scan of the entries already there — which is
-	// also why a reference by a data field requires the referenced field to
-	// carry one. Omitted when false, so an ordinary index's body is unchanged.
-	Unique bool `json:"unique,omitempty"`
-}
+// fqIndexDef is one declared secondary index over a `data` field — the wire
+// shape of both /admin/indexes bodies, now the generated CreateIndexRequest
+// (schema/facetql_wire.fct) directly: Name/Kind/Field/Unique match field-for-
+// field (Name is the index's identity and also its filename on the engine,
+// which is why it has a restricted alphabet — see fqIndexName; Unique refuses
+// a write that would give two nodes of the kind the same value for the
+// field). The generated type also carries an optional `Mode`, unused by
+// every real caller here, which simply stays unset. GET /admin/indexes's
+// real response is a separate, richer shape (IndexInfo) the schema doesn't
+// cover yet (SCHEMA_IDL_SCOPE.md, "known remaining gap"); decoding it into
+// this request-shaped type still works because every field fct has ever
+// actually read (Name/Kind/Field/Unique) is a subset of it, exactly as the
+// old hand-written fqIndexDef only ever captured that same subset.
+type fqIndexDef = wire.CreateIndexRequest
 
 // fqReferenceDef is one declared referential rule — the wire shape of both
-// /admin/references bodies. Kind.Field is the referencing (child) side, which
-// holds the parent's key and whose index serves the lookup; ParentKind is the
+// /admin/references bodies, now the generated CreateReferenceRequest
+// directly. Kind.Field is the referencing (child) side, which holds the
+// parent's key and whose index serves the lookup; ParentKind is the
 // referenced side and ParentField the value on it that the child's field
-// matches. OnDelete is what deleting the parent does: FacetQL takes `cascade`,
-// `restrict` or `set_null`, and fct declares only `cascade`, because that is the
-// one rule an fct relation has ever meant (ir.Field: "a foreign key with ON
-// DELETE CASCADE") and the one pgStore's DDL emits.
-type fqReferenceDef struct {
-	Name        string `json:"name"`
-	Kind        string `json:"kind"`
-	Field       string `json:"field"`
-	ParentKind  string `json:"parent_kind"`
-	ParentField string `json:"parent_field,omitempty"`
-	OnDelete    string `json:"on_delete"`
-}
+// matches. OnDelete is a wire.ReferentialAction now (was a bare string);
+// fct declares only "cascade" (an untyped string constant, so every existing
+// call site assigns to it unchanged), because that is the one rule an fct
+// relation has ever meant (ir.Field: "a foreign key with ON DELETE CASCADE")
+// and the one pgStore's DDL emits. Same GET-response caveat as fqIndexDef.
+type fqReferenceDef = wire.CreateReferenceRequest
 
 // fqPublish is the POST /publish body (replaces Postgres LISTEN/NOTIFY).
+//
+// Deliberately NOT cut over to the generated wire.PublishRequest: that type
+// is {payload} only, because FacetQL's own /publish audience is identity-
+// scoped (Audience::Owner/Everyone in database.rs), not channel-scoped — see
+// this session's investigation of the "channel field drift", which found the
+// field is real but consumed one layer up, by fabric's frontdoor
+// (fabric-facetql/src/frontdoor/plan.rs), which reads `channel` straight out
+// of the raw request body to route a publish to the correct backend shard by
+// keyspace. A fabric-fronted deployment depends on this client still sending
+// it — cutting fqPublish over to the generated (channel-less) type would
+// silently break shard routing for exactly the deployments that need it
+// most. Facetql itself accepts and ignores the field either way, so keeping
+// it costs facetql nothing and fabric needs it kept.
 type fqPublish struct {
 	Channel string `json:"channel"`
 	Payload string `json:"payload"`
@@ -335,7 +352,7 @@ func (c *fqClient) do(ctx context.Context, method, path string, body any) ([]byt
 }
 
 // upsert stores or replaces a node (POST /node).
-func (c *fqClient) upsert(ctx context.Context, n fqNode) error {
+func (c *fqClient) upsert(ctx context.Context, n fqNodeWrite) error {
 	_, _, err := c.do(ctx, http.MethodPost, "/node", n)
 	return err
 }
@@ -349,12 +366,13 @@ func (c *fqClient) upsert(ctx context.Context, n fqNode) error {
 // inserts through (facetql api/routes.rs, create_node), so exactly one racer
 // creates it and every other one is told so. That is what makes a first-ever cron
 // tick decidable — see fqStore.ReserveCron, the only caller.
-func (c *fqClient) createIfAbsent(ctx context.Context, n fqNode) (created bool, err error) {
-	body := struct {
-		fqNode
-		IfAbsent bool `json:"if_absent"`
-	}{n, true}
-	_, status, err := c.do(ctx, http.MethodPost, "/node", body)
+//
+// IfAbsent is a real field on the generated request type now (it used to be a
+// hand-written wrapper struct embedding fqNode); setting it directly is the
+// whole change.
+func (c *fqClient) createIfAbsent(ctx context.Context, n fqNodeWrite) (created bool, err error) {
+	n.IfAbsent = true
+	_, status, err := c.do(ctx, http.MethodPost, "/node", n)
 	switch {
 	case status == http.StatusConflict:
 		return false, nil // it already exists: somebody else created it
@@ -443,19 +461,36 @@ func decodeNodes(data []byte) ([]fqNode, error) {
 	return env.Nodes, nil
 }
 
-// fqQueryRequest is the POST /nodes/query body: the pushed-down read filter
-// (AGENT_LOG §4b). `where` is the ir.Expr predicate — its JSON tags already mirror
-// FacetQL's Rust predicate.rs field-for-field, so it serializes without any
-// translation. `after` is the opaque keyset cursor from the previous page; it is
+// fqQueryRequest is the POST /nodes/query body: the pushed-down read filter.
+// `Where` is fct's own compiler/runtime ir.Expr; MarshalJSON routes it
+// through the ir.Expr<->wire.Expr seam (wireseam.go) rather than relying on
+// ir.Expr's own tags to happen to still match FacetQL's real predicate.rs
+// shape. `after` is the opaque keyset cursor from the previous page; it is
 // omitted on the first page (empty = first page).
 type fqQueryRequest struct {
-	Kind    string   `json:"kind"`
-	Where   *ir.Expr `json:"where,omitempty"`
-	ItemVar string   `json:"item_var"`
-	Order   string   `json:"order"`
-	Desc    bool     `json:"desc"`
-	Limit   int      `json:"limit"`
-	After   string   `json:"after,omitempty"`
+	Kind    string
+	Where   *ir.Expr
+	ItemVar string
+	Order   string
+	Desc    bool
+	Limit   int
+	After   string
+}
+
+func (q fqQueryRequest) MarshalJSON() ([]byte, error) {
+	where, err := wireExprFromIR(q.Where)
+	if err != nil {
+		return nil, fmt.Errorf("facetql: query on kind %q: %w", q.Kind, err)
+	}
+	return json.Marshal(struct {
+		Kind    string     `json:"kind"`
+		Where   *wire.Expr `json:"where,omitempty"`
+		ItemVar string     `json:"item_var"`
+		Order   string     `json:"order"`
+		Desc    bool       `json:"desc"`
+		Limit   int        `json:"limit"`
+		After   string     `json:"after,omitempty"`
+	}{q.Kind, where, q.ItemVar, q.Order, q.Desc, q.Limit, q.After})
 }
 
 // query runs a predicate-pushdown, keyset-paginated read (POST /nodes/query) and
@@ -476,9 +511,21 @@ func (c *fqClient) query(ctx context.Context, req fqQueryRequest) ([]fqNode, str
 // because a caller handed a `limit` that did nothing would believe it had
 // counted a page.
 type fqCountRequest struct {
-	Kind    string   `json:"kind"`
-	Where   *ir.Expr `json:"where,omitempty"`
-	ItemVar string   `json:"item_var"`
+	Kind    string
+	Where   *ir.Expr
+	ItemVar string
+}
+
+func (q fqCountRequest) MarshalJSON() ([]byte, error) {
+	where, err := wireExprFromIR(q.Where)
+	if err != nil {
+		return nil, fmt.Errorf("facetql: count on kind %q: %w", q.Kind, err)
+	}
+	return json.Marshal(struct {
+		Kind    string     `json:"kind"`
+		Where   *wire.Expr `json:"where,omitempty"`
+		ItemVar string     `json:"item_var"`
+	}{q.Kind, where, q.ItemVar})
 }
 
 // fqCountByRequest is the POST /nodes/count_by body: one predicate answered for
@@ -487,11 +534,25 @@ type fqCountRequest struct {
 // record is read at all, whereas grouping the whole kind computes every answer to
 // use a handful. Omitting `values` asks for the whole kind on purpose.
 type fqCountByRequest struct {
-	Kind    string   `json:"kind"`
-	Where   *ir.Expr `json:"where,omitempty"`
-	ItemVar string   `json:"item_var"`
-	GroupBy string   `json:"group_by"`
-	Values  []any    `json:"values,omitempty"`
+	Kind    string
+	Where   *ir.Expr
+	ItemVar string
+	GroupBy string
+	Values  []any
+}
+
+func (q fqCountByRequest) MarshalJSON() ([]byte, error) {
+	where, err := wireExprFromIR(q.Where)
+	if err != nil {
+		return nil, fmt.Errorf("facetql: count_by on kind %q: %w", q.Kind, err)
+	}
+	return json.Marshal(struct {
+		Kind    string     `json:"kind"`
+		Where   *wire.Expr `json:"where,omitempty"`
+		ItemVar string     `json:"item_var"`
+		GroupBy string     `json:"group_by"`
+		Values  []any      `json:"values,omitempty"`
+	}{q.Kind, where, q.ItemVar, q.GroupBy, q.Values})
 }
 
 // count runs a predicate-pushdown cardinality read (POST /nodes/count). An
@@ -545,23 +606,53 @@ func (c *fqClient) countBy(ctx context.Context, req fqCountByRequest) (map[strin
 // or a `count` with one — before it reads a row, so a malformed ask is a 400
 // rather than a number that looks plausible.
 type fqAggregateRequest struct {
-	Kind    string   `json:"kind"`
-	Where   *ir.Expr `json:"where,omitempty"`
-	ItemVar string   `json:"item_var"`
-	Func    string   `json:"func"`
-	Field   string   `json:"field,omitempty"`
+	Kind    string
+	Where   *ir.Expr
+	ItemVar string
+	Func    string
+	Field   string
+}
+
+func (q fqAggregateRequest) MarshalJSON() ([]byte, error) {
+	where, err := wireExprFromIR(q.Where)
+	if err != nil {
+		return nil, fmt.Errorf("facetql: aggregate on kind %q: %w", q.Kind, err)
+	}
+	return json.Marshal(struct {
+		Kind    string     `json:"kind"`
+		Where   *wire.Expr `json:"where,omitempty"`
+		ItemVar string     `json:"item_var"`
+		Func    string     `json:"func"`
+		Field   string     `json:"field,omitempty"`
+	}{q.Kind, where, q.ItemVar, q.Func, q.Field})
 }
 
 // fqAggregateByRequest is the POST /nodes/aggregate_by body — the grouped form,
 // with the same `values` shortcut fqCountByRequest documents.
 type fqAggregateByRequest struct {
-	Kind    string   `json:"kind"`
-	Where   *ir.Expr `json:"where,omitempty"`
-	ItemVar string   `json:"item_var"`
-	GroupBy string   `json:"group_by"`
-	Values  []any    `json:"values,omitempty"`
-	Func    string   `json:"func"`
-	Field   string   `json:"field,omitempty"`
+	Kind    string
+	Where   *ir.Expr
+	ItemVar string
+	GroupBy string
+	Values  []any
+	Func    string
+	Field   string
+}
+
+func (q fqAggregateByRequest) MarshalJSON() ([]byte, error) {
+	where, err := wireExprFromIR(q.Where)
+	if err != nil {
+		return nil, fmt.Errorf("facetql: aggregate_by on kind %q: %w", q.Kind, err)
+	}
+	return json.Marshal(struct {
+		Kind    string     `json:"kind"`
+		Where   *wire.Expr `json:"where,omitempty"`
+		ItemVar string     `json:"item_var"`
+		GroupBy string     `json:"group_by"`
+		Values  []any      `json:"values,omitempty"`
+		Func    string     `json:"func"`
+		Field   string     `json:"field,omitempty"`
+	}{q.Kind, where, q.ItemVar, q.GroupBy, q.Values, q.Func, q.Field})
 }
 
 // aggregate runs a pushed-down reduction (POST /nodes/aggregate).
@@ -658,6 +749,56 @@ func (c *fqClient) transaction(ctx context.Context, ops []fqTxOp) error {
 func (c *fqClient) publish(ctx context.Context, channel, payload string) error {
 	_, _, err := c.do(ctx, http.MethodPost, "/publish", fqPublish{Channel: channel, Payload: payload})
 	return err
+}
+
+// eventsHTTPClient is dedicated to GET /events and carries no timeout: it is a
+// long-lived SSE stream by design (FacetQL's own routing deliberately keeps it
+// outside the request-timeout layer — a stream severed every N seconds is not
+// a guarded stream, it is a broken one), and fqClient.http's 15s timeout would
+// sever it on a schedule instead of on an actual disconnect.
+var eventsHTTPClient = &http.Client{}
+
+// errEventsResumeGone is returned by streamEvents when FacetQL answers 410 to
+// a resume — the requested position aged out of the engine's retention ring.
+// There is nothing to resume from at that point; the caller's own choice is
+// whether to reconnect from the live edge (accepting the gap) or give up.
+var errEventsResumeGone = errors.New("facetql: resume position for GET /events is no longer available")
+
+// streamEvents opens GET /events, resuming after the given sequence when it is
+// nonzero, and returns the raw response body for the caller to read as SSE
+// frames (id:/data: lines, blank-line-terminated) — decoding those frames is
+// the caller's concern (cluster.go's clusterEvent), not this client's. The
+// caller must close the returned body when done with it.
+func (c *fqClient) streamEvents(ctx context.Context, after uint64) (io.ReadCloser, error) {
+	path := "/events"
+	if after > 0 {
+		path = fmt.Sprintf("/events?after=%d", after)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("facetql build request GET %s: %w", path, err)
+	}
+	if c.token != "" {
+		req.Header.Set("x-api-key", c.token)
+	}
+	resp, err := eventsHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("facetql GET %s: %w", path, err)
+	}
+	if resp.StatusCode == http.StatusGone {
+		resp.Body.Close()
+		return nil, errEventsResumeGone
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, &fqHTTPError{
+			Method: http.MethodGet, Path: path,
+			Status: resp.StatusCode, StatusText: resp.Status,
+			Body: strings.TrimSpace(string(data)),
+		}
+	}
+	return resp.Body, nil
 }
 
 // listIndexes returns every declared secondary index (GET /admin/indexes). The

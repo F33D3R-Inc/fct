@@ -52,6 +52,7 @@ func isPresentational(f *ast.App) bool {
 		len(f.Theme) > 0 || len(f.DarkTheme) > 0 || len(f.Themes) > 0
 	return contributes &&
 		len(f.Entities) == 0 && len(f.Records) == 0 && len(f.Enums) == 0 &&
+		len(f.Types) == 0 && len(f.Messages) == 0 &&
 		len(f.States) == 0 && len(f.Derives) == 0 && len(f.Policies) == 0 &&
 		len(f.Actions) == 0 && len(f.Jobs) == 0 && len(f.Services) == 0 &&
 		len(f.Webhooks) == 0 && len(f.Triggers) == 0 && len(f.Views) == 0 &&

@@ -1,0 +1,324 @@
+# The FacetQL wire protocol, authored once (SCHEMA_IDL_SCOPE.md Tier C:
+# FCT-as-IDL) instead of hand-copied independently in facetql/src/api/routes.rs,
+# fct/runtime/fqclient.go, and facetql-console.html/a future TS client — the
+# root cause behind a recurring class of wire-drift bugs (an invented auth
+# header, a dropped `channel` field, a fourth hand-copy in facetql/fa/).
+#
+# Regenerate with ./scripts/generate-wire.sh after any change here; CI's
+# wire-schema-drift job (ci.yml) fails the build if schema/generated/ is
+# stale, so a schema edit and its regenerated output can never silently
+# diverge.
+#
+# wire-protocol-version: 1
+# Bump this number and add a line below whenever a change here is NOT
+# backward compatible (a field/variant removed, a field's type narrowed) —
+# additive changes (a new optional field, a new variant, a previously-missing
+# type now authored faithfully) don't need a bump. This is deliberately just
+# a comment convention, not governance tooling: nothing enforces it yet
+# because nothing depends on it yet (see SCHEMA_IDL_SCOPE.md's own "don't
+# over-build" note). This is intentionally distinct from facetql's crate
+# version and from the on-disk bincode storage format's version
+# (core/node.rs) — three different things that break on different schedules
+# for different reasons.
+#   - v1 (2026-09-07): frozen surface as of that date (Coordinate, Node,
+#     Edge, UserRecord, HistoryEntry, Expr, TxOp's 7 variants,
+#     TransactionRequest).
+#   - v1, extended (2026-09-07, same day): the full real request/response
+#     surface authored — EdgeSpec, CreateNodeRequest, UpdateNodeRequest,
+#     CreateEdgeRequest, DeleteEdgeRequest, QueryParams (query-string),
+#     SequenceRequest/Response, MultiGetRequest, QueryWhereRequest, the
+#     Count/Aggregate (+By) family, QueryPage, CreateNodeResponse/Error,
+#     PublishRequest, EventsQuery/ChangesQuery (query-string), the admin
+#     user/index/reference bodies. Additive: nothing removed or narrowed
+#     from the v1 surface above. This needed the two schema-language
+#     features below, both proven with real acid tests
+#     (internal/codegen/codegen_test.go) before being used here:
+#       - the `as "Wire"` enum-value rename (resolves the Visibility/Role
+#         gap noted below — every real field of either type is now included
+#         above, e.g. Node.visibility, UserRecord.role, CreateUserResponse's
+#         and UserSummary's role);
+#       - `= literal` field defaults, including `= []` and `= {}` for the
+#         two real fields that need a non-absent default that isn't a
+#         scalar (CreateNodeRequest.edges, TxOp.set_if.set);
+#       - `type Name query:` for a GET request's URL-query-string-bound
+#         type (QueryParams, EventsQuery, ChangesQuery) as opposed to a
+#         JSON body — same wire shape, different binding, so no change to
+#         the fields themselves, only to how a consumer wires them up.
+#
+# RESOLVED (previously an open gap, see prior version of this file):
+#   Visibility/Role's wire form is capitalized ("Private"/"Admin") on the
+#   real, already-shipped facetql::core::node::Visibility and
+#   facetql::core::user::Role enums (no `#[serde(rename_all)]`). Two options
+#   existed: (a) an FCT `enum` per-value rename escape hatch, or (b) a
+#   breaking change to facetql's two enums (`rename_all = "snake_case"`).
+#   Chose (a): investigation (grepping every real consumer across facetql,
+#   fct, and fabric) found fabric's `wire.rs` independently mirrors the exact
+#   same capitalized form today (explicitly documented there as
+#   `Serializes as the bare string "Private"/"Public"`) and is a real client
+#   that would silently fail to decode `GET /nodes` if facetql's wire form
+#   changed — option (b) would require also fixing fabric in lockstep, out
+#   of reach for a pass scoped to fct+facetql only. Option (a) has zero
+#   blast radius outside fct's own compiler. See `enum Visibility`/`enum
+#   Role` below for the actual `as` usage, and
+#   internal/codegen/codegen_test.go's TestEnumWireRenameRoundTrip for the
+#   real Rust+Go proof (including the acid test: generated Go decoding what
+#   generated Rust actually wrote on the wire).
+#
+# KNOWN REMAINING GAP:
+#   No cutover has happened: routes.rs, fqclient.go, and the console still
+#   use their hand-written types. This file and schema/generated/ prove the
+#   pipeline works against the full real surface (parity re-verified against
+#   current source, not assumed from an older audit); switching production
+#   code to consume them is a separate, higher-stakes change tracked in
+#   SCHEMA_IDL_SCOPE.md.
+#
+#   A handful of response types this file does not (yet) cover because they
+#   live in facetql/src/storage/{index,reference}.rs rather than routes.rs
+#   and were judged lower-value to trace under this pass's time budget:
+#   IndexInfo, ReferenceDef, and StorageStats. None of them round-trip
+#   through fct today (fct never reads them), unlike everything included
+#   above, all of which is on a real, currently-exercised path.
+
+app FacetQLWire:
+    enum Visibility: private as "Private", public as "Public"
+    enum Role: user as "User", admin as "Admin"
+    enum ReferentialAction: cascade, restrict, set_null
+
+    type Coordinate:
+        x: int
+        y: int
+        z: int
+        q: int
+
+    type Node:
+        address: text
+        coordinate: Coordinate
+        value: int
+        kind: text
+        data: text
+        owner: text
+        claimed_by: text?
+        visibility: Visibility
+
+    type Edge:
+        from: text
+        to: text
+        kind: text
+        owner: text
+
+    type UserRecord:
+        token_hash: text
+        owner: text
+        role: Role
+
+    type HistoryEntry:
+        address: text
+        archived_at_unix: int
+        node: Node
+        version: int
+
+    type Expr:
+        kind: text
+        val: json?
+        vtype: text?
+        name: text?
+        field: text?
+        obj: Expr?
+        key: Expr?
+        op: text?
+        args: [Expr]?
+        l: Expr?
+        r: Expr?
+        x: Expr?
+        var: text?
+        where: Expr?
+
+    message TxOp:
+        | insert_node(address: text, kind: text, x: int, y: int, z: int, q: int, data: text, public: bool?, owner: text?, claimed_by: text?)
+        | insert_edge(from: text, to: text, kind: text)
+        | delete_edge(from: text, to: text, kind: text)
+        | delete_node(address: text)
+        | clear_kind(kind: text)
+        | delete_where(kind: text, where: Expr?)
+        | set_if(address: text, field: text, expect_le: number?, expect_eq: json?, expect_absent: bool?, set: json = {})
+
+    type TransactionRequest:
+        operations: [TxOp]
+
+    # ── node/edge writes (POST /node, PUT /node/:address, POST /edge, DELETE /edge) ──
+
+    type EdgeSpec:
+        to: text
+        kind: text
+
+    type CreateNodeRequest:
+        address: text
+        kind: text
+        x: int
+        y: int
+        z: int
+        q: int
+        data: text
+        public: bool?
+        edges: [EdgeSpec] = []
+        if_absent: bool = false
+
+    type UpdateNodeRequest:
+        data: text
+        public: bool?
+
+    type CreateEdgeRequest:
+        from: text
+        to: text
+        kind: text
+
+    type DeleteEdgeRequest:
+        from: text
+        to: text
+        kind: text
+
+    type CreateNodeResponse:
+        address: text
+        edges_created: [Edge]
+
+    type CreateNodeError:
+        error: text
+        edges_created_before_failure: [Edge]
+
+    # ── reads: GET /nodes, POST /nodes/query, /count(_by), /aggregate(_by) ──
+
+    type QueryParams query:
+        kind: text?
+        owner: text?
+        limit: int?
+        offset: int?
+
+    type QueryWhereRequest:
+        kind: text?
+        owner: text?
+        where: Expr?
+        item_var: text = "item"
+        order: text?
+        desc: bool = false
+        after: text?
+        limit: int?
+        offset: int?
+
+    type QueryPage:
+        nodes: [Node]
+        next: text
+        examined: int
+
+    type CountRequest:
+        kind: text?
+        owner: text?
+        where: Expr?
+        item_var: text = "item"
+
+    type CountResponse:
+        count: int
+
+    type GroupCount:
+        value: json?
+        count: int
+
+    type CountByRequest:
+        kind: text?
+        owner: text?
+        where: Expr?
+        item_var: text = "item"
+        group_by: text
+        values: [json]?
+
+    type CountByResponse:
+        counts: [GroupCount]
+
+    type AggregateRequest:
+        kind: text?
+        owner: text?
+        where: Expr?
+        item_var: text = "item"
+        func: text
+        field: text?
+
+    type AggregateResponse:
+        result: json
+
+    type GroupAggregate:
+        value: json?
+        result: json
+
+    type AggregateByRequest:
+        kind: text?
+        owner: text?
+        where: Expr?
+        item_var: text = "item"
+        group_by: text
+        values: [json]?
+        func: text
+        field: text?
+
+    type AggregateByResponse:
+        groups: [GroupAggregate]
+
+    # ── sequences: POST /sequence/:name/next ──
+
+    type SequenceRequest:
+        count: int = 1
+
+    type SequenceResponse:
+        first: int
+        count: int
+
+    # ── multiget: POST /nodes/multiget ──
+
+    type MultiGetRequest:
+        addresses: [text]
+
+    # ── publish/events/changes: POST /publish, GET /events, GET /changes ──
+
+    type PublishRequest:
+        payload: text
+
+    type EventsQuery query:
+        after: int?
+
+    type ChangesQuery query:
+        after: int?
+        limit: int?
+
+    # ── admin: user management ──
+
+    type CreateUserRequest:
+        owner: text
+        role: text?
+
+    type CreateUserResponse:
+        owner: text
+        role: Role
+        token: text
+
+    type UserSummary:
+        owner: text
+        role: Role
+
+    # ── admin: index/reference declarations ──
+
+    type CreateIndexRequest:
+        name: text
+        kind: text
+        field: text
+        unique: bool = false
+        mode: text?
+
+    type CreateReferenceRequest:
+        name: text
+        kind: text
+        field: text
+        parent_kind: text
+        parent_field: text?
+        on_delete: ReferentialAction
+
+    view Home at "/":
+        box:
+            text "hi"

@@ -17,6 +17,8 @@ type IR struct {
 	Entities   []Entity                     `json:"entities"`
 	Records    []Record                     `json:"records,omitempty"` // value-object types: the typed shape of a service (brain) return
 	Enums      []Enum                       `json:"enums,omitempty"`
+	Types      []WireType                   `json:"types,omitempty"`    // wire-schema value types (SCHEMA_IDL_SCOPE.md Tier C) — codegen only, never entity/action-bound
+	Messages   []WireMessage                `json:"messages,omitempty"` // wire-schema tagged unions
 	States     []State                      `json:"states"`
 	Derives    []Derive                     `json:"derives"`
 	Policies   []Policy                     `json:"policies"`
@@ -71,8 +73,9 @@ type Route struct {
 
 // Enum is a closed text type: its name and ordered member values.
 type Enum struct {
-	Name   string   `json:"name"`
-	Values []string `json:"values"`
+	Name      string   `json:"name"`
+	Values    []string `json:"values"`
+	WireNames []string `json:"wireNames"`
 }
 
 // Record is a value-object type: a flat set of typed fields with no storage or
@@ -93,6 +96,51 @@ type RecordField struct {
 	Optional bool   `json:"optional,omitempty"`
 }
 
+// WireType is a `type Name:` declaration (SCHEMA_IDL_SCOPE.md Tier C): a wire
+// value object whose fields may reference other WireType/WireMessage
+// declarations, including itself — unlike Record, which is deliberately flat.
+// Exists only to be handed to codegen (Rust/Go/TS); it has no runtime/entity
+// meaning.
+type WireType struct {
+	Name string `json:"name"`
+	// Query marks this type as bound from a URL query string, never a JSON
+	// body — see ast.Type.Query's doc comment for what that changes (and
+	// deliberately does not change) in each codegen target.
+	Query  bool        `json:"query,omitempty"`
+	Fields []WireField `json:"fields"`
+}
+
+// WireMessage is a `message Name:` tagged union: a closed set of variants,
+// each carrying its own fields, discriminated on the wire by the variant's
+// own (already snake_case) name.
+type WireMessage struct {
+	Name     string               `json:"name"`
+	Variants []WireMessageVariant `json:"variants"`
+}
+
+// WireMessageVariant is one arm of a WireMessage.
+type WireMessageVariant struct {
+	Name   string      `json:"name"`
+	Fields []WireField `json:"fields"`
+}
+
+// WireField is one typed field of a WireType or WireMessageVariant. Ref marks
+// a field whose Type names another WireType/WireMessage (as opposed to a
+// primitive or Enum) — codegen always boxes/points at a Ref field and always
+// inlines a non-Ref one, which is what makes self- and mutual reference safe
+// to represent in Rust (`Box<T>`) and Go (`*T`) alike; TS needs no such split
+// since interfaces reference by name regardless.
+type WireField struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	List     bool   `json:"list,omitempty"`
+	Optional bool   `json:"optional,omitempty"`
+	Ref      bool   `json:"ref,omitempty"`
+	// Default is the raw literal text of a `= value` clause (`"item"`, `1`,
+	// `true`) — never set alongside Optional. Empty string means no default.
+	Default string `json:"default,omitempty"`
+}
+
 // Component is a reusable view fragment: parameters plus a node tree whose
 // interpolations are rendered inline against the call-site argument scope.
 type Component struct {
@@ -108,7 +156,15 @@ type Component struct {
 type Entity struct {
 	Name       string  `json:"name"`
 	SoftDelete bool    `json:"softDelete,omitempty"` // remove archives (flags + hides) instead of dropping; the row survives
+	Ephemeral  bool    `json:"ephemeral,omitempty"`  // never durable — in-memory working set only (ast.Entity.Ephemeral)
 	Fields     []Field `json:"fields"`
+	// Read is the compiled `read:` clause (ast.Entity.Read), or nil when the
+	// entity declares none. It is rooted at the reserved row variable "$row"
+	// (ast.Entity.Read's own doc explains why); a query site folds it into its
+	// own predicate by renaming "$row" to whatever variable actually binds the
+	// row being tested (runtime/region.go renameRowVar) before evaluating it —
+	// this field is never evaluated as-is.
+	Read *Expr `json:"read,omitempty"`
 }
 
 // Field is one entity column. For a relation field, Ref names the entity it
@@ -347,7 +403,7 @@ type Binding struct {
 
 // Node is one view node in the neutral tree.
 type Node struct {
-	Kind     string `json:"kind"` // box|row|text|heading|image|icon|video|richtext|badge|button|list|if|match|case|else|input|textarea|checkbox|radio|link|select|form|upload|use|slot|tabs|tab|overlay|typeahead|option|options
+	Kind     string `json:"kind"` // box|row|text|heading|image|icon|video|richtext|badge|button|list|if|match|case|else|input|textarea|checkbox|radio|link|select|form|upload|use|slot|tabs|tab|overlay|typeahead|option|options|stage|sprite
 	Children []Node `json:"children,omitempty"`
 
 	// Segs is the node's own interpolated value: a text/badge leaf's words, an
@@ -539,6 +595,22 @@ type Node struct {
 	// and a node can want both — a `for` region the reader can also link to — so
 	// merging them would mean either the addressing or the anchor losing its name.
 	Anchor string `json:"anchor,omitempty"`
+
+	// Width/Height are a stage's canvas pixel size (kind "stage"). Tiles is its
+	// optional background tile-grid source; nil means no tile layer. X/Y/Facing/
+	// Image are a sprite's (kind "sprite") per-row draw parameters — Image is
+	// mandatory, Facing is not. A sprite reuses Var/Coll/Where/Order/Desc/Limit
+	// above (the same Range fields a "list" node carries) for the rows it draws
+	// one mark per, and reuses Label for its optional on-canvas caption — it is a
+	// `for` that draws a mark instead of rendering a node body, so it shares the
+	// query half completely and adds only what drawing a mark needs.
+	Width  int   `json:"width,omitempty"`
+	Height int   `json:"height,omitempty"`
+	Tiles  *Expr `json:"tiles,omitempty"`
+	X      *Expr `json:"x,omitempty"`
+	Y      *Expr `json:"y,omitempty"`
+	Facing *Expr `json:"facing,omitempty"`
+	Image  *Expr `json:"image,omitempty"`
 }
 
 // SegLists is every interpolated value hanging off this node: its own segments
@@ -576,7 +648,20 @@ type Seg struct {
 	E2E  bool   `json:"e2e,omitempty"` // this interpolation reads an @e2e field: the value is ciphertext, rendered as a placeholder and opened on the client
 }
 
-// Expr is the serialized expression form interpreted identically by Go and JS.
+// Expr is the serialized expression form interpreted identically by Go and
+// JS — its JSON tags are load-bearing for that wire (server.go's per-page
+// `reqIR` ships whole Expr trees to runtime/assets/facet.js, which walks the
+// same "kind"/"field"/"obj"/"l"/"r"/... shape client-side), which is a
+// completely different, single-implementation protocol from FacetQL's HTTP
+// wire.
+//
+// It is NOT the FacetQL wire type, even though its tags happen to look like
+// the generated wire.Expr's (schema/facetql_wire.fct) — that resemblance
+// used to be exploited directly (Expr was marshaled straight into FacetQL
+// requests, relying on the two shapes matching by convention, a duplicate
+// definition and a real drift surface). Anything crossing the FacetQL wire
+// now goes through wireExprFromIR/wireExprToIR (runtime/wireseam.go)
+// instead; do not marshal an *Expr directly into a FacetQL request again.
 type Expr struct {
 	Kind  string  `json:"kind"` // lit | ref | get | eget | agg | call | bin | un
 	Val   any     `json:"val,omitempty"`

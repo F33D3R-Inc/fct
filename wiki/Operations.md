@@ -18,7 +18,7 @@ same IR — no extra moving parts unless you turn them on.
 
 `facet deploy app.fct` writes a `Dockerfile`, `.dockerignore`,
 `docker-compose.yml`, and `.env.example` (also created by `facet new`). The
-compose file brings up the app **and** its Postgres:
+compose file brings up the app **and** its FacetQL:
 
 ```sh
 cp .env.example .env                 # set FACET_SECRET (facet config --gen-secret)
@@ -28,7 +28,7 @@ docker compose up --build
 In production set, at minimum:
 
 ```sh
-FACET_DATABASE_URL=postgres://user:pw@host:5432/db
+FACET_DATABASE_URL=facetql://prod-token@host:8080?tls=1
 FACET_SECRET=<32+ bytes>             # facet config --gen-secret
 FACET_SECURE_COOKIES=1               # behind TLS
 ```
@@ -42,11 +42,13 @@ configuration and warnings.
 Set `FACET_CLUSTER=1` and run several stateless `facet run` instances behind a
 load balancer. They cooperate with **no extra infrastructure**:
 
-- **Sessions** live in the shared Postgres store, so any instance can serve any
+- **Sessions** live in the shared FacetQL store, so any instance can serve any
   request.
-- **Live updates** ride **Postgres `LISTEN`/`NOTIFY`** — the database you already
-  run is the cross-instance bus. An entity change on one instance fans out over
-  SSE to clients connected to every instance.
+- **Live updates** ride **FacetQL's own live feed** (`POST /publish` /
+  `GET /events`) — the database you already run is the cross-instance bus. An
+  entity change on one instance fans out over SSE to clients connected to
+  every instance. This requires a `facetql://` `FACET_DATABASE_URL`; there is
+  no shared bus over the in-memory store.
 
 A single-process dev run (no flag) keeps the fast in-memory path.
 

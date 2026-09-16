@@ -54,14 +54,23 @@ func eval(e *ir.Expr, scope map[string]any) any {
 		if v, hit := m.lookup(e); hit {
 			return v
 		}
+		// An aggregate ranges over a collection an entity's `read:` clause may
+		// restrict; ee is what actually gets resolved/scanned below, e is what
+		// still gets recorded — see withEntityReadPolicy on why those must stay
+		// two different values. EntityGet ("eget") is deliberately left alone: a
+		// row-read policy governs a list, not a lookup by id (see ast.Entity.Read).
+		ee := e
+		if e.Kind == "agg" {
+			ee = withEntityReadPolicy(m, e)
+		}
 		// A count/exists the database can answer is asked of the database: that is
 		// what stops the in-memory mirror from being the only thing that can answer
 		// it. Anything else — a sum, an unpushable predicate, an aggregate a list
 		// could not batch — is counted here, over the working set, as before.
-		if v, ok := m.resolveAgg(e, scope); ok {
+		if v, ok := m.resolveAgg(ee, scope); ok {
 			return m.record(e, v)
 		}
-		v := evalColl(e, scope)
+		v := evalColl(ee, scope)
 		if e.Kind == "eget" && e.Field == "" {
 			// A whole row is about to be recorded for the client, which re-renders
 			// this lookup from the recorded value. A field this actor may not read

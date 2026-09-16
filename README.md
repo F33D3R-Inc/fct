@@ -8,7 +8,7 @@ compiler decides *where each piece runs* (server vs. client), emits a neutral
 
 ```
 .fct source ──▶ facet compiler ──▶ Facet IR ──▶ runtime
- (your app)     (parse · placement · deps)      (server authority + client executor + Postgres)
+ (your app)     (parse · placement · deps)      (server authority + client executor + FacetQL)
 ```
 
 You write `.fct` and run the `facet` binary. That single file is the whole
@@ -27,17 +27,18 @@ Download the binary for your platform from the
 ```sh
 facet new myapp
 cd myapp
-export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/yourdb
 facet run app.fct
 ```
 
 Open <http://localhost:7373>. The same app is also a JSON API at `/api`. The first
 account you sign up becomes the admin.
 
-> Facet stores data in **Postgres** — point `FACET_DATABASE_URL` at your database.
-> Same model as Django/Rails/Phoenix: you bring the database, the framework does
-> the rest. Each entity is a real, typed, indexed table; relations are foreign
-> keys with cascade. The schema is reconciled on startup, or explicitly with
+> Facet stores data in **FacetQL**, its native database — an unset
+> `FACET_DATABASE_URL` already points `facet run`/`facet dev` at
+> `facetql://localhost:8080`, so a local install has nothing else to configure.
+> Point it elsewhere with `FACET_DATABASE_URL=facetql://[token@]host:port`. Each
+> entity is a real, typed, indexed FacetQL kind; relations are references with
+> cascade. The schema is reconciled on startup, or explicitly with
 > `facet migrate app.fct` (`--plan` to dry-run).
 
 ## The one idea
@@ -46,7 +47,7 @@ You declare **what** each thing is; the compiler infers **where** it lives.
 
 | You write | Compiler infers |
 |---|---|
-| `entity Post:` | durable, shared → **server** (a Postgres table) |
+| `entity Post:` | durable, shared → **server** (a FacetQL kind) |
 | `state count: int = 0` | authoritative → **server** (per session) |
 | `state draft: text = "" @client` | ephemeral/local → **client** |
 | `action like(id)` (mutates an entity) | authoritative → **server** |
@@ -63,7 +64,7 @@ nor write client-only state; `requires <policy>` forces server placement; a
 app Social:
     auth                                   # built-in users, login, roles
 
-    entity Post:                           # durable data (a Postgres table)
+    entity Post:                           # durable data (a FacetQL kind)
         id: int
         author: text
         body: text
@@ -254,7 +255,7 @@ app). See the [Modules & Imports](wiki/Modules.md) guide and
 (ENTERPRISE.md Phase 6) lands on top of the earlier phases:
 
 - **v1.3 — reliability, language depth, delivery, enterprise:** clustering over
-  Postgres `LISTEN`/`NOTIFY` · durable job queue (retries/backoff/dead-letter/
+  FacetQL's live event feed · durable job queue (retries/backoff/dead-letter/
   cron) · Prometheus `/metrics` + `/healthz`/`/readyz` · graceful shutdown ·
   lists/optionals/`money`/`date`/enums · `check` validation · dynamic routes,
   layouts & route guards · components · `select`/`form`/`upload` · theming ·

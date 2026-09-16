@@ -153,7 +153,7 @@ func Build(app *ast.App) (*IR, error) {
 			valSeen[v] = true
 		}
 		e.enums[en.Name] = en.Values
-		out.Enums = append(out.Enums, Enum{Name: en.Name, Values: en.Values})
+		out.Enums = append(out.Enums, Enum{Name: en.Name, Values: en.Values, WireNames: en.WireNames})
 	}
 
 	// 0b. Records: flat value-object types (the typed shape of a brain's reply).
@@ -189,6 +189,113 @@ func Build(app *ast.App) (*IR, error) {
 		out.Records = append(out.Records, Record{Name: rc.Name, Fields: irFields})
 	}
 
+	// 0c. Types & Messages: wire-schema-only value types and tagged unions
+	// (SCHEMA_IDL_SCOPE.md Tier C). Unlike Records these may reference each
+	// other and themselves, so names are collected in a first pass before any
+	// field is validated, and a self/mutual reference is resolved rather than
+	// rejected — codegen boxes/points at it (WireField.Ref), it never inlines.
+	wireNames := map[string]bool{}
+	wireSeen := map[string]int{}
+	for _, ty := range app.Types {
+		if prev, ok := wireSeen[ty.Name]; ok {
+			return nil, &BuildError{ty.Line, fmt.Sprintf("type %q redeclared (first at line %d)", ty.Name, prev)}
+		}
+		wireSeen[ty.Name] = ty.Line
+		wireNames[ty.Name] = true
+	}
+	for _, ms := range app.Messages {
+		if prev, ok := wireSeen[ms.Name]; ok {
+			return nil, &BuildError{ms.Line, fmt.Sprintf("message %q redeclared (first at line %d, possibly as a type)", ms.Name, prev)}
+		}
+		wireSeen[ms.Name] = ms.Line
+		wireNames[ms.Name] = true
+	}
+	resolveWireField := func(declName string, f ast.RecordField, seen map[string]bool) (WireField, error) {
+		if seen[f.Name] {
+			return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q has duplicate field %q", declName, f.Name)}
+		}
+		seen[f.Name] = true
+		wf := WireField{Name: f.Name, Type: f.Type, List: f.List, Optional: f.Optional}
+		if f.Default != nil {
+			wf.Default = *f.Default
+		}
+		switch {
+		case f.Type == "json", f.Type == "number", isPrimitive(f.Type):
+			// inline scalar
+		case wireNames[f.Type]:
+			wf.Ref = true
+		default:
+			if _, isEnum := e.enums[f.Type]; !isEnum {
+				return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q has unknown type %q (not a primitive, `json`, an enum, or a declared type/message)", declName, f.Name, f.Type)}
+			}
+		}
+		if wf.Default != "" {
+			// A list field's only legal default is `[]` (an empty list),
+			// checked here independent of the scalar switch below — the
+			// element type (even Ref/enum) is irrelevant to whether an empty
+			// list is a valid default, only List-ness is.
+			if wf.List {
+				if wf.Default != "[]" {
+					return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q: a list field's only supported default is [], not %s", declName, f.Name, wf.Default)}
+				}
+			} else {
+				isBoolLit := wf.Default == "true" || wf.Default == "false"
+				isStrLit := len(wf.Default) >= 2 && wf.Default[0] == '"'
+				isObjLit := wf.Default == "{}"
+				isIntLit := !isBoolLit && !isStrLit && !isObjLit
+				switch f.Type {
+				case "bool":
+					if !isBoolLit {
+						return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q: default %s doesn't match its bool type", declName, f.Name, wf.Default)}
+					}
+				case "int", "money", "number":
+					if !isIntLit {
+						return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q: default %s doesn't match its numeric type", declName, f.Name, wf.Default)}
+					}
+				case "text", "date":
+					if !isStrLit {
+						return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q: default %s doesn't match its text type", declName, f.Name, wf.Default)}
+					}
+				case "json":
+					if !isObjLit {
+						return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q: a json field's only supported default is {}, not %s", declName, f.Name, wf.Default)}
+					}
+				default:
+					return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q: a default is only supported on bool/int/money/number/text/date/json, or a list ([]), not %q", declName, f.Name, f.Type)}
+				}
+			}
+		}
+		return wf, nil
+	}
+	for _, ty := range app.Types {
+		seen := map[string]bool{}
+		var fields []WireField
+		for _, f := range ty.Fields {
+			wf, err := resolveWireField(ty.Name, f, seen)
+			if err != nil {
+				return nil, err
+			}
+			fields = append(fields, wf)
+		}
+		out.Types = append(out.Types, WireType{Name: ty.Name, Query: ty.Query, Fields: fields})
+	}
+	for _, ms := range app.Messages {
+		var variants []WireMessageVariant
+		for _, v := range ms.Variants {
+			seen := map[string]bool{}
+			var fields []WireField
+			for _, f := range v.Fields {
+				wf, err := resolveWireField(fmt.Sprintf("%s.%s", ms.Name, v.Name), f, seen)
+				if err != nil {
+					return nil, err
+				}
+				fields = append(fields, wf)
+			}
+			variants = append(variants, WireMessageVariant{Name: v.Name, Fields: fields})
+		}
+		out.Messages = append(out.Messages, WireMessage{Name: ms.Name, Variants: variants})
+	}
+
 	// 1. Entities.
 	entSeen := map[string]int{}
 	for _, ent := range app.Entities {
@@ -203,7 +310,7 @@ func Build(app *ast.App) (*IR, error) {
 		// value a data-driven option almost always stores, so the type table has to
 		// know it or `option "{c.name}" -> c.id` could not be typed at all.
 		e.entFieldType[ent.Name] = map[string]string{"id": "int"}
-		ei := Entity{Name: ent.Name, SoftDelete: ent.SoftDelete}
+		ei := Entity{Name: ent.Name, SoftDelete: ent.SoftDelete, Ephemeral: ent.Ephemeral}
 		for _, f := range ent.Fields {
 			if f.Secret && f.Name == "id" {
 				return nil, &BuildError{f.Line, "the id field cannot be @secret"}
@@ -233,6 +340,13 @@ func Build(app *ast.App) (*IR, error) {
 			e.entityFields[ent.Name][f.Name] = true
 			e.entFieldType[ent.Name][f.Name] = fld.Type
 		}
+		// @ephemeral rows are never durable, so an @softdelete "archive it instead
+		// of dropping it" has nothing to persist into — the combination is
+		// nonsensical, not merely redundant, so it is refused rather than silently
+		// accepted with one annotation quietly doing nothing.
+		if ent.Ephemeral && ent.SoftDelete {
+			return nil, &BuildError{ent.Line, fmt.Sprintf("entity %q is @ephemeral, so @softdelete has nothing to archive into — drop one", ent.Name)}
+		}
 		// Soft-delete needs a durable `archived` flag to persist the hidden state. The
 		// compiler injects it (reserved), so the author never models it by hand. It is
 		// indexed — the load path filters archived rows out of the live working set.
@@ -243,6 +357,21 @@ func Build(app *ast.App) (*IR, error) {
 			ei.Fields = append(ei.Fields, Field{Name: "archived", Type: "bool", Index: true})
 			e.entityFields[ent.Name]["archived"] = true
 			e.entFieldType[ent.Name]["archived"] = "bool"
+		}
+		// `read:` — validated the same way a policy's predicate is (checkPure: no
+		// unknown reference, no effectful builtin — a read rule that consulted
+		// now()/rand() would answer a different question on every evaluation of
+		// the same row) and lowered the same way (e.low). The parser has already
+		// turned every one of the entity's own field names into `Get{Ref{"$row"},
+		// name}` (qualifyRowRefs), so the only new name this scope has to admit is
+		// "$row" itself — everything else (actor and the identity builtins) comes
+		// from withActor exactly as a policy's does.
+		if ent.Read != nil {
+			locals := withActor(map[string]bool{"$row": true})
+			if err := e.checkPure(ent.Read, locals, ent.Line, fmt.Sprintf("entity %q's read clause", ent.Name)); err != nil {
+				return nil, err
+			}
+			ei.Read = e.low(ent.Read)
 		}
 		out.Entities = append(out.Entities, ei)
 	}
@@ -1950,9 +2079,9 @@ type viewCtx struct {
 	// slot holds the already-lowered children a `use` handed this component, and
 	// slotOK says a `slot` is legal here at all (a component body or a layout —
 	// never a view).
-	slot           []Node
-	slotOK         bool
-	nb, nl, nf, nu int
+	slot               []Node
+	slotOK             bool
+	nb, nl, nf, nu, ng int
 }
 
 // id mints a namespaced region/binding identifier.
@@ -2600,6 +2729,75 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 				for _, d := range sortedKeys(c.e.nodeDeps(kids)) {
 					c.addDep(d, node.ID)
 				}
+			}
+			out = append(out, node)
+
+		case ast.Stage:
+			// A stage has no `for`-region children of its own — no partial redraw,
+			// the whole canvas repaints when anything it draws from changes. So it
+			// gets exactly one region id, and every sprite's collection/where/draw
+			// expressions feed that one id instead of minting one each, unlike a
+			// `for`'s children (which are node trees the client patches piecemeal).
+			node := Node{Kind: "stage", Width: t.Width, Height: t.Height}
+			if t.Tiles != nil {
+				if err := c.checkView(t.Tiles, sc, t.Line, "a stage's `tiles`"); err != nil {
+					return nil, err
+				}
+				node.Tiles = c.e.low(t.Tiles)
+			}
+			if !sc.inRegion {
+				node.ID = c.id("g", c.ng)
+				c.ng++
+				if node.Tiles != nil {
+					for _, d := range sortedKeys(c.e.depsIR(node.Tiles)) {
+						c.addDep(d, node.ID)
+					}
+				}
+			}
+			for _, sp := range t.Sprites {
+				spNode := Node{Kind: "sprite"}
+				if err := c.lowerRange(sp.Range, &spNode, sc, sp.Line); err != nil {
+					return nil, err
+				}
+				child := c.bindRange(sc, sp.Range)
+				if err := c.checkView(sp.X, child, sp.Line, "a sprite's `x`"); err != nil {
+					return nil, err
+				}
+				spNode.X = c.e.low(sp.X)
+				if err := c.checkView(sp.Y, child, sp.Line, "a sprite's `y`"); err != nil {
+					return nil, err
+				}
+				spNode.Y = c.e.low(sp.Y)
+				if sp.Facing != nil {
+					if err := c.checkView(sp.Facing, child, sp.Line, "a sprite's `facing`"); err != nil {
+						return nil, err
+					}
+					spNode.Facing = c.e.low(sp.Facing)
+				}
+				if err := c.checkView(sp.Image, child, sp.Line, "a sprite's `image`"); err != nil {
+					return nil, err
+				}
+				spNode.Image = c.e.low(sp.Image)
+				if sp.Label != nil {
+					label, err := c.lowerSegs(sp.Label, child, false)
+					if err != nil {
+						return nil, err
+					}
+					spNode.Label = label
+				}
+				if node.ID != "" {
+					c.addDep(sp.Coll, node.ID)
+					exprs := []*Expr{spNode.Where, spNode.Limit, spNode.X, spNode.Y, spNode.Facing, spNode.Image}
+					for _, ex := range exprs {
+						if ex == nil {
+							continue
+						}
+						for _, d := range sortedKeys(c.e.depsIR(ex)) {
+							c.addDep(d, node.ID)
+						}
+					}
+				}
+				node.Children = append(node.Children, spNode)
 			}
 			out = append(out, node)
 

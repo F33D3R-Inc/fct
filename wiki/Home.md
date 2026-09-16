@@ -11,7 +11,7 @@ calculus** computes that for you from the shape of your declarations.
 
 ```
 .fct source ──▶ facet compiler ──▶ Facet IR ──▶ runtime
- (your app)     (parse · placement · deps)      (server authority + client executor + Postgres)
+ (your app)     (parse · placement · deps)      (server authority + client executor + FacetQL)
 ```
 
 This wiki is the **single reference for building with Facet**. If you read it
@@ -55,7 +55,7 @@ You declare **what** each thing is; the compiler infers **where** it lives.
 
 | You write | Compiler infers |
 |---|---|
-| `entity Post:` | durable, shared → **server** (a Postgres table) |
+| `entity Post:` | durable, shared → **server** (a FacetQL kind) |
 | `state count: int = 0` | authoritative → **server** (per session) |
 | `state draft: text = "" @client` | ephemeral/local → **client** |
 | `action like(id)` (mutates an entity) | authoritative → **server** |
@@ -73,7 +73,7 @@ a `where`/`derive`/view expression must be pure. See
 app Social:
     auth                                   # built-in users, login, roles
 
-    entity Post:                           # durable data (a Postgres table)
+    entity Post:                           # durable data (a FacetQL kind)
         id: int
         author: text
         body: text

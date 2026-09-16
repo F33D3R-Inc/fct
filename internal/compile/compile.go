@@ -143,6 +143,8 @@ func mergeInto(dst, src *ast.App) {
 	dst.Auth = dst.Auth || src.Auth
 	dst.Entities = append(dst.Entities, src.Entities...)
 	dst.Enums = append(dst.Enums, src.Enums...)
+	dst.Types = append(dst.Types, src.Types...)
+	dst.Messages = append(dst.Messages, src.Messages...)
 	dst.States = append(dst.States, src.States...)
 	dst.Derives = append(dst.Derives, src.Derives...)
 	dst.Policies = append(dst.Policies, src.Policies...)

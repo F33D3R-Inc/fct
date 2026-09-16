@@ -11,8 +11,8 @@ it, see the [wiki](wiki/Home.md).
 
 - **Compiler + placement calculus** — one declarative graph; the compiler decides
   server vs. client. Soundness enforced (authority can't see/touch client state).
-- **Data** — entities persisted in **Postgres** (`FACET_DATABASE_URL`); in-memory
-  working set, write-through durability.
+- **Data** — entities persisted in **FacetQL** (`FACET_DATABASE_URL`), the
+  stack's native database; in-memory working set, write-through durability.
 - **Language** — entities, server/client state, derives, aggregates (`count`/`sum`),
   policies, actions, jobs (scheduled server work), effectful builtins (`now`/`rand`).
 - **Queries** — `for x in C where … by … limit …` (filter / sort / paginate).
@@ -94,8 +94,9 @@ second instance and a restart mid-job, and the process is observable and
 shutdown-safe.
 
 - **Horizontal scale** ✅ — set `FACET_CLUSTER=1` and several stateless servers
-  cooperate. Sessions live in the shared store, and **cross-instance live
-  updates** ride **Postgres `LISTEN`/`NOTIFY`** — the database you already run is
+  cooperate (requires a `facetql://` `FACET_DATABASE_URL`). Sessions live in the
+  shared store, and **cross-instance live updates** ride **FacetQL's own live
+  feed** (`POST /publish` / `GET /events`) — the database you already run is
   the bus, so there is no Redis/NATS to operate. A single-process dev run keeps
   the in-memory path.
 - **Durable jobs** ✅ — every scheduled `every Ns` job is a **cron entry** in a
@@ -145,7 +146,7 @@ The authoring loop and the release pipeline are first-class.
   apps).
 - **Editor** ✅ — an **LSP** (`facet lsp`: diagnostics, completion, hovers) and
   **syntax highlighting** for VS Code, Vim, and Neovim (under `editors/`).
-- **Deploy** ✅ — a **Dockerfile** and **docker-compose** (app + Postgres), written
+- **Deploy** ✅ — a **Dockerfile** and **docker-compose** (app + FacetQL), written
   by `facet deploy` (and into every `facet new` project) for a one-command stack.
 - **Supply chain** ✅ — the release workflow emits a **CycloneDX SBOM**
   (`scripts/sbom.sh`), **keyless-signs** the checksums/SBOM/provenance with cosign

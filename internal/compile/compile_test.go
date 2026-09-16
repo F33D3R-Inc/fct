@@ -357,6 +357,95 @@ app Mail:
 	}
 }
 
+// TestEntityReadPolicy covers `read:`, the entity-level row-read clause: it
+// compiles to ir.Entity.Read rooted at the reserved row variable "$row" (every
+// bare reference to one of the entity's own fields is qualified into
+// `Get{Ref{"$row"}, field}`; `actor` is left a bare ref), a `read:` clause
+// referencing an undeclared name is a compile error exactly like any other
+// unknown reference, an entity with no `read:` clause compiles with a nil
+// Read (this feature is additive), and a genuine field named `read` — one
+// whose value IS a valid type token — stays an ordinary field rather than
+// being mistaken for the clause.
+func TestEntityReadPolicy(t *testing.T) {
+	g := mustCompile(t, `
+app Journal:
+    entity Post:
+        id: int
+        author: text
+        published: bool
+        read: published || author == actor
+    view M:
+        box:
+            for p in Post:
+                text "{p.author}"
+`)
+	post, _ := find(g.Entities, func(e ir.Entity) bool { return e.Name == "Post" })
+	if post.Read == nil {
+		t.Fatal("Post.Read should be compiled from its read: clause")
+	}
+	if post.Read.Kind != "bin" || post.Read.Op != "||" {
+		t.Fatalf("Post.Read should lower `published || author == actor` to a top-level ||, got kind=%q op=%q", post.Read.Kind, post.Read.Op)
+	}
+	left := post.Read.L
+	if left.Kind != "get" || left.Field != "published" || left.Obj.Kind != "ref" || left.Obj.Name != "$row" {
+		t.Errorf("bare `published` should qualify to Get{Ref{$row}, published}, got %+v", left)
+	}
+	right := post.Read.R
+	if right.Kind != "bin" || right.Op != "==" || right.R.Kind != "ref" || right.R.Name != "actor" {
+		t.Errorf("`actor` should stay a bare ref in the qualified clause, got %+v", right.R)
+	}
+
+	if g2 := mustCompile(t, `
+app Notify:
+    entity Notification:
+        id: int
+        user: text
+        read: bool
+    view M:
+        box:
+            for n in Notification:
+                text "{n.user}"
+`); true {
+		notif, _ := find(g2.Entities, func(e ir.Entity) bool { return e.Name == "Notification" })
+		if notif.Read != nil {
+			t.Errorf("Notification's `read: bool` is a real field (see facets/home.fct), not a read: clause — Read should be nil, got %+v", notif.Read)
+		}
+		readField, ok := find(notif.Fields, func(f ir.Field) bool { return f.Name == "read" })
+		if !ok || readField.Type != "bool" {
+			t.Errorf("Notification should still have a plain `read: bool` field, got %+v (found=%v)", readField, ok)
+		}
+	}
+
+	// An entity that never declares `read:` at all compiles with a nil Read —
+	// this feature must not change a single byte of an app that predates it.
+	plain, _ := find(mustCompile(t, `
+app Plain:
+    entity Item:
+        id: int
+        name: text
+    view M:
+        box:
+            for i in Item:
+                text "{i.name}"
+`).Entities, func(e ir.Entity) bool { return e.Name == "Item" })
+	if plain.Read != nil {
+		t.Errorf("an entity with no read: clause should compile with a nil Read, got %+v", plain.Read)
+	}
+
+	if _, err := String(`
+app A:
+    entity Post:
+        id: int
+        author: text
+        read: published || author == actor
+    view M:
+        box:
+            text "x"
+`); err == nil {
+		t.Error("a read: clause naming an undeclared field should be a compile error, like any other unknown reference")
+	}
+}
+
 // An effectful builtin (now/rand) makes an action impure, so the placement
 // calculus pins it to the server — and impurity is rejected in pure contexts.
 func TestEffectfulBuiltinsPlacementAndPurity(t *testing.T) {
