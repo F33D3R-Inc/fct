@@ -50,6 +50,7 @@ type App struct {
 	Auth       bool // a bare `auth` line turns on built-in users/login/logout/signup
 	Entities   []*Entity
 	Records    []*Record
+	Structs    []*Struct
 	Enums      []*Enum
 	Types      []*Type
 	Messages   []*Message
@@ -225,6 +226,45 @@ type MessageVariant struct {
 	Name   string
 	Fields []RecordField
 	Line   int
+}
+
+// Struct is a proc-local named-field composite type: `struct Name:` then one
+// `field: Type` line per field (inline on the header and/or indented
+// children, exactly like parseRecord's grammar) — see LANGUAGE.md's `proc`
+// section. This is the construct that replaces a hand-rolled flat `[int]`
+// arena of magic-numbered slots with a real Python-dataclass/Swift-struct
+// shape: `Node{kind: "bin", left: a, right: b}` reads like what it is,
+// `arena[5*i+2]` does not.
+//
+// Deliberately NOT Record: a record is flat by design (a primitive or an
+// enum, never another record — see ast.Record's doc), because it is the
+// decoded shape of a service's wire reply and a nested reference there would
+// weaken a guarantee its callers rely on. A struct has the opposite job — it
+// is ordinary proc-land data modeling, where a tree node's `children: [Node]`
+// field is exactly the point — so a field's type may be a scalar
+// (int/text/bool/float), another declared struct (including itself, for a
+// self-referential shape like a binary expression's `left`/`right`), or a
+// list of either. It is proc-only: never an entity field, a state cell, a
+// wire record/type/message, or an action/component/service parameter (see
+// internal/ir/build.go's checkNoIndex, which bars a struct literal the same
+// way it already bars a map literal outside a proc body).
+type Struct struct {
+	Name   string
+	Fields []StructField
+	Line   int
+}
+
+// StructField is one typed field of a struct: a name and a type that may be a
+// list (`[T]`). The type core is a primitive scalar (int/text/bool/float) or
+// another declared struct's name — resolved, and checked for existence, by
+// internal/ir/build.go once every struct's name is known (a two-pass
+// resolution, like ast.Type/Message, so a self- or forward-reference to a
+// struct declared later in the same file still works).
+type StructField struct {
+	Name string
+	Type string
+	List bool
+	Line int
 }
 
 // ThemeVar is one `name "value"` line in a `theme:` block. It becomes a CSS
@@ -1484,9 +1524,27 @@ type MapLit struct {
 	Vals []Expr
 }
 
+// StructLit is a struct literal: `Type{f1: v1, f2: v2}` — constructs a value
+// of a proc-declared `struct` type with real named fields (see ast.Struct's
+// doc). Fields reuses the same {Name, Expr} pair `add Entity { f: expr, ... }`
+// already uses (ast.FieldInit) — the same "name: expr" shape, just built for
+// an expression position instead of a statement.
+//
+// `Type{` — a capitalized identifier immediately followed by `{` — was free
+// to claim: a bare `{` starting a fresh atom is already a map literal
+// (ast.MapLit's own doc), and until now an identifier directly followed by
+// `{` was simply a syntax error (parsePostfix had no case for it), so this
+// cannot collide with anything a program could have written before. It is
+// proc-only, exactly like MapLit — see internal/ir/build.go's checkNoIndex.
+type StructLit struct {
+	Type   string
+	Fields []FieldInit
+}
+
 func (Lit) expr()       {}
 func (ListLit) expr()   {}
 func (MapLit) expr()    {}
+func (StructLit) expr() {}
 func (Index) expr()     {}
 func (Ref) expr()       {}
 func (ActState) expr()  {}

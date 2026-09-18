@@ -359,10 +359,10 @@
           case "%": return toInt(r) === 0 ? 0 : toInt(l) % toInt(r);
           case "==": return eq(l, r);
           case "!=": return !eq(l, r);
-          case "<": return toInt(l) < toInt(r);
-          case "<=": return toInt(l) <= toInt(r);
-          case ">": return toInt(l) > toInt(r);
-          case ">=": return toInt(l) >= toInt(r);
+          case "<": { const t = textOperands(l, r); return t ? t[0] < t[1] : toInt(l) < toInt(r); }
+          case "<=": { const t = textOperands(l, r); return t ? t[0] <= t[1] : toInt(l) <= toInt(r); }
+          case ">": { const t = textOperands(l, r); return t ? t[0] > t[1] : toInt(l) > toInt(r); }
+          case ">=": { const t = textOperands(l, r); return t ? t[0] >= t[1] : toInt(l) >= toInt(r); }
           case "in": return Array.isArray(r) && r.some((x) => eq(l, x));
         }
       }
@@ -462,6 +462,7 @@
       case "min": { const x = toInt(a(0)), y = toInt(a(1)); return x < y ? x : y; }
       case "max": { const x = toInt(a(0)), y = toInt(a(1)); return x > y ? x : y; }
       case "floor": case "round": return toInt(a(0));
+      case "toMoney": return toMoney(a(0));
       case "money": return money(toInt(a(0)));
       case "len": { const v = a(0); return Array.isArray(v) ? v.length : Array.from(toStr(v)).length; }
       case "upper": return toStr(a(0)).toUpperCase();
@@ -522,6 +523,15 @@
     const s = ((cents / 100) | 0) + "." + ((frac / 10) | 0) + (frac % 10);
     return neg ? "-" + s : s;
   }
+  // toMoney parses decimal text ("12.34", "-5", "0.5") into minor units
+  // (cents) — the exact inverse of money(), and eval.go's parseMoneyText
+  // mirror: same FA_NUMERIC shape as toInt, rounded (not truncated) to the
+  // nearest cent so a third decimal digit doesn't just vanish.
+  function toMoney(v) {
+    const t = typeof v === "string" ? v.trim() : toStr(v);
+    if (!FA_NUMERIC.test(t)) return 0;
+    return Math.round(Number(t) * 100);
+  }
   function truthy(v) { if (Array.isArray(v)) return v.length > 0; return !(v === false || v === 0 || v === "" || v == null); }
   // Mirrors eval.go's toInt exactly, including the accepted spelling of a number
   // written as text — optional sign, digits with an optional fractional part,
@@ -560,6 +570,13 @@
     if (typeof a === "string" || typeof b === "string") return toStr(a) === toStr(b);
     if (typeof a === "boolean" || typeof b === "boolean") return truthy(a) === truthy(b);
     return toInt(a) === toInt(b);
+  }
+  // Mirrors eval.go's textOperands exactly: only fires when at least one side
+  // is genuinely text, so a numeric/numeric comparison still goes through
+  // toInt below (unaffected by this) rather than being coerced to strings.
+  function textOperands(a, b) {
+    if (typeof a !== "string" && typeof b !== "string") return null;
+    return [typeof a === "string" ? a : toStr(a), typeof b === "string" ? b : toStr(b)];
   }
 
   // ── rendering ───────────────────────────────────────────────────────────────

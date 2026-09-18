@@ -474,7 +474,7 @@ var typeNames = []string{"int", "text", "bool", "money", "date", "float"}
 var builtins = []string{
 	"now", "rand", "count", "sum", "abs", "min", "max", "floor", "round", "money",
 	"len", "upper", "lower", "trim", "year", "month", "day", "actor", "role", "verified",
-	"route", "session", "toFloat", "toInt",
+	"route", "session", "toFloat", "toInt", "toMoney",
 }
 
 func builtinDoc(name string) string {
@@ -490,6 +490,7 @@ func builtinDoc(name string) string {
 		"round":   "`round(x)` → int — round-half-away-from-zero (proc-only for a float x; identity for an int).",
 		"toFloat": "`toFloat(n)` → float — explicit int→float conversion (proc-only; no automatic promotion).",
 		"toInt":   "`toInt(x)` → int — explicit float→int conversion, truncating toward zero (proc-only).",
+		"toMoney": "`toMoney(s)` → money — parse decimal text (\"12.34\") as a money amount, rounding to the nearest cent. Not proc-only.",
 		"len":     "`len(x)` → int — length of a string or list.",
 		"upper":   "`upper(s)` → text — uppercased.",
 		"lower":   "`lower(s)` → text — lowercased.",

@@ -132,6 +132,11 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 		if rc, err = parseRecord(c); err == nil {
 			app.Records = append(app.Records, rc)
 		}
+	case strings.HasPrefix(c.Line.Text, "struct "):
+		var sc *ast.Struct
+		if sc, err = parseStruct(c); err == nil {
+			app.Structs = append(app.Structs, sc)
+		}
 	case strings.HasPrefix(c.Line.Text, "enum "):
 		var en *ast.Enum
 		if en, err = parseEnum(c); err == nil {
@@ -228,7 +233,7 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 			app.Views = append(app.Views, v)
 		}
 	default:
-		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/enum/type/message/state/derive/policy/action/proc/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/struct/enum/type/message/state/derive/policy/action/proc/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
 	}
 	return err
 }
@@ -849,6 +854,74 @@ func parseRecord(n *source.Node) (*ast.Record, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("record %q has no fields", name)}
 	}
 	return r, nil
+}
+
+// parseStruct: `struct Node: kind: text, op: text` (fields on the header) or
+// each `name: type` on its own indented line — the same grammar parseRecord
+// uses. Unlike a record field, a struct field's type may be a list (`[T]`,
+// already true for a record too) AND may name another struct (or itself) —
+// ast.Struct's doc explains why that composability is the entire point.
+// Optional field types (`T?`) are refused: a struct is constructed whole, by
+// a literal that must set every field (internal/ir/build.go's
+// checkStructFieldTypes), so there is no "field may be absent" story yet —
+// the same reason parseRecord accepts one but a struct field does not need
+// to, and keeping it out now avoids having to decide its literal/zero-value
+// story later.
+func parseStruct(n *source.Node) (*ast.Struct, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "struct")), ":")
+	name := head
+	var inline string
+	if colon := strings.IndexByte(head, ':'); colon >= 0 {
+		name = strings.TrimSpace(head[:colon])
+		inline = strings.TrimSpace(head[colon+1:])
+	}
+	if !isIdent(name) || !isUpper(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("struct name %q must be capitalized", name)}
+	}
+	st := &ast.Struct{Name: name, Line: n.Line.No}
+	add := func(spec string, line int) error {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			return nil
+		}
+		colon := strings.IndexByte(spec, ':')
+		if colon < 0 {
+			return &Error{line, fmt.Sprintf("struct field %q must be `name: type`", spec)}
+		}
+		fn := strings.TrimSpace(spec[:colon])
+		ft := strings.TrimSpace(spec[colon+1:])
+		if !isIdent(fn) {
+			return &Error{line, fmt.Sprintf("invalid struct field name %q", fn)}
+		}
+		core, list, optional := splitType(ft)
+		if optional {
+			return &Error{line, fmt.Sprintf("struct field %q cannot be optional (?) — a struct literal must set every field", fn)}
+		}
+		if core == "money" || core == "date" {
+			return &Error{line, fmt.Sprintf("struct field %q: %s is not usable inside a proc's own struct type — use int/text/bool/float, another struct, or a list of those", fn, core)}
+		}
+		if !isTypeName(core) {
+			return &Error{line, fmt.Sprintf("unknown type %q in struct field %q (use int/text/bool/float, another struct, or a list of those)", core, fn)}
+		}
+		st.Fields = append(st.Fields, ast.StructField{Name: fn, Type: core, List: list, Line: line})
+		return nil
+	}
+	if inline != "" {
+		for _, f := range strings.Split(inline, ",") {
+			if err := add(f, n.Line.No); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, c := range n.Children {
+		if err := add(c.Line.Text, c.Line.No); err != nil {
+			return nil, err
+		}
+	}
+	if len(st.Fields) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("struct %q has no fields", name)}
+	}
+	return st, nil
 }
 
 // isWireTypeName is isTypeName plus two wire-only primitives with no

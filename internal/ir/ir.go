@@ -16,6 +16,7 @@ type IR struct {
 	Auth       bool                         `json:"auth,omitempty"` // built-in users/login enabled
 	Entities   []Entity                     `json:"entities"`
 	Records    []Record                     `json:"records,omitempty"` // value-object types: the typed shape of a service (brain) return
+	Structs    []Struct                     `json:"structs,omitempty"` // proc-local named-field composite types (declared with `struct Name:`)
 	Enums      []Enum                       `json:"enums,omitempty"`
 	Types      []WireType                   `json:"types,omitempty"`    // wire-schema value types (SCHEMA_IDL_SCOPE.md Tier C) — codegen only, never entity/action-bound
 	Messages   []WireMessage                `json:"messages,omitempty"` // wire-schema tagged unions
@@ -95,6 +96,18 @@ type RecordField struct {
 	Type     string `json:"type"`
 	List     bool   `json:"list,omitempty"`
 	Optional bool   `json:"optional,omitempty"`
+}
+
+// Struct is a proc-local named-field composite type declaration (see
+// ast.Struct's doc): a name and its typed fields. Reuses RecordField's exact
+// shape (name/type/list — a struct field is never optional, see
+// ast.StructField's doc) rather than inventing a parallel one, since the two
+// are structurally identical; Struct only differs from Record in what a
+// field's Type may name (another struct, including itself) and in being
+// proc-only rather than a service-reply shape.
+type Struct struct {
+	Name   string        `json:"name"`
+	Fields []RecordField `json:"fields"`
 }
 
 // WireType is a `type Name:` declaration (SCHEMA_IDL_SCOPE.md Tier C): a wire
@@ -740,22 +753,23 @@ type Seg struct {
 // now goes through wireExprFromIR/wireExprToIR (runtime/wireseam.go)
 // instead; do not marshal an *Expr directly into a FacetQL request again.
 type Expr struct {
-	Kind  string  `json:"kind"` // lit | ref | get | eget | agg | call | bin | un | list | index | map
-	Val   any     `json:"val,omitempty"`
-	VType string  `json:"vtype,omitempty"`
-	Name  string  `json:"name,omitempty"`  // ref / eget entity / agg collection / call builtin
-	Field string  `json:"field,omitempty"` // get / eget / agg (sum)
-	Obj   *Expr   `json:"obj,omitempty"`   // get / index (the array or map)
-	Key   *Expr   `json:"key,omitempty"`   // eget / index (the index/key expression)
-	Op    string  `json:"op,omitempty"`    // bin / un / agg (count|sum|exists)
-	Args  []*Expr `json:"args,omitempty"`  // call / list (the elements) / map (the values, parallel to Keys)
-	Keys  []*Expr `json:"keys,omitempty"`  // map literal only: its keys, parallel to Args (its values)
-	L     *Expr   `json:"l,omitempty"`
-	R     *Expr   `json:"r,omitempty"`
-	X     *Expr   `json:"x,omitempty"`
-	Var   string  `json:"var,omitempty"`   // agg: item variable for the filtered form
-	Where *Expr   `json:"where,omitempty"` // agg: filter predicate (nil = whole collection)
-	Sel   *Expr   `json:"sel,omitempty"`   // agg: the value reduced over each row (nil = the bare Field)
+	Kind   string   `json:"kind"` // lit | ref | get | eget | agg | call | bin | un | list | index | map | struct
+	Val    any      `json:"val,omitempty"`
+	VType  string   `json:"vtype,omitempty"`
+	Name   string   `json:"name,omitempty"`   // ref / eget entity / agg collection / call builtin / struct (its type name)
+	Field  string   `json:"field,omitempty"`  // get / eget / agg (sum)
+	Obj    *Expr    `json:"obj,omitempty"`    // get / index (the array or map)
+	Key    *Expr    `json:"key,omitempty"`    // eget / index (the index/key expression)
+	Op     string   `json:"op,omitempty"`     // bin / un / agg (count|sum|exists)
+	Args   []*Expr  `json:"args,omitempty"`   // call / list (the elements) / map (the values, parallel to Keys) / struct (the field values, parallel to Fields)
+	Keys   []*Expr  `json:"keys,omitempty"`   // map literal only: its keys, parallel to Args (its values)
+	Fields []string `json:"fields,omitempty"` // struct literal only: its field names, parallel to Args (its values)
+	L      *Expr    `json:"l,omitempty"`
+	R      *Expr    `json:"r,omitempty"`
+	X      *Expr    `json:"x,omitempty"`
+	Var    string   `json:"var,omitempty"`   // agg: item variable for the filtered form
+	Where  *Expr    `json:"where,omitempty"` // agg: filter predicate (nil = whole collection)
+	Sel    *Expr    `json:"sel,omitempty"`   // agg: the value reduced over each row (nil = the bare Field)
 }
 
 // Kids is every sub-expression hanging off this one, in the order both renderers

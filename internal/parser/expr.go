@@ -223,7 +223,23 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 	// `Entity(key).field`. The builtins are reserved only in this call position,
 	// so a state named `count` used as a bare value is unaffected.
 	if ref, ok := atom.(ast.Ref); ok {
-		if t, ok := p.peek(); ok && t.kind == tLParen {
+		if t, ok := p.peek(); ok && t.kind == tOp && t.text == "{" && isUpper(ref.Name) {
+			// A capitalized name directly followed by `{` is a struct literal:
+			// `Node{kind: "bin", left: a, right: b}` (ast.StructLit). This cannot
+			// collide with a bare `{...}` map literal (parseAtom's own tOp case
+			// for `{`, which only ever starts a FRESH atom, never follows one) —
+			// before this existed, an identifier directly followed by `{` was
+			// simply a syntax error, so nothing written before this could have
+			// meant anything else. A lower-case name is left alone (still that
+			// same syntax error as before), matching this language's existing
+			// capitalized-name convention for a declared type (Entity/Record/
+			// Enum/Struct).
+			sl, err := p.parseStructLit(ref.Name)
+			if err != nil {
+				return nil, err
+			}
+			atom = sl
+		} else if t, ok := p.peek(); ok && t.kind == tLParen {
 			switch {
 			case ref.Name == "count" || ref.Name == "sum" || ref.Name == "exists" || ref.Name == "avg" ||
 				((ref.Name == "min" || ref.Name == "max") && !p.argListHasComma()):
@@ -566,7 +582,8 @@ func isBuiltinCall(name string) bool {
 	switch name {
 	case "now", "rand", // effectful (pinned to the authority)
 		"abs", "min", "max", "floor", "round", "money", // math / money
-		"toFloat", "toInt", // explicit int<->float conversion (proc-only — see checkNoFloat)
+		"toFloat", "toInt", // explicit int<->float conversion (toFloat is proc-only — see checkNoFloat)
+		"toMoney", // explicit text->money conversion — not proc-only, money is a real type everywhere
 		"len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", // string
 		"year", "month", "day", // date
 		"ago", "compact", "commas", // formatting (render-time text)
@@ -744,6 +761,57 @@ func (p *exprParser) parseMapLit() (ast.Expr, error) {
 		p.pos++
 	}
 	return ast.MapLit{Keys: keys, Vals: vals}, nil
+}
+
+// parseStructLit parses a `Type{f1: v1, f2: v2}` struct literal (ast.StructLit)
+// — real field names, not the arbitrary key expressions a map literal takes;
+// p.peek() is at the opening `{`, and typeName is the capitalized name that
+// preceded it (already consumed). Unlike parseMapLit, `{}` (no fields) is not
+// accepted here: a struct literal must set every field the struct declares
+// (checked once the struct's own shape is known, in internal/ir/build.go),
+// and an empty literal can never be right for a struct with at least one
+// field, so requiring at least one `name: expr` catches the empty-literal typo
+// here, at parse time, with a clearer message than the field-completeness
+// check downstream would give it.
+func (p *exprParser) parseStructLit(typeName string) (ast.Expr, error) {
+	p.pos++ // consume {
+	var fields []ast.FieldInit
+	for {
+		t, ok := p.peek()
+		if !ok {
+			return nil, &Error{p.line, fmt.Sprintf("missing closing `}` in %s{...} literal", typeName)}
+		}
+		if t.kind != tIdent {
+			return nil, &Error{p.line, fmt.Sprintf("expected a field name in %s{...} literal", typeName)}
+		}
+		fn := t.text
+		p.pos++
+		if c, ok := p.peek(); !ok || c.kind != tOp || c.text != ":" {
+			return nil, &Error{p.line, fmt.Sprintf("expected `:` after field %q in %s{...} literal", fn, typeName)}
+		}
+		p.pos++
+		v, err := p.parseBinary(0)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, ast.FieldInit{Name: fn, Expr: v})
+		c, ok := p.peek()
+		if !ok {
+			return nil, &Error{p.line, fmt.Sprintf("missing closing `}` in %s{...} literal", typeName)}
+		}
+		if c.kind == tOp && c.text == "}" {
+			p.pos++
+			break
+		}
+		if c.kind != tOp || c.text != "," {
+			return nil, &Error{p.line, fmt.Sprintf("expected `,` or `}` in %s{...} literal", typeName)}
+		}
+		p.pos++
+	}
+	if len(fields) == 0 {
+		return nil, &Error{p.line, fmt.Sprintf("%s{...} literal has no fields — a struct literal must set every field", typeName)}
+	}
+	return ast.StructLit{Type: typeName, Fields: fields}, nil
 }
 
 func isIdentStart(c byte) bool {

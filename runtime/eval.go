@@ -16,6 +16,25 @@ import (
 // record is one entity row.
 type record = map[string]any
 
+// structVal is a proc-local struct value (`struct Name: field: Type` — see
+// LANGUAGE.md's `proc` section and ast.Struct's doc): a real named-field
+// composite, constructed by a `Type{field: expr, ...}` literal and read back
+// with ordinary `.field` access (evalInFrame's "struct"/"get" cases).
+//
+// A dedicated Go type rather than a bare map[string]any (which would work
+// just as well at the type-assertion level) so it can never be confused, in
+// a runtime type switch, with an entity row (this file's own `record` alias
+// for map[string]any) or a proc map value (map[any]any, the "map" case
+// below) — three genuinely different domains that happen to all be
+// string/any-ish, kept apart by using three different concrete Go types.
+// Type names which struct shape it is, purely for a clear diagnostic if a
+// value ever reaches a place expecting a different one; Fields holds the
+// field values by name.
+type structVal struct {
+	Type   string
+	Fields map[string]any
+}
+
 // frame is one proc invocation's local scope: its parameters plus its
 // `let`-bound locals, distinct from the flat action/session `map[string]any`
 // scope runActionLocked reads — a proc's scratch variable must never alias or
@@ -126,6 +145,40 @@ func (s *Server) evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 			out[key] = v
 		}
 		return out, nil
+	case "struct":
+		// A struct literal (`Type{f1: v1, ...}`) — see ast.StructLit's doc.
+		// internal/ir/build.go's checkStructFieldTypes already proved every
+		// field the struct declares is set exactly once (for the shapes it
+		// can see statically), so this just evaluates each value in field
+		// order; Fields and Args stay parallel exactly as the IR holds them.
+		fields := make(map[string]any, len(e.Args))
+		for i, valExpr := range e.Args {
+			v, err := s.evalInFrame(valExpr, fr)
+			if err != nil {
+				return nil, err
+			}
+			fields[e.Fields[i]] = v
+		}
+		return structVal{Type: e.Name, Fields: fields}, nil
+	case "get":
+		// `.field` read off a struct value (ast.Get) — the one composite-value
+		// field access a proc has (an entity/record's `.field` never reaches
+		// evalInFrame at all; those are eval()'s own "get" case, below).
+		// internal/ir/build.go's checkStructFieldTypes already proves this
+		// wherever the object's type is statically known; a value that
+		// reaches here as something other than a structVal is the runtime
+		// backstop for whatever that static check couldn't see through (a
+		// proc parameter's dynamic value, say) — a clean error, not a Go
+		// panic, the same stance an out-of-bounds array read already takes.
+		obj, err := s.evalInFrame(e.Obj, fr)
+		if err != nil {
+			return nil, err
+		}
+		sv, ok := obj.(structVal)
+		if !ok {
+			return nil, fmt.Errorf("cannot read field %q of a value that is not a struct", e.Field)
+		}
+		return sv.Fields[e.Field], nil
 	case "ref":
 		v, _ := fr.get(e.Name)
 		return v, nil
@@ -292,16 +345,41 @@ func cloneMapValue(v any) any {
 // array, or a map) is a clean error here, not a Go panic and not a silently
 // wrong answer — this codebase's established convention (see
 // runtime/array_test.go's TestArrayOutOfBoundsIsCleanError).
-// cloneCompositeValue applies cloneArrayValue then cloneMapValue, so a value
-// flowing into a new proc-local binding (a `let`, a plain reassignment, or a
-// parameter — see each clone helper's own doc for why that copy matters) is
-// copied whichever of the two proc-local composite value kinds it happens to
-// be. Composing them is safe and total: neither helper touches a value that
-// isn't its own kind, so a scalar passes through both unchanged, an array is
-// copied by the first and passed through the second unchanged, and a map the
-// reverse.
+
+// cloneCompositeValue applies cloneArrayValue, cloneMapValue, then
+// cloneStructValue, so a value flowing into a new proc-local binding (a
+// `let`, a plain reassignment, or a parameter — see each clone helper's own
+// doc for why that copy matters) is copied whichever of the three
+// proc-local composite value kinds it happens to be. Composing them is safe
+// and total: each helper touches only its own kind and passes everything
+// else through unchanged, so a scalar passes through all three unchanged,
+// an array is copied by the first and passed through the other two, a map
+// the second, and a struct the third.
 func cloneCompositeValue(v any) any {
-	return cloneMapValue(cloneArrayValue(v))
+	return cloneStructValue(cloneMapValue(cloneArrayValue(v)))
+}
+
+// cloneStructValue is cloneArrayValue's/cloneMapValue's counterpart for a
+// struct value (see structVal): returns v unchanged unless it is a
+// structVal, in which case it returns a copy with its own backing Fields
+// map, so a struct gets the same copy-on-assign value semantics an array or
+// map already has (see cloneArrayValue's doc for the full reasoning — it
+// applies here unchanged). One level deep, exactly like the other two: a
+// field that itself holds an array/map/struct is carried over by reference
+// at this level, the same way an array of arrays or a map of maps already
+// is — there is no in-place field mutation this milestone (a struct's
+// fields are set once, by its literal), so this one-level copy is already
+// enough to make two bindings of the same struct value fully independent.
+func cloneStructValue(v any) any {
+	sv, ok := v.(structVal)
+	if !ok {
+		return v
+	}
+	out := make(map[string]any, len(sv.Fields))
+	for k, val := range sv.Fields {
+		out[k] = val
+	}
+	return structVal{Type: sv.Type, Fields: out}
 }
 
 func mapKey(v any) (any, error) {
@@ -621,6 +699,54 @@ func evalRest(e *ir.Expr, scope map[string]any) any {
 	return nil
 }
 
+// textOperands reports whether `<`/`<=`/`>`/`>=` should compare l and r as
+// text, and if so, their string values.
+//
+// Before this existed, every ordering comparison went straight through
+// toInt/toFloat regardless of operand type — so two text values ("apple" <
+// "banana") were silently parsed as numbers (both failing to parse as one,
+// both becoming 0) and compared as 0 < 0, always false. That is the same
+// class of silent-wrong-answer toInt("sold out") == 0 already warns about at
+// equal's definition above, just reached from `<` instead of `==`. Real text
+// deserves real lexicographic (codepoint) ordering — the same ordering Go's
+// own `<` on strings already gives, and the same ordering Python/Swift give
+// their own string types — not a coercion through a numeric parse that
+// throws the actual characters away.
+//
+// A []byte is normalized to string first, matching equal's own treatment of
+// the shape a database driver hands back for a text column (see toStr's
+// doc) — otherwise a text column's value would take this string path when it
+// arrived as a Go string literal but silently fall through to the numeric
+// path when it arrived from a driver scan, and the two would disagree about
+// ordering the exact same column.
+//
+// Only fires when at least one side is genuinely text; a comparison that
+// mixes text with a non-text, non-numeric value (impossible from a
+// well-typed proc — checkNumericTypes and its surrounding static checks see
+// to that — but not something this defensive runtime path assumes) still
+// compares as text via toStr, the same total, never-guess stance equal
+// already takes for a mismatched pair.
+func textOperands(l, r any) (string, string, bool) {
+	if lb, ok := l.([]byte); ok {
+		l = string(lb)
+	}
+	if rb, ok := r.([]byte); ok {
+		r = string(rb)
+	}
+	ls, lok := l.(string)
+	rs, rok := r.(string)
+	if !lok && !rok {
+		return "", "", false
+	}
+	if !lok {
+		ls = toStr(l)
+	}
+	if !rok {
+		rs = toStr(r)
+	}
+	return ls, rs, true
+}
+
 // applyBin evaluates one binary operator over its already-evaluated operands.
 // Split out of evalRest's "bin" case so evalInFrame (a proc body's expression
 // evaluator, which has no flat scope map to hand eval) can share the exact same
@@ -697,21 +823,33 @@ func applyBin(op string, l, r any) any {
 	case "!=":
 		return !equal(l, r)
 	case "<":
+		if ls, rs, ok := textOperands(l, r); ok {
+			return ls < rs
+		}
 		if isFloatVal(l) || isFloatVal(r) {
 			return toFloat(l) < toFloat(r)
 		}
 		return toInt(l) < toInt(r)
 	case "<=":
+		if ls, rs, ok := textOperands(l, r); ok {
+			return ls <= rs
+		}
 		if isFloatVal(l) || isFloatVal(r) {
 			return toFloat(l) <= toFloat(r)
 		}
 		return toInt(l) <= toInt(r)
 	case ">":
+		if ls, rs, ok := textOperands(l, r); ok {
+			return ls > rs
+		}
 		if isFloatVal(l) || isFloatVal(r) {
 			return toFloat(l) > toFloat(r)
 		}
 		return toInt(l) > toInt(r)
 	case ">=":
+		if ls, rs, ok := textOperands(l, r); ok {
+			return ls >= rs
+		}
 		if isFloatVal(l) || isFloatVal(r) {
 			return toFloat(l) >= toFloat(r)
 		}
@@ -931,6 +1069,9 @@ func callBuiltin(name string, argVals []any) any {
 		return toFloat(arg(0))
 	case "toInt":
 		return toInt(arg(0))
+	case "toMoney":
+		n, _ := parseMoneyText(toStr(arg(0)))
+		return n
 	case "money":
 		return formatMoney(toInt(arg(0)))
 	case "len":
@@ -1208,6 +1349,27 @@ func parseNumericText(s string) (int, bool) {
 		return 0, false
 	}
 	return int(f), true
+}
+
+// parseMoneyText reports the value of a money amount written as decimal text
+// (dollars-and-cents, e.g. "12.34", "-5", "0.5"), in minor units (cents), and
+// whether it was one at all — toMoney's total parse, and the exact inverse of
+// formatMoney. It accepts the same numericText shape parseNumericText does
+// (so "$12.34" is not money text any more than it is int text — a caller
+// strips a currency symbol itself), then rounds to the nearest cent rather
+// than truncating, matching round()'s own round-half-away-from-zero
+// convention (see LANGUAGE.md's `float` section) rather than silently
+// dropping a third decimal.
+func parseMoneyText(s string) (int, bool) {
+	t := strings.TrimSpace(s)
+	if !numericText.MatchString(t) {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(t, 64)
+	if err != nil {
+		return 0, false
+	}
+	return int(math.Round(f * 100)), true
 }
 
 func toInt(v any) int {

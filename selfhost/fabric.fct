@@ -325,6 +325,463 @@ app FabricSelfHost:
         return allEq
 
     # ============================================================
+    # SECOND PORT, SAME FILE: fabric-replication's `failover.rs` —
+    # `FailoverAssessment::evaluate` and its private `ineligibility` helper.
+    # ============================================================
+    # WHY THIS PIECE: a follow-up survey of fabric/'s other 15 crates (this
+    # file originally ported only fabric-facetql/frontdoor/keyspace.rs) found
+    # that most of the "placement/replication/scheduling"-shaped crates are
+    # exactly what fabric-facetql's own header already warned this survey to
+    # expect: fabric-routing's `RoutingTable` (table.rs, ~960 non-test lines)
+    # IS a real, pure decision procedure — `resolve`/`candidates`/
+    # `write_candidates`/`read_candidates` never touch a socket — but it is
+    # also a mutable index over THREE other crates' types (`ReplicaSet`,
+    # `Migration`, `TopologyRegistry`) with no self-contained algorithm
+    # smaller than "port those three crates too", which is a port of its own,
+    # not a shared file with something else — the identical reason
+    # `frontdoor/plan.rs` was passed over the first time. fabric-controller
+    # (3 757 lines) and fabric-runtime (3 744 lines) are almost entirely
+    # orchestration over `dyn` trait objects and channels — real content, but
+    # glue-shaped. fabric-optimizer and fabric-ml are explicitly, honestly
+    # documented (both in their own doc comments and in the workspace
+    # README's "ML predicts, the optimizer decides, the controller executes"
+    # line quoted below) as depending on the ML crate's trained-model
+    # predictions, which this survey did not verify are pure of RNG/model
+    # state the way a hand-checkable decision table is.
+    #
+    # `fabric-replication/src/failover.rs` is the exception, and it says so
+    # about ITSELF, in its own module doc, in almost the same words this
+    # file's own header already uses for keyspace.rs: "This module
+    # deliberately stops one step short of acting. It reports whether the
+    # primary still looks like a primary, which copies could take over, what
+    # each promotion would cost, and what is in the way... It does not apply
+    # it, there is no timer here, and calling `evaluate` twice changes
+    # nothing." `FailoverAssessment::evaluate(set: &ReplicaSet, now_ms: u64,
+    # policy: &FailoverPolicy) -> Self` reads a replica set and a clock
+    # reading already in hand and returns a verdict — no socket, no async, no
+    # serde in the decision path (every `Serialize` derive here is for
+    # shipping the VERDICT over the wire afterward, exactly like keyspace.rs's
+    # own `RoutingKey`/`KeyspaceMiss`).
+    #
+    # ============================================================
+    # WHAT THE LOGIC ACTUALLY IS (read in full from failover.rs, not assumed
+    # from its own doc comment):
+    # ============================================================
+    # A replica set has at most one primary (this crate's own set.rs invariant
+    # header) and zero or more secondaries. `evaluate` answers three questions
+    # about it at one instant:
+    #   1. `primary_needs_replacement` — is the primary no longer good for
+    #      writes? True if there IS no primary, or its own state is not
+    #      `InSync`, or it has gone silent for longer than
+    #      `policy.primary_silence_ms`. A primary that has NEVER reported is
+    #      deliberately NOT silence-flagged (a freshly bootstrapped primary
+    #      has no reports yet, and failing over a healthy new shard on that
+    #      basis would be exactly the "guess instead of refuse" keyspace.rs's
+    #      own header already treats as the failure mode to avoid).
+    #   2. For every SECONDARY (the primary is never its own candidate): is it
+    #      promotable, and if not, the first reason it isn't
+    #      (`ineligibility`, checked in this exact order — matching
+    #      `fn ineligibility` read top to bottom): not `InSync` at all; never
+    #      reported (no evidence to promote on); its own health report too
+    #      stale (past `max_candidate_silence_ms`); promoting it would lose
+    #      unapplied writes (`pending_writes > max_promotion_pending_writes`);
+    #      or it is too far behind in time
+    #      (`apply_lag_ms > max_promotion_apply_lag_ms`).
+    #   3. Given 1 and 2: what, if anything, blocks a promotion right now, and
+    #      what operation (if any) would resolve it — named, never applied
+    #      (`promotion()` returns an `Option<ReplicaOperation>`; nothing in
+    #      this crate calls `ReplicaSet::apply` on its own result).
+    #
+    # ============================================================
+    # REPRESENTATION — a replica set as parallel arrays, the same convention
+    # this file's own keyspace port already established for a rule table:
+    #   nodes:         [text]  replica i's node id
+    #   isPrimary:     [bool]  replica i's role (exactly one true in a
+    #                          validly constructed non-empty set — set.rs's
+    #                          own invariant, restated here, not re-checked)
+    #   state:         [int]   replica i's `ReplicaState`, in the exact order
+    #                          replica.rs's own lifecycle diagram lists them:
+    #                          0=Absent, 1=Seeding, 2=InSync, 3=Lagging,
+    #                          4=Failed
+    #   pendingWrites: [int]   replica i's `ReplicaLag::pending_writes`
+    #   applyLagMs:    [int]   replica i's `ReplicaLag::apply_lag_ms`
+    #   lastReportMs:  [int]   replica i's `last_report_ms`, sentinel-encoded
+    #                          (see below) since fct has no option type
+    #
+    # `ReplicaLag`'s two fields are threaded as two parallel `[int]` arrays
+    # rather than one packed int (contrast keyspace.rs's `RoutingKey`, packed
+    # into one scalar because nothing there ever compared its two fields
+    # SEPARATELY): `ineligibility` branches on `pending_writes` and
+    # `apply_lag_ms` against two INDEPENDENT budgets, so packing them would
+    # force unpacking right back out for every comparison this file makes.
+    #
+    # `last_report_ms: Option<u64>` is encoded as a plain `int` with `-1`
+    # meaning "never reported" — a sentinel, not a `has*` flag pair like
+    # keyspace.rs's `hasKind`/`hasAddress` — because every real timestamp
+    # `Replica::silence_ms`/`FailoverAssessment::evaluate` ever compares it
+    # against is a non-negative millisecond clock reading (this crate's own
+    # `ReplicaReport::timestamp_ms: u64`), so `-1` can never collide with a
+    # genuine value, exactly the same reasoning `ruleIndexForKind`'s `-1` "no
+    # match" already relies on a few hundred lines up in this same file.
+    #
+    # ============================================================
+    # SATURATING SUBTRACTION — `Replica::silence_ms`'s `now_ms.saturating_sub(last)`
+    # restated with the `max` builtin (`facet lang`'s own list) rather than an
+    # `if`, since "clamp a subtraction at zero" is exactly what `max(a - b, 0)`
+    # already says without a branch.
+    # ============================================================
+    proc failoverSaturatingSub(a: int, b: int) -> int:
+        return max(a - b, 0)
+
+    # ============================================================
+    # INELIGIBILITY — restates `fn ineligibility` exactly, top to bottom, one
+    # candidate at a time. Return codes (this file's own numbering; the real
+    # `Ineligibility` enum declares them in a different order, which does not
+    # matter because at most one branch of this ladder can ever fire):
+    #   0 = eligible (Rust's `None`)
+    #   1 = NotInSync         2 = NeverReported        3 = HealthTooStale
+    #   4 = WouldLoseWrites   5 = TooFarBehind
+    # ============================================================
+    proc failoverIneligibility(state: int, lastReportMs: int, nowMs: int, pendingWrites: int, applyLagMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> int:
+        if state != 2:
+            return 1
+        if lastReportMs == -1:
+            return 2
+        let silenceMs = do failoverSaturatingSub(nowMs, lastReportMs)
+        if silenceMs > maxCandidateSilenceMs:
+            return 3
+        if pendingWrites > maxPromotionPendingWrites:
+            return 4
+        if applyLagMs > maxPromotionApplyLagMs:
+            return 5
+        return 0
+
+    # failoverPrimaryIndex: the one replica with isPrimary true. Mirrors
+    # `ruleIndexForKind`'s exact "keep looping, only latch the FIRST hit"
+    # shape — appropriate here for the identical reason: set.rs's own
+    # invariant guarantees at most one, so which occurrence a duplicate would
+    # latch never actually matters, but the loop is written to make the same
+    # promise keyspace.rs's rule lookups already do rather than trust the
+    # invariant silently.
+    proc failoverPrimaryIndex(isPrimary: [bool]) -> int:
+        let n = len(isPrimary)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if isPrimary[i]:
+                    found = i
+            i = i + 1
+        return found
+
+    # failoverPrimaryNeedsReplacement: restates the `match primary { None =>
+    # true, Some(replica) => ... }` exactly — no primary at all, a primary
+    # whose own state is not `InSync`, or (only when it HAS reported at least
+    # once) a primary silent past `primarySilenceBudgetMs`.
+    proc failoverPrimaryNeedsReplacement(isPrimary: [bool], state: [int], lastReportMs: [int], nowMs: int, primarySilenceBudgetMs: int) -> bool:
+        let primaryIdx = do failoverPrimaryIndex(isPrimary)
+        if primaryIdx == -1:
+            return true
+        if state[primaryIdx] != 2:
+            return true
+        if lastReportMs[primaryIdx] != -1:
+            let silenceMs = do failoverSaturatingSub(nowMs, lastReportMs[primaryIdx])
+            if silenceMs > primarySilenceBudgetMs:
+                return true
+        return false
+
+    proc failoverSetIsEmpty(nodes: [text]) -> bool:
+        return len(nodes) == 0
+
+    # failoverBestCandidateIndex: `Rust`'s `candidates.sort_by(...)` followed
+    # by `.find(is_eligible)`, restated as ONE linear scan rather than a sort
+    # — the same "find the extreme by scanning instead of maintaining a
+    # sorted structure" convention storage.fct's own
+    # `pagerCacheLruVictimIndex` already documents for the identical reason
+    # (no sort/map primitive in this language). The real comparator is
+    # `eligible-first, then pending_writes ascending, then apply_lag_ms
+    # ascending, then node id ascending` and Rust's `sort_by` is STABLE, so a
+    # four-way tie falls through to whichever replica came first in the
+    # array `sort_by` was called on. That array is `ReplicaSet::secondaries()`,
+    # iterating the set's own `replicas: Vec<Replica>` — which `set.rs`'s
+    # `ReplicaOperation::Add` handler keeps sorted by node id after every
+    # insert (`self.replicas.sort_by(|l, r| l.node.0.cmp(&r.node.0))`, read
+    # directly in `set.rs`). So the fourth tie-break this file's job would
+    # otherwise be to restate — comparing node id TEXT — is already decided
+    # BEFORE this proc ever runs: a caller that hands `nodes`/`isPrimary`/
+    # etc. to this file in the same order a real `ReplicaSet` holds them
+    # (node-id order) makes "first array index wins a full tie" and "lowest
+    # node id wins a full tie" the same rule. This is restated here rather
+    # than glossed over because this language genuinely has no lexicographic
+    # `<`/`<=` on `text` (`facet lang`'s comparison operators all coerce
+    # through `toInt`/`toFloat` — confirmed against this very selfhost
+    # directory's own `expr.fct`, STAGE 0 header) — a real, confirmed
+    # language gap this port works around by leaning on an invariant the
+    # SOURCE crate already upholds, rather than one this port invents.
+    proc failoverBestCandidateIndex(isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> int:
+        let n = len(isPrimary)
+        let mut i = 0
+        let mut bestIdx = -1
+        let mut bestPending = -1
+        let mut bestLag = -1
+        loop i < n:
+            if !isPrimary[i]:
+                let ineligible = do failoverIneligibility(state[i], lastReportMs[i], nowMs, pendingWrites[i], applyLagMs[i], maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+                if ineligible == 0:
+                    if bestIdx == -1:
+                        bestIdx = i
+                        bestPending = pendingWrites[i]
+                        bestLag = applyLagMs[i]
+                    else:
+                        if pendingWrites[i] < bestPending:
+                            bestIdx = i
+                            bestPending = pendingWrites[i]
+                            bestLag = applyLagMs[i]
+                        else:
+                            if pendingWrites[i] == bestPending && applyLagMs[i] < bestLag:
+                                bestIdx = i
+                                bestPending = pendingWrites[i]
+                                bestLag = applyLagMs[i]
+            i = i + 1
+        return bestIdx
+
+    # failoverAnyInSyncSecondary: distinguishes the two "nothing is eligible"
+    # blockers exactly like `evaluate`'s own nested `if` does — an in-sync
+    # secondary that failed the POLICY (`EveryCandidateIneligible`) is a
+    # different, more fixable situation than no in-sync secondary EXISTING
+    # at all (`NoInSyncSecondary`).
+    proc failoverAnyInSyncSecondary(isPrimary: [bool], state: [int]) -> bool:
+        let n = len(isPrimary)
+        let mut i = 0
+        let mut found = false
+        loop i < n:
+            if !isPrimary[i]:
+                if state[i] == 2:
+                    found = true
+            i = i + 1
+        return found
+
+    # ============================================================
+    # THE GATEKEEPER FAMILY — restating `evaluate`'s own field-by-field
+    # derivation as independent, pure re-derivations of the identical inputs,
+    # the same "one proc, one fact, guaranteed to agree because both are pure
+    # functions of the same arguments" shape this file's own
+    # `keyspaceResolveStatus`/`keyspaceResolveKey` pair already uses, restated
+    # here for the "evaluate() produces MANY facts from the same walk"
+    # constraint that gave that pair its name. Blocker codes (there is at
+    # most one, matching `evaluate`'s own `if / else if / else if` chain,
+    # which can never push more than one `FailoverBlocker` — read directly,
+    # not assumed): -1=none, 0=PrimaryStillServing, 1=SetIsEmpty,
+    # 2=NoInSyncSecondary, 3=EveryCandidateIneligible.
+    # ============================================================
+    proc failoverBlockerCode(nodes: [text], isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, primarySilenceBudgetMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> int:
+        let needsReplacement = do failoverPrimaryNeedsReplacement(isPrimary, state, lastReportMs, nowMs, primarySilenceBudgetMs)
+        if !needsReplacement:
+            return 0
+        let empty = do failoverSetIsEmpty(nodes)
+        if empty:
+            return 1
+        let bestIdx = do failoverBestCandidateIndex(isPrimary, state, pendingWrites, applyLagMs, lastReportMs, nowMs, maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+        if bestIdx == -1:
+            let anyInSync = do failoverAnyInSyncSecondary(isPrimary, state)
+            if anyInSync:
+                return 3
+            return 2
+        return -1
+
+    # failoverHasPromotion / failoverPromotionNode: restate `promotion()`
+    # exactly — `None` outright when the primary does not need replacing,
+    # otherwise the best ELIGIBLE candidate if one exists. `failoverPromotionNode`
+    # is only meaningful once `failoverHasPromotion` has already returned
+    # true for the identical arguments (the `keyspaceResolveKey` contract,
+    # restated): calling it when no candidate is eligible reads `nodes[-1]`,
+    # a clean out-of-bounds error rather than a silently wrong node name.
+    proc failoverHasPromotion(isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, primarySilenceBudgetMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> bool:
+        let needsReplacement = do failoverPrimaryNeedsReplacement(isPrimary, state, lastReportMs, nowMs, primarySilenceBudgetMs)
+        if !needsReplacement:
+            return false
+        let bestIdx = do failoverBestCandidateIndex(isPrimary, state, pendingWrites, applyLagMs, lastReportMs, nowMs, maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+        return bestIdx != -1
+
+    proc failoverPromotionNode(nodes: [text], isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> text:
+        let bestIdx = do failoverBestCandidateIndex(isPrimary, state, pendingWrites, applyLagMs, lastReportMs, nowMs, maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+        return nodes[bestIdx]
+
+    # failoverIsStuck: restates `is_stuck()` — the write path has no primary
+    # AND no safe promotion, the single most urgent fact a controller reading
+    # this assessment can be told.
+    proc failoverIsStuck(isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, primarySilenceBudgetMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> bool:
+        let needsReplacement = do failoverPrimaryNeedsReplacement(isPrimary, state, lastReportMs, nowMs, primarySilenceBudgetMs)
+        let hasPromo = do failoverHasPromotion(isPrimary, state, pendingWrites, applyLagMs, lastReportMs, nowMs, primarySilenceBudgetMs, maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+        return needsReplacement && !hasPromo
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES for failover.rs — hand-verified against
+    # four real traced scenarios restated from failover.rs's own unit tests
+    # (full trace in the task report). All four share one two-replica set,
+    # `healthy_pair()`: db-a bootstrapped as primary (InSync, never reported
+    # — bootstrap sets state directly, it is not seeded), db-b added,
+    # seeded, marked in-sync, then observed at t=1 000 with zero lag — the
+    # exact sequence `failover.rs`'s own `healthy_pair()` test helper runs.
+    #   Default `FailoverPolicy`: primarySilenceBudgetMs=30 000,
+    #   maxCandidateSilenceMs=30 000, maxPromotionPendingWrites=0,
+    #   maxPromotionApplyLagMs=0 — restating `FailoverPolicy::default()`
+    #   exactly.
+    #   D1 `a_serving_primary_produces_no_promotion`: evaluate at t=1 000.
+    #      db-a is still InSync and has never reported (so it cannot be
+    #      silence-flagged) -> primary_needs_replacement=false ->
+    #      blocker=PrimaryStillServing(0), no promotion.
+    #   D2 `a_failed_primary_names_the_promotion_but_does_not_perform_it`:
+    #      db-a MarkFailed'd (state=Failed=4, role untouched). Evaluate at
+    #      t=1 000: needsReplacement=true (state check); db-b is eligible
+    #      (InSync, reported at 1 000, zero lag) -> promotion=Some(db-b).
+    #   D3 `a_lagging_candidate_is_refused_with_its_reason`: db-b observed
+    #      again at t=2 000 with lag(12, 400) — under the LAG THRESHOLDS
+    #      (1 000 writes / 5 000 ms) so it stays InSync, but the FAILOVER
+    #      POLICY's stricter budget (0 pending writes) refuses it anyway;
+    #      db-a MarkFailed'd. Evaluate at t=2 000 with the default policy:
+    #      no eligible candidate (db-b: WouldLoseWrites) -> blocker=
+    #      EveryCandidateIneligible(3), isStuck=true. The SAME set evaluated
+    #      with a lenient policy (maxPromotionPendingWrites=100,
+    #      maxPromotionApplyLagMs=1 000) makes db-b eligible again ->
+    #      promotion=Some(db-b) — restating the test's own point that this
+    #      crate computes the tradeoff, never decides it.
+    #   D4 `a_silent_primary_needs_replacement_even_while_marked_in_sync`:
+    #      db-a (the primary) itself observed at t=1 000 (state stays InSync
+    #      — a report never changes a PRIMARY's state, only its
+    #      last-report clock). Evaluate at t=31 001 (1 000 +
+    #      primarySilenceBudgetMs(30 000) + 1): the primary is still
+    #      InSync but has been silent for 30 001ms, over budget ->
+    #      needsReplacement=true even though primary_state is still InSync;
+    #      db-b's own last report (also t=1 000) is equally stale -> its
+    #      ineligibility is HealthTooStale, not WouldLoseWrites — "promoting
+    #      on stale health is refused rather than guessed at".
+    proc demoFailoverNodesD1D2D3() -> [text]:
+        return ["db-a", "db-b"]
+
+    proc demoFailoverIsPrimaryD1D2D3() -> [bool]:
+        return [true, false]
+
+    proc demoFailoverStateD1() -> [int]:
+        return [2, 2]
+
+    proc demoFailoverStateD2D3() -> [int]:
+        return [4, 2]
+
+    proc demoFailoverPendingD1D2() -> [int]:
+        return [0, 0]
+
+    proc demoFailoverLagD1D2() -> [int]:
+        return [0, 0]
+
+    proc demoFailoverLastReportD1D2() -> [int]:
+        return [-1, 1000]
+
+    proc demoFailoverPendingD3() -> [int]:
+        return [0, 12]
+
+    proc demoFailoverLagD3() -> [int]:
+        return [0, 400]
+
+    proc demoFailoverLastReportD3() -> [int]:
+        return [-1, 2000]
+
+    proc demoFailoverStateD4() -> [int]:
+        return [2, 2]
+
+    proc demoFailoverLastReportD4() -> [int]:
+        return [1000, 1000]
+
+    proc demoD1Blocker() -> int:
+        let nodes = do demoFailoverNodesD1D2D3()
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD1()
+        let pending = do demoFailoverPendingD1D2()
+        let lag = do demoFailoverLagD1D2()
+        let lastReport = do demoFailoverLastReportD1D2()
+        let blocker = do failoverBlockerCode(nodes, isPrimary, state, pending, lag, lastReport, 1000, 30000, 30000, 0, 0)
+        return blocker
+
+    proc demoD1HasPromotion() -> bool:
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD1()
+        let pending = do demoFailoverPendingD1D2()
+        let lag = do demoFailoverLagD1D2()
+        let lastReport = do demoFailoverLastReportD1D2()
+        let has = do failoverHasPromotion(isPrimary, state, pending, lag, lastReport, 1000, 30000, 30000, 0, 0)
+        return has
+
+    proc demoD2HasPromotion() -> bool:
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD2D3()
+        let pending = do demoFailoverPendingD1D2()
+        let lag = do demoFailoverLagD1D2()
+        let lastReport = do demoFailoverLastReportD1D2()
+        let has = do failoverHasPromotion(isPrimary, state, pending, lag, lastReport, 1000, 30000, 30000, 0, 0)
+        return has
+
+    proc demoD2PromotionNode() -> text:
+        let nodes = do demoFailoverNodesD1D2D3()
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD2D3()
+        let pending = do demoFailoverPendingD1D2()
+        let lag = do demoFailoverLagD1D2()
+        let lastReport = do demoFailoverLastReportD1D2()
+        let node = do failoverPromotionNode(nodes, isPrimary, state, pending, lag, lastReport, 1000, 30000, 0, 0)
+        return node
+
+    proc demoD3StrictBlocker() -> int:
+        let nodes = do demoFailoverNodesD1D2D3()
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD2D3()
+        let pending = do demoFailoverPendingD3()
+        let lag = do demoFailoverLagD3()
+        let lastReport = do demoFailoverLastReportD3()
+        let blocker = do failoverBlockerCode(nodes, isPrimary, state, pending, lag, lastReport, 2000, 30000, 30000, 0, 0)
+        return blocker
+
+    proc demoD3StrictIsStuck() -> bool:
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD2D3()
+        let pending = do demoFailoverPendingD3()
+        let lag = do demoFailoverLagD3()
+        let lastReport = do demoFailoverLastReportD3()
+        let stuck = do failoverIsStuck(isPrimary, state, pending, lag, lastReport, 2000, 30000, 30000, 0, 0)
+        return stuck
+
+    proc demoD3LenientHasPromotion() -> bool:
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD2D3()
+        let pending = do demoFailoverPendingD3()
+        let lag = do demoFailoverLagD3()
+        let lastReport = do demoFailoverLastReportD3()
+        let has = do failoverHasPromotion(isPrimary, state, pending, lag, lastReport, 2000, 30000, 30000, 100, 1000)
+        return has
+
+    proc demoD3LenientPromotionNode() -> text:
+        let nodes = do demoFailoverNodesD1D2D3()
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD2D3()
+        let pending = do demoFailoverPendingD3()
+        let lag = do demoFailoverLagD3()
+        let lastReport = do demoFailoverLastReportD3()
+        let node = do failoverPromotionNode(nodes, isPrimary, state, pending, lag, lastReport, 2000, 30000, 100, 1000)
+        return node
+
+    proc demoD4NeedsReplacement() -> bool:
+        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
+        let state = do demoFailoverStateD4()
+        let lastReport = do demoFailoverLastReportD4()
+        let needs = do failoverPrimaryNeedsReplacement(isPrimary, state, lastReport, 31001, 30000)
+        return needs
+
+    proc demoD4CandidateIneligibility() -> int:
+        let state = do demoFailoverStateD4()
+        let lastReport = do demoFailoverLastReportD4()
+        let ineligible = do failoverIneligibility(state[1], lastReport[1], 31001, 0, 0, 30000, 0, 0)
+        return ineligible
+
+    # ============================================================
     # DEMO / BUILD-CHECK FIXTURES — hand-verified against three real traced
     # scenarios restated from keyspace.rs's own unit tests (full trace in
     # the task report):
@@ -504,6 +961,39 @@ app FabricSelfHost:
         let status = do keyspaceAddRuleStatus(kinds, prefixes, "Comment", "Comment:")
         return status
 
+    state demoD1Blocker: int = 0
+    state demoD1HasPromotion: bool = true
+    state demoD2HasPromotion: bool = false
+    state demoD2PromotionNode: text = ""
+    state demoD3StrictBlocker: int = 0
+    state demoD3StrictIsStuck: bool = false
+    state demoD3LenientHasPromotion: bool = false
+    state demoD3LenientPromotionNode: text = ""
+    state demoD4NeedsReplacement: bool = false
+    state demoD4CandidateIneligibility: int = 0
+
+    action runDemoFailover():
+        let d1Blocker = do demoD1Blocker()
+        let d1HasPromotion = do demoD1HasPromotion()
+        let d2HasPromotion = do demoD2HasPromotion()
+        let d2PromotionNode = do demoD2PromotionNode()
+        let d3StrictBlocker = do demoD3StrictBlocker()
+        let d3StrictIsStuck = do demoD3StrictIsStuck()
+        let d3LenientHasPromotion = do demoD3LenientHasPromotion()
+        let d3LenientPromotionNode = do demoD3LenientPromotionNode()
+        let d4NeedsReplacement = do demoD4NeedsReplacement()
+        let d4CandidateIneligibility = do demoD4CandidateIneligibility()
+        demoD1Blocker = d1Blocker
+        demoD1HasPromotion = d1HasPromotion
+        demoD2HasPromotion = d2HasPromotion
+        demoD2PromotionNode = d2PromotionNode
+        demoD3StrictBlocker = d3StrictBlocker
+        demoD3StrictIsStuck = d3StrictIsStuck
+        demoD3LenientHasPromotion = d3LenientHasPromotion
+        demoD3LenientPromotionNode = d3LenientPromotionNode
+        demoD4NeedsReplacement = d4NeedsReplacement
+        demoD4CandidateIneligibility = d4CandidateIneligibility
+
     state demoA1Status: int = 0
     state demoA1Key: int = 0
     state demoA2Status: int = 0
@@ -558,3 +1048,4 @@ app FabricSelfHost:
     view Home at "/":
         box:
             text "{demoA1Status} {demoA1Key} {demoA2Status} {demoB1Status} {demoB1Key} {demoB2Key} {demoC1Status} {demoC1Key} {demoC1bStatus} {demoC2NotSpanning} {demoC2SingleSpanning} {demoValEmptyKind} {demoValEmptyPrefix} {demoValDupKind} {demoValDupPrefix} {demoValOk}"
+            text "{demoD1Blocker} {demoD1HasPromotion} {demoD2HasPromotion} {demoD2PromotionNode} {demoD3StrictBlocker} {demoD3StrictIsStuck} {demoD3LenientHasPromotion} {demoD3LenientPromotionNode} {demoD4NeedsReplacement} {demoD4CandidateIneligibility}"

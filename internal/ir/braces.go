@@ -181,6 +181,10 @@ func textLits(ex ast.Expr) []string {
 			for _, el := range t.Elems {
 				walk(el)
 			}
+		case ast.StructLit:
+			for _, fi := range t.Fields {
+				walk(fi.Expr)
+			}
 		case ast.Get:
 			walk(t.Obj)
 		case ast.EntityGet:

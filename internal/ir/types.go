@@ -263,6 +263,10 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			// money() is the *formatter*: it renders int cents as text. The `money`
 			// type is what it reads, not what it returns.
 			return vtype{core: "text"}
+		case "toMoney":
+			// toMoney()'s the inverse: it *parses* text into a money amount, so
+			// (unlike money()) the money type is what it returns, not what it reads.
+			return vtype{core: "money"}
 		case "contains":
 			return vtype{core: "bool"}
 		case "len", "year", "month", "day", "rand":

@@ -1,0 +1,962 @@
+import "expr.fct"
+
+app NodesSelfHost:
+    # Partial, honest self-hosting port of internal/parser/parser.go's
+    # VIEW / UI-NODE parsing layer — `parseView` (the `view Name at
+    # "/path":` header) and `parseNodes` (the recursive tree of `box`/
+    # `row`/`text`/`link`/... node lines beneath it) — into `.fct` `proc`s.
+    #
+    # ============================================================
+    # WHY THIS IS A NEW FILE, NOT AN EXTENSION OF parser.fct
+    # ============================================================
+    # Read fresh before choosing: parser.fct already declares its own
+    # `view Home at "/"` (its STAGE 18 driver view) and does NOT import
+    # expr.fct — every one of its ~90 ported declarations (proc header,
+    # entity, state, derive, webhook, job, policy, service) is plain text
+    # surgery with no embedded sub-EXPRESSION ever actually parsed into a
+    # tree. This file's own job is different in exactly the way that
+    # matters: `text "Hi {name}"` and `link "…" -> "/user/{id}"` both need
+    # a REAL expression parsed out of `{…}`, and this task's own brief says
+    # to reuse expr.fct for that rather than re-deriving a second
+    # expression grammar. Importing expr.fct INTO parser.fct to get that
+    # would merge expr.fct's own `view Home at "/"` alongside parser.fct's
+    # existing one — internal/compile/compile.go's checkDuplicates rejects
+    # two declarations of the same name in the same kind ("view %q is
+    # declared more than once") — the EXACT collision stmt.fct's own header
+    # already hit and documented for source.fct+expr.fct. So: a new sibling
+    # file, importing expr.fct alone (for real `tokenKinds`/`tokenTexts`/
+    # `orNodes`), with its own view at a different name AND path
+    # ("/nodes") to stay clear of expr.fct's `Home` at "/". parser.fct's
+    # own text-surgery/header conventions (hasPrefix/trimPrefix/
+    # trimSuffix/indexOf/isIdentToken) are restated locally here under
+    # this file's own names rather than imported, exactly as stmt.fct
+    # restated source.fct's parents/children convention under `body`/
+    # `stmt` names instead of importing source.fct.
+    #
+    # ============================================================
+    # SCOPE: the view header, plus four node keywords — box, row, text,
+    # link — chosen as the most foundational (a block that lays out
+    # children, a leaf that shows content, a leaf that navigates), per the
+    # task's own suggested short list. NOT ported (genuinely out of scope,
+    # not silently approximated): `requires`/`in Layout` trailing clauses
+    # and `meta title/description` on the view header; every other node
+    # keyword (for/if/match/tabs/button/image/input/form/...); and
+    # `class`/`style`/`anchor` trailing modifiers (parser.go's
+    # stripNodeMods/trailingNodeMod) — that machinery does its own
+    # balanced, string-aware backward scan for a trailing `kw "value"`
+    # pair, a genuinely separate feature from node-body parsing, and
+    # porting it honestly would be its own round of work, not a bolt-on
+    # here.
+    #
+    # ============================================================
+    # IS stmt.fct's Block/StmtSlot MACHINERY REUSABLE FOR "A NODE WITH N
+    # CHILD NODES" THE SAME WAY IT WORKED FOR "A STATEMENT WITH N CHILD
+    # STATEMENTS"? YES, directly in SHAPE — a `box`/`row`'s children are
+    # exactly a sibling list recovered off source.fct's own
+    # parents/children convention, the identical shape a proc body's own
+    # statement list already was. This file's NodeBlock (kind 17) and
+    # NodeSlot (kind 22) are a straight rename of stmt.fct's Block (17) /
+    # StmtSlot (28) — same fields, same "build every child's subtree
+    # first, then append N pointer rows contiguously, then the Block/
+    # NodeBlock row itself" discipline, same `count = selfIdx - firstSlot`
+    # arithmetic. The kind NUMBERS are independent (this file never merges
+    # with stmt.fct, only with expr.fct, so there is no risk of collision
+    # with stmt.fct's own 17-29 range; they were kept numerically similar
+    # only for a reader's convenience in cross-referencing the two files).
+    #
+    # One real adaptation was needed, though, not just a rename: `link`'s
+    # label and destination are NOT child NODES the way a `box`'s children
+    # are — they are each a piece of TEXT (a run of literal characters and
+    # `{expr}` interpolations). This is a variable-arity shape on a NEW
+    # axis stmt.fct never needed (segments INSIDE one string, not sibling
+    # statements/nodes in a list), so it needed its own auxiliary-row
+    # family, SegSlot (kind 23) — ArgSlot's/StmtSlot's exact "N contiguous
+    # pointer rows, count recovered by idx-minus-first arithmetic" trick,
+    # generalized to point at an EXPRESSION's root instead of a
+    # statement's or a call argument's. And rather than give `Link` four
+    # separate facts (label-first-slot, label-count, dest-first-slot,
+    # dest-count — more than one row's four usable slots comfortably
+    # carry two of independently), this file applies stmt.fct's own `If`
+    # lesson one level further: `text`'s own shape (a firstSegSlot plus a
+    # lineIdx) is built as a small reusable node in its own right (kind 20,
+    # via nodeTextLikeNodes below) and `link` just stores the two
+    # resulting NODE INDICES (its label's Text-shaped node, its dest's) as
+    # its own two facts — collapsing "content plus content's own segment
+    # count" into one fact each, exactly the way wrapping an `if`
+    # branch's statements in their own Block collapsed "body plus
+    # body-count" into one fact in stmt.fct.
+    #
+    # ============================================================
+    # THE ARENA: the SAME flat `[int]` array expr.fct's own arena uses (5
+    # ints per row: kind, then four payload slots), imported and threaded
+    # exactly the way stmt.fct threads it through expr.fct's own
+    # `orNodes`. Kinds 0-16 belong to expr.fct (Lit/Ref/Bin/.../AggMeta —
+    # read fresh from expr.fct before picking this file's own range, so
+    # there is no numeric overlap even though both live in the one array).
+    # This file's own kinds:
+    #
+    #   17 NodeBlock — a child-NODE list (a view's own top-level body, or
+    #                  a `box`/`row`'s own children). Slot1 = the index of
+    #                  this block's first NodeSlot row (-1 if empty),
+    #                  slots 2-4 unused. Count recovered the same
+    #                  idx-minus-firstSlot arithmetic every Block-shaped
+    #                  kind in this whole self-hosting effort already uses
+    #                  (see blockStmtCount's own doc in stmt.fct).
+    #   18 Box        — Slot1 = the NodeBlock index holding this box's
+    #                  children.
+    #   19 Row        — identical shape to Box; the kind number alone
+    #                  distinguishes them (the same "kind alone, no extra
+    #                  flag slot" convention expr.fct's own Lit(int) vs.
+    #                  Lit(float) split already established).
+    #   20 Text       — a (possibly empty, possibly segmented) piece of
+    #                  content: literal runs interleaved with `{expr}`
+    #                  interpolations. Slot1 = the index of this text's
+    #                  first SegSlot row (-1 if every segment is literal —
+    #                  including the common case of NO interpolation at
+    #                  all). Slot2 = lineIdx, the index of this node's own
+    #                  source line in the caller's `texts`/`parents`
+    #                  arrays (stmt.fct's own "recover a name on demand
+    #                  from texts[lineIdx] rather than storing it" idiom —
+    #                  see textInnerOf/linkLabelInnerOf/linkDestInnerOf
+    #                  below for exactly how a literal segment's own raw
+    #                  TEXT, never stored in the arena, is recovered from
+    #                  it). Built by nodeTextLikeNodes, shared verbatim by
+    #                  both the real `text` keyword AND `link`'s label/
+    #                  destination — see the header note above.
+    #   21 Link       — Slot1 = the label's own Text-shaped node index.
+    #                  Slot2 = the destination's own Text-shaped node
+    #                  index. Slot3 = lineIdx. Slot4 unused.
+    #   22 NodeSlot   — the auxiliary "pointer" row a NodeBlock's own
+    #                  variable-arity child list needs — stmt.fct's
+    #                  StmtSlot / expr.fct's ArgSlot, renamed: Slot1 =
+    #                  one child NODE's real root index, slots 2-4 unused.
+    #   23 SegSlot    — the auxiliary "pointer" row a Text-shaped node's
+    #                  own variable-arity EXPRESSION-segment list needs:
+    #                  Slot1 = one `{…}` segment's real expression root
+    #                  index (into this same shared arena — an ordinary
+    #                  expr.fct subtree), slots 2-4 unused. A LITERAL
+    #                  segment gets no SegSlot row at all (it carries no
+    #                  arena-representable value — its own raw text is
+    #                  recovered from source on demand, never stored),
+    #                  exactly mirroring how ArgSlot/StmtSlot only ever
+    #                  point at real, already-built subtrees.
+    #   25 Unsupported — a node-shaped line this file was not scoped to
+    #                  parse (any keyword besides box/row/text/link,
+    #                  reported honestly rather than crashing or guessing
+    #                  a wrong shape — the same convention every earlier
+    #                  file in this port already established for its own
+    #                  out-of-scope constructs). Slot1 = lineIdx.
+    #
+    # (Kind 24 is deliberately left unused — a placeholder the way
+    # stmt.fct's own kind numbering leaves gaps for a future node this
+    # round did not need, e.g. an `if`/`for` node's own condition/loop
+    # facts, which a later round could add without renumbering anything
+    # above.)
+    #
+    # ============================================================
+    # HAND-TRACED VERIFICATION (see this file's own closing report for the
+    # full row-by-row arithmetic): three real, multi-line view bodies —
+    # (1) a `box` with two plain `text "…"` children, (2) a `link` whose
+    # label is pure literal and whose destination is pure literal, and
+    # (3) a `text` line with a real `{name}` interpolation in the middle
+    # of two literal runs — were traced by hand against the algorithm
+    # below, confirming: a NodeBlock's own child count and each child's
+    # real root index are recoverable by pure arithmetic with no
+    # backpatching; a Text node's segment count and each segment's own
+    # literal text / expression root are both recoverable; and `link`'s
+    # label/destination each resolve, via their own Text-shaped node
+    # index, to the identical reader family `text` itself uses — no
+    # separate code path needed for "a link's label" versus "a bare text
+    # node".
+    #
+    # ============================================================
+    # STAGE 1: generic text-surgery primitives — parser.fct's own STAGE 1
+    # (hasPrefixText/trimPrefixText/trimSuffixText/indexOf), restated
+    # locally under `node`-prefixed names (see the header above for why
+    # this file does not import parser.fct itself).
+    # ============================================================
+    proc nodeHasPrefix(s: text, p: text) -> bool:
+        let n = len(p)
+        if n > len(s):
+            return false
+        return slice(s, 0, n) == p
+
+    proc nodeTrimPrefix(s: text, p: text) -> text:
+        let has = do nodeHasPrefix(s, p)
+        if has:
+            return slice(s, len(p), len(s))
+        return s
+
+    proc nodeHasSuffix(s: text, suf: text) -> bool:
+        let n = len(suf)
+        let ls = len(s)
+        if n > ls:
+            return false
+        return slice(s, ls - n, ls) == suf
+
+    proc nodeTrimSuffix(s: text, suf: text) -> text:
+        let has = do nodeHasSuffix(s, suf)
+        if has:
+            return slice(s, 0, len(s) - len(suf))
+        return s
+
+    proc nodeIndexOfFrom(s: text, sub: text, from: int) -> int:
+        let n = len(s)
+        let m = len(sub)
+        let mut i = from
+        if i < 0:
+            i = 0
+        let mut found = -1
+        loop i <= n - m && found == -1:
+            if slice(s, i, i + m) == sub:
+                found = i
+            i = i + 1
+        return found
+
+    proc nodeIndexOf(s: text, sub: text) -> int:
+        let r = do nodeIndexOfFrom(s, sub, 0)
+        return r
+
+    # ============================================================
+    # STAGE 2: closed-alphabet identifier classification — parser.fct's
+    # own STAGE 2 (isDigitChar/isIdentStartChar/isIdentChar/isIdentToken),
+    # restated locally; needed only for the view header's own name check.
+    # ============================================================
+    proc nodeIsDigitChar(c: text) -> bool:
+        return c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+    proc nodeIsIdentStartChar(c: text) -> bool:
+        return c in ["_", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
+    proc nodeIsIdentChar(c: text) -> bool:
+        let startOk = do nodeIsIdentStartChar(c)
+        if startOk:
+            return true
+        let digitOk = do nodeIsDigitChar(c)
+        return digitOk
+
+    proc nodeIsIdentToken(s: text) -> bool:
+        let n = len(s)
+        if n == 0:
+            return false
+        let mut ok = true
+        let mut i = 0
+        loop i < n && ok:
+            let c = charAt(s, i)
+            if i == 0:
+                let st = do nodeIsIdentStartChar(c)
+                if !st:
+                    ok = false
+            else:
+                let ic = do nodeIsIdentChar(c)
+                if !ic:
+                    ok = false
+            i = i + 1
+        return ok
+
+    # ============================================================
+    # STAGE 3: quote/brace scanning — the machinery `stripNodeMods`'s own
+    # `endOfQuoted`/`endOfInterp` provide in parser.go, restated here in
+    # the narrower shape this file's own scope actually needs.
+    #
+    # nodeSkipQuoted mirrors expr.fct's own string-literal tokenizer
+    # branch (STAGE 1 there) exactly — the same "scan forward, a `\`
+    # unconditionally skips the next character, stop at the first bare
+    # `"`" idiom, reused verbatim rather than re-derived.
+    #
+    # nodeMatchBrace is the same idea applied to `{`/`}` DEPTH instead of
+    # a single closing quote — real parser.go's own endOfInterp is also
+    # QUOTE-aware (a `"` inside an interpolation is opaque to brace
+    # counting, so `{f("}")}` closes where the author meant). This port's
+    # version is honestly narrower: depth-counting only, no quote
+    # awareness inside `{…}` — a `"` containing a literal `}` inside an
+    # interpolation is a genuine, documented gap (the same class of
+    # honestly-reported narrowing this whole self-hosting effort already
+    # uses elsewhere, e.g. expr.fct's own out-of-scope shift operators).
+    # Every hand-traced example below avoids that shape.
+    # ============================================================
+    proc nodeSkipQuoted(s: text, openIdx: int) -> int:
+        let n = len(s)
+        let mut j = openIdx + 1
+        let mut scanning = true
+        loop scanning:
+            if j < n:
+                if charAt(s, j) == "\"":
+                    scanning = false
+                else:
+                    if charAt(s, j) == "\\":
+                        j = j + 1
+                    j = j + 1
+            else:
+                scanning = false
+        return j
+
+    # nodeQuotedSpan: the inner content of a value expected to be EXACTLY
+    # one quoted string spanning the whole of `s` (parser.go's own
+    # unquoteText requirement for `text "…"`/a link's label or
+    # destination) — "" for anything that does not even open with a
+    # quote. Like every other quote handling in this whole self-hosting
+    # effort (parser.fct's STAGE 13 quotedInner, expr.fct's FINDING 7),
+    # this does not decode backslash escapes — the raw substring between
+    # the two quote characters is exactly what nodeSegLitAt/
+    # nodeSegExprInnerAt below need, and decoding is left to whoever
+    # ultimately renders the value.
+    proc nodeQuotedSpan(s: text) -> text:
+        if len(s) < 2:
+            return ""
+        if slice(s, 0, 1) != "\"":
+            return ""
+        let close = do nodeSkipQuoted(s, 0)
+        if close >= len(s):
+            return ""
+        return slice(s, 1, close)
+
+    # nodeIndexTopArrow: the first `->` OUTSIDE any quoted string — the
+    # `link "label" -> "dest"` splitter, parser.go's own indexTop("->")
+    # restated over this file's own quote scanner.
+    proc nodeIndexTopArrow(s: text) -> int:
+        let n = len(s)
+        let mut i = 0
+        let mut found = -1
+        loop i < n && found == -1:
+            let c = charAt(s, i)
+            if c == "\"":
+                let close = do nodeSkipQuoted(s, i)
+                i = close + 1
+            else:
+                if i + 1 < n:
+                    if slice(s, i, i + 2) == "->":
+                        found = i
+                    else:
+                        i = i + 1
+                else:
+                    i = i + 1
+        return found
+
+    # nodeMatchBrace: the index of the `}` matching the `{` at s[openIdx]
+    # (which must be a `{`), or -1 if it never closes — see this stage's
+    # own header note for the honest "no quote-awareness inside braces"
+    # scope limit.
+    proc nodeMatchBrace(s: text, openIdx: int) -> int:
+        let n = len(s)
+        let mut depth = 1
+        let mut j = openIdx + 1
+        let mut scanning = true
+        let mut result = -1
+        loop scanning:
+            if j < n:
+                if charAt(s, j) == "\\":
+                    j = j + 2
+                else:
+                    if charAt(s, j) == "{":
+                        depth = depth + 1
+                        j = j + 1
+                    else:
+                        if charAt(s, j) == "}":
+                            depth = depth - 1
+                            if depth == 0:
+                                result = j
+                                scanning = false
+                            else:
+                                j = j + 1
+                        else:
+                            j = j + 1
+            else:
+                scanning = false
+        return result
+
+    # ============================================================
+    # STAGE 4: segment splitting — a pure function of an already-dequoted
+    # `inner` string (e.g. `Hi {name}!`) into an ordered run of literal
+    # and `{expr}` segments. Every "at index i" reader below independently
+    # re-walks the scan from the start rather than sharing one pass — the
+    # same "position vs. data are separate pure families of procs" idiom
+    # this whole self-hosting effort uses throughout, forced by a proc
+    # never returning more than one value or a heterogeneous shape.
+    # ============================================================
+    proc nodeSegCount(inner: text) -> int:
+        let n = len(inner)
+        let mut i = 0
+        let mut count = 0
+        let mut inLit = false
+        loop i < n:
+            let c = charAt(inner, i)
+            if c == "{":
+                if inLit:
+                    count = count + 1
+                    inLit = false
+                let close = do nodeMatchBrace(inner, i)
+                count = count + 1
+                if close < 0:
+                    i = n
+                else:
+                    i = close + 1
+            else:
+                inLit = true
+                i = i + 1
+        if inLit:
+            count = count + 1
+        return count
+
+    # nodeSegStartAt: the START offset (into `inner`) of segment #idx —
+    # the one fact every other segment reader below is built from
+    # (nodeSegEndAt(idx) is just nodeSegStartAt(idx+1), or len(inner) for
+    # the last segment — no separate "end" scan needed).
+    proc nodeSegStartAt(inner: text, idx: int) -> int:
+        let n = len(inner)
+        let mut i = 0
+        let mut segIdx = 0
+        let mut result = -1
+        let mut litOpen = false
+        let mut litStart = 0
+        loop i < n && result == -1:
+            let c = charAt(inner, i)
+            if c == "{":
+                if litOpen:
+                    if segIdx == idx:
+                        result = litStart
+                    segIdx = segIdx + 1
+                    litOpen = false
+                if result == -1:
+                    if segIdx == idx:
+                        result = i
+                    let close = do nodeMatchBrace(inner, i)
+                    let mut endIdx = n
+                    if close >= 0:
+                        endIdx = close + 1
+                    segIdx = segIdx + 1
+                    i = endIdx
+            else:
+                if !litOpen:
+                    litOpen = true
+                    litStart = i
+                i = i + 1
+        if result == -1 && litOpen:
+            if segIdx == idx:
+                result = litStart
+        return result
+
+    proc nodeSegEndAt(inner: text, idx: int) -> int:
+        let cnt = do nodeSegCount(inner)
+        if idx + 1 < cnt:
+            let r = do nodeSegStartAt(inner, idx + 1)
+            return r
+        return len(inner)
+
+    proc nodeSegIsExprAt(inner: text, idx: int) -> bool:
+        let start = do nodeSegStartAt(inner, idx)
+        if start < 0:
+            return false
+        if start >= len(inner):
+            return false
+        return charAt(inner, start) == "{"
+
+    proc nodeSegLitAt(inner: text, idx: int) -> text:
+        let isE = do nodeSegIsExprAt(inner, idx)
+        if isE:
+            return ""
+        let start = do nodeSegStartAt(inner, idx)
+        let end = do nodeSegEndAt(inner, idx)
+        return slice(inner, start, end)
+
+    # nodeSegExprInnerAt: the substring BETWEEN the `{`/`}` of an
+    # expression segment — exactly what tokenKinds/tokenTexts/orNodes
+    # below parse, mirroring the "the token span is what matters, decoding
+    # is someone else's job" idiom expr.fct's own FINDING 7 established.
+    proc nodeSegExprInnerAt(inner: text, idx: int) -> text:
+        let isE = do nodeSegIsExprAt(inner, idx)
+        if !isE:
+            return ""
+        let start = do nodeSegStartAt(inner, idx)
+        let end = do nodeSegEndAt(inner, idx)
+        return slice(inner, start + 1, end - 1)
+
+    proc nodeSegExprCount(inner: text) -> int:
+        let cnt = do nodeSegCount(inner)
+        let mut m = 0
+        let mut i = 0
+        loop i < cnt:
+            let isE = do nodeSegIsExprAt(inner, i)
+            if isE:
+                m = m + 1
+            i = i + 1
+        return m
+
+    # ============================================================
+    # STAGE 5: nodeSegNodes — builds every expression segment's own
+    # subtree (via expr.fct's real `tokenKinds`/`tokenTexts`/`orNodes`,
+    # not a re-derived expression grammar), then appends one SegSlot row
+    # per expression segment, CONTIGUOUSLY, exactly mirroring expr.fct's
+    # own argListNodes (FINDING 8) / stmt.fct's own stmtBlockNodes: build
+    # every child subtree into a proc-LOCAL accumulator first (safe to
+    # grow with `append` since it never crosses a return-value boundary),
+    # then walk that accumulator once at the end to emit the pointer rows
+    # in order, so "the first SegSlot's index" is recoverable by the
+    # caller via pure arithmetic (idx-minus-count) afterward.
+    # ============================================================
+    proc nodeSegNodes(inner: text, arena: [int]) -> [int]:
+        let cnt = do nodeSegCount(inner)
+        let mut a = arena
+        let mut rootIdxs = []
+        let mut i = 0
+        loop i < cnt:
+            let isE = do nodeSegIsExprAt(inner, i)
+            if isE:
+                let innerExpr = do nodeSegExprInnerAt(inner, i)
+                let k = do tokenKinds(innerExpr)
+                let tx = do tokenTexts(innerExpr)
+                let a1 = do orNodes(k, tx, 0, a)
+                let rootIdx = (len(a1) / 5) - 1
+                rootIdxs = append(rootIdxs, rootIdx)
+                a = a1
+            i = i + 1
+        let m = len(rootIdxs)
+        let mut k2 = 0
+        loop k2 < m:
+            a = append(a, 23)
+            a = append(a, rootIdxs[k2])
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            k2 = k2 + 1
+        return a
+
+    # nodeTextLikeNodes: appends one Text-shaped row (kind 20) built from
+    # `inner`'s own segments — shared, verbatim, by the real `text`
+    # keyword and by `link`'s own label/destination (see this file's
+    # header for why that sharing is the real design win here).
+    proc nodeTextLikeNodes(inner: text, lineIdx: int, arena: [int]) -> [int]:
+        let a1 = do nodeSegNodes(inner, arena)
+        let exprCount = do nodeSegExprCount(inner)
+        let mut first = -1
+        if exprCount > 0:
+            first = (len(a1) / 5) - exprCount
+        let mut a = a1
+        a = append(a, 20)
+        a = append(a, first)
+        a = append(a, lineIdx)
+        a = append(a, -1)
+        a = append(a, -1)
+        return a
+
+    # ============================================================
+    # STAGE 6: raw multi-line node-tree TEXT -> the two parallel arrays
+    # (`texts`/`parents`) this file's node builder consumes — source.fct's
+    # own algorithm, restated locally under `body`-prefixed names exactly
+    # as stmt.fct already restated it (see this file's header for why
+    # source.fct itself is not imported).
+    # ============================================================
+    proc bodyIsBlankOrComment(line: text) -> bool:
+        let t = trim(line)
+        if len(t) == 0:
+            return true
+        return slice(t, 0, 1) == "#"
+
+    proc bodyIndentOf(line: text) -> int:
+        let n = len(line)
+        let mut count = 0
+        loop count < n && charAt(line, count) == " ":
+            count = count + 1
+        return count
+
+    proc bodyLineText(line: text) -> text:
+        return trim(line)
+
+    proc bodyIndents(src: text) -> [int]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let skip = do bodyIsBlankOrComment(raw)
+            if !skip:
+                let ind = do bodyIndentOf(raw)
+                out = append(out, ind)
+            i = i + 1
+        return out
+
+    proc bodyTexts(src: text) -> [text]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let skip = do bodyIsBlankOrComment(raw)
+            if !skip:
+                let tx = do bodyLineText(raw)
+                out = append(out, tx)
+            i = i + 1
+        return out
+
+    proc bodyParents(indents: [int]) -> [int]:
+        let n = len(indents)
+        let mut stackIndent = []
+        let mut stackNode = []
+        let mut fillI = 0
+        loop fillI < n:
+            stackIndent = append(stackIndent, -1)
+            stackNode = append(stackNode, -1)
+            fillI = fillI + 1
+        let mut top = -1
+        let mut parents = []
+        let mut k = 0
+        loop k < n:
+            let cur = indents[k]
+            loop top >= 0:
+                if stackIndent[top] >= cur:
+                    top = top - 1
+                else:
+                    break
+            let mut parent = -1
+            if top >= 0:
+                parent = stackNode[top]
+            parents = append(parents, parent)
+            top = top + 1
+            stackIndent[top] = cur
+            stackNode[top] = k
+            k = k + 1
+        return parents
+
+    proc nodeChildrenOf(node: int, parents: [int]) -> [int]:
+        let n = len(parents)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if parents[i] == node:
+                out = append(out, i)
+            i = i + 1
+        return out
+
+    # ============================================================
+    # STAGE 7: per-line recovery of a `text`/`link` line's own raw content
+    # substring — re-derived from `lineText` alone (never stored in the
+    # arena), the exact same "recover a name/value on demand from the
+    # source line" idiom stmt.fct's own letOrAssignName/bareDoProcName
+    # already established.
+    # ============================================================
+    proc textInnerOf(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do nodeTrimPrefix(t, "text ")
+        let rest = trim(rest0)
+        let r = do nodeQuotedSpan(rest)
+        return r
+
+    proc linkArrowOf(lineText: text) -> int:
+        let t = trim(lineText)
+        let rest0 = do nodeTrimPrefix(t, "link ")
+        let rest = trim(rest0)
+        let r = do nodeIndexTopArrow(rest)
+        return r
+
+    proc linkHasArrow(lineText: text) -> bool:
+        let idx = do linkArrowOf(lineText)
+        return idx >= 0
+
+    proc linkLabelInnerOf(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do nodeTrimPrefix(t, "link ")
+        let rest = trim(rest0)
+        let arrow = do nodeIndexTopArrow(rest)
+        if arrow < 0:
+            return ""
+        let labelRaw = trim(slice(rest, 0, arrow))
+        let r = do nodeQuotedSpan(labelRaw)
+        return r
+
+    proc linkDestInnerOf(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do nodeTrimPrefix(t, "link ")
+        let rest = trim(rest0)
+        let arrow = do nodeIndexTopArrow(rest)
+        if arrow < 0:
+            return ""
+        let destRaw = trim(slice(rest, arrow + 2, len(rest)))
+        let r = do nodeQuotedSpan(destRaw)
+        return r
+
+    # ============================================================
+    # STAGE 8: nodeSingleNodes / nodeBlockNodes — the recursive tree
+    # builder itself, mirroring stmt.fct's singleStmtNodes/stmtBlockNodes
+    # split exactly (one proc per LINE, one proc per whole sibling list).
+    # No `if`/`else`-style sibling lookahead is needed for this file's own
+    # four keywords (unlike stmt.fct's `if`), so nodeBlockNodes is
+    # simpler than stmtBlockNodes in exactly that one respect.
+    # ============================================================
+    proc nodeSingleNodes(texts: [text], parents: [int], lineIdx: int, arena: [int]) -> [int]:
+        let raw = trim(texts[lineIdx])
+        let mut a = arena
+        if raw == "box:" || raw == "box":
+            let a1 = do nodeBlockNodes(texts, parents, lineIdx, a)
+            let childBlockIdx = (len(a1) / 5) - 1
+            a = a1
+            a = append(a, 18)
+            a = append(a, childBlockIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        if raw == "row:" || raw == "row":
+            let a1 = do nodeBlockNodes(texts, parents, lineIdx, a)
+            let childBlockIdx = (len(a1) / 5) - 1
+            a = a1
+            a = append(a, 19)
+            a = append(a, childBlockIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        let isText = do nodeHasPrefix(raw, "text ")
+        if isText:
+            let inner = do textInnerOf(raw)
+            let a1 = do nodeTextLikeNodes(inner, lineIdx, a)
+            return a1
+        let isLink = do nodeHasPrefix(raw, "link ")
+        if isLink:
+            let hasArrow = do linkHasArrow(raw)
+            if hasArrow:
+                let labelInner = do linkLabelInnerOf(raw)
+                let destInner = do linkDestInnerOf(raw)
+                let a1 = do nodeTextLikeNodes(labelInner, lineIdx, a)
+                let labelNodeIdx = (len(a1) / 5) - 1
+                let a2 = do nodeTextLikeNodes(destInner, lineIdx, a1)
+                let destNodeIdx = (len(a2) / 5) - 1
+                a = a2
+                a = append(a, 21)
+                a = append(a, labelNodeIdx)
+                a = append(a, destNodeIdx)
+                a = append(a, lineIdx)
+                a = append(a, -1)
+                return a
+            a = append(a, 25)
+            a = append(a, lineIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        a = append(a, 25)
+        a = append(a, lineIdx)
+        a = append(a, -1)
+        a = append(a, -1)
+        a = append(a, -1)
+        return a
+
+    proc nodeBlockNodes(texts: [text], parents: [int], node: int, arena: [int]) -> [int]:
+        let kids = do nodeChildrenOf(node, parents)
+        let m = len(kids)
+        let mut a = arena
+        let mut rootIdxs = []
+        let mut i = 0
+        loop i < m:
+            let lineIdx = kids[i]
+            let a1 = do nodeSingleNodes(texts, parents, lineIdx, a)
+            let rootIdx = (len(a1) / 5) - 1
+            rootIdxs = append(rootIdxs, rootIdx)
+            a = a1
+            i = i + 1
+        let cnt = len(rootIdxs)
+        let mut k = 0
+        loop k < cnt:
+            a = append(a, 22)
+            a = append(a, rootIdxs[k])
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            k = k + 1
+        let mut first = -1
+        if cnt > 0:
+            first = (len(a) / 5) - cnt
+        a = append(a, 17)
+        a = append(a, first)
+        a = append(a, -1)
+        a = append(a, -1)
+        a = append(a, -1)
+        return a
+
+    # nodeTreeSrc: the end-to-end driver for a view's own node-tree BODY
+    # text (everything indented beneath the `view Name at "…":` line
+    # itself, dedented to start at column 0 — exactly what
+    # source.fct's/stmt.fct's own body-src drivers take for their own
+    # trees). The header line is handled entirely separately, below —
+    # mirroring how the real parseView calls parseNodes(n.Children) on a
+    # SEPARATE value from the header text it already consumed.
+    proc nodeTreeSrc(src: text) -> [int]:
+        let indents = do bodyIndents(src)
+        let parents = do bodyParents(indents)
+        let texts = do bodyTexts(src)
+        let a = do nodeBlockNodes(texts, parents, -1, [])
+        return a
+
+    # ============================================================
+    # STAGE 9: the view HEADER line — `view Name at "/path":` — parser.fct's
+    # own STAGE 17 (parseService's `Name at "url"` header) restated for
+    # this file's own keyword and quote convention (`nodeQuotedSpan`
+    # instead of parser.fct's `quotedInner`). `at "/path"` is optional in
+    # the real grammar (a view may have no route of its own — see
+    # parser.go's parseView, read fresh: `name := head` before the `at`
+    # check ever runs), honored here as well.
+    # ============================================================
+    proc viewHeadOf(lineText: text) -> text:
+        let stripped = do nodeTrimPrefix(lineText, "view")
+        let trimmed = trim(stripped)
+        let r = do nodeTrimSuffix(trimmed, ":")
+        return r
+
+    proc viewAtMarkerIndex(head: text) -> int:
+        let r = do nodeIndexOf(head, " at ")
+        return r
+
+    proc viewHasAt(head: text) -> bool:
+        let idx = do viewAtMarkerIndex(head)
+        return idx >= 0
+
+    proc viewNameOf(head: text) -> text:
+        let idx = do viewAtMarkerIndex(head)
+        if idx < 0:
+            return trim(head)
+        return trim(slice(head, 0, idx))
+
+    proc viewNameValid(head: text) -> bool:
+        let name = do viewNameOf(head)
+        let r = do nodeIsIdentToken(name)
+        return r
+
+    proc viewPathQuotedOf(head: text) -> text:
+        let idx = do viewAtMarkerIndex(head)
+        if idx < 0:
+            return ""
+        return trim(slice(head, idx + 4, len(head)))
+
+    proc viewPathRaw(head: text) -> text:
+        let q = do viewPathQuotedOf(head)
+        let r = do nodeQuotedSpan(q)
+        return r
+
+    # viewPathValid: vacuously true when there is no `at` clause at all
+    # (a valid, route-less view); otherwise the quoted span must be a
+    # real quoted string starting with `/`, mirroring parser.fct's own
+    # serviceUrlValid shape.
+    proc viewPathValid(head: text) -> bool:
+        let hasAt = do viewHasAt(head)
+        if !hasAt:
+            return true
+        let q = do viewPathQuotedOf(head)
+        if len(q) < 2:
+            return false
+        if slice(q, 0, 1) != "\"":
+            return false
+        let p = do viewPathRaw(head)
+        let r = do nodeHasPrefix(p, "/")
+        return r
+
+    proc viewHeaderValid(lineText: text) -> bool:
+        let head = do viewHeadOf(lineText)
+        let nameOk = do viewNameValid(head)
+        if !nameOk:
+            return false
+        let pathOk = do viewPathValid(head)
+        return pathOk
+
+    proc parseViewName(lineText: text) -> text:
+        let head = do viewHeadOf(lineText)
+        let r = do viewNameOf(head)
+        return r
+
+    proc parseViewPath(lineText: text) -> text:
+        let head = do viewHeadOf(lineText)
+        let hasAt = do viewHasAt(head)
+        if !hasAt:
+            return ""
+        let r = do viewPathRaw(head)
+        return r
+
+    proc parseViewHeaderValid(lineText: text) -> bool:
+        let r = do viewHeaderValid(lineText)
+        return r
+
+    # ============================================================
+    # STAGE 10: reader/navigation helpers — proof the arena is actually
+    # walkable, not just buildable, mirroring stmt.fct's own STAGE 8.
+    # ============================================================
+    proc nodeKindAt(arena: [int], idx: int) -> int:
+        return arena[5 * idx]
+
+    proc nodeBlockFirstSlot(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc nodeBlockChildCount(arena: [int], idx: int) -> int:
+        let first = do nodeBlockFirstSlot(arena, idx)
+        if first < 0:
+            return 0
+        return idx - first
+
+    proc nodeSlotChild(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc nodeBlockChildRootAt(arena: [int], idx: int, i: int) -> int:
+        let first = do nodeBlockFirstSlot(arena, idx)
+        let slotIdx = first + i
+        let r = do nodeSlotChild(arena, slotIdx)
+        return r
+
+    proc boxChildBlockIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc rowChildBlockIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc textFirstSegSlot(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc textLineOf(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 2]
+
+    proc textSegExprCountAt(arena: [int], idx: int) -> int:
+        let first = do textFirstSegSlot(arena, idx)
+        if first < 0:
+            return 0
+        return idx - first
+
+    proc textSegExprRootAt(arena: [int], idx: int, i: int) -> int:
+        let first = do textFirstSegSlot(arena, idx)
+        let slotIdx = first + i
+        let r = do nodeSlotChild(arena, slotIdx)
+        return r
+
+    proc linkLabelNodeIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc linkDestNodeIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 2]
+
+    proc linkLineOf(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 3]
+
+    proc nodeArenaNodeCount(arena: [int]) -> int:
+        return len(arena) / 5
+
+    # ============================================================
+    # STAGE 11: the live HTTP-exercisable drivers.
+    # ============================================================
+    state viewHeaderNameResult: text = ""
+    state viewHeaderPathResult: text = ""
+    state viewHeaderValidResult: bool = false
+    state nodeArenaResult: [int] = []
+
+    action runParseViewHeader(lineText: text):
+        let n = do parseViewName(lineText)
+        let p = do parseViewPath(lineText)
+        let v = do parseViewHeaderValid(lineText)
+        viewHeaderNameResult = n
+        viewHeaderPathResult = p
+        viewHeaderValidResult = v
+
+    action runParseViewNodeTree(src: text):
+        let r = do nodeTreeSrc(src)
+        nodeArenaResult = r
+
+    view NodeViewHome at "/nodes":
+        box:
+            text "{viewHeaderNameResult} {viewHeaderPathResult} {viewHeaderValidResult}"
+            text "{nodeArenaResult}"

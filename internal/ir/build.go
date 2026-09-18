@@ -23,39 +23,40 @@ func (e *BuildError) Error() string {
 
 // env is the name environment used to validate references and compute deps.
 type env struct {
-	states        map[string]string              // name -> placement
-	entities      map[string]bool                // entity names
-	entityFields  map[string]map[string]bool     // entity -> field set (incl id)
-	entityDerives map[string]map[string]bool     // entity -> derive-field set (never a stored column; read-only, see ast.Entity.Derives)
-	queriedFields map[string]map[string]bool     // entity -> fields a `where`/`by`/relation reads at all
-	indexFields   map[string]map[string]bool     // entity -> fields whose use an index can actually serve
-	inline        map[string]*Expr               // zero-arg policy/derive name -> lowered expr, inlined at every use
-	inlineType    map[string]vtype               // the same names -> the type they resolve to (a derive's declared type, a policy's bool)
-	policySet     map[string]bool                // policy names (gating via `requires`)
-	policyParams  map[string][]Param             // policy name -> its parameters (row-level policies)
-	enums         map[string][]string            // enum name -> ordered member values
-	components    map[string][]ast.Param         // component name -> its parameters (a reference parameter carries its Ref kind)
-	compAST       map[string]*ast.Component      // component name -> its source, for call-site expansion of templates
-	compSlot      map[string]bool                // component names whose body contains a `slot` (so a `use` may pass children)
-	compDeps      map[string]map[string]bool     // component name -> the state/entity names its body reads (for use-site refresh)
-	compRegions   map[string]map[string][]string // component name -> the dependency edges its own regions/inputs need, folded into every page that uses it
-	special       []Component                    // per-call-site expansions of template components, appended to the IR
-	specialCalls  []call                         // action references made inside expansions, validated with the rest
-	specialLinks  []linkRef                      // link destinations inside expansions, route-checked with the rest
-	specStack     []string                       // components currently being expanded, to refuse recursion
-	nspec         int                            // expansions minted so far; names them and namespaces their region ids
-	stateTypes    map[string]string              // state name -> its (core/element) type, for enum-defaulted selects
-	stateList     map[string]bool                // state names that are `[T]` list cells, for `for x in <list>`
-	services      map[string]map[string]int      // service name -> op name -> parameter count, for checking `call`
-	serviceRets   map[string]map[string]opRet    // service name -> op name -> return type, for binding `let x = call …`
-	private       map[string]bool                // @private state names — server-only, non-renderable
-	entFieldEnum  map[string]map[string]string   // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
-	entFieldType  map[string]map[string]string   // entity -> field -> stored type core (enum fields read as "text"), for typing a data-driven option's value
-	records       map[string]map[string]recField // record name -> field name -> its type, for `let`-bound field access
-	entE2E        map[string]map[string]bool     // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
-	locRecords    map[string]recBind             // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
-	actionSet     map[string]bool                // action names, for validating pending()/failed() targets
-	procSigs      map[string]procSig             // proc name -> its signature, for checking `do` (from an action or another proc)
+	states        map[string]string                 // name -> placement
+	entities      map[string]bool                   // entity names
+	entityFields  map[string]map[string]bool        // entity -> field set (incl id)
+	entityDerives map[string]map[string]bool        // entity -> derive-field set (never a stored column; read-only, see ast.Entity.Derives)
+	queriedFields map[string]map[string]bool        // entity -> fields a `where`/`by`/relation reads at all
+	indexFields   map[string]map[string]bool        // entity -> fields whose use an index can actually serve
+	inline        map[string]*Expr                  // zero-arg policy/derive name -> lowered expr, inlined at every use
+	inlineType    map[string]vtype                  // the same names -> the type they resolve to (a derive's declared type, a policy's bool)
+	policySet     map[string]bool                   // policy names (gating via `requires`)
+	policyParams  map[string][]Param                // policy name -> its parameters (row-level policies)
+	enums         map[string][]string               // enum name -> ordered member values
+	components    map[string][]ast.Param            // component name -> its parameters (a reference parameter carries its Ref kind)
+	compAST       map[string]*ast.Component         // component name -> its source, for call-site expansion of templates
+	compSlot      map[string]bool                   // component names whose body contains a `slot` (so a `use` may pass children)
+	compDeps      map[string]map[string]bool        // component name -> the state/entity names its body reads (for use-site refresh)
+	compRegions   map[string]map[string][]string    // component name -> the dependency edges its own regions/inputs need, folded into every page that uses it
+	special       []Component                       // per-call-site expansions of template components, appended to the IR
+	specialCalls  []call                            // action references made inside expansions, validated with the rest
+	specialLinks  []linkRef                         // link destinations inside expansions, route-checked with the rest
+	specStack     []string                          // components currently being expanded, to refuse recursion
+	nspec         int                               // expansions minted so far; names them and namespaces their region ids
+	stateTypes    map[string]string                 // state name -> its (core/element) type, for enum-defaulted selects
+	stateList     map[string]bool                   // state names that are `[T]` list cells, for `for x in <list>`
+	services      map[string]map[string]int         // service name -> op name -> parameter count, for checking `call`
+	serviceRets   map[string]map[string]opRet       // service name -> op name -> return type, for binding `let x = call …`
+	private       map[string]bool                   // @private state names — server-only, non-renderable
+	entFieldEnum  map[string]map[string]string      // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
+	entFieldType  map[string]map[string]string      // entity -> field -> stored type core (enum fields read as "text"), for typing a data-driven option's value
+	records       map[string]map[string]recField    // record name -> field name -> its type, for `let`-bound field access
+	structs       map[string]map[string]structField // struct name -> field name -> its type, for a proc-local struct literal/field access (see ast.Struct)
+	entE2E        map[string]map[string]bool        // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
+	locRecords    map[string]recBind                // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
+	actionSet     map[string]bool                   // action names, for validating pending()/failed() targets
+	procSigs      map[string]procSig                // proc name -> its signature, for checking `do` (from an action or another proc)
 }
 
 // procSig is a proc's signature: enough to check a `do` call site (arity) and to
@@ -83,6 +84,19 @@ type opRet struct {
 
 // recField is one record field's resolved type, for checking a `v.field` access.
 type recField struct {
+	typ  string
+	list bool
+}
+
+// structField is one struct field's resolved type, for checking a
+// proc-local `Type{...}` literal (every field present, no unknown field, no
+// obvious type mismatch) and a `.field` read off a struct-typed proc value —
+// recField's exact shape, kept as its own named type since a struct field's
+// Type may resolve to ANOTHER struct name (recField's never does: a record
+// field is always a primitive or an enum — see ast.Record's doc), which is
+// what lets checkStructFieldTypes chase a field access chain like
+// `node.left.op` one struct at a time.
+type structField struct {
 	typ  string
 	list bool
 }
@@ -154,7 +168,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, structs: map[string]map[string]structField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -209,6 +223,50 @@ func Build(app *ast.App) (*IR, error) {
 		}
 		e.records[rc.Name] = fields
 		out.Records = append(out.Records, Record{Name: rc.Name, Fields: irFields})
+	}
+
+	// 0b2. Structs: proc-local named-field composite types (see ast.Struct's
+	// doc — the construct this task adds so a tree/composite value gets real
+	// field names instead of a flat `[int]` arena of magic slots). Unlike
+	// Record, a struct field may name another struct, including itself (a
+	// binary expression's `left: Expr, right: Expr`, or a tree node's
+	// `children: [Node]`), so names are collected in a first pass — exactly
+	// like Type/Message below — before any field is resolved, so a self- or
+	// forward-reference just works.
+	structSeen := map[string]int{}
+	for _, sc := range app.Structs {
+		if prev, ok := structSeen[sc.Name]; ok {
+			return nil, &BuildError{sc.Line, fmt.Sprintf("struct %q redeclared (first at line %d)", sc.Name, prev)}
+		}
+		if _, clash := e.enums[sc.Name]; clash {
+			return nil, &BuildError{sc.Line, fmt.Sprintf("struct %q clashes with an enum of the same name", sc.Name)}
+		}
+		if _, clash := e.records[sc.Name]; clash {
+			return nil, &BuildError{sc.Line, fmt.Sprintf("struct %q clashes with a record of the same name", sc.Name)}
+		}
+		structSeen[sc.Name] = sc.Line
+		e.structs[sc.Name] = map[string]structField{} // populated below, once every name is known
+	}
+	for _, sc := range app.Structs {
+		fields := e.structs[sc.Name]
+		var irFields []RecordField
+		for _, f := range sc.Fields {
+			if _, dup := fields[f.Name]; dup {
+				return nil, &BuildError{f.Line, fmt.Sprintf("struct %q has duplicate field %q", sc.Name, f.Name)}
+			}
+			switch {
+			case f.Type == "int", f.Type == "text", f.Type == "bool", f.Type == "float":
+				// a scalar field
+			case e.structs[f.Type] != nil:
+				// another declared struct (or this one, self-referentially)
+			default:
+				return nil, &BuildError{f.Line, fmt.Sprintf(
+					"struct %q field %q has type %q — a struct field must be int/text/bool/float, another declared struct, or a list of those", sc.Name, f.Name, f.Type)}
+			}
+			fields[f.Name] = structField{typ: f.Type, list: f.List}
+			irFields = append(irFields, RecordField{Name: f.Name, Type: f.Type, List: f.List})
+		}
+		out.Structs = append(out.Structs, Struct{Name: sc.Name, Fields: irFields})
 	}
 
 	// 0c. Types & Messages: wire-schema-only value types and tagged unions
@@ -1965,6 +2023,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				if sig.ret == "float" {
 					return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q returns float, which is only usable inside another proc — an action cannot bind it (no client-side representation exists for a float; see LANGUAGE.md's `proc` section). Convert it inside the proc first (e.g. `return round(x)`) and give %q an int/text/bool/money/date return type instead", st.Proc, st.Proc)}
 				}
+				if e.structs[sig.ret] != nil {
+					return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, a struct type usable only inside another proc — an action cannot bind it (structs are proc-local values, with no schema/wire representation yet; see LANGUAGE.md's `proc` section). Read its fields inside the proc and give %q a scalar/list return type instead", st.Proc, sig.ret, st.Proc)}
+				}
 				if loc[st.Bind] {
 					return Action{}, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
 				}
@@ -2659,6 +2720,9 @@ func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, ty
 	if err := checkNoTaskUse(ex, types, line); err != nil {
 		return err
 	}
+	if err := e.checkStructFieldTypes(ex, types, line); err != nil {
+		return err
+	}
 	if err := checkProcCapabilities(p, ex, line); err != nil {
 		return err
 	}
@@ -2742,6 +2806,14 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 		return arrayType
 	case ast.MapLit:
 		return mapType
+	case ast.StructLit:
+		// A struct literal's type is its own declared name (e.g. "Node") — a
+		// sibling of arrayType/mapType/bytesType, except it names a REAL
+		// declared type (checked against env.structs by
+		// checkStructFieldTypes) rather than a generic tag, which is what
+		// lets a `.field` read chase back into env.structs for its type
+		// (see structExprType).
+		return t.Type
 	case ast.Ref:
 		return types[t.Name]
 	case ast.Call:
@@ -2848,6 +2920,139 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 	return ""
 }
 
+// structExprType is inferProcType plus the one thing inferProcType cannot do
+// on its own: chase a `.field` read (ast.Get) back through env.structs to the
+// field's own declared type — inferProcType has no env to consult, so it
+// cannot see a struct's field table at all. This is what lets a field-access
+// chain like `node.left.op` be checked one struct at a time: structExprType
+// resolves `node` (a plain Ref, via inferProcType) to "Node", looks up
+// "left" in structs["Node"] to get "Node" back (a self-referential field),
+// then the caller resolves ".op" the same way against that.
+//
+// A list-typed field (`children: [Node]`) answers arrayType here, the same
+// tag a list literal or an `append(...)` result carries — element-type
+// information a list value never keeps (see arrayType's own doc) — so
+// `node.children[i].kind` is checkable up to the index read (as an array
+// operation) but not past it, the same "prove what can be proven" limit
+// every other array use already has in this builder.
+func (e *env) structExprType(ex ast.Expr, types map[string]string) string {
+	if g, ok := ex.(ast.Get); ok {
+		ot := e.structExprType(g.Obj, types)
+		if fields, ok := e.structs[ot]; ok {
+			if f, ok := fields[g.Field]; ok {
+				if f.list {
+					return arrayType
+				}
+				return f.typ
+			}
+		}
+		return ""
+	}
+	return inferProcType(ex, types)
+}
+
+// checkStructFieldTypes walks a proc expression for the two places a struct
+// type's shape actually matters: a `Type{...}` literal (every declared field
+// must be set exactly once, to a value of the right type, and no unknown
+// field) and a `.field` read (ast.Get) whose object's statically known type
+// is a declared struct (the field must exist on it). This is deliberately
+// stronger than checkIndexTypes' array bounds can ever be — an array's
+// element type is erased at compile time by design (arrayType, a generic
+// tag), but a struct's OWN type is never erased (its local/param type tag IS
+// the struct's real name), so every field name and, wherever the value's own
+// type is provable, its type too can be checked here rather than deferred to
+// a runtime backstop.
+//
+// Like checkIndexTypes/checkMapKeyTypes, this stays silent wherever
+// structExprType cannot prove an answer (e.g. a value that flows through a
+// builtin call) rather than guessing — runtime/eval.go's "get" case is the
+// backstop for whatever this cannot see.
+func (e *env) checkStructFieldTypes(ex ast.Expr, types map[string]string, line int) error {
+	switch t := ex.(type) {
+	case ast.StructLit:
+		fields, ok := e.structs[t.Type]
+		if !ok {
+			return &BuildError{line, fmt.Sprintf("unknown struct type %q", t.Type)}
+		}
+		set := map[string]bool{}
+		for _, fi := range t.Fields {
+			fdecl, exists := fields[fi.Name]
+			if !exists {
+				return &BuildError{line, fmt.Sprintf("struct %q has no field %q", t.Type, fi.Name)}
+			}
+			if set[fi.Name] {
+				return &BuildError{line, fmt.Sprintf("field %q set twice in a %s{...} literal", fi.Name, t.Type)}
+			}
+			set[fi.Name] = true
+			if err := e.checkStructFieldTypes(fi.Expr, types, line); err != nil {
+				return err
+			}
+			got := e.structExprType(fi.Expr, types)
+			if got == "" {
+				continue // unprovable — left to the runtime backstop, same stance as elsewhere
+			}
+			if fdecl.list {
+				if got != arrayType {
+					return &BuildError{line, fmt.Sprintf("field %q of %s{...} wants [%s], got %s", fi.Name, t.Type, fdecl.typ, got)}
+				}
+			} else if got != fdecl.typ {
+				return &BuildError{line, fmt.Sprintf("field %q of %s{...} wants %s, got %s", fi.Name, t.Type, fdecl.typ, got)}
+			}
+		}
+		for fn := range fields {
+			if !set[fn] {
+				return &BuildError{line, fmt.Sprintf("%s{...} literal is missing field %q", t.Type, fn)}
+			}
+		}
+	case ast.Get:
+		if ot := e.structExprType(t.Obj, types); ot != "" {
+			if fields, ok := e.structs[ot]; ok {
+				if _, exists := fields[t.Field]; !exists {
+					return &BuildError{line, fmt.Sprintf("struct %q has no field %q", ot, t.Field)}
+				}
+			} else if ot == arrayType || ot == mapType || ot == bytesType || ot == taskType || isPrimitive(ot) {
+				return &BuildError{line, fmt.Sprintf(
+					"field access (`.%s`) needs a struct value, but this expression is %s", t.Field, ot)}
+			}
+		}
+		return e.checkStructFieldTypes(t.Obj, types, line)
+	case ast.Bin:
+		if err := e.checkStructFieldTypes(t.L, types, line); err != nil {
+			return err
+		}
+		return e.checkStructFieldTypes(t.R, types, line)
+	case ast.Un:
+		return e.checkStructFieldTypes(t.X, types, line)
+	case ast.Call:
+		for _, a := range t.Args {
+			if err := e.checkStructFieldTypes(a, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := e.checkStructFieldTypes(el, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := e.checkStructFieldTypes(k, types, line); err != nil {
+				return err
+			}
+			if err := e.checkStructFieldTypes(t.Vals[i], types, line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if err := e.checkStructFieldTypes(t.Obj, types, line); err != nil {
+			return err
+		}
+		return e.checkStructFieldTypes(t.Idx, types, line)
+	}
+	return nil
+}
+
 // bitwiseCheckedTypes are the declared/inferred proc types checkBitwiseTypes
 // refuses as a bitwise operand: everything except "int" (and the unknown ""
 // type, which is left alone — see inferProcType's doc comment). `money`,
@@ -2931,6 +3136,12 @@ func checkBitwiseTypes(ex ast.Expr, types map[string]string, line int) error {
 				return err
 			}
 			if err := checkBitwiseTypes(t.Vals[i], types, line); err != nil {
+				return err
+			}
+		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkBitwiseTypes(fi.Expr, types, line); err != nil {
 				return err
 			}
 		}
@@ -3044,6 +3255,12 @@ func checkNumericTypes(ex ast.Expr, types map[string]string, line int) error {
 				return err
 			}
 		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkNumericTypes(fi.Expr, types, line); err != nil {
+				return err
+			}
+		}
 	case ast.Index:
 		if err := checkNumericTypes(t.Obj, types, line); err != nil {
 			return err
@@ -3109,6 +3326,12 @@ func checkIndexTypes(ex ast.Expr, types map[string]string, line int) error {
 				return err
 			}
 		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkIndexTypes(fi.Expr, types, line); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -3166,6 +3389,12 @@ func checkMapKeyTypes(ex ast.Expr, types map[string]string, line int) error {
 				return err
 			}
 		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkMapKeyTypes(fi.Expr, types, line); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -3212,6 +3441,12 @@ func checkNoTaskUse(ex ast.Expr, types map[string]string, line int) error {
 				return err
 			}
 			if err := checkNoTaskUse(t.Vals[i], types, line); err != nil {
+				return err
+			}
+		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkNoTaskUse(fi.Expr, types, line); err != nil {
 				return err
 			}
 		}
@@ -4652,6 +4887,12 @@ func checkNoBitwise(ex ast.Expr, line int) error {
 				return err
 			}
 		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkNoBitwise(fi.Expr, line); err != nil {
+				return err
+			}
+		}
 	case ast.Agg:
 		if err := checkNoBitwise(t.Where, line); err != nil {
 			return err
@@ -4685,12 +4926,20 @@ func checkNoBitwise(ex ast.Expr, line int) error {
 // bodies) never calls check(), so a proc may use a map literal and index an
 // array or map freely — see checkIndexTypes/checkMapKeyTypes for the
 // (different) checks that DO apply there.
+//
+// A struct literal (`Type{...}`, ast.StructLit) is barred the same way, for
+// the same reason: its only interpreter is evalInFrame's "struct" case,
+// there is no schema representation, wire encoding, or facet.js mirror for
+// one yet, and — like a map — it is a genuinely new proc-local value kind,
+// not a general field type any other part of the language already knows.
 func checkNoIndex(ex ast.Expr, line int) error {
 	switch t := ex.(type) {
 	case ast.Index:
 		return &BuildError{line, "array/map indexing (`x[i]`) is only available inside a proc — arrays and maps are proc-local values, not readable from an action, view, policy, or derive yet"}
 	case ast.MapLit:
 		return &BuildError{line, "a map literal (`{...}`) is only available inside a proc — maps are proc-local values, not readable from an action, view, policy, or derive yet"}
+	case ast.StructLit:
+		return &BuildError{line, fmt.Sprintf("a %s{...} struct literal is only available inside a proc — structs are proc-local values, not readable from an action, view, policy, or derive yet", t.Type)}
 	case ast.Bin:
 		if err := checkNoIndex(t.L, line); err != nil {
 			return err
@@ -4787,6 +5036,14 @@ func checkNoFloat(ex ast.Expr, line int) error {
 				return err
 			}
 		}
+	case ast.StructLit:
+		// Reachable only via checkNoIndex's own error for the struct literal
+		// itself; walked anyway for the same defensive-depth reason as MapLit.
+		for _, fi := range t.Fields {
+			if err := checkNoFloat(fi.Expr, line); err != nil {
+				return err
+			}
+		}
 	case ast.Index:
 		if err := checkNoFloat(t.Obj, line); err != nil {
 			return err
@@ -4855,6 +5112,12 @@ func checkNoIO(ex ast.Expr, line int) error {
 				return err
 			}
 		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkNoIO(fi.Expr, line); err != nil {
+				return err
+			}
+		}
 	case ast.Index:
 		if err := checkNoIO(t.Obj, line); err != nil {
 			return err
@@ -4918,6 +5181,12 @@ func checkNoConcurrency(ex ast.Expr, line int) error {
 				return err
 			}
 			if err := checkNoConcurrency(t.Vals[i], line); err != nil {
+				return err
+			}
+		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkNoConcurrency(fi.Expr, line); err != nil {
 				return err
 			}
 		}
@@ -5146,6 +5415,12 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 				return err
 			}
 		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := e.checkBuiltins(fi.Expr, line); err != nil {
+				return err
+			}
+		}
 	case ast.Get:
 		// Enum member access (`Status.active`) must name a declared member.
 		if r, ok := t.Obj.(ast.Ref); ok {
@@ -5263,6 +5538,10 @@ func procCapabilities(ex ast.Expr) map[string]string {
 				walk(k)
 				walk(t.Vals[i])
 			}
+		case ast.StructLit:
+			for _, fi := range t.Fields {
+				walk(fi.Expr)
+			}
 		case ast.Bin:
 			walk(t.L)
 			walk(t.R)
@@ -5331,7 +5610,7 @@ func checkProcCapabilities(p *ast.Proc, ex ast.Expr, line int) error {
 func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
-		"ago", "compact", "commas", "bytes", "toFloat", "toInt":
+		"ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney":
 		return 1, true
 	case "append":
 		return 2, true
@@ -5581,6 +5860,12 @@ func freeNames(ex ast.Expr) map[string]bool {
 				walk(k)
 				walk(t.Vals[i])
 			}
+		case ast.StructLit:
+			// Same reasoning again: a struct literal's field values can
+			// themselves be references (`Node{left: a, right: b}`).
+			for _, fi := range t.Fields {
+				walk(fi.Expr)
+			}
 		case ast.Index:
 			walk(t.Obj)
 			walk(t.Idx)
@@ -5621,6 +5906,15 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 		for i := range t.Keys {
 			out.Keys = append(out.Keys, lower(t.Keys[i], inline, enums))
 			out.Args = append(out.Args, lower(t.Vals[i], inline, enums))
+		}
+		return out
+	case ast.StructLit:
+		// Fields (its field names) and Args (its values) stay parallel, the
+		// same shape MapLit's Keys/Args already have — see ir.Expr's doc.
+		out := &Expr{Kind: "struct", Name: t.Type}
+		for _, fi := range t.Fields {
+			out.Fields = append(out.Fields, fi.Name)
+			out.Args = append(out.Args, lower(fi.Expr, inline, enums))
 		}
 		return out
 	case ast.Index:
