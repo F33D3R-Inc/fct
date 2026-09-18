@@ -3412,6 +3412,14 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 				html.EscapeString(n.Bind), checked, html.EscapeString(label))
 		})
 		b.WriteString(`</div>`)
+	case "after":
+		// A client-only, fire-once timer (ast.After) has no first paint: nothing to
+		// show, nothing a no-JS request could ever fire on a clock it doesn't run.
+		// assets/facet.js's mount() replaces this SSR output wholesale on load —
+		// even the very first paint's interactive tree is client-rendered — which
+		// is what schedules the real setTimeout. So the authority writes nothing
+		// for it at all, the same way an `if` with no ID and a false condition
+		// writes nothing for its (absent) branch.
 	case "overlay":
 		fmt.Fprintf(b, `<div%s>`, regionAttrs("", n.ID, n))
 		if truthy(scope[n.Bind]) {

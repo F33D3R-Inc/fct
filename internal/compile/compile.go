@@ -115,6 +115,11 @@ func collectModules(abs string, visited map[string]bool, stack []string, res *re
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", filepath.Base(abs), err)
 	}
+	// Mangle this file's own `private` proc/view declarations (and every
+	// same-file call to a private proc) to file-unique names before this
+	// file's declarations ever reach mergeInto/checkDuplicates below — see
+	// private.go for why this has to happen per-file, this early.
+	manglePrivate(app, abs)
 	dir := filepath.Dir(abs)
 	// `css from "styles.css"` is the external-file counterpart of an inline
 	// `css:` block: a sibling stylesheet on disk, referenced by the same quoted

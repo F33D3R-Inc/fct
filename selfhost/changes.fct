@@ -1,0 +1,834 @@
+app ChangesSelfHost:
+    # Self-hosting port of facetql/src/storage/changes.rs (the durable scan
+    # behind `GET /changes`) plus the one piece of facetql/src/storage/
+    # recovery.rs it depends on and that nothing in this directory ports yet:
+    # `classify_transactions` (PLURAL — grouping every record in the log by
+    # transaction id and classifying each group). storage.fct's PART THREE
+    # already ports `classify_transaction` (SINGULAR — the per-transaction
+    # replay rule itself, as `walClassifyTransactionOutcome`/
+    # `walClassifyTransactionCommitSequence`) and wal.rs's frame envelope;
+    # this file does NOT redeclare or import those (see "WHY THIS FILE DOES
+    # NOT IMPORT storage.fct" below) — it restates the same, already
+    # hand-verified replay-rule shape locally, over its own record struct,
+    # and spends its real effort on the material genuinely new here: turning
+    # a flat, already-classified WAL log into the paginated, audience-
+    # filtered change feed `changes.rs` builds on top of it. Read changes.rs
+    # in full, then recovery.rs's `classify_transactions`/`classify_
+    # transaction` (both), before editing this file.
+    #
+    # ============================================================
+    # WHAT WAS PORTED, AND WHY THE CUT LANDS WHERE IT DOES:
+    # ============================================================
+    # Everything downstream of "the log has already been read and decoded
+    # into records":
+    #   - `classify_transactions` (recovery.rs) — group by transaction id,
+    #     reject a control record on the reserved standalone id, classify
+    #     each group with the (already-verified-elsewhere) replay rule, and
+    #     collect which transaction ids committed and at what sequence.
+    #   - `horizon` — the oldest position a scan may serve `after=` from.
+    #   - `validate_positions` — refuse a log whose operation ids do not
+    #     ascend in file order (the invariant the whole paging scheme leans
+    #     on).
+    #   - `durable_unit` — the contiguous run of records belonging to one
+    #     transaction id (or a single standalone record).
+    #   - `frame_state` — Committed / Terminal / InFlight for one durable
+    #     unit, including the tail-only "maybe still being written" case.
+    #   - `Lens::admit` — the two-part visibility test (`seq > after` AND
+    #     the caller's audience admits the subject) collapsed from
+    #     `Audience::admits`/`Audience::for_node` (database.rs), which are
+    #     three lines of pure logic over already-loaded fields and are
+    #     restated directly rather than pulled in as their own module.
+    #   - `emit_unit` — the archive-tracking pass that turns one committed
+    #     unit's `Archive`/`Insert`/`Delete` records into `created` /
+    #     `updated` / `deleted` `ChangeRecord`s, each run through the lens.
+    #   - `scan`'s own driving loop — walk whole durable units in file
+    #     order, skip Terminal ones, stop in front of an InFlight tail unit,
+    #     skip a committed unit entirely when its last position is still
+    #     `<= after`, otherwise emit it and stop once the page fills.
+    #
+    # ============================================================
+    # WHY THIS FILE DOES NOT IMPORT storage.fct:
+    # ============================================================
+    # core_types.fct's own header states the confirmed rule for this whole
+    # directory: there is no mechanism to reuse another file's STRUCT type,
+    # even where the shape genuinely overlaps ("procs/structs don't cross
+    # files in this language... every other file in this directory restates
+    # its own copy of whatever it needs"). heap.fct's cross-file `import
+    # "storage.fct"` only ever calls storage.fct's procs over PRIMITIVE
+    # types ([int] byte buffers) — never passes a storage.fct-defined
+    # struct across the file boundary. This file's record shape needs
+    # fields (address/kind/owner/visibility) storage.fct's `WalRecordEntry`
+    # doesn't carry, so extending it would mean either widening a file this
+    # task was told not to edit, or constructing an unverified cross-file
+    # struct literal. Restating the small (~30-line) replay-rule walk
+    # locally, over this file's own `ChangeWalRecord`, avoids both and
+    # matches the directory's own documented convention.
+    #
+    # ============================================================
+    # NOT PORTED, AND WHY EACH IS A REAL I/O/CRYPTO OR OUT-OF-SCOPE BOUNDARY:
+    # ============================================================
+    #   - `wal::read_all()` — a whole-file read, hex decode, AEAD decrypt
+    #     and bincode deserialize of the on-disk log. `changesScan` below
+    #     takes `records: [ChangeWalRecord]` as an already-decoded
+    #     parameter, exactly the boundary storage.fct's own WAL section
+    #     draws around `crypto::decrypt`'s output.
+    #   - `wal::scan_horizon()` — a persisted, process-wide counter recovery
+    #     stamps when the log's prefix has been rotated away. It is global
+    #     mutable state read from disk, not a computation over the records
+    #     handed to this call, so `changesHorizon` below takes the same
+    #     stand-in every empty-log case needs and returns 0 for an empty
+    #     log, documented at the proc itself.
+    #   - `ScanTooOld`'s `Display` impl — string formatting for an HTTP
+    #     error body, not decision logic. `ScanOutcome` below carries the
+    #     same three raw fields (`requested`/`earliest`/`retained`) a
+    #     caller would format into that message itself.
+    #   - The full `Node`/`HistoryEntry` shapes — `emit_unit` only ever
+    #     reads four facts about the subject of an `Archive`/`Insert`
+    #     record (`address`, `kind`, `owner`, `visibility`), so
+    #     `ChangeWalRecord` carries exactly those four, the same
+    #     flattening convention storage.fct's own `WalRecordEntry` already
+    #     established for `seq`/`opKind`.
+    #   - Edge/user/index/reference/text-index WAL operations — collapsed
+    #     to `opKind` 6 ("Other"), the same catch-all `emit_unit`'s own
+    #     Rust `_ => None` arm already treats them as.
+    #
+    # No crypto anywhere in this file's own logic (see the WAL boundary
+    # above) and no I/O — every proc is a pure function over its arguments,
+    # exactly like storage.fct's own PART TWO/PART THREE.
+    #
+    # ============================================================
+    # REPRESENTATION — real named structs throughout, never an
+    # arena-of-ints. `opKind` codes (this file's own convention, distinct
+    # from storage.fct's narrower 0/1/2/other-mutation split because
+    # `emit_unit` — unlike the bare replay rule — has to tell `Archive`,
+    # `Insert` and `Delete` apart):
+    #   0 = Begin, 1 = Commit, 2 = Abort,
+    #   3 = Archive, 4 = Insert, 5 = Delete, 6 = Other (edge/user/index/
+    #       reference/text-index mutations — ignored by emit_unit exactly
+    #       like Rust's `_ => None`).
+    #
+    # No indexed array assignment and no `do` call inside a loop-body
+    # reassignment or nested expression exist in this language — see
+    # storage.fct's own header notes 1 and 2, both followed identically
+    # below: every "updated array" is a brand-new array built by
+    # slice+concat, and every `do` result is bound to its own fresh `let`
+    # before being folded into an accumulator with a plain, `do`-free
+    # reassignment.
+    struct ChangeWalRecord:
+        sequence: int
+        transactionId: int
+        operationId: int
+        opKind: int
+        address: text
+        kind: text
+        owner: text
+        isPublic: bool
+
+    struct CommittedTx:
+        transactionId: int
+        commitSeq: int
+
+    struct ArchivedEntry:
+        address: text
+        kind: text
+        owner: text
+        isPublic: bool
+
+    struct ArchivedLookup:
+        found: bool
+        kind: text
+        owner: text
+        isPublic: bool
+
+    struct ChangeRecord:
+        seq: int
+        changeKind: int
+        address: text
+        kind: text
+
+    struct ChangePage:
+        changes: [ChangeRecord]
+        next: int
+        complete: bool
+
+    # ScanOutcome: the proc-has-no-Result restatement of
+    # `Result<ChangePage, ScanError>` — exactly one of `tooOld`/
+    # `badPositions`/`malformed` is true when `ok` is false, and `page` is
+    # only meaningful when `ok` is true (left at harmless defaults
+    # otherwise, never consulted).
+    struct ScanOutcome:
+        ok: bool
+        tooOld: bool
+        badPositions: bool
+        malformed: bool
+        requested: int
+        earliest: int
+        retained: int
+        page: ChangePage
+
+    struct AdmitOutcome:
+        present: bool
+        seq: int
+        changeKind: int
+        address: text
+        kind: text
+
+    proc changesDefaultLimit() -> int:
+        return 500
+
+    proc changesMaxLimit() -> int:
+        return 2000
+
+    # ============================================================
+    # GENERIC ARRAY HELPERS — one slice/concat/contains pair per array
+    # type this file threads, following storage.fct's own convention of a
+    # dedicated helper per element type rather than a generic the language
+    # has no way to express.
+    # ============================================================
+    proc intArrayContains(xs: [int], v: int) -> bool:
+        let n = len(xs)
+        let mut i = 0
+        let mut found = false
+        loop i < n:
+            if xs[i] == v:
+                found = true
+            i = i + 1
+        return found
+
+    proc sliceChangeRecords(buf: [ChangeWalRecord], start: int, end: int) -> [ChangeWalRecord]:
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            out = append(out, buf[i])
+            i = i + 1
+        return out
+
+    proc concatChangeRecordList(a: [ChangeRecord], b: [ChangeRecord]) -> [ChangeRecord]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc archivedSliceEntries(buf: [ArchivedEntry], start: int, end: int) -> [ArchivedEntry]:
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            out = append(out, buf[i])
+            i = i + 1
+        return out
+
+    proc archivedConcatEntries(a: [ArchivedEntry], b: [ArchivedEntry]) -> [ArchivedEntry]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc archivedSetEntryAt(entries: [ArchivedEntry], index: int, val: ArchivedEntry) -> [ArchivedEntry]:
+        let before = do archivedSliceEntries(entries, 0, index)
+        let n = len(entries)
+        let after = do archivedSliceEntries(entries, index + 1, n)
+        let withVal = append(before, val)
+        let result = do archivedConcatEntries(withVal, after)
+        return result
+
+    proc archivedRemoveEntryAt(entries: [ArchivedEntry], index: int) -> [ArchivedEntry]:
+        let before = do archivedSliceEntries(entries, 0, index)
+        let n = len(entries)
+        let after = do archivedSliceEntries(entries, index + 1, n)
+        let result = do archivedConcatEntries(before, after)
+        return result
+
+    # ============================================================
+    # `horizon` / `validate_positions` — the two log-shape sanity checks
+    # `scan` runs before trusting the log at all.
+    # ============================================================
+    # changesHorizon: `horizon`. The `wal::scan_horizon()` fallback for an
+    # empty log is out of this pure module's scope (see header) — 0 stands
+    # in for it, which is exactly what a log that has never been rotated
+    # ever returns anyway.
+    proc changesHorizon(records: [ChangeWalRecord]) -> int:
+        let n = len(records)
+        if n == 0:
+            return 0
+        let first = records[0]
+        if first.sequence == 1:
+            return 0
+        return first.operationId
+
+    # changesPositionsAscendingOk: `validate_positions`, restated as a bool
+    # (see storage.fct's own precedent for why a proc reports this as a
+    # yes/no rather than an error carrying which pair failed).
+    proc changesPositionsAscendingOk(records: [ChangeWalRecord]) -> bool:
+        let n = len(records)
+        let mut i = 1
+        let mut ok = true
+        loop i < n:
+            if records[i].operationId <= records[i - 1].operationId:
+                ok = false
+            i = i + 1
+        return ok
+
+    # ============================================================
+    # `durable_unit` — the contiguous run starting at `start` that shares
+    # one transaction id, or a single standalone record.
+    # ============================================================
+    proc changesDurableUnitEnd(records: [ChangeWalRecord], start: int) -> int:
+        let txId = records[start].transactionId
+        if txId == 0:
+            return start + 1
+        let n = len(records)
+        let mut end = start
+        let mut looping = true
+        loop looping:
+            if end < n && records[end].transactionId == txId:
+                end = end + 1
+            else:
+                looping = false
+        return end
+
+    # ============================================================
+    # THE REPLAY RULE, RESTATED LOCALLY (see header: this is the same
+    # algorithm storage.fct's `walClassifyTransactionOutcome`/
+    # `walClassifyTransactionCommitSequence` already hand-verified, over
+    # this file's own `ChangeWalRecord` instead of `WalRecordEntry`). The
+    # transaction-id-mismatch guard `classify_transaction` itself carries
+    # is not restated: every caller below builds `txRecords` by filtering
+    # on one transaction id, so every record in it already carries that id
+    # by construction — the same "an invariant every real call site's
+    # input already has is not reimplemented" precedent storage.fct's own
+    # header states for `classify_transaction`'s defensive `sort_by_key`.
+    # ============================================================
+    proc changesClassifyOutcome(records: [ChangeWalRecord]) -> int:
+        let n = len(records)
+        if n == 0:
+            return 0
+        if records[0].opKind != 0:
+            let mut i = 0
+            let mut hasCommit = false
+            loop i < n:
+                if records[i].opKind == 1:
+                    hasCommit = true
+                i = i + 1
+            if hasCommit:
+                return 2
+            return 0
+        let mut commitSeq = -1
+        let mut aborted = false
+        let mut i = 0
+        loop i < n:
+            let opKind = records[i].opKind
+            if opKind == 0:
+                if i != 0:
+                    return 2
+            if opKind == 1:
+                if aborted:
+                    return 2
+                if commitSeq != -1:
+                    return 2
+                if i != n - 1:
+                    return 2
+                commitSeq = records[i].sequence
+            if opKind == 2:
+                if commitSeq != -1:
+                    return 2
+                if aborted:
+                    return 2
+                if i != n - 1:
+                    return 2
+                aborted = true
+            if opKind != 0 && opKind != 1 && opKind != 2:
+                if i == 0:
+                    return 2
+                if commitSeq != -1 || aborted:
+                    return 2
+            i = i + 1
+        if commitSeq != -1:
+            return 1
+        return 0
+
+    proc changesClassifyCommitSeq(records: [ChangeWalRecord]) -> int:
+        let n = len(records)
+        if n == 0:
+            return -1
+        if records[0].opKind != 0:
+            return -1
+        let mut commitSeq = -1
+        let mut aborted = false
+        let mut i = 0
+        loop i < n:
+            let opKind = records[i].opKind
+            if opKind == 0:
+                if i != 0:
+                    return -1
+            if opKind == 1:
+                if aborted:
+                    return -1
+                if commitSeq != -1:
+                    return -1
+                if i != n - 1:
+                    return -1
+                commitSeq = records[i].sequence
+            if opKind == 2:
+                if commitSeq != -1:
+                    return -1
+                if aborted:
+                    return -1
+                if i != n - 1:
+                    return -1
+                aborted = true
+            if opKind != 0 && opKind != 1 && opKind != 2:
+                if i == 0:
+                    return -1
+                if commitSeq != -1 || aborted:
+                    return -1
+            i = i + 1
+        return commitSeq
+
+    # ============================================================
+    # `classify_transactions` (PLURAL) — group by transaction id, reject a
+    # control record on the reserved standalone id, classify each group.
+    # ============================================================
+    proc changesStandaloneReservedViolation(records: [ChangeWalRecord]) -> bool:
+        let n = len(records)
+        let mut i = 0
+        let mut violated = false
+        loop i < n:
+            if records[i].transactionId == 0:
+                let opKind = records[i].opKind
+                if opKind == 0 || opKind == 1 || opKind == 2:
+                    violated = true
+            i = i + 1
+        return violated
+
+    proc changesDistinctTxIds(records: [ChangeWalRecord]) -> [int]:
+        let n = len(records)
+        let mut ids = []
+        let mut i = 0
+        loop i < n:
+            let txId = records[i].transactionId
+            if txId != 0:
+                let already = do intArrayContains(ids, txId)
+                if !already:
+                    ids = append(ids, txId)
+            i = i + 1
+        return ids
+
+    proc filterByTxId(records: [ChangeWalRecord], txId: int) -> [ChangeWalRecord]:
+        let n = len(records)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if records[i].transactionId == txId:
+                out = append(out, records[i])
+            i = i + 1
+        return out
+
+    # changesClassifyAllOk: true iff no transaction frame in the log is
+    # structurally impossible (recovery's hard-error case) and no control
+    # record carries the reserved standalone id. A caller MUST check this
+    # before trusting `changesClassifyCommitted` — the two are independent
+    # re-walks of the same grouping, the same twin-proc shape storage.fct's
+    # PART TWO/THREE already document for the identical constraint (a proc
+    # returns exactly one typed value).
+    proc changesClassifyAllOk(records: [ChangeWalRecord]) -> bool:
+        let reserved = do changesStandaloneReservedViolation(records)
+        if reserved:
+            return false
+        let ids = do changesDistinctTxIds(records)
+        let n = len(ids)
+        let mut i = 0
+        let mut ok = true
+        loop i < n:
+            let txId = ids[i]
+            let txRecords = do filterByTxId(records, txId)
+            let outcome = do changesClassifyOutcome(txRecords)
+            if outcome == 2:
+                ok = false
+            i = i + 1
+        return ok
+
+    proc changesClassifyCommitted(records: [ChangeWalRecord]) -> [CommittedTx]:
+        let ids = do changesDistinctTxIds(records)
+        let n = len(ids)
+        let mut i = 0
+        let mut out = []
+        loop i < n:
+            let txId = ids[i]
+            let txRecords = do filterByTxId(records, txId)
+            let outcome = do changesClassifyOutcome(txRecords)
+            if outcome == 1:
+                let seq = do changesClassifyCommitSeq(txRecords)
+                out = append(out, CommittedTx{transactionId: txId, commitSeq: seq})
+            i = i + 1
+        return out
+
+    proc committedContains(committed: [CommittedTx], txId: int) -> bool:
+        let n = len(committed)
+        let mut i = 0
+        let mut found = false
+        loop i < n:
+            if committed[i].transactionId == txId:
+                found = true
+            i = i + 1
+        return found
+
+    # ============================================================
+    # `frame_state` — Committed / Terminal / InFlight, as a code:
+    #   0 = Committed, 1 = Terminal, 2 = InFlight
+    # ============================================================
+    proc unitHasAbort(records: [ChangeWalRecord], start: int, end: int) -> bool:
+        let mut i = start
+        let mut found = false
+        loop i < end:
+            if records[i].opKind == 2:
+                found = true
+            i = i + 1
+        return found
+
+    proc changesFrameState(records: [ChangeWalRecord], start: int, end: int, committed: [CommittedTx], isTail: bool) -> int:
+        if start >= end:
+            return 1
+        let first = records[start]
+        if first.transactionId == 0:
+            return 0
+        let isCommitted = do committedContains(committed, first.transactionId)
+        if isCommitted:
+            return 0
+        let aborted = do unitHasAbort(records, start, end)
+        if aborted || !isTail:
+            return 1
+        return 2
+
+    # ============================================================
+    # THE LENS — `Audience::admits`/`Audience::for_node` (database.rs)
+    # collapsed into one predicate over the four facts `emit_unit` ever
+    # has about a subject: public nodes admit everyone, private nodes
+    # admit only their owner or an admin. Together with `seq > after`
+    # (`Lens::admit`'s own first check) this is the WHOLE audience/position
+    # filter.
+    # ============================================================
+    proc audienceAdmits(isPublic: bool, subjectOwner: text, callerOwner: text, isAdmin: bool) -> bool:
+        if isPublic:
+            return true
+        return isAdmin || subjectOwner == callerOwner
+
+    proc lensAdmit(after: int, owner: text, isAdmin: bool, seq: int, changeKind: int, subjectOwner: text, subjectIsPublic: bool, subjectKind: text, address: text) -> AdmitOutcome:
+        if seq <= after:
+            return AdmitOutcome{present: false, seq: 0, changeKind: 0, address: "", kind: ""}
+        let admitted = do audienceAdmits(subjectIsPublic, subjectOwner, owner, isAdmin)
+        if !admitted:
+            return AdmitOutcome{present: false, seq: 0, changeKind: 0, address: "", kind: ""}
+        return AdmitOutcome{present: true, seq: seq, changeKind: changeKind, address: address, kind: subjectKind}
+
+    # ============================================================
+    # `emit_unit` — the archive-tracking pass. `archived` is a real
+    # `[ArchivedEntry]` array threaded through the loop (never mutated in
+    # place — see header) standing in for `HashMap<&str, &Node>`;
+    # `archivedFind`/`archivedSet`/`archivedRemoveByAddress` are its
+    # get/insert/remove, restated as pure functions the same way PART TWO
+    # of storage.fct restates `HashMap`/`BTreeMap` operations over
+    # `[PagerEntry]`.
+    # ============================================================
+    proc archivedFindIndex(archived: [ArchivedEntry], address: text) -> int:
+        let n = len(archived)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if archived[i].address == address:
+                    found = i
+            i = i + 1
+        return found
+
+    proc archivedFind(archived: [ArchivedEntry], address: text) -> ArchivedLookup:
+        let idx = do archivedFindIndex(archived, address)
+        if idx == -1:
+            return ArchivedLookup{found: false, kind: "", owner: "", isPublic: false}
+        let e = archived[idx]
+        return ArchivedLookup{found: true, kind: e.kind, owner: e.owner, isPublic: e.isPublic}
+
+    proc archivedSet(archived: [ArchivedEntry], address: text, kind: text, owner: text, isPublic: bool) -> [ArchivedEntry]:
+        let idx = do archivedFindIndex(archived, address)
+        let entry = ArchivedEntry{address: address, kind: kind, owner: owner, isPublic: isPublic}
+        if idx == -1:
+            return append(archived, entry)
+        let result = do archivedSetEntryAt(archived, idx, entry)
+        return result
+
+    proc archivedRemoveByAddress(archived: [ArchivedEntry], address: text) -> [ArchivedEntry]:
+        let idx = do archivedFindIndex(archived, address)
+        if idx == -1:
+            return archived
+        let result = do archivedRemoveEntryAt(archived, idx)
+        return result
+
+    proc changesEmitUnit(unit: [ChangeWalRecord], after: int, owner: text, isAdmin: bool) -> [ChangeRecord]:
+        let n = len(unit)
+        let mut archived = []
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let rec = unit[i]
+            if rec.opKind == 3:
+                let newArchived = do archivedSet(archived, rec.address, rec.kind, rec.owner, rec.isPublic)
+                archived = newArchived
+            else:
+                if rec.opKind == 4:
+                    let lookup = do archivedFind(archived, rec.address)
+                    let mut changeKind = 0
+                    if lookup.found:
+                        changeKind = 1
+                    let admitted = do lensAdmit(after, owner, isAdmin, rec.operationId, changeKind, rec.owner, rec.isPublic, rec.kind, rec.address)
+                    if admitted.present:
+                        let record = ChangeRecord{seq: admitted.seq, changeKind: admitted.changeKind, address: admitted.address, kind: admitted.kind}
+                        out = append(out, record)
+                else:
+                    if rec.opKind == 5:
+                        let lookup = do archivedFind(archived, rec.address)
+                        if lookup.found:
+                            let newArchived = do archivedRemoveByAddress(archived, rec.address)
+                            archived = newArchived
+                            let admitted = do lensAdmit(after, owner, isAdmin, rec.operationId, 2, lookup.owner, lookup.isPublic, lookup.kind, rec.address)
+                            if admitted.present:
+                                let record = ChangeRecord{seq: admitted.seq, changeKind: admitted.changeKind, address: admitted.address, kind: admitted.kind}
+                                out = append(out, record)
+            i = i + 1
+        return out
+
+    # ============================================================
+    # `scan`'s own driving loop.
+    # ============================================================
+    proc changesScan(records: [ChangeWalRecord], after: int, limit: int, owner: text, isAdmin: bool) -> ScanOutcome:
+        let n = len(records)
+        let earliest = do changesHorizon(records)
+        let emptyPage = ChangePage{changes: [], next: after, complete: true}
+        if after < earliest:
+            return ScanOutcome{ok: false, tooOld: true, badPositions: false, malformed: false, requested: after, earliest: earliest, retained: n, page: emptyPage}
+        let positionsOk = do changesPositionsAscendingOk(records)
+        if !positionsOk:
+            return ScanOutcome{ok: false, tooOld: false, badPositions: true, malformed: false, requested: after, earliest: earliest, retained: n, page: emptyPage}
+        let classifyOk = do changesClassifyAllOk(records)
+        if !classifyOk:
+            return ScanOutcome{ok: false, tooOld: false, badPositions: false, malformed: true, requested: after, earliest: earliest, retained: n, page: emptyPage}
+        let committed = do changesClassifyCommitted(records)
+        let mut index = 0
+        let mut changes = []
+        let mut next = after
+        let mut complete = true
+        let mut looping = true
+        loop looping:
+            if index >= n:
+                looping = false
+            else:
+                let unitEnd = do changesDurableUnitEnd(records, index)
+                let isTail = unitEnd == n
+                let state = do changesFrameState(records, index, unitEnd, committed, isTail)
+                if state == 2:
+                    looping = false
+                else:
+                    if state == 1:
+                        index = unitEnd
+                    else:
+                        let unit = do sliceChangeRecords(records, index, unitEnd)
+                        index = unitEnd
+                        let unitLen = len(unit)
+                        let lastOpId = unit[unitLen - 1].operationId
+                        if lastOpId > after:
+                            let emitted = do changesEmitUnit(unit, after, owner, isAdmin)
+                            let newChanges = do concatChangeRecordList(changes, emitted)
+                            changes = newChanges
+                            let emittedLen = len(emitted)
+                            if emittedLen > 0:
+                                next = emitted[emittedLen - 1].seq
+                            let changesLen = len(changes)
+                            if changesLen >= limit && index < n:
+                                complete = false
+                                looping = false
+        let page = ChangePage{changes: changes, next: next, complete: complete}
+        return ScanOutcome{ok: true, tooOld: false, badPositions: false, malformed: false, requested: after, earliest: earliest, retained: n, page: page}
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — the same six scenarios changes.rs's
+    # own `#[cfg(test)]` module checks, hand-traced here against this
+    # port's procs (operationId set equal to sequence throughout, since
+    # nothing below depends on the two diverging — only on each ascending
+    # in file order, which they do either way).
+    # ============================================================
+    # Scenario A (`a_delete_is_authorized_by_the_state_it_removed`):
+    # BEGIN(1) -> Archive("secret:1", kind=Thing, owner=alice, private)(2)
+    # -> Delete("secret:1")(3) -> COMMIT(4). Alice sees one Deleted change
+    # for "secret:1"/"Thing"; Bob (a stranger) sees nothing; an admin sees
+    # it regardless of ownership.
+    proc demoUnitA() -> [ChangeWalRecord]:
+        let r1 = ChangeWalRecord{sequence: 1, transactionId: 7, operationId: 1, opKind: 0, address: "", kind: "", owner: "", isPublic: false}
+        let r2 = ChangeWalRecord{sequence: 2, transactionId: 7, operationId: 2, opKind: 3, address: "secret:1", kind: "Thing", owner: "alice", isPublic: false}
+        let r3 = ChangeWalRecord{sequence: 3, transactionId: 7, operationId: 3, opKind: 5, address: "secret:1", kind: "", owner: "", isPublic: false}
+        let r4 = ChangeWalRecord{sequence: 4, transactionId: 7, operationId: 4, opKind: 1, address: "", kind: "", owner: "", isPublic: false}
+        return [r1, r2, r3, r4]
+
+    proc demoAliceSeesDelete() -> bool:
+        let unit = do demoUnitA()
+        let out = do changesEmitUnit(unit, 0, "alice", false)
+        if len(out) != 1:
+            return false
+        return out[0].changeKind == 2 && out[0].address == "secret:1" && out[0].kind == "Thing"
+
+    proc demoStrangerSeesNothing() -> bool:
+        let unit = do demoUnitA()
+        let out = do changesEmitUnit(unit, 0, "bob", false)
+        return len(out) == 0
+
+    proc demoAdminSeesDeleteRegardless() -> bool:
+        let unit = do demoUnitA()
+        let out = do changesEmitUnit(unit, 0, "root", true)
+        return len(out) == 1
+
+    # Scenario B (`an_unattributable_delete_is_omitted`): a standalone
+    # Delete of an address nothing archived first. Nobody sees it, admins
+    # included.
+    proc demoUnitB() -> [ChangeWalRecord]:
+        let r1 = ChangeWalRecord{sequence: 1, transactionId: 0, operationId: 1, opKind: 5, address: "never-existed", kind: "", owner: "", isPublic: false}
+        return [r1]
+
+    proc demoUnattributableDeleteOmitted() -> bool:
+        let unit = do demoUnitB()
+        let outAlice = do changesEmitUnit(unit, 0, "alice", false)
+        let outAdmin = do changesEmitUnit(unit, 0, "root", true)
+        return len(outAlice) == 0 && len(outAdmin) == 0
+
+    # Scenario C (`an_archive_before_an_insert_makes_it_an_update`): an
+    # Archive immediately ahead of an Insert of the same address is an
+    # Updated change; an Insert with no preceding Archive is Created. The
+    # node is public, so a stranger (Bob) can see either.
+    proc demoUnitCOverwrite() -> [ChangeWalRecord]:
+        let r1 = ChangeWalRecord{sequence: 1, transactionId: 7, operationId: 1, opKind: 0, address: "", kind: "", owner: "", isPublic: false}
+        let r2 = ChangeWalRecord{sequence: 2, transactionId: 7, operationId: 2, opKind: 3, address: "post:1", kind: "Thing", owner: "alice", isPublic: true}
+        let r3 = ChangeWalRecord{sequence: 3, transactionId: 7, operationId: 3, opKind: 4, address: "post:1", kind: "Thing", owner: "alice", isPublic: true}
+        let r4 = ChangeWalRecord{sequence: 4, transactionId: 7, operationId: 4, opKind: 1, address: "", kind: "", owner: "", isPublic: false}
+        return [r1, r2, r3, r4]
+
+    proc demoOverwriteIsUpdated() -> bool:
+        let unit = do demoUnitCOverwrite()
+        let out = do changesEmitUnit(unit, 0, "bob", false)
+        if len(out) != 1:
+            return false
+        return out[0].changeKind == 1
+
+    proc demoUnitCFresh() -> [ChangeWalRecord]:
+        let r1 = ChangeWalRecord{sequence: 1, transactionId: 0, operationId: 1, opKind: 4, address: "post:1", kind: "Thing", owner: "alice", isPublic: true}
+        return [r1]
+
+    proc demoFreshInsertIsCreated() -> bool:
+        let unit = do demoUnitCFresh()
+        let out = do changesEmitUnit(unit, 0, "bob", false)
+        if len(out) != 1:
+            return false
+        return out[0].changeKind == 0
+
+    # Scenario D (`an_uncommitted_frame_is_in_flight_only_at_the_tail`): a
+    # frame with no COMMIT is InFlight when it is the tail of the log
+    # (its COMMIT may just not have arrived yet) and Terminal otherwise
+    # (a frame with records after it cannot be in flight — see the real
+    # comment in changes.rs on why).
+    proc demoUnitDIncomplete() -> [ChangeWalRecord]:
+        let r1 = ChangeWalRecord{sequence: 1, transactionId: 7, operationId: 1, opKind: 0, address: "", kind: "", owner: "", isPublic: false}
+        let r2 = ChangeWalRecord{sequence: 2, transactionId: 7, operationId: 2, opKind: 4, address: "a", kind: "Thing", owner: "alice", isPublic: true}
+        return [r1, r2]
+
+    proc demoIncompleteAtTailIsInFlight() -> bool:
+        let unit = do demoUnitDIncomplete()
+        let state = do changesFrameState(unit, 0, 2, [], true)
+        return state == 2
+
+    proc demoIncompleteNotAtTailIsTerminal() -> bool:
+        let unit = do demoUnitDIncomplete()
+        let state = do changesFrameState(unit, 0, 2, [], false)
+        return state == 1
+
+    # Scenario E (`the_horizon_moves_only_once_the_first_record_is_gone`):
+    # the log is servable from position 0 while its very first record
+    # (sequence 1) is still present; once it is gone, the oldest position
+    # servable is the oldest surviving record's own position.
+    proc demoHorizonComplete() -> bool:
+        let r1 = ChangeWalRecord{sequence: 1, transactionId: 0, operationId: 1, opKind: 5, address: "x", kind: "", owner: "", isPublic: false}
+        let h = do changesHorizon([r1])
+        return h == 0
+
+    proc demoHorizonRotated() -> bool:
+        let r1 = ChangeWalRecord{sequence: 94, transactionId: 0, operationId: 94, opKind: 5, address: "x", kind: "", owner: "", isPublic: false}
+        let h = do changesHorizon([r1])
+        return h == 94
+
+    # Scenario F (`positions_that_do_not_ascend_are_refused`): two records
+    # sharing one operation id fail the check; the first record alone
+    # passes it trivially.
+    proc demoPositionsNonAscendingRefused() -> bool:
+        let r1 = ChangeWalRecord{sequence: 1, transactionId: 0, operationId: 5, opKind: 5, address: "a", kind: "", owner: "", isPublic: false}
+        let r2 = ChangeWalRecord{sequence: 2, transactionId: 0, operationId: 5, opKind: 5, address: "b", kind: "", owner: "", isPublic: false}
+        let full = do changesPositionsAscendingOk([r1, r2])
+        let prefix = do changesPositionsAscendingOk([r1])
+        return !full && prefix
+
+    # Scenario G: an end-to-end `changesScan` over scenario A's unit —
+    # confirms the top-level driver reaches the same one Deleted change
+    # for Alice via the full horizon/positions/classify/scan pipeline, not
+    # just via `changesEmitUnit` called directly.
+    proc demoScanEndToEnd() -> bool:
+        let unit = do demoUnitA()
+        let outcome = do changesScan(unit, 0, 500, "alice", false)
+        if !outcome.ok:
+            return false
+        if len(outcome.page.changes) != 1:
+            return false
+        return outcome.page.changes[0].changeKind == 2 && outcome.page.complete
+
+    state demoResultA1: bool = false
+    state demoResultA2: bool = false
+    state demoResultA3: bool = false
+    state demoResultB: bool = false
+    state demoResultC1: bool = false
+    state demoResultC2: bool = false
+    state demoResultD1: bool = false
+    state demoResultD2: bool = false
+    state demoResultE1: bool = false
+    state demoResultE2: bool = false
+    state demoResultF: bool = false
+    state demoResultG: bool = false
+
+    action runDemoChanges():
+        let a1 = do demoAliceSeesDelete()
+        let a2 = do demoStrangerSeesNothing()
+        let a3 = do demoAdminSeesDeleteRegardless()
+        let b = do demoUnattributableDeleteOmitted()
+        let c1 = do demoOverwriteIsUpdated()
+        let c2 = do demoFreshInsertIsCreated()
+        let d1 = do demoIncompleteAtTailIsInFlight()
+        let d2 = do demoIncompleteNotAtTailIsTerminal()
+        let e1 = do demoHorizonComplete()
+        let e2 = do demoHorizonRotated()
+        let f = do demoPositionsNonAscendingRefused()
+        let g = do demoScanEndToEnd()
+        demoResultA1 = a1
+        demoResultA2 = a2
+        demoResultA3 = a3
+        demoResultB = b
+        demoResultC1 = c1
+        demoResultC2 = c2
+        demoResultD1 = d1
+        demoResultD2 = d2
+        demoResultE1 = e1
+        demoResultE2 = e2
+        demoResultF = f
+        demoResultG = g
+
+    view ChangesHome at "/":
+        box:
+            text "{demoResultA1} {demoResultA2} {demoResultA3} {demoResultB}"
+            text "{demoResultC1} {demoResultC2} {demoResultD1} {demoResultD2}"
+            text "{demoResultE1} {demoResultE2} {demoResultF} {demoResultG}"

@@ -1,0 +1,798 @@
+app FabricCoreSelfHost:
+    # Self-hosting port of fabric/crates/fabric-core/src/ IN FULL — the
+    # native FacetQL data model every other fabric-* crate is built on top
+    # of: atom.rs (33L), coordinate.rs (24L), value.rs (68L), record.rs
+    # (46L), grid.rs (66L), storage.rs (76L), engine.rs (93L), shard.rs
+    # (93L), topology.rs (47L), workload.rs (23L) — 609 real Rust lines,
+    # zero crypto, zero network I/O, no test modules (`cargo test -p
+    # fabric-core` — confirmed by reading every file: no `#[cfg(test)]`
+    # module anywhere in this crate), verified by hand-tracing this port
+    # against each Rust file read in full, line for line.
+    #
+    # WHY THIS CRATE, chosen over the other untouched candidates surveyed
+    # first (fabric-telemetry, fabric-workload, fabric-ml, fabric-optimizer,
+    # fabric-simulator, fabric-controller, fabric-cli, and fabric-replication's
+    # remaining replica.rs/placement.rs/set.rs): fabric-core is the one
+    # crate every other fabric-* crate actually depends on for its own real
+    # types (`fabric_core::Coordinate` is imported directly by
+    # fabric-routing's key.rs, confirmed by reading its Cargo.toml and its
+    # `use` line) — porting it is foundational rather than one more
+    # independent leaf, it is small enough to port completely rather than
+    # partially (unlike fabric-controller's 3757L or fabric-simulator's
+    # 2269L), and unlike fabric-replication's remaining files it is a
+    # genuinely different concern (the native storage ENGINE, not more
+    # replication-set policy), so porting it adds real new coverage rather
+    # than extending what fabric.fct/fabric_routing.fct already cover.
+    #
+    # ============================================================
+    # RELATIONSHIP TO fabric_routing.fct's OWN `Coordinate` — read in full
+    # before writing this file. fabric_routing.fct already restates a
+    # `Coordinate{x,y}` with `coordinateIsValid`/`coordinateIndex` (its own
+    # header explains why: fabric-routing's real key.rs imports
+    # `fabric_core::Coordinate` directly — the SAME real Rust type this file
+    # ports). This file restates its own copy again rather than
+    # `import`-ing fabric_routing.fct, for the same reason core_types.fct's
+    # own header gives for its own restatement of an overlapping shape
+    # ("the same way every other file in this directory restates its own
+    # copy of whatever it needs") — this directory's established convention
+    # is per-file self-containment, not cross-file struct reuse, and this
+    # task's own instructions treat fabric_routing.fct as read-only
+    # reference, not as an import target. The two restatements are
+    # byte-for-byte the same real logic (verified against the identical
+    # Rust source, fabric-core/src/coordinate.rs), just declared twice, the
+    # same way fabric_routing.fct's own Coordinate is already a second
+    # declaration of the first one implied by fabric.fct's unrelated packed-
+    # int representation.
+    #
+    # ============================================================
+    # REPRESENTATION CHOICES
+    # ============================================================
+    # Value (value.rs) — a 7-variant Rust enum (Null/Bool/Integer/Unsigned/
+    # Float/Text/Bytes), several variants carrying DIFFERENT payload types.
+    # Ported with this directory's established text-tagged-struct
+    # convention (predicate.fct's `Field`, fabric_routing.fct's
+    # `RoutingError`/`ReadPreference`): `kind` names the live variant, every
+    # payload field is always present but only the one `kind` names is
+    # meaningful. `Integer(i64)` and `Unsigned(u64)` both collapse onto this
+    # language's single `int` type (LANGUAGE.md: `int` is the only
+    # non-float integer type, no fixed-width variants) — kept as two
+    # separate fields (`intVal`/`uintVal`) rather than merged into one, so
+    # `kind` alone still tells a caller which Rust variant produced the
+    # value, exactly as `as_integer`/`as_unsigned` staying separate methods
+    # does in the real source. `Bytes(Vec<u8>)` is `[int]`, one array slot
+    # per byte (0..255 each, unchecked the same way core_types.fct's own
+    # u8 fields go unchecked — a genuine, honestly-noted width gap, not a
+    # silent one).
+    #
+    # `as_bool`/`as_integer`/`as_unsigned`/`as_float`/`as_text`/`as_bytes`
+    # (each `Option<T>`) are ported with this directory's other established
+    # Option convention (core_types.fct's `hasClaimedBy`/`claimedBy`): a
+    # small `has`/`val` result struct per return type, one per accessor.
+    #
+    # Atom::new/ShardStorage/TopologyRegistry/FacetEngine::write all mirror
+    # patterns fabric_routing.fct already established (Result-shaped
+    # structs for fallible operations, array-searched-linearly-by-key
+    # instead of a HashMap, "mutating" procs returning a new value instead
+    # of taking `&mut self` since a `proc` has none) — see each one's own
+    # comment below for the specific precedent it follows.
+    #
+    # ONE GENUINE BEHAVIOR GAP, flagged honestly rather than silently
+    # ported around: `Atom::new` calls `assert!(coordinate.is_valid(), ...)`
+    # in the real Rust — an invalid coordinate PANICS (aborts the whole
+    # process), it does not return an error. This language's `proc`s have
+    # no abort/panic primitive at all (LANGUAGE.md's `check`/`requires`
+    # guard clauses exist only for `action`s, a different declaration kind
+    # this crate has no use for). `atomNew` below restates the exact same
+    # condition as a checked `AtomNewResult{ok, atom}` instead — the same
+    # Result-struct convention `fabric_routing.fct`'s `routingKeyNew`
+    # already uses for its own (non-panicking, `Result`-returning) coordinate
+    # check. This is a real semantic difference from the Rust source (a
+    # caller here gets `ok: false` back and keeps running, rather than the
+    # process crashing outright) — every real call site in grid.rs only
+    # ever calls `Atom::new` with a coordinate it just built from its own
+    # `0..GRID_WIDTH`/`0..GRID_HEIGHT` loop, so `ok` is always true in
+    # practice, and this port does not invent a scenario where it isn't.
+    #
+    # DEFERRED, not ported: `Shard`'s `serde` (de)serialization attributes
+    # and `#[derive(Debug, ...)]` machinery have no meaning outside Rust's
+    # own trait system and are not "logic" to port — every derived trait
+    # this file's own procs actually need (equality, a stand-in for Hash,
+    # Clone's real field-by-field behavior) is ported as an explicit named
+    # proc below (`shardEquals`, `shardClone`) instead.
+
+    # ============================================================
+    # coordinate.rs — Coordinate. `is_valid`: x<12 && y<13. `index`: row-
+    # major, `y*12 + x`, 0..156 across a shard's 12x13 grid.
+    # ============================================================
+    struct Coordinate:
+        x: int
+        y: int
+
+    proc coordinateNew(x: int, y: int) -> Coordinate:
+        return Coordinate{x: x, y: y}
+
+    proc coordinateIsValid(c: Coordinate) -> bool:
+        return c.x >= 0 && c.x < 12 && c.y >= 0 && c.y < 13
+
+    proc coordinateIndex(c: Coordinate) -> int:
+        return (c.y * 12) + c.x
+
+    # ============================================================
+    # atom.rs — Atom: the smallest addressable unit, a stable id plus its
+    # coordinate inside the parent shard's grid.
+    # ============================================================
+    struct Atom:
+        id: text
+        coordinate: Coordinate
+
+    struct AtomNewResult:
+        ok: bool
+        atom: Atom
+
+    # atomNew: `Atom::new` — see this file's header for the honest
+    # panic-vs-Result gap this restates.
+    proc atomNew(id: text, coordinate: Coordinate) -> AtomNewResult:
+        let valid = do coordinateIsValid(coordinate)
+        if !valid:
+            return AtomNewResult{ok: false, atom: Atom{id: "", coordinate: Coordinate{x: 0, y: 0}}}
+        return AtomNewResult{ok: true, atom: Atom{id: id, coordinate: coordinate}}
+
+    proc atomIndex(a: Atom) -> int:
+        let idx = do coordinateIndex(a.coordinate)
+        return idx
+
+    struct AtomOption:
+        has: bool
+        val: Atom
+
+    # ============================================================
+    # value.rs — Value, text-tagged per this file's header. `kind` is one
+    # of: "null" | "bool" | "integer" | "unsigned" | "float" | "text" |
+    # "bytes".
+    # ============================================================
+    struct Value:
+        kind: text
+        boolVal: bool
+        intVal: int
+        uintVal: int
+        floatVal: float
+        textVal: text
+        bytesVal: [int]
+
+    proc valueNull() -> Value:
+        return Value{kind: "null", boolVal: false, intVal: 0, uintVal: 0, floatVal: 0.0, textVal: "", bytesVal: []}
+
+    proc valueBool(v: bool) -> Value:
+        return Value{kind: "bool", boolVal: v, intVal: 0, uintVal: 0, floatVal: 0.0, textVal: "", bytesVal: []}
+
+    proc valueInteger(v: int) -> Value:
+        return Value{kind: "integer", boolVal: false, intVal: v, uintVal: 0, floatVal: 0.0, textVal: "", bytesVal: []}
+
+    proc valueUnsigned(v: int) -> Value:
+        return Value{kind: "unsigned", boolVal: false, intVal: 0, uintVal: v, floatVal: 0.0, textVal: "", bytesVal: []}
+
+    proc valueFloat(v: float) -> Value:
+        return Value{kind: "float", boolVal: false, intVal: 0, uintVal: 0, floatVal: v, textVal: "", bytesVal: []}
+
+    proc valueText(v: text) -> Value:
+        return Value{kind: "text", boolVal: false, intVal: 0, uintVal: 0, floatVal: 0.0, textVal: v, bytesVal: []}
+
+    proc valueBytes(v: [int]) -> Value:
+        return Value{kind: "bytes", boolVal: false, intVal: 0, uintVal: 0, floatVal: 0.0, textVal: "", bytesVal: v}
+
+    proc valueIsNull(v: Value) -> bool:
+        return v.kind == "null"
+
+    struct BoolOption:
+        has: bool
+        val: bool
+
+    proc valueAsBool(v: Value) -> BoolOption:
+        if v.kind == "bool":
+            return BoolOption{has: true, val: v.boolVal}
+        return BoolOption{has: false, val: false}
+
+    struct IntOption:
+        has: bool
+        val: int
+
+    proc valueAsInteger(v: Value) -> IntOption:
+        if v.kind == "integer":
+            return IntOption{has: true, val: v.intVal}
+        return IntOption{has: false, val: 0}
+
+    proc valueAsUnsigned(v: Value) -> IntOption:
+        if v.kind == "unsigned":
+            return IntOption{has: true, val: v.uintVal}
+        return IntOption{has: false, val: 0}
+
+    struct FloatOption:
+        has: bool
+        val: float
+
+    proc valueAsFloat(v: Value) -> FloatOption:
+        if v.kind == "float":
+            return FloatOption{has: true, val: v.floatVal}
+        return FloatOption{has: false, val: 0.0}
+
+    struct TextOption:
+        has: bool
+        val: text
+
+    proc valueAsText(v: Value) -> TextOption:
+        if v.kind == "text":
+            return TextOption{has: true, val: v.textVal}
+        return TextOption{has: false, val: ""}
+
+    struct BytesOption:
+        has: bool
+        val: [int]
+
+    proc valueAsBytes(v: Value) -> BytesOption:
+        if v.kind == "bytes":
+            return BytesOption{has: true, val: v.bytesVal}
+        return BytesOption{has: false, val: []}
+
+    # ============================================================
+    # record.rs — AtomRecord: an atom (the logical address) paired with the
+    # value stored there.
+    # ============================================================
+    struct AtomRecord:
+        atom: Atom
+        value: Value
+
+    proc atomRecordNew(atom: Atom, value: Value) -> AtomRecord:
+        return AtomRecord{atom: atom, value: value}
+
+    proc atomRecordCoordinate(r: AtomRecord) -> Coordinate:
+        return r.atom.coordinate
+
+    proc atomRecordValue(r: AtomRecord) -> Value:
+        return r.value
+
+    # atomRecordSetValue: `AtomRecord::set_value(&mut self, ...)` — a
+    # `proc` has no `&mut self`, so this returns the new record rather than
+    # mutating in place, the same functional-update shape
+    # `topologyRegistryPlace` already uses in fabric_routing.fct.
+    proc atomRecordSetValue(r: AtomRecord, value: Value) -> AtomRecord:
+        return AtomRecord{atom: r.atom, value: value}
+
+    proc zeroAtomRecord() -> AtomRecord:
+        let noValue = do valueNull()
+        return AtomRecord{atom: Atom{id: "", coordinate: Coordinate{x: 0, y: 0}}, value: noValue}
+
+    # ============================================================
+    # grid.rs — Grid: every one of a shard's 156 atoms (12 wide, 13 tall),
+    # built once at construction, `atom-<index>` as each one's id, in the
+    # SAME row-major order `Coordinate::index` itself defines (verified by
+    # iterating a single flat 0..156 counter below and deriving x/y from it
+    # via the exact inverse of `index = y*12 + x`, rather than the real
+    # source's nested `for y in 0..HEIGHT { for x in 0..WIDTH }` — both
+    # orders visit the same 156 cells in the same sequence, confirmed by
+    # hand-tracing the first few and last few indices: i=0 -> (0,0), i=11
+    # -> (11,0), i=12 -> (0,1), i=155 -> (11,12)).
+    # ============================================================
+    struct Grid:
+        atoms: [Atom]
+
+    proc gridNew() -> Grid:
+        let mut atoms = []
+        let mut i = 0
+        loop i < 156:
+            let x = i % 12
+            let y = i / 12
+            let coordinate = Coordinate{x: x, y: y}
+            let built = do atomNew("atom-" + i, coordinate)
+            atoms = append(atoms, built.atom)
+            i = i + 1
+        return Grid{atoms: atoms}
+
+    proc gridAtom(g: Grid, coordinate: Coordinate) -> AtomOption:
+        let valid = do coordinateIsValid(coordinate)
+        if !valid:
+            return AtomOption{has: false, val: Atom{id: "", coordinate: Coordinate{x: 0, y: 0}}}
+        let idx = do coordinateIndex(coordinate)
+        return AtomOption{has: true, val: g.atoms[idx]}
+
+    proc gridAtoms(g: Grid) -> [Atom]:
+        return g.atoms
+
+    proc gridLen(g: Grid) -> int:
+        return 156
+
+    proc gridIsEmpty(g: Grid) -> bool:
+        return false
+
+    # ============================================================
+    # storage.rs — ShardStorage: native per-shard record storage, keyed by
+    # Coordinate. `HashMap<Coordinate, AtomRecord>` restated as `[AtomRecord]`
+    # searched linearly by (x,y) equality — this file's own restatement of
+    # the same array-instead-of-map convention fabric_routing.fct's
+    # `TopologyRegistry` already establishes, for the identical reason (no
+    # native map type in this language).
+    # ============================================================
+    struct ShardStorage:
+        records: [AtomRecord]
+
+    proc shardStorageNew() -> ShardStorage:
+        return ShardStorage{records: []}
+
+    proc shardStorageIndexOf(records: [AtomRecord], coordinate: Coordinate) -> int:
+        let n = len(records)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if records[i].atom.coordinate.x == coordinate.x && records[i].atom.coordinate.y == coordinate.y:
+                    found = i
+            i = i + 1
+        return found
+
+    proc atomRecordArrayRemoveAt(records: [AtomRecord], idx: int) -> [AtomRecord]:
+        let n = len(records)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            if i != idx:
+                result = append(result, records[i])
+            i = i + 1
+        return result
+
+    struct ShardStorageInsertResult:
+        storage: ShardStorage
+        hadPrevious: bool
+        previous: AtomRecord
+
+    # shardStorageInsert: `ShardStorage::insert` — `HashMap::insert`
+    # semantics, overwrite-and-return-the-old-value-if-any, otherwise
+    # append. Keyed off the record's OWN coordinate (`record.coordinate()`),
+    # exactly like the real method, which never takes a separate key
+    # parameter.
+    proc shardStorageInsert(storage: ShardStorage, record: AtomRecord) -> ShardStorageInsertResult:
+        let coordinate = record.atom.coordinate
+        let idx = do shardStorageIndexOf(storage.records, coordinate)
+        if idx == -1:
+            let grown = append(storage.records, record)
+            let zeroRec = do zeroAtomRecord()
+            return ShardStorageInsertResult{storage: ShardStorage{records: grown}, hadPrevious: false, previous: zeroRec}
+        let mut records = storage.records
+        let previous = records[idx]
+        records[idx] = record
+        return ShardStorageInsertResult{storage: ShardStorage{records: records}, hadPrevious: true, previous: previous}
+
+    struct AtomRecordOption:
+        has: bool
+        val: AtomRecord
+
+    proc shardStorageGet(storage: ShardStorage, coordinate: Coordinate) -> AtomRecordOption:
+        let idx = do shardStorageIndexOf(storage.records, coordinate)
+        if idx == -1:
+            let zeroRec = do zeroAtomRecord()
+            return AtomRecordOption{has: false, val: zeroRec}
+        return AtomRecordOption{has: true, val: storage.records[idx]}
+
+    # shardStorageGetMut is NOT ported: `&mut AtomRecord` handed back for
+    # the caller to mutate through has no equivalent in a value-semantics
+    # `proc` language and adds no logic of its own beyond `get` — a
+    # self-hosted caller gets the same result via `shardStorageGet` plus
+    # `atomRecordSetValue` plus `shardStorageInsert`, the same three-step
+    # substitution this file already uses internally.
+
+    struct ShardStorageRemoveResult:
+        storage: ShardStorage
+        removed: bool
+        previous: AtomRecord
+
+    proc shardStorageRemove(storage: ShardStorage, coordinate: Coordinate) -> ShardStorageRemoveResult:
+        let idx = do shardStorageIndexOf(storage.records, coordinate)
+        if idx == -1:
+            let zeroRec = do zeroAtomRecord()
+            return ShardStorageRemoveResult{storage: storage, removed: false, previous: zeroRec}
+        let previous = storage.records[idx]
+        let shrunk = do atomRecordArrayRemoveAt(storage.records, idx)
+        return ShardStorageRemoveResult{storage: ShardStorage{records: shrunk}, removed: true, previous: previous}
+
+    proc shardStorageContains(storage: ShardStorage, coordinate: Coordinate) -> bool:
+        let idx = do shardStorageIndexOf(storage.records, coordinate)
+        return idx != -1
+
+    proc shardStorageLen(storage: ShardStorage) -> int:
+        return len(storage.records)
+
+    proc shardStorageIsEmpty(storage: ShardStorage) -> bool:
+        let n = len(storage.records)
+        return n == 0
+
+    proc shardStorageRecords(storage: ShardStorage) -> [AtomRecord]:
+        return storage.records
+
+    # ============================================================
+    # shard.rs — Shard: one shard's identity (id, workload_domain) plus its
+    # own Grid and ShardStorage.
+    # ============================================================
+    struct Shard:
+        id: int
+        workloadDomain: text
+        grid: Grid
+        storage: ShardStorage
+
+    proc shardNew(id: int, workloadDomain: text) -> Shard:
+        let g = do gridNew()
+        let s = do shardStorageNew()
+        return Shard{id: id, workloadDomain: workloadDomain, grid: g, storage: s}
+
+    # shardEquals: the real `PartialEq for Shard` impl compares ONLY
+    # `id`/`workload_domain` — grid and storage are deliberately excluded,
+    # restated verbatim here rather than "improving" it into a full deep
+    # comparison the source does not perform.
+    proc shardEquals(a: Shard, b: Shard) -> bool:
+        return a.id == b.id && a.workloadDomain == b.workloadDomain
+
+    # shardClone: the real `impl Clone for Shard` is HAND-WRITTEN, not
+    # derived, and it does NOT deep-copy `grid`/`storage` — it rebuilds a
+    # brand new empty `Grid::new()`/`ShardStorage::new()` instead, so
+    # cloning a Shard silently drops every record ever written to it. This
+    # looks like a bug but it is the literal, deliberate source behavior
+    # (a hand-written `impl`, not a derive that would have copied the
+    # fields), so it is ported exactly as written, not "fixed" — per this
+    # task's own root-solutions rule, fixing it would be rework on a crate
+    # this port is not asked to change.
+    proc shardClone(s: Shard) -> Shard:
+        let g = do gridNew()
+        let storage = do shardStorageNew()
+        return Shard{id: s.id, workloadDomain: s.workloadDomain, grid: g, storage: storage}
+
+    proc shardGrid(s: Shard) -> Grid:
+        return s.grid
+
+    proc shardStorageOf(s: Shard) -> ShardStorage:
+        return s.storage
+
+    # shardContains: the real method checks ONLY `coordinate.is_valid()` —
+    # it does not consult the shard's own grid or storage at all, restated
+    # exactly that way rather than assuming a stronger check was intended.
+    proc shardContains(s: Shard, coordinate: Coordinate) -> bool:
+        let valid = do coordinateIsValid(coordinate)
+        return valid
+
+    proc shardAtom(s: Shard, coordinate: Coordinate) -> AtomOption:
+        let found = do gridAtom(s.grid, coordinate)
+        return found
+
+    proc shardAtomCount(s: Shard) -> int:
+        return 156
+
+    # ============================================================
+    # engine.rs — FacetEngine: the native storage engine for one shard.
+    # Every "mutating" operation below returns the new engine value rather
+    # than mutating in place, for the same `proc`-has-no-`&mut self` reason
+    # already stated throughout this file.
+    # ============================================================
+    struct FacetEngine:
+        shard: Shard
+
+    proc facetEngineNew(shard: Shard) -> FacetEngine:
+        return FacetEngine{shard: shard}
+
+    proc facetEngineShard(e: FacetEngine) -> Shard:
+        return e.shard
+
+    struct FacetEngineWriteResult:
+        ok: bool
+        err: text
+        engine: FacetEngine
+
+    # facetEngineWrite: `FacetEngine::write` — rejects an off-grid
+    # coordinate, then rejects a coordinate whose atom does not exist in
+    # this shard's grid (both real early-return checks, same order as the
+    # source), otherwise builds a fresh `AtomRecord` from the grid's own
+    # atom at that coordinate (not a caller-supplied one — the source reads
+    # `self.shard.atom(coordinate)...clone()` for exactly this reason) and
+    # inserts it.
+    proc facetEngineWrite(engine: FacetEngine, coordinate: Coordinate, value: Value) -> FacetEngineWriteResult:
+        let valid = do coordinateIsValid(coordinate)
+        if !valid:
+            return FacetEngineWriteResult{ok: false, err: "invalid FacetQL coordinate", engine: engine}
+        let found = do gridAtom(engine.shard.grid, coordinate)
+        if !found.has:
+            return FacetEngineWriteResult{ok: false, err: "atom does not exist", engine: engine}
+        let record = do atomRecordNew(found.val, value)
+        let inserted = do shardStorageInsert(engine.shard.storage, record)
+        let newShard = Shard{id: engine.shard.id, workloadDomain: engine.shard.workloadDomain, grid: engine.shard.grid, storage: inserted.storage}
+        return FacetEngineWriteResult{ok: true, err: "", engine: FacetEngine{shard: newShard}}
+
+    struct ValueOption:
+        has: bool
+        val: Value
+
+    proc facetEngineRead(engine: FacetEngine, coordinate: Coordinate) -> ValueOption:
+        let found = do shardStorageGet(engine.shard.storage, coordinate)
+        if !found.has:
+            let noValue = do valueNull()
+            return ValueOption{has: false, val: noValue}
+        return ValueOption{has: true, val: found.val.value}
+
+    struct FacetEngineDeleteResult:
+        engine: FacetEngine
+        removed: bool
+
+    proc facetEngineDelete(engine: FacetEngine, coordinate: Coordinate) -> FacetEngineDeleteResult:
+        let removedRes = do shardStorageRemove(engine.shard.storage, coordinate)
+        let newShard = Shard{id: engine.shard.id, workloadDomain: engine.shard.workloadDomain, grid: engine.shard.grid, storage: removedRes.storage}
+        return FacetEngineDeleteResult{engine: FacetEngine{shard: newShard}, removed: removedRes.removed}
+
+    proc facetEngineContains(engine: FacetEngine, coordinate: Coordinate) -> bool:
+        let has = do shardStorageContains(engine.shard.storage, coordinate)
+        return has
+
+    proc facetEngineLen(engine: FacetEngine) -> int:
+        let n = do shardStorageLen(engine.shard.storage)
+        return n
+
+    # ============================================================
+    # topology.rs — DbmsId/DbmsNode/Topology: the physical side of the
+    # fabric, a plain ownership tree (a node owns shards, a topology owns
+    # nodes) with no placement logic of its own (that lives in the
+    # separate fabric-topology crate, already ported in fabric_routing.fct).
+    # ============================================================
+    struct DbmsId:
+        value: text
+
+    proc dbmsIdNew(id: text) -> DbmsId:
+        return DbmsId{value: id}
+
+    struct DbmsNode:
+        id: DbmsId
+        region: text
+        shards: [Shard]
+
+    proc dbmsNodeNew(id: DbmsId, region: text) -> DbmsNode:
+        return DbmsNode{id: id, region: region, shards: []}
+
+    proc dbmsNodeAddShard(node: DbmsNode, shard: Shard) -> DbmsNode:
+        let grown = append(node.shards, shard)
+        return DbmsNode{id: node.id, region: node.region, shards: grown}
+
+    struct Topology:
+        nodes: [DbmsNode]
+
+    proc topologyNew() -> Topology:
+        return Topology{nodes: []}
+
+    proc topologyAddNode(topology: Topology, node: DbmsNode) -> Topology:
+        let grown = append(topology.nodes, node)
+        return Topology{nodes: grown}
+
+    # ============================================================
+    # workload.rs — WorkloadClass (a 7-variant Rust enum, no payload on any
+    # variant, restated as this directory's plain-text-tag convention —
+    # core_types.fct's `roleUser`/`roleAdmin` — since there is no per-
+    # variant data to carry) and Workload.
+    # ============================================================
+    proc workloadClassReadHeavy() -> text:
+        return "ReadHeavy"
+
+    proc workloadClassWriteHeavy() -> text:
+        return "WriteHeavy"
+
+    proc workloadClassMixed() -> text:
+        return "Mixed"
+
+    proc workloadClassEventHeavy() -> text:
+        return "EventHeavy"
+
+    proc workloadClassMedia() -> text:
+        return "Media"
+
+    proc workloadClassRealtime() -> text:
+        return "Realtime"
+
+    proc workloadClassUnknown() -> text:
+        return "Unknown"
+
+    struct Workload:
+        id: int
+        class: text
+
+    proc workloadNew(id: int, class: text) -> Workload:
+        return Workload{id: id, class: class}
+
+    # ============================================================
+    # DEMO / HAND-TRACE FIXTURES — no `cargo test` exists for this crate
+    # (verified: no `#[cfg(test)]` module in any of its 10 files), so every
+    # one of these is traced directly against the Rust source method body
+    # it names, not against a pre-existing test.
+    # ============================================================
+
+    # D1: Coordinate(7,3).isValid() -> true (7<12, 3<13); index = 3*12+7 = 43.
+    proc demoCoordinateValid() -> bool:
+        let c = do coordinateNew(7, 3)
+        let valid = do coordinateIsValid(c)
+        return valid
+
+    proc demoCoordinateIndex() -> int:
+        let c = do coordinateNew(7, 3)
+        let idx = do coordinateIndex(c)
+        return idx
+
+    # D2: Coordinate(12,0) is off-grid (x==12 is NOT <12) -> isValid false.
+    proc demoCoordinateInvalid() -> bool:
+        let c = do coordinateNew(12, 0)
+        let valid = do coordinateIsValid(c)
+        return valid
+
+    # D3: Atom::new("a1", (7,3)) succeeds since (7,3) is on-grid; index()
+    # delegates to coordinate.index() == 43.
+    proc demoAtomIndex() -> int:
+        let c = do coordinateNew(7, 3)
+        let built = do atomNew("a1", c)
+        let idx = do atomIndex(built.atom)
+        return idx
+
+    # D4: Atom::new with an off-grid coordinate — real Rust panics; this
+    # port reports ok=false instead (see header).
+    proc demoAtomInvalidOk() -> bool:
+        let c = do coordinateNew(99, 99)
+        let built = do atomNew("bad", c)
+        return built.ok
+
+    # D5: Grid::new has exactly 156 atoms; atom at index 43 is "atom-43"
+    # with coordinate (7,3), matching D1's index directly (grid.rs's own
+    # `format!("atom-{}", coordinate.index())`).
+    proc demoGridLen() -> int:
+        let g = do gridNew()
+        let n = len(g.atoms)
+        return n
+
+    proc demoGridAtomId() -> text:
+        let g = do gridNew()
+        let c = do coordinateNew(7, 3)
+        let found = do gridAtom(g, c)
+        return found.val.id
+
+    # D6: ShardStorage insert/get/remove round trip at (7,3): insert
+    # reports hadPrevious=false the first time, get finds the integer value
+    # 42, remove reports removed=true and the entry is gone afterward.
+    proc demoStorageRoundTripInsertedPrevious() -> bool:
+        let storage = do shardStorageNew()
+        let c = do coordinateNew(7, 3)
+        let built = do atomNew("a1", c)
+        let val = do valueInteger(42)
+        let record = do atomRecordNew(built.atom, val)
+        let inserted = do shardStorageInsert(storage, record)
+        return inserted.hadPrevious
+
+    proc demoStorageRoundTripGetValue() -> int:
+        let storage = do shardStorageNew()
+        let c = do coordinateNew(7, 3)
+        let built = do atomNew("a1", c)
+        let val = do valueInteger(42)
+        let record = do atomRecordNew(built.atom, val)
+        let inserted = do shardStorageInsert(storage, record)
+        let found = do shardStorageGet(inserted.storage, c)
+        let asInt = do valueAsInteger(found.val.value)
+        return asInt.val
+
+    proc demoStorageRoundTripRemoveThenMissing() -> bool:
+        let storage = do shardStorageNew()
+        let c = do coordinateNew(7, 3)
+        let built = do atomNew("a1", c)
+        let val = do valueInteger(42)
+        let record = do atomRecordNew(built.atom, val)
+        let inserted = do shardStorageInsert(storage, record)
+        let removedRes = do shardStorageRemove(inserted.storage, c)
+        let stillThere = do shardStorageContains(removedRes.storage, c)
+        return stillThere
+
+    # D7: FacetEngine.write at an on-grid coordinate succeeds and read
+    # returns exactly what was written; write at an off-grid coordinate
+    # fails with the exact error message engine.rs's source returns.
+    proc demoEngineWriteReadOk() -> int:
+        let s = do shardNew(1, "domain")
+        let e = do facetEngineNew(s)
+        let c = do coordinateNew(2, 5)
+        let val = do valueInteger(7)
+        let wrote = do facetEngineWrite(e, c, val)
+        let readBack = do facetEngineRead(wrote.engine, c)
+        let asInt = do valueAsInteger(readBack.val)
+        return asInt.val
+
+    proc demoEngineWriteInvalidCoordinateErr() -> text:
+        let s = do shardNew(1, "domain")
+        let e = do facetEngineNew(s)
+        let c = do coordinateNew(50, 50)
+        let val = do valueInteger(1)
+        let wrote = do facetEngineWrite(e, c, val)
+        return wrote.err
+
+    # D8: shardClone drops storage — write to a shard, clone the engine's
+    # shard, and confirm the clone no longer contains what was written
+    # (the real hand-written `impl Clone for Shard` rebuilds empty
+    # grid/storage, see shardClone's own comment above).
+    proc demoShardCloneDropsStorage() -> bool:
+        let s = do shardNew(1, "domain")
+        let e = do facetEngineNew(s)
+        let c = do coordinateNew(3, 3)
+        let val = do valueInteger(9)
+        let wrote = do facetEngineWrite(e, c, val)
+        let cloned = do shardClone(wrote.engine.shard)
+        let stillThere = do shardContains(cloned, c)
+        let hasRecord = do shardStorageContains(cloned.storage, c)
+        return hasRecord
+
+    # D9: Topology/DbmsNode composition round trip — add a shard to a
+    # node, add the node to a topology, confirm both counts.
+    proc demoTopologyNodeCount() -> int:
+        let id = do dbmsIdNew("node-1")
+        let node = do dbmsNodeNew(id, "us-east")
+        let s = do shardNew(1, "domain")
+        let grown = do dbmsNodeAddShard(node, s)
+        let topo = do topologyNew()
+        let topo2 = do topologyAddNode(topo, grown)
+        return len(topo2.nodes)
+
+    proc demoTopologyNodeShardCount() -> int:
+        let id = do dbmsIdNew("node-1")
+        let node = do dbmsNodeNew(id, "us-east")
+        let s = do shardNew(1, "domain")
+        let grown = do dbmsNodeAddShard(node, s)
+        return len(grown.shards)
+
+    # ============================================================
+    # LIVE CONSOLE VERIFICATION — this app has no entities/actions of its
+    # own (it is a pure-logic port), so `facet console`'s `<expression>`
+    # evaluator has nothing to call a bare proc against directly. The same
+    # pattern fabric.fct's own `runDemoMigration`/`state demoM1...` already
+    # uses for this exact problem: one `action` runs every demo proc above
+    # and latches each result into a `state` cell, then `:run
+    # runFabricCoreDemo()` followed by `:state` in `facet console` prints
+    # the real, executed results for direct comparison against the hand-
+    # traced expectations documented next to each demo proc above.
+    # ============================================================
+    state demoCoordinateValidResult: bool = false
+    state demoCoordinateIndexResult: int = 0
+    state demoCoordinateInvalidResult: bool = true
+    state demoAtomIndexResult: int = 0
+    state demoAtomInvalidOkResult: bool = true
+    state demoGridLenResult: int = 0
+    state demoGridAtomIdResult: text = ""
+    state demoStorageInsertedPreviousResult: bool = true
+    state demoStorageGetValueResult: int = 0
+    state demoStorageRemovedThenMissingResult: bool = true
+    state demoEngineWriteReadValueResult: int = 0
+    state demoEngineWriteInvalidErrResult: text = ""
+    state demoShardCloneHasRecordResult: bool = true
+    state demoTopologyNodeCountResult: int = 0
+    state demoTopologyNodeShardCountResult: int = 0
+
+    action runFabricCoreDemo():
+        let coordinateValid = do demoCoordinateValid()
+        let coordinateIndex = do demoCoordinateIndex()
+        let coordinateInvalid = do demoCoordinateInvalid()
+        let atomIndex = do demoAtomIndex()
+        let atomInvalidOk = do demoAtomInvalidOk()
+        let gridLen = do demoGridLen()
+        let gridAtomId = do demoGridAtomId()
+        let storageInsertedPrevious = do demoStorageRoundTripInsertedPrevious()
+        let storageGetValue = do demoStorageRoundTripGetValue()
+        let storageRemovedThenMissing = do demoStorageRoundTripRemoveThenMissing()
+        let engineWriteReadValue = do demoEngineWriteReadOk()
+        let engineWriteInvalidErr = do demoEngineWriteInvalidCoordinateErr()
+        let shardCloneHasRecord = do demoShardCloneDropsStorage()
+        let topologyNodeCount = do demoTopologyNodeCount()
+        let topologyNodeShardCount = do demoTopologyNodeShardCount()
+        demoCoordinateValidResult = coordinateValid
+        demoCoordinateIndexResult = coordinateIndex
+        demoCoordinateInvalidResult = coordinateInvalid
+        demoAtomIndexResult = atomIndex
+        demoAtomInvalidOkResult = atomInvalidOk
+        demoGridLenResult = gridLen
+        demoGridAtomIdResult = gridAtomId
+        demoStorageInsertedPreviousResult = storageInsertedPrevious
+        demoStorageGetValueResult = storageGetValue
+        demoStorageRemovedThenMissingResult = storageRemovedThenMissing
+        demoEngineWriteReadValueResult = engineWriteReadValue
+        demoEngineWriteInvalidErrResult = engineWriteInvalidErr
+        demoShardCloneHasRecordResult = shardCloneHasRecord
+        demoTopologyNodeCountResult = topologyNodeCount
+        demoTopologyNodeShardCountResult = topologyNodeShardCount

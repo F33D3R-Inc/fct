@@ -119,6 +119,22 @@ func parseApp(n *source.Node, comments []source.Line) (*ast.App, error) {
 // returned facet's contents; here we only parse what is structurally a member.
 func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 	var err error
+	// `private` marks a proc/view whose name is file-local: internal/compile
+	// mangles it (and every same-file call to it) to a name unique to this
+	// file before merging imported modules together, so two files that each
+	// declare their own file-local helper under the same name never collide.
+	// Stripped here so every case below (and the specific parseProc/parseView
+	// that reads c.Line.Text directly) sees the declaration as if `private `
+	// were never there; the flag itself is threaded onto the parsed node
+	// right after a successful parse.
+	private := false
+	if strings.HasPrefix(c.Line.Text, "private ") {
+		private = true
+		c.Line.Text = strings.TrimPrefix(c.Line.Text, "private ")
+	}
+	if private && !strings.HasPrefix(c.Line.Text, "proc ") && !strings.HasPrefix(c.Line.Text, "view ") {
+		return &Error{c.Line.No, fmt.Sprintf("`private` is only supported on proc and view declarations, not %q", firstWord(c.Line.Text))}
+	}
 	switch {
 	case c.Line.Text == "auth" || c.Line.Text == "auth:":
 		app.Auth = true
@@ -210,6 +226,7 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 	case strings.HasPrefix(c.Line.Text, "proc "):
 		var p *ast.Proc
 		if p, err = parseProc(c); err == nil {
+			p.Private = private
 			app.Procs = append(app.Procs, p)
 		}
 	case strings.HasPrefix(c.Line.Text, "job "):
@@ -245,6 +262,7 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 	case strings.HasPrefix(c.Line.Text, "view "):
 		var v *ast.View
 		if v, err = parseView(c); err == nil {
+			v.Private = private
 			app.Views = append(app.Views, v)
 		}
 	default:
@@ -2403,6 +2421,58 @@ func parseDuration(s string, line int) (int, error) {
 	}
 }
 
+// parseAfter parses `after 5s: cell = false` (ast.After): a client-only,
+// fire-once timer nested in a view/component body. The duration reuses
+// parseDuration — job/daemon's exact `every 30s`/`5m`/`2h` grammar — rather
+// than inventing a second one. The body is one or more plain cell
+// assignments, parsed the same way an action body's trailing `target = expr`
+// arm already is (parseAction's default case, below); every other action-body
+// statement shape (check/requires/add/set/remove/clear/call/do/let/establish)
+// is refused here with a diagnostic naming why, since a client timer body can
+// only ever run the one thing runClient (assets/facet.js) already knows how
+// to execute with no round trip to the authority.
+func parseAfter(n *source.Node) (ast.After, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "after")), ":")
+	if head == "" {
+		return ast.After{}, &Error{n.Line.No, "after needs a duration: `after 5s: cell = false`"}
+	}
+	secs, err := parseDuration(head, n.Line.No)
+	if err != nil {
+		return ast.After{}, err
+	}
+	if len(n.Children) == 0 {
+		return ast.After{}, &Error{n.Line.No, "after has no body: `after 5s: cell = false`"}
+	}
+	var body []ast.Stmt
+	for _, c := range n.Children {
+		t := c.Line.Text
+		switch {
+		case strings.HasPrefix(t, "check "), strings.HasPrefix(t, "requires "),
+			strings.HasPrefix(t, "add "), strings.HasPrefix(t, "set "),
+			strings.HasPrefix(t, "remove "), strings.HasPrefix(t, "clear "),
+			strings.HasPrefix(t, "call "), strings.HasPrefix(t, "do "),
+			strings.HasPrefix(t, "let "), strings.HasPrefix(t, "establish "):
+			return ast.After{}, &Error{c.Line.No, fmt.Sprintf(
+				"after body can only assign a @client cell (`name = expr`) — %q needs the authority (entity/service access, validation, identity) and cannot run in a client-side timer; put it in an action instead", firstWord(t))}
+		default:
+			eq := strings.IndexByte(t, '=')
+			if eq < 0 {
+				return ast.After{}, &Error{c.Line.No, fmt.Sprintf("after body can only assign a @client cell (`name = expr`), not %q", firstWord(t))}
+			}
+			target := strings.TrimSpace(t[:eq])
+			if !isIdent(target) {
+				return ast.After{}, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q", target)}
+			}
+			val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)
+			if err != nil {
+				return ast.After{}, err
+			}
+			body = append(body, ast.Assign{Target: target, Value: val, Line: c.Line.No})
+		}
+	}
+	return ast.After{Seconds: secs, Body: body, Line: n.Line.No}, nil
+}
+
 // parseDaemon parses a detached, process-lifetime background task:
 //
 //	daemon Heartbeat every 2s:
@@ -2960,6 +3030,12 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, ast.If{Cond: cond, Body: kids})
+		case strings.HasPrefix(t, "after "):
+			af, err := parseAfter(c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, af)
 		case strings.HasPrefix(t, "overlay "):
 			ov, err := parseOverlay(c)
 			if err != nil {

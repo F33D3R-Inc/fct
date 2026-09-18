@@ -931,6 +931,17 @@
         fillIf(d, node, sc, path);
         return d;
       }
+      case "after": {
+        // A client-only, fire-once timer (ast.After / IR "after"): no visible
+        // element, so a comment node holds its place the way a fragment does for
+        // a plain `if` — and scheduling happens right here, at build time, so
+        // "fires once after mount" falls out of this function's own name: render0
+        // runs exactly when this node is (re)built into the DOM, whether that is
+        // this page's first render or a later region refill that brought the
+        // branch it lives in back to true.
+        scheduleAfter(node, sc);
+        return document.createComment("after");
+      }
       case "match": {
         const d = el("div");
         if (node.id) d.setAttribute("data-fa-region", node.id);
@@ -1832,6 +1843,30 @@
     const data = await res.json();
     if (data.reload) { location.reload(); return; } // identity changed (login/logout)
     applyDeltas(data.deltas);
+  }
+
+  // scheduleAfter arms one "after" node's timer: `sc` is this node's own render
+  // scope, captured now because it may hold a `for`/option-row binding no later
+  // lookup could recover (the row this particular DOM instance was built for).
+  // Every OTHER name reads fresh off `store` when the timer actually fires,
+  // matching dispatch()'s own "now, not when scheduled" rule for a button's
+  // action body — an `after` a `for` did not bind locally still sees whatever
+  // that cell holds five seconds from now, not what it held at mount.
+  function scheduleAfter(node, sc) {
+    const body = list(node.body);
+    if (!body.length) return;
+    const locals = {};
+    for (const k in sc) if (!(k in store) || sc[k] !== store[k]) locals[k] = sc[k];
+    setTimeout(function () {
+      const scope = Object.assign({}, store, locals);
+      const changed = [];
+      for (const st of body) {
+        if (st.op !== "assign") continue;
+        const v = ev(st.value, scope);
+        if (store[st.target] !== v) { store[st.target] = v; scope[st.target] = v; changed.push(st.target); }
+      }
+      if (changed.length) refresh(changed);
+    }, Math.max(0, (node.seconds || 0) * 1000));
   }
 
   function runClient(act, vals) {

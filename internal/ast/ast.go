@@ -582,6 +582,14 @@ type Proc struct {
 	Uses []string
 	Body []Stmt
 	Line int
+	// Private marks a `private proc Name(...):` declaration — its name is
+	// visible only within the file that declares it. internal/compile mangles
+	// a private declaration's name (and every same-file call to it) to a
+	// name unique to that file before merging imported modules together, so
+	// two files that each declare their own file-local helper under the same
+	// name can be imported side by side without colliding. See
+	// internal/compile/private.go.
+	Private bool
 }
 
 // Service is an external service (a "brain") fct can call over HTTP: a base URL
@@ -1035,6 +1043,12 @@ type View struct {
 	TitleSegs []Seg
 	DescSegs  []Seg
 	Line      int
+	// Private marks a `private view Name [at "/path"]:` declaration — see
+	// Proc.Private above for what this means and why; a view's name carries
+	// no other same-file reference (routing is by Path, not Name), so a
+	// private view only ever needs its own Name mangled, never a call-site
+	// rewrite.
+	Private bool
 }
 
 // ── view nodes ──────────────────────────────────────────────────────────────
@@ -1338,6 +1352,32 @@ type If struct {
 	Body []Node
 }
 
+// After is a client-only, fire-once timer: `after 5s: cell = false`. Seconds
+// reuses parseDuration — the exact `30s`/`5m`/`2h` grammar `job … every` and
+// `daemon … every` already parse — so this is a second use of that grammar,
+// not a second parser for it. Body runs once, this many seconds after the
+// node it is declared under is (re)rendered client-side (assets/facet.js's
+// render0 schedules the setTimeout the moment it builds this node's element,
+// so a toast that re-appears — its enclosing `if` refilled true again —
+// restarts the clock, exactly what "on mount" should mean here).
+//
+// Every statement in Body must be a plain `target = expr` assignment to a
+// @client cell (internal/ir/build.go's `case ast.After` checks this) — the
+// same restriction a client-placed Action's body already has in practice
+// (see e.action's placement inference), and the reason: runClient, the one
+// client-side interpreter capable of running a statement with no round trip
+// to the authority, only ever executes "assign" statements. Reusing that
+// interpreter (instead of writing a second one for `after`) is what keeps
+// this narrow: no `if`, no `add`/`set`/`remove`/`call`/`do`, no nested
+// control flow — every cataloged use case (a toast auto-dismiss, a slow-mode
+// countdown, a typing indicator, a timed banner) is one or a few flips of a
+// bool/text @client cell.
+type After struct {
+	Seconds int
+	Body    []Stmt
+	Line    int
+}
+
 // Input is a text control two-way bound to a client state cell. The placeholder
 // is interpolated segments, so a reusable field component can be handed its hint.
 type Input struct {
@@ -1582,6 +1622,7 @@ func (Button) node()    {}
 func (For) node()       {}
 func (Stage) node()     {}
 func (If) node()        {}
+func (After) node()     {}
 func (Input) node()     {}
 func (Overlay) node()   {}
 func (Popover) node()   {}

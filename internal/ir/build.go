@@ -4586,6 +4586,36 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			node.Children = kids
 			out = append(out, node)
 
+		case ast.After:
+			// A client-only, fire-once timer (ast.After). It carries no ID/dependency
+			// edge of its own — unlike If/Overlay/Popover it never re-fills on a cell
+			// change, it fires once when assets/facet.js's render0 builds it, which
+			// happens exactly when its enclosing region (re)renders it — so "on
+			// mount" falls out of the existing region-refresh mechanism for free,
+			// with no new one to add. Each statement must assign a @client cell,
+			// checked exactly like Control/Input/Overlay/Popover's own bind checks
+			// above: only a client cell may be written with no round trip to the
+			// authority.
+			var body []Stmt
+			for _, s := range t.Body {
+				as, ok := s.(ast.Assign)
+				if !ok {
+					return nil, &BuildError{t.Line, "after body can only assign a client cell"}
+				}
+				p, ok := c.e.states[as.Target]
+				if !ok {
+					return nil, &BuildError{as.Line, fmt.Sprintf("after assigns unknown state %q", as.Target)}
+				}
+				if p != Client {
+					return nil, &BuildError{as.Line, fmt.Sprintf("after assigns %q, which is authoritative; a timer runs client-side with no round trip, so it needs a @client state — declare it `@client` or flip it from an action instead", as.Target)}
+				}
+				if err := c.checkView(as.Value, sc, as.Line, "an `after` assignment"); err != nil {
+					return nil, err
+				}
+				body = append(body, Stmt{Op: "assign", Target: as.Target, Value: c.e.low(as.Value)})
+			}
+			out = append(out, Node{Kind: "after", Seconds: t.Seconds, Body: body})
+
 		case ast.Input:
 			p, ok := c.e.states[t.Bind]
 			if !ok {

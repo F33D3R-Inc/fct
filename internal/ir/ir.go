@@ -597,6 +597,14 @@ type Node struct {
 	More string `json:"more,omitempty"`
 	Cond *Expr  `json:"cond,omitempty"` // if: condition
 
+	// Seconds and Body are "after"'s own fields: a client-only, fire-once timer
+	// (ast.After). Seconds is the parsed delay; Body is the statement list
+	// runClient (assets/facet.js) already knows how to run with no round trip —
+	// reused here rather than duplicated, and restricted to "assign" ops by
+	// internal/ir/build.go's `case ast.After` (see ast.After's doc).
+	Seconds int    `json:"seconds,omitempty"`
+	Body    []Stmt `json:"body,omitempty"`
+
 	// Level is a heading's document level, 1..6 — an expression, because the
 	// depth a header renders at belongs to the page that uses it and not to the
 	// component that draws it (see ast.Heading). It is evaluated per render and
