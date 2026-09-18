@@ -908,3 +908,254 @@ func TestTokenizeRound3StringAndBracketTokens(t *testing.T) {
 		}
 	}
 }
+
+// ============================================================
+// Round 4: builtin function calls (`name(args...)`) and list literals
+// (`[elems...]`) — verified the exact same way rounds 1/2/3 were: real
+// expression strings, fed to both the real, unmodified
+// internal/parser.ParseExpr and expr.fct's own tokenizer+parser (over
+// HTTP), compared as the same treeShape.
+//
+// Two real grammar findings shaped this round's case list (see expr.fct's
+// own ROUND 4 SCOPE NOTE for the full reasoning):
+//
+//   - This language has no user-defined functions in expression position —
+//     `name(args)` only ever means a call to one of expr.go's fixed builtin
+//     names (isBuiltinCall). An arbitrary identifier followed by `(` that is
+//     NOT one of those names is `Entity(key).field` lookup syntax in the
+//     real grammar (a different AST shape, ast.EntityGet) — genuinely out of
+//     scope this round, not merely untested. exprCasesRound4 therefore only
+//     ever calls real builtin names (len/abs/trim/contains/upper/slice/
+//     charAt/append/...), the same allowlist expr.fct's own isCallNameTok
+//     uses (minus min/max — see below).
+//   - `min`/`max` are excluded from this round's call-name allowlist
+//     entirely, because they are genuinely ambiguous with the (also out of
+//     scope) aggregate grammar in the real parser (`min(x)` alone is an
+//     aggregate; `min(a, b)` is a call) — see
+//     TestCallDisambiguationAndOutOfScopeNames below for this exact
+//     divergence, checked directly against this port's own honest
+//     behavior rather than against the real Go parser (which would produce
+//     a wholly different AST shape for some of these inputs).
+//
+// exprCasesRound4 covers, per the task's own priority list: calls with 0,
+// 1, 2, and 3+ arguments; nested calls; calls with complex argument
+// expressions; list literals with 0, 1, and several elements; nested list
+// literals (confirmed in scope — expr.go's own parseListLit parses each
+// element via parseBinary(0), which can itself bottom out in another `[`);
+// lists of complex expressions; and the disambiguation cases that matter
+// most (`a[0]` index vs. `[0]` list literal; `len` bare ref vs. `len(x)`
+// call; a list literal immediately indexed, `[1, 2][0]`); plus precedence
+// interactions between calls/lists and every earlier round's operators.
+var exprCasesRound4 = []string{
+	// calls: 0, 1, 2, 3+ arguments
+	"len()",
+	"len(x)",
+	"abs(x)",
+	"trim(a)",
+	"contains(a, b)",
+	"slice(a, b, c)",
+	"charAt(s, i)",
+	"append(a, b, c)",
+	// nested calls
+	"contains(trim(a), upper(b))",
+	"abs(len(x))",
+	"len(trim(upper(x)))",
+	// calls with complex argument expressions
+	"abs(a + b)",
+	"len(a.field)",
+	"contains(a.field, b + 1)",
+	"trim(a[i])",
+	"contains(a == b, c != d)",
+	// list literals: 0, 1, several elements
+	"[]",
+	"[1]",
+	"[1, 2, 3]",
+	"[a, b, c]",
+	// nested list literals
+	"[1, [2, 3], 4]",
+	"[[1, 2], [3, 4]]",
+	"[[]]",
+	// lists of complex expressions
+	"[a + b, c.field, len(x)]",
+	"[a == b, c != d]",
+	// disambiguation: index vs. list literal
+	"a[0]",
+	"[0]",
+	"[1, 2][0]",
+	"a[0] + [1, 2][0]",
+	"[a, b][i]",
+	// disambiguation: bare ref vs. call
+	"len",
+	"len(x)",
+	"len + x",
+	"abs",
+	"abs(x) + abs(y)",
+	// precedence interactions
+	"2 + len(x)",
+	"len(x) + 2",
+	"-len(x)",
+	"!contains(a, b) && c",
+	"len(x) == 0",
+	"len(x) > 0 && len(y) > 0",
+}
+
+// TestExprArenaMatchesGoParserRound4 is TestExprArenaMatchesGoParser's exact
+// twin, run over exprCasesRound4 instead of exprCases — same real-Go-parser
+// cross-check, same shape comparison, same consumedAll assertion. Kept as a
+// separate test (rather than folded into exprCases/exprCasesRound2/
+// exprCasesRound3) so a round-4 regression is reported distinctly, per this
+// file's own convention of never editing an already-verified case list.
+func TestExprArenaMatchesGoParserRound4(t *testing.T) {
+	ts := loadExprApp(t)
+	for _, src := range exprCasesRound4 {
+		t.Run(src, func(t *testing.T) {
+			wantExpr, err := parser.ParseExpr(src)
+			if err != nil {
+				t.Fatalf("real Go parser.ParseExpr(%q): %v", src, err)
+			}
+			want := shapeFromGoExpr(t, wantExpr)
+
+			d := postExprJSON(t, ts, "runParseExpr", src)
+			arenaRaw, ok := d["arenaResult"].([]any)
+			if !ok {
+				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
+			}
+			arena := make([]int, len(arenaRaw))
+			for i, v := range arenaRaw {
+				arena[i] = int(v.(float64))
+			}
+			textsRaw, ok := d["tokenTextsResult"].([]any)
+			if !ok {
+				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
+			}
+			texts := make([]string, len(textsRaw))
+			for i, v := range textsRaw {
+				texts[i] = v.(string)
+			}
+			if len(arena)%5 != 0 || len(arena) == 0 {
+				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
+			}
+			rootIdx := len(arena)/5 - 1
+			got := shapeFromArena(t, arena, texts, rootIdx)
+
+			if !shapesEqual(got, want) {
+				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
+			}
+
+			if consumedOK, _ := d["consumedAllResult"].(bool); !consumedOK {
+				t.Errorf("%q: parseExprConsumedAll = false, want true (a fully valid expression in this subset)", src)
+			}
+		})
+	}
+}
+
+// TestCallDisambiguationAndOutOfScopeNames checks this round's one real,
+// documented divergence from the real Go parser directly (not via
+// shapesEqual against parser.ParseExpr, which would produce a genuinely
+// different AST — ast.EntityGet or ast.Agg — for these inputs): a name
+// immediately followed by `(` that is NOT in this port's builtin-call
+// allowlist (isCallNameTok) is honestly left UNCONSUMED, exactly like any
+// other out-of-scope construct in this file (see
+// TestParseExprConsumedAllDetectsTrailingGarbage for the established
+// pattern this mirrors) — never silently misparsed as a call, and never a
+// crash.
+//
+//   - "foo(x)": "foo" is not a builtin name, so in the real grammar this is
+//     `Entity(key).field`-shaped (ast.EntityGet) syntax — out of scope here
+//     (see expr.fct's ROUND 4 SCOPE NOTE, finding 1). This port's
+//     isCallStartAt returns false for "foo", so postfixEnd/postfixNodes
+//     fall through to a plain Ref("foo") leaf, consuming only the "foo"
+//     token; "(x)" is left over, so consumedAll must be false.
+//   - "min(a, b)" / "max(x)": deliberately excluded from isCallNameTok
+//     (ROUND 4 SCOPE NOTE, finding 2) because the real grammar's own
+//     disambiguation for these two names (call vs. aggregate, decided by
+//     whether the argument list has a top-level comma) is itself out of
+//     scope — including them here would risk a WRONG tree shape for the
+//     no-comma case, not just an incomplete one, so both degrade the same
+//     honest "not consumed" way "foo(x)" does, regardless of arity.
+//   - "len" alone (no trailing `(`) and "len + x" both confirm the other
+//     direction: a builtin name NOT immediately followed by `(` is still
+//     just a bare Ref and IS fully consumed — isCallStartAt's lookahead
+//     never fires without an immediately-adjacent `(`.
+func TestCallDisambiguationAndOutOfScopeNames(t *testing.T) {
+	ts := loadExprApp(t)
+	cases := []struct {
+		src  string
+		want bool
+	}{
+		{"foo(x)", false},    // non-builtin name + `(`: out of scope (real grammar: EntityGet)
+		{"min(a, b)", false}, // min/max deliberately excluded (aggregate ambiguity)
+		{"max(x)", false},
+		{"len", true},     // builtin name, no `(`: just a bare Ref, fully consumed
+		{"len + x", true}, // ditto, mid-expression
+		{"len(x)", true},  // builtin name + `(`: a real call, fully consumed
+	}
+	for _, c := range cases {
+		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
+		got, _ := d["consumedAllResult"].(bool)
+		if got != c.want {
+			t.Errorf("parseExprConsumedAll(%q) = %v, want %v", c.src, got, c.want)
+		}
+	}
+}
+
+// TestIndexVsListLitDisambiguation is this round's headline new-grammar-
+// boundary check: `a[0]` (postfix indexing — `[` appearing AFTER an atom
+// already exists) and `[0]` (a list literal — `[` appearing where a fresh
+// atom is expected) must never be confused, in either direction, including
+// when they appear right next to each other in the same expression. Cross-
+// checked against the real Go parser's own ast.Expr, exactly like
+// TestExprArenaMatchesGoParserRound4 above (folded into that test's own
+// case list too; kept as its own focused test so this specific boundary is
+// never accidentally deleted or diluted by an unrelated future edit to
+// exprCasesRound4).
+func TestIndexVsListLitDisambiguation(t *testing.T) {
+	ts := loadExprApp(t)
+	cases := []string{
+		"a[0]",             // index: `[` after an existing atom `a`
+		"[0]",              // list literal: `[` starting a fresh atom
+		"[1, 2][0]",        // a list literal immediately indexed
+		"a[0] + [1, 2][0]", // both forms in one expression
+		"[a, b][i]",        // list literal of refs, indexed by a ref
+		"a[[0][0]]",        // a list literal used AS an index expression
+	}
+	for _, src := range cases {
+		t.Run(src, func(t *testing.T) {
+			wantExpr, err := parser.ParseExpr(src)
+			if err != nil {
+				t.Fatalf("real Go parser.ParseExpr(%q): %v", src, err)
+			}
+			want := shapeFromGoExpr(t, wantExpr)
+
+			d := postExprJSON(t, ts, "runParseExpr", src)
+			arenaRaw, ok := d["arenaResult"].([]any)
+			if !ok {
+				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
+			}
+			arena := make([]int, len(arenaRaw))
+			for i, v := range arenaRaw {
+				arena[i] = int(v.(float64))
+			}
+			textsRaw, ok := d["tokenTextsResult"].([]any)
+			if !ok {
+				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
+			}
+			texts := make([]string, len(textsRaw))
+			for i, v := range textsRaw {
+				texts[i] = v.(string)
+			}
+			if len(arena)%5 != 0 || len(arena) == 0 {
+				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
+			}
+			rootIdx := len(arena)/5 - 1
+			got := shapeFromArena(t, arena, texts, rootIdx)
+
+			if !shapesEqual(got, want) {
+				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
+			}
+			if consumedOK, _ := d["consumedAllResult"].(bool); !consumedOK {
+				t.Errorf("%q: parseExprConsumedAll = false, want true", src)
+			}
+		})
+	}
+}
