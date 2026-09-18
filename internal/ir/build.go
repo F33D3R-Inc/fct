@@ -1781,6 +1781,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	entWrite := false           // any entity mutation
 	reads := map[string]bool{}  // state names read (for soundness)
 	impure := false             // uses an effectful builtin (now/rand)
+	usesPrint := false          // calls print(...) — unconditionally server-executed, see printCap
 	callsService := false       // calls an external service (an effect)
 	callsProc := false          // calls a proc (`do`) — unconditionally server-executed
 	establishesID := false      // sets the session identity (`establish`)
@@ -1798,6 +1799,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		}
 		if hasImpure(ex) {
 			impure = true
+		}
+		if hasPrint(ex) {
+			usesPrint = true
 		}
 		for n := range e.depsIR(e.low(ex)) {
 			if _, isState := e.states[n]; isState {
@@ -2097,6 +2101,19 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				es.Role = e.low(st.Role)
 			}
 			act.Body = append(act.Body, es)
+		case ast.ExprStmt:
+			// A bare builtin call for its side effect alone, its result discarded —
+			// print(...) on its own line, the action-body counterpart to procBlock's
+			// identical ast.ExprStmt case. Not print-specific machinery: readExpr's
+			// e.check funnel already refuses any builtin that doesn't belong in an
+			// action body (readFile/writeFile/httpGet/httpPost/channel/bitwise/float
+			// all stay proc-only via checkNoIO/checkNoConcurrency/checkNoBitwise/
+			// checkNoFloat), so print is simply the one builtin this shape is
+			// actually useful for today.
+			if err := readExpr(st.Call, st.Line); err != nil {
+				return Action{}, err
+			}
+			act.Body = append(act.Body, Stmt{Op: "exprstmt", Value: e.low(st.Call)})
 		}
 	}
 
@@ -2149,6 +2166,8 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			case ast.Establish:
 				collect(st.Actor)
 				collect(st.Role)
+			case ast.ExprStmt:
+				collect(st.Call)
 			}
 		}
 		for _, r := range a.Requires {
@@ -2192,6 +2211,14 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	case entWrite:
 		act.Placement = Server
 		act.Reason = "writes durable entity data — the authority owns the database"
+	case usesPrint:
+		// Unlike now/rand (the `impure` case below), print has no client-side
+		// implementation and no "only writes @client state" escape hatch would
+		// make sense for it even if it did: the entire point of print(...) is a
+		// line in the AUTHORITY's own log output, so an action that calls it
+		// must always run there, regardless of what state it writes.
+		act.Placement = Server
+		act.Reason = "calls print(...) — a server-only debugging aid with no client implementation; the authority is the only process with log output to write it to"
 	case impure && !writesOnlyClientState(writes, e.states):
 		act.Placement = Server
 		act.Reason = "uses an effectful builtin (now/rand) — the authority owns nondeterminism, so every client sees one agreed result"
@@ -2952,6 +2979,14 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// proc, the same "clean error, not a silent wrong answer" stance an
 			// out-of-bounds array read already takes (see runtime/io.go).
 			return "bool"
+		case "print":
+			// print(value) returns value unchanged (the same "log it, keep going"
+			// shape as Rust's dbg!()) — so it types identically to its own
+			// argument, whatever that argument's type is, exactly like abs
+			// below preserves int-vs-float.
+			if len(t.Args) == 1 {
+				return inferProcType(t.Args[0], types)
+			}
 		case "toFloat":
 			return "float"
 		case "toInt", "floor", "round":
@@ -5338,6 +5373,10 @@ func (e *env) checkPure(ex ast.Expr, locals map[string]bool, line int, ctx strin
 		return &BuildError{line, fmt.Sprintf(
 			"%s cannot use an effectful builtin (now/rand); it must be pure so it can run on any client. Compute it in an action instead", ctx)}
 	}
+	if hasPrint(ex) {
+		return &BuildError{line, fmt.Sprintf(
+			"%s cannot call print(...); it is a server-only debugging aid with no client implementation. Call it from an action body or a proc instead", ctx)}
+	}
 	return nil
 }
 
@@ -5621,6 +5660,20 @@ var knownCapabilities = map[string]bool{"io.file": true, "io.net": true}
 // declaration, only placement.
 const impureCap = "impure"
 
+// printCap is printCap's own never-user-declared capability key, the same
+// device impureCap uses for now()/rand(): procCapabilities' one shared walker
+// flags a print(...) call under this key so hasPrint (below) can answer "does
+// ex call print" without a second tree-walk, and checkProcCapabilities skips
+// it exactly like impureCap — print needs no `uses` declaration (see
+// isBuiltinCall's doc in internal/parser/expr.go: it is a language-level
+// debugging aid, not I/O to an external resource). It is deliberately its own
+// key rather than reusing impureCap: unlike now/rand, print must never fall
+// into the "an impure action that only writes @client state runs on the
+// client instead" placement exception (env.action's placement switch), since
+// there is no client-side implementation of it and its whole point is a line
+// in the AUTHORITY's own log output.
+const printCap = "print"
+
 // procCapabilities walks ex and collects every capability its builtin calls
 // require, keyed by capability name to one builtin call that needed it (for a
 // clear diagnostic — see checkProcCapabilities). This is hasImpure's exact
@@ -5639,6 +5692,8 @@ func procCapabilities(ex ast.Expr) map[string]string {
 		case ast.Call:
 			if t.Name == "now" || t.Name == "rand" {
 				caps[impureCap] = t.Name
+			} else if t.Name == "print" {
+				caps[printCap] = t.Name
 			} else if cap, ok := builtinCapability(t.Name); ok {
 				caps[cap] = t.Name
 			}
@@ -5695,6 +5750,18 @@ func hasImpure(ex ast.Expr) bool {
 	return ok
 }
 
+// hasPrint reports whether ex invokes print(...) anywhere in its tree — the
+// print counterpart to hasImpure, above, with the same "computed off the
+// shared procCapabilities set" shape. Its two call sites are env.action's
+// placement switch (print forces server placement unconditionally — see
+// printCap's doc) and checkPure (print has a side effect and no client
+// implementation, so it is barred from a view/check/requires expression,
+// exactly as an impure now()/rand() call already is).
+func hasPrint(ex ast.Expr) bool {
+	_, ok := procCapabilities(ex)[printCap]
+	return ok
+}
+
 // checkProcCapabilities rejects a proc expression that calls a capability-
 // gated builtin (readFile/writeFile/httpGet/httpPost) the proc did not declare
 // in its own `uses` clause — the static enforcement side of the capability
@@ -5706,7 +5773,7 @@ func checkProcCapabilities(p *ast.Proc, ex ast.Expr, line int) error {
 	caps := procCapabilities(ex)
 	names := make([]string, 0, len(caps))
 	for cap := range caps {
-		if cap != impureCap {
+		if cap != impureCap && cap != printCap {
 			names = append(names, cap)
 		}
 	}
@@ -5744,6 +5811,14 @@ func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
 		"ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney":
+		return 1, true
+	case "print":
+		// print(value): a debugging aid, not real arithmetic/string/date
+		// computation like the rest of this group — arity-checked the exact
+		// same way (one argument, any type) because it shares this function's
+		// only job (arity), not its "pure" name. See printCap's doc for why it
+		// is walked and capability-exempted alongside now/rand instead of
+		// living with readFile/writeFile/httpGet/httpPost's capability gate.
 		return 1, true
 	case "append":
 		return 2, true

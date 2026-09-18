@@ -581,6 +581,7 @@ func (p *exprParser) parseCall(name string) (ast.Expr, error) {
 func isBuiltinCall(name string) bool {
 	switch name {
 	case "now", "rand", // effectful (pinned to the authority)
+		"print", // debug output (server-only, but callable from action AND proc bodies — see internal/ir/build.go's printCap)
 		"abs", "min", "max", "floor", "round", "money", // math / money
 		"toFloat", "toInt", // explicit int<->float conversion (toFloat is proc-only — see checkNoFloat)
 		"toMoney",                                                                       // explicit text->money conversion — not proc-only, money is a real type everywhere

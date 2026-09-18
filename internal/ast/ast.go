@@ -898,11 +898,18 @@ type Do struct {
 
 // ExprStmt is a bare builtin call used as its own statement, purely for its
 // side effect, its result discarded — the counterpart to Do's fire-and-forget
-// form, but for a builtin (writeFile/httpPost/...) instead of a proc. Needed
-// because a proc's statement grammar otherwise has no "call for effect, don't
-// bind" shape for anything but `do`: `writeFile(path, content)` on its own
-// line has no `=` and isn't a `do`, so without this it would fall through to
-// parseProcBody's "unknown statement" case. Proc-only, like Do.
+// form, but for a builtin (writeFile/httpPost/print/...) instead of a proc.
+// Needed because a proc's statement grammar otherwise has no "call for
+// effect, don't bind" shape for anything but `do`: `writeFile(path, content)`
+// on its own line has no `=` and isn't a `do`, so without this it would fall
+// through to parseProcBody's "unknown statement" case. Valid in both a proc
+// body (parseProcBody) and an action body (parseAction) — unlike most of
+// this AST's proc-only shapes (Spawn/Join and the I/O file ops), because
+// print(...), the one builtin this shape sees in an action today, is not
+// I/O-capability-gated and is checked by the same funnel (readExpr's
+// e.check) every other action expression already goes through, which is
+// what keeps a genuinely proc-only builtin (readFile/channel/...) refused
+// here without ExprStmt itself needing to know which builtin it is.
 type ExprStmt struct {
 	Call Call
 	Line int

@@ -1783,6 +1783,15 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 					scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
 				}
 			}
+		case "exprstmt":
+			// A bare builtin call for its side effect alone — print(...), its
+			// result discarded. Mirrors execProcBlock's identical "exprstmt" case
+			// below, using eval() (this action's flat scope) instead of
+			// evalInFrame (a proc's frame chain) — internal/ir/build.go's
+			// action() builder already proved this is a builtin the language
+			// allows in an action body (readExpr's e.check funnel), so there is
+			// nothing left to fail on here.
+			eval(st.Value, scope)
 		}
 		// keep entity collections in scope fresh for later statements.
 		for ent := range entChanged {

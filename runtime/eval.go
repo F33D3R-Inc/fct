@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1072,6 +1074,18 @@ func callBuiltin(name string, argVals []any) any {
 	case "toMoney":
 		n, _ := parseMoneyText(toStr(arg(0)))
 		return n
+	case "print":
+		// A developer debugging aid, not I/O to an external resource (no `uses`
+		// capability, unlike readFile/writeFile/httpGet/httpPost — see printCap's
+		// doc in internal/ir/build.go): writes one clearly-tagged line straight to
+		// the server process's own stdout, visible in `facet serve`'s console
+		// alongside (but never mixed into) the JSON http_request logs
+		// runtime/observability.go writes to stderr. Returns its argument
+		// unchanged (Rust's dbg!() shape) so `let y = print(x)` types and
+		// evaluates identically to `let y = x` — see internal/ir/build.go's
+		// inferProcType "print" case.
+		fmt.Fprintln(os.Stdout, "[print] "+formatDebugValue(arg(0)))
+		return arg(0)
 	case "money":
 		return formatMoney(toInt(arg(0)))
 	case "len":
@@ -1223,6 +1237,87 @@ func formatMoney(cents int) string {
 		s = "-" + s
 	}
 	return s
+}
+
+// formatDebugValue renders any runtime value print() can be handed as a
+// readable one-line debug form: this runtime's own toStr for the flat scalar
+// kinds already reachable from an action (int/text/bool/date/money — the
+// latter two are plain ints at this layer, same as toStr already treats
+// them, matching the fact that neither auto-formats in a `text "{...}"`
+// interpolation either without an explicit money()/ago() call), plus the
+// composite kinds a proc value can additionally be (array, proc map, and a
+// proc-local struct) that toStr was never asked to handle (its one []any
+// case flattens comma-joined, mirroring JS `"" + array`, which reads as one
+// value rather than the array print(...) should show it as). Deterministic
+// key order (sorted) so a printed map/struct's fields never shuffle between
+// two runs of the same program — a debugging aid whose whole point is a
+// stable line to compare across requests.
+func formatDebugValue(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return "nil"
+	case string:
+		return strconv.Quote(t)
+	case []byte:
+		return strconv.Quote(string(t))
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return strconv.FormatFloat(t, 'g', -1, 64)
+	case []any:
+		parts := make([]string, len(t))
+		for i, el := range t {
+			parts[i] = formatDebugValue(el)
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case map[string]any:
+		return formatDebugMap(t)
+	case map[any]any:
+		// A proc's own `map` type (runtime/eval.go's "map" case) — keys can be
+		// any scalar, unlike an entity row's always-string keys, so they are
+		// rendered through formatDebugValue too rather than assumed to be text.
+		keyed := make(map[string]any, len(t))
+		for k, val := range t {
+			keyed[formatDebugValue(k)] = val
+		}
+		return formatDebugMap(keyed)
+	case structVal:
+		keys := make([]string, 0, len(t.Fields))
+		for k := range t.Fields {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, len(keys))
+		for i, k := range keys {
+			parts[i] = k + ": " + formatDebugValue(t.Fields[k])
+		}
+		return t.Type + "{" + strings.Join(parts, ", ") + "}"
+	default:
+		// int/int64 and anything else this runtime hands print() go through
+		// toStr, which already has their exact rendering (itoa, etc.) — no
+		// reason for a second, possibly-drifting int formatter here.
+		return toStr(v)
+	}
+}
+
+// formatDebugMap renders a string-keyed map's entries sorted by key, shared
+// by formatDebugValue's map[string]any and map[any]any cases (the latter
+// keys are turned into their own formatDebugValue text first, then handed
+// here exactly like a real string key — see its call site).
+func formatDebugMap(m map[string]any) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = k + ": " + formatDebugValue(m[k])
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
 }
 
 func litValue(e *ir.Expr) any {

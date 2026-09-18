@@ -1565,6 +1565,19 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 				est.Role = roleExpr
 			}
 			a.Body = append(a.Body, est)
+		case isBareCallStmt(t):
+			// A builtin call for its side effect alone, its result discarded —
+			// `print(x)` on its own line, the action-body counterpart to
+			// parseProcBody's identical case. See ast.ExprStmt's doc.
+			ex, err := parseExpr(t, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			call, ok := ex.(ast.Call)
+			if !ok {
+				return nil, &Error{c.Line.No, fmt.Sprintf("%q is not a valid statement on its own", t)}
+			}
+			a.Body = append(a.Body, ast.ExprStmt{Call: call, Line: c.Line.No})
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {
