@@ -96,6 +96,29 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 			out[i] = v
 		}
 		return out, nil
+	case "map":
+		// A map literal (`{k1: v1, ...}`) — see ast.MapLit's doc. Keys and Args
+		// (its values) are parallel, exactly as the AST holds them; each key is
+		// evaluated and validated (mapKey) exactly as an index read/write's key
+		// is, so a bad-typed key is refused here at construction time too, not
+		// only when it is later read or overwritten.
+		out := make(map[any]any, len(e.Args))
+		for i, valExpr := range e.Args {
+			kv, err := evalInFrame(e.Keys[i], fr)
+			if err != nil {
+				return nil, err
+			}
+			key, err := mapKey(kv)
+			if err != nil {
+				return nil, err
+			}
+			v, err := evalInFrame(valExpr, fr)
+			if err != nil {
+				return nil, err
+			}
+			out[key] = v
+		}
+		return out, nil
 	case "ref":
 		v, _ := fr.get(e.Name)
 		return v, nil
@@ -108,15 +131,38 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		arr, ok := obj.([]any)
-		if !ok {
-			return nil, fmt.Errorf("cannot index a non-array value")
+		switch coll := obj.(type) {
+		case []any:
+			idx := toInt(idxV)
+			if idx < 0 || idx >= len(coll) {
+				return nil, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(coll))
+			}
+			return coll[idx], nil
+		case map[any]any:
+			key, err := mapKey(idxV)
+			if err != nil {
+				return nil, err
+			}
+			// A missing key answers nil (Go's own zero value for an absent map
+			// entry) rather than a clean error — deliberately the opposite
+			// stance from an out-of-bounds array read, above. This mirrors the
+			// language's existing precedent for "read of something absent"
+			// elsewhere: eval()'s "get" case already returns a missing record
+			// field silently (`m[e.Field]` on a Go map), not an error. A hash
+			// map's entire reason to exist is answering "is this key here" —
+			// unlike an array bound (fixed once the array is built, so any
+			// out-of-range index is a programmer bug), a map lookup missing is
+			// the ordinary, expected shape of building one up (a frequency
+			// counter's `m[k] = m[k] + 1` needs to read an as-yet-absent key
+			// without a guard first) — and toInt(nil) already answers 0, so
+			// that idiom works for free. See runtime/array_test.go's
+			// TestArrayOutOfBoundsIsCleanError for the array side of this
+			// same contrast and runtime/map_test.go's missing-key test for
+			// this one.
+			return coll[key], nil
+		default:
+			return nil, fmt.Errorf("cannot index a value that is not an array or map")
 		}
-		idx := toInt(idxV)
-		if idx < 0 || idx >= len(arr) {
-			return nil, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(arr))
-		}
-		return arr[idx], nil
 	case "un":
 		x, err := evalInFrame(e.X, fr)
 		if err != nil {
@@ -176,6 +222,70 @@ func cloneArrayValue(v any) any {
 	out := make([]any, len(arr))
 	copy(out, arr)
 	return out
+}
+
+// cloneMapValue is cloneArrayValue's counterpart for a map value: returns v
+// unchanged unless it is a map[any]any (a map value, runtime/eval.go's "map"
+// case), in which case it returns a fresh copy with its own backing map.
+//
+// This gives a proc-local map the same copy-on-assign value semantics an
+// array already has (see cloneArrayValue's doc, above, for the full
+// reasoning — it applies here unchanged): called at every point a value
+// flows into a new binding, so `let m2 = m1` never leaves m1 and m2 sharing
+// one backing map, and mutating one afterward (via an index-write,
+// runtime/server.go's "indexset") can never be observed through the other.
+func cloneMapValue(v any) any {
+	m, ok := v.(map[any]any)
+	if !ok {
+		return v
+	}
+	out := make(map[any]any, len(m))
+	for k, val := range m {
+		out[k] = val
+	}
+	return out
+}
+
+// mapKey validates and normalizes a map-index/-literal key to this
+// milestone's two allowed key types — int and text, the two scalar types
+// with obvious, unambiguous equality/hashing (see ast.MapLit's doc). It is
+// the runtime backstop for whatever internal/ir/build.go's checkMapKeyTypes
+// could not decide at compile time (a proc parameter, a `do`-bound result,
+// or any other key whose type isn't statically provable) — the same
+// division of labor checkIndexTypes/evalInFrame's "index" case already have
+// for an array's bounds. A key of any other type (bool, money, date, an
+// array, or a map) is a clean error here, not a Go panic and not a silently
+// wrong answer — this codebase's established convention (see
+// runtime/array_test.go's TestArrayOutOfBoundsIsCleanError).
+// cloneCompositeValue applies cloneArrayValue then cloneMapValue, so a value
+// flowing into a new proc-local binding (a `let`, a plain reassignment, or a
+// parameter — see each clone helper's own doc for why that copy matters) is
+// copied whichever of the two proc-local composite value kinds it happens to
+// be. Composing them is safe and total: neither helper touches a value that
+// isn't its own kind, so a scalar passes through both unchanged, an array is
+// copied by the first and passed through the second unchanged, and a map the
+// reverse.
+func cloneCompositeValue(v any) any {
+	return cloneMapValue(cloneArrayValue(v))
+}
+
+func mapKey(v any) (any, error) {
+	switch t := v.(type) {
+	case int:
+		return t, nil
+	case int64:
+		return int(t), nil
+	case string:
+		return t, nil
+	case []byte:
+		// A text value from a database driver — see toStr's doc for why this
+		// shape reaches the runtime at all; normalized to string so the same
+		// text key always hashes and compares equal no matter which shape it
+		// arrived in.
+		return string(t), nil
+	default:
+		return nil, fmt.Errorf("map key must be int or text, got %T", v)
+	}
 }
 
 // eval interprets an IR expression over a scope (state + entities + locals like
@@ -495,6 +605,24 @@ func applyBin(op string, l, r any) any {
 	case ">=":
 		return toInt(l) >= toInt(r)
 	case "in":
+		// Extends the existing array-membership operator to map key presence
+		// (`k in m`) rather than adding a separate `has` builtin for one more
+		// container kind — Python draws the same equivalence (`x in list` /
+		// `k in dict`), and this language already has the array precedent to
+		// match. A key of a type a map cannot hold (bool/money/date/an array/
+		// another map) can never be present, so this reports false for it
+		// rather than the clean error a get/set raises for the same bad key
+		// (runtime/eval.go's mapKey) — `in` is a pure predicate with an
+		// always-safe answer here, unlike a read or write, which the
+		// key-type restriction is really about.
+		if m, ok := r.(map[any]any); ok {
+			key, err := mapKey(l)
+			if err != nil {
+				return false
+			}
+			_, ok := m[key]
+			return ok
+		}
 		items, _ := r.([]any)
 		for _, el := range items {
 			if equal(l, el) {
@@ -603,9 +731,33 @@ func callBuiltin(name string, argVals []any) any {
 		switch v := arg(0).(type) {
 		case []any:
 			return len(v)
+		case map[any]any:
+			return len(v)
 		default:
 			return utf8.RuneCountInString(toStr(v))
 		}
+	case "bytes":
+		// bytes(n): an n-length, zero-filled byte buffer — the common way to start
+		// building one up byte-by-byte in a loop (mirroring `[]` + append for a
+		// plain array, but pre-sized since a real codec/hash loop indexes by
+		// position rather than growing one element at a time). Represented as
+		// exactly the same []any a plain array literal produces (see arrayType/
+		// bytesType in internal/ir/build.go): a byte buffer is a specialization
+		// of the array value, not a parallel runtime kind, so it is len()-able,
+		// index-readable, and copy-on-assign (cloneArrayValue) for free. What
+		// makes it a byte buffer rather than a plain array is purely the 0-255
+		// range check on every index-write (runtime/server.go's execProcBlock,
+		// "indexset" case, gated on the IR's Stmt.Bytes flag) — a compile-time
+		// distinction the elements themselves carry no runtime tag for.
+		n := toInt(arg(0))
+		if n < 0 {
+			n = 0
+		}
+		out := make([]any, n)
+		for i := range out {
+			out[i] = 0
+		}
+		return out
 	case "append":
 		// Functional, Go-`append`-flavored, but deliberately never reusing the
 		// input's backing array (unlike Go's own append, which may extend it in
@@ -693,6 +845,8 @@ func truthy(v any) bool {
 	case []byte:
 		return len(t) != 0
 	case []any:
+		return len(t) > 0
+	case map[any]any:
 		return len(t) > 0
 	case nil:
 		return false

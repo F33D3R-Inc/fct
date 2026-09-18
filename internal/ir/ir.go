@@ -446,6 +446,7 @@ type Stmt struct {
 	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
 	Body    []Stmt      `json:"body,omitempty"`    // loop: the repeated body; if: the `then` branch
 	Else    []Stmt      `json:"else,omitempty"`    // if: the `else` branch (nil = none)
+	Bytes   bool        `json:"bytes,omitempty"`   // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int
 }
 
 // FieldInit is a `name: expr` in an `add`.
@@ -724,15 +725,16 @@ type Seg struct {
 // now goes through wireExprFromIR/wireExprToIR (runtime/wireseam.go)
 // instead; do not marshal an *Expr directly into a FacetQL request again.
 type Expr struct {
-	Kind  string  `json:"kind"` // lit | ref | get | eget | agg | call | bin | un | list | index
+	Kind  string  `json:"kind"` // lit | ref | get | eget | agg | call | bin | un | list | index | map
 	Val   any     `json:"val,omitempty"`
 	VType string  `json:"vtype,omitempty"`
 	Name  string  `json:"name,omitempty"`  // ref / eget entity / agg collection / call builtin
 	Field string  `json:"field,omitempty"` // get / eget / agg (sum)
-	Obj   *Expr   `json:"obj,omitempty"`   // get / index (the array)
-	Key   *Expr   `json:"key,omitempty"`   // eget / index (the index expression)
+	Obj   *Expr   `json:"obj,omitempty"`   // get / index (the array or map)
+	Key   *Expr   `json:"key,omitempty"`   // eget / index (the index/key expression)
 	Op    string  `json:"op,omitempty"`    // bin / un / agg (count|sum|exists)
-	Args  []*Expr `json:"args,omitempty"`  // call / list (the elements)
+	Args  []*Expr `json:"args,omitempty"`  // call / list (the elements) / map (the values, parallel to Keys)
+	Keys  []*Expr `json:"keys,omitempty"`  // map literal only: its keys, parallel to Args (its values)
 	L     *Expr   `json:"l,omitempty"`
 	R     *Expr   `json:"r,omitempty"`
 	X     *Expr   `json:"x,omitempty"`
@@ -760,5 +762,6 @@ func (e *Expr) Kids() []*Expr {
 		return nil
 	}
 	kids := []*Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where, e.Sel}
+	kids = append(kids, e.Keys...)
 	return append(kids, e.Args...)
 }

@@ -1845,10 +1845,11 @@ func (s *Server) runProcLocked(p *ir.Proc, args []any) (any, error) {
 		} else {
 			v = zero(prm.Type)
 		}
-		// cloneArrayValue: a param binding is a new variable taking on a value,
-		// exactly like a `let` — see cloneArrayValue's doc for why an array value
-		// is copied at every such point instead of aliased.
-		fr.vars[prm.Name] = cloneArrayValue(v)
+		// cloneCompositeValue: a param binding is a new variable taking on a
+		// value, exactly like a `let` — see cloneArrayValue's/cloneMapValue's
+		// docs for why an array or map value is copied at every such point
+		// instead of aliased.
+		fr.vars[prm.Name] = cloneCompositeValue(v)
 	}
 	c, err := s.execProcBlock(p.Body, fr)
 	if err != nil {
@@ -1894,51 +1895,88 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 		case "let":
 			// Declares fresh in this frame; internal/ir/build.go already refused a
 			// name already in scope, so there is nothing to accidentally shadow.
-			// cloneArrayValue: see its doc — a `let` is a new variable taking on a
-			// value, so an array value is copied here rather than aliased.
+			// cloneCompositeValue: see its doc — a `let` is a new variable taking
+			// on a value, so an array or map value is copied here rather than
+			// aliased.
 			v, err := evalInFrame(st.Value, fr)
 			if err != nil {
 				return ctlSignal{}, err
 			}
-			fr.vars[st.Target] = cloneArrayValue(v)
+			fr.vars[st.Target] = cloneCompositeValue(v)
 		case "assign":
 			// A `let mut` reassignment; the compiler guarantees st.Target was already
 			// declared somewhere in the enclosing frame chain, so frame.set always
 			// finds and updates it in place — including a local declared OUTSIDE a
 			// loop and reassigned inside it, which is how an accumulator persists
-			// across iterations instead of resetting. cloneArrayValue for the same
-			// reason as "let": the local is taking on a freshly-computed value.
+			// across iterations instead of resetting. cloneCompositeValue for the
+			// same reason as "let": the local is taking on a freshly-computed
+			// value.
 			v, err := evalInFrame(st.Value, fr)
 			if err != nil {
 				return ctlSignal{}, err
 			}
-			fr.set(st.Target, cloneArrayValue(v))
+			fr.set(st.Target, cloneCompositeValue(v))
 		case "indexset":
-			// `xs[i] = expr` — mutate one element of an array local in place.
-			// internal/ir/build.go's procBlock already proved Target is a declared
-			// `let mut` array local, so frame.get always finds it; the index itself
-			// is only bounds-checked here, at runtime (see ast.Index's doc for why
-			// it cannot be checked earlier). Because cloneArrayValue guarantees
-			// Target's backing array is never shared with any other variable, this
-			// mutation is safely in place: it cannot be observed through any alias.
-			arrVal, _ := fr.get(st.Target)
-			arr, ok := arrVal.([]any)
-			if !ok {
-				return ctlSignal{}, fmt.Errorf("%q is not an array", st.Target)
+			// `xs[i] = expr` — mutate one element of an array/byte-buffer local
+			// in place — or `m[k] = expr` — insert-or-overwrite a map local's
+			// entry. internal/ir/build.go's procBlock already proved Target is a
+			// declared `let mut` local of one of these kinds, so frame.get always
+			// finds it; which of the two this actually is can only be told apart
+			// here, at runtime, by Target's dynamic value (checkIndexTypes only
+			// catches the statically-provable cases at compile time). Because
+			// cloneCompositeValue guarantees Target's backing array/map is never
+			// shared with any other variable, this mutation is safely in place:
+			// it cannot be observed through any alias.
+			tv, _ := fr.get(st.Target)
+			switch coll := tv.(type) {
+			case []any:
+				// The index itself is only bounds-checked here, at runtime (see
+				// ast.Index's doc for why it cannot be checked earlier).
+				idxV, err := evalInFrame(st.Key, fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				idx := toInt(idxV)
+				if idx < 0 || idx >= len(coll) {
+					return ctlSignal{}, fmt.Errorf("array index %d out of bounds (length %d) assigning to %q", idx, len(coll), st.Target)
+				}
+				val, err := evalInFrame(st.Value, fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				if st.Bytes {
+					// A byte buffer: the whole point of this specialization over a plain
+					// array is that every slot holds a raw byte (0-255), so a write outside
+					// that range is a clean error here — never a silent truncate/wrap
+					// (e.g. Go's own byte(v) modulo-256 behavior), matching this codebase's
+					// stance on out-of-bounds array access above.
+					n := toInt(val)
+					if n < 0 || n > 255 {
+						return ctlSignal{}, fmt.Errorf("byte value %d out of range (must be 0-255) assigning to %q[%d]", n, st.Target, idx)
+					}
+					val = n
+				}
+				coll[idx] = val
+			case map[any]any:
+				idxV, err := evalInFrame(st.Key, fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				key, err := mapKey(idxV)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				val, err := evalInFrame(st.Value, fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				// Insert-or-overwrite: unlike an array's fixed-length write, a map
+				// simply grows to fit a new key — that is the entire point of a
+				// map set, so there is no "out of bounds" case to reject here.
+				coll[key] = val
+			default:
+				return ctlSignal{}, fmt.Errorf("%q is not an array or map", st.Target)
 			}
-			idxV, err := evalInFrame(st.Key, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			idx := toInt(idxV)
-			if idx < 0 || idx >= len(arr) {
-				return ctlSignal{}, fmt.Errorf("array index %d out of bounds (length %d) assigning to %q", idx, len(arr), st.Target)
-			}
-			val, err := evalInFrame(st.Value, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			arr[idx] = val
 		case "do":
 			sub := s.byProc[st.Service]
 			if sub == nil {

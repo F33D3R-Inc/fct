@@ -544,7 +544,8 @@ func isBuiltinCall(name string) bool {
 		"len", "upper", "lower", "trim", "contains", "take", // string
 		"year", "month", "day", // date
 		"ago", "compact", "commas", // formatting (render-time text)
-		"append": // array (proc-only — see internal/ir/build.go's checkBuiltins)
+		"append", // array (proc-only — see internal/ir/build.go's checkBuiltins)
+		"bytes":  // byte-buffer constructor (proc-only, same reason as append)
 		return true
 	}
 	return false
@@ -595,6 +596,9 @@ func (p *exprParser) parseAtom() (ast.Expr, error) {
 	case tOp:
 		if t.text == "[" {
 			return p.parseListLit()
+		}
+		if t.text == "{" {
+			return p.parseMapLit()
 		}
 		return nil, &Error{p.line, fmt.Sprintf("unexpected %q in expression", t.text)}
 	case tNum:
@@ -656,6 +660,49 @@ func (p *exprParser) parseListLit() (ast.Expr, error) {
 		p.pos++
 	}
 	return ast.ListLit{Elems: elems}, nil
+}
+
+// parseMapLit parses a `{k1: v1, k2: v2}` map literal (`{}` for an empty
+// map); p.peek() is at the opening `{`. See ast.MapLit's doc for why this `{`
+// cannot collide with the entity-add record literal's own `{` — that one is
+// parsed entirely separately, at the statement level, and never reaches this
+// expression grammar.
+func (p *exprParser) parseMapLit() (ast.Expr, error) {
+	p.pos++ // consume {
+	var keys, vals []ast.Expr
+	if t, ok := p.peek(); ok && t.kind == tOp && t.text == "}" {
+		p.pos++
+		return ast.MapLit{}, nil
+	}
+	for {
+		k, err := p.parseBinary(0)
+		if err != nil {
+			return nil, err
+		}
+		if t, ok := p.peek(); !ok || t.kind != tOp || t.text != ":" {
+			return nil, &Error{p.line, "expected `:` after a map key in a map literal"}
+		}
+		p.pos++
+		v, err := p.parseBinary(0)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+		vals = append(vals, v)
+		t, ok := p.peek()
+		if !ok {
+			return nil, &Error{p.line, "missing closing `}` in map literal"}
+		}
+		if t.kind == tOp && t.text == "}" {
+			p.pos++
+			break
+		}
+		if t.kind != tOp || t.text != "," {
+			return nil, &Error{p.line, "expected `,` or `}` in map literal"}
+		}
+		p.pos++
+	}
+	return ast.MapLit{Keys: keys, Vals: vals}, nil
 }
 
 func isIdentStart(c byte) bool {

@@ -1398,8 +1398,38 @@ type Un struct {
 	X  Expr
 }
 
+// MapLit is a map literal: `{k1: v1, k2: v2}` (or `{}` for an empty map).
+// Keys and Vals are parallel slices — Keys[i]: Vals[i] is one entry.
+//
+// `{` was free to claim for this: the entity-add record literal (`add Entity
+// { f: expr, ... }`) is parsed independently, ad hoc, at the statement level
+// (parseAdd in internal/parser/parser.go) and never reaches this expression
+// grammar (internal/parser/expr.go), whose tokenizer had no `{`/`}` handling
+// at all before this. The two forms cannot collide: a map literal only ever
+// appears where an expression is expected (inside a proc body), and an add
+// record only ever appears right after `add Entity`.
+//
+// Proc-only, like ListLit's array: internal/ir/build.go's checkNoIndex now
+// also rejects a map literal outside a proc body, and runtime/eval.go's
+// evalInFrame is the only interpreter that knows the "map" IR kind this
+// lowers to — eval() (the flat scope evaluator every action/view/policy/
+// derive expression runs through) has no case for it, the same reason it has
+// none for "index".
+//
+// Map keys are restricted to int and text — the two scalar types with
+// obvious, unambiguous equality/hashing — for this milestone. See
+// internal/ir/build.go's checkMapKeyTypes for the compile-time half of that
+// restriction (wherever a key's type is statically provable) and
+// runtime/eval.go's mapKey for the runtime backstop (a proc parameter or a
+// `do`-bound result, whose type this shallow checker cannot see through).
+type MapLit struct {
+	Keys []Expr
+	Vals []Expr
+}
+
 func (Lit) expr()       {}
 func (ListLit) expr()   {}
+func (MapLit) expr()    {}
 func (Index) expr()     {}
 func (Ref) expr()       {}
 func (ActState) expr()  {}

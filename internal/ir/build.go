@@ -2194,22 +2194,24 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
 		case ast.IndexAssign:
-			// `xs[i] = expr` — an array element mutation. Gated exactly like a plain
-			// `name = expr` reassignment (ast.Assign, above), since it mutates the
-			// value Target is bound to: Target must already be a declared `let mut`
-			// local. On top of that, the type map lets this catch the common case of
-			// indexing something that plainly isn't an array at compile time (see
+			// `xs[i] = expr` — an array element mutation, or `m[k] = expr` — a map
+			// insert-or-overwrite. Gated exactly like a plain `name = expr`
+			// reassignment (ast.Assign, above), since it mutates the value Target is
+			// bound to: Target must already be a declared `let mut` local. On top of
+			// that, the type map lets this catch the common case of indexing
+			// something that plainly isn't an array or map at compile time (see
 			// checkIndexTypes) — the index itself is never bounds-checked here; that
 			// can only be a runtime error (runtime/server.go's execProcBlock,
-			// "indexset"), since bounds are data-dependent.
+			// "indexset"), since bounds are data-dependent (and, for a map, so is
+			// whether the key is already present).
 			if !locals[st.Target] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not declared in proc %q — use `let %s = …` first", st.Target, p.Name, st.Target)}
 			}
 			if !mutable[st.Target] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to index-assign into it", st.Target, st.Target)}
 			}
-			if ty := types[st.Target]; ty != "" && ty != arrayType {
-				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not an array (its type is %s) — index assignment (`%s[...] = …`) needs an array local", st.Target, ty, st.Target)}
+			if ty := types[st.Target]; ty != "" && ty != arrayType && ty != bytesType && ty != mapType {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not an array or map (its type is %s) — index assignment (`%s[...] = …`) needs an array, map, or byte-buffer local", st.Target, ty, st.Target)}
 			}
 			if err := e.checkProcExpr(st.Index, locals, types, st.Line); err != nil {
 				return nil, err
@@ -2217,7 +2219,29 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
 				return nil, err
 			}
-			out = append(out, Stmt{Op: "indexset", Target: st.Target, Key: e.low(st.Index), Value: e.low(st.Value)})
+			// The key-type restriction (int/text only) applies to a map SET too —
+			// checkProcExpr's own checkMapKeyTypes call above only recognizes a key
+			// inside an ast.Index READ expression, so a bare `st.Index` here (the
+			// write side, carried on the IndexAssign statement rather than wrapped
+			// in its own ast.Index node) needs the same check spelled out
+			// explicitly. Silent ("") when the key's type can't be proven — the
+			// runtime backstop (runtime/eval.go's mapKey, reached via
+			// execProcBlock's "indexset" case) catches that case instead.
+			if types[st.Target] == mapType {
+				if kt := inferProcType(st.Index, types); !isMapKeyType(kt) {
+					return nil, &BuildError{st.Line, fmt.Sprintf("map key must be int or text, got %s", kt)}
+				}
+			}
+			// Bytes: true tells the runtime (execProcBlock's "indexset" case) to
+			// range-check the written value to 0-255 and reject anything outside it
+			// as a clean error, rather than accepting any int the way a plain array
+			// index-write does — the domain invariant a byte buffer exists to
+			// enforce. types[st.Target] is exact here (not a "can't prove" guess):
+			// bytesType can only reach a local via bytes(...), a list literal never
+			// produces it, and a proc param/return can't be array/bytes/map-typed
+			// (see isPrimitive), so every value ever bound to a bytesType local was
+			// created by bytes(...) or copied from another bytesType local.
+			out = append(out, Stmt{Op: "indexset", Target: st.Target, Key: e.low(st.Index), Value: e.low(st.Value), Bytes: types[st.Target] == bytesType})
 		case ast.Do:
 			sig, ok := e.procSigs[st.Proc]
 			if !ok {
@@ -2375,7 +2399,10 @@ func (e *env) checkProcExpr(ex ast.Expr, locals map[string]bool, types map[strin
 	if err := checkBitwiseTypes(ex, types, line); err != nil {
 		return err
 	}
-	return checkIndexTypes(ex, types, line)
+	if err := checkIndexTypes(ex, types, line); err != nil {
+		return err
+	}
+	return checkMapKeyTypes(ex, types, line)
 }
 
 // arrayType is inferProcType/checkIndexTypes's type tag for an array-valued
@@ -2386,6 +2413,34 @@ func (e *env) checkProcExpr(ex ast.Expr, locals map[string]bool, types map[strin
 // locals have no richer type system than this map to hang it off (see
 // checkIndexTypes).
 const arrayType = "array"
+
+// bytesType is inferProcType/checkIndexTypes's type tag for a byte-buffer
+// proc expression — the result of a `bytes(n)` call, or (transitively, via
+// ast.Ref's case below) a `let` bound to one. A byte buffer is a deliberate
+// specialization of the array machinery above, not a parallel value kind: at
+// runtime it is the exact same []any representation an array is (see
+// runtime/eval.go's "bytes" case in callBuiltin), so it gets every one of
+// arrays' mechanics — index read, `len`, copy-on-assign (cloneArrayValue) —
+// for free, purely by being tagged with a different string here. The one
+// place it actually diverges is index-WRITE: a byte buffer must reject a
+// value outside 0-255, which is exactly what this tag exists to let
+// procBlock's ast.IndexAssign case flag on the lowered Stmt (its Bytes
+// field), so runtime/server.go's execProcBlock can range-check only the
+// writes that need it.
+const bytesType = "bytes"
+
+// mapType is inferProcType/checkIndexTypes's type tag for a map-valued proc
+// expression — a map literal (`{...}`), or (transitively, via ast.Ref's case
+// below) a `let` bound to one. A sibling of arrayType/bytesType, not a real
+// declared type: proc locals have no richer type system than this map to
+// hang it off (see checkIndexTypes). At runtime a map value is a Go
+// map[any]any (runtime/eval.go), a distinct representation from an array's
+// []any, so — unlike bytesType — it is NOT a specialization of the array
+// machinery: index-read/-write dispatch on the actual runtime value's Go
+// type (runtime/eval.go's evalInFrame "index" case, runtime/server.go's
+// execProcBlock "indexset" case), and this compile-time tag exists only to
+// catch the statically-provable cases before that.
+const mapType = "map"
 
 // inferProcType statically infers the type of an expression inside a proc
 // body from literal kinds and the declared/inferred types of the locals it
@@ -2403,11 +2458,16 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 		return t.Kind
 	case ast.ListLit:
 		return arrayType
+	case ast.MapLit:
+		return mapType
 	case ast.Ref:
 		return types[t.Name]
 	case ast.Call:
 		if t.Name == "append" {
 			return arrayType
+		}
+		if t.Name == "bytes" {
+			return bytesType
 		}
 	case ast.Un:
 		switch t.Op {
@@ -2454,6 +2514,17 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 // value, so it can catch that where a runtime type switch could not.
 func isIntType(t string) bool { return t == "" || t == "int" }
 
+// isMapKeyType reports whether t is a legal map-key type under this
+// milestone's restriction (see ast.MapLit's doc): int or text, the two
+// scalar types with obvious, unambiguous equality/hashing — never bool,
+// money, date, array, map, or bytes. "" (unknown — inferProcType could not
+// determine it, e.g. a proc parameter or a `do`-bound result) is treated as
+// legal here, the same "stay silent on what can't be proven" stance every
+// other static check in this builder takes; runtime/eval.go's mapKey is the
+// backstop that catches a genuinely bad key at the one point it can no
+// longer be deferred.
+func isMapKeyType(t string) bool { return t == "" || t == "int" || t == "text" }
+
 // checkBitwiseTypes walks a proc expression for a bitwise operator (binary
 // `& | ^ << >>` or unary `~`) applied to an operand whose statically known
 // type is not `int`. Only proc bodies get this check: only there does the
@@ -2497,6 +2568,15 @@ func checkBitwiseTypes(ex ast.Expr, types map[string]string, line int) error {
 				return err
 			}
 		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := checkBitwiseTypes(k, types, line); err != nil {
+				return err
+			}
+			if err := checkBitwiseTypes(t.Vals[i], types, line); err != nil {
+				return err
+			}
+		}
 	case ast.Index:
 		if err := checkBitwiseTypes(t.Obj, types, line); err != nil {
 			return err
@@ -2506,26 +2586,28 @@ func checkBitwiseTypes(ex ast.Expr, types map[string]string, line int) error {
 	return nil
 }
 
-// checkIndexTypes walks a proc expression for an array index read (`x[i]`)
-// whose object is a bare name the proc's own type map (types) already knows
-// is NOT an array — the one piece of static typing an index read can be
-// given without a richer type system for proc locals. inferProcType tags a
-// list literal, an `append(...)` result, and (transitively) any `let` bound
-// to either with arrayType; anything the map has no opinion on (a parameter —
-// proc parameters cannot be list-typed in this milestone — or an index over
-// any shape other than a bare name) is accepted unchecked, the same "stay
-// silent on what can't be proven" stance checkBitwiseTypes takes above. The
-// index value itself is never checked here — it is data, not type, and can
-// only be bounds-checked at runtime (runtime/eval.go's evalInFrame, "index"
-// case, and runtime/server.go's execProcBlock, "indexset" case) — see
-// ast.Index's doc.
+// checkIndexTypes walks a proc expression for an array/map index read
+// (`x[i]` / `m[k]`) whose object is a bare name the proc's own type map
+// (types) already knows is NOT an array or map — the one piece of static
+// typing an index read can be given without a richer type system for proc
+// locals. inferProcType tags a list literal, an `append(...)` result, and
+// (transitively) any `let` bound to either with arrayType (a map literal,
+// likewise, with mapType); anything the map has no opinion on (a parameter —
+// proc parameters cannot be list/map-typed in this milestone — or an index
+// over any shape other than a bare name) is accepted unchecked, the same
+// "stay silent on what can't be proven" stance checkBitwiseTypes takes
+// above. The index/key value itself is never type-checked here beyond that —
+// an array's bounds are data-dependent and a map's key-type restriction is
+// its own separate check (checkMapKeyTypes) — both can only be fully settled
+// at runtime (runtime/eval.go's evalInFrame, "index" case, and
+// runtime/server.go's execProcBlock, "indexset" case) — see ast.Index's doc.
 func checkIndexTypes(ex ast.Expr, types map[string]string, line int) error {
 	switch t := ex.(type) {
 	case ast.Index:
 		if r, ok := t.Obj.(ast.Ref); ok {
-			if ty := types[r.Name]; ty != "" && ty != arrayType {
+			if ty := types[r.Name]; ty != "" && ty != arrayType && ty != bytesType && ty != mapType {
 				return &BuildError{line, fmt.Sprintf(
-					"%q is not an array (its type is %s) — index access (`%s[...]`) needs an array local", r.Name, ty, r.Name)}
+					"%q is not an array or map (its type is %s) — index access (`%s[...]`) needs an array, map, or byte-buffer local", r.Name, ty, r.Name)}
 			}
 		}
 		if err := checkIndexTypes(t.Obj, types, line); err != nil {
@@ -2548,6 +2630,72 @@ func checkIndexTypes(ex ast.Expr, types map[string]string, line int) error {
 	case ast.ListLit:
 		for _, el := range t.Elems {
 			if err := checkIndexTypes(el, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := checkIndexTypes(k, types, line); err != nil {
+				return err
+			}
+			if err := checkIndexTypes(t.Vals[i], types, line); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkMapKeyTypes walks a proc expression for a map literal entry or a map
+// index read (`m[k]`) whose key's statically known type is neither int nor
+// text — the milestone's key-type restriction (see ast.MapLit's doc),
+// enforced here wherever inferProcType can prove the type. Anything it
+// can't prove (a parameter, a `do`-bound result, ...) is left for
+// runtime/eval.go's mapKey to catch instead, the same "stay silent on what
+// can't be proven" stance checkBitwiseTypes/checkIndexTypes take. The write
+// side (`m[k] = v`, ast.IndexAssign) is a statement, not an expression this
+// walk ever reaches, so procBlock's own ast.IndexAssign case applies the
+// same rule to its Index field directly.
+func checkMapKeyTypes(ex ast.Expr, types map[string]string, line int) error {
+	switch t := ex.(type) {
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if kt := inferProcType(k, types); !isMapKeyType(kt) {
+				return &BuildError{line, fmt.Sprintf("map key must be int or text, got %s", kt)}
+			}
+			if err := checkMapKeyTypes(k, types, line); err != nil {
+				return err
+			}
+			if err := checkMapKeyTypes(t.Vals[i], types, line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if r, ok := t.Obj.(ast.Ref); ok && types[r.Name] == mapType {
+			if kt := inferProcType(t.Idx, types); !isMapKeyType(kt) {
+				return &BuildError{line, fmt.Sprintf("map key must be int or text, got %s", kt)}
+			}
+		}
+		if err := checkMapKeyTypes(t.Obj, types, line); err != nil {
+			return err
+		}
+		return checkMapKeyTypes(t.Idx, types, line)
+	case ast.Bin:
+		if err := checkMapKeyTypes(t.L, types, line); err != nil {
+			return err
+		}
+		return checkMapKeyTypes(t.R, types, line)
+	case ast.Un:
+		return checkMapKeyTypes(t.X, types, line)
+	case ast.Call:
+		for _, a := range t.Args {
+			if err := checkMapKeyTypes(a, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkMapKeyTypes(el, types, line); err != nil {
 				return err
 			}
 		}
@@ -3965,6 +4113,15 @@ func checkNoBitwise(ex ast.Expr, line int) error {
 				return err
 			}
 		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := checkNoBitwise(k, line); err != nil {
+				return err
+			}
+			if err := checkNoBitwise(t.Vals[i], line); err != nil {
+				return err
+			}
+		}
 	case ast.Agg:
 		if err := checkNoBitwise(t.Where, line); err != nil {
 			return err
@@ -3979,20 +4136,31 @@ func checkNoBitwise(ex ast.Expr, line int) error {
 	return nil
 }
 
-// checkNoIndex rejects an array index read (`x[i]`) anywhere outside a proc
-// body, the same way checkNoBitwise (above) rejects a bitwise operator there
-// and for the same underlying reason: an index read's only interpreter is
-// runtime/eval.go's evalInFrame, which resolves it against a proc's own
-// scope-frame. eval() — the flat scope evaluator every action/view/policy/
-// derive expression runs through instead — has no "index" case, so without
-// this check an index read there would silently evaluate to nil rather than
-// fail to compile. checkProcExpr (proc bodies) never calls check(), so a
-// proc may index an array freely — see checkIndexTypes for the (different)
-// check that DOES apply there.
+// checkNoIndex rejects an array/map index read (`x[i]` / `m[k]`) and a map
+// literal (`{...}`) anywhere outside a proc body, the same way checkNoBitwise
+// (above) rejects a bitwise operator there and for the same underlying
+// reason: an index read's only interpreter is runtime/eval.go's evalInFrame,
+// which resolves it against a proc's own scope-frame. eval() — the flat
+// scope evaluator every action/view/policy/derive expression runs through
+// instead — has no "index" or "map" case, so without this check either would
+// silently evaluate to nil rather than fail to compile.
+//
+// A map literal is barred outright (unlike ast.ListLit, an array literal,
+// which IS allowed outside a proc — it long predates this milestone as a
+// general list-typed state/entity field default, and only indexing into one
+// is proc-gated): a map has no such existing general field type, and giving
+// it one — schema representation, wire serialization for client hydration,
+// facet.js support — is well outside this milestone's scope (proc-local
+// maps only, per the task ordering that put maps last). checkProcExpr (proc
+// bodies) never calls check(), so a proc may use a map literal and index an
+// array or map freely — see checkIndexTypes/checkMapKeyTypes for the
+// (different) checks that DO apply there.
 func checkNoIndex(ex ast.Expr, line int) error {
 	switch t := ex.(type) {
 	case ast.Index:
-		return &BuildError{line, "array indexing (`x[i]`) is only available inside a proc — arrays are proc-local values, not readable from an action, view, policy, or derive yet"}
+		return &BuildError{line, "array/map indexing (`x[i]`) is only available inside a proc — arrays and maps are proc-local values, not readable from an action, view, policy, or derive yet"}
+	case ast.MapLit:
+		return &BuildError{line, "a map literal (`{...}`) is only available inside a proc — maps are proc-local values, not readable from an action, view, policy, or derive yet"}
 	case ast.Bin:
 		if err := checkNoIndex(t.L, line); err != nil {
 			return err
@@ -4207,6 +4375,15 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 				return err
 			}
 		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := e.checkBuiltins(k, line); err != nil {
+				return err
+			}
+			if err := e.checkBuiltins(t.Vals[i], line); err != nil {
+				return err
+			}
+		}
 	case ast.Get:
 		// Enum member access (`Status.active`) must name a declared member.
 		if r, ok := t.Obj.(ast.Ref); ok {
@@ -4281,6 +4458,13 @@ func hasImpure(ex ast.Expr) bool {
 			}
 		}
 		return false
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if hasImpure(k) || hasImpure(t.Vals[i]) {
+				return true
+			}
+		}
+		return false
 	case ast.Bin:
 		return hasImpure(t.L) || hasImpure(t.R)
 	case ast.Un:
@@ -4298,7 +4482,7 @@ func hasImpure(ex ast.Expr) bool {
 func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
-		"ago", "compact", "commas":
+		"ago", "compact", "commas", "bytes":
 		return 1, true
 	case "append":
 		return 2, true
@@ -4524,6 +4708,13 @@ func freeNames(ex ast.Expr) map[string]bool {
 			for _, el := range t.Elems {
 				walk(el)
 			}
+		case ast.MapLit:
+			// Same reasoning as ast.ListLit above: a map literal's keys and values
+			// can themselves be references (`{a: b}`).
+			for i, k := range t.Keys {
+				walk(k)
+				walk(t.Vals[i])
+			}
 		case ast.Index:
 			walk(t.Obj)
 			walk(t.Idx)
@@ -4555,6 +4746,15 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 		out := &Expr{Kind: "list"}
 		for _, el := range t.Elems {
 			out.Args = append(out.Args, lower(el, inline, enums))
+		}
+		return out
+	case ast.MapLit:
+		// Keys and Args (its values) stay parallel, exactly as ast.MapLit's own
+		// Keys/Vals do — see its doc.
+		out := &Expr{Kind: "map"}
+		for i := range t.Keys {
+			out.Keys = append(out.Keys, lower(t.Keys[i], inline, enums))
+			out.Args = append(out.Args, lower(t.Vals[i], inline, enums))
 		}
 		return out
 	case ast.Index:
@@ -4623,6 +4823,12 @@ func cloneExpr(e *Expr) *Expr {
 		c.Args = make([]*Expr, len(e.Args))
 		for i, a := range e.Args {
 			c.Args[i] = cloneExpr(a)
+		}
+	}
+	if e.Keys != nil {
+		c.Keys = make([]*Expr, len(e.Keys))
+		for i, k := range e.Keys {
+			c.Keys[i] = cloneExpr(k)
 		}
 	}
 	return &c
