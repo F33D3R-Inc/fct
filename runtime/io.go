@@ -112,6 +112,72 @@ func (s *Server) ioWriteFile(path, content string) (any, error) {
 	return true, nil
 }
 
+// ioReadFileBytes is ioReadFile's counterpart for a declared `file ... bytes
+// at ...` resource (a `let x = read Name()` statement over a bytes-typed
+// file — see internal/ir/build.go's ast.FileOp case): reads the file's raw
+// bytes and hands them back as a byte-buffer array ([]any of 0-255 ints), the
+// exact representation bytes(n)/index-read/len() already work over (see
+// runtime/eval.go's "bytes" case in callBuiltin) — so a bytes file's content
+// is usable with every existing byte-buffer mechanic with no special-casing
+// anywhere else. Same sandbox and error shape as ioReadFile.
+func (s *Server) ioReadFileBytes(path string) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("read: %q not found", path)
+		}
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("read: %q: permission denied", path)
+		}
+		return nil, fmt.Errorf("read: %q: %v", path, err)
+	}
+	buf := make([]any, len(data))
+	for i, b := range data {
+		buf[i] = int(b)
+	}
+	return buf, nil
+}
+
+// ioWriteFileBytes is ioWriteFile's counterpart for a bytes-typed `file`
+// resource (a `write Name(content)` statement, content a byte-buffer array):
+// every element that can ever reach here was already range-checked to 0-255
+// by whatever produced it (bytes(n)'s zero-fill, or an index-write's own
+// 0-255 check in runtime/server.go's execProcBlock "indexset" case), so the
+// re-check below is defensive rather than load-bearing. Same sandbox,
+// parent-dir creation, and overwrite semantics as ioWriteFile.
+func (s *Server) ioWriteFileBytes(path string, content any) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("write: %w", err)
+	}
+	arr, ok := content.([]any)
+	if !ok {
+		return nil, fmt.Errorf("write: %q: content is not a byte buffer", path)
+	}
+	data := make([]byte, len(arr))
+	for i, v := range arr {
+		n := toInt(v)
+		if n < 0 || n > 255 {
+			return nil, fmt.Errorf("write: %q: byte value %d out of range (must be 0-255)", path, n)
+		}
+		data[i] = byte(n)
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return nil, fmt.Errorf("write: %q: %v", path, err)
+	}
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("write: %q: permission denied", path)
+		}
+		return nil, fmt.Errorf("write: %q: %v", path, err)
+	}
+	return true, nil
+}
+
 // ioHTTPClient is the client every httpGet/httpPost call shares — a 5-second
 // timeout, matching this codebase's existing convention for an authority's
 // own outbound HTTP call (runtime/server.go's callService/callServiceSync,

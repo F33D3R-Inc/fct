@@ -222,6 +222,11 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 		if sv, err = parseService(c); err == nil {
 			app.Services = append(app.Services, sv)
 		}
+	case strings.HasPrefix(c.Line.Text, "file "):
+		var f *ast.File
+		if f, err = parseFile(c); err == nil {
+			app.Files = append(app.Files, f)
+		}
 	case strings.HasPrefix(c.Line.Text, "webhook "):
 		var wh *ast.Webhook
 		if wh, err = parseWebhook(c.Line.Text, c.Line.No); err == nil {
@@ -238,7 +243,7 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 			app.Views = append(app.Views, v)
 		}
 	default:
-		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/struct/enum/type/message/state/derive/policy/action/proc/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/struct/enum/type/message/state/derive/policy/action/proc/job/service/file/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
 	}
 	return err
 }
@@ -1642,6 +1647,43 @@ func parseService(n *source.Node) (*ast.Service, error) {
 	return sv, nil
 }
 
+// parseFile parses `file Name: Type at "path"` — a declared file resource
+// (mirrors parseService's `service Name at "url"` header shape exactly, for
+// local disk instead of HTTP). Type must be `text` or `bytes`; Path is
+// resolved through the runtime's existing io.file sandbox exactly as
+// readFile/writeFile already are (see ast.File's doc). Unlike a service, a
+// file takes no indented block of operations — `read`/`write` are fixed,
+// proc-body statements (parseProcBody), not something a file declaration
+// itself enumerates.
+func parseFile(n *source.Node) (*ast.File, error) {
+	if len(n.Children) > 0 {
+		return nil, &Error{n.Line.No, "file declares no body — `read`/`write` are proc statements, not part of the declaration"}
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "file"))
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return nil, &Error{n.Line.No, `file needs a type: file Name: text at "path.txt"`}
+	}
+	name := strings.TrimSpace(rest[:colon])
+	tail := strings.TrimSpace(rest[colon+1:])
+	i := strings.Index(tail, " at ")
+	if i < 0 {
+		return nil, &Error{n.Line.No, `file needs a path: file Name: text at "path.txt"`}
+	}
+	typ := strings.TrimSpace(tail[:i])
+	path, err := unquote(strings.TrimSpace(tail[i+len(" at "):]), n.Line.No)
+	if err != nil || path == "" {
+		return nil, &Error{n.Line.No, `file needs a quoted path: file Name: text at "path.txt"`}
+	}
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid file name %q", name)}
+	}
+	if typ != "text" && typ != "bytes" {
+		return nil, &Error{n.Line.No, fmt.Sprintf("file %q type must be text or bytes, got %q", name, typ)}
+	}
+	return &ast.File{Name: name, Type: typ, Path: path, Line: n.Line.No}, nil
+}
+
 // parseWebhook parses a one-line inbound endpoint:
 //
 //	webhook "/hooks/pay" -> confirmPaid secret PAY_KEY
@@ -1772,6 +1814,38 @@ func parseJoin(s string, line int) (ast.Join, error) {
 		return ast.Join{}, &Error{line, fmt.Sprintf("join needs a spawned task handle: join <handle>, got %q", h)}
 	}
 	return ast.Join{Handle: h, Line: line}, nil
+}
+
+// parseFileOp parses the `Name(args)` half of a file-resource statement —
+// `write Name(content)` or the `read Name()` half of `let x = read Name()` —
+// identical shape to parseDo/parseSpawn (a named-resource call), since these
+// are the human-friendly verb form of readFile/writeFile over a declared
+// `file` resource rather than a raw builtin call (see ast.FileOp's doc). op
+// is "read" or "write", used only to phrase this function's own errors.
+func parseFileOp(op, s string, line int) (ast.FileOp, error) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return ast.FileOp{}, &Error{line, fmt.Sprintf("%s needs a file resource: %s Name(...)", op, op)}
+	}
+	name := strings.TrimSpace(s[:open])
+	if !isIdent(name) {
+		return ast.FileOp{}, &Error{line, fmt.Sprintf("invalid file name %q", name)}
+	}
+	closeP := strings.LastIndexByte(s, ')')
+	if closeP < open {
+		return ast.FileOp{}, &Error{line, fmt.Sprintf("missing `)` in %s", op)}
+	}
+	fo := ast.FileOp{Op: op, File: name, Line: line}
+	if inner := strings.TrimSpace(s[open+1 : closeP]); inner != "" {
+		for _, a := range splitTop(inner, ',') {
+			e, err := parseExpr(strings.TrimSpace(a), line)
+			if err != nil {
+				return ast.FileOp{}, err
+			}
+			fo.Args = append(fo.Args, e)
+		}
+	}
+	return fo, nil
 }
 
 // parseProc parses `proc Name(params) -> RetType:` (the arrow and its type are
@@ -1932,6 +2006,24 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				return nil, err
 			}
 			body = append(body, d)
+		case strings.HasPrefix(t, "write "):
+			// `write Name(content)` — fire-and-forget (result discarded); a
+			// bound `let ok = write Name(content)` is handled below, in the
+			// `let ` case, exactly like `do`'s two forms.
+			fo, err := parseFileOp("write", strings.TrimSpace(t[len("write "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, fo)
+		case strings.HasPrefix(t, "read "):
+			// A bare `read Name()`, its content discarded — the read
+			// counterpart of a fire-and-forget `write`/`do`. The useful form,
+			// `let x = read Name()`, is handled below in the `let ` case.
+			fo, err := parseFileOp("read", strings.TrimSpace(t[len("read "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, fo)
 		case strings.HasPrefix(t, "spawn "):
 			// A bare `spawn ProcName(args)`, its handle discarded, has no legal
 			// reading: structured concurrency requires every spawned task be
@@ -1998,6 +2090,30 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				body = append(body, j)
 				continue
 			}
+			if strings.HasPrefix(rhs, "read ") {
+				if mut {
+					return nil, &Error{c.Line.No, "`let mut` can't bind a `read` result yet — bind it plainly, then use it to compute a `let mut` local if you need to mutate it"}
+				}
+				fo, err := parseFileOp("read", strings.TrimSpace(rhs[len("read "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				fo.Bind = lname
+				body = append(body, fo)
+				continue
+			}
+			if strings.HasPrefix(rhs, "write ") {
+				if mut {
+					return nil, &Error{c.Line.No, "`let mut` can't bind a `write` result yet — bind it plainly, then use it to compute a `let mut` local if you need to mutate it"}
+				}
+				fo, err := parseFileOp("write", strings.TrimSpace(rhs[len("write "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				fo.Bind = lname
+				body = append(body, fo)
+				continue
+			}
 			val, err := parseExpr(rhs, c.Line.No)
 			if err != nil {
 				return nil, err
@@ -2020,7 +2136,7 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {
-				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/spawn/join/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
+				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/read/write/spawn/join/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
 			}
 			target := strings.TrimSpace(t[:eq])
 			val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)

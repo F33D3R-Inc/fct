@@ -54,7 +54,7 @@ func isPresentational(f *ast.App) bool {
 		len(f.Entities) == 0 && len(f.Records) == 0 && len(f.Enums) == 0 &&
 		len(f.Types) == 0 && len(f.Messages) == 0 &&
 		len(f.States) == 0 && len(f.Derives) == 0 && len(f.Policies) == 0 &&
-		len(f.Actions) == 0 && len(f.Procs) == 0 && len(f.Jobs) == 0 && len(f.Services) == 0 &&
+		len(f.Actions) == 0 && len(f.Procs) == 0 && len(f.Jobs) == 0 && len(f.Services) == 0 && len(f.Files) == 0 &&
 		len(f.Webhooks) == 0 && len(f.Triggers) == 0 && len(f.Views) == 0 &&
 		len(f.Mounts) == 0 && len(f.Sockets) == 0 && len(f.Frame) == 0 && !f.Auth
 }
@@ -165,12 +165,14 @@ func compose(facets []*ast.App) (*ast.App, error) {
 	app.DarkTheme = append(app.DarkTheme, playground.DarkTheme...)
 	app.Themes = append(app.Themes, playground.Themes...)
 	app.CSS = joinCSS(app.CSS, playground.CSS)
+	mergeAssets(app, playground)
 	knownPolicy := map[string]int{} // policy name -> param count, for guard checks
 	for _, w := range wireframes {
 		app.Theme = append(app.Theme, w.Theme...)
 		app.DarkTheme = append(app.DarkTheme, w.DarkTheme...)
 		app.Themes = append(app.Themes, w.Themes...)
 		app.CSS = joinCSS(app.CSS, w.CSS)
+		mergeAssets(app, w)
 	}
 	for _, b := range bricks {
 		app.Auth = app.Auth || b.Auth
@@ -185,10 +187,12 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.Components = append(app.Components, b.Components...)
 		app.Layouts = append(app.Layouts, b.Layouts...)
 		app.Services = append(app.Services, b.Services...)
+		app.Files = append(app.Files, b.Files...)
 		app.Theme = append(app.Theme, b.Theme...)
 		app.DarkTheme = append(app.DarkTheme, b.DarkTheme...)
 		app.Themes = append(app.Themes, b.Themes...)
 		app.CSS = joinCSS(app.CSS, b.CSS)
+		mergeAssets(app, b)
 		for _, p := range b.Policies {
 			knownPolicy[p.Name] = len(p.Params)
 		}
@@ -202,6 +206,7 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.DarkTheme = append(app.DarkTheme, a.DarkTheme...)
 		app.Themes = append(app.Themes, a.Themes...)
 		app.CSS = joinCSS(app.CSS, a.CSS)
+		mergeAssets(app, a)
 	}
 
 	// 5. Each playground mount becomes one screen: its wireframe's frame composited

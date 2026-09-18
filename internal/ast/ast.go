@@ -55,6 +55,16 @@ type App struct {
 	// `css:` block, so a `.fct` file can keep its structure/logic separate from
 	// its styling while every downstream pass still sees one stylesheet string.
 	CSSFiles   []CSSFile
+	// Assets accumulates the binary/static payload of every resolved `asset from
+	// "..."` reference anywhere in this file, keyed by the content-addressed
+	// name internal/compile mints for it ("<hash><ext>"). A text file resolves
+	// in place (see Asset.Kind/Val below) and never lands here; only a
+	// binary/static file (image, font, ...) needs a byte payload carried
+	// forward to ir.Build, because a resolved Asset expression only holds the
+	// URL it will be served from, not the bytes themselves. Two files that
+	// reference the same image, even from different directories, contribute
+	// the same key and therefore bundle exactly one copy.
+	Assets     map[string]AssetBlob
 	Auth       bool // a bare `auth` line turns on built-in users/login/logout/signup
 	Entities   []*Entity
 	Records    []*Record
@@ -72,6 +82,7 @@ type App struct {
 	Layouts    []*Layout
 	Views      []*View
 	Services   []*Service
+	Files      []*File
 	Webhooks   []*Webhook
 	Triggers   []*Trigger
 	Theme      []ThemeVar   // base design tokens (the light palette)
@@ -133,6 +144,66 @@ type CSSFile struct {
 	Path string
 	Line int
 }
+
+// AssetBlob is one binary/static file this app bundles — the payload a
+// resolved `asset from "..."` reference copies out of the compiled graph
+// (see App.Assets and ir.IR.Assets). Read once from disk by internal/compile
+// and carried forward unchanged; nothing downstream re-reads the file.
+type AssetBlob struct {
+	Bytes       []byte
+	ContentType string
+}
+
+// Asset is an `asset from "path"` expression — a reference to a sibling file
+// on disk, the general counterpart of `css from` for any file type rather
+// than only a stylesheet. It is parsed with no filesystem access, exactly
+// like a CSSFile: Path is the raw quoted string the author wrote, untouched.
+//
+// It differs from every other Expr in this file in two ways, both forced by
+// generalizing beyond CSS's one fixed shape (a single stylesheet string every
+// file contributes to):
+//
+//   - It can appear anywhere an expression can — inside a component's
+//     content, a proc body, a policy condition — not just in one field the
+//     parser collects top to bottom (CSSFiles). There is no single place to
+//     look for it the way compile.go looks at app.CSSFiles.
+//   - What it resolves to depends on what the file actually is. A text file
+//     (anything not recognized as binary/static) is inlined verbatim, the
+//     same "raw content, folded in" treatment `css from` gives every file it
+//     reads. An image, a font, or any other binary/static file cannot be
+//     folded into a string the same way — it is copied into the compiled app
+//     as a content-addressed asset (App.Assets / ir.IR.Assets) and this
+//     resolves to the URL it is served from instead.
+//
+// Both of those are why Asset is a pointer and resolves itself IN PLACE
+// rather than being replaced by a plain ast.Lit wherever it was written:
+// internal/compile's walkAssets finds every *Asset reachable from a freshly
+// parsed file (by any path — a slice, a struct field, an interface, walked
+// with reflection because there is no fixed list of "the places an
+// expression can appear" to hand-maintain, unlike ast.WalkNodes's node-only
+// traversal) and fills in Kind/Val on the object itself, which every holder
+// of the same pointer sees without the tree around it ever being rebuilt.
+// internal/ir/build.go's lower() then reads a resolved Asset exactly like a
+// Lit — see its own case — so nothing downstream (placement, either
+// renderer) ever has to learn a new expression kind.
+type Asset struct {
+	Path string // the quoted path as written; unresolved until compile time
+	Line int
+
+	// Resolved is set by internal/compile once this reference has been read
+	// from disk. Kind/Val then carry exactly what an ast.Lit's fields would
+	// ("text" and either the file's own content or its resolved URL).
+	// ir.Build refuses to lower an Asset that reaches it still unresolved
+	// (internal/ir/build.go's checkBuiltins) — the same guard compile.String
+	// already raises for `import`/`css from`, restated here at the
+	// expression level because an Asset is not confined to one field
+	// compile.String can check the length of before ir.Build ever runs.
+	Resolved bool
+	Kind     string
+	Val      any
+}
+
+func (*Asset) expr() {}
 
 // Record is a named value-object type: `record Verdict: score: int, reasons: [text]`.
 // Unlike an entity it has no storage, id, or persistence — it is a pure in-flight
@@ -533,6 +604,58 @@ type ServiceOp struct {
 	RetList bool   // the return is a list of Ret (`-> [T]`)
 	Line    int
 }
+
+// File is a declared file resource fct can read/write through the sandboxed
+// io.file capability — a name, a content type ("text" or "bytes"), and a
+// path. Mirrors Service's shape exactly (a named, app-level declaration of an
+// external resource, with typed operations against it via the `read`/`write`
+// statements below) but for local disk instead of HTTP:
+//
+//	file Config: text at "config.json"
+//	file Blob: bytes at "data.bin"
+//
+// Path is resolved through the exact same sandbox readFile/writeFile already
+// use (runtime/io.go's resolveDataPath, rooted at FACET_DATA_DIR) — this
+// declaration and the `read`/`write` statements are a human-friendly syntax
+// layer over that existing mechanism, not a new one. Type governs both what
+// `write Name(content)` will accept and what `read Name()` returns (checked
+// at compile time — see internal/ir/build.go's ast.FileOp case): "text"
+// round-trips a plain string; "bytes" round-trips a byte-buffer array
+// (bytesType — see ast.FileOp and inferProcType), for binary content a text
+// string cannot carry losslessly.
+type File struct {
+	Name string
+	Type string // "text" | "bytes"
+	Path string
+	Line int
+}
+
+// FileOp is a statement-level read/write against a declared `file` resource —
+// the human-friendly verb form of the readFile/writeFile builtins, written the
+// same call-shaped way `do ProcName(args)`/`let x = do ProcName(args)`
+// already read: `write Name(content)` (a fire-and-forget effect; Bind == "")
+// or, bound, `let x = read Name()` (Bind names the local the read's content
+// lands in). Op is "read" or "write"; File names the declared ast.File; Args
+// holds write's single content expression (empty for read, which takes
+// none). A read may also be bound via `let ok = write Name(content)` — write
+// returns bool on success, mirroring writeFile — for the same reason `do`
+// supports both a bound and fire-and-forget form.
+//
+// This is proc-only, exactly like readFile/writeFile: parseProcBody is the
+// only parser that recognizes the `read`/`write` statement prefixes. Gated by
+// the same `uses io.file` capability the raw builtins require (see
+// internal/ir/build.go's checkProcCapabilities) and type-checked against the
+// named File's declared Type (internal/ir/build.go's ast.FileOp case) — a
+// real compile-time check, not just a runtime coercion.
+type FileOp struct {
+	Op   string // "read" | "write"
+	File string
+	Args []Expr // write: [content]; read: none
+	Bind string // "" = fire-and-forget; else the local the result binds to
+	Line int
+}
+
+func (FileOp) stmt() {}
 
 // ServiceCall invokes a service operation from an action. Two forms, both
 // effectful (egress) so both pin the action to the server authority:

@@ -683,6 +683,28 @@ func (p *exprParser) parseAtom() (ast.Expr, error) {
 			return ast.Lit{Kind: "bool", Val: true}, nil
 		case "false":
 			return ast.Lit{Kind: "bool", Val: false}, nil
+		case "asset":
+			// `asset from "path"` — the general, any-file-type counterpart of
+			// `css from "path.css"` (see ast.Asset). Recognized only in this
+			// exact shape (immediately followed by `from` and a quoted string),
+			// so a state or param actually named `asset` used bare is untouched
+			// and falls through to the plain Ref case below like any other name.
+			if nt, ok := p.peek(); ok && nt.kind == tIdent && nt.text == "from" {
+				p.pos++ // consume "from"
+				st, ok := p.peek()
+				if !ok || st.kind != tStr {
+					return nil, &Error{p.line, `asset from needs a quoted path: asset from "logo.png"`}
+				}
+				p.pos++
+				path, err := strconv.Unquote(st.text)
+				if err != nil {
+					return nil, &Error{p.line, fmt.Sprintf("bad string %q", st.text)}
+				}
+				if path == "" {
+					return nil, &Error{p.line, "asset from path is empty"}
+				}
+				return &ast.Asset{Path: path, Line: p.line}, nil
+			}
 		}
 		return ast.Ref{Name: t.text}, nil
 	default:

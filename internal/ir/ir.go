@@ -28,12 +28,22 @@ type IR struct {
 	Jobs       []Job                        `json:"jobs"`
 	Components []Component                  `json:"components,omitempty"` // reusable view fragments
 	Services   []Service                    `json:"services,omitempty"`   // external services (brains) actions may call
+	Files      []File                       `json:"files,omitempty"`      // declared file resources a proc may read/write (io.file)
 	Webhooks   []Webhook                    `json:"webhooks,omitempty"`   // inbound endpoints external systems POST to
 	Triggers   []Trigger                    `json:"triggers,omitempty"`   // event reactions: an action's success runs another action
 	Theme      map[string]string            `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
 	ThemeDark  map[string]string            `json:"themeDark,omitempty"`  // dark-mode token overrides (prefers-color-scheme: dark)
 	Themes     map[string]map[string]string `json:"themes,omitempty"`     // named alternate palettes (name -> tokens), selected at runtime via the `theme` state
 	CSS        string                       `json:"css,omitempty"`        // raw author stylesheet from `css:` blocks, emitted verbatim into the page <head>
+	// Assets is every binary/static file bundled via `asset from "..."`
+	// (an image, a font, ...), keyed by the content-addressed name it is
+	// served under at /assets/<name>. It travels inside the graph exactly
+	// like CSS travels as a string field: `facet build --release` has no
+	// separate output directory to carry files in, only the one artifact it
+	// produces, so the bytes have to ride along in the same JSON the rest of
+	// the app does. A text file resolved by the same directive is inlined
+	// directly at its use (an ordinary "lit" Expr) and never appears here.
+	Assets     map[string]Asset             `json:"assets,omitempty"`
 	Routes     []Route                      `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
 	Pages      []Page                       `json:"pages"`                // one per view; each is a route
 	// View/Bindings/DepGraph mirror the *current* page. `facet build` shows the
@@ -42,6 +52,18 @@ type IR struct {
 	Bindings []Binding           `json:"bindings"`
 	View     []Node              `json:"view"`
 	DepGraph map[string][]string `json:"depGraph"`
+}
+
+// Asset is one binary/static file bundled via `asset from "..."` — an image,
+// a font, a PDF, anything not recognized as inlinable text. Bytes round-trips
+// through JSON as a base64 string, encoding/json's default for a []byte
+// field, so the whole graph (this included) stays the one JSON document every
+// target already reads. ContentType is sniffed once at compile time
+// (internal/compile) from the extension, falling back to content sniffing,
+// so runtime/staticassets.go never has to reopen the file to serve it.
+type Asset struct {
+	ContentType string `json:"contentType"`
+	Bytes       []byte `json:"bytes"`
 }
 
 // Page is one routed view: its URL plus its own node tree, tracked bindings, and
@@ -399,6 +421,20 @@ type ServiceOp struct {
 	RetList bool     `json:"retList,omitempty"` // the return is a list of Ret
 }
 
+// File is a declared file resource a proc's `read`/`write` statements
+// (Stmt.Op "fileread"/"filewrite") operate on — a name, its content type
+// ("text" or "bytes"), and the sandboxed path readFile/writeFile already
+// resolve through (runtime/io.go). Purely descriptive at this layer: each
+// `read`/`write` statement is already lowered with its own resolved Path/
+// Bytes fields (see Stmt), so nothing at runtime looks File back up by name;
+// it exists on the IR for the same reason Service does — an inspectable
+// record of the app's declared external resources (see cmd/facet/inspect.go).
+type File struct {
+	Name string `json:"name"`
+	Type string `json:"type"` // "text" | "bytes"
+	Path string `json:"path"`
+}
+
 // Webhook is a resolved inbound endpoint: an external system POSTs to Path, the
 // runtime verifies an HMAC over the raw body, and runs Action with the JSON body
 // decoded into its parameters by name. Secret names the env var holding the HMAC
@@ -474,7 +510,9 @@ type Stmt struct {
 	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
 	Body    []Stmt      `json:"body,omitempty"`    // loop: the repeated body; if: the `then` branch
 	Else    []Stmt      `json:"else,omitempty"`    // if: the `else` branch (nil = none)
-	Bytes   bool        `json:"bytes,omitempty"`   // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int
+	Bytes   bool        `json:"bytes,omitempty"`   // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int; fileread/filewrite: the file resource is `bytes`-typed rather than `text`
+	File    string      `json:"file,omitempty"`   // fileread/filewrite: the declared `file` resource's name (for a clear runtime error)
+	Path    string      `json:"path,omitempty"`   // fileread/filewrite: the file's author-facing path, resolved from its `file` declaration at compile time — still passed through the sandbox (resolveDataPath) at runtime
 }
 
 // FieldInit is a `name: expr` in an `add`.

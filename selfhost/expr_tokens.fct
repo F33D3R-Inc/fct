@@ -1,0 +1,519 @@
+app ExprTokensSelfHost:
+    # Partial, honest self-hosting port of internal/parser/expr.go (the
+    # expression tokenizer + precedence-climbing/recursive-descent parser
+    # stage of fct's own compiler pipeline) into `.fct` `proc`s.
+    #
+    # ============================================================
+    # REWRITE NOTE (struct milestone): this file used to represent the
+    # expression tree as a flat postorder `[int]` "arena" — `arena[5*i]` was
+    # a node's numeric kind (0 = Lit(int), 1 = Ref, 2 = Bin, ... 16 =
+    # AggMeta), `arena[5*i+1..4]` were four more slots whose MEANING
+    # depended silently on that kind, and a variable-arity construct (a
+    # call's arguments, a list literal's elements, a map literal's pairs)
+    # needed a whole extra family of "auxiliary pointer row" kinds —
+    # ArgSlot, MapPairSlot, AggMeta — just to fake having a real child
+    # array. Reading it meant holding that whole slot-numbering scheme in
+    # your head; nothing in the shape of the data said what any slot was.
+    # Now that a proc can declare a real `struct` (see LANGUAGE.md's `proc`
+    # section, and selfhost/predicate.fct's own just-landed rewrite for the
+    # first port to use one), the tree is an actual tree: an `ExprNode`
+    # value with named fields, one of which — `children: [ExprNode]` — is a
+    # real array of the struct itself. A call's arguments, a list literal's
+    # elements, and a binary operator's two operands are now all just...
+    # `node.children`, an ordinary array, not `arena[5*(first+k)+1]`. The
+    # ArgSlot/MapPairSlot/AggMeta auxiliary-row tricks are gone entirely —
+    # they existed only to fake a variable-length child list inside a fixed
+    # 5-int row; a real `[ExprNode]` (or `[Pair]`, for a map literal's
+    # key/value entries) needs no such workaround, since arrays are now
+    # real, ordinary, arbitrary-length values.
+    #
+    # One thing this rewrite deliberately did NOT change: the tokenizer's
+    # own output is still two parallel arrays (`tokenKinds`/`tokenTexts`,
+    # STAGE 1 below), not a `[Token]` struct array, even though a `Token`
+    # struct would be the more obviously "correct" mirror of this file's own
+    # new `ExprNode`. The reason is a real constraint, not an oversight:
+    # internal/ir/build.go's own `do` handling refuses to let an ACTION bind
+    # a struct-typed (or struct-list-typed) proc result at all — "structs
+    # are proc-local values, with no schema/wire representation yet" — and
+    # this file's own demo/view section (STAGE 3, below) needs to expose
+    # SOMETHING about the tokenizer's raw output through `state` for the
+    # build-check fixture to show anything at all, exactly the same wall
+    # predicate.fct's own demo hit for its Node tree (its demo exposes only
+    # two derived `bool`s, never the tree itself). A token, unlike a tree
+    # node, has exactly two fixed, always-meaningful facts (kind, text) with
+    # no variable arity and no recursion — a real struct buys real clarity
+    # for `ExprNode`'s many kinds and variable-length children, but a token
+    # was already exactly two aligned scalar arrays' worth of information
+    # with zero ambiguity about what each slot means, so turning it into a
+    # struct here would only add the action-can't-bind-it wall for no
+    # readability gain. What DID change for tokens: the magic int kind
+    # codes (0 = tNum, 1 = tIdent, ...) are gone too — `tokenKinds` now
+    # returns real kind NAMES (`"num"`, `"ident"`, `"op"`, `"lparen"`,
+    # `"rparen"`, `"str"`), the same "the value says what it means, not a
+    # number that means it" fix applied everywhere else in this file.
+    #
+    # The GRAMMAR covered is unchanged from the arena version (a genuine
+    # subset of expr.go's real grammar, grown over six rounds — see git
+    # history for that round-by-round story if it's ever needed): every
+    # precedence level from `||` down to unary `- ! ~`, member access and
+    # indexing (including chains), int/float/bool/text literals, list and
+    # map literals, builtin calls, `Entity(key).field` lookups, and the full
+    # `count`/`sum`/`exists`/`avg`/`min`/`max` aggregate grammar (`<value>
+    # in Coll [where <cond>]`, or a bare `Coll`/`Coll.field`). Still out of
+    # scope, unchanged: shifts (`<<`/`>>`), `%`, and the general binPrec-6
+    # `in` MEMBERSHIP operator (as opposed to an aggregate's own `in`/`where`
+    # keywords, which this file has always fully covered). Only the
+    # REPRESENTATION changed — see STAGE 2b's own doc for the struct design
+    # itself, and this file's git history for the byte-for-byte arena
+    # version if a comparison is ever needed.
+    #
+    # FINDINGS FROM THE ARENA ERA THAT STILL MATTER (trimmed to what a
+    # reader of the CURRENT code needs; the full round-by-round essay lives
+    # in git history):
+    #
+    # - `do` is more restricted than it looks: it is ONLY ever a bare
+    #   fire-and-forget statement or the RHS of a FRESH `let name = do
+    #   Proc(args)` binding — never nested inside another expression, never
+    #   the RHS of a `let mut` or a plain reassignment, never the argument
+    #   to `return`. Every recursive call in this file therefore reads `let
+    #   freshName = do Proc(...)` followed by a plain use of `freshName`,
+    #   even where a more direct `return do Proc(...)` would read shorter.
+    # - `&&`/`||` genuinely short-circuit now (this was FIXED at the
+    #   language level after this file was first written), so every
+    #   `isXOpTok`-style lookahead below is safely written as one flat
+    #   `pos < n && texts[pos] == "..."` rather than a nested `if`.
+    # - `[`/`]`/`.`/`{`/`}`/`:` need no dedicated tokenizer handling: none
+    #   of them is a two-character operator (isTwoCharOp's set), so they all
+    #   fall through tokenize's generic "operator character" branch (kind
+    #   `"op"`) exactly like `+`/`&`/etc. always have — only string literals
+    #   needed a real dedicated scan (quotes aren't self-delimiting the way
+    #   a single operator character is).
+    # - A literal's actual VALUE (an int/float/bool's numeric meaning, a
+    #   string literal's unescaped content) is never decoded anywhere in
+    #   this file — every literal `ExprNode` stores its RAW token text
+    #   (still-quoted-and-escaped for a string; undecoded digits for a
+    #   number), exactly mirroring the arena version's own `valTok`
+    #   indirection. Decoding is left entirely to whoever consumes the
+    #   tree (expr_test.go's own `shapeFromArena`-equivalent does it with
+    #   `strconv.Unquote`/`strconv.ParseFloat`, the same real functions
+    #   expr.go's own parseAtom already calls) — this file's job is only to
+    #   prove the SHAPE and the TOKEN SPAN are right, not to re-implement
+    #   Go's numeric/escape decoding a second time in `.fct`.
+    # - `min`/`max` are genuinely ambiguous in the real grammar: call-shaped
+    #   (`min(a, b)`, a two-argument scalar builtin) only when their
+    #   argument list has a top-level comma; single-argument `min(x)` is
+    #   always the AGGREGATE form (`min(Order.amount)`) instead —
+    #   disambiguated by `hasTopLevelCommaAt` (STAGE 2f), expr.go's own
+    #   `argListHasComma` restated. This is also why `min`/`max` are
+    #   excluded from both `isCallNameTok` and `isEntityNameTok`'s name
+    #   sets: they can never be a plain call or an entity lookup, only
+    #   Agg-or-Call, and that split is resolved once, in `isAggStartAt`.
+    #
+    # ============================================================
+    # THE STRUCT DESIGN
+    # ============================================================
+    # ExprNode is ONE struct covering every node shape this subset's grammar
+    # produces, `kind` saying which shape and every other field always
+    # present but only meaningful for the kinds that use it (the same
+    # convention predicate.fct's own `Node` established):
+    #
+    #   kind == "int" | "float" | "bool" | "text"
+    #       a literal leaf. `text` holds its RAW, undecoded token text (see
+    #       the finding above on why decoding is left to the consumer).
+    #   kind == "ref"
+    #       a bare variable/field-name reference. `text` is the name.
+    #   kind == "bin"
+    #       a binary operator. `text` is the operator symbol (any of `&&
+    #       || | ^ & == != < <= > >= + - * /`); `children` is `[left,
+    #       right]`.
+    #   kind == "un"
+    #       a unary operator. `text` is `- ! ~`; `children` is `[operand]`.
+    #   kind == "get"
+    #       a field read, `obj.field`. `text` is the field name; `children`
+    #       is `[obj]`.
+    #   kind == "index"
+    #       an index read, `obj[i]`. `children` is `[obj, indexExpr]`.
+    #   kind == "call"
+    #       a builtin call, `name(args...)`. `text` is the builtin's name;
+    #       `children` is the real argument list, in order — no fixed
+    #       arity, no auxiliary rows, just an ordinary array.
+    #   kind == "list"
+    #       a list literal, `[elems...]`. `children` is the element list.
+    #   kind == "entityGet"
+    #       `Entity(key).field`, or bare `Entity(key)`. `text` is the
+    #       entity name; `field` is the optional trailing field name ("" if
+    #       absent — a bare `Entity(key)` has no `.field`); `children` is
+    #       `[keyExpr]`.
+    #   kind == "map"
+    #       a map literal, `{k: v, ...}`. `pairs` is the real key/value
+    #       list, in order (see `Pair`, below); every other field (`text`,
+    #       `field`, `itemVar`, `coll`, `children`, `whereClause`, `sel`)
+    #       is unused.
+    #   kind == "agg"
+    #       an aggregate: `count`/`sum`/`exists`/`avg`/`min`/`max`. `text`
+    #       is the aggregate's own name; `itemVar` is the bound item
+    #       variable's name (`x` in `count(x in Coll where ...)`), "" for
+    #       the whole-collection form (`sum(Coll.field)`, which binds no
+    #       variable); `coll` is the collection/entity name, "" if it could
+    #       not be determined (an honest degrade, not a crash — see
+    #       `aggNodes`' own doc, STAGE 2f); `field` is the optional bare
+    #       reduce field (`field` in `sum(Coll.field)`/`sum(x.field in Coll
+    #       ...)`), "" if the reduced value was the row itself or a general
+    #       expression instead; `whereClause` is the optional filter
+    #       sub-expression, 0 or 1 elements; `sel` is the optional GENERAL
+    #       reduced-value sub-expression (only set when the reduced value
+    #       was neither a bare row reference nor a bare field read), 0 or 1
+    #       elements. There is no separate `sel(...)` syntax anywhere in the
+    #       real grammar — `Sel` is purely a derived fact about which SHAPE
+    #       the parsed reduced value turned out to have (see `aggNodes`'
+    #       own doc for the exact three-way dispatch).
+    #
+    # `children`/`pairs`/`whereClause`/`sel` are all `[ExprNode]`/`[Pair]`
+    # rather than a bare `ExprNode` field, even where a kind's real arity is
+    # fixed (e.g. `un`'s one operand, `bin`'s exactly two) — a struct field
+    # CAN legally name itself directly in this language (LANGUAGE.md's
+    # `struct` section allows self-reference), but only a LIST can actually
+    # be built for every kind without a chicken-and-egg problem: a literal
+    # leaf (`"int"`/`"ref"`/etc.) has no real operand to put in a bare
+    # `left: ExprNode` field, and every struct literal must set every field
+    # to SOME value — an empty list (`[]`) is a real, well-formed "no
+    # children" answer; a placeholder scalar `ExprNode` would not be. This
+    # is exactly the choice predicate.fct's own `Node.children: [Node]`
+    # already made, restated here for a grammar with actual variable arity
+    # (calls, lists) as well as the fixed-arity kinds `Node` also has.
+    struct ExprNode:
+        kind: text
+        text: text
+        field: text
+        itemVar: text
+        coll: text
+        children: [ExprNode]
+        pairs: [Pair]
+        whereClause: [ExprNode]
+        sel: [ExprNode]
+
+    # Pair: one `key: value` entry of a map literal. A plain two-field
+    # struct, not self-referential and never optional-arity itself (a pair
+    # that exists always has a real key AND a real value), so — unlike
+    # ExprNode's own children — direct `ExprNode`-typed fields are exactly
+    # right here, no list wrapper needed.
+    struct Pair:
+        key: ExprNode
+        value: ExprNode
+
+    # ============================================================
+    # NODE CONSTRUCTORS — one tiny smart constructor per shape, the same
+    # "convenience a struct's memberwise initializer would give for free in
+    # a language that had one" idiom predicate.fct's own numNode/boolNode/
+    # etc. already established, so every call site below reads as `do
+    # binNode(op, l, r)` instead of repeating all nine of ExprNode's fields
+    # (most of them irrelevant to that shape) everywhere a node is built.
+    # ============================================================
+    proc emptyNode() -> ExprNode:
+        # The one honest-degrade filler this file needs: a harmless "int
+        # literal 0" node, used only where malformed/out-of-range input
+        # would otherwise leave a caller with nothing to return — never
+        # reached by any well-formed input this subset's grammar accepts,
+        # exactly like factorEnd's own "no progress" degrade for position
+        # tracking (STAGE 2a) has always existed for the identical reason.
+        return ExprNode{kind: "int", text: "0", field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    proc intLitNode(litText: text) -> ExprNode:
+        return ExprNode{kind: "int", text: litText, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    proc floatLitNode(litText: text) -> ExprNode:
+        return ExprNode{kind: "float", text: litText, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    proc boolLitNode(litText: text) -> ExprNode:
+        return ExprNode{kind: "bool", text: litText, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    proc textLitNode(litText: text) -> ExprNode:
+        return ExprNode{kind: "text", text: litText, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    proc refNode(name: text) -> ExprNode:
+        return ExprNode{kind: "ref", text: name, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    proc binNode(op: text, l: ExprNode, r: ExprNode) -> ExprNode:
+        return ExprNode{kind: "bin", text: op, field: "", itemVar: "", coll: "", children: [l, r], pairs: [], whereClause: [], sel: []}
+
+    proc unNode(op: text, x: ExprNode) -> ExprNode:
+        return ExprNode{kind: "un", text: op, field: "", itemVar: "", coll: "", children: [x], pairs: [], whereClause: [], sel: []}
+
+    proc getNode(obj: ExprNode, fieldName: text) -> ExprNode:
+        return ExprNode{kind: "get", text: fieldName, field: "", itemVar: "", coll: "", children: [obj], pairs: [], whereClause: [], sel: []}
+
+    proc indexNode(obj: ExprNode, idx: ExprNode) -> ExprNode:
+        return ExprNode{kind: "index", text: "", field: "", itemVar: "", coll: "", children: [obj, idx], pairs: [], whereClause: [], sel: []}
+
+    proc callNode(name: text, args: [ExprNode]) -> ExprNode:
+        return ExprNode{kind: "call", text: name, field: "", itemVar: "", coll: "", children: args, pairs: [], whereClause: [], sel: []}
+
+    proc listNode(elems: [ExprNode]) -> ExprNode:
+        return ExprNode{kind: "list", text: "", field: "", itemVar: "", coll: "", children: elems, pairs: [], whereClause: [], sel: []}
+
+    proc entityGetNode(entityName: text, key: ExprNode, fieldName: text) -> ExprNode:
+        return ExprNode{kind: "entityGet", text: entityName, field: fieldName, itemVar: "", coll: "", children: [key], pairs: [], whereClause: [], sel: []}
+
+    proc mapLitNode(mapPairs: [Pair]) -> ExprNode:
+        return ExprNode{kind: "map", text: "", field: "", itemVar: "", coll: "", children: [], pairs: mapPairs, whereClause: [], sel: []}
+
+    proc aggNode(op: text, itemVar: text, coll: text, fieldName: text, whereClause: [ExprNode], sel: [ExprNode]) -> ExprNode:
+        return ExprNode{kind: "agg", text: op, field: fieldName, itemVar: itemVar, coll: coll, children: [], pairs: [], whereClause: whereClause, sel: sel}
+
+    # ============================================================
+    # STAGE 0: character classification.
+    # ============================================================
+    # No `isDigit`/`isAlpha` builtin exists, and there is no lexicographic
+    # `<`/`<=` on `text` in this language (every comparison coerces through
+    # toInt/toFloat), so a digit/letter range check is an enumerated
+    # CLOSED-ALPHABET membership test via `in` against an explicit array
+    # literal, exactly like source.fct's own indentOf/hasLeadingTab already
+    # do for their own (smaller) closed alphabets.
+    proc isDigitChar(c: text) -> bool:
+        return c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+    # (a single logical statement cannot span multiple physical lines in
+    # this language, so this literal stays on one line.)
+    proc isIdentStartChar(c: text) -> bool:
+        return c in ["_", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
+    proc isIdentChar(c: text) -> bool:
+        let startOk = do isIdentStartChar(c)
+        if startOk:
+            return true
+        let digitOk = do isDigitChar(c)
+        return digitOk
+
+    proc isSpaceChar(c: text) -> bool:
+        return c == " " || c == "\t"
+
+    # isTwoCharOp: the real tokenizer's own longest-match rule, restated as
+    # a closed-alphabet membership test. `<<`/`>>` are deliberately NOT in
+    # this set (shifts are out of scope — see this file's header), so a
+    # bare `<`/`>` always tokenizes as its own one-character operator here.
+    proc isTwoCharOp(combo: text) -> bool:
+        return combo in ["==", "!=", "<=", ">=", "&&", "||"]
+
+    # ============================================================
+    # STAGE 1: the tokenizer — expr.go's own `tokenize(s string) []token`,
+    # ported to the "parallel arrays" pattern source.fct's own header
+    # explains (a proc cannot construct or return a list of HETEROGENEOUS
+    # records; two SAME-shaped arrays, aligned by index, is the working
+    # substitute) — kept as two arrays even now that a real `Token` struct
+    # is possible, for the reason this file's header spells out (an action
+    # cannot bind a struct-typed result, and a token's two facts have no
+    # ambiguity a struct would resolve that two aligned arrays don't
+    # already resolve just as well).
+    #
+    # Kind names (tEOF still never occurs — "at end" is simply "index >=
+    # len(tokenKinds(...))"):
+    #   "num"     a run of digits, optionally extended past a `.` IFF that
+    #             `.` is immediately followed by another digit (a bare
+    #             trailing dot, as in `3.`, stays unconsumed — its own `.`
+    #             operator token). Int and float share this one kind, same
+    #             as expr.go's own single tNum — factorLeafNodes (STAGE 2b)
+    #             is the only place that asks "does this token's TEXT
+    #             contain a `.`" to tell them apart.
+    #   "ident"   an identifier: isIdentStartChar then isIdentChar*.
+    #   "op"      `+ - * / ! < > = & | ^ ~ . [ ] { } :`, one- or
+    #             two-character (see isTwoCharOp) — every consumer below
+    #             dispatches on the token TEXT, never a finer-grained kind,
+    #             so one kind covers every operator this subset has.
+    #   "lparen" / "rparen"
+    #   "str"     a double-quoted string literal, `"` through the next
+    #             UNESCAPED closing quote (a `\` skips the next character
+    #             unconditionally, whatever it is). Kept RAW in tokenTexts
+    #             (quotes, backslashes, and all) — unescaping is left to
+    #             the tree's consumer, per this file's header.
+    proc tokenKinds(src: text) -> [text]:
+        let n = len(src)
+        let mut kinds = []
+        let mut i = 0
+        loop i < n:
+            let c = charAt(src, i)
+            let isSpace = do isSpaceChar(c)
+            if isSpace:
+                i = i + 1
+            else:
+                if c == "(":
+                    kinds = append(kinds, "lparen")
+                    i = i + 1
+                else:
+                    if c == ")":
+                        kinds = append(kinds, "rparen")
+                        i = i + 1
+                    else:
+                        if c == "\"":
+                            let mut j = i + 1
+                            let mut scanning = true
+                            loop scanning:
+                                if j < n:
+                                    if charAt(src, j) == "\"":
+                                        scanning = false
+                                    else:
+                                        if charAt(src, j) == "\\":
+                                            j = j + 1
+                                        j = j + 1
+                                else:
+                                    scanning = false
+                            if j < n:
+                                j = j + 1
+                            kinds = append(kinds, "str")
+                            i = j
+                        else:
+                            let isDigit = do isDigitChar(c)
+                            if isDigit:
+                                let mut j = i
+                                let mut scanning = true
+                                loop scanning:
+                                    if j < n:
+                                        let dj = do isDigitChar(charAt(src, j))
+                                        if dj:
+                                            j = j + 1
+                                        else:
+                                            scanning = false
+                                    else:
+                                        scanning = false
+                                if j < n:
+                                    if charAt(src, j) == ".":
+                                        if j + 1 < n:
+                                            let fracDigit = do isDigitChar(charAt(src, j + 1))
+                                            if fracDigit:
+                                                j = j + 1
+                                                let mut scanning2 = true
+                                                loop scanning2:
+                                                    if j < n:
+                                                        let dj2 = do isDigitChar(charAt(src, j))
+                                                        if dj2:
+                                                            j = j + 1
+                                                        else:
+                                                            scanning2 = false
+                                                    else:
+                                                        scanning2 = false
+                                kinds = append(kinds, "num")
+                                i = j
+                            else:
+                                let isStart = do isIdentStartChar(c)
+                                if isStart:
+                                    let mut j = i
+                                    let mut scanning = true
+                                    loop scanning:
+                                        if j < n:
+                                            let ij = do isIdentChar(charAt(src, j))
+                                            if ij:
+                                                j = j + 1
+                                            else:
+                                                scanning = false
+                                        else:
+                                            scanning = false
+                                    kinds = append(kinds, "ident")
+                                    i = j
+                                else:
+                                    let mut opLen = 1
+                                    if i + 1 < n:
+                                        let c2 = charAt(src, i + 1)
+                                        let combo = c + c2
+                                        let isTwo = do isTwoCharOp(combo)
+                                        if isTwo:
+                                            opLen = 2
+                                    kinds = append(kinds, "op")
+                                    i = i + opLen
+        return kinds
+
+    proc tokenTexts(src: text) -> [text]:
+        let n = len(src)
+        let mut texts = []
+        let mut i = 0
+        loop i < n:
+            let c = charAt(src, i)
+            let isSpace = do isSpaceChar(c)
+            if isSpace:
+                i = i + 1
+            else:
+                if c == "(":
+                    texts = append(texts, "(")
+                    i = i + 1
+                else:
+                    if c == ")":
+                        texts = append(texts, ")")
+                        i = i + 1
+                    else:
+                        if c == "\"":
+                            let mut j = i + 1
+                            let mut scanning = true
+                            loop scanning:
+                                if j < n:
+                                    if charAt(src, j) == "\"":
+                                        scanning = false
+                                    else:
+                                        if charAt(src, j) == "\\":
+                                            j = j + 1
+                                        j = j + 1
+                                else:
+                                    scanning = false
+                            if j < n:
+                                j = j + 1
+                            texts = append(texts, slice(src, i, j))
+                            i = j
+                        else:
+                            let isDigit = do isDigitChar(c)
+                            if isDigit:
+                                let mut j = i
+                                let mut scanning = true
+                                loop scanning:
+                                    if j < n:
+                                        let dj = do isDigitChar(charAt(src, j))
+                                        if dj:
+                                            j = j + 1
+                                        else:
+                                            scanning = false
+                                    else:
+                                        scanning = false
+                                if j < n:
+                                    if charAt(src, j) == ".":
+                                        if j + 1 < n:
+                                            let fracDigit = do isDigitChar(charAt(src, j + 1))
+                                            if fracDigit:
+                                                j = j + 1
+                                                let mut scanning2 = true
+                                                loop scanning2:
+                                                    if j < n:
+                                                        let dj2 = do isDigitChar(charAt(src, j))
+                                                        if dj2:
+                                                            j = j + 1
+                                                        else:
+                                                            scanning2 = false
+                                                    else:
+                                                        scanning2 = false
+                                texts = append(texts, slice(src, i, j))
+                                i = j
+                            else:
+                                let isStart = do isIdentStartChar(c)
+                                if isStart:
+                                    let mut j = i
+                                    let mut scanning = true
+                                    loop scanning:
+                                        if j < n:
+                                            let ij = do isIdentChar(charAt(src, j))
+                                            if ij:
+                                                j = j + 1
+                                            else:
+                                                scanning = false
+                                        else:
+                                            scanning = false
+                                    texts = append(texts, slice(src, i, j))
+                                    i = j
+                                else:
+                                    let mut opLen = 1
+                                    let mut opText = c
+                                    if i + 1 < n:
+                                        let c2 = charAt(src, i + 1)
+                                        let combo = c + c2
+                                        let isTwo = do isTwoCharOp(combo)
+                                        if isTwo:
+                                            opLen = 2
+                                            opText = combo
+                                    texts = append(texts, opText)
+                                    i = i + opLen
+        return texts
+

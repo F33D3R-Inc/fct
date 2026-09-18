@@ -135,6 +135,13 @@ func collectModules(abs string, visited map[string]bool, stack []string, res *re
 		}
 		app.CSS = joinStylesheets(app.CSS, string(cssSrc))
 	}
+	// `asset from "path"` is css from's general counterpart: any file type,
+	// resolved the same way (relative to this file's own directory) but found
+	// by walking the whole parsed file rather than one collected list — see
+	// resolveAssets' own doc for why.
+	if err := resolveAssets(app, dir); err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.Base(abs), err)
+	}
 	list := []*ast.App{app}
 	for _, imp := range app.Imports {
 		// Resolve turns the import string into an absolute local path: a local ref
@@ -179,6 +186,7 @@ func mergeInto(dst, src *ast.App) {
 	dst.Layouts = append(dst.Layouts, src.Layouts...)
 	dst.Views = append(dst.Views, src.Views...)
 	dst.Services = append(dst.Services, src.Services...)
+	dst.Files = append(dst.Files, src.Files...)
 	dst.Theme = append(dst.Theme, src.Theme...)
 
 	// A facet's stylesheet ships with the facet, exactly like its theme
@@ -189,6 +197,10 @@ func mergeInto(dst, src *ast.App) {
 	// undistributable: it rendered correctly only in whichever host app happened
 	// to carry a copy of its rules.
 	dst.CSS = joinStylesheets(dst.CSS, src.CSS)
+
+	// Binary/static assets a facet bundled travel with it for the same reason
+	// its stylesheet does, directly above.
+	mergeAssets(dst, src)
 }
 
 // joinStylesheets concatenates two stylesheet fragments. Mirrors the parser's

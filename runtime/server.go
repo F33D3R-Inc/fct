@@ -444,6 +444,7 @@ var builtins = []builtinRoute{
 	// resumable: init/chunk/finish/abort
 	{BuiltinRoute{"/upload/", "the resumable upload endpoints", true}, func(s *Server) http.HandlerFunc { return s.handleUploadChunked }},
 	{BuiltinRoute{"/uploads/", "stored media", true}, func(s *Server) http.HandlerFunc { return s.handleUploads }},
+	{BuiltinRoute{"/assets/", "bundled static assets (`asset from \"...\"`)", true}, func(s *Server) http.HandlerFunc { return s.handleAssets }},
 	// Phase 6: the generated admin dashboard and the billing provider webhook.
 	{BuiltinRoute{"/admin", "the generated admin console", true}, func(s *Server) http.HandlerFunc { return s.handleAdmin }},
 	{BuiltinRoute{"/admin/", "the generated admin console", true}, func(s *Server) http.HandlerFunc { return s.handleAdmin }},
@@ -2020,6 +2021,49 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			// exactly like any other proc-body failure.
 			if _, err := s.evalInFrame(st.Value, fr); err != nil {
 				return ctlSignal{}, err
+			}
+		case "fileread":
+			// `let x = read Name()` (or a bare, result-discarded `read Name()`)
+			// — the verb form of readFile/writeFile over a declared `file`
+			// resource (internal/ir/build.go's ast.FileOp case already
+			// resolved st.Path/st.Bytes from that declaration at compile
+			// time). Wired to the exact same sandboxed primitives readFile
+			// itself uses — st.Bytes only picks which representation (text
+			// vs. byte-buffer array) the content comes back as.
+			var v any
+			var err error
+			if st.Bytes {
+				v, err = s.ioReadFileBytes(st.Path)
+			} else {
+				v, err = s.ioReadFile(st.Path)
+			}
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			if st.Bind != "" {
+				fr.vars[st.Bind] = cloneCompositeValue(v)
+			}
+		case "filewrite":
+			// `write Name(content)` (or a bound `let ok = write Name(content)`)
+			// — writeFile's verb form. internal/ir/build.go's ast.FileOp case
+			// already proved content's static type matches the file's
+			// declared Type, so st.Bytes alone is enough to pick which
+			// underlying primitive runs.
+			val, err := s.evalInFrame(st.Value, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			var res any
+			if st.Bytes {
+				res, err = s.ioWriteFileBytes(st.Path, val)
+			} else {
+				res, err = s.ioWriteFile(st.Path, toStr(val))
+			}
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			if st.Bind != "" {
+				fr.vars[st.Bind] = res
 			}
 		case "spawn":
 			// `let h = spawn ProcName(args)` (Milestone 5: structured

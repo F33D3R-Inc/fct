@@ -32,14 +32,15 @@ import (
 )
 
 // loadParserApp compiles and boots selfhost/parser.fct through the same
-// in-memory server pattern loadApp/loadExprApp already use.
+// in-memory server pattern loadApp/loadExprApp already use. parser.fct is now
+// a driver that imports parser_proc.fct/parser_entity.fct/parser_service.fct
+// (the STAGE 1-17 split), so it must go through compile.File — the
+// import-aware entry point — exactly like TestCrossFileDoCallComposition
+// below already does for its own multi-file fixtures; compile.String
+// explicitly rejects any source that declares imports.
 func loadParserApp(t *testing.T) *httptest.Server {
 	t.Helper()
-	src, err := os.ReadFile(filepath.Join("parser.fct"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	g, err := compile.String(string(src))
+	g, err := compile.File(filepath.Join("parser.fct"))
 	if err != nil {
 		t.Fatalf("compile selfhost/parser.fct: %v", err)
 	}

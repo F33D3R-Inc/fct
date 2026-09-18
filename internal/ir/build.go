@@ -57,6 +57,7 @@ type env struct {
 	locRecords    map[string]recBind                // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
 	actionSet     map[string]bool                   // action names, for validating pending()/failed() targets
 	procSigs      map[string]procSig                // proc name -> its signature, for checking `do` (from an action or another proc)
+	files         map[string]*ast.File              // file name -> its declaration, for checking a proc's `read`/`write` statements
 }
 
 // procSig is a proc's signature: enough to check a `do` call site (arity) and to
@@ -168,7 +169,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, structs: map[string]map[string]structField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, structs: map[string]map[string]structField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}, files: map[string]*ast.File{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -701,6 +702,17 @@ func Build(app *ast.App) (*IR, error) {
 	// hatch for layout the token system can't express (pinned rails, breakpoints).
 	out.CSS = app.CSS
 
+	// Binary/static files bundled via `asset from "..."` — internal/compile
+	// already read them from disk and keyed them by content hash; this is a
+	// straight carry-forward into the graph, the same "resolved by the time
+	// ir.Build sees it" shape app.CSS has.
+	if len(app.Assets) > 0 {
+		out.Assets = make(map[string]Asset, len(app.Assets))
+		for name, blob := range app.Assets {
+			out.Assets[name] = Asset{ContentType: blob.ContentType, Bytes: blob.Bytes}
+		}
+	}
+
 	// Pre-register action names so a component body's pending()/failed() resolves an
 	// action declared later in source order — components are lowered (3d) before the
 	// action pass (4) that normally registers these. Full validation still runs in 4;
@@ -853,7 +865,29 @@ func Build(app *ast.App) (*IR, error) {
 		out.Services = append(out.Services, irsv)
 	}
 
-	// 3d″. Procs: general-purpose, unconditionally server-executed declarations
+	// 3d″. Files: declared file resources a proc's `read`/`write` statements
+	// operate on (see ast.File) — the same named-resource pattern as Service,
+	// for local disk instead of HTTP. Registered before proc bodies are built
+	// (procBlock's ast.FileOp case resolves against e.files), and a bad path
+	// shape is caught here, at declaration time, rather than only once some
+	// proc happens to use it — the same "author's mistake, not something to
+	// discover later" stance resolveDataPath's own absolute-path check takes
+	// at runtime, just moved as early as it can provably be for a literal path.
+	for _, f := range app.Files {
+		if _, dup := e.files[f.Name]; dup {
+			return nil, &BuildError{f.Line, fmt.Sprintf("file %q redeclared", f.Name)}
+		}
+		if f.Type != "text" && f.Type != bytesType {
+			return nil, &BuildError{f.Line, fmt.Sprintf("file %q type must be text or bytes, got %q", f.Name, f.Type)}
+		}
+		if strings.HasPrefix(f.Path, "/") {
+			return nil, &BuildError{f.Line, fmt.Sprintf("file %q path %q must be relative to the sandboxed data directory, not absolute", f.Name, f.Path)}
+		}
+		e.files[f.Name] = f
+		out.Files = append(out.Files, File{Name: f.Name, Type: f.Type, Path: f.Path})
+	}
+
+	// 3d″′. Procs: general-purpose, unconditionally server-executed declarations
 	// (self-hosting + product logic — see ROADMAP.md, "Decision superseded: full
 	// self-hosting"). Signatures are registered in one pass — so a proc may call
 	// another declared later in source order, and an action's `do` resolves
@@ -2509,6 +2543,77 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "exprstmt", Value: e.low(st.Call)})
+		case ast.FileOp:
+			// `write Name(content)` / `let x = read Name()` — the verb form of
+			// readFile/writeFile over a declared `file` resource (see
+			// ast.FileOp's doc). Name must resolve to a real `file` declaration,
+			// the capability gate is the exact same one a raw readFile/writeFile
+			// call goes through (requireProcCapability, checkProcCapabilities'
+			// own per-capability check), and the content/return type is checked
+			// against the file's declared Type — the real compile-time
+			// enforcement LANGUAGE.md's `write`/`read` promise, not a runtime
+			// coercion: a `text` file always round-trips a string, a `bytes`
+			// file always round-trips a byte-buffer array (bytesType).
+			f, ok := e.files[st.File]
+			if !ok {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%s %s(...) — %q is not a declared file (add `file %s: text at \"...\"` or `bytes`)", st.Op, st.File, st.File, st.File)}
+			}
+			isBytes := f.Type == bytesType
+			switch st.Op {
+			case "read":
+				if len(st.Args) != 0 {
+					return nil, &BuildError{st.Line, fmt.Sprintf("read %s() takes no arguments", st.File)}
+				}
+				if err := requireProcCapability(p, "io.file", fmt.Sprintf("read %s(...)", st.File), st.Line); err != nil {
+					return nil, err
+				}
+				rs := Stmt{Op: "fileread", File: f.Name, Path: f.Path, Bytes: isBytes}
+				if st.Bind != "" {
+					if locals[st.Bind] {
+						return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
+					}
+					locals[st.Bind] = true
+					if isBytes {
+						types[st.Bind] = bytesType
+					} else {
+						types[st.Bind] = "text"
+					}
+					rs.Bind = st.Bind
+				}
+				out = append(out, rs)
+			case "write":
+				if len(st.Args) != 1 {
+					return nil, &BuildError{st.Line, fmt.Sprintf("write %s(...) takes exactly one argument (the content to write)", st.File)}
+				}
+				if err := requireProcCapability(p, "io.file", fmt.Sprintf("write %s(...)", st.File), st.Line); err != nil {
+					return nil, err
+				}
+				if err := e.checkProcExpr(p, st.Args[0], locals, types, st.Line); err != nil {
+					return nil, err
+				}
+				wantType := "text"
+				if isBytes {
+					wantType = bytesType
+				}
+				if argType := inferProcType(st.Args[0], types); argType != "" && argType != wantType {
+					if isBytes {
+						return nil, &BuildError{st.Line, fmt.Sprintf("write %s(...) needs a byte buffer — file %q is declared `bytes`, got %s", st.File, st.File, argType)}
+					}
+					return nil, &BuildError{st.Line, fmt.Sprintf("write %s(...) needs text — file %q is declared `text`, got %s", st.File, st.File, argType)}
+				}
+				ws := Stmt{Op: "filewrite", File: f.Name, Path: f.Path, Bytes: isBytes, Value: e.low(st.Args[0])}
+				if st.Bind != "" {
+					if locals[st.Bind] {
+						return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
+					}
+					locals[st.Bind] = true
+					types[st.Bind] = "bool"
+					ws.Bind = st.Bind
+				}
+				out = append(out, ws)
+			default:
+				return nil, &BuildError{st.Line, fmt.Sprintf("unknown file operation %q", st.Op)}
+			}
 		case ast.Loop:
 			if err := checkSpawnsJoined(pendingSpawns, p.Name, st.Line, "starting a loop"); err != nil {
 				return nil, err
@@ -5315,6 +5420,20 @@ func (c *viewCtx) checkRowFields(ex ast.Expr, sc scope, line int) error {
 // an existing field) and builtin calls (known name, correct arity).
 func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 	switch t := ex.(type) {
+	case *ast.Asset:
+		// internal/compile resolves every `asset from "..."` reachable from a
+		// parsed file before this ever runs (see its walkAssets) — an
+		// unresolved one here means either the app was compiled with
+		// compile.String (no file, nowhere to resolve a relative path
+		// against — the same reason it refuses `import`/`css from`), or the
+		// reference sits somewhere that pass doesn't reach. Either way it is
+		// a compile error, not a value: lower() only knows how to lower a
+		// *resolved* Asset (as a literal), so letting this through would
+		// silently drop the expression instead of failing loudly.
+		if !t.Resolved {
+			return &BuildError{line, fmt.Sprintf(
+				"asset from %q was never resolved — asset from \"...\" is only supported when compiling from a file (run `facet <command> <file.fct>`)", t.Path)}
+		}
 	case ast.Agg:
 		if !e.entities[t.Coll] {
 			return &BuildError{line, fmt.Sprintf("%s(...) needs an entity collection; %q is not an entity", t.Op, t.Coll)}
@@ -5592,18 +5711,31 @@ func checkProcCapabilities(p *ast.Proc, ex ast.Expr, line int) error {
 		}
 	}
 	sort.Strings(names)
-	uses := map[string]bool{}
-	for _, u := range p.Uses {
-		uses[u] = true
-	}
 	for _, cap := range names {
-		if !uses[cap] {
-			return &BuildError{line, fmt.Sprintf(
-				"proc %q calls %s(...), which requires capability %q — declare it on the proc header (e.g. `proc %s(...) -> ... uses %s:`)",
-				p.Name, caps[cap], cap, p.Name, cap)}
+		if err := requireProcCapability(p, cap, caps[cap]+"(...)", line); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// requireProcCapability is checkProcCapabilities' one-capability check,
+// pulled out so ast.FileOp's `read`/`write` statements (internal/ir/build.go's
+// procBlock, ast.FileOp case) can enforce the exact same `uses io.file` gate
+// that a raw readFile/writeFile builtin CALL goes through above — an io.file
+// effect requires the capability whichever surface syntax spelled it, so both
+// paths report the identical diagnostic. what names the effect in the message
+// (e.g. "readFile(...)" for a builtin call, "read Config(...)" for a file
+// statement) — the two callers differ only in that string.
+func requireProcCapability(p *ast.Proc, cap, what string, line int) error {
+	for _, u := range p.Uses {
+		if u == cap {
+			return nil
+		}
+	}
+	return &BuildError{line, fmt.Sprintf(
+		"proc %q calls %s, which requires capability %q — declare it on the proc header (e.g. `proc %s(...) -> ... uses %s:`)",
+		p.Name, what, cap, p.Name, cap)}
 }
 
 // pureBuiltinArity gives the fixed argument count of a pure standard-library
@@ -5893,6 +6025,12 @@ func (e *env) low(ex ast.Expr) *Expr { return lower(ex, e.inline, e.enums) }
 func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Expr {
 	switch t := ex.(type) {
 	case ast.Lit:
+		return &Expr{Kind: "lit", Val: t.Val, VType: t.Kind}
+	case *ast.Asset:
+		// checkBuiltins (called before lower() at every site that reaches it —
+		// see check()'s doc) has already refused an unresolved Asset, so by
+		// this point Kind/Val are exactly what an ast.Lit's are: the file's own
+		// text, or the URL it was copied to.
 		return &Expr{Kind: "lit", Val: t.Val, VType: t.Kind}
 	case ast.ListLit:
 		out := &Expr{Kind: "list"}

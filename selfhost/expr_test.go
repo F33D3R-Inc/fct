@@ -14,7 +14,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -29,14 +28,14 @@ import (
 // loadExprApp compiles and boots selfhost/expr.fct through the same
 // in-memory server source_test.go's loadApp already uses for source.fct —
 // a separate helper (not a shared one) only because loadApp there is
-// hardcoded to "source.fct"; the pattern is otherwise identical.
+// hardcoded to "source.fct"; the pattern is otherwise identical. expr.fct is
+// now a driver that imports expr_tokens.fct/expr_tree.fct (the STAGE 0-2f
+// split), so it must go through compile.File — the import-aware entry
+// point — rather than compile.String, which rejects any source declaring
+// imports.
 func loadExprApp(t *testing.T) *httptest.Server {
 	t.Helper()
-	src, err := os.ReadFile(filepath.Join("expr.fct"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	g, err := compile.String(string(src))
+	g, err := compile.File(filepath.Join("expr.fct"))
 	if err != nil {
 		t.Fatalf("compile selfhost/expr.fct: %v", err)
 	}
