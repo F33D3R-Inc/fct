@@ -63,6 +63,7 @@ app Journal:                            # everything indented under this line
 | `view Name at "/path" in Layout:` | A page: a route + what renders at it | A Django URL pattern + its template, fused |
 | `layout Name:` | A shared shell other views render inside, via `slot` | A Django base template / a React layout wrapper |
 | `action name(args):` | A server-side function the UI can trigger | A Django form-handling view / an RPC endpoint |
+| `proc Name(params) -> RetType:` | A general-purpose, always-server-side function — real local variables, loops, and branches | A plain function/method (Python `def`, Swift `func`) that only ever runs on the server |
 | `theme:` / `theme dark:` | Named design tokens (colors, spacing) for light/dark | CSS custom properties, declared once |
 | `css:` | An escape hatch: literal CSS, for anything the layout primitives can't express | A plain `.css` file |
 | `import "path"` | Pull in facets (components/entities/pages) from elsewhere | `import` in any language |
@@ -129,6 +130,91 @@ action createPost(title: text, slug: text, body: text):
 
 `requires`/`check` run top-to-bottom before the body; the first failure aborts
 the whole action with its message, and nothing partial is written.
+
+## `proc`: real local variables and control flow, always on the server
+
+```
+proc classify(x: int, limit: int) -> text:  # a peer declaration to entity/
+                                             # action/view/service — a plain
+    if x > limit:                           # function with a real body. This
+        return "high"                       # `if` is proc control flow, NOT
+    else:                                   # the view-rendering `if` node
+        return "low"                        # from the node table above
+
+proc sumTo(n: int) -> int:
+    let mut total = 0        # `let mut` = a genuinely reassignable local
+    let mut i = 0
+    loop i < n:               # while-style: check the condition, then run
+        total = total + i     # the body while it holds. There's no separate
+        i = i + 1              # for-loop keyword — counting is just a
+    return total                # `let mut` counter bumped inside the loop
+
+action run(x: int, limit: int, n: int):
+    let label = do classify(x, limit)   # `do` calls a proc. Bound, it's the
+    let total = do sumTo(n)             # same shape as `let v = call
+    ...                                  # Service.op(...)` — but `do` is for
+                                         # code in this same app; `call` is
+                                         # for an external service
+```
+
+A `proc` is a new peer declaration alongside `entity`/`action`/`view`/`service`
+— the place for real computation, declared `proc Name(params) -> RetType:`
+(drop `-> RetType` for a proc that returns nothing). Unlike `action`, whose
+placement (browser vs. server) the compiler infers from what it touches, a
+`proc` is unconditionally server-executed — there's no browser version of it
+and no placement question to reason about. In exchange, its body can do
+things an `action` body can't:
+
+- `let name = expr` declares an immutable local; `let mut name = expr`
+  declares one you can reassign later with a plain `name = expr` — a real
+  local variable, like a Python or Swift local (contrast with an `action`'s
+  `let`, below).
+- `if cond: ... else: ...` is proc control flow with a statement body —
+  distinct from the `if cond: ...` view node in the node table above, which
+  only decides what to render and carries no statements of its own.
+- `loop cond: ...` runs its body while `cond` holds, checked before each
+  pass (a while loop). A proc has no separate for-loop form.
+- `break` exits the nearest enclosing `loop` immediately; `continue` skips
+  straight to its next condition check — the usual meanings.
+- `return expr` (bare `return` for a proc with no return type) exits the
+  whole proc immediately, from anywhere, including from inside a nested `if`
+  inside a `loop`.
+
+A `proc` body is pure: it can see only its own parameters and its own
+`let`/`let mut` locals. It cannot read or write `state`, `entity` rows, or
+anything else from the surrounding app — `requires`, `check`, `establish`,
+`add`, `set`, `remove`, and `clear` are all invalid inside one. Data has to
+come in as a parameter; results have to go out via `return`, to be used by
+whichever `action` called it.
+
+`do ProcName(args)` calls a proc as a statement — fire-and-forget, its result
+discarded — the same way `call Service.op(args)` invokes an external service.
+Bound, `let x = do ProcName(args)` keeps the result, same shape as
+`let x = call Service.op(args)`: `do` is for a proc defined in this same app,
+`call` is for an external service. (One current sharp edge: `let mut` can't
+bind a `do` call directly — bind it plainly first, then copy it into a
+`let mut` if you need to mutate it afterward.)
+
+Because a `proc` always runs on the server, any `action` that calls one
+(`do ProcName(args)` or `let x = do ProcName(args)`) is pinned to the server
+too — there's no browser-side way to run proc code, so the compiler has no
+placement choice left to make for that action.
+
+### `let` means something different in an `action` than in a `proc`
+
+Same keyword, two different jobs — the thing most likely to trip up a cold
+read:
+
+- **Inside an `action`**, `let` only ever binds the result of a
+  request→response call: `let verdict = call Verity.check(id)` or
+  `let r = do sum3(x, y, z)`. There is no general local variable in an
+  action — `let` here just means "name the thing that came back." Everything
+  else an action does to change something goes through `set`/`add`/`remove`/
+  `clear` against real entities, never through a local variable.
+- **Inside a `proc`**, `let`/`let mut` is a real local variable: `let mut
+  total = a` starts one at `a`, and a later `total = total + b` changes it in
+  place. There's no `call` or `set`/`add`/`remove`/`clear` inside a proc at
+  all — parameters plus locals are the entire vocabulary.
 
 ## Built-in functions
 
