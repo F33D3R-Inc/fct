@@ -207,6 +207,44 @@ func textLits(ex ast.Expr) []string {
 	return out
 }
 
+// checkProcLiteral applies the rule inside a proc body, whose scope rule is
+// narrower than every other position this file covers: checkProcExpr's own
+// free-name check (internal/ir/build.go) resolves a name to exactly the
+// proc's own parameters and `let` locals — never a state cell, an entity, or
+// the actor/session builtins e.resolves also accepts for an action or a view.
+// Using e.resolves here would under-refuse in one direction (a proc that
+// happens to share a name with an app-level state cell would see it treated
+// as "defined" and get flagged as a dropped interpolation, or worse, quietly
+// pass, even though a proc can never actually read that name) and there is no
+// reason to accept that drift when checkProcExpr already computes the exact
+// right scope and hands it in as locals.
+//
+// This is the same "a text literal does not interpolate" position and fix
+// message every other expression position uses (see checkLiteralExpr) — a
+// proc has no interpolation mechanism at all (that machinery is lowerSegs,
+// which builds reactive bindings a one-shot server computation has no use
+// for), so the rule is identical, just scoped to what a proc can actually see.
+func (e *env) checkProcLiteral(s string, locals map[string]bool, line int) error {
+	snip, bad := litInterp(s, func(n string) bool { return locals[n] })
+	if !bad {
+		return nil
+	}
+	return braceErr(line, "a text literal", s, snip, "write the value as an expression: "+concatForm(s))
+}
+
+// checkProcLiteralExpr is checkLiteralExpr's proc-body counterpart: it applies
+// checkProcLiteral to every text literal an expression contains, at any depth,
+// so a `let`, a `set`, a `do`/`spawn` argument, an `if`/`loop` condition, and a
+// `return` value are all covered by the one call checkProcExpr already makes.
+func (e *env) checkProcLiteralExpr(ex ast.Expr, locals map[string]bool, line int) error {
+	for _, s := range textLits(ex) {
+		if err := e.checkProcLiteral(s, locals, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // checkUseArgs applies the rule to a `use`'s arguments before they are lowered.
 //
 // The generic sweep in `check` would catch these too, but this position deserves

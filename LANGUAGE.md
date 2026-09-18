@@ -102,7 +102,25 @@ running actually implements it — new rows get added there, not just here.
 ## The two arrows and the two kinds of interpolation
 
 - `"{expr}"` inside a string — string interpolation, the same idea as a Python
-  f-string (`f"{expr}"`) or Swift's `"\(expr)"`.
+  f-string (`f"{expr}"`) or Swift's `"\(expr)"`. **`{expr}` only interpolates
+  in a fixed, small set of positions**: node text, headings, labels (button/
+  link/tab/option labels), placeholders, `class`, `meta`, and a link/image/
+  icon/video destination — everywhere a view renders something, and nowhere
+  else. Concretely, `{expr}` does **not** interpolate in: a component
+  argument, `style`, an option/tab/`case` value, a `check` message, a `requires`
+  argument, a `theme` token, a service's base URL, a webhook path, a view's own
+  route, a `state` default, or **any text literal inside any other expression**
+  — an action argument, a `set`/`let` value, a `where` operand, or (as of this
+  fix) a `proc` body's own `let`/`set`/`return`/`do` argument. Writing `{expr}`
+  in any of those positions is a **compile error**, not silent text — the
+  compiler names the position, quotes the string, and hands back the `+`
+  concatenation to write instead (`"{slot}:{pid}:{score}"` becomes
+  `slot + ":" + pid + ":" + score`, since `+` already stringifies an int
+  against a text operand — see the `proc` section below). This is deliberately
+  narrow, not a blanket ban on `{` in a literal position: braces around a name
+  nothing in scope defines (a JSON sample, a CSS block, prose about FDL syntax
+  itself) still compile as plain text everywhere, because there was no value
+  for them to silently drop.
 - `label -> "/path"` — this control/link navigates to a route.
 - `label -> actionName(args)` — this control calls a server action instead of
   navigating. Same arrow, two meanings, disambiguated by what's on the right.
@@ -187,6 +205,23 @@ anything else from the surrounding app — `requires`, `check`, `establish`,
 come in as a parameter; results have to go out via `return`, to be used by
 whichever `action` called it.
 
+**A proc body's own string literals never interpolate** — `{expr}` only
+renders inside a view (see "The two arrows and the two kinds of
+interpolation" above), and a proc computes a plain value with no rendering
+involved at all. Build a text value by concatenating with `+` instead, which
+already stringifies an int (or any value) against a text operand:
+
+```
+proc tag(slot: int, pid: int, score: int) -> text:
+    return slot + ":" + pid + ":" + score   # "3:42:99", not the four
+                                             # literal braces of
+                                             # "{slot}:{pid}:{score}"
+```
+
+Writing `"{slot}:{pid}:{score}"` here is a compile error, not a silently
+wrong runtime value — the compiler names the offending literal and hands
+back the exact `+` form to write instead.
+
 `do ProcName(args)` calls a proc as a statement — fire-and-forget, its result
 discarded — the same way `call Service.op(args)` invokes an external service.
 Bound, `let x = do ProcName(args)` keeps the result, same shape as
@@ -199,6 +234,66 @@ Because a `proc` always runs on the server, any `action` that calls one
 (`do ProcName(args)` or `let x = do ProcName(args)`) is pinned to the server
 too — there's no browser-side way to run proc code, so the compiler has no
 placement choice left to make for that action.
+
+**A proc parameter may be list-typed** (`p: [T]`), exactly like a proc's own
+return type — the shape two cooperating procs need, one producing a list the
+next consumes as its own parameter, not just as an internal local:
+
+```
+proc buildRange(n: int) -> [int]:
+    let mut xs = []
+    let mut i = 0
+    loop i < n:
+        xs = append(xs, i)
+        i = i + 1
+    return xs
+
+proc sumList(xs: [int]) -> int:      # a list-typed PARAMETER
+    let mut total = 0
+    let mut i = 0
+    loop i < len(xs):
+        total = total + xs[i]
+        i = i + 1
+    return total
+
+action run(n: int):
+    let xs = do buildRange(n)        # xs: a real list value, bound from a proc
+    let total = do sumList(xs)       # …passed straight into another proc's [int] param
+    ...
+```
+
+`len(xs)`/`xs[i]` on a list-typed parameter type-check exactly like they
+already do on a `let mut xs = [1,2,3]` local. It is bound by copy, like every
+other proc-local value: the callee may copy it into a `let mut` local and
+mutate that copy freely without the caller's original array ever changing.
+Only an `action`/`component`/`policy` parameter stays scalar-only — a proc
+parameter is the one place besides a proc's own return type where `[T]` is
+allowed.
+
+**`xs[i]` out of range is a runtime error, not a clamp.** Unlike
+`charAt`/`slice`/`take` (which clamp a bad index to something in range), an
+array/byte-buffer index read past the array's length ends the request as a
+clean error, not a silently-wrong answer and not a Go panic reaching the
+HTTP layer — bounds are data-dependent, so this is the one failure a proc's
+own compile-time checks can never fully rule out.
+
+**`&&` and `||` short-circuit**, exactly like every mainstream language
+(Go, JS, Python, Rust, Java, C, …): `a && b` evaluates `a` first, and only
+evaluates `b` at all if `a` is true; `a || b` evaluates `a` first, and only
+evaluates `b` if `a` is false. This is what makes the standard bounds-guard
+idiom safe: `if i < len(xs) && xs[i] == target: ...` never evaluates
+`xs[i]` when `i` is already out of range, because the left side being false
+already decides the whole `&&`. The mirror form, `i >= len(xs) || xs[i] ==
+target`, is equally safe: once the left side is true, the right side (the
+unguarded index read) never runs. This holds for both `proc` bodies and
+`action`/view/policy/derive expressions — the two interpreters
+(`runtime/eval.go`'s `eval()`/`evalInFrame()`, and their client mirror
+`assets/facet.js`) agree on this exactly as they do on every other operator.
+Because placement (`action` server/client inference) is decided statically
+at compile time rather than per call, an impure builtin (`now()`/`rand()`)
+that only appears on the right of a short-circuited `&&`/`||` still forces
+that action to server placement — it is a possible effect of calling the
+action at all, even on calls where it doesn't end up running.
 
 ### `let` means something different in an `action` than in a `proc`
 
@@ -333,19 +428,121 @@ clean runtime error that aborts the proc (and whatever action called it, via
 silent corruption" contract an out-of-bounds array read or an out-of-range
 byte write already has.
 
+### Structured concurrency: `spawn`, `join`, and channels
+
+`spawn ProcName(args)` runs a proc call concurrently — a real Go goroutine
+under the hood (this milestone's reference/bootstrap implementation; no green
+threads, no scheduler of the language's own yet) — and immediately hands back
+a task handle, always bound: `let h = spawn ProcName(args)`. `join h` blocks
+until that goroutine finishes; bound, `let r = join h` also keeps its result.
+
+```
+proc fetchOne(url: text) -> text uses io.net:
+    return httpGet(url)
+
+proc fetchBoth(u1: text, u2: text) -> text uses io.net:
+    let h1 = spawn fetchOne(u1)   # both requests start now, concurrently
+    let h2 = spawn fetchOne(u2)
+    let r1 = join h1               # blocks until fetchOne(u1) finishes
+    let r2 = join h2               # already finished or blocks the rest of the way
+    return r1 + r2
+```
+
+**Structured, not fire-and-forget.** A spawned task can never outlive the
+proc call that started it. `spawn` has no bare/unbound form at all — a
+discarded handle could never be joined, which is exactly the leaked
+goroutine structured concurrency forbids — and a handle, once produced by
+`spawn`, is not an ordinary value: it cannot be used in an expression,
+returned, or passed as an argument, only consumed by exactly one `join`. The
+compiler proves every handle is joined **before the statement block it was
+spawned in ends** — the proc's own top level, or a `loop`/`if` body — which
+is also why no `if`, `loop`, `break`, `continue`, or `return` may appear in
+that same block while a handle is still unjoined: any of those could exit
+the block on some path before reaching a `join` written later in it. Spawn
+everything, join everything, then branch or return:
+
+```
+proc runIt(a: int) -> int:
+    let h = spawn slow(a)
+    if a > 0:      # ← compile error: `h` is still unjoined here
+        return 1
+    let r = join h
+    return r
+```
+
+**Concurrency safety.** A spawned call gets its own independent frame (its
+own parameters and `let` locals) — nothing is ever shared with the spawning
+call's frame, so two spawned tasks mutating their own `let mut` locals can
+never corrupt each other. A proc's existing rules already make this safe by
+construction: a proc can't touch entities or `state` at all, so nothing a
+spawned task does can race the durable store or another request. The two
+capability builtins (`readFile`/`writeFile`/`httpGet`/`httpPost`) are
+likewise safe to run concurrently — they only ever touch the sandbox's root
+path (fixed at startup) and a shared `net/http` client (already safe for
+concurrent use). A panic inside a spawned task — any bug that slips past
+every static check — is recovered and surfaced through `join` as an ordinary
+error instead of crashing the server, the same "clean error" contract every
+other proc failure already has.
+
+**Channels.** `channel()` creates a small (single-slot buffered), text-only
+channel — deliberately minimal, not a full CSP feature set — represented as
+a plain `int` handle, so it is usable anywhere an `int` already is: a proc
+parameter, a `let` local, an argument to another proc. `send(ch, value)`
+blocks until `value` is delivered; `recv(ch)` blocks until a value arrives.
+Channels are how two independently spawned tasks talk to each other, since
+they otherwise share no state at all:
+
+```
+proc producer(ch: int, msg: text) -> bool:
+    return send(ch, msg)
+
+proc consumer(ch: int) -> text:
+    return recv(ch)
+
+proc roundTrip(msg: text) -> text:
+    let ch = channel()
+    let h1 = spawn producer(ch, msg)
+    let h2 = spawn consumer(ch)
+    join h1
+    return join h2
+```
+
+`spawn`/`join`/`channel`/`send`/`recv` are all proc-only, the same "no client
+mirror to disagree with it" reasoning bitwise operators, `float`, and the I/O
+builtins already follow.
+
 ## Built-in functions
 
-`facet lang` lists these live; as of this page: `abs, ago, commas, compact,
-contains, day, floor, httpGet, httpPost, len, lower, max, min, money, month,
-now, rand, readFile, round, take, toFloat, toInt, trim, upper, writeFile,
-year`. Most of this list is deliberately small and pure — there is no
-`replace`/`split`/`slugify`, so anything that needs one (like turning a title
-into a URL slug) is written by hand rather than derived, and `check` enforces
-whatever invariant that leaves. If you're looking for a string-manipulation
-function and it's not in that list, it doesn't exist yet — that's a real gap,
-not something you're missing. `readFile`/`writeFile`/`httpGet`/`httpPost` are
-the exception to "pure": real, capability-gated I/O effects, proc-only — see
-the `uses` subsection above.
+`facet lang` lists these live; as of this page: `abs, ago, channel, charAt,
+commas, compact, contains, day, floor, httpGet, httpPost, len, lower, max,
+min, money, month, now, rand, readFile, recv, round, send, slice, split,
+take, toFloat, toInt, trim, upper, writeFile, year`. Most of this list is
+deliberately small and pure — there is no `replace`/`slugify`, so anything
+that needs one (like turning a title into a URL slug) is written by hand
+rather than derived, and `check` enforces whatever invariant that leaves. If
+you're looking for a string-manipulation function and it's not in that list,
+it doesn't exist yet — that's a real gap, not something you're missing.
+`readFile`/`writeFile`/`httpGet`/`httpPost` are the exception to "pure": real,
+capability-gated I/O effects, proc-only — see the `uses` subsection above.
+
+**String decomposition.** `split(s, sep) -> [text]` splits `s` on every
+occurrence of `sep`, matching Go's own `strings.Split` exactly — an empty
+`sep` splits after every character, consecutive occurrences of `sep` produce
+empty-string elements, and a `sep` never found in `s` returns a
+single-element result holding `s` unchanged. `slice(s, start, end) -> text`
+is the general (not prefix-only) counterpart to `take`: it returns the
+substring from `start` up to (not including) `end`. `charAt(s, i) -> text`
+returns the single character at `i` as a length-1 string (there is no
+separate character/rune type). All three are rune-indexed, not byte-indexed
+— consistent with `take`/`len`, which already count/slice by rune rather than
+by byte — so a multi-byte character is never cut in half. Like `take`,
+`slice`/`charAt` never raise a runtime error for an out-of-range `start`/
+`end`/`i`: both bounds of `slice` are clamped into `[0, len(s)]`
+independently, and a `start` left past `end` after clamping (or a `charAt`
+index outside the string) yields `""` rather than an error. Together with
+`len` and a `loop`, these are enough to write a real line-oriented scan —
+`split(src, "\n")` followed by a per-line `charAt`/`len` pass is exactly what
+a hand-written lexer needs.
 
 ## The `@` modifiers
 

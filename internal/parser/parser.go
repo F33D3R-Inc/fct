@@ -1702,7 +1702,12 @@ func parseProc(n *source.Node) (*ast.Proc, error) {
 		}
 		ret, retList = core, list
 	}
-	name, params, err := parseSignature(head, n.Line.No, false, false)
+	// allowList=true: unlike an action/component/policy, a proc parameter may be
+	// list-typed (`buildTree(lines: [text])`) — the shape composing two procs
+	// needs (one proc's `-> [T]` return flowing into a second proc's `[T]`
+	// parameter), which was previously blocked here even though a proc's own
+	// RETURN type could already be a list. See LANGUAGE.md's `proc` section.
+	name, params, err := parseSignature(head, n.Line.No, true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2110,9 +2115,9 @@ func parseDuration(s string, line int) (int, error) {
 
 // parseSignature parses `name(p: T, ...)`. allowList permits list-typed params
 // (`p: [T]`) — used for service operations, whose ops genuinely take collections
-// (`rank(posts: [int])`); action/component/policy params stay scalar.
-// parseSignature parses `name(p: T, ...)`. allowList admits `[T]` parameters
-// (service operations only). allowRef admits the by-reference parameter forms a
+// (`rank(posts: [int])`), and for a proc, which may compose with another proc's
+// list-typed return the same way (`buildTree(lines: [text])`); action/component/
+// policy params stay scalar. allowRef admits the by-reference parameter forms a
 // component may declare — `p: cell T` (a state cell) and `p: action` (an action)
 // — which bind to a NAME at the call site rather than to a value.
 func parseSignature(head string, line int, allowList, allowRef bool) (string, []ast.Param, error) {
@@ -4097,8 +4102,15 @@ func isThemeKey(s string) bool {
 	return isIdent(strings.ReplaceAll(s, "-", "_"))
 }
 
-// splitTop splits on sep at the top level (ignoring separators inside parens or
-// quotes), so `add Post { body: f(a, b) }` and string args survive.
+// splitTop splits on sep at the top level (ignoring separators inside parens,
+// braces, brackets, or quotes), so `add Post { body: f(a, b) }`, a list
+// literal argument (`do sumList([1, 2, 3])`), and string args all survive.
+// `[`/`]` joined `(`/`{` and `)`/`}` here once a list literal could appear as a
+// top-level, comma-separated argument to `do`/`spawn`/`call` — before that, a
+// bracketed list only ever showed up already nested one level inside some
+// other bracket pair this function already tracked (e.g. `add`'s own `{...}`),
+// so the gap was invisible; splitTopByte (this file's own sibling function)
+// already tracked `[`/`]` for exactly this reason.
 func splitTop(s string, sep byte) []string {
 	var out []string
 	depth := 0
@@ -4110,9 +4122,9 @@ func splitTop(s string, sep byte) []string {
 		case c == '"':
 			inStr = !inStr
 		case inStr:
-		case c == '(' || c == '{':
+		case c == '(' || c == '{' || c == '[':
 			depth++
-		case c == ')' || c == '}':
+		case c == ')' || c == '}' || c == ']':
 			depth--
 		case c == sep && depth == 0:
 			out = append(out, strings.TrimSpace(s[start:i]))

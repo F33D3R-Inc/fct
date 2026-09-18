@@ -718,3 +718,75 @@ func TestProcBitwiseEdgeCasesLive(t *testing.T) {
 		t.Fatalf("~0 over the wire = %v, want %d (Go's own ^0)", deltas["result"], wantNot0)
 	}
 }
+
+// procConcatWorkaroundApp is the mechanical rewrite TestProcBodyLiteralBracesAreRefused
+// (internal/compile/braces_test.go) proves the compiler now hands back for the exact
+// motivating bug: a proc body composing a tag string from mixed int/text locals.
+// `+` already stringifies an int operand against a text one (runtime/eval.go's "+"
+// case, via toStr) — this is what a real app used instead of
+// `"{slot}:{pid}:{score}"` once that silently dropped every brace pair at runtime,
+// and this test proves the workaround was correct then and stays correct now that
+// the interpolated form is a compile-time error instead of a silent no-op.
+const procConcatWorkaroundApp = `app A:
+    proc tag(slot: int, pid: int, score: int) -> text:
+        return slot + ":" + pid + ":" + score
+    state result: text = ""
+    action run(slot: int, pid: int, score: int):
+        let r = do tag(slot, pid, score)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`
+
+// TestProcConcatWorkaroundStillWorksLive is this fix's other half, live: the proc
+// body's own `+` concatenation must still compute the right text (this is not new
+// behavior — the fix only closes the SILENT-WRONG path, it never touched `+`), and
+// the view's own `{result}` interpolation — the position this whole rule exists to
+// protect, not to break — must still render that computed value on first paint
+// exactly as every other app in this codebase depends on it doing.
+func TestProcConcatWorkaroundStillWorksLive(t *testing.T) {
+	g, err := compile.String(procConcatWorkaroundApp)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+
+	resp, err := client.Post(ts.URL+"/api/run", "application/json", strings.NewReader(`{"args":[3,42,99]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Deltas map[string]any `json:"deltas"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(out.Deltas["result"]), "3:42:99"; got != want {
+		t.Fatalf("proc tag result over the wire = %q, want %q (slot:pid:score via `+`, the mechanical fix for the dropped-interpolation bug)", got, want)
+	}
+
+	// Same value, server-rendered page: the view's `{result}` interpolation
+	// (an actual, still-working interpolation position) must show it too.
+	page, err := client.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer page.Body.Close()
+	body, err := io.ReadAll(page.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "3:42:99") {
+		t.Errorf("rendered page should show the proc's computed tag (3:42:99) via the view's {result} interpolation, got: %s", string(body))
+	}
+}

@@ -349,11 +349,15 @@ type Require struct {
 	Args []*Expr `json:"args,omitempty"`
 }
 
-// Param is a typed action/policy/component parameter.
+// Param is a typed action/policy/component parameter. List marks a proc's own
+// list-typed parameter (`p: [T]` — see internal/parser/parser.go's
+// parseSignature); action/policy/component parameters never set it, since only
+// a proc parameter may be list-typed.
 type Param struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`
 	Optional bool   `json:"optional,omitempty"`
+	List     bool   `json:"list,omitempty"`
 }
 
 // Job is a scheduled server action: the runtime invokes Action on a timer

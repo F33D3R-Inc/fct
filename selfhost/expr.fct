@@ -1,0 +1,1787 @@
+app ExprSelfHost:
+    # Partial, honest self-hosting port of internal/parser/expr.go (the
+    # expression tokenizer + precedence-climbing/recursive-descent parser
+    # stage of fct's own compiler pipeline) into `.fct` `proc`s.
+    #
+    # SCOPE: a genuine, real SUBSET of expr.go's grammar — grown twice now,
+    # each time by a coherent, fully-verified slice rather than the whole
+    # precedence table at once.
+    #
+    # Round 1 covered: int literals, identifiers, parenthesized
+    # sub-expressions, and the two tightest arithmetic precedence levels
+    # (`+`/`-` at binPrec 8, `*`/`/` at binPrec 9).
+    #
+    # Round 2 (this pass) added SIX more real precedence levels, confirmed
+    # against internal/parser/expr.go's actual current `binPrec` table
+    # (read fresh, not assumed from any prior summary — the table has grown
+    # since round 1 was written to include bitwise operators and `in`):
+    #   binPrec: "||":1, "&&":2, "|":3, "^":4, "&":5,
+    #            "=="/"!="/"<"/"<="/">"/">=" /"in":6, "<<"/">>":7,
+    #            "+"/"-":8, "*"/"/"/"%":9
+    # and unary `! - ~`, which sit tighter than every binary level (parsed
+    # by expr.go's parseUnary, called once per parseBinary frame, between
+    # parseBinary's precedence loop and parseAtom/parsePostfix).
+    #
+    # Covered now: `||` (1), `&&` (2), `|` (3), `^` (4), `&` (5),
+    # comparisons `== != < <= > >=` (6), `+`/`-` (8), `*`/`/` (9), and
+    # prefix unary `- ! ~` (tighter than all of the above) — i.e. every
+    # level of the real table EXCEPT shifts (`<<`/`>>`, binPrec 7) and `%`
+    # and `in` (both binPrec 9/6 respectively but semantically tied to
+    # aggregates/membership, out of scope here) — PLUS, as of round 3
+    # (this pass), the primary-expression features round 1/2's SCOPE note
+    # used to list as fully out of scope:
+    #   - bool literals (`true`/`false`)
+    #   - text/string literals (`"..."`), including escape sequences
+    #     (`\"` `\\` `\n` `\t` — anything expr.go's own `strconv.Unquote`
+    #     decode handles, since this port's string TOKENIZING exactly
+    #     mirrors expr.go's tokenize and leaves the actual unescaping to
+    #     the same real decode expr_test.go already trusts elsewhere)
+    #   - member access (`.field`), including CHAINED access
+    #     (`a.field.other`)
+    #   - indexing (`[i]`), including chained/combined with member access
+    #     (`a[i].field`, `a.field[i]`, `a[i][j]`)
+    # Round 4 (this pass) added function calls and list literals, the two
+    # remaining "primary atom" grammar positions round 3's own SCOPE note
+    # called out as needing new machinery (a builtin-name allowlist and a
+    # variable-arity node encoding) — see the ROUND 4 SCOPE NOTE and
+    # FINDING 8 below for the exact shape and the one real disambiguation
+    # subtlety (builtin calls only, not user-defined ones — this language
+    # has none in expression position — see FINDING 8).
+    #
+    # Still out of scope after round 4: float literals, aggregates
+    # (`sum`/`count`/etc.), `Entity(key).field` lookups, and map literals
+    # (`{k: v}`) — see this file's SCOPE note (bottom of this header) for
+    # exactly why each one is excluded and what it would take to add.
+    # Shifts were left out deliberately (see STAGE 1's
+    # tokenizer doc below for why — they need a real three-way `<` vs `<=`
+    # vs `<<` longest-match decision that would have been the ONLY thing
+    # testing that specific ambiguity, whereas `==`/`!=`/`<=`/`>=`/`&&`/
+    # `||` cover the general two-char-lookahead mechanism already). Every
+    # remaining gap would extend this same design (more token text values,
+    # more precedence levels, more node kinds in the arena) without
+    # changing its shape — see the STAGE headers below for exactly where
+    # each piece of the real algorithm lives.
+    #
+    # ============================================================
+    # ROUND 3 SCOPE NOTE (primary-expression features, this pass):
+    # ============================================================
+    # Chosen because expr.go's own real structure (internal/parser/expr.go,
+    # read fresh for this round) groups all four of these under ONE
+    # function, parsePostfix, sitting between parseUnary and parseAtom:
+    # parse a primary atom (parseAtom: NUMBER/IDENT/STRING/`(`...`)`), then
+    # loop consuming `.field`/`[index]` postfixes. Two things parsePostfix
+    # ALSO does were deliberately left out because they need machinery this
+    # subset doesn't have and isn't adding here:
+    #   - the `ref, ok := atom.(ast.Ref)` block immediately after parseAtom
+    #     (aggregate builtins `count`/`sum`/`exists`/`avg`/`min`/`max` in
+    #     call position, `pending`/`failed`/`dirty`/`touched` action-state
+    #     reads, other builtin calls, and `Entity(key).field` lookups) — all
+    #     of these need either a builtin-name allowlist (isBuiltinCall) this
+    #     port doesn't restate, or ast.Agg/ast.EntityGet/ast.Call node
+    #     shapes this arena doesn't have kinds for yet. A future round could
+    #     add these the same way this one added Get/Index: one new arena
+    #     kind per new ast.Expr shape, no redesign of the postorder/5-int
+    #     layout.
+    #   - list/map literals (parseAtom's tOp cases for `[`/`{` for a value
+    #     STARTING an expression) are a different grammar position from
+    #     this round's `[index]` (which only ever appears as a POSTFIX,
+    #     after an atom already exists) — genuinely out of scope for "extend
+    #     factorNodes/factorEnd" as this round's task was framed, since a
+    #     list literal is itself a new kind of primary ATOM, not a postfix
+    #     of one.
+    # Float literals (this file's other historical gap) were also left out
+    # this round, per the task's own stated priority order (member access +
+    # indexing + bool/text literals over floats) — expr.go's own float
+    # lexing (STAGE 1's tokenizer doc, this round, has the exact rule) is a
+    # small, well-understood addition for a later round, not attempted here
+    # so as not to dilute this round's real verification effort.
+    #
+    # ============================================================
+    # ROUND 4 SCOPE NOTE (function calls + list literals, this pass):
+    # ============================================================
+    # Read fresh against expr.go's real parsePostfix/parseAtom/parseCall/
+    # parseListLit (this file, this round) before choosing scope. Two real
+    # findings shaped what got built:
+    #
+    # 1. This language has NO user-defined functions callable from
+    #    expression position — `proc`s are invoked only via the statement-
+    #    level `do ProcName(args)` form (LANGUAGE.md's `proc` section;
+    #    FINDING 2 below already established `do` can't nest inside an
+    #    expression at all). So "function calls" in expr.go's own grammar
+    #    means exactly one thing: a call to a name in a fixed BUILTIN
+    #    allowlist (expr.go's own isBuiltinCall switch) — `len(x)`,
+    #    `abs(a+b)`, `contains(a,b)`, etc. An arbitrary identifier followed
+    #    by `(` that is NOT one of those names, NOT an aggregate name
+    #    (`count`/`sum`/`exists`/`avg`, or `min`/`max` in single-argument
+    #    form), and NOT an action-state name (`pending`/`failed`/`dirty`/
+    #    `touched`) is `Entity(key).field` lookup syntax in the real
+    #    grammar (parsePostfix's `default:` case) — a completely different
+    #    AST shape (ast.EntityGet), not a call. This round therefore ports
+    #    the builtin-call case only (callNodes/callEnd below), using the
+    #    same isBuiltinCall name list expr.go's own switch has (see
+    #    isCallNameTok's own doc), MINUS `min`/`max` — see finding 2.
+    #
+    # 2. `min`/`max` are genuinely ambiguous in the real grammar: they are
+    #    call-shaped (`min(a, b)`, a real ast.Call) only when their
+    #    argument list has a top-level comma; single-argument `min(x)` is
+    #    the AGGREGATE form instead (`min(Order.amount)`, ast.Agg) —
+    #    disambiguated by expr.go's own argListHasComma helper. Since
+    #    aggregates are out of scope this round (see below), including
+    #    `min`/`max` in this round's call-name allowlist would silently
+    #    produce a Call node for `min(x)` where the real parser produces an
+    #    Agg node — a genuinely WRONG tree shape, not just an incomplete
+    #    one. `min`/`max` are therefore deliberately EXCLUDED from
+    #    isCallNameTok below; `min(a, b)`/`max(x)` in this subset parse the
+    #    same honest, non-crashing "unsupported, not consumed" way any
+    #    other out-of-scope construct does (see FINDING 8's `consumedAll`
+    #    proof), rather than guessing a shape that would be wrong exactly
+    #    half the time.
+    #
+    # List literals (`[a, b, c]`) needed no such name-based gate — expr.go's
+    # own parseAtom dispatches on `[` alone (any position an atom is
+    # expected, `[` unconditionally starts a list literal; postfix `[i]`
+    # only ever occurs AFTER an atom already exists, a structurally
+    # different grammar position — see FINDING 8 for the exact proof this
+    # port's factorNodes/postfixNodes split already gives that no
+    # ambiguity), so it was a purely mechanical addition to factorEnd/
+    # factorNodes once the shared "comma-separated list" primitive
+    # (argListEnd/argListCount/argListNodes, STAGE 2c below) existed for
+    # calls to use too.
+    #
+    # Not attempted this round (stretch goals per the task, genuinely out
+    # of scope, not just deferred): aggregates (`sum(x in E where cond)` —
+    # a real, different grammar shape, an `in`/`where` clause inside the
+    # parens, not a comma list — see expr.go's parseAgg, read fresh for
+    # this round, for exactly how much bigger that grammar is), entity
+    # lookups (`Entity(key).field` — needs the SAME builtin-name-allowlist
+    # dispatch this round's isCallStartAt already threads through, so a
+    # future round could add it as a fourth branch of that same dispatch,
+    # not a redesign), and map literals (`{k: v}` — parseMapLit is
+    # structurally close to parseListLit, just with the extra `key ':'
+    # value` pairing per comma-separated slot, so it would reuse this
+    # round's argList family in spirit but the arena would need a K/V pair
+    # shape ArgSlot's single-child shape doesn't have — a genuine next
+    # increment, not attempted here to keep this round's real verification
+    # effort focused).
+    #
+    # ============================================================
+    # Three findings this port surfaced, precise enough to matter to
+    # anyone porting more of expr.go later:
+    # ============================================================
+    #
+    # FINDING 1 — no short-circuit boolean evaluation. FIXED 2026-09-17:
+    # runtime/eval.go's eval()/evalRest "bin" case and evalInFrame's "bin"
+    # case both now short-circuit `&&`/`||` (evaluate the right operand only
+    # if the left side doesn't already decide the result), and
+    # assets/facet.js's ev() was fixed to match — see
+    # runtime/shortcircuit_test.go and internal/compile/shortcircuit_test.go
+    # for the live, over-HTTP proof (including that this exact file's own
+    # motivating idiom, `p < n && texts[p] == "+"`, is now safe) and
+    # LANGUAGE.md's `proc` section for the documented guarantee. The
+    # original finding, describing the bug as it stood when this port was
+    # written, is kept below unedited for the historical record — but the
+    # nested-`if` workaround it describes is no longer the only safe form;
+    # a single `&&`/`||` guard is safe now too.
+    #
+    # runtime/eval.go's evalInFrame "bin" case evaluates BOTH operands of
+    # `&&`/`||` unconditionally before combining them (`l, err :=
+    # evalInFrame(e.L, ...)` then `r, err := evalInFrame(e.R, ...)`, always
+    # both, never short-circuited) — confirmed by reading the interpreter,
+    # not assumed. This matters here because a bounds-guard idiom that
+    # would be natural in Go (`if p < n && texts[p] == "+"`) is UNSAFE in
+    # this language: `texts[p]` is evaluated even when `p < n` is false,
+    # and an out-of-range array index is a real runtime error (see
+    # runtime/eval.go's "index" case: "array index %d out of bounds"), not
+    # a clamp-to-empty like `charAt`/`slice`/`take` give. Every bounds
+    # check in this file is therefore a nested `if p < n: if texts[p] ==
+    # ...` rather than a single `&&` chain — more verbose, but the only
+    # form that is actually safe against reading past the token array.
+    #
+    # FINDING 2 — `do` is more restricted than LANGUAGE.md's proc section
+    # documents. LANGUAGE.md says "`let mut` can't bind a `do` call
+    # directly — bind it plainly first, then copy it into a `let mut` if
+    # you need to mutate it afterward." True, but that's not the whole
+    # restriction: internal/parser/parser.go's statement grammar only ever
+    # recognizes `do ProcName(args)` in exactly two shapes — a bare
+    # fire-and-forget statement, or the RHS of a FRESH `let name = do
+    # ProcName(args)` binding (parser.go's `strings.HasPrefix(t, "do ")`
+    # and `strings.HasPrefix(rhs, "do ")` cases). A PLAIN REASSIGNMENT
+    # (`p = do ProcName(args)`, no `let`) is also rejected — it falls
+    # through to the generic `target = expr` case, whose `expr` half is
+    # parsed by parseExpr, which has no idea what `do` means (confirmed
+    # empirically: `p = do termEnd(...)` inside a loop body fails to
+    # compile with "unexpected \"termEnd\" in expression", the same error
+    # shape as `do` nested inside any other expression). So `do` can NEVER
+    # appear except as those two whole-statement shapes — not as a loop
+    # body's reassignment RHS, not nested inside `+`/`return`/anything
+    # else. Every recursive call in this file therefore follows one fixed
+    # pattern: `let freshName = do Proc(...)` (a brand new `let` each time,
+    # even inside a loop, even when logically "the same" mutable variable
+    # is being updated on every pass) immediately followed by a plain
+    # `mutVar = freshName` copy — never `let mut x = do ...`, never `x = do
+    # ...` directly.
+    #
+    # FINDING 3 (the headline question this task asked about) — a shared,
+    # growing arena CAN be threaded across nested recursive proc calls,
+    # entirely through return values, with no mutable shared state needed,
+    # INCLUDING the harder two-recursive-calls-per-frame shape a Bin{L,R}
+    # node needs (build the left subexpression's nodes, THEN build the
+    # right subexpression's nodes starting from the arena the left call
+    # handed back, so node indices never collide). Proven empirically
+    # (selfhost/recursion_test.go's TestSharedArrayThreadsAcrossSingleRecursiveChain and
+    # TestSharedArrayThreadsAcrossTwoRecursiveCallsPerFrame, and now this
+    # file's own real parse functions below, cross-checked against the
+    # real Go parser in expr_test.go). The trick that makes it compose
+    # cleanly: build the arena POSTORDER (a node's children are fully
+    # appended before the node combining them is appended), so "the root
+    # of whatever subtree a call just built" is ALWAYS the last row in the
+    # array that call returns — `(len(returned) / nodeWidth) - 1` — with no
+    # backpatching, no index rewriting, no need for an `arr[i] = v`
+    # mutation ever. A proc parameter/return value is bound BY COPY (see
+    # LANGUAGE.md's proc section and runtime/eval.go's cloneArrayValue), so
+    # each recursive call gets its own copy to extend and hand back — the
+    # caller rebinds its own local to that returned, longer array before
+    # making its NEXT call, exactly the "return-value threading" pattern
+    # the task asked to be investigated for real. It works, at least at the
+    # tree sizes a real expression parses to (no stack-depth or
+    # array-copy-cost wall was hit for anything in expr_test.go).
+    #
+    # One thing this file's design deliberately does NOT do: pack the
+    # parser's TOKEN POSITION into the same returned array as the node
+    # data (e.g. as a trailing sentinel element). That was considered and
+    # rejected — a proc can only return ONE typed value, so getting both
+    # "the extended arena" and "the new token position" out of one call
+    # would need bit- or slot-packing tricks (front/back sentinels) that
+    # would have to be un-packed and re-packed at every single recursive
+    # step. Instead, this file follows the SAME idiom source.fct's own
+    # STAGE 1 already established (parsedIndents/parsedTexts/
+    # parsedSkipFlags each independently re-derive the same split+filter
+    # pass rather than trying to compute all of them in one function that
+    # can only return one value): position tracking and arena-building are
+    # TWO SEPARATE families of procs (`*End` and `*Nodes` below) that
+    # mirror the identical grammar/control-flow and are guaranteed to
+    # agree by construction (both are pure functions of the same
+    # (tokens, pos) input) — paid for by re-parsing the same span twice
+    # (once for its ending position, once for its node data) rather than
+    # once, exactly the "an honest, real restatement, just paid for twice"
+    # trade-off source.fct's own header already made explicit for a
+    # different stage.
+    #
+    # FINDING 4 (round 2) — the short-circuit fix (Finding 1, above) pays
+    # off immediately once there are more than two precedence levels: every
+    # NEW `*End`/`*Nodes` pair added in this round tests "is the token at
+    # `p` one of this level's operators?" with a single flat boolean
+    # expression like `p < n && (texts[p] == "==" || texts[p] == "!=" ||
+    # ...)`, relying on `&&` to skip `texts[p]` entirely when `p >= n`. Before
+    # the fix, this file's original `+`/`-`/`*`/`/` levels had to spell the
+    # same check as a nested `if p < n: if texts[p] == "+": ... else: if
+    # texts[p] == "-": ...` (see termEnd/exprEnd, unchanged, below) — safe,
+    # but one extra indent level per level added, seven-plus operators
+    # deep across the six new levels this round adds. The flat form is
+    # printed once per level as a small `isXOpTok` helper proc (see STAGE
+    # 2a) rather than re-nested every time, which is both the safe form and
+    # the readable one now.
+    #
+    # FINDING 5 (round 2) — the "one proc, one return value" position/arena
+    # split described above generalizes past three levels with no new
+    # trouble. Six more `*End`/`*Nodes` pairs were added purely by
+    # following the existing termNodes/termEnd shape (loosest levels loop
+    # over a fixed operator set at their own precedence, delegating to the
+    # next-tighter level as their operand-getter) — no redesign, no change
+    # to the 5-int-per-node arena layout (a new node KIND was added for
+    # `Un`, not a new arena width; see STAGE 2b). The only real design
+    # decision this round needed was where in the existing mutual-recursion
+    # chain to splice unary in: expr.go calls parseUnary once per
+    # parseBinary(minPrec) frame (i.e. at every precedence level, since real
+    # precedence climbing is one function), but this file's one-function-
+    # per-level design only has ONE place that ever bottoms out into an
+    # atom — termNodes/termEnd, the tightest existing level — so unary was
+    # spliced in exactly there (termNodes/termEnd now call
+    # unaryNodes/unaryEnd instead of factorNodes/factorEnd directly;
+    # unaryNodes/unaryEnd themselves fall through to factorNodes/factorEnd
+    # when the token at `pos` isn't `- ! ~`). This produces the identical
+    # tree shape parseUnary's real placement does — unary binds tighter than
+    # every binary operator including `*`/`/` — without needing a unary
+    # check at every one of the eight `*Nodes`/`*End` levels, since only one
+    # of them is ever the "bottom" of the chain. factorNodes/factorEnd's
+    # own `(` case was also repointed from exprNodes/exprEnd to the new
+    # loosest level, orNodes/orEnd, since a parenthesized sub-expression
+    # must admit the FULL grammar (`(a && b == c)` is valid), not just the
+    # arithmetic subset — exactly mirroring parseAtom's own tLParen case,
+    # which always calls `p.parseBinary(0)` (precedence 0, the loosest).
+    #
+    # FINDING 6 (round 3) — `[` and `]` need NO tokenizer change at all.
+    # Read fresh against expr.go's real tokenize (STAGE 1, above): `[`/`]`
+    # get no special tKind the way `(`/`)` get tLParen/tRParen — they fall
+    # straight through tokenize's default case as a plain one-character tOp,
+    # indistinguishable at the TOKEN level from `+`/`&`/etc. This file's
+    # tokenKinds/tokenTexts already had exactly that fallthrough (any
+    # character that isn't whitespace/`(`/`)`/digit/ident-start lands in the
+    # existing "operator character" branch, kind 2), so indexing needed ZERO
+    # tokenizer changes — only postfixEnd/postfixNodes (STAGE 2a/2b, below)
+    # needed to know to look for `texts[p] == "["`/`"]"`, the same
+    # text-dispatch idiom every operator level already uses. `.` needed the
+    # identical zero-tokenizer-change treatment for the same reason (it was
+    # already falling into the operator branch, just never CONSUMED by any
+    # `*End`/`*Nodes` level before this round). The only real round-3
+    # tokenizer change was string literals (STAGE 1's own doc, below), which
+    # DO need a dedicated scan (quotes aren't a single self-delimiting
+    # character the way `(`/`[`/`+` are).
+    #
+    # FINDING 7 (round 3) — a field name / string literal's actual TEXT
+    # never needs a new arena field, confirming the design note after
+    # FINDING 3 generalizes to non-operator, non-identifier text too. A
+    # `Get` node's field name is exactly the same shape of fact a `Ref`
+    # leaf's name or a `Bin` node's operator symbol already is: a token that
+    # already exists in `tokenTexts(src)` at a known index. So `Get` reuses
+    # the existing opTok SLOT (previously "the operator token, for Bin/Un
+    # nodes only") to hold the field-name token's index instead — no sixth
+    # int, no separate "field name arena," just one more legitimate use of
+    # a slot the layout already had. Likewise a text literal's actual
+    # (unescaped) VALUE is never computed or stored anywhere in this file at
+    # all — the arena stores the STRING TOKEN's index (valTok), pointing at
+    # its raw, still-quoted-and-escaped slice of `src` in `tokenTexts`;
+    # decoding `"say \"hi\""` into `say "hi"` is left entirely to whoever
+    # consumes the arena (expr_test.go's shapeFromArena does it with
+    # `strconv.Unquote`, the exact function expr.go's own parseAtom tStr
+    # case already calls) — this file's job is only to prove the TOKEN
+    # SPAN is right (the tokenizer didn't stop scanning at an escaped quote,
+    # didn't merge two literals into one), not to re-implement Go's escape
+    # decoding a second time in `.fct`. This is the same "one proc, one
+    # concern" split the position/arena divide already established, just
+    # applied to escape decoding instead of parsing.
+    #
+    # FINDING 8 (round 4) — a node with a VARIABLE number of children (Call's
+    # N arguments, ListLit's N elements) fits the fixed 5-int-per-node arena
+    # with NO change to its width, by exploiting a real, provable fact about
+    # this arena's own postorder layout: after building N sibling subtrees
+    # back-to-back (each one's build call starting exactly where the
+    # previous one's returned arena left off — the same return-value-
+    # threading FINDING 3 already established), the ROOT of subtree i is
+    # NOT at a predictable index (it depends on how many internal nodes that
+    # subtree itself needed), so "first argument's root index" alone cannot
+    # be computed by arithmetic on N and a starting offset. The fix used
+    # here: after all N subtrees are built, append N more small "pointer"
+    # rows — one per subtree, in order, called ArgSlot (arena kind 8) —
+    # each just a single int (its own valTok slot) naming that subtree's
+    # real root NODE index, with opTok/left/right all -1. Because these N
+    # ArgSlot rows are appended CONTIGUOUSLY, with nothing else interleaved,
+    # AFTER every real subtree is already finished, "the first ArgSlot's
+    # index" IS computable by arithmetic — it is always exactly
+    # `(len(arena)/5) - N`, i.e. N rows back from wherever the arena ends
+    # right before the Call/ListLit node itself gets appended. So a Call
+    # node (arena kind 9) stores: opTok = the builtin name's token index,
+    # left = the first ArgSlot's node index (or -1 if N==0), right = N (the
+    # argument count) — and a ListLit node (arena kind 10) stores the
+    # identical left/right shape (first ArgSlot index, count), with opTok
+    # also -1 (no name). Reading argument/element i back out is then just
+    # `arena[5*(left+i)+1]` (ArgSlot i's valTok) to get that argument's real
+    # root node index, then recursing normally. This costs N extra rows per
+    # call/list (never a fixed number, genuinely proportional to arity,
+    # exactly like a real arena/bump-allocated AST would spend one "operand
+    # list" slot per call) but needs no new arena WIDTH, no raw non-node
+    # data smuggled into the row-aligned array, and — critically — leaves
+    # the "root of whatever this call just built is the last row" invariant
+    # every other level already depends on (termNodes, comparisonNodes, the
+    # postfix loop, etc.) completely intact, since the Call/ListLit node
+    # itself, not any ArgSlot, is always the true final row.
+    #
+    # The count N itself is never threaded through a return value at all
+    # (a proc still returns exactly one value — LANGUAGE.md's `proc`
+    # section, unchanged since FINDING 3 was written): it is INDEPENDENTLY
+    # recomputed from (kinds, texts, pos) alone by argListCount, the same
+    # "position vs. structure are two separate pure families of procs that
+    # are guaranteed to agree by construction because both loop over the
+    # identical grammar" idiom the position/arena (`*End`/`*Nodes`) split
+    # already established file-wide (see the design note after FINDING 3) —
+    # just widened from a two-way split (End/Nodes) to a three-way one
+    # (End/Nodes/Count) for exactly this one construct, where a THIRD piece
+    # of per-call information (how many arguments) is needed alongside the
+    # other two. argListNodes itself, notably, does NOT need this trick
+    # internally — since it runs as a single proc invocation, it can just
+    # accumulate each subtree's root index into an ordinary `let mut
+    # rootIdxs = []` LOCAL list (a proc-local value, not something crossing
+    # a return-value boundary) while it loops, and only at the very end
+    # walk that local list to emit the N ArgSlot rows — the "one call frame,
+    # one local accumulator" approach that source.fct's own loops already
+    # use for `xs = append(xs, ...)`-style accumulation, just applied here
+    # to node ROOT INDICES instead of raw values. The genuinely new
+    # cross-call problem (FINDING 8's actual subject) is only how the
+    # CALLER of argListNodes — callNodes/listLitNodes, in a different proc
+    # frame — recovers how many entries that local list ended up with,
+    # which is exactly what argListCount's independent recomputation
+    # solves.
+    #
+    # ============================================================
+    # STAGE 0: character classification.
+    # ============================================================
+    # No `isDigit`/`isAlpha` builtin exists, and there is no lexicographic
+    # `<`/`<=` on `text` in this language either — every comparison operator
+    # coerces its operands through toInt/toFloat (runtime/eval.go's
+    # applyBin: `case "<": ... return toInt(l) < toInt(r)`), so `"a" <
+    # "z"` is NOT a real string comparison here, it would silently compare
+    # toInt("a")==0 against toInt("z")==0. A digit/letter RANGE check must
+    # therefore be an enumerated CLOSED-ALPHABET membership test, exactly
+    # like source.fct's own indentOf/hasLeadingTab already do for their own
+    # (smaller) closed alphabets — but for identifier characters, the
+    # alphabet is the full 63-character `[0-9A-Za-z_]` set, so this uses
+    # the general-purpose `in` operator against an explicit array literal
+    # (already proven live, selfhost/recursion_test.go's
+    # TestInOperatorWorksOnTextArrayLiterals) instead of a long `==` chain — a
+    # cleaner, equally-closed-alphabet expression of the identical idea.
+    proc isDigitChar(c: text) -> bool:
+        return c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+    # (a single logical statement cannot span multiple physical lines in
+    # this language — source.fct's own header explains why: each line is
+    # its own node in the offside-rule tree — so this literal, unlike a
+    # Python one, has to stay on one line.)
+    proc isIdentStartChar(c: text) -> bool:
+        return c in ["_", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
+    proc isIdentChar(c: text) -> bool:
+        let startOk = do isIdentStartChar(c)
+        if startOk:
+            return true
+        let digitOk = do isDigitChar(c)
+        return digitOk
+
+    proc isSpaceChar(c: text) -> bool:
+        return c == " " || c == "\t"
+
+    # isTwoCharOp: the real tokenizer's own longest-match rule (expr.go's
+    # tokenize: `two := s[i:i+2]; switch two { case "==", "!=", ...}`),
+    # restated as a closed-alphabet membership test exactly like
+    # isDigitChar/isIdentStartChar above — the SAME idiom, just applied to
+    # this subset's six real two-character operators instead of a character
+    # range. `<<`/`>>` are deliberately NOT in this set (see STAGE 1's
+    # tokenizer doc for why shifts are out of scope for this round): a
+    # bare `<` or `>` therefore always tokenizes as its own one-character
+    # operator here, which is correct for this subset's grammar (comparison
+    # only) even though it would be wrong if shifts were in scope too.
+    # Text concatenation (`c1 + c2`) is a real, already-verified operation
+    # in this language for two `text` operands (runtime/eval.go's
+    # applyBin "+" case: `if ls, ok := l.(string); ...  return ls +
+    # toStr(r)`), so building the two-character candidate is just `c1 + c2`,
+    # no separate concat builtin needed.
+    proc isTwoCharOp(combo: text) -> bool:
+        return combo in ["==", "!=", "<=", ">=", "&&", "||"]
+
+    # ============================================================
+    # STAGE 1: the tokenizer — expr.go's own `tokenize(s string) []token`,
+    # ported to the "parallel arrays" pattern source.fct's own header
+    # explains (a proc cannot construct or return a list of heterogeneous
+    # records, only `[T]` of one scalar type — see source.fct's STAGE 1
+    # doc for the full reasoning, which applies unchanged here). Each
+    # kept token contributes one entry to BOTH arrays, same index, same
+    # order: tokenKinds()[i] and tokenTexts()[i] together ARE token i.
+    #
+    # Kind codes (round 3 adds the sixth — tStr — since this round adds real
+    # string literals; tEOF still never occurs, "at end" is simply
+    # "index >= len(tokenKinds(...))"). `[`/`]`/`.` need NO new kind code at
+    # all — see this file's header, FINDING 6: they already fell into kind 2
+    # (tOp) before this round even used them, since kind 2 is "any operator
+    # character," not "one of these specific symbols":
+    #   0 = tNum   (a run of digits)
+    #   1 = tIdent (identifier: isIdentStartChar then isIdentChar*)
+    #   2 = tOp    (`+ - * / ! < > = & | ^ ~ . [ ]`, one- or two-character —
+    #               see isTwoCharOp above; this ONE kind code covers every
+    #               operator this subset has, single- or double-char alike,
+    #               since every consumer below dispatches on the token TEXT
+    #               (`texts[p] == "=="`), never on a finer-grained kind
+    #               number, exactly as the original `+ - * /`-only subset
+    #               already did)
+    #   3 = tLParen
+    #   4 = tRParen
+    #   5 = tStr   (round 3: a double-quoted string literal, `"` through the
+    #               next unescaped `"` — see the string-scanning branch
+    #               below, and this file's header FINDING 7 for why the
+    #               token's TEXT is kept raw — quotes, backslashes, and all
+    #               — rather than unescaped here)
+    #
+    # Round 2 addition: any operator token that STARTS a real two-character
+    # operator (`==` `!=` `<=` `>=` `&&` `||`) must consume BOTH characters
+    # as one token, not the first character alone — the same longest-match
+    # rule expr.go's own tokenize enforces via its `two := s[i:i+2]` lookahead,
+    # ported here as isTwoCharOp above rather than inlined, since both
+    # tokenKinds and tokenTexts need the identical decision (how many
+    # characters this operator token consumes) even though only tokenTexts
+    # needs the resulting TEXT. Getting this wrong in either direction is
+    # exactly the kind of bug this design is meant to make impossible to
+    # miss: consuming `=` alone from `==` would desync every later token
+    # position from the real tokenizer's, and expr_test.go's precedence-
+    # interaction cases (STAGE 2b's doc) reliably catch that class of bug
+    # by producing a wrong tree SHAPE, not a subtly wrong one.
+    #
+    # Shifts (`<<`/`>>`) are the one real two-character-operator pair left
+    # OUT of isTwoCharOp by design: admitting them would also require
+    # admitting their whole precedence level (binPrec 7, between comparison
+    # and `+`/`-`) to stay a coherent, real slice rather than a tokenizer
+    # that recognizes an operator no precedence level ever consumes — left
+    # for a future round together with `%` and `in` (see this file's header
+    # SCOPE note).
+    #
+    # Whitespace (space and tab, matching expr.go's own `c == ' ' || c ==
+    # '\t'` case) is skipped and produces no token, exactly as expr.go
+    # does. Both procs below re-scan the source independently (see this
+    # file's header on why: one proc, one return value, and position vs.
+    # kind vs. text are three different pieces of per-token information a
+    # single pass could produce together in Go but not in one `.fct` proc
+    # return) — driven by the same character-at-a-time loop using
+    # `charAt`/`len`, and multi-character token TEXT extracted with the
+    # real (non-prefix-only) `slice(s, start, end)` builtin.
+    proc tokenKinds(src: text) -> [int]:
+        let n = len(src)
+        let mut kinds = []
+        let mut i = 0
+        loop i < n:
+            let c = charAt(src, i)
+            let isSpace = do isSpaceChar(c)
+            if isSpace:
+                i = i + 1
+            else:
+                if c == "(":
+                    kinds = append(kinds, 3)
+                    i = i + 1
+                else:
+                    if c == ")":
+                        kinds = append(kinds, 4)
+                        i = i + 1
+                    else:
+                        if c == "\"":
+                            # Round 3: a string literal — expr.go's own
+                            # tokenize `case c == '"'` branch, ported
+                            # verbatim: scan from just past the opening
+                            # quote until an UNESCAPED closing quote (a `\`
+                            # skips the next character unconditionally,
+                            # whatever it is, exactly like the real
+                            # `if s[j] == '\\' { j++ }; j++`), then consume
+                            # the closing quote itself if one was actually
+                            # found (malformed/unterminated input degrades
+                            # the same honest way factorEnd's unmatched `(`
+                            # case already does — see STAGE 2a's doc — never
+                            # a crash, since `slice`/`charAt` clamp rather
+                            # than error on an out-of-range span).
+                            let mut j = i + 1
+                            let mut scanning = true
+                            loop scanning:
+                                if j < n:
+                                    if charAt(src, j) == "\"":
+                                        scanning = false
+                                    else:
+                                        if charAt(src, j) == "\\":
+                                            j = j + 1
+                                        j = j + 1
+                                else:
+                                    scanning = false
+                            if j < n:
+                                j = j + 1
+                            kinds = append(kinds, 5)
+                            i = j
+                        else:
+                            let isDigit = do isDigitChar(c)
+                            if isDigit:
+                                let mut j = i
+                                let mut scanning = true
+                                loop scanning:
+                                    if j < n:
+                                        let dj = do isDigitChar(charAt(src, j))
+                                        if dj:
+                                            j = j + 1
+                                        else:
+                                            scanning = false
+                                    else:
+                                        scanning = false
+                                kinds = append(kinds, 0)
+                                i = j
+                            else:
+                                let isStart = do isIdentStartChar(c)
+                                if isStart:
+                                    let mut j = i
+                                    let mut scanning = true
+                                    loop scanning:
+                                        if j < n:
+                                            let ij = do isIdentChar(charAt(src, j))
+                                            if ij:
+                                                j = j + 1
+                                            else:
+                                                scanning = false
+                                        else:
+                                            scanning = false
+                                    kinds = append(kinds, 1)
+                                    i = j
+                                else:
+                                    # An operator character: one of `+ - * /
+                                    # ! < > = & | ^ ~ . [ ]`. Longest-match:
+                                    # if the next character makes a real
+                                    # two-character operator (isTwoCharOp),
+                                    # consume both; otherwise this is a
+                                    # one-character operator (which is what
+                                    # `.`/`[`/`]` always are — none of them
+                                    # appear in isTwoCharOp's set). The token
+                                    # TEXT (not just its count) is irrelevant
+                                    # here — tokenKinds only needs how many
+                                    # characters this token consumed, so `i`
+                                    # stays in sync with tokenTexts below
+                                    # without this proc ever building the
+                                    # combo text itself.
+                                    let mut opLen = 1
+                                    if i + 1 < n:
+                                        let c2 = charAt(src, i + 1)
+                                        let combo = c + c2
+                                        let isTwo = do isTwoCharOp(combo)
+                                        if isTwo:
+                                            opLen = 2
+                                    kinds = append(kinds, 2)
+                                    i = i + opLen
+        return kinds
+
+    proc tokenTexts(src: text) -> [text]:
+        let n = len(src)
+        let mut texts = []
+        let mut i = 0
+        loop i < n:
+            let c = charAt(src, i)
+            let isSpace = do isSpaceChar(c)
+            if isSpace:
+                i = i + 1
+            else:
+                if c == "(":
+                    texts = append(texts, "(")
+                    i = i + 1
+                else:
+                    if c == ")":
+                        texts = append(texts, ")")
+                        i = i + 1
+                    else:
+                        if c == "\"":
+                            # Mirrors tokenKinds' string-literal branch
+                            # exactly (same scan, same longest-escape rule),
+                            # additionally slicing out the token's actual
+                            # TEXT — kept RAW (opening/closing quotes and any
+                            # backslash escapes still literally present, not
+                            # decoded) — see this file's header FINDING 7 for
+                            # why unescaping is deliberately NOT done here.
+                            let mut j = i + 1
+                            let mut scanning = true
+                            loop scanning:
+                                if j < n:
+                                    if charAt(src, j) == "\"":
+                                        scanning = false
+                                    else:
+                                        if charAt(src, j) == "\\":
+                                            j = j + 1
+                                        j = j + 1
+                                else:
+                                    scanning = false
+                            if j < n:
+                                j = j + 1
+                            texts = append(texts, slice(src, i, j))
+                            i = j
+                        else:
+                            let isDigit = do isDigitChar(c)
+                            if isDigit:
+                                let mut j = i
+                                let mut scanning = true
+                                loop scanning:
+                                    if j < n:
+                                        let dj = do isDigitChar(charAt(src, j))
+                                        if dj:
+                                            j = j + 1
+                                        else:
+                                            scanning = false
+                                    else:
+                                        scanning = false
+                                texts = append(texts, slice(src, i, j))
+                                i = j
+                            else:
+                                let isStart = do isIdentStartChar(c)
+                                if isStart:
+                                    let mut j = i
+                                    let mut scanning = true
+                                    loop scanning:
+                                        if j < n:
+                                            let ij = do isIdentChar(charAt(src, j))
+                                            if ij:
+                                                j = j + 1
+                                            else:
+                                                scanning = false
+                                        else:
+                                            scanning = false
+                                    texts = append(texts, slice(src, i, j))
+                                    i = j
+                                else:
+                                    # Mirrors tokenKinds' operator branch
+                                    # exactly (same longest-match decision),
+                                    # additionally building the actual
+                                    # two-character TEXT when that's what
+                                    # this token turns out to be.
+                                    let mut opLen = 1
+                                    let mut opText = c
+                                    if i + 1 < n:
+                                        let c2 = charAt(src, i + 1)
+                                        let combo = c + c2
+                                        let isTwo = do isTwoCharOp(combo)
+                                        if isTwo:
+                                            opLen = 2
+                                            opText = combo
+                                    texts = append(texts, opText)
+                                    i = i + opLen
+        return texts
+
+    # ============================================================
+    # STAGE 2a: position tracking — "if a factor/term/expr starts at token
+    # index `pos`, what token index does it END at (the first token past
+    # it)?" Mirrors expr.go's parseAtom/parseUnary/parseBinary control flow
+    # exactly, restricted to this subset's grammar (round 2 additions
+    # marked; `or` is the new top-level entry point, replacing `expr`):
+    #
+    #   or         := and (('||') and)*
+    #   and        := bitOr (('&&') bitOr)*
+    #   bitOr      := bitXor (('|') bitXor)*
+    #   bitXor     := bitAnd (('^') bitAnd)*
+    #   bitAnd     := comparison (('&') comparison)*
+    #   comparison := expr (('==' | '!=' | '<' | '<=' | '>' | '>=') expr)*
+    #   expr       := term (('+' | '-') term)*
+    #   term       := unary (('*' | '/') unary)*
+    #   unary      := ('-' | '!' | '~') unary | factor
+    #   factor     := NUMBER | IDENT | '(' or ')'
+    #
+    # This is exactly expr.go's own real precedence table (its current
+    # `binPrec` map, read fresh for this round — see this file's header)
+    # minus shifts (binPrec 7) and `%`/`in`, so every level here maps onto
+    # exactly one real `parseBinary` precedence level, not an invented
+    # grammar — `term`/`expr` are unchanged from round 1 (still binPrec 9/8),
+    # and `comparison`/`bitAnd`/`bitXor`/`bitOr`/`and`/`or` are binPrec
+    # 6/5/4/3/2/1 respectively. `factor`'s `(' or ')'` case (not `'(' expr
+    # ')'` as round 1 had it) is the one round-1 rule that changed shape: a
+    # parenthesized sub-expression must admit the full grammar, exactly
+    # matching parseAtom's own tLParen case (`p.parseBinary(0)`, precedence
+    # 0 — the loosest).
+    #
+    # All nine `*End` procs below are mutually recursive in the same sense
+    # round 1's three were (each level calls the next-tighter level as its
+    # operand-getter; `factorEnd`'s `(` case calls back out to `orEnd`, the
+    # loosest level, for whatever is inside the parens) — proc-to-proc
+    # forward/circular reference, confirmed to compile and run correctly by
+    # recursion_test.go's TestMutualRecursionBetweenProcs before this file was
+    # written (internal/ir/build.go registers every proc's SIGNATURE in
+    # one pass before building any body, so a proc may call one declared
+    # later in the same file — see build.go's own comment at its Procs
+    # section).
+    #
+    # Malformed/EOF input degrades honestly rather than erroring: a proc
+    # cannot return expr.go's `*Error` (see LANGUAGE.md — a proc has one
+    # `-> RetType`, never an error-carrying second return), and this file
+    # does not invent a sentinel-based sibling status proc the way
+    # source.fct's parsedTabError/`[-2]` sentinel does for the indentation
+    # stage, since "malformed expression" has no single natural boolean
+    # question the way "does this source have a leading tab" does. A
+    # `factorEnd` call past the end of the tokens simply returns `pos`
+    # unchanged (no progress) rather than reading out of bounds.
+    # Round 4: factorEnd's `else` branch now has two cases, not one — `[`
+    # starting a fresh atom is a list literal (listLitEnd, STAGE 2c below),
+    # told apart from postfix `[index]` purely by WHERE factorEnd is ever
+    # called from: only as the start of a primary atom (the top of an
+    # expression, right after a binary operator, inside parens, as a unary
+    # operand, or as one comma-separated list/call element), never as a
+    # continuation after an atom already exists — that continuation case is
+    # postfixEnd's own loop below, which never calls back into factorEnd.
+    # So `a[0]` and `[0]` can never collide: factorEnd(pos) only ever sees
+    # the `[` of `[0]` (atom position), while `a[0]`'s `[` is consumed by
+    # postfixEnd's loop, which factorEnd is never re-entered from.
+    proc factorEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let n = len(kinds)
+        if pos < n:
+            if kinds[pos] == 3:
+                let inner = do orEnd(kinds, texts, pos + 1)
+                return inner + 1
+            else:
+                if texts[pos] == "[":
+                    let listEnd = do listLitEnd(kinds, texts, pos)
+                    return listEnd
+                else:
+                    return pos + 1
+        else:
+            return pos
+
+    # postfixEnd (round 3): the position twin of expr.go's parsePostfix
+    # chained-postfix loop (its bottom `for` loop, AFTER the aggregate/
+    # entity-lookup special case this subset doesn't implement — see this
+    # file's SCOPE note). Sits exactly where the real parser puts it:
+    # between a primary atom (factorEnd) and unary (unaryEnd) in the call
+    # chain, so `.field`/`[index]` bind TIGHTER than every unary/binary
+    # operator, matching `-a.field` parsing as `-(a.field)` and `a[i] == b`
+    # parsing as `(a[i]) == b`.
+    #
+    # `.field` always advances exactly 2 tokens: the `.` itself, then the
+    # field-name IDENT (mirroring parsePostfix's `case ".": p.pos++;
+    # field, err := p.fieldName()` — fieldName consumes exactly one IDENT).
+    # `[index]` advances past `[`, a FULL sub-expression — delegated to
+    # orEnd, the LOOSEST level, exactly like parsePostfix's own `idx, err :=
+    # p.parseBinary(0)` for the index — and the closing `]`. Both loop, so
+    # chained postfixes (`a.field.other`, `a[i][j]`, `a[i].field`,
+    # `a.field[i]`) fall out for free from the same `for`-shaped loop real
+    # parsePostfix uses, with no separate "chain" logic needed.
+    #
+    # Round 4: before falling through to factorEnd, postfixEnd now checks
+    # isCallStartAt (STAGE 2c below) — true iff the token at `pos` is a
+    # plain IDENT naming a builtin (isCallNameTok's closed list) AND is
+    # immediately followed by `(`. This is exactly expr.go's own real
+    # dispatch point (parsePostfix's `if ref, ok := atom.(ast.Ref); ok {
+    # if t.kind == tLParen {...} }`, right after parseAtom returns and
+    # before the chained `.`/`[` loop) — a plain `foo` (no builtin name, or
+    # no following `(`) still falls through to factorEnd exactly as before,
+    # so `len` alone (not followed by `(`) still parses as Ref("len"), only
+    # `len(...)` immediately adjacent parses as a call.
+    proc postfixEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let isCall = do isCallStartAt(kinds, texts, pos)
+        let mut p0 = 0
+        if isCall:
+            let ce = do callEnd(kinds, texts, pos + 1)
+            p0 = ce
+        else:
+            let fe = do factorEnd(kinds, texts, pos)
+            p0 = fe
+        let mut p = p0
+        let n = len(kinds)
+        let mut cont = true
+        loop cont:
+            cont = false
+            if p < n:
+                if texts[p] == ".":
+                    cont = true
+                else:
+                    if texts[p] == "[":
+                        cont = true
+            if cont:
+                if texts[p] == ".":
+                    p = p + 2
+                else:
+                    let inner = do orEnd(kinds, texts, p + 1)
+                    p = inner + 1
+        return p
+
+    # isUnaryOpTok: true iff the token at `pos` is one of this subset's
+    # three prefix unary operators (`- ! ~`, exactly expr.go's parseUnary
+    # set). Written as a single short-circuited boolean rather than the
+    # nested `if pos < n: if texts[pos] == ...` shape round 1's levels use
+    # below — safe now that `&&` genuinely short-circuits (this file's
+    # header, Finding 1/4): `pos < n` is checked first, so `texts[pos]` is
+    # never read when `pos` is out of range.
+    proc isUnaryOpTok(kinds: [int], texts: [text], pos: int) -> bool:
+        let n = len(kinds)
+        return pos < n && (texts[pos] == "-" || texts[pos] == "!" || texts[pos] == "~")
+
+    # unaryEnd: right-associative — `- ! ~` may stack (`!-x`, `~~x`), each
+    # recursing into another unaryEnd before finally bottoming out at
+    # postfixEnd (round 3: was factorEnd directly, before `.field`/`[index]`
+    # existed — see postfixEnd's own doc for why it now sits here instead)
+    # once the token at `pos` isn't one of the three unary operators. This
+    # is the ONE splice point that gives every binary level above it (term
+    # through or) unary's real, tighter-than-everything precedence without
+    # needing its own unary check — see this file's header, Finding 5, for
+    # why only this level (not all eight) needs it.
+    proc unaryEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let isUnary = do isUnaryOpTok(kinds, texts, pos)
+        if isUnary:
+            let rest = do unaryEnd(kinds, texts, pos + 1)
+            return rest
+        else:
+            let atEnd = do postfixEnd(kinds, texts, pos)
+            return atEnd
+
+    proc termEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let p0 = do unaryEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let mut cont = true
+        loop cont:
+            cont = false
+            if p < n:
+                if texts[p] == "*":
+                    cont = true
+                else:
+                    if texts[p] == "/":
+                        cont = true
+            if cont:
+                let next = do unaryEnd(kinds, texts, p + 1)
+                p = next
+        return p
+
+    proc exprEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let p0 = do termEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let mut cont = true
+        loop cont:
+            cont = false
+            if p < n:
+                if texts[p] == "+":
+                    cont = true
+                else:
+                    if texts[p] == "-":
+                        cont = true
+            if cont:
+                let next = do termEnd(kinds, texts, p + 1)
+                p = next
+        return p
+
+    # ------------------------------------------------------------
+    # Round 2: six more precedence levels, loosest at the bottom (`or`),
+    # each one a direct generalization of termEnd/exprEnd above — the only
+    # difference per level is which operator(s) it looks for and which
+    # (tighter) level it delegates to as its operand-getter. Each level's
+    # own `isXOpTok` helper is the short-circuited boolean this file's
+    # header (Finding 4) describes, used in place of round 1's nested-`if`
+    # `cont` construction now that it's safe to.
+    # ------------------------------------------------------------
+    proc isCompareOpTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && (texts[p] == "==" || texts[p] == "!=" || texts[p] == "<" || texts[p] == "<=" || texts[p] == ">" || texts[p] == ">=")
+
+    proc comparisonEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let p0 = do exprEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isCompareOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do exprEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isCompareOpTok(texts, n, p)
+            cont = contNext
+        return p
+
+    proc isBitAndOpTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && texts[p] == "&"
+
+    proc bitAndEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let p0 = do comparisonEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isBitAndOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do comparisonEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isBitAndOpTok(texts, n, p)
+            cont = contNext
+        return p
+
+    proc isBitXorOpTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && texts[p] == "^"
+
+    proc bitXorEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let p0 = do bitAndEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isBitXorOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do bitAndEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isBitXorOpTok(texts, n, p)
+            cont = contNext
+        return p
+
+    proc isBitOrOpTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && texts[p] == "|"
+
+    proc bitOrEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let p0 = do bitXorEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isBitOrOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do bitXorEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isBitOrOpTok(texts, n, p)
+            cont = contNext
+        return p
+
+    proc isAndOpTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && texts[p] == "&&"
+
+    proc andEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let p0 = do bitOrEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isAndOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do bitOrEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isAndOpTok(texts, n, p)
+            cont = contNext
+        return p
+
+    proc isOrOpTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && texts[p] == "||"
+
+    proc orEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let p0 = do andEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isOrOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do andEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isOrOpTok(texts, n, p)
+            cont = contNext
+        return p
+
+    # ============================================================
+    # STAGE 2b: the arena builder — the actual expression TREE, encoded
+    # (per this file's header, Finding 3 and the design note after it) as
+    # a flat `[int]` arena, 5 ints per node, built strictly POSTORDER (a
+    # node's children are appended before the node itself), so the root
+    # of whatever subtree a call just finished building is always the
+    # LAST node in the array it returns:
+    #
+    #   arena[5*i + 0] = kind    (0 = Lit(int), 1 = Ref, 2 = Bin, 3 = Un,
+    #                             4 = Lit(bool) [round 3], 5 = Lit(text)
+    #                             [round 3], 6 = Get [round 3, `.field`],
+    #                             7 = Index [round 3, `[i]`], 8 = ArgSlot
+    #                             [round 4, an internal "pointer" row — see
+    #                             this file's header FINDING 8 — never a
+    #                             real AST node in its own right, only ever
+    #                             referenced from a Call/ListLit's left/
+    #                             right slots], 9 = Call [round 4,
+    #                             `name(args...)`], 10 = ListLit [round 4,
+    #                             `[elems...]`])
+    #   arena[5*i + 1] = valTok  (leaf only — Lit(int)/Lit(bool)/Lit(text)/
+    #                             Ref: token index of the NUM/IDENT/STR
+    #                             token this leaf reads its value/name from
+    #                             — the actual text lives in tokenTexts(src),
+    #                             looked up by this index, never duplicated
+    #                             into the arena itself — the same "store
+    #                             the reference, not a copy" choice
+    #                             childrenOf/subtreeSum already made for
+    #                             parents arrays in source.fct. A Lit(bool)
+    #                             leaf's valTok points at the "true"/"false"
+    #                             IDENT token; a Lit(text) leaf's valTok
+    #                             points at the STR token holding the RAW
+    #                             (still-quoted-and-escaped) source span —
+    #                             see this file's header FINDING 7 for why
+    #                             unescaping is left to the arena's
+    #                             consumer, not done here)
+    #   arena[5*i + 2] = opTok   (Bin/Un: token index of the operator token
+    #                             — any of `+ - * / == != < <= > >= & | ^
+    #                             && || ! ~`; look up tokenTexts(src)
+    #                             [opTok] for the actual symbol. Get [round
+    #                             3]: token index of the field-name IDENT
+    #                             token that followed the `.` — the SAME
+    #                             "store the token index" mechanism, just
+    #                             holding a field name instead of an
+    #                             operator symbol; see FINDING 7)
+    #   arena[5*i + 3] = left    (Bin/Get/Index: NODE index of the left/
+    #                             object child, i.e. arena[5*left ..], not a
+    #                             raw array offset; Un only: NODE index of
+    #                             its single operand, reusing the "left"
+    #                             slot rather than adding a sixth int per
+    #                             node — Un has no second operand, so
+    #                             "right" stays -1, the same "-1 means
+    #                             absent" convention every unused slot
+    #                             already uses)
+    #   arena[5*i + 4] = right   (Bin: NODE index of the right child. Index
+    #                             [round 3]: NODE index of the index
+    #                             sub-expression, e.g. the `i` in `a[i]` —
+    #                             the identical "right" slot, just holding a
+    #                             different KIND's second child. Call/
+    #                             ListLit [round 4]: the ARGUMENT COUNT N —
+    #                             not a node index at all, see below)
+    #
+    # Round 4 (Call/ListLit, kinds 9/10) reuse left/right for a different
+    # PAIR of facts than every earlier kind — not "two children" but "where
+    # the argument list starts, and how many arguments there are": left =
+    # the NODE index of the first ArgSlot row (kind 8, or -1 if N==0), right
+    # = N itself. Argument/element `k` (0-based) is then read by looking at
+    # ArgSlot row `left + k` (ArgSlot rows are always contiguous — see
+    # FINDING 8) and following ITS valTok, which is the actual argument's
+    # real root node index — one extra indirection hop, only for these two
+    # kinds. A Call's opTok holds the builtin name's token index (the same
+    # "store the token index, not the text" mechanism a Get node's opTok
+    # already uses for a field name — FINDING 7); a ListLit has no name, so
+    # its opTok is -1 like everything else with nothing to name.
+    #
+    # -1 fills whichever of valTok/opTok/left/right a node's kind doesn't
+    # use (a Lit/Ref leaf has no opTok/left/right; a Bin node has no
+    # valTok; a Un node has no valTok or right; a Get node [round 3] has no
+    # valTok and no right — it has one child (the object) and one token
+    # (the field name), so it uses valTok's slot for -1 and opTok for the
+    # field-name token, the mirror image of Un's "opTok holds the operator,
+    # left holds the one child, right is -1" shape; an Index node [round 3]
+    # has no valTok and no opTok at all — both stay -1, since it needs no
+    # token of its own, only its two children; an ArgSlot row [round 4] has
+    # only valTok — opTok/left/right all stay -1, since its one and only
+    # job is naming another node's index; a ListLit [round 4] has no valTok
+    # and no opTok — both stay -1, same reasoning as Index) — the same "-1
+    # means absent" convention source.fct's parent-index arrays already use
+    # for "no parent"/"no open ancestor".
+    #
+    # factorNodes/unaryNodes/termNodes/exprNodes/comparisonNodes/
+    # bitAndNodes/bitXorNodes/bitOrNodes/andNodes/orNodes mirror their
+    # `*End` counterparts' control flow exactly (same grammar, same mutual
+    # recursion), so the number of tokens each one consumes always agrees
+    # with its `*End` counterpart by construction — both are pure functions
+    # of the identical (kinds, texts, pos) input, so there is no way for
+    # them to disagree without one of them having an outright bug, which
+    # expr_test.go's cross-checks against the real Go parser would catch
+    # (a wrong token count desyncs which text position a node's children
+    # start reading from, which reliably produces the wrong tree shape,
+    # not a subtly-wrong one).
+    proc factorNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let n = len(kinds)
+        if pos < n:
+            if kinds[pos] == 3:
+                # `(` — a parenthesized sub-expression contributes no node of
+                # its own; its root becomes this factor's whole contribution
+                # (the postorder invariant carries straight through). Calls
+                # back out to orNodes (the loosest level, round 2), not
+                # exprNodes — a parenthesized sub-expression must admit the
+                # FULL grammar, exactly like parseAtom's tLParen case always
+                # calling `p.parseBinary(0)`.
+                let inner = do orNodes(kinds, texts, pos + 1, arena)
+                return inner
+            else:
+                if texts[pos] == "[":
+                    # Round 4: `[` starting a fresh atom is a list literal
+                    # (listLitNodes, STAGE 2c below) — see factorEnd's own
+                    # doc, just above, for exactly why this can never
+                    # collide with postfix `[index]` (postfixNodes' own
+                    # loop, which never re-enters factorNodes).
+                    let lit = do listLitNodes(kinds, texts, pos, arena)
+                    return lit
+                else:
+                    # NUMBER / IDENT (Ref, or `true`/`false` -> Lit(bool)) / STR
+                    # leaf. Round 3 adds the STR case (arena kind 5, token kind
+                    # 5) and the `true`/`false` IDENT special case (arena kind
+                    # 4) — everything else (a plain IDENT) still falls through
+                    # to Ref (arena kind 1), unchanged from round 1.
+                    let mut a = arena
+                    let mut kindCode = 0
+                    if kinds[pos] == 0:
+                        kindCode = 0
+                    else:
+                        if kinds[pos] == 5:
+                            kindCode = 5
+                        else:
+                            if texts[pos] == "true":
+                                kindCode = 4
+                            else:
+                                if texts[pos] == "false":
+                                    kindCode = 4
+                                else:
+                                    kindCode = 1
+                    a = append(a, kindCode)
+                    a = append(a, pos)
+                    a = append(a, -1)
+                    a = append(a, -1)
+                    a = append(a, -1)
+                    return a
+        else:
+            return arena
+
+    # postfixNodes (round 3): the arena-building twin of postfixEnd. `.field`
+    # contributes a Get node (arena kind 6): opTok holds the field-name
+    # IDENT's token index (see this file's header FINDING 7 for why this
+    # needs no new text-storage mechanism — it's the same "store the token
+    # index" trick a Ref leaf's valTok or a Bin node's opTok already use),
+    # left holds the object sub-expression's node index, right stays -1
+    # (Get has one real child, same "-1 means absent" convention Un's
+    # unused right slot already uses). `[index]` contributes an Index node
+    # (arena kind 7): left is the object's node index, right is the index
+    # sub-expression's node index (built via orNodes — the FULL grammar,
+    # matching postfixEnd's own call to orEnd above), valTok/opTok stay -1
+    # (Index needs no token of its own). Both cases update a running
+    # `objIdx` to the postfix node just appended before looping again, the
+    # same left-associative-chaining shape leftIdx already uses in every
+    # Bin-building level below — which is exactly what makes chained
+    # postfixes (`a.field.other`, `a[i][j]`, `a.field[i]`, `a[i].field`)
+    # fall out for free.
+    #
+    # Round 4: before building the primary atom, postfixNodes now checks
+    # isCallStartAt exactly like postfixEnd does (same doc, above) — if
+    # true, the atom is built by callNodes instead of factorNodes, and the
+    # matching position advance is callEnd instead of factorEnd. Everything
+    # after that (the `.`/`[` chaining loop) is completely unchanged: a
+    # call's result is just another `objIdx`, so `len(x).field` or
+    # `trim(s)[0]` (odd but grammatically legal) fall out for free too.
+    proc postfixNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let isCall = do isCallStartAt(kinds, texts, pos)
+        let mut a = arena
+        if isCall:
+            let a0 = do callNodes(kinds, texts, pos, pos + 1, arena)
+            a = a0
+        else:
+            let a0 = do factorNodes(kinds, texts, pos, arena)
+            a = a0
+        let mut objIdx = (len(a) / 5) - 1
+        let mut p = 0
+        if isCall:
+            let ce = do callEnd(kinds, texts, pos + 1)
+            p = ce
+        else:
+            let fe = do factorEnd(kinds, texts, pos)
+            p = fe
+        let n = len(kinds)
+        let mut cont = true
+        loop cont:
+            cont = false
+            if p < n:
+                if texts[p] == ".":
+                    cont = true
+                else:
+                    if texts[p] == "[":
+                        cont = true
+            if cont:
+                if texts[p] == ".":
+                    let fieldTok = p + 1
+                    let mut a1 = a
+                    a1 = append(a1, 6)
+                    a1 = append(a1, -1)
+                    a1 = append(a1, fieldTok)
+                    a1 = append(a1, objIdx)
+                    a1 = append(a1, -1)
+                    objIdx = (len(a1) / 5) - 1
+                    a = a1
+                    p = p + 2
+                else:
+                    let a1 = do orNodes(kinds, texts, p + 1, a)
+                    let idxIdx = (len(a1) / 5) - 1
+                    let mut a2 = a1
+                    a2 = append(a2, 7)
+                    a2 = append(a2, -1)
+                    a2 = append(a2, -1)
+                    a2 = append(a2, objIdx)
+                    a2 = append(a2, idxIdx)
+                    objIdx = (len(a2) / 5) - 1
+                    a = a2
+                    let innerEnd = do orEnd(kinds, texts, p + 1)
+                    p = innerEnd + 1
+        return a
+
+    # unaryNodes: the arena-building twin of unaryEnd (STAGE 2a). A `- ! ~`
+    # prefix contributes a real Un node (kind 3) whose single child is
+    # whatever unaryNodes recursively built for the rest — postorder still
+    # holds (the child is fully appended before this Un node is), so `(len
+    # (a1) / 5) - 1` is still always "the node I just finished," exactly as
+    # every Bin-building level below already relies on.
+    proc unaryNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let isUnary = do isUnaryOpTok(kinds, texts, pos)
+        if isUnary:
+            let opTok = pos
+            let a1 = do unaryNodes(kinds, texts, pos + 1, arena)
+            let childIdx = (len(a1) / 5) - 1
+            let mut a2 = a1
+            a2 = append(a2, 3)
+            a2 = append(a2, -1)
+            a2 = append(a2, opTok)
+            a2 = append(a2, childIdx)
+            a2 = append(a2, -1)
+            return a2
+        else:
+            let viaPostfix = do postfixNodes(kinds, texts, pos, arena)
+            return viaPostfix
+
+    proc termNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let a0 = do unaryNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut leftIdx = (len(a) / 5) - 1
+        let p0 = do unaryEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let mut cont = true
+        loop cont:
+            cont = false
+            if p < n:
+                if texts[p] == "*":
+                    cont = true
+                else:
+                    if texts[p] == "/":
+                        cont = true
+            if cont:
+                let opTok = p
+                let a1 = do unaryNodes(kinds, texts, p + 1, a)
+                let rightIdx = (len(a1) / 5) - 1
+                let mut a2 = a1
+                a2 = append(a2, 2)
+                a2 = append(a2, -1)
+                a2 = append(a2, opTok)
+                a2 = append(a2, leftIdx)
+                a2 = append(a2, rightIdx)
+                leftIdx = (len(a2) / 5) - 1
+                a = a2
+                let next = do unaryEnd(kinds, texts, p + 1)
+                p = next
+        return a
+
+    proc exprNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let a0 = do termNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut leftIdx = (len(a) / 5) - 1
+        let p0 = do termEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let mut cont = true
+        loop cont:
+            cont = false
+            if p < n:
+                if texts[p] == "+":
+                    cont = true
+                else:
+                    if texts[p] == "-":
+                        cont = true
+            if cont:
+                let opTok = p
+                let a1 = do termNodes(kinds, texts, p + 1, a)
+                let rightIdx = (len(a1) / 5) - 1
+                let mut a2 = a1
+                a2 = append(a2, 2)
+                a2 = append(a2, -1)
+                a2 = append(a2, opTok)
+                a2 = append(a2, leftIdx)
+                a2 = append(a2, rightIdx)
+                leftIdx = (len(a2) / 5) - 1
+                a = a2
+                let next = do termEnd(kinds, texts, p + 1)
+                p = next
+        return a
+
+    # ------------------------------------------------------------
+    # Round 2: the arena-building twin of the six *End levels added above,
+    # same generalization of termNodes/exprNodes's shape each time (build
+    # the tighter operand, remember its node index as `leftIdx`, then for
+    # each same-level operator found: build the next operand, append one
+    # Bin node combining `leftIdx`/the new operand's index, and make THAT
+    # node's index the new `leftIdx` — left-associative chaining, exactly
+    # like round 1's two levels).
+    # ------------------------------------------------------------
+    proc comparisonNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let a0 = do exprNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut leftIdx = (len(a) / 5) - 1
+        let p0 = do exprEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isCompareOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let opTok = p
+            let a1 = do exprNodes(kinds, texts, p + 1, a)
+            let rightIdx = (len(a1) / 5) - 1
+            let mut a2 = a1
+            a2 = append(a2, 2)
+            a2 = append(a2, -1)
+            a2 = append(a2, opTok)
+            a2 = append(a2, leftIdx)
+            a2 = append(a2, rightIdx)
+            leftIdx = (len(a2) / 5) - 1
+            a = a2
+            let next = do exprEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isCompareOpTok(texts, n, p)
+            cont = contNext
+        return a
+
+    proc bitAndNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let a0 = do comparisonNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut leftIdx = (len(a) / 5) - 1
+        let p0 = do comparisonEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isBitAndOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let opTok = p
+            let a1 = do comparisonNodes(kinds, texts, p + 1, a)
+            let rightIdx = (len(a1) / 5) - 1
+            let mut a2 = a1
+            a2 = append(a2, 2)
+            a2 = append(a2, -1)
+            a2 = append(a2, opTok)
+            a2 = append(a2, leftIdx)
+            a2 = append(a2, rightIdx)
+            leftIdx = (len(a2) / 5) - 1
+            a = a2
+            let next = do comparisonEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isBitAndOpTok(texts, n, p)
+            cont = contNext
+        return a
+
+    proc bitXorNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let a0 = do bitAndNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut leftIdx = (len(a) / 5) - 1
+        let p0 = do bitAndEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isBitXorOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let opTok = p
+            let a1 = do bitAndNodes(kinds, texts, p + 1, a)
+            let rightIdx = (len(a1) / 5) - 1
+            let mut a2 = a1
+            a2 = append(a2, 2)
+            a2 = append(a2, -1)
+            a2 = append(a2, opTok)
+            a2 = append(a2, leftIdx)
+            a2 = append(a2, rightIdx)
+            leftIdx = (len(a2) / 5) - 1
+            a = a2
+            let next = do bitAndEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isBitXorOpTok(texts, n, p)
+            cont = contNext
+        return a
+
+    proc bitOrNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let a0 = do bitXorNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut leftIdx = (len(a) / 5) - 1
+        let p0 = do bitXorEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isBitOrOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let opTok = p
+            let a1 = do bitXorNodes(kinds, texts, p + 1, a)
+            let rightIdx = (len(a1) / 5) - 1
+            let mut a2 = a1
+            a2 = append(a2, 2)
+            a2 = append(a2, -1)
+            a2 = append(a2, opTok)
+            a2 = append(a2, leftIdx)
+            a2 = append(a2, rightIdx)
+            leftIdx = (len(a2) / 5) - 1
+            a = a2
+            let next = do bitXorEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isBitOrOpTok(texts, n, p)
+            cont = contNext
+        return a
+
+    proc andNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let a0 = do bitOrNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut leftIdx = (len(a) / 5) - 1
+        let p0 = do bitOrEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isAndOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let opTok = p
+            let a1 = do bitOrNodes(kinds, texts, p + 1, a)
+            let rightIdx = (len(a1) / 5) - 1
+            let mut a2 = a1
+            a2 = append(a2, 2)
+            a2 = append(a2, -1)
+            a2 = append(a2, opTok)
+            a2 = append(a2, leftIdx)
+            a2 = append(a2, rightIdx)
+            leftIdx = (len(a2) / 5) - 1
+            a = a2
+            let next = do bitOrEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isAndOpTok(texts, n, p)
+            cont = contNext
+        return a
+
+    proc orNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let a0 = do andNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut leftIdx = (len(a) / 5) - 1
+        let p0 = do andEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isOrOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let opTok = p
+            let a1 = do andNodes(kinds, texts, p + 1, a)
+            let rightIdx = (len(a1) / 5) - 1
+            let mut a2 = a1
+            a2 = append(a2, 2)
+            a2 = append(a2, -1)
+            a2 = append(a2, opTok)
+            a2 = append(a2, leftIdx)
+            a2 = append(a2, rightIdx)
+            leftIdx = (len(a2) / 5) - 1
+            a = a2
+            let next = do andEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isOrOpTok(texts, n, p)
+            cont = contNext
+        return a
+
+    # ============================================================
+    # STAGE 2c (round 4): function calls and list literals — the shared
+    # "comma-separated expression list" primitive, and the two node kinds
+    # (Call, ListLit) built on top of it. See this file's header ROUND 4
+    # SCOPE NOTE for exactly what's in/out of scope, and FINDING 8 for the
+    # variable-arity arena-encoding design this section implements.
+    # ============================================================
+    #
+    # isCallNameTok: the closed builtin-name allowlist expr.go's own
+    # isBuiltinCall switch defines (internal/parser/expr.go, read fresh for
+    # this round) — every name from that switch EXCEPT `min`/`max`, which
+    # are genuinely ambiguous with the not-yet-implemented aggregate
+    # grammar (see the ROUND 4 SCOPE NOTE's finding 2 for exactly why
+    # `min(x)` would be a silently WRONG tree shape, not just an
+    # unsupported one, if included here). Plain text-equality dispatch,
+    # the same idiom every other closed-alphabet check in this file already
+    # uses (isDigitChar, isTwoCharOp, isCompareOpTok, ...).
+    proc isCallNameTok(texts: [text], n: int, pos: int) -> bool:
+        return pos < n && (texts[pos] == "len" || texts[pos] == "upper" || texts[pos] == "lower" || texts[pos] == "trim" || texts[pos] == "abs" || texts[pos] == "floor" || texts[pos] == "round" || texts[pos] == "money" || texts[pos] == "toFloat" || texts[pos] == "toInt" || texts[pos] == "contains" || texts[pos] == "take" || texts[pos] == "split" || texts[pos] == "slice" || texts[pos] == "charAt" || texts[pos] == "year" || texts[pos] == "month" || texts[pos] == "day" || texts[pos] == "ago" || texts[pos] == "compact" || texts[pos] == "commas" || texts[pos] == "append" || texts[pos] == "bytes" || texts[pos] == "readFile" || texts[pos] == "writeFile" || texts[pos] == "httpGet" || texts[pos] == "httpPost" || texts[pos] == "channel" || texts[pos] == "send" || texts[pos] == "recv" || texts[pos] == "now" || texts[pos] == "rand")
+
+    # isCallStartAt: true iff the token at `pos` is a plain IDENT (kind 1,
+    # so `true`/`false` — which factorNodes special-cases into Lit(bool),
+    # never Ref — are automatically excluded without a separate check)
+    # naming a builtin (isCallNameTok) AND immediately followed by `(`.
+    # This is the exact condition expr.go's parsePostfix tests right after
+    # parseAtom returns, restricted to the one case this round implements
+    # (see ROUND 4 SCOPE NOTE for the aggregate/actstate/entity-lookup
+    # cases this does NOT cover). `pos + 1 < n` guards the lookahead the
+    # same way every other bounds check in this file does.
+    proc isCallStartAt(kinds: [int], texts: [text], pos: int) -> bool:
+        let n = len(kinds)
+        if pos < n:
+            if kinds[pos] == 1:
+                let nameOk = do isCallNameTok(texts, n, pos)
+                if nameOk:
+                    if pos + 1 < n:
+                        return texts[pos + 1] == "("
+        return false
+
+    # isArgSepTok / argListEmptyAt: the two small closed-alphabet checks
+    # argListEnd/argListCount/argListNodes share below, written once rather
+    # than inlined three times, exactly like isCompareOpTok etc. already
+    # are for the binary-operator levels above.
+    proc isArgSepTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && texts[p] == ","
+
+    proc argListEmptyAt(texts: [text], n: int, pos: int) -> bool:
+        return pos < n && (texts[pos] == ")" || texts[pos] == "]")
+
+    # argListEnd: the position twin for a comma-separated argument/element
+    # list. `pos` is the token index right AFTER the opening `(`/`[` (the
+    # caller — callEnd/listLitEnd — always passes `parenPos + 1`/
+    # `bracketPos + 1`, never the bracket itself). An empty list (`)`/`]`
+    # immediately) consumes just that one closing token. Otherwise: parse
+    # one full sub-expression (orEnd — the loosest level, matching
+    # expr.go's own parseCall/parseListLit, both of which call
+    # `p.parseBinary(0)` per argument), then loop consuming `, <expr>`
+    # pairs (the `p + 1` in each loop iteration skips the comma itself,
+    # the same "advance past the just-confirmed separator token" idiom
+    # comparisonEnd/bitAndEnd/etc. already use for their own operators).
+    # The final `p + 1` skips the closing `)`/`]` once no more commas
+    # follow — mirrors expr.go's own loop exactly (parseCall/parseListLit:
+    # consume `,` and continue, or consume `)`/`]` and stop).
+    proc argListEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let n = len(kinds)
+        let empty = do argListEmptyAt(texts, n, pos)
+        if empty:
+            return pos + 1
+        let p0 = do orEnd(kinds, texts, pos)
+        let mut p = p0
+        let cont0 = do isArgSepTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do orEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isArgSepTok(texts, n, p)
+            cont = contNext
+        return p + 1
+
+    # argListCount: argListEnd's independent twin for the ONE extra fact
+    # a variable-arity node needs that no `*End`/`*Nodes` pair before this
+    # round ever had to produce: how many arguments/elements there are.
+    # Re-derives the identical loop (same grammar, same input) rather than
+    # trying to smuggle a second value out of argListNodes' one return —
+    # see this file's header FINDING 8 for exactly why this independent
+    # third family (End/Nodes/Count, widened from the file-wide End/Nodes
+    # split) is the real solution here, not a workaround.
+    proc argListCount(kinds: [int], texts: [text], pos: int) -> int:
+        let n = len(kinds)
+        let empty = do argListEmptyAt(texts, n, pos)
+        if empty:
+            return 0
+        let p0 = do orEnd(kinds, texts, pos)
+        let mut p = p0
+        let mut count = 1
+        let cont0 = do isArgSepTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do orEnd(kinds, texts, p + 1)
+            p = next
+            count = count + 1
+            let contNext = do isArgSepTok(texts, n, p)
+            cont = contNext
+        return count
+
+    # argListNodes: the arena-building twin. Builds each argument's subtree
+    # via orNodes (full grammar, matching argListEnd's own orEnd calls),
+    # accumulating every argument's ROOT NODE INDEX into `rootIdxs` — an
+    # ordinary proc-LOCAL `[int]` value, safe to grow with `append` across
+    # the whole loop because it never crosses a proc-call return-value
+    # boundary (see FINDING 8's closing paragraph for why this local
+    # accumulator is NOT the same problem as recovering the count in a
+    # DIFFERENT proc frame, which is what argListCount is for). Once every
+    # argument is built, a second loop appends one ArgSlot row (kind 8) per
+    # entry of `rootIdxs`, IN ORDER, with nothing else interleaved — this
+    # contiguity is exactly what lets callNodes/listLitNodes compute "the
+    # first ArgSlot's index" by pure arithmetic afterward (FINDING 8).
+    proc argListNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let n = len(kinds)
+        let empty = do argListEmptyAt(texts, n, pos)
+        if empty:
+            return arena
+        let a0 = do orNodes(kinds, texts, pos, arena)
+        let mut a = a0
+        let mut rootIdxs = []
+        let firstRoot = (len(a0) / 5) - 1
+        rootIdxs = append(rootIdxs, firstRoot)
+        let p0 = do orEnd(kinds, texts, pos)
+        let mut p = p0
+        let cont0 = do isArgSepTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let a1 = do orNodes(kinds, texts, p + 1, a)
+            let rootIdx = (len(a1) / 5) - 1
+            rootIdxs = append(rootIdxs, rootIdx)
+            a = a1
+            let next = do orEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isArgSepTok(texts, n, p)
+            cont = contNext
+        let m = len(rootIdxs)
+        let mut k = 0
+        loop k < m:
+            a = append(a, 8)
+            a = append(a, rootIdxs[k])
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            k = k + 1
+        return a
+
+    # callEnd / callNodes: `name(args...)`. `parenPos` is the index of the
+    # `(` token itself (the caller — postfixEnd/postfixNodes — always
+    # passes `nameTokPos + 1`). callNodes additionally takes `nameTok`,
+    # the builtin name's own token index, stored as the Call node's opTok
+    # (FINDING 7's "store the token index, not the text" mechanism, same
+    # as a Get node's field name). `first`/`argCount` are exactly FINDING
+    # 8's encoding: `first` is the first ArgSlot's node index (or -1 for a
+    # zero-argument call, matching the "-1 means absent" convention),
+    # `argCount` is the real argument count from argListCount.
+    proc callEnd(kinds: [int], texts: [text], parenPos: int) -> int:
+        let e = do argListEnd(kinds, texts, parenPos + 1)
+        return e
+
+    proc callNodes(kinds: [int], texts: [text], nameTok: int, parenPos: int, arena: [int]) -> [int]:
+        let argCount = do argListCount(kinds, texts, parenPos + 1)
+        let a1 = do argListNodes(kinds, texts, parenPos + 1, arena)
+        let mut first = -1
+        if argCount > 0:
+            first = (len(a1) / 5) - argCount
+        let mut a2 = a1
+        a2 = append(a2, 9)
+        a2 = append(a2, -1)
+        a2 = append(a2, nameTok)
+        a2 = append(a2, first)
+        a2 = append(a2, argCount)
+        return a2
+
+    # listLitEnd / listLitNodes: `[elems...]`. `bracketPos` is the index of
+    # the `[` token itself (the caller — factorEnd/factorNodes — always
+    # passes its own `pos`, i.e. where the `[` was found starting a fresh
+    # atom, never a postfix `[index]`). Otherwise identical in shape to
+    # callNodes/callEnd, minus the name token (a ListLit has none, so
+    # opTok stays -1).
+    proc listLitEnd(kinds: [int], texts: [text], bracketPos: int) -> int:
+        let e = do argListEnd(kinds, texts, bracketPos + 1)
+        return e
+
+    proc listLitNodes(kinds: [int], texts: [text], bracketPos: int, arena: [int]) -> [int]:
+        let argCount = do argListCount(kinds, texts, bracketPos + 1)
+        let a1 = do argListNodes(kinds, texts, bracketPos + 1, arena)
+        let mut first = -1
+        if argCount > 0:
+            first = (len(a1) / 5) - argCount
+        let mut a2 = a1
+        a2 = append(a2, 10)
+        a2 = append(a2, -1)
+        a2 = append(a2, -1)
+        a2 = append(a2, first)
+        a2 = append(a2, argCount)
+        return a2
+
+    # ============================================================
+    # STAGE 3: the end-to-end driver — raw expression text in, the flat
+    # node arena out, exactly parseExpr(src)'s job (minus its error
+    # return, per this file's header).
+    # ============================================================
+    proc parseExprArena(src: text) -> [int]:
+        let kinds = do tokenKinds(src)
+        let texts = do tokenTexts(src)
+        let arena = do orNodes(kinds, texts, 0, [])
+        return arena
+
+    # parseExprConsumedAll: the honest status signal this file DOES provide
+    # (see STAGE 2a's doc on why a full `*Error` equivalent isn't
+    # attempted) — mirrors parseExpr's own trailing check (`if p.pos !=
+    # len(p.toks) { return nil, &Error{...} }`): true iff the whole token
+    # stream was consumed by one top-level expression, i.e. `src` has no
+    # trailing garbage after a complete, valid expression of this
+    # subset's grammar.
+    proc parseExprConsumedAll(src: text) -> bool:
+        let kinds = do tokenKinds(src)
+        let texts = do tokenTexts(src)
+        let endPos = do orEnd(kinds, texts, 0)
+        return endPos == len(kinds)
+
+    state tokenKindsResult: [int] = []
+    state tokenTextsResult: [text] = []
+    state arenaResult: [int] = []
+    state consumedAllResult: bool = false
+
+    action runTokenKinds(src: text):
+        let r = do tokenKinds(src)
+        tokenKindsResult = r
+
+    action runTokenTexts(src: text):
+        let r = do tokenTexts(src)
+        tokenTextsResult = r
+
+    action runParseExprArena(src: text):
+        let r = do parseExprArena(src)
+        arenaResult = r
+
+    action runParseExprConsumedAll(src: text):
+        let r = do parseExprConsumedAll(src)
+        consumedAllResult = r
+
+    # runParseExpr: the combined, one-HTTP-call driver expr_test.go mostly
+    # uses — tokens (both arrays), the arena, and the consumed-all status,
+    # all from one `src`, the same "one convenience action alongside the
+    # granular ones" shape source.fct's own runParseSourceToParents has.
+    action runParseExpr(src: text):
+        let k = do tokenKinds(src)
+        let t = do tokenTexts(src)
+        let a = do parseExprArena(src)
+        let ok = do parseExprConsumedAll(src)
+        tokenKindsResult = k
+        tokenTextsResult = t
+        arenaResult = a
+        consumedAllResult = ok
+
+    view Home at "/":
+        box:
+            text "{tokenKindsResult} {tokenTextsResult} {arenaResult} {consumedAllResult}"

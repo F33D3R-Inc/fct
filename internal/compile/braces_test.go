@@ -164,6 +164,125 @@ func TestLiteralBracesAreRefused(t *testing.T) {
 	}
 }
 
+// TestProcBodyLiteralBracesAreRefused closes the one funnel the rest of this
+// file's refusal never reached: a proc body's own expression checker
+// (checkProcExpr, internal/ir/build.go) predates braces.go and never got the
+// same checkLiteralExpr call every other expression position (an action
+// argument, a `set` value, a `where` operand — see TestLiteralBracesAreRefused's
+// "an action argument"/"a where operand" cases) already has. Before this fix,
+// `let line = "{slot}:{pid}:{score}"` inside a proc compiled clean and
+// returned the nineteen characters "{slot}:{pid}:{score}" verbatim, at every
+// call, regardless of slot/pid/score's actual values — this is the exact shape
+// a real app hit and had to work around with `+` concatenation instead, because
+// the compiler gave no signal anything was wrong. One case per proc-body
+// position that reads an expression, so a funnel that goes quiet again fails
+// here exactly as the other positions already do.
+func TestProcBodyLiteralBracesAreRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{{
+		name: "a let initializer",
+		src: `app A:
+    proc tag(slot: int, pid: int, score: int) -> text:
+        let line = "{slot}:{pid}:{score}"
+        return line
+    state out: text = ""
+    action run(slot: int, pid: int, score: int):
+        let r = do tag(slot, pid, score)
+        out = r
+    view V at "/":
+        text "{out}"
+`,
+	}, {
+		name: "a set (reassignment)",
+		src: `app A:
+    proc tag(slot: int, pid: int, score: int) -> text:
+        let mut line = ""
+        line = "{slot}:{pid}:{score}"
+        return line
+    state out: text = ""
+    action run(slot: int, pid: int, score: int):
+        let r = do tag(slot, pid, score)
+        out = r
+    view V at "/":
+        text "{out}"
+`,
+	}, {
+		name: "a return value",
+		src: `app A:
+    proc tag(slot: int, pid: int, score: int) -> text:
+        return "{slot}:{pid}:{score}"
+    state out: text = ""
+    action run(slot: int, pid: int, score: int):
+        let r = do tag(slot, pid, score)
+        out = r
+    view V at "/":
+        text "{out}"
+`,
+	}, {
+		name: "a do argument",
+		src: `app A:
+    proc report(msg: text):
+        return
+    proc tag(slot: int) -> int:
+        do report("slot is {slot}")
+        return slot
+    state out: int = 0
+    action run(slot: int):
+        let r = do tag(slot)
+        out = r
+    view V at "/":
+        text "{out}"
+`,
+	}}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := String(c.src)
+			if err == nil {
+				t.Fatalf("expected a compile error, got none")
+			}
+			if !strings.Contains(err.Error(), "a text literal does not interpolate") {
+				t.Fatalf("expected the standard literal-braces message, got: %v", err)
+			}
+			// The diagnostic must hand back the concatenation the author should
+			// have written instead, exactly as it does at every other position —
+			// the fix is mechanical, so the compiler computes it rather than
+			// describing it.
+			if !strings.Contains(err.Error(), "slot") {
+				t.Fatalf("expected the fix suggestion to name the dropped value, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestProcBodyLiteralBracesScopedToProcLocals proves checkProcLiteral (braces.go)
+// resolves a name against exactly what checkProcExpr's own free-name rule
+// resolves it against — the proc's own parameters and `let` locals — not
+// e.resolves' broader app-wide scope (state cells, entities, the actor). A
+// proc cannot read an app-level state cell at all in this milestone, so a
+// text literal that happens to share a spelling with one is not a dropped
+// interpolation: there was never a proc-local value there to drop. Getting
+// this wrong in the other direction (using e.resolves here) would flag code
+// that is not the bug this file exists for.
+func TestProcBodyLiteralBracesScopedToProcLocals(t *testing.T) {
+	_, err := String(`app A:
+    state count: int = 5
+    proc greet(name: text) -> text:
+        return "count is not mine to read: {count}"
+    state out: text = ""
+    action run(name: text):
+        let r = do greet(name)
+        out = r
+    view V at "/":
+        text "{out}"
+`)
+	if err != nil {
+		t.Fatalf("compiling: %v, want it to compile — {count} inside the proc names a state cell the proc cannot see, so it is literal text, not a dropped interpolation", err)
+	}
+}
+
 // The refusal is narrow on purpose, and this is the half that keeps it honest.
 //
 // FDL has no escape for a literal brace — `{` in text demands a `}` and the

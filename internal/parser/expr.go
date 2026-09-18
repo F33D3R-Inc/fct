@@ -567,7 +567,7 @@ func isBuiltinCall(name string) bool {
 	case "now", "rand", // effectful (pinned to the authority)
 		"abs", "min", "max", "floor", "round", "money", // math / money
 		"toFloat", "toInt", // explicit int<->float conversion (proc-only — see checkNoFloat)
-		"len", "upper", "lower", "trim", "contains", "take", // string
+		"len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", // string
 		"year", "month", "day", // date
 		"ago", "compact", "commas", // formatting (render-time text)
 		"append",                // array (proc-only — see internal/ir/build.go's checkBuiltins)

@@ -1846,6 +1846,17 @@ func (s *Server) runProcLocked(p *ir.Proc, args []any) (any, error) {
 		var v any
 		if i < len(args) {
 			v = args[i]
+		} else if prm.List {
+			// A missing trailing argument's zero value for a list-typed parameter
+			// is an empty list, not zero(prm.Type) — that would give the frame a
+			// scalar zero value (e.g. "") for what the proc body expects to index/
+			// len()/append() as an array. internal/ir/build.go's arity check
+			// currently requires every `do`/`spawn` call site to supply exactly
+			// len(sig.params) arguments, so this path is not reachable from
+			// compiled `.fct` source today — it exists so this fallback is
+			// correct rather than silently wrong if that arity rule is ever
+			// relaxed (e.g. optional proc parameters).
+			v = []any{}
 		} else {
 			v = zero(prm.Type)
 		}

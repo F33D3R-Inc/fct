@@ -184,6 +184,34 @@ func (s *Server) evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 			return ^toInt(x), nil
 		}
 	case "bin":
+		// `&&`/`||` short-circuit: the right operand must not even be
+		// evaluated once the left side already determines the result — see
+		// evalRest's "bin" case (this function's flat-scope counterpart) for
+		// the full reasoning, which applies here unchanged. This matters more
+		// here than there: a proc body is the one place an unevaluated right
+		// operand can otherwise throw a genuine runtime error (an
+		// out-of-bounds "index" read, e.g. `i < len(xs) && xs[i] == y`), not
+		// just waste work, so this has to happen before e.R is ever passed to
+		// evalInFrame, not inside applyBin (which only ever sees
+		// already-evaluated operands).
+		if e.Op == "&&" || e.Op == "||" {
+			l, err := s.evalInFrame(e.L, fr)
+			if err != nil {
+				return nil, err
+			}
+			lt := truthy(l)
+			if e.Op == "&&" && !lt {
+				return false, nil
+			}
+			if e.Op == "||" && lt {
+				return true, nil
+			}
+			r, err := s.evalInFrame(e.R, fr)
+			if err != nil {
+				return nil, err
+			}
+			return truthy(r), nil
+		}
 		l, err := s.evalInFrame(e.L, fr)
 		if err != nil {
 			return nil, err
@@ -561,6 +589,33 @@ func evalRest(e *ir.Expr, scope map[string]any) any {
 			return ^toInt(x)
 		}
 	case "bin":
+		// `&&`/`||` short-circuit: evaluate the left operand first, and only
+		// evaluate the right operand if the left side doesn't already
+		// determine the result (`false && ...` -> false, `true || ...` ->
+		// true, neither ever touching the right side). This has to live
+		// here, at the call site that decides whether e.R gets evaluated at
+		// all, rather than inside applyBin — by the time applyBin runs, both
+		// operands have already been evaluated, which is exactly the bug
+		// this fixes (see evalInFrame's "bin" case, this function's
+		// proc-body counterpart, for the motivating out-of-bounds case that
+		// makes this more than a performance nicety there). eval() itself
+		// has no "index" case today (only a proc body can index an array —
+		// see evalInFrame), so no expression eval() evaluates can fail the
+		// way an unguarded `xs[i]` can; this still keeps eval() and
+		// evalInFrame's short-circuit semantics identical, per this file's
+		// existing convention that the two interpreters never disagree
+		// about what an operator means, and protects any future eval() case
+		// that can fail or have a side effect on the right of `&&`/`||`.
+		if e.Op == "&&" || e.Op == "||" {
+			l := truthy(eval(e.L, scope))
+			if e.Op == "&&" && !l {
+				return false
+			}
+			if e.Op == "||" && l {
+				return true
+			}
+			return truthy(eval(e.R, scope))
+		}
 		return applyBin(e.Op, eval(e.L, scope), eval(e.R, scope))
 	}
 	return nil
@@ -574,6 +629,17 @@ func evalRest(e *ir.Expr, scope map[string]any) any {
 func applyBin(op string, l, r any) any {
 	switch op {
 	case "&&":
+		// Neither of applyBin's two callers (evalRest's and evalInFrame's
+		// "bin" cases, above) ever reaches this arm for "&&"/"||" — both
+		// intercept these two ops before calling applyBin at all, so they
+		// can short-circuit and skip evaluating e.R entirely (see their own
+		// "bin" cases for why that has to happen before evaluation, not
+		// here after both operands already exist). Kept as a correct,
+		// non-short-circuiting fallback rather than removed, in case a
+		// future caller ever hands applyBin two already-evaluated operands
+		// directly — it must still answer the right value for those two
+		// operators, just without the short-circuit guarantee that requires
+		// deciding whether to evaluate r before r exists.
 		return truthy(l) && truthy(r)
 	case "||":
 		return truthy(l) || truthy(r)
@@ -936,6 +1002,63 @@ func callBuiltin(name string, argVals []any) any {
 			n = len(r)
 		}
 		return string(r[:n])
+	case "split":
+		// split(s, sep) -> [text], matching Go's strings.Split exactly,
+		// including its edge cases (empty sep splits after every UTF-8
+		// sequence; a sep not present in s returns a single-element slice
+		// holding s unchanged; adjacent separators produce empty-string
+		// elements; a leading/trailing separator produces a leading/trailing
+		// empty element). strings.Split operates on bytes, but that is
+		// rune-safe here for the same reason strings.Contains/Index already
+		// are: UTF-8 is self-synchronizing, so a byte-for-byte search for a
+		// valid UTF-8 separator can only ever match at rune boundaries — it
+		// never lands inside another rune's encoding. The result is returned
+		// as the same []any representation every other array value uses (see
+		// bytesType's doc), so it is len()-able and index-readable for free.
+		parts := strings.Split(toStr(arg(0)), toStr(arg(1)))
+		out := make([]any, len(parts))
+		for i, s := range parts {
+			out[i] = s
+		}
+		return out
+	case "slice":
+		// slice(s, start, end) -> text, a general (not prefix-only) substring,
+		// rune-indexed to match take/len's own rune-based indexing (see their
+		// cases above/below) so a multi-byte character is never cut in half.
+		// Out-of-range start/end never error — both are clamped into
+		// [0, len(r)], and a start left past end after clamping yields "" —
+		// the exact same "clamp, never error" convention take already
+		// established for an n longer than the string.
+		r := []rune(toStr(arg(0)))
+		start, end := toInt(arg(1)), toInt(arg(2))
+		if start < 0 {
+			start = 0
+		}
+		if start > len(r) {
+			start = len(r)
+		}
+		if end < 0 {
+			end = 0
+		}
+		if end > len(r) {
+			end = len(r)
+		}
+		if end < start {
+			end = start
+		}
+		return string(r[start:end])
+	case "charAt":
+		// charAt(s, i) -> text, a length-1 string (this language has no
+		// separate character/rune type) — defined as exactly slice(s, i,
+		// i+1), so it inherits the same clamp-not-error behavior: an
+		// out-of-range i (negative or >= len) yields "" rather than a runtime
+		// error.
+		r := []rune(toStr(arg(0)))
+		i := toInt(arg(1))
+		if i < 0 || i >= len(r) {
+			return ""
+		}
+		return string(r[i])
 	case "year":
 		return int(time.Unix(int64(toInt(arg(0))), 0).UTC().Year())
 	case "month":

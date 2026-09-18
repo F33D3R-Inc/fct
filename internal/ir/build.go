@@ -2170,8 +2170,19 @@ func (e *env) proc(p *ast.Proc) (Proc, error) {
 			return Proc{}, &BuildError{p.Line, fmt.Sprintf("proc %q has duplicate parameter %q", p.Name, prm.Name)}
 		}
 		locals[prm.Name] = true
-		types[prm.Name] = prm.Type
-		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional})
+		// A list-typed parameter (`p: [T]`) is tagged arrayType, exactly like a
+		// list literal or an append(...) result — see inferProcType/
+		// checkIndexTypes — not its element type, so `p[i]`/`len(p)`/passing p to
+		// another proc's list parameter all type-check against it the same way
+		// they already do for a `let mut xs = [1,2,3]` local. Only the element
+		// type (prm.Type) is real to the runtime/database/wire layers, so it is
+		// still what's recorded on the lowered Param below.
+		if prm.List {
+			types[prm.Name] = arrayType
+		} else {
+			types[prm.Name] = prm.Type
+		}
+		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional, List: prm.List})
 	}
 	body, err := e.procBlock(p, p.Body, locals, mutable, types, 0)
 	if err != nil {
@@ -2237,33 +2248,6 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 	// empty before returning. See ast.Spawn's doc for why "same block" is
 	// this milestone's chosen structured-concurrency enforcement boundary.
 	pendingSpawns := map[string]spawnedTask{}
-	// noPendingSpawns is checked before any statement that can transfer
-	// control non-sequentially (if/loop/break/continue/return): every one of
-	// those can — on some path, however deeply nested inside it — skip
-	// straight over the rest of this block (a `return` unwinds the whole
-	// proc; even a one-armed `if` with no `return` inside it can still run
-	// zero or one of two different continuations). A join sitting later in
-	// this same block only actually guarantees the goroutine is waited on if
-	// every statement between the spawn and it is guaranteed to run — so
-	// once a spawn is outstanding, the only statements allowed before its
-	// join are ones that cannot skip ahead (let/assign/indexset/do/exprstmt/
-	// another spawn/another join). This is more conservative than strictly
-	// necessary (see stmtsReturnComplete's own doc for this codebase's
-	// standing preference for a simple, provably sound rule over a precise
-	// one) but it is what makes "spawn, then join before this block ends"
-	// airtight rather than just usually true.
-	noPendingSpawns := func(line int, what string) error {
-		if len(pendingSpawns) == 0 {
-			return nil
-		}
-		names := make([]string, 0, len(pendingSpawns))
-		for n := range pendingSpawns {
-			names = append(names, n)
-		}
-		sort.Strings(names)
-		return &BuildError{line, fmt.Sprintf(
-			"proc %q has a spawned task handle %q still unjoined — `join %s` before %s can run, since %s might exit this block before the join is reached", p.Name, names[0], names[0], what, what)}
-	}
 	var out []Stmt
 	for i, s := range stmts {
 		last := i == len(stmts)-1
@@ -2368,7 +2352,17 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type to bind it", st.Proc)}
 				}
 				locals[st.Bind] = true
-				types[st.Bind] = sig.ret
+				// Same arrayType tagging as a parameter (see e.proc's doc): a
+				// list-returning proc's result must be tagged arrayType, not its
+				// element type, or a later `st.Bind[i]`/`len(st.Bind)` inside THIS
+				// proc would wrongly be rejected by checkIndexTypes as "not an
+				// array" — exactly the composition shape a proc chaining into
+				// another proc's list-typed result needs.
+				if sig.retList {
+					types[st.Bind] = arrayType
+				} else {
+					types[st.Bind] = sig.ret
+				}
 				ds.Bind = st.Bind
 				ds.Ret = sig.ret
 				ds.RetList = sig.retList
@@ -2430,7 +2424,13 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 					return nil, &BuildError{st.Line, fmt.Sprintf("spawned proc %q returns nothing — declare a return type to bind its joined result", task.proc)}
 				}
 				locals[st.Bind] = true
-				types[st.Bind] = task.sig.ret
+				// Same arrayType tagging as a `do` bind above — a spawned proc's
+				// list-typed result must be tagged arrayType, not its element type.
+				if task.sig.retList {
+					types[st.Bind] = arrayType
+				} else {
+					types[st.Bind] = task.sig.ret
+				}
 				js.Bind = st.Bind
 				js.Ret = task.sig.ret
 				js.RetList = task.sig.retList
@@ -2448,7 +2448,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "exprstmt", Value: e.low(st.Call)})
 		case ast.Loop:
-			if err := noPendingSpawns(st.Line, "a loop"); err != nil {
+			if err := checkSpawnsJoined(pendingSpawns, p.Name, st.Line, "starting a loop"); err != nil {
 				return nil, err
 			}
 			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line); err != nil {
@@ -2460,7 +2460,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "loop", Value: e.low(st.Cond), Body: kids})
 		case ast.IfStmt:
-			if err := noPendingSpawns(st.Line, "an if"); err != nil {
+			if err := checkSpawnsJoined(pendingSpawns, p.Name, st.Line, "branching (if)"); err != nil {
 				return nil, err
 			}
 			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line); err != nil {
@@ -2479,7 +2479,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "if", Value: e.low(st.Cond), Body: then, Else: els})
 		case ast.Break:
-			if err := noPendingSpawns(st.Line, "break"); err != nil {
+			if err := checkSpawnsJoined(pendingSpawns, p.Name, st.Line, "breaking"); err != nil {
 				return nil, err
 			}
 			if loopDepth == 0 {
@@ -2490,7 +2490,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "break"})
 		case ast.Continue:
-			if err := noPendingSpawns(st.Line, "continue"); err != nil {
+			if err := checkSpawnsJoined(pendingSpawns, p.Name, st.Line, "continuing"); err != nil {
 				return nil, err
 			}
 			if loopDepth == 0 {
@@ -2501,7 +2501,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "continue"})
 		case ast.Return:
-			if err := noPendingSpawns(st.Line, "return"); err != nil {
+			if err := checkSpawnsJoined(pendingSpawns, p.Name, st.Line, "returning"); err != nil {
 				return nil, err
 			}
 			if !last {
@@ -2525,21 +2525,46 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			return nil, &BuildError{p.Line, fmt.Sprintf("unsupported statement in proc %q", p.Name)}
 		}
 	}
-	// checkSpawnsJoined's backstop: every per-statement noPendingSpawns guard
-	// above catches a spawn left outstanding across an if/loop/break/continue/
+	// checkSpawnsJoined's backstop: every per-statement call to it above
+	// catches a spawn left outstanding across an if/loop/break/continue/
 	// return, but a block that spawns and then simply ENDS — no further
-	// statement of any kind, so no guard ever ran — needs its own check here,
-	// once, after every statement in it has been processed.
-	if len(pendingSpawns) > 0 {
-		names := make([]string, 0, len(pendingSpawns))
-		for n := range pendingSpawns {
-			names = append(names, n)
-		}
-		sort.Strings(names)
-		return nil, &BuildError{p.Line, fmt.Sprintf(
-			"proc %q spawns a task into %q but never joins it in the same block — every spawn must be joined with `join %s` before this block ends", p.Name, names[0], names[0])}
+	// statement of any kind, so it was never called again — needs its own
+	// check here, once, after every statement in it has been processed.
+	if err := checkSpawnsJoined(pendingSpawns, p.Name, p.Line, "the block ends"); err != nil {
+		return nil, err
 	}
 	return out, nil
+}
+
+// checkSpawnsJoined is Milestone 5's structured-concurrency enforcement: it
+// refuses to let procBlock continue past any point where pending (a `spawn`
+// declared earlier in the SAME statement list, not yet consumed by a `join`)
+// is non-empty and what is about to happen might skip over a `join` written
+// later in that same list. procBlock calls this before handling an `if`,
+// `loop`, `break`, `continue`, or `return` — every one of those can, on some
+// path (however deeply nested), exit this block before reaching a later
+// statement — and once more after processing every statement in the block,
+// to catch the block simply ending with nothing left to run at all. Two call
+// sites, one rule, one message.
+//
+// This is deliberately more conservative than a precise dataflow analysis
+// would need to be (the same standing preference stmtsReturnComplete's own
+// doc explains: a simple, provably sound rule over a precise one) — it
+// requires spawn everything, then join everything, THEN branch or return,
+// rather than trying to prove a specific branch always joins first. That
+// trade is what makes "every spawn is joined before its enclosing call
+// returns" airtight rather than merely typical.
+func checkSpawnsJoined(pending map[string]spawnedTask, procName string, line int, what string) error {
+	if len(pending) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(pending))
+	for n := range pending {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return &BuildError{line, fmt.Sprintf(
+		"proc %q has a spawned task handle %q still unjoined when %s — join it with `join %s` first; every spawn must be joined in the same block before it can end", procName, names[0], what, names[0])}
 }
 
 // stmtsReturnComplete reports whether every execution path through body
@@ -2594,6 +2619,21 @@ func stmtsReturnComplete(body []Stmt) bool {
 // checkProcCapabilities, below, which is this function's own funnel for the
 // I/O capability system (p is threaded through only for that: its name, for
 // the diagnostic, and its declared `uses` set).
+//
+// It ends with checkProcLiteralExpr (braces.go) for the same reason check()
+// ends with checkLiteralExpr: a proc body has `{expr}`-shaped string literals
+// exactly as any other expression position does, and a proc has no
+// interpolation mechanism at all — lowerSegs, the code that actually makes
+// `{expr}` render, only runs while lowering a view, and produces a reactive
+// binding a one-shot server computation has no use for. Before this, a proc
+// body's `"{slot}:{pid}:{score}"` compiled clean and returned the four
+// characters `{slot}:{pid}:{score}` unchanged at runtime — check() already
+// refused this everywhere else an expression can appear (an argument, a
+// `set` value, a `where` operand); checkProcExpr was the one funnel that
+// still let it through, because it was written before that refusal existed
+// and never got the same call added. checkProcLiteral (braces.go) uses
+// locals directly rather than e.resolves, since a proc's actual scope is
+// narrower than e.resolves' (no state, no entity, no actor/session builtin).
 func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, types map[string]string, line int) error {
 	for n := range freeNames(ex) {
 		if !locals[n] {
@@ -2619,7 +2659,10 @@ func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, ty
 	if err := checkNoTaskUse(ex, types, line); err != nil {
 		return err
 	}
-	return checkProcCapabilities(p, ex, line)
+	if err := checkProcCapabilities(p, ex, line); err != nil {
+		return err
+	}
+	return e.checkProcLiteralExpr(ex, locals, line)
 }
 
 // arrayType is inferProcType/checkIndexTypes's type tag for an array-valued
@@ -2704,6 +2747,12 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 	case ast.Call:
 		switch t.Name {
 		case "append":
+			return arrayType
+		case "split":
+			// split(s, sep) -> [text], the one builtin in this milestone that
+			// turns a scalar into an array — tagged exactly like append/bytes so
+			// a `let lines = split(src, "\n")` local is index-readable
+			// (checkIndexTypes) and len()-able, the same as any other array.
 			return arrayType
 		case "bytes":
 			return bytesType
@@ -5286,8 +5335,10 @@ func pureBuiltinArity(name string) (int, bool) {
 		return 1, true
 	case "append":
 		return 2, true
-	case "min", "max", "contains", "take":
+	case "min", "max", "contains", "take", "split", "charAt":
 		return 2, true
+	case "slice":
+		return 3, true
 	}
 	return 0, false
 }

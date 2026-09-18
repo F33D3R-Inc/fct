@@ -334,10 +334,21 @@
         return e.op === "!" ? !truthy(x) : -toInt(x);
       }
       case "bin": {
+        // `&&`/`||` short-circuit, matching runtime/eval.go's "bin" case
+        // exactly: the right operand is not evaluated once the left side
+        // already determines the result. This has to be decided before `r`
+        // is computed at all, not folded into the truthy(l) && truthy(r)
+        // shape below (which — like Go's own applyBin — evaluates both
+        // sides first and only combines them after), the same reasoning
+        // eval.go's own comment on this gives.
+        if (e.op === "&&" || e.op === "||") {
+          const l = truthy(ev(e.l, sc));
+          if (e.op === "&&" && !l) return false;
+          if (e.op === "||" && l) return true;
+          return truthy(ev(e.r, sc));
+        }
         const l = ev(e.l, sc), r = ev(e.r, sc);
         switch (e.op) {
-          case "&&": return truthy(l) && truthy(r);
-          case "||": return truthy(l) || truthy(r);
           case "+":
             if (typeof l === "string") return l + toStr(r);
             if (typeof r === "string") return toStr(l) + r;

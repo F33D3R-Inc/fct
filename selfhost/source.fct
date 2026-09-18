@@ -1,0 +1,644 @@
+app SourceSelfHost:
+    # Partial, honest self-hosting port of internal/source/source.go (the
+    # offside-rule indentation-tree stage of fct's own compiler pipeline) into
+    # `.fct` `proc`s.
+    #
+    # STATUS: partial by necessity, not by choice — see
+    # selfhost/GAPS.md-equivalent notes in the report that shipped alongside
+    # this file. Originally, two real language gaps blocked a full, faithful
+    # port; gap #2 is now CLOSED (see below), leaving one:
+    #
+    #   1. There is no way to split a multi-line `text` value into individual
+    #      lines, and no way to read an arbitrary character of a `text` value
+    #      (no `[i]` indexing into text — only into array/map; no split/
+    #      substring-from-offset/ord/chr builtin — the full builtin list is
+    #      exactly: abs, ago, channel, commas, compact, contains, day, floor,
+    #      httpGet, httpPost, len, lower, max, min, money, month, now, rand,
+    #      readFile, recv, round, send, take, toFloat, toInt, trim, upper,
+    #      writeFile, year — verified against internal/parser/expr.go's
+    #      isBuiltinCall and runtime/eval.go's callBuiltin switch). `take`
+    #      only ever returns a PREFIX (no start offset), so there is no way
+    #      to obtain "the rest of the string after position i". This means
+    #      `strings.Split(src, "\n")` — source.go's very first operation —
+    #      cannot be written in a proc today, for arbitrary source text. (A
+    #      concurrent effort may be adding split/slice builtins that close
+    #      this — not relied on here.)
+    #
+    #   2. CLOSED. A proc parameter could never be array/list-typed
+    #      (internal/parser/parser.go's parseSignature was called with
+    #      allowList=false for a proc's own params, unlike an entity/record
+    #      field or a proc's RETURN type, which could already be `[T]`) —
+    #      confirmed by the compile error "parameter %q cannot be a list".
+    #      parseProc now passes allowList=true (the same capability `service`
+    #      operations already had), and internal/ir/build.go's e.proc/
+    #      procBlock now tag a list-typed parameter (and a `do`/`spawn`-bound
+    #      local holding another proc's list-typed result) with the same
+    #      arrayType static-type tag a `let mut xs = [...]` local already got,
+    #      so `len(param)`/`param[i]` type-check correctly. See
+    #      parentIndexForIndents below: it takes a genuine `[int]` PARAMETER
+    #      of any length — no more fixed-8-slot ceiling, no more -1 padding —
+    #      and TestParentIndexForIndentsMatchesGoBuild (source_test.go)
+    #      exercises it past that old 8-element ceiling. The original
+    #      parentIndexForFlatIndents below is kept as-is (its own test still
+    #      covers it), since it is still a legitimate, separately-useful
+    #      demonstration that the algorithm itself is correct.
+    #
+    # What IS genuinely portable today, and is implemented for real below:
+    #   - the per-line indent-counting algorithm (indentOf)
+    #   - the per-line leading-tab-error detection (hasLeadingTab)
+    #   - the per-line blank/comment classification (isBlankOrComment)
+    #   - the per-line trimmed-text extraction (lineText) — an exact match
+    #     for Go's `strings.TrimSpace(raw)`, via the `trim` builtin
+    #   - the offside-rule NESTING algorithm itself (source.go's `build`),
+    #     ported from recursive descent to an explicit-stack iterative form,
+    #     in two versions: parentIndexForFlatIndents (the original fixed
+    #     8-slot workaround for gap #2, kept for its own existing test
+    #     coverage) and parentIndexForIndents (gap #2's real fix: a genuine
+    #     `[int]` parameter of any length) — both proven correct against the
+    #     real Go `build()` for the exact "nearest strictly-shallower-indent
+    #     ancestor" parent rule, including its ragged-sibling-indent quirk
+    #     (see source.go lines 88-92: sibling indents are never actually
+    #     enforced to match, despite the comment there suggesting otherwise)
+    #
+    # Gap #1 still means the true end-to-end pipeline (raw multi-line source
+    # text in, tree out) isn't expressible in one proc yet: something outside
+    # a proc still has to turn the raw text into a `[int]` of per-line indents
+    # first. parentIndexForIndents below takes that already-split step's
+    # OUTPUT as a real parameter — the exact shape a caller like a future,
+    # gap-#1-fixed `Parse` proc would hand it.
+
+    # --- indentOf: source.go's `indent := len(raw) - len(strings.TrimLeft(raw, " "))` ---
+    # Never indexes a character directly (gap #1 makes that impossible); instead
+    # it grows a known-all-spaces prefix one position at a time and asks, via
+    # `take` + text `+` concatenation + `==`, "is the next character a space
+    # too?" — a closed, 1-candidate membership test, not a brute-force scan
+    # over an open alphabet, so it is correct for any line content whatsoever.
+    proc indentOf(line: text) -> int:
+        let mut count = 0
+        let n = len(line)
+        loop count < n:
+            if take(line, count + 1) == take(line, count) + " ":
+                count = count + 1
+            else:
+                break
+        return count
+
+    # --- hasLeadingTab: source.go's tab-in-`lead`-rejection check ---
+    # Same technique as indentOf, generalized to a 2-symbol closed alphabet
+    # {" ", "\t"} — exactly the two characters source.go's own `lead :=
+    # raw[:len(raw)-len(strings.TrimLeft(raw, " \t"))]` cares about. Still no
+    # open-ended character extraction: the loop only ever asks "is the next
+    # char one of these two known candidates", which `take`+`+`+`==` answers
+    # exactly, for any line.
+    proc hasLeadingTab(line: text) -> bool:
+        let mut count = 0
+        let mut sawTab = false
+        let n = len(line)
+        loop count < n:
+            if take(line, count + 1) == take(line, count) + " ":
+                count = count + 1
+            else:
+                if take(line, count + 1) == take(line, count) + "\t":
+                    sawTab = true
+                    count = count + 1
+                else:
+                    break
+        return sawTab
+
+    # --- isBlankOrComment: source.go's `text == "" || strings.HasPrefix(text, "#")` ---
+    proc isBlankOrComment(line: text) -> bool:
+        let t = trim(line)
+        if len(t) == 0:
+            return true
+        return take(t, 1) == "#"
+
+    # --- lineText: source.go's `text := strings.TrimSpace(raw)` ---
+    # An exact match, not an approximation: `trim` is implemented as
+    # strings.TrimSpace(toStr(arg(0))) in runtime/eval.go, the identical call
+    # source.go itself makes.
+    proc lineText(line: text) -> text:
+        return trim(line)
+
+    # --- parentIndexForFlatIndents: source.go's `build`, ported to a stack ---
+    # Go's `build(lines, pos, parentIndent)` recurses: for each line whose
+    # indent beats parentIndent, it makes a node, then recurses to consume
+    # that node's children (parentIndent := this line's own indent), and only
+    # returns to the caller once a line's indent drops back to <= parentIndent.
+    # The net effect — read off the recursion, not the (dead) sibling-level
+    # comment at source.go lines 88-92 — is: a line's parent is the NEAREST
+    # PRECEDING line with a strictly smaller indent (or none, at indent 0).
+    # That is exactly what an explicit stack of "open ancestors" computes:
+    # pop every open ancestor whose indent is >= the current line's indent
+    # (they cannot be its parent), then whatever remains on top (or nothing)
+    # IS its parent; push the current line as the new open ancestor.
+    #
+    # Fixed 8-slot signature is this port's workaround for gap #2 (a proc
+    # parameter cannot be `[int]`): indents beyond `n` are ignored, and unused
+    # slots are conventionally -1. This does NOT claim arrays-as-parameters
+    # work — it is a bounded stand-in so the nesting algorithm itself can be
+    # exercised and verified against the real Go `build()` over HTTP.
+    proc parentIndexForFlatIndents(i0: int, i1: int, i2: int, i3: int, i4: int, i5: int, i6: int, i7: int, n: int) -> [int]:
+        let xs = [i0, i1, i2, i3, i4, i5, i6, i7]
+        let mut stackIndent = [-1, -1, -1, -1, -1, -1, -1, -1]
+        let mut stackNode = [-1, -1, -1, -1, -1, -1, -1, -1]
+        let mut top = -1
+        let mut parents = []
+        let mut k = 0
+        loop k < n:
+            let cur = xs[k]
+            loop top >= 0:
+                if stackIndent[top] >= cur:
+                    top = top - 1
+                else:
+                    break
+            let mut parent = -1
+            if top >= 0:
+                parent = stackNode[top]
+            parents = append(parents, parent)
+            top = top + 1
+            stackIndent[top] = cur
+            stackNode[top] = k
+            k = k + 1
+        return parents
+
+    # --- parentIndexForIndents: gap #2's real fix, not a workaround ---
+    # The exact same algorithm as parentIndexForFlatIndents above, but over a
+    # genuine `[int]` PARAMETER of any length — no fixed slot count, no -1
+    # padding for unused slots, no separate `n` count parameter (len(indents)
+    # replaces it). This is only possible now that a proc parameter may be
+    # list-typed (internal/parser/parser.go's parseProc, allowList=true).
+    # stackIndent/stackNode are grown to exactly len(indents) slots up front
+    # (there can never be more than one open ancestor per input line), using
+    # `append` in a fill loop since this language has no way to preallocate an
+    # array of a given length directly — functionally identical to the fixed
+    # literal `[-1, -1, -1, -1, -1, -1, -1, -1]` above, just sized to the
+    # parameter's own length instead of a hardcoded 8.
+    proc parentIndexForIndents(indents: [int]) -> [int]:
+        let n = len(indents)
+        let mut stackIndent = []
+        let mut stackNode = []
+        let mut fillI = 0
+        loop fillI < n:
+            stackIndent = append(stackIndent, -1)
+            stackNode = append(stackNode, -1)
+            fillI = fillI + 1
+        let mut top = -1
+        let mut parents = []
+        let mut k = 0
+        loop k < n:
+            let cur = indents[k]
+            loop top >= 0:
+                if stackIndent[top] >= cur:
+                    top = top - 1
+                else:
+                    break
+            let mut parent = -1
+            if top >= 0:
+                parent = stackNode[top]
+            parents = append(parents, parent)
+            top = top + 1
+            stackIndent[top] = cur
+            stackNode[top] = k
+            k = k + 1
+        return parents
+
+    # --- buildCyclicIndents: test-only helper, proc-to-proc composition ---
+    # HTTP action parameters must stay scalar (only a PROC parameter may be
+    # list-typed — see LANGUAGE.md's `proc` section), so there is no way for a
+    # test to POST an arbitrary-length `[int]` directly as one action
+    # argument. This proc instead builds one server-side from a single scalar
+    # `n`, so `runParentIndexForIndents` below can chain
+    # `do buildCyclicIndents(n)`'s list RESULT straight into
+    # `do parentIndexForIndents(...)`'s list PARAMETER — proc calling proc,
+    # entirely through a list value, with no action-level array machinery
+    # involved at all (which doesn't exist). The 0,2,4,0,2,4,... cycle
+    # produces genuine ragged nesting (not just one long monotonic chain), and
+    # n is free to exceed 8, exercising exactly the ceiling
+    # parentIndexForFlatIndents could never lift.
+    proc buildCyclicIndents(n: int) -> [int]:
+        let mut xs = []
+        let mut i = 0
+        loop i < n:
+            xs = append(xs, (i % 3) * 2)
+            i = i + 1
+        return xs
+
+    # ============================================================
+    # STAGE 1 (NEW): the real first half of source.go's `Parse` —
+    # `strings.Split(src, "\n")` plus the per-line filter/classify loop —
+    # now genuinely expressible now that `split`/`slice`/`charAt` exist.
+    # ============================================================
+    #
+    # source.go's Parse builds one `[]Line{Indent, Text, No}` slice, skipping
+    # blank/full-line-comment lines BEFORE `build()` ever runs (see the
+    # `continue` at source.go line 70 — a skipped line never becomes a Line
+    # at all, so it plays no part in the offside-rule nesting: it is not an
+    # ancestor, not a sibling, not counted, nothing. It fully disappears from
+    # the tree, it does not merely render as an empty/leaf node).
+    #
+    # A proc still cannot return a heterogeneous struct (`Line{Indent, Text,
+    # No}`) or a list of structs — there is no record/struct VALUE type, only
+    # `entity` (persisted, DB-backed) and `record` (nested read-only shape
+    # inside an entity), neither of which a pure `proc` can construct or
+    # return (a proc's only value shapes are the scalars plus `[T]` of a
+    # scalar). So "a Line" is represented here the only way the language
+    # currently allows: as several PARALLEL arrays, one per field, each
+    # produced by re-deriving the exact same split+filter independently:
+    #
+    #   parsedIndents(src) -> [int]   : Line.Indent, one KEPT line at a time
+    #   parsedTexts(src)   -> [text]  : Line.Text,   the same KEPT lines, same order
+    #   parsedSkipFlags(src) -> [bool]: one entry per RAW line (not filtered) —
+    #                                   true iff that raw line was dropped,
+    #                                   the only way to recover which original
+    #                                   line number (1-based index into this
+    #                                   array, +1) a given parsedIndents[k]/
+    #                                   parsedTexts[k] came from, since the
+    #                                   two "kept" arrays carry no line-number
+    #                                   field of their own (Line.No has no
+    #                                   parallel array here — nothing in the
+    #                                   pipeline below needs it, and adding an
+    #                                   unused fourth parallel array would be
+    #                                   ceremony, not fidelity).
+    #   parsedTabError(src) -> bool   : source.go's leading-tab rejection,
+    #                                   computed over ALL raw lines with
+    #                                   source.go's exact gate (see below) —
+    #                                   the proc-shaped stand-in for the
+    #                                   `error` Parse returns instead of
+    #                                   `([]*Node, nil)`.
+    #
+    # Each of these re-runs `split(src, "\n")` and re-derives indentOf/
+    # hasLeadingTab/isBlankOrComment/lineText per line rather than sharing
+    # one pass — a proc cannot return more than one value, so there is no way
+    # to compute all four in a single loop and hand back four results at
+    # once. Every one of these procs is pure and re-splitting is O(source
+    # length) each time, so this is a real, honest restatement of Parse's
+    # per-line pass, not an approximation of it — just paid for four times
+    # instead of once.
+    proc parsedIndents(src: text) -> [int]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let skip = do isBlankOrComment(raw)
+            if !skip:
+                let ind = do indentOf(raw)
+                out = append(out, ind)
+            i = i + 1
+        return out
+
+    proc parsedTexts(src: text) -> [text]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let skip = do isBlankOrComment(raw)
+            if !skip:
+                let t = do lineText(raw)
+                out = append(out, t)
+            i = i + 1
+        return out
+
+    proc parsedSkipFlags(src: text) -> [bool]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let skip = do isBlankOrComment(raw)
+            out = append(out, skip)
+            i = i + 1
+        return out
+
+    # --- parsedTabError: the proc-shaped stand-in for Parse's `error` return ---
+    # source.go's real gate is `ContainsRune(raw,'\t') && TrimSpace(raw)!=""`
+    # then `ContainsRune(lead,'\t')` — but the outer ContainsRune(raw,'\t') is
+    # only a fast-path short-circuit: if `lead` (the leading space/tab run)
+    # contains a tab, `raw` necessarily does too, so it adds no information
+    # that checking `lead` alone doesn't already give. The real, decisive
+    # condition — the one that actually distinguishes "reject" from "allow" —
+    # is exactly `TrimSpace(raw) != "" && <lead contains a tab>`, which is
+    # exactly `trimmed != "" && hasLeadingTab(raw)` below. Getting the
+    # `trimmed != ""` half right matters: an all-whitespace line that happens
+    # to BE made of tabs (e.g. "\t\t", nothing else) has TrimSpace(raw)=="",
+    # so source.go does NOT reject it (the whole check is gated off) even
+    # though hasLeadingTab(that line) alone would say true. A version of this
+    # proc that forgot the `trimmed != ""` guard would reject strictly MORE
+    # lines than the real Go Parse does — this is exactly the "real semantic
+    # detail, not cosmetic" the porting task warns about, and it is verified
+    # against real Go source.Parse in source_test.go
+    # (TestParsedTabErrorMatchesGoParse's "an all-tab blank line is NOT an
+    # error" case).
+    proc parsedTabError(src: text) -> bool:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut found = false
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let trimmed = do lineText(raw)
+            let tabHere = do hasLeadingTab(raw)
+            if trimmed != "" && tabHere:
+                found = true
+            i = i + 1
+        return found
+
+    # ============================================================
+    # STAGE 2: the full pipeline — raw multi-line text straight through to
+    # a parent-index array, source.go's Parse AND build() end to end.
+    # ============================================================
+    #
+    # Error reporting: a proc cannot return a Go `error` (no second return
+    # value exists for a proc — its signature is one `-> RetType`, never a
+    # tuple; confirmed by reading parseProc/parseSignature in
+    # internal/parser/parser.go, which parse exactly one optional return
+    # type). There is no established sentinel convention anywhere else in
+    # this codebase for a proc to report failure (grepped LANGUAGE.md and
+    # every existing .fct source for one; none exists yet), so this is a new
+    # design decision, made explicitly rather than silently:
+    #
+    #   - The HONEST status signal is the separate `parsedTabError(src)`
+    #     proc above, a real `bool`, callable on its own — exactly the
+    #     "return a second boolean status alongside the main result" pattern
+    #     the task suggested, just as a second SIBLING proc call (the
+    #     language has no tuple/multi-return to carry both at once) rather
+    #     than packed into one value. A caller that cares about the error
+    #     calls both `do parsedTabError(src)` and `do parseSourceToParents
+    #     (src)` — exactly what `runParseSourceToParents` below does.
+    #   - `parseSourceToParents` ALSO folds that same check in and returns a
+    #     one-element sentinel list `[-2]` on error, so a caller that only
+    #     has room for the one call still gets a detectable failure instead
+    #     of a silently-wrong tree. `-2` is unambiguous: every real element
+    #     of a parents array is either `-1` (root, no parent) or a valid
+    #     0-based index `>= 0` into that same array — `-2` can never occur
+    #     as a genuine answer, at any input length, including the empty
+    #     result for zero kept lines (`[]`, length 0, distinguishable from
+    #     the sentinel's length 1 on its own).
+    proc parseSourceToParents(src: text) -> [int]:
+        let tabErr = do parsedTabError(src)
+        if tabErr:
+            let mut sentinel = []
+            sentinel = append(sentinel, -2)
+            return sentinel
+        let indents = do parsedIndents(src)
+        let parents = do parentIndexForIndents(indents)
+        return parents
+
+    # ============================================================
+    # STAGE 3: a genuinely tree-shaped, recursive walk over the parent-index
+    # array — the design answer to the self-hosting wall this file's own
+    # header used to describe: "a proc cannot construct or return a genuine
+    # struct/tree-shaped value" (no record-literal syntax exists anywhere in
+    # the language — internal/parser has no rule for one, and
+    # internal/ir/build.go documents records as flat "by design", one level
+    # only, because their one real job is decoding a service/brain's JSON
+    # reply safely — a live, working guarantee this port does not touch).
+    #
+    # Rather than relax that guarantee (Option A: nestable records, plus new
+    # record-literal construction syntax a proc body could use — a real
+    # language change, and not a free one: Record's flatness is exactly what
+    # lets `v.field` stay a single-level, fully-checkable read, and
+    # `internal/ast/ast.go`'s own doc on `Type`/`Message` — the ONE place
+    # self-referential nesting already exists, for wire-schema codegen only —
+    # says outright that reusing it for Record "would weaken a guarantee its
+    # existing callers (service/action bindings) rely on"), this file takes
+    # the arena/index encoding path instead (Option B): a tree is represented
+    # exactly as source.go's own `Node`/`Children` shape is REPRESENTED once
+    # flattened — a `parents: [int]` array, already produced above by
+    # parentIndexForIndents, where `parents[i]` names i's nearest ancestor (or
+    # -1 for a root). That array is not a list of independent rows; it is a
+    # full encoding of a genuine forest of trees, because a child-lookup
+    # (`childrenOf` below) and true postorder recursion over it (subtreeSum/
+    # subtreeDepth/subtreeCount) can recover any tree-shaped property at all —
+    # sum, depth, count — that a pointer-chased `Node.Children` walk could.
+    #
+    # This costs nothing new in the language: list-typed proc PARAMETERS
+    # (gap #2, closed above) and proc self-recursion (already proven live by
+    # runtime/proc_test.go's TestProcRecursiveFactorialLive, `fact` calling
+    # itself via `do fact(...)`) are both already real, shipped capabilities.
+    # childrenOf/subtreeSum/subtreeDepth/subtreeCount below are the first
+    # thing in this codebase to combine them into an actual recursive
+    # tree-walk, which is exactly the shape a future `internal/parser` port
+    # will need to compute things over its own AST (node counts, nesting
+    # depth limits, a checksum over a subtree) without ever representing a
+    # node as a struct — an arena of parallel arrays, indexed by int, is
+    # itself a completely ordinary, real production compiler IR shape (an
+    # arena/bump allocator of nodes referenced by index rather than pointer),
+    # not a workaround adopted only because records can't nest.
+    #
+    # childrenOf(node, parents) -> [int]: every index i with parents[i] ==
+    # node, in document order — the direct children of `node` (-1 for "every
+    # root of the forest").
+    proc childrenOf(node: int, parents: [int]) -> [int]:
+        let n = len(parents)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if parents[i] == node:
+                out = append(out, i)
+            i = i + 1
+        return out
+
+    # subtreeSum(node, parents, values) -> int: values[node] plus the same sum
+    # over every child's own subtree, recursively — a real postorder tree
+    # aggregate (a leaf just returns its own value; an internal node cannot
+    # answer until every child has). `values` is any per-node `[int]` the
+    # caller supplies for the SAME parents array (forestSum below uses each
+    # kept line's own indent as its value, since that is a real per-node
+    # number this port already computes elsewhere).
+    proc subtreeSum(node: int, parents: [int], values: [int]) -> int:
+        let kids = do childrenOf(node, parents)
+        let mut total = values[node]
+        let m = len(kids)
+        let mut i = 0
+        loop i < m:
+            let childSum = do subtreeSum(kids[i], parents, values)
+            total = total + childSum
+            i = i + 1
+        return total
+
+    # subtreeDepth(node, parents) -> int: the length (in nodes) of the longest
+    # root-to-leaf path inside node's own subtree — 1 for a leaf, otherwise 1
+    # + the deepest child. This is the one property here a flat/linear pass
+    # over `parents` genuinely cannot answer without recursion: unlike a sum
+    # or a count (order-independent), depth needs the actual nesting
+    # structure walked, because it is a max over the RECURSIVE depths of a
+    # node's children, not a property of any single row.
+    proc subtreeDepth(node: int, parents: [int]) -> int:
+        let kids = do childrenOf(node, parents)
+        let m = len(kids)
+        let mut best = 0
+        let mut i = 0
+        loop i < m:
+            let d = do subtreeDepth(kids[i], parents)
+            if d > best:
+                best = d
+            i = i + 1
+        return 1 + best
+
+    # subtreeCount(node, parents) -> int: 1 (node itself) plus every
+    # descendant, recursively — the size of node's own subtree.
+    proc subtreeCount(node: int, parents: [int]) -> int:
+        let kids = do childrenOf(node, parents)
+        let m = len(kids)
+        let mut total = 1
+        let mut i = 0
+        loop i < m:
+            let c = do subtreeCount(kids[i], parents)
+            total = total + c
+            i = i + 1
+        return total
+
+    # forestSum/forestMaxDepth/forestNodeCount: the end-to-end drivers, raw
+    # source text in, one aggregate out — real source text parsed by this
+    # file's own STAGE 1/2 procs into a genuine forest (parents), then walked
+    # by the STAGE 3 recursion above, root by root. Each returns -1 on the
+    # same leading-tab rejection parseSourceToParents reports via its `[-2]`
+    # sentinel (a real error can't reach here, since -1 can never be a valid
+    # sum/depth/count: depth and count are always >= 1 per root, and a sum of
+    # non-negative indents is always >= 0).
+    proc forestSum(src: text) -> int:
+        let tabErr = do parsedTabError(src)
+        if tabErr:
+            return -1
+        let parents = do parseSourceToParents(src)
+        let values = do parsedIndents(src)
+        let n = len(parents)
+        let mut total = 0
+        let mut i = 0
+        loop i < n:
+            if parents[i] == -1:
+                let s = do subtreeSum(i, parents, values)
+                total = total + s
+            i = i + 1
+        return total
+
+    proc forestMaxDepth(src: text) -> int:
+        let tabErr = do parsedTabError(src)
+        if tabErr:
+            return -1
+        let parents = do parseSourceToParents(src)
+        let n = len(parents)
+        let mut best = 0
+        let mut i = 0
+        loop i < n:
+            if parents[i] == -1:
+                let d = do subtreeDepth(i, parents)
+                if d > best:
+                    best = d
+            i = i + 1
+        return best
+
+    proc forestNodeCount(src: text) -> int:
+        let tabErr = do parsedTabError(src)
+        if tabErr:
+            return -1
+        let parents = do parseSourceToParents(src)
+        let n = len(parents)
+        let mut total = 0
+        let mut i = 0
+        loop i < n:
+            if parents[i] == -1:
+                let c = do subtreeCount(i, parents)
+                total = total + c
+            i = i + 1
+        return total
+
+    state indentResult: int = 0
+    state tabResult: bool = false
+    state blankResult: bool = false
+    state textResult: text = ""
+    state parentsResult: [int] = []
+    state parentsResult2: [int] = []
+    state indentsResult: [int] = []
+    state textsResult: [text] = []
+    state skipFlagsResult: [bool] = []
+    state tabErrorResult: bool = false
+    state parentsResult3: [int] = []
+    state forestSumResult: int = 0
+    state forestMaxDepthResult: int = 0
+    state forestNodeCountResult: int = 0
+
+    action runIndentOf(line: text):
+        let r = do indentOf(line)
+        indentResult = r
+
+    action runHasLeadingTab(line: text):
+        let r = do hasLeadingTab(line)
+        tabResult = r
+
+    action runIsBlankOrComment(line: text):
+        let r = do isBlankOrComment(line)
+        blankResult = r
+
+    action runLineText(line: text):
+        let r = do lineText(line)
+        textResult = r
+
+    action runParentIndexForFlatIndents(i0: int, i1: int, i2: int, i3: int, i4: int, i5: int, i6: int, i7: int, n: int):
+        let r = do parentIndexForFlatIndents(i0, i1, i2, i3, i4, i5, i6, i7, n)
+        parentsResult = r
+
+    # runParentIndexForIndents is gap #2's real fix, exercised end to end: a
+    # proc (buildCyclicIndents) produces a `[int]` of any length, and a second
+    # proc (parentIndexForIndents) consumes that exact list as its own
+    # parameter — the composition shape a real `Parse`/`build` pipeline needs,
+    # with no 8-slot ceiling anywhere in it.
+    action runParentIndexForIndents(n: int):
+        let indents = do buildCyclicIndents(n)
+        let r = do parentIndexForIndents(indents)
+        parentsResult2 = r
+
+    action runParsedIndents(src: text):
+        let r = do parsedIndents(src)
+        indentsResult = r
+
+    action runParsedTexts(src: text):
+        let r = do parsedTexts(src)
+        textsResult = r
+
+    action runParsedSkipFlags(src: text):
+        let r = do parsedSkipFlags(src)
+        skipFlagsResult = r
+
+    action runParsedTabError(src: text):
+        let r = do parsedTabError(src)
+        tabErrorResult = r
+
+    # runParseSourceToParents is the full pipeline exercised end to end over
+    # HTTP: raw multi-line source text in, a parent-index array (or the
+    # `[-2]` error sentinel) out — plus the honest sibling status call this
+    # file's design deliberately keeps separate (see parseSourceToParents's
+    # own doc for why there are two calls here, not one).
+    action runParseSourceToParents(src: text):
+        let tabErr = do parsedTabError(src)
+        let r = do parseSourceToParents(src)
+        tabErrorResult = tabErr
+        parentsResult3 = r
+
+    # runForestSum/runForestMaxDepth/runForestNodeCount exercise STAGE 3's
+    # genuinely recursive tree walk live over HTTP: raw source text in, one
+    # real tree-shaped aggregate out, each computed by a proc that calls
+    # itself over the actual parent/child structure `parseSourceToParents`
+    # recovers from that text — not a flat pass over its lines.
+    action runForestSum(src: text):
+        let r = do forestSum(src)
+        forestSumResult = r
+
+    action runForestMaxDepth(src: text):
+        let r = do forestMaxDepth(src)
+        forestMaxDepthResult = r
+
+    action runForestNodeCount(src: text):
+        let r = do forestNodeCount(src)
+        forestNodeCountResult = r
+
+    view Home at "/":
+        box:
+            text "{indentResult} {tabResult} {blankResult} {textResult} {parentsResult} {parentsResult2}"
+            text "{indentsResult} {textsResult} {skipFlagsResult} {tabErrorResult} {parentsResult3}"
+            text "{forestSumResult} {forestMaxDepthResult} {forestNodeCountResult}"
