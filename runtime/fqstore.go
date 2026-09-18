@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"facet/internal/ir"
+	wire "facet/schema/generated"
 )
 
 // envToken is the fallback FacetQL bearer token when the URL carries none.
@@ -566,6 +567,22 @@ func (s *fqStore) migrateIndexes(ctx context.Context, entities []ir.Entity, appl
 	return plan, nil
 }
 
+// fqOnDelete maps a relation field's on-delete modifier (ir.Field.OnDelete /
+// ir.Reference.OnDelete — "" | "restrict" | "setNull") to the referential-action
+// FacetQL's wire protocol expects. "" (no annotation) maps to cascade: the
+// historical, sole behavior, and so still what every relation gets that
+// declares no modifier at all.
+func fqOnDelete(mode string) wire.ReferentialAction {
+	switch mode {
+	case "restrict":
+		return wire.ReferentialActionRestrict
+	case "setNull":
+		return wire.ReferentialActionSetNull
+	default:
+		return wire.ReferentialActionCascade
+	}
+}
+
 // migrateReferences declares this app's relations to FacetQL as durable
 // referential rules, so the ENGINE cascades a delete to the rows that referenced
 // it — the same rule pgStore states as `REFERENCES … ON DELETE CASCADE`.
@@ -620,16 +637,17 @@ func (s *fqStore) migrateReferences(ctx context.Context, entities []ir.Entity, a
 		declared[ir.Index{Entity: d.Kind, Field: d.Field}] = d
 	}
 	for _, r := range refs {
+		onDelete := fqOnDelete(r.OnDelete)
 		def := fqReferenceDef{
 			Name:        fqReferenceName(r.Entity, r.Field),
 			Kind:        r.Entity,
 			Field:       r.Field,
 			ParentKind:  r.Parent,
 			ParentField: fqRelationKeyField,
-			OnDelete:    "cascade",
+			OnDelete:    onDelete,
 		}
-		what := fmt.Sprintf("reference %s.%s -> %s.%s on delete cascade",
-			r.Entity, r.Field, r.Parent, fqRelationKeyField)
+		what := fmt.Sprintf("reference %s.%s -> %s.%s on delete %s",
+			r.Entity, r.Field, r.Parent, fqRelationKeyField, onDelete)
 		if d, ok := declared[ir.Index{Entity: r.Entity, Field: r.Field}]; ok {
 			if d.ParentKind != def.ParentKind || d.ParentField != def.ParentField || d.OnDelete != def.OnDelete {
 				return plan, fmt.Errorf(

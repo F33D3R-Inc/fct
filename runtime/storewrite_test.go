@@ -306,6 +306,152 @@ func TestFQTransactionDoesNotCollapseAcrossADeleteOrClear(t *testing.T) {
 	})
 }
 
+// ── two `set` gaps once documented broken in apps/storefront/gaps/*.fct, now
+//    locked in as passing end to end against a live server ──────────────────
+
+// GAP 2 (fixed) — set-no-where.fct: a bulk filtered `set` (`set p in Entity
+// where cond: field = expr`) must actually move every matching row in the
+// store, and leave non-matching rows untouched, from one action call.
+const filteredSetApp = `app Cart:
+    entity Product:
+        id: int
+        stock: int
+    entity CartLine:
+        id: int
+        product: Product
+    action addProduct(stock: int):
+        add Product { stock: stock }
+    action addLine(product: Product):
+        add CartLine { product: product }
+    action checkout():
+        set p in Product where exists(l in CartLine where l.product == p.id):
+            stock = p.stock - 1
+    view Home at "/":
+        box:
+            for p in Product by id:
+                text "{p.stock}"
+`
+
+func TestFilteredSetUpdatesOnlyMatchingRows(t *testing.T) {
+	g, err := compile.String(filteredSetApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(apiReadEnv, "Product,CartLine")
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(path, body string) int {
+		t.Helper()
+		r, err := http.Post(ts.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+
+	// Two products, stock 10 each; only product 1 has a cart line against it.
+	if code := post("/api/addProduct", `{"args":[10]}`); code != 200 {
+		t.Fatalf("seed product 1: %d", code)
+	}
+	if code := post("/api/addProduct", `{"args":[10]}`); code != 200 {
+		t.Fatalf("seed product 2: %d", code)
+	}
+	if code := post("/api/addLine", `{"args":[1]}`); code != 200 {
+		t.Fatalf("seed cart line: %d", code)
+	}
+	if code := post("/api/checkout", `{"args":[]}`); code != 200 {
+		t.Fatalf("checkout: %d", code)
+	}
+
+	rows, _ := getJSON(t, ts.URL+"/api/Product")["rows"].([]any)
+	if len(rows) != 2 {
+		t.Fatalf("want 2 products, got %d", len(rows))
+	}
+	byID := map[int]int{}
+	for _, r := range rows {
+		m := r.(map[string]any)
+		byID[toInt(m["id"])] = toInt(m["stock"])
+	}
+	if byID[1] != 9 {
+		t.Errorf("product 1 (in the cart) should have decremented to 9, got %d", byID[1])
+	}
+	if byID[2] != 10 {
+		t.Errorf("product 2 (not in the cart) should be untouched at 10, got %d", byID[2])
+	}
+}
+
+// GAP 4 (fixed) — set-nested-key.fct: a `set` target's key may itself be a
+// nested entity lookup (`set Product(CartLine(lid).product).stock = 0`) and
+// must resolve through both lookups to the right row.
+const nestedKeySetApp = `app NestedKey:
+    entity Product:
+        id: int
+        stock: int
+    entity CartLine:
+        id: int
+        product: Product
+    action addProduct(stock: int):
+        add Product { stock: stock }
+    action addLine(product: Product):
+        add CartLine { product: product }
+    action zero(lid: int):
+        check Product(CartLine(lid).product).stock >= 1 "this line is fine"
+        set Product(CartLine(lid).product).stock = 0
+    view Home at "/":
+        box:
+            for p in Product by id:
+                text "{p.stock}"
+`
+
+func TestSetTargetWithNestedEntityLookupKey(t *testing.T) {
+	g, err := compile.String(nestedKeySetApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(apiReadEnv, "Product,CartLine")
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(path, body string) int {
+		t.Helper()
+		r, err := http.Post(ts.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+
+	if code := post("/api/addProduct", `{"args":[10]}`); code != 200 {
+		t.Fatalf("seed product: %d", code)
+	}
+	if code := post("/api/addLine", `{"args":[1]}`); code != 200 {
+		t.Fatalf("seed cart line: %d", code)
+	}
+	// lid=1 -> CartLine(1).product == 1 -> Product(1).stock = 0.
+	if code := post("/api/zero", `{"args":[1]}`); code != 200 {
+		t.Fatalf("zero: %d", code)
+	}
+
+	rows, _ := getJSON(t, ts.URL+"/api/Product")["rows"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 product, got %d", len(rows))
+	}
+	if got := toInt(rows[0].(map[string]any)["stock"]); got != 0 {
+		t.Errorf("nested-key set should have zeroed the looked-up product's stock, got %d", got)
+	}
+}
+
 // newTestFQStore builds an fqStore with no client behind it: these tests read the
 // buffered batch rather than sending it.
 func newTestFQStore(ents []ir.Entity) *fqStore {

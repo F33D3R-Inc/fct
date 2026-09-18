@@ -197,7 +197,7 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			return v
 		}
 		switch t.Name {
-		case "actor", "role", "tenantRole", "route":
+		case "actor", "role", "tenantRole", "route", "session":
 			return vtype{core: "text"}
 		case "verified":
 			return vtype{core: "bool"}

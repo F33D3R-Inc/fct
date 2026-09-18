@@ -6,10 +6,15 @@ What Facet is, what it can express today, and what it still needs to express
 ## The thesis
 
 Facet is a **compiler-first application language** — built specifically for making
-apps and sites, not a general-purpose language. One typed app graph, no
-frontend/backend split in the source, placement (server · client · edge) computed
-by the compiler. The language is organized around **five declaration families**,
-and the **placement calculus** decides how each materializes:
+apps and sites. The **declaration-first, placement-inferred surface** (`data` /
+`state` / `action` / `view` / effects) is deliberately not a general-purpose
+language — but as of 2026-09-17 that is no longer the whole story: see
+"Decision superseded: full self-hosting" near the end of this file for `proc`, a
+new, genuinely general-purpose peer declaration kind that carries self-hosting and
+all non-UI product logic. One typed app graph, no frontend/backend split in the
+source, placement (server · client · edge) computed by the compiler for the
+declarative families below. The language is organized around **five declaration
+families**, and the **placement calculus** decides how each materializes:
 
 1. **data** — entities, storage, relationships, queries, migrations
 2. **state** — local, shared, derived, persisted, replicated
@@ -116,16 +121,20 @@ avatar/badge) — Tier 2 (notifications, feeds) is already expressible on Tier 1
 | Generics / parametric polymorphism | 🟡→⬜ | **Next, scoped**: generic *components* & *collections* only |
 | Type inference | 🟡 | placement is inferred; value types are mostly annotated. Rows are typed through `for` variables and entity-typed component params (`component PostCard(t: Tweet)`), so `t.field` is checked and an id cannot stand in for a row |
 | Branded IDs / newtypes | ⬜ | Later |
-| First-class functions / closures | 🚫 | a general-purpose-language feature; fights the declaration-first model |
-| `async`/await | 🚫 | **subsumed by placement** — the compiler decides round-trips; there is no async to write |
-| Macros / metaprogramming | 🚫 | the IR + facets are the extension mechanism |
+| First-class functions / closures | ⬜ | **Next, critical path** (reclassified 2026-09-17) — landing as `proc`, a new general-purpose peer declaration kind, **not** by making `action` Turing-complete; `action`/`view` keep the declaration-first, placement-inferred model unchanged. See "Decision superseded: full self-hosting" below. |
+| `async`/await | 🚫 | **subsumed by placement** — the compiler decides round-trips; there is no async to write. Unaffected by the `proc` change: `proc` is unconditionally server-executed, so it has no round-trip to schedule either. |
+| Macros / metaprogramming | 🚫 | the IR + facets are the extension mechanism for the declarative surface; `proc` gives ordinary imperative code, not a macro/metaprogramming facility, so this stays out of scope for now |
 
-**Call:** add *just enough* core — **sum types + pattern matching + scoped
-generics** — to express variants, state machines, and typed errors. Stop there.
-Full first-class-function/closure/async machinery is explicitly **not** the goal;
-it would turn Facet into a general-purpose language and break the "compiler decides
-placement" contract. (We considered going general-purpose on 2026-06-20 and
-deliberately decided against it — the goal is to build a site, not a language.)
+**Call:** add *just enough* core to the declarative surface — **sum types +
+pattern matching + scoped generics** — to express variants, state machines, and
+typed errors in `data`/`state`/`action`/`view`. That surface stays
+declaration-first; general-purpose, Turing-complete code is **not** added to it.
+What changed 2026-09-17: general-purpose code is no longer rejected for Facet as a
+whole — it is required, for self-hosting and for all product logic (ML, codecs,
+crypto, etc.) — but it lands as the separate `proc` declaration kind (below), so
+`action`'s placement-inference contract is never retrofitted or weakened. (We
+considered going general-purpose on 2026-06-20 and decided against it then; that
+decision has since been superseded — see below.)
 
 ## 2 · Placement & authority
 
@@ -212,7 +221,10 @@ declares the effects it performs (`db.write`, `http`, `clock`, `random`, `email`
 them, and tests mock them. This is the single feature that (a) generalizes
 services, jobs, and impurity into one model, (b) makes placement provably sound at
 scale, and (c) unlocks email/SMS/push/queue integrations without one-off nodes. It
-is the most important thing on this roadmap after request→response calls.
+is the most important thing on the **declarative surface's** roadmap after
+request→response calls — `proc` + self-hosting (see "Next (v2)" above and
+"Decision superseded: full self-hosting" near the end) is the overall critical
+path and now comes first.
 
 ## 7 · Views & UI
 
@@ -330,26 +342,31 @@ as queries/jobs, streaming-output UI primitives.
 
 ### Next (v2) — the smallest set that makes Facet "express any app"
 1. ✅ **Request→response service calls** — bind a brain's result back into an action (shipped v1.18.0). This is the keystone for the F33D3R rebuild: fct is the edge brain (Nantar), a typed client of the mesh (AethyrRank/Ain Soph/Verity/Astraon/…). Next: typed records for structured payloads (today: scalars + lists).
-2. **The effects/capability system** — the keystone; generalizes services/jobs/impurity; unlocks email/push/queue.
-3. **Sum types + pattern matching + scoped generics** — variants, state machines, typed errors, generic components.
-4. **Typed error hierarchy** (rides #3).
-5. **Declarative data constraints** (unique/required/range) + **soft-delete/audit-fields**.
-6. **Forms with state** (dirty/touched/pending, array fields) + **error boundaries** + **a11y primitives**.
-7. **Tables + modal/drawer/toast** UI patterns (internal-tools dealbreakers).
-8. **DX: placement-explanation diagnostic** + **graph/IR inspector**.
-9. **Query depth: group-by + multi-hop joins.**
-10. **OpenAPI/JSON-schema export** + **typed config & feature flags.**
+2. **`proc` + full self-hosting** — **critical path (added 2026-09-17); blocks all f33d3r.com feature work until done.** New general-purpose, Turing-complete peer declaration kind, unconditionally server-executed, invoked from an `action` via `do ProcName(args)` over the existing `call Service.op()` request/response shape. Carries all product logic that must not hide behind opaque Rust/Go builtins (ML inference/training, video transcoding, live audio, cryptography) and, beyond that, the eventual rewrite of the fct compiler/runtime and facetql's engine internals in `.fct` — zero Rust/Go left in the toolchain. See "Decision superseded: full self-hosting" below.
+3. **The effects/capability system** — the keystone for the declarative surface; generalizes services/jobs/impurity; unlocks email/push/queue.
+4. **Sum types + pattern matching + scoped generics** — variants, state machines, typed errors, generic components.
+5. **Typed error hierarchy** (rides #4).
+6. **Declarative data constraints** (unique/required/range) + **soft-delete/audit-fields**.
+7. **Forms with state** (dirty/touched/pending, array fields) + **error boundaries** + **a11y primitives**.
+8. **Tables + modal/drawer/toast** UI patterns (internal-tools dealbreakers).
+9. **DX: placement-explanation diagnostic** + **graph/IR inspector**.
+10. **Query depth: group-by + multi-hop joins.**
+11. **OpenAPI/JSON-schema export** + **typed config & feature flags.**
 
 ### Later (v3+)
 Offline/local-first (§13) · edge placement & deploy · websocket realtime
 (presence/typing) · blob adapters/signed URLs/image transforms · full-text & vector
 search · streaming SSR/islands · desktop shell · saga/workflow primitives ·
 passkeys/WebAuthn · persistence classes (localStorage/TTL) · undo/redo · property &
-UI-render tests · AI-era features (§15).
+UI-render tests · AI-era features (§15) · **compiling the Go interpreter to WASM**
+and shipping that in place of `runtime/assets/facet.js`'s hand-ported optimistic-UI
+semantics for `action` (noted future direction, not urgent — `proc`, being
+server-only, never needs a JS mirror, so this only matters for `action`'s existing
+client-side prediction).
 
 ### Out of scope (a feature, not a gap)
 - **`async`/await** — placement subsumes it; there is no round-trip to hand-write.
-- **First-class functions / closures / macros** — would make Facet general-purpose and break declaration-first placement. The IR + facets are the extension mechanism.
+- **First-class functions / closures — superseded 2026-09-17, no longer out of scope for Facet as a whole.** See "Decision superseded: full self-hosting" below: general-purpose code is now required, for self-hosting and for all product logic (ML, transcoding, audio, crypto). It lands as `proc`, a new general-purpose peer declaration kind — `action`/`view` are not retrofitted and keep declaration-first placement. **Macros / metaprogramming** remain out of scope: `proc` supplies ordinary imperative code, not a macro facility, so the IR + facets are still the extension mechanism for the declarative surface.
 - **GraphQL / gRPC parallel APIs** — the IR-derived JSON API is the single contract.
 - **Raw escape hatches** (inline SQL, arbitrary FFI) — allowed only as explicit, typed, placement-annotated capabilities, never as an unchecked back door. "No anonymous effects" is the whole point.
 
@@ -370,3 +387,55 @@ stays a **declaration-first application language** where the compiler owns
 placement. Everything in "Next" is sized to that line. Revisit only if the goal
 itself changes from "build my site" to "build a language" — and only with a real
 reason.
+
+This decision is kept here as a historical record, not deleted: it is *why* the
+codebase looks the way it does today — e.g. why `internal/ir/build.go`'s
+whole-action analysis assumes flat, non-branching actions. It was superseded
+2026-09-17; see immediately below.
+
+## Decision superseded (2026-09-17): full self-hosting
+
+The reason from 2026-06-20 held for about three months, and then the goal itself
+changed — the exact condition that section named for revisiting it. The new mandate, decided
+explicitly by the project owner: **all product logic — ML inference/training,
+video transcoding, live audio, cryptography, all of it — must be authored as
+ordinary `.fct` source**, never hidden behind opaque Rust/Go builtins. Beyond that,
+the `fct` compiler/runtime itself, and `facetql`'s (the Rust database engine `fct`
+talks to) engine internals, must themselves eventually be rewritten in `.fct` —
+full self-hosting, **zero Rust/Go remaining anywhere in the toolchain**, no
+exceptions. This is now the critical path: no f33d3r.com feature work starts until
+self-hosting is complete (see "Next (v2)" item 2 above).
+
+**The resolution is not to retrofit Turing-completeness into `action`.** `action`'s
+existing guarantees — placement-inference soundness, `@e2e` seal-dataflow (§2),
+`@optimistic` client-side prediction (§6) — depend on the whole-action analysis
+that the 2026-06-20 decision (above) describes, which assumes flat, non-branching
+actions. Bolting general-purpose control flow onto that model would break exactly
+the soundness properties existing tests and apps (`journal`, `storefront`, `game`)
+depend on.
+
+Instead, general-purpose code gets a **new peer declaration kind: `proc`.**
+
+- A `proc` is genuinely general-purpose — ordinary imperative code, unrestricted
+  control flow — and is the home for compiler passes, storage-engine code, codecs,
+  ML math, and cryptography.
+- A `proc` is **unconditionally server-executed**. It needs no placement inference:
+  an arbitrary loop has no statically decidable client/server split, so the
+  question placement inference answers for `action` doesn't arise for `proc`.
+- A `proc` is called from an `action` via **`do ProcName(args)`**, reusing the
+  existing `call Service.op()` request/response shape rather than inventing a new
+  calling convention.
+- This also resolves a standing, unrelated problem: `runtime/assets/facet.js`
+  hand-mirrors `action` semantics in JS for optimistic UI, and has to be kept in
+  lockstep with the Go interpreter by hand. Since every `proc` is server-only,
+  `proc` never needs a client-side JS mirror at all.
+- Noted for later, not needed yet (see "Later (v3+)" above): the longer-term fix
+  for keeping `action` and `facet.js` in sync is to compile the same Go
+  interpreter to WASM and ship that, instead of hand-porting semantics to JS.
+
+Net effect on this document: `action`/`view` and the declaration-first, placement-
+inferred model are **unchanged** — that surface still deliberately stays
+non-general-purpose, per the 2026-06-20 reasoning. What changed is that Facet as a
+whole is no longer confined to that surface: `proc` sits beside it as the
+general-purpose home for self-hosting and for product logic that must not be a
+black-box builtin.

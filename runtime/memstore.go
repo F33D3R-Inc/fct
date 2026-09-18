@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -81,13 +82,63 @@ func (s *memStore) Save(entity string, row map[string]any) error {
 func (s *memStore) Delete(entity string, id any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.deleteCascade(entity, map[int]bool{toInt(id): true})
+	ids := map[int]bool{toInt(id): true}
+	if err := s.checkRestrict(entity, ids); err != nil {
+		return err
+	}
+	s.deleteCascade(entity, ids)
 	return nil
 }
 
-// deleteCascade removes the given parent rows and, following the reverse-relation
-// graph, every child row that referenced them — the same effect as the database's
-// ON DELETE CASCADE.
+// checkRestrict walks the same reverse-relation graph deleteCascade does,
+// failing before anything is mutated if a `@restrict` relation still has a row
+// pointing at one of the ids about to be removed. It has to run first and
+// separately, rather than fail partway through deleteCascade, because a delete
+// is one operation: finding the violation after some rows are already gone
+// would leave the working set half-applied, which is exactly what the rest of
+// this store (Save/Delete/Clear, the transaction in Begin) is built to avoid.
+//
+// `@setNull` children are not walked further — they survive the delete with
+// their reference cleared, so nothing beneath them is at risk from THIS delete
+// — but a plain (cascade) child is, so the walk recurses through it exactly as
+// deleteCascade will.
+func (s *memStore) checkRestrict(entity string, ids map[int]bool) error {
+	for _, ch := range s.children[entity] {
+		var refIDs map[int]bool
+		for _, r := range s.rows[ch.Entity] {
+			if m, ok := r.(record); ok && ids[toInt(m[ch.Field])] {
+				if refIDs == nil {
+					refIDs = map[int]bool{}
+				}
+				refIDs[toInt(m["id"])] = true
+			}
+		}
+		if len(refIDs) == 0 {
+			continue
+		}
+		switch ch.OnDelete {
+		case "restrict":
+			return fmt.Errorf("cannot delete %s: %d row(s) in %s.%s still reference it (on delete restrict)",
+				entity, len(refIDs), ch.Entity, ch.Field)
+		case "setNull":
+			// These children survive (their reference is cleared, not removed), so
+			// nothing further down this edge is threatened by this delete.
+		default: // cascade
+			if err := s.checkRestrict(ch.Entity, refIDs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// deleteCascade removes the given parent rows and, following the
+// reverse-relation graph, applies each child relation's own rule: a plain
+// (cascade) relation loses the referencing row too, exactly as the database's
+// ON DELETE CASCADE would; a `@setNull` relation keeps the row and clears the
+// reference instead. A `@restrict` relation never reaches here with a row still
+// pointing at what is being removed — checkRestrict already refused the whole
+// delete in that case — so it needs no case of its own.
 func (s *memStore) deleteCascade(entity string, ids map[int]bool) {
 	rows := s.rows[entity]
 	kept := rows[:0:0]
@@ -99,6 +150,14 @@ func (s *memStore) deleteCascade(entity string, ids map[int]bool) {
 	}
 	s.rows[entity] = kept
 	for _, ch := range s.children[entity] {
+		if ch.OnDelete == "setNull" {
+			for _, r := range s.rows[ch.Entity] {
+				if m, ok := r.(record); ok && ids[toInt(m[ch.Field])] {
+					m[ch.Field] = nil
+				}
+			}
+			continue
+		}
 		childIDs := map[int]bool{}
 		for _, r := range s.rows[ch.Entity] {
 			if m, ok := r.(record); ok && ids[toInt(m[ch.Field])] {
@@ -134,6 +193,9 @@ func (s *memStore) Clear(entity string) error {
 		if m, ok := r.(record); ok {
 			ids[toInt(m["id"])] = true
 		}
+	}
+	if err := s.checkRestrict(entity, ids); err != nil {
+		return err
 	}
 	s.deleteCascade(entity, ids)
 	return nil

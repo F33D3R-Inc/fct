@@ -38,6 +38,7 @@ type Server struct {
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
 	byService   map[string]*ir.Service
+	byProc      map[string]*ir.Proc     // proc name -> its IR, for `do ProcName(args)`
 	byRecord    map[string]*ir.Record   // record name -> its field schema, for decoding a structured service reply
 	triggers    map[string][]ir.Trigger // source action name -> reactions to run on its success
 	gated       map[string][]gatedField // entity -> @requires-gated fields (API per-actor, never SSE)
@@ -166,6 +167,7 @@ func newServer(graph *ir.IR) *Server {
 		byPolicy:    map[string]*ir.Policy{},
 		byComponent: map[string]*ir.Component{},
 		byService:   map[string]*ir.Service{},
+		byProc:      map[string]*ir.Proc{},
 		byRecord:    map[string]*ir.Record{},
 		triggers:    map[string][]ir.Trigger{},
 		gated:       map[string][]gatedField{},
@@ -201,6 +203,9 @@ func newServer(graph *ir.IR) *Server {
 	}
 	for i := range graph.Services {
 		s.byService[graph.Services[i].Name] = &graph.Services[i]
+	}
+	for i := range graph.Procs {
+		s.byProc[graph.Procs[i].Name] = &graph.Procs[i]
 	}
 	for i := range graph.Records {
 		s.byRecord[graph.Records[i].Name] = &graph.Records[i]
@@ -840,9 +845,14 @@ func (s *Server) fanout(deltas map[string]any) {
 // from the very same actor can still disagree about the fields a policy reads:
 // `tenant`/`tenantRole` are per-session (the active tenant), so the same person
 // switched into two different tenants in two tabs must be evaluated separately.
+// `session` is included for the same reason: two anonymous, never-logged-in
+// connections share the same actor/role ("guest"/"guest") and the same (empty)
+// tenant, so a `read:` clause distinguishing them by `session` — the anonymous-
+// cart case `session` exists for — would otherwise see them collapse into one
+// group and be filtered against whichever one of them connected first.
 func identityKey(scope map[string]any) string {
-	return fmt.Sprintf("%v\x00%v\x00%v\x00%v\x00%v",
-		scope["actor"], scope["role"], scope["verified"], scope["tenant"], scope["tenantRole"])
+	return fmt.Sprintf("%v\x00%v\x00%v\x00%v\x00%v\x00%v",
+		scope["actor"], scope["role"], scope["verified"], scope["tenant"], scope["tenantRole"], scope["session"])
 }
 
 // handlePage routes the request to the view whose path matches, server-renders
@@ -1744,6 +1754,30 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 					s.callService(sv.URL, st.Field, body) // fire-and-forget
 				}
 			}
+		case "do":
+			// A proc call: same-process, synchronous, in-binary — not a network
+			// round-trip like "call" above, so there is no URL to post to and
+			// nothing to fail on unavailability. The compiler proved this action
+			// (and the proc itself) run on the authority.
+			if p := s.byProc[st.Service]; p != nil {
+				argVals := make([]any, len(st.Args))
+				for i, arg := range st.Args {
+					argVals[i] = eval(arg, scope)
+				}
+				res, err := s.runProcLocked(p, argVals)
+				if err != nil {
+					s.obs.metrics.observeAction(act.Name, "proc_error")
+					return nil, http.StatusInternalServerError, fmt.Sprintf("%s: proc %s failed: %v", act.Name, st.Service, err)
+				}
+				if st.Bind != "" {
+					// The bound result joins the ACTION's own scope, exactly like a
+					// service call's bind — it is not written into sess/deltas unless
+					// a later statement explicitly assigns it into a state cell. The
+					// proc's OWN internal `let` locals never reach here at all: they
+					// lived only in the frame runProcLocked built and discarded.
+					scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
+				}
+			}
 		}
 		// keep entity collections in scope fresh for later statements.
 		for ent := range entChanged {
@@ -1783,6 +1817,172 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 	s.recordAudit(actor, act.Name, true, "")
 	s.obs.metrics.observeAction(act.Name, "ok")
 	return deltas, http.StatusOK, ""
+}
+
+// runProcLocked runs a proc synchronously, in-process, under the caller's lock
+// (an action's `do ProcName(args)`, or another proc's). Unlike runActionLocked
+// above, it has no placement to compute (a proc is unconditionally
+// server-executed), no policy gate, no entity/session state to read or write,
+// and no wire deltas to produce — it is pure computation over a fresh frame of
+// its own: one scope-frame chain (runtime/eval.go's `frame`) built fresh for this
+// call, holding only its parameters and its `let`-bound locals. That frame is
+// never the caller's scope map, so a proc-local can share a name with a state
+// cell, an entity, or the calling action's own parameter without aliasing or
+// leaking into it — when the proc returns, the frame (and everything in it) is
+// simply discarded; only the `return`ed value crosses back to the caller.
+//
+// The body itself is interpreted by execProcBlock, a genuinely recursive
+// tree-walker (Milestone 2: `loop`/`if` bodies nest). A proc whose body falls
+// off the end without a `return` — only possible when it declares no return
+// type, since internal/ir/build.go's stmtsReturnComplete refuses that for a
+// return-typed proc — simply yields nil.
+func (s *Server) runProcLocked(p *ir.Proc, args []any) (any, error) {
+	fr := &frame{vars: map[string]any{}}
+	for i, prm := range p.Params {
+		var v any
+		if i < len(args) {
+			v = args[i]
+		} else {
+			v = zero(prm.Type)
+		}
+		fr.vars[prm.Name] = v
+	}
+	c, err := s.execProcBlock(p.Body, fr)
+	if err != nil {
+		return nil, err
+	}
+	return c.val, nil
+}
+
+// ctlKind distinguishes how a proc block finished, so a `return` can unwind
+// every nested loop/if it is inside (all the way out of the proc) while
+// `break`/`continue` stop or restart exactly one enclosing loop and go no
+// further — the standard tree-walking-interpreter control-transfer signal,
+// threaded back up through execProcBlock's recursive calls and checked after
+// every statement/nested block so it propagates correctly.
+type ctlKind int
+
+const (
+	ctlNone     ctlKind = iota // fell off the end of this block normally
+	ctlReturn                  // `return`: unwind all the way out of the proc
+	ctlBreak                   // `break`: stop the nearest enclosing loop
+	ctlContinue                // `continue`: skip to the nearest enclosing loop's next condition check
+)
+
+// ctlSignal is what execProcBlock and its loop/if helpers pass back up: which
+// of the four things happened, and — for ctlReturn only — the value the proc
+// returns.
+type ctlSignal struct {
+	kind ctlKind
+	val  any
+}
+
+// execProcBlock runs one nested statement list — a proc's own top-level body,
+// or a `loop`/`if` statement's own Body/Else — against frame fr, in source
+// order, stopping early the moment a statement (or a nested block it calls
+// into) produces a non-ctlNone signal so nothing after it ever runs; that
+// signal is simply returned to the caller, which is what makes a `return`
+// inside an `if` inside a `loop` unwind every one of those levels: each level
+// just forwards whatever its nested call handed back instead of only checking
+// its own immediate statements.
+func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
+	for _, st := range body {
+		switch st.Op {
+		case "let":
+			// Declares fresh in this frame; internal/ir/build.go already refused a
+			// name already in scope, so there is nothing to accidentally shadow.
+			fr.vars[st.Target] = evalInFrame(st.Value, fr)
+		case "assign":
+			// A `let mut` reassignment; the compiler guarantees st.Target was already
+			// declared somewhere in the enclosing frame chain, so frame.set always
+			// finds and updates it in place — including a local declared OUTSIDE a
+			// loop and reassigned inside it, which is how an accumulator persists
+			// across iterations instead of resetting.
+			fr.set(st.Target, evalInFrame(st.Value, fr))
+		case "do":
+			sub := s.byProc[st.Service]
+			if sub == nil {
+				return ctlSignal{}, fmt.Errorf("calls unknown proc %q", st.Service)
+			}
+			subArgs := make([]any, len(st.Args))
+			for i, a := range st.Args {
+				subArgs[i] = evalInFrame(a, fr)
+			}
+			res, err := s.runProcLocked(sub, subArgs)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			if st.Bind != "" {
+				fr.vars[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
+			}
+		case "return":
+			return ctlSignal{kind: ctlReturn, val: evalInFrame(st.Value, fr)}, nil
+		case "break":
+			return ctlSignal{kind: ctlBreak}, nil
+		case "continue":
+			return ctlSignal{kind: ctlContinue}, nil
+		case "loop":
+			sig, err := s.execProcLoop(st, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			if sig.kind == ctlReturn {
+				return sig, nil
+			}
+			// ctlNone: the loop's condition started (or ended) false; carry on to
+			// whatever follows the loop in this block.
+		case "if":
+			branch := st.Else
+			if truthy(evalInFrame(st.Value, fr)) {
+				branch = st.Body
+			}
+			if branch == nil {
+				continue // the untaken side of a one-armed `if` — nothing to run
+			}
+			// Runs directly against fr, not a child frame: only one branch ever
+			// executes per pass through this block, so a `let` declared inside it
+			// cannot collide with the other (unreached) branch, and the compiler
+			// already refused any reference to it once the `if` ends.
+			sig, err := s.execProcBlock(branch, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			if sig.kind != ctlNone {
+				return sig, nil
+			}
+		}
+	}
+	return ctlSignal{}, nil
+}
+
+// execProcLoop runs a `loop <cond>:` statement's iterations. Each pass gets its
+// own fresh child frame chained to fr, so a `let` declared inside the loop body
+// is redeclared clean every iteration instead of accumulating stale bindings —
+// while a `let mut` declared OUTSIDE the loop and reassigned inside it resolves
+// through the chain to the same outer slot every time (frame.set walks parent
+// links), which is what makes an accumulator actually accumulate.
+//
+// A `return` from anywhere inside the loop body (however deeply nested in its
+// own if/loop statements) is handed straight back to the caller, unwinding out
+// of the loop entirely. `break` stops iterating and lets execProcBlock resume
+// with whatever follows the loop; `continue` simply moves on to the next
+// condition check.
+func (s *Server) execProcLoop(st ir.Stmt, fr *frame) (ctlSignal, error) {
+	for truthy(evalInFrame(st.Value, fr)) {
+		child := &frame{vars: map[string]any{}, parent: fr}
+		sig, err := s.execProcBlock(st.Body, child)
+		if err != nil {
+			return ctlSignal{}, err
+		}
+		switch sig.kind {
+		case ctlReturn:
+			return sig, nil
+		case ctlBreak:
+			return ctlSignal{}, nil
+		}
+		// ctlNone or ctlContinue: re-check the condition and go again.
+	}
+	return ctlSignal{}, nil
 }
 
 // policyPasses evaluates one permission check against the action scope. A
@@ -1890,6 +2090,29 @@ func (s *Server) commit(ops []durOp) error {
 func (s *Server) cascadeMem(parent string, removedIDs map[int]bool, entChanged map[string]bool, undo *undoLog) {
 	for _, ch := range s.children[parent] {
 		rows := s.entities[ch.Entity]
+		// `@setNull`: the child row survives — the store clears its reference
+		// rather than deleting it (memStore.deleteCascade) — so the cache mirrors
+		// that as a field edit, not a row removal, and does not recurse: nothing
+		// beneath a surviving row was touched by this delete.
+		if ch.OnDelete == "setNull" {
+			changed := false
+			for _, r := range rows {
+				if m, ok := r.(record); ok && removedIDs[toInt(m[ch.Field])] {
+					undo.field(m, ch.Field)
+					m[ch.Field] = nil
+					changed = true
+				}
+			}
+			if changed {
+				entChanged[ch.Entity] = true
+			}
+			continue
+		}
+		// `@restrict` never reaches here with a live reference: the store refuses
+		// the whole delete first (memStore.checkRestrict), the commit fails, and
+		// undo.rollback discards whatever this function did before that failure
+		// was known — so it falls through to the same cascade the unmarked default
+		// gets, and is a no-op whenever it matters.
 		kept := rows[:0:0]
 		childRemoved := map[int]bool{}
 		for _, r := range rows {
@@ -1921,16 +2144,23 @@ func (s *Server) persist(err error) error {
 }
 
 // scope builds the evaluation scope for a session: durable entities + per-session
-// server state + the session identity (actor/role/verified). Client states are
-// not here (the authority cannot see them; the compiler guarantees server
-// actions never read them).
+// server state + the session identity (actor/role/verified/session). Client
+// states are not here (the authority cannot see them; the compiler guarantees
+// server actions never read them).
 func (s *Server) scope(sid string) map[string]any {
 	ses := s.sessions[sid]
 	actor, role, verified := "guest", "guest", false
 	if ses != nil {
 		actor, role, verified = ses.actor, ses.role, ses.verified
 	}
-	scope := map[string]any{"actor": actor, "role": role, "verified": verified}
+	// `session` is the raw session id itself: unlike `actor` (which stays "guest"
+	// until login), it is stable for a caller from the moment their browser first
+	// arrives (see Server.session), so it is what a pre-login, anonymous visitor
+	// can key state to — an anonymous cart, kept by browser rather than by
+	// account. apiScope can pass sid == "" for a cookieless machine caller; that
+	// is a legitimate value here too (an identity that resolves to "no session"),
+	// not an error.
+	scope := map[string]any{"actor": actor, "role": role, "verified": verified, "session": sid}
 	// Phase 6: the session's active tenant and the actor's role within it, exposed
 	// to the graph like `actor`/`role` so policies can scope rows by `tenant`.
 	tid := activeTenant(ses)

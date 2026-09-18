@@ -43,9 +43,10 @@ import (
 // ── what an actor may receive ───────────────────────────────────────────────
 
 // visibleRows is the single answer to "what may this actor receive of these
-// rows". It drops every `@requires`-gated field whose read policy the scope's
-// actor fails. The JSON API, the page bootstrap, the region endpoint and the
-// live stream all call this — an entity row reaches a client through no other
+// rows". It fills in every entity-carried `derive` field (ast.Entity.Derives)
+// and drops every `@requires`-gated field whose read policy the scope's actor
+// fails. The JSON API, the page bootstrap, the region endpoint and the live
+// stream all call this — an entity row reaches a client through no other
 // door, because a second, parallel filter is exactly what let `fa-state` serve
 // what `GET /api/<Entity>` withheld.
 //
@@ -53,6 +54,7 @@ import (
 // dropped: that is the correct reading for the SSE stream, which fans one
 // payload out to all subscribers and cannot authorize any of them.
 func (s *Server) visibleRows(entity string, rows any, scope map[string]any) any {
+	rows = s.applyDerives(entity, rows, scope)
 	if len(s.gated[entity]) == 0 {
 		return rows // no gated fields on this entity: nothing to decide, no copy
 	}
@@ -60,6 +62,90 @@ func (s *Server) visibleRows(entity string, rows any, scope map[string]any) any 
 		scope = map[string]any{} // never nil: a policy with an aggregate writes its item var into the scope
 	}
 	return stripFields(rows, s.gateForActor(entity, scope))
+}
+
+// applyDerives computes every entity-carried `derive` field this entity
+// declares (ir.Entity.Derives, see ast.Entity.Derives's own doc) fresh from
+// each row's OWN current fields, and returns rows carrying them as ordinary
+// keys — so a view's `{line.lineTotal}`, a for-loop's row var, and the JSON
+// API's marshaled row all see it exactly the way they see a real column,
+// with no further special-casing anywhere downstream.
+//
+// It is the entity-scoped analog of applyReadPolicy/renameRowVar for
+// ent.Read: that mechanism folds a compiled, "$row"-rooted predicate into a
+// query's own predicate at the point a row is tested; this one evaluates a
+// compiled, "$row"-rooted expression at the point a row is handed to a
+// client. Nothing here is cached — every call recomputes from the row's
+// current values, so a `set` on a field a derive reads is reflected the
+// instant the row is next projected, never stale.
+//
+// It runs unconditionally from visibleRows (not gated behind "any @requires
+// fields?" the way stripFields is), because a derive has nothing to do with
+// field-read authorization — an entity with no derives pays one no-op map
+// lookup and gets its rows back unchanged.
+func (s *Server) applyDerives(entity string, rows any, scope map[string]any) any {
+	ent, ok := s.entityByName(entity)
+	if !ok || len(ent.Derives) == 0 {
+		return rows
+	}
+	list, ok := rows.([]any)
+	if !ok {
+		return rows
+	}
+	out := make([]any, len(list))
+	for i, r := range list {
+		rec, ok := r.(record)
+		if !ok {
+			out[i] = r
+			continue
+		}
+		c := make(record, len(rec)+len(ent.Derives))
+		for k, v := range rec {
+			c[k] = v
+		}
+		row := cloneScope(scope)
+		row["$row"] = c
+		for _, d := range ent.Derives {
+			c[d.Name] = eval(d.Expr, row)
+		}
+		out[i] = c
+	}
+	return out
+}
+
+// entityDeriveValue evaluates one entity-carried derive (ast.Entity.Derives)
+// against an already-resolved row, for the one read path applyDerives does not
+// cover: a bare `Entity(key).field` lookup (ir "eget" with Field set) — eval's
+// "eget" case in eval.go falls back to this when the field it asked for is not
+// an actual key of the row it found. A `for` region's rows (and everything
+// else a client ever sees) already carry every derive as a real key by the
+// time anything reads them, because listRows/the JSON API/the live stream all
+// go through visibleRows -> applyDerives before a single field of a row is
+// read; a keyed lookup is the one shape that walks straight past that and
+// reads the row directly.
+//
+// It needs the compiled entity (for its Derives) and is only reachable with
+// one in hand: materializerOf(scope) is non-nil only during a page render (see
+// its own doc), so an action or a policy reading `Entity(key).someDerive`
+// still gets nil here — the same answer this language has always given an
+// eget field it does not recognize from those contexts.
+func entityDeriveValue(scope map[string]any, entity, field string, row record) (any, bool) {
+	m := materializerOf(scope)
+	if m == nil || m.s == nil {
+		return nil, false
+	}
+	ent, ok := m.s.entityByName(entity)
+	if !ok {
+		return nil, false
+	}
+	for _, d := range ent.Derives {
+		if d.Name == field {
+			sub := cloneScope(scope)
+			sub["$row"] = row
+			return eval(d.Expr, sub), true
+		}
+	}
+	return nil, false
 }
 
 // visibleRowList is visibleRows for a row slice, keeping the slice type so the
@@ -423,7 +509,7 @@ func (s *Server) filterByReadPolicy(ent ir.Entity, rows []any, scope map[string]
 
 // identityScope is the subset of a full render scope (s.scope) an entity's
 // `read:` clause can actually evaluate: `actor` plus the other identity builtins
-// `withActor` admits — role, verified, tenant, tenantRole. It deliberately
+// `withActor` admits — role, verified, tenant, tenantRole, session. It deliberately
 // leaves out everything else s.scope builds, in particular the whole entity
 // working set, because a live SSE subscriber (see handleLive) keeps this for the
 // life of its connection: the rows a `read:` clause is tested against always
@@ -434,7 +520,7 @@ func (s *Server) identityScope(sid string) map[string]any {
 	full := s.scope(sid)
 	return map[string]any{
 		"actor": full["actor"], "role": full["role"], "verified": full["verified"],
-		"tenant": full["tenant"], "tenantRole": full["tenantRole"],
+		"tenant": full["tenant"], "tenantRole": full["tenantRole"], "session": full["session"],
 	}
 }
 

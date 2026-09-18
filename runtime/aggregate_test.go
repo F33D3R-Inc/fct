@@ -266,6 +266,65 @@ func TestTheStoreAndTheMirrorAnswerIdentically(t *testing.T) {
 	}
 }
 
+// ── sum of an expression, not just a bare field ─────────────────────────────
+
+// GAP 3 (fixed) — sum-bare-field.fct: `sum` reduces an arbitrary per-row
+// expression, not only a bare column, so a cart subtotal (Σ qty × price) needs
+// no denormalised stored column kept in step by hand:
+// `sum(l.qty * l.unitPrice in CartLine where l.owner == "ana")`.
+//
+// resolveAgg refuses to push a Sel-carrying aggregate down to the store (see
+// region.go), so this is exercised purely through the interpreter/mirror path —
+// which is exactly the path that had no way to express this before Agg.Sel
+// existed.
+const cartSubtotalApp = `app CartSum:
+    entity CartLine:
+        id: int
+        owner: text
+        qty: int
+        unitPrice: int
+    action addLine(owner: text, qty: int, unitPrice: int):
+        add CartLine { owner: owner, qty: qty, unitPrice: unitPrice }
+    view Home at "/":
+        box:
+            text "ana {sum(l.qty * l.unitPrice in CartLine where l.owner == "ana")}"
+            text "bo {sum(l.qty * l.unitPrice in CartLine where l.owner == "bo")}"
+`
+
+func TestSumOfAnExpressionAcrossRows(t *testing.T) {
+	g, err := compile.String(cartSubtotalApp)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Shutdown)
+
+	for _, row := range [][]any{
+		{"ana", 2, 3},  // 6
+		{"ana", 1, 10}, // 10 -> ana subtotal 16
+		{"bo", 5, 2},   // 10 -> bo subtotal 10
+	} {
+		if _, status, msg := srv.runAction(systemSID, srv.byAction["addLine"], row); status != 200 {
+			t.Fatalf("seeding a line: %d %s", status, msg)
+		}
+	}
+
+	html := renderLedger(t, srv)
+	// Each aggregate renders inside its own binding span (see
+	// TestReductionsResolveThroughTheStore above), so the value is asserted
+	// rather than the label next to it. The two subtotals are distinct numbers,
+	// so each is unambiguous on its own.
+	if !strings.Contains(html, ">16<") {
+		t.Errorf("ana's subtotal should be 16 (2*3 + 1*10):\n%s", html)
+	}
+	if !strings.Contains(html, ">10<") {
+		t.Errorf("bo's subtotal should be 10 (5*2):\n%s", html)
+	}
+}
+
 // ── the wire to FacetQL ─────────────────────────────────────────────────────
 
 // fqAggServer stands in for FacetQL: it records the last request body and

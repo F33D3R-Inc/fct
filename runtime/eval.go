@@ -14,6 +14,93 @@ import (
 // record is one entity row.
 type record = map[string]any
 
+// frame is one proc invocation's local scope: its parameters plus its
+// `let`-bound locals, distinct from the flat action/session `map[string]any`
+// scope runActionLocked reads — a proc's scratch variable must never alias or
+// leak into session state or wire deltas, which a shared map could not guarantee
+// (a proc-local named the same as a state cell or an action parameter would
+// silently collide). It chains to a parent so a nested block can shadow an
+// outer local without a flat namespace: runProcLocked builds the proc's own
+// top-level frame (parent == nil), and execProcBlock (runtime/server.go) gives
+// each `loop` iteration a fresh child frame chained to the frame it was called
+// with, so a loop-local declared inside the body doesn't survive past that one
+// pass while a `let mut` declared OUTSIDE the loop and reassigned inside it
+// still resolves (via frame.set walking the chain) to the same outer slot every
+// iteration — the whole point of an accumulator.
+type frame struct {
+	vars   map[string]any
+	parent *frame
+}
+
+// get resolves a name by walking the frame chain from the innermost scope
+// outward.
+func (f *frame) get(name string) (any, bool) {
+	for fr := f; fr != nil; fr = fr.parent {
+		if v, ok := fr.vars[name]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+// set reassigns name in whichever frame of the chain already declares it (a
+// `let mut` local written back to by a plain `name = expr`); the compiler
+// guarantees the name was declared by a `let` first, so it is always found.
+func (f *frame) set(name string, v any) {
+	for fr := f; fr != nil; fr = fr.parent {
+		if _, ok := fr.vars[name]; ok {
+			fr.vars[name] = v
+			return
+		}
+	}
+	f.vars[name] = v
+}
+
+// evalInFrame evaluates an IR expression against a proc's frame chain instead of
+// the flat scope map eval() reads — the resolver a proc's own scope needs (see
+// frame, above). A proc's expressions are restricted at compile time
+// (internal/ir/build.go, checkProcExpr) to literals, its own locals/params,
+// arithmetic/comparison/boolean operators, and pure builtins — never a state
+// read, an entity/aggregate read, or client reactive state — so those are the
+// only IR node kinds this needs to know about. Where the logic is identical to
+// eval's (binary/unary operators, builtin calls), it delegates to the same
+// helpers eval uses, so the two interpreters cannot silently drift apart.
+func evalInFrame(e *ir.Expr, fr *frame) any {
+	if e == nil {
+		return nil
+	}
+	switch e.Kind {
+	case "lit":
+		return litValue(e)
+	case "list":
+		out := make([]any, len(e.Args))
+		for i, el := range e.Args {
+			out[i] = evalInFrame(el, fr)
+		}
+		return out
+	case "ref":
+		v, _ := fr.get(e.Name)
+		return v
+	case "un":
+		x := evalInFrame(e.X, fr)
+		switch e.Op {
+		case "!":
+			return !truthy(x)
+		case "-":
+			return -toInt(x)
+		}
+	case "bin":
+		return applyBin(e.Op, evalInFrame(e.L, fr), evalInFrame(e.R, fr))
+	case "call":
+		args := make([]any, len(e.Args))
+		for i, a := range e.Args {
+			args[i] = evalInFrame(a, fr)
+		}
+		return callBuiltin(e.Name, args)
+	}
+	return nil
+}
+
 // eval interprets an IR expression over a scope (state + entities + locals like
 // action params, item vars, and `actor`). It is the server half of the one
 // shared expression semantics (the client half is assets/facet.js); both must
@@ -96,7 +183,16 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 				if e.Field == "" {
 					return m // `Post(id)`: the row itself
 				}
-				return m[e.Field]
+				if v, ok := m[e.Field]; ok {
+					return v
+				}
+				// Not a stored key: `Post(id).lineTotal` may be naming an
+				// entity-carried derive (ast.Entity.Derives), which is never a
+				// map entry — see entityDeriveValue.
+				if v, ok := entityDeriveValue(scope, e.Name, e.Field, m); ok {
+					return v
+				}
+				return nil
 			}
 		}
 		return nil
@@ -269,56 +365,64 @@ func evalRest(e *ir.Expr, scope map[string]any) any {
 			return -toInt(x)
 		}
 	case "bin":
-		l := eval(e.L, scope)
-		r := eval(e.R, scope)
-		switch e.Op {
-		case "&&":
-			return truthy(l) && truthy(r)
-		case "||":
-			return truthy(l) || truthy(r)
-		case "+":
-			if ls, ok := l.(string); ok {
-				return ls + toStr(r)
-			}
-			if rs, ok := r.(string); ok {
-				return toStr(l) + rs
-			}
-			return toInt(l) + toInt(r)
-		case "-":
-			return toInt(l) - toInt(r)
-		case "*":
-			return toInt(l) * toInt(r)
-		case "/":
-			if toInt(r) == 0 {
-				return 0
-			}
-			return toInt(l) / toInt(r)
-		case "%":
-			if toInt(r) == 0 {
-				return 0
-			}
-			return toInt(l) % toInt(r)
-		case "==":
-			return equal(l, r)
-		case "!=":
-			return !equal(l, r)
-		case "<":
-			return toInt(l) < toInt(r)
-		case "<=":
-			return toInt(l) <= toInt(r)
-		case ">":
-			return toInt(l) > toInt(r)
-		case ">=":
-			return toInt(l) >= toInt(r)
-		case "in":
-			items, _ := r.([]any)
-			for _, el := range items {
-				if equal(l, el) {
-					return true
-				}
-			}
-			return false
+		return applyBin(e.Op, eval(e.L, scope), eval(e.R, scope))
+	}
+	return nil
+}
+
+// applyBin evaluates one binary operator over its already-evaluated operands.
+// Split out of evalRest's "bin" case so evalInFrame (a proc body's expression
+// evaluator, which has no flat scope map to hand eval) can share the exact same
+// operator semantics rather than reimplementing them — eval() and evalInFrame()
+// must never disagree about what `+`/`==`/etc. mean.
+func applyBin(op string, l, r any) any {
+	switch op {
+	case "&&":
+		return truthy(l) && truthy(r)
+	case "||":
+		return truthy(l) || truthy(r)
+	case "+":
+		if ls, ok := l.(string); ok {
+			return ls + toStr(r)
 		}
+		if rs, ok := r.(string); ok {
+			return toStr(l) + rs
+		}
+		return toInt(l) + toInt(r)
+	case "-":
+		return toInt(l) - toInt(r)
+	case "*":
+		return toInt(l) * toInt(r)
+	case "/":
+		if toInt(r) == 0 {
+			return 0
+		}
+		return toInt(l) / toInt(r)
+	case "%":
+		if toInt(r) == 0 {
+			return 0
+		}
+		return toInt(l) % toInt(r)
+	case "==":
+		return equal(l, r)
+	case "!=":
+		return !equal(l, r)
+	case "<":
+		return toInt(l) < toInt(r)
+	case "<=":
+		return toInt(l) <= toInt(r)
+	case ">":
+		return toInt(l) > toInt(r)
+	case ">=":
+		return toInt(l) >= toInt(r)
+	case "in":
+		items, _ := r.([]any)
+		for _, el := range items {
+			if equal(l, el) {
+				return true
+			}
+		}
+		return false
 	}
 	return nil
 }
@@ -328,13 +432,25 @@ func evalRest(e *ir.Expr, scope map[string]any) any {
 // the pure standard library (string/date/math/money), evaluated identically here
 // and in assets/facet.js so every executor agrees.
 func evalCall(e *ir.Expr, scope map[string]any) any {
+	args := make([]any, len(e.Args))
+	for i, a := range e.Args {
+		args[i] = eval(a, scope)
+	}
+	return callBuiltin(e.Name, args)
+}
+
+// callBuiltin dispatches a builtin over its already-evaluated arguments. Split
+// out of evalCall the same way applyBin is split out of evalRest's "bin" case:
+// evalInFrame has no flat scope map to hand eval, but a proc body may still call
+// a pure builtin (abs/min/max/…), and it must resolve identically either way.
+func callBuiltin(name string, argVals []any) any {
 	arg := func(i int) any {
-		if i < len(e.Args) {
-			return eval(e.Args[i], scope)
+		if i < len(argVals) {
+			return argVals[i]
 		}
 		return nil
 	}
-	switch e.Name {
+	switch name {
 	case "now":
 		return int(time.Now().Unix())
 	case "rand":

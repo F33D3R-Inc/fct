@@ -23,6 +23,7 @@ type IR struct {
 	Derives    []Derive                     `json:"derives"`
 	Policies   []Policy                     `json:"policies"`
 	Actions    []Action                     `json:"actions"`
+	Procs      []Proc                       `json:"procs,omitempty"` // general-purpose, unconditionally server-executed code (self-hosting + product logic)
 	Jobs       []Job                        `json:"jobs"`
 	Components []Component                  `json:"components,omitempty"` // reusable view fragments
 	Services   []Service                    `json:"services,omitempty"`   // external services (brains) actions may call
@@ -165,6 +166,14 @@ type Entity struct {
 	// row being tested (runtime/region.go renameRowVar) before evaluating it —
 	// this field is never evaluated as-is.
 	Read *Expr `json:"read,omitempty"`
+	// Derives are the entity's own computed fields (ast.Entity.Derives) — never
+	// stored columns, so they never appear in Fields and never reach the
+	// database schema/migration. Like Read, each one is compiled once, rooted
+	// at the reserved row variable "$row", and evaluated fresh against a row's
+	// actual current fields wherever that row is projected to a client
+	// (runtime/region.go applyDerives) — the entity-scoped analog of how
+	// internal/ir/build.go inlines a top-level Derive wherever it is read.
+	Derives []Derive `json:"derives,omitempty"`
 }
 
 // Field is one entity column. For a relation field, Ref names the entity it
@@ -188,6 +197,10 @@ type Field struct {
 	Min      *int   `json:"min,omitempty"`      // @min(n): numeric value ≥ n, or text length ≥ n
 	Max      *int   `json:"max,omitempty"`      // @max(n): numeric value ≤ n, or text length ≤ n
 	Matches  string `json:"matches,omitempty"`  // @matches("re"): text matches this pattern
+	// OnDelete is set only when Ref != "" (a relation field): what happens to this
+	// row when the row it points at (Ref) is deleted. "" means the default,
+	// cascade — see Reference's doc for the three modes.
+	OnDelete string `json:"onDelete,omitempty"` // "" (cascade) | "restrict" | "setNull"
 }
 
 // IsRelation reports whether the field is a foreign key to another entity.
@@ -232,14 +245,19 @@ func Indexes(entities []Entity) []Index {
 // graph (parent -> the children that point at it), without every caller
 // re-deriving the graph by walking every field of every entity.
 //
-// The deletion rule itself is not encoded here because there is only one: a
-// relation is a foreign key with ON DELETE CASCADE (Field's doc), and every
-// backend implements exactly that — pgStore as an FK constraint, fqStore as a
-// declared FacetQL reference, memStore in its own map.
+// The deletion rule defaults to cascade — a foreign key with ON DELETE CASCADE
+// (Field's doc) — the sole behavior before a relation field could carry an
+// on-delete modifier, and still what every field that declares none gets. A
+// field's `@restrict` (OnDelete == "restrict") refuses the parent delete while
+// a referencing row remains; `@setNull` (OnDelete == "setNull") clears the
+// reference on the child row instead of deleting it. Every backend implements
+// all three — pgStore as an FK constraint, fqStore as a declared FacetQL
+// reference, memStore in its own map.
 type Reference struct {
-	Entity string `json:"entity"` // the child: the entity whose row holds the reference
-	Field  string `json:"field"`  // the relation field on it, holding the parent row's id
-	Parent string `json:"parent"` // the entity being referenced
+	Entity   string `json:"entity"`             // the child: the entity whose row holds the reference
+	Field    string `json:"field"`              // the relation field on it, holding the parent row's id
+	Parent   string `json:"parent"`             // the entity being referenced
+	OnDelete string `json:"onDelete,omitempty"` // "" (cascade) | "restrict" | "setNull" — see the type doc
 }
 
 // References is an app's whole relation graph, in entity then field declaration
@@ -251,7 +269,7 @@ func References(entities []Entity) []Reference {
 	for _, e := range entities {
 		for _, f := range e.Fields {
 			if f.IsRelation() {
-				out = append(out, Reference{Entity: e.Name, Field: f.Name, Parent: f.Ref})
+				out = append(out, Reference{Entity: e.Name, Field: f.Name, Parent: f.Ref, OnDelete: f.OnDelete})
 			}
 		}
 	}
@@ -306,6 +324,22 @@ type Action struct {
 	Reads      []string  `json:"reads"`
 	Seal       []string  `json:"seal,omitempty"` // @e2e: param names the client must seal (encrypt) before POSTing, so the authority only ever receives ciphertext
 	Body       []Stmt    `json:"body"`           // statements in source order, including `check` validations
+}
+
+// Proc is a general-purpose, unconditionally server-executed declaration:
+// ordinary imperative code — including real control flow (`loop`/`if`, each
+// with a nested, recursive statement block; `break`/`continue`; `return` from
+// anywhere) as of Milestone 2 — over its own parameters and `let`-bound locals.
+// Unlike Action it carries no Placement, Reads/Writes, Requires, or Seal — a
+// proc needs none of the placement calculus (it always runs on the authority)
+// and does not touch state/entities in this milestone. Called from an action
+// (or another proc) via `do ProcName(args)`.
+type Proc struct {
+	Name    string  `json:"name"`
+	Params  []Param `json:"params"`
+	Ret     string  `json:"ret,omitempty"`     // return type core ("" = no return)
+	RetList bool    `json:"retList,omitempty"` // the return is a list of Ret
+	Body    []Stmt  `json:"body"`
 }
 
 // Require is one resolved permission check on an action: the policy name plus the
@@ -367,24 +401,43 @@ type Trigger struct {
 	Action string `json:"action"`
 }
 
-// Stmt is one action statement. Op ∈ assign | add | set | remove | clear | call.
+// Stmt is one action or proc statement.
+// Op ∈ assign | add | set | remove | clear | call | check | establish | let |
+// return | do | loop | if | break | continue.
+//
+// let/return/loop/if/break/continue are proc-only (a proc's own local-variable
+// model, control flow, and result); do calls a proc — from either an action or
+// another proc — over the same fields a service `call` uses (Service holds the
+// proc's name; there is no operation to route through, unlike a service).
+// assign is shared: in an action it writes a state cell (into session state +
+// wire deltas); in a proc it reassigns a `let mut` local in the proc's own
+// frame. The two never alias, because runActionLocked and runProcLocked/
+// execProcBlock interpret the two bodies separately.
+//
+// loop/if are the one place a Stmt nests (Milestone 2): Value holds the
+// condition both share, Body is loop's repeated body / if's `then` branch, and
+// Else is if's optional `else` branch (nil = none — loop never sets it). A
+// runtime interpreter (runtime/server.go execProcBlock) walks Body/Else
+// recursively; break/continue carry no payload beyond Op itself.
 type Stmt struct {
 	Op      string      `json:"op"`
-	Target  string      `json:"target,omitempty"`  // assign
+	Target  string      `json:"target,omitempty"`  // assign (action: a state cell; proc: a `let mut` local); let: the local's name
 	Entity  string      `json:"entity,omitempty"`  // add/set/remove/clear
 	Field   string      `json:"field,omitempty"`   // set; for a call, the operation name
 	Key     *Expr       `json:"key,omitempty"`     // set/remove
-	Value   *Expr       `json:"value,omitempty"`   // assign/set
+	Value   *Expr       `json:"value,omitempty"`   // assign/set/let/return/loop (cond)/if (cond)
 	Fields  []FieldInit `json:"fields,omitempty"`  // add
-	Service string      `json:"service,omitempty"` // call: the service name
-	Args    []*Expr     `json:"args,omitempty"`    // call: the operation arguments
+	Service string      `json:"service,omitempty"` // call: the service name; do: the proc name
+	Args    []*Expr     `json:"args,omitempty"`    // call/do: the arguments
 	Var     string      `json:"var,omitempty"`     // remove (filtered): item variable
 	Where   *Expr       `json:"where,omitempty"`   // remove (filtered): predicate (nil = by-id)
-	Bind    string      `json:"bind,omitempty"`    // call (request→response): local the result binds to
-	Ret     string      `json:"ret,omitempty"`     // call (request→response): result type core, for decode/coerce
-	RetList bool        `json:"retList,omitempty"` // call (request→response): result is a list of Ret
+	Bind    string      `json:"bind,omitempty"`    // call/do (request→response): local the result binds to
+	Ret     string      `json:"ret,omitempty"`     // call/do (request→response): result type core, for decode/coerce
+	RetList bool        `json:"retList,omitempty"` // call/do (request→response): result is a list of Ret
 	Role    *Expr       `json:"role,omitempty"`    // establish: optional new session role (Value holds the new actor)
 	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
+	Body    []Stmt      `json:"body,omitempty"`    // loop: the repeated body; if: the `then` branch
+	Else    []Stmt      `json:"else,omitempty"`    // if: the `else` branch (nil = none)
 }
 
 // FieldInit is a `name: expr` in an `add`.

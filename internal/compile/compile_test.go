@@ -357,6 +357,122 @@ app Mail:
 	}
 }
 
+// An entity may carry its own `derive` fields: a value computed from the
+// row's own other fields on every read, never a stored column. It parses
+// like the top-level construct and lowers the same way — rooted at the
+// reserved row variable "$row", exactly like Entity.Read — and it must never
+// join the entity's stored Fields (that would make it a database column).
+func TestEntityDeriveInlinedAndExcludedFromFields(t *testing.T) {
+	g := mustCompile(t, `
+app Cart:
+    entity CartLine:
+        id: int
+        qty: int
+        unitPrice: money
+        derive lineTotal: money = qty * unitPrice
+    action addLine(q: int, p: money):
+        add CartLine { qty: q, unitPrice: p }
+    view Main:
+        box:
+            for l in CartLine:
+                text "{l.lineTotal}"
+`)
+	ent, ok := find(g.Entities, func(e ir.Entity) bool { return e.Name == "CartLine" })
+	if !ok {
+		t.Fatalf("CartLine entity not found")
+	}
+	for _, f := range ent.Fields {
+		if f.Name == "lineTotal" {
+			t.Fatalf("lineTotal is a derive; it must not become a stored column: %+v", f)
+		}
+	}
+	d, ok := find(ent.Derives, func(d ir.Derive) bool { return d.Name == "lineTotal" })
+	if !ok || d.Expr == nil || d.Expr.Kind != "bin" || d.Expr.Op != "*" {
+		t.Fatalf("lineTotal should be a derive lowered to qty * unitPrice, got %+v", d)
+	}
+	// Both operands are qualified to the reserved row variable: Get{Ref{$row}, name} —
+	// the same shape qualifyRowRefs gives Entity.Read.
+	for _, side := range []*ir.Expr{d.Expr.L, d.Expr.R} {
+		if side == nil || side.Kind != "get" || side.Obj == nil || side.Obj.Kind != "ref" || side.Obj.Name != "$row" {
+			t.Errorf("operand should read the row's own field via $row, got %+v", side)
+		}
+	}
+}
+
+// Writing to a derive directly — in `add`, a by-id `set`, or a filtered `set`
+// — is a compile error: its value is computed, not stored.
+func TestEntityDeriveCannotBeWritten(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+	}{
+		{"add", `
+app Cart:
+    entity CartLine:
+        id: int
+        qty: int
+        unitPrice: money
+        derive lineTotal: money = qty * unitPrice
+    action addLine(q: int, p: money, t: money):
+        add CartLine { qty: q, unitPrice: p, lineTotal: t }
+    view Main:
+        box:
+            text "hi"
+`},
+		{"set by id", `
+app Cart:
+    entity CartLine:
+        id: int
+        qty: int
+        unitPrice: money
+        derive lineTotal: money = qty * unitPrice
+    action fix(id: int, t: money):
+        set CartLine(id).lineTotal = t
+    view Main:
+        box:
+            text "hi"
+`},
+		{"set filtered", `
+app Cart:
+    entity CartLine:
+        id: int
+        qty: int
+        unitPrice: money
+        derive lineTotal: money = qty * unitPrice
+    action fixAll(t: money):
+        set l in CartLine where l.qty > 0:
+            lineTotal = t
+    view Main:
+        box:
+            text "hi"
+`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := String(tc.src)
+			if err == nil || !strings.Contains(err.Error(), "derive") {
+				t.Fatalf("expected a derive-write compile error, got: %v", err)
+			}
+		})
+	}
+}
+
+// A derive name colliding with a real field of the same entity is refused.
+func TestEntityDeriveNameCollision(t *testing.T) {
+	_, err := String(`
+app Cart:
+    entity CartLine:
+        id: int
+        qty: int
+        derive qty: int = 1
+    view Main:
+        box:
+            text "hi"
+`)
+	if err == nil || !strings.Contains(err.Error(), "qty") {
+		t.Fatalf("expected a name-collision compile error, got: %v", err)
+	}
+}
+
 // TestEntityReadPolicy covers `read:`, the entity-level row-read clause: it
 // compiles to ir.Entity.Read rooted at the reserved row variable "$row" (every
 // bare reference to one of the entity's own fields is qualified into

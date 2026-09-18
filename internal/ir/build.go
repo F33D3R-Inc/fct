@@ -26,6 +26,7 @@ type env struct {
 	states        map[string]string              // name -> placement
 	entities      map[string]bool                // entity names
 	entityFields  map[string]map[string]bool     // entity -> field set (incl id)
+	entityDerives map[string]map[string]bool     // entity -> derive-field set (never a stored column; read-only, see ast.Entity.Derives)
 	queriedFields map[string]map[string]bool     // entity -> fields a `where`/`by`/relation reads at all
 	indexFields   map[string]map[string]bool     // entity -> fields whose use an index can actually serve
 	inline        map[string]*Expr               // zero-arg policy/derive name -> lowered expr, inlined at every use
@@ -54,6 +55,15 @@ type env struct {
 	entE2E        map[string]map[string]bool     // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
 	locRecords    map[string]recBind             // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
 	actionSet     map[string]bool                // action names, for validating pending()/failed() targets
+	procSigs      map[string]procSig             // proc name -> its signature, for checking `do` (from an action or another proc)
+}
+
+// procSig is a proc's signature: enough to check a `do` call site (arity) and to
+// bind/coerce its result (Ret/RetList), mirroring opRet for a service operation.
+type procSig struct {
+	params  []ast.Param
+	ret     string
+	retList bool
 }
 
 // opRet is a service operation's declared return type ("" core = no return).
@@ -135,7 +145,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -316,7 +326,7 @@ func Build(app *ast.App) (*IR, error) {
 				return nil, &BuildError{f.Line, "the id field cannot be @secret"}
 			}
 			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, E2E: f.E2E, ReadPolicy: f.ReadPolicy, Optional: f.Optional,
-				Unique: f.Unique, Required: f.Required, Min: f.Min, Max: f.Max, Matches: f.Matches}
+				Unique: f.Unique, Required: f.Required, Min: f.Min, Max: f.Max, Matches: f.Matches, OnDelete: f.OnDelete}
 			if f.Unique {
 				e.markIndex(ent.Name, f.Name) // a uniqueness check reads by value; index it
 			}
@@ -373,6 +383,36 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			ei.Read = e.low(ent.Read)
 		}
+		// Derives — entity-carried `derive name: Type = expr` fields (ast.Entity.
+		// Derives). Validated and lowered exactly like `read:` above (checkPure
+		// over the same {"$row"}+withActor locals, e.low), because the parser
+		// qualified them the same way (qualifyRowRefs): each one is already
+		// rooted at "$row". They are deliberately kept OUT of e.entityFields —
+		// that map gates `set`/`add`/order-by/typeahead, every one of which needs
+		// a real, stored column — and tracked instead in e.entityDerives, which
+		// only the read-side field checks (checkRowFields, an EntityGet's field)
+		// consult. Nothing here becomes a database column: ei.Fields never grows
+		// from this loop, so the schema/migration never sees it (runtime/region.go
+		// applyDerives is what actually computes the value, on every read).
+		if len(ent.Derives) > 0 {
+			e.entityDerives[ent.Name] = map[string]bool{}
+			seenDerive := map[string]int{}
+			for _, d := range ent.Derives {
+				if e.entityFields[ent.Name][d.Name] {
+					return nil, &BuildError{d.Line, fmt.Sprintf("entity %q already has a field %q; derive %q needs a different name", ent.Name, d.Name, d.Name)}
+				}
+				if prev, ok := seenDerive[d.Name]; ok {
+					return nil, &BuildError{d.Line, fmt.Sprintf("entity %q's derive %q redeclared (first at line %d)", ent.Name, d.Name, prev)}
+				}
+				seenDerive[d.Name] = d.Line
+				locals := withActor(map[string]bool{"$row": true})
+				if err := e.checkPure(d.Expr, locals, d.Line, fmt.Sprintf("entity %q's derive %q", ent.Name, d.Name)); err != nil {
+					return nil, err
+				}
+				ei.Derives = append(ei.Derives, Derive{Name: d.Name, Type: d.Type, Expr: e.low(d.Expr)})
+				e.entityDerives[ent.Name][d.Name] = true
+			}
+		}
 		out.Entities = append(out.Entities, ei)
 	}
 	// Validate relation field types now that every entity name is known (so a
@@ -383,6 +423,14 @@ func Build(app *ast.App) (*IR, error) {
 		for fi := range out.Entities[ei].Fields {
 			f := &out.Entities[ei].Fields[fi]
 			if isPrimitive(f.Type) {
+				// @restrict/@setNull govern what happens to THIS row when the row it
+				// points at is deleted — meaningless off a relation, so a primitive or
+				// enum field (already lowered to "text" by the time it reaches here)
+				// carrying one is refused rather than silently ignored.
+				if f.OnDelete != "" {
+					return nil, &BuildError{0, fmt.Sprintf(
+						"field %q has an on-delete modifier (@restrict/@setNull) but is not a relation to another entity", f.Name)}
+				}
 				continue
 			}
 			if !e.entities[f.Type] {
@@ -718,6 +766,40 @@ func Build(app *ast.App) (*IR, error) {
 		e.services[sv.Name] = ops
 		e.serviceRets[sv.Name] = rets
 		out.Services = append(out.Services, irsv)
+	}
+
+	// 3d″. Procs: general-purpose, unconditionally server-executed declarations
+	// (self-hosting + product logic — see ROADMAP.md, "Decision superseded: full
+	// self-hosting"). Signatures are registered in one pass — so a proc may call
+	// another declared later in source order, and an action's `do` resolves
+	// against the same table `call` uses for services — then each body is built.
+	procSeen := map[string]int{}
+	for _, p := range app.Procs {
+		if prev, ok := procSeen[p.Name]; ok {
+			return nil, &BuildError{p.Line, fmt.Sprintf("proc %q redeclared (first at line %d)", p.Name, prev)}
+		}
+		procSeen[p.Name] = p.Line
+		if e.entities[p.Name] {
+			return nil, &BuildError{p.Line, fmt.Sprintf("proc %q collides with an entity name", p.Name)}
+		}
+		if _, dup := e.services[p.Name]; dup {
+			return nil, &BuildError{p.Line, fmt.Sprintf("proc %q collides with a service name", p.Name)}
+		}
+		if p.Ret != "" && !isPrimitive(p.Ret) {
+			_, isEnum := e.enums[p.Ret]
+			_, isRec := e.records[p.Ret]
+			if !isEnum && !isRec {
+				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q returns unknown type %q", p.Name, p.Ret)}
+			}
+		}
+		e.procSigs[p.Name] = procSig{params: p.Params, ret: p.Ret, retList: p.RetList}
+	}
+	for _, p := range app.Procs {
+		pr, err := e.proc(p)
+		if err != nil {
+			return nil, err
+		}
+		out.Procs = append(out.Procs, pr)
 	}
 
 	// 3e. Layouts: page chrome with one `slot` where the routed view is injected.
@@ -1490,7 +1572,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	defer func() { e.locRecords = nil }()
 	sealParams := map[string]bool{} // params whose value flows into an @e2e field (the client seals them before sending)
 	paramSet := map[string]bool{}   // this action's parameter names
-	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true}
+	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true, "session": true}
 	for _, p := range a.Params {
 		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type})
 		loc[p.Name] = true
@@ -1544,6 +1626,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	reads := map[string]bool{}  // state names read (for soundness)
 	impure := false             // uses an effectful builtin (now/rand)
 	callsService := false       // calls an external service (an effect)
+	callsProc := false          // calls a proc (`do`) — unconditionally server-executed
 	establishesID := false      // sets the session identity (`establish`)
 	mutated := false            // a state/entity mutation has run — checks/lets must precede it
 
@@ -1614,6 +1697,10 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			mutated = true
 			out := Stmt{Op: "add", Entity: st.Entity}
 			for _, fi := range st.Fields {
+				if e.entityDerives[st.Entity][fi.Name] {
+					return Action{}, &BuildError{st.Line, fmt.Sprintf(
+						"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set in `add`", st.Entity, fi.Name)}
+				}
 				isE2E, err := e2eWrite(st.Entity, fi.Name, fi.Expr, st.Line)
 				if err != nil {
 					return Action{}, err
@@ -1656,6 +1743,10 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				out := Stmt{Op: "set", Entity: st.Entity, Var: st.Var, Where: lw}
 
 				for _, fi := range st.Fields {
+					if e.entityDerives[st.Entity][fi.Name] {
+						return Action{}, &BuildError{st.Line, fmt.Sprintf(
+							"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set", st.Entity, fi.Name)}
+					}
 					if !e.entityFields[st.Entity][fi.Name] {
 						return Action{}, &BuildError{st.Line, fmt.Sprintf(
 							"entity %q has no field %q to set", st.Entity, fi.Name)}
@@ -1678,6 +1769,10 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				}
 				act.Body = append(act.Body, out)
 				break
+			}
+			if e.entityDerives[st.Entity][st.Field] {
+				return Action{}, &BuildError{st.Line, fmt.Sprintf(
+					"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set", st.Entity, st.Field)}
 			}
 			if err := readExpr(st.Key, st.Line); err != nil {
 				return Action{}, err
@@ -1774,6 +1869,48 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				}
 			}
 			act.Body = append(act.Body, cs)
+		case ast.Do:
+			// A proc call: same-process, in-binary, synchronous — not egress like a
+			// service call, so it is not the reason placement below forces the
+			// server (see the placement switch, `case callsProc`). It still can only
+			// ever run on the authority, because a proc is unconditionally
+			// server-executed (no client mirror exists, or ever will, for it — see
+			// ROADMAP.md), so an action that calls one has to be server-placed too:
+			// a client-placed action runs in facet.js, which cannot run proc code.
+			sig, ok := e.procSigs[st.Proc]
+			if !ok {
+				return Action{}, &BuildError{st.Line, fmt.Sprintf("do calls unknown proc %q", st.Proc)}
+			}
+			if len(st.Args) != len(sig.params) {
+				return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q expects %d argument(s), got %d", st.Proc, len(sig.params), len(st.Args))}
+			}
+			callsProc = true
+			ds := Stmt{Op: "do", Service: st.Proc}
+			for _, arg := range st.Args {
+				if err := readExpr(arg, st.Line); err != nil {
+					return Action{}, err
+				}
+				ds.Args = append(ds.Args, e.low(arg))
+			}
+			if st.Bind != "" {
+				if err := mustValidateFirst("a `let` bind", st.Line); err != nil {
+					return Action{}, err
+				}
+				if sig.ret == "" {
+					return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type (`proc %s(...) -> Type`) to bind it", st.Proc, st.Proc)}
+				}
+				if loc[st.Bind] {
+					return Action{}, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
+				}
+				loc[st.Bind] = true
+				ds.Bind = st.Bind
+				ds.Ret = sig.ret
+				ds.RetList = sig.retList
+				if _, isRec := e.records[sig.ret]; isRec {
+					e.locRecords[st.Bind] = recBind{rec: sig.ret, list: sig.retList}
+				}
+			}
+			act.Body = append(act.Body, ds)
 		case ast.Establish:
 			// Adopt a custom session identity. Setting who you are is the authority's
 			// job, so it forces server placement; the actor/role exprs are reads.
@@ -1843,6 +1980,10 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				for _, arg := range st.Args {
 					collect(arg)
 				}
+			case ast.Do:
+				for _, arg := range st.Args {
+					collect(arg)
+				}
 			case ast.Establish:
 				collect(st.Actor)
 				collect(st.Role)
@@ -1895,6 +2036,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	case callsService:
 		act.Placement = Server
 		act.Reason = "calls an external service — egress routes through the authority, never the client"
+	case callsProc:
+		act.Placement = Server
+		act.Reason = "calls a `proc`, which is unconditionally server-executed — no client mirror of proc code exists"
 	case establishesID:
 		act.Placement = Server
 		act.Reason = "establishes the session identity — only the authority may set who you are"
@@ -1935,6 +2079,247 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	act.Writes = sortedKeys(writes)
 	act.Reads = sortedKeys(reads)
 	return act, nil
+}
+
+// proc lowers a `proc` declaration. Deliberately NOT built by action() above: a
+// proc needs none of what makes that function big — no placement inference (a
+// proc is unconditionally server-executed), no @e2e seal-dataflow tracking, no
+// mustValidateFirst check-ordering, no policy gate. It is pure computation
+// checked against its own small scope (its parameters plus `let`-bound locals),
+// not the action/session model — entities and state are out of reach in this
+// milestone (see checkProcExpr).
+//
+// Milestone 2 adds real control flow (`loop`/`if`, each with a nested,
+// recursive statement block), so the statement lowering itself is recursive —
+// see procBlock, which this delegates its whole body to. Once every path is
+// lowered, a return-typed proc is checked for return-completeness (every
+// execution path must reach a `return`) by stmtsReturnComplete, below.
+func (e *env) proc(p *ast.Proc) (Proc, error) {
+	pr := Proc{Name: p.Name, Ret: p.Ret, RetList: p.RetList}
+	locals := map[string]bool{}  // every name in scope: params + `let`s seen so far
+	mutable := map[string]bool{} // the subset declared `let mut`, and so reassignable
+	for _, prm := range p.Params {
+		if locals[prm.Name] {
+			return Proc{}, &BuildError{p.Line, fmt.Sprintf("proc %q has duplicate parameter %q", p.Name, prm.Name)}
+		}
+		locals[prm.Name] = true
+		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional})
+	}
+	body, err := e.procBlock(p, p.Body, locals, mutable, 0)
+	if err != nil {
+		return Proc{}, err
+	}
+	pr.Body = body
+	if len(pr.Body) == 0 {
+		return Proc{}, &BuildError{p.Line, fmt.Sprintf("proc %q has no body", p.Name)}
+	}
+	if p.Ret != "" && !stmtsReturnComplete(pr.Body) {
+		return Proc{}, &BuildError{p.Line, fmt.Sprintf(
+			"proc %q declares a return type %s, so its body must end with `return <expr>` on every path — an `if` used as the last statement needs an `else`, and both branches must themselves end that way", p.Name, p.Ret)}
+	}
+	return pr, nil
+}
+
+// cloneNameSet copies a name-set map so a nested block can add its own
+// declarations (`let`) without those leaking back into the caller's scope once
+// the block ends, while still seeing everything the caller had already
+// declared (the copy starts as a full snapshot of it).
+func cloneNameSet(m map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// procBlock lowers one nested statement list belonging to proc p: either the
+// proc's own top-level body, or a `loop`/`if` statement's own Body/Then/Else
+// (recursing into itself for those two — the one genuinely recursive structural
+// shape Milestone 2 adds). locals/mutable are cloned on entry so a `let`
+// declared in this block cannot leak into the caller's scope once the block
+// ends, while everything the caller already declared stays visible here.
+// loopDepth counts the number of enclosing `loop`s, so break/continue can be
+// rejected outside one. Within THIS block, a `return`/`break`/`continue` must
+// be the last statement — anything after it is unreachable — but that
+// restriction is per-block, not per-proc, which is what lets `return` appear
+// from inside a nested loop/if while dead code after it is still refused.
+func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[string]bool, loopDepth int) ([]Stmt, error) {
+	locals = cloneNameSet(locals)
+	mutable = cloneNameSet(mutable)
+	var out []Stmt
+	for i, s := range stmts {
+		last := i == len(stmts)-1
+		switch st := s.(type) {
+		case ast.Let:
+			if locals[st.Name] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is already declared in proc %q", st.Name, p.Name)}
+			}
+			if err := e.checkProcExpr(st.Value, locals, st.Line); err != nil {
+				return nil, err
+			}
+			locals[st.Name] = true
+			if st.Mut {
+				mutable[st.Name] = true
+			}
+			out = append(out, Stmt{Op: "let", Target: st.Name, Value: e.low(st.Value)})
+		case ast.Assign:
+			// A reassignment: only legal against a local this proc already declared
+			// `let mut` — a bare `let` local is immutable, and an unknown name is not
+			// state (a proc has none in this milestone), so both are compile errors
+			// rather than the runtime silently creating or overwriting something.
+			if !locals[st.Target] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not declared in proc %q — use `let %s = …` first", st.Target, p.Name, st.Target)}
+			}
+			if !mutable[st.Target] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to reassign it", st.Target, st.Target)}
+			}
+			if err := e.checkProcExpr(st.Value, locals, st.Line); err != nil {
+				return nil, err
+			}
+			out = append(out, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
+		case ast.Do:
+			sig, ok := e.procSigs[st.Proc]
+			if !ok {
+				return nil, &BuildError{st.Line, fmt.Sprintf("do calls unknown proc %q", st.Proc)}
+			}
+			if len(st.Args) != len(sig.params) {
+				return nil, &BuildError{st.Line, fmt.Sprintf("proc %q expects %d argument(s), got %d", st.Proc, len(sig.params), len(st.Args))}
+			}
+			ds := Stmt{Op: "do", Service: st.Proc}
+			for _, arg := range st.Args {
+				if err := e.checkProcExpr(arg, locals, st.Line); err != nil {
+					return nil, err
+				}
+				ds.Args = append(ds.Args, e.low(arg))
+			}
+			if st.Bind != "" {
+				if locals[st.Bind] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
+				}
+				if sig.ret == "" {
+					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type to bind it", st.Proc)}
+				}
+				locals[st.Bind] = true
+				ds.Bind = st.Bind
+				ds.Ret = sig.ret
+				ds.RetList = sig.retList
+			}
+			out = append(out, ds)
+		case ast.Loop:
+			if err := e.checkProcExpr(st.Cond, locals, st.Line); err != nil {
+				return nil, err
+			}
+			kids, err := e.procBlock(p, st.Body, locals, mutable, loopDepth+1)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Stmt{Op: "loop", Value: e.low(st.Cond), Body: kids})
+		case ast.IfStmt:
+			if err := e.checkProcExpr(st.Cond, locals, st.Line); err != nil {
+				return nil, err
+			}
+			then, err := e.procBlock(p, st.Then, locals, mutable, loopDepth)
+			if err != nil {
+				return nil, err
+			}
+			var els []Stmt
+			if len(st.Else) > 0 {
+				els, err = e.procBlock(p, st.Else, locals, mutable, loopDepth)
+				if err != nil {
+					return nil, err
+				}
+			}
+			out = append(out, Stmt{Op: "if", Value: e.low(st.Cond), Body: then, Else: els})
+		case ast.Break:
+			if loopDepth == 0 {
+				return nil, &BuildError{st.Line, fmt.Sprintf("break outside a loop in proc %q", p.Name)}
+			}
+			if !last {
+				return nil, &BuildError{st.Line, "break must be the last statement of its block"}
+			}
+			out = append(out, Stmt{Op: "break"})
+		case ast.Continue:
+			if loopDepth == 0 {
+				return nil, &BuildError{st.Line, fmt.Sprintf("continue outside a loop in proc %q", p.Name)}
+			}
+			if !last {
+				return nil, &BuildError{st.Line, "continue must be the last statement of its block"}
+			}
+			out = append(out, Stmt{Op: "continue"})
+		case ast.Return:
+			if !last {
+				return nil, &BuildError{st.Line, "return must be the last statement of its block"}
+			}
+			if p.Ret == "" {
+				if st.Value != nil {
+					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q declares no return type, so `return` cannot carry a value", p.Name)}
+				}
+				out = append(out, Stmt{Op: "return"})
+				continue
+			}
+			if st.Value == nil {
+				return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, so `return` needs a value", p.Name, p.Ret)}
+			}
+			if err := e.checkProcExpr(st.Value, locals, st.Line); err != nil {
+				return nil, err
+			}
+			out = append(out, Stmt{Op: "return", Value: e.low(st.Value)})
+		default:
+			return nil, &BuildError{p.Line, fmt.Sprintf("unsupported statement in proc %q", p.Name)}
+		}
+	}
+	return out, nil
+}
+
+// stmtsReturnComplete reports whether every execution path through body
+// provably reaches a `return` — the rule a return-typed proc's body must
+// satisfy. It looks only at the block's last statement (every earlier
+// statement is checked elsewhere to not be a return/break/continue, since
+// procBlock already refuses one of those anywhere but last in its own block):
+//   - a bare `return` completes the block unconditionally.
+//   - an `if` completes the block only when it has BOTH a `then` and an `else`
+//     branch, and each of those branches is itself (recursively) complete —
+//     mirroring exactly what an author must write for a value to be guaranteed
+//     on every path: a one-armed `if` might not run its body at all, so it can
+//     never complete a block on its own, no matter what is inside it.
+//   - a `loop` never completes a block by itself: a while-style precondition
+//     loop may run zero iterations, so nothing inside it can be guaranteed to
+//     run — a proc that only "returns" from inside a loop is a proc that can
+//     fall off the end whenever the loop's condition starts out false.
+//
+// This is deliberately simpler than full dataflow (no reachability analysis
+// through break/continue, no attempt to prove a loop always iterates at least
+// once) — sound but conservative: it can reject a proc a human could prove
+// always returns, and it will never accept one that might not.
+func stmtsReturnComplete(body []Stmt) bool {
+	if len(body) == 0 {
+		return false
+	}
+	last := body[len(body)-1]
+	switch last.Op {
+	case "return":
+		return true
+	case "if":
+		return len(last.Else) > 0 && stmtsReturnComplete(last.Body) && stmtsReturnComplete(last.Else)
+	default:
+		return false
+	}
+}
+
+// checkProcExpr validates an expression inside a proc body: every free name must
+// resolve to the proc's own scope (a parameter or an earlier `let`) — never a
+// state cell, an entity, or any other action/view name. It otherwise reuses
+// checkBuiltins for aggregate/builtin/enum-member validity, exactly as action
+// bodies do. A proc is pure computation over its own locals and parameters in
+// this milestone; entity/state access from inside a proc is a later milestone.
+func (e *env) checkProcExpr(ex ast.Expr, locals map[string]bool, line int) error {
+	for n := range freeNames(ex) {
+		if !locals[n] {
+			return &BuildError{line, fmt.Sprintf(
+				"unknown reference %q — a proc sees only its own parameters and `let` locals (no state or entities in this milestone)", n)}
+		}
+	}
+	return e.checkBuiltins(ex, line)
 }
 
 // ── view lowering ────────────────────────────────────────────────────────────
@@ -3358,7 +3743,7 @@ func (c *viewCtx) checkRowFields(ex ast.Expr, sc scope, line int) error {
 	switch t := ex.(type) {
 	case ast.Get:
 		if r, ok := t.Obj.(ast.Ref); ok {
-			if ent, isRow := c.rowEntity(sc, r.Name); isRow && t.Field != "id" && !c.e.entityFields[ent][t.Field] {
+			if ent, isRow := c.rowEntity(sc, r.Name); isRow && t.Field != "id" && !c.e.entityFields[ent][t.Field] && !c.e.entityDerives[ent][t.Field] {
 				return &BuildError{line, fmt.Sprintf("entity %q has no field %q (in `%s.%s`)", ent, t.Field, r.Name, t.Field)}
 			}
 		}
@@ -3502,7 +3887,7 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		// `Post(id).field` names a field the entity has (or `id`); `Post(id)` alone
 		// is the row and names none. Checked only for an entity whose fields the
 		// builder recorded, so a managed entity it did not is not refused.
-		if fields := e.entityFields[t.Entity]; t.Field != "" && t.Field != "id" && fields != nil && !fields[t.Field] {
+		if fields := e.entityFields[t.Entity]; t.Field != "" && t.Field != "id" && fields != nil && !fields[t.Field] && !e.entityDerives[t.Entity][t.Field] {
 			return &BuildError{line, fmt.Sprintf("entity %q has no field %q (in `%s(…).%s`)", t.Entity, t.Field, t.Entity, t.Field)}
 		}
 		return e.checkBuiltins(t.Key, line)
@@ -3879,11 +4264,16 @@ func locals(names ...string) map[string]bool {
 
 // isBuiltinRef reports whether a name is a runtime-provided identity value: the
 // signed-in user's name (`actor`), role (`role`), verified-email flag
-// (`verified`), the active tenant id (`tenant`), or the actor's role within it
-// (`tenantRole`). The tenant values are 0/"" unless multi-tenancy is enabled.
+// (`verified`), the active tenant id (`tenant`), the actor's role within it
+// (`tenantRole`), or the caller's session id (`session`). The tenant values are
+// 0/"" unless multi-tenancy is enabled. `session` is set for every caller,
+// signed in or not — it is the one identity a pre-login, anonymous visitor
+// already has, minted the moment their browser first arrives (see
+// Server.session), so it is what an anonymous-cart-style feature keys state to
+// before there is an `actor` to key it to instead.
 func isBuiltinRef(n string) bool {
 	switch n {
-	case "actor", "role", "verified", "tenant", "tenantRole":
+	case "actor", "role", "verified", "tenant", "tenantRole", "session":
 		return true
 	}
 	return false
@@ -3905,7 +4295,7 @@ func viewScope(locals map[string]bool) map[string]bool {
 }
 
 func withActor(locals map[string]bool) map[string]bool {
-	m := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true}
+	m := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true, "session": true}
 	for k := range locals {
 		m[k] = true
 	}

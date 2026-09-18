@@ -149,6 +149,7 @@ func mergeInto(dst, src *ast.App) {
 	dst.Derives = append(dst.Derives, src.Derives...)
 	dst.Policies = append(dst.Policies, src.Policies...)
 	dst.Actions = append(dst.Actions, src.Actions...)
+	dst.Procs = append(dst.Procs, src.Procs...)
 	dst.Jobs = append(dst.Jobs, src.Jobs...)
 	dst.Components = append(dst.Components, src.Components...)
 	dst.Layouts = append(dst.Layouts, src.Layouts...)
@@ -199,7 +200,7 @@ func checkDuplicates(app *ast.App) error {
 	}
 	var (
 		entities, enums, states, derives []string
-		policies, actions, jobs          []string
+		policies, actions, procs, jobs   []string
 		components, layouts, views       []string
 	)
 	for _, e := range app.Entities {
@@ -220,6 +221,9 @@ func checkDuplicates(app *ast.App) error {
 	for _, a := range app.Actions {
 		actions = append(actions, a.Name)
 	}
+	for _, p := range app.Procs {
+		procs = append(procs, p.Name)
+	}
 	for _, j := range app.Jobs {
 		jobs = append(jobs, j.Name)
 	}
@@ -237,7 +241,7 @@ func checkDuplicates(app *ast.App) error {
 		names []string
 	}{
 		{"entity", entities}, {"enum", enums}, {"state", states}, {"derive", derives},
-		{"policy", policies}, {"action", actions}, {"job", jobs},
+		{"policy", policies}, {"action", actions}, {"proc", procs}, {"job", jobs},
 		{"component", components}, {"layout", layouts}, {"view", views},
 	} {
 		if err := dup(check.kind, check.names); err != nil {

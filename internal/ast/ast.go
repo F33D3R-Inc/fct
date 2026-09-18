@@ -57,6 +57,7 @@ type App struct {
 	Derives    []*Derive
 	Policies   []*Policy
 	Actions    []*Action
+	Procs      []*Proc
 	Jobs       []*Job
 	Components []*Component
 	Layouts    []*Layout
@@ -301,6 +302,21 @@ type Entity struct {
 	// entity (see fanout's existing per-identity grouping).
 	Ephemeral bool
 	Fields    []EntityField
+	// Derives are `derive name: Type = expr` lines written inside the entity
+	// body — a value computed from this row's OWN other fields on every read,
+	// never a stored column (contrast Fields). `derive lineTotal: money = qty *
+	// unitPrice` inside `entity CartLine:` reads exactly like the top-level
+	// Derive construct and reuses its type: the parser (parseEntity) resolves
+	// every bare reference to one of this entity's own field names into
+	// `Get{Ref{"$row"}, name}` — qualifyRowRefs, the same helper Entity.Read is
+	// put through — so by the time anything downstream sees one of these, its
+	// Expr is already rooted at the reserved row variable "$row" exactly like
+	// Read's. internal/ir/build.go lowers it the same way (Entity.Derives), and
+	// runtime/region.go's applyDerives is the query-site analog of
+	// applyReadPolicy/renameRowVar: it recomputes the value fresh from the
+	// row's current fields wherever a row is projected to a client, so nothing
+	// here is ever cached or can go stale.
+	Derives []*Derive
 	// Read is the entity's row-level read policy: `read: <bool expr>` over the
 	// entity's own fields plus `actor` (and the other identity builtins
 	// `withActor` admits — role/verified/tenant/tenantRole). nil means what it
@@ -347,6 +363,15 @@ type EntityField struct {
 	Min      *int   // @min(n) — numeric: value ≥ n; text: length ≥ n (nil = unset)
 	Max      *int   // @max(n) — numeric: value ≤ n; text: length ≤ n (nil = unset)
 	Matches  string // @matches("regex") — text must match this anchored pattern ("" = unset)
+	// OnDelete governs a relation field only (Type names an entity): what happens
+	// to THIS row when the row it points at is deleted. "" (unset) means the
+	// historical, sole behavior — cascade — so every .fct file written before
+	// this existed keeps behaving exactly as it did. "restrict" refuses the
+	// parent delete outright while a referencing row remains (a storefront's
+	// CartLine.product, so a Product in an open cart cannot vanish out from under
+	// it). "setNull" clears this field to null instead of deleting the row (the
+	// field must be optional, `Type?`, so it has a null to hold).
+	OnDelete string // "" (cascade, default) | "restrict" | "setNull"
 	Line     int
 }
 
@@ -401,6 +426,26 @@ type Action struct {
 	// (and lets) must precede any mutation, so a failed check rolls back nothing.
 	Body []Stmt
 	Line int
+}
+
+// Proc is a general-purpose, unconditionally server-executed declaration — the
+// home for compiler passes, storage-engine code, codecs, ML math, and
+// cryptography (see ROADMAP.md, "Decision superseded: full self-hosting"). Unlike
+// `action`, a proc needs no placement inference: it is genuinely imperative code
+// (Milestone 2: real control flow — `loop`/`if` with nested, recursive statement
+// blocks, `break`/`continue`, and `return` from anywhere), and an arbitrary loop
+// has no statically decidable client/server split, so the question placement
+// inference answers for `action` doesn't arise here. A proc has its own small
+// scope (its parameters plus `let`-bound locals) — it does not read or write
+// state/entities in this milestone — and is called from an action via
+// `do ProcName(args)`.
+type Proc struct {
+	Name    string
+	Params  []Param
+	Ret     string // return type core ("" = no return)
+	RetList bool   // the return is a list of Ret (`-> [T]`)
+	Body    []Stmt
+	Line    int
 }
 
 // Service is an external service (a "brain") fct can call over HTTP: a base URL
@@ -580,6 +625,76 @@ type Clear struct {
 	Line   int
 }
 
+// Let declares a proc-local variable: `let name = expr` (immutable) or
+// `let mut name = expr` (a genuinely reassignable local, written back to with a
+// plain `name = expr` — see Assign). Proc-only: an action's `let` instead binds a
+// service/proc call's result (ServiceCall.Bind / Do.Bind), since an action has no
+// general local-variable model.
+type Let struct {
+	Name  string
+	Mut   bool
+	Value Expr
+	Line  int
+}
+
+// Return yields a proc's result: `return expr` (or bare `return` for a proc
+// declaring no return type), immediately exiting the whole proc — including
+// from inside any number of nested `loop`/`if` blocks, not just the proc's own
+// top level. Proc-only. It must still be the last statement of whichever
+// statement list (block) it appears in — the proc's own top level, or a
+// `loop`/`if`'s own Body/Then/Else — so nothing written after it is dead code;
+// see internal/ir/build.go's per-block lowering for the exact rule.
+type Return struct {
+	Value Expr // nil for a bare `return` (no declared return type)
+	Line  int
+}
+
+// Loop is a proc-only `loop <cond>:` precondition (while-style) iteration: Cond
+// is checked before every pass, and Body (a nested, recursive statement list —
+// this is Milestone 2's one genuinely new structural shape) runs while it holds.
+// Bounded iteration is ordinary `let mut` counter bookkeeping inside Body
+// (`let mut i = 0` outside, `i = i + 1` inside), not a separate C-style
+// three-clause form — kept minimal on purpose, see ROADMAP.md Milestone 2.
+type Loop struct {
+	Cond Expr
+	Body []Stmt
+	Line int
+}
+
+// If is a proc-only if-as-statement: Then runs when Cond is truthy, Else runs
+// otherwise (nil = no else clause). Distinct from the UI node of the same name
+// (ast.If, above) — that one is a pure view-rendering conditional with no
+// statement body; this one is proc control flow, written `if <cond>: ... [else:
+// ...]` with each branch a nested, recursive statement list.
+type IfStmt struct {
+	Cond Expr
+	Then []Stmt
+	Else []Stmt // nil = no else clause
+	Line int
+}
+
+// Break exits the nearest enclosing Loop immediately, skipping the rest of its
+// body and any remaining iterations. Proc-only; valid only inside a Loop.
+type Break struct{ Line int }
+
+// Continue skips straight to the nearest enclosing Loop's next condition check,
+// abandoning the rest of the current pass through its body. Proc-only; valid
+// only inside a Loop.
+type Continue struct{ Line int }
+
+// Do calls a proc: `do ProcName(args)` (its result discarded) or, bound,
+// `let x = do ProcName(args)` (Bind names the local the result lands in). Mirrors
+// ServiceCall's shape, but a proc call is a same-process, in-binary call — not
+// egress over HTTP — so it carries no placement effect of its own beyond what
+// calling an unconditionally-server-executed proc already implies. Valid inside
+// both an action body and a proc body (a proc may call another proc).
+type Do struct {
+	Proc string
+	Args []Expr
+	Bind string // "" = fire-and-forget (result discarded)
+	Line int
+}
+
 func (Assign) stmt()      {}
 func (ServiceCall) stmt() {}
 func (Establish) stmt()   {}
@@ -587,6 +702,13 @@ func (Add) stmt()         {}
 func (Set) stmt()         {}
 func (Remove) stmt()      {}
 func (Clear) stmt()       {}
+func (Let) stmt()         {}
+func (Return) stmt()      {}
+func (Do) stmt()          {}
+func (Loop) stmt()        {}
+func (IfStmt) stmt()      {}
+func (Break) stmt()       {}
+func (Continue) stmt()    {}
 
 // View is one `view Name [at "/path"]:` projection of state into a UI node tree.
 // A view is a page, served at its route; Path defaults are filled in by the

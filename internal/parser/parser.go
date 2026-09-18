@@ -197,6 +197,11 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 		if a, err = parseAction(c); err == nil {
 			app.Actions = append(app.Actions, a)
 		}
+	case strings.HasPrefix(c.Line.Text, "proc "):
+		var p *ast.Proc
+		if p, err = parseProc(c); err == nil {
+			app.Procs = append(app.Procs, p)
+		}
 	case strings.HasPrefix(c.Line.Text, "job "):
 		var j *ast.Job
 		if j, err = parseJob(c); err == nil {
@@ -223,7 +228,7 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 			app.Views = append(app.Views, v)
 		}
 	default:
-		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/enum/type/message/state/derive/policy/action/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/enum/type/message/state/derive/policy/action/proc/job/service/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
 	}
 	return err
 }
@@ -499,7 +504,24 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 	// so it may appear before the fields it references.
 	var readRaw ast.Expr
 	var readLine int
+	// `derive name: Type = expr` lines are collected raw here, exactly as
+	// `read:` is above, and qualified (qualifyRowRefs) after the field loop so
+	// a derive may reference a field declared later in the same entity — see
+	// ast.Entity.Derives. Told apart from a real field the same way `read:` is:
+	// parseDerive is reused as-is (the top-level and entity-embedded forms are
+	// the same grammar), so this is checked before the generic `name: type`
+	// split below ever sees the line (a derive's own name contains no colon,
+	// but its declaration line does, right after "derive <name>").
+	var rawDerives []*ast.Derive
 	for _, c := range n.Children {
+		if strings.HasPrefix(strings.TrimSpace(c.Line.Text), "derive ") {
+			d, err := parseDerive(c)
+			if err != nil {
+				return nil, err
+			}
+			rawDerives = append(rawDerives, d)
+			continue
+		}
 		colon := strings.IndexByte(c.Line.Text, ':')
 		if colon < 0 {
 			return nil, &Error{c.Line.No, "entity field must be `name: type`"}
@@ -513,7 +535,7 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		// Projection: `@requires(policy)`. Declarative constraints, enforced by the
 		// authority on every write: `@unique`, `@required`, `@min(n)`, `@max(n)`,
 		// `@matches("regex")`. They are stripped from the type token wherever they sit.
-		secret, e2e, unique, required := false, false, false, false
+		secret, e2e, unique, required, restrict, setNull := false, false, false, false, false, false
 		var fmin, fmax *int
 		matches, readPolicy := "", ""
 		// `@matches("…")` first — its argument is a quoted string that may hold parens.
@@ -567,11 +589,14 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 			}
 			ft = strings.TrimSpace(ft[:i] + " " + rest[closeP+1:])
 		}
-		// Bare flag markers, any order.
+		// Bare flag markers, any order. `@restrict`/`@setNull` govern a relation
+		// field's on-delete behavior (ast.EntityField.OnDelete); unset means the
+		// historical, sole behavior, cascade.
 		for _, m := range []struct {
 			name string
 			dst  *bool
-		}{{"@secret", &secret}, {"@e2e", &e2e}, {"@unique", &unique}, {"@required", &required}} {
+		}{{"@secret", &secret}, {"@e2e", &e2e}, {"@unique", &unique}, {"@required", &required},
+			{"@restrict", &restrict}, {"@setNull", &setNull}} {
 			if i := strings.Index(ft, m.name); i >= 0 {
 				*m.dst = true
 				ft = strings.TrimSpace(ft[:i] + " " + ft[i+len(m.name):])
@@ -607,18 +632,51 @@ func parseEntity(n *source.Node) (*ast.Entity, error) {
 		if matches != "" && core != "text" {
 			return nil, &Error{c.Line.No, fmt.Sprintf("@matches on field %q applies to text, not %s", fn, core)}
 		}
+		if restrict && setNull {
+			return nil, &Error{c.Line.No, fmt.Sprintf("field %q cannot be both @restrict and @setNull — @restrict refuses the delete while a reference remains, @setNull clears this field instead; pick one", fn)}
+		}
+		onDelete := ""
+		switch {
+		case restrict:
+			onDelete = "restrict"
+		case setNull:
+			onDelete = "setNull"
+		}
+		// A `?` on the type makes the column nullable; @setNull needs that to have
+		// anything to set the column to once the row it pointed at is gone. Whether
+		// the field is actually a relation (vs. a primitive/enum, where an on-delete
+		// modifier makes no sense at all) is checked later, once every entity name is
+		// known (internal/ir/build.go).
+		if setNull && !optional {
+			return nil, &Error{c.Line.No, fmt.Sprintf("field %q is @setNull but not optional — write `%s: %s?` so the column has a null to hold once the referenced row is deleted", fn, fn, core)}
+		}
 		e.Fields = append(e.Fields, ast.EntityField{Name: fn, Type: core, Secret: secret, E2E: e2e, ReadPolicy: readPolicy, Optional: optional,
-			Unique: unique, Required: required, Min: fmin, Max: fmax, Matches: matches, Line: c.Line.No})
+			Unique: unique, Required: required, Min: fmin, Max: fmax, Matches: matches, OnDelete: onDelete, Line: c.Line.No})
 	}
 	if len(e.Fields) == 0 {
 		return nil, &Error{n.Line.No, fmt.Sprintf("entity %q has no fields", name)}
 	}
-	if readRaw != nil {
+	if readRaw != nil || len(rawDerives) > 0 {
 		fields := make(map[string]bool, len(e.Fields))
 		for _, f := range e.Fields {
 			fields[f.Name] = true
 		}
-		e.Read = qualifyRowRefs(readRaw, fields)
+		if readRaw != nil {
+			e.Read = qualifyRowRefs(readRaw, fields)
+		}
+		seen := map[string]int{}
+		for _, d := range rawDerives {
+			if fields[d.Name] {
+				return nil, &Error{d.Line, fmt.Sprintf("entity %q already has a field %q; derive %q needs a different name", name, d.Name, d.Name)}
+			}
+			if prev, ok := seen[d.Name]; ok {
+				return nil, &Error{d.Line, fmt.Sprintf("entity %q's derive %q redeclared (first at line %d)", name, d.Name, prev)}
+			}
+			seen[d.Name] = d.Line
+			dd := *d
+			dd.Expr = qualifyRowRefs(d.Expr, fields)
+			e.Derives = append(e.Derives, &dd)
+		}
 	}
 	return e, nil
 }
@@ -1330,27 +1388,43 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 				return nil, err
 			}
 			a.Body = append(a.Body, cl)
+		case strings.HasPrefix(t, "do "):
+			d, err := parseDo(strings.TrimSpace(t[len("do "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			a.Body = append(a.Body, d)
 		case strings.HasPrefix(t, "let "):
-			// Request→response bind: `let name = call Service.op(args)`.
+			// Request→response bind: `let name = call Service.op(args)` or
+			// `let name = do ProcName(args)`.
 			rest := strings.TrimSpace(t[len("let "):])
 			eq := strings.IndexByte(rest, '=')
 			if eq < 0 {
-				return nil, &Error{c.Line.No, "let needs `let name = call Service.op(args)`"}
+				return nil, &Error{c.Line.No, "let needs `let name = call Service.op(args)` or `let name = do ProcName(args)`"}
 			}
 			name := strings.TrimSpace(rest[:eq])
 			if !isIdent(name) {
 				return nil, &Error{c.Line.No, fmt.Sprintf("invalid let binding %q", name)}
 			}
 			rhs := strings.TrimSpace(rest[eq+1:])
-			if !strings.HasPrefix(rhs, "call ") {
-				return nil, &Error{c.Line.No, "let binds a service call: `let name = call Service.op(args)`"}
+			switch {
+			case strings.HasPrefix(rhs, "call "):
+				cl, err := parseCall(strings.TrimSpace(rhs[len("call "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				cl.Bind = name
+				a.Body = append(a.Body, cl)
+			case strings.HasPrefix(rhs, "do "):
+				d, err := parseDo(strings.TrimSpace(rhs[len("do "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				d.Bind = name
+				a.Body = append(a.Body, d)
+			default:
+				return nil, &Error{c.Line.No, "let binds a service call or a proc call: `let name = call Service.op(args)` or `let name = do ProcName(args)`"}
 			}
-			cl, err := parseCall(strings.TrimSpace(rhs[len("call "):]), c.Line.No)
-			if err != nil {
-				return nil, err
-			}
-			cl.Bind = name
-			a.Body = append(a.Body, cl)
 		case strings.HasPrefix(t, "establish "):
 			// `establish actor <expr> [role <expr>]` — adopt a custom session identity.
 			rest := strings.TrimSpace(t[len("establish "):])
@@ -1516,6 +1590,220 @@ func parseTrigger(line string, no int) (*ast.Trigger, error) {
 		return nil, &Error{no, fmt.Sprintf("trigger reaction %q must be an action name", react)}
 	}
 	return &ast.Trigger{On: on, Action: react, Line: no}, nil
+}
+
+// parseDo parses `ProcName(arg, ...)` — a proc call statement (`do ProcName(args)`,
+// or bound via `let x = do ProcName(args)`). Mirrors parseCall, minus the
+// `Service.op` dot: a proc has no service namespace to route through.
+func parseDo(s string, line int) (ast.Do, error) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return ast.Do{}, &Error{line, "do needs arguments: do ProcName(args)"}
+	}
+	name := strings.TrimSpace(s[:open])
+	if !isIdent(name) {
+		return ast.Do{}, &Error{line, fmt.Sprintf("invalid proc name %q", name)}
+	}
+	closeP := strings.LastIndexByte(s, ')')
+	if closeP < open {
+		return ast.Do{}, &Error{line, "missing `)` in do"}
+	}
+	d := ast.Do{Proc: name, Line: line}
+	if inner := strings.TrimSpace(s[open+1 : closeP]); inner != "" {
+		for _, a := range splitTop(inner, ',') {
+			e, err := parseExpr(strings.TrimSpace(a), line)
+			if err != nil {
+				return ast.Do{}, err
+			}
+			d.Args = append(d.Args, e)
+		}
+	}
+	return d, nil
+}
+
+// parseProc parses `proc Name(params) -> RetType:` (the arrow and its type are
+// optional — a proc may return nothing) plus a body, delegating the body itself
+// to parseProcBody. Unlike parseAction, a proc isn't policy-gated or optimistic
+// and doesn't touch entities directly (out of scope for this milestone), so its
+// statement vocabulary is deliberately smaller — see parseProcBody.
+func parseProc(n *source.Node) (*ast.Proc, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "proc")), ":")
+	var ret string
+	var retList bool
+	if arrow := strings.Index(head, "->"); arrow >= 0 {
+		rt := strings.TrimSpace(head[arrow+2:])
+		head = strings.TrimSpace(head[:arrow])
+		core, list, optional := splitType(rt)
+		if optional || !isTypeName(core) {
+			return nil, &Error{n.Line.No, fmt.Sprintf("invalid return type %q", rt)}
+		}
+		ret, retList = core, list
+	}
+	name, params, err := parseSignature(head, n.Line.No, false, false)
+	if err != nil {
+		return nil, err
+	}
+	p := &ast.Proc{Name: name, Params: params, Ret: ret, RetList: retList, Line: n.Line.No}
+	body, err := parseProcBody(n.Children, fmt.Sprintf("proc %q", name))
+	if err != nil {
+		return nil, err
+	}
+	p.Body = body
+	if len(p.Body) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("proc %q has no body", name)}
+	}
+	return p, nil
+}
+
+// parseProcBody recursively parses one nested statement block inside a proc: the
+// proc's own top-level body, or a `loop`/`if` statement's own Body/Then/Else.
+// ctx names the enclosing construct for error messages ("proc %q", "a loop
+// body", "an if body", "an else body").
+//
+// Milestone 2 statement vocabulary: `let`/`let mut` (a proc-local variable), a
+// plain reassignment (`name = expr`, legal only for a `let mut` local —
+// enforced in internal/ir/build.go, which tracks the proc's own declared-locals
+// scope), `return` (from anywhere, not just this block's end), `do` (calling
+// another proc), `loop <cond>:` (a while-style precondition loop whose body is
+// parsed by recursing into this same function — the one genuinely recursive
+// shape a proc statement can carry), `if <cond>:` with an optional sibling
+// `else:` (each branch likewise parsed by recursing), and `break`/`continue`
+// (loop-nesting validity is a build.go concern, not the parser's).
+// check/requires/establish/add/set/remove/clear are explicitly rejected: a proc
+// is pure computation over its own locals and parameters.
+func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
+	var body []ast.Stmt
+	for i := 0; i < len(children); i++ {
+		c := children[i]
+		t := strings.TrimSpace(c.Line.Text)
+		switch {
+		case strings.HasPrefix(t, "check "), t == "check", strings.HasPrefix(t, "requires "), t == "requires",
+			strings.HasPrefix(t, "establish "), t == "establish", strings.HasPrefix(t, "add "), t == "add",
+			strings.HasPrefix(t, "set "), t == "set", strings.HasPrefix(t, "remove "), t == "remove",
+			strings.HasPrefix(t, "clear "), t == "clear":
+			return nil, &Error{c.Line.No, fmt.Sprintf(
+				"%s can't use %q — a proc is pure computation over its own locals and parameters; entity/policy access from a proc is a later milestone", ctx, firstWord(t))}
+		case t == "break":
+			body = append(body, ast.Break{Line: c.Line.No})
+		case t == "continue":
+			body = append(body, ast.Continue{Line: c.Line.No})
+		case t == "else:" || t == "else":
+			return nil, &Error{c.Line.No, "`else` with no matching `if`"}
+		case strings.HasPrefix(t, "loop "):
+			condS := strings.TrimSuffix(strings.TrimSpace(t[len("loop "):]), ":")
+			if condS == "" {
+				return nil, &Error{c.Line.No, "loop needs a condition: loop <cond>:"}
+			}
+			cond, err := parseExpr(condS, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			kids, err := parseProcBody(c.Children, "a loop body")
+			if err != nil {
+				return nil, err
+			}
+			if len(kids) == 0 {
+				return nil, &Error{c.Line.No, "loop has no body"}
+			}
+			body = append(body, ast.Loop{Cond: cond, Body: kids, Line: c.Line.No})
+		case strings.HasPrefix(t, "if "):
+			condS := strings.TrimSuffix(strings.TrimSpace(t[len("if "):]), ":")
+			if condS == "" {
+				return nil, &Error{c.Line.No, "if needs a condition: if <cond>:"}
+			}
+			cond, err := parseExpr(condS, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			then, err := parseProcBody(c.Children, "an if body")
+			if err != nil {
+				return nil, err
+			}
+			if len(then) == 0 {
+				return nil, &Error{c.Line.No, "if has no body"}
+			}
+			var els []ast.Stmt
+			if i+1 < len(children) {
+				nt := strings.TrimSpace(children[i+1].Line.Text)
+				if nt == "else:" || nt == "else" {
+					els, err = parseProcBody(children[i+1].Children, "an else body")
+					if err != nil {
+						return nil, err
+					}
+					if len(els) == 0 {
+						return nil, &Error{children[i+1].Line.No, "else has no body"}
+					}
+					i++ // consume the sibling `else:` node
+				}
+			}
+			body = append(body, ast.IfStmt{Cond: cond, Then: then, Else: els, Line: c.Line.No})
+		case strings.HasPrefix(t, "return"):
+			rest := strings.TrimSpace(strings.TrimPrefix(t, "return"))
+			var val ast.Expr
+			var err error
+			if rest != "" {
+				val, err = parseExpr(rest, c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+			}
+			body = append(body, ast.Return{Value: val, Line: c.Line.No})
+		case strings.HasPrefix(t, "do "):
+			d, err := parseDo(strings.TrimSpace(t[len("do "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, d)
+		case strings.HasPrefix(t, "let "):
+			rest := strings.TrimSpace(t[len("let "):])
+			mut := false
+			if strings.HasPrefix(rest, "mut ") {
+				mut = true
+				rest = strings.TrimSpace(rest[len("mut "):])
+			}
+			eq := strings.IndexByte(rest, '=')
+			if eq < 0 {
+				return nil, &Error{c.Line.No, "let needs `let [mut] name = expr`"}
+			}
+			lname := strings.TrimSpace(rest[:eq])
+			if !isIdent(lname) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid let binding %q", lname)}
+			}
+			rhs := strings.TrimSpace(rest[eq+1:])
+			if strings.HasPrefix(rhs, "do ") {
+				if mut {
+					return nil, &Error{c.Line.No, "`let mut` can't bind a `do` call result yet — bind it plainly, then use it to compute a `let mut` local if you need to mutate it"}
+				}
+				d, err := parseDo(strings.TrimSpace(rhs[len("do "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				d.Bind = lname
+				body = append(body, d)
+				continue
+			}
+			val, err := parseExpr(rhs, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, ast.Let{Name: lname, Mut: mut, Value: val, Line: c.Line.No})
+		default:
+			eq := strings.IndexByte(t, '=')
+			if eq < 0 {
+				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
+			}
+			target := strings.TrimSpace(t[:eq])
+			if !isIdent(target) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q", target)}
+			}
+			val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, ast.Assign{Target: target, Value: val, Line: c.Line.No})
+		}
+	}
+	return body, nil
 }
 
 // parseCall parses `Service.op(arg, ...)` — a service call statement in an action.
@@ -1757,6 +2045,10 @@ func parseSignature(head string, line int, allowList, allowRef bool) (string, []
 
 func parseAdd(n *source.Node) (ast.Stmt, error) {
 	rest := strings.TrimSpace(n.Line.Text[len("add "):])
+	rest, err := closeAddRecord(rest, n)
+	if err != nil {
+		return nil, err
+	}
 	open := strings.IndexByte(rest, '{')
 	close := strings.LastIndexByte(rest, '}')
 	if open < 0 || close < open {
@@ -1783,6 +2075,72 @@ func parseAdd(n *source.Node) (ast.Stmt, error) {
 		}
 	}
 	return add, nil
+}
+
+// closeAddRecord reassembles the raw text of an `add Entity { ... }` record
+// literal that continues past its header line. FDL's offside rule already
+// nests any line indented under `add`'s header as a child of it — the same
+// tree shape `if`/`for`/`policy` use for their bodies — so when the header's
+// own text doesn't yet balance its opening `{`, the record's remaining fields
+// (and its closing `}`) are sitting right there as descendants of n, in
+// source order. This walks them depth-first, space-joining each line's text
+// onto rest until the running brace/paren/bracket depth returns to zero, and
+// hands back the reassembled one-line text for the existing single-line
+// record parsing in parseAdd to work on unchanged.
+//
+// A line whose header already balances (the common single-line case) is
+// returned untouched — no children are consumed, so an accidental over-indent
+// after a complete `add` can't get silently absorbed into it. A record that
+// never closes, even after every descendant line is consumed, is reported
+// against the `add` line rather than swallowed: n.Children is a fixed,
+// finite list, so this always terminates and never reaches past add's own
+// nested lines into whatever statement follows it.
+func closeAddRecord(rest string, n *source.Node) (string, error) {
+	depth := braceDepth(rest, 0)
+	if depth <= 0 {
+		return rest, nil
+	}
+	for _, ln := range flattenLines(n) {
+		rest = rest + " " + ln.Text
+		depth = braceDepth(ln.Text, depth)
+		if depth <= 0 {
+			return rest, nil
+		}
+	}
+	return "", &Error{n.Line.No, "add's record literal is missing its closing `}` (indent the fields, and the closing `}`, under `add` — the same offside rule as a block's body)"}
+}
+
+// flattenLines returns n's descendant lines, depth-first, in source order —
+// the order they appeared in the file, regardless of how deep the offside
+// rule nested each one.
+func flattenLines(n *source.Node) []source.Line {
+	var out []source.Line
+	for _, c := range n.Children {
+		out = append(out, c.Line)
+		out = append(out, flattenLines(c)...)
+	}
+	return out
+}
+
+// braceDepth folds s's `(`/`{`/`[` and `)`/`}`/`]` into depth (starting from
+// start), skipping the inside of "..." string literals exactly as splitTop
+// does, so a brace quoted in a field's text value never perturbs where the
+// record literal actually closes.
+func braceDepth(s string, start int) int {
+	depth := start
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"':
+			inStr = !inStr
+		case inStr:
+		case c == '(' || c == '{' || c == '[':
+			depth++
+		case c == ')' || c == '}' || c == ']':
+			depth--
+		}
+	}
+	return depth
 }
 
 // parseSet parses the two forms of a write to stored rows:
