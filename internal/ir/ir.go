@@ -26,7 +26,7 @@ type IR struct {
 	Actions    []Action                     `json:"actions"`
 	Procs      []Proc                       `json:"procs,omitempty"` // general-purpose, unconditionally server-executed code (self-hosting + product logic)
 	Jobs       []Job                        `json:"jobs"`
-	Daemons    []Daemon                     `json:"daemons,omitempty"` // detached, process-lifetime background tasks (see Daemon's doc)
+	Daemons    []Daemon                     `json:"daemons,omitempty"`    // detached, process-lifetime background tasks (see Daemon's doc)
 	Components []Component                  `json:"components,omitempty"` // reusable view fragments
 	Services   []Service                    `json:"services,omitempty"`   // external services (brains) actions may call
 	Files      []File                       `json:"files,omitempty"`      // declared file resources a proc may read/write (io.file)

@@ -65,6 +65,13 @@ func (s *Server) StartJobs() {
 		}
 	}
 
+	// Daemons (runtime/daemon.go) start here too — the same boot point an
+	// `on start` job runs at — but each in its own goroutine: unlike an
+	// on-start job (a bounded, one-shot action run inline, blocking StartJobs
+	// until it returns) a daemon is meant to run for the rest of the
+	// process's life, so starting it inline here would never return.
+	s.startDaemons()
+
 	hasPeriodic := false
 	for _, j := range s.ir.Jobs {
 		if j.Every > 0 {

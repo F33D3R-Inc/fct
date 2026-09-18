@@ -1,0 +1,62 @@
+# Daemons — a detached, process-lifetime background task, the counterpart to
+# `job` that's shaped for a genuine background SERVICE rather than scheduled
+# work. Where `job every Ns -> action` is fleet-wide exactly-once (one instance
+# wins the tick; see runtime/jobs.go) and its body is a reference to one
+# existing zero-arg action, `daemon` runs on THIS instance unconditionally and
+# its body is real imperative code — the same vocabulary a `proc` has
+# (loop/if/spawn/join), plus `act ActionName(args)`, the one way its body may
+# touch entity/session state. It is never joined: there is no handle, by
+# design — it starts once at boot and runs for the life of the process.
+#
+# Pulse below ticks once a second, forever, incrementing Heartbeat(1) through
+# an ordinary action (`act tick()`). Each tick's store access is scoped to
+# exactly that one `act` call — runtime/daemon.go's runDaemonTicking never
+# holds the store lock between ticks — so it never blocks (or is blocked by)
+# `bump`, the ordinary request-handling action below that concurrent HTTP
+# clients hit to increment a Widget's count. Run both at once (`facet run
+# examples/daemon.fct`, then hammer POST /api/bump while it's up) and watch
+# Heartbeat.ticks keep climbing on its own second-by-second schedule with no
+# stalls, no matter how hard bump is hit.
+app Daemons:
+    entity Heartbeat:
+        id: int
+        ticks: int
+        lastTick: int
+
+    entity Widget:
+        id: int
+        name: text
+        count: int
+
+    action seedHeartbeat:
+        add Heartbeat { ticks: 0, lastTick: 0 }
+
+    action seedWidgets:
+        add Widget { name: "left", count: 0 }
+        add Widget { name: "right", count: 0 }
+
+    # The daemon's own store access — a plain action, run under system
+    # authority exactly like a job's dispatch, so its store lock is held only
+    # for this one call (runtime/server.go's "actcall" op).
+    action tick:
+        set Heartbeat(1).ticks = Heartbeat(1).ticks + 1
+        set Heartbeat(1).lastTick = now()
+
+    # Ordinary request-handling work, wired to real HTTP clients below — the
+    # thing a daemon must never block.
+    action bump(id: int):
+        set Widget(id).count = Widget(id).count + 1
+
+    job seedHeartbeatJob on start -> seedHeartbeat
+    job seedWidgetsJob on start -> seedWidgets
+
+    daemon Pulse every 1s:
+        act tick()
+
+    view Main at "/":
+        box:
+            text "heartbeat: {Heartbeat(1).ticks} ticks, last at {Heartbeat(1).lastTick}"
+            for w in Widget by id:
+                row:
+                    text "{w.name}: {w.count}"
+                    button "bump" -> bump(w.id)

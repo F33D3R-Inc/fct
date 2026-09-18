@@ -1,0 +1,1275 @@
+import "parser_service.fct"
+
+app ParserDecl2SelfHost:
+    # Partial, honest self-hosting port of a SECOND slice of
+    # internal/parser/parser.go's declaration parsers into `.fct` `proc`s —
+    # parseRecord (lines 826-879), parseStruct (881-947), parseEnum
+    # (761-824), parseComponent's own HEADER (1139-1159), parseTrigger
+    # (1743-1758), and parsePolicy's own BODY shape gate (1425-1440),
+    # plus one composition-only addition: EntityFieldDecl, a real struct
+    # gathering the "relation/index" field modifiers (@unique/@restrict/
+    # @setNull — parseEntity lines 561-681) that parser_entity.fct's own
+    # STAGE 10 already ported as separate flat booleans, restated here as
+    # ONE named value instead of many parallel results (see that STAGE's
+    # own header for why the flat-result shape was chosen there — this file
+    # simply demonstrates the struct-milestone alternative on top of it,
+    # without touching parser_entity.fct itself).
+    #
+    # ============================================================
+    # WHY THIS IS A NEW FILE, NOT AN EXTENSION OF parser.fct/parser_proc.fct/
+    # parser_entity.fct/parser_service.fct
+    # ============================================================
+    # Those four files are being actively worked on elsewhere in this same
+    # port (one adds stmt.fct wiring to parser_proc.fct concurrently with
+    # this file's own work) — editing any of them here would collide. This
+    # file only IMPORTS parser_service.fct (which itself imports
+    # parser_entity.fct, which imports parser_proc.fct), so every STAGE 1-17
+    # primitive (hasPrefixText/trimPrefixText/indexOf/isIdentToken/
+    # isUpperName/isTypeNameToken/typeCore/typeIsList/typeIsOptional/
+    # paramColonIndex/paramNameOf/paramTypeRawOf/headerName/
+    # headerHasParenSection/headerParensValid/headerParamPieces/
+    # arrowIndexOf/quotedInner/entityField*/parsePolicy*) is available to
+    # `do` here exactly as if it were declared locally — the same
+    # cross-file composition parser.fct's own header already verified live
+    # (TestCrossFileDoCallComposition). None of those three files declares
+    # a `struct`, `state`, `action`, or `view` of its own, so nothing here
+    # can collide with them; this file's own `struct`s, `state`s, and its
+    # `view Decl2Home at "/decl2"` (a fresh path, unused by any file in the
+    # import chain) are the only new declarations.
+    #
+    # ============================================================
+    # STRUCTS, NOT ARENAS — every declaration kind below is represented as
+    # a real named `struct` (RecordDecl/StructDecl/EnumDecl/ComponentDecl/
+    # TriggerDecl/PolicyDecl/EntityFieldDecl), each holding a real
+    # `[SomeFieldStruct]` list where the real grammar has a variable-length
+    # field/value/param list — never a flat `[int]`/parallel-array kind-tag
+    # encoding. This mirrors the "struct milestone" nodes.fct/predicate.fct/
+    # expr_tokens.fct/stmt.fct already went through (their own headers
+    # explain why), applied here to the declaration-header layer for the
+    # first time. Per those files' own established limitation (nodes.fct's
+    # own STAGE 11 header: "A struct value itself... can never be a `state`
+    # cell"), the demo drivers at the bottom flatten each struct into plain
+    # text/int/bool `state` via small `describe*` procs — the struct tree
+    # itself is real and complete; only the HTTP-visible demo layer, which
+    # every other file in this port already works around the identical way,
+    # degrades to scalars.
+    # ============================================================
+
+    # ============================================================
+    # STAGE 18: shared primitives this file needs that the imported chain
+    # doesn't already have — a generic `[text]` concatenation (STAGE 1's own
+    # concatInts/concatBytes idiom from btree.fct/storage.fct, restated for
+    # `text` since no cross-file import of THOSE unrelated apps is worth
+    # taking just for one proc), and a "first line / rest of the lines"
+    # split for a multi-line declaration's raw source text — the same
+    # "hand the whole dedented block in as one `src: text`, split it
+    # internally" convention source.fct/nodes.fct's own nodeTreeSrc already
+    # established, used here because a real action's parameter may never be
+    # list-typed (parseSignature's own allowList=false for both
+    # parseAction's and parsePolicy's calls, confirmed live by reading both
+    # again), so a driver action cannot take a ready-made `[text]` of child
+    # lines directly — it must take one `text` blob and split it itself.
+    # ============================================================
+    proc concatText(a: [text], b: [text]) -> [text]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc linesFrom(lines: [text], start: int) -> [text]:
+        let n = len(lines)
+        let mut out = []
+        let mut i = start
+        loop i < n:
+            out = append(out, lines[i])
+            i = i + 1
+        return out
+
+    proc firstLineOf(lines: [text]) -> text:
+        if len(lines) == 0:
+            return ""
+        return lines[0]
+
+    # declHeadName/declHeadInline: the ONE header shape parseRecord,
+    # parseStruct, AND parseEnum all three share verbatim (confirmed by
+    # reading all three fresh, not assumed) — `name := head; if colon :=
+    # IndexByte(head, ':'); colon >= 0 { name = TrimSpace(head[:colon]);
+    # inline = TrimSpace(head[colon+1:]) }` — i.e. "the header's own text,
+    # with an OPTIONAL `: inline, fields, here` tail". Shared once here
+    # rather than re-derived three times.
+    proc declHeadColonIndex(head: text) -> int:
+        let r = do indexOf(head, ":")
+        return r
+
+    proc declHeadName(head: text) -> text:
+        let c = do declHeadColonIndex(head)
+        if c < 0:
+            return trim(head)
+        return trim(slice(head, 0, c))
+
+    proc declHeadInline(head: text) -> text:
+        let c = do declHeadColonIndex(head)
+        if c < 0:
+            return ""
+        return trim(slice(head, c + 1, len(head)))
+
+    # ============================================================
+    # STAGE 19: parseRecord — `record Name: score: int, ok: bool` (inline)
+    # or one `name: type` per child line (parser.go lines 826-879, read
+    # fresh). Unlike an entity field, a record field MAY be a list or
+    # optional — parseRecord never rejects either, confirmed by reading it
+    # fresh (no `if list { error }` at all, unlike parseEntity's own field
+    # loop). Field-spec splitting reuses STAGE 4's own paramHasColon/
+    # paramNameOf/paramTypeRawOf verbatim (a record field's `name: type`
+    # shape is byte-for-byte the same grammar a signature parameter's own
+    # piece already has), exactly the way parsePolicyParamsValid already
+    # reuses those same three procs for an unrelated declaration kind.
+    # ============================================================
+    struct RecordField:
+        name: text
+        typeCore: text
+        isList: bool
+        isOptional: bool
+        valid: bool
+
+    struct RecordDecl:
+        name: text
+        fields: [RecordField]
+        valid: bool
+
+    proc recordFieldSpecValid(spec: text) -> bool:
+        let hasColon = do paramHasColon(spec)
+        if !hasColon:
+            return false
+        let fn = do paramNameOf(spec)
+        let idOk = do isIdentToken(fn)
+        if !idOk:
+            return false
+        let ft = do paramTypeRawOf(spec)
+        let core = do typeCore(ft)
+        let typeOk = do isTypeNameToken(core)
+        return typeOk
+
+    proc buildRecordField(spec: text) -> RecordField:
+        let fn = do paramNameOf(spec)
+        let ft = do paramTypeRawOf(spec)
+        let core = do typeCore(ft)
+        let isL = do typeIsList(ft)
+        let isOpt = do typeIsOptional(ft)
+        let ok = do recordFieldSpecValid(spec)
+        return RecordField{name: fn, typeCore: core, isList: isL, isOptional: isOpt, valid: ok}
+
+    # buildRecordFields: parser.go's own `add` closure applied over every
+    # spec — an EMPTY (all-whitespace) spec is silently skipped (Go's own
+    # `spec = TrimSpace(spec); if spec == "" { return nil }`), never turned
+    # into an invalid field. This matters for a trailing comma in the
+    # header's inline field list (`record R: a: int,` splits to
+    # ["a: int", ""]) and is deliberately NOT the rule component params use
+    # below (a component signature has no such tolerance — see STAGE 22).
+    proc buildRecordFields(specs: [text]) -> [RecordField]:
+        let n = len(specs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let t = trim(specs[i])
+            if t != "":
+                let f = do buildRecordField(specs[i])
+                out = append(out, f)
+            i = i + 1
+        return out
+
+    proc recordFieldsAllValid(fields: [RecordField]) -> bool:
+        let n = len(fields)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            if !fields[i].valid:
+                ok = false
+            i = i + 1
+        return ok
+
+    # recordDeclValid: parser.go's own three real gates — `isIdent(name) &&
+    # isUpper(name)`, and `len(r.Fields) == 0` (a record needs at least one
+    # field) — plus every field's own validity (each an independent `add`
+    # call in Go; ANDed together here since a boolean verdict cannot name
+    # WHICH one failed, the same convention entityFieldValid/deriveValid
+    # already established).
+    proc recordDeclValid(name: text, fields: [RecordField]) -> bool:
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let upOk = do isUpperName(name)
+        if !upOk:
+            return false
+        if len(fields) == 0:
+            return false
+        let allOk = do recordFieldsAllValid(fields)
+        return allOk
+
+    proc buildRecordDecl(name: text, specs: [text]) -> RecordDecl:
+        let fields = do buildRecordFields(specs)
+        let v = do recordDeclValid(name, fields)
+        return RecordDecl{name: name, fields: fields, valid: v}
+
+    proc recordHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "record")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc recordHeaderName(head: text) -> text:
+        let r = do declHeadName(head)
+        return r
+
+    proc recordInlineSpecs(head: text) -> [text]:
+        let raw = do declHeadInline(head)
+        if raw == "":
+            return []
+        return split(raw, ",")
+
+    # parseRecordDeclSrc: the end-to-end driver, taking the WHOLE dedented
+    # `record Name:\n    field: type\n    ...` block as one `src` (or a
+    # single line for the fully-inline form) — the same "one text blob in,
+    # split internally" shape nodeTreeSrc already uses, needed here because
+    # an action's own parameter may never be list-typed (see STAGE 18's own
+    # header). parser.go's real order is inline fields first, THEN each
+    # child line, in source order — preserved here via concatText(inline,
+    # children), never the reverse.
+    proc parseRecordDeclSrc(src: text) -> RecordDecl:
+        let lines = split(src, "\n")
+        let headerLine = do firstLineOf(lines)
+        let childLines = do linesFrom(lines, 1)
+        let head = do recordHeadOf(headerLine)
+        let name = do recordHeaderName(head)
+        let inlineSpecs = do recordInlineSpecs(head)
+        let specs = do concatText(inlineSpecs, childLines)
+        let d = do buildRecordDecl(name, specs)
+        return d
+
+    # ============================================================
+    # STAGE 20: parseStruct — the same `Name: field: type` grammar as
+    # parseRecord (STAGE 19), MINUS list rejection (still allowed, exactly
+    # like a record) but PLUS two rejections a record field never has: no
+    # `?` (a struct is constructed whole — internal/ir/build.go's
+    # checkStructFieldTypes) and no `money`/`date` core (parser.go lines
+    # 892-947, read fresh: `if optional { error }`, `if core == "money" ||
+    # core == "date" { error }`, THEN `if !isTypeName(core) { error }`, in
+    # that exact order — order doesn't change the ANDed boolean verdict
+    # this file reports, only which specific error real Go would raise, so
+    # it is preserved here for readability, not because it changes the
+    # result).
+    # ============================================================
+    struct StructField:
+        name: text
+        typeCore: text
+        isList: bool
+        valid: bool
+
+    struct StructDecl:
+        name: text
+        fields: [StructField]
+        valid: bool
+
+    proc structFieldSpecValid(spec: text) -> bool:
+        let hasColon = do paramHasColon(spec)
+        if !hasColon:
+            return false
+        let fn = do paramNameOf(spec)
+        let idOk = do isIdentToken(fn)
+        if !idOk:
+            return false
+        let ft = do paramTypeRawOf(spec)
+        let opt = do typeIsOptional(ft)
+        if opt:
+            return false
+        let core = do typeCore(ft)
+        if core == "money":
+            return false
+        if core == "date":
+            return false
+        let typeOk = do isTypeNameToken(core)
+        return typeOk
+
+    proc buildStructField(spec: text) -> StructField:
+        let fn = do paramNameOf(spec)
+        let ft = do paramTypeRawOf(spec)
+        let core = do typeCore(ft)
+        let isL = do typeIsList(ft)
+        let ok = do structFieldSpecValid(spec)
+        return StructField{name: fn, typeCore: core, isList: isL, valid: ok}
+
+    proc buildStructFields(specs: [text]) -> [StructField]:
+        let n = len(specs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let t = trim(specs[i])
+            if t != "":
+                let f = do buildStructField(specs[i])
+                out = append(out, f)
+            i = i + 1
+        return out
+
+    proc structFieldsAllValid(fields: [StructField]) -> bool:
+        let n = len(fields)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            if !fields[i].valid:
+                ok = false
+            i = i + 1
+        return ok
+
+    proc structDeclValid(name: text, fields: [StructField]) -> bool:
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let upOk = do isUpperName(name)
+        if !upOk:
+            return false
+        if len(fields) == 0:
+            return false
+        let allOk = do structFieldsAllValid(fields)
+        return allOk
+
+    proc buildStructDecl(name: text, specs: [text]) -> StructDecl:
+        let fields = do buildStructFields(specs)
+        let v = do structDeclValid(name, fields)
+        return StructDecl{name: name, fields: fields, valid: v}
+
+    proc structHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "struct")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc structHeaderName(head: text) -> text:
+        let r = do declHeadName(head)
+        return r
+
+    proc structInlineSpecs(head: text) -> [text]:
+        let raw = do declHeadInline(head)
+        if raw == "":
+            return []
+        return split(raw, ",")
+
+    proc parseStructDeclSrc(src: text) -> StructDecl:
+        let lines = split(src, "\n")
+        let headerLine = do firstLineOf(lines)
+        let childLines = do linesFrom(lines, 1)
+        let head = do structHeadOf(headerLine)
+        let name = do structHeaderName(head)
+        let inlineSpecs = do structInlineSpecs(head)
+        let specs = do concatText(inlineSpecs, childLines)
+        let d = do buildStructDecl(name, specs)
+        return d
+
+    # ============================================================
+    # STAGE 21: parseEnum — `enum Name: a, b, c` (inline) or values on child
+    # lines, EACH child line ALSO split on comma (parser.go lines 761-824,
+    # read fresh: `for _, c := range n.Children { for _, v :=
+    # range strings.Split(c.Line.Text, ",") { add(v) } }`) — genuinely
+    # DIFFERENT from parseRecord/parseStruct's own child-line handling
+    # (STAGE 19/20 add each child line WHOLE, never re-splitting it), so
+    # flattenCommaLines below is real, load-bearing logic, not an
+    # oversight-turned-shared-helper. Each value may carry an optional wire
+    # rename, `v as "Wire"` (schema/facetql_wire.fct's own real
+    # `enum Visibility: private as "Private", public as "Public"`).
+    # ============================================================
+    struct EnumValue:
+        name: text
+        wireName: text
+        valid: bool
+
+    struct EnumDecl:
+        name: text
+        values: [EnumValue]
+        valid: bool
+
+    proc enumValueWireMarkerIndex(v: text) -> int:
+        let r = do indexOf(v, " as ")
+        return r
+
+    proc enumValueHasWireClause(v: text) -> bool:
+        let idx = do enumValueWireMarkerIndex(v)
+        return idx >= 0
+
+    proc enumValueBaseNameRaw(v: text) -> text:
+        let idx = do enumValueWireMarkerIndex(v)
+        if idx < 0:
+            return trim(v)
+        return trim(slice(v, 0, idx))
+
+    proc enumValueWireRawText(v: text) -> text:
+        let idx = do enumValueWireMarkerIndex(v)
+        if idx < 0:
+            return ""
+        return trim(slice(v, idx + 4, len(v)))
+
+    # enumValueWireQuoted: parser.go's own `len(wire) < 2 || wire[0] != '"'
+    # || wire[len(wire)-1] != '"'` — the ENTIRE trimmed wire clause must
+    # itself be one quoted literal, not merely CONTAIN a quoted span
+    # anywhere (so this deliberately does NOT reuse STAGE 13's
+    # quotedInner/hasQuotedText — those answer a different question, "is
+    # there a quoted span somewhere in here", which is the wrong check for
+    # this exact gate). Vacuously true when there is no wire clause at all.
+    proc enumValueWireQuoted(v: text) -> bool:
+        let hasWire = do enumValueHasWireClause(v)
+        if !hasWire:
+            return true
+        let wireRaw = do enumValueWireRawText(v)
+        let n = len(wireRaw)
+        if n < 2:
+            return false
+        let first = charAt(wireRaw, 0)
+        let last = charAt(wireRaw, n - 1)
+        return first == "\"" && last == "\""
+
+    proc enumValueWireInnerText(v: text) -> text:
+        let hasWire = do enumValueHasWireClause(v)
+        if !hasWire:
+            return ""
+        let quoted = do enumValueWireQuoted(v)
+        if !quoted:
+            return ""
+        let wireRaw = do enumValueWireRawText(v)
+        let n = len(wireRaw)
+        return slice(wireRaw, 1, n - 1)
+
+    proc enumValueName(v: text) -> text:
+        let r = do enumValueBaseNameRaw(v)
+        return r
+
+    # enumValueWireName: parser.go's own `if wire == "" { wire = v }` — the
+    # wire name defaults to the value's own (already `as`-stripped)
+    # identifier when no rename clause is present.
+    proc enumValueWireName(v: text) -> text:
+        let hasWire = do enumValueHasWireClause(v)
+        if !hasWire:
+            let base = do enumValueName(v)
+            return base
+        let inner = do enumValueWireInnerText(v)
+        return inner
+
+    proc enumValueSpecValid(v: text) -> bool:
+        let hasWire = do enumValueHasWireClause(v)
+        if hasWire:
+            let quoted = do enumValueWireQuoted(v)
+            if !quoted:
+                return false
+            let inner = do enumValueWireInnerText(v)
+            if inner == "":
+                return false
+        let name = do enumValueName(v)
+        let idOk = do isIdentToken(name)
+        return idOk
+
+    proc buildEnumValue(v: text) -> EnumValue:
+        let name = do enumValueName(v)
+        let wire = do enumValueWireName(v)
+        let ok = do enumValueSpecValid(v)
+        return EnumValue{name: name, wireName: wire, valid: ok}
+
+    # buildEnumValues: mirrors buildRecordFields' own empty-spec skip —
+    # parser.go's own `add` returns nil (no value, no error) for a blank
+    # piece, the same trailing-comma tolerance STAGE 19 already documents.
+    proc buildEnumValues(specs: [text]) -> [EnumValue]:
+        let n = len(specs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let t = trim(specs[i])
+            if t != "":
+                let ev = do buildEnumValue(specs[i])
+                out = append(out, ev)
+            i = i + 1
+        return out
+
+    proc enumValuesAllValid(values: [EnumValue]) -> bool:
+        let n = len(values)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            if !values[i].valid:
+                ok = false
+            i = i + 1
+        return ok
+
+    proc enumDeclValid(name: text, values: [EnumValue]) -> bool:
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let upOk = do isUpperName(name)
+        if !upOk:
+            return false
+        if len(values) == 0:
+            return false
+        let allOk = do enumValuesAllValid(values)
+        return allOk
+
+    proc buildEnumDecl(name: text, specs: [text]) -> EnumDecl:
+        let values = do buildEnumValues(specs)
+        let v = do enumDeclValid(name, values)
+        return EnumDecl{name: name, values: values, valid: v}
+
+    proc enumHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "enum")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc enumHeaderName(head: text) -> text:
+        let r = do declHeadName(head)
+        return r
+
+    proc enumInlineSpecs(head: text) -> [text]:
+        let raw = do declHeadInline(head)
+        if raw == "":
+            return []
+        return split(raw, ",")
+
+    proc flattenCommaLines(lines: [text]) -> [text]:
+        let n = len(lines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let pieces = split(lines[i], ",")
+            let merged = do concatText(out, pieces)
+            out = merged
+            i = i + 1
+        return out
+
+    proc parseEnumDeclSrc(src: text) -> EnumDecl:
+        let lines = split(src, "\n")
+        let headerLine = do firstLineOf(lines)
+        let childLines = do linesFrom(lines, 1)
+        let head = do enumHeadOf(headerLine)
+        let name = do enumHeaderName(head)
+        let inlineSpecs = do enumInlineSpecs(head)
+        let childSpecs = do flattenCommaLines(childLines)
+        let specs = do concatText(inlineSpecs, childSpecs)
+        let d = do buildEnumDecl(name, specs)
+        return d
+
+    # ============================================================
+    # STAGE 22: parseComponent's own HEADER — `component Name(label: text,
+    # value: cell text, act: action):` (parser.go lines 1139-1159, calling
+    # parseSignature with allowList=false, allowRef=true — read fresh
+    # against the real parseSignature body at lines 2362-2421, NOT assumed
+    # from parseProc's own allowList=true/allowRef=false call). A component
+    # parameter may be a plain value (never a list — allowList=false), a
+    # `cell T` reference (MAY be a list; may never be optional — a cell
+    # names a state slot, which either exists or doesn't), or a bare
+    # `action` reference (no type at all). Real integration/component_test.go
+    # examples verified against: `TextField(label: text, value: cell
+    # text)`, `SubmitButton(label: text, act: action, value: cell text)`,
+    # `Card(title: text)`, `NavLink(label: text, href: text)`.
+    #
+    # componentHeadOf strips ONLY the `component`/`:` wrapping — everything
+    # after that (name-before-`(`, paren balance, comma-split params) reuses
+    # STAGE 4's own headerName/headerHasParenSection/headerParensValid/
+    # headerParamPieces VERBATIM. This is safe because a component header
+    # never contains a `->` or a ` uses ` clause (confirmed by reading
+    # parseComponent fresh: it calls parseSignature directly on `head`, no
+    # arrow/uses stripping of its own, unlike parseProc), so headerSigCore's
+    # own internal headBeforeUses/headBeforeArrow no-op on every real
+    # component header — the identical reuse justification STAGE 16
+    # (parsePolicy) already gives for the same three procs.
+    # ============================================================
+    struct ComponentParam:
+        name: text
+        refKind: text
+        typeCore: text
+        isList: bool
+        isOptional: bool
+        valid: bool
+
+    struct ComponentDecl:
+        name: text
+        params: [ComponentParam]
+        valid: bool
+
+    proc componentParamIsAction(piece: text) -> bool:
+        let pt = do paramTypeRawOf(piece)
+        return pt == "action"
+
+    proc componentParamIsCell(piece: text) -> bool:
+        let pt = do paramTypeRawOf(piece)
+        let r = do hasPrefixText(pt, "cell ")
+        return r
+
+    proc componentParamRefKind(piece: text) -> text:
+        let isAction = do componentParamIsAction(piece)
+        if isAction:
+            return "action"
+        let isCell = do componentParamIsCell(piece)
+        if isCell:
+            return "cell"
+        return "value"
+
+    proc componentParamEffectiveType(piece: text) -> text:
+        let kind = do componentParamRefKind(piece)
+        let pt = do paramTypeRawOf(piece)
+        if kind == "cell":
+            let stripped = do trimPrefixText(pt, "cell ")
+            return trim(stripped)
+        return pt
+
+    proc componentParamCore(piece: text) -> text:
+        let et = do componentParamEffectiveType(piece)
+        let r = do typeCore(et)
+        return r
+
+    proc componentParamIsList(piece: text) -> bool:
+        let et = do componentParamEffectiveType(piece)
+        let r = do typeIsList(et)
+        return r
+
+    proc componentParamIsOptional(piece: text) -> bool:
+        let et = do componentParamEffectiveType(piece)
+        let r = do typeIsOptional(et)
+        return r
+
+    # componentParamValid: parseSignature's own per-param gates, restated —
+    # a colon and a valid identifier name always required; an `action` ref
+    # needs nothing further (Go: `if ref == RefAction { append; continue }`
+    # — no type/list/optional check at all); a `cell` ref may never be
+    # optional but MAY be a list; a plain value may be neither optional (…
+    # wait: optional IS allowed for a value param — only LIST is barred —
+    # `list && !allowList && ref != RefCell` is the one rejection, optional
+    # has no such gate for a value ref at all, confirmed fresh); every
+    # non-action ref's core must be a syntactically valid type name.
+    proc componentParamValid(piece: text) -> bool:
+        let hasColon = do paramHasColon(piece)
+        if !hasColon:
+            return false
+        let pn = do paramNameOf(piece)
+        let idOk = do isIdentToken(pn)
+        if !idOk:
+            return false
+        let kind = do componentParamRefKind(piece)
+        if kind == "action":
+            return true
+        let opt = do componentParamIsOptional(piece)
+        if kind == "cell":
+            if opt:
+                return false
+        let isL = do componentParamIsList(piece)
+        if isL:
+            if kind != "cell":
+                return false
+        let core = do componentParamCore(piece)
+        let typeOk = do isTypeNameToken(core)
+        return typeOk
+
+    proc buildComponentParam(piece: text) -> ComponentParam:
+        let pn = do paramNameOf(piece)
+        let kind = do componentParamRefKind(piece)
+        let ok = do componentParamValid(piece)
+        if kind == "action":
+            return ComponentParam{name: pn, refKind: kind, typeCore: "", isList: false, isOptional: false, valid: ok}
+        let core = do componentParamCore(piece)
+        let isL = do componentParamIsList(piece)
+        let isOpt = do componentParamIsOptional(piece)
+        return ComponentParam{name: pn, refKind: kind, typeCore: core, isList: isL, isOptional: isOpt, valid: ok}
+
+    # buildComponentParams: unlike buildRecordFields/buildEnumValues (STAGE
+    # 19/21), an empty piece is NOT skipped — parseSignature has no such
+    # tolerance (a stray blank piece fails `paramHasColon` and is reported,
+    # via componentParamValid, as an invalid param, exactly as a real
+    # `component C(a: int, , b: text):` would hit Go's own "needs a type"
+    # error on the empty middle piece).
+    proc buildComponentParams(pieces: [text]) -> [ComponentParam]:
+        let n = len(pieces)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let p = do buildComponentParam(pieces[i])
+            out = append(out, p)
+            i = i + 1
+        return out
+
+    proc componentParamsAllValid(params: [ComponentParam]) -> bool:
+        let n = len(params)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            if !params[i].valid:
+                ok = false
+            i = i + 1
+        return ok
+
+    proc componentHeaderNameValid(head: text) -> bool:
+        let name = do headerName(head)
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let upOk = do isUpperName(name)
+        return upOk
+
+    proc componentDeclValid(head: text, params: [ComponentParam]) -> bool:
+        let hasParen = do headerHasParenSection(head)
+        if hasParen:
+            let parensOk = do headerParensValid(head)
+            if !parensOk:
+                return false
+        let nameOk = do componentHeaderNameValid(head)
+        if !nameOk:
+            return false
+        let paramsOk = do componentParamsAllValid(params)
+        return paramsOk
+
+    proc componentHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "component")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc buildComponentDecl(lineText: text) -> ComponentDecl:
+        let head = do componentHeadOf(lineText)
+        let name = do headerName(head)
+        let hasParen = do headerHasParenSection(head)
+        let mut params = []
+        if hasParen:
+            let parensOk = do headerParensValid(head)
+            if parensOk:
+                let pieces = do headerParamPieces(head)
+                let builtParams = do buildComponentParams(pieces)
+                params = builtParams
+        let valid = do componentDeclValid(head, params)
+        return ComponentDecl{name: name, params: params, valid: valid}
+
+    # ============================================================
+    # STAGE 23: parseTrigger — `on <action> -> <reaction>` (parser.go lines
+    # 1743-1758, read fresh) — a fully self-contained one-liner, the
+    # "non-cron sibling of a job" (examples/trigger.fct's own real `on post
+    # -> fanout` / `on fanout -> tally`). Field names avoid the bare words
+    # `on`/`action` (both meaningful tokens elsewhere in this grammar) for
+    # the struct's own fields, out of caution rather than a confirmed
+    # conflict.
+    # ============================================================
+    struct TriggerDecl:
+        onAction: text
+        reactionAction: text
+        valid: bool
+
+    proc triggerRestOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "on")
+        return trim(stripped)
+
+    proc triggerArrowIndex(rest: text) -> int:
+        let r = do arrowIndexOf(rest)
+        return r
+
+    proc triggerHasArrow(rest: text) -> bool:
+        let idx = do triggerArrowIndex(rest)
+        return idx >= 0
+
+    proc triggerOnPart(rest: text) -> text:
+        let idx = do triggerArrowIndex(rest)
+        if idx < 0:
+            return ""
+        return trim(slice(rest, 0, idx))
+
+    proc triggerReactPart(rest: text) -> text:
+        let idx = do triggerArrowIndex(rest)
+        if idx < 0:
+            return ""
+        return trim(slice(rest, idx + 2, len(rest)))
+
+    proc triggerValid(lineText: text) -> bool:
+        let rest = do triggerRestOf(lineText)
+        let hasArrow = do triggerHasArrow(rest)
+        if !hasArrow:
+            return false
+        let on = do triggerOnPart(rest)
+        let onOk = do isIdentToken(on)
+        if !onOk:
+            return false
+        let react = do triggerReactPart(rest)
+        let reactOk = do isIdentToken(react)
+        return reactOk
+
+    proc buildTriggerDecl(lineText: text) -> TriggerDecl:
+        let rest = do triggerRestOf(lineText)
+        let onA = do triggerOnPart(rest)
+        let reactA = do triggerReactPart(rest)
+        let ok = do triggerValid(lineText)
+        return TriggerDecl{onAction: onA, reactionAction: reactA, valid: ok}
+
+    # ============================================================
+    # STAGE 24: parsePolicy's own BODY — the piece parser_service.fct's own
+    # STAGE 16 explicitly left undone (its header names it out of scope).
+    # The full real function (parser.go lines 1425-1440) is:
+    #   name, params, err := parseSignature(head, line, false, false)
+    #   if len(n.Children) != 1 { error "policy must have exactly one
+    #       predicate line" }
+    #   e, err := parseExpr(n.Children[0].Line.Text, ...)
+    # The header half (name/params) is STAGE 16, already ported and reused
+    # here verbatim via `do`. The body's own real content is ONE expression
+    # — needing expr.fct's real parser, out of scope for this file for the
+    # exact reason STAGE 16's own header states (and stateValid/deriveValid/
+    # entityFieldValid's `read:` clause/checkStatementValid's condition
+    # before it: importing expr.fct here would collide, since expr.fct
+    # declares its own `isDigitChar`/`isIdentChar`/etc. under the SAME
+    # names STAGE 1/2 of parser_proc.fct already does — confirmed by that
+    # file's own STAGE 2 header, not assumed). What genuinely WAS missing
+    # and IS real, complete, non-expression-dependent work is the body's
+    # own SHAPE gate — `len(n.Children) != 1` — ported here as
+    # policyBodyShapeValid, then composed with the already-ported header
+    # into one real PolicyDecl struct (STAGE 16 only ever exposed flat
+    # `state` results, never a single composed value).
+    # ============================================================
+    struct PolicyDecl:
+        name: text
+        paramNames: [text]
+        paramTypes: [text]
+        paramOptionals: [bool]
+        headerValid: bool
+        bodyChildCount: int
+        bodyShapeValid: bool
+        valid: bool
+
+    proc policyBodyShapeValid(bodyChildCount: int) -> bool:
+        return bodyChildCount == 1
+
+    proc buildPolicyDecl(headerLineText: text, bodyChildCount: int) -> PolicyDecl:
+        let name = do parsePolicyName(headerLineText)
+        let pn = do parsePolicyParamNames(headerLineText)
+        let pt = do parsePolicyParamTypes(headerLineText)
+        let po = do parsePolicyParamOptionals(headerLineText)
+        let hv = do parsePolicyValid(headerLineText)
+        let bodyOk = do policyBodyShapeValid(bodyChildCount)
+        let mut overallValid = false
+        if hv:
+            if bodyOk:
+                overallValid = true
+        return PolicyDecl{name: name, paramNames: pn, paramTypes: pt, paramOptionals: po, headerValid: hv, bodyChildCount: bodyChildCount, bodyShapeValid: bodyOk, valid: overallValid}
+
+    # ============================================================
+    # STAGE 25: EntityFieldDecl — a real struct composing parser_entity.fct's
+    # own already-ported STAGE 10 flat results (entityFieldSecret/E2E/
+    # Unique/Required/Restrict/SetNull — the @unique/@restrict/@setNull
+    # relation-and-index-style modifiers this task asked for — plus @min/
+    # @max/@requires/@matches) into ONE named value, exactly the way STAGE
+    # 19-21 above build a RecordField/StructField/EnumValue instead of
+    # returning a fistful of parallel arrays. Every proc `do`-called below
+    # already exists, unmodified, in parser_entity.fct — this is pure
+    # composition, zero duplicated logic. There is no separate `@index` or
+    # `@relation` annotation anywhere in this grammar (confirmed by reading
+    # parser.go's entire entity-field modifier loop, lines 561-681, plus a
+    # repo-wide search for "@index"/"@relation" — neither exists); a
+    # relation is simply a field whose type names another entity, and its
+    # on-delete behavior IS @restrict/@setNull, which is exactly what this
+    # struct's own onDeleteRestrict/onDeleteSetNull fields carry.
+    # ============================================================
+    struct EntityFieldDecl:
+        name: text
+        typeCore: text
+        isList: bool
+        isOptional: bool
+        secret: bool
+        e2e: bool
+        unique: bool
+        required: bool
+        onDeleteRestrict: bool
+        onDeleteSetNull: bool
+        hasMin: bool
+        minValue: int
+        hasMax: bool
+        maxValue: int
+        hasRequiresPolicy: bool
+        requiresPolicy: text
+        matchesPattern: text
+        valid: bool
+
+    proc buildEntityFieldDecl(lineText: text) -> EntityFieldDecl:
+        let name = do entityFieldNameOf(lineText)
+        let ft = do entityFieldTypeRawOf(lineText)
+        let core = do entityFieldCore(ft)
+        let isL = do entityFieldIsList(ft)
+        let isOpt = do entityFieldIsOptional(ft)
+        let secret = do entityFieldSecret(ft)
+        let e2e = do entityFieldE2E(ft)
+        let unique = do entityFieldUnique(ft)
+        let required = do entityFieldRequired(ft)
+        let restrict = do entityFieldRestrict(ft)
+        let setNull = do entityFieldSetNull(ft)
+        let hasMin = do entityFieldHasMin(ft)
+        let minValue = do entityFieldMinValue(ft)
+        let hasMax = do entityFieldHasMax(ft)
+        let maxValue = do entityFieldMaxValue(ft)
+        let hasReq = do entityFieldHasRequires(ft)
+        let reqPolicy = do entityFieldRequiresPolicy(ft)
+        let matches = do entityFieldMatchesPattern(ft)
+        let ok = do entityFieldValid(lineText)
+        return EntityFieldDecl{name: name, typeCore: core, isList: isL, isOptional: isOpt, secret: secret, e2e: e2e, unique: unique, required: required, onDeleteRestrict: restrict, onDeleteSetNull: setNull, hasMin: hasMin, minValue: minValue, hasMax: hasMax, maxValue: maxValue, hasRequiresPolicy: hasReq, requiresPolicy: reqPolicy, matchesPattern: matches, valid: ok}
+
+    # ============================================================
+    # STAGE 26: describe* — flatten each struct tree above to plain text/int
+    # for the `state`/`view` layer below, since a struct value itself can
+    # never be a `state` cell (nodes.fct's own STAGE 11 header, restated
+    # verbatim as the reason here).
+    # ============================================================
+    proc describeRecordField(f: RecordField) -> text:
+        let mut s = f.name + ": "
+        if f.isList:
+            s = s + "[" + f.typeCore + "]"
+        else:
+            s = s + f.typeCore
+        if f.isOptional:
+            s = s + "?"
+        if !f.valid:
+            s = s + "(invalid)"
+        return s
+
+    proc describeRecordFields(fields: [RecordField]) -> text:
+        let n = len(fields)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let d = do describeRecordField(fields[i])
+            if i > 0:
+                out = out + ", "
+            out = out + d
+            i = i + 1
+        return out
+
+    proc describeStructField(f: StructField) -> text:
+        let mut s = f.name + ": "
+        if f.isList:
+            s = s + "[" + f.typeCore + "]"
+        else:
+            s = s + f.typeCore
+        if !f.valid:
+            s = s + "(invalid)"
+        return s
+
+    proc describeStructFields(fields: [StructField]) -> text:
+        let n = len(fields)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let d = do describeStructField(fields[i])
+            if i > 0:
+                out = out + ", "
+            out = out + d
+            i = i + 1
+        return out
+
+    proc describeEnumValue(v: EnumValue) -> text:
+        let mut s = v.name
+        if v.wireName != v.name:
+            s = s + " as \"" + v.wireName + "\""
+        if !v.valid:
+            s = s + "(invalid)"
+        return s
+
+    proc describeEnumValues(values: [EnumValue]) -> text:
+        let n = len(values)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let d = do describeEnumValue(values[i])
+            if i > 0:
+                out = out + ", "
+            out = out + d
+            i = i + 1
+        return out
+
+    proc describeComponentParam(p: ComponentParam) -> text:
+        let mut s = p.name + ": "
+        if p.refKind == "action":
+            s = s + "action"
+        else:
+            if p.refKind == "cell":
+                s = s + "cell "
+            if p.isList:
+                s = s + "[" + p.typeCore + "]"
+            else:
+                s = s + p.typeCore
+            if p.isOptional:
+                s = s + "?"
+        if !p.valid:
+            s = s + "(invalid)"
+        return s
+
+    proc describeComponentParams(params: [ComponentParam]) -> text:
+        let n = len(params)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let d = do describeComponentParam(params[i])
+            if i > 0:
+                out = out + ", "
+            out = out + d
+            i = i + 1
+        return out
+
+    proc describeEntityFieldDecl(d: EntityFieldDecl) -> text:
+        let mut s = d.name + ": "
+        if d.isList:
+            s = s + "[" + d.typeCore + "]"
+        else:
+            s = s + d.typeCore
+        if d.isOptional:
+            s = s + "?"
+        if d.secret:
+            s = s + " @secret"
+        if d.e2e:
+            s = s + " @e2e"
+        if d.unique:
+            s = s + " @unique"
+        if d.required:
+            s = s + " @required"
+        if d.onDeleteRestrict:
+            s = s + " @restrict"
+        if d.onDeleteSetNull:
+            s = s + " @setNull"
+        if d.hasMin:
+            s = s + " @min"
+        if d.hasMax:
+            s = s + " @max"
+        if d.hasRequiresPolicy:
+            s = s + " @requires(" + d.requiresPolicy + ")"
+        if d.matchesPattern != "":
+            s = s + " @matches"
+        if !d.valid:
+            s = s + " (invalid)"
+        return s
+
+    # ============================================================
+    # STAGE 27: per-scalar summary procs. An action may never bind a struct
+    # value directly — confirmed LIVE (not assumed) by first writing this
+    # section with `let d = do parseRecordDeclSrc(src)` inside an action and
+    # getting a real compiler rejection: `proc "parseRecordDeclSrc" returns
+    # RecordDecl, a struct type usable only inside another proc — an action
+    # cannot bind it ... Read its fields inside the proc and give
+    # "parseRecordDeclSrc" a scalar/list return type instead`. This is a
+    # STRICTER version of nodes.fct's own STAGE 11 rule ("a struct can never
+    # be a `state` cell") — a struct cannot even pass through an action's
+    # own local `let`, not just its `state`. Each proc below re-runs the
+    # relevant build once and returns exactly one already-flattened scalar,
+    # the same "independent re-derivation, no shared pass" convention this
+    # whole port already uses everywhere a proc's single-return-value limit
+    # would otherwise force a struct/tuple back out through an action.
+    # ============================================================
+    proc recordDeclSummaryName(src: text) -> text:
+        let d = do parseRecordDeclSrc(src)
+        return d.name
+
+    proc recordDeclSummaryFields(src: text) -> text:
+        let d = do parseRecordDeclSrc(src)
+        let r = do describeRecordFields(d.fields)
+        return r
+
+    proc recordDeclSummaryCount(src: text) -> int:
+        let d = do parseRecordDeclSrc(src)
+        return len(d.fields)
+
+    proc recordDeclSummaryValid(src: text) -> bool:
+        let d = do parseRecordDeclSrc(src)
+        return d.valid
+
+    proc structDeclSummaryName(src: text) -> text:
+        let d = do parseStructDeclSrc(src)
+        return d.name
+
+    proc structDeclSummaryFields(src: text) -> text:
+        let d = do parseStructDeclSrc(src)
+        let r = do describeStructFields(d.fields)
+        return r
+
+    proc structDeclSummaryCount(src: text) -> int:
+        let d = do parseStructDeclSrc(src)
+        return len(d.fields)
+
+    proc structDeclSummaryValid(src: text) -> bool:
+        let d = do parseStructDeclSrc(src)
+        return d.valid
+
+    proc enumDeclSummaryName(src: text) -> text:
+        let d = do parseEnumDeclSrc(src)
+        return d.name
+
+    proc enumDeclSummaryValues(src: text) -> text:
+        let d = do parseEnumDeclSrc(src)
+        let r = do describeEnumValues(d.values)
+        return r
+
+    proc enumDeclSummaryCount(src: text) -> int:
+        let d = do parseEnumDeclSrc(src)
+        return len(d.values)
+
+    proc enumDeclSummaryValid(src: text) -> bool:
+        let d = do parseEnumDeclSrc(src)
+        return d.valid
+
+    proc componentDeclSummaryName(lineText: text) -> text:
+        let d = do buildComponentDecl(lineText)
+        return d.name
+
+    proc componentDeclSummaryParams(lineText: text) -> text:
+        let d = do buildComponentDecl(lineText)
+        let r = do describeComponentParams(d.params)
+        return r
+
+    proc componentDeclSummaryCount(lineText: text) -> int:
+        let d = do buildComponentDecl(lineText)
+        return len(d.params)
+
+    proc componentDeclSummaryValid(lineText: text) -> bool:
+        let d = do buildComponentDecl(lineText)
+        return d.valid
+
+    proc triggerDeclSummaryOn(lineText: text) -> text:
+        let d = do buildTriggerDecl(lineText)
+        return d.onAction
+
+    proc triggerDeclSummaryReaction(lineText: text) -> text:
+        let d = do buildTriggerDecl(lineText)
+        return d.reactionAction
+
+    proc triggerDeclSummaryValid(lineText: text) -> bool:
+        let d = do buildTriggerDecl(lineText)
+        return d.valid
+
+    proc policyDeclSummaryName(headerLineText: text, bodyChildCount: int) -> text:
+        let d = do buildPolicyDecl(headerLineText, bodyChildCount)
+        return d.name
+
+    proc policyDeclSummaryHeaderValid(headerLineText: text, bodyChildCount: int) -> bool:
+        let d = do buildPolicyDecl(headerLineText, bodyChildCount)
+        return d.headerValid
+
+    proc policyDeclSummaryBodyShapeValid(headerLineText: text, bodyChildCount: int) -> bool:
+        let d = do buildPolicyDecl(headerLineText, bodyChildCount)
+        return d.bodyShapeValid
+
+    proc policyDeclSummaryValid(headerLineText: text, bodyChildCount: int) -> bool:
+        let d = do buildPolicyDecl(headerLineText, bodyChildCount)
+        return d.valid
+
+    proc entityFieldDeclSummaryText(lineText: text) -> text:
+        let d = do buildEntityFieldDecl(lineText)
+        let r = do describeEntityFieldDecl(d)
+        return r
+
+    proc entityFieldDeclSummaryValid(lineText: text) -> bool:
+        let d = do buildEntityFieldDecl(lineText)
+        return d.valid
+
+    # ============================================================
+    # STAGE 28: the live HTTP-exercisable drivers, at a fresh view path
+    # ("/decl2") clear of parser.fct's own "/" and nodes.fct's own "/nodes".
+    # Each action calls only the scalar-returning summary procs above —
+    # never binds a struct itself, per STAGE 27's own header.
+    # ============================================================
+    state recordDeclName: text = ""
+    state recordDeclFieldsSummary: text = ""
+    state recordDeclFieldCount: int = 0
+    state recordDeclValidResult: bool = false
+
+    state structDeclName: text = ""
+    state structDeclFieldsSummary: text = ""
+    state structDeclFieldCount: int = 0
+    state structDeclValidResult: bool = false
+
+    state enumDeclName: text = ""
+    state enumDeclValuesSummary: text = ""
+    state enumDeclValueCount: int = 0
+    state enumDeclValidResult: bool = false
+
+    state componentDeclName: text = ""
+    state componentDeclParamsSummary: text = ""
+    state componentDeclParamCount: int = 0
+    state componentDeclValidResult: bool = false
+
+    state triggerOnActionResult: text = ""
+    state triggerReactionActionResult: text = ""
+    state triggerValidResult: bool = false
+
+    state policyDeclName: text = ""
+    state policyDeclHeaderValidResult: bool = false
+    state policyDeclBodyShapeValidResult: bool = false
+    state policyDeclValidResult: bool = false
+
+    state entityFieldDeclSummary: text = ""
+    state entityFieldDeclValidResult: bool = false
+
+    action runParseRecordDecl(src: text):
+        let n = do recordDeclSummaryName(src)
+        let f = do recordDeclSummaryFields(src)
+        let c = do recordDeclSummaryCount(src)
+        let v = do recordDeclSummaryValid(src)
+        recordDeclName = n
+        recordDeclFieldsSummary = f
+        recordDeclFieldCount = c
+        recordDeclValidResult = v
+
+    action runParseStructDecl(src: text):
+        let n = do structDeclSummaryName(src)
+        let f = do structDeclSummaryFields(src)
+        let c = do structDeclSummaryCount(src)
+        let v = do structDeclSummaryValid(src)
+        structDeclName = n
+        structDeclFieldsSummary = f
+        structDeclFieldCount = c
+        structDeclValidResult = v
+
+    action runParseEnumDecl(src: text):
+        let n = do enumDeclSummaryName(src)
+        let vs = do enumDeclSummaryValues(src)
+        let c = do enumDeclSummaryCount(src)
+        let v = do enumDeclSummaryValid(src)
+        enumDeclName = n
+        enumDeclValuesSummary = vs
+        enumDeclValueCount = c
+        enumDeclValidResult = v
+
+    action runParseComponentDecl(lineText: text):
+        let n = do componentDeclSummaryName(lineText)
+        let p = do componentDeclSummaryParams(lineText)
+        let c = do componentDeclSummaryCount(lineText)
+        let v = do componentDeclSummaryValid(lineText)
+        componentDeclName = n
+        componentDeclParamsSummary = p
+        componentDeclParamCount = c
+        componentDeclValidResult = v
+
+    action runParseTriggerDecl(lineText: text):
+        let on = do triggerDeclSummaryOn(lineText)
+        let react = do triggerDeclSummaryReaction(lineText)
+        let v = do triggerDeclSummaryValid(lineText)
+        triggerOnActionResult = on
+        triggerReactionActionResult = react
+        triggerValidResult = v
+
+    action runParsePolicyDecl(headerLineText: text, bodyChildCount: int):
+        let n = do policyDeclSummaryName(headerLineText, bodyChildCount)
+        let hv = do policyDeclSummaryHeaderValid(headerLineText, bodyChildCount)
+        let bv = do policyDeclSummaryBodyShapeValid(headerLineText, bodyChildCount)
+        let v = do policyDeclSummaryValid(headerLineText, bodyChildCount)
+        policyDeclName = n
+        policyDeclHeaderValidResult = hv
+        policyDeclBodyShapeValidResult = bv
+        policyDeclValidResult = v
+
+    action runParseEntityFieldDecl(lineText: text):
+        let s = do entityFieldDeclSummaryText(lineText)
+        let v = do entityFieldDeclSummaryValid(lineText)
+        entityFieldDeclSummary = s
+        entityFieldDeclValidResult = v
+
+    view Decl2Home at "/decl2":
+        box:
+            text "{recordDeclName} {recordDeclFieldsSummary} {recordDeclFieldCount} {recordDeclValidResult}"
+            text "{structDeclName} {structDeclFieldsSummary} {structDeclFieldCount} {structDeclValidResult}"
+            text "{enumDeclName} {enumDeclValuesSummary} {enumDeclValueCount} {enumDeclValidResult}"
+            text "{componentDeclName} {componentDeclParamsSummary} {componentDeclParamCount} {componentDeclValidResult}"
+            text "{triggerOnActionResult} {triggerReactionActionResult} {triggerValidResult}"
+            text "{policyDeclName} {policyDeclHeaderValidResult} {policyDeclBodyShapeValidResult} {policyDeclValidResult}"
+            text "{entityFieldDeclSummary} {entityFieldDeclValidResult}"

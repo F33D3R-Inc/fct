@@ -2022,6 +2022,32 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			if st.Bind != "" {
 				fr.vars[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
 			}
+		case "actcall":
+			// `act ActionName(args)` (daemon-only — internal/ir/build.go's
+			// procBlock never emits this for a real proc's body): invoke a
+			// full server action exactly the way a Job or trigger already
+			// does, under the synthetic system actor. s.runAction acquires
+			// s.mu (runActionLocked) for only THIS call's duration and
+			// releases it before returning — never for the daemon's own
+			// lifetime — which is precisely what lets a daemon's own loop
+			// (execProcBlock's "loop" case, or runtime/daemon.go's ticker)
+			// run forever between calls without holding up any concurrent
+			// request the rest of the server is handling.
+			act := s.byAction[st.Service]
+			if act == nil {
+				return ctlSignal{}, fmt.Errorf("act calls unknown action %q", st.Service)
+			}
+			argVals := make([]any, len(st.Args))
+			for i, a := range st.Args {
+				v, err := s.evalInFrame(a, fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				argVals[i] = v
+			}
+			if _, status, msg := s.runAction(systemSID, act, argVals); status != http.StatusOK {
+				return ctlSignal{}, fmt.Errorf("act %s failed: %s", st.Service, msg)
+			}
 		case "exprstmt":
 			// A bare builtin call for its side effect alone (writeFile/httpPost/
 			// …), its result discarded — the "do" case above, but for a builtin

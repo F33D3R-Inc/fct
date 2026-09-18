@@ -237,8 +237,8 @@ func checkDuplicates(app *ast.App) error {
 	}
 	var (
 		entities, records, structs, enums, states, derives []string
-		policies, actions, procs, jobs, daemons             []string
-		components, layouts, views                          []string
+		policies, actions, procs, jobs, daemons            []string
+		components, layouts, views                         []string
 	)
 	for _, e := range app.Entities {
 		entities = append(entities, e.Name)

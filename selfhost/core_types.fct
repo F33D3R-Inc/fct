@@ -1,0 +1,374 @@
+app CoreTypesSelfHost:
+    # Self-hosting port of facetql/src/core/{user,coordinate,history,node,edge}.rs
+    # — five small, pure data-model files: no I/O, no crypto, just the shapes
+    # FacetQL's engine and API pass around, plus the handful of real methods
+    # each one carries (constructors, access checks, identity derivation).
+    #
+    # NOTE ON REUSE: predicate.fct and query.fct already carry an unrelated
+    # "one value, its own kind tag" `Field` struct (row/predicate values), and
+    # triggers.fct carries an unrelated `Edge{from, to}` (a dependency-graph
+    # edge for cycle detection) — neither is FacetQL's own graph `Node`/`Edge`,
+    # and query.fct's own comment on this point is the confirmed rule for this
+    # whole selfhost directory: "procs/structs don't cross files in this
+    # language, so a name shared with predicate.fct is coincidence, not
+    # reuse." There is no import/composition mechanism to reuse another
+    # file's struct even where the shape genuinely overlaps, so the five
+    # structs below are defined standalone here, the same way every other
+    # file in this directory restates its own copy of whatever it needs.
+    #
+    # NOTE ON u8: coordinate.rs's `Coordinate` and node.rs's `Node.value` are
+    # typed `u8`/`u64` in Rust, which the language itself bounds/wraps at
+    # those widths. fct has only one integer type (`int`, LANGUAGE.md's
+    # "`float`: a second numeric type, proc-only" section implies `int` is
+    # the sole non-float numeric type) with no fixed-width variant. That is a
+    # genuine language gap this port cannot close without a compiler change,
+    # which is out of scope this round — ported fields below are plain `int`,
+    # and `coordinateAxisInByteRange` is provided as an opt-in helper a
+    # caller MAY use to catch what Rust's `u8` would catch at compile time.
+    # `Coordinate::new` itself stays a byte-for-byte match of the real,
+    # unvalidated constructor (see its own doc below) rather than silently
+    # inventing a check the Rust source does not have.
+
+    # ============================================================
+    # coordinate.rs — Coordinate
+    # ============================================================
+    # A point in FacetQL's 4-axis address space. Wire-contract type: x/y/z/q
+    # are serialized on every insert_node op and every Node the API returns.
+    # Each axis is a plain u8 with NO range restriction beyond what u8 itself
+    # bounds — coordinate.rs deliberately removed the old grid/address-encode
+    # layer (try_new/to_address/from_address/grid_index) as unreachable
+    # scaffolding nothing in the engine, API or CLI ever used; this port
+    # carries only what coordinate.rs carries today.
+    struct Coordinate:
+        x: int
+        y: int
+        z: int
+        q: int
+
+    # coordinateNew: Coordinate::new, verbatim — accepts any axis value and
+    # performs NO validation, because the wire contract puts no bound on the
+    # axes beyond u8's own range and neither does the real constructor.
+    proc coordinateNew(x: int, y: int, z: int, q: int) -> Coordinate:
+        return Coordinate{x: x, y: y, z: z, q: q}
+
+    # coordinateAxisInByteRange: NOT part of coordinate.rs — Rust's `u8` type
+    # makes this check unnecessary there (it's enforced at compile time,
+    # before `new` ever runs). Offered here only as an opt-in helper for a
+    # self-hosted caller who wants the same guarantee at the data boundary,
+    # since fct's plain `int` won't stop an out-of-range value the way `u8`
+    # does. `coordinateNew` does NOT call this — calling it would add
+    # behavior the real constructor never had.
+    proc coordinateAxisInByteRange(v: int) -> bool:
+        return v >= 0 && v <= 255
+
+    # ============================================================
+    # user.rs — Role, UserRecord
+    # ============================================================
+    # Role: two roles for v0.6 — "regular user vs. superuser," same shape as
+    # a Postgres superuser bypassing row-level security. fct has no closed
+    # enum type (this directory's own convention, e.g. predicate.fct's
+    # `Node.kind`, is a validated text tag), so Role is the text tag "user"
+    # or "admin" and roleUser/roleAdmin are its two constructors — the same
+    # role that `Role::User`/`Role::Admin` play as the enum's two variants.
+    proc roleUser() -> text:
+        return "user"
+
+    proc roleAdmin() -> text:
+        return "admin"
+
+    # roleIsAdmin: the actual use-site logic user.rs's own doc points at —
+    # "an Admin bypasses ownership checks entirely (see Node::can_read/
+    # can_write callers in api/routes.rs)" — restated as the one predicate
+    # that check reduces to.
+    proc roleIsAdmin(role: text) -> bool:
+        return role == "admin"
+
+    # UserRecord: a persistent, admin-manageable identity — the durable
+    # counterpart to the static FACETQL_TOKENS env var. The plaintext token
+    # is never stored, only its hash (tokenHash) — shown to the caller
+    # exactly once, at creation, same pattern as a GitHub PAT or AWS IAM key.
+    # No constructor in user.rs (no `impl UserRecord` block) — it is built
+    # by field assignment at each call site, so this port carries only the
+    # struct itself, faithfully.
+    struct UserRecord:
+        tokenHash: text
+        owner: text
+        role: text
+
+    # userRecordIsAdmin: UserRecord's own role checked through roleIsAdmin —
+    # the one derived fact api/routes.rs actually needs from a UserRecord.
+    proc userRecordIsAdmin(u: UserRecord) -> bool:
+        let isAdmin = do roleIsAdmin(u.role)
+        return isAdmin
+
+    # ============================================================
+    # node.rs — Visibility, Node
+    # ============================================================
+    # Visibility: who may read a node. Private: only the owner. Public:
+    # anyone authenticated. Intentionally minimal for v0.1 (no per-node ACL
+    # list yet) — same text-tag treatment as Role, for the same reason.
+    proc visibilityPrivate() -> text:
+        return "private"
+
+    proc visibilityPublic() -> text:
+        return "public"
+
+    # Node: address.rs's core graph vertex. `claimedBy`/`hasClaimedBy`
+    # restate Rust's `claimed_by: Option<String>` the same way query.fct's
+    # `Cursor.hasOrder`/`orderVal` already restates an `Option` in this
+    # directory — `claimedBy` is meaningless when `hasClaimedBy` is false,
+    # exactly like an `Option::None`'s absent payload.
+    struct Node:
+        address: text
+        coordinate: Coordinate
+        value: int
+        kind: text
+        data: text
+        owner: text
+        hasClaimedBy: bool
+        claimedBy: text
+        visibility: text
+
+    # nodeNew: Node::new, verbatim — value 0, empty data, unclaimed, private
+    # by default. Every field Node::new doesn't take a parameter for is set
+    # to exactly the same default the real constructor sets it to.
+    proc nodeNew(coordinate: Coordinate, address: text, kind: text, owner: text) -> Node:
+        let privVis = do visibilityPrivate()
+        return Node{address: address, coordinate: coordinate, value: 0, kind: kind, data: "", owner: owner, hasClaimedBy: false, claimedBy: "", visibility: privVis}
+
+    # nodeCanRead: Node::can_read, verbatim — address knowledge alone never
+    # grants access; every read must pass through this check.
+    proc nodeCanRead(node: Node, requester: text) -> bool:
+        let pubVis = do visibilityPublic()
+        if node.visibility == pubVis:
+            return true
+        return node.owner == requester
+
+    # nodeCanWrite: Node::can_write, verbatim — only the owner may mutate a
+    # node in this version (shared/collaborative write is a future ACL
+    # feature, not yet built, same caveat the Rust doc carries).
+    proc nodeCanWrite(node: Node, requester: text) -> bool:
+        return node.owner == requester
+
+    # ============================================================
+    # edge.rs — Edge, EdgeId
+    # ============================================================
+    # Edge: a directed, typed relationship between two nodes. `kind` is
+    # free-text (e.g. "HAS_GOAL", "VERIFIED_BY") rather than a closed set,
+    # since the set of relationship types is a product decision that keeps
+    # growing — the storage layer shouldn't need a code change per new kind.
+    struct Edge:
+        from: text
+        to: text
+        kind: text
+        owner: text
+
+    # EdgeId: an edge's identity — the triple (from, to, kind), deliberately
+    # WITHOUT owner. An edge is a statement that a relationship exists
+    # between two nodes ("A follows B" is one fact, not one fact per
+    # asserter) — if owner were part of identity, two owners could each hold
+    # their own copy of the same fact and a traversal would double-count it.
+    # Ownership is an authorization attribute (who may remove the edge, see
+    # edgeCanWrite), not an identity one — the same split Node has between
+    # `address` (identity) and `owner` (authorization).
+    struct EdgeId:
+        from: text
+        to: text
+        kind: text
+
+    # edgeIdNew: EdgeId::new, verbatim.
+    proc edgeIdNew(from: text, to: text, kind: text) -> EdgeId:
+        return EdgeId{from: from, to: to, kind: kind}
+
+    # edgeNew: Edge::new, verbatim.
+    proc edgeNew(from: text, to: text, kind: text, owner: text) -> Edge:
+        return Edge{from: from, to: to, kind: kind, owner: owner}
+
+    # edgeId: Edge::id — this edge's identity, with owner deliberately
+    # dropped, exactly as EdgeId's own doc explains.
+    proc edgeId(e: Edge) -> EdgeId:
+        let id = do edgeIdNew(e.from, e.to, e.kind)
+        return id
+
+    # edgeCanWrite: Edge::can_write, verbatim — same ownership model as
+    # Node::can_write: only the edge's creator (or, at the caller layer, an
+    # admin bypassing this the same way it bypasses a node's can_write) may
+    # remove it. Because EdgeId excludes owner, whoever creates "A follows
+    # B" first owns the single copy of that fact and only they can retract
+    # it — the asymmetry edge.rs's own doc calls out.
+    proc edgeCanWrite(e: Edge, requester: text) -> bool:
+        return e.owner == requester
+
+    # ============================================================
+    # history.rs — HistoryEntry
+    # ============================================================
+    # HistoryEntry: one archived previous state of a node, captured the
+    # instant it's about to be overwritten — the real feature that replaced
+    # the old "3D temporal axis" idea. `node` holds the FULL previous node
+    # (every field, not just `data`) so a caller can see what the owner,
+    # visibility or kind used to be too. `version` is a monotonic number,
+    # unique across the life of the database, that makes history addressable
+    # by (address, version) rather than merely appended — two overwrites in
+    # the same second would otherwise share one `archivedAtUnix` and
+    # collide into a single key.
+    struct HistoryEntry:
+        address: text
+        archivedAtUnix: int
+        node: Node
+        version: int
+
+    # historyEntryMake: the pure half of HistoryEntry::now. The real
+    # `now()` pulls TWO impure values this file cannot and should not
+    # reproduce (this is a pure, I/O-free module by design, same as every
+    # other file in this directory):
+    #   - `archived_at_unix` from `SystemTime::now()` (a wall-clock read)
+    #   - `version` from `storage::wal::next_operation_id()` (the WAL's
+    #     process-wide, restart-surviving operation-id counter — a shared,
+    #     mutable, stateful subsystem, not a pure computation)
+    # Both are deliberately left as caller-supplied parameters instead of
+    # being faked with a local counter or a clock read that would NOT carry
+    # `next_operation_id`'s real property (unique and increasing across
+    # restarts, which is what makes archive-replay idempotent). Everything
+    # that IS pure in `now()` — deriving `address` from `node.address` and
+    # packaging the full node alongside it — is ported verbatim below.
+    proc historyEntryMake(node: Node, archivedAtUnix: int, version: int) -> HistoryEntry:
+        return HistoryEntry{address: node.address, archivedAtUnix: archivedAtUnix, node: node, version: version}
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURE — hand-verified against the real Rust
+    # semantics documented above:
+    #   - a private node owned by "alice": alice can read/write it, "bob"
+    #     can read/write neither (Node::can_read/can_write)
+    #   - the same node made public: bob can now read it, still can't write
+    #   - an edge "alice --FOLLOWS--> bob" owned by alice: alice can remove
+    #     it, bob cannot (Edge::can_write); its id drops the owner
+    #     (EdgeId == {from, to, kind} only)
+    #   - an admin UserRecord reports isAdmin true, a plain user false
+    #   - a history entry archiving that node carries the node's own
+    #     address and the caller-supplied version/timestamp through
+    #     unchanged
+    # ============================================================
+    proc demoNode() -> Node:
+        let coord = do coordinateNew(1, 2, 3, 4)
+        let n = do nodeNew(coord, "7Bm3", "Person", "alice")
+        return n
+
+    proc demoAliceCanReadPrivate() -> bool:
+        let n = do demoNode()
+        let ok = do nodeCanRead(n, "alice")
+        return ok
+
+    proc demoBobCanReadPrivate() -> bool:
+        let n = do demoNode()
+        let ok = do nodeCanRead(n, "bob")
+        return ok
+
+    proc demoBobCanReadPublic() -> bool:
+        let n = do demoNode()
+        let pubVis = do visibilityPublic()
+        let n2 = Node{address: n.address, coordinate: n.coordinate, value: n.value, kind: n.kind, data: n.data, owner: n.owner, hasClaimedBy: n.hasClaimedBy, claimedBy: n.claimedBy, visibility: pubVis}
+        let ok = do nodeCanRead(n2, "bob")
+        return ok
+
+    proc demoBobCanWrite() -> bool:
+        let n = do demoNode()
+        let ok = do nodeCanWrite(n, "bob")
+        return ok
+
+    proc demoEdge() -> Edge:
+        let e = do edgeNew("alice", "bob", "FOLLOWS", "alice")
+        return e
+
+    proc demoAliceCanWriteEdge() -> bool:
+        let e = do demoEdge()
+        let ok = do edgeCanWrite(e, "alice")
+        return ok
+
+    proc demoBobCanWriteEdge() -> bool:
+        let e = do demoEdge()
+        let ok = do edgeCanWrite(e, "bob")
+        return ok
+
+    proc demoEdgeIdDropsOwner() -> bool:
+        let e = do demoEdge()
+        let id = do edgeId(e)
+        return id.from == "alice" && id.to == "bob" && id.kind == "FOLLOWS"
+
+    proc demoAdminIsAdmin() -> bool:
+        let admin = do roleAdmin()
+        let u = UserRecord{tokenHash: "deadbeef", owner: "alice", role: admin}
+        let ok = do userRecordIsAdmin(u)
+        return ok
+
+    proc demoUserIsNotAdmin() -> bool:
+        let user = do roleUser()
+        let u = UserRecord{tokenHash: "cafef00d", owner: "bob", role: user}
+        let ok = do userRecordIsAdmin(u)
+        return ok
+
+    proc demoHistoryPreservesAddressAndVersion() -> bool:
+        let n = do demoNode()
+        let h = do historyEntryMake(n, 1758000000, 42)
+        return h.address == n.address && h.version == 42 && h.archivedAtUnix == 1758000000
+
+    # Coordinate checks: coordinateNew is a pure passthrough (no validation,
+    # matching Rust's real behavior — see coordinateNew's own doc), so an
+    # out-of-byte-range axis (300, -1) is stored unchanged, exactly as an
+    # unvalidated field assignment would leave it. coordinateAxisInByteRange
+    # is the opt-in helper this port adds for a caller who wants what u8's
+    # compile-time bound would have caught — it is NOT called by
+    # coordinateNew itself, so a caller who skips it still gets the
+    # unvalidated Rust-equivalent behavior below.
+    proc demoCoordinateNewIsUnvalidated() -> bool:
+        let c = do coordinateNew(300, -1, 0, 999)
+        return c.x == 300 && c.y == -1 && c.z == 0 && c.q == 999
+
+    proc demoCoordinateAxisRangeHelper() -> bool:
+        let inRange = do coordinateAxisInByteRange(255)
+        let tooHigh = do coordinateAxisInByteRange(256)
+        let tooLow = do coordinateAxisInByteRange(-1)
+        let zero = do coordinateAxisInByteRange(0)
+        return inRange && zero && !tooHigh && !tooLow
+
+    state demoResult1: bool = false
+    state demoResult2: bool = false
+    state demoResult3: bool = false
+    state demoResult4: bool = false
+    state demoResult5: bool = false
+    state demoResult6: bool = false
+    state demoResult7: bool = false
+    state demoResult8: bool = false
+    state demoResult9: bool = false
+    state demoResult10: bool = false
+    state demoResult11: bool = false
+    state demoResult12: bool = false
+
+    action runDemoCoreTypes():
+        let r1 = do demoAliceCanReadPrivate()
+        let r2 = do demoBobCanReadPrivate()
+        let r3 = do demoBobCanReadPublic()
+        let r4 = do demoBobCanWrite()
+        let r5 = do demoAliceCanWriteEdge()
+        let r6 = do demoBobCanWriteEdge()
+        let r7 = do demoEdgeIdDropsOwner()
+        let r8 = do demoAdminIsAdmin()
+        let r9 = do demoUserIsNotAdmin()
+        let r10 = do demoHistoryPreservesAddressAndVersion()
+        let r11 = do demoCoordinateNewIsUnvalidated()
+        let r12 = do demoCoordinateAxisRangeHelper()
+        demoResult1 = r1
+        demoResult2 = r2
+        demoResult3 = r3
+        demoResult4 = r4
+        demoResult5 = r5
+        demoResult6 = r6
+        demoResult7 = r7
+        demoResult8 = r8
+        demoResult9 = r9
+        demoResult10 = r10
+        demoResult11 = r11
+        demoResult12 = r12
+
+    view CoreTypesHome at "/":
+        box:
+            text "{demoResult1} {demoResult2} {demoResult3} {demoResult4} {demoResult5} {demoResult6} {demoResult7} {demoResult8} {demoResult9} {demoResult10} {demoResult11} {demoResult12}"
