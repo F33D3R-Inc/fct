@@ -922,6 +922,534 @@ app FabricSelfHost:
         let status = do keyspaceAddRuleStatus(rules, "Comment", "Comment:")
         return status
 
+    # ============================================================
+    # THIRD PORT, SAME FILE: fabric-migration's `phase.rs` + `migration.rs`
+    # (the shard-move state machine), plus `plan.rs`'s one construction-time
+    # check.
+    # ============================================================
+    # WHY THIS PIECE: the survey that found fabric-replication's failover.rs
+    # (above) checked the remaining unlisted crates too. fabric-topology
+    # (112 lines) and fabric-workload (236 lines) turned out to be exactly
+    # what their small size suggested: thin registries (`registry.rs`'s
+    # `HashMap` CRUD, `placement.rs`'s trait-object dispatch) and a
+    # profile-sampling accumulator (`analyzer.rs` folds observed read/write
+    # counts into running rates — real arithmetic, but "average a stream of
+    # samples", not a decision procedure with branches worth restating).
+    # fabric-protocol and fabric-telemetry are, respectively, wire-message
+    # framing and a metrics-collection trait — both genuinely I/O-shaped, not
+    # disqualified by a shallow guess. fabric-cli and fabric-daemon are
+    # command-line/process glue exactly like fabric-controller and
+    # fabric-runtime already were. fabric-simulator deliberately owns its own
+    # seeded PRNG (`rng.rs`) to drive fault injection — useful, but its
+    # decisions are conditioned on randomness this survey did not verify is
+    # reproducible the way a hand-checkable table is, the same reservation
+    # that already excluded fabric-optimizer/fabric-ml.
+    #
+    # `fabric-migration` is the exception, and — like keyspace.rs and
+    # failover.rs before it — it says so about itself, in its own crate doc,
+    # word for word: "Everything here is pure logic. Copying bytes, streaming
+    # the tail of the write stream, and deleting the source copy are the
+    # runtime's work; this crate says what is allowed to happen next and
+    # refuses what is not." No socket, no async; every `Serialize` derive is
+    # for shipping a `MigrationStatus` snapshot afterward, never read back in
+    # a decision (identical to `RoutingKey`/`KeyspaceMiss` and the failover
+    # verdict types before it).
+    #
+    # ============================================================
+    # WHAT THE LOGIC ACTUALLY IS (read in full from phase.rs and
+    # migration.rs, not assumed from the crate doc):
+    # ============================================================
+    # A migration moves one shard through eight phases (`MigrationPhase`,
+    # phase.rs): Planned -> Copying -> CatchingUp -> Cutover -> Cleanup ->
+    # Completed, with CatchingUp able to fall back to Copying (a bad copy is
+    # re-copied, not cut over to), and Aborted/Failed reachable as described
+    # below. `can_advance_to` is the one true edge table; every state-machine
+    # method in migration.rs either restates one of its edges directly or
+    # calls the private `advance` helper, which is just "not already
+    # terminal, AND the edge exists" — ported once, below, as
+    # `migrationAdvanceStatus`, and reused exactly the way `advance` itself
+    # is reused by every phase-changing method in the real crate.
+    #
+    # The crate doc names two invariants and this port's job is to make both
+    # checkable by hand, not just asserted:
+    #   1. A read always has an owner: the source until cutover COMPLETES
+    #      (`complete_cutover`, which sets `cutover_completed_at_ms`), the
+    #      destination after — tracked by that timestamp, deliberately NOT
+    #      by the phase, so a migration that later fails during cleanup still
+    #      correctly reports the destination as owner (ported as
+    #      `migrationReadOwnerIsDestination`, restating `read_owner` exactly).
+    #   2. A write is never lost or double-applied: `accept_write` routes a
+    #      write to the source before cutover and the destination after,
+    #      refusing anything not strictly past the accepting side's own
+    #      high-water mark (`NonMonotonicWrite`) or already covered by the
+    #      cutover fence or the destination's own applied mark
+    #      (`WriteAlreadyApplied`); `record_applied` is the mirror check on
+    #      the DESTINATION's report, refusing a sequence the source never
+    #      took (`UnknownWrite`) or already recorded (`WriteAlreadyApplied`).
+    #      Both are ported below exactly as `migrationAcceptWriteStatus` /
+    #      `migrationRecordAppliedStatus`, restating each `if`/branch in the
+    #      order `accept_write`/`record_applied` run them.
+    # `begin_cutover` and `complete_cutover` are where the two invariants
+    # actually meet: cutover may only START with the pending-write gap
+    # already inside `plan.max_cutover_pending_writes` (a live shard's write
+    # stream never fully stops, so the fence narrows the gap rather than
+    # requiring it already be zero) and may only COMPLETE once that gap has
+    # been driven to exactly zero — ported as `migrationBeginCutoverStatus` /
+    # `migrationCompleteCutoverStatus`.
+    #
+    # ============================================================
+    # REPRESENTATION — one struct for the whole machine, the same "several
+    # named facts about one entity" reasoning `RoutingRule`/`ReplicaEntry`
+    # already state above, extended for the reason `ReplicaEntry`'s own
+    # header already gives for NOT packing `pendingWrites`/`applyLagMs`
+    # together: every gatekeeper below reads `atomsCopied`, `sourceHighWater`,
+    # `destinationApplied`, etc. on their own, so packing any of them would
+    # only force unpacking back out.
+    # ============================================================
+    # `Option<WriteSeq>`/`Option<u64>` fields (`source_high_water`,
+    # `destination_applied`, `fence.last_write`, `cutover_completed_at_ms`)
+    # are each a sentinel `-1` int exactly like `ReplicaEntry.lastReportMs`
+    # above, for the identical reason: every real value compared against
+    # them is a non-negative sequence number or millisecond clock reading, so
+    # `-1` can never collide with one. `fence` itself (there is at most one,
+    # raised once per cutover attempt) gets a `hasFence` flag alongside its
+    # own `-1`-sentinelled `fenceLastWrite`, mirroring `Keyspace`'s
+    # `hasFallback`/`fallbackKey` pair above for the same "the sentinel
+    # inside only means something once the flag says the fence exists"
+    # reason — `fence.last_write` is ITSELF an `Option`, so this is a flag
+    # guarding a sentinel, not a flag standing in for one.
+    #
+    # `MigrationPhase` is ported as a plain `int` in the exact order phase.rs
+    # declares its variants (0=Planned .. 7=Failed), the same convention
+    # `ReplicaState` already uses above. `MigrationPlan`'s only field this
+    # file's procs need is `maxCutoverPendingWrites`, since `atoms`/`source`/
+    # `destination`/`reason` are either folded into `MigrationState` directly
+    # (`atomsTotal`) or never inspected by a decision procedure at all
+    # (source/destination node identity only matters for EQUALITY at
+    # planning time, ported separately as `migrationPlanStatus`, and is never
+    # read again by anything in this section).
+    struct MigrationState:
+        phase: int
+        atomsTotal: int
+        atomsCopied: int
+        sourceHighWater: int
+        destinationApplied: int
+        hasFence: bool
+        fenceLastWrite: int
+        cutoverCompletedAtMs: int
+        maxCutoverPendingWrites: int
+
+    # ============================================================
+    # PHASE TABLE — restates `phase.rs` exactly, one proc per method, in
+    # phase.rs's own declaration order.
+    # ============================================================
+    proc phaseIsTerminal(phase: int) -> bool:
+        return phase == 5 || phase == 6 || phase == 7
+
+    proc phaseIsPreCutover(phase: int) -> bool:
+        return phase == 0 || phase == 1 || phase == 2 || phase == 3
+
+    proc phaseAllowsAbort(phase: int) -> bool:
+        let preCutover = do phaseIsPreCutover(phase)
+        return preCutover
+
+    proc phaseIsFenced(phase: int) -> bool:
+        return phase == 3
+
+    # phaseCanAdvanceTo: restates the match arm by arm, top to bottom,
+    # exactly as `can_advance_to` orders them — the two `(_, Aborted)` /
+    # `(_, Failed)` catch-alls MUST come after the specific pairs precisely
+    # because Rust's own match does (a specific arm shadows a wildcard one
+    # earlier in the same list; restating them in the other order would let
+    # the wildcards fire first and never wrongly, since none of the specific
+    # pairs target Aborted/Failed, but this keeps the port's reading order
+    # identical to the source's, which is the point of a restatement).
+    proc phaseCanAdvanceTo(from: int, to: int) -> bool:
+        if from == 0 && to == 1:
+            return true
+        if from == 1 && to == 2:
+            return true
+        if from == 2 && to == 3:
+            return true
+        if from == 2 && to == 1:
+            return true
+        if from == 3 && to == 4:
+            return true
+        if from == 4 && to == 5:
+            return true
+        if to == 6:
+            let allowed = do phaseAllowsAbort(from)
+            return allowed
+        if to == 7:
+            let terminal = do phaseIsTerminal(from)
+            return !terminal
+        return false
+
+    # ============================================================
+    # THE `advance` HELPER — `Migration::advance`'s own gatekeeper, reused by
+    # every phase-changing method below exactly as the real one is reused by
+    # `begin_copy`/`begin_catch_up`/`restart_copy`/`begin_cutover`/
+    # `complete_cutover`/`complete`. 0=Ok, 1=AlreadyTerminal,
+    # 2=InvalidTransition.
+    # ============================================================
+    proc migrationAdvanceStatus(phase: int, to: int) -> int:
+        let terminal = do phaseIsTerminal(phase)
+        if terminal:
+            return 1
+        let canAdvance = do phaseCanAdvanceTo(phase, to)
+        if !canAdvance:
+            return 2
+        return 0
+
+    # migrationPendingWrites: `Migration::pending_writes` exactly — the
+    # sequence-slot arithmetic invariant 2 is built on.
+    proc migrationPendingWrites(state: MigrationState) -> int:
+        if state.sourceHighWater == -1:
+            return 0
+        if state.destinationApplied == -1:
+            return state.sourceHighWater + 1
+        return max(state.sourceHighWater - state.destinationApplied, 0)
+
+    proc migrationHasCutOver(state: MigrationState) -> bool:
+        return state.cutoverCompletedAtMs != -1
+
+    proc migrationIsWriteFenced(state: MigrationState) -> bool:
+        let fenced = do phaseIsFenced(state.phase)
+        return fenced
+
+    # migrationReadOwnerIsDestination: `read_owner` restated as "is it the
+    # destination" (true) or "is it the source" (false) — this port has no
+    # `DbmsId` type to return, and nothing below ever needs one: every real
+    # caller of `read_owner`/`write_owner` in the source only ever compares
+    # the result against `plan.source`/`plan.destination`, i.e. asks WHICH of
+    # the two, exactly the fact this bool already is.
+    proc migrationReadOwnerIsDestination(state: MigrationState) -> bool:
+        let cutOver = do migrationHasCutOver(state)
+        return cutOver
+
+    # migrationHasWriteOwner / migrationWriteOwnerIsDestination: `write_owner`
+    # split the same way `keyspaceResolveStatus`/`keyspaceResolveKey` split
+    # "does an answer exist" from "what is it" — `migrationWriteOwnerIsDestination`
+    # is only meaningful once `migrationHasWriteOwner` has already returned
+    # true for the identical state (mirroring `write_owner`'s own `None`
+    # while fenced).
+    proc migrationHasWriteOwner(state: MigrationState) -> bool:
+        let fenced = do migrationIsWriteFenced(state)
+        return !fenced
+
+    proc migrationWriteOwnerIsDestination(state: MigrationState) -> bool:
+        let isDestination = do migrationReadOwnerIsDestination(state)
+        return isDestination
+
+    # ============================================================
+    # THE TWO INVARIANTS — `accept_write` and `record_applied`, restated
+    # branch for branch in the order the real methods run them. Status codes
+    # are this file's own numbering (there is no shared enum to match against
+    # here, unlike phase.rs's phases, since `MigrationError` has far more
+    # variants than either method can actually produce):
+    #   accept_write: 0=Ok(Source) 1=Ok(Destination) 2=WriteFenced
+    #                 3=WriteAlreadyApplied 4=NonMonotonicWrite
+    #   record_applied: 0=Ok 1=UnknownWrite 2=WriteAlreadyApplied
+    # ============================================================
+    proc migrationAcceptWriteStatus(state: MigrationState, seq: int) -> int:
+        let fenced = do migrationIsWriteFenced(state)
+        if fenced:
+            return 2
+        let cutOver = do migrationHasCutOver(state)
+        if cutOver:
+            if state.hasFence:
+                if state.fenceLastWrite != -1:
+                    if seq <= state.fenceLastWrite:
+                        return 3
+            if state.destinationApplied != -1:
+                if seq <= state.destinationApplied:
+                    return 3
+            return 1
+        if state.sourceHighWater != -1:
+            if seq <= state.sourceHighWater:
+                return 4
+        return 0
+
+    proc migrationRecordAppliedStatus(state: MigrationState, seq: int) -> int:
+        if state.sourceHighWater == -1:
+            return 1
+        if seq > state.sourceHighWater:
+            return 1
+        if state.destinationApplied != -1:
+            if seq <= state.destinationApplied:
+                return 2
+        return 0
+
+    # ============================================================
+    # THE PHASE-CHANGING METHODS — each restates its real counterpart's
+    # guard(s) then, on success, the exact `advance` call it makes.
+    # ============================================================
+    proc migrationBeginCopyStatus(state: MigrationState) -> int:
+        let status = do migrationAdvanceStatus(state.phase, 1)
+        return status
+
+    # 0=Ok 1=WrongPhase 2=ProgressExceedsTotal 3=ProgressWentBackwards
+    proc migrationRecordCopyStatus(state: MigrationState, newAtomsCopied: int) -> int:
+        if state.phase != 1:
+            return 1
+        if newAtomsCopied > state.atomsTotal:
+            return 2
+        if newAtomsCopied < state.atomsCopied:
+            return 3
+        return 0
+
+    # 0=Ok 1=WrongPhase 2=CopyIncomplete
+    proc migrationBeginCatchUpStatus(state: MigrationState) -> int:
+        if state.phase != 1:
+            return 1
+        if state.atomsCopied < state.atomsTotal:
+            return 2
+        let status = do migrationAdvanceStatus(state.phase, 2)
+        return status
+
+    proc migrationRestartCopyStatus(state: MigrationState) -> int:
+        if state.phase != 2:
+            return 1
+        let status = do migrationAdvanceStatus(state.phase, 1)
+        return status
+
+    # 0=Ok 1=WrongPhase 2=CopyIncomplete 3=NotCaughtUp — the pending-write
+    # budget check where invariant 2's fence is actually raised.
+    proc migrationBeginCutoverStatus(state: MigrationState) -> int:
+        if state.phase != 2:
+            return 1
+        if state.atomsCopied < state.atomsTotal:
+            return 2
+        let pending = do migrationPendingWrites(state)
+        if pending > state.maxCutoverPendingWrites:
+            return 3
+        return 0
+
+    # 0=Ok 1=WrongPhase 2=CutoverNotDrained — authority may move only once
+    # the fence's own gap has been driven to exactly zero.
+    proc migrationCompleteCutoverStatus(state: MigrationState) -> int:
+        if state.phase != 3:
+            return 1
+        let pending = do migrationPendingWrites(state)
+        if pending > 0:
+            return 2
+        return 0
+
+    proc migrationCompleteStatus(state: MigrationState) -> int:
+        if state.phase != 4:
+            return 1
+        let status = do migrationAdvanceStatus(state.phase, 5)
+        return status
+
+    # 0=Ok 1=AlreadyTerminal 2=AbortAfterCutover — abort is available exactly
+    # through `allows_abort`'s pre-cutover window, restated here rather than
+    # re-derived, matching `abort`'s own two guard checks in order.
+    proc migrationAbortStatus(state: MigrationState) -> int:
+        let terminal = do phaseIsTerminal(state.phase)
+        if terminal:
+            return 1
+        let allowed = do phaseAllowsAbort(state.phase)
+        if !allowed:
+            return 2
+        return 0
+
+    proc migrationFailStatus(state: MigrationState) -> int:
+        let terminal = do phaseIsTerminal(state.phase)
+        if terminal:
+            return 1
+        return 0
+
+    # migrationPlanStatus: `MigrationPlan::new`'s one guard — a move to the
+    # node a shard is already on is not a migration. 0=Ok
+    # 1=SameSourceAndDestination.
+    proc migrationPlanStatus(source: text, destination: text) -> int:
+        if source == destination:
+            return 1
+        return 0
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — hand-verified against real traced
+    # scenarios restated from migration.rs's own unit tests (full trace in
+    # the task report). M1-M3 share one base fixture, `caught_up()`,
+    # restating migration.rs's own test helper of the same name exactly:
+    # begin_copy(2000); accept_write(0); accept_write(1); record_copy(156,
+    # 4096, 3000); begin_catch_up(4000); record_applied(1, 4100) — leaving
+    # phase=CatchingUp, sourceHighWater=1, destinationApplied=1,
+    # atomsCopied=atomsTotal=156, no fence yet, cutover not completed.
+    # `maxCutoverPendingWrites` is the plan default, 64.
+    # ============================================================
+    proc demoMigrationCaughtUp() -> MigrationState:
+        return MigrationState{phase: 2, atomsTotal: 156, atomsCopied: 156, sourceHighWater: 1, destinationApplied: 1, hasFence: false, fenceLastWrite: -1, cutoverCompletedAtMs: -1, maxCutoverPendingWrites: 64}
+
+    # M1 `catch_up_cannot_begin_with_atoms_missing`: phase=Copying,
+    # atomsCopied=100 of 156 -> begin_catch_up is CopyIncomplete(2).
+    proc demoM1BeginCatchUpStatus() -> int:
+        let state = MigrationState{phase: 1, atomsTotal: 156, atomsCopied: 100, sourceHighWater: -1, destinationApplied: -1, hasFence: false, fenceLastWrite: -1, cutoverCompletedAtMs: -1, maxCutoverPendingWrites: 64}
+        let status = do migrationBeginCatchUpStatus(state)
+        return status
+
+    # M2 `cutover_cannot_complete_while_a_write_is_undrained`: from
+    # caught_up(), one more write lands (seq 2, source-side, since the fence
+    # is not up yet) before begin_cutover. Traced: pending=max(2-1,0)=1 <= 64
+    # -> begin_cutover Ok, fence.lastWrite=2. complete_cutover with
+    # destinationApplied still 1 -> pending=1>0 -> CutoverNotDrained(2). Once
+    # record_applied(2) lands (destinationApplied=2) -> pending=0 ->
+    # complete_cutover Ok(0).
+    proc demoM2AfterExtraWrite() -> MigrationState:
+        let base = do demoMigrationCaughtUp()
+        return MigrationState{phase: base.phase, atomsTotal: base.atomsTotal, atomsCopied: base.atomsCopied, sourceHighWater: 2, destinationApplied: base.destinationApplied, hasFence: base.hasFence, fenceLastWrite: base.fenceLastWrite, cutoverCompletedAtMs: base.cutoverCompletedAtMs, maxCutoverPendingWrites: base.maxCutoverPendingWrites}
+
+    proc demoM2BeginCutoverStatus() -> int:
+        let state = do demoM2AfterExtraWrite()
+        let status = do migrationBeginCutoverStatus(state)
+        return status
+
+    proc demoM2Undrained() -> MigrationState:
+        let state = do demoM2AfterExtraWrite()
+        return MigrationState{phase: 3, atomsTotal: state.atomsTotal, atomsCopied: state.atomsCopied, sourceHighWater: state.sourceHighWater, destinationApplied: state.destinationApplied, hasFence: true, fenceLastWrite: 2, cutoverCompletedAtMs: -1, maxCutoverPendingWrites: state.maxCutoverPendingWrites}
+
+    proc demoM2UndrainedPending() -> int:
+        let state = do demoM2Undrained()
+        let pending = do migrationPendingWrites(state)
+        return pending
+
+    proc demoM2CompleteCutoverUndrainedStatus() -> int:
+        let state = do demoM2Undrained()
+        let status = do migrationCompleteCutoverStatus(state)
+        return status
+
+    proc demoM2Drained() -> MigrationState:
+        let state = do demoM2Undrained()
+        return MigrationState{phase: state.phase, atomsTotal: state.atomsTotal, atomsCopied: state.atomsCopied, sourceHighWater: state.sourceHighWater, destinationApplied: 2, hasFence: state.hasFence, fenceLastWrite: state.fenceLastWrite, cutoverCompletedAtMs: state.cutoverCompletedAtMs, maxCutoverPendingWrites: state.maxCutoverPendingWrites}
+
+    proc demoM2CompleteCutoverDrainedStatus() -> int:
+        let state = do demoM2Drained()
+        let status = do migrationCompleteCutoverStatus(state)
+        return status
+
+    # M3 `a_write_is_never_applied_twice_across_the_handover`: from
+    # caught_up() DIRECTLY (no extra write this time) -> begin_cutover
+    # (pending=max(1-1,0)=0, fence.lastWrite=1) -> complete_cutover
+    # (pending=0, Ok) -> phase=Cleanup, cutoverCompletedAtMs set. A replay of
+    # seq 1 is refused (WriteAlreadyApplied, matching the fence); seq 2 is
+    # accepted, routed to the destination.
+    proc demoM3AfterCutoverComplete() -> MigrationState:
+        let base = do demoMigrationCaughtUp()
+        return MigrationState{phase: 4, atomsTotal: base.atomsTotal, atomsCopied: base.atomsCopied, sourceHighWater: base.sourceHighWater, destinationApplied: base.destinationApplied, hasFence: true, fenceLastWrite: 1, cutoverCompletedAtMs: 5100, maxCutoverPendingWrites: base.maxCutoverPendingWrites}
+
+    proc demoM3ReplayStatus() -> int:
+        let state = do demoM3AfterCutoverComplete()
+        let status = do migrationAcceptWriteStatus(state, 1)
+        return status
+
+    proc demoM3NewWriteStatus() -> int:
+        let state = do demoM3AfterCutoverComplete()
+        let status = do migrationAcceptWriteStatus(state, 2)
+        return status
+
+    # M4 `abort_is_available_up_to_cutover_and_never_after`: fenced but not
+    # yet cut over (phase=Cutover) allows abort(0); once cutover has
+    # completed (phase=Cleanup) it is refused (AbortAfterCutover=2) even
+    # though Cleanup itself is not terminal.
+    proc demoM4BeforeCutoverComplete() -> MigrationState:
+        let base = do demoMigrationCaughtUp()
+        return MigrationState{phase: 3, atomsTotal: base.atomsTotal, atomsCopied: base.atomsCopied, sourceHighWater: base.sourceHighWater, destinationApplied: base.destinationApplied, hasFence: true, fenceLastWrite: 1, cutoverCompletedAtMs: -1, maxCutoverPendingWrites: base.maxCutoverPendingWrites}
+
+    proc demoM4AbortBeforeStatus() -> int:
+        let state = do demoM4BeforeCutoverComplete()
+        let status = do migrationAbortStatus(state)
+        return status
+
+    proc demoM4AbortAfterStatus() -> int:
+        let state = do demoM3AfterCutoverComplete()
+        let status = do migrationAbortStatus(state)
+        return status
+
+    # M5 `a_replayed_write_to_the_source_is_refused` /
+    # `the_destination_cannot_claim_a_write_the_source_never_took`: two
+    # smaller, independent traces exercising accept_write's
+    # NonMonotonicWrite(4) and record_applied's UnknownWrite(1) branches,
+    # neither reached by M1-M4.
+    proc demoM5NonMonotonicStatus() -> int:
+        let state = MigrationState{phase: 1, atomsTotal: 156, atomsCopied: 0, sourceHighWater: 7, destinationApplied: -1, hasFence: false, fenceLastWrite: -1, cutoverCompletedAtMs: -1, maxCutoverPendingWrites: 64}
+        let status = do migrationAcceptWriteStatus(state, 7)
+        return status
+
+    proc demoM5UnknownWriteStatus() -> int:
+        let state = MigrationState{phase: 1, atomsTotal: 156, atomsCopied: 0, sourceHighWater: 3, destinationApplied: -1, hasFence: false, fenceLastWrite: -1, cutoverCompletedAtMs: -1, maxCutoverPendingWrites: 64}
+        let status = do migrationRecordAppliedStatus(state, 9)
+        return status
+
+    # M6 `a_plan_to_the_same_node_is_refused` / phase-table sanity restating
+    # `cutover_cannot_be_skipped` and `abort_stops_being_available_once_authority_has_moved`.
+    proc demoM6PlanSameNode() -> int:
+        let status = do migrationPlanStatus("db-a", "db-a")
+        return status
+
+    proc demoM6PlanDifferentNodes() -> int:
+        let status = do migrationPlanStatus("db-a", "db-b")
+        return status
+
+    proc demoM6CutoverCannotBeSkipped() -> bool:
+        let a = do phaseCanAdvanceTo(1, 4)
+        let b = do phaseCanAdvanceTo(2, 4)
+        let c = do phaseCanAdvanceTo(0, 5)
+        return !a && !b && !c
+
+    proc demoM6AbortWindowNarrowsAfterCutover() -> bool:
+        let cutoverToAborted = do phaseCanAdvanceTo(3, 6)
+        let cleanupToAborted = do phaseCanAdvanceTo(4, 6)
+        let completedToAborted = do phaseCanAdvanceTo(5, 6)
+        return cutoverToAborted && !cleanupToAborted && !completedToAborted
+
+    state demoM1BeginCatchUp: int = 0
+    state demoM2BeginCutover: int = 0
+    state demoM2UndrainedPending: int = 0
+    state demoM2CompleteUndrained: int = 0
+    state demoM2CompleteDrained: int = 0
+    state demoM3Replay: int = 0
+    state demoM3NewWrite: int = 0
+    state demoM4AbortBefore: int = 0
+    state demoM4AbortAfter: int = 0
+    state demoM5NonMonotonic: int = 0
+    state demoM5UnknownWrite: int = 0
+    state demoM6PlanSameNode: int = 0
+    state demoM6PlanDifferentNodes: int = 0
+    state demoM6CutoverCannotBeSkipped: bool = false
+    state demoM6AbortWindowNarrows: bool = false
+
+    action runDemoMigration():
+        let m1BeginCatchUp = do demoM1BeginCatchUpStatus()
+        let m2BeginCutover = do demoM2BeginCutoverStatus()
+        let m2UndrainedPending = do demoM2UndrainedPending()
+        let m2CompleteUndrained = do demoM2CompleteCutoverUndrainedStatus()
+        let m2CompleteDrained = do demoM2CompleteCutoverDrainedStatus()
+        let m3Replay = do demoM3ReplayStatus()
+        let m3NewWrite = do demoM3NewWriteStatus()
+        let m4AbortBefore = do demoM4AbortBeforeStatus()
+        let m4AbortAfter = do demoM4AbortAfterStatus()
+        let m5NonMonotonic = do demoM5NonMonotonicStatus()
+        let m5UnknownWrite = do demoM5UnknownWriteStatus()
+        let m6PlanSameNode = do demoM6PlanSameNode()
+        let m6PlanDifferentNodes = do demoM6PlanDifferentNodes()
+        let m6CutoverCannotBeSkipped = do demoM6CutoverCannotBeSkipped()
+        let m6AbortWindowNarrows = do demoM6AbortWindowNarrowsAfterCutover()
+        demoM1BeginCatchUp = m1BeginCatchUp
+        demoM2BeginCutover = m2BeginCutover
+        demoM2UndrainedPending = m2UndrainedPending
+        demoM2CompleteUndrained = m2CompleteUndrained
+        demoM2CompleteDrained = m2CompleteDrained
+        demoM3Replay = m3Replay
+        demoM3NewWrite = m3NewWrite
+        demoM4AbortBefore = m4AbortBefore
+        demoM4AbortAfter = m4AbortAfter
+        demoM5NonMonotonic = m5NonMonotonic
+        demoM5UnknownWrite = m5UnknownWrite
+        demoM6PlanSameNode = m6PlanSameNode
+        demoM6PlanDifferentNodes = m6PlanDifferentNodes
+        demoM6CutoverCannotBeSkipped = m6CutoverCannotBeSkipped
+        demoM6AbortWindowNarrows = m6AbortWindowNarrows
+
     state demoD1Blocker: int = 0
     state demoD1HasPromotion: bool = true
     state demoD2HasPromotion: bool = false
@@ -1010,3 +1538,4 @@ app FabricSelfHost:
         box:
             text "{demoA1Status} {demoA1Key} {demoA2Status} {demoB1Status} {demoB1Key} {demoB2Key} {demoC1Status} {demoC1Key} {demoC1bStatus} {demoC2NotSpanning} {demoC2SingleSpanning} {demoValEmptyKind} {demoValEmptyPrefix} {demoValDupKind} {demoValDupPrefix} {demoValOk}"
             text "{demoD1Blocker} {demoD1HasPromotion} {demoD2HasPromotion} {demoD2PromotionNode} {demoD3StrictBlocker} {demoD3StrictIsStuck} {demoD3LenientHasPromotion} {demoD3LenientPromotionNode} {demoD4NeedsReplacement} {demoD4CandidateIneligibility}"
+            text "{demoM1BeginCatchUp} {demoM2BeginCutover} {demoM2UndrainedPending} {demoM2CompleteUndrained} {demoM2CompleteDrained} {demoM3Replay} {demoM3NewWrite} {demoM4AbortBefore} {demoM4AbortAfter} {demoM5NonMonotonic} {demoM5UnknownWrite} {demoM6PlanSameNode} {demoM6PlanDifferentNodes} {demoM6CutoverCannotBeSkipped} {demoM6AbortWindowNarrows}"

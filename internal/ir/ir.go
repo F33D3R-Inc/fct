@@ -43,9 +43,9 @@ type IR struct {
 	// produces, so the bytes have to ride along in the same JSON the rest of
 	// the app does. A text file resolved by the same directive is inlined
 	// directly at its use (an ordinary "lit" Expr) and never appears here.
-	Assets     map[string]Asset             `json:"assets,omitempty"`
-	Routes     []Route                      `json:"routes,omitempty"`     // every page's path + guard, for client link-hiding and SPA navigation
-	Pages      []Page                       `json:"pages"`                // one per view; each is a route
+	Assets map[string]Asset `json:"assets,omitempty"`
+	Routes []Route          `json:"routes,omitempty"` // every page's path + guard, for client link-hiding and SPA navigation
+	Pages  []Page           `json:"pages"`            // one per view; each is a route
 	// View/Bindings/DepGraph mirror the *current* page. `facet build` shows the
 	// first page; the server swaps them per request to the matched route, so the
 	// client runtime can keep reading these three fields unchanged.
@@ -511,8 +511,8 @@ type Stmt struct {
 	Body    []Stmt      `json:"body,omitempty"`    // loop: the repeated body; if: the `then` branch
 	Else    []Stmt      `json:"else,omitempty"`    // if: the `else` branch (nil = none)
 	Bytes   bool        `json:"bytes,omitempty"`   // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int; fileread/filewrite: the file resource is `bytes`-typed rather than `text`
-	File    string      `json:"file,omitempty"`   // fileread/filewrite: the declared `file` resource's name (for a clear runtime error)
-	Path    string      `json:"path,omitempty"`   // fileread/filewrite: the file's author-facing path, resolved from its `file` declaration at compile time — still passed through the sandbox (resolveDataPath) at runtime
+	File    string      `json:"file,omitempty"`    // fileread/filewrite: the declared `file` resource's name (for a clear runtime error)
+	Path    string      `json:"path,omitempty"`    // fileread/filewrite: the file's author-facing path, resolved from its `file` declaration at compile time — still passed through the sandbox (resolveDataPath) at runtime
 }
 
 // FieldInit is a `name: expr` in an `add`.

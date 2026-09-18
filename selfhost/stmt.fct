@@ -10,16 +10,16 @@ app StmtSelfHost:
     # expression subtrees, the only shape expr.fct's own arena ever needed).
     #
     # ============================================================
-    # REWRITE NOTE (struct milestone): this file used to represent the
-    # statement tree as a flat postorder `[int]` "arena" SHARED with
-    # expr.fct's own expression arena — 5 ints per row, a numeric kind tag
-    # (17 Block, 18 Let, 24 If, 28 StmtSlot, ...) whose slot MEANINGS
-    # depended silently on that tag, and a Block's own child statement list
-    # required an auxiliary StmtSlot row per child plus pure index
-    # arithmetic (`count = idx - firstSlotIdx`) to recover how many
+    # REWRITE NOTE (struct milestone, second pass): this file used to
+    # represent the statement tree as a flat postorder `[int]` "arena"
+    # SHARED with expr.fct's own expression arena — 5 ints per row, a
+    # numeric kind tag (17 Block, 18 Let, 24 If, 28 StmtSlot, ...) whose slot
+    # MEANINGS depended silently on that tag, and a Block's own child
+    # statement list required an auxiliary StmtSlot row per child plus pure
+    # index arithmetic (`count = idx - firstSlotIdx`) to recover how many
     # statements it held and where each one's own subtree started — see git
-    # history for the byte-for-byte encoding this file used to carry.
-    # Now that a proc can declare a real `struct` (see predicate.fct's own
+    # history for the byte-for-byte encoding this file used to carry. Now
+    # that a proc can declare a real `struct` (see predicate.fct's own
     # rewrite note and LANGUAGE.md's `proc` section), a Block is no longer
     # an indirect fact recovered by arithmetic: it is just `body: [Stmt]`, a
     # real array of the struct itself. An `if`'s then/else bodies, a
@@ -27,38 +27,29 @@ app StmtSelfHost:
     # the statement that owns it, not a NodeBlock/StmtSlot chain reached by
     # following an index into a shared int array.
     #
-    # One thing does NOT change: expr.fct (as of this rewrite) is still int-
-    # arena-based, not struct-based — this file was written to keep working
-    # against WHATEVER expr.fct's real current arena-building functions are,
-    # not to assume it had already been converted (checked fresh: it has
-    # not). So a statement's own expression(s) — a `let`'s RHS, an `if`/
-    # `loop`'s condition, a `do` call's arguments — are still parsed into,
-    # and referenced by a plain `int` root index into, THE SAME shared
-    # `[int]` expression arena expr.fct's own `orNodes`/`argListNodes`
-    # already build (exactly as before this rewrite). What changed is only
-    # the STATEMENT structure wrapped around that index: instead of a
-    # numeric-kind arena row, it is now a named field (`exprIdx: int`) on a
-    # real `Stmt` struct value.
+    # UPDATED (this pass): expr.fct itself has NOW ALSO been rewritten to
+    # structs (checked fresh, not assumed — its tokenizer/tree logic moved
+    # into expr_tokens.fct/expr_tree.fct, both re-exported through
+    # expr.fct's own import chain). `orNodes`/`argListNodes` etc. no longer
+    # take or return a shared `[int]` arena at all — `orNodes(kinds, texts,
+    # pos)` returns one real `ExprNode` value directly, and
+    # `argListNodes(kinds, texts, pos)` returns a real `[ExprNode]` whose
+    # own `len()` IS the arity, no separate count family needed. So a
+    # statement's own expression(s) — a `let`'s RHS, an `if`/`loop`'s
+    # condition, a `do` call's arguments — are now real `ExprNode`/
+    # `[ExprNode]` values held directly on `Stmt`, not an `int` index into
+    # anything.
     #
-    # This raises a genuinely new design question the arena version never
-    # had, because a flat `[int]` array could hold BOTH a statement's own
-    # numeric facts AND the expression arena's rows in the same value (see
-    # this file's original header, "the arena" section, now git history):
-    # once a statement becomes a real (non-`int`) struct, it can no longer
-    # live in the SAME array as the int-typed expression arena, so how does
-    # a call that both (a) builds a new `Stmt` value and (b) extends the
-    # shared expression arena hand BOTH facts back to its caller, when a
-    # proc can only ever return ONE value (LANGUAGE.md's `proc` section,
-    # unchanged)? The arena version never faced this because "the new
-    # array, extended" WAS the one value every recursive call threaded
-    # (expr.fct's own FINDING 3). The answer used throughout this rewrite:
-    # a small "pairing" struct — StmtResult (one built Stmt plus the arena
-    # as extended by building it) and BlockResult (one built [Stmt] list
-    # plus the same) — is itself exactly what a struct is FOR: grouping two
-    # facts that must travel together into one named-field value, the same
-    # way Node{kind, name, ...} replaced a five-slot arena row in
-    # predicate.fct. See StmtResult/BlockResult's own doc, below, for the
-    # full shape.
+    # This also retires the "pairing struct" this file used to need
+    # (StmtResult/BlockResult, one built value plus "the arena as extended
+    # by building it"): that shape existed ONLY because a proc returns
+    # exactly one value, yet building a Stmt also had to hand back how far
+    # the shared arena had grown. Now that expr.fct hands back a real
+    # ExprNode value with nothing shared left to thread, there is nothing
+    # left to pair — `singleStmt` returns a plain `Stmt`, `stmtBlockStmts`
+    # returns a plain `[Stmt]`, and `parseProcBodySrc` returns a plain
+    # `[Stmt]`, exactly like any other proc with one real return value.
+    # StmtResult/BlockResult are gone entirely, not just renamed.
     #
     # ============================================================
     # WHY THIS FILE DOES NOT `import "source.fct"` TOO
@@ -124,23 +115,25 @@ app StmtSelfHost:
     #       arena version) — always cheaply re-derivable from the one fact
     #       already kept, so a name never has to be threaded as a second
     #       payload alongside a statement's own struct value.
-    #   exprIdx: int
-    #       the root index, INTO THE SHARED expr.fct EXPRESSION ARENA (see
-    #       the REWRITE NOTE above for why this is still an int, not a
-    #       struct field, this rewrite), of: a `let`/`let mut`/`assign`'s
-    #       RHS, a `return`'s value (or -1 for a bare `return`), or an
-    #       `if`/`loop`'s condition. -1 for every kind that has no
-    #       expression of its own (do, letDo, break, continue,
-    #       unsupported).
-    #   argFirst: int / argCount: int
-    #       a `do`/`letDo` call's arguments — STILL expr.fct's own ArgSlot
-    #       auxiliary-row encoding (kind 8 in ITS arena), reused verbatim,
-    #       since expr.fct has not been rewritten to structs as of this
-    #       pass and a `do ProcName(args)` argument list is syntactically
-    #       identical to a builtin call's, parsed by expr.fct's own
-    #       argListCount/argListNodes exactly as before. argFirst is the
-    #       first ArgSlot row's index (or -1 for zero arguments); argCount
-    #       is the argument count. -1/0 for every other kind.
+    #   expr: ExprNode
+    #       the real, already-parsed expression tree (expr.fct's own
+    #       `ExprNode`, see expr_tokens.fct's struct doc) of: a `let`/
+    #       `let mut`/`assign`'s RHS, a `return`'s value, or an `if`/
+    #       `loop`'s condition. For every kind that has no expression of
+    #       its own (do, letDo, break, continue, unsupported) — including a
+    #       bare `return` with no value — this holds `emptyNode()`, the
+    #       same honest-degrade filler expr_tokens.fct's own constructors
+    #       already use for "no real node here": a harmless `Lit(int, "0")`
+    #       that never has to be treated as a real result, exactly the same
+    #       role `-1` played for the old `exprIdx: int` sentinel.
+    #   args: [ExprNode]
+    #       a `do`/`letDo` call's real argument list, in order — a `do
+    #       ProcName(args)` argument list is syntactically identical to a
+    #       builtin call's, so this is built by the exact same
+    #       `argListNodes` expr.fct's own Call/ListLit parsing already
+    #       uses. `len(args)` IS the arity; there is no separate count to
+    #       keep in sync, unlike the old arena's `argFirst`/`argCount` pair.
+    #       `[]` for every other kind.
     #   body: [Stmt]
     #       the THEN branch's statements (`if`) or the loop body's
     #       statements (`loop`) — a real array of this same struct, direct
@@ -151,35 +144,107 @@ app StmtSelfHost:
     #   elseBody: [Stmt]
     #       the ELSE branch's statements (`if` only) — `[]` if there is no
     #       `else:` sibling, or for any non-`if` kind.
+    #
+    # ------------------------------------------------------------
+    # EXTENSION (third pass): real proc bodies also carry structured
+    # concurrency (`spawn`/`join`), declared file resources (`read`/
+    # `write`), indexed assignment (`arr[i] = expr` / `map[k] = expr`), and
+    # channels (`channel()`/`send`/`recv`) — see internal/ast/ast.go's
+    # `Spawn`/`Join`/`FileOp`/`IndexAssign`/`ExprStmt` (read fresh, not
+    # assumed) and LANGUAGE.md's "Structured concurrency" section. Six new
+    # `kind` values cover them, reusing this struct's EXISTING fields
+    # exactly where the real AST's own shape reuses the same idea (no new
+    # field for anything that already has a home):
+    #   "spawn"      `let h = spawn ProcName(args)` (spawn has NO
+    #                fire-and-forget form — real grammar requires a bind,
+    #                see ast.Spawn's doc — so unlike do/read/write there is
+    #                no separate bare-vs-let pair here, just this one kind).
+    #                `args` holds the spawned call's real argument list
+    #                (built by the exact same `doArgsNodes` a `do`/`letDo`
+    #                already uses — a spawn's `ProcName(args)` half is
+    #                syntactically identical to a call's). `expr` is
+    #                `emptyNode()`. The proc name and the bound handle name
+    #                are both recovered on demand from `texts[lineIdx]` —
+    #                spawnProcName/spawnHandleName below — exactly like
+    #                `do`'s own name recovery, never stored as a field.
+    #   "join"       bare `join h` (fire-and-forget — still a real
+    #                barrier, its result just discarded).
+    #   "letJoin"    bound `let r = join h`. Neither kind has an `expr`/
+    #                `args` of its own (`join` takes only a bare handle
+    #                name, never a call) — both hold `emptyNode()`/`[]`;
+    #                the joined handle's name is recovered from
+    #                `texts[lineIdx]` (joinHandleName / letJoinHandleName
+    #                below).
+    #   "write"      bare `write Name(content)` (fire-and-forget effect).
+    #   "letWrite"   bound `let ok = write Name(content)` (write returns
+    #                bool on success, mirroring writeFile).
+    #   "read"       bare `read Name()` (content discarded).
+    #   "letRead"    bound `let x = read Name()`.
+    #                All four reuse `args` for write's single content
+    #                expression (`[]` for read, which takes none) via the
+    #                same `doArgsNodes` helper — `write`/`read Name(args)`
+    #                is syntactically identical to a call's own arg list,
+    #                exactly like `do`. The declared `file` resource's own
+    #                name is recovered on demand (bareFileOpName /
+    #                letFileOpFileName below), not stored as a field,
+    #                matching this struct's existing name-recovery
+    #                convention for `let`/`do`/`letDo`.
+    #   "indexAssign"
+    #                `arr[i] = expr` or `map[k] = expr` (real grammar gives
+    #                both the identical ast.IndexAssign shape — see
+    #                ast.go's own doc — so one kind covers both; nothing
+    #                downstream needs to tell an array target from a map
+    #                target apart). Unlike every kind above, this needs a
+    #                REAL second expression subtree alongside the assigned
+    #                value — the index/key itself — so this is the one
+    #                extension that adds a new field below (`index`) rather
+    #                than reusing an existing one. `expr` holds the
+    #                assigned value (mirroring plain `assign`'s own use of
+    #                `expr` for its RHS); `index` holds the index/key
+    #                expression. The target array/map's name is recovered
+    #                on demand (indexAssignTargetName below), same
+    #                convention as everything else.
+    #   "exprStmt"   a bare BUILTIN call used as its own statement, its
+    #                result discarded — `send(ch, value)` being the
+    #                motivating case (channels have no dedicated statement
+    #                shape of their own: `channel()`/`recv(ch)` are already
+    #                ordinary expressions this struct's existing `"let"`/
+    #                `"letMut"` kinds handle unchanged, since `orNodes`
+    #                already parses any builtin call as a real `ExprNode`;
+    #                only the fire-and-forget `send(ch, value)` shape needs
+    #                a NEW kind, since it has no `=` and no `do`/`spawn`/
+    #                `write`/`read`/`join` prefix to dispatch on — see
+    #                ast.ExprStmt's own doc, the direct real-AST analogue).
+    #                `expr` holds the whole call as one real `ExprNode`
+    #                (kind "call", its own args already nested in that
+    #                node's `children` — see expr_tokens.fct's `callNode`)
+    #                — no separate `args` needed here, unlike do/spawn/
+    #                write/read, precisely because the real call's own
+    #                arguments are already carried inside the ExprNode
+    #                itself rather than threaded alongside it.
+    # ------------------------------------------------------------
+    #   index: ExprNode
+    #       `indexAssign`'s own index/key expression (see above) —
+    #       `emptyNode()` for every other kind.
     struct Stmt:
         kind: text
         lineIdx: int
-        exprIdx: int
-        argFirst: int
-        argCount: int
+        expr: ExprNode
+        args: [ExprNode]
         body: [Stmt]
         elseBody: [Stmt]
+        index: ExprNode
 
-    # StmtResult / BlockResult: the "pairing struct" answer to the REWRITE
-    # NOTE's own question above — a proc still returns exactly one value,
-    # so a call that both builds a Stmt (or a whole [Stmt] list) AND
-    # extends the shared expr.fct arena while doing so returns ONE struct
-    # bundling both facts, rather than either (a) smuggling the arena back
-    # through some side channel that does not exist, or (b) losing track of
-    # how far the shared arena grew. The caller always continues from
-    # `result.arena` before making its own next call — the exact same
-    # "rebind your local to the returned, longer array before the next
-    # call" discipline expr.fct's own FINDING 3 already established for a
-    # bare `[int]` return; this is that same discipline, just with the
-    # returned value now a named field of a struct instead of the struct
-    # itself.
-    struct StmtResult:
-        stmt: Stmt
-        arena: [int]
-
-    struct BlockResult:
-        stmts: [Stmt]
-        arena: [int]
+    # No StmtResult/BlockResult "pairing struct" here (a previous pass of
+    # this file had one, back when expr.fct was still arena-based and a
+    # proc that built a Stmt also had to hand back how far the shared
+    # arena had grown). Now that expr.fct's own `orNodes`/`argListNodes`
+    # return real `ExprNode`/`[ExprNode]` values directly, with nothing
+    # shared left to thread through, there is nothing left to pair: a proc
+    # that builds a Stmt just returns a Stmt, and one that builds a whole
+    # sibling list just returns a `[Stmt]`, exactly like any other proc
+    # with a single real return value. See this file's own REWRITE NOTE,
+    # above.
 
     # ============================================================
     # HAND-TRACED VERIFICATION (no formal test suite — see this file's own
@@ -192,10 +257,11 @@ app StmtSelfHost:
     #     let mut y = 2
     #     y = y + x
     #     return y
-    #   -> a top-level BlockResult.stmts of length 4: Stmt{kind:"let",...},
+    #   -> a top-level [Stmt] of length 4: Stmt{kind:"let",...},
     #      Stmt{kind:"letMut",...}, Stmt{kind:"assign",...},
-    #      Stmt{kind:"return",...} — each one's own exprIdx checked by hand
-    #      to land on the correct expression root in the shared arena.
+    #      Stmt{kind:"return",...} — each one's own `expr` field checked by
+    #      hand to hold the correctly-shaped ExprNode directly (no arena
+    #      index to check against anymore).
     #
     #   FIXTURE 2 (if/else, flat bodies):
     #     let x = 5
@@ -218,7 +284,7 @@ app StmtSelfHost:
     #             break
     #         i = i + 1
     #     return i
-    #   -> traced by hand: the outer BlockResult.stmts has length 3
+    #   -> traced by hand: the outer top-level [Stmt] has length 3
     #      (LetMut, Loop, Return); the Loop Stmt's own body has length 2
     #      (the nested If and the `i = i + 1` Assign); the nested If's own
     #      body has length 1 (Break) and elseBody is [] (no `else:`).
@@ -295,6 +361,67 @@ app StmtSelfHost:
                 found = i
             i = i + 1
         return found
+
+    # firstBracketIndex: the first `[` character — used to isolate an
+    # `arr[i] = expr` / `map[k] = expr` indexed-assignment target's own
+    # array/map NAME (everything before it), the identical single-character
+    # forward scan firstParenIndex already uses for a call's own name.
+    proc firstBracketIndex(s: text) -> int:
+        let n = len(s)
+        let mut i = 0
+        let mut found = -1
+        loop i < n && found == -1:
+            if charAt(s, i) == "[":
+                found = i
+            i = i + 1
+        return found
+
+    # stmtIsIdent: every character a real identifier (start char first,
+    # then start-or-digit), reusing expr.fct's own isIdentStartChar/
+    # isIdentChar verbatim (both already merged into this app's namespace
+    # via the `import "expr.fct"` chain — see this file's header for why
+    # only expr.fct, not parser.fct, is imported) rather than restating
+    # the alphabet a third time. Mirrors parser.go's own `isIdent`.
+    proc stmtIsIdent(s: text) -> bool:
+        let n = len(s)
+        if n == 0:
+            return false
+        let mut i = 0
+        let mut ok = true
+        loop i < n && ok:
+            let c = charAt(s, i)
+            if i == 0:
+                let good = do isIdentStartChar(c)
+                if !good:
+                    ok = false
+            else:
+                let good = do isIdentChar(c)
+                if !good:
+                    ok = false
+            i = i + 1
+        return ok
+
+    # stmtIsBareCallStmt: a bare BUILTIN call used as its own statement —
+    # `send(ch, value)` being the motivating case — told apart from
+    # everything else in singleStmt's own dispatch by a simple structural
+    # test, mirroring parser.go's own `isBareCallStmt` (its separate "no
+    # top-level `=`" check is redundant given these two conditions: a
+    # target text containing `=`/spaces can never itself pass stmtIsIdent,
+    # so `x = foo(a)` is already rejected by the name check below, no
+    # nesting-aware equals scan needed): the FIRST `(` must come after at
+    # least one character (so there is a real name before it), the LINE
+    # must end in `)`, and everything before that first `(` must be a
+    # valid identifier.
+    proc stmtIsBareCallStmt(t: text) -> bool:
+        let open = do firstParenIndex(t)
+        if open <= 0:
+            return false
+        let endsClose = do stmtHasSuffix(t, ")")
+        if !endsClose:
+            return false
+        let name = trim(slice(t, 0, open))
+        let ok = do stmtIsIdent(name)
+        return ok
 
     # ============================================================
     # STAGE 2: raw multi-line proc-body text -> the two parallel arrays
@@ -401,32 +528,23 @@ app StmtSelfHost:
     # ============================================================
     # STAGE 4: `do ProcName(args)`'s argument list — syntactically IDENTICAL
     # to a builtin Call's argument list, so this reuses expr.fct's own
-    # argListCount/argListNodes VERBATIM (still int-arena-based — see the
-    # REWRITE NOTE above) rather than re-deriving comma-splitting a second
-    # time. `rest` is "ProcName(args)" (already trimmed of the leading
-    # `do `/`let name = do ` this file's callers strip first) — tokenizing
-    # it always puts the proc name at token 0 and the `(` at token 1, so
-    # argument parsing always starts at token 2. Unchanged by this rewrite.
+    # `argListNodes` VERBATIM rather than re-deriving comma-splitting a
+    # second time. `rest` is "ProcName(args)" (already trimmed of the
+    # leading `do `/`let name = do ` this file's callers strip first) —
+    # tokenizing it always puts the proc name at token 0 and the `(` at
+    # token 1, so argument parsing always starts at token 2.
+    #
+    # `argListNodes` now returns a real `[ExprNode]` directly — no separate
+    # `argListCount` call needed (`len()` on the result IS the arity), and
+    # no `doArgExprRootAt` two-hop arena read needed either: a Stmt's own
+    # `args: [ExprNode]` field already holds the real values, so
+    # `stmt.args[i]` is a plain, direct array read.
     # ============================================================
-    proc doArgsCount(rest: text) -> int:
+    proc doArgsNodes(rest: text) -> [ExprNode]:
         let k = do tokenKinds(rest)
         let tx = do tokenTexts(rest)
-        let c = do argListCount(k, tx, 2)
-        return c
-
-    proc doArgsNodes(rest: text, arena: [int]) -> [int]:
-        let k = do tokenKinds(rest)
-        let tx = do tokenTexts(rest)
-        let a1 = do argListNodes(k, tx, 2, arena)
-        return a1
-
-    # doArgExprRootAt: the i-th call argument's own expression root index,
-    # read back out of expr.fct's ArgSlot rows (`argFirst` is a Stmt's own
-    # field now, not an arena-row slot — the one remaining two-hop read
-    # this design needs, since expr.fct's own Call/ArgSlot encoding is
-    # unchanged by this rewrite).
-    proc doArgExprRootAt(arena: [int], argFirst: int, i: int) -> int:
-        return arena[5 * (argFirst + i) + 1]
+        let args = do argListNodes(k, tx, 2)
+        return args
 
     # ============================================================
     # STAGE 5: singleStmt — one LINE, one statement (every kind except
@@ -434,30 +552,34 @@ app StmtSelfHost:
     # `else:` — see stmtBlockStmts below, mirroring parseProcBody's own
     # real structure exactly: the `if`/`else` pairing lookahead happens in
     # the loop over a node's children, never inside a single statement's
-    # own dispatch). Returns a StmtResult — the newly-built Stmt plus the
-    # expr.fct arena as extended by parsing whatever expression(s) this one
-    # statement needed.
+    # own dispatch). Returns a plain Stmt — expr.fct's own `orNodes`/
+    # `argListNodes` hand back real `ExprNode`/`[ExprNode]` values directly,
+    # so there is no shared arena left to extend or carry back.
     #
     # Prefix-dispatch ORDER deliberately mirrors parseProcBody's real
     # switch order for every kind this file implements (break, continue,
-    # loop, return, do, let, default-assign) — including one genuine
-    # upstream quirk preserved on purpose: parseProcBody's own `return`
-    # case is `strings.HasPrefix(t, "return")`, WITH NO REQUIRED TRAILING
-    # SPACE, checked before `do`/`let` — so a line like "returnValue = 5"
-    # would ALSO be misread as a bare `return` statement by the real
-    # compiler. That is the real, current behavior of parseProcBody (read
-    # fresh, not assumed), so it is replicated here rather than "fixed" —
-    # per this port's established convention of matching the real
-    # algorithm's actual behavior, quirks included.
+    # loop, return, do, write, read, join, let, isBareCallStmt,
+    # default-assign/indexAssign) — including one genuine upstream quirk
+    # preserved on purpose: parseProcBody's own `return` case is
+    # `strings.HasPrefix(t, "return")`, WITH NO REQUIRED TRAILING SPACE,
+    # checked before `do`/`let` — so a line like "returnValue = 5" would
+    # ALSO be misread as a bare `return` statement by the real compiler.
+    # That is the real, current behavior of parseProcBody (read fresh, not
+    # assumed), so it is replicated here rather than "fixed" — per this
+    # port's established convention of matching the real algorithm's
+    # actual behavior, quirks included. `spawn` has no bare form at all
+    # (real grammar requires a bind — parseProcBody rejects a bare `spawn
+    # ProcName(args)` outright), so it is dispatched only from inside the
+    # `let` case below, never as its own top-level prefix check.
     # ============================================================
-    proc singleStmt(texts: [text], parents: [int], lineIdx: int, arena: [int]) -> StmtResult:
+    proc singleStmt(texts: [text], parents: [int], lineIdx: int) -> Stmt:
         let t = trim(texts[lineIdx])
         if t == "break":
-            let s = Stmt{kind: "break", lineIdx: lineIdx, exprIdx: -1, argFirst: -1, argCount: 0, body: [], elseBody: []}
-            return StmtResult{stmt: s, arena: arena}
+            let noExpr = do emptyNode()
+            return Stmt{kind: "break", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
         if t == "continue":
-            let s = Stmt{kind: "continue", lineIdx: lineIdx, exprIdx: -1, argFirst: -1, argCount: 0, body: [], elseBody: []}
-            return StmtResult{stmt: s, arena: arena}
+            let noExpr = do emptyNode()
+            return Stmt{kind: "continue", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
         let isLoop = do stmtHasPrefix(t, "loop ")
         if isLoop:
             let after = do stmtTrimPrefix(t, "loop ")
@@ -465,37 +587,60 @@ app StmtSelfHost:
             let condText = do stmtTrimSuffix(afterTrim, ":")
             let ck = do tokenKinds(condText)
             let ct = do tokenTexts(condText)
-            let a1 = do orNodes(ck, ct, 0, arena)
-            let condIdx = (len(a1) / 5) - 1
-            let br = do stmtBlockStmts(texts, parents, lineIdx, a1)
-            let s = Stmt{kind: "loop", lineIdx: lineIdx, exprIdx: condIdx, argFirst: -1, argCount: 0, body: br.stmts, elseBody: []}
-            return StmtResult{stmt: s, arena: br.arena}
+            let cond = do orNodes(ck, ct, 0)
+            let bodyStmts = do stmtBlockStmts(texts, parents, lineIdx)
+            let noExpr = do emptyNode()
+            return Stmt{kind: "loop", lineIdx: lineIdx, expr: cond, args: [], body: bodyStmts, elseBody: [], index: noExpr}
         let hasReturnPrefix = do stmtHasPrefix(t, "return")
         let isReturn = t == "return" || hasReturnPrefix
         if isReturn:
             let rest0 = do stmtTrimPrefix(t, "return")
             let rest = trim(rest0)
-            let mut exprIdx = -1
-            let mut a = arena
+            let noExpr = do emptyNode()
+            let mut retExpr = noExpr
             if rest != "":
                 let rk = do tokenKinds(rest)
                 let rt = do tokenTexts(rest)
-                let a1 = do orNodes(rk, rt, 0, arena)
-                exprIdx = (len(a1) / 5) - 1
-                a = a1
-            let s = Stmt{kind: "return", lineIdx: lineIdx, exprIdx: exprIdx, argFirst: -1, argCount: 0, body: [], elseBody: []}
-            return StmtResult{stmt: s, arena: a}
+                let e = do orNodes(rk, rt, 0)
+                retExpr = e
+            return Stmt{kind: "return", lineIdx: lineIdx, expr: retExpr, args: [], body: [], elseBody: [], index: noExpr}
         let isDo = do stmtHasPrefix(t, "do ")
         if isDo:
             let rest0 = do stmtTrimPrefix(t, "do ")
             let rest = trim(rest0)
-            let argCount = do doArgsCount(rest)
-            let a1 = do doArgsNodes(rest, arena)
-            let mut first = -1
-            if argCount > 0:
-                first = (len(a1) / 5) - argCount
-            let s = Stmt{kind: "do", lineIdx: lineIdx, exprIdx: -1, argFirst: first, argCount: argCount, body: [], elseBody: []}
-            return StmtResult{stmt: s, arena: a1}
+            let args = do doArgsNodes(rest)
+            let noExpr = do emptyNode()
+            return Stmt{kind: "do", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+        # `write Name(content)` — bare, fire-and-forget (result discarded);
+        # a bound `let ok = write Name(content)` is handled below, in the
+        # `let ` case, exactly like `do`'s two forms. `Name(content)` is
+        # syntactically identical to a call's own arg list, so this reuses
+        # `doArgsNodes` verbatim — `args` holds write's single content
+        # expression.
+        let isWrite = do stmtHasPrefix(t, "write ")
+        if isWrite:
+            let rest0 = do stmtTrimPrefix(t, "write ")
+            let rest = trim(rest0)
+            let args = do doArgsNodes(rest)
+            let noExpr = do emptyNode()
+            return Stmt{kind: "write", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+        # `read Name()` — bare, its content discarded — the read
+        # counterpart of a fire-and-forget `write`/`do`. The useful bound
+        # form, `let x = read Name()`, is handled below in the `let ` case.
+        let isRead = do stmtHasPrefix(t, "read ")
+        if isRead:
+            let rest0 = do stmtTrimPrefix(t, "read ")
+            let rest = trim(rest0)
+            let args = do doArgsNodes(rest)
+            let noExpr = do emptyNode()
+            return Stmt{kind: "read", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+        # `join h` — bare, fire-and-forget (still a real barrier: it blocks
+        # until the spawned task finishes, the result just discarded). The
+        # bound form, `let r = join h`, is handled below in the `let ` case.
+        let isJoin = do stmtHasPrefix(t, "join ")
+        if isJoin:
+            let noExpr = do emptyNode()
+            return Stmt{kind: "join", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
         let isLet = do stmtHasPrefix(t, "let ")
         if isLet:
             let rest0 = do stmtTrimPrefix(t, "let ")
@@ -507,8 +652,8 @@ app StmtSelfHost:
                 rest = trim(stripped)
             let eq = do firstEqIndex(rest)
             if eq < 0:
-                let s = Stmt{kind: "unsupported", lineIdx: lineIdx, exprIdx: -1, argFirst: -1, argCount: 0, body: [], elseBody: []}
-                return StmtResult{stmt: s, arena: arena}
+                let noExpr = do emptyNode()
+                return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
             let rhs0 = slice(rest, eq + 1, len(rest))
             let rhs = trim(rhs0)
             let isRhsDo = do stmtHasPrefix(rhs, "do ")
@@ -516,48 +661,127 @@ app StmtSelfHost:
                 if isMut:
                     # `let mut name = do ...` is real-grammar-illegal (a `do`
                     # result can never bind mut — LANGUAGE.md's `proc`
-                    # section, and expr.fct's own header FINDING 2) —
-                    # degrades to Unsupported rather than silently producing
-                    # a wrong LetDo, this port's established honest-degrade
-                    # convention.
-                    let s = Stmt{kind: "unsupported", lineIdx: lineIdx, exprIdx: -1, argFirst: -1, argCount: 0, body: [], elseBody: []}
-                    return StmtResult{stmt: s, arena: arena}
+                    # section) — degrades to Unsupported rather than
+                    # silently producing a wrong LetDo, this port's
+                    # established honest-degrade convention.
+                    let noExpr = do emptyNode()
+                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
                 let callRest0 = do stmtTrimPrefix(rhs, "do ")
                 let callRest = trim(callRest0)
-                let argCount = do doArgsCount(callRest)
-                let a1 = do doArgsNodes(callRest, arena)
-                let mut first = -1
-                if argCount > 0:
-                    first = (len(a1) / 5) - argCount
-                let s = Stmt{kind: "letDo", lineIdx: lineIdx, exprIdx: -1, argFirst: first, argCount: argCount, body: [], elseBody: []}
-                return StmtResult{stmt: s, arena: a1}
+                let args = do doArgsNodes(callRest)
+                let noExpr = do emptyNode()
+                return Stmt{kind: "letDo", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+            # `let h = spawn ProcName(args)` — real grammar forbids `let mut`
+            # here too (LANGUAGE.md: "a handle ... is not an ordinary value",
+            # never reassigned), same honest-degrade-to-Unsupported handling
+            # as `let mut name = do ...` just above, for the identical reason.
+            let isRhsSpawn = do stmtHasPrefix(rhs, "spawn ")
+            if isRhsSpawn:
+                if isMut:
+                    let noExpr = do emptyNode()
+                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+                let callRest0 = do stmtTrimPrefix(rhs, "spawn ")
+                let callRest = trim(callRest0)
+                let args = do doArgsNodes(callRest)
+                let noExpr = do emptyNode()
+                return Stmt{kind: "spawn", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+            # `let r = join h` — bound join. `let mut` is real-grammar-
+            # illegal here too (a join result, once bound, follows the same
+            # plain-`let`-only rule `do`'s own bound result does), same
+            # degrade.
+            let isRhsJoin = do stmtHasPrefix(rhs, "join ")
+            if isRhsJoin:
+                if isMut:
+                    let noExpr = do emptyNode()
+                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+                let noExpr = do emptyNode()
+                return Stmt{kind: "letJoin", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+            # `let x = read Name()` — bound read. Same `let mut` illegality
+            # and degrade as `do`/`join`'s own bound forms.
+            let isRhsRead = do stmtHasPrefix(rhs, "read ")
+            if isRhsRead:
+                if isMut:
+                    let noExpr = do emptyNode()
+                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+                let callRest0 = do stmtTrimPrefix(rhs, "read ")
+                let callRest = trim(callRest0)
+                let args = do doArgsNodes(callRest)
+                let noExpr = do emptyNode()
+                return Stmt{kind: "letRead", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+            # `let ok = write Name(content)` — bound write (write returns
+            # bool on success, mirroring writeFile — real grammar allows
+            # binding it exactly like `do`'s own bound form).
+            let isRhsWrite = do stmtHasPrefix(rhs, "write ")
+            if isRhsWrite:
+                if isMut:
+                    let noExpr = do emptyNode()
+                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+                let callRest0 = do stmtTrimPrefix(rhs, "write ")
+                let callRest = trim(callRest0)
+                let args = do doArgsNodes(callRest)
+                let noExpr = do emptyNode()
+                return Stmt{kind: "letWrite", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
             let rk = do tokenKinds(rhs)
             let rt = do tokenTexts(rhs)
-            let a1 = do orNodes(rk, rt, 0, arena)
-            let exprIdx = (len(a1) / 5) - 1
+            let e = do orNodes(rk, rt, 0)
             let mut kindCode = "let"
             if isMut:
                 kindCode = "letMut"
-            let s = Stmt{kind: kindCode, lineIdx: lineIdx, exprIdx: exprIdx, argFirst: -1, argCount: 0, body: [], elseBody: []}
-            return StmtResult{stmt: s, arena: a1}
+            let noExpr = do emptyNode()
+            return Stmt{kind: kindCode, lineIdx: lineIdx, expr: e, args: [], body: [], elseBody: [], index: noExpr}
+        # `send(ch, value)` (or any other bare builtin call used purely for
+        # its side effect, result discarded) — the one shape a proc's
+        # statement grammar has for "call a BUILTIN for effect, don't bind"
+        # that isn't `do` (proc-to-proc, not builtin-to-proc). Channels
+        # otherwise need no dedicated Stmt kind at all: `channel()`/
+        # `recv(ch)` are already ordinary expressions the existing
+        # "let"/"letMut" cases above handle unchanged, since `orNodes`
+        # already parses any builtin call (including these) into a real
+        # `ExprNode`. Checked here, right before the default eq-based
+        # fallback, mirroring parseProcBody's own `isBareCallStmt` position
+        # (after every keyword-prefixed case, before the generic
+        # assignment/unknown-statement default).
+        let isBareCall = do stmtIsBareCallStmt(t)
+        if isBareCall:
+            let ck2 = do tokenKinds(t)
+            let ct2 = do tokenTexts(t)
+            let callNode = do orNodes(ck2, ct2, 0)
+            let noExpr = do emptyNode()
+            return Stmt{kind: "exprStmt", lineIdx: lineIdx, expr: callNode, args: [], body: [], elseBody: [], index: noExpr}
         let eq2 = do firstEqIndex(t)
         if eq2 >= 0:
+            let target = trim(slice(t, 0, eq2))
             let rhs2 = trim(slice(t, eq2 + 1, len(t)))
             let rk2 = do tokenKinds(rhs2)
             let rt2 = do tokenTexts(rhs2)
-            let a1 = do orNodes(rk2, rt2, 0, arena)
-            let exprIdx2 = (len(a1) / 5) - 1
-            let s = Stmt{kind: "assign", lineIdx: lineIdx, exprIdx: exprIdx2, argFirst: -1, argCount: 0, body: [], elseBody: []}
-            return StmtResult{stmt: s, arena: a1}
-        let s = Stmt{kind: "unsupported", lineIdx: lineIdx, exprIdx: -1, argFirst: -1, argCount: 0, body: [], elseBody: []}
-        return StmtResult{stmt: s, arena: arena}
+            let e2 = do orNodes(rk2, rt2, 0)
+            # `arr[i] = expr` / `map[k] = expr` — an indexed mutation, told
+            # apart from a plain reassignment by the target ending in `]`
+            # (mirrors parseProcBody's own `strings.HasSuffix(target, "]")`
+            # check exactly). One real AST shape (ast.IndexAssign) covers
+            # both an array and a map target, so one kind does here too.
+            let isIndexed = do stmtHasSuffix(target, "]")
+            if isIndexed:
+                let lb = do firstBracketIndex(target)
+                let noExpr = do emptyNode()
+                if lb < 0:
+                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+                let idxText = slice(target, lb + 1, len(target) - 1)
+                let ik = do tokenKinds(idxText)
+                let it = do tokenTexts(idxText)
+                let idxNode = do orNodes(ik, it, 0)
+                return Stmt{kind: "indexAssign", lineIdx: lineIdx, expr: e2, args: [], body: [], elseBody: [], index: idxNode}
+            let noExpr = do emptyNode()
+            return Stmt{kind: "assign", lineIdx: lineIdx, expr: e2, args: [], body: [], elseBody: [], index: noExpr}
+        let noExpr = do emptyNode()
+        return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
 
     # ============================================================
     # STAGE 6: stmtBlockStmts — one BLOCK, i.e. one whole sibling statement
     # list (a proc's own top-level body, or an `if`/`loop`'s own indented
-    # children), recursively. Returns a BlockResult — the built [Stmt] list
-    # (a real array, no Block/StmtSlot indirection at all) plus the arena
-    # as extended by every statement and sub-block it built along the way.
+    # children), recursively. Returns a plain `[Stmt]` — a real array, no
+    # Block/StmtSlot indirection at all, and no arena to carry alongside it
+    # either now that expr.fct hands back real ExprNode values directly.
     # This is the one place `if`'s `else:` sibling lookahead lives
     # (mirroring parseProcBody's own `children[i+1]` check exactly): while
     # walking `node`'s children in order, an `if` line peeks at its
@@ -572,10 +796,9 @@ app StmtSelfHost:
     # parse error, "`else` with no matching `if`" — this port has no error
     # channel, so it degrades rather than crashes).
     # ============================================================
-    proc stmtBlockStmts(texts: [text], parents: [int], node: int, arena: [int]) -> BlockResult:
+    proc stmtBlockStmts(texts: [text], parents: [int], node: int) -> [Stmt]:
         let kids = do stmtChildrenOf(node, parents)
         let m = len(kids)
-        let mut a = arena
         let mut stmts = []
         let mut i = 0
         loop i < m:
@@ -588,23 +811,20 @@ app StmtSelfHost:
                 let condText = do stmtTrimSuffix(condTrim, ":")
                 let ck = do tokenKinds(condText)
                 let ct = do tokenTexts(condText)
-                let a1 = do orNodes(ck, ct, 0, a)
-                let condIdx = (len(a1) / 5) - 1
-                let thenRes = do stmtBlockStmts(texts, parents, lineIdx, a1)
+                let cond = do orNodes(ck, ct, 0)
+                let thenStmts = do stmtBlockStmts(texts, parents, lineIdx)
                 let mut elseStmts = []
                 let mut consumedElse = false
-                let mut nextArena = thenRes.arena
                 if i + 1 < m:
                     let nextLineIdx = kids[i + 1]
                     let nt = trim(texts[nextLineIdx])
                     if nt == "else:" || nt == "else":
-                        let elseRes = do stmtBlockStmts(texts, parents, nextLineIdx, thenRes.arena)
-                        elseStmts = elseRes.stmts
-                        nextArena = elseRes.arena
+                        let es = do stmtBlockStmts(texts, parents, nextLineIdx)
+                        elseStmts = es
                         consumedElse = true
-                let ifStmt = Stmt{kind: "if", lineIdx: lineIdx, exprIdx: condIdx, argFirst: -1, argCount: 0, body: thenRes.stmts, elseBody: elseStmts}
+                let noExpr = do emptyNode()
+                let ifStmt = Stmt{kind: "if", lineIdx: lineIdx, expr: cond, args: [], body: thenStmts, elseBody: elseStmts, index: noExpr}
                 stmts = append(stmts, ifStmt)
-                a = nextArena
                 if consumedElse:
                     i = i + 2
                 else:
@@ -613,27 +833,27 @@ app StmtSelfHost:
                 if t == "else:" || t == "else":
                     i = i + 1
                 else:
-                    let sr = do singleStmt(texts, parents, lineIdx, a)
-                    stmts = append(stmts, sr.stmt)
-                    a = sr.arena
+                    let s = do singleStmt(texts, parents, lineIdx)
+                    stmts = append(stmts, s)
                     i = i + 1
-        return BlockResult{stmts: stmts, arena: a}
+        return stmts
 
     # ============================================================
     # STAGE 7: the end-to-end driver — raw multi-line proc-body TEXT in
     # (exactly what a proc's own indented body would look like, dedented
-    # to start at column 0), a BlockResult (the top-level [Stmt] list plus
-    # the final shared expr.fct arena) out. This is parseProcBody(n.Children,
-    # ...)'s own job, minus the (a) declaration-header/type-checking
-    # concerns parseProc itself handles separately (out of scope — this
-    # file is the BODY only) and (b) error return (this port's established
-    # honest-sentinel convention instead — see kind "unsupported", above).
+    # to start at column 0), a plain top-level `[Stmt]` out (no shared
+    # arena left to hand back alongside it). This is
+    # parseProcBody(n.Children, ...)'s own job, minus the (a) declaration-
+    # header/type-checking concerns parseProc itself handles separately
+    # (out of scope — this file is the BODY only) and (b) error return
+    # (this port's established honest-sentinel convention instead — see
+    # kind "unsupported", above).
     # ============================================================
-    proc parseProcBodySrc(src: text) -> BlockResult:
+    proc parseProcBodySrc(src: text) -> [Stmt]:
         let indents = do bodyIndents(src)
         let parents = do bodyParents(indents)
         let texts = do bodyTexts(src)
-        let r = do stmtBlockStmts(texts, parents, -1, [])
+        let r = do stmtBlockStmts(texts, parents, -1)
         return r
 
     # ============================================================
@@ -643,7 +863,7 @@ app StmtSelfHost:
     # STAGE 8 reader family (stmtKindAt/blockStmtCount/blockStmtRootAt/
     # ifCondIdx/ifThenBlockIdx/... — every one of those collapses into an
     # ordinary field read now: `stmt.kind`, `len(stmt.body)`,
-    # `stmt.body[i]`, `stmt.exprIdx`, `stmt.body`/`stmt.elseBody` directly).
+    # `stmt.body[i]`, `stmt.expr`, `stmt.body`/`stmt.elseBody` directly).
     # This walks the real struct tree and renders a small, real (not just
     # "would work") text summary — a kind name per statement, `if(...)`/
     # `loop(...)` recursing into their own real `body: [Stmt]`/
@@ -675,12 +895,12 @@ app StmtSelfHost:
 
     proc describeProcBody(src: text) -> text:
         let r = do parseProcBodySrc(src)
-        let d = do describeStmts(r.stmts)
+        let d = do describeStmts(r)
         return d
 
     proc topLevelStmtCount(src: text) -> int:
         let r = do parseProcBodySrc(src)
-        return len(r.stmts)
+        return len(r)
 
     # ============================================================
     # STAGE 9: name recovery — the actual variable/proc-name TEXT for a
@@ -744,13 +964,139 @@ app StmtSelfHost:
             return afterDo
         return trim(slice(afterDo, 0, openParen))
 
+    # spawnProcName: the spawned proc's own name, for a "spawn" Stmt — `let
+    # h = spawn ProcName(args)` is always bound (real grammar has no bare
+    # spawn), so this only ever needs to strip `let `/`mut `/the `=`/
+    # `spawn ` the same way letDoProcName strips `do `.
+    proc spawnProcName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "let ")
+        let rest = trim(rest0)
+        let eq = do firstEqIndex(rest)
+        if eq < 0:
+            return ""
+        let rhs0 = slice(rest, eq + 1, len(rest))
+        let rhs = trim(rhs0)
+        let afterSpawn0 = do stmtTrimPrefix(rhs, "spawn ")
+        let afterSpawn = trim(afterSpawn0)
+        let openParen = do firstParenIndex(afterSpawn)
+        if openParen < 0:
+            return afterSpawn
+        return trim(slice(afterSpawn, 0, openParen))
+
+    # spawnHandleName: the handle a "spawn" Stmt binds (the `h` in `let h =
+    # spawn ProcName(args)`) — identical shape to letDoBoundName, restated
+    # under its own name for symmetry with spawnProcName above (both name-
+    # recovery halves of the same statement should read as a pair).
+    proc spawnHandleName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "let ")
+        let rest = trim(rest0)
+        let eq = do firstEqIndex(rest)
+        if eq < 0:
+            return ""
+        return trim(slice(rest, 0, eq))
+
+    # joinHandleName: the joined task handle's own name — for a bare "join"
+    # Stmt (`join h`), just the trimmed remainder after the `join ` prefix
+    # (a join takes a bare handle name, never a call, so there is no `(`
+    # to isolate against, unlike do/spawn/read/write).
+    proc joinHandleName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "join ")
+        return trim(rest0)
+
+    # letJoinBoundName / letJoinHandleName: the two name-recovery halves of
+    # a bound "letJoin" Stmt (`let r = join h`) — the local `r` the result
+    # lands in, and the handle `h` being joined.
+    proc letJoinBoundName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "let ")
+        let rest = trim(rest0)
+        let eq = do firstEqIndex(rest)
+        if eq < 0:
+            return ""
+        return trim(slice(rest, 0, eq))
+
+    proc letJoinHandleName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "let ")
+        let rest = trim(rest0)
+        let eq = do firstEqIndex(rest)
+        if eq < 0:
+            return ""
+        let rhs0 = slice(rest, eq + 1, len(rest))
+        let rhs = trim(rhs0)
+        let afterJoin0 = do stmtTrimPrefix(rhs, "join ")
+        return trim(afterJoin0)
+
+    # bareFileOpName: the declared `file` resource's own name for a bare
+    # "write"/"read" Stmt (`write Name(content)` / `read Name()`) — op is
+    # "write " or "read " (the caller's own prefix, WITH its trailing
+    # space, so this stays one shared helper instead of two near-identical
+    # ones), mirroring bareDoProcName's own prefix-then-paren isolation.
+    proc bareFileOpName(lineText: text, op: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, op)
+        let rest = trim(rest0)
+        let openParen = do firstParenIndex(rest)
+        if openParen < 0:
+            return rest
+        return trim(slice(rest, 0, openParen))
+
+    # letFileOpBoundName / letFileOpFileName: the two name-recovery halves
+    # of a bound "letWrite"/"letRead" Stmt (`let ok = write Name(content)`
+    # / `let x = read Name()`) — the local the result lands in, and the
+    # declared file resource's own name. op is again "write " or "read ".
+    proc letFileOpBoundName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "let ")
+        let rest = trim(rest0)
+        let eq = do firstEqIndex(rest)
+        if eq < 0:
+            return ""
+        return trim(slice(rest, 0, eq))
+
+    proc letFileOpFileName(lineText: text, op: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "let ")
+        let rest = trim(rest0)
+        let eq = do firstEqIndex(rest)
+        if eq < 0:
+            return ""
+        let rhs0 = slice(rest, eq + 1, len(rest))
+        let rhs = trim(rhs0)
+        let afterOp0 = do stmtTrimPrefix(rhs, op)
+        let afterOp = trim(afterOp0)
+        let openParen = do firstParenIndex(afterOp)
+        if openParen < 0:
+            return afterOp
+        return trim(slice(afterOp, 0, openParen))
+
+    # indexAssignTargetName: the array/map local's own name for an
+    # "indexAssign" Stmt (`arr[i] = expr` / `map[k] = expr`) — the text
+    # before the `[`, isolated the same two-step way letOrAssignName finds
+    # a plain assign's own target (find the `=` first to isolate the whole
+    # target, then find the `[` inside THAT to isolate the name from its
+    # own index).
+    proc indexAssignTargetName(lineText: text) -> text:
+        let t = trim(lineText)
+        let eq = do firstEqIndex(t)
+        if eq < 0:
+            return ""
+        let target = trim(slice(t, 0, eq))
+        let lb = do firstBracketIndex(target)
+        if lb < 0:
+            return ""
+        return trim(slice(target, 0, lb))
+
     # ============================================================
     # STAGE 10: the live HTTP-exercisable driver — POST a real multi-line
     # proc-body `src` (see this file's own verification section for the
     # three hand-traced fixtures) and get back a text summary of the real
     # [Stmt] tree plus its top-level statement count. A struct value itself
-    # (Stmt/StmtResult/BlockResult) can never be a `state` cell — it is a
-    # proc-local value kind, the same restriction that already bars a map
+    # (Stmt, or expr.fct's own ExprNode) can never be a `state` cell — it is
+    # a proc-local value kind, the same restriction that already bars a map
     # literal from state/entity/wire use (see ast.Struct's own doc) — so
     # the action below calls proc-land summary functions
     # (describeProcBody/topLevelStmtCount) that do the struct-walking

@@ -1,0 +1,583 @@
+app QuerySelfHost:
+    # Self-hosting port of a piece of facetql/src/storage/engine.rs's
+    # `query_where` — the main indexed query + predicate-pushdown + keyset
+    # pagination path — beyond what selfhost/predicate.fct already covers
+    # (predicate.fct ports `predicate.rs`'s row-matching evaluator; nothing
+    # in this repo yet ports how `query_where` decides row ORDER or how a
+    # page boundary carries forward into the next request).
+    #
+    # ============================================================
+    # WHAT WAS FOUND, AND WHY THIS PIECE
+    # ============================================================
+    # `query_where` ends every one of its access paths (`query_by_data_index`,
+    # `query_sorted`, etc.) the same way: candidates are put into the
+    # ascending base order `(order_key, address)`, reversed if `desc`, and
+    # then a keyset cursor decides where the NEXT page starts — never an
+    # offset into that ordering, which is what makes the pagination stable
+    # under concurrent writes. Three pieces of `engine.rs` make that work,
+    # and this file ports all three as one coherent unit (they don't mean
+    # anything apart from each other):
+    #
+    #   - `order_key`/`compare_order_keys` (engine.rs) and the
+    #     `type_rank`/`compare_order_values` pair it delegates to
+    #     (storage/index.rs) — the total order over a `data` field's value
+    #     when that value's JSON type can DIFFER row to row (a number in
+    #     one node, a string in the next, absent in a third). This is
+    #     "the ordering/sort-key comparison logic used to decide row order
+    #     during a scan" the task named as one candidate piece.
+    #   - `Cursor` / `Cursor::from_node` / `cmp_node_to_cursor` (engine.rs)
+    #     — the decoded shape of an opaque `after` cursor (an order value
+    #     plus an address tiebreak) and how a candidate is tested against
+    #     one to decide "does this row belong on the page AFTER the
+    #     cursor's row." This is "how a page boundary/cursor is encoded
+    #     and how the next page's starting point is computed," the task's
+    #     other candidate piece.
+    #   - `query_sorted`'s own tail (engine.rs, from `candidates.sort_by`
+    #     through building `next`) — the part that actually USES the two
+    #     pieces above to turn "some candidates" into "one page plus a
+    #     cursor for the next one": sort ascending by `(order_key,
+    #     address)`, reverse for `desc`, find the cursor's position (or
+    #     `offset` when there is no cursor), slice out `limit` rows, and
+    #     cursor-encode the last one if more remain.
+    #
+    # No crypto anywhere in this: `compare_order_values` is total-order
+    # comparison logic, the cursor is a plain (order value, address) pair,
+    # and (per this port's own scope note below) the actual base64/JSON
+    # WIRE encoding of that pair is left where it belongs — as opaque
+    # plumbing around the decision logic this file ports, not a decision
+    # itself. Same standard prior facetql ports in this repo have used.
+    #
+    # ============================================================
+    # TWO SCOPE DECISIONS, BOTH FORCED BY CONFIRMED LANGUAGE GAPS
+    # ============================================================
+    # 1. NO LEXICOGRAPHIC `<`/`<=` ON `text`. This is not a gap discovered
+    #    by this port — it's already documented twice in this exact
+    #    selfhost directory (fabric.fct's `failoverBestCandidateIndex`,
+    #    and expr_tokens.fct's own note), and confirmed the same way here:
+    #    LANGUAGE.md's builtin list has no `ord`/codepoint function and no
+    #    string-order builtin, and `facet lang`'s comparison operators
+    #    coerce through `toInt`/`toFloat`, not byte order. Two places in
+    #    the source need exactly that ordering:
+    #      a. The address tiebreak. `node.address` is an opaque string in
+    #         engine.rs, compared with `str::cmp` (real lexicographic byte
+    #         order) purely to give the keyset cursor a well-defined
+    #         position when `order_key` values repeat. This port follows
+    #         fabric.fct's own precedent for the identical problem
+    #         ("leaning on an invariant the SOURCE crate already
+    #         upholds, rather than one this port invents"): every access
+    #         path `query_where` can hand `query_sorted` a candidate list
+    #         from — `scan_candidates`, an index range scan, a text
+    #         posting list — already enumerates in address order (see
+    #         `query_where`'s own comment: "Entries under one prefix are
+    #         ordered by address"). So "this row's position in address
+    #         order" is a fact already true of the input BEFORE this
+    #         file's logic ever runs, and `Row.seq` below just names that
+    #         fact directly, as a plain `int`, instead of re-deriving it
+    #         from string comparison this language cannot perform. `seq`
+    #         is never read as a value anywhere below — only ever compared
+    #         to another row's `seq` — which is the one property
+    #         `node.address` itself actually needs to have.
+    #      b. Sorting BY a text-valued `data` field (`order by name`,
+    #         say). `compareOrderValues`'s "text" arm below answers `0`
+    #         (equal, for ordering purposes) whenever two order values are
+    #         both text and are not byte-identical — a deliberate,
+    #         documented simplification in exactly the spirit of
+    #         predicate.fct's own "two `in`-sets always compare unequal"
+    #         simplification: named where it happens, not hidden, and not
+    #         a silent wrong answer, because equality (`==`) — which this
+    #         language DOES have on `text` — is still exact. A caller
+    #         ordering by a numeric field (this file's fully hand-verified
+    #         case, see the demo below) never touches this arm at all.
+    # 2. NO `sort` BUILTIN. `facet lang`'s builtin list (checked against
+    #    LANGUAGE.md's "Built-in functions" section) has no sort/map
+    #    primitive, matching this same selfhost directory's own established
+    #    convention for the gap (fabric.fct's `failoverBestCandidateIndex`,
+    #    storage.fct's pager eviction scan). `sortRowsAscending` below is a
+    #    hand-written insertion sort — candidate lists reaching this stage
+    #    are page-scale, not kind-scale, in the source too (`max_scan_rows`
+    #    bounds them upstream), so O(n^2) here is the same tradeoff this
+    #    codebase has already made elsewhere for the identical reason.
+    #
+    # ============================================================
+    # Field/OrderValue: the same "one value, its own kind tag" shape
+    # predicate.fct's own `Field` already uses (num/text/bool/null,
+    # int/float collapsed into "num" for the same reason predicate.fct
+    # documents: the source's own numeric handling doesn't distinguish
+    # them either). `OrderValue` adds the one case a `data` field lookup
+    # has that a predicate operand never does: "absent" — `order_key`
+    # returns `None` when the field is missing or unparsable, and `None`
+    # sorts last unconditionally (`type_rank`'s `0xF0`), which is why
+    # "absent" gets the highest rank below rather than being folded into
+    # "null".
+    # ============================================================
+    struct Field:
+        name: text
+        kind: text
+        num: float
+        text: text
+        bool: bool
+
+    struct OrderValue:
+        kind: text
+        numVal: float
+        boolVal: bool
+        textVal: text
+
+    # Row: one candidate the way this file's demo constructs it directly,
+    # rather than decoding it from a JSON blob the way `order_key` does in
+    # the source (this port has no JSON decoder to reuse or reimplement —
+    # out of scope the same way predicate.fct's own row was always handed
+    # in pre-decoded). `seq` is address order, not an address — see the
+    # scope note above.
+    struct Row:
+        seq: int
+        fields: [Field]
+
+    # Cursor: engine.rs's own `Cursor { o: Option<Value>, a: String }`,
+    # restated as a real struct instead of an `Option` (this language has
+    # none) plus a string this port cannot order (see above): `hasOrder`
+    # is `o`'s `Some`/`None`, `orderVal` is `o`'s payload when `hasOrder`
+    # (meaningless otherwise, exactly like predicate.fct's Node fields
+    # that only matter for certain `kind`s), and `seq` is `a` restated as
+    # address order.
+    struct Cursor:
+        hasOrder: bool
+        orderVal: OrderValue
+        seq: int
+
+    # PageResult: `QueryPage`'s `nodes`/`next` pair, minus `examined`
+    # (that counter belongs to the `matches` closure `query_where` builds
+    # around a whole plan, not to the sort/cursor tail this file ports) —
+    # restated as `hasNext`/`nextCursor` instead of `next: ""` meaning "no
+    # more pages," since this language has no empty-string-as-sentinel
+    # convention to lean on and a real `bool` says the same thing without
+    # one.
+    struct PageResult:
+        rows: [Row]
+        hasNext: bool
+        nextCursor: Cursor
+
+    # ============================================================
+    # VALUE EXTRACTION — order_key, restated over this file's own `Row`
+    # instead of `serde_json::Value`, plus rowFieldIndex exactly as
+    # predicate.fct already has it (restated locally: procs/structs don't
+    # cross files in this language, so a name shared with predicate.fct is
+    # coincidence, not reuse).
+    # ============================================================
+    proc rowFieldIndex(fields: [Field], name: text) -> int:
+        let n = len(fields)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if fields[i].name == name:
+                    found = i
+            i = i + 1
+        return found
+
+    proc absentOrderValue() -> OrderValue:
+        return OrderValue{kind: "absent", numVal: 0.0, boolVal: false, textVal: ""}
+
+    # orderKey: `order_key`'s own body (`data.get(field).cloned()`),
+    # restated as a lookup into `[Field]` instead of a JSON object index.
+    # "absent" here is exactly `order_key`'s `None` — field missing, OR
+    # (the case JSON's untyped decode collapses into the same `None` that
+    # a truly-missing field gives) a kind this row model has no fifth
+    # bucket for.
+    proc orderKey(fields: [Field], field: text) -> OrderValue:
+        let idx = do rowFieldIndex(fields, field)
+        if idx == -1:
+            let ov = do absentOrderValue()
+            return ov
+        let f = fields[idx]
+        if f.kind == "null":
+            return OrderValue{kind: "null", numVal: 0.0, boolVal: false, textVal: ""}
+        if f.kind == "num":
+            return OrderValue{kind: "num", numVal: f.num, boolVal: false, textVal: ""}
+        if f.kind == "bool":
+            return OrderValue{kind: "bool", numVal: 0.0, boolVal: f.bool, textVal: ""}
+        if f.kind == "text":
+            return OrderValue{kind: "text", numVal: 0.0, boolVal: false, textVal: f.text}
+        let ov2 = do absentOrderValue()
+        return ov2
+
+    # ============================================================
+    # THE TOTAL ORDER — `type_rank` (storage/index.rs) and
+    # `compare_order_values`, the pair `order_key`'s own comparator
+    # (`compare_order_keys`) just forwards to. Two DIFFERENT-kind values
+    # are ordered by rank alone (null < bool < num < text < absent,
+    # `type_rank`'s own order — the source's composite/array-object rank
+    # sits between "text" and "absent" and is out of scope here for the
+    # same reason predicate.fct never introduced a JSON-composite operand:
+    # this port has no generic "any JSON value" leaf). Same-kind values
+    # fall through to a payload comparison — see the scope note above for
+    # why "text" answers `0` there rather than a real order.
+    # ============================================================
+    proc orderValueTypeRank(v: OrderValue) -> int:
+        if v.kind == "null":
+            return 10
+        if v.kind == "bool":
+            return 20
+        if v.kind == "num":
+            return 30
+        if v.kind == "text":
+            return 40
+        return 90
+
+    # compareOrderValues: -1 (a before b), 0 (equal), 1 (a after b) — this
+    # language has no `Ordering` enum, so this port picks the same
+    # three-value convention `strcmp`/Rust's `cmp` reduces to at the byte
+    # level, spelled out as a plain `int` return.
+    proc compareOrderValues(a: OrderValue, b: OrderValue) -> int:
+        let ra = do orderValueTypeRank(a)
+        let rb = do orderValueTypeRank(b)
+        if ra < rb:
+            return -1
+        if ra > rb:
+            return 1
+        if a.kind == "bool":
+            if a.boolVal == b.boolVal:
+                return 0
+            if a.boolVal:
+                return 1
+            return -1
+        if a.kind == "num":
+            if a.numVal < b.numVal:
+                return -1
+            if a.numVal > b.numVal:
+                return 1
+            return 0
+        if a.kind == "text":
+            # See the scope note above: no lexicographic order on `text`
+            # in this language. Equal text still compares equal; unequal
+            # text also answers 0 rather than a real order (documented
+            # simplification, not a bug).
+            if a.textVal == b.textVal:
+                return 0
+            return 0
+        # Both "null" (no payload) or both "absent" (no payload) — equal
+        # ranks with nothing left to compare, same as `compare_order_values`'s
+        # own final `_ => Ordering::Equal` arm.
+        return 0
+
+    # ============================================================
+    # THE KEYSET CURSOR — `Cursor::from_node` and `cmp_node_to_cursor`,
+    # restated over `Row`/`Cursor`. `hasOrderField` is the source's own
+    # `order_field: Option<&str>` (`None`/`"id"` both meaning "order by
+    # address alone," normalized by `query_where` BEFORE any of this
+    # runs — restated here as the caller passing `hasOrderField: false`).
+    # ============================================================
+    proc cursorFromRow(row: Row, hasOrderField: bool, field: text) -> Cursor:
+        if hasOrderField:
+            let ov = do orderKey(row.fields, field)
+            return Cursor{hasOrder: true, orderVal: ov, seq: row.seq}
+        let absentOv = do absentOrderValue()
+        return Cursor{hasOrder: false, orderVal: absentOv, seq: row.seq}
+
+    proc emptyCursor() -> Cursor:
+        let ov = do absentOrderValue()
+        return Cursor{hasOrder: false, orderVal: ov, seq: -1}
+
+    # cmpNodeToCursor: `cmp_node_to_cursor`'s own body exactly — compare
+    # by `order_key` first (when there is one), fall through to the
+    # address ("seq") tiebreak only when that compares equal, or use the
+    # tiebreak alone when there is no order field at all. Ascending
+    # sense throughout ("Greater" = row belongs on a later page); the
+    # caller applies `desc` — see `findCursorStart` below, mirroring
+    # `query_sorted`'s own `if desc { Less } else { Greater }` split.
+    proc cmpRowToCursor(row: Row, hasOrderField: bool, field: text, cur: Cursor) -> int:
+        if hasOrderField:
+            let ov = do orderKey(row.fields, field)
+            let base = do compareOrderValues(ov, cur.orderVal)
+            if base != 0:
+                return base
+            if row.seq < cur.seq:
+                return -1
+            if row.seq > cur.seq:
+                return 1
+            return 0
+        if row.seq < cur.seq:
+            return -1
+        if row.seq > cur.seq:
+            return 1
+        return 0
+
+    # compareRows: the ascending base order `query_sorted` sorts
+    # candidates into BEFORE `desc` is applied — `(order_key, address)`,
+    # `address` restated as `seq` throughout for the reason above.
+    proc compareRows(a: Row, b: Row, hasOrderField: bool, field: text) -> int:
+        if hasOrderField:
+            let oa = do orderKey(a.fields, field)
+            let ob = do orderKey(b.fields, field)
+            let base = do compareOrderValues(oa, ob)
+            if base != 0:
+                return base
+        if a.seq < b.seq:
+            return -1
+        if a.seq > b.seq:
+            return 1
+        return 0
+
+    # ============================================================
+    # THE SORT — hand-written insertion sort (no `sort` builtin; see the
+    # scope note above). `[Row]` is a real, mutable-once-copied array of a
+    # `struct`, and `xs[j-1] = xs[j]` is genuine indexed assignment into
+    # it — confirmed against this compiler directly (`internal/compile/
+    # array_test.go`'s `TestIndexAssignCompiles`) rather than assumed;
+    # storage.fct's older note that "`arr[i] = v` does not exist for a
+    # struct array" no longer holds against this build.
+    # ============================================================
+    proc sortRowsAscending(rows: [Row], hasOrderField: bool, field: text) -> [Row]:
+        let mut xs = rows
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                let c = do compareRows(xs[j - 1], xs[j], hasOrderField, field)
+                if c > 0:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    proc reverseRows(rows: [Row]) -> [Row]:
+        let n = len(rows)
+        let mut out = []
+        let mut i = n - 1
+        loop i >= 0:
+            out = append(out, rows[i])
+            i = i - 1
+        return out
+
+    proc takeRange(rows: [Row], start: int, limit: int) -> [Row]:
+        let n = len(rows)
+        let mut out = []
+        let mut i = start
+        let mut taken = 0
+        loop i < n && taken < limit:
+            out = append(out, rows[i])
+            i = i + 1
+            taken = taken + 1
+        return out
+
+    proc clampOffset(offset: int, n: int) -> int:
+        if offset > n:
+            return n
+        return offset
+
+    # findCursorStart: `query_sorted`'s own
+    # `candidates.iter().position(|n| { ... })` — the first row that
+    # belongs strictly AFTER the cursor's row in whichever direction
+    # `ordered` is already sorted, or `n` (one past the end, meaning "no
+    # more rows") when nothing does. `desc` picks `Less`/`Greater` exactly
+    # as `query_sorted` itself does; `ordered` must already be sorted in
+    # that same direction, same as the source.
+    proc findCursorStart(ordered: [Row], hasOrderField: bool, field: text, desc: bool, cur: Cursor) -> int:
+        let n = len(ordered)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                let c = do cmpRowToCursor(ordered[i], hasOrderField, field, cur)
+                if desc:
+                    if c < 0:
+                        found = i
+                else:
+                    if c > 0:
+                        found = i
+            i = i + 1
+        if found == -1:
+            return n
+        return found
+
+    # ============================================================
+    # THE ENTRY POINT — `query_sorted`'s own tail, from `candidates.sort_by`
+    # through building `next`, restated over `Row`/`Cursor`/`PageResult`:
+    # sort ascending, reverse for `desc`, find where this page starts
+    # (from the cursor, or from `offset` when there is none — mirroring
+    # `query_where`'s own "the cursor supersedes offset" contract), slice
+    # `limit` rows, and hand back a cursor for the next page when rows
+    # remain past this one.
+    # ============================================================
+    proc computeQueryPage(rows: [Row], hasOrderField: bool, field: text, desc: bool, hasCursor: bool, cursor: Cursor, limit: int, offset: int) -> PageResult:
+        let sortedAsc = do sortRowsAscending(rows, hasOrderField, field)
+        let mut ordered = sortedAsc
+        if desc:
+            let rev = do reverseRows(sortedAsc)
+            ordered = rev
+        let n = len(ordered)
+        let mut start = 0
+        if hasCursor:
+            let s = do findCursorStart(ordered, hasOrderField, field, desc, cursor)
+            start = s
+        else:
+            let c = do clampOffset(offset, n)
+            start = c
+        let page = do takeRange(ordered, start, limit)
+        let pageLen = len(page)
+        let ec = do emptyCursor()
+        let mut hasNext = false
+        let mut nextCur = ec
+        if pageLen > 0:
+            if start + pageLen < n:
+                hasNext = true
+                let lastRow = page[pageLen - 1]
+                let nc = do cursorFromRow(lastRow, hasOrderField, field)
+                nextCur = nc
+        return PageResult{rows: page, hasNext: hasNext, nextCursor: nextCur}
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURE — hand-verified against three scenarios
+    # walked by hand below each proc: ascending pagination across a tie in
+    # the order field (proving the `seq` tiebreak), descending pagination
+    # (proving `desc`'s reverse-then-cursor interaction), and pagination
+    # with NO order field at all (`hasOrderField: false`, `query_where`'s
+    # own "order by address alone" path).
+    #
+    # Five rows, field "score" (num), seq 0..4:
+    #   seq 0: score 30      seq 1: score 10      seq 2: score 20
+    #   seq 3: score 10      seq 4: score 40
+    # Ascending base order (score, then seq to break the 10/10 tie):
+    #   seq1(10), seq3(10), seq2(20), seq0(30), seq4(40)
+    # ============================================================
+    proc demoRows() -> [Row]:
+        let r0 = Row{seq: 0, fields: [Field{name: "score", kind: "num", num: 30.0, text: "", bool: false}]}
+        let r1 = Row{seq: 1, fields: [Field{name: "score", kind: "num", num: 10.0, text: "", bool: false}]}
+        let r2 = Row{seq: 2, fields: [Field{name: "score", kind: "num", num: 20.0, text: "", bool: false}]}
+        let r3 = Row{seq: 3, fields: [Field{name: "score", kind: "num", num: 10.0, text: "", bool: false}]}
+        let r4 = Row{seq: 4, fields: [Field{name: "score", kind: "num", num: 40.0, text: "", bool: false}]}
+        return [r0, r1, r2, r3, r4]
+
+    proc rowsToSummary(rows: [Row], field: text) -> text:
+        let n = len(rows)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let ov = do orderKey(rows[i].fields, field)
+            out = out + ov.numVal + ":" + rows[i].seq
+            i = i + 1
+        return out
+
+    proc pageSummaryText(page: PageResult, field: text) -> text:
+        let rowsSummary = do rowsToSummary(page.rows, field)
+        if page.hasNext:
+            return rowsSummary + "|next=true"
+        return rowsSummary + "|next=false"
+
+    # --- Scenario A: ascending, limit 2, walked across the 10/10 tie ---
+    # Page 1 (no cursor): take(0, 2) of [1(10),3(10),2(20),0(30),4(40)]
+    #   -> "10:1,10:3|next=true" — the tie breaks seq1 before seq3.
+    proc demoAscPage1() -> text:
+        let rows = do demoRows()
+        let ec = do emptyCursor()
+        let page = do computeQueryPage(rows, true, "score", false, false, ec, 2, 0)
+        let s = do pageSummaryText(page, "score")
+        return s
+
+    # Page 2 (cursor = page 1's last row, seq3/score10): the first row
+    # strictly after (10, seq3) is seq2(20) — seq1(10) and seq3(10) both
+    # compare <= the cursor and are skipped, proving the tiebreak also
+    # governs where the NEXT page resumes, not just how ties sort.
+    #   -> "20:2,30:0|next=true"
+    proc demoAscPage2() -> text:
+        let rows = do demoRows()
+        let ec = do emptyCursor()
+        let page1 = do computeQueryPage(rows, true, "score", false, false, ec, 2, 0)
+        let page2 = do computeQueryPage(rows, true, "score", false, true, page1.nextCursor, 2, 0)
+        let s = do pageSummaryText(page2, "score")
+        return s
+
+    # Page 3 (cursor = page 2's last row, seq0/score30): only seq4(40)
+    # remains -> "40:4|next=false", proving the walk terminates exactly
+    # at the fifth row with no gap and no repeat.
+    proc demoAscPage3() -> text:
+        let rows = do demoRows()
+        let ec = do emptyCursor()
+        let page1 = do computeQueryPage(rows, true, "score", false, false, ec, 2, 0)
+        let page2 = do computeQueryPage(rows, true, "score", false, true, page1.nextCursor, 2, 0)
+        let page3 = do computeQueryPage(rows, true, "score", false, true, page2.nextCursor, 2, 0)
+        let s = do pageSummaryText(page3, "score")
+        return s
+
+    # --- Scenario B: descending, limit 3 ---
+    # Descending order is the ascending list REVERSED whole (matching
+    # `query_sorted`'s own `candidates.reverse()`, which flips a tied
+    # sub-run's order along with everything else — not a re-sort with the
+    # comparator negated): [4(40),0(30),2(20),3(10),1(10)].
+    # Page 1: take(0,3) -> "40:4,30:0,20:2|next=true"
+    proc demoDescPage1() -> text:
+        let rows = do demoRows()
+        let ec = do emptyCursor()
+        let page = do computeQueryPage(rows, true, "score", true, false, ec, 3, 0)
+        let s = do pageSummaryText(page, "score")
+        return s
+
+    # Page 2 (cursor = seq2/score20, desc): first row strictly BEFORE
+    # (20, seq2) in descending sense is seq3(10) — seq1(10) follows it,
+    # the tie now breaking HIGHER seq first (seq3 before seq1), exactly
+    # because the whole ascending run was reversed rather than re-sorted.
+    #   -> "10:3,10:1|next=false"
+    proc demoDescPage2() -> text:
+        let rows = do demoRows()
+        let ec = do emptyCursor()
+        let page1 = do computeQueryPage(rows, true, "score", true, false, ec, 3, 0)
+        let page2 = do computeQueryPage(rows, true, "score", true, true, page1.nextCursor, 3, 0)
+        let s = do pageSummaryText(page2, "score")
+        return s
+
+    # --- Scenario C: no order field (`query_where`'s "order by address
+    # alone" path, `hasOrderField: false`) ---
+    # Order is pure seq order: 0,1,2,3,4. Page 1 (limit 3): "30:0,10:1,20:2|next=true"
+    # (the field values print in the summary but play no role in the
+    # order — only `seq` does, matching `cmp_node_to_cursor`'s own `None`
+    # arm, which never looks at `order_key` at all).
+    proc demoAddrPage1() -> text:
+        let rows = do demoRows()
+        let ec = do emptyCursor()
+        let page = do computeQueryPage(rows, false, "score", false, false, ec, 3, 0)
+        let s = do pageSummaryText(page, "score")
+        return s
+
+    # Page 2 (cursor = seq2): remaining rows in seq order -> "10:3,40:4|next=false"
+    proc demoAddrPage2() -> text:
+        let rows = do demoRows()
+        let ec = do emptyCursor()
+        let page1 = do computeQueryPage(rows, false, "score", false, false, ec, 3, 0)
+        let page2 = do computeQueryPage(rows, false, "score", false, true, page1.nextCursor, 3, 0)
+        let s = do pageSummaryText(page2, "score")
+        return s
+
+    state ascPage1Result: text = ""
+    state ascPage2Result: text = ""
+    state ascPage3Result: text = ""
+    state descPage1Result: text = ""
+    state descPage2Result: text = ""
+    state addrPage1Result: text = ""
+    state addrPage2Result: text = ""
+
+    action runDemoQueryPagination():
+        let a1 = do demoAscPage1()
+        let a2 = do demoAscPage2()
+        let a3 = do demoAscPage3()
+        let d1 = do demoDescPage1()
+        let d2 = do demoDescPage2()
+        let n1 = do demoAddrPage1()
+        let n2 = do demoAddrPage2()
+        ascPage1Result = a1
+        ascPage2Result = a2
+        ascPage3Result = a3
+        descPage1Result = d1
+        descPage2Result = d2
+        addrPage1Result = n1
+        addrPage2Result = n2
+
+    view Home at "/":
+        box:
+            text "{ascPage1Result} | {ascPage2Result} | {ascPage3Result} | {descPage1Result} | {descPage2Result} | {addrPage1Result} | {addrPage2Result}"

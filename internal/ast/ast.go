@@ -54,7 +54,7 @@ type App struct {
 	// reads it verbatim, and folds its content into CSS exactly like an inline
 	// `css:` block, so a `.fct` file can keep its structure/logic separate from
 	// its styling while every downstream pass still sees one stylesheet string.
-	CSSFiles   []CSSFile
+	CSSFiles []CSSFile
 	// Assets accumulates the binary/static payload of every resolved `asset from
 	// "..."` reference anywhere in this file, keyed by the content-addressed
 	// name internal/compile mints for it ("<hash><ext>"). A text file resolves
