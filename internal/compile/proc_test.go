@@ -574,3 +574,237 @@ func TestProcControlFlowDeclarationErrors(t *testing.T) {
 		})
 	}
 }
+
+// ── Bitwise operators ───────────────────────────────────────────────────────
+
+// packRGBApp packs three small integers into one via shift/or and unpacks one
+// of them back via shift/and — the canonical multi-operator bitwise idiom
+// (`(r << 16) | (g << 8) | b` / `(packed >> 16) & 0xFF`) that exercises `<<`,
+// `>>`, `|` and `&` together in a single proc, straight-line (no loop needed).
+const packRGBApp = `app A:
+    proc pack(r: int, g: int, b: int) -> int:
+        return (r << 16) | (g << 8) | b
+    proc unpackRed(packed: int) -> int:
+        return (packed >> 16) & 255
+    state result: int = 0
+    action run(r: int, g: int, b: int):
+        let p = do pack(r, g, b)
+        result = p
+    view Home at "/":
+        box:
+            text "{result}"
+`
+
+func TestProcBitwiseCompiles(t *testing.T) {
+	g, err := String(packRGBApp)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if len(g.Procs) != 2 {
+		t.Fatalf("want 2 procs, got %d: %+v", len(g.Procs), g.Procs)
+	}
+	var pack *ir.Proc
+	for i := range g.Procs {
+		if g.Procs[i].Name == "pack" {
+			pack = &g.Procs[i]
+		}
+	}
+	if pack == nil {
+		t.Fatalf("missing proc pack: %+v", g.Procs)
+	}
+	if len(pack.Body) != 1 || pack.Body[0].Op != "return" {
+		t.Fatalf("pack.Body = %+v, want a single return", pack.Body)
+	}
+	top := pack.Body[0].Value
+	if top == nil || top.Kind != "bin" || top.Op != "|" {
+		t.Fatalf("pack's returned expression = %+v, want a top-level `|`", top)
+	}
+}
+
+// bitwiseUnaryApp exercises unary `~` alongside `^`, checked structurally
+// (Kind/Op) rather than just "it compiles", since a mis-wired unary parse
+// could silently produce the wrong AST shape and still build.
+const bitwiseUnaryApp = `app A:
+    proc flip(x: int, mask: int) -> int:
+        return ~x ^ mask
+    state result: int = 0
+    action run(x: int, mask: int):
+        let r = do flip(x, mask)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`
+
+func TestProcBitwiseUnaryCompiles(t *testing.T) {
+	g, err := String(bitwiseUnaryApp)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	p := g.Procs[0]
+	ret := p.Body[0].Value
+	if ret == nil || ret.Kind != "bin" || ret.Op != "^" {
+		t.Fatalf("flip's returned expression = %+v, want a top-level `^`", ret)
+	}
+	if ret.L == nil || ret.L.Kind != "un" || ret.L.Op != "~" {
+		t.Fatalf("flip's left operand = %+v, want a unary `~`", ret.L)
+	}
+}
+
+// precedenceApp pins down (the int-only, well-typed slice of) the precedence
+// table this task chose: `+`/`-` bind tighter than `<<`/`>>`, which in turn
+// bind tighter than `&` — so `a + b << 1 & c`, with no parentheses at all,
+// must parse as `((a + b) << 1) & c`, not any other grouping.
+//
+// This deliberately never puts a comparison (`==` et al., which produce
+// `bool`) next to a bitwise operator (which this task's checkBitwiseTypes
+// requires an `int` operand for): this codebase's real, C-consistent
+// precedence — comparison binds TIGHTER than `& | ^`, the classic "a == b & c
+// means (a == b) & c, not a == (b & c)" gotcha — means an unparenthesized mix
+// of the two is essentially never well-typed (the comparison's `bool` result
+// ends up as a bitwise operand or vice versa). That relative ordering is
+// instead verified directly against the parser's AST in
+// internal/parser/expr_test.go, which has no type checker to fight with.
+const precedenceApp = `app A:
+    proc f(a: int, b: int, c: int) -> int:
+        return a + b << 1 & c
+    state result: int = 0
+    action run(a: int, b: int, c: int):
+        let r = do f(a, b, c)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`
+
+func TestBitwisePrecedence(t *testing.T) {
+	g, err := String(precedenceApp)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	top := g.Procs[0].Body[0].Value
+	if top == nil || top.Kind != "bin" || top.Op != "&" {
+		t.Fatalf("top = %+v, want `&` (loosest operator present)", top)
+	}
+	if top.R == nil || top.R.Kind != "ref" || top.R.Name != "c" {
+		t.Fatalf("right of & = %+v, want ref c", top.R)
+	}
+	// Left of `&`: (a + b) << 1.
+	left := top.L
+	if left == nil || left.Kind != "bin" || left.Op != "<<" {
+		t.Fatalf("left of & = %+v, want `<<`", left)
+	}
+	if left.L == nil || left.L.Kind != "bin" || left.L.Op != "+" {
+		t.Fatalf("left of << = %+v, want `+` (a + b)", left.L)
+	}
+}
+
+func TestBitwiseDeclarationErrors(t *testing.T) {
+	cases := []struct {
+		name, src, want string
+	}{
+		{
+			"& outside a proc (view expression) is rejected",
+			`app A:
+    state flags: int = 0
+    view Home at "/":
+        box:
+            text "{flags & 1}"
+`,
+			"only available inside a proc",
+		},
+		{
+			"<< outside a proc (a `check` in an action) is rejected",
+			`app A:
+    state result: int = 0
+    action run(x: int):
+        check x << 1 == 2 "bad"
+        result = x
+    view Home at "/":
+        box:
+            text "{result}"
+`,
+			"only available inside a proc",
+		},
+		{
+			"~ outside a proc is rejected",
+			`app A:
+    state result: int = 0
+    action run(x: int):
+        result = ~x
+    view Home at "/":
+        box:
+            text "{result}"
+`,
+			"only available inside a proc",
+		},
+		{
+			"& on a text operand inside a proc is rejected",
+			`app A:
+    proc bad(s: text, m: int) -> int:
+        return s & m
+    state result: int = 0
+    action run(s: text, m: int):
+        let r = do bad(s, m)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`,
+			"int operands",
+		},
+		{
+			"& on a bool operand inside a proc is rejected",
+			`app A:
+    proc bad(f: bool, m: int) -> int:
+        return f & m
+    state result: int = 0
+    action run(f: bool, m: int):
+        let r = do bad(f, m)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`,
+			"int operands",
+		},
+		{
+			"& on a money operand inside a proc is rejected",
+			`app A:
+    proc bad(amount: money, m: int) -> int:
+        return amount & m
+    state result: int = 0
+    action run(amount: money, m: int):
+        let r = do bad(amount, m)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`,
+			"int operands",
+		},
+		{
+			"~ on a text operand inside a proc is rejected",
+			`app A:
+    proc bad(s: text) -> int:
+        return ~s
+    state result: int = 0
+    action run(s: text):
+        let r = do bad(s)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`,
+			"int operand",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := String(c.src)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want error containing %q, got %v", c.want, err)
+			}
+		})
+	}
+}

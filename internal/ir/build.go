@@ -2098,14 +2098,16 @@ func (e *env) proc(p *ast.Proc) (Proc, error) {
 	pr := Proc{Name: p.Name, Ret: p.Ret, RetList: p.RetList}
 	locals := map[string]bool{}  // every name in scope: params + `let`s seen so far
 	mutable := map[string]bool{} // the subset declared `let mut`, and so reassignable
+	types := map[string]string{} // each name's declared/inferred type — see checkBitwiseTypes
 	for _, prm := range p.Params {
 		if locals[prm.Name] {
 			return Proc{}, &BuildError{p.Line, fmt.Sprintf("proc %q has duplicate parameter %q", p.Name, prm.Name)}
 		}
 		locals[prm.Name] = true
+		types[prm.Name] = prm.Type
 		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional})
 	}
-	body, err := e.procBlock(p, p.Body, locals, mutable, 0)
+	body, err := e.procBlock(p, p.Body, locals, mutable, types, 0)
 	if err != nil {
 		return Proc{}, err
 	}
@@ -2132,6 +2134,18 @@ func cloneNameSet(m map[string]bool) map[string]bool {
 	return out
 }
 
+// cloneTypeMap is cloneNameSet's counterpart for a proc's per-local type map
+// (see checkBitwiseTypes) — the same reason: a `let` declared inside a nested
+// `loop`/`if` block must not leak its type back into the caller's map once the
+// block ends.
+func cloneTypeMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 // procBlock lowers one nested statement list belonging to proc p: either the
 // proc's own top-level body, or a `loop`/`if` statement's own Body/Then/Else
 // (recursing into itself for those two — the one genuinely recursive structural
@@ -2143,9 +2157,10 @@ func cloneNameSet(m map[string]bool) map[string]bool {
 // be the last statement — anything after it is unreachable — but that
 // restriction is per-block, not per-proc, which is what lets `return` appear
 // from inside a nested loop/if while dead code after it is still refused.
-func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[string]bool, loopDepth int) ([]Stmt, error) {
+func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[string]bool, types map[string]string, loopDepth int) ([]Stmt, error) {
 	locals = cloneNameSet(locals)
 	mutable = cloneNameSet(mutable)
+	types = cloneTypeMap(types)
 	var out []Stmt
 	for i, s := range stmts {
 		last := i == len(stmts)-1
@@ -2154,10 +2169,11 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if locals[st.Name] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is already declared in proc %q", st.Name, p.Name)}
 			}
-			if err := e.checkProcExpr(st.Value, locals, st.Line); err != nil {
+			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			locals[st.Name] = true
+			types[st.Name] = inferProcType(st.Value, types)
 			if st.Mut {
 				mutable[st.Name] = true
 			}
@@ -2173,10 +2189,35 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if !mutable[st.Target] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to reassign it", st.Target, st.Target)}
 			}
-			if err := e.checkProcExpr(st.Value, locals, st.Line); err != nil {
+			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
+		case ast.IndexAssign:
+			// `xs[i] = expr` — an array element mutation. Gated exactly like a plain
+			// `name = expr` reassignment (ast.Assign, above), since it mutates the
+			// value Target is bound to: Target must already be a declared `let mut`
+			// local. On top of that, the type map lets this catch the common case of
+			// indexing something that plainly isn't an array at compile time (see
+			// checkIndexTypes) — the index itself is never bounds-checked here; that
+			// can only be a runtime error (runtime/server.go's execProcBlock,
+			// "indexset"), since bounds are data-dependent.
+			if !locals[st.Target] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not declared in proc %q — use `let %s = …` first", st.Target, p.Name, st.Target)}
+			}
+			if !mutable[st.Target] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to index-assign into it", st.Target, st.Target)}
+			}
+			if ty := types[st.Target]; ty != "" && ty != arrayType {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not an array (its type is %s) — index assignment (`%s[...] = …`) needs an array local", st.Target, ty, st.Target)}
+			}
+			if err := e.checkProcExpr(st.Index, locals, types, st.Line); err != nil {
+				return nil, err
+			}
+			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
+				return nil, err
+			}
+			out = append(out, Stmt{Op: "indexset", Target: st.Target, Key: e.low(st.Index), Value: e.low(st.Value)})
 		case ast.Do:
 			sig, ok := e.procSigs[st.Proc]
 			if !ok {
@@ -2187,7 +2228,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			ds := Stmt{Op: "do", Service: st.Proc}
 			for _, arg := range st.Args {
-				if err := e.checkProcExpr(arg, locals, st.Line); err != nil {
+				if err := e.checkProcExpr(arg, locals, types, st.Line); err != nil {
 					return nil, err
 				}
 				ds.Args = append(ds.Args, e.low(arg))
@@ -2200,31 +2241,32 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type to bind it", st.Proc)}
 				}
 				locals[st.Bind] = true
+				types[st.Bind] = sig.ret
 				ds.Bind = st.Bind
 				ds.Ret = sig.ret
 				ds.RetList = sig.retList
 			}
 			out = append(out, ds)
 		case ast.Loop:
-			if err := e.checkProcExpr(st.Cond, locals, st.Line); err != nil {
+			if err := e.checkProcExpr(st.Cond, locals, types, st.Line); err != nil {
 				return nil, err
 			}
-			kids, err := e.procBlock(p, st.Body, locals, mutable, loopDepth+1)
+			kids, err := e.procBlock(p, st.Body, locals, mutable, types, loopDepth+1)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "loop", Value: e.low(st.Cond), Body: kids})
 		case ast.IfStmt:
-			if err := e.checkProcExpr(st.Cond, locals, st.Line); err != nil {
+			if err := e.checkProcExpr(st.Cond, locals, types, st.Line); err != nil {
 				return nil, err
 			}
-			then, err := e.procBlock(p, st.Then, locals, mutable, loopDepth)
+			then, err := e.procBlock(p, st.Then, locals, mutable, types, loopDepth)
 			if err != nil {
 				return nil, err
 			}
 			var els []Stmt
 			if len(st.Else) > 0 {
-				els, err = e.procBlock(p, st.Else, locals, mutable, loopDepth)
+				els, err = e.procBlock(p, st.Else, locals, mutable, types, loopDepth)
 				if err != nil {
 					return nil, err
 				}
@@ -2260,7 +2302,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if st.Value == nil {
 				return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, so `return` needs a value", p.Name, p.Ret)}
 			}
-			if err := e.checkProcExpr(st.Value, locals, st.Line); err != nil {
+			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "return", Value: e.low(st.Value)})
@@ -2312,14 +2354,205 @@ func stmtsReturnComplete(body []Stmt) bool {
 // checkBuiltins for aggregate/builtin/enum-member validity, exactly as action
 // bodies do. A proc is pure computation over its own locals and parameters in
 // this milestone; entity/state access from inside a proc is a later milestone.
-func (e *env) checkProcExpr(ex ast.Expr, locals map[string]bool, line int) error {
+//
+// types is the proc's per-local declared/inferred type map (built by proc/
+// procBlock from parameter annotations and each `let`'s initializer) — it is
+// checkProcExpr's own addition on top of what action/view checking does,
+// because only a proc body has any static type information to check against
+// (see checkBitwiseTypes). checkProcExpr deliberately does NOT call check()
+// (the action/view funnel that runs checkNoBitwise): a proc is where bitwise
+// operators are allowed.
+func (e *env) checkProcExpr(ex ast.Expr, locals map[string]bool, types map[string]string, line int) error {
 	for n := range freeNames(ex) {
 		if !locals[n] {
 			return &BuildError{line, fmt.Sprintf(
 				"unknown reference %q — a proc sees only its own parameters and `let` locals (no state or entities in this milestone)", n)}
 		}
 	}
-	return e.checkBuiltins(ex, line)
+	if err := e.checkBuiltins(ex, line); err != nil {
+		return err
+	}
+	if err := checkBitwiseTypes(ex, types, line); err != nil {
+		return err
+	}
+	return checkIndexTypes(ex, types, line)
+}
+
+// arrayType is inferProcType/checkIndexTypes's type tag for an array-valued
+// proc expression — a list literal, an `append(...)` call, or (transitively,
+// via ast.Ref's case below) a `let` bound to either. It is a sibling of the
+// primitive type names inferProcType already produces ("int"/"text"/"bool"),
+// not a real declared type the rest of the language knows about — proc
+// locals have no richer type system than this map to hang it off (see
+// checkIndexTypes).
+const arrayType = "array"
+
+// inferProcType statically infers the type of an expression inside a proc
+// body from literal kinds and the declared/inferred types of the locals it
+// names — "" when it cannot be determined (an unknown, not an error). It is
+// deliberately shallow — enough to catch a bitwise operator applied to a
+// plainly non-int operand (see checkBitwiseTypes below) or an index read on
+// something that plainly isn't an array (see checkIndexTypes) — not a general
+// type checker for the language, and it errs toward "" (unknown, so
+// unchecked) whenever it isn't sure, the same stance every other static check
+// in this builder takes: flag what can be proven wrong, stay silent on what
+// can't be proven either way.
+func inferProcType(ex ast.Expr, types map[string]string) string {
+	switch t := ex.(type) {
+	case ast.Lit:
+		return t.Kind
+	case ast.ListLit:
+		return arrayType
+	case ast.Ref:
+		return types[t.Name]
+	case ast.Call:
+		if t.Name == "append" {
+			return arrayType
+		}
+	case ast.Un:
+		switch t.Op {
+		case "!":
+			return "bool"
+		case "-", "~":
+			return inferProcType(t.X, types)
+		}
+	case ast.Bin:
+		switch t.Op {
+		case "==", "!=", "<", "<=", ">", ">=", "&&", "||", "in":
+			return "bool"
+		case "&", "|", "^", "<<", ">>":
+			return "int"
+		case "+":
+			// `+` also concatenates text (see applyBin in runtime/eval.go); only
+			// call the result "int" when neither side could be text, otherwise
+			// stay unknown rather than guess.
+			lt, rt := inferProcType(t.L, types), inferProcType(t.R, types)
+			if lt == "text" || rt == "text" {
+				return "text"
+			}
+			if lt == "int" && rt == "int" {
+				return "int"
+			}
+		case "-", "*", "/", "%":
+			if lt, rt := inferProcType(t.L, types), inferProcType(t.R, types); lt == "int" && rt == "int" {
+				return "int"
+			}
+		}
+	}
+	return ""
+}
+
+// bitwiseCheckedTypes are the declared/inferred proc types checkBitwiseTypes
+// refuses as a bitwise operand: everything except "int" (and the unknown ""
+// type, which is left alone — see inferProcType's doc comment). `money`,
+// though it happens to share `int`'s runtime representation (see
+// runtime/eval.go's callBuiltin, "money" case — a money value is minor units,
+// a plain Go int, until formatMoney renders it to text), is a distinct
+// *declared* type in this list: bit-shifting a monetary amount is a silent
+// unit error even though the machine would happily compute an answer, and
+// this check runs at compile time against the declared type, not the runtime
+// value, so it can catch that where a runtime type switch could not.
+func isIntType(t string) bool { return t == "" || t == "int" }
+
+// checkBitwiseTypes walks a proc expression for a bitwise operator (binary
+// `& | ^ << >>` or unary `~`) applied to an operand whose statically known
+// type is not `int`. Only proc bodies get this check: only there does the
+// builder have any per-local type map to check against (a parameter's
+// annotation, or a `let`'s inferred type) — action/view expressions have none,
+// so a bitwise operator there is barred entirely by checkNoBitwise instead of
+// being type-checked. When an operand's type cannot be inferred (e.g. it flows
+// through a builtin call, whose return type this shallow inference does not
+// track), the check stays silent rather than guessing — see inferProcType.
+func checkBitwiseTypes(ex ast.Expr, types map[string]string, line int) error {
+	switch t := ex.(type) {
+	case ast.Bin:
+		if bitwiseOps[t.Op] {
+			if lt := inferProcType(t.L, types); !isIntType(lt) {
+				return &BuildError{line, fmt.Sprintf("%s needs int operands; left side is %s", t.Op, lt)}
+			}
+			if rt := inferProcType(t.R, types); !isIntType(rt) {
+				return &BuildError{line, fmt.Sprintf("%s needs int operands; right side is %s", t.Op, rt)}
+			}
+		}
+		if err := checkBitwiseTypes(t.L, types, line); err != nil {
+			return err
+		}
+		return checkBitwiseTypes(t.R, types, line)
+	case ast.Un:
+		if t.Op == "~" {
+			if xt := inferProcType(t.X, types); !isIntType(xt) {
+				return &BuildError{line, fmt.Sprintf("~ needs an int operand; got %s", xt)}
+			}
+		}
+		return checkBitwiseTypes(t.X, types, line)
+	case ast.Call:
+		for _, a := range t.Args {
+			if err := checkBitwiseTypes(a, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkBitwiseTypes(el, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if err := checkBitwiseTypes(t.Obj, types, line); err != nil {
+			return err
+		}
+		return checkBitwiseTypes(t.Idx, types, line)
+	}
+	return nil
+}
+
+// checkIndexTypes walks a proc expression for an array index read (`x[i]`)
+// whose object is a bare name the proc's own type map (types) already knows
+// is NOT an array — the one piece of static typing an index read can be
+// given without a richer type system for proc locals. inferProcType tags a
+// list literal, an `append(...)` result, and (transitively) any `let` bound
+// to either with arrayType; anything the map has no opinion on (a parameter —
+// proc parameters cannot be list-typed in this milestone — or an index over
+// any shape other than a bare name) is accepted unchecked, the same "stay
+// silent on what can't be proven" stance checkBitwiseTypes takes above. The
+// index value itself is never checked here — it is data, not type, and can
+// only be bounds-checked at runtime (runtime/eval.go's evalInFrame, "index"
+// case, and runtime/server.go's execProcBlock, "indexset" case) — see
+// ast.Index's doc.
+func checkIndexTypes(ex ast.Expr, types map[string]string, line int) error {
+	switch t := ex.(type) {
+	case ast.Index:
+		if r, ok := t.Obj.(ast.Ref); ok {
+			if ty := types[r.Name]; ty != "" && ty != arrayType {
+				return &BuildError{line, fmt.Sprintf(
+					"%q is not an array (its type is %s) — index access (`%s[...]`) needs an array local", r.Name, ty, r.Name)}
+			}
+		}
+		if err := checkIndexTypes(t.Obj, types, line); err != nil {
+			return err
+		}
+		return checkIndexTypes(t.Idx, types, line)
+	case ast.Bin:
+		if err := checkIndexTypes(t.L, types, line); err != nil {
+			return err
+		}
+		return checkIndexTypes(t.R, types, line)
+	case ast.Un:
+		return checkIndexTypes(t.X, types, line)
+	case ast.Call:
+		for _, a := range t.Args {
+			if err := checkIndexTypes(a, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkIndexTypes(el, types, line); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ── view lowering ────────────────────────────────────────────────────────────
@@ -3669,12 +3902,127 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 	if err := e.checkBuiltins(ex, line); err != nil {
 		return err
 	}
+	if err := checkNoBitwise(ex, line); err != nil {
+		return err
+	}
+	if err := checkNoIndex(ex, line); err != nil {
+		return err
+	}
 	for n := range freeNames(ex) {
 		if !e.resolves(n, locals) {
 			return &BuildError{line, fmt.Sprintf("unknown reference %q", n)}
 		}
 	}
 	return e.checkLiteralExpr(ex, locals, line)
+}
+
+// bitwiseOps is the operator set restricted to `proc` bodies (see
+// checkNoBitwise and checkBitwiseTypes): `& | ^ << >>` and unary `~` have
+// exactly one interpreter today, runtime/eval.go's applyBin/evalInFrame/
+// evalRest, which only ever runs on the server. A `proc` is unconditionally
+// server-executed (LANGUAGE.md's `proc` section), so it can use them safely.
+// An action or view expression, by contrast, may be placed on (or
+// re-evaluated by) the client — assets/facet.js has no bitwise cases — so
+// using one there would silently diverge between server and browser with no
+// diagnostic. checkNoBitwise below is what keeps that from happening.
+var bitwiseOps = map[string]bool{"&": true, "|": true, "^": true, "<<": true, ">>": true}
+
+// checkNoBitwise rejects a bitwise operator anywhere outside a proc body. It
+// is called from check() — the one funnel every action/view/policy/derive
+// expression in the language passes through (see check's doc comment) —
+// which is what makes this a complete restriction with a single call site:
+// checkProcExpr (proc bodies) calls checkBuiltins directly and never calls
+// check, so it is unaffected and a proc may use these operators freely.
+func checkNoBitwise(ex ast.Expr, line int) error {
+	switch t := ex.(type) {
+	case ast.Bin:
+		if bitwiseOps[t.Op] {
+			return &BuildError{line, fmt.Sprintf(
+				"%q is only available inside a proc — a proc always runs on the server, but this expression may run on the client too, and the client has no bitwise operators", t.Op)}
+		}
+		if err := checkNoBitwise(t.L, line); err != nil {
+			return err
+		}
+		return checkNoBitwise(t.R, line)
+	case ast.Un:
+		if t.Op == "~" {
+			return &BuildError{line, "`~` is only available inside a proc — a proc always runs on the server, but this expression may run on the client too, and the client has no bitwise operators"}
+		}
+		return checkNoBitwise(t.X, line)
+	case ast.Get:
+		return checkNoBitwise(t.Obj, line)
+	case ast.EntityGet:
+		return checkNoBitwise(t.Key, line)
+	case ast.Call:
+		for _, a := range t.Args {
+			if err := checkNoBitwise(a, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkNoBitwise(el, line); err != nil {
+				return err
+			}
+		}
+	case ast.Agg:
+		if err := checkNoBitwise(t.Where, line); err != nil {
+			return err
+		}
+		return checkNoBitwise(t.Sel, line)
+	case ast.Index:
+		if err := checkNoBitwise(t.Obj, line); err != nil {
+			return err
+		}
+		return checkNoBitwise(t.Idx, line)
+	}
+	return nil
+}
+
+// checkNoIndex rejects an array index read (`x[i]`) anywhere outside a proc
+// body, the same way checkNoBitwise (above) rejects a bitwise operator there
+// and for the same underlying reason: an index read's only interpreter is
+// runtime/eval.go's evalInFrame, which resolves it against a proc's own
+// scope-frame. eval() — the flat scope evaluator every action/view/policy/
+// derive expression runs through instead — has no "index" case, so without
+// this check an index read there would silently evaluate to nil rather than
+// fail to compile. checkProcExpr (proc bodies) never calls check(), so a
+// proc may index an array freely — see checkIndexTypes for the (different)
+// check that DOES apply there.
+func checkNoIndex(ex ast.Expr, line int) error {
+	switch t := ex.(type) {
+	case ast.Index:
+		return &BuildError{line, "array indexing (`x[i]`) is only available inside a proc — arrays are proc-local values, not readable from an action, view, policy, or derive yet"}
+	case ast.Bin:
+		if err := checkNoIndex(t.L, line); err != nil {
+			return err
+		}
+		return checkNoIndex(t.R, line)
+	case ast.Un:
+		return checkNoIndex(t.X, line)
+	case ast.Get:
+		return checkNoIndex(t.Obj, line)
+	case ast.EntityGet:
+		return checkNoIndex(t.Key, line)
+	case ast.Call:
+		for _, a := range t.Args {
+			if err := checkNoIndex(a, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkNoIndex(el, line); err != nil {
+				return err
+			}
+		}
+	case ast.Agg:
+		if err := checkNoIndex(t.Where, line); err != nil {
+			return err
+		}
+		return checkNoIndex(t.Sel, line)
+	}
+	return nil
 }
 
 // checkPure is check plus the guarantee that ex is side-effect-free: it rejects
@@ -3898,6 +4246,11 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		return e.checkBuiltins(t.R, line)
 	case ast.Un:
 		return e.checkBuiltins(t.X, line)
+	case ast.Index:
+		if err := e.checkBuiltins(t.Obj, line); err != nil {
+			return err
+		}
+		return e.checkBuiltins(t.Idx, line)
 	}
 	return nil
 }
@@ -3934,6 +4287,8 @@ func hasImpure(ex ast.Expr) bool {
 		return hasImpure(t.X)
 	case ast.Agg:
 		return (t.Where != nil && hasImpure(t.Where)) || (t.Sel != nil && hasImpure(t.Sel))
+	case ast.Index:
+		return hasImpure(t.Obj) || hasImpure(t.Idx)
 	}
 	return false
 }
@@ -3945,6 +4300,8 @@ func pureBuiltinArity(name string) (int, bool) {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
 		"ago", "compact", "commas":
 		return 1, true
+	case "append":
+		return 2, true
 	case "min", "max", "contains", "take":
 		return 2, true
 	}
@@ -4158,6 +4515,18 @@ func freeNames(ex ast.Expr) map[string]bool {
 			for _, a := range t.Args {
 				walk(a)
 			}
+		case ast.ListLit:
+			// Was missing until array support needed it: a list literal's elements
+			// can themselves be references (`[a, b, c]`), and without this case a
+			// name used only inside one silently skipped checkProcExpr's/check()'s
+			// name-resolution pass instead of being validated like everywhere else
+			// that name could appear.
+			for _, el := range t.Elems {
+				walk(el)
+			}
+		case ast.Index:
+			walk(t.Obj)
+			walk(t.Idx)
 		case ast.Bin:
 			walk(t.L)
 			walk(t.R)
@@ -4188,6 +4557,11 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 			out.Args = append(out.Args, lower(el, inline, enums))
 		}
 		return out
+	case ast.Index:
+		// Reuses Obj (the array) and Key (the index expression) — the same fields
+		// "get" and "eget" already carry an addressing sub-expression in — rather
+		// than adding new Expr fields just for this one kind.
+		return &Expr{Kind: "index", Obj: lower(t.Obj, inline, enums), Key: lower(t.Idx, inline, enums)}
 	case ast.Ref:
 		if inline != nil {
 			if p, ok := inline[t.Name]; ok {

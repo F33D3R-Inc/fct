@@ -1845,7 +1845,10 @@ func (s *Server) runProcLocked(p *ir.Proc, args []any) (any, error) {
 		} else {
 			v = zero(prm.Type)
 		}
-		fr.vars[prm.Name] = v
+		// cloneArrayValue: a param binding is a new variable taking on a value,
+		// exactly like a `let` — see cloneArrayValue's doc for why an array value
+		// is copied at every such point instead of aliased.
+		fr.vars[prm.Name] = cloneArrayValue(v)
 	}
 	c, err := s.execProcBlock(p.Body, fr)
 	if err != nil {
@@ -1891,14 +1894,51 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 		case "let":
 			// Declares fresh in this frame; internal/ir/build.go already refused a
 			// name already in scope, so there is nothing to accidentally shadow.
-			fr.vars[st.Target] = evalInFrame(st.Value, fr)
+			// cloneArrayValue: see its doc — a `let` is a new variable taking on a
+			// value, so an array value is copied here rather than aliased.
+			v, err := evalInFrame(st.Value, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			fr.vars[st.Target] = cloneArrayValue(v)
 		case "assign":
 			// A `let mut` reassignment; the compiler guarantees st.Target was already
 			// declared somewhere in the enclosing frame chain, so frame.set always
 			// finds and updates it in place — including a local declared OUTSIDE a
 			// loop and reassigned inside it, which is how an accumulator persists
-			// across iterations instead of resetting.
-			fr.set(st.Target, evalInFrame(st.Value, fr))
+			// across iterations instead of resetting. cloneArrayValue for the same
+			// reason as "let": the local is taking on a freshly-computed value.
+			v, err := evalInFrame(st.Value, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			fr.set(st.Target, cloneArrayValue(v))
+		case "indexset":
+			// `xs[i] = expr` — mutate one element of an array local in place.
+			// internal/ir/build.go's procBlock already proved Target is a declared
+			// `let mut` array local, so frame.get always finds it; the index itself
+			// is only bounds-checked here, at runtime (see ast.Index's doc for why
+			// it cannot be checked earlier). Because cloneArrayValue guarantees
+			// Target's backing array is never shared with any other variable, this
+			// mutation is safely in place: it cannot be observed through any alias.
+			arrVal, _ := fr.get(st.Target)
+			arr, ok := arrVal.([]any)
+			if !ok {
+				return ctlSignal{}, fmt.Errorf("%q is not an array", st.Target)
+			}
+			idxV, err := evalInFrame(st.Key, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			idx := toInt(idxV)
+			if idx < 0 || idx >= len(arr) {
+				return ctlSignal{}, fmt.Errorf("array index %d out of bounds (length %d) assigning to %q", idx, len(arr), st.Target)
+			}
+			val, err := evalInFrame(st.Value, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			arr[idx] = val
 		case "do":
 			sub := s.byProc[st.Service]
 			if sub == nil {
@@ -1906,7 +1946,11 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			}
 			subArgs := make([]any, len(st.Args))
 			for i, a := range st.Args {
-				subArgs[i] = evalInFrame(a, fr)
+				v, err := evalInFrame(a, fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				subArgs[i] = v
 			}
 			res, err := s.runProcLocked(sub, subArgs)
 			if err != nil {
@@ -1916,7 +1960,11 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 				fr.vars[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
 			}
 		case "return":
-			return ctlSignal{kind: ctlReturn, val: evalInFrame(st.Value, fr)}, nil
+			v, err := evalInFrame(st.Value, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			return ctlSignal{kind: ctlReturn, val: v}, nil
 		case "break":
 			return ctlSignal{kind: ctlBreak}, nil
 		case "continue":
@@ -1933,7 +1981,11 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			// whatever follows the loop in this block.
 		case "if":
 			branch := st.Else
-			if truthy(evalInFrame(st.Value, fr)) {
+			cond, err := evalInFrame(st.Value, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			if truthy(cond) {
 				branch = st.Body
 			}
 			if branch == nil {
@@ -1968,7 +2020,14 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 // with whatever follows the loop; `continue` simply moves on to the next
 // condition check.
 func (s *Server) execProcLoop(st ir.Stmt, fr *frame) (ctlSignal, error) {
-	for truthy(evalInFrame(st.Value, fr)) {
+	for {
+		cond, err := evalInFrame(st.Value, fr)
+		if err != nil {
+			return ctlSignal{}, err
+		}
+		if !truthy(cond) {
+			return ctlSignal{}, nil
+		}
 		child := &frame{vars: map[string]any{}, parent: fr}
 		sig, err := s.execProcBlock(st.Body, child)
 		if err != nil {
@@ -1982,7 +2041,6 @@ func (s *Server) execProcLoop(st ir.Stmt, fr *frame) (ctlSignal, error) {
 		}
 		// ctlNone or ctlContinue: re-check the condition and go again.
 	}
-	return ctlSignal{}, nil
 }
 
 // policyPasses evaluates one permission check against the action scope. A

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"math/rand"
 	"regexp"
 	"strconv"
@@ -60,45 +61,121 @@ func (f *frame) set(name string, v any) {
 // the flat scope map eval() reads — the resolver a proc's own scope needs (see
 // frame, above). A proc's expressions are restricted at compile time
 // (internal/ir/build.go, checkProcExpr) to literals, its own locals/params,
-// arithmetic/comparison/boolean operators, and pure builtins — never a state
-// read, an entity/aggregate read, or client reactive state — so those are the
-// only IR node kinds this needs to know about. Where the logic is identical to
-// eval's (binary/unary operators, builtin calls), it delegates to the same
-// helpers eval uses, so the two interpreters cannot silently drift apart.
-func evalInFrame(e *ir.Expr, fr *frame) any {
+// arithmetic/comparison/boolean/bitwise operators, pure builtins, and array
+// literals/index reads — never a state read, an entity/aggregate read, or
+// client reactive state — so those are the only IR node kinds this needs to
+// know about. Where the logic is identical to eval's (binary/unary operators,
+// builtin calls), it delegates to the same helpers eval uses, so the two
+// interpreters cannot silently drift apart.
+//
+// Unlike eval(), this returns an error as its second result: an array index
+// read (case "index") is the one place a proc expression can fail at runtime
+// in a way no compile-time check can rule out (bounds are data-dependent, not
+// static — see ast.Index) — reading past an array's length, or indexing a
+// value that isn't an array despite the compile-time check on the common
+// `name[i]` shape (internal/ir/build.go's checkIndexTypes only catches
+// that shape; anything it couldn't prove statically is checked here instead).
+// That error threads back up through every caller in this function and in
+// runtime/server.go's execProcBlock/execProcLoop, the same way a `do` call's
+// own failure already does, and ends the request as a clean 5xx rather than a
+// Go panic reaching the HTTP layer.
+func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 	if e == nil {
-		return nil
+		return nil, nil
 	}
 	switch e.Kind {
 	case "lit":
-		return litValue(e)
+		return litValue(e), nil
 	case "list":
 		out := make([]any, len(e.Args))
 		for i, el := range e.Args {
-			out[i] = evalInFrame(el, fr)
+			v, err := evalInFrame(el, fr)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = v
 		}
-		return out
+		return out, nil
 	case "ref":
 		v, _ := fr.get(e.Name)
-		return v
+		return v, nil
+	case "index":
+		obj, err := evalInFrame(e.Obj, fr)
+		if err != nil {
+			return nil, err
+		}
+		idxV, err := evalInFrame(e.Key, fr)
+		if err != nil {
+			return nil, err
+		}
+		arr, ok := obj.([]any)
+		if !ok {
+			return nil, fmt.Errorf("cannot index a non-array value")
+		}
+		idx := toInt(idxV)
+		if idx < 0 || idx >= len(arr) {
+			return nil, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(arr))
+		}
+		return arr[idx], nil
 	case "un":
-		x := evalInFrame(e.X, fr)
+		x, err := evalInFrame(e.X, fr)
+		if err != nil {
+			return nil, err
+		}
 		switch e.Op {
 		case "!":
-			return !truthy(x)
+			return !truthy(x), nil
 		case "-":
-			return -toInt(x)
+			return -toInt(x), nil
+		case "~":
+			return ^toInt(x), nil
 		}
 	case "bin":
-		return applyBin(e.Op, evalInFrame(e.L, fr), evalInFrame(e.R, fr))
+		l, err := evalInFrame(e.L, fr)
+		if err != nil {
+			return nil, err
+		}
+		r, err := evalInFrame(e.R, fr)
+		if err != nil {
+			return nil, err
+		}
+		return applyBin(e.Op, l, r), nil
 	case "call":
 		args := make([]any, len(e.Args))
 		for i, a := range e.Args {
-			args[i] = evalInFrame(a, fr)
+			v, err := evalInFrame(a, fr)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = v
 		}
-		return callBuiltin(e.Name, args)
+		return callBuiltin(e.Name, args), nil
 	}
-	return nil
+	return nil, nil
+}
+
+// cloneArrayValue returns v unchanged unless it is a []any (an array value),
+// in which case it returns a fresh copy with its own backing array.
+//
+// This is what gives a proc-local array value semantics instead of Go's
+// default slice-aliasing assignment: called at every point a value flows into
+// a NEW binding — a `let`, a plain `name = expr` reassignment, and a proc
+// parameter — so `let ys = xs` (or passing xs as an argument) never leaves ys
+// and xs sharing a backing array. Mutating one afterward (via an index-write,
+// runtime/server.go's "indexset") therefore cannot be observed through the
+// other. This matches the rest of the language's copy-on-read value model
+// (an action's state cells are never shared references either) rather than
+// adding a new, inconsistent reference-semantics value kind; the cost is one
+// copy per assignment, paid only for actual array values (everything else —
+// the overwhelming majority of assignments — returns immediately unchanged).
+func cloneArrayValue(v any) any {
+	arr, ok := v.([]any)
+	if !ok {
+		return v
+	}
+	out := make([]any, len(arr))
+	copy(out, arr)
+	return out
 }
 
 // eval interprets an IR expression over a scope (state + entities + locals like
@@ -363,6 +440,8 @@ func evalRest(e *ir.Expr, scope map[string]any) any {
 			return !truthy(x)
 		case "-":
 			return -toInt(x)
+		case "~":
+			return ^toInt(x)
 		}
 	case "bin":
 		return applyBin(e.Op, eval(e.L, scope), eval(e.R, scope))
@@ -423,8 +502,46 @@ func applyBin(op string, l, r any) any {
 			}
 		}
 		return false
+	case "&":
+		return toInt(l) & toInt(r)
+	case "|":
+		return toInt(l) | toInt(r)
+	case "^":
+		return toInt(l) ^ toInt(r)
+	case "<<":
+		return shiftLeft(toInt(l), toInt(r))
+	case ">>":
+		return shiftRight(toInt(l), toInt(r))
 	}
 	return nil
+}
+
+// shiftLeft and shiftRight implement `<<`/`>>` on this runtime's int (a plain
+// Go `int` — 64-bit two's complement on every platform this compiles for).
+// Go itself panics at run time on a negative shift count (the shift count
+// must be non-negative), which is not an acceptable way for an .fct value to
+// misbehave — the same reasoning applyBin already applies to `/` and `%` by
+// zero, just for a different illegal operand: a negative shift count is
+// defined here as 0, the same sentinel division/modulo by zero already
+// answers with, rather than propagating Go's panic into a request.
+//
+// A count at or beyond the operand's bit width is NOT special-cased: unlike C,
+// Go's own shift semantics are already well-defined for any non-negative
+// count (as if shifted one bit at a time that many times), so `1 << 100`
+// naturally yields 0 and `-1 >> 100` naturally yields -1 — exactly the
+// two's-complement behavior a bit-manipulation algorithm expects.
+func shiftLeft(x, n int) int {
+	if n < 0 {
+		return 0
+	}
+	return x << uint(n)
+}
+
+func shiftRight(x, n int) int {
+	if n < 0 {
+		return 0
+	}
+	return x >> uint(n)
 }
 
 // evalCall interprets a builtin invocation. now/rand are effectful and the
@@ -489,6 +606,20 @@ func callBuiltin(name string, argVals []any) any {
 		default:
 			return utf8.RuneCountInString(toStr(v))
 		}
+	case "append":
+		// Functional, Go-`append`-flavored, but deliberately never reusing the
+		// input's backing array (unlike Go's own append, which may extend it in
+		// place when spare capacity exists) — it always allocates a fresh one, so
+		// a caller holding the old array (e.g. an alias made before this call)
+		// never sees the appended element land in it. Combined with
+		// cloneArrayValue (copy-on-assign), no two proc-local array variables
+		// ever share a backing array, which is what makes `xs[i] = v` a safe,
+		// genuinely-in-place mutation of exactly the one variable it names.
+		arr, _ := arg(0).([]any)
+		out := make([]any, len(arr)+1)
+		copy(out, arr)
+		out[len(arr)] = arg(1)
+		return out
 	case "upper":
 		return strings.ToUpper(toStr(arg(0)))
 	case "lower":

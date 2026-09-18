@@ -637,6 +637,20 @@ type Let struct {
 	Line  int
 }
 
+// IndexAssign mutates one element of a proc-local array in place:
+// `xs[i] = expr`. Proc-only, and parallels Assign's own mutability rule: Target
+// must already be a `let mut` array local (checked in internal/ir/build.go's
+// procBlock exactly like a plain `name = expr` reassignment is) — an
+// index-write is a mutation of the array VALUE that name is bound to, so it is
+// gated the same way a whole-value reassignment is, for the same reason. The
+// index itself (Index) is only bounds-checked at runtime — see Index, above.
+type IndexAssign struct {
+	Target string
+	Index  Expr
+	Value  Expr
+	Line   int
+}
+
 // Return yields a proc's result: `return expr` (or bare `return` for a proc
 // declaring no return type), immediately exiting the whole proc — including
 // from inside any number of nested `loop`/`if` blocks, not just the proc's own
@@ -703,6 +717,7 @@ func (Set) stmt()         {}
 func (Remove) stmt()      {}
 func (Clear) stmt()       {}
 func (Let) stmt()         {}
+func (IndexAssign) stmt() {}
 func (Return) stmt()      {}
 func (Do) stmt()          {}
 func (Loop) stmt()        {}
@@ -1358,6 +1373,19 @@ type ListLit struct {
 	Elems []Expr
 }
 
+// Index is an indexed array read: `xs[i]`. Proc-only (see checkProcExpr in
+// internal/ir/build.go and evalInFrame in runtime/eval.go) — a proc-local
+// array lives in its own scope-frame, which is the only interpreter with the
+// bounds-checked read this needs; a compile-time check confirms Obj resolves
+// to a name the proc has already bound to an array value where that is
+// statically decidable (a bare `name[i]`), but the index itself is never
+// bounds-checked at compile time — only at runtime, as a clean error rather
+// than a Go panic.
+type Index struct {
+	Obj Expr
+	Idx Expr
+}
+
 // Bin is a binary operation.
 type Bin struct {
 	Op   string
@@ -1372,6 +1400,7 @@ type Un struct {
 
 func (Lit) expr()       {}
 func (ListLit) expr()   {}
+func (Index) expr()     {}
 func (Ref) expr()       {}
 func (ActState) expr()  {}
 func (Get) expr()       {}

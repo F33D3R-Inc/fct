@@ -1793,12 +1793,30 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
 			}
 			target := strings.TrimSpace(t[:eq])
-			if !isIdent(target) {
-				return nil, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q", target)}
-			}
 			val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)
 			if err != nil {
 				return nil, err
+			}
+			// `xs[i] = expr` — an indexed array mutation, told apart from a plain
+			// reassignment by the target ending in `]`. Parsed as its own statement
+			// shape (ast.IndexAssign) rather than folded into ast.Assign, since it
+			// carries an extra sub-expression (the index) that a bare name target
+			// never has.
+			if strings.HasSuffix(target, "]") {
+				lb := strings.IndexByte(target, '[')
+				arrName := strings.TrimSpace(target[:lb])
+				if lb < 0 || !isIdent(arrName) {
+					return nil, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q", target)}
+				}
+				idx, err := parseExpr(target[lb+1:len(target)-1], c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				body = append(body, ast.IndexAssign{Target: arrName, Index: idx, Value: val, Line: c.Line.No})
+				continue
+			}
+			if !isIdent(target) {
+				return nil, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q", target)}
 			}
 			body = append(body, ast.Assign{Target: target, Value: val, Line: c.Line.No})
 		}

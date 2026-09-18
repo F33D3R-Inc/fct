@@ -13,10 +13,17 @@ import (
 func ParseExpr(src string) (ast.Expr, error) { return parseExpr(src, 1) }
 
 // parseExpr parses a Facet expression: identifiers, member access (`p.field`),
-// entity lookup (`Entity(key).field`), int/text/bool literals, unary ! and -,
-// arithmetic (+ - * / %), comparison (== != < <= > >=) and boolean (&& ||),
-// with parentheses. Precedence-climbing; produces an ast.Expr every executor
-// interprets identically.
+// entity lookup (`Entity(key).field`), int/text/bool literals, unary ! - and ~,
+// arithmetic (+ - * / %), comparison (== != < <= > >=), boolean (&& ||) and
+// bitwise (& | ^ << >>) operators, with parentheses. Precedence-climbing;
+// produces an ast.Expr every executor interprets identically.
+//
+// The bitwise operators parse everywhere (there is no syntactic distinction
+// between a proc expression and an action/view one at this layer), but
+// internal/ir/build.go's checkNoBitwise rejects them outside a `proc` body at
+// compile time — they only have one interpreter (runtime/eval.go), which the
+// server always runs, and an action/view expression can be re-evaluated by
+// assets/facet.js on the client, which has no bitwise cases.
 func parseExpr(src string, line int) (ast.Expr, error) {
 	p := &exprParser{toks: tokenize(src), line: line}
 	e, err := p.parseBinary(0)
@@ -93,7 +100,7 @@ func tokenize(s string) []token {
 				two = s[i : i+2]
 			}
 			switch two {
-			case "==", "!=", "<=", ">=", "&&", "||":
+			case "==", "!=", "<=", ">=", "&&", "||", "<<", ">>":
 				toks = append(toks, token{tOp, two})
 				i += 2
 			default:
@@ -111,11 +118,20 @@ type exprParser struct {
 	line int
 }
 
+// Precedence levels, loosest to tightest. Bitwise `| ^ &` sit between the
+// boolean operators and comparison — the same relative slot they hold in most
+// C-family languages, just collapsed to three levels since this table has
+// never split `==`/`!=` from `<`/`<=`/`>`/`>=` the way C does. Shifts sit
+// between comparison and the arithmetic operators, tighter than a comparison
+// (`x << 1 == y` reads as `(x << 1) == y`) but looser than `+ - * /` (`a + b
+// << 1` reads as `(a + b) << 1`), matching C's own placement of `<< >>`.
 var binPrec = map[string]int{
 	"||": 1, "&&": 2,
-	"==": 3, "!=": 3, "<": 3, "<=": 3, ">": 3, ">=": 3, "in": 3,
-	"+": 4, "-": 4,
-	"*": 5, "/": 5, "%": 5,
+	"|": 3, "^": 4, "&": 5,
+	"==": 6, "!=": 6, "<": 6, "<=": 6, ">": 6, ">=": 6, "in": 6,
+	"<<": 7, ">>": 7,
+	"+": 8, "-": 8,
+	"*": 9, "/": 9, "%": 9,
 }
 
 func (p *exprParser) peek() (token, bool) {
@@ -160,7 +176,7 @@ func (p *exprParser) parseBinary(minPrec int) (ast.Expr, error) {
 
 func (p *exprParser) parseUnary() (ast.Expr, error) {
 	t, ok := p.peek()
-	if ok && t.kind == tOp && (t.text == "!" || t.text == "-") {
+	if ok && t.kind == tOp && (t.text == "!" || t.text == "-" || t.text == "~") {
 		p.pos++
 		x, err := p.parseUnary()
 		if err != nil {
@@ -233,18 +249,34 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 			}
 		}
 	}
-	// chained `.field`
+	// chained `.field` / `[index]` — e.g. `xs[i].field`, `xs[0]`.
 	for {
 		t, ok := p.peek()
-		if !ok || t.kind != tOp || t.text != "." {
+		if !ok || t.kind != tOp {
 			break
 		}
-		p.pos++
-		field, err := p.fieldName()
-		if err != nil {
-			return nil, err
+		switch t.text {
+		case ".":
+			p.pos++
+			field, err := p.fieldName()
+			if err != nil {
+				return nil, err
+			}
+			atom = ast.Get{Obj: atom, Field: field}
+		case "[":
+			p.pos++
+			idx, err := p.parseBinary(0)
+			if err != nil {
+				return nil, err
+			}
+			if c, ok := p.peek(); !ok || c.kind != tOp || c.text != "]" {
+				return nil, &Error{p.line, "missing closing `]` in index"}
+			}
+			p.pos++
+			atom = ast.Index{Obj: atom, Idx: idx}
+		default:
+			return atom, nil
 		}
-		atom = ast.Get{Obj: atom, Field: field}
 	}
 	return atom, nil
 }
@@ -278,12 +310,18 @@ func numericAgg(op string) bool {
 }
 
 // precArith is the precedence floor an aggregate's reduced value is parsed at:
-// high enough that `+ - * / %` and everything tighter bind into it, low enough
-// that `in` — which is the token separating the value from the collection it
-// ranges over — is left for parseAgg to see. Without the floor,
+// high enough that `<< >> + - * / %` and everything tighter bind into it, low
+// enough that `in` — which is the token separating the value from the
+// collection it ranges over — is left for parseAgg to see. Without the floor,
 // `sum(l.qty * l.unitPrice in CartLine …)` would parse as one `in` expression and
 // the aggregate would have no collection.
-const precArith = 4
+//
+// This sits one level above `in`/comparison (binPrec's level 6), the same
+// relative position `+`/`-` held before bitwise operators were added — so
+// `| ^ &`, which bind looser than comparison, stay excluded from a reduced
+// value exactly as `&&`/`||` always were, and only shifts/arithmetic (which
+// this floor was always meant to admit) are pulled in.
+const precArith = 7
 
 // parseAgg parses the argument list of an aggregate builtin; p.peek() is at the
 // opening `(`. Whole-collection forms: `count(Coll)`, `sum(Coll.field)`,
@@ -505,7 +543,8 @@ func isBuiltinCall(name string) bool {
 		"abs", "min", "max", "floor", "round", "money", // math / money
 		"len", "upper", "lower", "trim", "contains", "take", // string
 		"year", "month", "day", // date
-		"ago", "compact", "commas": // formatting (render-time text)
+		"ago", "compact", "commas", // formatting (render-time text)
+		"append": // array (proc-only — see internal/ir/build.go's checkBuiltins)
 		return true
 	}
 	return false

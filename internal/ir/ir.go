@@ -403,16 +403,24 @@ type Trigger struct {
 
 // Stmt is one action or proc statement.
 // Op ∈ assign | add | set | remove | clear | call | check | establish | let |
-// return | do | loop | if | break | continue.
+// return | do | loop | if | break | continue | indexset.
 //
-// let/return/loop/if/break/continue are proc-only (a proc's own local-variable
-// model, control flow, and result); do calls a proc — from either an action or
-// another proc — over the same fields a service `call` uses (Service holds the
-// proc's name; there is no operation to route through, unlike a service).
+// let/return/loop/if/break/continue/indexset are proc-only (a proc's own
+// local-variable model, control flow, and result); do calls a proc — from
+// either an action or another proc — over the same fields a service `call`
+// uses (Service holds the proc's name; there is no operation to route
+// through, unlike a service).
 // assign is shared: in an action it writes a state cell (into session state +
 // wire deltas); in a proc it reassigns a `let mut` local in the proc's own
 // frame. The two never alias, because runActionLocked and runProcLocked/
 // execProcBlock interpret the two bodies separately.
+//
+// indexset is a proc-only array element mutation, `xs[i] = expr`: Target names
+// the array local (gated the same way a plain reassignment is — see Assign,
+// above — since it mutates the value Target is bound to), Key is the index
+// expression (reusing the same field a `set`/`remove` entity key already
+// carries), and Value is the new element. It is bounds-checked only at
+// runtime (runtime/server.go's execProcBlock) — see ast.Index's doc for why.
 //
 // loop/if are the one place a Stmt nests (Milestone 2): Value holds the
 // condition both share, Body is loop's repeated body / if's `then` branch, and
@@ -716,15 +724,15 @@ type Seg struct {
 // now goes through wireExprFromIR/wireExprToIR (runtime/wireseam.go)
 // instead; do not marshal an *Expr directly into a FacetQL request again.
 type Expr struct {
-	Kind  string  `json:"kind"` // lit | ref | get | eget | agg | call | bin | un
+	Kind  string  `json:"kind"` // lit | ref | get | eget | agg | call | bin | un | list | index
 	Val   any     `json:"val,omitempty"`
 	VType string  `json:"vtype,omitempty"`
 	Name  string  `json:"name,omitempty"`  // ref / eget entity / agg collection / call builtin
 	Field string  `json:"field,omitempty"` // get / eget / agg (sum)
-	Obj   *Expr   `json:"obj,omitempty"`   // get
-	Key   *Expr   `json:"key,omitempty"`   // eget
+	Obj   *Expr   `json:"obj,omitempty"`   // get / index (the array)
+	Key   *Expr   `json:"key,omitempty"`   // eget / index (the index expression)
 	Op    string  `json:"op,omitempty"`    // bin / un / agg (count|sum|exists)
-	Args  []*Expr `json:"args,omitempty"`  // call
+	Args  []*Expr `json:"args,omitempty"`  // call / list (the elements)
 	L     *Expr   `json:"l,omitempty"`
 	R     *Expr   `json:"r,omitempty"`
 	X     *Expr   `json:"x,omitempty"`

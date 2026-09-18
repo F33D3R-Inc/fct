@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -517,5 +518,203 @@ func TestProcNestedReturnUnwindsLive(t *testing.T) {
 	deltas := postJSON(t, ts, "run", `{"args":[1000,10]}`)
 	if got := toInt(deltas["result"]); got != 5 {
 		t.Fatalf("firstOver(1000, limit 10) over the wire = %v, want 5 (return must unwind out of the if AND the loop, not fall through to -1)", deltas["result"])
+	}
+}
+
+// ── Bitwise operators, live over HTTP ───────────────────────────────────────
+
+// packRGBRunApp packs three 8-bit channels into one int via shift/or, and
+// unpacks the red channel back out via shift/and — a straight-line proc
+// exercising `<<`, `>>`, `|` and `&` together, the multi-operator idiom
+// (`(r << 16) | (g << 8) | b` / `(packed >> 16) & 0xFF`) the task asked for.
+const packRGBRunApp = `app A:
+    proc pack(r: int, g: int, b: int) -> int:
+        return (r << 16) | (g << 8) | b
+    proc unpackRed(v: int) -> int:
+        return (v >> 16) & 255
+    state packedOut: int = 0
+    state redOut: int = 0
+    action doPack(r: int, g: int, b: int):
+        let p = do pack(r, g, b)
+        packedOut = p
+    action doUnpack(v: int):
+        let red = do unpackRed(v)
+        redOut = red
+    view Home at "/":
+        box:
+            text "{packedOut}"
+            text "{redOut}"
+`
+
+// TestProcBitwisePackUnpackLive is the task's cross-check requirement in its
+// most direct form: the expected value is computed in THIS test, using Go's
+// own `<<`/`>>`/`|`/`&` on the identical input, and the live HTTP result from
+// the compiled .fct proc must match it exactly — not a hardcoded, hand-derived
+// "looks plausible" number.
+func TestProcBitwisePackUnpackLive(t *testing.T) {
+	g, err := compile.String(packRGBRunApp)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	r, gr, b := 200, 130, 45
+	// Go's own bitwise operators over the identical input — the cross-check.
+	wantPacked := (r << 16) | (gr << 8) | b
+	wantRed := (wantPacked >> 16) & 0xFF
+
+	deltas := postJSON(t, ts, "doPack", fmt.Sprintf(`{"args":[%d,%d,%d]}`, r, gr, b))
+	if got := toInt(deltas["packedOut"]); got != wantPacked {
+		t.Fatalf("pack(%d,%d,%d) over the wire = %v, want %d (Go's own (r<<16)|(g<<8)|b)", r, gr, b, deltas["packedOut"], wantPacked)
+	}
+
+	deltas = postJSON(t, ts, "doUnpack", fmt.Sprintf(`{"args":[%d]}`, wantPacked))
+	if got := toInt(deltas["redOut"]); got != wantRed {
+		t.Fatalf("unpackRed(%d) over the wire = %v, want %d (Go's own (packed>>16)&0xFF)", wantPacked, deltas["redOut"], wantRed)
+	}
+}
+
+// crc8RunApp computes a bit-by-bit CRC-8 (polynomial 0x07, no reflection) over
+// a single byte, entirely with `loop`/`if` and bitwise operators — the
+// genuinely-needs-iteration algorithm the task asked for as an alternative to
+// the straight-line pack/unpack example. It is the textbook software CRC-8
+// inner loop: shift the running CRC left one bit at a time, XOR in the
+// polynomial whenever the bit shifted out was a 1, masking back to 8 bits
+// each pass.
+const crc8RunApp = `app A:
+    proc crc8(byteVal: int) -> int:
+        let mut crc = byteVal & 255
+        let mut i = 0
+        loop i < 8:
+            if (crc & 128) != 0:
+                crc = (crc << 1) ^ 7
+            else:
+                crc = crc << 1
+            crc = crc & 255
+            i = i + 1
+        return crc
+    state result: int = 0
+    action run(byteVal: int):
+        let r = do crc8(byteVal)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`
+
+// goCRC8 is the reference implementation of the identical bit-by-bit CRC-8
+// crc8RunApp's proc computes, written with Go's own bitwise operators — the
+// cross-check every live result below is asserted against.
+func goCRC8(b int) int {
+	crc := b & 0xFF
+	for i := 0; i < 8; i++ {
+		if crc&0x80 != 0 {
+			crc = (crc << 1) ^ 0x07
+		} else {
+			crc = crc << 1
+		}
+		crc &= 0xFF
+	}
+	return crc
+}
+
+func TestProcCRC8Live(t *testing.T) {
+	g, err := compile.String(crc8RunApp)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	for _, in := range []int{0x00, 0x01, 0xA5, 0xFF, 0x7B} {
+		want := goCRC8(in)
+		deltas := postJSON(t, ts, "run", fmt.Sprintf(`{"args":[%d]}`, in))
+		if got := toInt(deltas["result"]); got != want {
+			t.Fatalf("crc8(%#x) over the wire = %v, want %d (Go's own bit-by-bit CRC-8, same input)", in, deltas["result"], want)
+		}
+	}
+}
+
+// bitwiseEdgeApp isolates the two operators whose edge-case behavior this
+// task asked to pin down explicitly: `<<` (shift by 0, by a negative amount,
+// and by an amount at/beyond the operand's bit width) and `~` (a negative
+// operand).
+const bitwiseEdgeApp = `app A:
+    proc shl(x: int, n: int) -> int:
+        return x << n
+    proc bnot(x: int) -> int:
+        return ~x
+    state result: int = 0
+    action doShl(x: int, n: int):
+        let r = do shl(x, n)
+        result = r
+    action doNot(x: int):
+        let r = do bnot(x)
+        result = r
+    view Home at "/":
+        box:
+            text "{result}"
+`
+
+func TestProcBitwiseEdgeCasesLive(t *testing.T) {
+	g, err := compile.String(bitwiseEdgeApp)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Shift by 0 is the identity.
+	deltas := postJSON(t, ts, "doShl", `{"args":[1,0]}`)
+	if got := toInt(deltas["result"]); got != 1 {
+		t.Fatalf("1 << 0 over the wire = %v, want 1", deltas["result"])
+	}
+
+	// A shift amount at/beyond the operand's bit width is well-defined in Go
+	// (unlike C's undefined behavior for this case) — shifted that many times,
+	// every original bit is gone, so the result is 0. Computed via a runtime
+	// variable (not a constant expression, which Go would refuse to compile as
+	// an overflow) so this is Go's own runtime shift semantics, not a
+	// hand-typed number.
+	one, big := 1, 100
+	wantBig := one << uint(big)
+	deltas = postJSON(t, ts, "doShl", `{"args":[1,100]}`)
+	if got := toInt(deltas["result"]); got != wantBig {
+		t.Fatalf("1 << 100 over the wire = %v, want %d (Go's own semantics for an oversized shift)", deltas["result"], wantBig)
+	}
+
+	// A negative shift count is defined here as 0 — the same sentinel this
+	// runtime already answers division/modulo by zero with (see applyBin's "/"
+	// and "%" cases in runtime/eval.go) — rather than propagating Go's own
+	// run-time panic for a negative shift count into the request.
+	deltas = postJSON(t, ts, "doShl", `{"args":[1,-5]}`)
+	if got := toInt(deltas["result"]); got != 0 {
+		t.Fatalf("1 << -5 over the wire = %v, want 0 (a negative shift count is defined as 0, mirroring division by zero)", deltas["result"])
+	}
+
+	// Unary ~ on a negative operand: two's complement, ~(-1) == 0.
+	deltas = postJSON(t, ts, "doNot", `{"args":[-1]}`)
+	if got := toInt(deltas["result"]); got != 0 {
+		t.Fatalf("~(-1) over the wire = %v, want 0", deltas["result"])
+	}
+	// The complementary edge, cross-checked against Go's own ^0: ~0 == -1.
+	zero := 0
+	wantNot0 := ^zero
+	deltas = postJSON(t, ts, "doNot", `{"args":[0]}`)
+	if got := toInt(deltas["result"]); got != wantNot0 {
+		t.Fatalf("~0 over the wire = %v, want %d (Go's own ^0)", deltas["result"], wantNot0)
 	}
 }
