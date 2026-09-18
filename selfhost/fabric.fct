@@ -1,0 +1,560 @@
+app FabricSelfHost:
+    # Self-hosting port of fabric/crates/fabric-facetql/src/frontdoor/keyspace.rs
+    # — the declared map from FacetQL's namespace (a `kind` name, or an
+    # `address` string) to one Fabric `RoutingKey`. Read in full before writing
+    # this file, alongside fabric-routing's `RoutingKey`/`Coordinate` (for the
+    # value this port threads through) and frontdoor/plan.rs (the module that
+    # actually calls `Keyspace::resolve` once per incoming request).
+    #
+    # ============================================================
+    # WHY THIS PIECE, OUT OF ALL OF FABRIC:
+    # ============================================================
+    # `fabric/` was last characterized as an immature scaffold. Reading it
+    # fresh (16 crates, ~31 000 lines of non-test Rust as of this port) shows
+    # that characterization is now WRONG for the crate this task cares about:
+    # `fabric-facetql` alone is ~7 250 lines across client/wire/poller/sample/
+    # mover/placement/frontdoor, and most of it is genuine logic, not
+    # boilerplate. But most of THAT logic is disqualified for a self-hosting
+    # port for one of two reasons this file's header states plainly rather
+    # than glossing over:
+    #   - it is fundamentally I/O (client.rs's HTTP calls, poller.rs's stats
+    #     polling loop, mover.rs's keyset-cursor walk + SSE catch-up — real
+    #     protocol logic, but ABOUT talking to a socket, not a pure function
+    #     of already-in-hand data);
+    #   - or it is a thin CAS-over-HTTP wrapper (placement.rs's
+    #     PlacementStore::create/update/remove — the interesting part, the
+    #     compare-and-set contract, is FacetQL's `set_if`/`if_absent`, not
+    #     anything fabric COMPUTES).
+    # `frontdoor/keyspace.rs` is the exception: `Keyspace::resolve` and the
+    # construction-time checks around it are a PURE decision procedure over
+    # already-decoded strings and a small declared rule table — no socket, no
+    # async, no serde — exactly the shape predicate.fct and storage.fct were
+    # each chosen for. `frontdoor/plan.rs` (the module keyspace.rs feeds) is
+    # ALSO pure and arguably more central, but it is ~980 lines dispatching
+    # on axum's `Method`/HTTP path/route-specific body shapes for every one of
+    # FacetQL's ~30 routes — real content, but glue-shaped (a giant match, not
+    # an algorithm) and sized for a port of its own, not a shared file with
+    # something else. keyspace.rs is the load-bearing ALGORITHM inside it: the
+    # longest-prefix-match-plus-consistency-check that plan.rs calls once per
+    # request and refuses to second-guess.
+    #
+    # ============================================================
+    # WHAT keyspace.rs's REAL LOGIC ACTUALLY IS (verified by reading
+    # frontdoor/keyspace.rs in full, not assumed from its module doc):
+    # ============================================================
+    # A `Keyspace` is a small table of rules — each rule states "kind K, AND
+    # every address beginning prefix P, both route to routing key X" — plus an
+    # optional fallback key for anything no rule covers. `resolve(kind,
+    # address)` is called with EITHER or BOTH of a kind and an address (a
+    # `POST /node` supplies both; a `GET /nodes?kind=` supplies only a kind;
+    # a `GET /node/:address` supplies only an address) and must produce
+    # exactly one of three outcomes:
+    #   - Ok(key)          — every part of the request that named a rule
+    #                        agrees, or only one part named a rule, or
+    #                        neither did but a fallback exists.
+    #   - Unmapped         — nothing covers this request and there is no
+    #                        fallback: refuse rather than guess.
+    #   - Inconsistent      — the request named BOTH a kind and an address,
+    #                        and they resolve to DIFFERENT keys: the
+    #                        operator's own declared table is being violated,
+    #                        so the write is refused rather than filed
+    #                        somewhere its own kind's queries will never
+    #                        look.
+    # `for_kind` is an exact-name lookup. `for_address` is LONGEST-PREFIX-WINS
+    # (`__fabric_placement:` beats `__` on the same address) via Rust's
+    # `.max_by_key(|rule| rule.address_prefix.len())` — and `max_by_key`'s own
+    # documented tie-break is "the LAST equally-maximal element wins", which
+    # matters here and is restated deliberately below, not glossed over as
+    # "pick either": two rules of the SAME prefix length are already refused
+    # at construction time (`DuplicateAddressPrefix`), but nothing stops two
+    # DIFFERENT rules from having prefixes of the same length as each OTHER
+    # (e.g. "Post:" and "User:" both length 5) — the tie only ever fires
+    # between two rules that could not both match one address to begin with,
+    # so it is unreachable in practice, but this port matches Rust's real
+    # tie-break exactly rather than inventing a different one that happens to
+    # agree today.
+    #
+    # A keyspace is also validated once, at CONSTRUCTION: `KeyspaceRule::new`
+    # refuses an empty kind or an empty address prefix (an empty prefix would
+    # match every address, which is what the fallback is for), and
+    # `Keyspace::with_rule` refuses a second rule for a kind or a prefix
+    # already declared — checked in that exact order (empty kind, then empty
+    # prefix, then duplicate kind, then duplicate prefix) because that is the
+    # order the two Rust functions run in when a caller builds a rule and
+    # then adds it.
+    #
+    # `spanning_key` answers a different question: is there ONE key that
+    # answers for the WHOLE namespace (every rule's key, and the fallback,
+    # all the same)? True for a single-shard deployment (or one that has not
+    # actually been split yet) and false the moment any rule points somewhere
+    # the fallback does not.
+    #
+    # ============================================================
+    # ROUTING-KEY REPRESENTATION — the design decision this port has to make
+    # explicit, the same way predicate.fct's header states its row
+    # representation and storage.fct's states its byte-buffer one:
+    # ============================================================
+    # `fabric_routing::RoutingKey` is `{ shard_id: u64, coordinate:
+    # fabric_core::Coordinate }`, and `Coordinate` is `{ x: u8, y: u8 }` with
+    # `x < 12 && y < 13` (`Coordinate::is_valid`) and `index() = y*12 + x`,
+    # i.e. exactly 156 valid cells per shard (`fabric_core/src/coordinate.rs`,
+    # read directly, not assumed). A proc returns one scalar (LANGUAGE.md's
+    # `proc` section — no record/tuple return), and keyspace.rs itself never
+    # does arithmetic ON a `RoutingKey` beyond equality — every real
+    # operation this file ports is "are these two keys the SAME key", never
+    # "what shard is this" or "what cell is this" — so a `RoutingKey` is
+    # represented here as ONE `int`, packed as `shard_id * 156 +
+    # coordinate.index()`. This is a lossless encoding of the real type for
+    # every value keyspace.rs's own tests actually use (small shard ids,
+    # `Coordinate::new(0, 0)` in every test fixture) and is never unpacked
+    # back into shard/x/y anywhere below, exactly because nothing in
+    # `Keyspace::resolve` needs to: it is an opaque comparable token from
+    # `resolve`'s point of view, restated as an int instead of a struct
+    # purely so it can live in an `[int]` array and flow through a proc
+    # return the way LANGUAGE.md allows.
+    #
+    # ============================================================
+    # OPTIONAL PARAMETERS — `resolve(kind: Option<&str>, address:
+    # Option<&str>)`:
+    # ============================================================
+    # fct has no option/union type (checked against LANGUAGE.md's full type
+    # list before assuming one — scalars, `[T]` of one scalar type, nothing
+    # else). Exactly like predicate.fct's row design turns an absent field
+    # into a defined "kind" tag rather than a null pointer, an absent kind or
+    # address here is a separate `bool` flag (`hasKind`/`hasAddress`) plus a
+    # text value that is simply ignored when the flag is false — mirroring
+    # `KeyspaceMiss::Unmapped`'s own `Option<String>` fields, which likewise
+    # exist only to be printed, never branched on beyond "was one supplied".
+    #
+    # ============================================================
+    # WHY TWO FAMILIES OF PROC ("resolveStatus" vs "resolveKey") INSTEAD OF
+    # ONE, restating predicate.fct's own header rationale for the identical
+    # reason:
+    # ============================================================
+    # A proc cannot return "an outcome tag PLUS a payload that depends on the
+    # tag" in one call. `keyspaceResolveStatus` is the gatekeeper — it runs
+    # the WHOLE decision (kind lookup, address lookup, the consistency
+    # check, the fallback) and reports one of three outcome codes (0=Ok,
+    # 1=Unmapped, 2=Inconsistent), mirroring `Result<RoutingKey,
+    # KeyspaceMiss>`'s two-variant-of-which-one-has-two-shapes shape flattened
+    # into three plain codes. `keyspaceResolveKey` re-derives the identical
+    # lookup and returns the actual key — defined (and only ever called)
+    # when `keyspaceResolveStatus` already returned 0, exactly like
+    # predicate.fct's `evalNum`/`evalText`/`evalBool` are only ever called
+    # once `evalKind` has already vetted the node. Both procs are pure
+    # re-derivations of the same two lookups, guaranteed to agree because
+    # both are pure functions of the identical input — paid for by doing the
+    # kind/address lookup twice on the `Ok` path rather than once.
+    #
+    # ============================================================
+    # RULE-TABLE REPRESENTATION — parallel arrays, aligned by index, the same
+    # convention predicate.fct's row and storage.fct's byte buffer both
+    # already use:
+    #   ruleKinds:    [text]  rule i's declared kind name
+    #   rulePrefixes: [text]  rule i's declared address prefix
+    #   ruleKeys:     [int]   rule i's routing key (packed, see above)
+    # plus `hasFallback: bool` / `fallbackKey: int` for the keyspace's single
+    # optional fallback (there is at most one, so it needs no array).
+
+    # ============================================================
+    # SMALL STRING HELPER — restates the exact `starts_with` idiom
+    # predicate.fct's own `evalBinBool` (opCode 13) already uses for
+    # FacetQL's `starts_with` operator: false whenever the needle is longer
+    # than the haystack (never an out-of-bounds slice), true iff the
+    # haystack's own leading slice of the needle's length equals it.
+    # ============================================================
+    proc textStartsWith(haystack: text, prefix: text) -> bool:
+        let hlen = len(haystack)
+        let plen = len(prefix)
+        if plen > hlen:
+            return false
+        let lead = slice(haystack, 0, plen)
+        return lead == prefix
+
+    # ruleIndexForKind: `Keyspace::for_kind` — the first (and, in a validly
+    # constructed keyspace, only) rule whose declared kind name matches
+    # exactly. Mirrors predicate.fct's own `rowFieldIndex` shape precisely
+    # (same "keep looping, but only latch the FIRST hit" pattern) since both
+    # are "find this exact name in a parallel-array table" over an
+    # already-validated-unique key.
+    proc ruleIndexForKind(ruleKinds: [text], kind: text) -> int:
+        let n = len(ruleKinds)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if ruleKinds[i] == kind:
+                    found = i
+            i = i + 1
+        return found
+
+    # ruleIndexForAddress: `Keyspace::for_address` — every rule whose prefix
+    # the address starts with, longest prefix wins; a LATER rule of EQUAL
+    # length overtakes an earlier one, restating Rust's own `max_by_key`
+    # tie-break ("the last equally-maximal element") exactly rather than the
+    # more obvious "first longest wins", per the header note above. `>=`
+    # (not `>`) on the length comparison is what encodes that tie-break.
+    proc ruleIndexForAddress(rulePrefixes: [text], address: text) -> int:
+        let n = len(rulePrefixes)
+        let mut i = 0
+        let mut bestIdx = -1
+        let mut bestLen = -1
+        loop i < n:
+            let matches = do textStartsWith(address, rulePrefixes[i])
+            if matches:
+                let plen = len(rulePrefixes[i])
+                if plen >= bestLen:
+                    bestIdx = i
+                    bestLen = plen
+            i = i + 1
+        return bestIdx
+
+    # ============================================================
+    # THE GATEKEEPER: keyspaceResolveStatus.
+    # ============================================================
+    # Restates `Keyspace::resolve`'s full match exactly:
+    #   (Some(by_kind), Some(by_address)) if by_kind != by_address -> Inconsistent
+    #   (Some(key), _) | (None, Some(key))                         -> Ok(key)
+    #   (None, None)                                                -> fallback, or Unmapped
+    # over this port's two `has*` flags standing in for `Option<&str>`.
+    proc keyspaceResolveStatus(ruleKinds: [text], rulePrefixes: [text], ruleKeys: [int], hasFallback: bool, hasKind: bool, kind: text, hasAddress: bool, address: text) -> int:
+        let mut kindIdx = -1
+        if hasKind:
+            let ki = do ruleIndexForKind(ruleKinds, kind)
+            kindIdx = ki
+        let mut addrIdx = -1
+        if hasAddress:
+            let ai = do ruleIndexForAddress(rulePrefixes, address)
+            addrIdx = ai
+
+        if kindIdx != -1:
+            if addrIdx != -1:
+                if ruleKeys[kindIdx] != ruleKeys[addrIdx]:
+                    return 2
+                return 0
+            return 0
+        if addrIdx != -1:
+            return 0
+        if hasFallback:
+            return 0
+        return 1
+
+    # keyspaceResolveKey: only meaningful once `keyspaceResolveStatus` has
+    # already returned 0 for the identical arguments (see header). When both
+    # a kind and an address matched, `resolve` itself only reaches this
+    # branch once they are already known equal (the `Inconsistent` case took
+    # the other branch), so returning the kind-side key is exactly as
+    # correct as returning the address-side one — matching Rust's own
+    # `(Some(key), _)` pattern, which likewise prefers `by_kind` on a tie.
+    proc keyspaceResolveKey(ruleKinds: [text], rulePrefixes: [text], ruleKeys: [int], fallbackKey: int, hasKind: bool, kind: text, hasAddress: bool, address: text) -> int:
+        let mut kindIdx = -1
+        if hasKind:
+            let ki = do ruleIndexForKind(ruleKinds, kind)
+            kindIdx = ki
+        if kindIdx != -1:
+            return ruleKeys[kindIdx]
+        let mut addrIdx = -1
+        if hasAddress:
+            let ai = do ruleIndexForAddress(rulePrefixes, address)
+            addrIdx = ai
+        if addrIdx != -1:
+            return ruleKeys[addrIdx]
+        return fallbackKey
+
+    # ============================================================
+    # CONSTRUCTION-TIME VALIDATION — `KeyspaceRule::new` (empty kind / empty
+    # prefix) fused with `Keyspace::with_rule` (duplicate kind / duplicate
+    # prefix against the rules already in the table), in the exact order the
+    # two real functions run when a caller builds a rule and adds it: empty
+    # kind, then empty prefix, then duplicate kind, then duplicate prefix.
+    # Returns a status code rather than a `Result<_, KeyspaceError>` for the
+    # same reason every gatekeeper in this file does (no proc-returnable
+    # sum type): 0=ok, 1=EmptyKind, 2=EmptyAddressPrefix, 3=DuplicateKind,
+    # 4=DuplicateAddressPrefix.
+    # ============================================================
+    proc ruleTableHasKind(ruleKinds: [text], kind: text) -> bool:
+        let idx = do ruleIndexForKind(ruleKinds, kind)
+        return idx != -1
+
+    proc ruleTableHasPrefixExact(rulePrefixes: [text], prefix: text) -> bool:
+        let n = len(rulePrefixes)
+        let mut i = 0
+        let mut found = false
+        loop i < n:
+            if rulePrefixes[i] == prefix:
+                found = true
+            i = i + 1
+        return found
+
+    proc keyspaceAddRuleStatus(ruleKinds: [text], rulePrefixes: [text], newKind: text, newPrefix: text) -> int:
+        if len(newKind) == 0:
+            return 1
+        if len(newPrefix) == 0:
+            return 2
+        let dupKind = do ruleTableHasKind(ruleKinds, newKind)
+        if dupKind:
+            return 3
+        let dupPrefix = do ruleTableHasPrefixExact(rulePrefixes, newPrefix)
+        if dupPrefix:
+            return 4
+        return 0
+
+    # ============================================================
+    # spanning_key — is there one key that answers for the WHOLE namespace:
+    # a fallback must be declared (an address matching no rule would
+    # otherwise have no home), and every rule's key must equal it.
+    # `spanningKeyPresent` is this file's gatekeeper for the pair; an empty
+    # rule table with a fallback is vacuously "every rule agrees" (the
+    # single-shard `Keyspace::single` case), matching Rust's `.all(...)` on
+    # an empty iterator returning `true`.
+    # ============================================================
+    proc allRuleKeysEqual(ruleKeys: [int], target: int) -> bool:
+        let n = len(ruleKeys)
+        let mut i = 0
+        let mut allEq = true
+        loop i < n:
+            if ruleKeys[i] != target:
+                allEq = false
+            i = i + 1
+        return allEq
+
+    proc spanningKeyPresent(ruleKeys: [int], hasFallback: bool, fallbackKey: int) -> bool:
+        if !hasFallback:
+            return false
+        let allEq = do allRuleKeysEqual(ruleKeys, fallbackKey)
+        return allEq
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — hand-verified against three real traced
+    # scenarios restated from keyspace.rs's own unit tests (full trace in
+    # the task report):
+    #   A. `keyspace()` = {"Post"->"Post:", "__session"->"__session:"}, no
+    #      fallback. `resolve(Some("Post"), Some("Post:17"))` -> Ok(key(1)),
+    #      and the contradictory `resolve(Some("Post"),
+    #      Some("__session:abc"))` -> Inconsistent.
+    #   B. Longest-prefix: {"A"->"__" (key1), "B"->"__fabric_placement:"
+    #      (key2)}. `resolve(None, Some("__fabric_placement:1:0:0"))` ->
+    #      Ok(key2); `resolve(None, Some("__session:x"))` -> Ok(key1) (only
+    #      the shorter "__" prefix matches that address at all).
+    #   C. Fallback + spanning_key: `keyspace()` (no rule covers "Unknown")
+    #      with `.with_fallback(key(9))` resolves Unknown -> Ok(key(9)), and
+    #      is NOT a spanning keyspace (its two rules' keys, 1 and 2, do not
+    #      equal the fallback, 9); `Keyspace::single(key(1))` (no rules) IS
+    #      spanning, and equals key(1).
+    # `key(n)` throughout mirrors keyspace.rs's own test helper exactly:
+    # `RoutingKey::new(n, Coordinate::new(0, 0))`, packed per this file's
+    # header as `n * 156 + 0`.
+    proc demoRuleKindsAB() -> [text]:
+        return ["Post", "__session"]
+
+    proc demoRulePrefixesAB() -> [text]:
+        return ["Post:", "__session:"]
+
+    proc demoRuleKeysAB() -> [int]:
+        return [156, 312]
+
+    # Scenario A1: resolve(Some("Post"), Some("Post:17")) -> Ok, key(1)=156.
+    # Traced: kindIdx=0 (ruleKinds[0]=="Post"); addrIdx: "Post:" (len 5) is a
+    # prefix of "Post:17" (len 7, leading 5 = "Post:") -> bestIdx=0; "__session:"
+    # (len 10) is not (10 > 7) -> addrIdx stays 0. ruleKeys[0]==ruleKeys[0], so
+    # status=0 (Ok), key=156.
+    proc demoScenarioA1Status() -> int:
+        let ruleKinds = do demoRuleKindsAB()
+        let rulePrefixes = do demoRulePrefixesAB()
+        let ruleKeys = do demoRuleKeysAB()
+        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, false, true, "Post", true, "Post:17")
+        return status
+
+    proc demoScenarioA1Key() -> int:
+        let ruleKinds = do demoRuleKindsAB()
+        let rulePrefixes = do demoRulePrefixesAB()
+        let ruleKeys = do demoRuleKeysAB()
+        let key = do keyspaceResolveKey(ruleKinds, rulePrefixes, ruleKeys, -1, true, "Post", true, "Post:17")
+        return key
+
+    # Scenario A2: resolve(Some("Post"), Some("__session:abc")) -> Inconsistent.
+    # Traced: kindIdx=0 (key 156). addrIdx: "Post:" (len5) is not a prefix of
+    # "__session:abc" (leading 5 = "__ses" != "Post:"); "__session:" (len10) IS
+    # a prefix (leading 10 = "__session:") -> addrIdx=1 (key 312). 156 != 312
+    # -> status=2 (Inconsistent).
+    proc demoScenarioA2Status() -> int:
+        let ruleKinds = do demoRuleKindsAB()
+        let rulePrefixes = do demoRulePrefixesAB()
+        let ruleKeys = do demoRuleKeysAB()
+        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, false, true, "Post", true, "__session:abc")
+        return status
+
+    proc demoRuleKindsB() -> [text]:
+        return ["A", "B"]
+
+    proc demoRulePrefixesB() -> [text]:
+        return ["__", "__fabric_placement:"]
+
+    proc demoRuleKeysB() -> [int]:
+        return [156, 312]
+
+    # Scenario B1: resolve(None, Some("__fabric_placement:1:0:0")) -> Ok, key2=312.
+    # Traced: no kind. addrIdx: "__" (len2) matches (leading2="__") ->
+    # bestIdx=0,bestLen=2; "__fabric_placement:" (len19) matches (leading19
+    # equals it exactly) and 19 >= 2 -> bestIdx=1,bestLen=19. Final addrIdx=1,
+    # key=ruleKeys[1]=312.
+    proc demoScenarioB1Status() -> int:
+        let rulePrefixes = do demoRulePrefixesB()
+        let ruleKeys = do demoRuleKeysB()
+        let ruleKinds = do demoRuleKindsB()
+        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, false, false, "", true, "__fabric_placement:1:0:0")
+        return status
+
+    proc demoScenarioB1Key() -> int:
+        let rulePrefixes = do demoRulePrefixesB()
+        let ruleKeys = do demoRuleKeysB()
+        let ruleKinds = do demoRuleKindsB()
+        let key = do keyspaceResolveKey(ruleKinds, rulePrefixes, ruleKeys, -1, false, "", true, "__fabric_placement:1:0:0")
+        return key
+
+    # Scenario B2: resolve(None, Some("__session:x")) -> Ok, key1=156.
+    # Traced: "__" (len2) matches "__session:x" (leading2="__") ->
+    # bestIdx=0,bestLen=2. "__fabric_placement:" (len19) does NOT match
+    # (19 > len("__session:x")=11) -> addrIdx stays 0, key=156.
+    proc demoScenarioB2Key() -> int:
+        let rulePrefixes = do demoRulePrefixesB()
+        let ruleKeys = do demoRuleKeysB()
+        let ruleKinds = do demoRuleKindsB()
+        let key = do keyspaceResolveKey(ruleKinds, rulePrefixes, ruleKeys, -1, false, "", true, "__session:x")
+        return key
+
+    # Scenario C1: keyspace() + with_fallback(key(9)=1404); resolve(Some("Unknown"), None) -> Ok, key(9).
+    # Traced: kindIdx: "Unknown" not in ["Post","__session"] -> -1. No address
+    # -> addrIdx=-1. hasFallback=true -> status=0; key=fallbackKey=1404.
+    proc demoScenarioC1Status() -> int:
+        let ruleKinds = do demoRuleKindsAB()
+        let rulePrefixes = do demoRulePrefixesAB()
+        let ruleKeys = do demoRuleKeysAB()
+        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, true, true, "Unknown", false, "")
+        return status
+
+    proc demoScenarioC1Key() -> int:
+        let ruleKinds = do demoRuleKindsAB()
+        let rulePrefixes = do demoRulePrefixesAB()
+        let ruleKeys = do demoRuleKeysAB()
+        let key = do keyspaceResolveKey(ruleKinds, rulePrefixes, ruleKeys, 1404, true, "Unknown", false, "")
+        return key
+
+    # Scenario C1b: the SAME keyspace() with no fallback declared at all ->
+    # resolve(Some("Unknown"), None) is Unmapped (status=1), matching
+    # keyspace.rs's own `an_unmapped_request_is_refused_rather_than_guessed`.
+    proc demoScenarioC1bStatus() -> int:
+        let ruleKinds = do demoRuleKindsAB()
+        let rulePrefixes = do demoRulePrefixesAB()
+        let ruleKeys = do demoRuleKeysAB()
+        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, false, true, "Unknown", false, "")
+        return status
+
+    # Scenario C2: keyspace() (rule keys [156,312]) + with_fallback(1404) is
+    # NOT spanning (156 != 1404). Keyspace::single(key(1)=156) — an empty
+    # rule table — IS spanning, and equals 156.
+    proc demoEmptyRuleKeys() -> [int]:
+        return []
+
+    proc demoScenarioC2NotSpanning() -> bool:
+        let ruleKeys = do demoRuleKeysAB()
+        let present = do spanningKeyPresent(ruleKeys, true, 1404)
+        return present
+
+    proc demoScenarioC2SingleSpanning() -> bool:
+        let empty = do demoEmptyRuleKeys()
+        let present = do spanningKeyPresent(empty, true, 156)
+        return present
+
+    # Construction-time validation demo, mirroring
+    # `an_ambiguous_keyspace_is_refused_at_construction` and
+    # `a_half_declared_rule_is_refused`: adding ("", "Post:") to an empty
+    # table is EmptyKind (1); adding ("Post", "") is EmptyAddressPrefix (2);
+    # adding ("Post", "Other:") to a table that already has kind "Post" is
+    # DuplicateKind (3); adding ("Other", "Post:") to a table that already
+    # has prefix "Post:" is DuplicateAddressPrefix (4); adding ("Comment",
+    # "Comment:") to that same table is fine (0).
+    proc demoValidationEmptyKind() -> int:
+        let kinds = do demoRuleKindsAB()
+        let prefixes = do demoRulePrefixesAB()
+        let status = do keyspaceAddRuleStatus(kinds, prefixes, "", "Post:")
+        return status
+
+    proc demoValidationEmptyPrefix() -> int:
+        let kinds = do demoRuleKindsAB()
+        let prefixes = do demoRulePrefixesAB()
+        let status = do keyspaceAddRuleStatus(kinds, prefixes, "Post", "")
+        return status
+
+    proc demoValidationDuplicateKind() -> int:
+        let kinds = do demoRuleKindsAB()
+        let prefixes = do demoRulePrefixesAB()
+        let status = do keyspaceAddRuleStatus(kinds, prefixes, "Post", "Other:")
+        return status
+
+    proc demoValidationDuplicatePrefix() -> int:
+        let kinds = do demoRuleKindsAB()
+        let prefixes = do demoRulePrefixesAB()
+        let status = do keyspaceAddRuleStatus(kinds, prefixes, "Other", "Post:")
+        return status
+
+    proc demoValidationOk() -> int:
+        let kinds = do demoRuleKindsAB()
+        let prefixes = do demoRulePrefixesAB()
+        let status = do keyspaceAddRuleStatus(kinds, prefixes, "Comment", "Comment:")
+        return status
+
+    state demoA1Status: int = 0
+    state demoA1Key: int = 0
+    state demoA2Status: int = 0
+    state demoB1Status: int = 0
+    state demoB1Key: int = 0
+    state demoB2Key: int = 0
+    state demoC1Status: int = 0
+    state demoC1Key: int = 0
+    state demoC1bStatus: int = 0
+    state demoC2NotSpanning: bool = true
+    state demoC2SingleSpanning: bool = false
+    state demoValEmptyKind: int = 0
+    state demoValEmptyPrefix: int = 0
+    state demoValDupKind: int = 0
+    state demoValDupPrefix: int = 0
+    state demoValOk: int = 0
+
+    action runDemoFabric():
+        let a1Status = do demoScenarioA1Status()
+        let a1Key = do demoScenarioA1Key()
+        let a2Status = do demoScenarioA2Status()
+        let b1Status = do demoScenarioB1Status()
+        let b1Key = do demoScenarioB1Key()
+        let b2Key = do demoScenarioB2Key()
+        let c1Status = do demoScenarioC1Status()
+        let c1Key = do demoScenarioC1Key()
+        let c1bStatus = do demoScenarioC1bStatus()
+        let c2NotSpanning = do demoScenarioC2NotSpanning()
+        let c2SingleSpanning = do demoScenarioC2SingleSpanning()
+        let valEmptyKind = do demoValidationEmptyKind()
+        let valEmptyPrefix = do demoValidationEmptyPrefix()
+        let valDupKind = do demoValidationDuplicateKind()
+        let valDupPrefix = do demoValidationDuplicatePrefix()
+        let valOk = do demoValidationOk()
+        demoA1Status = a1Status
+        demoA1Key = a1Key
+        demoA2Status = a2Status
+        demoB1Status = b1Status
+        demoB1Key = b1Key
+        demoB2Key = b2Key
+        demoC1Status = c1Status
+        demoC1Key = c1Key
+        demoC1bStatus = c1bStatus
+        demoC2NotSpanning = c2NotSpanning
+        demoC2SingleSpanning = c2SingleSpanning
+        demoValEmptyKind = valEmptyKind
+        demoValEmptyPrefix = valEmptyPrefix
+        demoValDupKind = valDupKind
+        demoValDupPrefix = valDupPrefix
+        demoValOk = valOk
+
+    view Home at "/":
+        box:
+            text "{demoA1Status} {demoA1Key} {demoA2Status} {demoB1Status} {demoB1Key} {demoB2Key} {demoC1Status} {demoC1Key} {demoC1bStatus} {demoC2NotSpanning} {demoC2SingleSpanning} {demoValEmptyKind} {demoValEmptyPrefix} {demoValDupKind} {demoValDupPrefix} {demoValOk}"

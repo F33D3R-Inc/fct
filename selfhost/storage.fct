@@ -1,0 +1,1038 @@
+app StorageSelfHost:
+    # Self-hosting port of a piece of facetql/src/storage/page.rs — the
+    # physical page: a fixed-size (16 KiB), self-describing, individually
+    # verifiable block every durable structure in FacetQL (heap, B-tree,
+    # catalog) is built out of. Read in full before writing this file,
+    # along with facetql/src/storage/pager.rs (the buffer cache + AES-GCM
+    # layer built on top of Page) for context.
+    #
+    # ============================================================
+    # WHAT WAS PORTED, AND WHY THE CUT LANDS WHERE IT DOES:
+    # ============================================================
+    # This file ports Page's STRUCTURAL surface only: the fixed 24-byte
+    # header layout, the slot-directory offset math, `free_space`/
+    # `reclaimable_space`, the CRC-32 checksum (byte-for-byte the same
+    # algorithm as `crc32_parts` in facetql/src/storage/binary.rs), and
+    # the FULL structural validation pipeline `Page::decode` runs before
+    # any caller sees a cell (magic → version → kind → CRC → directory/
+    # cell-area bounds → per-slot bounds) — everything page.rs's own doc
+    # comment means by "a page verifies itself."
+    #
+    # Deliberately NOT ported: `insert_cell`/`push_cell`/`replace_cell`/
+    # `remove_cell`/`compact` — these are a page-MUTATION/allocation
+    # POLICY (shifting the slot directory, packing cells toward one end,
+    # deciding when to compact vs. fail) layered on top of the pure
+    # layout arithmetic this file covers. That is a genuinely separate,
+    # well-scoped piece of its own — folding it in here would have meant
+    # two unrelated algorithms in one file, and the task asked for one.
+    #
+    # Also NOT here, and needing no stub: any crypto. Page (page.rs)
+    # itself makes zero calls to `crypto::encrypt`/`crypto::decrypt` —
+    # encryption wraps a page's ENCODED bytes one layer up, in
+    # pager.rs's `read_from_disk`/`write_to_disk` (page.rs's own header
+    # comment says so explicitly: "Pages are encrypted at rest (see
+    # `storage::pager`)"). Choosing Page's own logic rather than
+    # Pager's therefore sidesteps the "don't ship unverified crypto"
+    # concern by construction, not by adding a pass-through stub for
+    # something that was never called in the first place.
+    #
+    # ============================================================
+    # BYTE-BUFFER REPRESENTATION:
+    # ============================================================
+    # A page body is one `[int]` array, one element per byte (0-255) —
+    # this file's own version of predicate.fct's parallel-array "row"
+    # convention, and the literal reading of the task's own "byte
+    # buffers" suggestion. There is no text anywhere in this file.
+    # Checked against LANGUAGE.md's full builtin list (`abs, ago,
+    # channel, charAt, commas, compact, contains, day, floor, httpGet,
+    # httpPost, len, lower, max, min, money, month, now, rand, readFile,
+    # recv, round, send, slice, split, take, toFloat, toInt, trim,
+    # upper, writeFile, year`) before assuming anything: fct has no
+    # ord()/charCode-style "the numeric byte value of this character"
+    # builtin. That is a real, confirmed gap (LANGUAGE.md says so
+    # outright for any missing string function: "it doesn't exist yet
+    # — that's a real gap, not something you're missing"), so turning
+    # `readFile`'s text or a real on-disk page into this file's `[int]`
+    # buffers is out of scope for this port. Every buffer here is
+    # constructed directly as byte values, exactly mirroring how
+    # `crc32_parts` itself is always called with `&[u8]`, never text.
+    #
+    # ============================================================
+    # TWO LANGUAGE FACTS THIS FILE'S SHAPE IS BUILT AROUND (both
+    # confirmed against fct's own source/docs, not assumed):
+    # ============================================================
+    # 1. No indexed array assignment. `arr[i] = v` does not exist in
+    #    fct — LANGUAGE.md's own array examples only ever build one with
+    #    a literal or `append`, and `append` (runtime/eval.go's "append"
+    #    case) always allocates a fresh backing array rather than
+    #    mutating in place. So every Page "setter" the Rust source has
+    #    (`set_slot_count`/`set_free_end`/`set_extra`/`set_slot`) is
+    #    restated here as a PURE function returning a brand-new body
+    #    array with that one field's bytes replaced (`replaceBytesRange`,
+    #    below) — never an in-place mutation, because this language has
+    #    no in-place array mutation to reach for.
+    # 2. `do ProcName(args)` may only appear as a bare fire-and-forget
+    #    statement, or as the RHS of a FRESH `let name = do
+    #    ProcName(args)` binding — never as a loop-body reassignment
+    #    (`x = do Foo()`), and never nested inside another expression
+    #    (`return do Foo()`, `a + do Foo()`). This is stricter than
+    #    LANGUAGE.md's own "let mut can't bind a do call directly" note
+    #    — expr.fct's own header documents hitting this empirically
+    #    (`p = do termEnd(...)` inside a loop body fails to compile with
+    #    "unexpected \"termEnd\" in expression"). Every proc below
+    #    follows the one shape that survives it: bind each `do` result
+    #    to its own fresh `let` (even inside a loop, even when it is
+    #    logically "the same" running value each pass — expr.fct's
+    #    `tokenKinds` does exactly this with `let dj = do
+    #    isDigitChar(...)` inside its scan loop), then fold that into an
+    #    accumulator with a plain, `do`-free expression
+    #    (`allOk = allOk && slotOk`, not `allOk = do ...`).
+    #
+    # ============================================================
+    # CRC-32 — restated bit-for-bit from `crc32_parts`
+    # (facetql/src/storage/binary.rs): same init (`0xFFFFFFFF`), same
+    # polynomial (`0xEDB88320`), same one-bit-at-a-time inner loop, same
+    # final complement. The one necessary rewording: Rust's branchless
+    # `(crc & 1).wrapping_neg()` mask trick negates a `u32`, an operation
+    # this language has no equivalent for (and if it did, `~`/unary `-`
+    # on this language's `int` would flip/negate across 64 bits, not the
+    # 32 this algorithm needs). Restated as the arithmetic identity
+    # `(crc & 1) * 0xFFFFFFFF` instead: 0 when the low bit is clear,
+    # exactly `0xFFFFFFFF` when it is set — the same two outcomes Rust's
+    # trick produces, reached by multiplication rather than negation,
+    # and still branchless.
+    #
+    # Hand-verified before writing this file: a from-scratch Python
+    # transliteration of the exact operations below (same mask trick,
+    # same mask/shift/XOR sequence) was checked against `zlib.crc32` for
+    # four inputs, including the empty string (0x00000000) and the
+    # standard CRC-32/ISO-HDLC catalogue check value for the ASCII bytes
+    # of "123456789" (0xCBF43926 = 3421780262 decimal) — see this file's
+    # own `demoCrc32Check9`/`demoCrc32CheckEmpty` below, and the task
+    # report for the full trace.
+    #
+    # ============================================================
+    # PAGE LAYOUT — restated exactly from page.rs's own doc comment and
+    # constants (PAGE_SIZE=16384, PAGE_ENVELOPE_LEN=28,
+    # PAGE_BODY_LEN=16356, PAGE_HEADER_LEN=24, SLOT_LEN=4). Offsets used
+    # as plain integer literals throughout (the same convention
+    # predicate.fct's own arena stride (`5 * node`) already uses, rather
+    # than defining a wrapper proc per constant):
+    #   0   4   magic ("FQPG" = bytes 70,81,80,71)
+    #   4   1   page kind (1=Meta 2=Leaf 3=Branch 4=Heap 5=Overflow)
+    #   5   1   page format version (1)
+    #   6   2   slot count (u16 LE)
+    #   8   2   free_end — start of the cell area (u16 LE)
+    #   10  2   reserved
+    #   12  4   extra (u32 LE)
+    #   16  4   CRC-32 of the body with these 4 bytes excluded (u32 LE)
+    #   20  4   reserved
+    #   24  ... slot directory: slot_count × (offset u16 LE, len u16 LE)
+    proc sliceBytes(buf: [int], start: int, end: int) -> [int]:
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            out = append(out, buf[i])
+            i = i + 1
+        return out
+
+    proc concatBytes(a: [int], b: [int]) -> [int]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    # replaceBytesRange: the pure-functional stand-in for every Page
+    # "setter" in the Rust source — since fct arrays have no indexed
+    # assignment (see header note 1), "setting" a field means building a
+    # whole new buffer: everything before `start`, then `replacement`,
+    # then everything after it.
+    proc replaceBytesRange(buf: [int], start: int, replacement: [int]) -> [int]:
+        let before = do sliceBytes(buf, 0, start)
+        let replacedLen = len(replacement)
+        let afterStart = start + replacedLen
+        let bufLen = len(buf)
+        let after = do sliceBytes(buf, afterStart, bufLen)
+        let withReplacement = do concatBytes(before, replacement)
+        let result = do concatBytes(withReplacement, after)
+        return result
+
+    proc bytesEqual(a: [int], b: [int]) -> bool:
+        let na = len(a)
+        let nb = len(b)
+        if na != nb:
+            return false
+        let mut i = 0
+        let mut eq = true
+        loop i < na:
+            if a[i] != b[i]:
+                eq = false
+            i = i + 1
+        return eq
+
+    proc zeroBytes(count: int) -> [int]:
+        let mut out = []
+        let mut i = 0
+        loop i < count:
+            out = append(out, 0)
+            i = i + 1
+        return out
+
+    proc readU16LE(buf: [int], offset: int) -> int:
+        let b0 = buf[offset]
+        let b1 = buf[offset + 1]
+        return b0 | (b1 << 8)
+
+    proc readU32LE(buf: [int], offset: int) -> int:
+        let b0 = buf[offset]
+        let b1 = buf[offset + 1]
+        let b2 = buf[offset + 2]
+        let b3 = buf[offset + 3]
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+    proc writeU16LEBytes(v: int) -> [int]:
+        let b0 = v & 255
+        let b1 = (v >> 8) & 255
+        return [b0, b1]
+
+    proc writeU32LEBytes(v: int) -> [int]:
+        let b0 = v & 255
+        let b1 = (v >> 8) & 255
+        let b2 = (v >> 16) & 255
+        let b3 = (v >> 24) & 255
+        return [b0, b1, b2, b3]
+
+    # ============================================================
+    # CRC-32 (see header note above for the full derivation).
+    # ============================================================
+    proc crc32Bytes(bytes: [int]) -> int:
+        let n = len(bytes)
+        let mut crc = 4294967295
+        let mut i = 0
+        loop i < n:
+            crc = crc ^ bytes[i]
+            let mut b = 0
+            loop b < 8:
+                let lsb = crc & 1
+                let mask = lsb * 4294967295
+                crc = ((crc >> 1) ^ (3988292384 & mask)) & 4294967295
+                b = b + 1
+            i = i + 1
+        return crc ^ 4294967295
+
+    # crc32TwoParts: `crc32_parts`'s own real call shape in facetql — a
+    # page's checksum covers the whole body EXCEPT the 4 bytes holding
+    # the checksum itself, which is two ranges and no single slice.
+    # `crc32_parts`'s own doc says this computes the CRC "as if [the
+    # parts] were concatenated", so concatenating and delegating to
+    # `crc32Bytes` is not a shortcut — it is that exact definition,
+    # restated instead of duplicating the bit-loop a second time (which
+    # `do`-inside-a-loop's restriction, header note 2, would make
+    # awkward here anyway, since a two-array version would need the SAME
+    # running `crc` folded across two loops).
+    proc crc32TwoParts(a: [int], b: [int]) -> int:
+        let combined = do concatBytes(a, b)
+        let crc = do crc32Bytes(combined)
+        return crc
+
+    # ============================================================
+    # PAGE CONSTRUCTION / ENCODE.
+    # ============================================================
+    proc pageMagicBytes() -> [int]:
+        return [70, 81, 80, 71]
+
+    # pageNewBody: `Page::new` — a fresh, all-zero PAGE_BODY_LEN-byte
+    # body with the header fields it sets (magic, kind, version,
+    # slot_count=0, free_end=PAGE_BODY_LEN, extra=0) written in, and the
+    # CRC field left at 0 (a placeholder — `pageEncode`, not this proc,
+    # is what fills in a real checksum, mirroring how `Page::new` alone
+    # never computes one either; only `encode` does).
+    proc pageNewBody(kind: int) -> [int]:
+        let magic = do pageMagicBytes()
+        let h1 = append(magic, kind)
+        let h2 = append(h1, 1)
+        let slotCountBytes = do writeU16LEBytes(0)
+        let h3 = do concatBytes(h2, slotCountBytes)
+        let freeEndBytes = do writeU16LEBytes(16356)
+        let h4 = do concatBytes(h3, freeEndBytes)
+        let h5 = append(h4, 0)
+        let h6 = append(h5, 0)
+        let extraBytes = do writeU32LEBytes(0)
+        let h7 = do concatBytes(h6, extraBytes)
+        let crcPlaceholder = do writeU32LEBytes(0)
+        let h8 = do concatBytes(h7, crcPlaceholder)
+        let h9 = append(h8, 0)
+        let h10 = append(h9, 0)
+        let h11 = append(h10, 0)
+        let header = append(h11, 0)
+        let pad = do zeroBytes(16332)
+        let body = do concatBytes(header, pad)
+        return body
+
+    # pageComputeCrc / pageEncode: `Page::compute_crc` / `Page::encode`.
+    proc pageComputeCrc(body: [int]) -> int:
+        let before = do sliceBytes(body, 0, 16)
+        let bodyLen = len(body)
+        let after = do sliceBytes(body, 20, bodyLen)
+        let crc = do crc32TwoParts(before, after)
+        return crc
+
+    proc pageEncode(body: [int]) -> [int]:
+        let crc = do pageComputeCrc(body)
+        let crcBytes = do writeU32LEBytes(crc)
+        let encoded = do replaceBytesRange(body, 16, crcBytes)
+        return encoded
+
+    # ============================================================
+    # FIELD ACCESSORS — `Page::kind`/`extra`/`slot_count`/`free_end`,
+    # plus the CRC field and the read half of `Page::slot`.
+    # ============================================================
+    proc pageKind(body: [int]) -> int:
+        return body[4]
+
+    proc pageVersion(body: [int]) -> int:
+        return body[5]
+
+    proc pageSlotCount(body: [int]) -> int:
+        let v = do readU16LE(body, 6)
+        return v
+
+    proc pageFreeEnd(body: [int]) -> int:
+        let v = do readU16LE(body, 8)
+        return v
+
+    proc pageExtra(body: [int]) -> int:
+        let v = do readU32LE(body, 12)
+        return v
+
+    proc pageCrcStored(body: [int]) -> int:
+        let v = do readU32LE(body, 16)
+        return v
+
+    proc pageSlotOffset(body: [int], index: int) -> int:
+        let at = 24 + index * 4
+        let v = do readU16LE(body, at)
+        return v
+
+    proc pageSlotLength(body: [int], index: int) -> int:
+        let at = 24 + index * 4 + 2
+        let v = do readU16LE(body, at)
+        return v
+
+    # ============================================================
+    # FIELD "SETTERS" — pure functions returning a new body (see header
+    # note 1: no indexed assignment exists to set one in place).
+    # ============================================================
+    proc pageSetSlotCount(body: [int], count: int) -> [int]:
+        let bytes = do writeU16LEBytes(count)
+        let result = do replaceBytesRange(body, 6, bytes)
+        return result
+
+    proc pageSetFreeEnd(body: [int], value: int) -> [int]:
+        let bytes = do writeU16LEBytes(value)
+        let result = do replaceBytesRange(body, 8, bytes)
+        return result
+
+    proc pageSetExtra(body: [int], value: int) -> [int]:
+        let bytes = do writeU32LEBytes(value)
+        let result = do replaceBytesRange(body, 12, bytes)
+        return result
+
+    proc pageSetSlot(body: [int], index: int, offset: int, length: int) -> [int]:
+        let offsetBytes = do writeU16LEBytes(offset)
+        let lengthBytes = do writeU16LEBytes(length)
+        let slotBytes = do concatBytes(offsetBytes, lengthBytes)
+        let at = 24 + index * 4
+        let result = do replaceBytesRange(body, at, slotBytes)
+        return result
+
+    # ============================================================
+    # LAYOUT ARITHMETIC — `Page::free_space` / `Page::reclaimable_space`.
+    # ============================================================
+    proc pageFreeSpace(body: [int]) -> int:
+        let slotCount = do pageSlotCount(body)
+        let freeEnd = do pageFreeEnd(body)
+        let directoryEnd = 24 + slotCount * 4
+        let diff = freeEnd - directoryEnd
+        # `saturating_sub` in the Rust source: a malformed page could in
+        # principle have a directory that already runs past free_end,
+        # and free_space is defined as 0 then, not a negative number.
+        if diff < 0:
+            return 0
+        return diff
+
+    proc sumSlotLengths(body: [int], count: int) -> int:
+        let mut i = 0
+        let mut total = 0
+        loop i < count:
+            let length = do pageSlotLength(body, i)
+            total = total + length
+            i = i + 1
+        return total
+
+    proc pageReclaimableSpace(body: [int]) -> int:
+        let slotCount = do pageSlotCount(body)
+        let used = do sumSlotLengths(body, slotCount)
+        return 16356 - 24 - slotCount * 4 - used
+
+    # ============================================================
+    # STRUCTURAL VALIDATION — `Page::decode`'s full check sequence,
+    # restated as a bool (a proc has no `Result` to return — the same
+    # split predicate.fct's own `evalPredicateOk` documents for the same
+    # reason: a caller that gets `true` back already holds the exact
+    # body array it asked about, so there is nothing further a decoded
+    # "Page" value would need to carry that this array doesn't already
+    # carry itself).
+    # ============================================================
+    proc pageMagicOk(body: [int]) -> bool:
+        let magic = do sliceBytes(body, 0, 4)
+        let expected = do pageMagicBytes()
+        let eq = do bytesEqual(magic, expected)
+        return eq
+
+    proc pageVersionOk(body: [int]) -> bool:
+        return body[5] == 1
+
+    proc pageKindValid(kind: int) -> bool:
+        return kind >= 1 && kind <= 5
+
+    proc pageCrcOk(body: [int]) -> bool:
+        let stored = do pageCrcStored(body)
+        let computed = do pageComputeCrc(body)
+        return stored == computed
+
+    proc pageBoundsOk(body: [int]) -> bool:
+        let slotCount = do pageSlotCount(body)
+        let freeEnd = do pageFreeEnd(body)
+        let directoryEnd = 24 + slotCount * 4
+        return directoryEnd <= freeEnd && freeEnd <= 16356
+
+    proc pageSlotBoundsOk(body: [int], index: int) -> bool:
+        let offset = do pageSlotOffset(body, index)
+        let length = do pageSlotLength(body, index)
+        let freeEnd = do pageFreeEnd(body)
+        return offset >= freeEnd && offset + length <= 16356
+
+    proc pageAllSlotsBoundsOk(body: [int], count: int) -> bool:
+        let mut i = 0
+        let mut allOk = true
+        loop i < count:
+            let slotOk = do pageSlotBoundsOk(body, i)
+            allOk = allOk && slotOk
+            i = i + 1
+        return allOk
+
+    proc pageDecodeOk(body: [int]) -> bool:
+        let bodyLen = len(body)
+        if bodyLen != 16356:
+            return false
+        let magicOk = do pageMagicOk(body)
+        if !magicOk:
+            return false
+        let versionOk = do pageVersionOk(body)
+        if !versionOk:
+            return false
+        let kind = do pageKind(body)
+        let kindOk = do pageKindValid(kind)
+        if !kindOk:
+            return false
+        let crcOk = do pageCrcOk(body)
+        if !crcOk:
+            return false
+        let boundsOk = do pageBoundsOk(body)
+        if !boundsOk:
+            return false
+        let slotCount = do pageSlotCount(body)
+        let slotsOk = do pageAllSlotsBoundsOk(body, slotCount)
+        if !slotsOk:
+            return false
+        return true
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES.
+    # ============================================================
+    # A fresh Heap page (kind=4), encoded (CRC filled in), should decode
+    # clean; the same bytes with one byte flipped inside the (currently
+    # all-zero) cell area should fail decode on the CRC check alone,
+    # exactly like page.rs's own "the page checksum mismatch" case.
+    proc demoFreshPageEncoded() -> [int]:
+        let fresh = do pageNewBody(4)
+        let encoded = do pageEncode(fresh)
+        return encoded
+
+    proc demoFreshPageOk() -> bool:
+        let encoded = do demoFreshPageEncoded()
+        let ok = do pageDecodeOk(encoded)
+        return ok
+
+    proc demoOneCorruptByte() -> [int]:
+        return [255]
+
+    proc demoCorruptedPageOk() -> bool:
+        let encoded = do demoFreshPageEncoded()
+        let corruptByte = do demoOneCorruptByte()
+        let corrupted = do replaceBytesRange(encoded, 5000, corruptByte)
+        let ok = do pageDecodeOk(corrupted)
+        return ok
+
+    proc demoFreeSpaceCheck() -> bool:
+        let fresh = do pageNewBody(4)
+        let freeSpace = do pageFreeSpace(fresh)
+        return freeSpace == 16332
+
+    # CRC-32 hand-verification fixtures (see header note + task report
+    # for the full derivation): the empty input's CRC-32 is 0x00000000,
+    # and the ASCII bytes of "123456789" (49,50,...,57) are the standard
+    # CRC-32/ISO-HDLC catalogue check value, 0xCBF43926 = 3421780262.
+    proc demoEmptyBytes() -> [int]:
+        return []
+
+    proc demoNineDigitsBytes() -> [int]:
+        return [49, 50, 51, 52, 53, 54, 55, 56, 57]
+
+    proc demoCrc32CheckEmpty() -> bool:
+        let bytes = do demoEmptyBytes()
+        let crc = do crc32Bytes(bytes)
+        return crc == 0
+
+    proc demoCrc32Check9() -> bool:
+        let bytes = do demoNineDigitsBytes()
+        let crc = do crc32Bytes(bytes)
+        return crc == 3421780262
+
+    # ============================================================
+    # PART TWO — the buffer cache's LRU eviction policy, ported from
+    # facetql/src/storage/pager.rs (`PagerInner`, read in full alongside
+    # page.rs before writing this section).
+    # ============================================================
+    # WHAT WAS PORTED: `PagerInner::admit` — the "which page to evict"
+    # decision a bounded-size page cache makes every time a page is
+    # faulted in or written — plus the two call shapes that reach it,
+    # `Pager::read`'s cache-hit tick bump and its cache-miss admit, and
+    # `Pager::write`'s unconditional dirty admit. Together these are
+    # exactly the task's own "LRU eviction policy... a real,
+    # self-contained, checkable algorithm using arrays/maps" example.
+    #
+    # NOT ported, and confirmed needing no stub: `Pager::flush`,
+    # `read_from_disk`, `write_to_disk` — the actual disk I/O, and the
+    # ONLY place `crypto::encrypt`/`crypto::decrypt` are called anywhere
+    # in pager.rs (verified by reading the whole file: `admit`, `read`,
+    # `write`, `allocate`, `page_count` make zero crypto calls; only
+    # `PagerInner::read_from_disk` calls `crypto::decrypt` and only
+    # `PagerInner::write_to_disk` calls `crypto::encrypt`). This is the
+    # same finding storage.fct's PART ONE already made for `Page` itself
+    # ("Page makes zero calls to crypto::encrypt/decrypt... encryption
+    # wraps a page's ENCODED bytes one layer up, in pager.rs's
+    # read_from_disk/write_to_disk") — restated here because this port
+    # reaches into pager.rs itself and the same layering boundary holds
+    # one level in: the CACHE POLICY (which page id is resident, which
+    # is dirty, which is least recently used) is pure bookkeeping over
+    # page ids and tick counters, decided entirely before any byte is
+    # ever encrypted or decrypted. Eviction only ever decides WHETHER a
+    # write-back would be needed (a dirty flag this port tracks
+    # faithfully); it never performs one.
+    #
+    # ============================================================
+    # REPRESENTATION: `PagerInner`'s real fields are a `HashMap<u32,
+    # Entry>` (`cache`) plus a `BTreeMap<u64, u32>` ordered by tick
+    # (`order`) purely so eviction can find the globally oldest tick in
+    # O(log n) via `.iter().next()`. Neither a hash map nor an ordered
+    # map exists in this language (LANGUAGE.md's builtin list has no map
+    # type at all, only `[T]`), so — exactly like predicate.fct's row
+    # and this file's own PART ONE page body — the whole cache is
+    # threaded as parallel arrays, aligned by index, one entry per
+    # resident page:
+    #   ids:   [int]   the resident page id at index i
+    #   ticks: [int]   that page's last-access tick (bigger = newer)
+    #   dirty: [bool]  whether that page has unflushed writes
+    # There is no `order` array at all: rather than keeping a second
+    # structure sorted by tick, `pagerCacheLruVictimIndex` finds the
+    # minimum-tick index by a linear scan over `ticks` — the direct
+    # restatement of what `order.iter().next()` returns (the entry with
+    # the smallest key), reached by scanning instead of by a
+    # pre-sorted map this language has no primitive for. Tick values are
+    # a strictly increasing counter assigned once per access (mirroring
+    # `self.tick += 1`), so two entries never tie — the scan's
+    # first-minimum tie-break is never actually exercised, just never
+    # wrong either.
+    #
+    # As with PART ONE's page body, no field is ever set in place —
+    # `arr[i] = v` does not exist — so every "set"/"remove" below
+    # (`pagerCacheSetIntAt`, `pagerCacheRemoveIntAt`, ...) is a pure
+    # function returning a brand-new array, and every `do` result inside
+    # a loop is bound to its own fresh `let` before being folded into an
+    # accumulator with a plain, `do`-free reassignment — the same two
+    # restrictions PART ONE's own header already documents in full.
+    #
+    # ============================================================
+    # WHY FOUR "STEP" PROCS INSTEAD OF ONE: a proc returns exactly one
+    # typed value, and one page access can change three different
+    # arrays (`ids`/`ticks`/`dirty`) plus produce a fourth fact (which
+    # id, if any, got evicted) — so, following predicate.fct's own
+    # documented precedent for the identical constraint (`evalKind` vs.
+    # `evalNum`/`evalText`/`evalBool`), `pagerCacheStepIds` /
+    # `pagerCacheStepTicks` / `pagerCacheStepDirty` /
+    # `pagerCacheStepEvicted` are four independent, pure re-derivations
+    # of the SAME access decision, each returning one fact, guaranteed
+    # to agree by construction because all four are pure functions of
+    # the identical (ids, ticks, dirty, capacity, id, tick) input. Only
+    # `pagerCacheStepDirty` actually needs `dirty` or `isWrite` as
+    # input: whether an access is a read or a write never changes WHICH
+    # ids are resident or WHAT their tick becomes (`Pager::write`
+    # readmits exactly like a miss-then-admit, `Pager::read`'s hit path
+    # only ever bumps a tick) — it only changes whether the resulting
+    # entry is marked dirty. `pagerCacheStepIds`/`Ticks`/`Evicted`
+    # therefore take no `isWrite` parameter at all, rather than
+    # threading one through that nothing in their own logic reads.
+    proc pagerDemoEmptyInts() -> [int]:
+        return []
+
+    proc pagerDemoEmptyBools() -> [bool]:
+        return []
+
+    proc pagerSliceBools(buf: [bool], start: int, end: int) -> [bool]:
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            out = append(out, buf[i])
+            i = i + 1
+        return out
+
+    proc pagerConcatBools(a: [bool], b: [bool]) -> [bool]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    # pagerCacheFindIndex: `self.cache.get(&id)` restated as a linear
+    # scan over the `ids` array — the direct analog of predicate.fct's
+    # own `rowFieldIndex`.
+    proc pagerCacheFindIndex(ids: [int], target: int) -> int:
+        let n = len(ids)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if ids[i] == target:
+                    found = i
+            i = i + 1
+        return found
+
+    proc pagerCacheSetIntAt(arr: [int], index: int, val: int) -> [int]:
+        let before = do sliceBytes(arr, 0, index)
+        let n = len(arr)
+        let after = do sliceBytes(arr, index + 1, n)
+        let withVal = append(before, val)
+        let result = do concatBytes(withVal, after)
+        return result
+
+    proc pagerCacheSetBoolAt(arr: [bool], index: int, val: bool) -> [bool]:
+        let before = do pagerSliceBools(arr, 0, index)
+        let n = len(arr)
+        let after = do pagerSliceBools(arr, index + 1, n)
+        let withVal = append(before, val)
+        let result = do pagerConcatBools(withVal, after)
+        return result
+
+    proc pagerCacheRemoveIntAt(arr: [int], index: int) -> [int]:
+        let before = do sliceBytes(arr, 0, index)
+        let n = len(arr)
+        let after = do sliceBytes(arr, index + 1, n)
+        let result = do concatBytes(before, after)
+        return result
+
+    proc pagerCacheRemoveBoolAt(arr: [bool], index: int) -> [bool]:
+        let before = do pagerSliceBools(arr, 0, index)
+        let n = len(arr)
+        let after = do pagerSliceBools(arr, index + 1, n)
+        let result = do pagerConcatBools(before, after)
+        return result
+
+    # pagerCacheLruVictimIndex: `order.iter().next()` restated — the
+    # index of the resident page with the SMALLEST tick, i.e. the one
+    # least recently touched. Returns -1 for an empty cache (mirrors
+    # `order.iter().next()` returning `None`).
+    proc pagerCacheLruVictimIndex(ids: [int], ticks: [int]) -> int:
+        let n = len(ids)
+        if n == 0:
+            return -1
+        let mut bestIdx = 0
+        let mut bestTick = ticks[0]
+        let mut i = 1
+        loop i < n:
+            if ticks[i] < bestTick:
+                bestTick = ticks[i]
+                bestIdx = i
+            i = i + 1
+        return bestIdx
+
+    # ============================================================
+    # THE EVICTION LOOP — `PagerInner::admit`'s `while self.cache.len() >
+    # self.capacity { ... }`, restated three times (see the header's
+    # "WHY FOUR STEP PROCS" note) plus once more to trace which id, if
+    # any, was actually evicted. Every copy threads the SAME two facts
+    # (`curIds`/`curTicks`) to pick the same victim at each pass — the
+    # one Rust guards against evicting is the entry just admitted itself
+    # (`if victim_id == id { break }`, needed because a freshly admitted
+    # page always carries the newest tick and can only ever be its own
+    # cache's minimum when it is the cache's ONLY entry, e.g. a capacity
+    # of 0 — see demoScenario3 below for that exact edge case traced by
+    # hand).
+    # ============================================================
+    proc pagerCacheEvictLoopIds(ids: [int], ticks: [int], capacity: int, justAdmittedId: int) -> [int]:
+        let mut curIds = ids
+        let mut curTicks = ticks
+        let mut looping = true
+        loop looping:
+            let n = len(curIds)
+            if n <= capacity:
+                looping = false
+            else:
+                let victimIdx = do pagerCacheLruVictimIndex(curIds, curTicks)
+                if victimIdx == -1:
+                    looping = false
+                else:
+                    let victimId = curIds[victimIdx]
+                    if victimId == justAdmittedId:
+                        looping = false
+                    else:
+                        let newIds = do pagerCacheRemoveIntAt(curIds, victimIdx)
+                        let newTicks = do pagerCacheRemoveIntAt(curTicks, victimIdx)
+                        curIds = newIds
+                        curTicks = newTicks
+        return curIds
+
+    proc pagerCacheEvictLoopTicks(ids: [int], ticks: [int], capacity: int, justAdmittedId: int) -> [int]:
+        let mut curIds = ids
+        let mut curTicks = ticks
+        let mut looping = true
+        loop looping:
+            let n = len(curIds)
+            if n <= capacity:
+                looping = false
+            else:
+                let victimIdx = do pagerCacheLruVictimIndex(curIds, curTicks)
+                if victimIdx == -1:
+                    looping = false
+                else:
+                    let victimId = curIds[victimIdx]
+                    if victimId == justAdmittedId:
+                        looping = false
+                    else:
+                        let newIds = do pagerCacheRemoveIntAt(curIds, victimIdx)
+                        let newTicks = do pagerCacheRemoveIntAt(curTicks, victimIdx)
+                        curIds = newIds
+                        curTicks = newTicks
+        return curTicks
+
+    proc pagerCacheEvictLoopDirty(ids: [int], ticks: [int], dirty: [bool], capacity: int, justAdmittedId: int) -> [bool]:
+        let mut curIds = ids
+        let mut curTicks = ticks
+        let mut curDirty = dirty
+        let mut looping = true
+        loop looping:
+            let n = len(curIds)
+            if n <= capacity:
+                looping = false
+            else:
+                let victimIdx = do pagerCacheLruVictimIndex(curIds, curTicks)
+                if victimIdx == -1:
+                    looping = false
+                else:
+                    let victimId = curIds[victimIdx]
+                    if victimId == justAdmittedId:
+                        looping = false
+                    else:
+                        let newIds = do pagerCacheRemoveIntAt(curIds, victimIdx)
+                        let newTicks = do pagerCacheRemoveIntAt(curTicks, victimIdx)
+                        let newDirty = do pagerCacheRemoveBoolAt(curDirty, victimIdx)
+                        curIds = newIds
+                        curTicks = newTicks
+                        curDirty = newDirty
+        return curDirty
+
+    proc pagerCacheEvictLoopLastEvicted(ids: [int], ticks: [int], capacity: int, justAdmittedId: int) -> int:
+        let mut curIds = ids
+        let mut curTicks = ticks
+        let mut lastEvicted = -1
+        let mut looping = true
+        loop looping:
+            let n = len(curIds)
+            if n <= capacity:
+                looping = false
+            else:
+                let victimIdx = do pagerCacheLruVictimIndex(curIds, curTicks)
+                if victimIdx == -1:
+                    looping = false
+                else:
+                    let victimId = curIds[victimIdx]
+                    if victimId == justAdmittedId:
+                        looping = false
+                    else:
+                        let newIds = do pagerCacheRemoveIntAt(curIds, victimIdx)
+                        let newTicks = do pagerCacheRemoveIntAt(curTicks, victimIdx)
+                        curIds = newIds
+                        curTicks = newTicks
+                        lastEvicted = victimId
+        return lastEvicted
+
+    # ============================================================
+    # THE FOUR TOP-LEVEL STEP PROCS a real caller (a self-hosted Pager)
+    # would actually call once per page access.
+    # ============================================================
+    # pagerCacheStepIds / pagerCacheStepTicks: `Pager::read`'s hit
+    # branch (bump tick, cache unchanged) merged with its miss branch
+    # (`admit(id, page, false, ...)`), and `Pager::write`'s branch
+    # (always `admit(id, page, true, ...)`) — since, per the header
+    # note, admitting on an existing id changes no resident id and
+    # always refreshes its tick, exactly like a hit does; only whether
+    # the entry is dirty differs, which these two procs do not track.
+    proc pagerCacheStepIds(ids: [int], ticks: [int], capacity: int, id: int, tick: int) -> [int]:
+        let idx = do pagerCacheFindIndex(ids, id)
+        if idx != -1:
+            return ids
+        let appendedIds = append(ids, id)
+        let appendedTicks = append(ticks, tick)
+        let result = do pagerCacheEvictLoopIds(appendedIds, appendedTicks, capacity, id)
+        return result
+
+    proc pagerCacheStepTicks(ids: [int], ticks: [int], capacity: int, id: int, tick: int) -> [int]:
+        let idx = do pagerCacheFindIndex(ids, id)
+        if idx != -1:
+            let updated = do pagerCacheSetIntAt(ticks, idx, tick)
+            return updated
+        let appendedIds = append(ids, id)
+        let appendedTicks = append(ticks, tick)
+        let result = do pagerCacheEvictLoopTicks(appendedIds, appendedTicks, capacity, id)
+        return result
+
+    proc pagerCacheStepEvicted(ids: [int], ticks: [int], capacity: int, id: int, tick: int) -> int:
+        let idx = do pagerCacheFindIndex(ids, id)
+        if idx != -1:
+            return -1
+        let appendedIds = append(ids, id)
+        let appendedTicks = append(ticks, tick)
+        let result = do pagerCacheEvictLoopLastEvicted(appendedIds, appendedTicks, capacity, id)
+        return result
+
+    # pagerCacheStepDirty: the one proc `isWrite` reaches — a read hit
+    # leaves `dirty` untouched (`Pager::read`'s hit path never touches
+    # the dirty flag), a write hit sets it true in place (`admit`'s
+    # `dirty: bool` parameter, always `true` from `Pager::write`), and
+    # either kind of miss admits a fresh entry whose dirty flag is
+    # exactly `isWrite` (`false` from a page fault, `true` from writing
+    # a brand-new page).
+    proc pagerCacheStepDirty(ids: [int], ticks: [int], dirty: [bool], capacity: int, id: int, tick: int, isWrite: bool) -> [bool]:
+        let idx = do pagerCacheFindIndex(ids, id)
+        if idx != -1:
+            if isWrite:
+                let updated = do pagerCacheSetBoolAt(dirty, idx, true)
+                return updated
+            return dirty
+        let appendedIds = append(ids, id)
+        let appendedTicks = append(ticks, tick)
+        let appendedDirty = append(dirty, isWrite)
+        let result = do pagerCacheEvictLoopDirty(appendedIds, appendedTicks, appendedDirty, capacity, id)
+        return result
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — three hand-traced scenarios (full
+    # arithmetic in the task report):
+    #
+    # Scenario 1 — classic 3-slot LRU, all reads, page ids/ticks
+    # (1,1) (2,2) (3,3) (1,4) (4,5) on a capacity-3 cache: filling the
+    # cache with 1,2,3, re-touching 1 (so 2 becomes the oldest), then
+    # faulting in 4 evicts 2, not 1 or 3. Expected eviction trace
+    # [-1,-1,-1,-1,2]; expected final ids [1,3,4], ticks [4,3,5].
+    #
+    # Scenario 2 — continues scenario 1, adds two writes: write(3)
+    # (a hit — ticks[idx]=6, dirty[idx]=true, nothing evicted) then
+    # write(5) (a miss — evicts page 1, the true LRU survivor from
+    # scenario 1 that was never touched again, and it evicts CLEAN
+    # since page 1's dirty flag was still false). Expected final ids
+    # [3,4,5], dirty [true,false,true], evicted-at-this-step 1.
+    #
+    # Scenario 3 — the `victim_id == id` self-eviction guard: a single
+    # access on a capacity-0 cache admits its own only entry, finds
+    # itself as the (only, therefore minimum-tick) victim, and refuses
+    # to evict itself — the cache is left one page over its target
+    # capacity rather than evicting the page the caller is actively
+    # using, exactly mirroring the real `admit`'s documented reason for
+    # that guard. Expected final ids [1], evicted -1.
+    # ============================================================
+    proc pagerDemoScenario1EvictedTrace() -> [int]:
+        let ids0 = do pagerDemoEmptyInts()
+        let ticks0 = do pagerDemoEmptyInts()
+        let e1 = do pagerCacheStepEvicted(ids0, ticks0, 3, 1, 1)
+        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
+        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
+        let e2 = do pagerCacheStepEvicted(ids1, ticks1, 3, 2, 2)
+        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
+        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
+        let e3 = do pagerCacheStepEvicted(ids2, ticks2, 3, 3, 3)
+        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
+        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
+        let e4 = do pagerCacheStepEvicted(ids3, ticks3, 3, 1, 4)
+        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
+        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
+        let e5 = do pagerCacheStepEvicted(ids4, ticks4, 3, 4, 5)
+        return [e1, e2, e3, e4, e5]
+
+    proc pagerDemoScenario1FinalIds() -> [int]:
+        let ids0 = do pagerDemoEmptyInts()
+        let ticks0 = do pagerDemoEmptyInts()
+        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
+        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
+        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
+        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
+        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
+        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
+        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
+        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
+        let ids5 = do pagerCacheStepIds(ids4, ticks4, 3, 4, 5)
+        return ids5
+
+    proc pagerDemoScenario1FinalTicks() -> [int]:
+        let ids0 = do pagerDemoEmptyInts()
+        let ticks0 = do pagerDemoEmptyInts()
+        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
+        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
+        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
+        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
+        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
+        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
+        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
+        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
+        let ticks5 = do pagerCacheStepTicks(ids4, ticks4, 3, 4, 5)
+        return ticks5
+
+    proc pagerDemoScenario2FinalIds() -> [int]:
+        let ids0 = do pagerDemoEmptyInts()
+        let ticks0 = do pagerDemoEmptyInts()
+        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
+        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
+        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
+        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
+        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
+        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
+        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
+        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
+        let ids5 = do pagerCacheStepIds(ids4, ticks4, 3, 4, 5)
+        let ticks5 = do pagerCacheStepTicks(ids4, ticks4, 3, 4, 5)
+        let ids6 = do pagerCacheStepIds(ids5, ticks5, 3, 3, 6)
+        let ticks6 = do pagerCacheStepTicks(ids5, ticks5, 3, 3, 6)
+        let ids7 = do pagerCacheStepIds(ids6, ticks6, 3, 5, 7)
+        return ids7
+
+    proc pagerDemoScenario2FinalDirty() -> [bool]:
+        let ids0 = do pagerDemoEmptyInts()
+        let ticks0 = do pagerDemoEmptyInts()
+        let dirty0 = do pagerDemoEmptyBools()
+        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
+        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
+        let dirty1 = do pagerCacheStepDirty(ids0, ticks0, dirty0, 3, 1, 1, false)
+        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
+        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
+        let dirty2 = do pagerCacheStepDirty(ids1, ticks1, dirty1, 3, 2, 2, false)
+        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
+        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
+        let dirty3 = do pagerCacheStepDirty(ids2, ticks2, dirty2, 3, 3, 3, false)
+        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
+        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
+        let dirty4 = do pagerCacheStepDirty(ids3, ticks3, dirty3, 3, 1, 4, false)
+        let ids5 = do pagerCacheStepIds(ids4, ticks4, 3, 4, 5)
+        let ticks5 = do pagerCacheStepTicks(ids4, ticks4, 3, 4, 5)
+        let dirty5 = do pagerCacheStepDirty(ids4, ticks4, dirty4, 3, 4, 5, false)
+        let ids6 = do pagerCacheStepIds(ids5, ticks5, 3, 3, 6)
+        let ticks6 = do pagerCacheStepTicks(ids5, ticks5, 3, 3, 6)
+        let dirty6 = do pagerCacheStepDirty(ids5, ticks5, dirty5, 3, 3, 6, true)
+        let ids7 = do pagerCacheStepIds(ids6, ticks6, 3, 5, 7)
+        let ticks7 = do pagerCacheStepTicks(ids6, ticks6, 3, 5, 7)
+        let dirty7 = do pagerCacheStepDirty(ids6, ticks6, dirty6, 3, 5, 7, true)
+        return dirty7
+
+    proc pagerDemoScenario2EvictedAtStep7() -> int:
+        let ids0 = do pagerDemoEmptyInts()
+        let ticks0 = do pagerDemoEmptyInts()
+        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
+        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
+        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
+        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
+        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
+        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
+        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
+        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
+        let ids5 = do pagerCacheStepIds(ids4, ticks4, 3, 4, 5)
+        let ticks5 = do pagerCacheStepTicks(ids4, ticks4, 3, 4, 5)
+        let ids6 = do pagerCacheStepIds(ids5, ticks5, 3, 3, 6)
+        let ticks6 = do pagerCacheStepTicks(ids5, ticks5, 3, 3, 6)
+        let e7 = do pagerCacheStepEvicted(ids6, ticks6, 3, 5, 7)
+        return e7
+
+    proc pagerDemoScenario3FinalIds() -> [int]:
+        let ids0 = do pagerDemoEmptyInts()
+        let ticks0 = do pagerDemoEmptyInts()
+        let ids1 = do pagerCacheStepIds(ids0, ticks0, 0, 1, 1)
+        return ids1
+
+    proc pagerDemoScenario3Evicted() -> int:
+        let ids0 = do pagerDemoEmptyInts()
+        let ticks0 = do pagerDemoEmptyInts()
+        let e1 = do pagerCacheStepEvicted(ids0, ticks0, 0, 1, 1)
+        return e1
+
+    state demoFreshOk: bool = false
+    state demoCorruptedOk: bool = false
+    state demoFreeSpaceOk: bool = false
+    state demoCrcEmptyOk: bool = false
+    state demoCrc9Ok: bool = false
+
+    action runDemoStorage():
+        let freshOk = do demoFreshPageOk()
+        let corruptedOk = do demoCorruptedPageOk()
+        let freeSpaceOk = do demoFreeSpaceCheck()
+        let crcEmptyOk = do demoCrc32CheckEmpty()
+        let crc9Ok = do demoCrc32Check9()
+        demoFreshOk = freshOk
+        demoCorruptedOk = corruptedOk
+        demoFreeSpaceOk = freeSpaceOk
+        demoCrcEmptyOk = crcEmptyOk
+        demoCrc9Ok = crc9Ok
+
+    state demoLruEvictedTrace: [int] = []
+    state demoLruFinalIds: [int] = []
+    state demoLruFinalTicks: [int] = []
+    state demoLruWritesFinalIds: [int] = []
+    state demoLruWritesFinalDirty: [bool] = []
+    state demoLruWritesEvicted: int = 0
+    state demoLruZeroCapIds: [int] = []
+    state demoLruZeroCapEvicted: int = 0
+
+    action runDemoPagerCache():
+        let trace1 = do pagerDemoScenario1EvictedTrace()
+        let ids1 = do pagerDemoScenario1FinalIds()
+        let ticks1 = do pagerDemoScenario1FinalTicks()
+        let ids2 = do pagerDemoScenario2FinalIds()
+        let dirty2 = do pagerDemoScenario2FinalDirty()
+        let evicted2 = do pagerDemoScenario2EvictedAtStep7()
+        let ids3 = do pagerDemoScenario3FinalIds()
+        let evicted3 = do pagerDemoScenario3Evicted()
+        demoLruEvictedTrace = trace1
+        demoLruFinalIds = ids1
+        demoLruFinalTicks = ticks1
+        demoLruWritesFinalIds = ids2
+        demoLruWritesFinalDirty = dirty2
+        demoLruWritesEvicted = evicted2
+        demoLruZeroCapIds = ids3
+        demoLruZeroCapEvicted = evicted3
+
+    view Home at "/":
+        box:
+            text "{demoFreshOk} {demoCorruptedOk} {demoFreeSpaceOk} {demoCrcEmptyOk} {demoCrc9Ok}"
+            text "{demoLruEvictedTrace} {demoLruFinalIds} {demoLruFinalTicks} {demoLruWritesFinalIds} {demoLruWritesFinalDirty} {demoLruWritesEvicted} {demoLruZeroCapIds} {demoLruZeroCapEvicted}"
