@@ -543,30 +543,22 @@ app FabricSelfHost:
     # `pagerCacheLruVictimIndex` already documents for the identical reason
     # (no sort/map primitive in this language). The real comparator is
     # `eligible-first, then pending_writes ascending, then apply_lag_ms
-    # ascending, then node id ascending` and Rust's `sort_by` is STABLE, so a
-    # four-way tie falls through to whichever replica came first in the
-    # array `sort_by` was called on. That array is `ReplicaSet::secondaries()`,
-    # iterating the set's own `replicas: Vec<Replica>` — which `set.rs`'s
-    # `ReplicaOperation::Add` handler keeps sorted by node id after every
-    # insert (`self.replicas.sort_by(|l, r| l.node.0.cmp(&r.node.0))`, read
-    # directly in `set.rs`). So the fourth tie-break this file's job would
-    # otherwise be to restate — comparing node id TEXT — is already decided
-    # BEFORE this proc ever runs: a caller that hands `nodes`/`isPrimary`/
-    # etc. to this file in the same order a real `ReplicaSet` holds them
-    # (node-id order) makes "first array index wins a full tie" and "lowest
-    # node id wins a full tie" the same rule. This is restated here rather
-    # than glossed over because this language genuinely has no lexicographic
-    # `<`/`<=` on `text` (`facet lang`'s comparison operators all coerce
-    # through `toInt`/`toFloat` — confirmed against this very selfhost
-    # directory's own `expr.fct`, STAGE 0 header) — a real, confirmed
-    # language gap this port works around by leaning on an invariant the
-    # SOURCE crate already upholds, rather than one this port invents.
+    # ascending, then node id ascending`. The fourth tie-break (node id TEXT,
+    # ascending) is a REAL exact port below: `<`/`<=` on `text` do genuine
+    # byte-wise comparison in this language (confirmed live via
+    # `facet console` — see reference.fct's correction of an earlier,
+    # incorrect "no lexicographic order" claim this file's older revision
+    # also made). Kept exact-match with Rust's own STABLE `sort_by` semantics:
+    # a caller supplying entries in a different order than node-id order is
+    # still handled correctly now, since the tiebreak no longer depends on
+    # incoming array order at all.
     proc failoverBestCandidateIndex(entries: [ReplicaEntry], nowMs: int, policy: FailoverPolicy) -> int:
         let n = len(entries)
         let mut i = 0
         let mut bestIdx = -1
         let mut bestPending = -1
         let mut bestLag = -1
+        let mut bestNode = ""
         loop i < n:
             if !entries[i].isPrimary:
                 let ineligible = do failoverIneligibility(entries[i], nowMs, policy)
@@ -575,16 +567,25 @@ app FabricSelfHost:
                         bestIdx = i
                         bestPending = entries[i].pendingWrites
                         bestLag = entries[i].applyLagMs
+                        bestNode = entries[i].node
                     else:
                         if entries[i].pendingWrites < bestPending:
                             bestIdx = i
                             bestPending = entries[i].pendingWrites
                             bestLag = entries[i].applyLagMs
+                            bestNode = entries[i].node
                         else:
                             if entries[i].pendingWrites == bestPending && entries[i].applyLagMs < bestLag:
                                 bestIdx = i
                                 bestPending = entries[i].pendingWrites
                                 bestLag = entries[i].applyLagMs
+                                bestNode = entries[i].node
+                            else:
+                                if entries[i].pendingWrites == bestPending && entries[i].applyLagMs == bestLag && entries[i].node < bestNode:
+                                    bestIdx = i
+                                    bestPending = entries[i].pendingWrites
+                                    bestLag = entries[i].applyLagMs
+                                    bestNode = entries[i].node
             i = i + 1
         return bestIdx
 
@@ -1534,7 +1535,7 @@ app FabricSelfHost:
         demoValDupPrefix = valDupPrefix
         demoValOk = valOk
 
-    view FabricHome at "/":
+    private view Home at "/":
         box:
             text "{demoA1Status} {demoA1Key} {demoA2Status} {demoB1Status} {demoB1Key} {demoB2Key} {demoC1Status} {demoC1Key} {demoC1bStatus} {demoC2NotSpanning} {demoC2SingleSpanning} {demoValEmptyKind} {demoValEmptyPrefix} {demoValDupKind} {demoValDupPrefix} {demoValOk}"
             text "{demoD1Blocker} {demoD1HasPromotion} {demoD2HasPromotion} {demoD2PromotionNode} {demoD3StrictBlocker} {demoD3StrictIsStuck} {demoD3LenientHasPromotion} {demoD3LenientPromotionNode} {demoD4NeedsReplacement} {demoD4CandidateIneligibility}"

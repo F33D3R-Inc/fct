@@ -1,0 +1,293 @@
+app FabricMigrationPlanSelfHost:
+    # Self-hosting port of the parts of fabric/crates/fabric-migration/src/
+    # NOT already covered by fabric.fct's "THIRD PORT, SAME FILE" section
+    # (phase.rs + migration.rs + plan.rs's one construction-time guard,
+    # ported there as MigrationState / migrationPlanStatus). All three
+    # remaining files — plan.rs (123L), progress.rs (72L), lib.rs (54L) —
+    # read in full before writing a line here.
+    #
+    # ============================================================
+    # SURVEY OF THE THREE FILES
+    # ============================================================
+    # lib.rs (54L): crate doc comment + `pub mod` declarations
+    # (migration/phase/plan/progress) + `pub use` re-exports of the types
+    # those modules define. No logic and no type of its own — confirmed by
+    # reading it in full. Nothing to port from it.
+    #
+    # plan.rs (123L): DEFAULT_MAX_CUTOVER_PENDING_WRITES (a plain constant —
+    # already restated as the literal 64 in fabric.fct's MigrationState demo
+    # fixtures, but never given its own named accessor; ported here as
+    # migrationDefaultMaxCutoverPendingWrites); MigrationId (a u64 wrapper
+    # whose only behavior is Display, `"migration-{}"`; ported as
+    # migrationIdLabel); MigrationReason (an enum recording WHY a migration
+    # was ordered — Hotspot{pressure_score}/Rebalance/DrainNode/
+    # RegionLocality{target_region}/CapacityPressure/Operator{note} — plus
+    # its one real method, `label()`, a match returning a static string per
+    # variant; ported below as the MigrationReason struct, its six
+    # migrationReason* constructors, and migrationReasonLabel).
+    # MigrationPlan itself and MigrationPlan::new are NOT re-ported here —
+    # fabric.fct's own header, right above its MigrationState struct,
+    # already explains why: every field MigrationPlan carries besides
+    # maxCutoverPendingWrites either folds into MigrationState directly
+    # (atoms -> atomsTotal) or is never read by a decision procedure at all
+    # (source/destination node identity only matters for EQUALITY at
+    # planning time, which is migrationPlanStatus, already ported there).
+    # Restating the struct here too would just be a second, unused home for
+    # fields nothing in this file's procs inspect either.
+    #
+    # progress.rs (72L): MigrationProgress, a plain counters struct
+    # (atoms_total/atoms_copied/bytes_copied/pending_writes/
+    # phase_started_at_ms/updated_at_ms) plus four real methods —
+    # copy_fraction, is_copy_complete, overall_fraction (a per-phase
+    # fixed-vs-measured blend, explicitly documented in the Rust as an
+    # ESTIMATE never used to decide anything — "Never use this to decide
+    # anything — the phase and the counters are the truth"), and
+    # phase_age_ms (saturating_sub). This is a distinct, REPORTING-only
+    # struct the real crate keeps separate from Migration's own decision
+    # state: migration.rs holds a MigrationProgress field but never reads it
+    # back for a decision, only returns it verbatim from `status()`. Ported
+    # below as its own struct with all four methods restated.
+    #
+    # `overall_fraction` takes a `MigrationPhase` in the real crate; this
+    # selfhost directory has no cross-file `import` (the same standalone-file
+    # constraint fabric_telemetry.fct's own header documents), so sharing
+    # fabric.fct's MigrationState/phase table is not possible — instead
+    # `migrationProgressOverallFraction` takes a plain `phase: int` in the
+    # IDENTICAL 0..7 encoding fabric.fct's phase table already uses
+    # (0=Planned, 1=Copying, 2=CatchingUp, 3=Cutover, 4=Cleanup,
+    # 5=Completed, 6=Aborted, 7=Failed) — restated, not reinvented.
+    # ============================================================
+
+    # ------------------------------------------------------------
+    # plan.rs
+    # ------------------------------------------------------------
+    proc migrationDefaultMaxCutoverPendingWrites() -> int:
+        return 64
+
+    struct MigrationId:
+        value: int
+
+    # migrationIdLabel: MigrationId's Display impl, `"migration-{}"`.
+    proc migrationIdLabel(id: MigrationId) -> text:
+        return "migration-" + id.value
+
+    # MigrationReason: recorded, never acted on by this crate (the crate doc
+    # says so directly), so — like MigrationPlan — only the one real method
+    # (`label`) is decision-shaped; the rest is inert data along for the
+    # ride. tag: 0=Hotspot 1=Rebalance 2=DrainNode 3=RegionLocality
+    # 4=CapacityPressure 5=Operator, mirroring fabric.fct's own phase-as-int
+    # convention. Only the field matching the active tag is meaningful on
+    # any given value; pressureScore is 0.0 and targetRegion/note are ""
+    # on every variant that does not carry them.
+    struct MigrationReason:
+        tag: int
+        pressureScore: float
+        targetRegion: text
+        note: text
+
+    proc migrationReasonHotspot(pressureScore: float) -> MigrationReason:
+        return MigrationReason{tag: 0, pressureScore: pressureScore, targetRegion: "", note: ""}
+
+    proc migrationReasonRebalance() -> MigrationReason:
+        return MigrationReason{tag: 1, pressureScore: 0.0, targetRegion: "", note: ""}
+
+    proc migrationReasonDrainNode() -> MigrationReason:
+        return MigrationReason{tag: 2, pressureScore: 0.0, targetRegion: "", note: ""}
+
+    proc migrationReasonRegionLocality(targetRegion: text) -> MigrationReason:
+        return MigrationReason{tag: 3, pressureScore: 0.0, targetRegion: targetRegion, note: ""}
+
+    proc migrationReasonCapacityPressure() -> MigrationReason:
+        return MigrationReason{tag: 4, pressureScore: 0.0, targetRegion: "", note: ""}
+
+    proc migrationReasonOperator(note: text) -> MigrationReason:
+        return MigrationReason{tag: 5, pressureScore: 0.0, targetRegion: "", note: note}
+
+    # migrationReasonLabel: `MigrationReason::label`, restated arm for arm in
+    # the same order.
+    proc migrationReasonLabel(reason: MigrationReason) -> text:
+        if reason.tag == 0:
+            return "hotspot"
+        if reason.tag == 1:
+            return "rebalance"
+        if reason.tag == 2:
+            return "drain-node"
+        if reason.tag == 3:
+            return "region-locality"
+        if reason.tag == 4:
+            return "capacity-pressure"
+        return "operator"
+
+    # ------------------------------------------------------------
+    # progress.rs
+    # ------------------------------------------------------------
+    struct MigrationProgress:
+        atomsTotal: int
+        atomsCopied: int
+        bytesCopied: int
+        pendingWrites: int
+        phaseStartedAtMs: int
+        updatedAtMs: int
+
+    proc migrationProgressNew(atomsTotal: int, startedAtMs: int) -> MigrationProgress:
+        return MigrationProgress{atomsTotal: atomsTotal, atomsCopied: 0, bytesCopied: 0, pendingWrites: 0, phaseStartedAtMs: startedAtMs, updatedAtMs: startedAtMs}
+
+    proc migrationProgressCopyFraction(progress: MigrationProgress) -> float:
+        if progress.atomsTotal == 0:
+            return 1.0
+        return toFloat(progress.atomsCopied) / toFloat(progress.atomsTotal)
+
+    proc migrationProgressIsCopyComplete(progress: MigrationProgress) -> bool:
+        return progress.atomsCopied >= progress.atomsTotal
+
+    # migrationProgressOverallFraction: `overall_fraction` restated arm for
+    # arm — `phase` is the 0..7 int convention documented above, NOT a type
+    # of this file's own (there is none; see header).
+    proc migrationProgressOverallFraction(progress: MigrationProgress, phase: int) -> float:
+        let copyFraction = do migrationProgressCopyFraction(progress)
+        if phase == 0:
+            return 0.0
+        if phase == 1:
+            return copyFraction * 0.80
+        if phase == 2:
+            return 0.85
+        if phase == 3:
+            return 0.95
+        if phase == 4:
+            return 0.98
+        if phase == 5:
+            return 1.0
+        return copyFraction * 0.80
+
+    # migrationProgressPhaseAgeMs: `phase_age_ms`'s `saturating_sub` — never
+    # negative even if `now_ms` is (wrongly) earlier than the phase start.
+    proc migrationProgressPhaseAgeMs(progress: MigrationProgress, nowMs: int) -> int:
+        let age = nowMs - progress.phaseStartedAtMs
+        return max(age, 0)
+
+    # ------------------------------------------------------------
+    # DEMOS — hand-traced directly against plan.rs/progress.rs (neither has
+    # its own crate unit tests; `cargo test -p fabric-migration --lib`
+    # confirmed all 14 existing tests live in phase.rs/migration.rs, none
+    # touching plan.rs's label() or any of progress.rs).
+    # ------------------------------------------------------------
+    proc demoReasonLabels() -> bool:
+        let hotspot = do migrationReasonHotspot(0.92)
+        let rebalance = do migrationReasonRebalance()
+        let drainNode = do migrationReasonDrainNode()
+        let regionLocality = do migrationReasonRegionLocality("us-east")
+        let capacityPressure = do migrationReasonCapacityPressure()
+        let operator = do migrationReasonOperator("scheduled maintenance")
+        let l1 = do migrationReasonLabel(hotspot)
+        let l2 = do migrationReasonLabel(rebalance)
+        let l3 = do migrationReasonLabel(drainNode)
+        let l4 = do migrationReasonLabel(regionLocality)
+        let l5 = do migrationReasonLabel(capacityPressure)
+        let l6 = do migrationReasonLabel(operator)
+        return l1 == "hotspot" && l2 == "rebalance" && l3 == "drain-node" && l4 == "region-locality" && l5 == "capacity-pressure" && l6 == "operator" && regionLocality.targetRegion == "us-east" && operator.note == "scheduled maintenance" && hotspot.pressureScore > 0.9
+
+    proc demoMigrationIdLabel() -> text:
+        let id = MigrationId{value: 42}
+        let label = do migrationIdLabel(id)
+        return label
+
+    proc demoDefaultMaxCutoverPendingWrites() -> int:
+        let writes = do migrationDefaultMaxCutoverPendingWrites()
+        return writes
+
+    # Traced against progress.rs directly: atomsTotal=156 (a shard's full
+    # 12x13 grid, matching plan.rs's own `atoms` field / Shard::atom_count),
+    # atomsCopied=100 -> copy_fraction = 100/156 ~= 0.641, not complete;
+    # Copying's overall_fraction = 0.641*0.80 ~= 0.513.
+    proc demoProgressPartialCopy() -> MigrationProgress:
+        let progress = do migrationProgressNew(156, 1000)
+        return MigrationProgress{atomsTotal: progress.atomsTotal, atomsCopied: 100, bytesCopied: progress.bytesCopied, pendingWrites: progress.pendingWrites, phaseStartedAtMs: progress.phaseStartedAtMs, updatedAtMs: progress.updatedAtMs}
+
+    # 100/156 = 0.641025... — a bounded check, not an exact-literal one,
+    # since this fraction (unlike the phase table's own fixed shares below)
+    # is not a clean binary fraction; the bound pins it to the same value
+    # hand-computed from the trace in this proc's own header comment above.
+    proc demoProgressPartialCopyFractionOk() -> bool:
+        let progress = do demoProgressPartialCopy()
+        let fraction = do migrationProgressCopyFraction(progress)
+        return fraction > 0.64 && fraction < 0.65
+
+    proc demoProgressPartialIsComplete() -> bool:
+        let progress = do demoProgressPartialCopy()
+        let complete = do migrationProgressIsCopyComplete(progress)
+        return complete
+
+    # Copying's overall_fraction = copyFraction*0.80 ~= 0.641*0.80 ~= 0.513.
+    proc demoProgressPartialOverallFractionOk() -> bool:
+        let progress = do demoProgressPartialCopy()
+        let fraction = do migrationProgressOverallFraction(progress, 1)
+        return fraction > 0.51 && fraction < 0.52
+
+    # Zero-atom edge case: copy_fraction defined as 1.0 (avoids a divide by
+    # zero), matching the Rust guard exactly — this one IS a clean literal,
+    # so it is checked for exact equality.
+    proc demoProgressZeroAtomsCopyFractionOk() -> bool:
+        let progress = do migrationProgressNew(0, 0)
+        let fraction = do migrationProgressCopyFraction(progress)
+        return fraction == 1.0
+
+    # Each phase's fixed share, traced directly against the match:
+    # Planned=0.0, CatchingUp=0.85, Cutover=0.95, Cleanup=0.98,
+    # Completed=1.0, and Aborted/Failed fall back to the same
+    # copy-fraction-based estimate Copying uses.
+    proc demoProgressPhaseFractions() -> bool:
+        let progress = do demoProgressPartialCopy()
+        let planned = do migrationProgressOverallFraction(progress, 0)
+        let copying = do migrationProgressOverallFraction(progress, 1)
+        let catchingUp = do migrationProgressOverallFraction(progress, 2)
+        let cutover = do migrationProgressOverallFraction(progress, 3)
+        let cleanup = do migrationProgressOverallFraction(progress, 4)
+        let completed = do migrationProgressOverallFraction(progress, 5)
+        let aborted = do migrationProgressOverallFraction(progress, 6)
+        let failed = do migrationProgressOverallFraction(progress, 7)
+        return planned == 0.0 && catchingUp == 0.85 && cutover == 0.95 && cleanup == 0.98 && completed == 1.0 && aborted == copying && failed == copying
+
+    proc demoProgressPhaseAge() -> int:
+        let progress = do migrationProgressNew(156, 5000)
+        let age = do migrationProgressPhaseAgeMs(progress, 8000)
+        return age
+
+    # saturating_sub floor: now_ms earlier than the phase start never goes
+    # negative.
+    proc demoProgressPhaseAgeSaturates() -> int:
+        let progress = do migrationProgressNew(156, 5000)
+        let age = do migrationProgressPhaseAgeMs(progress, 1000)
+        return age
+
+    state demoReasonLabelsOk: bool = false
+    state demoIdLabel: text = ""
+    state demoDefaultMaxCutover: int = 0
+    state demoPartialCopyFractionOk: bool = false
+    state demoPartialIsComplete: bool = false
+    state demoPartialOverallFractionOk: bool = false
+    state demoZeroAtomsCopyFractionOk: bool = false
+    state demoPhaseFractionsOk: bool = false
+    state demoPhaseAge: int = 0
+    state demoPhaseAgeSaturates: int = 0
+
+    action runDemoMigrationPlan():
+        let reasonLabelsOk = do demoReasonLabels()
+        let idLabel = do demoMigrationIdLabel()
+        let defaultMaxCutover = do demoDefaultMaxCutoverPendingWrites()
+        let partialCopyFractionOk = do demoProgressPartialCopyFractionOk()
+        let partialIsComplete = do demoProgressPartialIsComplete()
+        let partialOverallFractionOk = do demoProgressPartialOverallFractionOk()
+        let zeroAtomsCopyFractionOk = do demoProgressZeroAtomsCopyFractionOk()
+        let phaseFractionsOk = do demoProgressPhaseFractions()
+        let phaseAge = do demoProgressPhaseAge()
+        let phaseAgeSaturates = do demoProgressPhaseAgeSaturates()
+        demoReasonLabelsOk = reasonLabelsOk
+        demoIdLabel = idLabel
+        demoDefaultMaxCutover = defaultMaxCutover
+        demoPartialCopyFractionOk = partialCopyFractionOk
+        demoPartialIsComplete = partialIsComplete
+        demoPartialOverallFractionOk = partialOverallFractionOk
+        demoZeroAtomsCopyFractionOk = zeroAtomsCopyFractionOk
+        demoPhaseFractionsOk = phaseFractionsOk
+        demoPhaseAge = phaseAge
+        demoPhaseAgeSaturates = phaseAgeSaturates

@@ -1,0 +1,604 @@
+import "program.fct"
+
+app PlacementHelpersSelfHost:
+    # Partial, honest self-hosting port of THREE small sub-helpers out of
+    # internal/ir/build.go's job/trigger "must be Server-placed" placement
+    # gate — NOT the gate itself, which stays blocked on `e.check`/`e.low`
+    # (both still massive, unported; see semantics.fct's own header for the
+    # full accounting of what that gate needs and why it isn't here yet).
+    # These three were independently checked and found tractable in
+    # isolation because each one is a plain tree walk over a shape this
+    # port already builds for real (expr_tree.fct's `ExprNode`) plus, for
+    # `depsIR`, a plain name-list membership test against fields
+    # program.fct's `Program` already carries (`states: [StateDecl]`,
+    # `entities: [EntityDecl]`) — no `env`, no `e.check`/`e.low`, no AST
+    # type this port hasn't already built.
+    #
+    # ============================================================
+    # hasImpure / hasPrint (build.go lines 6048-6063)
+    # ============================================================
+    # The real Go functions are one-line wrappers:
+    #
+    #   func hasImpure(ex ast.Expr) bool { _, ok := procCapabilities(ex)[impureCap]; return ok }
+    #   func hasPrint(ex ast.Expr) bool  { _, ok := procCapabilities(ex)[printCap];  return ok }
+    #
+    # `procCapabilities` (build.go lines 5987-6039) is a SINGLE shared tree
+    # walk that also collects the declared io.file/io.net/io.net.listen
+    # capabilities a `readFile`/`writeFile`/`httpGet`/`httpPost`/etc. call
+    # needs (`builtinCapability`, lines 5926-5945) — that half is
+    # `checkProcCapabilities`'s job (lines 6072-6087), a DIFFERENT gate (a
+    # proc's own `uses` clause) that is out of this task's scope entirely.
+    # hasImpure/hasPrint only ever ask "does `ex` contain a call named
+    # now/rand" or "...named print" (procCapabilities' own case ast.Call:
+    # `if t.Name == "now" || t.Name == "rand" { caps[impureCap] = t.Name }
+    # else if t.Name == "print" { caps[printCap] = t.Name }`, lines
+    # 5993-5996) — so this port skips the general capability-map machinery
+    # (irrelevant here, and it has no plain-value shape anyway: a
+    # `map[string]string` keyed by capability name has no proc-param type
+    # in this language, exactly the wall semantics.fct's own header already
+    # hit for `e.states`) and instead walks directly for a single builtin
+    # name, over the exact same node-kind set procCapabilities' switch
+    # covers (ast.Call/ast.Get/ast.EntityGet/ast.ListLit/ast.MapLit/
+    # ast.StructLit/ast.Bin/ast.Un/ast.Agg/ast.Index, lines 5991-6035) —
+    # restated below against expr_tree.fct's `ExprNode` kinds
+    # ("call"/"get"/"entityGet"/"list"/"map"/"bin"/"un"/"agg"/"index"; see
+    # exprCallsName's own doc for the one real absence, `struct`).
+    # `hasImpure` then simply asks the shared walk twice (once per name)
+    # instead of once against a two-key map — same yes/no answer, a plain
+    # `bool`-returning walk instead of a map neither this language nor this
+    # task needs.
+    #
+    # ============================================================
+    # depsIR (build.go lines 6202-6255) — AST vs. lowered-IR shape, checked
+    # ============================================================
+    # The real depsIR walks a *lowered* `*ir.Expr` (internal/ir/ir.go lines
+    # 829-847: `Kind string`, plus `Name`/`Field`/`Obj`/`Key`/`Op`/`Args`/
+    # `Keys`/`Fields`/`L`/`R`/`X`/`Var`/`Where`/`Sel`), produced by `e.low`
+    # AFTER policy inlining — not the raw `ast.Expr`/`ExprNode` this port's
+    # parser stage builds. The task named this as the one open question:
+    # does the AST shape already carry everything this specific walk needs,
+    # or does lowering add something the AST doesn't represent? Checked
+    # case by case, against depsIR's own 7-case switch (build.go lines
+    # 6211-6251) and expr_tree.fct's `ExprNode` (kinds "int"/"float"/
+    # "bool"/"text"/"ref"/"bin"/"un"/"get"/"index"/"call"/"list"/
+    # "entityGet"/"map"/"agg" — expr_tokens.fct lines 184-262):
+    #
+    #   - "ref"/"get"/"eget"/"call"+"list"/"bin"/"un": every field depsIR
+    #     reads (x.Name, x.Obj, x.Key, x.Args, x.L, x.R, x.X) is already
+    #     present on ExprNode under a same-shaped name (node.text, one
+    #     `children` slot instead of a dedicated field per arity, but the
+    #     same tree) — a direct, faithful port, no lowering-only fact
+    #     needed. IR's "eget" is ExprNode's "entityGet"; the entity name
+    #     lives on `x.Name` in IR vs. `node.text` in ExprNode (see
+    #     entityGetNode's own constructor, expr_tokens.fct line 254) —
+    #     same fact, different field name, not a shape gap.
+    #   - "agg": depsIR only ever reads `x.Name` (the collection/entity
+    #     name) and walks `x.Where` — it does NOT walk `x.Sel` (the general
+    #     reduced-value sub-expression), even though ir.Expr carries one.
+    #     ExprNode's "agg" carries the identical pair of optional-arity
+    #     facts, just under different names: `coll` (not `text`, which
+    #     holds the aggregate's OWN name — count/sum/exists/avg/min/max —
+    #     on this node shape; see aggNode's constructor, expr_tokens.fct
+    #     line 260) for the collection, and `whereClause: [ExprNode]`
+    #     (0-or-1) for the filter. This port's depsIR, below, walks
+    #     `node.coll` and `node.whereClause` ONLY, deliberately leaving
+    #     `node.sel` unwalked — matching the real function's own choice,
+    #     not an oversight introduced by this port.
+    #   - "astate" (build.go lines 6225-6234, `pending()`/`failed()`/
+    #     `dirty()`/`touched()` action-status reads): this is a REAL
+    #     shape difference, and the honest answer is that it does not
+    #     apply to this port at all, in either direction — not "lowering
+    #     adds it", but "the raw AST-level `ExprNode` this file's own
+    #     grammar subset builds has no counterpart kind for it, full stop".
+    #     expr_tokens.fct's `ExprNode` (see its own kind-by-kind doc,
+    #     lines 120-169) lists no "astate" kind at all, and expr_tree.fct
+    #     confirms why: `pending`/`failed`/`dirty`/`touched` are reserved
+    #     as non-entity, non-call names by `isEntityNameTok`
+    #     (expr_tree.fct line 698) specifically so they are never parsed
+    #     as an `Entity(key)` lookup, but they are ALSO absent from
+    #     `isCallNameTok`/`isAggNameTok` — so `postfixNodes` falls through
+    #     to `factorNodes`/`factorLeafNodes` for them, which (having no
+    #     "it's a builtin call" or "it's an aggregate" case to catch them
+    #     either) silently parses a bare `pending` as an ordinary `ref`
+    #     node and leaves the following `(...)` for the surrounding
+    #     grammar to choke on. In short: action-state reads are simply
+    #     outside this subset grammar's coverage already (a pre-existing,
+    #     documented limit of expr_tree.fct/expr_tokens.fct, not something
+    #     this file introduces) — so depsIR's "astate" case has no
+    #     `ExprNode` counterpart to port, and this port's depsIR omits that
+    #     case entirely rather than fake one against a node shape that can
+    #     never actually arise from this grammar's own parser.
+    #   - "map"/"index"/"struct": depsIR's own switch (build.go lines
+    #     6211-6251) has NO case for any of these three IR kinds either —
+    #     a map-literal key/value, an index target/subscript, or a struct
+    #     field value can reference state/entity names, but the real
+    #     function simply never descends into them (whatever they read is
+    #     not tracked as a dependency). ExprNode has "map" and "index"
+    #     kinds (StructLit has no ExprNode counterpart at all — this
+    #     subset's grammar never builds struct literals, per
+    #     expr_tokens.fct's own kind list); this port's depsIR below adds
+    #     no case for "map" or "index" either, exactly mirroring the real
+    #     function's own omission rather than "improving" on it — a
+    #     silent behavioral divergence from the real compiler would be a
+    #     worse bug than reproducing its blind spot faithfully.
+    #
+    # Bottom line: for every case depsIR actually implements, ExprNode's
+    # AST-level shape is already equivalent enough to port directly against
+    # (no lowering-only fact is missing) — except "astate", which the AST
+    # layer here cannot represent at all because expr_tree.fct's own
+    # grammar subset doesn't parse that construct in the first place, a
+    # pre-existing gap this task did not introduce and does not close.
+    #
+    # `e.states`/`e.entities` (Go: `map[string]*ast.State`-ish /
+    # `map[string]bool`, looked up by plain membership) become `isStateName`
+    # / `isEntityName` below, linear scans over program.fct's own
+    # `[StateDecl]`/`[EntityDecl]` — the same "no map param type in this
+    # language, so restate the lookup as a scan over the real list" idiom
+    # semantics.fct's own `statePlacementOf` already established for
+    # `e.states` (its header, "THE ONE REPRESENTATION GAP: no map type for
+    # a proc", explains why in full).
+    #
+    # depsIR's own Go return value is a `map[string]bool` (a set); this
+    # port returns a plain `[text]` instead, built via the same
+    # dedup-on-append idiom triggers.fct's `distinctFromNames` already uses
+    # (`containsName`/`addNameUnique`/`mergeNames`, below) — order is never
+    # semantically meaningful for a dependency SET (every real caller in
+    # build.go immediately re-sorts it via `sortedKeys` before using it),
+    # so no ordering-fidelity claim is made or needed here.
+
+    # ------------------------------------------------------------
+    # hasImpure / hasPrint
+    # ------------------------------------------------------------
+    #
+    # exprCallsName: the shared walk both hasImpure and hasPrint are built
+    # from — "does `node`'s tree contain a call to the builtin named
+    # `name`, anywhere" — over the exact node-kind set procCapabilities'
+    # own switch covers (build.go lines 5991-6035), restated against
+    # ExprNode's kinds. The one kind procCapabilities has a case for that
+    # ExprNode cannot produce at all is `ast.StructLit` (expr_tokens.fct's
+    # grammar subset never builds a "struct" ExprNode — see this file's own
+    # header above) — omitted below for the same "cannot arise, so no case
+    # to fake" reason "astate" is omitted from depsIR.
+    private proc exprCallsName(node: ExprNode, name: text) -> bool:
+        if node.kind == "call":
+            if node.text == name:
+                return true
+            let kids = node.children
+            let n = len(kids)
+            let mut found = false
+            let mut i = 0
+            loop i < n:
+                let viaKid = do exprCallsName(kids[i], name)
+                if viaKid:
+                    found = true
+                i = i + 1
+            return found
+        if node.kind == "list":
+            let kids = node.children
+            let n = len(kids)
+            let mut found = false
+            let mut i = 0
+            loop i < n:
+                let viaKid = do exprCallsName(kids[i], name)
+                if viaKid:
+                    found = true
+                i = i + 1
+            return found
+        if node.kind == "get":
+            let obj = node.children[0]
+            let viaObj = do exprCallsName(obj, name)
+            return viaObj
+        if node.kind == "entityGet":
+            let key = node.children[0]
+            let viaKey = do exprCallsName(key, name)
+            return viaKey
+        if node.kind == "map":
+            let pairs = node.pairs
+            let n = len(pairs)
+            let mut found = false
+            let mut i = 0
+            loop i < n:
+                let viaKey = do exprCallsName(pairs[i].key, name)
+                if viaKey:
+                    found = true
+                let viaVal = do exprCallsName(pairs[i].value, name)
+                if viaVal:
+                    found = true
+                i = i + 1
+            return found
+        if node.kind == "bin":
+            let l = node.children[0]
+            let viaL = do exprCallsName(l, name)
+            if viaL:
+                return true
+            let r = node.children[1]
+            let viaR = do exprCallsName(r, name)
+            return viaR
+        if node.kind == "un":
+            let x = node.children[0]
+            let viaX = do exprCallsName(x, name)
+            return viaX
+        if node.kind == "agg":
+            let mut found = false
+            let hasWhere = len(node.whereClause) > 0
+            if hasWhere:
+                let viaWhere = do exprCallsName(node.whereClause[0], name)
+                if viaWhere:
+                    found = true
+            let hasSel = len(node.sel) > 0
+            if hasSel:
+                let viaSel = do exprCallsName(node.sel[0], name)
+                if viaSel:
+                    found = true
+            return found
+        if node.kind == "index":
+            let obj = node.children[0]
+            let viaObj = do exprCallsName(obj, name)
+            if viaObj:
+                return true
+            let idx = node.children[1]
+            let viaIdx = do exprCallsName(idx, name)
+            return viaIdx
+        return false
+
+    # hasImpure: build.go line 6048 — `now`/`rand` anywhere in the tree.
+    # Forces server placement (see build.go's own env.action placement
+    # switch and checkPure).
+    proc hasImpure(node: ExprNode) -> bool:
+        let callsNow = do exprCallsName(node, "now")
+        if callsNow:
+            return true
+        let callsRand = do exprCallsName(node, "rand")
+        return callsRand
+
+    # hasPrint: build.go line 6060 — `print` anywhere in the tree. Also
+    # forces server placement, unconditionally (print has no client
+    # implementation).
+    proc hasPrint(node: ExprNode) -> bool:
+        let callsPrint = do exprCallsName(node, "print")
+        return callsPrint
+
+    # ------------------------------------------------------------
+    # depsIR
+    # ------------------------------------------------------------
+    #
+    # containsName / addNameUnique / mergeNames: the plain-array "set" idiom
+    # (triggers.fct's `containsText`/`distinctFromNames` restated locally so
+    # this file has no import on triggers.fct it doesn't otherwise need).
+    private proc containsName(names: [text], name: text) -> bool:
+        let n = len(names)
+        let mut found = false
+        let mut i = 0
+        loop i < n:
+            if names[i] == name:
+                found = true
+            i = i + 1
+        return found
+
+    private proc addNameUnique(names: [text], name: text) -> [text]:
+        let already = do containsName(names, name)
+        if already:
+            return names
+        let out = append(names, name)
+        return out
+
+    private proc mergeNames(a: [text], b: [text]) -> [text]:
+        let n = len(b)
+        let mut out = a
+        let mut i = 0
+        loop i < n:
+            let merged = do addNameUnique(out, b[i])
+            out = merged
+            i = i + 1
+        return out
+
+    # isStateName / isEntityName: e.states[name] / e.entities[name]
+    # restated as a linear scan over program.fct's own decl lists — see
+    # this file's header ("THE ONE REPRESENTATION GAP") for why.
+    proc isStateName(states: [StateDecl], name: text) -> bool:
+        let n = len(states)
+        let mut found = false
+        let mut i = 0
+        loop i < n:
+            if states[i].name == name:
+                found = true
+            i = i + 1
+        return found
+
+    proc isEntityName(entities: [EntityDecl], name: text) -> bool:
+        let n = len(entities)
+        let mut found = false
+        let mut i = 0
+        loop i < n:
+            if entities[i].name == name:
+                found = true
+            i = i + 1
+        return found
+
+    # depsIR: build.go lines 6204-6255, ported against ExprNode directly —
+    # see this file's own header for the full case-by-case shape check
+    # against the real lowered-IR switch, including the two cases (agg's
+    # unwalked `sel`, and the wholly-absent "astate"/"map"/"index") this
+    # port deliberately does NOT add, to match the real function's own
+    # coverage exactly rather than silently improve on it.
+    proc depsIR(states: [StateDecl], entities: [EntityDecl], node: ExprNode) -> [text]:
+        if node.kind == "ref":
+            let isState = do isStateName(states, node.text)
+            if isState:
+                return [node.text]
+            let isEntity = do isEntityName(entities, node.text)
+            if isEntity:
+                return [node.text]
+            return []
+        if node.kind == "get":
+            let obj = node.children[0]
+            let viaObj = do depsIR(states, entities, obj)
+            return viaObj
+        if node.kind == "entityGet":
+            let mut out = []
+            let isEntity = do isEntityName(entities, node.text)
+            if isEntity:
+                out = [node.text]
+            let key = node.children[0]
+            let viaKey = do depsIR(states, entities, key)
+            let merged = do mergeNames(out, viaKey)
+            return merged
+        if node.kind == "agg":
+            let mut out = []
+            let isEntity = do isEntityName(entities, node.coll)
+            if isEntity:
+                out = [node.coll]
+            let hasWhere = len(node.whereClause) > 0
+            if hasWhere:
+                let viaWhere = do depsIR(states, entities, node.whereClause[0])
+                let merged = do mergeNames(out, viaWhere)
+                return merged
+            return out
+        if node.kind == "call" || node.kind == "list":
+            let kids = node.children
+            let m = len(kids)
+            let mut out = []
+            let mut k = 0
+            loop k < m:
+                let viaKid = do depsIR(states, entities, kids[k])
+                let merged = do mergeNames(out, viaKid)
+                out = merged
+                k = k + 1
+            return out
+        if node.kind == "bin":
+            let l = node.children[0]
+            let r = node.children[1]
+            let viaL = do depsIR(states, entities, l)
+            let viaR = do depsIR(states, entities, r)
+            let merged = do mergeNames(viaL, viaR)
+            return merged
+        if node.kind == "un":
+            let x = node.children[0]
+            let viaX = do depsIR(states, entities, x)
+            return viaX
+        return []
+
+    # ============================================================
+    # HAND-TRACED VERIFICATION FIXTURES — real source text, run through the
+    # ALREADY-REAL `parseExprTree` (expr.fct, imported transitively via
+    # program.fct -> nodes.fct -> expr.fct) so every fixture below exercises
+    # the genuine tokenizer + precedence-climbing parser, not a hand-built
+    # `ExprNode` literal standing in for one. Each fixture's expected answer
+    # was hand-derived against build.go's own `now`/`rand`/`print` name sets
+    # and depsIR's own 7-case switch (see this file's header), the same
+    # "describe + valid, only a scalar crosses into an action" idiom
+    # decl_checks.fct's own checkProgramSrcSummary/checkProgramSrcValid pair
+    # established. `runVerify` (the action, below) actually runs every one
+    # of these live via `facet console` — this is not a test file (no test
+    # framework, no assertion library; every proc here IS the port or a
+    # thin fixture around it), the identical convention every earlier
+    # selfhost file's own DEMO/SCENARIO section already uses.
+    # ============================================================
+    private proc boolText(b: bool) -> text:
+        if b:
+            return "true"
+        return "false"
+
+    private proc checkImpureFixture(label: text, src: text, expected: bool) -> text:
+        let tree = do parseExprTree(src)
+        let actual = do hasImpure(tree)
+        let et = do boolText(expected)
+        let at = do boolText(actual)
+        let mut status = "FAIL"
+        if expected == actual:
+            status = "PASS"
+        return status + " hasImpure(" + label + ") expected=" + et + " actual=" + at
+
+    private proc checkPrintFixture(label: text, src: text, expected: bool) -> text:
+        let tree = do parseExprTree(src)
+        let actual = do hasPrint(tree)
+        let et = do boolText(expected)
+        let at = do boolText(actual)
+        let mut status = "FAIL"
+        if expected == actual:
+            status = "PASS"
+        return status + " hasPrint(" + label + ") expected=" + et + " actual=" + at
+
+    # checkPrintFixtureNode: the same check, but against a directly
+    # CONSTRUCTED `ExprNode` (via callNode/binNode/mapLitNode/refNode —
+    # expr_tokens.fct's own node constructors, already public) instead of
+    # through `parseExprTree` on raw source text.
+    #
+    # WHY THIS SECOND VARIANT EXISTS — A REAL FINDING, CAUGHT LIVE:
+    # the first draft of this file's fixtures tried `checkPrintFixture`
+    # with source text like `"print(x)"`, expecting `parseExprTree` to
+    # yield a `Call` node the same way it does for `"now()"`/`"rand()"`.
+    # Running that draft live via `facet console`'s `:run runVerify()`
+    # (this file's own required verification step) surfaced three
+    # unexpected FAILs, not three PASSes — real evidence, not a hand-trace
+    # assumption, that something was wrong. Tracing it down: expr_tree.fct's
+    # `isCallNameTok` (its closed builtin-name allowlist for what may ever
+    # become a `Call` node) does NOT include `"print"` — grepped and
+    # confirmed absent from both expr_tree.fct and expr_tokens.fct entirely
+    # — unlike the real Go `pureBuiltinArity`/`isBuiltinCall` (build.go line
+    # 6116), which explicitly does. Given that, `postfixNodes`' dispatch for
+    # `print(x)` falls through `isAggStartAt` (false — not an agg name) and
+    # `isCallStartAt` (false — not in `isCallNameTok`) to
+    # `isEntityLookupStartAt`, which accepts ANY unreserved, non-builtin
+    # ident immediately followed by `(` — and `"print"` is neither reserved
+    # (not in `isEntityNameTok`) nor a recognized builtin (per the same
+    # missing-from-`isCallNameTok` fact) — so `print(x)` is actually
+    # MISPARSED by this subset grammar's own parser as `entityGet` with
+    # entity name `"print"`, key `x`, not as a `Call`. Confirmed live too:
+    # tokenizing `"print(x)"` gives the expected
+    # `["ident","lparen","ident","rparen"]` / `["print","(","x",")"]`, so
+    # this is genuinely `postfixNodes`' own dispatch choice, not a
+    # tokenizer artifact.
+    #
+    # This is a real, PRE-EXISTING gap in expr_tree.fct/expr_tokens.fct
+    # (files this task must not edit, and which is out of this task's own
+    # scope — the task is porting hasImpure/hasPrint/depsIR, not fixing the
+    # parser's builtin-name allowlist) — not a bug in `hasPrint`'s own walk
+    # above, which correctly recognizes a `Call` node named `"print"`
+    # wherever one actually exists in the tree, exactly mirroring
+    # `procCapabilities`' own `ast.Call` case. The three print fixtures
+    # below route around the parser gap the honest way: build the exact
+    # `Call("print", args)` shape the REAL Go parser produces for this
+    # source (and that `hasPrint` must recognize) directly via `callNode`,
+    # rather than silently asserting a wrong expectation against a node
+    # shape this subset's own parser cannot currently produce for `print`
+    # specifically. `hasImpure`'s own fixtures needed no such workaround —
+    # `"now"`/`"rand"` are both present in `isCallNameTok`, so `now()`/
+    # `rand()` parse as real `Call` nodes through `parseExprTree` exactly
+    # like the real Go parser's own `Call` shape, live-confirmed by every
+    # PASS already in the impure section above.
+    private proc checkPrintFixtureNode(label: text, node: ExprNode, expected: bool) -> text:
+        let actual = do hasPrint(node)
+        let et = do boolText(expected)
+        let at = do boolText(actual)
+        let mut status = "FAIL"
+        if expected == actual:
+            status = "PASS"
+        return status + " hasPrint(" + label + ") expected=" + et + " actual=" + at
+
+    # depsFixtureProgramSrc: a tiny real program (one state, one entity)
+    # parsed via program.fct's own real `parseProgramSrc`, giving depsIR a
+    # genuine `[StateDecl]`/`[EntityDecl]` pair to test membership against —
+    # not a hand-built stand-in for what a parsed Program looks like.
+    private proc depsFixtureProgramSrc() -> text:
+        return "app DepsFixture:\n    state counter: int = 0\n    entity Order:\n        amount: int\n"
+
+    private proc depsFixtureStates() -> [StateDecl]:
+        let src = do depsFixtureProgramSrc()
+        let prog = do parseProgramSrc(src)
+        return prog.states
+
+    private proc depsFixtureEntities() -> [EntityDecl]:
+        let src = do depsFixtureProgramSrc()
+        let prog = do parseProgramSrc(src)
+        return prog.entities
+
+    private proc describeNames(names: [text]) -> text:
+        let n = len(names)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            out = out + names[i]
+            i = i + 1
+        return out
+
+    # sameNameSet: order-independent equality for two already-deduplicated
+    # name lists (both `actual`, built via mergeNames/addNameUnique above,
+    # and `expected`, hand-written per fixture) — depsIR's real callers all
+    # re-sort its `map[string]bool` result via `sortedKeys` before use, so
+    # order was never a fact worth comparing here either.
+    private proc sameNameSet(a: [text], b: [text]) -> bool:
+        if len(a) != len(b):
+            return false
+        let n = len(a)
+        let mut allIn = true
+        let mut i = 0
+        loop i < n:
+            let inB = do containsName(b, a[i])
+            if !inB:
+                allIn = false
+            i = i + 1
+        return allIn
+
+    private proc checkDepsFixture(label: text, src: text, expected: [text]) -> text:
+        let states = do depsFixtureStates()
+        let entities = do depsFixtureEntities()
+        let tree = do parseExprTree(src)
+        let actual = do depsIR(states, entities, tree)
+        let same = do sameNameSet(actual, expected)
+        let mut status = "FAIL"
+        if same:
+            status = "PASS"
+        let ed = do describeNames(expected)
+        let ad = do describeNames(actual)
+        return status + " depsIR(" + label + ") expected={" + ed + "} actual={" + ad + "}"
+
+    # runVerification: nineteen fixtures — one per real branch of
+    # exprCallsName/depsIR's own switches (ref/get/entityGet/bin/un/call/
+    # list/map/agg-where, plus agg-sel for hasImpure/hasPrint alongside
+    # agg-where-only for depsIR) — concatenated into one report `runVerify`
+    # exposes live.
+    proc runVerification() -> text:
+        let r1 = do checkImpureFixture("bin pure 1+2*3", "1 + 2 * 3", false)
+        let r2 = do checkImpureFixture("bin impure 1+rand()", "1 + rand()", true)
+        let r3 = do checkImpureFixture("now in list", "[1, now(), 3]", true)
+        let r4 = do checkImpureFixture("entityGet key rand", "Order(rand()).amount", true)
+        let r5 = do checkImpureFixture("index rand", "arr[rand()]", true)
+        let r6 = do checkImpureFixture("unary -rand()", "-rand()", true)
+        let r7 = do checkImpureFixture("agg where now()", "sum(o.amt in Order where o.amt > now())", true)
+        let r8 = do checkImpureFixture("print alone is not impure", "print(x)", false)
+        let printAloneXRef = do refNode("x")
+        let printAloneArgs = [printAloneXRef]
+        let printAloneNode = do callNode("print", printAloneArgs)
+        let r9 = do checkPrintFixtureNode("print alone", printAloneNode, true)
+        let nestedPrintYRef = do refNode("y")
+        let nestedPrintArgs = [nestedPrintYRef]
+        let nestedPrintCall = do callNode("print", nestedPrintArgs)
+        let nestedPrintXRef = do refNode("x")
+        let nestedPrintNode = do binNode("+", nestedPrintXRef, nestedPrintCall)
+        let r10 = do checkPrintFixtureNode("nested print in bin", nestedPrintNode, true)
+        let mapPrintKey = do intLitNode("1")
+        let mapPrintXRef = do refNode("x")
+        let mapPrintArgs = [mapPrintXRef]
+        let mapPrintCall = do callNode("print", mapPrintArgs)
+        let mapPrintPair = Pair{key: mapPrintKey, value: mapPrintCall}
+        let mapPrintPairs = [mapPrintPair]
+        let mapPrintNode = do mapLitNode(mapPrintPairs)
+        let r11 = do checkPrintFixtureNode("map value print", mapPrintNode, true)
+        let r12 = do checkPrintFixture("pure has no print", "1 + 2 * 3", false)
+        let r13 = do checkPrintFixture("now is not print", "now()", false)
+        let r14 = do checkDepsFixture("bare state ref", "counter + 1", ["counter"])
+        let r15 = do checkDepsFixture("entityGet dep", "Order(1).amount", ["Order"])
+        let r16 = do checkDepsFixture("bin merges both", "counter + Order(1).amount", ["counter", "Order"])
+        let r17 = do checkDepsFixture("agg whole-collection", "sum(Order.amount)", ["Order"])
+        let r18 = do checkDepsFixture("agg where merges coll+state", "sum(o.amount in Order where o.amount > counter)", ["Order", "counter"])
+        let r19 = do checkDepsFixture("unrelated ref is not a dep", "x + 1", [])
+        let report = r1 + "\n" + r2 + "\n" + r3 + "\n" + r4 + "\n" + r5 + "\n" + r6 + "\n" + r7 + "\n" + r8 + "\n" + r9 + "\n" + r10 + "\n" + r11 + "\n" + r12 + "\n" + r13 + "\n" + r14 + "\n" + r15 + "\n" + r16 + "\n" + r17 + "\n" + r18 + "\n" + r19
+        return report
+
+    proc runVerificationOk() -> bool:
+        let report = do runVerification()
+        let hasFail = contains(report, "FAIL")
+        return !hasFail
+
+    state verificationReport: text = ""
+    state verificationOk: bool = false
+
+    action runVerify():
+        let r = do runVerification()
+        let ok = do runVerificationOk()
+        verificationReport = r
+        verificationOk = ok
+
+    # Not "/" — expr.fct's own imported `view Home at "/"` (reached via
+    # program.fct -> nodes.fct -> expr.fct) is already in this merged
+    # program's route table; program.fct/nodes.fct/stmt.fct/action_stmt.fct
+    # each hit the identical collision and resolved it the same way (see
+    # program.fct's own `/program`, nodes.fct's `/nodes`, stmt.fct's
+    # `/stmt`, action_stmt.fct's `/action_stmt`).
+    private view Home at "/placement_helpers":
+        box:
+            text "{verificationReport}"
+            text "{verificationOk}"

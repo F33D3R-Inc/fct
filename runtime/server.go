@@ -47,6 +47,7 @@ type Server struct {
 	uploadDir   string                  // directory uploaded files are written to and served from
 	dataDir     string                  // sandbox root for a proc's readFile/writeFile (io.file) — see runtime/io.go
 	channels    *channelRegistry        // backs the `channel()`/`send`/`recv` builtins — see runtime/channel.go
+	netConns    *netRegistry            // backs listen/accept/readBytes/writeBytes/closeConn (io.net.listen) — see runtime/netconn.go
 
 	uploadMu       sync.Mutex                // guards uploadSessions
 	uploadSessions map[string]*uploadSession // in-flight resumable uploads, keyed by session id
@@ -177,6 +178,7 @@ func newServer(graph *ir.IR) *Server {
 		uploadDir:   uploadDirFromEnv(),
 		dataDir:     dataDirFromEnv(),
 		channels:    newChannelRegistry(),
+		netConns:    newNetRegistry(),
 
 		uploadSessions: map[string]*uploadSession{},
 		idem:           map[string]*idemRecord{},

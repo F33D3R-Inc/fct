@@ -1,0 +1,291 @@
+import "storage.fct"
+
+app LocationSelfHost:
+    # Self-hosting port of facetql/src/storage/location.rs
+    # (`RecordLocation`) — the physical address of one record in the heap:
+    # which segment file, which page within it, which slot within that
+    # page, and the on-disk length of the record frame. Read location.rs
+    # in full (it is short, 77 lines) before editing this file, along
+    # with selfhost/heap.fct's own header, which already names exactly
+    # the gap this file closes.
+    #
+    # ============================================================
+    # WHAT WAS PORTED, AND WHY THIS PIECE
+    # ============================================================
+    # heap.fct already returns page/slot/length as three loose fields on
+    # its own `AppendOutcome`/`ReadOutcome` structs — deliberately WITHOUT
+    # a `segment` field, since that port has exactly one arena (see
+    # heap.fct's header: "struct RecordLocation-equivalent: ... WITHOUT a
+    # `segment` field ... Restoring it is a mechanical, honest follow-up").
+    # And every index in this engine — `storage::index`'s primary/kind/
+    # owner/edge/history trees, still unported on the Rust side, plus the
+    # already-ported selfhost/btree.fct that would carry them — stores
+    # exactly this shape as an index entry's VALUE payload:
+    # `address -> RecordLocation`, encoded as 14 raw bytes, is what a
+    # caller reads back out of an index before it can ask heap.fct for
+    # the actual record. That encode/decode pair — not the four-field
+    # struct alone, which is trivial — is the real content of
+    # location.rs, and it was the one piece of the index-value/heap-
+    # location boundary nothing in this directory ported yet. This file
+    # ports it complete: `RecordLocation::encode` and
+    # `RecordLocation::decode`, byte-for-byte, including the exact-length
+    # rejection `decode` performs before trusting any field (not merely
+    # "at least LOCATION_LEN bytes" — exactly, matching the Rust source).
+    #
+    # ============================================================
+    # WHY THIS ONE, OVER THE OTHER CANDIDATES SURVEYED THIS ROUND
+    # ============================================================
+    # Re-checked instead of assumed:
+    #
+    #   - facetql/src/storage/engine.rs (10,382 lines): read its full
+    #     top-level structure (every `fn`/`struct`/`impl` header in the
+    #     file). Beyond what selfhost/query.fct already ports
+    #     (order_key/Cursor/the query_sorted pagination tail), the rest of
+    #     the file is one `impl StorageEngine` spanning roughly lines
+    #     493-6300 whose methods are ALL `&self`/`self.pager`/
+    #     `self.indexes`/`self.trees` methods over live Pager/BTree state —
+    #     including the mutation-validation candidates this round's brief
+    #     itself named (`check_unique`, `check_references`,
+    #     `check_backfill_admissible`, `check_text_backfill_admissible`):
+    #     every one of them walks a live `index.tree.for_each_range`/
+    #     `self.get_node`/a data-index lookup, not a pure function over
+    #     already-in-memory values the way reference.fct's
+    #     `ReferenceDef::validate` was. There is no further self-contained,
+    #     non-Pager-dependent slice here — the brief's own framing ("likely
+    #     the single highest-value remaining target if any such slice can
+    #     be found") is REFUTED by actually reading the file's structure
+    #     this round, not assumed from its size.
+    #   - facetql/src/storage/index.rs (990 lines) and storage/text.rs
+    #     (436 lines): re-checked whether the concurrent UTF-8-bytes
+    #     builtin work had landed. It has not: grepping fct/internal and
+    #     fct/runtime turns up no string-to-bytes encoder anywhere;
+    #     runtime/eval.go's only "bytes" builtin is an unrelated
+    #     n-length, zero-filled buffer allocator (its own doc comment says
+    #     so explicitly). Every remaining unported function in both
+    #     files — `index::component`/`kind_key`/`owner_key`/
+    #     `edge_out_key`/`data_key`/... and `text::fold_into`/`grams`/
+    #     `key` — calls `str::as_bytes()`/`String::from_utf8_lossy` on a
+    #     `&str`, i.e. needs exactly the UTF-8 encode/decode this round
+    #     was told not to depend on. Genuinely still blocked, not assumed
+    #     blocked.
+    #   - facetql/src/storage/binary.rs (846 lines, never investigated by
+    #     anyone before this round): its only pure, crypto-free logic —
+    #     `crc32`/`crc32_parts` and the record frame `encode_frame`/
+    #     `decode_frame` — is already ported (storage.fct's `crc32Bytes`/
+    #     `crc32TwoParts`, heap.fct's `heapEncodeFrame`/
+    #     `heapDecodeFrameOutcome`, each restated per those files' own
+    #     headers). Every other function in the file — `append_record`,
+    #     `read_record_at`, `read_all_records_framed`, `rewrite_records` —
+    #     calls `crypto::encrypt`/`crypto::decrypt` and does real file I/O
+    #     (`File::open`/`sync_all`/`rename`): out of scope on both counts.
+    #   - facetql/src/storage/catalog.rs (224 lines): re-read in full.
+    #     Its only non-I/O logic is two inline equality checks inside
+    #     `open()` (`format_version`/`page_size` mismatch) — a couple of
+    #     `if` statements, not a distinct algorithm — and everything else
+    #     is `fs::read`/`fs::rename`/`bincode`/`crypto::encrypt`/
+    #     `crypto::decrypt`. Confirmed too thin and too I/O-bound to be
+    #     the pick, per the brief's own instruction to verify rather than
+    #     trust the earlier survey.
+    #   - facetql/src/storage/lock.rs (176 lines): re-read in full to
+    #     verify rather than trust the earlier "pure OS-wrapper" note.
+    #     Still true: `acquire`/`lock_exclusive` are a `flock(2)` wrapper
+    #     plus a process-lifetime `OnceLock<File>`, with zero portable
+    #     computation — there is no algorithm here to self-host, only a
+    #     syscall and an error message.
+    #
+    # location.rs (77 lines) was the one candidate left whose entire
+    # content is pure, crypto-free, Pager-free computation over
+    # fixed-WIDTH INTEGERS — no `&str`/UTF-8 dependency anywhere, because
+    # a location's four fields (segment, page: u32; slot: u16;
+    # length: u32) are never text. Small, but genuinely load-bearing: it
+    # is exactly what an index lookup returns, and what heap.fct's own
+    # `AppendOutcome`/`ReadOutcome` are one `encode` call away from being
+    # able to hand to an index, and one `decode` call away from having
+    # received from one.
+    #
+    # ============================================================
+    # LAYOUT (byte-for-byte, from location.rs's own doc comment)
+    # ============================================================
+    #   offset  size  field
+    #   0       4     segment (u32 LE)
+    #   4       4     page (u32 LE)
+    #   8       2     slot (u16 LE)
+    #   10      4     length (u32 LE)
+    # Total: 14 bytes (LOCATION_LEN in the Rust source).
+    #
+    # Reuses selfhost/storage.fct's byte-buffer helpers
+    # (readU16LE/readU32LE/writeU16LEBytes/writeU32LEBytes/concatBytes)
+    # rather than re-deriving them a third time in this codebase, exactly
+    # as heap.fct already does.
+
+    struct RecordLocation:
+        segment: int
+        page: int
+        slot: int
+        length: int
+
+    # LOCATION_LEN as a zero-arg proc, matching this codebase's existing
+    # convention for a named constant (no top-level `const` in this
+    # language — see e.g. storage.fct's inline page-header-layout
+    # constants, all expressed the same way).
+    proc recordLocationLen() -> int:
+        return 14
+
+    # `RecordLocation::encode` — always exactly `recordLocationLen()`
+    # bytes. No failure mode: every field is already a validated
+    # in-range integer by construction on this side (the ports of the
+    # fields' own bounds, e.g. a page id's range, live where the fields
+    # are produced — heap.fct/btree.fct — not here).
+    proc recordLocationEncode(loc: RecordLocation) -> [int]:
+        let segBytes = do writeU32LEBytes(loc.segment)
+        let pageBytes = do writeU32LEBytes(loc.page)
+        let slotBytes = do writeU16LEBytes(loc.slot)
+        let lenBytes = do writeU32LEBytes(loc.length)
+        let withPage = do concatBytes(segBytes, pageBytes)
+        let withSlot = do concatBytes(withPage, slotBytes)
+        let out = do concatBytes(withSlot, lenBytes)
+        return out
+
+    # The proc-has-no-Result restatement of `Result<RecordLocation, Error>`,
+    # exactly reference.fct's `ReferenceValidateResult`/aggregate.fct's
+    # `FoldOutcome` shape: `value` is only meaningful when `ok` is true.
+    struct RecordLocationDecodeResult:
+        ok: bool
+        err: text
+        value: RecordLocation
+
+    # `RecordLocation::decode` — refuses anything but EXACTLY
+    # `recordLocationLen()` bytes, matching the Rust source's own
+    # `bytes.len() != LOCATION_LEN` check (not "at least"): a location is
+    # a fixed-width record, and a caller handing over the wrong number of
+    # bytes has a bug worth surfacing rather than a value worth silently
+    # reading short or long.
+    proc recordLocationDecode(bytes: [int]) -> RecordLocationDecodeResult:
+        let n = len(bytes)
+        let want = do recordLocationLen()
+        if n != want:
+            let msg = "record location is " + n + " bytes, expected " + want
+            let zero = RecordLocation{segment: 0, page: 0, slot: 0, length: 0}
+            return RecordLocationDecodeResult{ok: false, err: msg, value: zero}
+        let segment = do readU32LE(bytes, 0)
+        let page = do readU32LE(bytes, 4)
+        let slot = do readU16LE(bytes, 8)
+        let length = do readU32LE(bytes, 10)
+        let loc = RecordLocation{segment: segment, page: page, slot: slot, length: length}
+        return RecordLocationDecodeResult{ok: true, err: "", value: loc}
+
+    # ============================================================
+    # DEMO / HAND-TRACED VERIFICATION FIXTURES
+    # ============================================================
+    # Hand-traced against location.rs's own `encode`/`decode`, the same
+    # verification discipline every other file in this directory uses
+    # (see e.g. query.fct's `demoRows`/`demoAscPage1`).
+
+    # Small, distinct field values so a transposed field (e.g. segment
+    # and page swapped) would visibly break the byte listing:
+    # segment=1, page=2, slot=3, length=4 ->
+    #   [1,0,0,0, 2,0,0,0, 3,0, 4,0,0,0]  (14 bytes)
+    proc demoLocationA() -> RecordLocation:
+        return RecordLocation{segment: 1, page: 2, slot: 3, length: 4}
+
+    proc demoEncodeAText() -> text:
+        let loc = do demoLocationA()
+        let bytes = do recordLocationEncode(loc)
+        let __r = do bytesToCommaText(bytes)
+        return __r
+
+    proc demoRoundTripAText() -> text:
+        let loc = do demoLocationA()
+        let bytes = do recordLocationEncode(loc)
+        let decoded = do recordLocationDecode(bytes)
+        let __r = do decodeSummaryText(decoded)
+        return __r
+
+    # Multi-byte fields, each byte of the u32/u16 distinct, so a
+    # byte-order bug (BE instead of LE, or a shifted byte) shows up as a
+    # wrong number rather than accidentally matching:
+    #   segment = 0x04030201 = 67305985  -> bytes [1,2,3,4]
+    #   page    = 0x01020304 = 16909060  -> bytes [4,3,2,1]
+    #   slot    = 0x0201     = 513       -> bytes [1,2]
+    #   length  = 0                      -> bytes [0,0,0,0]
+    # encode -> [1,2,3,4, 4,3,2,1, 1,2, 0,0,0,0]
+    proc demoLocationB() -> RecordLocation:
+        return RecordLocation{segment: 67305985, page: 16909060, slot: 513, length: 0}
+
+    proc demoEncodeBText() -> text:
+        let loc = do demoLocationB()
+        let bytes = do recordLocationEncode(loc)
+        let __r = do bytesToCommaText(bytes)
+        return __r
+
+    proc demoRoundTripBText() -> text:
+        let loc = do demoLocationB()
+        let bytes = do recordLocationEncode(loc)
+        let decoded = do recordLocationDecode(bytes)
+        let __r = do decodeSummaryText(decoded)
+        return __r
+
+    # Wrong-length input, both directions — `decode` must reject both,
+    # exactly location.rs's own `bytes.len() != LOCATION_LEN` guard
+    # (checked BEFORE any field is read, so a short buffer can never be
+    # read out of bounds).
+    proc demoDecodeTooShortText() -> text:
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        let decoded = do recordLocationDecode(bytes)
+        let __r = do decodeSummaryText(decoded)
+        return __r
+
+    proc demoDecodeTooLongText() -> text:
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        let decoded = do recordLocationDecode(bytes)
+        let __r = do decodeSummaryText(decoded)
+        return __r
+
+    private proc bytesToCommaText(bytes: [int]) -> text:
+        let n = len(bytes)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i == 0:
+                out = "" + bytes[i]
+            else:
+                out = out + "," + bytes[i]
+            i = i + 1
+        return out
+
+    private proc decodeSummaryText(decoded: RecordLocationDecodeResult) -> text:
+        if decoded.ok:
+            return "ok seg=" + decoded.value.segment + " page=" + decoded.value.page + " slot=" + decoded.value.slot + " len=" + decoded.value.length
+        return "err: " + decoded.err
+
+    state encodeAResult: text = ""
+    state roundTripAResult: text = ""
+    state encodeBResult: text = ""
+    state roundTripBResult: text = ""
+    state tooShortResult: text = ""
+    state tooLongResult: text = ""
+
+    action runDemoRecordLocation():
+        let ea = do demoEncodeAText()
+        let ra = do demoRoundTripAText()
+        let eb = do demoEncodeBText()
+        let rb = do demoRoundTripBText()
+        let ts = do demoDecodeTooShortText()
+        let tl = do demoDecodeTooLongText()
+        encodeAResult = ea
+        roundTripAResult = ra
+        encodeBResult = eb
+        roundTripBResult = rb
+        tooShortResult = ts
+        tooLongResult = tl
+
+    # `view Home at "/"` is not reused for this file's own view —
+    # storage.fct (imported above for its byte-buffer helpers) already
+    # declares one, and importing two files that each declare
+    # `view Home at "/"` fails as a duplicate-route build error (see
+    # heap.fct's own header for the same finding). This file's view is
+    # `LocationHome` at `/location`, matching heap.fct's `HeapHome` at
+    # `/heap` precedent for exactly this situation.
+    private view LocationHome at "/location":
+        box:
+            text "{encodeAResult} | {roundTripAResult} | {encodeBResult} | {roundTripBResult} | {tooShortResult} | {tooLongResult}"

@@ -933,7 +933,7 @@ func Build(app *ast.App) (*IR, error) {
 		seenUse := map[string]bool{}
 		for _, u := range p.Uses {
 			if !knownCapabilities[u] {
-				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q declares unknown capability %q — known capabilities: io.file, io.net", p.Name, u)}
+				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q declares unknown capability %q — known capabilities: io.file, io.net, io.net.listen", p.Name, u)}
 			}
 			if seenUse[u] {
 				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q declares capability %q more than once", p.Name, u)}
@@ -2376,7 +2376,7 @@ func (e *env) daemon(d *ast.Daemon, actionSigs map[string]actionSig) (Daemon, er
 	seenUse := map[string]bool{}
 	for _, u := range d.Uses {
 		if !knownCapabilities[u] {
-			return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q declares unknown capability %q — known capabilities: io.file, io.net", d.Name, u)}
+			return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q declares unknown capability %q — known capabilities: io.file, io.net, io.net.listen", d.Name, u)}
 		}
 		if seenUse[u] {
 			return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q declares capability %q more than once", d.Name, u)}
@@ -2456,7 +2456,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if locals[st.Name] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is already declared in proc %q", st.Name, p.Name)}
 			}
-			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
 			locals[st.Name] = true
@@ -2476,7 +2476,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if !mutable[st.Target] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to reassign it", st.Target, st.Target)}
 			}
-			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
@@ -2500,10 +2500,10 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if ty := types[st.Target]; ty != "" && ty != arrayType && ty != bytesType && ty != mapType {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not an array or map (its type is %s) — index assignment (`%s[...] = …`) needs an array, map, or byte-buffer local", st.Target, ty, st.Target)}
 			}
-			if err := e.checkProcExpr(p, st.Index, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Index, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
-			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
 			// The key-type restriction (int/text only) applies to a map SET too —
@@ -2539,7 +2539,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			ds := Stmt{Op: "do", Service: st.Proc}
 			for _, arg := range st.Args {
-				if err := e.checkProcExpr(p, arg, locals, types, st.Line); err != nil {
+				if err := e.checkProcExpr(p, arg, locals, types, st.Line, actionSigs); err != nil {
 					return nil, err
 				}
 				ds.Args = append(ds.Args, e.low(arg))
@@ -2588,7 +2588,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			as := Stmt{Op: "actcall", Service: st.Action}
 			for _, arg := range st.Args {
-				if err := e.checkProcExpr(p, arg, locals, types, st.Line); err != nil {
+				if err := e.checkProcExpr(p, arg, locals, types, st.Line, actionSigs); err != nil {
 					return nil, err
 				}
 				as.Args = append(as.Args, e.low(arg))
@@ -2610,7 +2610,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			sp := Stmt{Op: "spawn", Target: st.Bind, Service: st.Proc}
 			for _, arg := range st.Args {
-				if err := e.checkProcExpr(p, arg, locals, types, st.Line); err != nil {
+				if err := e.checkProcExpr(p, arg, locals, types, st.Line, actionSigs); err != nil {
 					return nil, err
 				}
 				sp.Args = append(sp.Args, e.low(arg))
@@ -2669,7 +2669,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			// call needs checked: known-builtin/arity (checkBuiltins), and —
 			// since this is exactly the position a capability-gated builtin is
 			// used for its effect rather than its value — the capability check.
-			if err := e.checkProcExpr(p, st.Call, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Call, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "exprstmt", Value: e.low(st.Call)})
@@ -2718,7 +2718,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				if err := requireProcCapability(p, "io.file", fmt.Sprintf("write %s(...)", st.File), st.Line); err != nil {
 					return nil, err
 				}
-				if err := e.checkProcExpr(p, st.Args[0], locals, types, st.Line); err != nil {
+				if err := e.checkProcExpr(p, st.Args[0], locals, types, st.Line, actionSigs); err != nil {
 					return nil, err
 				}
 				wantType := "text"
@@ -2748,7 +2748,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if err := checkSpawnsJoined(pendingSpawns, p.Name, st.Line, "starting a loop"); err != nil {
 				return nil, err
 			}
-			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
 			kids, err := e.procBlock(p, st.Body, locals, mutable, types, loopDepth+1, actionSigs)
@@ -2760,7 +2760,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if err := checkSpawnsJoined(pendingSpawns, p.Name, st.Line, "branching (if)"); err != nil {
 				return nil, err
 			}
-			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
 			then, err := e.procBlock(p, st.Then, locals, mutable, types, loopDepth, actionSigs)
@@ -2814,7 +2814,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if st.Value == nil {
 				return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, so `return` needs a value", p.Name, p.Ret)}
 			}
-			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "return", Value: e.low(st.Value)})
@@ -2931,7 +2931,7 @@ func stmtsReturnComplete(body []Stmt) bool {
 // and never got the same call added. checkProcLiteral (braces.go) uses
 // locals directly rather than e.resolves, since a proc's actual scope is
 // narrower than e.resolves' (no state, no entity, no actor/session builtin).
-func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, types map[string]string, line int) error {
+func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, types map[string]string, line int, actionSigs map[string]actionSig) error {
 	for n := range freeNames(ex) {
 		if !locals[n] {
 			return &BuildError{line, fmt.Sprintf(
@@ -2939,6 +2939,9 @@ func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, ty
 		}
 	}
 	if err := e.checkBuiltins(ex, line); err != nil {
+		return err
+	}
+	if err := checkDaemonOnlyBuiltins(ex, actionSigs != nil, line); err != nil {
 		return err
 	}
 	if err := checkBitwiseTypes(ex, types, line); err != nil {
@@ -3064,8 +3067,39 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return arrayType
 		case "bytes":
 			return bytesType
+		case "textToBytes":
+			// textToBytes(s) -> [int], the real UTF-8 byte sequence of s (one
+			// int per byte, not per rune) — tagged exactly like bytes(n)/
+			// readBytes (see bytesType's doc) so the result is len()-able,
+			// index-readable, and range-checked on index-write the same as
+			// any other byte buffer.
+			return bytesType
+		case "bytesToText":
+			// bytesToText(b) -> text, textToBytes' inverse.
+			return "text"
+		case "byteLen":
+			// byteLen(s) -> int, s's real UTF-8 byte length (as opposed to
+			// len(s)'s rune count) — always an int, the same as len().
+			return "int"
 		case "readFile", "httpGet", "httpPost":
 			return "text"
+		case "listen", "accept":
+			// Listener/Conn are, deliberately, just int handles — the exact same
+			// "no new type anywhere in this type system" move `channel()` already
+			// makes (see its case below and runtime/netconn.go's doc): an int is
+			// already a legal proc/daemon local, so a listen()/accept() handle
+			// gets every existing mechanic (passing it to another builtin,
+			// storing it in a `let`) for free.
+			return "int"
+		case "readBytes":
+			// A raw byte-buffer array, exactly like ioReadFileBytes's return —
+			// see bytesType's doc for why this reuses the array machinery.
+			return bytesType
+		case "writeBytes", "closeConn":
+			// true on success; a transport failure (connection reset, bad
+			// handle) is a runtime error that aborts the daemon tick, the same
+			// stance writeFile already takes for a disk failure.
+			return "bool"
 		case "channel":
 			// A channel value is, deliberately, just an int handle — see
 			// runtime/channel.go's doc for why that needs no new type anywhere
@@ -5122,6 +5156,9 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 	if err := checkNoConcurrency(ex, line); err != nil {
 		return err
 	}
+	if err := checkDaemonOnlyBuiltins(ex, false, line); err != nil {
+		return err
+	}
 	for n := range freeNames(ex) {
 		if !e.resolves(n, locals) {
 			return &BuildError{line, fmt.Sprintf("unknown reference %q", n)}
@@ -5505,6 +5542,90 @@ func checkNoConcurrency(ex ast.Expr, line int) error {
 	return nil
 }
 
+// listenBuiltins is listen/accept/readBytes/writeBytes/closeConn — the
+// io.net.listen capability's five builtins (runtime/netconn.go). Unlike
+// every other capability-gated builtin (readFile/writeFile/httpGet/httpPost,
+// restricted only to "inside some proc-shaped body" by checkNoIO),
+// accept()/readBytes() can block INDEFINITELY — waiting for a client to
+// connect, or to send more bytes — not the bounded 5s timeout httpGet/
+// httpPost already have. runtime/server.go's runProcLocked doc is explicit
+// that an ordinary proc "runs synchronously, under the caller's lock": one
+// reached via `do` from an action runs for that action's whole s.mu hold,
+// and one reached via `spawn` is still `join`ed before the spawning block
+// (itself under s.mu, if it's an action) ends — so either path would hold
+// the durable-store lock hostage to an indefinitely blocking accept(). Only
+// a daemon body (runtime/daemon.go's runDaemonOnce/runDaemonBody) runs
+// detached, under no request's lock at all, for exactly as long as it likes.
+// checkDaemonOnlyBuiltins is that restriction, reusing the exact signal
+// procBlock's own `act ActionName(...)` gate already uses (actionSigs == nil
+// means "lowering a real proc's body", non-nil means "lowering a daemon's")
+// rather than inventing a second one.
+var listenBuiltins = map[string]bool{"listen": true, "accept": true, "readBytes": true, "writeBytes": true, "closeConn": true}
+
+// checkDaemonOnlyBuiltins rejects a call to listen/accept/readBytes/
+// writeBytes/closeConn anywhere isDaemon is false, mirroring checkNoIO's
+// exact recursive shape (see its doc) over this narrower set.
+func checkDaemonOnlyBuiltins(ex ast.Expr, isDaemon bool, line int) error {
+	if isDaemon {
+		return nil
+	}
+	switch t := ex.(type) {
+	case ast.Call:
+		if listenBuiltins[t.Name] {
+			return &BuildError{line, fmt.Sprintf(
+				"%s(...) is only available inside a daemon body — it can block indefinitely, and only a daemon runs detached from every request's lock (see `daemon Name uses io.net.listen:`)", t.Name)}
+		}
+		for _, a := range t.Args {
+			if err := checkDaemonOnlyBuiltins(a, isDaemon, line); err != nil {
+				return err
+			}
+		}
+	case ast.Bin:
+		if err := checkDaemonOnlyBuiltins(t.L, isDaemon, line); err != nil {
+			return err
+		}
+		return checkDaemonOnlyBuiltins(t.R, isDaemon, line)
+	case ast.Un:
+		return checkDaemonOnlyBuiltins(t.X, isDaemon, line)
+	case ast.Get:
+		return checkDaemonOnlyBuiltins(t.Obj, isDaemon, line)
+	case ast.EntityGet:
+		return checkDaemonOnlyBuiltins(t.Key, isDaemon, line)
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkDaemonOnlyBuiltins(el, isDaemon, line); err != nil {
+				return err
+			}
+		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := checkDaemonOnlyBuiltins(k, isDaemon, line); err != nil {
+				return err
+			}
+			if err := checkDaemonOnlyBuiltins(t.Vals[i], isDaemon, line); err != nil {
+				return err
+			}
+		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := checkDaemonOnlyBuiltins(fi.Expr, isDaemon, line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if err := checkDaemonOnlyBuiltins(t.Obj, isDaemon, line); err != nil {
+			return err
+		}
+		return checkDaemonOnlyBuiltins(t.Idx, isDaemon, line)
+	case ast.Agg:
+		if err := checkDaemonOnlyBuiltins(t.Where, isDaemon, line); err != nil {
+			return err
+		}
+		return checkDaemonOnlyBuiltins(t.Sel, isDaemon, line)
+	}
+	return nil
+}
+
 // checkPure is check plus the guarantee that ex is side-effect-free: it rejects
 // the effectful builtins (now/rand). Pure contexts — derives, policies, views —
 // may run on any client, so they must be deterministic.
@@ -5692,6 +5813,14 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 2 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
 			}
+		case "listen", "accept", "closeConn":
+			if len(t.Args) != 1 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
+			}
+		case "readBytes", "writeBytes":
+			if len(t.Args) != 2 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
+			}
 		case "channel":
 			if len(t.Args) != 0 {
 				return &BuildError{line, "channel() takes no arguments"}
@@ -5800,6 +5929,17 @@ func builtinCapability(name string) (string, bool) {
 		return "io.file", true
 	case "httpGet", "httpPost":
 		return "io.net", true
+	case "listen", "accept", "readBytes", "writeBytes", "closeConn":
+		// io.net.listen: deliberately a MORE specific capability than io.net
+		// (outbound httpGet/httpPost), not a reuse of it — accepting arbitrary
+		// inbound connections is a materially bigger trust boundary than this
+		// instance choosing to make its own outbound calls, so a proc/daemon
+		// must opt into it by name, separately from io.net. See
+		// checkDaemonOnlyBuiltins for the other half of this gate: these five
+		// are additionally restricted to a daemon body specifically, never an
+		// ordinary proc, because accept()/readBytes() block indefinitely (see
+		// runtime/netconn.go).
+		return "io.net.listen", true
 	}
 	return "", false
 }
@@ -5809,7 +5949,7 @@ func builtinCapability(name string) (string, bool) {
 // Checked against at proc-registration time (see e.proc's caller) so a typo
 // (`uses io.fiel`) is a clear compile error instead of a capability that can
 // never be satisfied.
-var knownCapabilities = map[string]bool{"io.file": true, "io.net": true}
+var knownCapabilities = map[string]bool{"io.file": true, "io.net": true, "io.net.listen": true}
 
 // impureCap is the internal (never user-declared) capability key
 // procCapabilities uses to flag now()/rand() — the nondeterminism that forces
@@ -5970,7 +6110,8 @@ func requireProcCapability(p *ast.Proc, cap, what string, line int) error {
 func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
-		"ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney":
+		"ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney",
+		"textToBytes", "bytesToText", "byteLen":
 		return 1, true
 	case "print":
 		// print(value): a debugging aid, not real arithmetic/string/date

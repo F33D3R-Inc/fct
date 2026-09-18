@@ -586,12 +586,14 @@ func isBuiltinCall(name string) bool {
 		"toFloat", "toInt", // explicit int<->float conversion (toFloat is proc-only — see checkNoFloat)
 		"toMoney",                                                                       // explicit text->money conversion — not proc-only, money is a real type everywhere
 		"len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", // string
+		"textToBytes", "bytesToText", "byteLen", // UTF-8 <-> raw byte buffer conversion (proc-only, same reason "bytes" is)
 		"year", "month", "day", // date
 		"ago", "compact", "commas", // formatting (render-time text)
 		"append",                // array (proc-only — see internal/ir/build.go's checkBuiltins)
 		"bytes",                 // byte-buffer constructor (proc-only, same reason as append)
 		"readFile", "writeFile", // file I/O (proc-only, capability-gated — see checkNoIO/checkProcCapabilities)
 		"httpGet", "httpPost", // HTTP client (proc-only, capability-gated — same as above)
+		"listen", "accept", "readBytes", "writeBytes", "closeConn", // inbound TCP (daemon-only, capability-gated — see checkDaemonOnlyBuiltins/checkProcCapabilities)
 		"channel", "send", "recv": // structured concurrency's channel primitive (proc-only — see checkNoConcurrency)
 		return true
 	}

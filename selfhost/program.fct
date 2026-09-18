@@ -1,5 +1,6 @@
 import "parser_decl2.fct"
 import "nodes.fct"
+import "action_stmt.fct"
 
 app ProgramSelfHost:
     # Real, honest self-hosting port of the ACTUAL ASSEMBLY LAYER internal/
@@ -95,16 +96,19 @@ app ProgramSelfHost:
     # ============================================================
     # OTHER GENUINE GAPS, CARRIED FORWARD HONESTLY (NOT FAKED)
     # ============================================================
-    #   - `action`: parser_proc.fct's own STAGE 9 closing note already
-    #     establishes, by reading real parseAction fresh, that an action's
+    #   - `action`: CLOSED (this pass). parser_proc.fct's own STAGE 9
+    #     closing note (and this file's own note here, before this pass)
+    #     established, by reading real parseAction fresh, that an action's
     #     body is NOT proc-body grammar (`check`/`requires`/`add`/`set`/
     #     `remove`/`clear`/`call`/`establish` — proc bodies reject every one
     #     of those) — calling `parseProcDecl` on an action would silently
-    #     mis-parse every real action. No `ActionStmt`/`parseActionBodySrc`
-    #     exists anywhere in this port yet; that is real, separate,
-    #     additional work, not something `Program` can honestly claim today.
-    #     `action` blocks are therefore left out of `Program`'s own fields
-    #     and counted only in `unknownKeywords` below.
+    #     mis-parse every real action. `action_stmt.fct` now provides the
+    #     real, separate `ActionStmt`/`parseActionBodySrc` port that gap
+    #     called for (its own header explains the full real grammar and the
+    #     `private`-enabled import fix that made pulling BOTH that file's
+    #     own tree-splitting AND expr.fct's grammar into this file's own
+    #     import chain possible), so `ActionDecl` (above) now composes a
+    #     real header with a real body — see `buildActionDecl`, below.
     #   - `type`, `message`, `layout`, `theme`/`theme dark`/named `theme`,
     #     `css`/`css from`, `daemon`, `file`: NO existing selfhost
     #     infrastructure ports any of these yet (confirmed by grepping every
@@ -380,6 +384,36 @@ app ProgramSelfHost:
         headerValid: bool
         ops: [ServiceOpDecl]
 
+    # ActionDecl: closes program.fct's own previously-named gap ("`action`:
+    # ... `action` blocks are therefore left out of `Program`'s own fields
+    # and counted only in `unknownKeywords`") — action_stmt.fct's real,
+    # separate `ActionStmt`/`parseActionBodySrc` port (a DIFFERENT statement
+    # grammar than `proc`'s own `Stmt`/`parseProcBodySrc` — see that file's
+    # header) now exists, so an action's header (reusing parser_proc.fct's
+    # own header helpers, exactly like ProcDecl already does — an action
+    # header is a proc header with no return type/`uses` clause) can
+    # finally be composed with its real body.
+    #
+    # `requires`/`body` are the real ast.Action's own two-list split
+    # (action_stmt.fct's `actionRequiresOnly`/`actionBodyOnly` over ONE
+    # `parseActionBodySrc` result — see that file's header for why
+    # `requires` is modeled as one more ActionStmt kind rather than
+    # dropped): `body` excludes every "requires" statement, matching real
+    # ast.Action.Body exactly; `bodyValid` mirrors real parseAction's own
+    # separate empty-body check (`if len(a.Body) == 0 { error }`) — over
+    # `body` alone, NOT `requires` (an action with only `requires` clauses
+    # and no real body statement is still invalid, exactly like real Go).
+    struct ActionDecl:
+        name: text
+        paramNames: [text]
+        paramTypes: [text]
+        paramOptionals: [bool]
+        optimistic: bool
+        headerValid: bool
+        requires: [ActionStmt]
+        body: [ActionStmt]
+        bodyValid: bool
+
     # ComponentEntry/ViewEntry: header genuinely parsed (ComponentDecl reused
     # verbatim from parser_decl2.fct; the view header restated locally per
     # STAGE 2's own header note); body now a real `[UiNode]` tree, via
@@ -406,6 +440,7 @@ app ProgramSelfHost:
         derives: [DeriveDeclFull]
         policies: [PolicyDeclFull]
         procs: [ProcDecl]
+        actions: [ActionDecl]
         webhooks: [WebhookDecl]
         jobs: [JobDecl]
         services: [ServiceDecl]
@@ -569,6 +604,29 @@ app ProgramSelfHost:
             i = i + 1
         return ServiceDecl{name: name, url: url, headerValid: hv, ops: ops}
 
+    # buildActionDecl: real parseAction's header (action_stmt.fct's own
+    # `actionHeadOf`/`actionIsOptimistic`/`actionHeadStripOptimistic`, then
+    # parser_proc.fct's existing `headerName`/`headerParamNames`/
+    # `headerParamTypes`/`headerParamOptionals` reused verbatim over the
+    # action's own `@optimistic`-and-`:`-stripped head — see action_stmt.fct's
+    # own STAGE 5 header for why that reuse is faithful) plus its real body
+    # (action_stmt.fct's `parseActionBodySrc`, split into `requires`/`body`
+    # via `actionRequiresOnly`/`actionBodyOnly`).
+    proc buildActionDecl(header: text, bodySrc: text) -> ActionDecl:
+        let rawHead = do actionHeadOf(header)
+        let optimistic = do actionIsOptimistic(rawHead)
+        let head = do actionHeadStripOptimistic(rawHead)
+        let name = do headerName(head)
+        let paramNames = do headerParamNames(head)
+        let paramTypes = do headerParamTypes(head)
+        let paramOptionals = do headerParamOptionals(head)
+        let headerValid = do actionHeaderValid(head)
+        let allStmts = do parseActionBodySrc(bodySrc)
+        let body = do actionBodyOnly(allStmts)
+        let requiresList = do actionRequiresOnly(allStmts)
+        let bodyValid = len(body) > 0
+        return ActionDecl{name: name, paramNames: paramNames, paramTypes: paramTypes, paramOptionals: paramOptionals, optimistic: optimistic, headerValid: headerValid, requires: requiresList, body: body, bodyValid: bodyValid}
+
     proc buildComponentEntry(header: text, bodySrc: text) -> ComponentEntry:
         let cd = do buildComponentDecl(header)
         let body = do nodeTreeSrc(bodySrc)
@@ -634,6 +692,8 @@ app ProgramSelfHost:
             return true
         if kw == "proc":
             return true
+        if kw == "action":
+            return true
         if kw == "webhook":
             return true
         if kw == "job":
@@ -678,6 +738,7 @@ app ProgramSelfHost:
         let mut derives = []
         let mut policies = []
         let mut procs = []
+        let mut actions = []
         let mut webhooks = []
         let mut jobs = []
         let mut services = []
@@ -745,6 +806,9 @@ app ProgramSelfHost:
                 if kw == "proc":
                     let pcd = do parseProcDecl(header, bodySrc)
                     procs = append(procs, pcd)
+                if kw == "action":
+                    let ad = do buildActionDecl(header, bodySrc)
+                    actions = append(actions, ad)
                 if kw == "webhook":
                     let wh = do buildWebhookDecl(header)
                     webhooks = append(webhooks, wh)
@@ -770,7 +834,7 @@ app ProgramSelfHost:
 
                 k = k + 1
 
-        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, unknownKeywords: unknownKeywords}
+        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, unknownKeywords: unknownKeywords}
 
     # ============================================================
     # STAGE 7: the live, HTTP-exercisable driver — proof `parseProgramSrc`
@@ -782,7 +846,7 @@ app ProgramSelfHost:
     # closing drivers.
     # ============================================================
     proc demoProgramSrc() -> text:
-        return "app Demo:\n    entity Widget:\n        name: text\n        price: int @min(0)\n    state counter: int = 0\n    derive doubled: int = counter * 2\n    record Point: x: int, y: int\n    proc addOne(n: int) -> int:\n        return n + 1\n    webhook \"/hook\" -> onHook\n    job Sweep every 60s -> sweepNow\n    policy owns(id: int):\n        actor == id\n    service Pay at \"https://pay.example.com\":\n        charge(amount: int) -> bool\n    on addOne -> sweepNow\n"
+        return "app Demo:\n    entity Widget:\n        name: text\n        price: int @min(0)\n    state counter: int = 0\n    derive doubled: int = counter * 2\n    record Point: x: int, y: int\n    proc addOne(n: int) -> int:\n        return n + 1\n    action bump():\n        check counter >= 0 \"counter went negative\"\n        counter = counter + 1\n    webhook \"/hook\" -> onHook\n    job Sweep every 60s -> sweepNow\n    policy owns(id: int):\n        actor == id\n    service Pay at \"https://pay.example.com\":\n        charge(amount: int) -> bool\n    on addOne -> sweepNow\n"
 
     # demoProgramXxx: a struct value (`Program`) can never be a `state` cell
     # or cross an action's own boundary (this file's own STAGE 3/4 header;
@@ -808,6 +872,15 @@ app ProgramSelfHost:
     proc demoProgramProcCount(src: text) -> int:
         let prog = do parseProgramSrc(src)
         return len(prog.procs)
+
+    proc demoProgramActionCount(src: text) -> int:
+        let prog = do parseProgramSrc(src)
+        return len(prog.actions)
+
+    proc demoProgramActionBodyDescribed(src: text) -> text:
+        let prog = do parseProgramSrc(src)
+        let d = do describeActionStmts(prog.actions[0].body)
+        return d
 
     proc demoProgramStateCount(src: text) -> int:
         let prog = do parseProgramSrc(src)
@@ -875,6 +948,8 @@ app ProgramSelfHost:
     state demoEntityCount: int = 0
     state demoRecordCount: int = 0
     state demoProcCount: int = 0
+    state demoActionCount: int = 0
+    state demoActionBodyDescribed: text = ""
     state demoStateCount: int = 0
     state demoDeriveCount: int = 0
     state demoPolicyCount: int = 0
@@ -893,6 +968,8 @@ app ProgramSelfHost:
         let ec = do demoProgramEntityCount(src)
         let rc = do demoProgramRecordCount(src)
         let pc = do demoProgramProcCount(src)
+        let ac = do demoProgramActionCount(src)
+        let abd = do demoProgramActionBodyDescribed(src)
         let sc = do demoProgramStateCount(src)
         let dc = do demoProgramDeriveCount(src)
         let plc = do demoProgramPolicyCount(src)
@@ -909,6 +986,8 @@ app ProgramSelfHost:
         demoEntityCount = ec
         demoRecordCount = rc
         demoProcCount = pc
+        demoActionCount = ac
+        demoActionBodyDescribed = abd
         demoStateCount = sc
         demoDeriveCount = dc
         demoPolicyCount = plc
@@ -921,8 +1000,9 @@ app ProgramSelfHost:
         demoViewBodyDirectDescribed = vbdd
         demoViewBodyNodeCount = vbc
 
-    view ProgramHome at "/program":
+    private view Home at "/program":
         box:
-            text "{demoName} entities={demoEntityCount} records={demoRecordCount} procs={demoProcCount}"
+            text "{demoName} entities={demoEntityCount} records={demoRecordCount} procs={demoProcCount} actions={demoActionCount}"
+            text "actionBody={demoActionBodyDescribed}"
             text "states={demoStateCount} derives={demoDeriveCount} policies={demoPolicyCount}"
             text "webhooks={demoWebhookCount} jobs={demoJobCount} services={demoServiceCount} triggers={demoTriggerCount} unknown={demoUnknownCount}"

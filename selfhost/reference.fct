@@ -1,0 +1,514 @@
+app ReferenceSelfHost:
+    # Self-hosting port of facetql/src/storage/reference.rs — declared
+    # referential integrity: which `data` field of which kind points at
+    # which other kind, and what a delete of the referenced node does to
+    # the nodes referencing it. Read reference.rs in full before editing
+    # this file.
+    #
+    # ============================================================
+    # WHAT WAS PORTED, AND WHY THE CUT LANDS WHERE IT DOES:
+    # ============================================================
+    # Everything reference.rs itself calls "declared" logic, i.e. every
+    # piece of it that is pure computation over already-in-memory values
+    # rather than I/O:
+    #   - `ReferenceDef::validate` — the full admissibility gate a
+    #     declaration passes through before it is ever logged: name
+    #     bounds + alphabet, the three required components non-empty and
+    #     within `check_component`'s bound, the optional `parent_field`'s
+    #     same checks when present, and the "does this reference point a
+    #     field at itself" self-loop refusal (a same-kind, same-field
+    #     tree reference through a *different* field, e.g. a reply-to-a-
+    #     reply, is explicitly still accepted — reference.rs's own test
+    #     `a_field_pointing_at_itself_is_refused` is restated verbatim
+    #     below as a `demo*` fixture pair).
+    #   - `index::check_component` — restated locally (see "WHY THIS FILE
+    #     DOES NOT IMPORT" below) as `checkReferenceComponent`, since
+    #     `ReferenceDef::validate` calls it three or four times per
+    #     declaration.
+    #   - The `References` registry itself: `put` (declare-or-replace by
+    #     name, idempotent), `remove` (idempotent), `get`, `all` (name-
+    #     ordered), `is_empty`, `for_child` (every reference a node of a
+    #     kind carries), `for_parent` (every reference pointing at a
+    #     kind), and `depending_on_index` (every reference that would be
+    #     left unenforceable if the index over `(kind, field)` were
+    #     dropped — both the child side, which finds cascade targets, and
+    #     the parent side, which is what makes the referenced value
+    #     unique). Rust's `filtered` private helper is restated
+    #     per-caller rather than pulled in as a shared higher-order
+    #     helper — see "NO GENERICS / NO HIGHER-ORDER PROCS" below.
+    #
+    # `References` here is not the original's `RwLock<HashMap<String,
+    # ReferenceDef>>` — there is no map type and no interior mutability
+    # in this language (see core_types.fct's own header on the same
+    # point). It is restated as a plain `[ReferenceDef]`, exactly the
+    # convention query.fct's `Row`/`Cursor` machinery and changes.fct's
+    # record lists already use throughout this directory: every
+    # "mutating" registry op here is a pure function taking the old
+    # array and returning the new one, and the caller is responsible for
+    # threading the result forward (a `let mut registry = do
+    # referencesPut(registry, def)` at the call site) the same way a real
+    # `RwLock` write is a caller-visible step here too, just an explicit
+    # one instead of a hidden lock acquisition.
+    #
+    # ============================================================
+    # WHY THIS FILE DOES NOT IMPORT index.fct — THERE IS NO index.fct:
+    # ============================================================
+    # `index.rs` itself is NOT ported (see the task's own scope note: its
+    # key-byte-encoding half is blocked on a missing string→UTF-8-bytes
+    # builtin, and its ordering half is already covered by query.fct).
+    # `check_component` is the one piece of index.rs that `reference.rs`
+    # depends on, and it turns out to need neither of the blocked halves:
+    # it is three lines of pure length arithmetic with no byte encoding
+    # at all. Restating those three lines locally, as this directory's
+    # own established convention already does for every small
+    # cross-module dependency (changes.fct's header spells this out at
+    # length for its own `WalRecordEntry`/replay-rule restatement), costs
+    # nothing and needs no file that does not exist.
+    #
+    # ============================================================
+    # A REAL, BYTE-LENGTH VS. RUNE-LENGTH DIVERGENCE — DOCUMENTED, NOT
+    # PATCHED OVER:
+    # ============================================================
+    # Rust's `str::len()` (used throughout reference.rs's `validate`)
+    # counts UTF-8 *bytes*. fct's `len()` builtin, confirmed against
+    # runtime/eval.go's own `"len"` case, counts *runes*
+    # (`utf8.RuneCountInString`) for a `text` value. For the name bound
+    # this is checked BEFORE the ASCII-alphabet gate, so a non-ASCII name
+    # could in principle read as "under the limit" here by rune count
+    # while Rust would already have measured it in bytes — a real,
+    # confirmed divergence, not something worked around, because there is
+    # no byte-length-of-a-string builtin in this language (the same gap
+    # storage.fct's header documents for the same reason). It cannot
+    # produce a wrong ACCEPTANCE, though: every name that survives this
+    # proc still has to pass the very next check, the ASCII
+    # alphanumeric/'_'/'-' whitelist, and for a string that is pure ASCII
+    # rune count and byte count are the same number — so the only
+    # observable effect of the divergence is a non-ASCII name occasionally
+    # being rejected by the alphabet check with a different bound already
+    # having silently passed, never a non-ASCII name being wrongly
+    # accepted.
+    #
+    # ============================================================
+    # NO GENERICS / NO HIGHER-ORDER PROCS:
+    # ============================================================
+    # Rust's `References::filtered` takes a closure and is called three
+    # ways (`for_child`, `for_parent`, `depending_on_index`). This
+    # language has no proc-valued parameters (confirmed against every
+    # other file in this directory: changes.fct's own header describes
+    # the same absence for its per-type array helpers), so the three
+    # callers below each restate their own filter-then-sort loop rather
+    # than sharing one — the same shape changes.fct's
+    # `sliceChangeRecords`/`archivedSliceEntries` pair already
+    # establishes for "one helper per case, no generic to reach for."
+    #
+    # ============================================================
+    # A CORRECTION TO AN EARLIER FILE'S DOCUMENTED GAP — TEXT ORDERING
+    # DOES WORK:
+    # ============================================================
+    # query.fct's header (this same directory) documents "no
+    # lexicographic order on `text` in this language" as a confirmed gap
+    # and has `compareOrderValues` answer 0 (equal) for any two unequal
+    # `text` values as a result. That claim does not hold against this
+    # build: `<`/`>`/`<=`/`>=` between two `text` operands compile
+    # (internal/ir/build.go's `checkNumericTypes` only ever rejects a
+    # *mismatched* numeric pair, and neither side of a `text`/`text`
+    # comparison is a numeric flavor, so the check never fires) and
+    # execute as genuine byte-wise Go string comparison
+    # (runtime/eval.go's `textOperands` + the `<`/`>` cases built on it).
+    # Verified directly this session, not assumed: a throwaway app with
+    # `proc cmp(a: text, b: text) -> bool: return a < b` wired to a
+    # `state`/`action` pair and driven through `facet console`'s `:run`/
+    # `:state` returned `cmp("apple","banana") = true`,
+    # `cmp("banana","apple") = false`, `cmp("apple","apple") = false` —
+    # exactly right-answer lexicographic order. `referencesSortedByName`
+    # below therefore uses a real `compareReferenceNames` over `.name`
+    # with genuine `<`/`>`, not a stand-in — this file does NOT repeat
+    # query.fct's workaround, and query.fct's own note is now stale (this
+    # port does not edit that file to say so; noted here instead).
+    #
+    # ============================================================
+    # NOT PORTED, AND WHY EACH IS A REAL I/O/CRYPTO OR OUT-OF-SCOPE
+    # BOUNDARY:
+    # ============================================================
+    #   - `ReferenceOpRecord` (Put/Drop) and `definitions_path()` — the
+    #     durable log this registry is replayed from/appended to is a
+    #     file, not a computation; every other selfhost file draws the
+    #     same line at "already-decoded records in, already-applied
+    #     registry out."
+    #   - Actually ENFORCING a reference (resolving `parent_field` through
+    #     a unique index, running a cascade delete's transitive closure,
+    #     restricting or null-ing a live mutation) — that is
+    #     `StorageEngine::apply_committed`'s job in engine.rs, reading
+    #     and writing heap/index pages. This file ports the DECLARATION
+    #     half only: what a reference IS and how the registry of them is
+    #     kept, exactly the boundary reference.rs's own module doc draws
+    #     ("nothing here is new information... what it cannot do from
+    #     outside is act on it atomically").
+
+    # ReferenceDef restates `ReferentialAction` as `onDelete: text`
+    # ("cascade"/"restrict"/"set_null") rather than an int tag — matching
+    # aggregate.fct's own `AggFunc` convention (a small, closed,
+    # associated-data-free Rust enum restated as its wire spelling) and,
+    # not incidentally, exactly the `#[serde(rename_all = "snake_case")]`
+    # string reference.rs itself serializes to. `on_delete` plays no part
+    # in `validate()` or the registry lookups below — it is carried
+    # purely as data, unexamined, exactly as `parseAggFunc`'s callers
+    # examine `.func` only after parsing it.
+    struct ReferenceDef:
+        name: text
+        kind: text
+        field: text
+        parentKind: text
+        # hasParentField/parentField restate `parent_field: Option<String>`
+        # the same way core_types.fct's `hasClaimedBy`/`claimedBy` restates
+        # `claimed_by: Option<String>` — see that file's own header.
+        hasParentField: bool
+        parentField: text
+        onDelete: text
+
+    proc referenceDefNew(name: text, kind: text, field: text, parentKind: text, hasParentField: bool, parentField: text, onDelete: text) -> ReferenceDef:
+        return ReferenceDef{name: name, kind: kind, field: field, parentKind: parentKind, hasParentField: hasParentField, parentField: parentField, onDelete: onDelete}
+
+    # The proc-has-no-Result restatement of `Result<(), String>`, exactly
+    # aggregate.fct's own `ParseAggFuncResult`/`FoldOutcome` shape: `err`
+    # is only meaningful when `ok` is false.
+    struct ReferenceValidateResult:
+        ok: bool
+        err: text
+
+    struct ReferenceGetOutcome:
+        found: bool
+        def: ReferenceDef
+
+    # ============================================================
+    # BOUNDS AND THE NAME ALPHABET
+    # ============================================================
+    proc referenceMaxNameLen() -> int:
+        return 64
+
+    # `index::MAX_COMPONENT_LEN = u16::MAX as usize` — the bound
+    # `check_component` (restated below as `checkReferenceComponent`)
+    # enforces on every kind/field/parent_kind/parent_field.
+    proc referenceMaxComponentLen() -> int:
+        return 65535
+
+    # isReferenceNameChar: the exact alphabet `ReferenceDef::validate`
+    # checks a name against — ASCII letters, digits, '_' and '-' — using
+    # this directory's established `c in [...]` closed-alphabet idiom
+    # (expr_tokens.fct's `isIdentStartChar`/`isDigitChar`), extended with
+    # '-' since a reference name (like an index name) is a URL path
+    # segment and both are drawn from the same alphabet in the Rust
+    # source.
+    private proc isReferenceNameChar(c: text) -> bool:
+        return c in ["_", "-", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
+    proc referenceNameIsValid(name: text) -> bool:
+        let n = len(name)
+        let mut i = 0
+        let mut allOk = true
+        loop i < n:
+            let c = charAt(name, i)
+            let good = do isReferenceNameChar(c)
+            if !good:
+                allOk = false
+            i = i + 1
+        return allOk
+
+    # checkReferenceComponent: `index::check_component` restated (see the
+    # header note on why this file does not import a nonexistent
+    # index.fct for three lines of pure arithmetic).
+    proc checkReferenceComponent(label: text, value: text) -> ReferenceValidateResult:
+        let n = len(value)
+        let maxLen = do referenceMaxComponentLen()
+        if n > maxLen:
+            let msg = label + " is " + n + " bytes; the maximum is " + maxLen
+            return ReferenceValidateResult{ok: false, err: msg}
+        return ReferenceValidateResult{ok: true, err: ""}
+
+    # ============================================================
+    # ReferenceDef::validate, verbatim in structure and in message
+    # wording, restated over the fields above.
+    # ============================================================
+    proc referenceDefValidate(def: ReferenceDef) -> ReferenceValidateResult:
+        let nameLen = len(def.name)
+        let maxNameLen = do referenceMaxNameLen()
+        if def.name == "" || nameLen > maxNameLen:
+            let msg = "reference name must be 1.." + maxNameLen + " bytes"
+            return ReferenceValidateResult{ok: false, err: msg}
+
+        let nameOk = do referenceNameIsValid(def.name)
+        if !nameOk:
+            return ReferenceValidateResult{ok: false, err: "reference name may contain only letters, digits, '_' and '-'"}
+
+        if def.kind == "":
+            return ReferenceValidateResult{ok: false, err: "reference kind must not be empty"}
+        if def.field == "":
+            return ReferenceValidateResult{ok: false, err: "reference field must not be empty"}
+        if def.parentKind == "":
+            return ReferenceValidateResult{ok: false, err: "reference parent_kind must not be empty"}
+
+        let kindCheck = do checkReferenceComponent("reference kind", def.kind)
+        if !kindCheck.ok:
+            return kindCheck
+        let fieldCheck = do checkReferenceComponent("reference field", def.field)
+        if !fieldCheck.ok:
+            return fieldCheck
+        let parentKindCheck = do checkReferenceComponent("reference parent_kind", def.parentKind)
+        if !parentKindCheck.ok:
+            return parentKindCheck
+
+        if def.hasParentField:
+            if def.parentField == "":
+                return ReferenceValidateResult{ok: false, err: "reference parent_field must not be empty when present"}
+            let parentFieldCheck = do checkReferenceComponent("reference parent_field", def.parentField)
+            if !parentFieldCheck.ok:
+                return parentFieldCheck
+
+        # A node referencing its own kind is a tree (a reply to a reply),
+        # supported and cascading transitively. A node referencing
+        # *itself* through the same field is not: the cascade would have
+        # to delete the node it is already deleting, and a `restrict`
+        # would refuse every delete forever.
+        let selfRef = def.kind == def.parentKind && def.hasParentField && def.parentField == def.field
+        if selfRef:
+            let msg = "reference \"" + def.name + "\" points " + def.kind + "." + def.field + " at itself"
+            return ReferenceValidateResult{ok: false, err: msg}
+
+        return ReferenceValidateResult{ok: true, err: ""}
+
+    # ============================================================
+    # THE REGISTRY — `References`, restated as pure functions over
+    # `[ReferenceDef]` (see the header note on why there is no map/lock
+    # type here to restate instead).
+    # ============================================================
+
+    # referencesPut: declare-or-replace by name. Idempotent, exactly like
+    # the original `HashMap::insert` — replaying a `Put` record for a
+    # name already present is harmless.
+    proc referencesPut(defs: [ReferenceDef], def: ReferenceDef) -> [ReferenceDef]:
+        let mut xs = defs
+        let n = len(xs)
+        let mut i = 0
+        let mut replaced = false
+        loop i < n:
+            if xs[i].name == def.name:
+                xs[i] = def
+                replaced = true
+            i = i + 1
+        if replaced:
+            return xs
+        let appended = append(xs, def)
+        return appended
+
+    # referencesRemove: idempotent, exactly like the original — dropping
+    # a name that is not there is not an error, matching recovery
+    # replaying a drop against a registry that already applied it.
+    proc referencesRemove(defs: [ReferenceDef], name: text) -> [ReferenceDef]:
+        let n = len(defs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if defs[i].name != name:
+                out = append(out, defs[i])
+            i = i + 1
+        return out
+
+    proc referencesGet(defs: [ReferenceDef], name: text) -> ReferenceGetOutcome:
+        let n = len(defs)
+        let mut i = 0
+        let mut found = false
+        let mut foundIdx = 0
+        loop i < n:
+            if defs[i].name == name:
+                found = true
+                foundIdx = i
+            i = i + 1
+        if found:
+            return ReferenceGetOutcome{found: true, def: defs[foundIdx]}
+        let empty = ReferenceDef{name: "", kind: "", field: "", parentKind: "", hasParentField: false, parentField: "", onDelete: ""}
+        return ReferenceGetOutcome{found: false, def: empty}
+
+    proc referencesIsEmpty(defs: [ReferenceDef]) -> bool:
+        let n = len(defs)
+        return n == 0
+
+    # referencesEmpty: a typed empty registry to start from. `let x: [T]
+    # = []` (an explicit array-typed `let`) is not valid syntax in this
+    # language (confirmed directly against this build below); every
+    # other file in this directory that needs a typed empty-array seed
+    # goes through a dedicated proc instead — fabric.fct's own
+    # `demoEmptyRules() -> [RoutingRule]: return []` is the precedent
+    # this restates for `[ReferenceDef]`.
+    proc referencesEmpty() -> [ReferenceDef]:
+        return []
+
+    # compareReferenceNames / referencesSortedByName: name-order, using a
+    # real `<`/`>` on `text` — see the header note correcting query.fct's
+    # documented gap. Hand-written insertion sort (no `sort` builtin in
+    # this language, confirmed against `facet lang`'s builtin list —
+    # query.fct's `sortRowsAscending` establishes the same shape), using
+    # genuine in-place indexed assignment into a `[ReferenceDef]`
+    # (`xs[j - 1] = xs[j]`), confirmed working for a struct array by
+    # query.fct's own header note against `internal/compile/
+    # array_test.go`'s `TestIndexAssignCompiles`.
+    proc compareReferenceNames(a: ReferenceDef, b: ReferenceDef) -> int:
+        if a.name < b.name:
+            return -1
+        if a.name > b.name:
+            return 1
+        return 0
+
+    proc referencesSortedByName(defs: [ReferenceDef]) -> [ReferenceDef]:
+        let mut xs = defs
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                let c = do compareReferenceNames(xs[j - 1], xs[j])
+                if c > 0:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    proc referencesAll(defs: [ReferenceDef]) -> [ReferenceDef]:
+        let sorted = do referencesSortedByName(defs)
+        return sorted
+
+    # referencesForChild: the references a node of this kind carries —
+    # what an insert of it has to resolve.
+    proc referencesForChild(defs: [ReferenceDef], kind: text) -> [ReferenceDef]:
+        let n = len(defs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if defs[i].kind == kind:
+                out = append(out, defs[i])
+            i = i + 1
+        let sorted = do referencesSortedByName(out)
+        return sorted
+
+    # referencesForParent: the references pointing *at* this kind — what
+    # a delete of one of its nodes has to act on.
+    proc referencesForParent(defs: [ReferenceDef], kind: text) -> [ReferenceDef]:
+        let n = len(defs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if defs[i].parentKind == kind:
+                out = append(out, defs[i])
+            i = i + 1
+        let sorted = do referencesSortedByName(out)
+        return sorted
+
+    # referencesDependingOnIndex: every reference that depends on the
+    # index over `(kind, field)` — both sides count, since the child
+    # index is how a cascade finds its targets and the parent index is
+    # what makes the referenced value unique.
+    proc referencesDependingOnIndex(defs: [ReferenceDef], kind: text, field: text) -> [ReferenceDef]:
+        let n = len(defs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let d = defs[i]
+            let childSide = d.kind == kind && d.field == field
+            let parentSide = d.parentKind == kind && d.hasParentField && d.parentField == field
+            if childSide || parentSide:
+                out = append(out, d)
+            i = i + 1
+        let sorted = do referencesSortedByName(out)
+        return sorted
+
+    # ============================================================
+    # DEMO FIXTURES — hand-verifiable, restating reference.rs's own
+    # `#[cfg(test)]` cases directly (this directory's established
+    # convention for a file with no harness of its own: storage.fct's
+    # CRC-32 fixtures, heap.fct's corrupt/torn-frame fixtures). Each
+    # `demo*Ok` proc below is checked by hand against the value the
+    # matching Rust test asserts.
+    # ============================================================
+
+    proc demoCommentPostRef() -> ReferenceDef:
+        let ref = do referenceDefNew("post_comments", "Comment", "post", "Post", false, "", "cascade")
+        return ref
+
+    # a_name_that_could_be_a_path_is_refused
+    proc demoPathEscapeNameRejectedOk() -> bool:
+        let bad = do referenceDefNew("../escape", "Comment", "post", "Post", false, "", "cascade")
+        let r = do referenceDefValidate(bad)
+        return !r.ok
+
+    proc demoValidNameAcceptedOk() -> bool:
+        let good = do demoCommentPostRef()
+        let r = do referenceDefValidate(good)
+        return r.ok
+
+    # a_field_pointing_at_itself_is_refused: same kind, same field on
+    # both sides — refused.
+    proc demoSelfPointingFieldRejectedOk() -> bool:
+        let selfRef = do referenceDefNew("self", "Comment", "post", "Comment", true, "post", "cascade")
+        let r = do referenceDefValidate(selfRef)
+        return !r.ok
+
+    # ...but the same two kinds through a *different* field (a reply to a
+    # reply) is exactly the supported tree shape, and is accepted.
+    proc demoTreeThroughDifferentFieldAcceptedOk() -> bool:
+        let tree = do referenceDefNew("self", "Comment", "parent", "Comment", true, "post", "cascade")
+        let r = do referenceDefValidate(tree)
+        return r.ok
+
+    # lookups_are_by_side
+    proc demoRegistryLookupsBySideOk() -> bool:
+        let empty = do referencesEmpty()
+        let def = do demoCommentPostRef()
+        let withOne = do referencesPut(empty, def)
+
+        let childHits = do referencesForChild(withOne, "Comment")
+        let childMisses = do referencesForChild(withOne, "Post")
+        let parentHits = do referencesForParent(withOne, "Post")
+        let parentMisses = do referencesForParent(withOne, "Comment")
+
+        let childHitsLen = len(childHits)
+        let childMissesLen = len(childMisses)
+        let parentHitsLen = len(parentHits)
+        let parentMissesLen = len(parentMisses)
+
+        let afterRemove = do referencesRemove(withOne, "a")
+        let stillThere = do referencesIsEmpty(afterRemove)
+
+        let byNameRemove = do referencesRemove(withOne, "post_comments")
+        let empties = do referencesIsEmpty(byNameRemove)
+
+        return childHitsLen == 1 && childMissesLen == 0 && parentHitsLen == 1 && parentMissesLen == 0 && empties
+
+    # an_index_both_sides_need_is_found_from_either_side
+    proc demoDependingOnIndexBothSidesOk() -> bool:
+        let empty = do referencesEmpty()
+        let def = do referenceDefNew("a", "Comment", "post", "Post", true, "id", "cascade")
+        let withOne = do referencesPut(empty, def)
+
+        let childSide = do referencesDependingOnIndex(withOne, "Comment", "post")
+        let parentSide = do referencesDependingOnIndex(withOne, "Post", "id")
+        let neither = do referencesDependingOnIndex(withOne, "Post", "body")
+
+        let childSideLen = len(childSide)
+        let parentSideLen = len(parentSide)
+        let neitherLen = len(neither)
+
+        return childSideLen == 1 && parentSideLen == 1 && neitherLen == 0
+
+    # all() returns its results in name order.
+    proc demoAllIsNameOrderedOk() -> bool:
+        let empty = do referencesEmpty()
+        let refB = do referenceDefNew("bbb", "Comment", "post", "Post", false, "", "cascade")
+        let refA = do referenceDefNew("aaa", "Reply", "comment", "Comment", false, "", "cascade")
+        let withB = do referencesPut(empty, refB)
+        let withBoth = do referencesPut(withB, refA)
+
+        let ordered = do referencesAll(withBoth)
+        return ordered[0].name == "aaa" && ordered[1].name == "bbb"

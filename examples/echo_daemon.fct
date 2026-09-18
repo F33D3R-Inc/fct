@@ -1,0 +1,90 @@
+# Inbound TCP — io.net.listen. Where io.net's httpGet/httpPost are OUTBOUND
+# only (this instance calling out, bounded by ioHTTPClient's 5s timeout),
+# io.net.listen is the other direction: a daemon body binds a real listening
+# socket and accepts real inbound connections, one at a time, forever. It is
+# a strictly bigger trust boundary than making an outbound call (anyone who
+# can reach this port can open a connection), hence the separate, more
+# specific capability name — a daemon opts into it by name, never by
+# accident via a plain `uses io.net`.
+#
+# accept()/readBytes() below block indefinitely — there is no timeout,
+# because there cannot be one: an accept loop's whole job is to wait,
+# possibly forever, for the next client. That is exactly why listen/accept/
+# readBytes/writeBytes/closeConn are restricted to a daemon body and refused
+# everywhere else (internal/ir/build.go's checkDaemonOnlyBuiltins) — a daemon
+# is the one place in this runtime that runs detached, under no request's
+# store lock, for as long as it likes (runtime/daemon.go's doc). Reached via
+# an ordinary proc (`do`/`spawn`+`join` from an action), the exact same
+# accept() call would hold the durable-store lock hostage for however long
+# it takes a client to connect — possibly the rest of the process's life.
+#
+# Connections are handled ONE AT A TIME, sequentially, by design: structured
+# concurrency here (spawn/join) requires a spawned handle be joined before
+# the enclosing statement LIST ends (see ast.Spawn's doc) — a handle can
+# never outlive the block it was spawned in, and can never be joined in a
+# later iteration of an enclosing loop. Handling connections concurrently
+# would need a spawn whose join happens on some LATER trip through this
+# loop's body, which that rule deliberately forbids. Rather than work around
+# it, this accepts the honest, narrower shape: one connection fully served
+# (read/echo until EOF) before the next is accepted. A concurrent version is
+# real future work (it needs either relaxing the join-scope rule or a
+# worker-pool-style primitive that doesn't exist yet), not something to fake
+# here.
+#
+# Verify with a real external client while the server's own HTTP API is
+# being hit concurrently, proving the accept loop neither blocks nor is
+# blocked by ordinary request handling:
+#
+#   facet run examples/echo_daemon.fct     # HTTP on :7373, echo on :7000
+#   printf 'hello world' | nc -q1 localhost 7000     # -> echoes "hello world"
+#   curl -s -X POST localhost:7373/api/bump/1        # ordinary HTTP, unaffected
+#   curl -s localhost:7373/api/EchoStats             # connections/bytesEchoed climb
+
+app EchoDaemon:
+    entity EchoStats:
+        id: int
+        connections: int
+        bytesEchoed: int
+
+    entity Widget:
+        id: int
+        count: int
+
+    action seedStats:
+        add EchoStats { connections: 0, bytesEchoed: 0 }
+
+    action seedWidget:
+        add Widget { count: 0 }
+
+    action recordConnection:
+        set EchoStats(1).connections = EchoStats(1).connections + 1
+
+    action recordBytes(n: int):
+        set EchoStats(1).bytesEchoed = EchoStats(1).bytesEchoed + n
+
+    # Ordinary request-handling work, hit over plain HTTP below — the thing
+    # the echo daemon's blocking accept()/readBytes() must never stall.
+    action bump(id: int):
+        set Widget(id).count = Widget(id).count + 1
+
+    job seedStatsJob on start -> seedStats
+    job seedWidgetJob on start -> seedWidget
+
+    daemon Echo uses io.net.listen:
+        let l = listen(7000)
+        loop true:
+            let c = accept(l)
+            act recordConnection()
+            loop true:
+                let data = readBytes(c, 4096)
+                if len(data) == 0:
+                    break
+                writeBytes(c, data)
+                act recordBytes(len(data))
+            closeConn(c)
+
+    view Main at "/":
+        box:
+            text "echo daemon: {EchoStats(1).connections} connections, {EchoStats(1).bytesEchoed} bytes echoed"
+            text "widget count: {Widget(1).count}"
+            button "bump" -> bump(1)

@@ -1,0 +1,195 @@
+# fabric_node.fct — self-hosted fabric-protocol LOGIC wired to a self-hosted
+# fabric-protocol TRANSPORT, as one live TCP service.
+#
+# selfhost/fabric_protocol.fct already ports fabric-protocol's real
+# decode/handle/encode dispatch (protocolDecode/protocolHandle/
+# protocolEncode over a tagged FabricMessage/FabricResponse). echo_daemon.fct
+# already proves a real `daemon` can `listen`/`accept`/`readBytes`/
+# `writeBytes`/`closeConn` real inbound TCP connections without blocking (or
+# being blocked by) ordinary HTTP request handling on the same running
+# server. Neither piece had, until this file, been wired to the other. This
+# app is that wiring: a `daemon` accept loop reads FabricMessage JSON off a
+# raw TCP socket, runs it through protocolDecode/protocolHandle/
+# protocolEncode (imported from selfhost/fabric_protocol.fct, read-only,
+# unmodified), and writes the FabricResponse JSON back.
+#
+# ============================================================
+# FRAMING: newline-delimited JSON, one message per line
+# ============================================================
+# fabric_protocol.fct's own header is explicit that real fabric-protocol has
+# NO framing of its own to port: its production wire format is bare JSON
+# inside an HTTP POST body, where HTTP's own Content-Length is the entire
+# framing layer (see that file's "INVESTIGATION" section). This daemon has
+# no HTTP request/response cycle to borrow a length from — it is a raw
+# io.net.listen TCP socket, where readBytes(c, n) hands back whatever bytes
+# happen to already be available (up to n), not a whole message. So SOME
+# framing convention has to exist here, invented for this example, not
+# ported from fabric-protocol itself.
+#
+# Newline-delimited JSON (one full JSON value per line, terminated by \n) is
+# the choice, because it is the simplest one that is still honest about what
+# it is: it needs no length header, no magic bytes and no checksum (unlike,
+# say, heap.fct's binary record frame) because JSON is already
+# self-delimiting once you know where it ends — and the one thing plain
+# JSON's grammar does NOT tell a byte-stream reader on its own is where the
+# LAST closing brace is (a scanner would otherwise have to track
+# brace/bracket/string-escape depth just to find the end). A trailing \n
+# sidesteps that: every message this protocol actually carries is built from
+# ASCII identifiers/labels (fabric_protocol.fct's own header makes the same
+# scope decision for its string escaping), so none of them can contain a
+# literal newline, and "read until \n" becomes a correct, five-minute-to-
+# explain framing rule — the same one real line-oriented TCP protocols
+# (SMTP, Redis inline commands, syslog) already use for exactly this reason.
+# This is NOT a claim that fabric-protocol's real wire format uses newlines
+# — it has none to match over a raw socket; this is this example's own,
+# separately invented and separately documented choice.
+#
+# ============================================================
+# CONNECTION LIFECYCLE: multiple messages per connection, until EOF
+# ============================================================
+# This part WAS available to copy from echo_daemon.fct, and does: one
+# connection is read in a loop until the peer closes it (readBytes returning
+# an empty result), exactly echo_daemon's own `loop true: ... if
+# len(data) == 0: break`. A real fabric node's traffic (per
+# fabric_protocol.fct's own NodeRegistration/NodeHeartbeat shapes) is a
+# register-once-then-heartbeat-repeatedly pattern, so reading every complete
+# line currently buffered, then blocking for more on the same connection, is
+# the realistic choice — closing after exactly one message would make every
+# heartbeat pay for a fresh TCP handshake this protocol has no reason to
+# need. Connections are still handled ONE AT A TIME by the accept loop, for
+# the exact structured-concurrency reason echo_daemon.fct's own header
+# documents in full (a spawned handle can never be joined on a later trip
+# through an enclosing loop) — restated there, not re-litigated here.
+#
+#   facet dev examples/fabric_node.fct :7373     # HTTP on :7373, fabric wire on :9600
+#
+#   printf '{"RegisterNode":{"protocol":"facet/1","node_id":"db-9","software_version":"1.2.3","region":"us-east"}}\n' | nc -q1 localhost 9600
+#     -> {"Registered":{"node_id":"db-9"}}
+#
+#   printf 'not json at all\n' | nc -q1 localhost 9600
+#     -> {"Rejected":{"reason":"invalid JSON body"}}
+#
+#   curl -s -X POST localhost:7373/api/bump/1        # ordinary HTTP, unaffected
+#   curl -s localhost:7373/api/FabricNodeStats       # connections/messagesHandled climb
+
+import "../selfhost/fabric_protocol.fct"
+
+app FabricNode:
+    entity FabricNodeStats:
+        id: int
+        connections: int
+        messagesHandled: int
+        registrations: int
+        rejections: int
+
+    entity Widget:
+        id: int
+        count: int
+
+    action seedStats:
+        add FabricNodeStats { connections: 0, messagesHandled: 0, registrations: 0, rejections: 0 }
+
+    action seedWidget:
+        add Widget { count: 0 }
+
+    action recordConnection:
+        set FabricNodeStats(1).connections = FabricNodeStats(1).connections + 1
+
+    action recordMessage:
+        set FabricNodeStats(1).messagesHandled = FabricNodeStats(1).messagesHandled + 1
+
+    action recordRegistration:
+        set FabricNodeStats(1).registrations = FabricNodeStats(1).registrations + 1
+
+    action recordRejection:
+        set FabricNodeStats(1).rejections = FabricNodeStats(1).rejections + 1
+
+    # Ordinary request-handling work, hit over plain HTTP below — the thing
+    # the fabric daemon's blocking accept()/readBytes() must never stall,
+    # the same proof echo_daemon.fct's own `bump` makes for its echo daemon.
+    action bump(id: int):
+        set Widget(id).count = Widget(id).count + 1
+
+    job seedStatsJob on start -> seedStats
+    job seedWidgetJob on start -> seedWidget
+
+    # fabricScanLine: locates the first `\n` in `buf` and splits it into the
+    # line before it (the framed message, newline excluded) and the
+    # unconsumed remainder after it. Pure text scanning over its own
+    # parameter — no entity/session access — so this is an ordinary proc,
+    # not daemon-only code; the daemon body below just calls it once per
+    # buffered chunk and again for every additional complete line the same
+    # chunk turned out to contain.
+    struct FabricLineScan:
+        found: bool
+        line: text
+        rest: text
+
+    proc fabricScanLine(buf: text) -> FabricLineScan:
+        let n = len(buf)
+        let mut i = 0
+        loop i < n:
+            let ch = charAt(buf, i)
+            if ch == "\n":
+                let line = slice(buf, 0, i)
+                let rest = slice(buf, i + 1, n)
+                return FabricLineScan{found: true, line: line, rest: rest}
+            i = i + 1
+        return FabricLineScan{found: false, line: "", rest: buf}
+
+    # FabricNodeWire: the transport. Binds a real listening socket on 9600,
+    # accepts real inbound connections one at a time, and for each one reads
+    # newline-framed lines, decoding/handling/encoding each with the
+    # imported, unmodified protocolDecode/protocolHandle/protocolEncode —
+    # the self-hosted logic this daemon exists to serve over a real socket.
+    daemon FabricNodeWire uses io.net.listen:
+        let l = listen(9600)
+        loop true:
+            let c = accept(l)
+            act recordConnection()
+            let mut buf = ""
+            loop true:
+                let chunk = readBytes(c, 4096)
+                if len(chunk) == 0:
+                    break
+                let chunkText = bytesToText(chunk)
+                buf = buf + chunkText
+                let scan0 = do fabricScanLine(buf)
+                let mut found = scan0.found
+                let mut line = scan0.line
+                let mut rest = scan0.rest
+                loop found:
+                    buf = rest
+                    let decoded = do protocolDecode(line)
+                    if decoded.ok:
+                        let response = do protocolHandle(decoded.message)
+                        act recordMessage()
+                        if response.kind == "Registered":
+                            act recordRegistration()
+                        let encoded = do protocolEncode(response)
+                        let framed = encoded + "\n"
+                        let replyBytes = textToBytes(framed)
+                        writeBytes(c, replyBytes)
+                    else:
+                        let response = FabricResponse{kind: "Rejected", registeredNodeId: "", proposalCoordinate: "", proposalAction: "", proposalExpectedGain: 0.0, proposalEstimatedCost: 0.0, proposalConfidence: 0.0, rejectedReason: decoded.error}
+                        act recordMessage()
+                        act recordRejection()
+                        let encoded = do protocolEncode(response)
+                        let framed = encoded + "\n"
+                        let replyBytes = textToBytes(framed)
+                        writeBytes(c, replyBytes)
+                    let scanNext = do fabricScanLine(buf)
+                    found = scanNext.found
+                    line = scanNext.line
+                    rest = scanNext.rest
+            closeConn(c)
+
+    # The trivial HTTP surface non-interference is proved against — bumping
+    # a Widget over ordinary POST /api/bump/1 while the daemon's accept loop
+    # is up (and possibly mid-connection) — plus the fabric wire's own
+    # climbing stats, viewable the same way.
+    view Main at "/":
+        box:
+            text "fabric node: {FabricNodeStats(1).connections} connections, {FabricNodeStats(1).messagesHandled} messages ({FabricNodeStats(1).registrations} registered, {FabricNodeStats(1).rejections} rejected)"
+            text "widget count: {Widget(1).count}"
+            button "bump" -> bump(1)

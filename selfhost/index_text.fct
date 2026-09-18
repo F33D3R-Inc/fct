@@ -1,0 +1,959 @@
+app IndexTextSelfHost:
+    # Self-hosting port of the byte-dependent halves of
+    # facetql/src/storage/index.rs (990L) and facetql/src/storage/text.rs
+    # (436L) — the two pieces of the engine's access-path layer that were
+    # blocked all session on one missing capability: turning a `text`
+    # value into its real UTF-8 bytes and back. That capability
+    # (`textToBytes`/`bytesToText`/`byteLen`) landed this session; this
+    # file is what it unblocks. Read both Rust files in full before
+    # editing this one. Read selfhost/query.fct (index.rs's
+    # ordering/cursor half) and selfhost/reference.fct (index.rs's
+    # `check_component`, restated there as `checkReferenceComponent`)
+    # first — neither is duplicated below.
+    #
+    # ============================================================
+    # BYTE-BUFFER REPRESENTATION — same convention as storage.fct/
+    # btree.fct/heap.fct, all in this directory: a byte buffer is one
+    # `[int]`, one element per byte (0-255). `textToBytes`/`bytesToText`
+    # are this file's bridge between that representation and `text`,
+    # exactly the role `bytes()`/`writeBytes` already play for a raw
+    # buffer built directly from int literals elsewhere in this
+    # directory — the difference here is the source/destination is a
+    # real UTF-8 string, not bytes chosen by hand.
+    #
+    # ============================================================
+    # PART 1 — index.rs: KEY ENCODING (module doc's own "Key encoding"
+    # section) AND KEY ADMISSIBILITY (its "Key admissibility" section).
+    # ============================================================
+    # Ported verbatim in structure:
+    #   - `component` (u16-big-endian length prefix + bytes) and
+    #     `split_component` (its inverse) — restated as `indexComponent`/
+    #     `indexSplitComponent`.
+    #   - `kind_prefix`/`kind_key`, `owner_prefix`/`owner_key`,
+    #     `edge_out_prefix`/`edge_out_key`, `edge_in_prefix`/
+    #     `edge_in_key`, `history_prefix`/`history_key` — every one of
+    #     these is `component(...)` concatenated with either another
+    #     component or a raw (unprefixed) trailing field, restated
+    #     exactly that way below.
+    #   - `MAX_COMPONENT_LEN`, `check_component`, `MAX_KEY_LEN` (read
+    #     directly off `facetql/src/storage/btree.rs`: `1024`, not
+    #     guessed), `check_key_admissible`, `check_node_keys`,
+    #     `check_history_keys`, `check_edge_keys` — the admissibility
+    #     gate that has to run BEFORE a key reaches the WAL (the module
+    #     doc's own reasoning: past the WAL a refusal is not a rejected
+    #     request, it is a committed mutation recovery can never apply).
+    #
+    # A REAL IMPROVEMENT OVER reference.fct's OWN RESTATEMENT: Rust's
+    # `check_component` measures `value.len()` — UTF-8 BYTES. When
+    # reference.fct restated this same function locally as
+    # `checkReferenceComponent` (before this session's byte builtins
+    # existed), it could only measure `len(value)` — fct's rune count —
+    # and documented the resulting divergence honestly in its own
+    # header. `checkIndexComponent` below uses the real `byteLen(value)`
+    # instead, so — unlike reference.fct's version — it matches Rust's
+    # bound exactly, byte for byte, with no divergence left to document.
+    #
+    # `encode_order_value`/`data_key` (the "`data`-field ordering" section)
+    # are ALSO ported below, but only three of `type_rank`'s four payload
+    # cases — see "DEFERRED" below for the one that is not.
+    #
+    # ============================================================
+    # PART 2 — text.rs: TOKENIZATION AND KEY ENCODING.
+    # ============================================================
+    # Ported verbatim in structure:
+    #   - `fold_into` (the bytewise, ASCII-only, length-preserving lower-
+    #     case fold — restated as `foldToBytes`, returning the folded
+    #     buffer directly rather than writing into a caller's `&mut
+    #     Vec<u8>`, since this language has no mutable-reference
+    #     parameter to restate that with).
+    #   - `grams` (every distinct trigram of the folded text, sorted) —
+    #     restated as `grams`, with a `Gram{b0,b1,b2}` struct standing in
+    #     for Rust's `[u8; 3]` (this language has no fixed-size array
+    #     type; a real named struct is exactly what the task's own rule
+    #     asks for in place of one). `BTreeSet`'s dedupe+sort is restated
+    #     as "scan for a duplicate before appending, then insertion-sort
+    #     the result" — no dedup/sort/set primitive in this language
+    #     (confirmed against the same builtin list query.fct/reference.fct
+    #     already checked), and candidate counts here are gram-per-field,
+    #     not kind-scale, so O(n^2) is the same tradeoff this directory
+    #     already made for `sortRowsAscending`/`referencesSortedByName`.
+    #   - `key`/`address_from_key` (the posting key: `gram · address`, no
+    #     length prefix because the gram is fixed-width) — restated as
+    #     `textIndexKey`/`addressFromTextIndexKey`.
+    #   - `GRAM_LEN` (3) and `MAX_TEXT_VALUE_LEN` (16384) — read directly
+    #     off text.rs's own constants.
+    #
+    # `indexed_text` and the `check_text_keys`/`check_data_keys` LOOPS
+    # (decode the node's JSON, iterate every declared def, look up its
+    # field) are NOT ported: this language has no JSON decoder, the same
+    # boundary reference.fct's own header draws for `ReferenceOpRecord`'s
+    # log format and query.fct's own header draws for `Row` ("this port
+    # has no JSON decoder to reuse or reimplement"). What IS ported is
+    # the actual admissibility ARITHMETIC each loop body runs once a
+    # value is already in hand — `checkDataKeyValue`/`checkTextKeyValue`
+    # below take that already-extracted value directly, exactly the same
+    # "already-decoded records in" line every file in this directory
+    # draws at its JSON boundary.
+    #
+    # `IndexDef::validate`/`TextIndexDef::validate` (name bound + ASCII
+    # alphabet + kind/field non-empty) are NOT re-ported here either —
+    # they need no byte encoding at all, and reference.fct's
+    # `referenceDefValidate` already established the identical pattern
+    # for `ReferenceDef` in this same directory. Restating it a third
+    # time here would be rework of a piece the task did not ask for.
+    #
+    # ============================================================
+    # DEFERRED, HONESTLY: THE NUMERIC ARM OF `encode_order_value`.
+    # ============================================================
+    # `encode_value_body`'s `Value::Number` arm needs `f64::to_bits` — a
+    # bit-for-bit reinterpretation of a float's IEEE-754 representation
+    # as an integer, then a sign-bit flip/complement to make the byte
+    # order match numeric order. This language DOES have real bitwise
+    # integer operators (`&`, `|`, `^`, `<<`, `>>`, `~` — confirmed
+    # already exercised by storage.fct's own CRC-32 port), but it has NO
+    # builtin that turns a `float` into the integer holding its bit
+    # pattern: `toInt`/`toFloat` (`facet lang`'s builtin list, confirmed
+    # directly against `internal/parser/expr.go`'s `isBuiltinCall`
+    # alongside `textToBytes`/`bytesToText`/`byteLen` — the only three
+    # additions this session made) are ARITHMETIC conversions (rounding/
+    # truncating a value), not bit-casts, and no `floatBits`/
+    # `reinterpret`-style builtin exists anywhere in that list. That is a
+    # real, different, still-open gap from the one this session closed —
+    # closing THIS one would need a fifth builtin, not just using the
+    # three that already landed.
+    #
+    # So `DataValue` below models exactly the four cases whose byte
+    # encoding needs no numeric bit-cast — `"null"`, `"bool"`, `"text"`,
+    # `"absent"` — and there is no `"num"` case at all, by construction:
+    # not a stubbed-out arm that silently produces a wrong (non-order-
+    # preserving, payload-free) encoding, but a value this file's own
+    # type cannot be asked to build. A caller with a genuinely numeric
+    # `data` field cannot get an order-preserving key out of this port;
+    # every other JSON type (including the ones a `data` index actually
+    # sees most, `null`/absent/text and the common case of a boolean
+    # flag) gets the real encoding, verified byte-for-byte below.
+    #
+    # `int`, this language's only integer type, is also signed 64-bit —
+    # there is no `u64`. `indexHistoryKey`'s `version` parameter is
+    # restated as `int`, and `writeU64BEBytes` below encodes any
+    # non-negative value in `[0, 2^63)` exactly as Rust's
+    # `version.to_be_bytes()` would encode the same value as a `u64` —
+    # same 8 bytes, same big-endian order. It cannot represent the top
+    # half of `u64`'s range (`[2^63, 2^64)`), a version counter would
+    # need over 9.2 quintillion writes to reach, and reach for the same
+    # reason `check_node_keys`'s own `u64::MAX` stand-in does not need
+    # to be an actual max here either: `indexHistoryKey`'s suffix is
+    # fixed-width (8 bytes) regardless of the version's value, so any
+    # representative value produces a key of the true length — see
+    # `checkNodeKeys` below, which uses `0`.
+    #
+    # ============================================================
+    # VERIFICATION — real Rust tests (all 5 non-JSON-dependent ones run
+    # via `cargo test --lib storage::text::`, all passing against this
+    # checkout: `a_substrings_grams_are_a_subset_of_the_haystacks`,
+    # `folding_is_case_insensitive_and_keeps_length`,
+    # `a_needle_under_one_window_has_no_grams`,
+    # `a_posting_key_round_trips_its_address`, plus
+    # `only_a_string_field_is_indexed`, which is JSON-dependent and out
+    # of scope here), each hand-traced below against a `demo*Ok` fixture
+    # — several restating the Rust test's OWN input verbatim
+    # (`"Ünïcode ÅBC"`), several built fresh with genuine multi-byte
+    # UTF-8 (`"héllo"`, byte-split across a 2-byte `é`) specifically to
+    # exercise the byte-level logic at the byte level, not the character
+    # level — `index.rs` has no `#[cfg(test)]` module of its own, so
+    # every `component`/`kindKey`/`dataKey` fixture below is hand-traced
+    # against the Rust source directly instead. All demos were run live
+    # via `facet console` against a freshly rebuilt binary — see the
+    # task report for the exact byte traces and console transcript.
+
+    # ============================================================
+    # SHARED BYTE-BUFFER HELPERS — restated locally rather than imported
+    # from storage.fct (procs/structs do not cross files in this
+    # language; every file in this directory restates its own small
+    # cross-cutting helpers, e.g. reference.fct's own header on
+    # `checkReferenceComponent`).
+    # ============================================================
+    proc sliceBytes(buf: [int], start: int, end: int) -> [int]:
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            out = append(out, buf[i])
+            i = i + 1
+        return out
+
+    proc concatBytes(a: [int], b: [int]) -> [int]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc bytesEqual(a: [int], b: [int]) -> bool:
+        let na = len(a)
+        let nb = len(b)
+        if na != nb:
+            return false
+        let mut i = 0
+        let mut eq = true
+        loop i < na:
+            if a[i] != b[i]:
+                eq = false
+            i = i + 1
+        return eq
+
+    proc bytesHasPrefix(buf: [int], prefix: [int]) -> bool:
+        let np = len(prefix)
+        let nb = len(buf)
+        if np > nb:
+            return false
+        let head = do sliceBytes(buf, 0, np)
+        let eq = do bytesEqual(head, prefix)
+        return eq
+
+    # writeU16BEBytes: `(bytes.len() as u16).to_be_bytes()` — the `as u16`
+    # truncation is restated as an explicit `& 65535` mask so the same
+    # (guarded-against-by-`checkIndexComponent`) wraparound Rust's cast
+    # would silently do is at least an explicit step here, not something
+    # `component` accidentally relies on Go's own int width to avoid.
+    proc writeU16BEBytes(v: int) -> [int]:
+        let vTrunc = v & 65535
+        let hi = (vTrunc >> 8) & 255
+        let lo = vTrunc & 255
+        return [hi, lo]
+
+    proc readU16BEBytes(hi: int, lo: int) -> int:
+        return (hi << 8) | lo
+
+    # writeU64BEBytes: `version.to_be_bytes()` — see the header's note on
+    # this file's `int` being signed 64-bit, not `u64`.
+    proc writeU64BEBytes(v: int) -> [int]:
+        let b7 = (v >> 56) & 255
+        let b6 = (v >> 48) & 255
+        let b5 = (v >> 40) & 255
+        let b4 = (v >> 32) & 255
+        let b3 = (v >> 24) & 255
+        let b2 = (v >> 16) & 255
+        let b1 = (v >> 8) & 255
+        let b0 = v & 255
+        return [b7, b6, b5, b4, b3, b2, b1, b0]
+
+    # ============================================================
+    # index.rs — KEY ENCODING.
+    # ============================================================
+
+    # indexComponent: `component` — `len(u16, big-endian) || bytes`.
+    proc indexComponent(value: text) -> [int]:
+        let bytes = textToBytes(value)
+        let n = len(bytes)
+        let lenBytes = do writeU16BEBytes(n)
+        let out = do concatBytes(lenBytes, bytes)
+        return out
+
+    struct SplitComponentResult:
+        ok: bool
+        component: [int]
+        rest: [int]
+
+    # indexSplitComponent: `split_component`'s own body exactly — read a
+    # 2-byte big-endian length, then split the rest at that many bytes,
+    # refusing (rather than panicking or truncating) whenever the buffer
+    # is too short for either step.
+    proc indexSplitComponent(key: [int]) -> SplitComponentResult:
+        let n = len(key)
+        if n < 2:
+            return SplitComponentResult{ok: false, component: [], rest: []}
+        let compLen = do readU16BEBytes(key[0], key[1])
+        if n < 2 + compLen:
+            return SplitComponentResult{ok: false, component: [], rest: []}
+        let comp = do sliceBytes(key, 2, 2 + compLen)
+        let rest = do sliceBytes(key, 2 + compLen, n)
+        return SplitComponentResult{ok: true, component: comp, rest: rest}
+
+    proc indexKindPrefix(kind: text) -> [int]:
+        let c = do indexComponent(kind)
+        return c
+
+    proc indexKindKey(kind: text, address: text) -> [int]:
+        let c = do indexComponent(kind)
+        let addrBytes = textToBytes(address)
+        let out = do concatBytes(c, addrBytes)
+        return out
+
+    proc indexOwnerPrefix(owner: text) -> [int]:
+        let c = do indexComponent(owner)
+        return c
+
+    proc indexOwnerKey(owner: text, address: text) -> [int]:
+        let c = do indexComponent(owner)
+        let addrBytes = textToBytes(address)
+        let out = do concatBytes(c, addrBytes)
+        return out
+
+    proc indexEdgeOutPrefix(from: text) -> [int]:
+        let c = do indexComponent(from)
+        return c
+
+    proc indexEdgeOutKey(from: text, kind: text, to: text) -> [int]:
+        let cFrom = do indexComponent(from)
+        let cKind = do indexComponent(kind)
+        let toBytes = textToBytes(to)
+        let withKind = do concatBytes(cFrom, cKind)
+        let out = do concatBytes(withKind, toBytes)
+        return out
+
+    proc indexEdgeInPrefix(to: text) -> [int]:
+        let c = do indexComponent(to)
+        return c
+
+    proc indexEdgeInKey(to: text, kind: text, from: text) -> [int]:
+        let cTo = do indexComponent(to)
+        let cKind = do indexComponent(kind)
+        let fromBytes = textToBytes(from)
+        let withKind = do concatBytes(cTo, cKind)
+        let out = do concatBytes(withKind, fromBytes)
+        return out
+
+    proc indexHistoryPrefix(address: text) -> [int]:
+        let c = do indexComponent(address)
+        return c
+
+    proc indexHistoryKey(address: text, version: int) -> [int]:
+        let c = do indexComponent(address)
+        let vBytes = do writeU64BEBytes(version)
+        let out = do concatBytes(c, vBytes)
+        return out
+
+    # ============================================================
+    # index.rs — KEY ADMISSIBILITY.
+    # ============================================================
+    struct CheckResult:
+        ok: bool
+        err: text
+
+    # `u16::MAX` — the bound `component`'s length prefix imposes.
+    proc indexMaxComponentLen() -> int:
+        return 65535
+
+    # `btree::MAX_KEY_LEN` — read directly off
+    # facetql/src/storage/btree.rs (`pub const MAX_KEY_LEN: usize = 1024`),
+    # not guessed.
+    proc indexMaxKeyLen() -> int:
+        return 1024
+
+    # `index::MAX_INDEX_VALUE_LEN`.
+    proc indexMaxIndexValueLen() -> int:
+        return 512
+
+    # checkIndexComponent: `check_component`, using the real UTF-8 byte
+    # length (`byteLen`) — see the header's note on why this is an exact
+    # match for Rust's `value.len()`, unlike reference.fct's
+    # `checkReferenceComponent`, which had only a rune count to measure
+    # with before this session's byte builtins existed.
+    proc checkIndexComponent(label: text, value: text) -> CheckResult:
+        let n = byteLen(value)
+        let maxLen = do indexMaxComponentLen()
+        if n > maxLen:
+            let msg = label + " is " + n + " bytes; the maximum is " + maxLen
+            return CheckResult{ok: false, err: msg}
+        return CheckResult{ok: true, err: ""}
+
+    # checkIndexKeyAdmissible: `check_key_admissible` — an already-built
+    # key measured against the tree's own limit.
+    proc checkIndexKeyAdmissible(indexName: text, key: [int]) -> CheckResult:
+        let n = len(key)
+        if n == 0:
+            let msg = "the " + indexName + " index key would be empty"
+            return CheckResult{ok: false, err: msg}
+        let maxLen = do indexMaxKeyLen()
+        if n > maxLen:
+            let msg2 = "the " + indexName + " index key would be " + n + " bytes; the maximum is " + maxLen
+            return CheckResult{ok: false, err: msg2}
+        return CheckResult{ok: true, err: ""}
+
+    # checkNodeKeys: `check_node_keys` — every durable key a node's
+    # identity produces, checked as a set. The history check uses `0` in
+    # place of Rust's `u64::MAX`; see the header's note on why either
+    # value produces a key of the true length.
+    proc checkNodeKeys(address: text, kind: text, owner: text) -> CheckResult:
+        let addrCheck = do checkIndexComponent("node address", address)
+        if !addrCheck.ok:
+            return addrCheck
+        let kindCheck = do checkIndexComponent("node kind", kind)
+        if !kindCheck.ok:
+            return kindCheck
+        let ownerCheck = do checkIndexComponent("node owner", owner)
+        if !ownerCheck.ok:
+            return ownerCheck
+
+        let addrBytes = textToBytes(address)
+        let primaryCheck = do checkIndexKeyAdmissible("primary", addrBytes)
+        if !primaryCheck.ok:
+            return primaryCheck
+
+        let kindKeyBytes = do indexKindKey(kind, address)
+        let kindKeyCheck = do checkIndexKeyAdmissible("kind", kindKeyBytes)
+        if !kindKeyCheck.ok:
+            return kindKeyCheck
+
+        let ownerKeyBytes = do indexOwnerKey(owner, address)
+        let ownerKeyCheck = do checkIndexKeyAdmissible("owner", ownerKeyBytes)
+        if !ownerKeyCheck.ok:
+            return ownerKeyCheck
+
+        let historyKeyBytes = do indexHistoryKey(address, 0)
+        let historyKeyCheck = do checkIndexKeyAdmissible("history", historyKeyBytes)
+        if !historyKeyCheck.ok:
+            return historyKeyCheck
+
+        return CheckResult{ok: true, err: ""}
+
+    proc checkHistoryKeys(address: text, nodeAddress: text, nodeKind: text, nodeOwner: text) -> CheckResult:
+        let addrCheck = do checkIndexComponent("history address", address)
+        if !addrCheck.ok:
+            return addrCheck
+        let historyKeyBytes = do indexHistoryKey(address, 0)
+        let historyKeyCheck = do checkIndexKeyAdmissible("history", historyKeyBytes)
+        if !historyKeyCheck.ok:
+            return historyKeyCheck
+        let nodeCheck = do checkNodeKeys(nodeAddress, nodeKind, nodeOwner)
+        return nodeCheck
+
+    proc checkEdgeKeys(from: text, to: text, kind: text) -> CheckResult:
+        let fromCheck = do checkIndexComponent("edge 'from'", from)
+        if !fromCheck.ok:
+            return fromCheck
+        let toCheck = do checkIndexComponent("edge 'to'", to)
+        if !toCheck.ok:
+            return toCheck
+        let kindCheck = do checkIndexComponent("edge 'kind'", kind)
+        if !kindCheck.ok:
+            return kindCheck
+
+        let outBytes = do indexEdgeOutKey(from, kind, to)
+        let outCheck = do checkIndexKeyAdmissible("outgoing-edge", outBytes)
+        if !outCheck.ok:
+            return outCheck
+
+        let inBytes = do indexEdgeInKey(to, kind, from)
+        let inCheck = do checkIndexKeyAdmissible("incoming-edge", inBytes)
+        if !inCheck.ok:
+            return inCheck
+
+        return CheckResult{ok: true, err: ""}
+
+    # ============================================================
+    # index.rs — `data`-FIELD ORDERING: `type_rank`/`encode_value_body`/
+    # `append_escaped`/`encode_order_value`/`encode_string_prefix`/
+    # `data_key`/`address_from_data_key`. See the header's DEFERRED note
+    # for why `DataValue` has no numeric case.
+    # ============================================================
+    struct DataValue:
+        kind: text
+        boolVal: bool
+        textVal: text
+
+    proc absentDataValue() -> DataValue:
+        return DataValue{kind: "absent", boolVal: false, textVal: ""}
+
+    proc nullDataValue() -> DataValue:
+        return DataValue{kind: "null", boolVal: false, textVal: ""}
+
+    proc boolDataValue(b: bool) -> DataValue:
+        return DataValue{kind: "bool", boolVal: b, textVal: ""}
+
+    proc textDataValue(t: text) -> DataValue:
+        return DataValue{kind: "text", boolVal: false, textVal: t}
+
+    # dataValueTypeRank: `type_rank`. The "num"/"composite" ranks (0x30,
+    # 0x50) are named here for the record — the full ordering `data`
+    # values fall into — even though `DataValue` itself can never hold
+    # either: `"num"` is the deferred case, and a JSON array/object was
+    # already out of scope before this file (query.fct's `OrderValue`
+    # never introduced one either).
+    proc dataValueTypeRank(v: DataValue) -> int:
+        if v.kind == "null":
+            return 16
+        if v.kind == "bool":
+            return 32
+        if v.kind == "text":
+            return 64
+        return 240
+
+    # appendEscaped: `0x00` escapes to `0x00 0xFF`, terminated by
+    # `0x00 0x00` — see index.rs's own doc comment on why a length prefix
+    # cannot be used here (it would sort short values ahead of long ones).
+    proc appendEscaped(out: [int], bytes: [int]) -> [int]:
+        let mut acc = out
+        let n = len(bytes)
+        let mut i = 0
+        loop i < n:
+            let b = bytes[i]
+            if b == 0:
+                acc = append(acc, 0)
+                acc = append(acc, 255)
+            else:
+                acc = append(acc, b)
+            i = i + 1
+        acc = append(acc, 0)
+        acc = append(acc, 0)
+        return acc
+
+    # encodeValueBody: `encode_value_body`, minus the `Value::Number` arm
+    # (deferred — see header).
+    proc encodeValueBody(v: DataValue) -> [int]:
+        let rank = do dataValueTypeRank(v)
+        let mut out = [rank]
+        if v.kind == "bool":
+            if v.boolVal:
+                out = append(out, 1)
+            else:
+                out = append(out, 0)
+        if v.kind == "text":
+            let bytes = textToBytes(v.textVal)
+            let withText = do concatBytes(out, bytes)
+            out = withText
+        # "null" and "absent" carry no payload — `Some(Value::Null) |
+        # None => {}` in the source.
+        return out
+
+    proc encodeOrderValue(v: DataValue) -> [int]:
+        let body = do encodeValueBody(v)
+        let out = do appendEscaped([], body)
+        return out
+
+    # encodeStringPrefix: the escaped, UNTERMINATED prefix of every
+    # string value beginning with `prefix` — `encode_string_prefix`'s own
+    # body, restated with `textDataValue`'s rank rather than
+    # reconstructing the string variant's tag by hand.
+    proc encodeStringPrefix(prefix: text) -> [int]:
+        let rankOf = do textDataValue("")
+        let rank = do dataValueTypeRank(rankOf)
+        let mut out = [rank]
+        let bytes = textToBytes(prefix)
+        let n = len(bytes)
+        let mut i = 0
+        loop i < n:
+            let b = bytes[i]
+            if b == 0:
+                out = append(out, 0)
+                out = append(out, 255)
+            else:
+                out = append(out, b)
+            i = i + 1
+        return out
+
+    proc dataKey(v: DataValue, address: text) -> [int]:
+        let encoded = do encodeOrderValue(v)
+        let addrBytes = textToBytes(address)
+        let out = do concatBytes(encoded, addrBytes)
+        return out
+
+    struct AddressLookupResult:
+        found: bool
+        address: [int]
+
+    # addressFromDataKey: `address_from_data_key`'s own scan — walk past
+    # escaped zeros (`0x00 0xFF`) until the real terminator (`0x00 0x00`),
+    # then everything after it is the address.
+    proc addressFromDataKey(key: [int]) -> AddressLookupResult:
+        let n = len(key)
+        let mut i = 0
+        let mut found = false
+        let mut addr = []
+        loop i + 1 < n:
+            if key[i] == 0:
+                if key[i + 1] == 0:
+                    let a = do sliceBytes(key, i + 2, n)
+                    addr = a
+                    found = true
+                    break
+                else:
+                    i = i + 2
+            else:
+                i = i + 1
+        return AddressLookupResult{found: found, address: addr}
+
+    # checkDataKeyValue: the admissibility arithmetic `check_data_keys`
+    # runs per declared index, once a `data` field's already-decoded
+    # value is in hand (the JSON-decode-and-iterate loop around it is out
+    # of scope — see header).
+    proc checkDataKeyValue(indexName: text, v: DataValue, address: text) -> CheckResult:
+        let encoded = do encodeOrderValue(v)
+        let encodedLen = len(encoded)
+        let maxValLen = do indexMaxIndexValueLen()
+        if encodedLen > maxValLen:
+            let msg = "field encodes to " + encodedLen + " bytes, over the " + maxValLen + "-byte maximum for index '" + indexName + "'"
+            return CheckResult{ok: false, err: msg}
+        let key = do dataKey(v, address)
+        let keyCheck = do checkIndexKeyAdmissible("'" + indexName + "'", key)
+        return keyCheck
+
+    # ============================================================
+    # text.rs — TOKENIZATION.
+    # ============================================================
+    proc textIndexGramLen() -> int:
+        return 3
+
+    proc textIndexMaxTextValueLen() -> int:
+        return 16384
+
+    # foldToBytes: `fold_into` — ASCII-only, bytewise, length-preserving.
+    # Only bytes 65..90 (`A`..`Z`) change; every byte of a multi-byte
+    # UTF-8 sequence is >= 0x80 and is left exactly as it is, which is
+    # what keeps the fold length-preserving and therefore keeps a
+    # substring of the raw text a substring of the folded text too.
+    proc foldToBytes(t: text) -> [int]:
+        let bytes = textToBytes(t)
+        let n = len(bytes)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let b = bytes[i]
+            let mut lower = b
+            if b >= 65 && b <= 90:
+                lower = b + 32
+            out = append(out, lower)
+            i = i + 1
+        return out
+
+    struct Gram:
+        b0: int
+        b1: int
+        b2: int
+
+    proc gramsEqual(a: Gram, b: Gram) -> bool:
+        return a.b0 == b.b0 && a.b1 == b.b1 && a.b2 == b.b2
+
+    proc gramsContains(gs: [Gram], g: Gram) -> bool:
+        let n = len(gs)
+        let mut i = 0
+        let mut found = false
+        loop i < n:
+            let eq = do gramsEqual(gs[i], g)
+            if eq:
+                found = true
+            i = i + 1
+        return found
+
+    proc compareGrams(a: Gram, b: Gram) -> int:
+        if a.b0 < b.b0:
+            return -1
+        if a.b0 > b.b0:
+            return 1
+        if a.b1 < b.b1:
+            return -1
+        if a.b1 > b.b1:
+            return 1
+        if a.b2 < b.b2:
+            return -1
+        if a.b2 > b.b2:
+            return 1
+        return 0
+
+    # sortGramsAscending: `BTreeSet`'s sort order, restated as a
+    # hand-written insertion sort — no `sort` builtin in this language
+    # (query.fct's own `sortRowsAscending`/reference.fct's
+    # `referencesSortedByName` establish the identical shape for the
+    # identical reason).
+    proc sortGramsAscending(gs: [Gram]) -> [Gram]:
+        let mut xs = gs
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                let c = do compareGrams(xs[j - 1], xs[j])
+                if c > 0:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    # grams: `grams`'s own body — fold, window, dedupe (scan-before-
+    # append standing in for `BTreeSet::insert`), then sort.
+    proc grams(t: text) -> [Gram]:
+        let folded = do foldToBytes(t)
+        let n = len(folded)
+        let mut uniq = []
+        let mut i = 0
+        loop i + 3 <= n:
+            let g = Gram{b0: folded[i], b1: folded[i + 1], b2: folded[i + 2]}
+            let already = do gramsContains(uniq, g)
+            if !already:
+                uniq = append(uniq, g)
+            i = i + 1
+        let sorted = do sortGramsAscending(uniq)
+        return sorted
+
+    # ============================================================
+    # text.rs — KEY ENCODING.
+    # ============================================================
+
+    # textIndexKey: `key` — `gram · address`, no length prefix (the gram
+    # is fixed-width, so an address can never be mistaken for part of
+    # it).
+    proc textIndexKey(g: Gram, address: text) -> [int]:
+        let addrBytes = textToBytes(address)
+        let mut out = [g.b0, g.b1, g.b2]
+        let withAddr = do concatBytes(out, addrBytes)
+        out = withAddr
+        return out
+
+    # addressFromTextIndexKey: `address_from_key` — `None` when there is
+    # nothing after the gram (`address_from_key(&gram[..])`, in
+    # `a_posting_key_round_trips_its_address`, is exactly this case: an
+    # address is never empty).
+    proc addressFromTextIndexKey(key: [int]) -> AddressLookupResult:
+        let n = len(key)
+        let gramLen = do textIndexGramLen()
+        if n <= gramLen:
+            return AddressLookupResult{found: false, address: []}
+        let addr = do sliceBytes(key, gramLen, n)
+        return AddressLookupResult{found: true, address: addr}
+
+    # checkTextKeyValue: the admissibility arithmetic `check_text_keys`
+    # runs per declared index, once a field's already-extracted text
+    # value is in hand (see header — same JSON-decode boundary as
+    # `checkDataKeyValue`). Uses the real `byteLen`, matching Rust's
+    # `text.len()` exactly, for both the text-value bound and the
+    # representative-posting-key bound.
+    proc checkTextKeyValue(indexName: text, t: text, address: text) -> CheckResult:
+        let textBytes = byteLen(t)
+        let maxTextLen = do textIndexMaxTextValueLen()
+        if textBytes > maxTextLen:
+            let msg = "field holds " + textBytes + " bytes of text, over the " + maxTextLen + "-byte maximum for the inverted index '" + indexName + "'"
+            return CheckResult{ok: false, err: msg}
+        let gramLen = do textIndexGramLen()
+        let addrBytes = byteLen(address)
+        let keyLen = gramLen + addrBytes
+        let maxKeyLen = do indexMaxKeyLen()
+        if keyLen > maxKeyLen:
+            let msg2 = "the '" + indexName + "' index key would be " + keyLen + " bytes; the maximum is " + maxKeyLen
+            return CheckResult{ok: false, err: msg2}
+        return CheckResult{ok: true, err: ""}
+
+    # ============================================================
+    # DEMO / VERIFICATION FIXTURES — every `demo*Ok` below was hand-
+    # traced against the Rust source (or, where index.rs's module has a
+    # real Rust test to restate, against that test's own input/expected
+    # value) and re-checked live via `facet console`. See the task
+    # report for the console transcript.
+    # ============================================================
+
+    # component("kind") — ASCII-only, hand-traced against
+    # `component`'s own doc: len(4) as u16 big-endian, then the bytes.
+    proc demoComponentAsciiOk() -> bool:
+        let c = do indexComponent("kind")
+        let expect = [0, 4, 107, 105, 110, 100]
+        let eq = do bytesEqual(c, expect)
+        return eq
+
+    # component + splitComponent round-trip through a GENUINE multi-byte
+    # UTF-8 value: "héllo" is 6 BYTES (h, é = 0xC3 0xA9, l, l, o) but 5
+    # RUNES — proving the length prefix is byte length, not rune count,
+    # and that splitComponent recovers the exact original bytes (which
+    # bytesToText then decodes back to the original text).
+    proc demoComponentMultibyteRoundTripOk() -> bool:
+        let value = "héllo"
+        let bl = byteLen(value)
+        let c = do indexComponent(value)
+        let split = do indexSplitComponent(c)
+        let recovered = bytesToText(split.component)
+        let restEmpty = len(split.rest) == 0
+        return bl == 6 && split.ok && recovered == value && restEmpty
+
+    # kindKey("Post", <multi-byte address>) — splitComponent recovers
+    # "Post" as the leading component, and the raw (unprefixed) rest
+    # decodes back to the original multi-byte address.
+    proc demoKindKeyMultibyteOk() -> bool:
+        let address = "héllo1"
+        let k = do indexKindKey("Post", address)
+        let split = do indexSplitComponent(k)
+        let recoveredKind = bytesToText(split.component)
+        let recoveredAddr = bytesToText(split.rest)
+        return split.ok && recoveredKind == "Post" && recoveredAddr == address
+
+    # edgeOutKey("Aé", "Likes", "B") — a TWO-LEVEL split (component,
+    # component, raw), each level's component holding a different mix of
+    # ASCII/multi-byte content, proving `component`'s length prefix is
+    # self-describing enough to walk a key built from more than one of
+    # them.
+    proc demoEdgeOutKeyTwoLevelSplitOk() -> bool:
+        let k = do indexEdgeOutKey("Aé", "Likes", "B")
+        let split1 = do indexSplitComponent(k)
+        let split2 = do indexSplitComponent(split1.rest)
+        let from = bytesToText(split1.component)
+        let kind = bytesToText(split2.component)
+        let to = bytesToText(split2.rest)
+        return split1.ok && split2.ok && from == "Aé" && kind == "Likes" && to == "B"
+
+    # historyKey: the version suffix is a real 8-byte big-endian
+    # encoding — version 1 must end in ...0,0,0,0,0,0,0,1, and a version
+    # of 256 must end in ...0,0,0,0,0,0,1,0 (proving byte order, not just
+    # byte count).
+    proc demoHistoryKeyVersionBytesOk() -> bool:
+        let k1 = do indexHistoryKey("N1", 1)
+        let k256 = do indexHistoryKey("N1", 256)
+        let n1 = len(k1)
+        let tail1 = do sliceBytes(k1, n1 - 8, n1)
+        let expect1 = [0, 0, 0, 0, 0, 0, 0, 1]
+        let n256 = len(k256)
+        let tail256 = do sliceBytes(k256, n256 - 8, n256)
+        let expect256 = [0, 0, 0, 0, 0, 0, 1, 0]
+        let eq1 = do bytesEqual(tail1, expect1)
+        let eq256 = do bytesEqual(tail256, expect256)
+        return eq1 && eq256
+
+    # checkIndexComponent/checkIndexKeyAdmissible — structural bound
+    # checks, hand-verified against small inputs.
+    proc demoCheckComponentAcceptsOk() -> bool:
+        let r = do checkIndexComponent("label", "abc")
+        return r.ok
+
+    proc demoCheckKeyAdmissibleRejectsEmptyOk() -> bool:
+        let r = do checkIndexKeyAdmissible("primary", [])
+        return !r.ok
+
+    proc demoCheckKeyAdmissibleAcceptsOk() -> bool:
+        let r = do checkIndexKeyAdmissible("primary", [1, 2, 3])
+        return r.ok
+
+    proc demoCheckNodeKeysAcceptsOk() -> bool:
+        let r = do checkNodeKeys("A1", "Kind1", "Owner1")
+        return r.ok
+
+    proc demoCheckEdgeKeysAcceptsOk() -> bool:
+        let r = do checkEdgeKeys("A1", "B1", "Likes")
+        return r.ok
+
+    # data_key: null/absent carry no payload, matching
+    # `Some(Value::Null) | None => {}`.
+    proc demoNullAbsentEncodingOk() -> bool:
+        let n = do nullDataValue()
+        let a = do absentDataValue()
+        let bodyN = do encodeValueBody(n)
+        let bodyA = do encodeValueBody(a)
+        let expectN = [16]
+        let expectA = [240]
+        let eqN = do bytesEqual(bodyN, expectN)
+        let eqA = do bytesEqual(bodyA, expectA)
+        return eqN && eqA
+
+    # data_key: the escaping/terminator logic exercised against a text
+    # value that contains a literal embedded 0x00 byte — the exact case
+    # `append_escaped`'s own doc explains, hand-traced byte-for-byte:
+    # rank(0x40=64), 'a'(97), escaped-zero(0,255), 'b'(98), terminator
+    # (0,0), then the raw (unescaped) address bytes.
+    proc demoDataKeyEscapingOk() -> bool:
+        let embeddedNul = bytesToText([97, 0, 98])
+        let v = do textDataValue(embeddedNul)
+        let address = "Z1"
+        let k = do dataKey(v, address)
+        let expect = [64, 97, 0, 255, 98, 0, 0, 90, 49]
+        let keyEq = do bytesEqual(k, expect)
+        let lookup = do addressFromDataKey(k)
+        let recoveredAddr = bytesToText(lookup.address)
+        return keyEq && lookup.found && recoveredAddr == address
+
+    # encode_string_prefix: the escaped prefix of "h" must be a genuine
+    # byte-prefix of the full encoding of "hello" — the property that
+    # turns `starts_with` into a range scan.
+    proc demoEncodeStringPrefixOk() -> bool:
+        let prefix = do encodeStringPrefix("h")
+        let helloVal = do textDataValue("hello")
+        let full = do encodeOrderValue(helloVal)
+        let isPrefix = do bytesHasPrefix(full, prefix)
+        return isPrefix
+
+    # fold_into's OWN Rust test, restated verbatim (input and expected
+    # output both copied from
+    # `folding_is_case_insensitive_and_keeps_length`): only the ASCII
+    # `B`/`C` fold; `Ü`, `ï`, `Å` (each 2-byte UTF-8) are untouched, and
+    # the byte length is unchanged.
+    proc demoFoldMatchesRustTestOk() -> bool:
+        let input = "Ünïcode ÅBC"
+        let folded = do foldToBytes(input)
+        let foldedText = bytesToText(folded)
+        let lenPreserved = len(folded) == byteLen(input)
+        return foldedText == "Ünïcode Åbc" && lenPreserved
+
+    # grams' OWN Rust test (`a_needle_under_one_window_has_no_grams`),
+    # restated verbatim.
+    proc demoGramsShortInputsEmptyOk() -> bool:
+        let g0 = do grams("")
+        let g1 = do grams("a")
+        let g2 = do grams("ab")
+        let g3 = do grams("abc")
+        return len(g0) == 0 && len(g1) == 0 && len(g2) == 0 && len(g3) == 1
+
+    # grams' OWN Rust test (`folding_is_case_insensitive_and_keeps_length`'s
+    # other half, "ABC"/"abc"/"AbC"/"aBc" all fold identically) —
+    # restated as equal gram SETS (both are length-1 here).
+    proc demoGramsCaseInsensitiveOk() -> bool:
+        let a = do grams("ABC")
+        let b = do grams("abc")
+        let c = do grams("AbC")
+        let d = do grams("aBc")
+        let ab = do gramsEqual(a[0], b[0])
+        let cd = do gramsEqual(c[0], d[0])
+        let ac = do gramsEqual(a[0], c[0])
+        return len(a) == 1 && len(b) == 1 && len(c) == 1 && len(d) == 1 && ab && cd && ac
+
+    # The subset property (`a_substrings_grams_are_a_subset_of_the_haystacks`)
+    # exercised against a GENUINE multi-byte haystack: "héllo" is
+    # [104,195,169,108,108,111] (h, é=0xC3 0xA9, l, l, o) — 6 bytes, 4
+    # trigrams. The needle "él" is exactly BYTES [195,169,108], one of
+    # those 4 trigrams verbatim, so its own (single) gram must be a
+    # member of the haystack's set — the one-directional property the
+    # whole index's correctness rests on, proven here across a
+    # multi-byte-character boundary, not just within ASCII.
+    proc demoGramsMultibyteSubsetOk() -> bool:
+        let haystack = "héllo"
+        let needle = "él"
+        let hgrams = do grams(haystack)
+        let ngrams = do grams(needle)
+        let n = len(ngrams)
+        let mut allIn = true
+        let mut i = 0
+        loop i < n:
+            let inSet = do gramsContains(hgrams, ngrams[i])
+            if !inSet:
+                allIn = false
+            i = i + 1
+        return len(hgrams) == 4 && len(ngrams) == 1 && allIn
+
+    # posting key round-trip — `a_posting_key_round_trips_its_address`,
+    # restated verbatim (gram "abc", address "Post:0001"), plus its own
+    # "an address is never empty" case (`address_from_key(&gram[..])` ==
+    # `None`).
+    proc demoPostingKeyRoundTripOk() -> bool:
+        let g = Gram{b0: 97, b1: 98, b2: 99}
+        let k = do textIndexKey(g, "Post:0001")
+        let prefixOk = do bytesHasPrefix(k, [97, 98, 99])
+        let lookup = do addressFromTextIndexKey(k)
+        let recovered = bytesToText(lookup.address)
+        let bare = [97, 98, 99]
+        let bareLookup = do addressFromTextIndexKey(bare)
+        return prefixOk && lookup.found && recovered == "Post:0001" && !bareLookup.found
+
+    # A multi-byte-ADDRESS posting key round-trip, for the same reason
+    # the component/kindKey demos above use a multi-byte value: the
+    # gram itself is fixed-width bytes regardless of script, but the
+    # address trailing it is real UTF-8 and must decode back exactly.
+    proc demoPostingKeyMultibyteAddressOk() -> bool:
+        let g = do grams("café")
+        let firstGram = g[0]
+        let k = do textIndexKey(firstGram, "café:1")
+        let lookup = do addressFromTextIndexKey(k)
+        let recovered = bytesToText(lookup.address)
+        return lookup.found && recovered == "café:1"
+
+    proc demoCheckTextKeyValueAcceptsOk() -> bool:
+        let r = do checkTextKeyValue("body_idx", "hello world", "Post:1")
+        return r.ok

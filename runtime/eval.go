@@ -937,16 +937,18 @@ func evalCall(e *ir.Expr, scope map[string]any) any {
 }
 
 // callProcBuiltin dispatches a proc-body builtin call, exactly like callBuiltin
-// below, except that it also recognizes the four I/O capability builtins
-// (readFile/writeFile/httpGet/httpPost — see runtime/io.go), which callBuiltin
-// itself cannot: they need the server's sandboxed data-directory root and
-// HTTP client config, and — unlike every builtin callBuiltin handles — they
-// can fail for reasons outside the program's control (missing file,
-// permission, unreachable host, non-2xx response), so this returns an error
-// where callBuiltin never does. Only evalInFrame's "call" case reaches this;
+// below, except that it also recognizes the I/O capability builtins
+// (readFile/writeFile/httpGet/httpPost — see runtime/io.go — and
+// listen/accept/readBytes/writeBytes/closeConn — see runtime/netconn.go),
+// which callBuiltin itself cannot: they need the server's sandboxed
+// data-directory root, HTTP client config, or listener/connection registry,
+// and — unlike every builtin callBuiltin handles — they can fail for reasons
+// outside the program's control (missing file, permission, unreachable host,
+// non-2xx response, connection reset), so this returns an error where
+// callBuiltin never does. Only evalInFrame's "call" case reaches this;
 // callBuiltin itself stays the single dispatch table for eval()/evalCall's
 // flat-scope (action/view) path, which can never be asked to run one of
-// these four (internal/ir/build.go's checkNoIO bars them from ever reaching
+// these (internal/ir/build.go's checkNoIO bars them from ever reaching
 // action/view/policy/derive source in the first place).
 func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 	arg := func(i int) any {
@@ -970,6 +972,16 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.channels.send(toInt(arg(0)), toStr(arg(1)))
 	case "recv":
 		return s.channels.recv(toInt(arg(0)))
+	case "listen":
+		return s.ioListen(toInt(arg(0)))
+	case "accept":
+		return s.ioAccept(toInt(arg(0)))
+	case "readBytes":
+		return s.ioReadBytes(toInt(arg(0)), toInt(arg(1)))
+	case "writeBytes":
+		return s.ioWriteBytes(toInt(arg(0)), arg(1))
+	case "closeConn":
+		return s.ioCloseConn(toInt(arg(0)))
 	}
 	return callBuiltin(name, argVals), nil
 }
@@ -1097,6 +1109,53 @@ func callBuiltin(name string, argVals []any) any {
 		default:
 			return utf8.RuneCountInString(toStr(v))
 		}
+	case "byteLen":
+		// byteLen(s) -> int: s's real UTF-8 byte length, as opposed to len's
+		// rune count above — a plain Go len() on the string's own byte
+		// representation, with no decoding at all.
+		return len(toStr(arg(0)))
+	case "textToBytes":
+		// textToBytes(s) -> [int]: s's real UTF-8 byte encoding, one int
+		// (0-255) per byte — a multi-byte codepoint produces its real
+		// multi-byte encoding, not one int per rune (contrast charAt/slice/
+		// len, which are rune-indexed). Represented as the same []any a
+		// bytes(n)/readBytes byte buffer already is (see bytesType's doc in
+		// internal/ir/build.go), so it is len()-able, index-readable, and
+		// accepted wherever a byte buffer already is (e.g. writeBytes).
+		buf := []byte(toStr(arg(0)))
+		out := make([]any, len(buf))
+		for i, b := range buf {
+			out[i] = int(b)
+		}
+		return out
+	case "bytesToText":
+		// bytesToText(b) -> text: textToBytes' inverse, decoding a [int]
+		// byte buffer as UTF-8. Invalid input (a byte value out of range, or
+		// a byte sequence that isn't valid UTF-8) is handled the same
+		// lenient way Go's own string([]byte) conversion already handles it
+		// everywhere else in this runtime (e.g. ioReadFile's os.ReadFile
+		// bytes, or readBytes' own buf above turned into text by a caller):
+		// bytes are copied through verbatim, never an error, and any
+		// ill-formed sequence only surfaces as U+FFFD replacement runes the
+		// next time something decodes the string rune-by-rune (len, charAt,
+		// slice, split, range) — exactly the same place Go's own decoder
+		// would show it, and the only "invalid UTF-8" behavior available
+		// without inventing an error-return shape none of this runtime's
+		// other pure builtins have. A byte value outside 0-255 is clamped
+		// into range first, the same defensive clamp writeBytes already
+		// applies to its own []int argument.
+		arr, _ := arg(0).([]any)
+		buf := make([]byte, len(arr))
+		for i, v := range arr {
+			n := toInt(v)
+			if n < 0 {
+				n = 0
+			} else if n > 255 {
+				n = 255
+			}
+			buf[i] = byte(n)
+		}
+		return string(buf)
 	case "bytes":
 		// bytes(n): an n-length, zero-filled byte buffer — the common way to start
 		// building one up byte-by-byte in a loop (mirroring `[]` + append for a
