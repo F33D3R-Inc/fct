@@ -1,0 +1,1128 @@
+app FabricRoutingSelfHost:
+    # Self-hosting port of four small, self-contained pure-logic files from
+    # fabric/crates/fabric-routing/src/ — key.rs (125L), range.rs (126L),
+    # route.rs (132L), error.rs (125L) — plus fabric/crates/fabric-topology/
+    # src/ in full — placement.rs (29L), registry.rs (79L). table.rs
+    # (1598L, fabric-routing's actual RoutingTable) is deliberately
+    # EXCLUDED this round, per this task's own brief: it is real pure logic
+    # (verified independently — fabric.fct's own header already surveyed it
+    # and reached the same conclusion) but it is a mutable index over THREE
+    # other crates' types (ReplicaSet, Migration, TopologyRegistry) with no
+    # self-contained algorithm smaller than porting all of them, sized for a
+    # port of its own.
+    #
+    # ============================================================
+    # RELATIONSHIP TO fabric.fct's EXISTING ROUTING-KEY HANDLING — read in
+    # full before writing this file, per this task's own instruction:
+    # ============================================================
+    # fabric.fct ports fabric-facetql/frontdoor/keyspace.rs, which resolves
+    # FacetQL's namespace (a `kind` name or an `address` string) to one
+    # fabric_routing::RoutingKey. Its own header states its `RoutingKey`
+    # representation choice explicitly: a routing key there is packed into
+    # ONE `int` (`shard_id * 156 + coordinate.index()`), deliberately never
+    # unpacked back into shard/x/y anywhere in that file, because
+    # `Keyspace::resolve` never does arithmetic on a key beyond EQUALITY.
+    #
+    # This file ports a DIFFERENT set of concerns about the SAME underlying
+    # Rust type (`fabric_routing::RoutingKey` itself, plus its sibling types
+    # in the same crate: `CoordinateRange`, `Route`, `RoutingError`,
+    # `TopologyRegistry`) — the actual field structure, textual address
+    # parsing (`"<shard>/<x>,<y>"`), grid-index arithmetic, range/segment
+    # logic, and the full error taxonomy that fabric-routing's own code
+    # depends on and fabric.fct's keyspace port never needed. Those
+    # operations are exactly the ones fabric.fct's header says its packed
+    # int is NOT meant to support ("never unpacked... exactly because
+    # nothing in Keyspace::resolve needs to"). So per this task's own
+    # instruction ("if fabric-routing's RoutingKey is a distinct type from a
+    # different crate, keep it separate and say so honestly rather than
+    # forcing a merge") this file declares its OWN real `RoutingKey`/
+    # `Coordinate` structs from scratch, with real named fields
+    # (shardId/coordinate, x/y) rather than reusing fabric.fct's packed
+    # int — the two representations model the same real-world value at
+    # different fidelity for different jobs, and merging them would force
+    # every future caller of the fuller one to unpack/repack through the
+    # lossy one for no reason. This file does not `import` fabric.fct and
+    # fabric.fct is not touched.
+    #
+    # ============================================================
+    # TEXT-TAGGED VARIANTS — the representation convention this file uses
+    # for `RoutingError` (nine variants, several carrying different payload
+    # shapes) and `ReadPreference` (four variants, one carrying a payload).
+    # This is the SAME convention predicate.fct's own `Node`/`Field` structs
+    # already established for the identical reason stated there: `kind:
+    # text` names which variant a value is; every other field is always
+    # present (a struct literal must set every field) but only the ones
+    # that `kind` actually uses are meaningful. Chosen over fabric.fct's own
+    # plain-`int`-status-code convention (`PlanRefusal.code`, `MigrationState`
+    # phase numbers) because a Rust `enum` with NAMED variants like
+    # `RoutingError` is exactly what predicate.fct's `Node.kind` already
+    # restates as readable text instead of a number a reader has to look up
+    # — and this task's own brief asks for RoutingError specifically to be
+    # ported this way.
+    #
+    # ============================================================
+    # WHAT THE REAL LOGIC IS, verified by reading all six files in full and
+    # by running `cargo test -p fabric-routing --lib` / `-p fabric-topology
+    # --lib` for ground truth (21 passed for fabric-routing, including all 6
+    # of key.rs's and range.rs's own tests; 0 tests exist for
+    # fabric-topology — registry.rs/placement.rs are hand-verified against
+    # the Rust source directly, see the demo section below):
+    #   key.rs    — RoutingKey{shard_id, coordinate}, no placement info at
+    #               all (the point: the same key routes to a different node
+    #               tomorrow). `new` rejects an off-grid coordinate.
+    #               `FromStr` parses "<shard>/<x>,<y>" (e.g. "42/7,3").
+    #               `index()` is the cell's position in the shard's 12x13
+    #               grid, 0..156.
+    #   range.rs  — CoordinateRange: an inclusive [start,end] in grid order
+    #               (row-major, same order as Coordinate::index). `full()`
+    #               is a whole-shard scan. `RouteSegment` pairs one range
+    #               with the one Route that answers for the whole thing —
+    #               table.rs's (excluded) job is producing segments; this
+    #               file only ports the segment/range SHAPE and its own
+    #               arithmetic (`len`/`contains`/`coordinates`).
+    #   route.rs  — What a lookup asks for (RouteRequest: a key plus a
+    #               RouteIntent — Read(ReadPreference) or Write) and what it
+    #               gets back (Route: which node, which region, why that
+    #               node is the answer (ServedBy), and the routing table's
+    #               generation when the answer was produced, so a caller
+    #               knows when to re-resolve). The only real behaviour here
+    #               is `ReadPreference::allows_stale` (true only for
+    #               AnyCopy) and `RouteIntent::kind`/`::read()`.
+    #   error.rs  — RoutingError, nine variants naming exactly what was
+    #               tried, plus `is_retryable` (true only for WriteFenced)
+    #               and the full Display impl restated as
+    #               `routingErrorMessage`.
+    #   placement.rs — Placement{dbms_id, shard_id, coordinate, region}: the
+    #               physical location of one logical coordinate. The
+    #               logical coordinate never changes; the Fabric is allowed
+    #               to change this placement. `Placement::new` takes a
+    #               `&Shard` but only ever reads `.id` from it — ported as
+    #               a plain `shardId: int` parameter, noted honestly here
+    #               rather than threading an unused Shard type through.
+    #   registry.rs — TopologyRegistry: a `HashMap<(shard_id, coordinate),
+    #               Placement>` CRUD wrapper — `place` (insert-or-overwrite,
+    #               matching `HashMap::insert`'s own replace-on-collision
+    #               semantics), `locate`, `move_coordinate` (mutate
+    #               dbms_id/region on an EXISTING entry only — false if
+    #               absent, unlike `place`, which never fails), `remove`,
+    #               `len`/`is_empty`/`placements`. This language has no
+    #               native map type (this codebase's own established
+    #               substitute, e.g. triggers.fct's `ColorMap`, is parallel
+    #               arrays or a linear-scan array of entries — predicate.fct's
+    #               `Field`-array-searched-by-name is the closer shape here),
+    #               so the registry is one `[Placement]` array searched
+    #               linearly by (shardId, coordinate) — correct for the
+    #               small, human-scale placement tables this crate's own
+    #               doc comments describe, and, being a `proc`, every
+    #               "mutating" operation here returns a NEW
+    #               `TopologyRegistry` value rather than mutating in place
+    #               (a `proc` has no `&mut self`) — the same functional-CRUD
+    #               shape fabric_plan.fct's own `planTransactionAddTouch`
+    #               already uses for its own growing key list.
+
+    # ============================================================
+    # fabric_core::Coordinate — `{ x: u8, y: u8 }`, x < 12 && y < 13
+    # (`is_valid`), `index() = y*12 + x` (row-major, 156 cells per shard —
+    # GRID_WIDTH=12, GRID_HEIGHT=13, GRID_ATOMS=156, read directly from
+    # fabric-core/src/grid.rs, not assumed). `coordinateAt` is the inverse
+    # of `index()`, restating the free function `coordinate_at` from
+    # range.rs (which fabric-core itself does not define — range.rs owns
+    # the inverse, Coordinate only owns the forward direction).
+    # ============================================================
+    struct Coordinate:
+        x: int
+        y: int
+
+    proc coordinateIsValid(c: Coordinate) -> bool:
+        return c.x >= 0 && c.x < 12 && c.y >= 0 && c.y < 13
+
+    proc coordinateIndex(c: Coordinate) -> int:
+        return (c.y * 12) + c.x
+
+    proc coordinateAt(index: int) -> Coordinate:
+        let x = index % 12
+        let y = index / 12
+        return Coordinate{x: x, y: y}
+
+    # ============================================================
+    # error.rs — RoutingError, text-tagged (see header). `kind` is one of:
+    #   "UnknownShard"        shardId
+    #   "InvalidCoordinate"   x, y
+    #   "InvalidAddress"      address, reason
+    #   "InvalidRange"        start, end
+    #   "UnknownNode"         node
+    #   "NoLiveOwner"         shardId, considered
+    #   "NoWritableReplica"   shardId
+    #   "NoReadableReplica"   shardId
+    #   "WriteFenced"         shardId, source, destination
+    # `""` (routingErrorNone) is this port's own "no error" sentinel for
+    # embedding inside a Result-shaped struct's `err` field on the Ok path —
+    # not a real Rust variant, exactly like fabric_plan.fct's own
+    # `missCode: -1` meaning Ok inside `PlanResolveResult`.
+    # ============================================================
+    struct RoutingError:
+        kind: text
+        shardId: int
+        x: int
+        y: int
+        address: text
+        reason: text
+        start: Coordinate
+        end: Coordinate
+        node: text
+        considered: [text]
+        source: text
+        destination: text
+
+    proc routingErrorNone() -> RoutingError:
+        return RoutingError{kind: "", shardId: 0, x: 0, y: 0, address: "", reason: "", start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: "", considered: [], source: "", destination: ""}
+
+    proc routingErrorUnknownShard(shardId: int) -> RoutingError:
+        return RoutingError{kind: "UnknownShard", shardId: shardId, x: 0, y: 0, address: "", reason: "", start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: "", considered: [], source: "", destination: ""}
+
+    proc routingErrorInvalidCoordinate(x: int, y: int) -> RoutingError:
+        return RoutingError{kind: "InvalidCoordinate", shardId: 0, x: x, y: y, address: "", reason: "", start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: "", considered: [], source: "", destination: ""}
+
+    proc routingErrorInvalidAddress(address: text, reason: text) -> RoutingError:
+        return RoutingError{kind: "InvalidAddress", shardId: 0, x: 0, y: 0, address: address, reason: reason, start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: "", considered: [], source: "", destination: ""}
+
+    proc routingErrorInvalidRange(start: Coordinate, end: Coordinate) -> RoutingError:
+        return RoutingError{kind: "InvalidRange", shardId: 0, x: 0, y: 0, address: "", reason: "", start: start, end: end, node: "", considered: [], source: "", destination: ""}
+
+    proc routingErrorUnknownNode(node: text) -> RoutingError:
+        return RoutingError{kind: "UnknownNode", shardId: 0, x: 0, y: 0, address: "", reason: "", start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: node, considered: [], source: "", destination: ""}
+
+    proc routingErrorNoLiveOwner(shardId: int, considered: [text]) -> RoutingError:
+        return RoutingError{kind: "NoLiveOwner", shardId: shardId, x: 0, y: 0, address: "", reason: "", start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: "", considered: considered, source: "", destination: ""}
+
+    proc routingErrorNoWritableReplica(shardId: int) -> RoutingError:
+        return RoutingError{kind: "NoWritableReplica", shardId: shardId, x: 0, y: 0, address: "", reason: "", start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: "", considered: [], source: "", destination: ""}
+
+    proc routingErrorNoReadableReplica(shardId: int) -> RoutingError:
+        return RoutingError{kind: "NoReadableReplica", shardId: shardId, x: 0, y: 0, address: "", reason: "", start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: "", considered: [], source: "", destination: ""}
+
+    proc routingErrorWriteFenced(shardId: int, source: text, destination: text) -> RoutingError:
+        return RoutingError{kind: "WriteFenced", shardId: shardId, x: 0, y: 0, address: "", reason: "", start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}, node: "", considered: [], source: source, destination: destination}
+
+    # is_retryable: true only for WriteFenced ("a cutover is in flight...
+    # Retry — this is not a failure").
+    proc routingErrorIsRetryable(e: RoutingError) -> bool:
+        return e.kind == "WriteFenced"
+
+    # joinTextArray: `considered.iter().map(|n| n.0.as_str()).collect::<Vec<_>>().join(", ")`,
+    # restated with a plain loop (this language has no `.join`).
+    proc joinTextArray(items: [text], sep: text) -> text:
+        let n = len(items)
+        let mut result = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                result = result + sep
+            result = result + items[i]
+            i = i + 1
+        return result
+
+    # routingErrorMessage: the full `Display` impl, restated arm for arm in
+    # the exact order the real `fmt` match declares them.
+    proc routingErrorMessage(e: RoutingError) -> text:
+        if e.kind == "UnknownShard":
+            return "shard " + e.shardId + " is not in the routing table"
+        if e.kind == "InvalidCoordinate":
+            return "coordinate (" + e.x + "," + e.y + ") is outside the 12x13 grid"
+        if e.kind == "InvalidAddress":
+            return "cannot route address '" + e.address + "': " + e.reason
+        if e.kind == "InvalidRange":
+            return "range (" + e.start.x + "," + e.start.y + ") to (" + e.end.x + "," + e.end.y + ") runs backwards"
+        if e.kind == "UnknownNode":
+            return "node '" + e.node + "' holds a placement but is not in the routing table"
+        if e.kind == "NoLiveOwner":
+            let names = do joinTextArray(e.considered, ", ")
+            return "shard " + e.shardId + " has no live owner (considered: " + names + ")"
+        if e.kind == "NoWritableReplica":
+            return "shard " + e.shardId + " has no in-sync primary to accept writes"
+        if e.kind == "NoReadableReplica":
+            return "shard " + e.shardId + " has no copy fresh enough for this read"
+        if e.kind == "WriteFenced":
+            return "shard " + e.shardId + " is fenced for cutover from '" + e.source + "' to '" + e.destination + "'; retry"
+        return ""
+
+    # ============================================================
+    # SMALL TEXT HELPERS — needed only for key.rs's `FromStr`. `indexOf`
+    # restates Go's `strings.Index` (first occurrence, -1 if absent), used
+    # in place of Rust's `str::split_once`, which splits on the FIRST
+    # occurrence only (a second `/` or `,` later in the string is left
+    # inside the second half, exactly like `split_once`, and unlike this
+    # language's own `split` builtin, which splits on EVERY occurrence —
+    # confirmed against LANGUAGE.md's own `split` section before relying on
+    # it, precisely because using it directly here would silently diverge
+    # from `split_once` on an address with more than one `/` or `,`).
+    # ============================================================
+    proc indexOf(s: text, sub: text) -> int:
+        let n = len(s)
+        let m = len(sub)
+        let mut i = 0
+        let mut found = -1
+        loop i <= n - m && found == -1:
+            if slice(s, i, i + m) == sub:
+                found = i
+            i = i + 1
+        return found
+
+    proc isDigitChar(c: text) -> bool:
+        return c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+    # isUnsignedIntText: the syntactic gate this port uses in place of
+    # `u8`/`u64::from_str`'s error return — an optional leading `+`
+    # (confirmed against real `rustc`: `"+7".parse::<u8>()` is `Ok(7)`,
+    # `"-7".parse::<u8>()` is `Err(InvalidDigit)` — unsigned integer parsing
+    # accepts a leading `+` but never a `-`) then one or more digits.
+    # Decoding the digits themselves is left to the real `toInt` builtin
+    # (confirmed to already handle a leading `+` and leading zeros
+    # correctly — `toInt("+7")` and `toInt("07")` both return `7`), exactly
+    # the same division of labour `isIntLiteralToken` already uses
+    # elsewhere in this codebase (parser_proc.fct) for `strconv.Atoi`.
+    # Magnitude overflow beyond what an `int` here can hold (Rust's real
+    # `u64::MAX` has 20 digits; this host's `int` is a 64-bit signed value)
+    # is a genuine, narrow, honestly-noted gap: neither key.rs's own tests
+    # nor any realistic shard id ever approaches that boundary, so this
+    # port does not special-case it, the same way fabric.fct's own header
+    # already flags (rather than silently papers over) the language's
+    # missing lexicographic text comparison.
+    # ============================================================
+    proc isUnsignedIntText(s: text) -> bool:
+        let n = len(s)
+        if n == 0:
+            return false
+        let mut start = 0
+        if charAt(s, 0) == "+":
+            start = 1
+        if start >= n:
+            return false
+        let mut ok = true
+        let mut i = start
+        loop i < n:
+            let d = do isDigitChar(charAt(s, i))
+            if !d:
+                ok = false
+            i = i + 1
+        return ok
+
+    # isU8Text: `isUnsignedIntText` plus the `u8` range check (`<= 255`) —
+    # `"256"` parses its digits fine but is rejected exactly like
+    # `"256".parse::<u8>()` returning `Err(PosOverflow)` (confirmed against
+    # real `rustc`).
+    proc isU8Text(s: text) -> bool:
+        let syntaxOk = do isUnsignedIntText(s)
+        if !syntaxOk:
+            return false
+        let v = toInt(s)
+        return v <= 255
+
+    proc isU64Text(s: text) -> bool:
+        let syntaxOk = do isUnsignedIntText(s)
+        return syntaxOk
+
+    # ============================================================
+    # key.rs — RoutingKey.
+    # ============================================================
+    struct RoutingKey:
+        shardId: int
+        coordinate: Coordinate
+
+    # RoutingKeyResult: `Result<RoutingKey, RoutingError>` flattened —
+    # `ok` says which of `key`/`err` is meaningful, the same shape
+    # `CoordinateRangeResult` below and `PlanResolveResult` in
+    # fabric_plan.fct already use for the identical reason (no sum-type
+    # return in this language).
+    struct RoutingKeyResult:
+        ok: bool
+        key: RoutingKey
+        err: RoutingError
+
+    # routingKeyNew: `RoutingKey::new` — rejects an off-grid coordinate.
+    proc routingKeyNew(shardId: int, coordinate: Coordinate) -> RoutingKeyResult:
+        let valid = do coordinateIsValid(coordinate)
+        if !valid:
+            let e = do routingErrorInvalidCoordinate(coordinate.x, coordinate.y)
+            return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
+        let noErr = do routingErrorNone()
+        return RoutingKeyResult{ok: true, key: RoutingKey{shardId: shardId, coordinate: coordinate}, err: noErr}
+
+    proc routingKeyIndex(k: RoutingKey) -> int:
+        let idx = do coordinateIndex(k.coordinate)
+        return idx
+
+    # routingKeyDisplay: `impl Display` — "{shard}/{x},{y}".
+    proc routingKeyDisplay(k: RoutingKey) -> text:
+        return k.shardId + "/" + k.coordinate.x + "," + k.coordinate.y
+
+    # routingKeyParse: `impl FromStr` — "<shard>/<x>,<y>", e.g. "42/7,3".
+    # Restates each guard in the real function's own order: missing '/',
+    # missing ',' after it, shard not a number, x not a number, y not a
+    # number, then `Self::new`'s own off-grid check (propagated as
+    # `InvalidCoordinate`, NOT wrapped in `InvalidAddress` — matching the
+    # real `Self::new(shard_id, Coordinate::new(x, y))` tail call, which
+    # returns its own error type directly via `?`).
+    proc routingKeyParse(address: text) -> RoutingKeyResult:
+        let slashIdx = do indexOf(address, "/")
+        if slashIdx < 0:
+            let e = do routingErrorInvalidAddress(address, "expected '<shard>/<x>,<y>'")
+            return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
+        let shardRaw = slice(address, 0, slashIdx)
+        let cell = slice(address, slashIdx + 1, len(address))
+        let commaIdx = do indexOf(cell, ",")
+        if commaIdx < 0:
+            let e = do routingErrorInvalidAddress(address, "expected '<x>,<y>' after the shard")
+            return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
+        let xRaw = slice(cell, 0, commaIdx)
+        let yRaw = slice(cell, commaIdx + 1, len(cell))
+        let shardTrim = trim(shardRaw)
+        let xTrim = trim(xRaw)
+        let yTrim = trim(yRaw)
+        let shardOk = do isU64Text(shardTrim)
+        if !shardOk:
+            let e = do routingErrorInvalidAddress(address, "shard id is not a number")
+            return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
+        let xOk = do isU8Text(xTrim)
+        if !xOk:
+            let e = do routingErrorInvalidAddress(address, "x is not a number")
+            return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
+        let yOk = do isU8Text(yTrim)
+        if !yOk:
+            let e = do routingErrorInvalidAddress(address, "y is not a number")
+            return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
+        let shardId = toInt(shardTrim)
+        let x = toInt(xTrim)
+        let y = toInt(yTrim)
+        let built = do routingKeyNew(shardId, Coordinate{x: x, y: y})
+        return built
+
+    # ============================================================
+    # range.rs — CoordinateRange, RouteSegment.
+    # ============================================================
+    struct CoordinateRange:
+        start: Coordinate
+        end: Coordinate
+
+    struct CoordinateRangeResult:
+        ok: bool
+        range: CoordinateRange
+        err: RoutingError
+
+    # coordinateRangeNew: checks BOTH endpoints (matching `for coordinate in
+    # [start, end]`, start first), then that `start.index() <= end.index()`
+    # (grid order, same order as `Coordinate::index`).
+    proc coordinateRangeNew(start: Coordinate, end: Coordinate) -> CoordinateRangeResult:
+        let startValid = do coordinateIsValid(start)
+        if !startValid:
+            let e = do routingErrorInvalidCoordinate(start.x, start.y)
+            return CoordinateRangeResult{ok: false, range: CoordinateRange{start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}}, err: e}
+        let endValid = do coordinateIsValid(end)
+        if !endValid:
+            let e = do routingErrorInvalidCoordinate(end.x, end.y)
+            return CoordinateRangeResult{ok: false, range: CoordinateRange{start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}}, err: e}
+        let startIdx = do coordinateIndex(start)
+        let endIdx = do coordinateIndex(end)
+        if startIdx > endIdx:
+            let e = do routingErrorInvalidRange(start, end)
+            return CoordinateRangeResult{ok: false, range: CoordinateRange{start: Coordinate{x: 0, y: 0}, end: Coordinate{x: 0, y: 0}}, err: e}
+        let noErr = do routingErrorNone()
+        return CoordinateRangeResult{ok: true, range: CoordinateRange{start: start, end: end}, err: noErr}
+
+    # coordinateRangeFull: every cell of a shard, GRID_ATOMS=156 atoms,
+    # end = coordinateAt(155) = (11,12).
+    proc coordinateRangeFull() -> CoordinateRange:
+        let endCoord = do coordinateAt(155)
+        return CoordinateRange{start: Coordinate{x: 0, y: 0}, end: endCoord}
+
+    proc coordinateRangeLen(r: CoordinateRange) -> int:
+        let startIdx = do coordinateIndex(r.start)
+        let endIdx = do coordinateIndex(r.end)
+        return (endIdx - startIdx) + 1
+
+    # is_empty: the real method is a literal `false` — a CoordinateRange is
+    # never empty by construction (start.index() <= end.index() is enforced
+    # at `new`).
+    proc coordinateRangeIsEmpty(r: CoordinateRange) -> bool:
+        return false
+
+    proc coordinateRangeContains(r: CoordinateRange, c: Coordinate) -> bool:
+        let valid = do coordinateIsValid(c)
+        if !valid:
+            return false
+        let idx = do coordinateIndex(c)
+        let startIdx = do coordinateIndex(r.start)
+        let endIdx = do coordinateIndex(r.end)
+        return idx >= startIdx && idx <= endIdx
+
+    # coordinateRangeCoordinates: `(start.index()..=end.index()).map(coordinate_at)`,
+    # restated as a real `[Coordinate]` array (this language's closest
+    # analogue to the iterator; `len(...)` on the result is this port's
+    # `.count()`).
+    proc coordinateRangeCoordinates(r: CoordinateRange) -> [Coordinate]:
+        let startIdx = do coordinateIndex(r.start)
+        let endIdx = do coordinateIndex(r.end)
+        let mut result = []
+        let mut idx = startIdx
+        loop idx <= endIdx:
+            let c = do coordinateAt(idx)
+            result = append(result, c)
+            idx = idx + 1
+        return result
+
+    # ============================================================
+    # route.rs — ReadPreference, RouteIntent, RouteKind, ServedBy, Route,
+    # RouteRequest.
+    # ============================================================
+    # ReadPreference, text-tagged: "Primary" | "AnyFresh" | "PreferRegion"
+    # (region meaningful) | "AnyCopy". Constructed with plain struct
+    # literals below (matching fabric_plan.fct's own convention for a
+    # payload-free/one-field variant — a wrapper proc would add nothing a
+    # literal doesn't already say).
+    struct ReadPreference:
+        kind: text
+        region: text
+
+    proc readPreferenceAllowsStale(p: ReadPreference) -> bool:
+        return p.kind == "AnyCopy"
+
+    # RouteIntent: Read(ReadPreference) | Write. `readPref` is only
+    # meaningful when `isWrite` is false, exactly like `PlanRouteIntent` in
+    # fabric_plan.fct already does for the same real Rust enum shape (a
+    # different crate's own re-derivation of the identical type, not
+    # reused here per this file's own header).
+    struct RouteIntent:
+        isWrite: bool
+        readPref: ReadPreference
+
+    # routeIntentReadDefault: `RouteIntent::read()` — Read(Primary), "the
+    # safe default when a caller has no staleness opinion".
+    proc routeIntentReadDefault() -> RouteIntent:
+        return RouteIntent{isWrite: false, readPref: ReadPreference{kind: "Primary", region: ""}}
+
+    # routeIntentKind: `RouteIntent::kind()` -> RouteKind, ported as plain
+    # text ("Read"/"Write") for the same text-tagged reason as
+    # RoutingError/ReadPreference above.
+    proc routeIntentKind(intent: RouteIntent) -> text:
+        if intent.isWrite:
+            return "Write"
+        return "Read"
+
+    # Route: one resolved answer. `hasCoordinate`/`coordinate` stands in for
+    # `coordinate: Option<Coordinate>` (`None` for a whole-shard route) —
+    # this language's established has*/value pair, the same shape
+    # fabric.fct's own `hasFallback`/`fallbackKey` already uses for an
+    # `Option`. `servedBy` (ServedBy) and `kind` (RouteKind) are both plain
+    # text tags; `node`/`region` restate `DbmsId`/`String` directly
+    # (`DbmsId` is itself just `pub struct DbmsId(pub String)` — read
+    # directly from fabric-core/src/topology.rs, not assumed).
+    struct Route:
+        shardId: int
+        hasCoordinate: bool
+        coordinate: Coordinate
+        node: text
+        region: text
+        servedBy: text
+        kind: text
+        generation: int
+
+    struct RouteSegment:
+        range: CoordinateRange
+        route: Route
+
+    proc routeSegmentLen(seg: RouteSegment) -> int:
+        let l = do coordinateRangeLen(seg.range)
+        return l
+
+    proc routeSegmentIsEmpty(seg: RouteSegment) -> bool:
+        return false
+
+    struct RouteRequest:
+        key: RoutingKey
+        intent: RouteIntent
+
+    proc routeRequestRead(key: RoutingKey, preference: ReadPreference) -> RouteRequest:
+        return RouteRequest{key: key, intent: RouteIntent{isWrite: false, readPref: preference}}
+
+    proc routeRequestWrite(key: RoutingKey) -> RouteRequest:
+        return RouteRequest{key: key, intent: RouteIntent{isWrite: true, readPref: ReadPreference{kind: "Primary", region: ""}}}
+
+    # ============================================================
+    # placement.rs — Placement. `Placement::new` takes a `&Shard` but only
+    # ever reads `.id` off it (verified directly against placement.rs — the
+    # struct itself stores `shard_id: u64`, never a `Shard`), so this port's
+    # constructor takes `shardId: int` directly rather than an unused Shard
+    # parameter — noted here rather than silently dropped.
+    # ============================================================
+    struct Placement:
+        dbmsId: text
+        shardId: int
+        coordinate: Coordinate
+        region: text
+
+    proc placementNew(dbmsId: text, shardId: int, coordinate: Coordinate, region: text) -> Placement:
+        return Placement{dbmsId: dbmsId, shardId: shardId, coordinate: coordinate, region: region}
+
+    # routingKeyFromPlacement: `RoutingKey::from_placement` — the key a
+    # topology placement is ABOUT. Note the direction, restated from
+    # key.rs's own doc comment: a Placement says WHERE a key currently
+    # lives, so it contains a key; a key never contains a placement.
+    proc routingKeyFromPlacement(p: Placement) -> RoutingKeyResult:
+        let r = do routingKeyNew(p.shardId, p.coordinate)
+        return r
+
+    # ============================================================
+    # registry.rs — TopologyRegistry (see header for the map-as-array
+    # representation choice).
+    # ============================================================
+    struct TopologyRegistry:
+        placements: [Placement]
+
+    proc topologyRegistryNew() -> TopologyRegistry:
+        return TopologyRegistry{placements: []}
+
+    # topologyRegistryIndexOf: the array position of the entry keyed by
+    # (shardId, coordinate), or -1 — this file's own `ruleIndexForKind`-
+    # shaped linear scan (mirrors fabric.fct's established "keep looping,
+    # only latch the first hit" pattern, appropriate here since a validly
+    # built registry has at most one entry per key by construction — `place`
+    # below never lets a second one in).
+    proc topologyRegistryIndexOf(placements: [Placement], shardId: int, coordinate: Coordinate) -> int:
+        let n = len(placements)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if placements[i].shardId == shardId && placements[i].coordinate.x == coordinate.x && placements[i].coordinate.y == coordinate.y:
+                    found = i
+            i = i + 1
+        return found
+
+    # topologyRegistryPlace: `TopologyRegistry::place` — `HashMap::insert`'s
+    # own semantics: overwrite an existing entry for the same
+    # (shardId, coordinate), otherwise append a new one. Being a `proc`
+    # (no `&mut self`), this returns the NEW registry rather than mutating
+    # in place — see this file's header.
+    proc topologyRegistryPlace(reg: TopologyRegistry, dbmsId: text, shardId: int, coordinate: Coordinate, region: text) -> TopologyRegistry:
+        let p = do placementNew(dbmsId, shardId, coordinate, region)
+        let idx = do topologyRegistryIndexOf(reg.placements, shardId, coordinate)
+        if idx == -1:
+            let grown = append(reg.placements, p)
+            return TopologyRegistry{placements: grown}
+        let mut placements = reg.placements
+        placements[idx] = p
+        return TopologyRegistry{placements: placements}
+
+    struct TopologyLocateResult:
+        found: bool
+        placement: Placement
+
+    proc topologyRegistryLocate(reg: TopologyRegistry, shardId: int, coordinate: Coordinate) -> TopologyLocateResult:
+        let idx = do topologyRegistryIndexOf(reg.placements, shardId, coordinate)
+        if idx == -1:
+            return TopologyLocateResult{found: false, placement: Placement{dbmsId: "", shardId: 0, coordinate: Coordinate{x: 0, y: 0}, region: ""}}
+        return TopologyLocateResult{found: true, placement: reg.placements[idx]}
+
+    struct TopologyMoveResult:
+        moved: bool
+        registry: TopologyRegistry
+
+    # topologyRegistryMoveCoordinate: `TopologyRegistry::move_coordinate` —
+    # unlike `place`, this NEVER inserts: it mutates dbms_id/region on an
+    # EXISTING entry only (shardId/coordinate are left untouched, matching
+    # the real method, which never rewrites the map key), returning false
+    # (and the registry unchanged) if no entry exists for that key.
+    proc topologyRegistryMoveCoordinate(reg: TopologyRegistry, shardId: int, coordinate: Coordinate, dbmsId: text, region: text) -> TopologyMoveResult:
+        let idx = do topologyRegistryIndexOf(reg.placements, shardId, coordinate)
+        if idx == -1:
+            return TopologyMoveResult{moved: false, registry: reg}
+        let mut placements = reg.placements
+        let existing = placements[idx]
+        placements[idx] = Placement{dbmsId: dbmsId, shardId: existing.shardId, coordinate: existing.coordinate, region: region}
+        return TopologyMoveResult{moved: true, registry: TopologyRegistry{placements: placements}}
+
+    # placementArrayRemoveAt: no builtin "remove at index" in this
+    # language, so rebuilt by copying every OTHER element — the array
+    # equivalent of `HashMap::remove`.
+    proc placementArrayRemoveAt(placements: [Placement], idx: int) -> [Placement]:
+        let n = len(placements)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            if i != idx:
+                result = append(result, placements[i])
+            i = i + 1
+        return result
+
+    struct TopologyRemoveResult:
+        removed: bool
+        placement: Placement
+        registry: TopologyRegistry
+
+    proc topologyRegistryRemove(reg: TopologyRegistry, shardId: int, coordinate: Coordinate) -> TopologyRemoveResult:
+        let idx = do topologyRegistryIndexOf(reg.placements, shardId, coordinate)
+        if idx == -1:
+            return TopologyRemoveResult{removed: false, placement: Placement{dbmsId: "", shardId: 0, coordinate: Coordinate{x: 0, y: 0}, region: ""}, registry: reg}
+        let removedPlacement = reg.placements[idx]
+        let shrunk = do placementArrayRemoveAt(reg.placements, idx)
+        return TopologyRemoveResult{removed: true, placement: removedPlacement, registry: TopologyRegistry{placements: shrunk}}
+
+    proc topologyRegistryLen(reg: TopologyRegistry) -> int:
+        return len(reg.placements)
+
+    proc topologyRegistryIsEmpty(reg: TopologyRegistry) -> bool:
+        let n = len(reg.placements)
+        return n == 0
+
+    # topologyRegistryPlacements: `.placements()` — a real Rust HashMap
+    # gives no ordering guarantee at all; this port's own insertion-order
+    # array is, if anything, a MORE predictable restatement, not a weaker
+    # one, and nothing in registry.rs's own contract depends on any
+    # particular order.
+    proc topologyRegistryPlacements(reg: TopologyRegistry) -> [Placement]:
+        return reg.placements
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — hand-verified against ground truth.
+    # key.rs/range.rs: restated from the crate's OWN unit tests, confirmed
+    # passing via `cargo test -p fabric-routing --lib` (21 passed, including
+    # all 6 tests in key::tests/range::tests). route.rs/error.rs have no
+    # test modules in the source (verified by reading each file in full);
+    # hand-traced below directly against their Rust source instead.
+    # fabric-topology (`cargo test -p fabric-topology --lib`) has ZERO
+    # tests at all — registry.rs/placement.rs are hand-traced against
+    # registry.rs's own method bodies, read directly.
+    # ============================================================
+
+    # K1 `an_address_round_trips`: "42/7,3" -> shard_id=42,
+    # coordinate=(7,3), to_string()=="42/7,3". Traced: slashIdx finds "/" at
+    # 2; shardRaw="42", cell="7,3"; commaIdx finds "," at 1; xRaw="7",
+    # yRaw="3"; all three parse; Coordinate(7,3).isValid (7<12,3<13) ->
+    # true; RoutingKey{42,(7,3)}; display "42/7,3".
+    proc demoKeyRoundTrip() -> RoutingKeyResult:
+        let r = do routingKeyParse("42/7,3")
+        return r
+
+    proc demoKeyRoundTripDisplay() -> text:
+        let r = do routingKeyParse("42/7,3")
+        let d = do routingKeyDisplay(r.key)
+        return d
+
+    # K2 `an_off_grid_coordinate_is_refused`: "42/12,0" -> x=12 parses as a
+    # valid u8 (<=255) but Coordinate(12,0).isValid is false (12<12 fails)
+    # -> InvalidCoordinate{x:12,y:0}, NOT wrapped in InvalidAddress —
+    # matching the real test's exact assertion.
+    proc demoKeyOffGrid() -> RoutingKeyResult:
+        let r = do routingKeyParse("42/12,0")
+        return r
+
+    # K3 `a_malformed_address_says_what_was_expected`: "42" has no '/' ->
+    # InvalidAddress{address:"42", reason:"expected '<shard>/<x>,<y>'"}.
+    proc demoKeyMalformed() -> RoutingKeyResult:
+        let r = do routingKeyParse("42")
+        return r
+
+    # R1 `a_full_range_covers_every_atom_of_the_grid`: full().len()==156,
+    # coordinates().count()==156, end()==Coordinate(11,12) (155%12=11,
+    # 155/12=12).
+    proc demoRangeFull() -> CoordinateRange:
+        let r = do coordinateRangeFull()
+        return r
+
+    proc demoRangeFullLen() -> int:
+        let r = do coordinateRangeFull()
+        let l = do coordinateRangeLen(r)
+        return l
+
+    proc demoRangeFullCount() -> int:
+        let r = do coordinateRangeFull()
+        let cs = do coordinateRangeCoordinates(r)
+        return len(cs)
+
+    # R2 `indexing_round_trips_through_the_grid`: for every index in
+    # 0..156, coordinateAt(index).index()==index. Ported as one bool
+    # covering the whole range rather than 156 separate demo procs.
+    proc demoRangeIndexRoundTrips() -> bool:
+        let mut i = 0
+        let mut allOk = true
+        loop i < 156:
+            let c = do coordinateAt(i)
+            let idx = do coordinateIndex(c)
+            if idx != i:
+                allOk = false
+            i = i + 1
+        return allOk
+
+    # R3 `a_backwards_range_is_refused`: new((5,5),(0,0)) -> both endpoints
+    # individually valid, but start.index()=65 > end.index()=0 ->
+    # InvalidRange{start:(5,5),end:(0,0)}.
+    proc demoRangeBackwards() -> CoordinateRangeResult:
+        let r = do coordinateRangeNew(Coordinate{x: 5, y: 5}, Coordinate{x: 0, y: 0})
+        return r
+
+    # Route.rs hand-trace (no Rust tests exist): AnyCopy is the only
+    # ReadPreference that allows a stale read; Read(_) always reports
+    # RouteKind::Read regardless of which preference it carries, Write
+    # always Write; RouteIntent::read() is Read(Primary).
+    proc demoReadPrefAnyCopyAllowsStale() -> bool:
+        let r = do readPreferenceAllowsStale(ReadPreference{kind: "AnyCopy", region: ""})
+        return r
+
+    proc demoReadPrefPrimaryAllowsStale() -> bool:
+        let r = do readPreferenceAllowsStale(ReadPreference{kind: "Primary", region: ""})
+        return r
+
+    proc demoRouteIntentReadKind() -> text:
+        let intent = do routeIntentReadDefault()
+        let k = do routeIntentKind(intent)
+        return k
+
+    proc demoRouteIntentWriteKind() -> text:
+        let intent = RouteIntent{isWrite: true, readPref: ReadPreference{kind: "Primary", region: ""}}
+        let k = do routeIntentKind(intent)
+        return k
+
+    # error.rs hand-trace (no Rust tests exist): is_retryable is true only
+    # for WriteFenced; the Display messages are checked against the exact
+    # `write!` format strings in error.rs's own `fmt` impl.
+    proc demoErrorWriteFencedIsRetryable() -> bool:
+        let e = do routingErrorWriteFenced(7, "db-a", "db-b")
+        let r = do routingErrorIsRetryable(e)
+        return r
+
+    proc demoErrorUnknownShardIsRetryable() -> bool:
+        let e = do routingErrorUnknownShard(7)
+        let r = do routingErrorIsRetryable(e)
+        return r
+
+    proc demoErrorNoLiveOwnerMessage() -> text:
+        let e = do routingErrorNoLiveOwner(3, ["db-a", "db-b"])
+        let m = do routingErrorMessage(e)
+        return m
+
+    proc demoErrorWriteFencedMessage() -> text:
+        let e = do routingErrorWriteFenced(7, "db-a", "db-b")
+        let m = do routingErrorMessage(e)
+        return m
+
+    # ============================================================
+    # registry.rs / placement.rs hand-trace, one linear CRUD story (no
+    # Rust tests exist for either file — cargo confirms 0 tests in
+    # fabric-topology):
+    #   T1 place(shard=1,(0,0), "db-a","us-east") into an empty registry:
+    #      len becomes 1, isEmpty false, locate(1,(0,0)) hits db-a/us-east.
+    #   T2 place the SAME key again with "db-b","us-west": HashMap::insert
+    #      semantics -> OVERWRITES (len stays 1), locate now returns
+    #      db-b/us-west, not db-a.
+    #   T3 locate(2,(0,0)) (a shard never placed) -> found=false.
+    #   T4 move_coordinate(1,(0,0), "db-c","eu-west"): entry exists ->
+    #      moved=true, dbms_id/region updated, shard_id/coordinate
+    #      untouched.
+    #   T5 move_coordinate(9,(0,0), ...) (unknown key) -> moved=false,
+    #      registry UNCHANGED (still holds the T4 state, len 1).
+    #   T6 remove(1,(0,0)) -> removed=true, placement is the T4 db-c one,
+    #      registry back to empty (len 0, isEmpty true).
+    #   T7 remove(1,(0,0)) again (already gone) -> removed=false.
+    # ============================================================
+    proc demoRegistryT1() -> TopologyRegistry:
+        let empty = do topologyRegistryNew()
+        let r = do topologyRegistryPlace(empty, "db-a", 1, Coordinate{x: 0, y: 0}, "us-east")
+        return r
+
+    proc demoRegistryT1Len() -> int:
+        let r = do demoRegistryT1()
+        let l = do topologyRegistryLen(r)
+        return l
+
+    proc demoRegistryT1Locate() -> TopologyLocateResult:
+        let r = do demoRegistryT1()
+        let loc = do topologyRegistryLocate(r, 1, Coordinate{x: 0, y: 0})
+        return loc
+
+    proc demoRegistryT2() -> TopologyRegistry:
+        let r1 = do demoRegistryT1()
+        let r2 = do topologyRegistryPlace(r1, "db-b", 1, Coordinate{x: 0, y: 0}, "us-west")
+        return r2
+
+    proc demoRegistryT2Len() -> int:
+        let r = do demoRegistryT2()
+        let l = do topologyRegistryLen(r)
+        return l
+
+    proc demoRegistryT2Locate() -> TopologyLocateResult:
+        let r = do demoRegistryT2()
+        let loc = do topologyRegistryLocate(r, 1, Coordinate{x: 0, y: 0})
+        return loc
+
+    proc demoRegistryT3Locate() -> TopologyLocateResult:
+        let r = do demoRegistryT2()
+        let loc = do topologyRegistryLocate(r, 2, Coordinate{x: 0, y: 0})
+        return loc
+
+    proc demoRegistryT4() -> TopologyMoveResult:
+        let r = do demoRegistryT2()
+        let mv = do topologyRegistryMoveCoordinate(r, 1, Coordinate{x: 0, y: 0}, "db-c", "eu-west")
+        return mv
+
+    proc demoRegistryT5() -> TopologyMoveResult:
+        let after4 = do demoRegistryT4()
+        let mv = do topologyRegistryMoveCoordinate(after4.registry, 9, Coordinate{x: 0, y: 0}, "db-z", "nowhere")
+        return mv
+
+    proc demoRegistryT6() -> TopologyRemoveResult:
+        let after4 = do demoRegistryT4()
+        let rem = do topologyRegistryRemove(after4.registry, 1, Coordinate{x: 0, y: 0})
+        return rem
+
+    proc demoRegistryT6Len() -> int:
+        let rem = do demoRegistryT6()
+        let l = do topologyRegistryLen(rem.registry)
+        return l
+
+    proc demoRegistryT7() -> TopologyRemoveResult:
+        let after6 = do demoRegistryT6()
+        let rem = do topologyRegistryRemove(after6.registry, 1, Coordinate{x: 0, y: 0})
+        return rem
+
+    # ============================================================
+    # SCALAR EXTRACTORS — an `action` cannot bind a struct-returning proc's
+    # result directly (`facet check`'s own diagnostic: "structs are
+    # proc-local values, with no schema/wire representation yet" — the same
+    # constraint fabric.fct's and fabric_plan.fct's own demo sections
+    # already respect by never exposing anything but int/text/bool/[T] of
+    # those to a `state` cell). Every proc above this line that returns a
+    # struct (RoutingKeyResult, CoordinateRange, CoordinateRangeResult,
+    # TopologyRegistry, TopologyLocateResult, TopologyMoveResult,
+    # TopologyRemoveResult, ...) stays proc-to-proc only; each one below
+    # unpacks exactly the scalar fields the action/view actually need.
+    # ============================================================
+    proc demoKeyRoundTripShard() -> int:
+        let r = do demoKeyRoundTrip()
+        return r.key.shardId
+
+    proc demoKeyRoundTripX() -> int:
+        let r = do demoKeyRoundTrip()
+        return r.key.coordinate.x
+
+    proc demoKeyRoundTripY() -> int:
+        let r = do demoKeyRoundTrip()
+        return r.key.coordinate.y
+
+    proc demoKeyOffGridOk() -> bool:
+        let r = do demoKeyOffGrid()
+        return r.ok
+
+    proc demoKeyOffGridKind() -> text:
+        let r = do demoKeyOffGrid()
+        return r.err.kind
+
+    proc demoKeyOffGridX() -> int:
+        let r = do demoKeyOffGrid()
+        return r.err.x
+
+    proc demoKeyOffGridY() -> int:
+        let r = do demoKeyOffGrid()
+        return r.err.y
+
+    proc demoKeyMalformedOk() -> bool:
+        let r = do demoKeyMalformed()
+        return r.ok
+
+    proc demoKeyMalformedKind() -> text:
+        let r = do demoKeyMalformed()
+        return r.err.kind
+
+    proc demoKeyMalformedReason() -> text:
+        let r = do demoKeyMalformed()
+        return r.err.reason
+
+    proc demoRangeFullEndX() -> int:
+        let r = do demoRangeFull()
+        return r.end.x
+
+    proc demoRangeFullEndY() -> int:
+        let r = do demoRangeFull()
+        return r.end.y
+
+    proc demoRangeBackwardsOk() -> bool:
+        let r = do demoRangeBackwards()
+        return r.ok
+
+    proc demoRangeBackwardsKind() -> text:
+        let r = do demoRangeBackwards()
+        return r.err.kind
+
+    proc demoRegistryT1Found() -> bool:
+        let loc = do demoRegistryT1Locate()
+        return loc.found
+
+    proc demoRegistryT1Dbms() -> text:
+        let loc = do demoRegistryT1Locate()
+        return loc.placement.dbmsId
+
+    proc demoRegistryT2Dbms() -> text:
+        let loc = do demoRegistryT2Locate()
+        return loc.placement.dbmsId
+
+    proc demoRegistryT3Found() -> bool:
+        let loc = do demoRegistryT3Locate()
+        return loc.found
+
+    proc demoRegistryT4Moved() -> bool:
+        let mv = do demoRegistryT4()
+        return mv.moved
+
+    proc demoRegistryT4Region() -> text:
+        let mv = do demoRegistryT4()
+        let loc = do topologyRegistryLocate(mv.registry, 1, Coordinate{x: 0, y: 0})
+        return loc.placement.region
+
+    proc demoRegistryT5Moved() -> bool:
+        let mv = do demoRegistryT5()
+        return mv.moved
+
+    proc demoRegistryT6Removed() -> bool:
+        let rem = do demoRegistryT6()
+        return rem.removed
+
+    proc demoRegistryT6Dbms() -> text:
+        let rem = do demoRegistryT6()
+        return rem.placement.dbmsId
+
+    proc demoRegistryT7Removed() -> bool:
+        let rem = do demoRegistryT7()
+        return rem.removed
+
+    # ============================================================
+    # WIRING — state + action + view, matching every other file in this
+    # directory's own convention.
+    # ============================================================
+    state demoKeyRoundTripShard: int = 0
+    state demoKeyRoundTripX: int = 0
+    state demoKeyRoundTripY: int = 0
+    state demoKeyRoundTripDisplay: text = ""
+    state demoKeyOffGridOk: bool = true
+    state demoKeyOffGridKind: text = ""
+    state demoKeyOffGridX: int = 0
+    state demoKeyOffGridY: int = 0
+    state demoKeyMalformedOk: bool = true
+    state demoKeyMalformedKind: text = ""
+    state demoKeyMalformedReason: text = ""
+    state demoRangeFullLen: int = 0
+    state demoRangeFullCount: int = 0
+    state demoRangeFullEndX: int = 0
+    state demoRangeFullEndY: int = 0
+    state demoRangeIndexRoundTrips: bool = false
+    state demoRangeBackwardsOk: bool = true
+    state demoRangeBackwardsKind: text = ""
+    state demoReadPrefAnyCopy: bool = false
+    state demoReadPrefPrimary: bool = true
+    state demoRouteIntentReadKind: text = ""
+    state demoRouteIntentWriteKind: text = ""
+    state demoErrorWriteFencedRetryable: bool = false
+    state demoErrorUnknownShardRetryable: bool = true
+    state demoErrorNoLiveOwnerMessage: text = ""
+    state demoErrorWriteFencedMessage: text = ""
+    state demoRegistryT1Len: int = 0
+    state demoRegistryT1Found: bool = false
+    state demoRegistryT1Dbms: text = ""
+    state demoRegistryT2Len: int = 0
+    state demoRegistryT2Dbms: text = ""
+    state demoRegistryT3Found: bool = true
+    state demoRegistryT4Moved: bool = false
+    state demoRegistryT4Region: text = ""
+    state demoRegistryT5Moved: bool = true
+    state demoRegistryT6Removed: bool = false
+    state demoRegistryT6Dbms: text = ""
+    state demoRegistryT6Len: int = 0
+    state demoRegistryT7Removed: bool = true
+
+    action runDemoFabricRouting():
+        let k1Shard = do demoKeyRoundTripShard()
+        let k1X = do demoKeyRoundTripX()
+        let k1Y = do demoKeyRoundTripY()
+        let k1d = do demoKeyRoundTripDisplay()
+        let k2Ok = do demoKeyOffGridOk()
+        let k2Kind = do demoKeyOffGridKind()
+        let k2X = do demoKeyOffGridX()
+        let k2Y = do demoKeyOffGridY()
+        let k3Ok = do demoKeyMalformedOk()
+        let k3Kind = do demoKeyMalformedKind()
+        let k3Reason = do demoKeyMalformedReason()
+        let rFullLen = do demoRangeFullLen()
+        let rFullCount = do demoRangeFullCount()
+        let rFullEndX = do demoRangeFullEndX()
+        let rFullEndY = do demoRangeFullEndY()
+        let rIdxOk = do demoRangeIndexRoundTrips()
+        let rBackOk = do demoRangeBackwardsOk()
+        let rBackKind = do demoRangeBackwardsKind()
+        let anyCopy = do demoReadPrefAnyCopyAllowsStale()
+        let primary = do demoReadPrefPrimaryAllowsStale()
+        let readKind = do demoRouteIntentReadKind()
+        let writeKind = do demoRouteIntentWriteKind()
+        let wfRetry = do demoErrorWriteFencedIsRetryable()
+        let usRetry = do demoErrorUnknownShardIsRetryable()
+        let noLiveMsg = do demoErrorNoLiveOwnerMessage()
+        let wfMsg = do demoErrorWriteFencedMessage()
+        let t1Len = do demoRegistryT1Len()
+        let t1Found = do demoRegistryT1Found()
+        let t1Dbms = do demoRegistryT1Dbms()
+        let t2Len = do demoRegistryT2Len()
+        let t2Dbms = do demoRegistryT2Dbms()
+        let t3Found = do demoRegistryT3Found()
+        let t4Moved = do demoRegistryT4Moved()
+        let t4Region = do demoRegistryT4Region()
+        let t5Moved = do demoRegistryT5Moved()
+        let t6Removed = do demoRegistryT6Removed()
+        let t6Dbms = do demoRegistryT6Dbms()
+        let t6Len = do demoRegistryT6Len()
+        let t7Removed = do demoRegistryT7Removed()
+
+        demoKeyRoundTripShard = k1Shard
+        demoKeyRoundTripX = k1X
+        demoKeyRoundTripY = k1Y
+        demoKeyRoundTripDisplay = k1d
+        demoKeyOffGridOk = k2Ok
+        demoKeyOffGridKind = k2Kind
+        demoKeyOffGridX = k2X
+        demoKeyOffGridY = k2Y
+        demoKeyMalformedOk = k3Ok
+        demoKeyMalformedKind = k3Kind
+        demoKeyMalformedReason = k3Reason
+        demoRangeFullLen = rFullLen
+        demoRangeFullCount = rFullCount
+        demoRangeFullEndX = rFullEndX
+        demoRangeFullEndY = rFullEndY
+        demoRangeIndexRoundTrips = rIdxOk
+        demoRangeBackwardsOk = rBackOk
+        demoRangeBackwardsKind = rBackKind
+        demoReadPrefAnyCopy = anyCopy
+        demoReadPrefPrimary = primary
+        demoRouteIntentReadKind = readKind
+        demoRouteIntentWriteKind = writeKind
+        demoErrorWriteFencedRetryable = wfRetry
+        demoErrorUnknownShardRetryable = usRetry
+        demoErrorNoLiveOwnerMessage = noLiveMsg
+        demoErrorWriteFencedMessage = wfMsg
+        demoRegistryT1Len = t1Len
+        demoRegistryT1Found = t1Found
+        demoRegistryT1Dbms = t1Dbms
+        demoRegistryT2Len = t2Len
+        demoRegistryT2Dbms = t2Dbms
+        demoRegistryT3Found = t3Found
+        demoRegistryT4Moved = t4Moved
+        demoRegistryT4Region = t4Region
+        demoRegistryT5Moved = t5Moved
+        demoRegistryT6Removed = t6Removed
+        demoRegistryT6Dbms = t6Dbms
+        demoRegistryT6Len = t6Len
+        demoRegistryT7Removed = t7Removed
+
+    view FabricRoutingHome at "/fabric_routing":
+        box:
+            text "{demoKeyRoundTripShard}/{demoKeyRoundTripX},{demoKeyRoundTripY} {demoKeyRoundTripDisplay} {demoKeyOffGridOk} {demoKeyOffGridKind} {demoKeyOffGridX} {demoKeyOffGridY} {demoKeyMalformedOk} {demoKeyMalformedKind} {demoKeyMalformedReason}"
+            text "{demoRangeFullLen} {demoRangeFullCount} {demoRangeFullEndX} {demoRangeFullEndY} {demoRangeIndexRoundTrips} {demoRangeBackwardsOk} {demoRangeBackwardsKind}"
+            text "{demoReadPrefAnyCopy} {demoReadPrefPrimary} {demoRouteIntentReadKind} {demoRouteIntentWriteKind} {demoErrorWriteFencedRetryable} {demoErrorUnknownShardRetryable}"
+            text "{demoErrorNoLiveOwnerMessage}"
+            text "{demoErrorWriteFencedMessage}"
+            text "{demoRegistryT1Len} {demoRegistryT1Found} {demoRegistryT1Dbms} {demoRegistryT2Len} {demoRegistryT2Dbms} {demoRegistryT3Found} {demoRegistryT4Moved} {demoRegistryT4Region} {demoRegistryT5Moved} {demoRegistryT6Removed} {demoRegistryT6Dbms} {demoRegistryT6Len} {demoRegistryT7Removed}"
