@@ -2589,6 +2589,283 @@ app ExprSelfHost:
         return a2
 
     # ============================================================
+    # STAGE 2f (round 6): aggregates — `count`/`sum`/`exists`/`avg`/`min`/
+    # `max` with the real `<value> in Coll [where <cond>]` / whole-collection
+    # `Coll`/`Coll.field` grammar (expr.go's own parseAgg, read fresh this
+    # round; not a `sel(...)` call-form — see the ROUND 6 SCOPE NOTE, above,
+    # for exactly why there is no such syntax in the real grammar). The
+    # AggMeta auxiliary-row design (arena kinds 15/16) is FINDING 11's
+    # subject, above; this section is the parsing/arena-building code that
+    # implements it.
+    # ============================================================
+    #
+    # isAggNameTok: the closed 6-name aggregate alphabet (expr.go's own
+    # parsePostfix switch's first case, restated the same closed-alphabet
+    # way isCallNameTok/isEntityNameTok already are). Includes `min`/`max`
+    # unconditionally — hasTopLevelCommaAt (below) is what actually decides
+    # whether a `min`/`max` CALL is this shape or the two-argument scalar
+    # builtin, not this name check alone.
+    proc isAggNameTok(texts: [text], n: int, pos: int) -> bool:
+        return pos < n && (texts[pos] == "count" || texts[pos] == "sum" || texts[pos] == "exists" || texts[pos] == "avg" || texts[pos] == "min" || texts[pos] == "max")
+
+    # hasTopLevelCommaAt: expr.go's own argListHasComma, restated verbatim —
+    # a depth-tracked scan for a `,` at paren-depth 1, starting AT the `(`
+    # token itself (`parenPos`, mirroring argListHasComma's own p.pos-is-on-
+    # the-open-paren convention exactly, unlike this file's other `parenPos`
+    # parameters — callEnd/entityGetEnd's own docs — which are also "index of
+    # the `(` itself" but never need to SEE that token's kind the way this
+    # scan does, since they always start their real work at `parenPos + 1`).
+    # Reaching depth 0 again (the matching `)`) before any such comma means
+    # false; this never runs past the real matching `)`, so it is a bounded
+    # lookahead, not an unbounded scan — the one thing in this file that
+    # looks further ahead than "the next token or two," but still a strictly
+    # LOCAL question (is there a comma inside THIS SPECIFIC pair of parens),
+    # not a global one.
+    proc hasTopLevelCommaAt(kinds: [int], texts: [text], parenPos: int) -> bool:
+        let n = len(kinds)
+        let mut i = parenPos
+        let mut depth = 0
+        loop i < n:
+            if kinds[i] == 3:
+                depth = depth + 1
+            else:
+                if kinds[i] == 4:
+                    depth = depth - 1
+                    if depth == 0:
+                        return false
+                else:
+                    if depth == 1:
+                        if texts[i] == ",":
+                            return true
+            i = i + 1
+        return false
+
+    # isAggStartAt: true iff the token at `pos` is a plain IDENT (kind 1)
+    # naming an aggregate (isAggNameTok) immediately followed by `(`, with
+    # `min`/`max` further gated on hasTopLevelCommaAt returning false (no
+    # top-level comma — the aggregate form, `min(Order.amount)`; a comma
+    # means the two-argument scalar builtin, `min(a, b)`, genuinely out of
+    # this port's call grammar still — see round 4's own finding 2, and
+    # FINDING 8). This is checked BEFORE isCallStartAt/isEntityLookupStartAt
+    # in postfixEnd/postfixNodes (see their own docs) since aggregate names
+    # are reserved in call position first, exactly like expr.go's own real
+    # switch order.
+    proc isAggStartAt(kinds: [int], texts: [text], pos: int) -> bool:
+        let n = len(kinds)
+        if pos < n:
+            if kinds[pos] == 1:
+                let nameOk = do isAggNameTok(texts, n, pos)
+                if nameOk:
+                    if pos + 1 < n:
+                        if texts[pos + 1] == "(":
+                            let isMinMax = texts[pos] == "min" || texts[pos] == "max"
+                            if isMinMax:
+                                let hasComma = do hasTopLevelCommaAt(kinds, texts, pos + 1)
+                                return !hasComma
+                            return true
+        return false
+
+    # aggRowVarTok: expr.go's own aggRowVar, restated as a recursive walk
+    # over the ARENA (node-index/kind/slot triples) instead of a Go type
+    # switch over ast.Expr — see FINDING 11 for why this is the one place in
+    # this file that reads structure back out of an already-built arena
+    # rather than only ever appending to one. Finds the item variable a
+    # general reduced-value expression reads its row through: the object of
+    # the LEFTMOST member access in it, in source order (a pre-order walk,
+    # matching aggRowVar's own doc) — Get's object-is-a-bare-Ref base case,
+    # else recurse into the object; EntityGet recurses into its key; Bin
+    # tries its left child first, then its right; Un recurses into its one
+    # operand; Call/ListLit (both use the identical ArgSlot indirection —
+    # FINDING 8 — so one branch covers both) try each argument/element in
+    # order, first non-empty wins. Every other kind (bare Ref, every Lit,
+    # Index, MapLit, MapPairSlot, ArgSlot, another Agg) falls through to -1,
+    # exactly matching aggRowVar's own Go switch having no case for them
+    # either (a bare `ast.Ref` notably included — aggRowVar is only ever
+    # called on a `head` that has ALREADY failed the direct bare-Ref/
+    # Get(Ref) shape checks in aggNodes, below, so a nested bare Ref several
+    # levels down genuinely contributes nothing on its own, only a Get whose
+    # OBJECT happens to be one does).
+    proc aggRowVarTok(arena: [int], idx: int) -> int:
+        let kind = arena[5 * idx]
+        if kind == 6:
+            let objIdx = arena[5 * idx + 3]
+            let objKind = arena[5 * objIdx]
+            if objKind == 1:
+                return arena[5 * objIdx + 1]
+            let viaObj = do aggRowVarTok(arena, objIdx)
+            return viaObj
+        if kind == 12:
+            let keyIdx = arena[5 * idx + 3]
+            let viaKey = do aggRowVarTok(arena, keyIdx)
+            return viaKey
+        if kind == 2:
+            let lIdx = arena[5 * idx + 3]
+            let viaL = do aggRowVarTok(arena, lIdx)
+            if viaL != -1:
+                return viaL
+            let rIdx = arena[5 * idx + 4]
+            let viaR = do aggRowVarTok(arena, rIdx)
+            return viaR
+        if kind == 3:
+            let childIdx = arena[5 * idx + 3]
+            let viaChild = do aggRowVarTok(arena, childIdx)
+            return viaChild
+        if kind == 9 || kind == 10:
+            let first = arena[5 * idx + 3]
+            let cnt = arena[5 * idx + 4]
+            let mut k = 0
+            let mut found = -1
+            loop k < cnt:
+                let argRoot = arena[5 * (first + k) + 1]
+                let viaArg = do aggRowVarTok(arena, argRoot)
+                if viaArg != -1:
+                    found = viaArg
+                    break
+                k = k + 1
+            return found
+        return -1
+
+    # aggEnd: the position twin. `parenPos` is the index of the `(` token
+    # itself (the caller — postfixEnd — always passes `nameTokPos + 1`,
+    # the same convention callEnd/entityGetEnd already use). The reduced
+    # value (`head`) is parsed at exprEnd's level — this port's equivalent
+    # of real precArith (see the ROUND 6 SCOPE NOTE for exactly why exprEnd,
+    # not orEnd/comparisonEnd, is the right floor: it admits `+`/`-`/`*`/`/`/
+    # unary, the full set this subset has that precArith=7 would also admit,
+    # and stops before comparison — leaving `in` free for THIS proc to see,
+    # exactly like the real floor leaves it for parseAgg to see). `in`/
+    # `where` are then matched by plain TEXT equality against IDENT tokens,
+    # no new tokenizer support needed (this file's own FINDING 6 precedent).
+    # Malformed input (no `in`, no `where`, straight to a `)` that may or may
+    # not really be there) degrades the same honest, optimistic way every
+    # other `*End` proc in this file already does — no validation, just an
+    # unconditional `p + 1` past whatever token is actually there.
+    proc aggEnd(kinds: [int], texts: [text], parenPos: int) -> int:
+        let headEnd = do exprEnd(kinds, texts, parenPos + 1)
+        let n = len(kinds)
+        let mut p = headEnd
+        if p < n:
+            if texts[p] == "in":
+                p = p + 2
+        if p < n:
+            if texts[p] == "where":
+                let condEnd = do orEnd(kinds, texts, p + 1)
+                p = condEnd
+        return p + 1
+
+    # aggNodes: the arena-building twin — and the one proc in this file that
+    # both builds new arena rows AND reads back rows it (or an earlier call)
+    # already built, to replicate expr.go's own `switch head.(type)` shape
+    # dispatch (see FINDING 11). `nameTok` is the aggregate name's own token
+    # index (the caller — postfixNodes — always passes `pos`, the identifier's
+    # own position, mirroring callNodes'/entityGetNodes' own `nameTok`
+    # parameter).
+    #
+    # Step 1: build `head` (the reduced value) via exprNodes, at the same
+    # floor aggEnd's own exprEnd call uses, and inspect its root node's KIND
+    # to replicate the real three-way shape dispatch:
+    #   - kind 1 (bare Ref, e.g. `l` in `count(l in CartLine …)`): the value
+    #     IS the row — itemVar is this Ref's own valTok, no field, no sel.
+    #   - kind 6 (Get) whose OWN object child is itself a bare Ref (e.g.
+    #     `l.qty` in `sum(l.qty in CartLine …)`, or `Order.amount` in
+    #     `avg(Order.amount)`): itemVar/coll is the object Ref's valTok,
+    #     field is this Get's own opTok (the field-name token) — no sel.
+    #   - anything else (e.g. `l.qty * l.price`, a Bin(*) whose own children
+    #     are Gets of `l`): a general expression. itemVar is recovered by
+    #     aggRowVarTok(head) (may come back -1 if the expression reads no
+    #     row at all — an honest degrade, not a crash, matching this file's
+    #     established convention for malformed/unusual input elsewhere); sel
+    #     is set to head's own root index either way, exactly mirroring
+    #     parseAgg's `sel = head` assignment in this branch.
+    #
+    # Step 2: whether that shape feeds `coll`/`field` (whole-collection form)
+    # or `itemVar`/`field`/`sel` (filtered form, after an `in`) depends on
+    # whether the token right after `head` is the IDENT `in` — checked once,
+    # reused for both the shape dispatch above and the raw collection-name
+    # token read below (`in`'s own following IDENT is `coll` verbatim in the
+    # filtered form, unlike the whole-collection form where `coll` instead
+    # comes from the ALREADY-BUILT head's own Ref/Get shape).
+    #
+    # Step 3: an optional `where <cond>` is built via orNodes (full grammar,
+    # matching aggEnd's own orEnd call) regardless of which form preceded it,
+    # exactly mirroring parseAgg's own where-parsing sitting outside/after
+    # the filtered-vs-whole-collection if/else.
+    #
+    # Step 4: append the AggMeta row (kind 16: valTok=coll token, opTok=field
+    # token, left=where root index, right=sel root index), then the Agg row
+    # itself (kind 15: valTok=itemVar token, opTok=nameTok, left=AggMeta's
+    # own node index, right=-1) — AggMeta strictly before Agg, preserving the
+    # file-wide postorder invariant ("the root of whatever this call just
+    # built is the last row") that postfixNodes' own `objIdx` computation
+    # depends on.
+    proc aggNodes(kinds: [int], texts: [text], nameTok: int, parenPos: int, arena: [int]) -> [int]:
+        let a0 = do exprNodes(kinds, texts, parenPos + 1, arena)
+        let headIdx = (len(a0) / 5) - 1
+        let headEnd = do exprEnd(kinds, texts, parenPos + 1)
+        let headKind = a0[5 * headIdx]
+        let n = len(kinds)
+        let mut itemVarTok = -1
+        let mut collTok = -1
+        let mut fieldTok = -1
+        let mut selIdx = -1
+        let mut p = headEnd
+        let mut hasIn = false
+        if p < n:
+            if texts[p] == "in":
+                hasIn = true
+        if hasIn:
+            collTok = p + 1
+            p = p + 2
+            if headKind == 1:
+                itemVarTok = a0[5 * headIdx + 1]
+            else:
+                let mut isGetOfRef = false
+                let mut objIdx = -1
+                if headKind == 6:
+                    objIdx = a0[5 * headIdx + 3]
+                    let objKind = a0[5 * objIdx]
+                    if objKind == 1:
+                        isGetOfRef = true
+                if isGetOfRef:
+                    itemVarTok = a0[5 * objIdx + 1]
+                    fieldTok = a0[5 * headIdx + 2]
+                else:
+                    let rowVar = do aggRowVarTok(a0, headIdx)
+                    itemVarTok = rowVar
+                    selIdx = headIdx
+        else:
+            if headKind == 1:
+                collTok = a0[5 * headIdx + 1]
+            else:
+                if headKind == 6:
+                    let objIdx2 = a0[5 * headIdx + 3]
+                    let objKind2 = a0[5 * objIdx2]
+                    if objKind2 == 1:
+                        collTok = a0[5 * objIdx2 + 1]
+                        fieldTok = a0[5 * headIdx + 2]
+        let mut a = a0
+        let mut whereIdx = -1
+        if p < n:
+            if texts[p] == "where":
+                let aw = do orNodes(kinds, texts, p + 1, a)
+                whereIdx = (len(aw) / 5) - 1
+                a = aw
+        let mut am = a
+        am = append(am, 16)
+        am = append(am, collTok)
+        am = append(am, fieldTok)
+        am = append(am, whereIdx)
+        am = append(am, selIdx)
+        let metaIdx = (len(am) / 5) - 1
+        let mut ag = am
+        ag = append(ag, 15)
+        ag = append(ag, itemVarTok)
+        ag = append(ag, nameTok)
+        ag = append(ag, metaIdx)
+        ag = append(ag, -1)
+        return ag
+
+    # ============================================================
     # STAGE 3: the end-to-end driver — raw expression text in, the flat
     # node arena out, exactly parseExpr(src)'s job (minus its error
     # return, per this file's header).

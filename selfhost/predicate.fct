@@ -1,0 +1,836 @@
+app PredicateSelfHost:
+    # Self-hosting port of facetql/src/core/predicate.rs — the predicate-
+    # pushdown evaluator FacetQL runs against one decoded row, deciding
+    # whether that row matches a query's `where` clause without the caller
+    # having to filter client-side. This is the FIRST selfhost file for
+    # facetql's own engine (source.fct/expr.fct/parser.fct all port fct's
+    # own compiler instead) — so unlike those files, there is no expr.go to
+    # cross-check against; the reference is predicate.rs itself, read fresh.
+    #
+    # ============================================================
+    # WHAT predicate.rs's real Expr/eval ACTUALLY are (verified by reading
+    # facetql/src/core/predicate.rs in full, not assumed from its doc
+    # comments):
+    # ============================================================
+    # `Expr` is a wire-compatible mirror of fct's OWN `internal/ir.Expr` —
+    # the same tree shape `expr.fct` already parses INTO — but it is
+    # deliberately the WHOLE shape fct can serialize (kind/val/vtype/name/
+    # field/obj/key/op/args/l/r/x/var/where), not just the pushable subset,
+    # so a client can send exactly what it already has without picking it
+    # apart. `eval()` (really `eval_at`, depth-tracked) then only actually
+    # INTERPRETS four of those kinds — "lit", "get", "un", "bin" — and
+    # rejects every other kind (including a bare "ref" outside a `get`'s
+    # `obj` position, and anything with args/key/var/where — calls,
+    # aggregates, entity lookups, indexing, map/list literals) with a plain
+    # `Err(String)`, exactly the same error channel a genuine RUNTIME
+    # failure uses (division by zero, an oversized `in` set, a
+    # concatenation past MAX_PREDICATE_STRING). From the caller's side there
+    # is only ONE failure outcome — "could not evaluate, fall back to
+    # loading rows and filtering client-side" — whether the cause was an
+    # unsupported SHAPE or a real runtime limit. This port's "-1" value-kind
+    # (see below) is that one outcome.
+    #
+    # "get" only resolves when its `obj` is `{"kind":"ref","name":item_var}`
+    # — a `get` on anything else is rejected, because FacetQL has nothing to
+    # push a non-item field access down to. A `get` whose FIELD is simply
+    # absent from the row's decoded `data` returns `Null` (not an error —
+    # `data.get(field).cloned().unwrap_or(Value::Null)`).
+    #
+    # "bin" combines two evaluated children per its `op`: `&&`/`||`
+    # short-circuit (matching SQL AND/OR — the right side is never evaluated
+    # once the left side already decides the result); `==`/`!=` compare by
+    # value (`Number`s compare by `f64` regardless of int/float
+    # representation, everything else structurally); `starts_with`/
+    # `ends_with`/`contains` are FALSE (not an error) unless both sides are
+    # strings; `in`/`not in` require an array on the right (an error
+    # otherwise) and are bounded at 1000 elements; ordering (`< <= > >=`)
+    # and arithmetic (`+ - * /` plus `%`) require numeric operands (an
+    # error otherwise) via the same `as_f64` coercion for BOTH int and float
+    # — the one exception being `+` on two strings, which concatenates
+    # instead, bounded at 64 KiB. "un" is `!` (never fails — `truthy()`
+    # accepts any value) and `-` (numeric negate, errors on a non-numeric
+    # operand).
+    #
+    # ============================================================
+    # ROW REPRESENTATION — the design decision the task asked to be made
+    # explicit:
+    # ============================================================
+    # A proc can't construct or return a heterogeneous record (this
+    # language's own `record` type is deliberately flat, and even THAT
+    # isn't a proc-return type at all — see LANGUAGE.md's `proc` section:
+    # a proc's return type and its list-typed parameters are scalars or
+    # `[T]` of ONE scalar type, nothing else). A "row" — a decoded
+    # FacetQL node's `data`, one JSON object of named int/text/bool/float/
+    # null fields — is therefore threaded as FIVE parallel arrays, aligned
+    # by index, mirroring source.fct's own parents/labels split and
+    # expr.fct's tokenKinds/tokenTexts split:
+    #   rowNames: [text]    field name at index i
+    #   rowKinds: [int]     that field's VALUE KIND at index i (see below)
+    #   rowNums:  [float]   that field's value, if rowKinds[i] == 0
+    #   rowTexts: [text]    that field's value, if rowKinds[i] == 1
+    #   rowBools: [bool]    that field's value, if rowKinds[i] == 2
+    # A row never needs a "null" payload array — rowKinds[i] == 3 already
+    # says everything a null entry has to say. One SEPARATE decision this
+    # design makes, worth stating precisely: `int` and `float` COLLAPSE
+    # into one row/value kind ("number", carried as `float`) rather than
+    # staying two kinds. This is not a shortcut — it is what
+    # `predicate.rs` itself already does: every numeric operator in
+    # `eval_bin_op` (`==`/`!=`/`< <= > >=`/`+ - * /`/`%`) goes through
+    # `as_f64` on BOTH sides before doing anything, so Rust's own `Value`
+    # already treats `5` and `5.0` identically for every operation this
+    # evaluator performs — `values_equal`'s own doc says so outright
+    # ("numbers compare by value regardless of int/float representation").
+    # Keeping int/float separate here would have meant re-deriving a
+    # distinction predicate.rs's own evaluator never uses. (fct the HOST
+    # language, by contrast, does NOT auto-promote int/float — LANGUAGE.md's
+    # `float` section — but every conversion below is an explicit
+    # `toFloat(...)` call, never an operator relying on promotion, so that
+    # restriction is honored, not fought.)
+    #
+    # ============================================================
+    # THE ARENA — is expr.fct's literally reusable? VERIFIED: no, and here
+    # is exactly why, read fresh against expr.fct's own STAGE 2b arena
+    # doc before deciding:
+    # ============================================================
+    # expr.fct's arena is the output of PARSING .fct SOURCE TEXT — its
+    # "kind" numbering (0=Lit(int), 1=Ref, 2=Bin, ...) is this port's own
+    # invented scheme, and every leaf's actual value lives OUTSIDE the
+    # arena, in `tokenTexts(src)`, referenced by TOKEN INDEX (valTok) — a
+    # design that only makes sense when there is a source string and a
+    # token stream to index into. predicate.rs's `Expr` arrives as already-
+    # DECODED JSON, wire-compatible with fct's `ir.Expr` — there is no
+    # source text and no token stream on this side at all, so "valTok as a
+    # token index into tokenTexts" has nothing to point at. The SHAPE
+    # (a flat postorder `[int]` array, 5 ints/node, `-1` for "unused",
+    # children referenced by NODE index not raw offset) is exactly the
+    # right idiom to reuse, and this file reuses it deliberately — but the
+    # per-kind NUMBERING and the leaf-value ENCODING are necessarily new,
+    # because they encode a different, wire-shaped input, not parsed
+    # source. Concretely: expr.fct's kind 2 IS Bin — chosen freely because
+    # this file, too, is free to invent its own numbering (nothing forces
+    # the two files to agree) — but expr.fct's kind 6 (Get) stores its field
+    # name as a TOKEN index, and this file's kind 7 (Get) stores it as a
+    # STRING-POOL index instead, because that pool (`strPool`, below) is
+    # this file's own invention, not expr.fct's `tokenTexts`. So: the
+    # POSTORDER-ARENA IDIOM is reused; the concrete arena is not, because
+    # the input it encodes (decoded wire JSON vs. tokenized source) is a
+    # genuinely different thing to point into.
+    #
+    # arena[5*i + 0] = kind:
+    #   0  = Lit(int)   valTok = the int value itself, embedded directly
+    #                    (no pool needed — arena is already `[int]`)
+    #   1  = Lit(float) valTok = index into litFloats
+    #   2  = Lit(bool)  valTok = 0 or 1, embedded directly
+    #   3  = Lit(text)  valTok = index into strPool
+    #   4  = Lit(null)  (valTok/opTok/left/right all -1)
+    #   5  = Lit(set)   opTok = element kind (0=number via litFloats,
+    #                    1=text via strPool); left = that pool's start
+    #                    index; right = element count. This is this port's
+    #                    ONE new node kind beyond a literal 1:1 mirror of
+    #                    predicate.rs's four interpreted kinds — needed
+    #                    because `in`/`not in`'s right side is a JSON
+    #                    ARRAY literal (`Value::Array` — predicate.rs's own
+    #                    "lit" arm returns it via `lit_value`'s fallback
+    #                    case, no dedicated Rust variant either), and this
+    #                    arena has no generic "any JSON value" leaf the way
+    #                    `serde_json::Value` does. Elements are assumed
+    #                    homogeneous (all-number or all-text) — the shape
+    #                    every real `in` predicate (`status in ["open",
+    #                    "closed"]`, `id in [1,2,3]`) actually has; a
+    #                    mixed-type or bool-element set is out of scope,
+    #                    same spirit as this file's other documented
+    #                    simplifications.
+    #   6  = Ref        valTok = index into strPool (the name) — only ever
+    #                    meaningful as a Get node's `obj` (see below); a Ref
+    #                    reached any other way is exactly predicate.rs's
+    #                    "ref" kind falling through eval_at's `other` arm.
+    #   7  = Get        opTok = index into strPool (the field name); left =
+    #                    node index of the object sub-expression (checked
+    #                    at eval time to be a Ref naming the item variable —
+    #                    predicate.rs's own `is_item_ref` check, restated).
+    #   8  = Un         opTok = 0 ("!") or 1 ("-"); left = operand node
+    #                    index; right unused (-1).
+    #   9  = Bin        opTok = one of the 18 codes below; left/right =
+    #                    child node indices.
+    #   10 = Other      every remaining real Expr shape this port does not
+    #                    interpret — a call, an aggregate, an entity
+    #                    lookup, an index/key access, a map/list literal,
+    #                    a `where`-bearing node — collapsed to one kind
+    #                    because eval() treats all of them identically:
+    #                    "cannot evaluate this expression". A real decoder
+    #                    upstream of this arena would still need to know
+    #                    WHICH shape it was for a good error message; this
+    #                    port only needs to know THAT it wasn't evaluable,
+    #                    matching the caller-facing contract exactly.
+    #
+    # Bin op codes (arena[5*i+2] when kind == 9), predicate.rs's own `op`
+    # strings assigned small integers in the same "store a code, not text"
+    # spirit expr.fct's opTok already uses:
+    #   0="&&"  1="||"  2="=="  3="!="  4="<"  5="<="  6=">"  7=">="
+    #   8="+"   9="-"   10="*"  11="/"  12="%" 13="starts_with"
+    #   14="ends_with"  15="contains"  16="in"  17="not in"
+    # Un op codes (arena[5*i+2] when kind == 8): 0="!"  1="-"
+    #
+    # ============================================================
+    # VALUE-KIND TAGS — the result of evaluating a node, a SEPARATE concept
+    # from the arena's own node kind above (a "get" node might evaluate to
+    # ANY of these depending on the row, for instance):
+    #   0 = number   1 = text   2 = bool   3 = null   4 = array
+    #  -1 = error (not evaluable — predicate.rs's `Err`, shape OR runtime)
+    # 4 (array) is only ever produced by a Lit(set) node, and only ever
+    # consumed as the immediate right operand of `in`/`not in` — exactly
+    # mirroring how `Value::Array` only ever arises from a "lit" node in
+    # predicate.rs and is only ever pattern-matched inside the "in" arm.
+    #
+    # ============================================================
+    # WHY TWO FAMILIES OF PROC ("evalKind" vs "evalNum"/"evalText"/
+    # "evalBool") INSTEAD OF ONE:
+    # ============================================================
+    # A proc returns exactly one typed value (LANGUAGE.md's `proc`
+    # section) — there is no way to hand back "a Value" (kind tag PLUS
+    # whichever payload matches it) from one call. This file follows the
+    # exact precedent expr.fct's own header already establishes for a
+    # different split (position vs. tree shape, `*End` vs. `*Nodes`): two
+    # independent, pure re-derivations of the SAME recursive walk, each
+    # returning one fact, are guaranteed to agree by construction (both are
+    # pure functions of the identical (arena, row, node) input) — paid for
+    # by walking the same subtree more than once rather than once.
+    # `evalKind` is the gatekeeper: it walks a node fully (including
+    # fetching numeric payloads where a runtime check needs one, e.g.
+    # division by zero, the 64 KiB string bound, the 1000-element `in`
+    # bound) and reports either -1 (not evaluable, for any reason) or the
+    # RESULT kind. Every other proc below ASSUMES its caller already called
+    # `evalKind` and got back the kind it expects — exactly like
+    # predicate.rs's own `match expr.kind.as_str()` assumes a variant it has
+    # already matched on. Calling `evalNum`/`evalText`/`evalBool` on a node
+    # `evalKind` would have rejected has no defined result (predicate.rs
+    # has no such call path either: `eval_bin_op` is only ever reached with
+    # values `eval_at` already produced successfully).
+    #
+    # ============================================================
+    # DEPTH: only `evalKind`/`evalUnKind`/`evalBinKind` thread a `depth`
+    # parameter (mirroring predicate.rs's own `MAX_PREDICATE_DEPTH = 64`,
+    # checked once per node the way `eval_at` checks it once per call).
+    # The value-getters (`evalNum`/`evalText`/`evalBool`/...) do not, on
+    # purpose: by the calling convention above, they are only ever invoked
+    # on a subtree `evalKind` already walked successfully — which means the
+    # depth bound was already enforced on that exact subtree before a
+    # value-getter ever sees it. Threading depth through a second family of
+    # procs that can only be reached after the first already vetted it
+    # would be a check with nothing left to catch.
+    proc rowFieldIndex(rowNames: [text], field: text) -> int:
+        let n = len(rowNames)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if rowNames[i] == field:
+                    found = i
+            i = i + 1
+        return found
+
+    # isItemRef: predicate.rs's own `is_item_ref` check (`obj.kind == "ref"
+    # && obj.name.as_deref() == Some(item_var)`), restated against the
+    # arena — true iff `objIdx` names a Ref node (kind 6) whose stored name
+    # equals `itemVar`.
+    proc isItemRef(arena: [int], strPool: [text], objIdx: int, itemVar: text) -> bool:
+        if objIdx == -1:
+            return false
+        let k = arena[5 * objIdx]
+        if k == 6:
+            let nameIdx = arena[5 * objIdx + 1]
+            return strPool[nameIdx] == itemVar
+        return false
+
+    proc numInFloatPool(pool: [float], start: int, count: int, target: float) -> bool:
+        let mut i = 0
+        let mut found = false
+        loop i < count:
+            if pool[start + i] == target:
+                found = true
+            i = i + 1
+        return found
+
+    proc textInStrPool(pool: [text], start: int, count: int, target: text) -> bool:
+        let mut i = 0
+        let mut found = false
+        loop i < count:
+            if pool[start + i] == target:
+                found = true
+            i = i + 1
+        return found
+
+    # ============================================================
+    # THE GATEKEEPER FAMILY: evalKind / evalUnKind / evalBinKind.
+    # ============================================================
+    # evalKind(node) mirrors predicate.rs's `eval_at` dispatch
+    # (`match expr.kind.as_str()`), restated over the arena's own kind
+    # numbers instead of string tags, returning the RESULT value-kind (see
+    # above) or -1 if this node — or anything it depends on — is not
+    # evaluable.
+    proc evalKind(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, node: int, depth: int) -> int:
+        if depth >= 64:
+            return -1
+        let k = arena[5 * node]
+        if k == 0:
+            return 0
+        if k == 1:
+            return 0
+        if k == 2:
+            return 2
+        if k == 3:
+            return 1
+        if k == 4:
+            return 3
+        if k == 5:
+            return 4
+        if k == 6:
+            return -1
+        if k == 7:
+            let objIdx = arena[5 * node + 3]
+            let isRef = do isItemRef(arena, strPool, objIdx, itemVar)
+            if isRef:
+                let fieldTokIdx = arena[5 * node + 2]
+                let field = strPool[fieldTokIdx]
+                let idx = do rowFieldIndex(rowNames, field)
+                if idx == -1:
+                    return 3
+                return rowKinds[idx]
+            return -1
+        if k == 8:
+            let unKind = do evalUnKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, node, depth)
+            return unKind
+        if k == 9:
+            let binKind = do evalBinKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, node, depth)
+            return binKind
+        return -1
+
+    # evalUnKind: predicate.rs's "un" arm. `!` never fails (`truthy`
+    # accepts any successfully-evaluated value); `-` requires a numeric
+    # operand.
+    proc evalUnKind(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, node: int, depth: int) -> int:
+        let opCode = arena[5 * node + 2]
+        let childIdx = arena[5 * node + 3]
+        let childKind = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, childIdx, depth + 1)
+        if childKind == -1:
+            return -1
+        if opCode == 0:
+            return 2
+        if opCode == 1:
+            if childKind == 0:
+                return 0
+            return -1
+        return -1
+
+    # evalBinKind: predicate.rs's "bin" arm plus `eval_bin_op`'s own type
+    # checks, fused into one pass since a code here has nowhere else to
+    # perform a runtime bound (string length, `in`-set size, division by
+    # zero) except by fetching the payload it needs to check it — see the
+    # DEPTH note above for why that is still cheap enough not to need its
+    # own bound.
+    proc evalBinKind(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, node: int, depth: int) -> int:
+        let opCode = arena[5 * node + 2]
+        let lIdx = arena[5 * node + 3]
+        let rIdx = arena[5 * node + 4]
+
+        if opCode == 0:
+            let lk = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, depth + 1)
+            if lk == -1:
+                return -1
+            let lt = do evalTruthy(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, depth + 1)
+            if lt == false:
+                return 2
+            let rk = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, depth + 1)
+            if rk == -1:
+                return -1
+            return 2
+
+        if opCode == 1:
+            let lk2 = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, depth + 1)
+            if lk2 == -1:
+                return -1
+            let lt2 = do evalTruthy(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, depth + 1)
+            if lt2 == true:
+                return 2
+            let rk2 = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, depth + 1)
+            if rk2 == -1:
+                return -1
+            return 2
+
+        let lk3 = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, depth + 1)
+        if lk3 == -1:
+            return -1
+        let rk3 = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, depth + 1)
+        if rk3 == -1:
+            return -1
+
+        if opCode == 2:
+            return 2
+        if opCode == 3:
+            return 2
+        if opCode == 13:
+            return 2
+        if opCode == 14:
+            return 2
+        if opCode == 15:
+            return 2
+        if opCode == 16:
+            if rk3 == 4:
+                let setLen = arena[5 * rIdx + 4]
+                if setLen > 1000:
+                    return -1
+                return 2
+            return -1
+        if opCode == 17:
+            if rk3 == 4:
+                let setLen2 = arena[5 * rIdx + 4]
+                if setLen2 > 1000:
+                    return -1
+                return 2
+            return -1
+        if opCode == 4:
+            if lk3 == 0:
+                if rk3 == 0:
+                    return 2
+            return -1
+        if opCode == 5:
+            if lk3 == 0:
+                if rk3 == 0:
+                    return 2
+            return -1
+        if opCode == 6:
+            if lk3 == 0:
+                if rk3 == 0:
+                    return 2
+            return -1
+        if opCode == 7:
+            if lk3 == 0:
+                if rk3 == 0:
+                    return 2
+            return -1
+        if opCode == 8:
+            if lk3 == 1:
+                if rk3 == 1:
+                    let lv = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                    let rv = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                    let totalLen = len(lv) + len(rv)
+                    if totalLen > 65536:
+                        return -1
+                    return 1
+            if lk3 == 0:
+                if rk3 == 0:
+                    return 0
+            return -1
+        if opCode == 9:
+            if lk3 == 0:
+                if rk3 == 0:
+                    return 0
+            return -1
+        if opCode == 10:
+            if lk3 == 0:
+                if rk3 == 0:
+                    return 0
+            return -1
+        if opCode == 11:
+            if lk3 == 0:
+                if rk3 == 0:
+                    let rv2 = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                    if rv2 == 0.0:
+                        return -1
+                    return 0
+            return -1
+        if opCode == 12:
+            if lk3 == 0:
+                if rk3 == 0:
+                    let rv3 = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                    if rv3 == 0.0:
+                        return -1
+                    return 0
+            return -1
+        return -1
+
+    # evalTruthy: predicate.rs's own `truthy()` — `Bool(b) -> b`,
+    # `Null -> false`, everything else (number/text/array) `-> true` —
+    # restated to call `evalKind` itself so every caller (the "&&"/"||"
+    # short-circuit in evalBinKind, the "!" case in evalBool, and a
+    # predicate's own top-level result) shares one definition.
+    proc evalTruthy(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, node: int, depth: int) -> bool:
+        let k = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, node, depth)
+        if k == 2:
+            let b = do evalBool(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, node)
+            return b
+        if k == 3:
+            return false
+        if k == -1:
+            return false
+        return true
+
+    # ============================================================
+    # THE VALUE-GETTER FAMILY: evalNum / evalText / evalBool, plus the two
+    # "combine two evaluated children" helpers (evalBinBool, and the
+    # equality/in-set tests it delegates to). Each ASSUMES evalKind has
+    # already vetted `node` (see the header's DEPTH note) — no depth
+    # parameter, no -1 handling of its own.
+    # ============================================================
+    proc evalNum(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, node: int) -> float:
+        let k = arena[5 * node]
+        if k == 0:
+            let iv = arena[5 * node + 1]
+            return toFloat(iv)
+        if k == 1:
+            let fIdx = arena[5 * node + 1]
+            return litFloats[fIdx]
+        if k == 7:
+            let fieldTokIdx = arena[5 * node + 2]
+            let field = strPool[fieldTokIdx]
+            let idx = do rowFieldIndex(rowNames, field)
+            return rowNums[idx]
+        if k == 8:
+            let childIdx = arena[5 * node + 3]
+            let cv = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, childIdx)
+            return 0.0 - cv
+        if k == 9:
+            let opCode = arena[5 * node + 2]
+            let lIdx = arena[5 * node + 3]
+            let rIdx = arena[5 * node + 4]
+            let lv = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+            let rv = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+            if opCode == 8:
+                return lv + rv
+            if opCode == 9:
+                return lv - rv
+            if opCode == 10:
+                return lv * rv
+            if opCode == 11:
+                return lv / rv
+            if opCode == 12:
+                # `%` is int-only in fct itself (LANGUAGE.md's `float`
+                # section: "a fractional modulus is a compile error"), so
+                # the native `%` operator isn't usable here even though
+                # both operands are already `float`. predicate.rs's own
+                # `%` is Rust's f64 `%` (a truncated remainder, sign
+                # follows the dividend) — restated by hand with the
+                # arithmetic this language DOES allow on floats
+                # (`+ - * /`) plus `toInt`'s own documented truncate-
+                # toward-zero behavior, which is exactly what a truncated
+                # quotient needs.
+                let q = toFloat(toInt(lv / rv))
+                return lv - q * rv
+            return 0.0
+        return 0.0
+
+    proc evalText(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, node: int) -> text:
+        let k = arena[5 * node]
+        if k == 3:
+            let sIdx = arena[5 * node + 1]
+            return strPool[sIdx]
+        if k == 7:
+            let fieldTokIdx = arena[5 * node + 2]
+            let field = strPool[fieldTokIdx]
+            let idx = do rowFieldIndex(rowNames, field)
+            return rowTexts[idx]
+        if k == 9:
+            let lIdx = arena[5 * node + 3]
+            let rIdx = arena[5 * node + 4]
+            let lv = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+            let rv = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+            return lv + rv
+        return ""
+
+    proc evalBool(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, node: int) -> bool:
+        let k = arena[5 * node]
+        if k == 2:
+            let bv = arena[5 * node + 1]
+            return bv == 1
+        if k == 7:
+            let fieldTokIdx = arena[5 * node + 2]
+            let field = strPool[fieldTokIdx]
+            let idx = do rowFieldIndex(rowNames, field)
+            return rowBools[idx]
+        if k == 8:
+            let childIdx = arena[5 * node + 3]
+            let ct = do evalTruthy(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, childIdx, 0)
+            return !ct
+        if k == 9:
+            let bb = do evalBinBool(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, node)
+            return bb
+        return false
+
+    # valuesEqual: predicate.rs's own `values_equal` — numbers compare by
+    # float value regardless of int/float origin (see the header's ROW
+    # REPRESENTATION note — this port's number kind already IS that
+    # comparison), everything else compares structurally within its own
+    # kind, and a kind MISMATCH is always false (mirrors Rust's
+    # `PartialEq` on `serde_json::Value`, where a `Number` never equals a
+    # `String` even if they'd print the same). Two array-kind operands are
+    # a documented simplification (see the header's Lit(set) note) — this
+    # port always answers `false` rather than a real elementwise
+    # comparison, since no real predicate compares two `in`-sets with `==`.
+    proc valuesEqual(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, lIdx: int, rIdx: int, depth: int) -> bool:
+        let lk = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, depth)
+        let rk = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, depth)
+        if lk == 0:
+            if rk == 0:
+                let a = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                let b = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                return a == b
+            return false
+        if lk == 1:
+            if rk == 1:
+                let ta = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                let tb = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                return ta == tb
+            return false
+        if lk == 2:
+            if rk == 2:
+                let ba = do evalBool(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                let bb = do evalBool(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                return ba == bb
+            return false
+        if lk == 3:
+            if rk == 3:
+                return true
+            return false
+        return false
+
+    # valueInSet: predicate.rs's "in"/"not in" membership test — the left
+    # value's kind must match the set's declared element kind (a number
+    # never matches a text set or vice versa, same as `values_equal`
+    # inside Rust's own `set.iter().any(|c| values_equal(l, c))`).
+    proc valueInSet(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, lIdx: int, setIdx: int, depth: int) -> bool:
+        let lk = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, depth)
+        let elemKind = arena[5 * setIdx + 2]
+        let start = arena[5 * setIdx + 3]
+        let count = arena[5 * setIdx + 4]
+        if lk == 0:
+            if elemKind == 0:
+                let lv = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                let hit = do numInFloatPool(litFloats, start, count, lv)
+                return hit
+            return false
+        if lk == 1:
+            if elemKind == 1:
+                let tv = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                let hit2 = do textInStrPool(strPool, start, count, tv)
+                return hit2
+            return false
+        return false
+
+    # evalBinBool: predicate.rs's `eval_bin_op`, the "how does a Bin node
+    # combine two evaluated children" logic the task asked about, restated
+    # for every op that PRODUCES a bool (comparisons, string tests,
+    # membership, and the already-short-circuited `&&`/`||`). Only reached
+    # once `evalKind` on this same node has already returned 2 (bool), so
+    # every branch below can assume its operands are exactly the kind
+    # `evalBinKind` already checked.
+    proc evalBinBool(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, node: int) -> bool:
+        let opCode = arena[5 * node + 2]
+        let lIdx = arena[5 * node + 3]
+        let rIdx = arena[5 * node + 4]
+
+        if opCode == 0:
+            let lt = do evalTruthy(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, 0)
+            if lt == false:
+                return false
+            let rt = do evalTruthy(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, 0)
+            return rt
+
+        if opCode == 1:
+            let lt2 = do evalTruthy(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, 0)
+            if lt2 == true:
+                return true
+            let rt2 = do evalTruthy(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, 0)
+            return rt2
+
+        if opCode == 2:
+            let eq = do valuesEqual(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, rIdx, 0)
+            return eq
+
+        if opCode == 3:
+            let eq2 = do valuesEqual(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, rIdx, 0)
+            return !eq2
+
+        if opCode == 13:
+            let lk = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, 0)
+            let rk = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, 0)
+            if lk == 1:
+                if rk == 1:
+                    let hv = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                    let nv = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                    let hlen = len(hv)
+                    let nlen = len(nv)
+                    if nlen > hlen:
+                        return false
+                    let prefix = slice(hv, 0, nlen)
+                    return prefix == nv
+            return false
+
+        if opCode == 14:
+            let lk2 = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, 0)
+            let rk2 = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, 0)
+            if lk2 == 1:
+                if rk2 == 1:
+                    let hv2 = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                    let nv2 = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                    let hlen2 = len(hv2)
+                    let nlen2 = len(nv2)
+                    if nlen2 > hlen2:
+                        return false
+                    let suffix = slice(hv2, hlen2 - nlen2, hlen2)
+                    return suffix == nv2
+            return false
+
+        if opCode == 15:
+            let lk3 = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, 0)
+            let rk3 = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx, 0)
+            if lk3 == 1:
+                if rk3 == 1:
+                    let hv3 = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+                    let nv3 = do evalText(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+                    let found = contains(hv3, nv3)
+                    return found
+            return false
+
+        if opCode == 16:
+            let inSet = do valueInSet(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, rIdx, 0)
+            return inSet
+
+        if opCode == 17:
+            let inSet2 = do valueInSet(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx, rIdx, 0)
+            return !inSet2
+
+        if opCode == 4:
+            let a = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+            let b = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+            return a < b
+        if opCode == 5:
+            let a2 = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+            let b2 = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+            return a2 <= b2
+        if opCode == 6:
+            let a3 = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+            let b3 = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+            return a3 > b3
+        if opCode == 7:
+            let a4 = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, lIdx)
+            let b4 = do evalNum(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, rIdx)
+            return a4 >= b4
+
+        return false
+
+    proc arenaRootIndex(arena: [int]) -> int:
+        return len(arena) / 5 - 1
+
+    # ============================================================
+    # THE TOP-LEVEL ENTRY POINTS a real caller (a future self-hosted
+    # FacetQL scan loop) would actually call, mirroring predicate.rs's own
+    # `pub fn eval(expr, item_var, data) -> Result<Value, String>` split
+    # into its two halves, since a proc has no `Result` type to return:
+    # `evalPredicateOk` answers "is this predicate evaluable at all"
+    # (predicate.rs's `Ok(_)` vs. `Err(_)`), and `evalPredicateResult`
+    # answers "does this row match" — defined as this predicate's TRUTHY
+    # value (`evalTruthy` on the root), since predicate.rs itself only
+    # documents, rather than enforces, that "top-level callers should
+    # expect a Bool"; reducing through the SAME `truthy()` every `&&`/`||`/
+    # `!` already uses is the one reading that stays consistent with the
+    # rest of the evaluator rather than inventing a second rule for the
+    # root node alone. `evalPredicateResult`'s return is undefined (as in:
+    # not meaningful, never a crash) when `evalPredicateOk` is false —
+    # exactly like reading predicate.rs's `Err` variant as if it were an
+    # `Ok` would be a caller bug, not a library one.
+    proc evalPredicateOk(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, root: int) -> bool:
+        let k = do evalKind(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, root, 0)
+        return k != -1
+
+    proc evalPredicateResult(arena: [int], litFloats: [float], strPool: [text], rowNames: [text], rowKinds: [int], rowNums: [float], rowTexts: [text], rowBools: [bool], itemVar: text, root: int) -> bool:
+        let t = do evalTruthy(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, root, 0)
+        return t
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURE — hand-verified predicate A from the task
+    # report: `item.status == "open"`, evaluated against a row where
+    # `status == "open"`, expected result `true`. Encoded by hand exactly
+    # per the arena layout documented above:
+    #   node0 (Ref):  kind=6, valTok=strPool[0]="item"
+    #   node1 (Get):  kind=7, opTok=strPool[1]="status", left=0
+    #   node2 (LitText): kind=3, valTok=strPool[2]="open"
+    #   node3 (Bin "=="): kind=9, opTok=2, left=1, right=2   <- root
+    # An action can only bind a `let` to a `do`/`call` result (LANGUAGE.md's
+    # `let` section), never to a bare literal expression — so every piece
+    # of this fixture is its own tiny proc, called from the action the same
+    # way expr.fct's own test-harness actions only ever call procs.
+    proc demoArena() -> [int]:
+        return [6, 0, -1, -1, -1, 7, -1, 1, 0, -1, 3, 2, -1, -1, -1, 9, -1, 2, 1, 2]
+
+    proc demoLitFloats() -> [float]:
+        return []
+
+    proc demoStrPool() -> [text]:
+        return ["item", "status", "open"]
+
+    proc demoRowNames() -> [text]:
+        return ["status", "age"]
+
+    proc demoRowKinds() -> [int]:
+        return [1, 0]
+
+    proc demoRowNums() -> [float]:
+        return [0.0, 30.0]
+
+    proc demoRowTexts() -> [text]:
+        return ["open", ""]
+
+    proc demoRowBools() -> [bool]:
+        return [false, false]
+
+    proc demoItemVar() -> text:
+        return "item"
+
+    # An action may not bind a float-returning proc's result at all
+    # (LANGUAGE.md's `float` section — no client-side representation for
+    # it in assets/facet.js, scalar OR `[float]`), even though float flows
+    # freely between procs calling each other. So `litFloats` can never be
+    # fetched by the action directly — these two wrapper procs assemble
+    # the whole fixture (arena, pools, row) INSIDE proc-to-proc calls and
+    # only ever hand the action a plain `bool`, the same boundary
+    # predicate.rs's own `eval` crosses once per call rather than per field.
+    proc demoPredicateAOk() -> bool:
+        let arena = do demoArena()
+        let litFloats = do demoLitFloats()
+        let strPool = do demoStrPool()
+        let rowNames = do demoRowNames()
+        let rowKinds = do demoRowKinds()
+        let rowNums = do demoRowNums()
+        let rowTexts = do demoRowTexts()
+        let rowBools = do demoRowBools()
+        let itemVar = do demoItemVar()
+        let root = do arenaRootIndex(arena)
+        let ok = do evalPredicateOk(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, root)
+        return ok
+
+    proc demoPredicateAMatch() -> bool:
+        let arena = do demoArena()
+        let litFloats = do demoLitFloats()
+        let strPool = do demoStrPool()
+        let rowNames = do demoRowNames()
+        let rowKinds = do demoRowKinds()
+        let rowNums = do demoRowNums()
+        let rowTexts = do demoRowTexts()
+        let rowBools = do demoRowBools()
+        let itemVar = do demoItemVar()
+        let root = do arenaRootIndex(arena)
+        let matched = do evalPredicateResult(arena, litFloats, strPool, rowNames, rowKinds, rowNums, rowTexts, rowBools, itemVar, root)
+        return matched
+
+    state demoOkResult: bool = false
+    state demoMatchResult: bool = false
+
+    action runDemoPredicateA():
+        let ok = do demoPredicateAOk()
+        let matched = do demoPredicateAMatch()
+        demoOkResult = ok
+        demoMatchResult = matched
+
+    view Home at "/":
+        box:
+            text "{demoOkResult} {demoMatchResult}"

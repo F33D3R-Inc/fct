@@ -1,0 +1,965 @@
+import "expr.fct"
+
+app StmtSelfHost:
+    # A statement-tree arena for a real `.fct` proc BODY — the gap this
+    # file's own task brief names as the real remaining wall for
+    # self-hosting `internal/parser/parser.go`'s parseProcBody: a
+    # heterogeneous, recursively-nested statement tree (let / let mut /
+    # assign / return / do / if / loop / break / continue), where `if`/
+    # `loop` each need a condition EXPRESSION plus a child STATEMENT LIST
+    # (not one or two child expression subtrees, the only shape expr.fct's
+    # own arena ever needed).
+    #
+    # ============================================================
+    # WHY THIS FILE DOES NOT `import "source.fct"` TOO
+    # ============================================================
+    # The obvious plan — import BOTH source.fct (for its parents/children
+    # tree encoding) and expr.fct (for its expression arena) — was tried
+    # first and rejected for a real, confirmed reason, not a style
+    # preference: both files declare `view Home at "/"`, and
+    # internal/compile/compile.go's checkDuplicates rejects a merged app
+    # with two declarations of the same NAME in the same kind ("view %q is
+    # declared more than once") — confirmed by reading compile.go fresh,
+    # not assumed. Since this task may not modify either file's `.go` or
+    # `.fct` source, and renaming an imported file's own view is not this
+    # file's call to make, source.fct and expr.fct cannot be merged into
+    # one app today. This is itself a small, real, separately-reportable
+    # finding: "nobody has combined both" (this task's own framing) turns
+    # out to be blocked not just by missing design work but by a genuine
+    # namespace collision between the two existing self-host files, the
+    # moment a third file tries to stand on both of their shoulders at
+    # once.
+    #
+    # The fix used here: `import "expr.fct"` alone (its own view is the
+    # ONLY other view in this merged app, so no collision — this file's own
+    # view below uses a different name AND a different path, "/stmt", to
+    # stay clear of expr.fct's own `Home` at "/" even though the NAMES
+    # wouldn't collide either way). source.fct's own CONVENTION — a line
+    # tree flattened into parallel `texts: [text]` / `parents: [int]`
+    # arrays, `parents[i]` naming i's nearest strictly-shallower-indent
+    # ancestor (or -1 for a root), read via a linear `childrenOf` scan — is
+    # reused verbatim (see stmtChildrenOf below, a direct restatement of
+    # source.fct's own childrenOf under a different name so this file can
+    # still declare it without importing source.fct itself). The tiny
+    # per-line indent/blank/comment/trim logic that turns raw multi-line
+    # text into those two arrays (source.fct's own indentOf/
+    # isBlankOrComment/lineText/parentIndexForIndents) is likewise
+    # restated locally, under `body*` names, below — not because it is hard
+    # (it is the smallest, least novel part of this file), but so this file
+    # stays a genuine end-to-end "raw proc-body text in" driver
+    # (parseProcBodySrc) without needing source.fct's own file merged in.
+    # Unlike source.fct's original version (written before `slice`/
+    # `charAt` existed), this restatement uses `charAt` directly — the
+    # gap #1 workaround source.fct needed no longer applies to freshly
+    # written code, only to that file's own historical text (parser.fct
+    # already made the identical simplification for its own text-surgery
+    # helpers; see parser.fct's own STAGE 1 doc).
+    #
+    # ============================================================
+    # THE ARENA: one flat `[int]` array, 5 ints per node — REUSING
+    # expr.fct's own row width and postorder-arena discipline exactly,
+    # not inventing a second, incompatible encoding next to it.
+    # ============================================================
+    # Every statement node lives in the SAME flat arena expr.fct's own
+    # `orNodes`/`argListNodes` build into — literally the same `[int]`
+    # value, threaded through exactly the same "whatever a call just
+    # built, its root is the last row; hand the whole grown array to the
+    # next call" discipline expr.fct's own header (FINDING 3) established.
+    # This is what makes the "combine both" problem tractable at all: a
+    # statement's own expression (its `let` RHS, `if`/`loop` condition, a
+    # `do` call's arguments) is parsed by literally calling expr.fct's
+    # `tokenKinds`/`tokenTexts`/`orNodes` (or, for `do`'s comma-separated
+    # argument list, expr.fct's own `argListCount`/`argListNodes` — a
+    # `do ProcName(args)` argument list is syntactically IDENTICAL to a
+    # builtin call's argument list, so this file reuses those two procs
+    # verbatim rather than re-deriving comma-splitting a second time) and
+    # APPENDING the result onto the SAME arena a statement row is about to
+    # be appended to — so a statement's "which expression is this" fact is
+    # simply an ordinary NODE INDEX into this one shared arena, exactly
+    # the same kind of fact a `Get`/`Index`/`EntityGet` node's `left`
+    # already is in expr.fct's own design. No second arena, no separate
+    # "expression arena" value ever has to be threaded alongside the
+    # statement arena across a recursive call boundary — there IS only
+    # one array, so the "how do I return two growing arrays from one
+    # proc" problem (which a naive design hits immediately, since a proc
+    # returns exactly one value — LANGUAGE.md's `proc` section, unchanged
+    # since expr.fct's own header established this) never comes up.
+    #
+    # Statement node KINDS (17 upward — expr.fct's own kinds run 0-16, most
+    # recently through kind 16, AggMeta, read fresh from the current file
+    # before choosing this range, so there is no numeric overlap between
+    # "this is an expression-arena row" and "this is a statement-arena
+    # row" even though both live in the one array):
+    #
+    #   17 Block       — a statement LIST (a proc's own top-level body, an
+    #                    `if`'s then/else body, a `loop`'s body). Slot 1 =
+    #                    the index of this block's FIRST StmtSlot row (or
+    #                    -1 if the block is empty), slots 2-4 unused (-1).
+    #                    The block's own STATEMENT COUNT is never stored —
+    #                    it is recovered by pure arithmetic, the same
+    #                    "no backpatching" trick expr.fct's own FINDING 8
+    #                    established for Call/ListLit's `argCount`: a
+    #                    Block's StmtSlot run is built, CONTIGUOUSLY, then
+    #                    the Block row itself is appended IMMEDIATELY
+    #                    after, with nothing else interleaved — so
+    #                    `count = blockIdx - firstSlotIdx` always holds
+    #                    (see blockStmtCount below).
+    #   18 Let          — `let name = expr`. Slot 1 = the RHS expression's
+    #                    root node index (into this same arena). Slot 2 =
+    #                    `lineIdx`, the index of this statement's own
+    #                    source line in the caller's `texts`/`parents`
+    #                    arrays — the ONLY place this arena keeps a text
+    #                    fact, and even that only indirectly (a token/line
+    #                    POSITION, never text itself — expr.fct's own
+    #                    FINDING 7 precedent, one level up: instead of a
+    #                    token index into a shared token array, this is a
+    #                    LINE index into the caller's own `texts` array,
+    #                    since a statement's "name" facts, unlike an
+    #                    expression's field/string names, live in a
+    #                    different line's text than whatever expression
+    #                    trails it). `name` itself is recovered on demand
+    #                    from `texts[lineIdx]` by letOrAssignName below —
+    #                    not stored as its own arena slot or a second
+    #                    parallel array, since it is always cheaply
+    #                    re-derivable from the one fact (lineIdx) already
+    #                    kept, and a proc-per-array "two arrays growing in
+    #                    lockstep across a recursive call boundary" design
+    #                    would have re-introduced exactly the multi-array
+    #                    threading problem the single shared arena (above)
+    #                    was chosen to avoid.
+    #   19 LetMut       — `let mut name = expr`. Identical shape to Let
+    #                    (slot 1 = RHS root, slot 2 = lineIdx) — the kind
+    #                    number alone distinguishes mutability, exactly
+    #                    like expr.fct's own Lit(int) vs Lit(float) split
+    #                    on kind alone (0 vs 11) rather than an extra flag
+    #                    slot.
+    #   20 Assign       — `name = expr` (reassignment, no `let`). Same
+    #                    shape again (slot 1 = RHS root, slot 2 = lineIdx).
+    #   21 Return       — `return` or `return expr`. Slot 1 = the value
+    #                    expression's root index, or -1 for a bare
+    #                    `return` (the same "-1 means absent" convention
+    #                    expr.fct's own EntityGet/Un/Get spare slots
+    #                    already use). Slot 2 = lineIdx.
+    #   22 Do           — a bare `do ProcName(args)` statement (its result,
+    #                    if any, discarded). Slot 1 = the index of this
+    #                    call's FIRST ArgSlot row (expr.fct's own kind 8 —
+    #                    reused VERBATIM, not reinvented, since a `do`
+    #                    call's argument list is the exact same grammar as
+    #                    a builtin Call's — or -1 for zero arguments).
+    #                    Slot 2 = lineIdx (from which `bareDoProcName`
+    #                    below recovers the proc name). The argument COUNT
+    #                    is, again, never stored — `doArgCountAt` recovers
+    #                    it the identical way `blockStmtCount` recovers a
+    #                    Block's statement count (`count = selfIdx -
+    #                    firstArgSlotIdx`), since the ArgSlot run
+    #                    immediately precedes this Do row with nothing
+    #                    interleaved, by construction.
+    #   23 LetDo        — `let name = do ProcName(args)`. Identical slot
+    #                    shape to Do (slot 1 = first ArgSlot idx or -1,
+    #                    slot 2 = lineIdx); `letDoBoundName`/
+    #                    `letDoProcName` below each recover their own half
+    #                    of `texts[lineIdx]`. `let mut name = do ...` is
+    #                    real-grammar-illegal (a `do` result can never bind
+    #                    mut — LANGUAGE.md's `proc` section, and expr.fct's
+    #                    own header FINDING 2) and is deliberately NOT
+    #                    given this kind: it degrades to Unsupported (29)
+    #                    instead of silently producing a wrong LetDo, the
+    #                    same honest-degrade convention every other
+    #                    out-of-scope shape in this file follows.
+    #   24 If           — `if cond: <then> [else: <else>]`. Slot 1 = the
+    #                    condition expression's root index. Slot 2 = the
+    #                    THEN branch's own Block node index (a full,
+    #                    already-built statement list — see kind 17).
+    #                    Slot 3 = the ELSE branch's Block node index, or -1
+    #                    if there is no `else:` sibling. Slot 4 = lineIdx.
+    #                    This is the one node this file's whole design was
+    #                    actually chosen around: it needs FIVE logical
+    #                    facts (cond, then-body, then-COUNT, else-body,
+    #                    else-COUNT) if a naive Call-like "first,count"
+    #                    pair were used for each branch separately — more
+    #                    than expr.fct's own 4 usable payload slots (valTok/
+    #                    opTok/left/right) can hold without a wider row.
+    #                    Wrapping each branch in its OWN Block node first
+    #                    (which independently derives its own count via
+    #                    the blockIdx-minus-firstSlot arithmetic above)
+    #                    collapses "then-body plus then-count" down to a
+    #                    SINGLE fact (thenBlockIdx) — the same win
+    #                    "MapPairSlot instead of two separate ArgSlot
+    #                    lists" gave FINDING 10 one level down, applied
+    #                    one level up here: composing an already-solved
+    #                    sub-problem (a Block already knows its own count)
+    #                    rather than re-deriving a second counting scheme.
+    #   25 Loop         — `loop cond: <body>`. Slot 1 = the condition
+    #                    expression's root index. Slot 2 = the body's own
+    #                    Block node index. Slot 3 = lineIdx.
+    #   26 Break        — `break`. Slot 1 = lineIdx, slots 2-4 unused.
+    #   27 Continue     — `continue`. Slot 1 = lineIdx, slots 2-4 unused.
+    #   28 StmtSlot     — the auxiliary "pointer" row a Block's own
+    #                    variable-arity statement list needs — expr.fct's
+    #                    own ArgSlot (kind 8) generalized one level up
+    #                    from "one call's N arguments" to "one block's N
+    #                    statements": built the identical way (every child
+    #                    STATEMENT's own subtree is fully built first, via
+    #                    ordinary postorder recursion, into arbitrarily
+    #                    non-contiguous positions in the arena — an `if`
+    #                    with a big nested body consumes far more rows
+    #                    than a bare `break` does, so "statement i's own
+    #                    root index" cannot be computed by arithmetic on i
+    #                    and a starting offset alone — then N StmtSlot rows
+    #                    are appended CONTIGUOUSLY, in order, right after
+    #                    every real statement subtree is finished, each
+    #                    just naming one statement's real root NODE index
+    #                    in slot 1 (slots 2-4 unused) — the exact ArgSlot
+    #                    shape, just pointing at a statement's root instead
+    #                    of an expression's).
+    #   29 Unsupported  — any statement-shaped line this subset's real
+    #                    grammar handles (spawn/join/check/requires/
+    #                    establish/add/set/remove/clear/a bare builtin-call
+    #                    statement/an indexed assignment `xs[i] = expr`) but
+    #                    this file was scoped NOT to implement (the task's
+    #                    own given statement vocabulary is exactly let/
+    #                    let-mut/assign/return/do/if/loop/break/continue),
+    #                    plus genuinely malformed input (a `let`/assign line
+    #                    with no `=`). Slot 1 = lineIdx, slots 2-4 unused.
+    #                    A proc has no error/exception channel (no second
+    #                    return value — LANGUAGE.md's `proc` section), so
+    #                    this is the same honest-sentinel convention
+    #                    source.fct's `[-2]` parents-array sentinel and
+    #                    parser.fct's `headerValid`/`checkStatementValid`
+    #                    booleans already established: a real, inspectable
+    #                    value instead of a crash or a silently-wrong tree.
+    #
+    # (Expression-arena rows embedded inside this same array — kinds 0-16,
+    # Lit/Ref/Bin/Un/Get/Index/Call/ListLit/ArgSlot/EntityGet/MapPairSlot/
+    # MapLit/Agg/AggMeta — are exactly as expr.fct's own header documents
+    # them; this file never redefines or reads their INTERNAL shape except
+    # by treating "some node index" as an opaque handle, precisely the way
+    # a Get/Index node in expr.fct itself already treats its own `left`/
+    # `right` children as opaque indices without caring what kind they
+    # turn out to be.)
+    #
+    # ============================================================
+    # HAND-TRACED VERIFICATION (no formal test suite — see this file's own
+    # task brief): three real, multi-statement proc bodies, traced by hand
+    # against the algorithm above before this file was considered done,
+    # confirming the arena is actually navigable and correct:
+    #
+    #   FIXTURE 1 (flat, no nesting):
+    #     let x = 1
+    #     let mut y = 2
+    #     y = y + x
+    #     return y
+    #   -> a 4-statement top-level Block: Let(x,1), LetMut(y,2),
+    #      Assign(y, y+x), Return(y) — traced to confirm each kind's slot 1
+    #      lands on the correct expression root and blockStmtCount reports
+    #      4.
+    #
+    #   FIXTURE 2 (if/else, flat bodies):
+    #     let x = 5
+    #     if x < 10:
+    #         x = x + 1
+    #     else:
+    #         x = x - 1
+    #     return x
+    #   -> confirms the else-sibling lookahead in stmtBlockNodes correctly
+    #      attaches the `else:` line's OWN children to the `if` node as its
+    #      elseBlockIdx, consumes that sibling line (it does not ALSO
+    #      appear as its own top-level statement), and that a plain `if`
+    #      with no `else:` sibling elsewhere in the same trace correctly
+    #      gets elseBlockIdx = -1.
+    #
+    #   FIXTURE 3 (nested `if` inside a `loop` — the shape this task
+    #   specifically asked to confirm):
+    #     let mut i = 0
+    #     loop i < 10:
+    #         if i == 5:
+    #             break
+    #         i = i + 1
+    #     return i
+    #   -> row-by-row arithmetic was traced by hand end to end, THEN
+    #      confirmed for real: compiled and run live in-process (the same
+    #      compile.File + runtime.NewInMemory + httptest.Server technique
+    #      expr_test.go/parser_test.go already use), POSTed to
+    #      runParseProcBody over real HTTP, and the returned arena decoded
+    #      row by row against the hand trace. The two agreed exactly — 26
+    #      nodes total (11 expression rows: the two Ref/Lit/Bin triples for
+    #      `i < 10` and `i == 5`, the Ref/Lit/Bin triple for `i + 1`, the
+    #      Lit for the initial `0`, and the Ref for the final `return i`; 6
+    #      statement rows: LetMut, Break, If, Assign, Loop, Return; 6
+    #      StmtSlot rows; 3 Block rows) — confirming: the Loop's own
+    #      condIdx and bodyBlockIdx both resolve to the correct nodes; the
+    #      body Block's blockStmtCount is 2 (the `if` and the `i = i + 1`
+    #      assign); the nested `if`'s thenBlockIdx resolves to a Block
+    #      whose blockStmtCount is 1 (the `break`) and whose elseBlockIdx
+    #      is -1 (no `else:`); and the outer, top-level Block's
+    #      blockStmtCount is 3 (the LetMut, the Loop, and the Return) with
+    #      blockStmtRootAt correctly recovering each of the three
+    #      top-level statements' real root node index by walking its own
+    #      StmtSlot run. Fixture 2's `if`/`else` was verified the same way:
+    #      its If row's elseBlockIdx correctly names a real Block (not -1),
+    #      that Block's own blockStmtCount is 1, and the top-level Block's
+    #      blockStmtCount is 3 — the `else:` sibling line was consumed by
+    #      the `if` and correctly did NOT also produce its own top-level
+    #      statement. Every index in both traces matched pure arithmetic
+    #      (`(len(arena)/5)-1` for "the row just appended", `selfIdx -
+    #      firstSlotIdx` for every count) with no backpatching anywhere,
+    #      confirming the design holds up under real recursive nesting,
+    #      not just the flat cases — and that it holds up running for
+    #      real, not just on paper.
+    #
+    # These fixtures are re-exercisable over HTTP via runParseProcBody
+    # below (POST `src` as the exact multi-line text shown, with real
+    # leading-space indentation). Verification performed for this file:
+    # `go build ./...` (clean), `facet check selfhost/stmt.fct` ("ok, 0
+    # entities, 6 actions, 2 views" — confirming the `import "expr.fct"`
+    # merge succeeds with no name collision), and a live in-process run of
+    # all three fixtures above through runParseProcBody, decoded and
+    # cross-checked node-by-node against the hand trace as described above.
+    # (`facet run`/`facet serve` themselves refuse to start without a
+    # FacetQL/Postgres backing store configured in this environment — a
+    # deployment-infra requirement unrelated to this file's own logic — so
+    # the in-memory-server technique the existing selfhost test files
+    # already established was used instead, exactly as it already is for
+    # every other selfhost file's own real verification.)
+
+    # ============================================================
+    # STAGE 1: generic text-surgery helpers this file needs — the same
+    # `hasPrefix`/`trimPrefix`/`hasSuffix`/`trimSuffix`/single-character-
+    # scan idiom parser.fct's own STAGE 1 already established (restated
+    # here under `stmt`-prefixed names rather than imported, since
+    # parser.fct is not imported by this file — see the header above for
+    # why only expr.fct is).
+    # ============================================================
+    proc stmtHasPrefix(s: text, p: text) -> bool:
+        let n = len(p)
+        if n > len(s):
+            return false
+        return slice(s, 0, n) == p
+
+    proc stmtTrimPrefix(s: text, p: text) -> text:
+        let has = do stmtHasPrefix(s, p)
+        if has:
+            return slice(s, len(p), len(s))
+        return s
+
+    proc stmtHasSuffix(s: text, suf: text) -> bool:
+        let n = len(suf)
+        let ls = len(s)
+        if n > ls:
+            return false
+        return slice(s, ls - n, ls) == suf
+
+    proc stmtTrimSuffix(s: text, suf: text) -> text:
+        let has = do stmtHasSuffix(s, suf)
+        if has:
+            return slice(s, 0, len(s) - len(suf))
+        return s
+
+    # firstEqIndex: the FIRST `=` character, scanned left to right — Go's
+    # own `strings.IndexByte(rest, '=')`, the exact (slightly naive) scan
+    # parser.go's real `let`/assign handling uses. Because a valid target
+    # (an identifier) never itself contains `=`, the first `=` encountered
+    # is always the real assignment separator even when the RHS later
+    # contains `==`/`!=`/`<=`/`>=` — e.g. "x = a == b" finds the separator
+    # at index 2, well before the `==` at index 6. Matched exactly, quirk
+    # included, per this port's established "replicate the real algorithm's
+    # actual behavior" convention (source.fct's ragged-sibling-indent note,
+    # parser.fct's imperfect-escape-check note).
+    proc firstEqIndex(s: text) -> int:
+        let n = len(s)
+        let mut i = 0
+        let mut found = -1
+        loop i < n && found == -1:
+            if charAt(s, i) == "=":
+                found = i
+            i = i + 1
+        return found
+
+    # firstParenIndex: the first `(` character — used to isolate a
+    # `do`/`let ... = do` call's proc NAME (everything before it), mirroring
+    # firstEqIndex's own single-character forward scan.
+    proc firstParenIndex(s: text) -> int:
+        let n = len(s)
+        let mut i = 0
+        let mut found = -1
+        loop i < n && found == -1:
+            if charAt(s, i) == "(":
+                found = i
+            i = i + 1
+        return found
+
+    # ============================================================
+    # STAGE 2: raw multi-line proc-body text -> the two parallel arrays
+    # (`texts`/`parents`) this file's statement builder actually consumes —
+    # source.fct's own STAGE 1 (parsedIndents/parsedTexts) and STAGE 2
+    # (parentIndexForIndents) algorithms, restated under local names so
+    # this file needs no `import "source.fct"` (see the header above for
+    # why that import is impossible alongside expr.fct's own). Unlike
+    # source.fct's ORIGINAL text, this restatement uses `charAt` directly
+    # (a real builtin, unavailable when source.fct was first written —
+    # parser.fct already made this identical simplification for its own
+    # text-surgery helpers) rather than the `take`+concatenation
+    # workaround gap #1 originally forced.
+    # ============================================================
+    proc bodyIsBlankOrComment(line: text) -> bool:
+        let t = trim(line)
+        if len(t) == 0:
+            return true
+        return slice(t, 0, 1) == "#"
+
+    proc bodyIndentOf(line: text) -> int:
+        let n = len(line)
+        let mut count = 0
+        loop count < n && charAt(line, count) == " ":
+            count = count + 1
+        return count
+
+    proc bodyLineText(line: text) -> text:
+        return trim(line)
+
+    proc bodyIndents(src: text) -> [int]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let skip = do bodyIsBlankOrComment(raw)
+            if !skip:
+                let ind = do bodyIndentOf(raw)
+                out = append(out, ind)
+            i = i + 1
+        return out
+
+    proc bodyTexts(src: text) -> [text]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let skip = do bodyIsBlankOrComment(raw)
+            if !skip:
+                let tx = do bodyLineText(raw)
+                out = append(out, tx)
+            i = i + 1
+        return out
+
+    # bodyParents: source.fct's own parentIndexForIndents algorithm,
+    # verbatim (the "pop every open ancestor whose indent is >= the
+    # current line's indent, whatever remains on top is the parent" stack
+    # walk), restated locally.
+    proc bodyParents(indents: [int]) -> [int]:
+        let n = len(indents)
+        let mut stackIndent = []
+        let mut stackNode = []
+        let mut fillI = 0
+        loop fillI < n:
+            stackIndent = append(stackIndent, -1)
+            stackNode = append(stackNode, -1)
+            fillI = fillI + 1
+        let mut top = -1
+        let mut parents = []
+        let mut k = 0
+        loop k < n:
+            let cur = indents[k]
+            loop top >= 0:
+                if stackIndent[top] >= cur:
+                    top = top - 1
+                else:
+                    break
+            let mut parent = -1
+            if top >= 0:
+                parent = stackNode[top]
+            parents = append(parents, parent)
+            top = top + 1
+            stackIndent[top] = cur
+            stackNode[top] = k
+            k = k + 1
+        return parents
+
+    # ============================================================
+    # STAGE 3: source.fct's own `childrenOf` convention, restated locally
+    # (see the header above for why this file cannot import source.fct
+    # itself) — every index i with parents[i] == node, in document order.
+    # ============================================================
+    proc stmtChildrenOf(node: int, parents: [int]) -> [int]:
+        let n = len(parents)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if parents[i] == node:
+                out = append(out, i)
+            i = i + 1
+        return out
+
+    # ============================================================
+    # STAGE 4: `do ProcName(args)`'s argument list — syntactically IDENTICAL
+    # to a builtin Call's argument list (a comma-separated list of full
+    # expressions between `(` and `)`), so this reuses expr.fct's own
+    # argListCount/argListNodes VERBATIM rather than re-deriving
+    # comma-splitting a second time, per this task's own instruction not to
+    # reimplement expression parsing. `rest` is "ProcName(args)" (already
+    # trimmed of the leading `do `/`let name = do ` this file's callers
+    # strip first) — tokenizing it always puts the proc name at token 0
+    # (a single IDENT token, whatever its own text) and the `(` at token 1
+    # (tokenKinds/tokenTexts skip whitespace entirely, so this holds
+    # whether or not there is a space before the `(`), so argument parsing
+    # always starts at token 2, exactly the same `parenPos + 1` convention
+    # expr.fct's own callNodes/callEnd use for a builtin call.
+    # ============================================================
+    proc doArgsCount(rest: text) -> int:
+        let k = do tokenKinds(rest)
+        let tx = do tokenTexts(rest)
+        let c = do argListCount(k, tx, 2)
+        return c
+
+    proc doArgsNodes(rest: text, arena: [int]) -> [int]:
+        let k = do tokenKinds(rest)
+        let tx = do tokenTexts(rest)
+        let a1 = do argListNodes(k, tx, 2, arena)
+        return a1
+
+    # ============================================================
+    # STAGE 5: singleStmtNodes — one LINE, one statement (every kind except
+    # `if`, which needs its BLOCK-level sibling to look ahead for an
+    # `else:` — see stmtBlockNodes below, mirroring parseProcBody's own
+    # real structure exactly: the `if`/`else` pairing lookahead happens in
+    # the loop over a node's children, never inside a single statement's
+    # own dispatch). Builds and returns the extended shared arena; the
+    # newly-built statement's own root is always its last row
+    # ((len(returned)/5)-1), the same invariant every level of expr.fct's
+    # own arena already guarantees.
+    #
+    # Prefix-dispatch ORDER deliberately mirrors parseProcBody's real
+    # switch order for every kind this file implements (break, continue,
+    # loop, return, do, let, default-assign) — including one genuine
+    # upstream quirk preserved on purpose: parseProcBody's own `return`
+    # case is `strings.HasPrefix(t, "return")`, WITH NO REQUIRED TRAILING
+    # SPACE, checked before `do`/`let` — so a line like "returnValue = 5"
+    # would ALSO be misread as a bare `return` statement by the real
+    # compiler. That is the real, current behavior of parseProcBody (read
+    # fresh, not assumed), so it is replicated here rather than "fixed" —
+    # per this port's established convention of matching the real
+    # algorithm's actual behavior, quirks included (source.fct's
+    # ragged-sibling-indent note; parser.fct's imperfect-escape-check
+    # note).
+    # ============================================================
+    proc singleStmtNodes(texts: [text], parents: [int], lineIdx: int, arena: [int]) -> [int]:
+        let t = trim(texts[lineIdx])
+        let mut a = arena
+        if t == "break":
+            a = append(a, 26)
+            a = append(a, lineIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        if t == "continue":
+            a = append(a, 27)
+            a = append(a, lineIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        let isLoop = do stmtHasPrefix(t, "loop ")
+        if isLoop:
+            let after = do stmtTrimPrefix(t, "loop ")
+            let afterTrim = trim(after)
+            let condText = do stmtTrimSuffix(afterTrim, ":")
+            let ck = do tokenKinds(condText)
+            let ct = do tokenTexts(condText)
+            let a1 = do orNodes(ck, ct, 0, a)
+            let condIdx = (len(a1) / 5) - 1
+            let a2 = do stmtBlockNodes(texts, parents, lineIdx, a1)
+            let bodyBlockIdx = (len(a2) / 5) - 1
+            a = a2
+            a = append(a, 25)
+            a = append(a, condIdx)
+            a = append(a, bodyBlockIdx)
+            a = append(a, lineIdx)
+            a = append(a, -1)
+            return a
+        let hasReturnPrefix = do stmtHasPrefix(t, "return")
+        let isReturn = t == "return" || hasReturnPrefix
+        if isReturn:
+            let rest0 = do stmtTrimPrefix(t, "return")
+            let rest = trim(rest0)
+            let mut exprIdx = -1
+            if rest != "":
+                let rk = do tokenKinds(rest)
+                let rt = do tokenTexts(rest)
+                let a1 = do orNodes(rk, rt, 0, a)
+                exprIdx = (len(a1) / 5) - 1
+                a = a1
+            a = append(a, 21)
+            a = append(a, exprIdx)
+            a = append(a, lineIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        let isDo = do stmtHasPrefix(t, "do ")
+        if isDo:
+            let rest0 = do stmtTrimPrefix(t, "do ")
+            let rest = trim(rest0)
+            let argCount = do doArgsCount(rest)
+            let a1 = do doArgsNodes(rest, a)
+            let mut first = -1
+            if argCount > 0:
+                first = (len(a1) / 5) - argCount
+            a = a1
+            a = append(a, 22)
+            a = append(a, first)
+            a = append(a, lineIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        let isLet = do stmtHasPrefix(t, "let ")
+        if isLet:
+            let rest0 = do stmtTrimPrefix(t, "let ")
+            let rest0Trim = trim(rest0)
+            let isMut = do stmtHasPrefix(rest0Trim, "mut ")
+            let mut rest = rest0Trim
+            if isMut:
+                let stripped = do stmtTrimPrefix(rest0Trim, "mut ")
+                rest = trim(stripped)
+            let eq = do firstEqIndex(rest)
+            if eq < 0:
+                a = append(a, 29)
+                a = append(a, lineIdx)
+                a = append(a, -1)
+                a = append(a, -1)
+                a = append(a, -1)
+                return a
+            let rhs0 = slice(rest, eq + 1, len(rest))
+            let rhs = trim(rhs0)
+            let isRhsDo = do stmtHasPrefix(rhs, "do ")
+            if isRhsDo:
+                if isMut:
+                    a = append(a, 29)
+                    a = append(a, lineIdx)
+                    a = append(a, -1)
+                    a = append(a, -1)
+                    a = append(a, -1)
+                    return a
+                let callRest0 = do stmtTrimPrefix(rhs, "do ")
+                let callRest = trim(callRest0)
+                let argCount = do doArgsCount(callRest)
+                let a1 = do doArgsNodes(callRest, a)
+                let mut first = -1
+                if argCount > 0:
+                    first = (len(a1) / 5) - argCount
+                a = a1
+                a = append(a, 23)
+                a = append(a, first)
+                a = append(a, lineIdx)
+                a = append(a, -1)
+                a = append(a, -1)
+                return a
+            let rk = do tokenKinds(rhs)
+            let rt = do tokenTexts(rhs)
+            let a1 = do orNodes(rk, rt, 0, a)
+            let exprIdx = (len(a1) / 5) - 1
+            a = a1
+            let mut kindCode = 18
+            if isMut:
+                kindCode = 19
+            a = append(a, kindCode)
+            a = append(a, exprIdx)
+            a = append(a, lineIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        let eq2 = do firstEqIndex(t)
+        if eq2 >= 0:
+            let target = trim(slice(t, 0, eq2))
+            let rhs2 = trim(slice(t, eq2 + 1, len(t)))
+            let rk2 = do tokenKinds(rhs2)
+            let rt2 = do tokenTexts(rhs2)
+            let a1 = do orNodes(rk2, rt2, 0, a)
+            let exprIdx2 = (len(a1) / 5) - 1
+            a = a1
+            a = append(a, 20)
+            a = append(a, exprIdx2)
+            a = append(a, lineIdx)
+            a = append(a, -1)
+            a = append(a, -1)
+            return a
+        a = append(a, 29)
+        a = append(a, lineIdx)
+        a = append(a, -1)
+        a = append(a, -1)
+        a = append(a, -1)
+        return a
+
+    # ============================================================
+    # STAGE 6: stmtBlockNodes — one BLOCK, i.e. one whole sibling statement
+    # list (a proc's own top-level body, or an `if`/`loop`'s own indented
+    # children), recursively. This is the one place `if`'s `else:` sibling
+    # lookahead lives (mirroring parseProcBody's own `children[i+1]` check
+    # exactly): while walking `node`'s children in order, an `if` line
+    # peeks at its immediate next sibling, and if that sibling's own text
+    # is exactly `else:`/`else`, consumes it as the else-branch (recursing
+    # into ITS OWN children) and skips it as a statement of its own — an
+    # `else:` line that is NOT immediately preceded by an `if` (e.g. the
+    # block's own first statement) falls through to the `t == "else:" ||
+    # t == "else"` guard just below and is silently dropped, the same
+    # honest-but-inert degrade this file uses elsewhere for a shape it
+    # cannot represent (parseProcBody's own real behavior here is a hard
+    # parse error, "`else` with no matching `if`" — this port has no error
+    # channel, so it degrades rather than crashes, per this file's
+    # established convention).
+    # ============================================================
+    proc stmtBlockNodes(texts: [text], parents: [int], node: int, arena: [int]) -> [int]:
+        let kids = do stmtChildrenOf(node, parents)
+        let m = len(kids)
+        let mut a = arena
+        let mut rootIdxs = []
+        let mut i = 0
+        loop i < m:
+            let lineIdx = kids[i]
+            let t = trim(texts[lineIdx])
+            let isIf = do stmtHasPrefix(t, "if ")
+            if isIf:
+                let condRaw = do stmtTrimPrefix(t, "if ")
+                let condTrim = trim(condRaw)
+                let condText = do stmtTrimSuffix(condTrim, ":")
+                let ck = do tokenKinds(condText)
+                let ct = do tokenTexts(condText)
+                let a1 = do orNodes(ck, ct, 0, a)
+                let condIdx = (len(a1) / 5) - 1
+                a = a1
+                let a2 = do stmtBlockNodes(texts, parents, lineIdx, a)
+                let thenBlockIdx = (len(a2) / 5) - 1
+                a = a2
+                let mut elseBlockIdx = -1
+                let mut consumedElse = false
+                if i + 1 < m:
+                    let nextLineIdx = kids[i + 1]
+                    let nt = trim(texts[nextLineIdx])
+                    if nt == "else:" || nt == "else":
+                        let a3 = do stmtBlockNodes(texts, parents, nextLineIdx, a)
+                        elseBlockIdx = (len(a3) / 5) - 1
+                        a = a3
+                        consumedElse = true
+                a = append(a, 24)
+                a = append(a, condIdx)
+                a = append(a, thenBlockIdx)
+                a = append(a, elseBlockIdx)
+                a = append(a, lineIdx)
+                let rootIdx = (len(a) / 5) - 1
+                rootIdxs = append(rootIdxs, rootIdx)
+                if consumedElse:
+                    i = i + 2
+                else:
+                    i = i + 1
+            else:
+                if t == "else:" || t == "else":
+                    i = i + 1
+                else:
+                    let a1 = do singleStmtNodes(texts, parents, lineIdx, a)
+                    let rootIdx = (len(a1) / 5) - 1
+                    rootIdxs = append(rootIdxs, rootIdx)
+                    a = a1
+                    i = i + 1
+        let cnt = len(rootIdxs)
+        let mut k = 0
+        loop k < cnt:
+            a = append(a, 28)
+            a = append(a, rootIdxs[k])
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, -1)
+            k = k + 1
+        let mut first = -1
+        if cnt > 0:
+            first = (len(a) / 5) - cnt
+        a = append(a, 17)
+        a = append(a, first)
+        a = append(a, -1)
+        a = append(a, -1)
+        a = append(a, -1)
+        return a
+
+    # ============================================================
+    # STAGE 7: the end-to-end driver — raw multi-line proc-body TEXT in
+    # (exactly what a proc's own indented body would look like, dedented
+    # to start at column 0), the flat combined statement+expression arena
+    # out. This is parseProcBody(n.Children, ...)'s own job, minus the
+    # (a) declaration-header/type-checking concerns parseProc itself
+    # handles separately (out of scope — this file is the BODY only) and
+    # (b) error return (this port's established honest-sentinel convention
+    # instead — see kind 29, Unsupported, above).
+    # ============================================================
+    proc parseProcBodySrc(src: text) -> [int]:
+        let indents = do bodyIndents(src)
+        let parents = do bodyParents(indents)
+        let texts = do bodyTexts(src)
+        let a = do stmtBlockNodes(texts, parents, -1, [])
+        return a
+
+    # ============================================================
+    # STAGE 8: reader/navigation helpers — proof the arena is actually
+    # walkable, not just buildable (this task's own verification ask).
+    # Every one of these is pure index arithmetic over the flat `[int]`
+    # arena, the same style expr.fct's own header (FINDING 8's closing
+    # paragraph) already describes a real consumer using.
+    # ============================================================
+    proc stmtKindAt(arena: [int], idx: int) -> int:
+        return arena[5 * idx]
+
+    # stmtLineOf: the source line index for any statement-kind row this
+    # file produces, dispatching on kind because lineIdx does not always
+    # live in the same slot (Break/Continue/Unsupported keep it in slot 1
+    # since they have no other fact to store; If keeps it last, in slot 4,
+    # since slots 1-3 are all taken by cond/then/else; every other kind
+    # keeps it in slot 2, right after its one expression/arg-list fact).
+    proc stmtLineOf(arena: [int], idx: int) -> int:
+        let k = do stmtKindAt(arena, idx)
+        if k == 24:
+            return arena[5 * idx + 4]
+        if k == 25:
+            return arena[5 * idx + 3]
+        if k == 26:
+            return arena[5 * idx + 1]
+        if k == 27:
+            return arena[5 * idx + 1]
+        if k == 29:
+            return arena[5 * idx + 1]
+        return arena[5 * idx + 2]
+
+    # stmtExprIdx: the RHS/value expression root for Let (18) / LetMut (19)
+    # / Assign (20) / Return (21) — all four share the identical (exprIdx,
+    # lineIdx) slot shape.
+    proc stmtExprIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc doArgCountAt(arena: [int], idx: int) -> int:
+        let first = arena[5 * idx + 1]
+        if first < 0:
+            return 0
+        return idx - first
+
+    proc doArgExprRootAt(arena: [int], idx: int, i: int) -> int:
+        let first = arena[5 * idx + 1]
+        let slotIdx = first + i
+        return arena[5 * slotIdx + 1]
+
+    proc ifCondIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc ifThenBlockIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 2]
+
+    proc ifElseBlockIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 3]
+
+    proc loopCondIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    proc loopBodyBlockIdx(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 2]
+
+    proc blockFirstSlot(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    # blockStmtCount: the pure-arithmetic count recovery this file's header
+    # describes — valid because a Block's own row is always appended
+    # immediately after its StmtSlot run, with nothing else interleaved.
+    proc blockStmtCount(arena: [int], idx: int) -> int:
+        let first = do blockFirstSlot(arena, idx)
+        if first < 0:
+            return 0
+        return idx - first
+
+    proc stmtSlotChild(arena: [int], idx: int) -> int:
+        return arena[5 * idx + 1]
+
+    # blockStmtRootAt: the i-th statement's own real root node index inside
+    # a given Block — walk to that Block's first StmtSlot row, then i more,
+    # then follow its pointer, exactly the same two-hop read expr.fct's own
+    # header describes for an ArgSlot-encoded call argument.
+    proc blockStmtRootAt(arena: [int], idx: int, i: int) -> int:
+        let first = do blockFirstSlot(arena, idx)
+        let slotIdx = first + i
+        let r = do stmtSlotChild(arena, slotIdx)
+        return r
+
+    proc stmtArenaNodeCount(arena: [int]) -> int:
+        return len(arena) / 5
+
+    # ============================================================
+    # STAGE 9: name recovery — the actual variable/proc-name TEXT for a
+    # naming statement kind, resolved on demand from `texts[lineIdx]`
+    # (never stored in the arena itself — see kind 18's own doc above for
+    # why). Each mirrors the exact prefix-stripping singleStmtNodes itself
+    # already does when it first classified that same line.
+    # ============================================================
+    proc letOrAssignName(lineText: text) -> text:
+        let t = trim(lineText)
+        let hasLet = do stmtHasPrefix(t, "let ")
+        if hasLet:
+            let rest0 = do stmtTrimPrefix(t, "let ")
+            let rest0Trim = trim(rest0)
+            let isMut = do stmtHasPrefix(rest0Trim, "mut ")
+            let mut rest = rest0Trim
+            if isMut:
+                let stripped = do stmtTrimPrefix(rest0Trim, "mut ")
+                rest = trim(stripped)
+            let eq = do firstEqIndex(rest)
+            if eq < 0:
+                return ""
+            return trim(slice(rest, 0, eq))
+        let eq2 = do firstEqIndex(t)
+        if eq2 < 0:
+            return ""
+        return trim(slice(t, 0, eq2))
+
+    proc bareDoProcName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "do ")
+        let rest = trim(rest0)
+        let openParen = do firstParenIndex(rest)
+        if openParen < 0:
+            return rest
+        return trim(slice(rest, 0, openParen))
+
+    proc letDoBoundName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "let ")
+        let rest = trim(rest0)
+        let eq = do firstEqIndex(rest)
+        if eq < 0:
+            return ""
+        return trim(slice(rest, 0, eq))
+
+    proc letDoProcName(lineText: text) -> text:
+        let t = trim(lineText)
+        let rest0 = do stmtTrimPrefix(t, "let ")
+        let rest = trim(rest0)
+        let eq = do firstEqIndex(rest)
+        if eq < 0:
+            return ""
+        let rhs0 = slice(rest, eq + 1, len(rest))
+        let rhs = trim(rhs0)
+        let afterDo0 = do stmtTrimPrefix(rhs, "do ")
+        let afterDo = trim(afterDo0)
+        let openParen = do firstParenIndex(afterDo)
+        if openParen < 0:
+            return afterDo
+        return trim(slice(afterDo, 0, openParen))
+
+    # ============================================================
+    # STAGE 10: the live HTTP-exercisable driver — POST a real multi-line
+    # proc-body `src` (see this file's header for the three hand-traced
+    # fixtures) and get the flat combined arena back.
+    # ============================================================
+    state stmtArenaResult: [int] = []
+
+    action runParseProcBody(src: text):
+        let r = do parseProcBodySrc(src)
+        stmtArenaResult = r
+
+    view StmtHome at "/stmt":
+        box:
+            text "{stmtArenaResult}"
