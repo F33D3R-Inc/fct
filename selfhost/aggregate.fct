@@ -1,0 +1,610 @@
+app AggregateSelfHost:
+    # Self-hosting port of facetql/src/core/aggregate.rs — the fold that
+    # turns many matching rows into one answer (count/sum/avg/min/max),
+    # so a caller never has to ship rows across the wire just to add them
+    # up client-side. Read in full before this port: it is ~480 lines of
+    # pure reduction math, no I/O, no storage access — AggFunc (which
+    # aggregate), AggSpec (function + the field it reads, validated
+    # up front), Accumulator (the running fold), and two small JSON-safety
+    # helpers (describe, number_from_f64/number_from_i128) it calls at the
+    # edges. There is no grouping/bucketing CODE in aggregate.rs itself —
+    # its own doc comment mentions "one group whose key is nothing" only
+    # to explain why Count lives in the same enum as the rest; a caller
+    # wanting one answer per group is expected to run one Accumulator per
+    # group (not shown in this file, so not ported here — see the module
+    # doc's own scope: "the fold, and nothing else").
+    #
+    # No crypto anywhere in this file: it is arithmetic over already-
+    # decoded values, nothing hashed, nothing signed.
+    #
+    # ============================================================
+    # ROW/VALUE MODEL — reusing predicate.fct's and query.fct's own
+    # established shape for a decoded row: one named `Field` per column,
+    # `kind` tagging which of num/text/bool/null it holds, `num` carried
+    # as `float` throughout (both files document why: this language's
+    # `int`/`float` distinction has nothing to attach to on the JSON side,
+    # since predicate.rs/engine.rs already run every numeric operand
+    # through `as_f64` or an untyped compare). This file's `FieldValue` is
+    # that exact same four-field shape (name dropped — a fold reads one
+    # already-selected field's value, not a whole row), plus the one case
+    # neither sibling file's row-value needs but this one does: "absent"
+    # (query.fct's OrderValue already has this for its own reason — a
+    # missing `order by` field — and aggregate.rs needs it for the same
+    # reason `fold`'s own `value: Option<&Value>` does: a row can simply
+    # not have the aggregated field at all).
+    #
+    # A DELIBERATE, DOCUMENTED SIMPLIFICATION FOLLOWS FROM THIS CHOICE:
+    # aggregate.rs's `Accumulator` tracks `int_sum: i128` / `all_int`
+    # separately from `float_sum`, specifically so a sum of integer
+    # columns renders back out as a JSON integer (`42`, not `42.0`) and
+    # survives a total wider than `i64` without precision loss
+    # (`an_integer_sum_wider_than_i64_is_still_right`). That distinction
+    # depends on knowing whether a JSON number was ORIGINALLY encoded as
+    # an integer or a float literal (`serde_json::Value::Number` keeps
+    # that tag; `json!(3.0).as_i64()` is `None` even though 3.0 is a whole
+    # number) — a distinction the row model here has already erased one
+    # layer up, in the very `Field`/`OrderValue` shape predicate.fct and
+    # query.fct established: `num` is one `float`, int-origin and
+    # float-origin alike, with no int/float tag surviving into it. This
+    # port cannot un-erase that tag without inventing a second, richer row
+    # shape the task was explicit not to do ("don't invent a second [row
+    # value shape]"). What IS ported for real: the actual reduction math —
+    # skip null/absent, refuse (not silently coerce) a non-numeric field
+    # on sum/avg, divide by the rows that contributed rather than the rows
+    # that matched, min/max via the same total order the source's own
+    # `compare_order_values` defines. What is deferred, narrowly, is only
+    # the JSON-rendering distinction of "does an all-integer sum print
+    # without a decimal point" — the numeric ANSWER this port computes is
+    # exactly right (`sum([1,2,39]) == 42.0`, numerically identical to the
+    # source's `42`); only whether that 42 would serialize with a `.0` is
+    # left unaddressed, because there is no wire/JSON encoder in this
+    # selfhost slice for either sibling file either. If `Field.kind` ever
+    # grows a real "int" vs "num"/float distinction, this is the file to
+    # revisit.
+    #
+    # A SECOND, ALREADY-CONFIRMED SIMPLIFICATION: min/max ordering. The
+    # source's `Accumulator::fold` orders MIN/MAX candidates with
+    # `keys::compare_order_values` (storage/index.rs) — a total order
+    # across JSON types (null < bool < num < text) with a REAL byte-order
+    # (`str::cmp`) comparison within two texts, per
+    # `min_and_max_order_text_as_the_indexes_do`
+    # (`min(["pear","apple","quince"]) == "apple"`). query.fct already
+    # confirmed, twice over (its own header, and fabric.fct's
+    # `failoverBestCandidateIndex` before it), that `facet lang` has no
+    # `ord`/codepoint builtin and no lexicographic `<`/`<=` on `text` —
+    # only `==`/`!=`. This port leans on that same confirmed gap rather
+    # than re-deriving it: `compareFieldValues`' "text" arm below answers
+    # `0` for two texts regardless of their real order (equality is still
+    # exact — unequal text just can't be ORDERED). The one place that
+    # bites, concretely: MIN/MAX over a text field keeps whichever value
+    # was seen FIRST rather than the alphabetically extreme one (`0` never
+    # counts as "better" against either `<` or `>`), which is a real,
+    # named divergence from `min_and_max_order_text_as_the_indexes_do` —
+    # not a silent wrong answer, a documented one. MIN/MAX over `num`
+    # (this port's fully-verified case) hits none of this: the source's
+    # own numeric compare is already plain `f64::partial_cmp`, identical
+    # to this port's float compare, so numeric min/max is an exact port.
+    # ============================================================
+    struct FieldValue:
+        kind: text
+        numVal: float
+        boolVal: bool
+        textVal: text
+
+    proc numValue(v: float) -> FieldValue:
+        return FieldValue{kind: "num", numVal: v, boolVal: false, textVal: ""}
+
+    proc textValue(v: text) -> FieldValue:
+        return FieldValue{kind: "text", numVal: 0.0, boolVal: false, textVal: v}
+
+    proc boolValue(v: bool) -> FieldValue:
+        return FieldValue{kind: "bool", numVal: 0.0, boolVal: v, textVal: ""}
+
+    proc nullValue() -> FieldValue:
+        return FieldValue{kind: "null", numVal: 0.0, boolVal: false, textVal: ""}
+
+    proc absentValue() -> FieldValue:
+        return FieldValue{kind: "absent", numVal: 0.0, boolVal: false, textVal: ""}
+
+    # ============================================================
+    # AggFunc — restated as plain `text` ("count"/"sum"/"avg"/"min"/"max"),
+    # matching predicate.fct's own convention of spelling an enum out as
+    # its wire text instead of an opaque tag (`node.kind == "bin"`, not
+    # `node.kind == 9`). `AggFunc::name()` is then just identity on this
+    # representation, so only `parse` (validation) needs its own proc.
+    # ============================================================
+    struct ParseAggFuncResult:
+        ok: bool
+        func: text
+        err: text
+
+    # parseAggFunc: `AggFunc::parse`'s own body — the wire spelling, or a
+    # refusal naming the whole set, verbatim (this port's text
+    # concatenation stands in for Rust's `format!`).
+    proc parseAggFunc(name: text) -> ParseAggFuncResult:
+        if name == "count":
+            return ParseAggFuncResult{ok: true, func: "count", err: ""}
+        if name == "sum":
+            return ParseAggFuncResult{ok: true, func: "sum", err: ""}
+        if name == "avg":
+            return ParseAggFuncResult{ok: true, func: "avg", err: ""}
+        if name == "min":
+            return ParseAggFuncResult{ok: true, func: "min", err: ""}
+        if name == "max":
+            return ParseAggFuncResult{ok: true, func: "max", err: ""}
+        let msg = "unknown aggregate \"" + name + "\"; expected one of count, sum, avg, min, max"
+        return ParseAggFuncResult{ok: false, func: "", err: msg}
+
+    # aggFuncNeedsField: `AggFunc::needs_field` verbatim — every aggregate
+    # but `count` has to read a field out of each row.
+    proc aggFuncNeedsField(func: text) -> bool:
+        return func != "count"
+
+    # ============================================================
+    # AggSpec — the function plus the field it reads (empty/unused for
+    # `count`), validated once up front exactly as `AggSpec::new` does:
+    # a function that needs a field but got none, or `count` handed a
+    # field it would silently ignore, is refused before any row is read.
+    # `hasField`/`field` restates `Option<String>` the same way query.fct's
+    # `Cursor.hasOrder`/`orderVal` restates its own `Option`.
+    # ============================================================
+    struct AggSpec:
+        func: text
+        hasField: bool
+        field: text
+
+    struct NewAggSpecResult:
+        ok: bool
+        err: text
+        spec: AggSpec
+
+    proc aggSpecCount() -> AggSpec:
+        return AggSpec{func: "count", hasField: false, field: ""}
+
+    # newAggSpec: `AggSpec::new`'s own two refusals, verbatim, then the
+    # same `field.filter(|f| !f.is_empty())` normalization on the
+    # accepted path.
+    proc newAggSpec(func: text, hasField: bool, field: text) -> NewAggSpecResult:
+        let needsField = do aggFuncNeedsField(func)
+        let realHasField = hasField && field != ""
+
+        if needsField:
+            if realHasField == false:
+                let msg = func + " needs a field to aggregate; pass `field`"
+                return NewAggSpecResult{ok: false, err: msg, spec: AggSpec{func: func, hasField: false, field: ""}}
+        else:
+            if realHasField:
+                let msg2 = "count aggregates rows, not the field \"" + field + "\"; omit `field`, or use a predicate to select the rows to count"
+                return NewAggSpecResult{ok: false, err: msg2, spec: AggSpec{func: func, hasField: false, field: ""}}
+
+        let mut finalField = ""
+        if realHasField:
+            finalField = field
+        let spec = AggSpec{func: func, hasField: realHasField, field: finalField}
+        return NewAggSpecResult{ok: true, err: "", spec: spec}
+
+    proc aggSpecNeedsField(spec: AggSpec) -> bool:
+        let needs = do aggFuncNeedsField(spec.func)
+        return needs
+
+    # ============================================================
+    # THE TOTAL ORDER — `compare_order_values`, restated over `FieldValue`
+    # exactly as query.fct's own `compareOrderValues` restates it over
+    # `OrderValue` (same rank numbers, same shape, same text-order
+    # scope note — see this file's header for why). Duplicated locally
+    # rather than shared: procs/structs don't cross files in this
+    # language, matching every sibling selfhost file's own convention.
+    # ============================================================
+    proc fieldValueTypeRank(v: FieldValue) -> int:
+        if v.kind == "null":
+            return 10
+        if v.kind == "bool":
+            return 20
+        if v.kind == "num":
+            return 30
+        if v.kind == "text":
+            return 40
+        return 90
+
+    proc compareFieldValues(a: FieldValue, b: FieldValue) -> int:
+        let ra = do fieldValueTypeRank(a)
+        let rb = do fieldValueTypeRank(b)
+        if ra < rb:
+            return -1
+        if ra > rb:
+            return 1
+        if a.kind == "bool":
+            if a.boolVal == b.boolVal:
+                return 0
+            if a.boolVal:
+                return 1
+            return -1
+        if a.kind == "num":
+            if a.numVal < b.numVal:
+                return -1
+            if a.numVal > b.numVal:
+                return 1
+            return 0
+        if a.kind == "text":
+            # No lexicographic order on `text` in this language (confirmed
+            # gap — see this file's header). Equal text still compares
+            # equal; unequal text also answers 0, a documented
+            # simplification rather than a real order.
+            return 0
+        return 0
+
+    # describeFieldValue: `describe`'s own body, restated over the four
+    # kinds a `FieldValue` can actually hold (no array/object case — this
+    # row model, like predicate.fct's and query.fct's, has no generic
+    # "any JSON value" leaf, so a composite field never reaches here).
+    proc describeFieldValue(v: FieldValue) -> text:
+        if v.kind == "null":
+            return "null"
+        if v.kind == "absent":
+            return "null"
+        if v.kind == "bool":
+            return "a boolean"
+        if v.kind == "num":
+            return "a number"
+        if v.kind == "text":
+            if len(v.textVal) <= 32:
+                return "the text \"" + v.textVal + "\""
+            return "text"
+        return "a value"
+
+    # ============================================================
+    # Accumulator — the running fold. Restated as an immutable value
+    # threaded through `foldValue` (which returns the NEXT accumulator
+    # rather than mutating in place, since a `proc` parameter is a
+    # value here, same convention `sortRowsAscending` uses for `[Row]`),
+    # plus `FoldOutcome` standing in for `fold`'s own `Result<(), String>`
+    # (this language has no `Result`; `ok`/`err` is the same split
+    # predicate.fct's `evalPredicateOk`/`evalPredicateResult` already
+    # uses for the identical reason).
+    # ============================================================
+    struct Accumulator:
+        func: text
+        rows: int
+        contributed: int
+        sum: float
+        hasExtreme: bool
+        extreme: FieldValue
+
+    struct FoldOutcome:
+        acc: Accumulator
+        ok: bool
+        err: text
+
+    proc newAccumulator(func: text) -> Accumulator:
+        let av = do absentValue()
+        return Accumulator{func: func, rows: 0, contributed: 0, sum: 0.0, hasExtreme: false, extreme: av}
+
+    proc accumulatorRows(acc: Accumulator) -> int:
+        return acc.rows
+
+    # foldValue: `Accumulator::fold`'s own body. `rows` increments before
+    # anything else — including before a refusal — exactly as the source
+    # does (`self.rows += 1` is the first line of `fold`, ahead of the
+    # `?`), so a row that FAILED to contribute is still counted as one
+    # that was read.
+    proc foldValue(acc: Accumulator, field: text, value: FieldValue) -> FoldOutcome:
+        let rows2 = acc.rows + 1
+
+        if acc.func == "count":
+            let counted = Accumulator{func: acc.func, rows: rows2, contributed: acc.contributed, sum: acc.sum, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+            return FoldOutcome{acc: counted, ok: true, err: ""}
+
+        if value.kind == "null":
+            let skippedN = Accumulator{func: acc.func, rows: rows2, contributed: acc.contributed, sum: acc.sum, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+            return FoldOutcome{acc: skippedN, ok: true, err: ""}
+
+        if value.kind == "absent":
+            let skippedA = Accumulator{func: acc.func, rows: rows2, contributed: acc.contributed, sum: acc.sum, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+            return FoldOutcome{acc: skippedA, ok: true, err: ""}
+
+        if acc.func == "sum" || acc.func == "avg":
+            if value.kind != "num":
+                let desc = do describeFieldValue(value)
+                let msg = acc.func + " over \"" + field + "\" found " + desc + " in a row that matched; an aggregate over a field that is not always a number has no answer, so this is refused rather than reported as a total over the rows that happened to be numeric"
+                let errored = Accumulator{func: acc.func, rows: rows2, contributed: acc.contributed, sum: acc.sum, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+                return FoldOutcome{acc: errored, ok: false, err: msg}
+
+            let summed = Accumulator{func: acc.func, rows: rows2, contributed: acc.contributed + 1, sum: acc.sum + value.numVal, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+            return FoldOutcome{acc: summed, ok: true, err: ""}
+
+        # min/max: never refuses — `compare_order_values` is a total order
+        # across every JSON type, so even a field that mixes types across
+        # rows still orders (this is exactly why the source's own MIN/MAX
+        # arm has no `as_f64`-style type check, unlike SUM/AVG above).
+        let mut better = true
+        if acc.hasExtreme:
+            let cmp = do compareFieldValues(value, acc.extreme)
+            if acc.func == "min":
+                better = cmp < 0
+            else:
+                better = cmp > 0
+
+        let mut nextExtreme = acc.extreme
+        let mut nextHasExtreme = acc.hasExtreme
+        if better:
+            nextExtreme = value
+            nextHasExtreme = true
+
+        let extremed = Accumulator{func: acc.func, rows: rows2, contributed: acc.contributed + 1, sum: acc.sum, hasExtreme: nextHasExtreme, extreme: nextExtreme}
+        return FoldOutcome{acc: extremed, ok: true, err: ""}
+
+    # foldRows: `Accumulator::fold_rows`'s own body — folding `by` rows at
+    # once, legal only for `count` (the source's own `debug_assert`; this
+    # port makes the same rule a plain runtime no-op for any other
+    # function rather than a crash, since a `proc` has no assert/panic to
+    # call — a caller passing the wrong function here is a caller bug the
+    # same way the source's debug_assert only catches it in a debug
+    # build).
+    proc foldRows(acc: Accumulator, by: int) -> Accumulator:
+        let needs = do aggFuncNeedsField(acc.func)
+        if needs:
+            return acc
+        return Accumulator{func: acc.func, rows: acc.rows + by, contributed: acc.contributed, sum: acc.sum, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+
+    # isNaNFloat: the one runtime check this port can still make without a
+    # dedicated `isNaN`/`isInf` builtin (neither is in `facet lang`'s
+    # built-in list) — NaN is the only IEEE-754 value that compares
+    # unequal to itself, which is exactly `number_from_f64`'s own trigger
+    # for answering `null` instead of a number. Infinity (`number_from_f64`'s
+    # OTHER trigger) has no equally cheap test without `isInf`, and isn't
+    # reachable by any of this file's own demo/verification data (a finite
+    # sum of finite floats), so it is left unhandled rather than faked
+    # with an ad hoc magnitude check.
+    proc isNaNFloat(x: float) -> bool:
+        return x != x
+
+    # finishAccumulator: `Accumulator::finish`'s own body — the empty-case
+    # split (count/sum have an identity, avg/min/max are `null`) verbatim,
+    # plus the NaN guard `number_from_f64` applies to whichever of
+    # sum/avg's answers came out of division or accumulation.
+    proc finishAccumulator(acc: Accumulator) -> FieldValue:
+        if acc.func == "count":
+            let countVal = do numValue(toFloat(acc.rows))
+            return countVal
+
+        if acc.func == "sum":
+            let sumBad = do isNaNFloat(acc.sum)
+            if sumBad:
+                let n1 = do nullValue()
+                return n1
+            let sumVal = do numValue(acc.sum)
+            return sumVal
+
+        if acc.func == "avg":
+            if acc.contributed == 0:
+                let n2 = do nullValue()
+                return n2
+            let avg = acc.sum / toFloat(acc.contributed)
+            let avgBad = do isNaNFloat(avg)
+            if avgBad:
+                let n3 = do nullValue()
+                return n3
+            let avgVal = do numValue(avg)
+            return avgVal
+
+        # min/max
+        if acc.hasExtreme:
+            return acc.extreme
+        let n4 = do nullValue()
+        return n4
+
+    # ============================================================
+    # THE ENTRY POINT — the calling convention every one of
+    # aggregate.rs's own callers (not shown in this file — they live in
+    # `StorageEngine`) follows: build an `Accumulator`, fold every
+    # matching row's value in, stop at the first refusal exactly as a
+    # `for row in rows { acc.fold(...)?; }` loop's `?` would, and finish.
+    # This is not new logic beyond aggregate.rs — it is the loop-and-
+    # finish shape `Accumulator`'s own doc comments describe throughout —
+    # restated here as one proc so this file, like predicate.fct's
+    # `evalPredicateOk`/`evalPredicateResult` and query.fct's
+    # `computeQueryPage`, has a single top-level call a future
+    # self-hosted scan loop can actually reach for.
+    # ============================================================
+    struct AggResult:
+        ok: bool
+        err: text
+        result: FieldValue
+        rows: int
+
+    proc aggregateOverValues(func: text, field: text, values: [FieldValue]) -> AggResult:
+        let acc0 = do newAccumulator(func)
+        let mut acc = acc0
+        let n = len(values)
+        let mut i = 0
+        let mut failed = false
+        let mut errMsg = ""
+        loop i < n:
+            if failed == false:
+                let outcome = do foldValue(acc, field, values[i])
+                acc = outcome.acc
+                if outcome.ok == false:
+                    failed = true
+                    errMsg = outcome.err
+            i = i + 1
+
+        if failed:
+            let failResult = do nullValue()
+            return AggResult{ok: false, err: errMsg, result: failResult, rows: acc.rows}
+
+        let finished = do finishAccumulator(acc)
+        return AggResult{ok: true, err: "", result: finished, rows: acc.rows}
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURE — each proc below hand-traces one of
+    # aggregate.rs's own `#[test]`s, by name in the comment, so a
+    # divergence from the real Rust value (there is exactly one,
+    # documented at this file's header: MIN/MAX over text) is visible
+    # at the call site rather than only in prose.
+    # ============================================================
+    proc numsFromFloats3(a: float, b: float, c: float) -> [FieldValue]:
+        let va = do numValue(a)
+        let vb = do numValue(b)
+        let vc = do numValue(c)
+        return [va, vb, vc]
+
+    # a_sum_of_integers_stays_an_integer: sum([1,2,39]) == 42 (numerically
+    # exact; see header for the int-vs-float rendering deferral).
+    proc demoSumIntegers() -> text:
+        let vals = do numsFromFloats3(1.0, 2.0, 39.0)
+        let r = do aggregateOverValues("sum", "f", vals)
+        return "" + r.result.numVal
+
+    # one_float_makes_the_whole_sum_a_float: sum([1, 0.5]) == 1.5.
+    proc demoSumMixed() -> text:
+        let v1 = do numValue(1.0)
+        let v2 = do numValue(0.5)
+        let vals = [v1, v2]
+        let r = do aggregateOverValues("sum", "f", vals)
+        return "" + r.result.numVal
+
+    # the_empty_sum_is_zero_and_the_empty_average_is_null, plus min/max/count.
+    proc demoEmptySum() -> text:
+        let r = do aggregateOverValues("sum", "f", [])
+        return "" + r.result.numVal
+
+    proc demoEmptyAvgIsNull() -> bool:
+        let r = do aggregateOverValues("avg", "f", [])
+        return r.result.kind == "null"
+
+    proc demoEmptyMinIsNull() -> bool:
+        let r = do aggregateOverValues("min", "f", [])
+        return r.result.kind == "null"
+
+    proc demoEmptyCount() -> text:
+        let r = do aggregateOverValues("count", "f", [])
+        return "" + r.result.numVal
+
+    # an_average_divides_by_the_rows_that_had_a_value: rows 2,4,absent,null
+    # -> avg == 3.0 (not 1.5 — the two valueless rows are not zeroes).
+    proc demoAvgSkipsMissing() -> text:
+        let v1 = do numValue(2.0)
+        let v2 = do numValue(4.0)
+        let v3 = do absentValue()
+        let v4 = do nullValue()
+        let vals = [v1, v2, v3, v4]
+        let r = do aggregateOverValues("avg", "f", vals)
+        return "" + r.result.numVal
+
+    # count_counts_rows_whatever_the_field_holds: absent/null/text all
+    # still count as rows -> rows == 3.
+    proc demoCountCountsEverything() -> int:
+        let v1 = do absentValue()
+        let v2 = do nullValue()
+        let v3 = do textValue("text")
+        let vals = [v1, v2, v3]
+        let r = do aggregateOverValues("count", "f", vals)
+        return r.rows
+
+    # a_sum_over_text_is_refused_rather_than_skipped: sum([1, "12"]) fails,
+    # and the message names both the function and the offending value.
+    proc demoSumOverTextRefused() -> bool:
+        let v1 = do numValue(1.0)
+        let v2 = do textValue("12")
+        let vals = [v1, v2]
+        let r = do aggregateOverValues("sum", "price", vals)
+        if r.ok:
+            return false
+        let mentionsSum = contains(r.err, "sum")
+        let mentionsValue = contains(r.err, "\"12\"")
+        return mentionsSum && mentionsValue
+
+    # min_and_max_order_text_as_the_indexes_do — real Rust: min == "apple",
+    # max == "quince". This port's DOCUMENTED divergence (see header): no
+    # lexicographic order on text, so both min and max keep the FIRST
+    # value seen, "pear". Traced explicitly, not silently wrong.
+    proc demoMinMaxOverTextFirstSeen() -> text:
+        let v1 = do textValue("pear")
+        let v2 = do textValue("apple")
+        let v3 = do textValue("quince")
+        let vals = [v1, v2, v3]
+        let minR = do aggregateOverValues("min", "f", vals)
+        let maxR = do aggregateOverValues("max", "f", vals)
+        return minR.result.textVal + "/" + maxR.result.textVal
+
+    # min/max over NUM is a fully-verified, exact port: real order.
+    proc demoMinMaxOverNumbers() -> text:
+        let v1 = do numValue(30.0)
+        let v2 = do numValue(10.0)
+        let v3 = do numValue(20.0)
+        let vals = [v1, v2, v3]
+        let minR = do aggregateOverValues("min", "f", vals)
+        let maxR = do aggregateOverValues("max", "f", vals)
+        return "" + minR.result.numVal + "/" + maxR.result.numVal
+
+    # a_spec_refuses_a_function_field_pair_it_cannot_answer.
+    proc demoSpecValidation() -> bool:
+        let sumNoField = do newAggSpec("sum", false, "")
+        let sumEmptyField = do newAggSpec("sum", true, "")
+        let countWithField = do newAggSpec("count", true, "price")
+        let countOk = do newAggSpec("count", false, "")
+        let avgOk = do newAggSpec("avg", true, "price")
+        if sumNoField.ok:
+            return false
+        if sumEmptyField.ok:
+            return false
+        if countWithField.ok:
+            return false
+        if countOk.ok == false:
+            return false
+        if avgOk.ok == false:
+            return false
+        return true
+
+    # an_unknown_function_names_the_ones_that_exist.
+    proc demoParseUnknown() -> bool:
+        let r = do parseAggFunc("mean")
+        if r.ok:
+            return false
+        return contains(r.err, "avg")
+
+    state demoSumIntegersResult: text = ""
+    state demoSumMixedResult: text = ""
+    state demoEmptySumResult: text = ""
+    state demoEmptyAvgIsNullResult: bool = false
+    state demoEmptyMinIsNullResult: bool = false
+    state demoEmptyCountResult: text = ""
+    state demoAvgSkipsMissingResult: text = ""
+    state demoCountCountsEverythingResult: int = 0
+    state demoSumOverTextRefusedResult: bool = false
+    state demoMinMaxOverTextResult: text = ""
+    state demoMinMaxOverNumbersResult: text = ""
+    state demoSpecValidationResult: bool = false
+    state demoParseUnknownResult: bool = false
+
+    action runDemoAggregate():
+        let a1 = do demoSumIntegers()
+        let a2 = do demoSumMixed()
+        let a3 = do demoEmptySum()
+        let a4 = do demoEmptyAvgIsNull()
+        let a5 = do demoEmptyMinIsNull()
+        let a6 = do demoEmptyCount()
+        let a7 = do demoAvgSkipsMissing()
+        let a8 = do demoCountCountsEverything()
+        let a9 = do demoSumOverTextRefused()
+        let a10 = do demoMinMaxOverTextFirstSeen()
+        let a11 = do demoMinMaxOverNumbers()
+        let a12 = do demoSpecValidation()
+        let a13 = do demoParseUnknown()
+        demoSumIntegersResult = a1
+        demoSumMixedResult = a2
+        demoEmptySumResult = a3
+        demoEmptyAvgIsNullResult = a4
+        demoEmptyMinIsNullResult = a5
+        demoEmptyCountResult = a6
+        demoAvgSkipsMissingResult = a7
+        demoCountCountsEverythingResult = a8
+        demoSumOverTextRefusedResult = a9
+        demoMinMaxOverTextResult = a10
+        demoMinMaxOverNumbersResult = a11
+        demoSpecValidationResult = a12
+        demoParseUnknownResult = a13
+
+    view AggregateHome at "/":
+        box:
+            text "{demoSumIntegersResult} {demoSumMixedResult} {demoEmptySumResult} {demoEmptyAvgIsNullResult} {demoEmptyMinIsNullResult} {demoEmptyCountResult} {demoAvgSkipsMissingResult} {demoCountCountsEverythingResult} {demoSumOverTextRefusedResult} {demoMinMaxOverTextResult} {demoMinMaxOverNumbersResult} {demoSpecValidationResult} {demoParseUnknownResult}"

@@ -184,6 +184,7 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.Actions = append(app.Actions, b.Actions...)
 		app.Procs = append(app.Procs, b.Procs...)
 		app.Jobs = append(app.Jobs, b.Jobs...)
+		app.Daemons = append(app.Daemons, b.Daemons...)
 		app.Components = append(app.Components, b.Components...)
 		app.Layouts = append(app.Layouts, b.Layouts...)
 		app.Services = append(app.Services, b.Services...)

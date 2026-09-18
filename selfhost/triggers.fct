@@ -1,0 +1,462 @@
+app TriggersSelfHost:
+    # Self-hosting port of ONE more self-contained sub-algorithm out of
+    # internal/ir/build.go: `triggerCycle` (build.go lines 6319-6361, plus
+    # its own `sortedEdgeKeys` helper at 6365-6372) — the DFS cycle detector
+    # run over the `on <action> -> <reaction>` trigger graph. semantics.fct's
+    # own header (this same directory) named this function as the strong
+    # runner-up candidate to the placement-calculus port it did instead, for
+    # the identical reason: it operates on a graph shape build.go has ALREADY
+    # reduced down to plain strings before calling it (`trigEdges :=
+    # map[string][]string{}`, build.go line 1063, built by walking
+    # `app.Triggers` — see build.go lines 1063-1091 for the caller), not on
+    # an `ast.Expr`/`ast.Node` tree — so, like the placement calculus, it
+    # needs no parser-AST prerequisite work to port for real right now.
+    #
+    # ============================================================
+    # THE REAL FUNCTION, READ IN FULL (build.go 6316-6361)
+    # ============================================================
+    # `triggerCycle(edges map[string][]string) string` runs a classic
+    # three-color (white/gray/black) DFS over a directed graph whose edge
+    # map is "source action name -> every reaction action name it triggers."
+    # It returns "" when the graph is acyclic, or a readable path like
+    # "a -> b -> a" naming the first cycle found (a cycle would let
+    # reactions re-fire forever, so build.go's caller turns a non-empty
+    # result straight into a BuildError, at line 1089-1091). The DFS itself:
+    # color every node white; walk nodes in `sortedEdgeKeys` order (nodes
+    # already black are skipped); recursing into a node paints it gray and
+    # pushes it on a path stack; a white neighbor recurses; a GRAY neighbor
+    # is a back-edge — the cycle is the stack slice from that neighbor's
+    # first appearance, plus the neighbor again, joined with " -> "; once
+    # every neighbor is explored with no cycle found, the node is popped and
+    # painted black. `sortedEdgeKeys` (6365-6372) is `sort.Strings` over the
+    # edge map's keys — the ONLY reason this exists is so "the compiler
+    # reports the same cycle across runs" (its own doc comment) rather than
+    # depending on Go's randomized map-iteration order; it does not change
+    # whether a cycle is found, only which one is reported first when a
+    # graph happens to contain more than one.
+    #
+    # ============================================================
+    # THE REPRESENTATION: a real Edge struct list, not a restated map
+    # ============================================================
+    # `edges` is a genuine Go map, and this language still has no map type a
+    # proc can declare (semantics.fct's header covers this in full: only a
+    # runtime `{k: v}` literal exists, never a map-typed parameter). But
+    # unlike semantics.fct's `e.states` (which really is naturally a
+    # dictionary at its use site), THIS map is not the natural shape of the
+    # actual source data: build.go builds `trigEdges` by walking a flat list
+    # of trigger declarations one at a time (`for _, tr := range
+    # app.Triggers { trigEdges[tr.On] = append(trigEdges[tr.On], tr.Action)
+    # }`, build.go line 1065-1087) — the map is just a grouping build.go
+    # happens to compute before calling `triggerCycle`, not a shape the
+    # algorithm actually depends on. A flat, ordered list of (from, to)
+    # pairs is the MORE faithful restatement of what a trigger graph really
+    # is: this file represents it as exactly that, a real named struct
+    # array, `[Edge]`, per this task's own hard requirement (no arena/tag
+    # tricks) — `struct Edge: from: text, to: text`, mirroring `on <from> ->
+    # <to>` directly. `reactionsOf` below (STAGE 1) is the one place that
+    # restates "the map lookup `edges[n]`" as a linear scan over that list,
+    # preserving first-occurrence declaration order exactly the way Go's own
+    # `append`-built slice value does for a given key.
+    #
+    # The white/gray/black COLOR MAP genuinely does need dictionary shape
+    # (arbitrary node name -> current color, looked up and updated by name
+    # throughout the walk) — for that one, this file uses the same
+    # semantics.fct idiom, a small struct bundling two parallel arrays
+    # (`ColorMap{names: [text], vals: [int]}`), with `colorMapGet`/
+    # `colorMapSet` (STAGE 2) as the get/insert-or-update primitives. This
+    # is a real struct value, not a magic-number-tag encoding: the only
+    # "numbers" here are the three DFS colors themselves (0/1/2), which
+    # build.go's own source uses too (its own `const` block, 6320-6324,
+    # names them `white`/`gray`/`black` for exactly this reason) — kept as
+    # named `int` constants would need a `const` construct this language
+    # doesn't have for a proc body, so each color is spelled out as a plain
+    # int literal at its use site with a comment, the same way this file's
+    # sibling ports already spell out small fixed enumerations inline.
+    #
+    # ============================================================
+    # RECURSION AND FUNCTIONAL STATE THREADING
+    # ============================================================
+    # The real `dfs` closure mutates `color` (a shared map) and `stack` (a
+    # shared slice) as it recurses. This language's `proc`s have no shared
+    # mutable state across calls — every value is copied on call/return
+    # (confirmed live in recursion_test.go, including a struct-returning
+    # proc recursing on itself: see btree.fct's `btreeInsertInto`) — so
+    # `dfsVisit` (STAGE 3) instead THREADS the color map through its return
+    # value (`DfsResult.colors`), exactly the "single growing value handed
+    # from one recursive call into the next" pattern
+    # TestSharedArrayThreadsAcrossSingleRecursiveChain already proved works,
+    # generalized from an array to a small struct. The path `stack` does NOT
+    # need to be threaded back out to the caller — it only ever matters
+    # WITHIN one `dfsVisit` call's own descendants (to build a cycle
+    # string), so it is passed DOWN (grown by one name per recursive call,
+    # exactly like `buildChain`'s `arena` parameter) but never read back out
+    # once `dfsVisit` returns; Go's own `stack = stack[:len(stack)-1]` pop on
+    # a clean return has no analog here for the same reason — there is
+    # nothing left to pop from once the call that pushed it returns, since
+    # nothing above ever sees that longer stack again.
+    #
+    # ============================================================
+    # SORTING: sortedEdgeKeys really does port, because this language DOES
+    # have `<`/`>` on `text` (confirmed live: `facet console` against a
+    # throwaway app proved "apple" < "banana" is true, "banana" < "apple" is
+    # false, ordinary lexicographic order — query.fct's own note that this
+    # language "has no Ordering enum" for a dynamic multi-kind value is a
+    # separate, narrower claim about ITS OrderValue variant type, not a
+    # blanket claim that `text < text` is unsupported). `sortTextAscending`
+    # (STAGE 1) is the same hand-written insertion sort query.fct's
+    # `sortRowsAscending` already established for this codebase's
+    # documented reason (no `sort` builtin) — so this port's node-visit
+    # order, and therefore which cycle among several gets reported first,
+    # matches the real compiler's exactly, not just its yes/no answer.
+    # ============================================================
+    struct Edge:
+        from: text
+        to: text
+
+    # ============================================================
+    # STAGE 1: the two array-only primitives every later stage needs —
+    # "does this name appear in this list already" (used both for
+    # deduplicating source names and, via colorMapIndexOf, for the color
+    # map), and the hand-written insertion sort for `sortedSourceNames`.
+    # ============================================================
+    proc containsText(names: [text], name: text) -> bool:
+        let n = len(names)
+        let mut found = false
+        let mut i = 0
+        loop i < n:
+            if names[i] == name:
+                found = true
+            i = i + 1
+        return found
+
+    proc distinctFromNames(edges: [Edge]) -> [text]:
+        let n = len(edges)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let already = do containsText(out, edges[i].from)
+            if !already:
+                out = append(out, edges[i].from)
+            i = i + 1
+        return out
+
+    proc sortTextAscending(names: [text]) -> [text]:
+        let mut xs = names
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                if xs[j - 1] > xs[j]:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    # sortedSourceNames: build.go's `sortedEdgeKeys(edges)` — the distinct
+    # `from` names (map keys), sorted ascending. A name that only ever
+    # appears as a `to` (a reaction with no outgoing edges of its own) is
+    # correctly absent here, exactly like a Go map key that was never
+    # assigned — it still gets visited (and colored) when some OTHER node's
+    # DFS walks an edge into it, it is just never itself a DFS ROOT, which
+    # is exactly right: a pure sink has no outgoing edges to explore, so
+    # rooting a walk there would find nothing a reachability walk wouldn't.
+    proc sortedSourceNames(edges: [Edge]) -> [text]:
+        let names = do distinctFromNames(edges)
+        let sorted = do sortTextAscending(names)
+        return sorted
+
+    # reactionsOf: `edges[n]` — the map lookup, restated as a linear scan
+    # over the flat Edge list that preserves first-occurrence order (see
+    # header). A name with no matching edge correctly yields `[]`, exactly
+    # like reading a missing key out of a Go map of slices.
+    proc reactionsOf(edges: [Edge], name: text) -> [text]:
+        let n = len(edges)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if edges[i].from == name:
+                out = append(out, edges[i].to)
+            i = i + 1
+        return out
+
+    # ============================================================
+    # STAGE 2: ColorMap — the map-restated-as-parallel-arrays idiom
+    # semantics.fct's header already establishes for this codebase, applied
+    # to the DFS color table instead of a placement table. 0 = white
+    # (unvisited, the same implicit zero-value a fresh/missing Go map key
+    # reads as), 1 = gray (on the current path), 2 = black (fully explored).
+    # ============================================================
+    struct ColorMap:
+        names: [text]
+        vals: [int]
+
+    proc colorMapIndexOf(m: ColorMap, name: text) -> int:
+        let n = len(m.names)
+        let mut idx = -1
+        let mut i = 0
+        loop i < n && idx == -1:
+            if m.names[i] == name:
+                idx = i
+            i = i + 1
+        return idx
+
+    # colorMapGet: "" -> white is the Go zero-value read; here the "not
+    # found" answer is 0 (white) for the identical reason.
+    proc colorMapGet(m: ColorMap, name: text) -> int:
+        let idx = do colorMapIndexOf(m, name)
+        if idx == -1:
+            return 0
+        return m.vals[idx]
+
+    # colorMapSet: `color[n] = v` — insert a new (name, val) pair when this
+    # is the name's first assignment, or overwrite the existing slot when
+    # it already has one (every name is set at most twice in the real DFS:
+    # white->gray on entry, gray->black on exit, so this never needs to
+    # append twice for the same name).
+    proc colorMapSet(m: ColorMap, name: text, val: int) -> ColorMap:
+        let idx = do colorMapIndexOf(m, name)
+        if idx == -1:
+            let newNames = append(m.names, name)
+            let newVals = append(m.vals, val)
+            return ColorMap{names: newNames, vals: newVals}
+        let mut vals = m.vals
+        vals[idx] = val
+        return ColorMap{names: m.names, vals: vals}
+
+    # ============================================================
+    # STAGE 3: the DFS itself. DfsResult bundles the one thing the caller
+    # actually needs back out (the cycle string, "" for none) with the one
+    # thing the NEXT sibling root's walk needs to see (the updated color
+    # map, so it does not re-walk an already-black subtree) — the same
+    # "bundle exactly what threads forward, nothing more" shape
+    # semantics.fct's own PlacementOutcome already established.
+    # ============================================================
+    struct DfsResult:
+        cycle: text
+        colors: ColorMap
+
+    # cycleIndexOnStack / cycleFromStack: build.go's own inline "find m's
+    # first appearance in stack, then join stack[start:] + [m] with ' -> '"
+    # (lines 6335-6342), split into its own find-then-build pair for the
+    # same reason semantics.fct split firstClientRead from
+    # anyReadIsClientState — a proc returns one value, so "where" and "what
+    # to build from where" are two separate derivations here.
+    # "0" is Go's own fallback here too (`start := 0`, never reassigned if
+    # the search never matches) — never actually reached in practice, since
+    # `m` is only ever looked up here when it is already known gray (on the
+    # current path), so it is guaranteed present in `stack`.
+    proc cycleIndexOnStack(stack: [text], name: text) -> int:
+        let n = len(stack)
+        let mut idx = 0
+        let mut found = false
+        let mut i = 0
+        loop i < n && !found:
+            if stack[i] == name:
+                idx = i
+                found = true
+            i = i + 1
+        return idx
+
+    proc cycleFromStack(stack: [text], m: text) -> text:
+        let start = do cycleIndexOnStack(stack, m)
+        let n = len(stack)
+        let mut result = stack[start]
+        let mut i = start + 1
+        loop i < n:
+            result = result + " -> " + stack[i]
+            i = i + 1
+        result = result + " -> " + m
+        return result
+
+    # dfsVisit: build.go's own `dfs` closure body (6328-6352), restated as
+    # an ordinary recursive proc. `stack` grows by one name on entry (the
+    # Go `stack = append(stack, n)`) and is handed down to each recursive
+    # call, never threaded back out (see header). `colors` is both threaded
+    # down AND returned, since a sibling's DFS later in the SAME call's loop
+    # (and later root walks in `triggerCycle` itself, STAGE 4) must see every
+    # color update a deeper call already made.
+    proc dfsVisit(n: text, edges: [Edge], colors: ColorMap, stack: [text]) -> DfsResult:
+        let coloredGray = do colorMapSet(colors, n, 1)
+        let path = append(stack, n)
+        let reactions = do reactionsOf(edges, n)
+        let rn = len(reactions)
+        let mut curColors = coloredGray
+        let mut cycle = ""
+        let mut i = 0
+        loop i < rn && cycle == "":
+            let m = reactions[i]
+            let c = do colorMapGet(curColors, m)
+            if c == 1:
+                # Back-edge to a node on the current path: this is the cycle.
+                # (`cycle = do cycleFromStack(...)` directly would not compile
+                # — a `do` result may only land in a FRESH `let`, never a loop-
+                # body reassignment; see storage.fct's header for this exact,
+                # already-documented language fact.)
+                let cyc = do cycleFromStack(path, m)
+                cycle = cyc
+            else:
+                if c == 0:
+                    let sub = do dfsVisit(m, edges, curColors, path)
+                    curColors = sub.colors
+                    cycle = sub.cycle
+            i = i + 1
+        if cycle != "":
+            return DfsResult{cycle: cycle, colors: curColors}
+        let coloredBlack = do colorMapSet(curColors, n, 2)
+        return DfsResult{cycle: "", colors: coloredBlack}
+
+    # ============================================================
+    # STAGE 4: triggerCycle — the full driver, build.go lines 6353-6360:
+    # walk every source name in sorted order, skip any already black,
+    # return the first cycle found (or "" once every root is exhausted).
+    # ============================================================
+    proc triggerCycle(edges: [Edge]) -> text:
+        let sources = do sortedSourceNames(edges)
+        let n = len(sources)
+        let mut colors = ColorMap{names: [], vals: []}
+        let mut cycle = ""
+        let mut i = 0
+        loop i < n && cycle == "":
+            let s = sources[i]
+            let c = do colorMapGet(colors, s)
+            if c == 0:
+                let result = do dfsVisit(s, edges, colors, [])
+                colors = result.colors
+                cycle = result.cycle
+            i = i + 1
+        return cycle
+
+    # ============================================================
+    # HAND-TRACED / LIVE VERIFICATION — four scenarios, each its own
+    # zero-argument graph-builder proc (an action parameter cannot be a
+    # `[Edge]` struct list directly, the same scalar-only-parameter wall
+    # every earlier list-consuming driver in this port already works
+    # around — see semantics.fct's own `runInferActionPlacement` note).
+    #
+    #   SCENARIO A — no cycle: a -> b -> c, a straight line. Expect "".
+    #
+    #   SCENARIO B — a direct 2-node cycle: a -> b, b -> a. Expect
+    #   "a -> b -> a".
+    #
+    #   SCENARIO C — a longer 4-node cycle: p -> q -> r -> s -> p. Expect
+    #   "p -> q -> r -> s -> p".
+    #
+    #   SCENARIO D — a graph with an unrelated disconnected component: the
+    #   SAME 2-node cycle as scenario B (a -> b -> a) PLUS two totally
+    #   separate acyclic edges (x -> y, y -> z) that share no node with the
+    #   cycle. Expect the cycle is still found and the disconnected part
+    #   changes nothing — "a -> b -> a" (sorted source order visits "a"
+    #   before "x", so the cycle is found first regardless).
+    # ============================================================
+    proc scenarioAEdges() -> [Edge]:
+        return [Edge{from: "a", to: "b"}, Edge{from: "b", to: "c"}]
+
+    proc scenarioBEdges() -> [Edge]:
+        return [Edge{from: "a", to: "b"}, Edge{from: "b", to: "a"}]
+
+    proc scenarioCEdges() -> [Edge]:
+        return [Edge{from: "p", to: "q"}, Edge{from: "q", to: "r"}, Edge{from: "r", to: "s"}, Edge{from: "s", to: "p"}]
+
+    proc scenarioDEdges() -> [Edge]:
+        return [Edge{from: "a", to: "b"}, Edge{from: "b", to: "a"}, Edge{from: "x", to: "y"}, Edge{from: "y", to: "z"}]
+
+    proc scenarioACycle() -> text:
+        let e = do scenarioAEdges()
+        let c = do triggerCycle(e)
+        return c
+
+    proc scenarioBCycle() -> text:
+        let e = do scenarioBEdges()
+        let c = do triggerCycle(e)
+        return c
+
+    proc scenarioCCycle() -> text:
+        let e = do scenarioCEdges()
+        let c = do triggerCycle(e)
+        return c
+
+    proc scenarioDCycle() -> text:
+        let e = do scenarioDEdges()
+        let c = do triggerCycle(e)
+        return c
+
+    # ============================================================
+    # STAGE 5: live HTTP/console-exercisable drivers — one shared `state`
+    # cell per the established convention (semantics.fct's own
+    # summaryResult), plus a general-purpose driver over a small fixed edge
+    # count so any graph can be exercised live without editing this file
+    # (an action parameter stays scalar, so the edges are four (from, to)
+    # scalar pairs built server-side into `[Edge]`, the same "build the list
+    # server-side from scalar arguments" shape semantics.fct's
+    # `runInferActionPlacement` already uses).
+    # ============================================================
+    state cycleResult: text = ""
+
+    action runScenarioA():
+        let c = do scenarioACycle()
+        cycleResult = c
+
+    action runScenarioB():
+        let c = do scenarioBCycle()
+        cycleResult = c
+
+    action runScenarioC():
+        let c = do scenarioCCycle()
+        cycleResult = c
+
+    action runScenarioD():
+        let c = do scenarioDCycle()
+        cycleResult = c
+
+    # edgeOrNone: a blank `from`/`to` scalar argument means "no fourth (or
+    # third/second) edge supplied" — the same "" -> [] convention
+    # semantics.fct's own `oneNameList` already established for turning an
+    # optional scalar action argument into an optional list entry.
+    proc edgeOrNone(from: text, to: text) -> [Edge]:
+        if from == "" || to == "":
+            return []
+        return [Edge{from: from, to: to}]
+
+    # buildFourEdges / runTriggerCycleFour: an action may only ever bind a
+    # SCALAR `do` result (see STAGE 7's own note in semantics.fct — a
+    # struct or struct-list value is proc-local, with no schema/wire
+    # representation an action could hold in a `let`), so the actual
+    # `[Edge]` list construction below has to happen entirely inside a
+    # proc; `runTriggerCycle` (the action) only ever sees the final `text`.
+    proc buildFourEdges(f1: text, t1: text, f2: text, t2: text, f3: text, t3: text, f4: text, t4: text) -> [Edge]:
+        let e1 = do edgeOrNone(f1, t1)
+        let e2 = do edgeOrNone(f2, t2)
+        let e3 = do edgeOrNone(f3, t3)
+        let e4 = do edgeOrNone(f4, t4)
+        let mut edges = e1
+        let mut i2 = 0
+        loop i2 < len(e2):
+            edges = append(edges, e2[i2])
+            i2 = i2 + 1
+        let mut i3 = 0
+        loop i3 < len(e3):
+            edges = append(edges, e3[i3])
+            i3 = i3 + 1
+        let mut i4 = 0
+        loop i4 < len(e4):
+            edges = append(edges, e4[i4])
+            i4 = i4 + 1
+        return edges
+
+    proc runTriggerCycleFour(f1: text, t1: text, f2: text, t2: text, f3: text, t3: text, f4: text, t4: text) -> text:
+        let edges = do buildFourEdges(f1, t1, f2, t2, f3, t3, f4, t4)
+        let c = do triggerCycle(edges)
+        return c
+
+    action runTriggerCycle(f1: text, t1: text, f2: text, t2: text, f3: text, t3: text, f4: text, t4: text):
+        let c = do runTriggerCycleFour(f1, t1, f2, t2, f3, t3, f4, t4)
+        cycleResult = c
+
+    view TriggersHome at "/triggers":
+        box:
+            text "{cycleResult}"

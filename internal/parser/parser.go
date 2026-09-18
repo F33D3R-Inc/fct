@@ -217,6 +217,11 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 		if j, err = parseJob(c); err == nil {
 			app.Jobs = append(app.Jobs, j)
 		}
+	case strings.HasPrefix(c.Line.Text, "daemon "):
+		var d *ast.Daemon
+		if d, err = parseDaemon(c); err == nil {
+			app.Daemons = append(app.Daemons, d)
+		}
 	case strings.HasPrefix(c.Line.Text, "service "):
 		var sv *ast.Service
 		if sv, err = parseService(c); err == nil {
@@ -243,7 +248,7 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 			app.Views = append(app.Views, v)
 		}
 	default:
-		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/struct/enum/type/message/state/derive/policy/action/proc/job/service/file/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
+		err = &Error{c.Line.No, fmt.Sprintf("unexpected %q; expected entity/record/struct/enum/type/message/state/derive/policy/action/proc/job/daemon/service/file/webhook/component/layout/theme/view", firstWord(c.Line.Text))}
 	}
 	return err
 }
@@ -1829,6 +1834,37 @@ func parseJoin(s string, line int) (ast.Join, error) {
 	return ast.Join{Handle: h, Line: line}, nil
 }
 
+// parseAct parses `ActionName(arg, ...)` — the argument-list half of a daemon
+// body's `act ActionName(args)` (see ast.Act's doc) — identical call shape to
+// parseDo/parseSpawn (a named declaration invoked with arguments), kept as its
+// own function for the same reason those two are: "act" and "do" name
+// different things (an action vs. a proc) and may want to diverge.
+func parseAct(s string, line int) (ast.Act, error) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return ast.Act{}, &Error{line, "act needs arguments: act ActionName(args)"}
+	}
+	name := strings.TrimSpace(s[:open])
+	if !isIdent(name) {
+		return ast.Act{}, &Error{line, fmt.Sprintf("invalid action name %q", name)}
+	}
+	closeP := strings.LastIndexByte(s, ')')
+	if closeP < open {
+		return ast.Act{}, &Error{line, "missing `)` in act"}
+	}
+	a := ast.Act{Action: name, Line: line}
+	if inner := strings.TrimSpace(s[open+1 : closeP]); inner != "" {
+		for _, arg := range splitTop(inner, ',') {
+			e, err := parseExpr(strings.TrimSpace(arg), line)
+			if err != nil {
+				return ast.Act{}, err
+			}
+			a.Args = append(a.Args, e)
+		}
+	}
+	return a, nil
+}
+
 // parseFileOp parses the `Name(args)` half of a file-resource statement —
 // `write Name(content)` or the `read Name()` half of `let x = read Name()` —
 // identical shape to parseDo/parseSpawn (a named-resource call), since these
@@ -2019,6 +2055,18 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				return nil, err
 			}
 			body = append(body, d)
+		case strings.HasPrefix(t, "act "):
+			// `act ActionName(args)` — fire-and-forget only (see ast.Act's doc:
+			// an action has no scalar return to bind). Valid to PARSE in any
+			// proc-shaped body; internal/ir/build.go's procBlock is what
+			// actually restricts it to a daemon body, the same way it lets
+			// `check`/`add`/`set`/etc. parse here only to reject them uniformly
+			// above — keeping that one semantic gate in one place.
+			a, err := parseAct(strings.TrimSpace(t[len("act "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, a)
 		case strings.HasPrefix(t, "write "):
 			// `write Name(content)` — fire-and-forget (result discarded); a
 			// bound `let ok = write Name(content)` is handled below, in the
@@ -2115,6 +2163,9 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				body = append(body, fo)
 				continue
 			}
+			if strings.HasPrefix(rhs, "act ") {
+				return nil, &Error{c.Line.No, "act has no bound form — an action has no scalar return, only the deltas its body applies; use a bare `act ActionName(args)`"}
+			}
 			if strings.HasPrefix(rhs, "write ") {
 				if mut {
 					return nil, &Error{c.Line.No, "`let mut` can't bind a `write` result yet — bind it plainly, then use it to compute a `let mut` local if you need to mutate it"}
@@ -2149,7 +2200,7 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {
-				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/read/write/spawn/join/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
+				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/act/read/write/spawn/join/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
 			}
 			target := strings.TrimSpace(t[:eq])
 			val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)
@@ -2350,6 +2401,63 @@ func parseDuration(s string, line int) (int, error) {
 	default:
 		return 0, &Error{line, fmt.Sprintf("unknown duration unit in %q (use s, m, h)", s)}
 	}
+}
+
+// parseDaemon parses a detached, process-lifetime background task:
+//
+//	daemon Heartbeat every 2s:
+//	    act Tick()
+//
+//	daemon Listener uses io.net:
+//	    loop true:
+//	        ...
+//
+// The optional `every <duration>` clause and the optional `uses <capabilities>`
+// clause may appear in either order before the header's `:`, mirroring how
+// parseProc pulls `uses` off a proc header and parseJob reads `every`. Omitting
+// `every` means Body runs exactly once, in its own goroutine, for the life of
+// the process (see ast.Daemon's doc) — the shape a self-looping body wants.
+func parseDaemon(n *source.Node) (*ast.Daemon, error) {
+	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "daemon")), ":")
+	var uses []string
+	if i := strings.Index(head, " uses "); i >= 0 {
+		usesPart := strings.TrimSpace(head[i+len(" uses "):])
+		head = strings.TrimSpace(head[:i])
+		if usesPart == "" {
+			return nil, &Error{n.Line.No, "uses needs at least one capability (e.g. `uses io.file`)"}
+		}
+		for _, c := range splitTop(usesPart, ',') {
+			c = strings.TrimSpace(c)
+			if !isCapabilityName(c) {
+				return nil, &Error{n.Line.No, fmt.Sprintf("invalid capability %q in uses clause (expected a dotted name like io.file)", c)}
+			}
+			uses = append(uses, c)
+		}
+	}
+	every := 0
+	if i := strings.Index(head, " every "); i >= 0 {
+		durS := strings.TrimSpace(head[i+len(" every "):])
+		head = strings.TrimSpace(head[:i])
+		secs, err := parseDuration(durS, n.Line.No)
+		if err != nil {
+			return nil, err
+		}
+		every = secs
+	}
+	name := strings.TrimSpace(head)
+	if !isIdent(name) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid daemon name %q", name)}
+	}
+	d := &ast.Daemon{Name: name, Every: every, Uses: uses, Line: n.Line.No}
+	body, err := parseProcBody(n.Children, fmt.Sprintf("daemon %q", name))
+	if err != nil {
+		return nil, err
+	}
+	d.Body = body
+	if len(d.Body) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("daemon %q has no body", name)}
+	}
+	return d, nil
 }
 
 // parseSignature parses `name(p: T, ...)`. allowList permits list-typed params

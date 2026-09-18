@@ -68,6 +68,16 @@ type procSig struct {
 	retList bool
 }
 
+// actionSig is enough of an already-built action's signature to check an
+// `act ActionName(args)` call site (arity) inside a daemon body — see
+// ast.Act's doc. Only ever populated for a daemon build (procBlock's
+// actionSigs parameter is nil while lowering a real proc's body, which is
+// what makes `act` a compile error there).
+type actionSig struct {
+	params    []Param
+	placement string
+}
+
 // spawnedTask is procBlock's own record of one still-outstanding `spawn`
 // (Milestone 5) — the spawned proc's name (for a clear diagnostic) plus its
 // signature (so `join`'s optional bind knows what type it's receiving),
@@ -998,6 +1008,30 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{j.Line, fmt.Sprintf("job %q runs action %q, which takes arguments; a job invokes a zero-argument action", j.Name, j.Action)}
 		}
 		out.Jobs = append(out.Jobs, Job{Name: j.Name, Action: j.Action, Every: j.Every, OnStart: j.OnStart})
+	}
+
+	// 4b′. Daemons: detached, process-lifetime background tasks (see
+	// ast.Daemon's doc). Built here — after actions, unlike procs, which are
+	// built earlier in pass 3d′ — because a daemon body's `act ActionName(args)`
+	// statements resolve against the actions just built, exactly like a Job's
+	// own Action reference above, except a daemon may call several, with
+	// arguments, from inside an arbitrary control-flow body instead of naming
+	// exactly one zero-arg action.
+	actionSigs := make(map[string]actionSig, len(byActionName))
+	for name, act := range byActionName {
+		actionSigs[name] = actionSig{params: act.Params, placement: act.Placement}
+	}
+	daemonSeen := map[string]int{}
+	for _, d := range app.Daemons {
+		if prev, ok := daemonSeen[d.Name]; ok {
+			return nil, &BuildError{d.Line, fmt.Sprintf("daemon %q redeclared (first at line %d)", d.Name, prev)}
+		}
+		daemonSeen[d.Name] = d.Line
+		dm, err := e.daemon(d, actionSigs)
+		if err != nil {
+			return nil, err
+		}
+		out.Daemons = append(out.Daemons, dm)
 	}
 
 	// 4c. Auth: when enabled, the runtime provides a managed user store and the
@@ -2307,7 +2341,7 @@ func (e *env) proc(p *ast.Proc) (Proc, error) {
 		}
 		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional, List: prm.List})
 	}
-	body, err := e.procBlock(p, p.Body, locals, mutable, types, 0)
+	body, err := e.procBlock(p, p.Body, locals, mutable, types, 0, nil)
 	if err != nil {
 		return Proc{}, err
 	}
@@ -2320,6 +2354,44 @@ func (e *env) proc(p *ast.Proc) (Proc, error) {
 			"proc %q declares a return type %s, so its body must end with `return <expr>` on every path — an `if` used as the last statement needs an `else`, and both branches must themselves end that way", p.Name, p.Ret)}
 	}
 	return pr, nil
+}
+
+// daemon lowers one detached, process-lifetime background task (see
+// ast.Daemon's doc). Its body is proc-shaped — the exact control-flow/locals
+// model procBlock already implements for a real proc, since a daemon has no
+// parameters and no return either — with actionSigs passed through non-nil,
+// which is what lets procBlock accept `act ActionName(args)` here (and only
+// here: e.proc, above, always passes nil).
+//
+// The body is lowered against a synthetic *ast.Proc wrapping the daemon's own
+// Uses/Line (never registered in e.procSigs, e.entities, or anywhere else a
+// real declaration would be — nothing can `do`/`spawn` a daemon by name, and
+// nothing needs to: it is started once, directly, by runtime/daemon.go). This
+// is deliberate reuse, not a hack: a daemon body genuinely has the same shape
+// procBlock already knows how to lower (no placement inference, no entity
+// access except through `act`, the same locals/control-flow/capability
+// rules), so giving it a second, parallel lowering function would only
+// duplicate procBlock's ~400 lines for no behavioral difference.
+func (e *env) daemon(d *ast.Daemon, actionSigs map[string]actionSig) (Daemon, error) {
+	seenUse := map[string]bool{}
+	for _, u := range d.Uses {
+		if !knownCapabilities[u] {
+			return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q declares unknown capability %q — known capabilities: io.file, io.net", d.Name, u)}
+		}
+		if seenUse[u] {
+			return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q declares capability %q more than once", d.Name, u)}
+		}
+		seenUse[u] = true
+	}
+	fake := &ast.Proc{Name: "daemon " + d.Name, Uses: d.Uses, Line: d.Line}
+	body, err := e.procBlock(fake, d.Body, map[string]bool{}, map[string]bool{}, map[string]string{}, 0, actionSigs)
+	if err != nil {
+		return Daemon{}, err
+	}
+	if len(body) == 0 {
+		return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q has no body", d.Name)}
+	}
+	return Daemon{Name: d.Name, Every: d.Every, Body: body}, nil
 }
 
 // cloneNameSet copies a name-set map so a nested block can add its own
@@ -2357,7 +2429,12 @@ func cloneTypeMap(m map[string]string) map[string]string {
 // be the last statement — anything after it is unreachable — but that
 // restriction is per-block, not per-proc, which is what lets `return` appear
 // from inside a nested loop/if while dead code after it is still refused.
-func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[string]bool, types map[string]string, loopDepth int) ([]Stmt, error) {
+// actionSigs is nil while lowering a real proc's body (e.proc never passes
+// one) and non-nil while lowering a daemon's (e.daemon does) — the one
+// difference between the two: it is both what makes `act ActionName(args)`
+// resolve at all and, by its nilness, what makes `act` a compile error inside
+// an ordinary proc. See ast.Act's and ast.Daemon's docs.
+func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[string]bool, types map[string]string, loopDepth int, actionSigs map[string]actionSig) ([]Stmt, error) {
 	locals = cloneNameSet(locals)
 	mutable = cloneNameSet(mutable)
 	types = cloneTypeMap(types)
@@ -2491,6 +2568,32 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				ds.RetList = sig.retList
 			}
 			out = append(out, ds)
+		case ast.Act:
+			// `act ActionName(args)` — the one way a daemon body touches
+			// entity/session state (see ast.Act's doc). actionSigs is nil for
+			// a real proc's body, which is exactly what makes this a compile
+			// error there rather than a silent no-op or a runtime surprise.
+			if actionSigs == nil {
+				return nil, &BuildError{st.Line, fmt.Sprintf("act is only valid inside a daemon body — %q is a proc, not a daemon", p.Name)}
+			}
+			sig, ok := actionSigs[st.Action]
+			if !ok {
+				return nil, &BuildError{st.Line, fmt.Sprintf("act calls unknown action %q", st.Action)}
+			}
+			if sig.placement != Server {
+				return nil, &BuildError{st.Line, fmt.Sprintf("act calls client-placed action %q; a daemon runs on the server authority, so the action must be authoritative", st.Action)}
+			}
+			if len(st.Args) != len(sig.params) {
+				return nil, &BuildError{st.Line, fmt.Sprintf("action %q expects %d argument(s), got %d", st.Action, len(sig.params), len(st.Args))}
+			}
+			as := Stmt{Op: "actcall", Service: st.Action}
+			for _, arg := range st.Args {
+				if err := e.checkProcExpr(p, arg, locals, types, st.Line); err != nil {
+					return nil, err
+				}
+				as.Args = append(as.Args, e.low(arg))
+			}
+			out = append(out, as)
 		case ast.Spawn:
 			// `let h = spawn ProcName(args)` — parseProcBody guarantees Bind is
 			// never "" (spawn has no fire-and-forget form; see ast.Spawn's doc),
@@ -2648,7 +2751,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line); err != nil {
 				return nil, err
 			}
-			kids, err := e.procBlock(p, st.Body, locals, mutable, types, loopDepth+1)
+			kids, err := e.procBlock(p, st.Body, locals, mutable, types, loopDepth+1, actionSigs)
 			if err != nil {
 				return nil, err
 			}
@@ -2660,13 +2763,13 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line); err != nil {
 				return nil, err
 			}
-			then, err := e.procBlock(p, st.Then, locals, mutable, types, loopDepth)
+			then, err := e.procBlock(p, st.Then, locals, mutable, types, loopDepth, actionSigs)
 			if err != nil {
 				return nil, err
 			}
 			var els []Stmt
 			if len(st.Else) > 0 {
-				els, err = e.procBlock(p, st.Else, locals, mutable, types, loopDepth)
+				els, err = e.procBlock(p, st.Else, locals, mutable, types, loopDepth, actionSigs)
 				if err != nil {
 					return nil, err
 				}

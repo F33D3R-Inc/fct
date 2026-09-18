@@ -1530,7 +1530,25 @@ func toStr(v any) string {
 	case int64:
 		return itoa(int(t))
 	case float64:
-		return itoa(int(t))
+		// A `float64` reaching this switch is one of two unrelated things
+		// that share a Go type but not a meaning: a wire-decoded int/date/
+		// money value (JSON has no separate int type, so these always
+		// arrive as float64, and always hold a whole number — the ORIGINAL
+		// reason this case truncated via itoa(int(t))), or a genuine proc
+		// `float` (LANGUAGE.md's `float` section) that can legitimately
+		// hold a fractional value a caller needs rendered exactly, not
+		// silently floored. The two are indistinguishable by Go type alone,
+		// so the split here is by VALUE instead: whole-number floats keep
+		// the exact old int-rendering path (byte-for-byte unchanged for
+		// every existing int/date/money caller), and only a value with a
+		// real fractional part — which no int/date/money field ever has —
+		// falls through to a real decimal rendering, the same
+		// `strconv.FormatFloat(t, 'g', -1, 64)` formatDebugValue already
+		// uses for exactly this type one function up.
+		if !math.IsNaN(t) && !math.IsInf(t, 0) && t == math.Trunc(t) {
+			return itoa(int(t))
+		}
+		return strconv.FormatFloat(t, 'g', -1, 64)
 	case bool:
 		if t {
 			return "true"

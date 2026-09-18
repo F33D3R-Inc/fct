@@ -26,6 +26,7 @@ type IR struct {
 	Actions    []Action                     `json:"actions"`
 	Procs      []Proc                       `json:"procs,omitempty"` // general-purpose, unconditionally server-executed code (self-hosting + product logic)
 	Jobs       []Job                        `json:"jobs"`
+	Daemons    []Daemon                     `json:"daemons,omitempty"` // detached, process-lifetime background tasks (see Daemon's doc)
 	Components []Component                  `json:"components,omitempty"` // reusable view fragments
 	Services   []Service                    `json:"services,omitempty"`   // external services (brains) actions may call
 	Files      []File                       `json:"files,omitempty"`      // declared file resources a proc may read/write (io.file)
@@ -404,6 +405,22 @@ type Job struct {
 	OnStart bool   `json:"onStart,omitempty"`
 }
 
+// Daemon is a detached, process-lifetime background task — see ast.Daemon's
+// doc for the full design rationale (why it is not simply a Job with the join
+// requirement dropped). Body is proc-shaped IR (Stmt's ordinary "let"/"loop"/
+// "if"/"spawn"/"join"/etc. ops) plus the "actcall" op (see Stmt's doc),
+// runtime/server.go's execProcBlock interprets both. Every, if nonzero, is
+// this instance's own tick interval (no fleet-wide coordination, unlike Job's
+// Every); Every == 0 means Body runs once, for the process's life, and is
+// expected to loop internally. runtime/daemon.go is what actually schedules
+// and runs these; StartJobs launches them at the same boot point an `on
+// start` Job runs, but a daemon is never re-run or joined.
+type Daemon struct {
+	Name  string `json:"name"`
+	Every int    `json:"every,omitempty"`
+	Body  []Stmt `json:"body"`
+}
+
 // Service is an external service the runtime may call: a base URL and its typed
 // operations. A `call` statement posts to URL + "/" + op with the named arguments.
 type Service struct {
@@ -454,9 +471,10 @@ type Trigger struct {
 	Action string `json:"action"`
 }
 
-// Stmt is one action or proc statement.
+// Stmt is one action, proc, or daemon statement.
 // Op ∈ assign | add | set | remove | clear | call | check | establish | let |
-// return | do | loop | if | break | continue | indexset | spawn | join.
+// return | do | loop | if | break | continue | indexset | spawn | join |
+// actcall.
 //
 // let/return/loop/if/break/continue/indexset are proc-only (a proc's own
 // local-variable model, control flow, and result); do calls a proc — from
@@ -491,6 +509,16 @@ type Trigger struct {
 // internal/ir/build.go's procBlock (checkSpawnsJoined) proves every spawn is
 // joined before its own enclosing statement block ends; runtime/server.go's
 // execProcBlock is the interpreter for both.
+//
+// actcall is daemon-only (Milestone: detached background tasks): it invokes
+// the action named by Service (reusing the same field "do"/"spawn" use for a
+// proc name) with Args, fire-and-forget — no Target, no Bind, since an action
+// has no scalar return, only the deltas its own body applies. Emitted only
+// when internal/ir/build.go's procBlock lowers a daemon body (never a real
+// proc's), and interpreted by runtime/server.go's execProcBlock via
+// s.runAction under the synthetic system actor — the same call a Job or
+// trigger fires through, which is what holds the store lock for only this one
+// call, not the daemon's own lifetime.
 type Stmt struct {
 	Op      string      `json:"op"`
 	Target  string      `json:"target,omitempty"`  // assign (action: a state cell; proc: a `let mut` local); let: the local's name

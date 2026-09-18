@@ -78,6 +78,7 @@ type App struct {
 	Actions    []*Action
 	Procs      []*Proc
 	Jobs       []*Job
+	Daemons    []*Daemon
 	Components []*Component
 	Layouts    []*Layout
 	Views      []*View
@@ -746,6 +747,39 @@ type Job struct {
 	Line    int
 }
 
+// Daemon is a detached, process-lifetime background task — the language's
+// primitive for a service that starts once at boot and runs for as long as
+// the process does. It is deliberately NOT a Job with the join requirement
+// dropped: a `job every Ns` is fleet-wide exactly-once (one instance wins
+// ReserveCron each tick — see runtime/jobs.go) and its "body" is a reference
+// to one existing zero-argument action, which cannot express an unbounded
+// blocking loop (a socket accept loop, a queue-drain loop). A daemon differs
+// on both axes:
+//
+//   - It runs on EVERY instance, unconditionally, with no cross-instance
+//     dedup — the right shape for a background service each process needs its
+//     own copy of (a listener, a local worker), not scheduled work a fleet
+//     should only do once.
+//   - Its body is real imperative code: the exact statement vocabulary a
+//     `proc` has (`let`, `loop`, `if`, `break`/`continue`, `return`,
+//     `spawn`/`join`, the I/O builtins under `uses`) plus one addition, `act
+//     ActionName(args)` (see Act) — the one way a daemon body may touch
+//     entity/session state, since a proc body otherwise never does.
+//
+// Every, if nonzero, makes the runtime run Body once per interval, on this
+// instance, forever (a heartbeat/sweep shape). Every == 0 means Body runs
+// exactly once, in its own goroutine, for as long as the process lives — the
+// shape a body that loops internally (`loop true:`) wants. Either way there is
+// no handle and no `join`: a daemon is detached by construction, not merely
+// unenforced — see runtime/daemon.go.
+type Daemon struct {
+	Name  string
+	Every int // seconds between runs of Body; 0 = Body runs once and is expected to loop internally
+	Uses  []string
+	Body  []Stmt
+	Line  int
+}
+
 // ── action statements ────────────────────────────────────────────────────────
 
 // Stmt is one line in an action body.
@@ -946,6 +980,24 @@ type Join struct {
 	Line   int
 }
 
+// Act invokes a named action from a daemon body — the one way a daemon body
+// (otherwise proc-shaped: no direct entity/session access, see Daemon's doc)
+// may touch state. Fire-and-forget only, like a Job's own dispatch: an action
+// has no scalar return to bind, only the deltas its body applies to session
+// state. internal/ir/build.go's procBlock accepts this statement only while
+// lowering a daemon body (a real proc's own body still rejects it, exactly
+// like check/add/set/requires above) and resolves Action against the app's
+// already-built actions. runtime/server.go's execProcBlock (the "actcall" op)
+// runs it via s.runAction under the synthetic system actor — the exact
+// mechanism a Job/trigger already fires through — which is what acquires the
+// store lock only for this one call's duration, not the daemon's own
+// lifetime.
+type Act struct {
+	Action string
+	Args   []Expr
+	Line   int
+}
+
 func (Assign) stmt()      {}
 func (ServiceCall) stmt() {}
 func (Establish) stmt()   {}
@@ -964,6 +1016,7 @@ func (Continue) stmt()    {}
 func (ExprStmt) stmt()    {}
 func (Spawn) stmt()       {}
 func (Join) stmt()        {}
+func (Act) stmt()         {}
 
 // View is one `view Name [at "/path"]:` projection of state into a UI node tree.
 // A view is a page, served at its route; Path defaults are filled in by the

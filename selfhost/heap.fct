@@ -1,0 +1,954 @@
+import "storage.fct"
+
+app HeapSelfHost:
+    # Self-hosting port of facetql/src/storage/heap.rs (`RecordStore`) — row
+    # storage layered on top of the physical `Page` that selfhost/storage.fct
+    # already ports (PART ONE: layout+CRC; read that file's header in full
+    # first, its byte-buffer helpers and field accessors are imported and
+    # reused below rather than re-derived). Read heap.rs in full, and
+    # selfhost/btree.fct's own header (the other consumer of storage.fct's
+    # Page layout), before editing this file.
+    #
+    # ============================================================
+    # WHAT WAS PORTED:
+    # ============================================================
+    # 1. The record frame envelope, `storage::binary::encode_frame`/
+    #    `decode_frame` — magic("FQR1")+version(2)+u32 length+CRC-32 around
+    #    an opaque payload — ported COMPLETE, byte-for-byte, because heap.rs's
+    #    own doc comment on `append` says outright that a record's frame is
+    #    NEVER separately encrypted ("The payload is plaintext here rather
+    #    than separately encrypted, because the page it lands in is
+    #    encrypted as a whole"): unlike storage.fct PART THREE's `wal.rs`
+    #    frame, there is no crypto call anywhere in this envelope to stop
+    #    short of, at either the write or the read end. `crc32_parts` is
+    #    reused via storage.fct's `crc32Bytes` rather than re-derived a third
+    #    time in this codebase.
+    # 2. Page-level cell placement (`Page::push_cell`, `Page::cell`, and the
+    #    `Page::compact` fallback `push_cell` can invoke) — REIMPLEMENTED
+    #    HERE, not imported, because storage.fct's own header says exactly
+    #    why it stopped short of this: "Deliberately NOT ported:
+    #    insert_cell/push_cell/replace_cell/remove_cell/compact — a
+    #    page-MUTATION/allocation POLICY... a genuinely separate,
+    #    well-scoped piece of its own." heap.rs is precisely the caller that
+    #    needs that piece, so it is built here, on top of storage.fct's
+    #    exported PURE layout accessors (`pageSlotCount`/`pageFreeEnd`/
+    #    `pageSlotOffset`/`pageSlotLength`/`pageSetSlot`/`pageSetSlotCount`/
+    #    `pageSetFreeEnd`/`pageFreeSpace`/`pageReclaimableSpace`/
+    #    `pageNewBody`/`pageKind`/`pageExtra`/`pageSetExtra`), scoped to
+    #    EXACTLY what heap.rs itself calls: `push_cell` (always at
+    #    `index == slot_count`, i.e. append) and `cell` (read by slot). Never
+    #    `insert_cell` at an arbitrary index, never `replace_cell`, never
+    #    `remove_cell` — heap.rs calls none of those (see its own module doc:
+    #    "Records are appended, never updated in place"), and a heap page's
+    #    slot numbering is documented as stable for exactly that reason
+    #    (page.rs: "this must never be called on a heap page: a
+    #    RecordLocation names a slot, and renumbering would silently repoint
+    #    every location"). `compact()` IS ported faithfully as `push_cell`'s
+    #    real fallback (free_space too small but reclaimable_space enough),
+    #    even though hand-tracing shows it is structurally unreachable via
+    #    this store's own call pattern: a heap page here only ever grows by
+    #    `push_cell`, never shrinks by `remove_cell`/`replace_cell`, so
+    #    `free_space` and `reclaimable_space` are always numerically equal
+    #    for a page this store built (`heapDemoCompactSample` below exercises
+    #    `heapPageCompact` directly anyway, since it is real ported logic and
+    #    deserves its own check even though the store never triggers it).
+    # 3. The overflow chain — `RecordStore::append_overflow`/the overflow
+    #    branch of `read_frame` — ported COMPLETE: chunking a frame wider
+    #    than one page's `MAX_CELL_LEN` (16328 = PAGE_BODY_LEN(16356) -
+    #    PAGE_HEADER_LEN(24) - SLOT_LEN(4)) into `Overflow`-kind pages
+    #    written back-to-front so each page's `extra` names its successor,
+    #    the "FQOV" stub cell (magic+total length+first chain page) that
+    #    addresses the whole chain exactly like an ordinary cell, and the
+    #    read-side walk with its two safety properties carried over
+    #    verbatim: the declared total is bounded against
+    #    `MAX_RECORD_FRAME_LEN` before it sizes anything, and the loop stops
+    #    on `bytes collected >= total`, NEVER on `extra == 0` — heap.rs's own
+    #    comment explains why the latter would be wrong ("page 0 of a
+    #    segment is a perfectly ordinary page... made it permanently
+    #    unreadable" — an actual historical bug in this codebase).
+    #    `heapDemoOverflowAppend`/`heapDemoOverflowReadOk` below hand-trace a
+    #    real two-page chain where BOTH pages carry `extra == 0` in different
+    #    roles (one meaning "go to page 0", the other meaning "true end of
+    #    chain") and confirm the length-based stop gets both right — the
+    #    exact case the historical bug got wrong.
+    # 4. Space accounting's pure arithmetic — `mark_obsolete` (a running
+    #    obsolete-byte tally) and `compaction_candidates`'s per-segment ratio
+    #    test (`obsolete_bytes as f64 >= capacity as f64 * ratio`) — ported
+    #    as `heapMarkObsolete`/`heapCompactionWorthwhile`. This IS how
+    #    "delete" really works in this engine, ported honestly rather than
+    #    invented: heap.rs has no `remove`/`delete` method at all. A logical
+    #    delete is a caller repointing (or dropping) an index entry and
+    #    calling `mark_obsolete` on the old location purely as a compaction
+    #    heuristic — the record's bytes stay physically present and
+    #    perfectly readable until a whole segment is later drained, which
+    #    `heapDemoReadAStillOkAfterObsolete` below demonstrates directly
+    #    (`heapRead` has no notion of a tombstone; nothing here fakes one).
+    #
+    # ============================================================
+    # WHAT WAS DEFERRED, AND WHY (the honest boundary, not a faked one):
+    # ============================================================
+    # Everything else in `RecordStore` is multi-FILE orchestration built on
+    # `Pager`/`Catalog` — real disk I/O and real multiple segment files, the
+    # same boundary selfhost/btree.fct already drew for the *same* engine's
+    # B-tree ("the real Pager... is modeled here as an in-memory array...
+    # NOT ported: Pager integration, meta-page/commit, free-list reuse").
+    # This file draws it in the same place, for the same reason: this port
+    # has ONE in-memory `HeapArena` standing in for "the pages of a segment
+    # a Pager would read/write from one file" — there is no second file, no
+    # segment id, no catalog. Concretely NOT ported:
+    #   * `OpenSegments`/`RecordStore::pager` — the bounded open-segment-file
+    #     LRU cache. Its actual algorithm (evict least-recently-used,
+    #     never the active or a still-pinned one) is not new work anyway:
+    #     it is exactly the generic bounded-cache-with-LRU-eviction problem
+    #     storage.fct's own PART TWO already ports in full from
+    #     `pager.rs`'s `PagerInner::admit` — reusing that finding rather
+    #     than re-deriving the identical algorithm a second time here.
+    #   * `roll`/`grow`/`extend`/`MAX_PAGES_PER_SEGMENT`/`active_segment`/
+    #     `set_pages` — segment-file rolling and the `Catalog`-backed
+    #     bookkeeping of how many pages each segment file holds. There is
+    #     one arena here, so "roll to a fresh segment" has nothing to roll
+    #     to; this shows up below as `heapAppendOverflowFrame`'s stub always
+    #     landing in the SAME arena the chain did, which is the real
+    #     invariant heap.rs enforces via `allow_roll = false` — this port
+    #     simply has no OTHER arena a roll could send it to instead.
+    #   * `scan_segment`'s page-hole and CRC/AEAD-failure handling
+    #     (`Err(e) if matches!(e.kind(), UnexpectedEof | NotFound |
+    #     InvalidInput) => continue`) and `drop_segment`'s file deletion —
+    #     these are real disk-read-error and real filesystem-deletion
+    #     concerns with no meaning against an in-memory arena that cannot
+    #     have "a hole left by an interrupted append" or a file to delete.
+    #   * `RecordStore::sync` — `pager.flush()` + `catalog.save()`, pure
+    #     durability I/O.
+    #   * `bincode::serialize`/`deserialize` of the `HeapRecord` enum
+    #     (`Node`/`Edge`/`HistoryEntry`) — those domain types are out of
+    #     scope for a storage-layer port (they are not defined anywhere in
+    #     this selfhost tree). Exactly like storage.fct PART THREE drew its
+    #     crypto line at a `payload: [int]` a real caller already encrypted,
+    #     this file draws its domain-serialization line at a `payload: [int]`
+    #     a real caller already ran through `bincode::serialize` — the frame
+    #     envelope (part 1 above) provably cannot tell a placeholder byte
+    #     array from a real one, so the demos below use concrete placeholder
+    #     bytes exactly like storage.fct's WAL demos do.
+    #
+    # ============================================================
+    # "IS X A REAL FEATURE" — answering the task's own explicit list:
+    # ============================================================
+    #   insert a row, read it back:        real; ported (part 1+2 above).
+    #   delete:                             real, but not what it sounds
+    #                                        like — see part 4 above. There
+    #                                        is no cell removal to port.
+    #   insert into reclaimed space:        NOT a real page-level feature.
+    #                                        `Page::compact` exists and is
+    #                                        ported (part 2), but nothing in
+    #                                        `RecordStore` ever calls
+    #                                        `remove_cell`/`replace_cell`, so
+    #                                        no heap page this store builds
+    #                                        ever actually has reclaimable
+    #                                        holes smaller than its free
+    #                                        space. Real space reclamation in
+    #                                        this engine happens at the
+    #                                        SEGMENT level (compaction drains
+    #                                        a whole file and the file is
+    #                                        deleted) — the deferred I/O
+    #                                        layer above — not by reusing
+    #                                        space inside a page.
+    #   row too big / overflow:            real; ported completely (part 3).
+    #
+    # ============================================================
+    # REPRESENTATION:
+    # ============================================================
+    #   struct HeapPage: body: [int]     — one page's raw PAGE_BODY_LEN-byte
+    #                                       body, storage.fct's own
+    #                                       convention (a page IS a byte
+    #                                       layout there too, for the same
+    #                                       reason page.rs's own doc comment
+    #                                       gives: "there is only one
+    #                                       representation of a page that can
+    #                                       ever be wrong").
+    #   struct HeapArena: pages: [HeapPage]
+    #                                     — stands in for "one segment's
+    #                                       pages, as a real Pager would
+    #                                       serve them" (see DEFERRED above).
+    #                                       fct has no nested list type
+    #                                       (`[[int]]` is not parseable —
+    #                                       confirmed against
+    #                                       internal/parser/parser.go's
+    #                                       `splitType`, which strips exactly
+    #                                       one `[...]` layer), so an array
+    #                                       of pages is an array of a
+    #                                       one-field STRUCT wrapping each
+    #                                       page's byte buffer, never a
+    #                                       nested array and never a flat
+    #                                       int encoding.
+    #   struct RecordLocation-equivalent: `AppendOutcome`/`ReadOutcome`'s
+    #                                       `page`/`slot`/`length` fields,
+    #                                       WITHOUT a `segment` field — there
+    #                                       is exactly one arena/segment in
+    #                                       this port (see DEFERRED above),
+    #                                       so a `segment` field would only
+    #                                       ever hold 0. Restoring it is a
+    #                                       mechanical, honest follow-up once
+    #                                       a real multi-segment Pager/
+    #                                       Catalog port exists to route it
+    #                                       against.
+    #
+    # As with storage.fct/btree.fct: no indexed array assignment exists in
+    # this language, so every "mutate a page"/"mutate the arena" operation
+    # below is a pure function returning a new value; every `do ProcName(...)`
+    # call is bound to its own fresh `let` (never a loop-body reassignment,
+    # never nested inside another expression, never `return do Foo(...)`
+    # directly) — the same two restrictions storage.fct's header documents
+    # in full, followed identically here.
+    #
+    # `view Home at "/"` is not reused for this file's own view — storage.fct
+    # already declares one, and (per stmt.fct's own confirmed finding
+    # reading `internal/compile/compile.go`) importing two files that each
+    # declare `view Home at "/"` fails as a duplicate-view build error. This
+    # file's view is `HeapHome` at `/heap`, matching stmt.fct's own
+    # `StmtHome at "/stmt"` / nodes.fct's `NodeViewHome at "/nodes"`
+    # precedent for exactly this situation.
+
+    struct HeapPage:
+        body: [int]
+
+    struct HeapArena:
+        pages: [HeapPage]
+
+    struct ByteChunk:
+        data: [int]
+
+    struct AppendOutcome:
+        arena: HeapArena
+        page: int
+        slot: int
+        length: int
+
+    struct OverflowChainResult:
+        arena: HeapArena
+        firstPage: int
+
+    struct ReadOutcome:
+        code: int
+        frame: [int]
+
+    struct DecodedRecordOutcome:
+        code: int
+        payload: [int]
+
+    # ============================================================
+    # GENERIC [HeapPage] ARRAY HELPERS — storage.fct's PagerEntry-array
+    # helpers, restated for HeapPage.
+    # ============================================================
+    proc heapSlicePages(buf: [HeapPage], start: int, end: int) -> [HeapPage]:
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            out = append(out, buf[i])
+            i = i + 1
+        return out
+
+    proc heapConcatPages(a: [HeapPage], b: [HeapPage]) -> [HeapPage]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc heapSetPageAt(pages: [HeapPage], index: int, val: HeapPage) -> [HeapPage]:
+        let before = do heapSlicePages(pages, 0, index)
+        let n = len(pages)
+        let after = do heapSlicePages(pages, index + 1, n)
+        let withVal = append(before, val)
+        let result = do heapConcatPages(withVal, after)
+        return result
+
+    # ============================================================
+    # PAGE CONSTRUCTION — `Page::new(PageKind::Heap)` / `Page::new
+    # (PageKind::Overflow)`, built on storage.fct's `pageNewBody`/
+    # `pageSetExtra`. Kind bytes (4=Heap, 5=Overflow) match storage.fct's
+    # own header table exactly.
+    # ============================================================
+    proc heapPageEmpty() -> HeapPage:
+        let body = do pageNewBody(4)
+        return HeapPage{body: body}
+
+    proc heapOverflowPageEmpty(next: int) -> HeapPage:
+        let body0 = do pageNewBody(5)
+        let body = do pageSetExtra(body0, next)
+        return HeapPage{body: body}
+
+    # ============================================================
+    # CELL MECHANICS — `Page::push_cell`/`Page::cell`/`Page::compact`,
+    # reimplemented here (see header: storage.fct deliberately stopped short
+    # of this). Scoped to exactly what heap.rs calls: push at the end, read
+    # by slot. `MAX_CELL_LEN` = 16356 - 24 - 4 = 16328, restated as a literal
+    # exactly like storage.fct restates every other page constant.
+    # ============================================================
+    proc heapPageCompact(body: [int]) -> [int]:
+        # `Page::compact`: snapshot every cell's bytes FIRST (their offsets
+        # are about to move), then rewrite the cell area from the end of the
+        # page downward, preserving slot INDICES (never renumbering) exactly
+        # like the real one.
+        let slotCount = do pageSlotCount(body)
+        let mut cells = []
+        let mut i = 0
+        loop i < slotCount:
+            let offset = do pageSlotOffset(body, i)
+            let length = do pageSlotLength(body, i)
+            let endOff = offset + length
+            let bytes = do sliceBytes(body, offset, endOff)
+            cells = append(cells, ByteChunk{data: bytes})
+            i = i + 1
+        let mut working = body
+        let mut freeEnd = 16356
+        let mut j = 0
+        loop j < slotCount:
+            let cellBytes = cells[j].data
+            let cellLen = len(cellBytes)
+            let newFreeEnd = freeEnd - cellLen
+            let withBytes = do replaceBytesRange(working, newFreeEnd, cellBytes)
+            let withSlot = do pageSetSlot(withBytes, j, newFreeEnd, cellLen)
+            working = withSlot
+            freeEnd = newFreeEnd
+            j = j + 1
+        let final = do pageSetFreeEnd(working, freeEnd)
+        return final
+
+    proc heapPagePushOk(body: [int], data: [int]) -> bool:
+        let dataLen = len(data)
+        if dataLen > 16328:
+            return false
+        let needed = dataLen + 4
+        let freeSpace = do pageFreeSpace(body)
+        if freeSpace >= needed:
+            return true
+        let reclaimable = do pageReclaimableSpace(body)
+        return reclaimable >= needed
+
+    # heapPagePushBody / heapPagePushSlot: the same "new body" + "what slot"
+    # twin-proc split storage.fct's own PagerEntry section uses for a
+    # non-recursive function producing two facts (`pagerCacheStep`/
+    # `pagerCacheStepEvicted`) — `push_cell` is exactly that shape (one flat
+    # pass, not recursive), so re-deriving it twice carries none of the
+    # drift risk btree.fct's header describes for its own (recursive)
+    # InsertResult/RemoveResult, which is why those are structs instead.
+    proc heapPagePushBody(body: [int], data: [int]) -> [int]:
+        let ok = do heapPagePushOk(body, data)
+        if !ok:
+            return body
+        let dataLen = len(data)
+        let needed = dataLen + 4
+        let freeSpace = do pageFreeSpace(body)
+        let mut working = body
+        if freeSpace < needed:
+            let compacted = do heapPageCompact(body)
+            working = compacted
+        let count = do pageSlotCount(working)
+        let freeEnd = do pageFreeEnd(working)
+        let newFreeEnd = freeEnd - dataLen
+        let withBytes = do replaceBytesRange(working, newFreeEnd, data)
+        let withSlot = do pageSetSlot(withBytes, count, newFreeEnd, dataLen)
+        let withCount = do pageSetSlotCount(withSlot, count + 1)
+        let final = do pageSetFreeEnd(withCount, newFreeEnd)
+        return final
+
+    proc heapPagePushSlot(body: [int], data: [int]) -> int:
+        let ok = do heapPagePushOk(body, data)
+        if !ok:
+            return -1
+        let count = do pageSlotCount(body)
+        return count
+
+    proc heapPageCell(body: [int], index: int) -> [int]:
+        let offset = do pageSlotOffset(body, index)
+        let length = do pageSlotLength(body, index)
+        let endOff = offset + length
+        let bytes = do sliceBytes(body, offset, endOff)
+        return bytes
+
+    # ============================================================
+    # RECORD FRAME ENVELOPE — `storage::binary::encode_frame`/
+    # `decode_frame`, ported complete (see header: zero crypto anywhere in
+    # this envelope). Layout: magic("FQR1", 4) + version(1) + length(u32) +
+    # CRC-32(u32) + payload. FRAME_HEADER_LEN = 13.
+    # ============================================================
+    proc heapRecordMagicBytes() -> [int]:
+        return [70, 81, 82, 49]
+
+    proc heapEncodeFrameOk(payload: [int]) -> bool:
+        let payloadLen = len(payload)
+        return payloadLen <= 67108864
+
+    proc heapEncodeFrame(payload: [int]) -> [int]:
+        let magic = do heapRecordMagicBytes()
+        let h1 = append(magic, 2)
+        let payloadLen = len(payload)
+        let lenBytes = do writeU32LEBytes(payloadLen)
+        let h2 = do concatBytes(h1, lenBytes)
+        let crc = do crc32Bytes(payload)
+        let crcBytes = do writeU32LEBytes(crc)
+        let h3 = do concatBytes(h2, crcBytes)
+        let frame = do concatBytes(h3, payload)
+        return frame
+
+    # heapDecodeFrameOutcome: 0 = ok, 1 = shorter than the header (torn),
+    # 2 = magic/version/length/CRC mismatch (corrupt) — the same two
+    # failure shapes `decode_frame` itself distinguishes (`UnexpectedEof`
+    # vs. `InvalidData`).
+    proc heapDecodeFrameOutcome(bytes: [int]) -> int:
+        let n = len(bytes)
+        if n < 13:
+            return 1
+        let magic = do sliceBytes(bytes, 0, 4)
+        let expectedMagic = do heapRecordMagicBytes()
+        let magicOk = do bytesEqual(magic, expectedMagic)
+        if !magicOk:
+            return 2
+        let version = bytes[4]
+        if version != 2:
+            return 2
+        let declared = do readU32LE(bytes, 5)
+        let expectedLen = 13 + declared
+        if n != expectedLen:
+            return 2
+        let payload = do sliceBytes(bytes, 13, n)
+        let expectedCrc = do readU32LE(bytes, 9)
+        let computedCrc = do crc32Bytes(payload)
+        if computedCrc != expectedCrc:
+            return 2
+        return 0
+
+    proc heapDecodeFramePayload(bytes: [int]) -> [int]:
+        let n = len(bytes)
+        let payload = do sliceBytes(bytes, 13, n)
+        return payload
+
+    # ============================================================
+    # OVERFLOW STUB — `OVERFLOW_MAGIC`/`OVERFLOW_STUB_LEN` and
+    # `is_overflow_stub`: magic("FQOV", 4) + total frame length(u32) + first
+    # chain page(u32) = 12 bytes.
+    # ============================================================
+    proc heapOverflowMagicBytes() -> [int]:
+        return [70, 81, 79, 86]
+
+    proc heapIsOverflowStub(cell: [int]) -> bool:
+        let n = len(cell)
+        if n != 12:
+            return false
+        let head = do sliceBytes(cell, 0, 4)
+        let expected = do heapOverflowMagicBytes()
+        let eq = do bytesEqual(head, expected)
+        return eq
+
+    proc heapOverflowStubBytes(totalLen: int, firstPage: int) -> [int]:
+        let magic = do heapOverflowMagicBytes()
+        let lenBytes = do writeU32LEBytes(totalLen)
+        let h1 = do concatBytes(magic, lenBytes)
+        let firstBytes = do writeU32LEBytes(firstPage)
+        let stub = do concatBytes(h1, firstBytes)
+        return stub
+
+    proc heapOverflowStubTotalLen(cell: [int]) -> int:
+        let v = do readU32LE(cell, 4)
+        return v
+
+    proc heapOverflowStubFirstPage(cell: [int]) -> int:
+        let v = do readU32LE(cell, 8)
+        return v
+
+    # ============================================================
+    # OVERFLOW CHAIN WRITE — `RecordStore::append_overflow`'s chunking loop,
+    # restated over a `HeapArena` in place of a live `Pager`. Chunks are cut
+    # in ORIGINAL order (`heapChunkFrame`) but written back-to-front
+    # (`heapAppendOverflowChain` walks the chunk array from its LAST index to
+    # its FIRST), exactly mirroring the real `chunks.reverse()` — so that
+    # every page's `extra` already names its successor's real arena index at
+    # the moment it is built, and the loop's final `next` is the FIRST
+    # original chunk's page id, which is what the stub addresses.
+    # ============================================================
+    proc heapChunkFrame(frame: [int]) -> [ByteChunk]:
+        let n = len(frame)
+        let mut out = []
+        let mut start = 0
+        loop start < n:
+            let end0 = start + 16328
+            let mut end = end0
+            if end > n:
+                end = n
+            let piece = do sliceBytes(frame, start, end)
+            out = append(out, ByteChunk{data: piece})
+            start = end
+        return out
+
+    proc heapAppendOverflowChain(arena: HeapArena, chunks: [ByteChunk]) -> OverflowChainResult:
+        let n = len(chunks)
+        let mut curPages = arena.pages
+        let mut next = 0
+        let mut i = n - 1
+        loop i >= 0:
+            let chunk = chunks[i]
+            let newPage = do heapOverflowPageEmpty(next)
+            let pushedBody = do heapPagePushBody(newPage.body, chunk.data)
+            let finalPage = HeapPage{body: pushedBody}
+            let pageId = len(curPages)
+            curPages = append(curPages, finalPage)
+            next = pageId
+            i = i - 1
+        let resultArena = HeapArena{pages: curPages}
+        return OverflowChainResult{arena: resultArena, firstPage: next}
+
+    # ============================================================
+    # APPEND — `RecordStore::append`/`append_cell`/`append_cell_to`/
+    # `append_overflow`, restated over one `HeapArena` (see header: no
+    # segment rolling to model, there is only one arena).
+    # ============================================================
+    proc heapAppendCellFrame(arena: HeapArena, frame: [int]) -> AppendOutcome:
+        # append_cell_to's real logic: try the last page if it is a Heap
+        # page with room; otherwise allocate a fresh Heap page (which
+        # cannot fail for anything at most MAX_CELL_LEN bytes, exactly the
+        # invariant `heapAppendPlain` establishes before ever calling this).
+        let pages = arena.pages
+        let n = len(pages)
+        let mut usedLast = false
+        let mut resultArena = arena
+        let mut resultPage = -1
+        let mut resultSlot = -1
+        if n > 0:
+            let lastIdx = n - 1
+            let lastPage = pages[lastIdx]
+            let kind = do pageKind(lastPage.body)
+            if kind == 4:
+                let fits = do heapPagePushOk(lastPage.body, frame)
+                if fits:
+                    let newBody = do heapPagePushBody(lastPage.body, frame)
+                    let slot = do heapPagePushSlot(lastPage.body, frame)
+                    let newPage = HeapPage{body: newBody}
+                    let newPages = do heapSetPageAt(pages, lastIdx, newPage)
+                    let newArena = HeapArena{pages: newPages}
+                    resultArena = newArena
+                    resultPage = lastIdx
+                    resultSlot = slot
+                    usedLast = true
+        if !usedLast:
+            let fresh = do heapPageEmpty()
+            let freshBody = do heapPagePushBody(fresh.body, frame)
+            let freshSlot = do heapPagePushSlot(fresh.body, frame)
+            let freshPage = HeapPage{body: freshBody}
+            let newPageId = len(pages)
+            let newPages2 = append(pages, freshPage)
+            let newArena2 = HeapArena{pages: newPages2}
+            resultArena = newArena2
+            resultPage = newPageId
+            resultSlot = freshSlot
+        let frameLen = len(frame)
+        return AppendOutcome{arena: resultArena, page: resultPage, slot: resultSlot, length: frameLen}
+
+    proc heapAppendOverflowFrame(arena: HeapArena, frame: [int]) -> AppendOutcome:
+        let chunks = do heapChunkFrame(frame)
+        let chainResult = do heapAppendOverflowChain(arena, chunks)
+        let frameLen = len(frame)
+        let stub = do heapOverflowStubBytes(frameLen, chainResult.firstPage)
+        # Never rolls to another arena (there is only one) — the direct
+        # restatement of `allow_roll = false`: the stub belongs with the
+        # chain it addresses, which here means simply "the same arena the
+        # chain was just written into," `chainResult.arena`.
+        let stubOutcome = do heapAppendCellFrame(chainResult.arena, stub)
+        # The RETURNED length is the full frame's length, not the 12-byte
+        # stub's — exactly `RecordLocation { length: frame.len() as u32 }`
+        # in the real `append_overflow`, so a caller sees the same kind of
+        # address for an oversized record as for any other.
+        return AppendOutcome{arena: stubOutcome.arena, page: stubOutcome.page, slot: stubOutcome.slot, length: frameLen}
+
+    proc heapAppend(arena: HeapArena, payload: [int]) -> AppendOutcome:
+        let frame = do heapEncodeFrame(payload)
+        let frameLen = len(frame)
+        if frameLen > 16328:
+            let overflowResult = do heapAppendOverflowFrame(arena, frame)
+            return overflowResult
+        let cellResult = do heapAppendCellFrame(arena, frame)
+        return cellResult
+
+    # ============================================================
+    # READ — `RecordStore::read`/`read_frame`, restated over one
+    # `HeapArena`. `heapReadFrame` is `read_frame` (location lookup +
+    # overflow-chain walk, returning the raw FRAME bytes); `heapRead` layers
+    # `decode_frame` on top, exactly like the real `read` does, and stops
+    # at the `bincode::deserialize` boundary (see header).
+    # ============================================================
+    proc heapDivCeil(a: int, b: int) -> int:
+        if a <= 0:
+            return 0
+        let q = a / b
+        let r = a - q * b
+        if r > 0:
+            return q + 1
+        return q
+
+    # heapReadFrame outcome codes: 0 = ok, 1 = no such page/slot, 2 = stub
+    # declares a total over MAX_RECORD_FRAME_LEN (corrupt stub), 3 = chain
+    # walked more links than a well-formed chain for `total` bytes ever
+    # could (cyclic/corrupt — `max_links` guard), 4 = chain reached a
+    # missing or non-Overflow page, 5 = chain yielded the wrong byte count.
+    proc heapReadFrame(arena: HeapArena, pageId: int, slot: int) -> ReadOutcome:
+        let pages = arena.pages
+        let numPages = len(pages)
+        if pageId < 0:
+            return ReadOutcome{code: 1, frame: []}
+        if pageId >= numPages:
+            return ReadOutcome{code: 1, frame: []}
+        let pg = pages[pageId]
+        let slotCount = do pageSlotCount(pg.body)
+        if slot < 0:
+            return ReadOutcome{code: 1, frame: []}
+        if slot >= slotCount:
+            return ReadOutcome{code: 1, frame: []}
+        let cell = do heapPageCell(pg.body, slot)
+        let isStub = do heapIsOverflowStub(cell)
+        if !isStub:
+            return ReadOutcome{code: 0, frame: cell}
+        let total = do heapOverflowStubTotalLen(cell)
+        if total > 67108877:
+            return ReadOutcome{code: 2, frame: []}
+        let firstPage = do heapOverflowStubFirstPage(cell)
+        let maxLinksRaw = do heapDivCeil(total, 16328)
+        let mut maxLinks = maxLinksRaw
+        if maxLinks < 1:
+            maxLinks = 1
+        let mut next = firstPage
+        let mut collected = []
+        let mut links = 0
+        let mut errorCode = 0
+        let mut looping = true
+        loop looping:
+            let collectedLen = len(collected)
+            if collectedLen >= total:
+                looping = false
+            else:
+                let newLinks = links + 1
+                links = newLinks
+                if links > maxLinks:
+                    errorCode = 3
+                    looping = false
+                else:
+                    if next < 0:
+                        errorCode = 4
+                        looping = false
+                    else:
+                        if next >= numPages:
+                            errorCode = 4
+                            looping = false
+                        else:
+                            let chainPage = pages[next]
+                            let chainKind = do pageKind(chainPage.body)
+                            if chainKind != 5:
+                                errorCode = 4
+                                looping = false
+                            else:
+                                let chainSlotCount = do pageSlotCount(chainPage.body)
+                                if chainSlotCount < 1:
+                                    errorCode = 4
+                                    looping = false
+                                else:
+                                    let chunk = do heapPageCell(chainPage.body, 0)
+                                    let newCollected = do concatBytes(collected, chunk)
+                                    collected = newCollected
+                                    let newNext = do pageExtra(chainPage.body)
+                                    next = newNext
+        if errorCode != 0:
+            return ReadOutcome{code: errorCode, frame: []}
+        let finalLen = len(collected)
+        if finalLen != total:
+            return ReadOutcome{code: 5, frame: []}
+        return ReadOutcome{code: 0, frame: collected}
+
+    # heapRead outcome codes: heapReadFrame's codes pass through unchanged;
+    # a frame-envelope failure (heapDecodeFrameOutcome != 0) is reported as
+    # 10 + that code (11 = torn frame, 12 = corrupt frame), kept distinct
+    # from heapReadFrame's own 1..5 so a caller can always tell "wrong
+    # location" from "right location, damaged bytes" apart.
+    proc heapRead(arena: HeapArena, pageId: int, slot: int) -> DecodedRecordOutcome:
+        let frameOutcome = do heapReadFrame(arena, pageId, slot)
+        if frameOutcome.code != 0:
+            return DecodedRecordOutcome{code: frameOutcome.code, payload: []}
+        let decodeCode = do heapDecodeFrameOutcome(frameOutcome.frame)
+        if decodeCode != 0:
+            let shifted = 10 + decodeCode
+            return DecodedRecordOutcome{code: shifted, payload: []}
+        let payload = do heapDecodeFramePayload(frameOutcome.frame)
+        return DecodedRecordOutcome{code: 0, payload: payload}
+
+    # ============================================================
+    # SPACE ACCOUNTING — `RecordStore::mark_obsolete`/
+    # `compaction_candidates`'s per-segment ratio test (see header part 4:
+    # this IS "delete" in this engine). The segment-selection loop over
+    # `data.segments` (multi-segment/catalog bookkeeping) is not modeled —
+    # there is one arena — but the actual worth-compacting arithmetic is
+    # ported exactly.
+    # ============================================================
+    proc heapMarkObsolete(obsoleteBytes: int, recordLength: int) -> int:
+        return obsoleteBytes + recordLength
+
+    proc heapCompactionWorthwhile(pageCount: int, obsoleteBytes: int, ratio: float) -> bool:
+        let capacity = pageCount * 16356
+        if capacity <= 0:
+            return false
+        let capacityF = toFloat(capacity)
+        let obsoleteF = toFloat(obsoleteBytes)
+        let threshold = capacityF * ratio
+        return obsoleteF >= threshold
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — hand-traced scenarios (full arithmetic
+    # in the task report):
+    #
+    # A/B — insert two small records into an empty arena: both land in the
+    # SAME page (0), at slots 0 and 1, and both read back byte-identical to
+    # what was appended.
+    #
+    # C — "delete": mark record A's location obsolete, then read it back
+    # anyway (still succeeds, unchanged bytes — see header part 4).
+    # Compaction-worthiness: A's 18-byte frame against a 16356-byte page is
+    # nowhere near a 50% ratio (not worth compacting); a contrived
+    # 10000-byte tally against the same one-page capacity is (worth
+    # compacting).
+    #
+    # D — overflow: a 20000-byte payload frames to 20013 bytes, over
+    # MAX_CELL_LEN (16328), so it chains across two Overflow pages (page 1
+    # holds the first 16328 bytes with extra=0 meaning "next is page 0";
+    # page 0 holds the last 3685 bytes with extra=0 meaning true end of
+    # chain — see header part 3 for why this specific pair of pages is the
+    # real historical bug's exact shape), addressed by a stub cell in a
+    # third, ordinary Heap page (page 2, slot 0). Reading it back
+    # reassembles the original payload exactly.
+    #
+    # E/F — a corrupted frame (one flipped payload byte) decodes as
+    # corrupt (2); a frame truncated to fewer than the 13-byte header
+    # decodes as torn (1).
+    #
+    # G — `heapPageCompact` exercised directly (see header part 2: never
+    # triggered by this store's own real call pattern) on a hand-built
+    # two-cell page, confirming both cells still read back correctly after
+    # compaction.
+    # ============================================================
+    proc heapDemoEmptyArena() -> HeapArena:
+        return HeapArena{pages: []}
+
+    proc heapDemoPayloadA() -> [int]:
+        return [1, 2, 3, 4, 5]
+
+    proc heapDemoPayloadB() -> [int]:
+        return [9, 8, 7]
+
+    proc heapDemoAppendA() -> AppendOutcome:
+        let arena = do heapDemoEmptyArena()
+        let payload = do heapDemoPayloadA()
+        let outcome = do heapAppend(arena, payload)
+        return outcome
+
+    proc heapDemoAppendAB() -> AppendOutcome:
+        let first = do heapDemoAppendA()
+        let payloadB = do heapDemoPayloadB()
+        let outcome = do heapAppend(first.arena, payloadB)
+        return outcome
+
+    proc heapDemoAPage() -> int:
+        let a = do heapDemoAppendA()
+        return a.page
+
+    proc heapDemoASlot() -> int:
+        let a = do heapDemoAppendA()
+        return a.slot
+
+    proc heapDemoALength() -> int:
+        let a = do heapDemoAppendA()
+        return a.length
+
+    proc heapDemoBPage() -> int:
+        let ab = do heapDemoAppendAB()
+        return ab.page
+
+    proc heapDemoBSlot() -> int:
+        let ab = do heapDemoAppendAB()
+        return ab.slot
+
+    proc heapDemoReadAOk() -> bool:
+        let a = do heapDemoAppendA()
+        let result = do heapRead(a.arena, a.page, a.slot)
+        if result.code != 0:
+            return false
+        let expected = do heapDemoPayloadA()
+        let eq = do bytesEqual(result.payload, expected)
+        return eq
+
+    proc heapDemoReadBOk() -> bool:
+        let ab = do heapDemoAppendAB()
+        let result = do heapRead(ab.arena, ab.page, ab.slot)
+        if result.code != 0:
+            return false
+        let expected = do heapDemoPayloadB()
+        let eq = do bytesEqual(result.payload, expected)
+        return eq
+
+    proc heapDemoObsoleteAfterA() -> int:
+        let a = do heapDemoAppendA()
+        let obsolete = do heapMarkObsolete(0, a.length)
+        return obsolete
+
+    proc heapDemoReadAStillOkAfterObsolete() -> bool:
+        let a = do heapDemoAppendA()
+        let obsolete = do heapMarkObsolete(0, a.length)
+        let result = do heapRead(a.arena, a.page, a.slot)
+        if result.code != 0:
+            return false
+        let expected = do heapDemoPayloadA()
+        let eq = do bytesEqual(result.payload, expected)
+        return eq
+
+    proc heapDemoSmallObsoleteWorthCompacting() -> bool:
+        let obsolete = do heapDemoObsoleteAfterA()
+        let worth = do heapCompactionWorthwhile(1, obsolete, 0.5)
+        return worth
+
+    proc heapDemoLargeObsoleteWorthCompacting() -> bool:
+        let worth = do heapCompactionWorthwhile(1, 10000, 0.5)
+        return worth
+
+    proc heapDemoBigPayload() -> [int]:
+        let mut out = []
+        let mut i = 0
+        loop i < 20000:
+            let b = i % 256
+            out = append(out, b)
+            i = i + 1
+        return out
+
+    proc heapDemoOverflowAppend() -> AppendOutcome:
+        let arena = do heapDemoEmptyArena()
+        let payload = do heapDemoBigPayload()
+        let outcome = do heapAppend(arena, payload)
+        return outcome
+
+    proc heapDemoOverflowPageCount() -> int:
+        let outcome = do heapDemoOverflowAppend()
+        let n = len(outcome.arena.pages)
+        return n
+
+    proc heapDemoOverflowStubPage() -> int:
+        let outcome = do heapDemoOverflowAppend()
+        return outcome.page
+
+    proc heapDemoOverflowLength() -> int:
+        let outcome = do heapDemoOverflowAppend()
+        return outcome.length
+
+    proc heapDemoOverflowReadOk() -> bool:
+        let outcome = do heapDemoOverflowAppend()
+        let result = do heapRead(outcome.arena, outcome.page, outcome.slot)
+        if result.code != 0:
+            return false
+        let expected = do heapDemoBigPayload()
+        let eq = do bytesEqual(result.payload, expected)
+        return eq
+
+    proc heapDemoCorruptFrame() -> [int]:
+        let payload = do heapDemoPayloadA()
+        let frame = do heapEncodeFrame(payload)
+        let corrupted = do replaceBytesRange(frame, 13, [255])
+        return corrupted
+
+    proc heapDemoCorruptOutcome() -> int:
+        let frame = do heapDemoCorruptFrame()
+        let outcome = do heapDecodeFrameOutcome(frame)
+        return outcome
+
+    proc heapDemoTornFrame() -> [int]:
+        let payload = do heapDemoPayloadA()
+        let frame = do heapEncodeFrame(payload)
+        let truncated = do sliceBytes(frame, 0, 5)
+        return truncated
+
+    proc heapDemoTornOutcome() -> int:
+        let frame = do heapDemoTornFrame()
+        let outcome = do heapDecodeFrameOutcome(frame)
+        return outcome
+
+    proc heapDemoCompactSample() -> bool:
+        let fresh = do heapPageEmpty()
+        let withA = do heapPagePushBody(fresh.body, [1, 2, 3])
+        let withB = do heapPagePushBody(withA, [4, 5])
+        let compacted = do heapPageCompact(withB)
+        let cellA = do heapPageCell(compacted, 0)
+        let cellB = do heapPageCell(compacted, 1)
+        let expectedA = [1, 2, 3]
+        let expectedB = [4, 5]
+        let eqA = do bytesEqual(cellA, expectedA)
+        let eqB = do bytesEqual(cellB, expectedB)
+        return eqA && eqB
+
+    state demoAPage: int = -1
+    state demoASlot: int = -1
+    state demoALength: int = -1
+    state demoBPage: int = -1
+    state demoBSlot: int = -1
+    state demoReadAOk: bool = false
+    state demoReadBOk: bool = false
+    state demoObsoleteAfterA: int = -1
+    state demoReadAStillOkAfterObsolete: bool = false
+    state demoSmallObsoleteWorthCompacting: bool = true
+    state demoLargeObsoleteWorthCompacting: bool = false
+    state demoOverflowPageCount: int = -1
+    state demoOverflowStubPage: int = -1
+    state demoOverflowLength: int = -1
+    state demoOverflowReadOk: bool = false
+    state demoCorruptOutcome: int = -1
+    state demoTornOutcome: int = -1
+    state demoCompactSampleOk: bool = false
+
+    action runDemoHeap():
+        let aPage = do heapDemoAPage()
+        let aSlot = do heapDemoASlot()
+        let aLength = do heapDemoALength()
+        let bPage = do heapDemoBPage()
+        let bSlot = do heapDemoBSlot()
+        let readAOk = do heapDemoReadAOk()
+        let readBOk = do heapDemoReadBOk()
+        let obsoleteAfterA = do heapDemoObsoleteAfterA()
+        let readAStillOk = do heapDemoReadAStillOkAfterObsolete()
+        let smallWorth = do heapDemoSmallObsoleteWorthCompacting()
+        let largeWorth = do heapDemoLargeObsoleteWorthCompacting()
+        let overflowPages = do heapDemoOverflowPageCount()
+        let overflowStubPage = do heapDemoOverflowStubPage()
+        let overflowLength = do heapDemoOverflowLength()
+        let overflowReadOk = do heapDemoOverflowReadOk()
+        let corruptOutcome = do heapDemoCorruptOutcome()
+        let tornOutcome = do heapDemoTornOutcome()
+        let compactSampleOk = do heapDemoCompactSample()
+
+        demoAPage = aPage
+        demoASlot = aSlot
+        demoALength = aLength
+        demoBPage = bPage
+        demoBSlot = bSlot
+        demoReadAOk = readAOk
+        demoReadBOk = readBOk
+        demoObsoleteAfterA = obsoleteAfterA
+        demoReadAStillOkAfterObsolete = readAStillOk
+        demoSmallObsoleteWorthCompacting = smallWorth
+        demoLargeObsoleteWorthCompacting = largeWorth
+        demoOverflowPageCount = overflowPages
+        demoOverflowStubPage = overflowStubPage
+        demoOverflowLength = overflowLength
+        demoOverflowReadOk = overflowReadOk
+        demoCorruptOutcome = corruptOutcome
+        demoTornOutcome = tornOutcome
+        demoCompactSampleOk = compactSampleOk
+
+    view HeapHome at "/heap":
+        box:
+            text "A: page={demoAPage} slot={demoASlot} length={demoALength} readOk={demoReadAOk}"
+            text "B: page={demoBPage} slot={demoBSlot} readOk={demoReadBOk}"
+            text "obsolete: afterA={demoObsoleteAfterA} readStillOk={demoReadAStillOkAfterObsolete} smallWorth={demoSmallObsoleteWorthCompacting} largeWorth={demoLargeObsoleteWorthCompacting}"
+            text "overflow: pages={demoOverflowPageCount} stubPage={demoOverflowStubPage} length={demoOverflowLength} readOk={demoOverflowReadOk}"
+            text "frames: corrupt={demoCorruptOutcome} torn={demoTornOutcome} compactSampleOk={demoCompactSampleOk}"
