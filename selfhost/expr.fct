@@ -59,17 +59,28 @@ app ExprSelfHost:
     # 5-int/4-usable-slot width can hold without a new kind of auxiliary-row
     # scheme this round didn't design), reported honestly rather than forced.
     #
-    # Still out of scope after round 5: aggregates only, plus (lower
-    # priority, unchanged from earlier rounds) shifts (`<<`/`>>`), `%`, and
-    # `in`. Shifts were left out deliberately (see STAGE 1's
-    # tokenizer doc below for why — they need a real three-way `<` vs `<=`
-    # vs `<<` longest-match decision that would have been the ONLY thing
-    # testing that specific ambiguity, whereas `==`/`!=`/`<=`/`>=`/`&&`/
-    # `||` cover the general two-char-lookahead mechanism already). Every
-    # remaining gap would extend this same design (more token text values,
-    # more precedence levels, more node kinds in the arena) without
-    # changing its shape — see the STAGE headers below for exactly where
-    # each piece of the real algorithm lives.
+    # Round 6 (this pass) closes that exact gap — see the ROUND 6 SCOPE NOTE
+    # and FINDING 11 below for the AggMeta auxiliary-row design that does it,
+    # and for why `min`/`max` are now finally usable in their real, single-
+    # argument aggregate form (`min(Order.amount)`) without disturbing round
+    # 4's own careful exclusion of `min(a, b)` (the two-argument scalar
+    # builtin) from this port's call grammar.
+    #
+    # Still out of scope after round 6: shifts (`<<`/`>>`), `%`, and the
+    # general binPrec-6 `in` MEMBERSHIP operator (`x in [a, b, c]` — note this
+    # is a genuinely different grammar position from the aggregate
+    # construct's own `in`/`where` KEYWORDS, which round 6 now does cover in
+    # full, since they belong to one fixed, literal production —
+    # `<value> in <Coll> [where <cond>]` inside an aggregate's parens — not
+    # the general two-operand binary operator). Shifts were left out
+    # deliberately (see STAGE 1's tokenizer doc below for why — they need a
+    # real three-way `<` vs `<=` vs `<<` longest-match decision that would
+    # have been the ONLY thing testing that specific ambiguity, whereas
+    # `==`/`!=`/`<=`/`>=`/`&&`/`||` cover the general two-char-lookahead
+    # mechanism already). Every remaining gap would extend this same design
+    # (more token text values, more precedence levels, more node kinds in
+    # the arena) without changing its shape — see the STAGE headers below for
+    # exactly where each piece of the real algorithm lives.
     #
     # ============================================================
     # ROUND 3 SCOPE NOTE (primary-expression features, this pass):
@@ -301,6 +312,80 @@ app ExprSelfHost:
     #    fully-scoped round, not a bolt-on to this one. Not attempted this
     #    round; genuinely deferred, not disguised as "unsupported input"
     #    the way `foo(x)`/`min(x)` already honestly are.
+    #
+    # ============================================================
+    # ROUND 6 SCOPE NOTE (aggregates — this pass):
+    # ============================================================
+    # Read fresh against expr.go's real parseAgg/aggRowVar/argListHasComma
+    # (internal/parser/expr.go, this round) before designing anything — not
+    # assumed from the ROUND 5 SCOPE NOTE's own summary of them. Two things
+    # that summary got exactly right (the six-fact shape, the "doesn't fit
+    # ArgSlot/MapPairSlot" diagnosis) and one thing worth restating precisely
+    # since it is easy to misread from the task's own shorthand: there is NO
+    # separate `sel(...)` call-form anywhere in the real grammar. `Sel` is
+    # purely a DERIVED field of ast.Agg — parseAgg always parses ONE reduced-
+    # value expression (`head`, at precedence floor precArith, admitting
+    # `<< >> + - * / %` and unary but stopping before comparison/`in`/
+    # bitwise/logical), then inspects what shape `head` turned out to be:
+    # a bare `ast.Ref` (the row itself: `count(x in Coll …)`), an
+    # `ast.Get` whose object is a bare `ast.Ref` (a field reduce:
+    # `sum(x.field in Coll …)`), or anything else (a general expression:
+    # `sum(x.a * x.b in Coll …)`, where `Sel` is set to the WHOLE head and the
+    # item variable is recovered by `aggRowVar`, a pre-order walk for the
+    # leftmost `x.field`'s `x`). This port's `head` is parsed by exprEnd/
+    # exprNodes (round 1/2's own "+"/"-"/"*"/"/" levels, unary spliced in
+    # underneath via termNodes/unaryNodes exactly as every other caller of
+    # them already gets) — the precise equivalent of real precArith=7 in a
+    # subset that has no shift/`%` operators to admit either, so nothing is
+    # lost by using the tightest existing level instead of a hypothetical new
+    # one. `in`/`where` themselves need NO new tokenizer support (this file's
+    # own FINDING 6 precedent): both are plain IDENT tokens already, matched
+    # by TEXT (`texts[p] == "in"`/`"where"`) exactly like `true`/`false`
+    # already are in factorLeafNodes — never promoted to the general binPrec-6
+    # `in` MEMBERSHIP operator, which stays genuinely out of scope everywhere
+    # else (see the header's "still out of scope" paragraph, above).
+    #
+    # `min`/`max` disambiguation (aggregate `min(Order.amount)` vs. scalar-
+    # builtin `min(a, b)`) is expr.go's own `argListHasComma`: a depth-
+    # tracked scan from the `(` for a top-level `,` before the matching `)`.
+    # This port restates it as hasTopLevelCommaAt (STAGE 2f, below) — the
+    # exact same scan, no arena involvement at all (it only reads `kinds`/
+    # `texts`, like every other `is*Tok`/`is*At` lookahead in this file). This
+    # is also exactly what makes `min`/`max` finally safe to recognize as
+    # aggregates without breaking round 4's own careful exclusion of them
+    # from isCallNameTok (FINDING 8's neighbor, round 4 finding 2): the two
+    # forms were always told apart by the SAME comma rule in the real
+    # grammar, this port just didn't have anywhere to put that check before
+    # aggregates existed at all.
+    #
+    # THE AGGMETA DESIGN (the actual answer to the ROUND 5 SCOPE NOTE's own
+    # closing question): an Agg node's six facts split cleanly into "one
+    # thing that fits the calling node's own spare slot" plus "four things
+    # that fit one chained auxiliary row," with NO second chain link needed —
+    # see FINDING 11, below, for the full reasoning. In short:
+    #   - Agg (arena kind 15): opTok = the aggregate name's own token index
+    #     (`count`/`sum`/`exists`/`avg`/`min`/`max` — read its TEXT to know
+    #     which op, the same "store the token, not the text" mechanism a
+    #     Call node's opTok already uses for its builtin name); valTok = the
+    #     item variable's token index (-1 for the whole-collection form,
+    #     which binds no variable at all); left = the node index of this
+    #     Agg's one AggMeta row; right = -1 (unused — Agg has no second
+    #     child of its own, everything else lives one hop away on AggMeta).
+    #   - AggMeta (arena kind 16, never a real AST node in its own right —
+    #     the same "internal pointer/bundle row" status ArgSlot and
+    #     MapPairSlot already have): valTok = the collection/entity name's
+    #     token index (-1 if it couldn't be determined — see the honest-
+    #     degrade note in aggNodes' own doc, STAGE 2f); opTok = the bare-
+    #     field name's token index, for the `sum(Coll.field)`/
+    #     `sum(x.field in Coll …)` shapes (-1 otherwise); left = the
+    #     Where-subtree's root NODE index (-1 if no `where` clause); right =
+    #     the Sel-subtree's root NODE index (-1 unless the reduced value was
+    #     a general expression, per the "no separate sel(...) form" note
+    #     above).
+    # Reading an Agg node therefore costs exactly one extra indirection hop
+    # (follow `left` to the AggMeta row, then read ITS four slots) — the same
+    # one-hop cost Get's field-name opTok or EntityGet's own shape already
+    # normalized this file to, not a new kind of cost.
     #
     # ============================================================
     # Three findings this port surfaced, precise enough to matter to
@@ -593,6 +678,47 @@ app ExprSelfHost:
     # sub-expression trees) doesn't fit the two shapes (ArgSlot's list-of-
     # one-fact, MapPairSlot's list-of-two-facts) this round's own machinery
     # was designed to generalize.)
+    #
+    # FINDING 11 (round 6) — the wall FINDING 10 leaves open (a FIXED,
+    # heterogeneous set of six facts, not a variable-arity list of uniform
+    # entries) turns out not to need ArgSlot/MapPairSlot's "N contiguous rows"
+    # machinery at ALL, and not even a two-row AggMeta chain the ROUND 5 SCOPE
+    # NOTE's own closing guess predicted — one auxiliary row is enough, because
+    # the six facts split unevenly by NATURE, not just by count: exactly one
+    # of them (the item variable's token index) is a single scalar that the
+    # calling Agg node has a genuinely spare slot for (valTok — Agg has no
+    # int-typed "value" of its own the way a Lit leaf does, so nothing else
+    # was ever going to use it), and the other four (Coll token, Field token,
+    # Where root, Sel root) fit EXACTLY the 4 usable slots one more row has
+    # (valTok, opTok, left, right) with nothing left over and nothing missing.
+    # This is the same lesson FINDING 9 already drew for EntityGet, one level
+    # up the chain: "how many facts" was never the right question on its own —
+    # it is "how many facts, after squeezing every one that fits into an
+    # already-spare slot on a node the parser was building anyway, are left
+    # over for a dedicated row." An Agg node's OWN four slots (kind, valTok,
+    # opTok, left; right stays -1, genuinely unused, the same "no second
+    # child" shape Get/EntityGet's own spare slots already have) absorb two of
+    # the six facts (Op, via opTok — already needed as a token reference
+    # exactly like a Call node's builtin-name opTok — and Var, via valTok);
+    # AggMeta's four slots (valTok, opTok, left, right; kind is its fifth,
+    # identifying int, same as every row) absorb the remaining four (Coll,
+    # Field, Where, Sel). 2 + 4 = 6, no row left holding fewer than its full
+    # complement of facts, no chain-of-two needed. The one genuinely NEW
+    # thing this finding required that FINDING 8/9/10 didn't: aggNodes has to
+    # READ BACK the arena it just built (`arena[5 * idx + k]`, inspecting a
+    # head subtree's own kind/valTok/opTok/left AFTER building it, to
+    # replicate expr.go's `switch head.(type)` shape-dispatch and its
+    # aggRowVar pre-order walk) rather than only ever appending to it — every
+    # earlier kind in this file only needed to remember an INDEX into what it
+    # had just built (FINDING 3's whole "root is always the last row"
+    # invariant), never to look at what KIND of node lived at that index or
+    # follow ITS children. aggRowVarTok (STAGE 2f, below) is exactly this: a
+    # small recursive arena-walker, structurally identical to expr.go's own
+    # aggRowVar, just walking node-index/kind/slot triples instead of a real
+    # ast.Expr's Go type switch — proof that "reading structure back out of
+    # the arena" is exactly as mechanical as building it was, not a different
+    # kind of problem, as long as the 5-int/postorder shape is honored on the
+    # read side too.
     #
     # ============================================================
     # STAGE 0: character classification.
@@ -1095,21 +1221,47 @@ app ExprSelfHost:
     # real grammar, always Agg-or-Call — both still out of scope here, so
     # both forms of `min(...)`/`max(...)` keep degrading the same honest
     # "not consumed" way they already did before this round, exactly like
-    # `count(...)`/`sum(...)`/etc. do).
+    # `count(...)`/`sum(...)`/etc. do — round 5 wrote this before round 6
+    # existed, and its own words are now literally out of date: `min`/`max`
+    # keep degrading that way only in their two-argument scalar-call form —
+    # see the next paragraph).
+    #
+    # Round 6: a FOURTH case — isAggStartAt (STAGE 2f below) — joins the
+    # SAME dispatch point, checked FIRST (before isCallStartAt/
+    # isEntityLookupStartAt), since expr.go's own real switch checks it
+    # first too (parsePostfix's `switch { case ref.Name == "count" || ...:
+    # ...aggregate...; case ref.Name is pending/...: ...; case
+    # isBuiltinCall(...): ...; default: ...entity lookup }` — this port's
+    # isCallNameTok/isEntityNameTok already exclude every aggregate name
+    # from their own sets, so checking order only matters for honesty about
+    # which real branch this mirrors, not for any actual ambiguity). true
+    # iff the token at `pos` is a plain IDENT naming an aggregate
+    # (`count`/`sum`/`exists`/`avg`, or `min`/`max` when the parenthesized
+    # argument list has NO top-level comma — expr.go's own argListHasComma,
+    # restated as hasTopLevelCommaAt) immediately followed by `(`. This is
+    # the one dispatch branch this port has ever needed to resolve with
+    # LOOKAHEAD past the matching `)`, not just the next one or two tokens —
+    # see hasTopLevelCommaAt's own doc, STAGE 2f, for why that is still a
+    # closed, bounded scan and not a new kind of parsing.
     proc postfixEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let isAgg = do isAggStartAt(kinds, texts, pos)
         let isCall = do isCallStartAt(kinds, texts, pos)
         let isEntity = do isEntityLookupStartAt(kinds, texts, pos)
         let mut p0 = 0
-        if isCall:
-            let ce = do callEnd(kinds, texts, pos + 1)
-            p0 = ce
+        if isAgg:
+            let ae = do aggEnd(kinds, texts, pos + 1)
+            p0 = ae
         else:
-            if isEntity:
-                let ee = do entityGetEnd(kinds, texts, pos + 1)
-                p0 = ee
+            if isCall:
+                let ce = do callEnd(kinds, texts, pos + 1)
+                p0 = ce
             else:
-                let fe = do factorEnd(kinds, texts, pos)
-                p0 = fe
+                if isEntity:
+                    let ee = do entityGetEnd(kinds, texts, pos + 1)
+                    p0 = ee
+                else:
+                    let fe = do factorEnd(kinds, texts, pos)
+                    p0 = fe
         let mut p = p0
         let n = len(kinds)
         let mut cont = true
@@ -1324,7 +1476,16 @@ app ExprSelfHost:
     #                             "pointer" row like ArgSlot — see FINDING
     #                             10 — only ever referenced from a MapLit's
     #                             left/right slots], 14 = MapLit [round 5,
-    #                             `{k: v, ...}`])
+    #                             `{k: v, ...}`], 15 = Agg [round 6,
+    #                             `count`/`sum`/`exists`/`avg`/`min`/`max`
+    #                             with the real `in`/`where` aggregate
+    #                             grammar — see the ROUND 6 SCOPE NOTE and
+    #                             FINDING 11], 16 = AggMeta [round 6, an
+    #                             internal "bundle" row like ArgSlot/
+    #                             MapPairSlot — see FINDING 11 — only ever
+    #                             referenced from an Agg node's own left
+    #                             slot, never a real AST node in its own
+    #                             right])
     #   arena[5*i + 1] = valTok  (leaf only — Lit(int)/Lit(bool)/Lit(text)/
     #                             Lit(float)/Ref: token index of the
     #                             NUM/IDENT/STR token this leaf reads its
@@ -1354,7 +1515,16 @@ app ExprSelfHost:
     #                             — just living in valTok here since opTok is
     #                             already taken by the entity name below), or
     #                             -1 if no `.field` followed (a bare
-    #                             `Entity(key)`))
+    #                             `Entity(key)`). Agg [round 6]: the ITEM
+    #                             VARIABLE's token index (the `x` in
+    #                             `count(x in Coll where …)`), or -1 for the
+    #                             whole-collection form (`sum(Coll.field)`),
+    #                             which binds no variable — see FINDING 11.
+    #                             AggMeta [round 6]: the COLLECTION/ENTITY
+    #                             NAME's token index, or -1 if the reduced
+    #                             value's shape made it undeterminable — see
+    #                             aggNodes' own doc, STAGE 2f, for the honest-
+    #                             degrade case)
     #   arena[5*i + 2] = opTok   (Bin/Un: token index of the operator token
     #                             — any of `+ - * / == != < <= > >= & | ^
     #                             && || ! ~`; look up tokenTexts(src)
@@ -1365,7 +1535,19 @@ app ExprSelfHost:
     #                             holding a field name instead of an
     #                             operator symbol; see FINDING 7. EntityGet
     #                             [round 5]: token index of the ENTITY NAME
-    #                             identifier)
+    #                             identifier. Agg [round 6]: token index of
+    #                             the aggregate OP NAME itself (`count`/
+    #                             `sum`/`exists`/`avg`/`min`/`max` — read its
+    #                             TEXT to know which op; the SAME "store the
+    #                             token, not the text" mechanism a Call
+    #                             node's own opTok already uses for a
+    #                             builtin name). AggMeta [round 6]: token
+    #                             index of the bare FIELD NAME (the `field`
+    #                             in `sum(Coll.field)`/
+    #                             `sum(x.field in Coll …)`), or -1 if the
+    #                             reduced value was the row itself or a
+    #                             general expression instead of a bare field
+    #                             read)
     #   arena[5*i + 3] = left    (Bin/Get/Index: NODE index of the left/
     #                             object child, i.e. arena[5*left ..], not a
     #                             raw array offset; Un only: NODE index of
@@ -1374,7 +1556,11 @@ app ExprSelfHost:
     #                             node — Un has no second operand, so
     #                             "right" stays -1, the same "-1 means
     #                             absent" convention every unused slot
-    #                             already uses)
+    #                             already uses. Agg [round 6]: NODE index of
+    #                             this Agg's one AggMeta row — see FINDING
+    #                             11. AggMeta [round 6]: the WHERE-subtree's
+    #                             root NODE index, or -1 if there is no
+    #                             `where` clause)
     #   arena[5*i + 4] = right   (Bin: NODE index of the right child. Index
     #                             [round 3]: NODE index of the index
     #                             sub-expression, e.g. the `i` in `a[i]` —
@@ -1388,7 +1574,15 @@ app ExprSelfHost:
     #                             MapPairSlot [round 5]: the VALUE root node
     #                             index — see FINDING 10. MapLit [round 5]:
     #                             the PAIR COUNT N, the identical Call/
-    #                             ListLit shape, just naming MapPairSlot rows)
+    #                             ListLit shape, just naming MapPairSlot rows.
+    #                             Agg [round 6]: unused, -1 (an Agg node has
+    #                             only the one AggMeta child, held in left —
+    #                             the mirror image of Get/EntityGet's own
+    #                             left-only shape). AggMeta [round 6]: the
+    #                             SEL-subtree's root NODE index, or -1 unless
+    #                             the reduced value was a general expression
+    #                             — see the ROUND 6 SCOPE NOTE's "no separate
+    #                             sel(...) form" note)
     #
     # Round 4 (Call/ListLit, kinds 9/10) reuse left/right for a different
     # PAIR of facts than every earlier kind — not "two children" but "where
@@ -1410,6 +1604,16 @@ app ExprSelfHost:
     # arena width, only a different pair of facts in an already-existing
     # pair of slots.
     #
+    # Round 6's Agg/AggMeta (kinds 15/16) split six facts across two rows
+    # instead of reusing left/right for a pair of unrelated purposes the way
+    # Call/ListLit/MapLit do: Agg keeps its own valTok/opTok as two ordinary
+    # single-token facts (Var, Op) and uses left alone as a ONE-ROW chain
+    # pointer (right stays genuinely unused, -1); AggMeta then uses all four
+    # of ITS OWN slots for the four facts that didn't fit on Agg (Coll in
+    # valTok, Field in opTok, Where in left, Sel in right) — see FINDING 11
+    # for why one auxiliary row, not a variable-length ArgSlot-style chain,
+    # is exactly enough here.
+    #
     # -1 fills whichever of valTok/opTok/left/right a node's kind doesn't
     # use (a Lit/Ref leaf has no opTok/left/right; a Bin node has no
     # valTok; a Un node has no valTok or right; a Get node [round 3] has no
@@ -1428,7 +1632,12 @@ app ExprSelfHost:
     # second child — see FINDING 9); a MapPairSlot row [round 5] has valTok
     # and opTok both -1, the same reasoning as ArgSlot, just with left/right
     # both in use instead of valTok alone; a MapLit node [round 5] has no
-    # valTok and no opTok — both stay -1, same reasoning as ListLit) — the
+    # valTok and no opTok — both stay -1, same reasoning as ListLit; an Agg
+    # node [round 6] has no unused slot among valTok/opTok/left (Var/Op/the
+    # AggMeta pointer) but right stays -1, the same "one child only" shape
+    # Get/EntityGet's own spare slot already has; an AggMeta row [round 6]
+    # is the second kind, after EntityGet, to use all four of its own slots
+    # with none free — Coll/Field/Where/Sel, see FINDING 11) — the
     # same "-1 means absent" convention source.fct's parent-index arrays
     # already use for "no parent"/"no open ancestor".
     #
@@ -1558,32 +1767,52 @@ app ExprSelfHost:
     # like the real parser's own shared postfix loop (parsePostfix, read
     # fresh for this round) continues past its `default:` case's own single
     # `.field` consumption.
+    #
+    # Round 6: isAggStartAt joins the same dispatch, checked FIRST (see
+    # postfixEnd's own doc, above, for why aggregate names must be checked
+    # before the call/entity-lookup checks) — if true, the atom is built by
+    # aggNodes instead, and the matching position advance is aggEnd. An
+    # aggregate's result is just another `objIdx` too, so the chained `.`/
+    # `[` loop below applies uniformly on top of it exactly as it already
+    # does for Call/EntityGet results — `count(x in Coll where …).field` is
+    # syntactically admitted the same way `len(x).field` already is, even
+    # though indexing/field-accessing a scalar aggregate result is an odd
+    # thing to actually write.
     proc postfixNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let isAgg = do isAggStartAt(kinds, texts, pos)
         let isCall = do isCallStartAt(kinds, texts, pos)
         let isEntity = do isEntityLookupStartAt(kinds, texts, pos)
         let mut a = arena
-        if isCall:
-            let a0 = do callNodes(kinds, texts, pos, pos + 1, arena)
+        if isAgg:
+            let a0 = do aggNodes(kinds, texts, pos, pos + 1, arena)
             a = a0
         else:
-            if isEntity:
-                let a0 = do entityGetNodes(kinds, texts, pos, pos + 1, arena)
+            if isCall:
+                let a0 = do callNodes(kinds, texts, pos, pos + 1, arena)
                 a = a0
             else:
-                let a0 = do factorNodes(kinds, texts, pos, arena)
-                a = a0
+                if isEntity:
+                    let a0 = do entityGetNodes(kinds, texts, pos, pos + 1, arena)
+                    a = a0
+                else:
+                    let a0 = do factorNodes(kinds, texts, pos, arena)
+                    a = a0
         let mut objIdx = (len(a) / 5) - 1
         let mut p = 0
-        if isCall:
-            let ce = do callEnd(kinds, texts, pos + 1)
-            p = ce
+        if isAgg:
+            let ae = do aggEnd(kinds, texts, pos + 1)
+            p = ae
         else:
-            if isEntity:
-                let ee = do entityGetEnd(kinds, texts, pos + 1)
-                p = ee
+            if isCall:
+                let ce = do callEnd(kinds, texts, pos + 1)
+                p = ce
             else:
-                let fe = do factorEnd(kinds, texts, pos)
-                p = fe
+                if isEntity:
+                    let ee = do entityGetEnd(kinds, texts, pos + 1)
+                    p = ee
+                else:
+                    let fe = do factorEnd(kinds, texts, pos)
+                    p = fe
         let n = len(kinds)
         let mut cont = true
         loop cont:
