@@ -1,0 +1,581 @@
+import "parser_entity.fct"
+
+app ParserServiceSelfHost:
+    # STAGE 14: parseWebhook — a one-line inbound endpoint declaration,
+    # `webhook "/path" -> actionName [secret ENV_VAR]` (parser.go lines
+    # 1535-1569, read fresh). Fully self-contained, no expr.fct dependency:
+    # every field here is plain text surgery, unlike a proc/action body.
+    # `arrowIndexOf` is STAGE 4's own generic `strings.Index(s, "->")`
+    # helper, reused verbatim rather than re-derived.
+    # ============================================================
+    proc webhookRestOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "webhook")
+        return trim(stripped)
+
+    proc webhookArrowIndex(rest: text) -> int:
+        let r = do arrowIndexOf(rest)
+        return r
+
+    proc webhookHasArrow(rest: text) -> bool:
+        let idx = do webhookArrowIndex(rest)
+        return idx >= 0
+
+    proc webhookPathQuoted(rest: text) -> text:
+        let idx = do webhookArrowIndex(rest)
+        if idx < 0:
+            return ""
+        return trim(slice(rest, 0, idx))
+
+    proc webhookPathRaw(rest: text) -> text:
+        let q = do webhookPathQuoted(rest)
+        let r = do quotedInner(q)
+        return r
+
+    # webhookPathValid: parser.go's own three real gates — an arrow must
+    # exist, the span before it must actually be a quoted (non-empty)
+    # literal, and the decoded path must start with `/`.
+    proc webhookPathValid(rest: text) -> bool:
+        let hasArrow = do webhookHasArrow(rest)
+        if !hasArrow:
+            return false
+        let q = do webhookPathQuoted(rest)
+        let hasQ = do hasQuotedText(q)
+        if !hasQ:
+            return false
+        let path = do webhookPathRaw(rest)
+        if path == "":
+            return false
+        let r = do hasPrefixText(path, "/")
+        return r
+
+    proc webhookTargetPart(rest: text) -> text:
+        let idx = do webhookArrowIndex(rest)
+        if idx < 0:
+            return ""
+        return trim(slice(rest, idx + 2, len(rest)))
+
+    # --- the optional `secret ENV_VAR` clause, parser.go's own
+    # `strings.Index(target, " secret ")` ---
+    proc webhookSecretMarkerIndex(target: text) -> int:
+        let r = do indexOf(target, " secret ")
+        return r
+
+    proc webhookHasSecret(target: text) -> bool:
+        let idx = do webhookSecretMarkerIndex(target)
+        return idx >= 0
+
+    proc webhookTargetBeforeSecret(target: text) -> text:
+        let idx = do webhookSecretMarkerIndex(target)
+        if idx < 0:
+            return target
+        return trim(slice(target, 0, idx))
+
+    proc webhookSecretName(target: text) -> text:
+        let idx = do webhookSecretMarkerIndex(target)
+        if idx < 0:
+            return ""
+        return trim(slice(target, idx + 8, len(target)))
+
+    proc webhookActionName(rest: text) -> text:
+        let target = do webhookTargetPart(rest)
+        let clean = do webhookTargetBeforeSecret(target)
+        return clean
+
+    # webhookValid: every real rejection gate parseWebhook has — path shape,
+    # an identifier secret name when a `secret` clause is present, and an
+    # identifier action/target name.
+    proc webhookValid(lineText: text) -> bool:
+        let rest = do webhookRestOf(lineText)
+        let pathOk = do webhookPathValid(rest)
+        if !pathOk:
+            return false
+        let target = do webhookTargetPart(rest)
+        let hasSecret = do webhookHasSecret(target)
+        if hasSecret:
+            let secret = do webhookSecretName(target)
+            let secretOk = do isIdentToken(secret)
+            if !secretOk:
+                return false
+        let action = do webhookActionName(rest)
+        let actionOk = do isIdentToken(action)
+        return actionOk
+
+    proc parseWebhookPath(lineText: text) -> text:
+        let rest = do webhookRestOf(lineText)
+        let r = do webhookPathRaw(rest)
+        return r
+
+    proc parseWebhookAction(lineText: text) -> text:
+        let rest = do webhookRestOf(lineText)
+        let r = do webhookActionName(rest)
+        return r
+
+    proc parseWebhookSecret(lineText: text) -> text:
+        let rest = do webhookRestOf(lineText)
+        let target = do webhookTargetPart(rest)
+        let r = do webhookSecretName(target)
+        return r
+
+    proc parseWebhookValid(lineText: text) -> bool:
+        let r = do webhookValid(lineText)
+        return r
+
+    # ============================================================
+    # STAGE 15: parseJob — a cron/durable job declaration,
+    # `job Name [every Ns] [on start] -> action` (parser.go lines 2048-2114,
+    # read fresh). `splitFields` restates Go's `strings.Fields` for the one
+    # separator this grammar position actually uses (a plain space) — the
+    # same "one real separator, not the full whitespace class" scope
+    # STAGE 11/12's comma splits already use, since a job schedule is
+    # always written on one line with single spaces.
+    # ============================================================
+    proc splitFields(s: text) -> [text]:
+        let raw = split(s, " ")
+        let n = len(raw)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if raw[i] != "":
+                out = append(out, raw[i])
+            i = i + 1
+        return out
+
+    # --- parseDuration: `30s`/`5m`/`2h` -> seconds (parser.go lines
+    # 2094-2114) ---
+    proc durationUnit(s: text) -> text:
+        let n = len(s)
+        if n == 0:
+            return ""
+        return charAt(s, n - 1)
+
+    proc durationNumberRaw(s: text) -> text:
+        let n = len(s)
+        if n < 2:
+            return ""
+        return slice(s, 0, n - 1)
+
+    proc durationValid(s: text) -> bool:
+        let n = len(s)
+        if n < 2:
+            return false
+        let numRaw = do durationNumberRaw(s)
+        let numOk = do isIntLiteralToken(numRaw)
+        if !numOk:
+            return false
+        let num = toInt(numRaw)
+        if num <= 0:
+            return false
+        let unit = do durationUnit(s)
+        return unit == "s" || unit == "m" || unit == "h"
+
+    # durationSeconds: -1 is the honest "invalid" sentinel — sized to this
+    # proc's own realistic range rather than reusing entityFieldMinValue's
+    # -999999999, since a genuine duration is always a small positive
+    # number of seconds.
+    proc durationSeconds(s: text) -> int:
+        let ok = do durationValid(s)
+        if !ok:
+            return -1
+        let numRaw = do durationNumberRaw(s)
+        let num = toInt(numRaw)
+        let unit = do durationUnit(s)
+        if unit == "s":
+            return num
+        if unit == "m":
+            return num * 60
+        return num * 3600
+
+    proc jobRestOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "job")
+        return trim(stripped)
+
+    proc jobArrowIndex(rest: text) -> int:
+        let r = do arrowIndexOf(rest)
+        return r
+
+    proc jobHasArrow(rest: text) -> bool:
+        let idx = do jobArrowIndex(rest)
+        return idx >= 0
+
+    proc jobActionName(rest: text) -> text:
+        let idx = do jobArrowIndex(rest)
+        if idx < 0:
+            return ""
+        return trim(slice(rest, idx + 2, len(rest)))
+
+    proc jobHeadPart(rest: text) -> text:
+        let idx = do jobArrowIndex(rest)
+        if idx < 0:
+            return ""
+        return trim(slice(rest, 0, idx))
+
+    proc jobHeadFields(rest: text) -> [text]:
+        let head = do jobHeadPart(rest)
+        let r = do splitFields(head)
+        return r
+
+    proc jobName(rest: text) -> text:
+        let fields = do jobHeadFields(rest)
+        if len(fields) == 0:
+            return ""
+        return fields[0]
+
+    # jobEverySeconds/jobOnStart/jobScheduleValid: parser.go's own
+    # `for i := 1; i < len(head); i++ { switch head[i] { case "every": ...
+    # i++; case "on": ...; i++; default: error } }` loop over the schedule
+    # tokens AFTER the job's own name (index 0) — restated as three
+    # independent re-derivations of the identical walk (a proc returns one
+    # value only), each advancing `i` the same two-tokens-at-a-time way the
+    # real loop's own extra `i++` inside each matched case plus the for
+    # loop's own per-iteration `i++` together do.
+    proc jobEverySeconds(fields: [text]) -> int:
+        let n = len(fields)
+        let mut result = 0
+        let mut i = 1
+        loop i < n:
+            let tok = fields[i]
+            if tok == "every":
+                if i + 1 < n:
+                    let secs = do durationSeconds(fields[i + 1])
+                    if secs > 0:
+                        result = secs
+                    i = i + 1
+            else:
+                if tok == "on":
+                    i = i + 1
+            i = i + 1
+        return result
+
+    proc jobOnStart(fields: [text]) -> bool:
+        let n = len(fields)
+        let mut result = false
+        let mut i = 1
+        loop i < n:
+            let tok = fields[i]
+            if tok == "on":
+                if i + 1 < n && fields[i + 1] == "start":
+                    result = true
+                    i = i + 1
+            else:
+                if tok == "every":
+                    i = i + 1
+            i = i + 1
+        return result
+
+    proc jobScheduleValid(fields: [text]) -> bool:
+        let n = len(fields)
+        let mut ok = true
+        let mut i = 1
+        loop i < n && ok:
+            let tok = fields[i]
+            if tok == "every":
+                if i + 1 >= n:
+                    ok = false
+                else:
+                    let durOk = do durationValid(fields[i + 1])
+                    if !durOk:
+                        ok = false
+                    i = i + 1
+            else:
+                if tok == "on":
+                    if i + 1 >= n || fields[i + 1] != "start":
+                        ok = false
+                    else:
+                        i = i + 1
+                else:
+                    ok = false
+            i = i + 1
+        return ok
+
+    # jobValid: every real rejection gate parseJob has — an arrow, an
+    # identifier action, a non-empty schedule-token list with an identifier
+    # name at position 0, a well-formed `every`/`on start` walk, and at
+    # least one real schedule (`job.Every == 0 && !job.OnStart` is rejected).
+    proc jobValid(lineText: text) -> bool:
+        let rest = do jobRestOf(lineText)
+        let hasArrow = do jobHasArrow(rest)
+        if !hasArrow:
+            return false
+        let action = do jobActionName(rest)
+        let actionOk = do isIdentToken(action)
+        if !actionOk:
+            return false
+        let fields = do jobHeadFields(rest)
+        if len(fields) == 0:
+            return false
+        let name = fields[0]
+        let nameOk = do isIdentToken(name)
+        if !nameOk:
+            return false
+        let schedOk = do jobScheduleValid(fields)
+        if !schedOk:
+            return false
+        let every = do jobEverySeconds(fields)
+        let onStart = do jobOnStart(fields)
+        if every == 0 && !onStart:
+            return false
+        return true
+
+    proc parseJobName(lineText: text) -> text:
+        let rest = do jobRestOf(lineText)
+        let r = do jobName(rest)
+        return r
+
+    proc parseJobAction(lineText: text) -> text:
+        let rest = do jobRestOf(lineText)
+        let r = do jobActionName(rest)
+        return r
+
+    proc parseJobEverySeconds(lineText: text) -> int:
+        let rest = do jobRestOf(lineText)
+        let fields = do jobHeadFields(rest)
+        let r = do jobEverySeconds(fields)
+        return r
+
+    proc parseJobOnStart(lineText: text) -> bool:
+        let rest = do jobRestOf(lineText)
+        let fields = do jobHeadFields(rest)
+        let r = do jobOnStart(fields)
+        return r
+
+    proc parseJobValid(lineText: text) -> bool:
+        let r = do jobValid(lineText)
+        return r
+
+    # ============================================================
+    # STAGE 16: parsePolicy's own HEADER line — `policy Name(params):` or
+    # bare `policy Name:` (parser.go lines 1310-1325, read fresh) — the
+    # exact piece this task's brief singled out, distinct from the single
+    # predicate line that follows it (which needs expr.fct's real parser
+    # for its own expression validity, out of scope here, same limitation
+    # checkStatementValid/stateValid/deriveValid/entityFieldValid already
+    # state for their own trailing expressions). `parsePolicy` calls
+    # `parseSignature(head, line, allowList=false, allowRef=false)` on the
+    # head DIRECTLY, with no `uses`/`->` clause of its own to strip first —
+    # STAGE 4's own headerName/headerParamPieces/headerParamNames/Types/
+    # Optionals/headerNameValid/headerParensValid all already no-op their
+    # own internal `headBeforeUses`/`headBeforeArrow` stripping when neither
+    # clause is present in the text handed to them, so every one of those
+    # is reused VERBATIM here (passed policyHeadOf's own output directly) —
+    # only the param-list rejection (`list && !allowList`, allowList=false
+    # for a policy, unlike a proc's always-true allowList) needs a genuinely
+    # new proc, policyParamsValid below, since STAGE 4's own
+    # headerParamsValid hard-codes allowList=true (documented there as
+    # exactly what parseProc always passes).
+    # ============================================================
+    proc policyHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "policy")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc policyParamsValid(head: text) -> bool:
+        let hasParen = do headerHasParenSection(head)
+        if !hasParen:
+            return true
+        let parensOk = do headerParensValid(head)
+        if !parensOk:
+            return false
+        let pieces = do headerParamPieces(head)
+        let n = len(pieces)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            let p = pieces[i]
+            let hasColon = do paramHasColon(p)
+            if !hasColon:
+                ok = false
+            else:
+                let pn = do paramNameOf(p)
+                let idOk = do isIdentToken(pn)
+                if !idOk:
+                    ok = false
+                else:
+                    let pt = do paramTypeRawOf(p)
+                    let isList = do typeIsList(pt)
+                    if isList:
+                        ok = false
+                    else:
+                        let core = do typeCore(pt)
+                        let typeOk = do isTypeNameToken(core)
+                        if !typeOk:
+                            ok = false
+            i = i + 1
+        return ok
+
+    proc policyHeaderValid(head: text) -> bool:
+        let nameOk = do headerNameValid(head)
+        if !nameOk:
+            return false
+        let parensOk = do headerParensValid(head)
+        if !parensOk:
+            return false
+        let paramsOk = do policyParamsValid(head)
+        return paramsOk
+
+    proc parsePolicyName(lineText: text) -> text:
+        let head = do policyHeadOf(lineText)
+        let r = do headerName(head)
+        return r
+
+    proc parsePolicyParamNames(lineText: text) -> [text]:
+        let head = do policyHeadOf(lineText)
+        let r = do headerParamNames(head)
+        return r
+
+    proc parsePolicyParamTypes(lineText: text) -> [text]:
+        let head = do policyHeadOf(lineText)
+        let r = do headerParamTypes(head)
+        return r
+
+    proc parsePolicyParamOptionals(lineText: text) -> [bool]:
+        let head = do policyHeadOf(lineText)
+        let r = do headerParamOptionals(head)
+        return r
+
+    proc parsePolicyValid(lineText: text) -> bool:
+        let head = do policyHeadOf(lineText)
+        let r = do policyHeaderValid(head)
+        return r
+
+    # ============================================================
+    # STAGE 17: parseService — `service Name at "http://host:port":` plus
+    # one op line per child, `opName(params) [-> RetType]` (parser.go lines
+    # 1491-1533, read fresh). The header (name + quoted base URL) is new
+    # text surgery (serviceNameOf/serviceUrlRaw, built on STAGE 13's
+    # quotedInner); a service OP line, once isolated, is syntactically
+    # IDENTICAL to a proc header with no `proc ` keyword and no `uses`
+    # clause — a name, an optional `(params)` list (allowList=true, exactly
+    # like a proc — parser.go's own `parseSignature(head, c.Line.No, true,
+    # false)` call, read fresh, confirms this, not assumed), and an optional
+    # `-> RetType`. Since STAGE 4's headerValid/headerName/headerParamNames/
+    # Types/Lists/Optionals/headerRetSectionExists/headerRetCore/
+    # headerRetIsList already no-op their own internal `uses`-clause
+    # stripping when none is present, and headerParamsValid/headerRetValid
+    # already hard-code the exact allowList=true, "optional return is
+    # invalid" rules a service op needs, EVERY one of them is reused
+    # VERBATIM on the op line's own trimmed text — no new per-op proc logic
+    # at all beyond the thin drivers below.
+    # ============================================================
+    proc serviceHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "service")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc serviceAtMarkerIndex(head: text) -> int:
+        let r = do indexOf(head, " at ")
+        return r
+
+    proc serviceHasAt(head: text) -> bool:
+        let idx = do serviceAtMarkerIndex(head)
+        return idx >= 0
+
+    proc serviceNameOf(head: text) -> text:
+        let idx = do serviceAtMarkerIndex(head)
+        if idx < 0:
+            return ""
+        return trim(slice(head, 0, idx))
+
+    proc serviceNameValid(head: text) -> bool:
+        let name = do serviceNameOf(head)
+        let r = do isIdentToken(name)
+        return r
+
+    proc serviceUrlQuotedOf(head: text) -> text:
+        let idx = do serviceAtMarkerIndex(head)
+        if idx < 0:
+            return ""
+        return trim(slice(head, idx + 4, len(head)))
+
+    proc serviceUrlRaw(head: text) -> text:
+        let q = do serviceUrlQuotedOf(head)
+        let r = do quotedInner(q)
+        return r
+
+    proc serviceUrlValid(head: text) -> bool:
+        let hasAt = do serviceHasAt(head)
+        if !hasAt:
+            return false
+        let url = do serviceUrlRaw(head)
+        if url == "":
+            return false
+        let httpOk = do hasPrefixText(url, "http://")
+        if httpOk:
+            return true
+        let httpsOk = do hasPrefixText(url, "https://")
+        return httpsOk
+
+    proc serviceHeaderValid(lineText: text) -> bool:
+        let head = do serviceHeadOf(lineText)
+        let nameOk = do serviceNameValid(head)
+        if !nameOk:
+            return false
+        let urlOk = do serviceUrlValid(head)
+        return urlOk
+
+    proc parseServiceName(lineText: text) -> text:
+        let head = do serviceHeadOf(lineText)
+        let r = do serviceNameOf(head)
+        return r
+
+    proc parseServiceUrl(lineText: text) -> text:
+        let head = do serviceHeadOf(lineText)
+        let r = do serviceUrlRaw(head)
+        return r
+
+    proc parseServiceHeaderValid(lineText: text) -> bool:
+        let r = do serviceHeaderValid(lineText)
+        return r
+
+    # --- one service OP line (a child of the `service` header) ---
+    proc parseServiceOpName(opLineText: text) -> text:
+        let t = trim(opLineText)
+        let r = do headerName(t)
+        return r
+
+    proc parseServiceOpParamNames(opLineText: text) -> [text]:
+        let t = trim(opLineText)
+        let r = do headerParamNames(t)
+        return r
+
+    proc parseServiceOpParamTypes(opLineText: text) -> [text]:
+        let t = trim(opLineText)
+        let r = do headerParamTypes(t)
+        return r
+
+    proc parseServiceOpParamLists(opLineText: text) -> [bool]:
+        let t = trim(opLineText)
+        let r = do headerParamLists(t)
+        return r
+
+    proc parseServiceOpParamOptionals(opLineText: text) -> [bool]:
+        let t = trim(opLineText)
+        let r = do headerParamOptionals(t)
+        return r
+
+    proc parseServiceOpHasRet(opLineText: text) -> bool:
+        let t = trim(opLineText)
+        let r = do headerRetSectionExists(t)
+        return r
+
+    proc parseServiceOpRetCore(opLineText: text) -> text:
+        let t = trim(opLineText)
+        let r = do headerRetCore(t)
+        return r
+
+    proc parseServiceOpRetIsList(opLineText: text) -> bool:
+        let t = trim(opLineText)
+        let r = do headerRetIsList(t)
+        return r
+
+    # parseServiceOpValid: reuses STAGE 4's own headerValid WHOLE —
+    # nameOk/parensOk/paramsOk(allowList=true)/retOk(optional-rejected)/
+    # usesOk(vacuously true, no `uses` clause on a service op) is exactly
+    # parser.go's own per-op validation, read fresh and confirmed to match
+    # field for field, not approximated.
+    proc parseServiceOpValid(opLineText: text) -> bool:
+        let t = trim(opLineText)
+        let r = do headerValid(t)
+        return r
+

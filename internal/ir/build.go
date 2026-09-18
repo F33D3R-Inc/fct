@@ -877,7 +877,8 @@ func Build(app *ast.App) (*IR, error) {
 		if p.Ret != "" && p.Ret != "float" && !isPrimitive(p.Ret) {
 			_, isEnum := e.enums[p.Ret]
 			_, isRec := e.records[p.Ret]
-			if !isEnum && !isRec {
+			_, isStruct := e.structs[p.Ret]
+			if !isEnum && !isRec && !isStruct {
 				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q returns unknown type %q", p.Name, p.Ret)}
 			}
 		}

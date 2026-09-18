@@ -147,14 +147,24 @@ app FabricSelfHost:
     # kind/address lookup twice on the `Ok` path rather than once.
     #
     # ============================================================
-    # RULE-TABLE REPRESENTATION — parallel arrays, aligned by index, the same
-    # convention predicate.fct's row and storage.fct's byte buffer both
-    # already use:
-    #   ruleKinds:    [text]  rule i's declared kind name
-    #   rulePrefixes: [text]  rule i's declared address prefix
-    #   ruleKeys:     [int]   rule i's routing key (packed, see above)
+    # RULE-TABLE REPRESENTATION:
+    # ============================================================
+    # REWRITE NOTE (struct milestone): a routing rule's three declared
+    # facts (its kind name, its address prefix, its routing key) used to
+    # be threaded as three parallel arrays, aligned by hand-maintained
+    # index — the same shape predicate.fct's own header describes
+    # replacing. That is exactly "several named facts about one entity",
+    # so it is now a real `RoutingRule` struct and the table is one
+    # `[RoutingRule]` array:
+    #   kind:   text  the rule's declared kind name
+    #   prefix: text  the rule's declared address prefix
+    #   key:    int   the rule's routing key (packed, see above)
     # plus `hasFallback: bool` / `fallbackKey: int` for the keyspace's single
     # optional fallback (there is at most one, so it needs no array).
+    struct RoutingRule:
+        kind: text
+        prefix: text
+        key: int
 
     # ============================================================
     # SMALL STRING HELPER — restates the exact `starts_with` idiom
@@ -175,15 +185,15 @@ app FabricSelfHost:
     # constructed keyspace, only) rule whose declared kind name matches
     # exactly. Mirrors predicate.fct's own `rowFieldIndex` shape precisely
     # (same "keep looping, but only latch the FIRST hit" pattern) since both
-    # are "find this exact name in a parallel-array table" over an
-    # already-validated-unique key.
-    proc ruleIndexForKind(ruleKinds: [text], kind: text) -> int:
-        let n = len(ruleKinds)
+    # are "find this exact name in a table" over an already-validated-unique
+    # key.
+    proc ruleIndexForKind(rules: [RoutingRule], kind: text) -> int:
+        let n = len(rules)
         let mut i = 0
         let mut found = -1
         loop i < n:
             if found == -1:
-                if ruleKinds[i] == kind:
+                if rules[i].kind == kind:
                     found = i
             i = i + 1
         return found
@@ -194,15 +204,15 @@ app FabricSelfHost:
     # tie-break ("the last equally-maximal element") exactly rather than the
     # more obvious "first longest wins", per the header note above. `>=`
     # (not `>`) on the length comparison is what encodes that tie-break.
-    proc ruleIndexForAddress(rulePrefixes: [text], address: text) -> int:
-        let n = len(rulePrefixes)
+    proc ruleIndexForAddress(rules: [RoutingRule], address: text) -> int:
+        let n = len(rules)
         let mut i = 0
         let mut bestIdx = -1
         let mut bestLen = -1
         loop i < n:
-            let matches = do textStartsWith(address, rulePrefixes[i])
+            let matches = do textStartsWith(address, rules[i].prefix)
             if matches:
-                let plen = len(rulePrefixes[i])
+                let plen = len(rules[i].prefix)
                 if plen >= bestLen:
                     bestIdx = i
                     bestLen = plen
@@ -217,19 +227,19 @@ app FabricSelfHost:
     #   (Some(key), _) | (None, Some(key))                         -> Ok(key)
     #   (None, None)                                                -> fallback, or Unmapped
     # over this port's two `has*` flags standing in for `Option<&str>`.
-    proc keyspaceResolveStatus(ruleKinds: [text], rulePrefixes: [text], ruleKeys: [int], hasFallback: bool, hasKind: bool, kind: text, hasAddress: bool, address: text) -> int:
+    proc keyspaceResolveStatus(rules: [RoutingRule], hasFallback: bool, hasKind: bool, kind: text, hasAddress: bool, address: text) -> int:
         let mut kindIdx = -1
         if hasKind:
-            let ki = do ruleIndexForKind(ruleKinds, kind)
+            let ki = do ruleIndexForKind(rules, kind)
             kindIdx = ki
         let mut addrIdx = -1
         if hasAddress:
-            let ai = do ruleIndexForAddress(rulePrefixes, address)
+            let ai = do ruleIndexForAddress(rules, address)
             addrIdx = ai
 
         if kindIdx != -1:
             if addrIdx != -1:
-                if ruleKeys[kindIdx] != ruleKeys[addrIdx]:
+                if rules[kindIdx].key != rules[addrIdx].key:
                     return 2
                 return 0
             return 0
@@ -246,19 +256,19 @@ app FabricSelfHost:
     # the other branch), so returning the kind-side key is exactly as
     # correct as returning the address-side one — matching Rust's own
     # `(Some(key), _)` pattern, which likewise prefers `by_kind` on a tie.
-    proc keyspaceResolveKey(ruleKinds: [text], rulePrefixes: [text], ruleKeys: [int], fallbackKey: int, hasKind: bool, kind: text, hasAddress: bool, address: text) -> int:
+    proc keyspaceResolveKey(rules: [RoutingRule], fallbackKey: int, hasKind: bool, kind: text, hasAddress: bool, address: text) -> int:
         let mut kindIdx = -1
         if hasKind:
-            let ki = do ruleIndexForKind(ruleKinds, kind)
+            let ki = do ruleIndexForKind(rules, kind)
             kindIdx = ki
         if kindIdx != -1:
-            return ruleKeys[kindIdx]
+            return rules[kindIdx].key
         let mut addrIdx = -1
         if hasAddress:
-            let ai = do ruleIndexForAddress(rulePrefixes, address)
+            let ai = do ruleIndexForAddress(rules, address)
             addrIdx = ai
         if addrIdx != -1:
-            return ruleKeys[addrIdx]
+            return rules[addrIdx].key
         return fallbackKey
 
     # ============================================================
@@ -272,29 +282,29 @@ app FabricSelfHost:
     # sum type): 0=ok, 1=EmptyKind, 2=EmptyAddressPrefix, 3=DuplicateKind,
     # 4=DuplicateAddressPrefix.
     # ============================================================
-    proc ruleTableHasKind(ruleKinds: [text], kind: text) -> bool:
-        let idx = do ruleIndexForKind(ruleKinds, kind)
+    proc ruleTableHasKind(rules: [RoutingRule], kind: text) -> bool:
+        let idx = do ruleIndexForKind(rules, kind)
         return idx != -1
 
-    proc ruleTableHasPrefixExact(rulePrefixes: [text], prefix: text) -> bool:
-        let n = len(rulePrefixes)
+    proc ruleTableHasPrefixExact(rules: [RoutingRule], prefix: text) -> bool:
+        let n = len(rules)
         let mut i = 0
         let mut found = false
         loop i < n:
-            if rulePrefixes[i] == prefix:
+            if rules[i].prefix == prefix:
                 found = true
             i = i + 1
         return found
 
-    proc keyspaceAddRuleStatus(ruleKinds: [text], rulePrefixes: [text], newKind: text, newPrefix: text) -> int:
+    proc keyspaceAddRuleStatus(rules: [RoutingRule], newKind: text, newPrefix: text) -> int:
         if len(newKind) == 0:
             return 1
         if len(newPrefix) == 0:
             return 2
-        let dupKind = do ruleTableHasKind(ruleKinds, newKind)
+        let dupKind = do ruleTableHasKind(rules, newKind)
         if dupKind:
             return 3
-        let dupPrefix = do ruleTableHasPrefixExact(rulePrefixes, newPrefix)
+        let dupPrefix = do ruleTableHasPrefixExact(rules, newPrefix)
         if dupPrefix:
             return 4
         return 0
@@ -308,20 +318,20 @@ app FabricSelfHost:
     # single-shard `Keyspace::single` case), matching Rust's `.all(...)` on
     # an empty iterator returning `true`.
     # ============================================================
-    proc allRuleKeysEqual(ruleKeys: [int], target: int) -> bool:
-        let n = len(ruleKeys)
+    proc allRuleKeysEqual(rules: [RoutingRule], target: int) -> bool:
+        let n = len(rules)
         let mut i = 0
         let mut allEq = true
         loop i < n:
-            if ruleKeys[i] != target:
+            if rules[i].key != target:
                 allEq = false
             i = i + 1
         return allEq
 
-    proc spanningKeyPresent(ruleKeys: [int], hasFallback: bool, fallbackKey: int) -> bool:
+    proc spanningKeyPresent(rules: [RoutingRule], hasFallback: bool, fallbackKey: int) -> bool:
         if !hasFallback:
             return false
-        let allEq = do allRuleKeysEqual(ruleKeys, fallbackKey)
+        let allEq = do allRuleKeysEqual(rules, fallbackKey)
         return allEq
 
     # ============================================================
@@ -393,36 +403,68 @@ app FabricSelfHost:
     #      this crate calls `ReplicaSet::apply` on its own result).
     #
     # ============================================================
-    # REPRESENTATION — a replica set as parallel arrays, the same convention
-    # this file's own keyspace port already established for a rule table:
-    #   nodes:         [text]  replica i's node id
-    #   isPrimary:     [bool]  replica i's role (exactly one true in a
-    #                          validly constructed non-empty set — set.rs's
-    #                          own invariant, restated here, not re-checked)
-    #   state:         [int]   replica i's `ReplicaState`, in the exact order
-    #                          replica.rs's own lifecycle diagram lists them:
-    #                          0=Absent, 1=Seeding, 2=InSync, 3=Lagging,
-    #                          4=Failed
-    #   pendingWrites: [int]   replica i's `ReplicaLag::pending_writes`
-    #   applyLagMs:    [int]   replica i's `ReplicaLag::apply_lag_ms`
-    #   lastReportMs:  [int]   replica i's `last_report_ms`, sentinel-encoded
-    #                          (see below) since fct has no option type
+    # REWRITE NOTE (struct milestone): a replica's six facts (node id,
+    # role, lifecycle state, pending-write count, apply lag, last-report
+    # clock reading) used to be threaded as six parallel arrays, aligned
+    # by hand-maintained index — this file's own keyspace port already
+    # replaced the identical shape for a rule table with a `RoutingRule`
+    # struct, above, and a replica record is exactly the same kind of
+    # "several named facts about one entity". It is now a real
+    # `ReplicaEntry` struct, and a replica set is one `[ReplicaEntry]`
+    # array:
+    #   node:          text  the replica's node id
+    #   isPrimary:     bool  the replica's role (exactly one true in a
+    #                        validly constructed non-empty set — set.rs's
+    #                        own invariant, restated here, not re-checked)
+    #   state:         int   the replica's `ReplicaState`, in the exact
+    #                        order replica.rs's own lifecycle diagram
+    #                        lists them: 0=Absent, 1=Seeding, 2=InSync,
+    #                        3=Lagging, 4=Failed
+    #   pendingWrites: int   the replica's `ReplicaLag::pending_writes`
+    #   applyLagMs:    int   the replica's `ReplicaLag::apply_lag_ms`
+    #   lastReportMs:  int   the replica's `last_report_ms`,
+    #                        sentinel-encoded (see below) since fct has
+    #                        no option type
     #
-    # `ReplicaLag`'s two fields are threaded as two parallel `[int]` arrays
-    # rather than one packed int (contrast keyspace.rs's `RoutingKey`, packed
+    # `ReplicaLag`'s two fields stay two separate struct fields rather
+    # than one packed int (contrast keyspace.rs's `RoutingKey`, packed
     # into one scalar because nothing there ever compared its two fields
-    # SEPARATELY): `ineligibility` branches on `pending_writes` and
-    # `apply_lag_ms` against two INDEPENDENT budgets, so packing them would
-    # force unpacking right back out for every comparison this file makes.
+    # SEPARATELY): `ineligibility` branches on `pendingWrites` and
+    # `applyLagMs` against two INDEPENDENT budgets, so packing them would
+    # force unpacking right back out for every comparison this file
+    # makes — a struct's whole point is that `entry.pendingWrites` and
+    # `entry.applyLagMs` can each be read on their own without unpacking
+    # anything.
     #
-    # `last_report_ms: Option<u64>` is encoded as a plain `int` with `-1`
-    # meaning "never reported" — a sentinel, not a `has*` flag pair like
-    # keyspace.rs's `hasKind`/`hasAddress` — because every real timestamp
-    # `Replica::silence_ms`/`FailoverAssessment::evaluate` ever compares it
-    # against is a non-negative millisecond clock reading (this crate's own
-    # `ReplicaReport::timestamp_ms: u64`), so `-1` can never collide with a
-    # genuine value, exactly the same reasoning `ruleIndexForKind`'s `-1` "no
-    # match" already relies on a few hundred lines up in this same file.
+    # `last_report_ms: Option<u64>` is encoded as a plain `int` field with
+    # `-1` meaning "never reported" — a sentinel, not a `has*` flag pair
+    # like keyspace.rs's `hasKind`/`hasAddress` — because every real
+    # timestamp `Replica::silence_ms`/`FailoverAssessment::evaluate` ever
+    # compares it against is a non-negative millisecond clock reading
+    # (this crate's own `ReplicaReport::timestamp_ms: u64`), so `-1` can
+    # never collide with a genuine value, exactly the same reasoning
+    # `ruleIndexForKind`'s `-1` "no match" already relies on a few hundred
+    # lines up in this same file.
+    #
+    # The four `FailoverPolicy` knobs every gatekeeper below reads
+    # (`primary_silence_ms`/`max_candidate_silence_ms`/
+    # `max_promotion_pending_writes`/`max_promotion_apply_lag_ms`) are a
+    # real Rust struct too (`failover.rs`'s own `FailoverPolicy`), so they
+    # get the identical treatment: one `FailoverPolicy` struct instead of
+    # four scalar parameters threaded through every proc in this section.
+    struct ReplicaEntry:
+        node: text
+        isPrimary: bool
+        state: int
+        pendingWrites: int
+        applyLagMs: int
+        lastReportMs: int
+
+    struct FailoverPolicy:
+        primarySilenceBudgetMs: int
+        maxCandidateSilenceMs: int
+        maxPromotionPendingWrites: int
+        maxPromotionApplyLagMs: int
     #
     # ============================================================
     # SATURATING SUBTRACTION — `Replica::silence_ms`'s `now_ms.saturating_sub(last)`
@@ -442,17 +484,17 @@ app FabricSelfHost:
     #   1 = NotInSync         2 = NeverReported        3 = HealthTooStale
     #   4 = WouldLoseWrites   5 = TooFarBehind
     # ============================================================
-    proc failoverIneligibility(state: int, lastReportMs: int, nowMs: int, pendingWrites: int, applyLagMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> int:
-        if state != 2:
+    proc failoverIneligibility(entry: ReplicaEntry, nowMs: int, policy: FailoverPolicy) -> int:
+        if entry.state != 2:
             return 1
-        if lastReportMs == -1:
+        if entry.lastReportMs == -1:
             return 2
-        let silenceMs = do failoverSaturatingSub(nowMs, lastReportMs)
-        if silenceMs > maxCandidateSilenceMs:
+        let silenceMs = do failoverSaturatingSub(nowMs, entry.lastReportMs)
+        if silenceMs > policy.maxCandidateSilenceMs:
             return 3
-        if pendingWrites > maxPromotionPendingWrites:
+        if entry.pendingWrites > policy.maxPromotionPendingWrites:
             return 4
-        if applyLagMs > maxPromotionApplyLagMs:
+        if entry.applyLagMs > policy.maxPromotionApplyLagMs:
             return 5
         return 0
 
@@ -463,13 +505,13 @@ app FabricSelfHost:
     # latch never actually matters, but the loop is written to make the same
     # promise keyspace.rs's rule lookups already do rather than trust the
     # invariant silently.
-    proc failoverPrimaryIndex(isPrimary: [bool]) -> int:
-        let n = len(isPrimary)
+    proc failoverPrimaryIndex(entries: [ReplicaEntry]) -> int:
+        let n = len(entries)
         let mut i = 0
         let mut found = -1
         loop i < n:
             if found == -1:
-                if isPrimary[i]:
+                if entries[i].isPrimary:
                     found = i
             i = i + 1
         return found
@@ -477,21 +519,22 @@ app FabricSelfHost:
     # failoverPrimaryNeedsReplacement: restates the `match primary { None =>
     # true, Some(replica) => ... }` exactly — no primary at all, a primary
     # whose own state is not `InSync`, or (only when it HAS reported at least
-    # once) a primary silent past `primarySilenceBudgetMs`.
-    proc failoverPrimaryNeedsReplacement(isPrimary: [bool], state: [int], lastReportMs: [int], nowMs: int, primarySilenceBudgetMs: int) -> bool:
-        let primaryIdx = do failoverPrimaryIndex(isPrimary)
+    # once) a primary silent past `policy.primarySilenceBudgetMs`.
+    proc failoverPrimaryNeedsReplacement(entries: [ReplicaEntry], nowMs: int, policy: FailoverPolicy) -> bool:
+        let primaryIdx = do failoverPrimaryIndex(entries)
         if primaryIdx == -1:
             return true
-        if state[primaryIdx] != 2:
+        let primary = entries[primaryIdx]
+        if primary.state != 2:
             return true
-        if lastReportMs[primaryIdx] != -1:
-            let silenceMs = do failoverSaturatingSub(nowMs, lastReportMs[primaryIdx])
-            if silenceMs > primarySilenceBudgetMs:
+        if primary.lastReportMs != -1:
+            let silenceMs = do failoverSaturatingSub(nowMs, primary.lastReportMs)
+            if silenceMs > policy.primarySilenceBudgetMs:
                 return true
         return false
 
-    proc failoverSetIsEmpty(nodes: [text]) -> bool:
-        return len(nodes) == 0
+    proc failoverSetIsEmpty(entries: [ReplicaEntry]) -> bool:
+        return len(entries) == 0
 
     # failoverBestCandidateIndex: `Rust`'s `candidates.sort_by(...)` followed
     # by `.find(is_eligible)`, restated as ONE linear scan rather than a sort
@@ -518,30 +561,30 @@ app FabricSelfHost:
     # directory's own `expr.fct`, STAGE 0 header) — a real, confirmed
     # language gap this port works around by leaning on an invariant the
     # SOURCE crate already upholds, rather than one this port invents.
-    proc failoverBestCandidateIndex(isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> int:
-        let n = len(isPrimary)
+    proc failoverBestCandidateIndex(entries: [ReplicaEntry], nowMs: int, policy: FailoverPolicy) -> int:
+        let n = len(entries)
         let mut i = 0
         let mut bestIdx = -1
         let mut bestPending = -1
         let mut bestLag = -1
         loop i < n:
-            if !isPrimary[i]:
-                let ineligible = do failoverIneligibility(state[i], lastReportMs[i], nowMs, pendingWrites[i], applyLagMs[i], maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+            if !entries[i].isPrimary:
+                let ineligible = do failoverIneligibility(entries[i], nowMs, policy)
                 if ineligible == 0:
                     if bestIdx == -1:
                         bestIdx = i
-                        bestPending = pendingWrites[i]
-                        bestLag = applyLagMs[i]
+                        bestPending = entries[i].pendingWrites
+                        bestLag = entries[i].applyLagMs
                     else:
-                        if pendingWrites[i] < bestPending:
+                        if entries[i].pendingWrites < bestPending:
                             bestIdx = i
-                            bestPending = pendingWrites[i]
-                            bestLag = applyLagMs[i]
+                            bestPending = entries[i].pendingWrites
+                            bestLag = entries[i].applyLagMs
                         else:
-                            if pendingWrites[i] == bestPending && applyLagMs[i] < bestLag:
+                            if entries[i].pendingWrites == bestPending && entries[i].applyLagMs < bestLag:
                                 bestIdx = i
-                                bestPending = pendingWrites[i]
-                                bestLag = applyLagMs[i]
+                                bestPending = entries[i].pendingWrites
+                                bestLag = entries[i].applyLagMs
             i = i + 1
         return bestIdx
 
@@ -550,13 +593,13 @@ app FabricSelfHost:
     # secondary that failed the POLICY (`EveryCandidateIneligible`) is a
     # different, more fixable situation than no in-sync secondary EXISTING
     # at all (`NoInSyncSecondary`).
-    proc failoverAnyInSyncSecondary(isPrimary: [bool], state: [int]) -> bool:
-        let n = len(isPrimary)
+    proc failoverAnyInSyncSecondary(entries: [ReplicaEntry]) -> bool:
+        let n = len(entries)
         let mut i = 0
         let mut found = false
         loop i < n:
-            if !isPrimary[i]:
-                if state[i] == 2:
+            if !entries[i].isPrimary:
+                if entries[i].state == 2:
                     found = true
             i = i + 1
         return found
@@ -574,16 +617,16 @@ app FabricSelfHost:
     # not assumed): -1=none, 0=PrimaryStillServing, 1=SetIsEmpty,
     # 2=NoInSyncSecondary, 3=EveryCandidateIneligible.
     # ============================================================
-    proc failoverBlockerCode(nodes: [text], isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, primarySilenceBudgetMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> int:
-        let needsReplacement = do failoverPrimaryNeedsReplacement(isPrimary, state, lastReportMs, nowMs, primarySilenceBudgetMs)
+    proc failoverBlockerCode(entries: [ReplicaEntry], nowMs: int, policy: FailoverPolicy) -> int:
+        let needsReplacement = do failoverPrimaryNeedsReplacement(entries, nowMs, policy)
         if !needsReplacement:
             return 0
-        let empty = do failoverSetIsEmpty(nodes)
+        let empty = do failoverSetIsEmpty(entries)
         if empty:
             return 1
-        let bestIdx = do failoverBestCandidateIndex(isPrimary, state, pendingWrites, applyLagMs, lastReportMs, nowMs, maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+        let bestIdx = do failoverBestCandidateIndex(entries, nowMs, policy)
         if bestIdx == -1:
-            let anyInSync = do failoverAnyInSyncSecondary(isPrimary, state)
+            let anyInSync = do failoverAnyInSyncSecondary(entries)
             if anyInSync:
                 return 3
             return 2
@@ -594,25 +637,25 @@ app FabricSelfHost:
     # otherwise the best ELIGIBLE candidate if one exists. `failoverPromotionNode`
     # is only meaningful once `failoverHasPromotion` has already returned
     # true for the identical arguments (the `keyspaceResolveKey` contract,
-    # restated): calling it when no candidate is eligible reads `nodes[-1]`,
+    # restated): calling it when no candidate is eligible reads `entries[-1]`,
     # a clean out-of-bounds error rather than a silently wrong node name.
-    proc failoverHasPromotion(isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, primarySilenceBudgetMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> bool:
-        let needsReplacement = do failoverPrimaryNeedsReplacement(isPrimary, state, lastReportMs, nowMs, primarySilenceBudgetMs)
+    proc failoverHasPromotion(entries: [ReplicaEntry], nowMs: int, policy: FailoverPolicy) -> bool:
+        let needsReplacement = do failoverPrimaryNeedsReplacement(entries, nowMs, policy)
         if !needsReplacement:
             return false
-        let bestIdx = do failoverBestCandidateIndex(isPrimary, state, pendingWrites, applyLagMs, lastReportMs, nowMs, maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+        let bestIdx = do failoverBestCandidateIndex(entries, nowMs, policy)
         return bestIdx != -1
 
-    proc failoverPromotionNode(nodes: [text], isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> text:
-        let bestIdx = do failoverBestCandidateIndex(isPrimary, state, pendingWrites, applyLagMs, lastReportMs, nowMs, maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
-        return nodes[bestIdx]
+    proc failoverPromotionNode(entries: [ReplicaEntry], nowMs: int, policy: FailoverPolicy) -> text:
+        let bestIdx = do failoverBestCandidateIndex(entries, nowMs, policy)
+        return entries[bestIdx].node
 
     # failoverIsStuck: restates `is_stuck()` — the write path has no primary
     # AND no safe promotion, the single most urgent fact a controller reading
     # this assessment can be told.
-    proc failoverIsStuck(isPrimary: [bool], state: [int], pendingWrites: [int], applyLagMs: [int], lastReportMs: [int], nowMs: int, primarySilenceBudgetMs: int, maxCandidateSilenceMs: int, maxPromotionPendingWrites: int, maxPromotionApplyLagMs: int) -> bool:
-        let needsReplacement = do failoverPrimaryNeedsReplacement(isPrimary, state, lastReportMs, nowMs, primarySilenceBudgetMs)
-        let hasPromo = do failoverHasPromotion(isPrimary, state, pendingWrites, applyLagMs, lastReportMs, nowMs, primarySilenceBudgetMs, maxCandidateSilenceMs, maxPromotionPendingWrites, maxPromotionApplyLagMs)
+    proc failoverIsStuck(entries: [ReplicaEntry], nowMs: int, policy: FailoverPolicy) -> bool:
+        let needsReplacement = do failoverPrimaryNeedsReplacement(entries, nowMs, policy)
+        let hasPromo = do failoverHasPromotion(entries, nowMs, policy)
         return needsReplacement && !hasPromo
 
     # ============================================================
@@ -656,129 +699,82 @@ app FabricSelfHost:
     #      db-b's own last report (also t=1 000) is equally stale -> its
     #      ineligibility is HealthTooStale, not WouldLoseWrites — "promoting
     #      on stale health is refused rather than guessed at".
-    proc demoFailoverNodesD1D2D3() -> [text]:
-        return ["db-a", "db-b"]
+    proc demoDefaultPolicy() -> FailoverPolicy:
+        return FailoverPolicy{primarySilenceBudgetMs: 30000, maxCandidateSilenceMs: 30000, maxPromotionPendingWrites: 0, maxPromotionApplyLagMs: 0}
 
-    proc demoFailoverIsPrimaryD1D2D3() -> [bool]:
-        return [true, false]
+    proc demoLenientPolicy() -> FailoverPolicy:
+        return FailoverPolicy{primarySilenceBudgetMs: 30000, maxCandidateSilenceMs: 30000, maxPromotionPendingWrites: 100, maxPromotionApplyLagMs: 1000}
 
-    proc demoFailoverStateD1() -> [int]:
-        return [2, 2]
+    proc demoEntriesD1() -> [ReplicaEntry]:
+        return [ReplicaEntry{node: "db-a", isPrimary: true, state: 2, pendingWrites: 0, applyLagMs: 0, lastReportMs: -1}, ReplicaEntry{node: "db-b", isPrimary: false, state: 2, pendingWrites: 0, applyLagMs: 0, lastReportMs: 1000}]
 
-    proc demoFailoverStateD2D3() -> [int]:
-        return [4, 2]
+    proc demoEntriesD2() -> [ReplicaEntry]:
+        return [ReplicaEntry{node: "db-a", isPrimary: true, state: 4, pendingWrites: 0, applyLagMs: 0, lastReportMs: -1}, ReplicaEntry{node: "db-b", isPrimary: false, state: 2, pendingWrites: 0, applyLagMs: 0, lastReportMs: 1000}]
 
-    proc demoFailoverPendingD1D2() -> [int]:
-        return [0, 0]
+    proc demoEntriesD3() -> [ReplicaEntry]:
+        return [ReplicaEntry{node: "db-a", isPrimary: true, state: 4, pendingWrites: 0, applyLagMs: 0, lastReportMs: -1}, ReplicaEntry{node: "db-b", isPrimary: false, state: 2, pendingWrites: 12, applyLagMs: 400, lastReportMs: 2000}]
 
-    proc demoFailoverLagD1D2() -> [int]:
-        return [0, 0]
-
-    proc demoFailoverLastReportD1D2() -> [int]:
-        return [-1, 1000]
-
-    proc demoFailoverPendingD3() -> [int]:
-        return [0, 12]
-
-    proc demoFailoverLagD3() -> [int]:
-        return [0, 400]
-
-    proc demoFailoverLastReportD3() -> [int]:
-        return [-1, 2000]
-
-    proc demoFailoverStateD4() -> [int]:
-        return [2, 2]
-
-    proc demoFailoverLastReportD4() -> [int]:
-        return [1000, 1000]
+    proc demoEntriesD4() -> [ReplicaEntry]:
+        return [ReplicaEntry{node: "db-a", isPrimary: true, state: 2, pendingWrites: 0, applyLagMs: 0, lastReportMs: 1000}, ReplicaEntry{node: "db-b", isPrimary: false, state: 2, pendingWrites: 0, applyLagMs: 0, lastReportMs: 1000}]
 
     proc demoD1Blocker() -> int:
-        let nodes = do demoFailoverNodesD1D2D3()
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD1()
-        let pending = do demoFailoverPendingD1D2()
-        let lag = do demoFailoverLagD1D2()
-        let lastReport = do demoFailoverLastReportD1D2()
-        let blocker = do failoverBlockerCode(nodes, isPrimary, state, pending, lag, lastReport, 1000, 30000, 30000, 0, 0)
+        let entries = do demoEntriesD1()
+        let policy = do demoDefaultPolicy()
+        let blocker = do failoverBlockerCode(entries, 1000, policy)
         return blocker
 
     proc demoD1HasPromotion() -> bool:
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD1()
-        let pending = do demoFailoverPendingD1D2()
-        let lag = do demoFailoverLagD1D2()
-        let lastReport = do demoFailoverLastReportD1D2()
-        let has = do failoverHasPromotion(isPrimary, state, pending, lag, lastReport, 1000, 30000, 30000, 0, 0)
+        let entries = do demoEntriesD1()
+        let policy = do demoDefaultPolicy()
+        let has = do failoverHasPromotion(entries, 1000, policy)
         return has
 
     proc demoD2HasPromotion() -> bool:
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD2D3()
-        let pending = do demoFailoverPendingD1D2()
-        let lag = do demoFailoverLagD1D2()
-        let lastReport = do demoFailoverLastReportD1D2()
-        let has = do failoverHasPromotion(isPrimary, state, pending, lag, lastReport, 1000, 30000, 30000, 0, 0)
+        let entries = do demoEntriesD2()
+        let policy = do demoDefaultPolicy()
+        let has = do failoverHasPromotion(entries, 1000, policy)
         return has
 
     proc demoD2PromotionNode() -> text:
-        let nodes = do demoFailoverNodesD1D2D3()
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD2D3()
-        let pending = do demoFailoverPendingD1D2()
-        let lag = do demoFailoverLagD1D2()
-        let lastReport = do demoFailoverLastReportD1D2()
-        let node = do failoverPromotionNode(nodes, isPrimary, state, pending, lag, lastReport, 1000, 30000, 0, 0)
+        let entries = do demoEntriesD2()
+        let policy = do demoDefaultPolicy()
+        let node = do failoverPromotionNode(entries, 1000, policy)
         return node
 
     proc demoD3StrictBlocker() -> int:
-        let nodes = do demoFailoverNodesD1D2D3()
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD2D3()
-        let pending = do demoFailoverPendingD3()
-        let lag = do demoFailoverLagD3()
-        let lastReport = do demoFailoverLastReportD3()
-        let blocker = do failoverBlockerCode(nodes, isPrimary, state, pending, lag, lastReport, 2000, 30000, 30000, 0, 0)
+        let entries = do demoEntriesD3()
+        let policy = do demoDefaultPolicy()
+        let blocker = do failoverBlockerCode(entries, 2000, policy)
         return blocker
 
     proc demoD3StrictIsStuck() -> bool:
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD2D3()
-        let pending = do demoFailoverPendingD3()
-        let lag = do demoFailoverLagD3()
-        let lastReport = do demoFailoverLastReportD3()
-        let stuck = do failoverIsStuck(isPrimary, state, pending, lag, lastReport, 2000, 30000, 30000, 0, 0)
+        let entries = do demoEntriesD3()
+        let policy = do demoDefaultPolicy()
+        let stuck = do failoverIsStuck(entries, 2000, policy)
         return stuck
 
     proc demoD3LenientHasPromotion() -> bool:
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD2D3()
-        let pending = do demoFailoverPendingD3()
-        let lag = do demoFailoverLagD3()
-        let lastReport = do demoFailoverLastReportD3()
-        let has = do failoverHasPromotion(isPrimary, state, pending, lag, lastReport, 2000, 30000, 30000, 100, 1000)
+        let entries = do demoEntriesD3()
+        let policy = do demoLenientPolicy()
+        let has = do failoverHasPromotion(entries, 2000, policy)
         return has
 
     proc demoD3LenientPromotionNode() -> text:
-        let nodes = do demoFailoverNodesD1D2D3()
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD2D3()
-        let pending = do demoFailoverPendingD3()
-        let lag = do demoFailoverLagD3()
-        let lastReport = do demoFailoverLastReportD3()
-        let node = do failoverPromotionNode(nodes, isPrimary, state, pending, lag, lastReport, 2000, 30000, 100, 1000)
+        let entries = do demoEntriesD3()
+        let policy = do demoLenientPolicy()
+        let node = do failoverPromotionNode(entries, 2000, policy)
         return node
 
     proc demoD4NeedsReplacement() -> bool:
-        let isPrimary = do demoFailoverIsPrimaryD1D2D3()
-        let state = do demoFailoverStateD4()
-        let lastReport = do demoFailoverLastReportD4()
-        let needs = do failoverPrimaryNeedsReplacement(isPrimary, state, lastReport, 31001, 30000)
+        let entries = do demoEntriesD4()
+        let policy = do demoDefaultPolicy()
+        let needs = do failoverPrimaryNeedsReplacement(entries, 31001, policy)
         return needs
 
     proc demoD4CandidateIneligibility() -> int:
-        let state = do demoFailoverStateD4()
-        let lastReport = do demoFailoverLastReportD4()
-        let ineligible = do failoverIneligibility(state[1], lastReport[1], 31001, 0, 0, 30000, 0, 0)
+        let entries = do demoEntriesD4()
+        let policy = do demoDefaultPolicy()
+        let ineligible = do failoverIneligibility(entries[1], 31001, policy)
         return ineligible
 
     # ============================================================
@@ -801,32 +797,22 @@ app FabricSelfHost:
     # `key(n)` throughout mirrors keyspace.rs's own test helper exactly:
     # `RoutingKey::new(n, Coordinate::new(0, 0))`, packed per this file's
     # header as `n * 156 + 0`.
-    proc demoRuleKindsAB() -> [text]:
-        return ["Post", "__session"]
-
-    proc demoRulePrefixesAB() -> [text]:
-        return ["Post:", "__session:"]
-
-    proc demoRuleKeysAB() -> [int]:
-        return [156, 312]
+    proc demoRulesAB() -> [RoutingRule]:
+        return [RoutingRule{kind: "Post", prefix: "Post:", key: 156}, RoutingRule{kind: "__session", prefix: "__session:", key: 312}]
 
     # Scenario A1: resolve(Some("Post"), Some("Post:17")) -> Ok, key(1)=156.
-    # Traced: kindIdx=0 (ruleKinds[0]=="Post"); addrIdx: "Post:" (len 5) is a
+    # Traced: kindIdx=0 (rules[0].kind=="Post"); addrIdx: "Post:" (len 5) is a
     # prefix of "Post:17" (len 7, leading 5 = "Post:") -> bestIdx=0; "__session:"
-    # (len 10) is not (10 > 7) -> addrIdx stays 0. ruleKeys[0]==ruleKeys[0], so
+    # (len 10) is not (10 > 7) -> addrIdx stays 0. rules[0].key==rules[0].key, so
     # status=0 (Ok), key=156.
     proc demoScenarioA1Status() -> int:
-        let ruleKinds = do demoRuleKindsAB()
-        let rulePrefixes = do demoRulePrefixesAB()
-        let ruleKeys = do demoRuleKeysAB()
-        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, false, true, "Post", true, "Post:17")
+        let rules = do demoRulesAB()
+        let status = do keyspaceResolveStatus(rules, false, true, "Post", true, "Post:17")
         return status
 
     proc demoScenarioA1Key() -> int:
-        let ruleKinds = do demoRuleKindsAB()
-        let rulePrefixes = do demoRulePrefixesAB()
-        let ruleKeys = do demoRuleKeysAB()
-        let key = do keyspaceResolveKey(ruleKinds, rulePrefixes, ruleKeys, -1, true, "Post", true, "Post:17")
+        let rules = do demoRulesAB()
+        let key = do keyspaceResolveKey(rules, -1, true, "Post", true, "Post:17")
         return key
 
     # Scenario A2: resolve(Some("Post"), Some("__session:abc")) -> Inconsistent.
@@ -835,38 +821,26 @@ app FabricSelfHost:
     # a prefix (leading 10 = "__session:") -> addrIdx=1 (key 312). 156 != 312
     # -> status=2 (Inconsistent).
     proc demoScenarioA2Status() -> int:
-        let ruleKinds = do demoRuleKindsAB()
-        let rulePrefixes = do demoRulePrefixesAB()
-        let ruleKeys = do demoRuleKeysAB()
-        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, false, true, "Post", true, "__session:abc")
+        let rules = do demoRulesAB()
+        let status = do keyspaceResolveStatus(rules, false, true, "Post", true, "__session:abc")
         return status
 
-    proc demoRuleKindsB() -> [text]:
-        return ["A", "B"]
-
-    proc demoRulePrefixesB() -> [text]:
-        return ["__", "__fabric_placement:"]
-
-    proc demoRuleKeysB() -> [int]:
-        return [156, 312]
+    proc demoRulesB() -> [RoutingRule]:
+        return [RoutingRule{kind: "A", prefix: "__", key: 156}, RoutingRule{kind: "B", prefix: "__fabric_placement:", key: 312}]
 
     # Scenario B1: resolve(None, Some("__fabric_placement:1:0:0")) -> Ok, key2=312.
     # Traced: no kind. addrIdx: "__" (len2) matches (leading2="__") ->
     # bestIdx=0,bestLen=2; "__fabric_placement:" (len19) matches (leading19
     # equals it exactly) and 19 >= 2 -> bestIdx=1,bestLen=19. Final addrIdx=1,
-    # key=ruleKeys[1]=312.
+    # key=rules[1].key=312.
     proc demoScenarioB1Status() -> int:
-        let rulePrefixes = do demoRulePrefixesB()
-        let ruleKeys = do demoRuleKeysB()
-        let ruleKinds = do demoRuleKindsB()
-        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, false, false, "", true, "__fabric_placement:1:0:0")
+        let rules = do demoRulesB()
+        let status = do keyspaceResolveStatus(rules, false, false, "", true, "__fabric_placement:1:0:0")
         return status
 
     proc demoScenarioB1Key() -> int:
-        let rulePrefixes = do demoRulePrefixesB()
-        let ruleKeys = do demoRuleKeysB()
-        let ruleKinds = do demoRuleKindsB()
-        let key = do keyspaceResolveKey(ruleKinds, rulePrefixes, ruleKeys, -1, false, "", true, "__fabric_placement:1:0:0")
+        let rules = do demoRulesB()
+        let key = do keyspaceResolveKey(rules, -1, false, "", true, "__fabric_placement:1:0:0")
         return key
 
     # Scenario B2: resolve(None, Some("__session:x")) -> Ok, key1=156.
@@ -874,52 +848,44 @@ app FabricSelfHost:
     # bestIdx=0,bestLen=2. "__fabric_placement:" (len19) does NOT match
     # (19 > len("__session:x")=11) -> addrIdx stays 0, key=156.
     proc demoScenarioB2Key() -> int:
-        let rulePrefixes = do demoRulePrefixesB()
-        let ruleKeys = do demoRuleKeysB()
-        let ruleKinds = do demoRuleKindsB()
-        let key = do keyspaceResolveKey(ruleKinds, rulePrefixes, ruleKeys, -1, false, "", true, "__session:x")
+        let rules = do demoRulesB()
+        let key = do keyspaceResolveKey(rules, -1, false, "", true, "__session:x")
         return key
 
     # Scenario C1: keyspace() + with_fallback(key(9)=1404); resolve(Some("Unknown"), None) -> Ok, key(9).
     # Traced: kindIdx: "Unknown" not in ["Post","__session"] -> -1. No address
     # -> addrIdx=-1. hasFallback=true -> status=0; key=fallbackKey=1404.
     proc demoScenarioC1Status() -> int:
-        let ruleKinds = do demoRuleKindsAB()
-        let rulePrefixes = do demoRulePrefixesAB()
-        let ruleKeys = do demoRuleKeysAB()
-        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, true, true, "Unknown", false, "")
+        let rules = do demoRulesAB()
+        let status = do keyspaceResolveStatus(rules, true, true, "Unknown", false, "")
         return status
 
     proc demoScenarioC1Key() -> int:
-        let ruleKinds = do demoRuleKindsAB()
-        let rulePrefixes = do demoRulePrefixesAB()
-        let ruleKeys = do demoRuleKeysAB()
-        let key = do keyspaceResolveKey(ruleKinds, rulePrefixes, ruleKeys, 1404, true, "Unknown", false, "")
+        let rules = do demoRulesAB()
+        let key = do keyspaceResolveKey(rules, 1404, true, "Unknown", false, "")
         return key
 
     # Scenario C1b: the SAME keyspace() with no fallback declared at all ->
     # resolve(Some("Unknown"), None) is Unmapped (status=1), matching
     # keyspace.rs's own `an_unmapped_request_is_refused_rather_than_guessed`.
     proc demoScenarioC1bStatus() -> int:
-        let ruleKinds = do demoRuleKindsAB()
-        let rulePrefixes = do demoRulePrefixesAB()
-        let ruleKeys = do demoRuleKeysAB()
-        let status = do keyspaceResolveStatus(ruleKinds, rulePrefixes, ruleKeys, false, true, "Unknown", false, "")
+        let rules = do demoRulesAB()
+        let status = do keyspaceResolveStatus(rules, false, true, "Unknown", false, "")
         return status
 
     # Scenario C2: keyspace() (rule keys [156,312]) + with_fallback(1404) is
     # NOT spanning (156 != 1404). Keyspace::single(key(1)=156) — an empty
     # rule table — IS spanning, and equals 156.
-    proc demoEmptyRuleKeys() -> [int]:
+    proc demoEmptyRules() -> [RoutingRule]:
         return []
 
     proc demoScenarioC2NotSpanning() -> bool:
-        let ruleKeys = do demoRuleKeysAB()
-        let present = do spanningKeyPresent(ruleKeys, true, 1404)
+        let rules = do demoRulesAB()
+        let present = do spanningKeyPresent(rules, true, 1404)
         return present
 
     proc demoScenarioC2SingleSpanning() -> bool:
-        let empty = do demoEmptyRuleKeys()
+        let empty = do demoEmptyRules()
         let present = do spanningKeyPresent(empty, true, 156)
         return present
 
@@ -932,33 +898,28 @@ app FabricSelfHost:
     # has prefix "Post:" is DuplicateAddressPrefix (4); adding ("Comment",
     # "Comment:") to that same table is fine (0).
     proc demoValidationEmptyKind() -> int:
-        let kinds = do demoRuleKindsAB()
-        let prefixes = do demoRulePrefixesAB()
-        let status = do keyspaceAddRuleStatus(kinds, prefixes, "", "Post:")
+        let rules = do demoRulesAB()
+        let status = do keyspaceAddRuleStatus(rules, "", "Post:")
         return status
 
     proc demoValidationEmptyPrefix() -> int:
-        let kinds = do demoRuleKindsAB()
-        let prefixes = do demoRulePrefixesAB()
-        let status = do keyspaceAddRuleStatus(kinds, prefixes, "Post", "")
+        let rules = do demoRulesAB()
+        let status = do keyspaceAddRuleStatus(rules, "Post", "")
         return status
 
     proc demoValidationDuplicateKind() -> int:
-        let kinds = do demoRuleKindsAB()
-        let prefixes = do demoRulePrefixesAB()
-        let status = do keyspaceAddRuleStatus(kinds, prefixes, "Post", "Other:")
+        let rules = do demoRulesAB()
+        let status = do keyspaceAddRuleStatus(rules, "Post", "Other:")
         return status
 
     proc demoValidationDuplicatePrefix() -> int:
-        let kinds = do demoRuleKindsAB()
-        let prefixes = do demoRulePrefixesAB()
-        let status = do keyspaceAddRuleStatus(kinds, prefixes, "Other", "Post:")
+        let rules = do demoRulesAB()
+        let status = do keyspaceAddRuleStatus(rules, "Other", "Post:")
         return status
 
     proc demoValidationOk() -> int:
-        let kinds = do demoRuleKindsAB()
-        let prefixes = do demoRulePrefixesAB()
-        let status = do keyspaceAddRuleStatus(kinds, prefixes, "Comment", "Comment:")
+        let rules = do demoRulesAB()
+        let status = do keyspaceAddRuleStatus(rules, "Comment", "Comment:")
         return status
 
     state demoD1Blocker: int = 0

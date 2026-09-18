@@ -46,7 +46,15 @@ type App struct {
 	// header. The compiler resolves them relative to the importing file. For plain
 	// apps each module's declarations are merged into this graph; for a layered
 	// stack the imports pull every brick into the pool the playground composes.
-	Imports    []string
+	Imports []string
+	// CSSFiles are the paths of `css from "..."` directives declared in the body,
+	// in source order. Unlike Imports these are never `.fct` modules and never
+	// fetched remotely — each names a sibling stylesheet on disk. The compiler
+	// (internal/compile) resolves each path relative to this file's directory,
+	// reads it verbatim, and folds its content into CSS exactly like an inline
+	// `css:` block, so a `.fct` file can keep its structure/logic separate from
+	// its styling while every downstream pass still sees one stylesheet string.
+	CSSFiles   []CSSFile
 	Auth       bool // a bare `auth` line turns on built-in users/login/logout/signup
 	Entities   []*Entity
 	Records    []*Record
@@ -115,6 +123,15 @@ type Mount struct {
 	Path      string // "" defaults to "/"
 	Requires  string // zero-arg guard policy; "" = open
 	Line      int
+}
+
+// CSSFile is one `css from "path.css"` directive: a reference to a sibling
+// stylesheet on disk, in the source's own author-facing spelling (`import`'s
+// path convention, applied to CSS). Line is kept for diagnostics when the
+// referenced file can't be found or read.
+type CSSFile struct {
+	Path string
+	Line int
 }
 
 // Record is a named value-object type: `record Verdict: score: int, reasons: [text]`.

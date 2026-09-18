@@ -1,0 +1,857 @@
+app ParserProcSelfHost:
+    # ============================================================
+    # STAGE 1: generic text-surgery primitives this file needs that
+    # source.fct/expr.fct didn't (both scanned forward only; this file's
+    # `check` message boundary needs a BACKWARD scan; parseProc's header
+    # needs prefix/suffix stripping and substring search by TEXT, not just
+    # by a single already-known character).
+    # ============================================================
+
+    # hasPrefixText/hasSuffixText: Go's strings.HasPrefix/HasSuffix, built
+    # on the real (non-prefix-only) `slice` builtin rather than `take`
+    # (which only ever returns a PREFIX) — slice can read from the END of a
+    # string too, which take alone never could (this is exactly gap #1's
+    # closure: source.fct's original header explains `take` could not do
+    # this).
+    proc hasPrefixText(s: text, p: text) -> bool:
+        let n = len(p)
+        if n > len(s):
+            return false
+        return slice(s, 0, n) == p
+
+    proc hasSuffixText(s: text, suf: text) -> bool:
+        let n = len(suf)
+        let ls = len(s)
+        if n > ls:
+            return false
+        return slice(s, ls - n, ls) == suf
+
+    proc trimPrefixText(s: text, p: text) -> text:
+        let has = do hasPrefixText(s, p)
+        if has:
+            return slice(s, len(p), len(s))
+        return s
+
+    proc trimSuffixText(s: text, suf: text) -> text:
+        let has = do hasSuffixText(s, suf)
+        if has:
+            return slice(s, 0, len(s) - len(suf))
+        return s
+
+    # indexOfFrom/indexOf: Go's strings.Index, restated as "does the
+    # candidate window starting at each position equal sub" — the same
+    # closed-window-comparison idiom source.fct's indentOf/hasLeadingTab
+    # already established for a single character, generalized to an
+    # arbitrary-length substring now that `slice` exists to build that
+    # window directly instead of growing it one character at a time.
+    proc indexOfFrom(s: text, sub: text, from: int) -> int:
+        let n = len(s)
+        let m = len(sub)
+        let mut i = from
+        if i < 0:
+            i = 0
+        let mut found = -1
+        loop i <= n - m && found == -1:
+            if slice(s, i, i + m) == sub:
+                found = i
+            i = i + 1
+        return found
+
+    proc indexOf(s: text, sub: text) -> int:
+        let r = do indexOfFrom(s, sub, 0)
+        return r
+
+    # lastCharIndex: the index of the LAST occurrence of a single character,
+    # scanned back to front — Go's strings.LastIndexByte, used for finding
+    # a signature's closing `)` (parseSignature's own
+    # `strings.LastIndexByte(head, ')')`).
+    proc lastCharIndex(s: text, ch: text) -> int:
+        let n = len(s)
+        let mut i = n - 1
+        let mut found = -1
+        loop i >= 0 && found == -1:
+            if charAt(s, i) == ch:
+                found = i
+            i = i - 1
+        return found
+
+    # ============================================================
+    # STAGE 2: closed-alphabet character classifiers — the same `in`-based
+    # idiom expr.fct's isDigitChar/isIdentStartChar/isIdentChar already
+    # established (verified live there), restated here rather than shared
+    # (this file has no import of expr.fct for its OWN procs — see the
+    # header's note on why the ONE place this file DOES import another
+    # file is the test-only composition proof, not this file's own real
+    # procs, to stay a fully self-contained, independently-compilable
+    # slice like source.fct and expr.fct both are).
+    # ============================================================
+    proc isDigitChar(c: text) -> bool:
+        return c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+    proc isIdentStartChar(c: text) -> bool:
+        return c in ["_", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
+    proc isIdentChar(c: text) -> bool:
+        let startOk = do isIdentStartChar(c)
+        if startOk:
+            return true
+        let digitOk = do isDigitChar(c)
+        return digitOk
+
+    proc isUpperStartChar(c: text) -> bool:
+        return c in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
+    # isIdentToken: parser.go's own isIdent — a non-empty run where the
+    # FIRST character is a letter/underscore and every later one may also
+    # be a digit. Ported exactly, including its ASCII-only scope (real
+    # parser.go's isIdent iterates runes but compares only against the
+    # ASCII letter/digit ranges, same as this closed-alphabet check).
+    proc isIdentToken(s: text) -> bool:
+        let n = len(s)
+        if n == 0:
+            return false
+        let mut ok = true
+        let mut i = 0
+        loop i < n && ok:
+            let c = charAt(s, i)
+            if i == 0:
+                let st = do isIdentStartChar(c)
+                if !st:
+                    ok = false
+            else:
+                let ic = do isIdentChar(c)
+                if !ic:
+                    ok = false
+            i = i + 1
+        return ok
+
+    # isUpperName: parser.go's own isUpper (`s[0] >= 'A' && s[0] <= 'Z'`),
+    # over a non-empty string.
+    proc isUpperName(s: text) -> bool:
+        if len(s) == 0:
+            return false
+        let c0 = charAt(s, 0)
+        let r = do isUpperStartChar(c0)
+        return r
+
+    # isTypeKeyword: parser.go's own isType — the closed set of built-in
+    # scalar type names.
+    proc isTypeKeyword(s: text) -> bool:
+        return s in ["int", "text", "bool", "money", "date", "float"]
+
+    # isTypeNameToken: parser.go's own isTypeName — a built-in scalar OR a
+    # capitalized identifier (an enum/entity name, resolved later by the
+    # IR, exactly as parser.go's own comment on isTypeName says: this
+    # checks SYNTAX only).
+    proc isTypeNameToken(s: text) -> bool:
+        let prim = do isTypeKeyword(s)
+        if prim:
+            return true
+        let ident = do isIdentToken(s)
+        if !ident:
+            return false
+        let up = do isUpperName(s)
+        return up
+
+    # isCapabilityNameToken: parser.go's own isCapabilityName — one or more
+    # dot-separated identifiers (`io.file`, `io.net`).
+    proc isCapabilityNameToken(s: text) -> bool:
+        if s == "":
+            return false
+        let parts = split(s, ".")
+        let n = len(parts)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            let idOk = do isIdentToken(parts[i])
+            if !idOk:
+                ok = false
+            i = i + 1
+        return ok
+
+    # ============================================================
+    # STAGE 3: splitType — parser.go's own splitType, pulling a trailing
+    # `?` (optional) and a `[...]` wrapper (list) off a type expression.
+    # Three separate procs (typeIsOptional/typeIsList/typeCore) since a
+    # proc has only one return value — the same "parallel derivation, not
+    # one shared pass" shape source.fct's parsedIndents/parsedTexts/
+    # parsedSkipFlags already established for exactly this reason.
+    # ============================================================
+    proc typeIsOptional(t: text) -> bool:
+        let s = trim(t)
+        let r = do hasSuffixText(s, "?")
+        return r
+
+    proc typeStripOptional(t: text) -> text:
+        let s = trim(t)
+        let opt = do typeIsOptional(t)
+        if opt:
+            let s2 = do trimSuffixText(s, "?")
+            return trim(s2)
+        return s
+
+    proc typeIsList(t: text) -> bool:
+        let s = do typeStripOptional(t)
+        let starts = do hasPrefixText(s, "[")
+        let ends = do hasSuffixText(s, "]")
+        return starts && ends
+
+    proc typeCore(t: text) -> text:
+        let s = do typeStripOptional(t)
+        let isL = do typeIsList(t)
+        if isL:
+            return trim(slice(s, 1, len(s) - 1))
+        return s
+
+    # ============================================================
+    # STAGE 4: parseProc's header, ported exactly — strip `proc`, strip the
+    # trailing `:`, pull off ` uses ...` (LAST clause), pull off `-> ...`
+    # (from what's left), then parse `Name(params)` from what's left of
+    # THAT. Every proc below takes the RAW header text (e.g. the full
+    # trimmed line "proc Name(a: int) -> int uses io.file:", exactly what
+    # source.fct's parsedTexts(src) would hand back for that line) and
+    # independently re-derives whatever it needs — the same "no shared
+    # pass, no shared struct" convention as every earlier file in this
+    # port, forced by a proc never being able to return more than one
+    # value or a heterogeneous shape.
+    # ============================================================
+
+    # procHeadOf: parser.go's own
+    # `strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(text, "proc")), ":")`
+    proc procHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "proc")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    # --- the `uses` clause: parser.go's own `strings.Index(head, " uses ")` ---
+    proc usesMarkerIndex(head: text) -> int:
+        let r = do indexOf(head, " uses ")
+        return r
+
+    proc headBeforeUses(head: text) -> text:
+        let idx = do usesMarkerIndex(head)
+        if idx < 0:
+            return head
+        return trim(slice(head, 0, idx))
+
+    proc usesPartOf(head: text) -> text:
+        let idx = do usesMarkerIndex(head)
+        if idx < 0:
+            return ""
+        return trim(slice(head, idx + 6, len(head)))
+
+    # headerUsesList: parser.go splits the uses clause with splitTop(usesPart,
+    # ',') — but a capability name can never itself contain a comma, paren,
+    # bracket, brace, or quote (isCapabilityNameToken enforces that), so a
+    # plain `split` on "," is exactly equivalent for every input this
+    # grammar position can ever actually contain — the same simplification
+    # parseSignature's own param-list split already makes for the identical
+    # reason (see headerParamPieces below).
+    proc headerUsesList(head: text) -> [text]:
+        let usesPart = do usesPartOf(head)
+        if usesPart == "":
+            return []
+        let pieces = split(usesPart, ",")
+        let n = len(pieces)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, trim(pieces[i]))
+            i = i + 1
+        return out
+
+    proc headerUsesValid(head: text) -> bool:
+        let idx = do usesMarkerIndex(head)
+        if idx < 0:
+            return true
+        let usesPart = do usesPartOf(head)
+        if usesPart == "":
+            return false
+        let caps = do headerUsesList(head)
+        let n = len(caps)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            let capOk = do isCapabilityNameToken(caps[i])
+            if !capOk:
+                ok = false
+            i = i + 1
+        return ok
+
+    # --- the return type: parser.go's own `strings.Index(head, "->")`,
+    # applied to what's left AFTER the uses clause is stripped ---
+    proc arrowIndexOf(headNoUses: text) -> int:
+        let r = do indexOf(headNoUses, "->")
+        return r
+
+    proc headBeforeArrow(headNoUses: text) -> text:
+        let idx = do arrowIndexOf(headNoUses)
+        if idx < 0:
+            return headNoUses
+        return trim(slice(headNoUses, 0, idx))
+
+    proc arrowPartOf(headNoUses: text) -> text:
+        let idx = do arrowIndexOf(headNoUses)
+        if idx < 0:
+            return ""
+        return trim(slice(headNoUses, idx + 2, len(headNoUses)))
+
+    proc headerRetSectionExists(head: text) -> bool:
+        let noUses = do headBeforeUses(head)
+        let idx = do arrowIndexOf(noUses)
+        return idx >= 0
+
+    proc headerRetTypeRaw(head: text) -> text:
+        let noUses = do headBeforeUses(head)
+        let r = do arrowPartOf(noUses)
+        return r
+
+    proc headerRetCore(head: text) -> text:
+        let rt = do headerRetTypeRaw(head)
+        let r = do typeCore(rt)
+        return r
+
+    proc headerRetIsList(head: text) -> bool:
+        let rt = do headerRetTypeRaw(head)
+        let r = do typeIsList(rt)
+        return r
+
+    proc headerRetIsOptional(head: text) -> bool:
+        let rt = do headerRetTypeRaw(head)
+        let r = do typeIsOptional(rt)
+        return r
+
+    # headerRetValid: parser.go's own `if optional || !isTypeName(core) { error }`
+    # — a proc's return type may never be optional, and its core must be a
+    # syntactically valid type name. True (vacuously) when there is no
+    # return type at all, matching parseProc leaving ret="" unvalidated.
+    proc headerRetValid(head: text) -> bool:
+        let has = do headerRetSectionExists(head)
+        if !has:
+            return true
+        let opt = do headerRetIsOptional(head)
+        if opt:
+            return false
+        let core = do headerRetCore(head)
+        let r = do isTypeNameToken(core)
+        return r
+
+    # --- Name(params): parser.go's own parseSignature, over what's left
+    # after uses AND the return type are both stripped ---
+    proc headerSigCore(head: text) -> text:
+        let noUses = do headBeforeUses(head)
+        let r = do headBeforeArrow(noUses)
+        return r
+
+    proc sigOpenParenIndex(sig: text) -> int:
+        let r = do indexOf(sig, "(")
+        return r
+
+    proc sigCloseParenIndex(sig: text) -> int:
+        let r = do lastCharIndex(sig, ")")
+        return r
+
+    proc headerName(head: text) -> text:
+        let sig = do headerSigCore(head)
+        let open = do sigOpenParenIndex(sig)
+        if open < 0:
+            return trim(sig)
+        return trim(slice(sig, 0, open))
+
+    proc headerNameValid(head: text) -> bool:
+        let name = do headerName(head)
+        let r = do isIdentToken(name)
+        return r
+
+    proc headerHasParenSection(head: text) -> bool:
+        let sig = do headerSigCore(head)
+        let open = do sigOpenParenIndex(sig)
+        return open >= 0
+
+    # headerParensValid: parser.go's own `if close < open { error missing ")" }`
+    proc headerParensValid(head: text) -> bool:
+        let sig = do headerSigCore(head)
+        let open = do sigOpenParenIndex(sig)
+        if open < 0:
+            return true
+        let close = do sigCloseParenIndex(sig)
+        return close >= open
+
+    proc headerParamsInner(head: text) -> text:
+        let sig = do headerSigCore(head)
+        let open = do sigOpenParenIndex(sig)
+        if open < 0:
+            return ""
+        let close = do sigCloseParenIndex(sig)
+        if close < open:
+            return ""
+        return trim(slice(sig, open + 1, close))
+
+    # headerParamPieces: parser.go's own `strings.Split(inner, ",")` — a
+    # PLAIN split, not the bracket-aware splitTop parseCheck/parseRequire
+    # use elsewhere, because parseSignature genuinely uses plain
+    # strings.Split for its own param list (a param's TYPE can be `[T]`,
+    # but a param list itself never nests a comma inside another
+    # delimiter — there are no default values, no nested calls, in a
+    # signature), confirmed by reading parseSignature itself, not assumed.
+    proc headerParamPieces(head: text) -> [text]:
+        let inner = do headerParamsInner(head)
+        if inner == "":
+            return []
+        return split(inner, ",")
+
+    proc paramColonIndex(p: text) -> int:
+        let r = do indexOf(p, ":")
+        return r
+
+    proc paramHasColon(p: text) -> bool:
+        let c = do paramColonIndex(p)
+        return c >= 0
+
+    proc paramNameOf(p: text) -> text:
+        let c = do paramColonIndex(p)
+        if c < 0:
+            return ""
+        return trim(slice(p, 0, c))
+
+    proc paramTypeRawOf(p: text) -> text:
+        let c = do paramColonIndex(p)
+        if c < 0:
+            return ""
+        return trim(slice(p, c + 1, len(p)))
+
+    # headerParamNames/Types/Lists/Optionals: the parallel-array encoding of
+    # "one ast.Param per piece" (see this file's header on why — no
+    # record/struct value a proc could build/return instead), each
+    # independently re-deriving headerParamPieces(head) and per-piece
+    # colon-splitting, exactly like source.fct's own parsedIndents/
+    # parsedTexts/parsedSkipFlags each re-derive split(src, "\n").
+    proc headerParamNames(head: text) -> [text]:
+        let pieces = do headerParamPieces(head)
+        let n = len(pieces)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let pn = do paramNameOf(pieces[i])
+            out = append(out, pn)
+            i = i + 1
+        return out
+
+    proc headerParamTypes(head: text) -> [text]:
+        let pieces = do headerParamPieces(head)
+        let n = len(pieces)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let pt = do paramTypeRawOf(pieces[i])
+            let core = do typeCore(pt)
+            out = append(out, core)
+            i = i + 1
+        return out
+
+    proc headerParamLists(head: text) -> [bool]:
+        let pieces = do headerParamPieces(head)
+        let n = len(pieces)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let pt = do paramTypeRawOf(pieces[i])
+            let isL = do typeIsList(pt)
+            out = append(out, isL)
+            i = i + 1
+        return out
+
+    proc headerParamOptionals(head: text) -> [bool]:
+        let pieces = do headerParamPieces(head)
+        let n = len(pieces)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let pt = do paramTypeRawOf(pieces[i])
+            let opt = do typeIsOptional(pt)
+            out = append(out, opt)
+            i = i + 1
+        return out
+
+    # headerParamsValid: parser.go's own per-param checks — a colon must be
+    # present, the name must be a valid identifier, and the core type must
+    # be a syntactically valid type name. (The `list && !allowList` check
+    # is deliberately omitted: parseProc always calls parseSignature with
+    # allowList=true, so that rejection can never fire for a proc header —
+    # unlike an action/component signature, which this file does not
+    # port.)
+    proc headerParamsValid(head: text) -> bool:
+        let hasParen = do headerHasParenSection(head)
+        if !hasParen:
+            return true
+        let parensOk = do headerParensValid(head)
+        if !parensOk:
+            return false
+        let pieces = do headerParamPieces(head)
+        let n = len(pieces)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            let p = pieces[i]
+            let hasColon = do paramHasColon(p)
+            if !hasColon:
+                ok = false
+            else:
+                let pn = do paramNameOf(p)
+                let idOk = do isIdentToken(pn)
+                if !idOk:
+                    ok = false
+                else:
+                    let pt = do paramTypeRawOf(p)
+                    let core = do typeCore(pt)
+                    let typeOk = do isTypeNameToken(core)
+                    if !typeOk:
+                        ok = false
+            i = i + 1
+        return ok
+
+    # headerValid: the overall accept/reject verdict — parser.go's own
+    # proc-shaped stand-in for parseProc's `error` return, the same design
+    # source.fct's parsedTabError/parseSourceToParents `[-2]` sentinel
+    # already established for "a proc reports failure as a separate real
+    # value, since it has no second return slot and no exception mechanism".
+    proc headerValid(head: text) -> bool:
+        let nameOk = do headerNameValid(head)
+        if !nameOk:
+            return false
+        let parensOk = do headerParensValid(head)
+        if !parensOk:
+            return false
+        let paramsOk = do headerParamsValid(head)
+        if !paramsOk:
+            return false
+        let retOk = do headerRetValid(head)
+        if !retOk:
+            return false
+        let usesOk = do headerUsesValid(head)
+        return usesOk
+
+    # ============================================================
+    # STAGE 5: end-to-end drivers — raw `proc ...:` LINE TEXT in (exactly
+    # what source.fct's parsedTexts(src) would hand back for that line),
+    # every header field out.
+    # ============================================================
+    proc parseProcHeaderName(lineText: text) -> text:
+        let head = do procHeadOf(lineText)
+        let r = do headerName(head)
+        return r
+
+    proc parseProcHeaderValid(lineText: text) -> bool:
+        let head = do procHeadOf(lineText)
+        let r = do headerValid(head)
+        return r
+
+    proc parseProcHeaderParamNames(lineText: text) -> [text]:
+        let head = do procHeadOf(lineText)
+        let r = do headerParamNames(head)
+        return r
+
+    proc parseProcHeaderParamTypes(lineText: text) -> [text]:
+        let head = do procHeadOf(lineText)
+        let r = do headerParamTypes(head)
+        return r
+
+    proc parseProcHeaderParamLists(lineText: text) -> [bool]:
+        let head = do procHeadOf(lineText)
+        let r = do headerParamLists(head)
+        return r
+
+    proc parseProcHeaderParamOptionals(lineText: text) -> [bool]:
+        let head = do procHeadOf(lineText)
+        let r = do headerParamOptionals(head)
+        return r
+
+    proc parseProcHeaderHasRet(lineText: text) -> bool:
+        let head = do procHeadOf(lineText)
+        let r = do headerRetSectionExists(head)
+        return r
+
+    proc parseProcHeaderRetCore(lineText: text) -> text:
+        let head = do procHeadOf(lineText)
+        let r = do headerRetCore(head)
+        return r
+
+    proc parseProcHeaderRetIsList(lineText: text) -> bool:
+        let head = do procHeadOf(lineText)
+        let r = do headerRetIsList(head)
+        return r
+
+    proc parseProcHeaderRetIsOptional(lineText: text) -> bool:
+        let head = do procHeadOf(lineText)
+        let r = do headerRetIsOptional(head)
+        return r
+
+    proc parseProcHeaderUses(lineText: text) -> [text]:
+        let head = do procHeadOf(lineText)
+        let r = do headerUsesList(head)
+        return r
+
+    # ============================================================
+    # STAGE 6: parseCheck's own real algorithm — `check <cond> "<msg>"`.
+    # A NEW scanning direction (backward, from the line's end) versus every
+    # earlier file in this port (source.fct/expr.fct both scan forward
+    # only): parser.go's parseCheck finds the message's opening quote by
+    # walking BACKWARD from just before the line's closing `"`, stopping at
+    # the first `"` that is not itself escaped (`s[i-1] != '\\'`). Ported
+    # exactly, including that exact (imperfect — a double-backslash before
+    # a quote is not specially handled either here or in the real Go code)
+    # escape check, per this port's established convention of matching the
+    # real algorithm's actual behavior rather than a "more correct" version
+    # of it (see source.fct's own note on the ragged-sibling-indent quirk
+    # for precedent).
+    #
+    # Message text is returned RAW (quotes and all, unescaped) rather than
+    # decoded — the same choice expr.fct's own string-literal tokens make
+    # (see expr.fct's header, Finding 7) and for the identical reason: this
+    # language has no string-unescape builtin, so decoding
+    # `\" \\ \n \t \uXXXX ...` (parser.go's real `unquote` calls Go's own
+    # strconv.Unquote, the FULL Go escape grammar) is out of scope for a
+    # proc to do itself. parser_test.go verifies the RAW span this file
+    # extracts is exactly right by handing it to Go's real strconv.Unquote
+    # and comparing against the real compiler's own decoded ast.Check.Msg —
+    # so the boundary-finding is fully, rigorously verified even though the
+    # decode step itself is not reimplemented here.
+    # ============================================================
+
+    # checkMessageOpenIndex: parser.go's own backward scan, verbatim —
+    # `for i := len(s) - 2; i >= 0; i--  { if s[i]=='"' && (i==0 ||
+    # s[i-1]!='\\') { open = i; break } }` — over s already trimmed of
+    # surrounding whitespace, matching parseCheck's own `s =
+    # strings.TrimSpace(s)` at function entry.
+    proc checkMessageOpenIndex(s: text) -> int:
+        let n = len(s)
+        let mut i = n - 2
+        let mut found = -1
+        loop i >= 0 && found == -1:
+            let ci = charAt(s, i)
+            if ci == "\"":
+                if i == 0:
+                    found = i
+                else:
+                    let prev = charAt(s, i - 1)
+                    if prev != "\\":
+                        found = i
+            i = i - 1
+        return found
+
+    # checkHasMessage: parser.go's own `if !strings.HasSuffix(s, `"`) { error }`
+    proc checkHasMessage(s: text) -> bool:
+        let t = trim(s)
+        let r = do hasSuffixText(t, "\"")
+        return r
+
+    proc checkOpenIndex(s: text) -> int:
+        let t = trim(s)
+        let r = do checkMessageOpenIndex(t)
+        return r
+
+    # checkConditionText: the condition span BEFORE the message's opening
+    # quote — parser.go's own `condSrc := strings.TrimSpace(s[:open])`.
+    proc checkConditionText(s: text) -> text:
+        let t = trim(s)
+        let open = do checkMessageOpenIndex(t)
+        if open < 0:
+            return ""
+        return trim(slice(t, 0, open))
+
+    # checkMessageRaw: the RAW (still-quoted-and-escaped) message span —
+    # parser.go's own `s[open:]`, handed to `unquote` there; handed back
+    # undecoded here (see this stage's header note on why).
+    proc checkMessageRaw(s: text) -> text:
+        let t = trim(s)
+        let open = do checkMessageOpenIndex(t)
+        if open < 0:
+            return ""
+        return slice(t, open, len(t))
+
+    # checkStatementValid: parser.go's own three real rejection gates —
+    # must end in `"`, a real (unescaped) opening quote must be found, and
+    # the condition span before it must be non-empty
+    # (`if condSrc == "" { error "check needs a condition before its message" }`).
+    # This does NOT check that the condition span is a syntactically valid
+    # EXPRESSION (that needs expr.fct's real parser as a sub-routine — see
+    # this file's header note and parser_test.go's cross-file composition
+    # proof for why that composition is real and live, just not folded
+    # into this standalone file).
+    proc checkStatementValid(s: text) -> bool:
+        let hasMsg = do checkHasMessage(s)
+        if !hasMsg:
+            return false
+        let open = do checkOpenIndex(s)
+        if open < 0:
+            return false
+        let cond = do checkConditionText(s)
+        return len(cond) > 0
+
+    # ============================================================
+    # STAGE 7: the real prefix-dispatch mechanism itself — parseDecl's own
+    # `strings.HasPrefix(c.Line.Text, "entity ")`-style switch, restated
+    # generically as "does this line start with keyword, either exactly or
+    # followed by a space" (parser.go's own `keyword` helper), then a
+    # concrete dispatcher over the SAME keyword vocabulary parseDecl
+    # actually recognizes (entity/record/enum/type/message/component/
+    # layout/theme/css/state/derive/policy/action/proc/job/service/
+    # webhook/on/view/auth), confirmed by reading parseDecl fresh rather
+    # than assumed. Returns the matched keyword as TEXT (not an enum this
+    # language has no way to construct) — "" for no match, mirroring
+    # parseDecl's own `default:` error case.
+    # ============================================================
+    proc keywordMatch(s: text, kw: text) -> bool:
+        if s == kw:
+            return true
+        let want = kw + " "
+        let r = do hasPrefixText(s, want)
+        return r
+
+    proc declKeywordOf(lineText: text) -> text:
+        let t = trim(lineText)
+        if t == "auth" || t == "auth:":
+            return "auth"
+        let mEntity = do keywordMatch(t, "entity")
+        if mEntity:
+            return "entity"
+        let mRecord = do keywordMatch(t, "record")
+        if mRecord:
+            return "record"
+        let mEnum = do keywordMatch(t, "enum")
+        if mEnum:
+            return "enum"
+        let mType = do keywordMatch(t, "type")
+        if mType:
+            return "type"
+        let mMessage = do keywordMatch(t, "message")
+        if mMessage:
+            return "message"
+        let mComponent = do keywordMatch(t, "component")
+        if mComponent:
+            return "component"
+        let mLayout = do keywordMatch(t, "layout")
+        if mLayout:
+            return "layout"
+        if t == "theme:" || t == "theme":
+            return "theme"
+        let mTheme = do keywordMatch(t, "theme")
+        if mTheme:
+            return "theme"
+        if t == "css:" || t == "css":
+            return "css"
+        let mState = do keywordMatch(t, "state")
+        if mState:
+            return "state"
+        let mDerive = do keywordMatch(t, "derive")
+        if mDerive:
+            return "derive"
+        let mPolicy = do keywordMatch(t, "policy")
+        if mPolicy:
+            return "policy"
+        let mAction = do keywordMatch(t, "action")
+        if mAction:
+            return "action"
+        let mProc = do keywordMatch(t, "proc")
+        if mProc:
+            return "proc"
+        let mJob = do keywordMatch(t, "job")
+        if mJob:
+            return "job"
+        let mService = do keywordMatch(t, "service")
+        if mService:
+            return "service"
+        let mWebhook = do keywordMatch(t, "webhook")
+        if mWebhook:
+            return "webhook"
+        let mOn = do keywordMatch(t, "on")
+        if mOn:
+            return "on"
+        let mView = do keywordMatch(t, "view")
+        if mView:
+            return "view"
+        return ""
+
+    # ============================================================
+    # STAGE 8: generic `@marker`/`@marker(...)` text-surgery primitives —
+    # parser.go's own repeated `strings.Index(ft, "@name")` /
+    # `strings.Index(ft, "@name(")` + `ft = strings.TrimSpace(ft[:i] + " " +
+    # ft[i+len(...):])` idiom (parseEntity's field-modifier loop, read fresh
+    # at parser.go lines 538-604), restated ONCE as two reusable procs rather
+    # than re-derived per modifier the way Go's own inline `for _, m :=
+    # range []struct{...}` loop already generalizes it there. `hasAtMarker`/
+    # `stripAtFlag` are the bare-flag half (`@secret`, no parens);
+    # `parenInnerRaw`/`stripAtParenClause` are the `@name(value)` half
+    # (`@min(`, `@max(`, `@requires(` — each caller passes the marker WITH
+    # its own opening paren already appended, exactly like Go's own
+    # `m.name` strings already do: `"@min("`, not `"@min"`).
+    # ============================================================
+    proc hasAtMarker(ft: text, marker: text) -> bool:
+        let i = do indexOf(ft, marker)
+        return i >= 0
+
+    proc stripAtFlag(ft: text, marker: text) -> text:
+        let i = do indexOf(ft, marker)
+        if i < 0:
+            return ft
+        let before = slice(ft, 0, i)
+        let after = slice(ft, i + len(marker), len(ft))
+        return trim(before + " " + after)
+
+    # parenInnerRaw: the raw (untrimmed-of-nothing-but-outer-whitespace)
+    # text between `marker`'s own `(` and its first `)` — Go's own `rest :=
+    # ft[i+len(m.name):]; closeP := strings.IndexByte(rest, ')');
+    # strings.TrimSpace(rest[:closeP])`. Returns "" if `marker` is absent OR
+    # has no closing `)` at all — the same honest "malformed input degrades
+    # to an empty/absent answer rather than crashing" convention this port
+    # uses everywhere else (a real caller pairs this with `hasAtMarker` to
+    # tell "absent" from "present but empty" when that distinction matters).
+    proc parenInnerRaw(ft: text, marker: text) -> text:
+        let i = do indexOf(ft, marker)
+        if i < 0:
+            return ""
+        let rest = slice(ft, i + len(marker), len(ft))
+        let closeP = do indexOf(rest, ")")
+        if closeP < 0:
+            return ""
+        return trim(slice(rest, 0, closeP))
+
+    proc stripAtParenClause(ft: text, marker: text) -> text:
+        let i = do indexOf(ft, marker)
+        if i < 0:
+            return ft
+        let rest = slice(ft, i + len(marker), len(ft))
+        let closeP = do indexOf(rest, ")")
+        if closeP < 0:
+            return ft
+        let before = slice(ft, 0, i)
+        let after = slice(rest, closeP + 1, len(rest))
+        return trim(before + " " + after)
+
+    # isIntLiteralToken: an optional leading `-` then one or more digits —
+    # the syntactic gate this port uses in place of `strconv.Atoi`'s error
+    # return (parser.go's own `@min(`/`@max(` handling: `n, err :=
+    # strconv.Atoi(...); if err != nil { error }`). Decoding the digits
+    # themselves is left to the real `toInt` builtin (which is total and
+    # never errors — see runtime/eval.go's own toInt — so this gate is what
+    # actually distinguishes "a real bound" from "garbage that toInt would
+    # silently turn into 0", not a safety requirement of toInt itself).
+    proc isIntLiteralToken(s: text) -> bool:
+        let n = len(s)
+        if n == 0:
+            return false
+        let mut start = 0
+        if charAt(s, 0) == "-":
+            start = 1
+        if start >= n:
+            return false
+        let mut ok = true
+        let mut i = start
+        loop i < n:
+            let d = do isDigitChar(charAt(s, i))
+            if !d:
+                ok = false
+            i = i + 1
+        return ok
+

@@ -1,0 +1,651 @@
+import "parser_proc.fct"
+
+app ParserEntitySelfHost:
+    # ============================================================
+    # STAGE 9: parseEntity's HEADER line — `entity Name [@softdelete]
+    # [@ephemeral]:` (parser.go lines 477-496, read fresh). `@softdelete`
+    # is stripped first, THEN `@ephemeral` is checked against whatever
+    # remains — sequential suffix checks, not an unordered pair — so
+    # `entity Post @ephemeral @softdelete:` and `entity Post @softdelete
+    # @ephemeral:` both correctly strip both annotations regardless of
+    # which one appears outermost in the source, exactly mirroring Go's own
+    # two independent (not else-if) `if strings.HasSuffix(...)` checks.
+    # ============================================================
+    proc entityHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "entity")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc entityHeaderHasSoftDelete(head: text) -> bool:
+        let r = do hasSuffixText(head, "@softdelete")
+        return r
+
+    proc entityHeaderNameAfterSoftDelete(head: text) -> text:
+        let has = do entityHeaderHasSoftDelete(head)
+        if has:
+            let s = do trimSuffixText(head, "@softdelete")
+            return trim(s)
+        return head
+
+    proc entityHeaderHasEphemeral(head: text) -> bool:
+        let afterSD = do entityHeaderNameAfterSoftDelete(head)
+        let r = do hasSuffixText(afterSD, "@ephemeral")
+        return r
+
+    proc entityHeaderName(head: text) -> text:
+        let afterSD = do entityHeaderNameAfterSoftDelete(head)
+        let hasEph = do entityHeaderHasEphemeral(head)
+        if hasEph:
+            let s = do trimSuffixText(afterSD, "@ephemeral")
+            return trim(s)
+        return afterSD
+
+    # entityHeaderValid: parser.go's own `if !isIdent(name) || !isUpper(name)
+    # { error }` — the same honest-boolean-verdict convention headerValid
+    # (STAGE 4) already established for a proc header.
+    proc entityHeaderValid(lineText: text) -> bool:
+        let head = do entityHeadOf(lineText)
+        let name = do entityHeaderName(head)
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let r = do isUpperName(name)
+        return r
+
+    # ============================================================
+    # STAGE 10: parseEntity's FIELD-LINE parsing — `name: Type [?] [@flag
+    # ...]` (parser.go lines 525-654, read fresh). This is the exact piece
+    # every `entity` declaration in every real `.fct` app, including this
+    # project's own selfhost files, is built from.
+    #
+    # Modifiers are stripped from the type token in the SAME order Go's own
+    # code applies them (matches -> min -> max -> requires -> the six bare
+    # flags, in the fixed order secret/e2e/unique/required/restrict/
+    # setNull), each stage taking the PREVIOUS stage's already-stripped text
+    # as input — `entityFieldTypeAfterX` names the type text as it stands
+    # right after stage X has run, mirroring `ft`'s own sequential mutation
+    # in the real Go function one `if`-block at a time. Every "does field
+    # have flag F" / "what is F's value" getter reads from the correct
+    # STAGE (the one immediately before F's own stripping step), not from
+    # the raw, unstripped `ft` — matching Go's `strings.Index(ft, ...)`
+    # calls, each of which sees whatever earlier strips already ran.
+    #
+    # `@matches("...")` is the one modifier with no `hasAtMarker`-style
+    # single-call presence proc — it needs a quote scan, not just a `)`
+    # scan (parser.go lines 542-558) — so it gets its own small STAGE 10a
+    # family (entityFieldMatches*) instead of reusing parenInnerRaw/
+    # stripAtParenClause.
+    # ============================================================
+    proc entityFieldColonIndex(lineText: text) -> int:
+        let r = do indexOf(lineText, ":")
+        return r
+
+    proc entityFieldNameOf(lineText: text) -> text:
+        let c = do entityFieldColonIndex(lineText)
+        if c < 0:
+            return ""
+        return trim(slice(lineText, 0, c))
+
+    proc entityFieldTypeRawOf(lineText: text) -> text:
+        let c = do entityFieldColonIndex(lineText)
+        if c < 0:
+            return ""
+        return trim(slice(lineText, c + 1, len(lineText)))
+
+    # --- STAGE 10a: `@matches("pattern")` ---
+    proc entityFieldMatchesMarkerIndex(ft: text) -> int:
+        let r = do indexOf(ft, "@matches(")
+        return r
+
+    proc entityFieldMatchesRestOf(ft: text) -> text:
+        let i = do entityFieldMatchesMarkerIndex(ft)
+        if i < 0:
+            return ""
+        let marker = "@matches("
+        return slice(ft, i + len(marker), len(ft))
+
+    proc entityFieldMatchesOpenQuoteIndex(ft: text) -> int:
+        let rest = do entityFieldMatchesRestOf(ft)
+        let r = do indexOf(rest, "\"")
+        return r
+
+    proc entityFieldHasMatches(ft: text) -> bool:
+        let i = do entityFieldMatchesMarkerIndex(ft)
+        if i < 0:
+            return false
+        let open = do entityFieldMatchesOpenQuoteIndex(ft)
+        if open < 0:
+            return false
+        let rest = do entityFieldMatchesRestOf(ft)
+        let afterOpen = slice(rest, open + 1, len(rest))
+        let closeQ = do indexOf(afterOpen, "\"")
+        return closeQ >= 0
+
+    proc entityFieldMatchesPattern(ft: text) -> text:
+        let has = do entityFieldHasMatches(ft)
+        if !has:
+            return ""
+        let rest = do entityFieldMatchesRestOf(ft)
+        let open = do entityFieldMatchesOpenQuoteIndex(ft)
+        let afterOpen = slice(rest, open + 1, len(rest))
+        let closeQ = do indexOf(afterOpen, "\"")
+        return slice(afterOpen, 0, closeQ)
+
+    proc entityFieldTypeAfterMatches(ft: text) -> text:
+        let has = do entityFieldHasMatches(ft)
+        if !has:
+            return ft
+        let i = do entityFieldMatchesMarkerIndex(ft)
+        let rest = do entityFieldMatchesRestOf(ft)
+        let open = do entityFieldMatchesOpenQuoteIndex(ft)
+        let afterOpen = slice(rest, open + 1, len(rest))
+        let closeQ = do indexOf(afterOpen, "\"")
+        let after0 = slice(afterOpen, closeQ + 1, len(afterOpen))
+        let p = do indexOf(after0, ")")
+        let mut after = after0
+        if p >= 0:
+            after = slice(after0, p + 1, len(after0))
+        let before = slice(ft, 0, i)
+        return trim(before + " " + after)
+
+    # --- STAGE 10b: `@min(n)` / `@max(n)` ---
+    proc entityFieldTypeAfterMin(ft: text) -> text:
+        let f1 = do entityFieldTypeAfterMatches(ft)
+        let r = do stripAtParenClause(f1, "@min(")
+        return r
+
+    proc entityFieldHasMin(ft: text) -> bool:
+        let f1 = do entityFieldTypeAfterMatches(ft)
+        let r = do hasAtMarker(f1, "@min(")
+        return r
+
+    proc entityFieldMinRaw(ft: text) -> text:
+        let f1 = do entityFieldTypeAfterMatches(ft)
+        let r = do parenInnerRaw(f1, "@min(")
+        return r
+
+    # entityFieldMinValue: -999999999 is this proc's chosen "absent/
+    # malformed" sentinel (source.fct's own `[-2]` and this file's own
+    # `headerValid`-style booleans already established that a proc reports
+    # failure as a real, honest value, never a crash) — chosen far outside
+    # any realistic `@min(n)` bound so it can never collide with a genuine
+    # answer, unlike plain `-1` which a real `@min(-1)` could legitimately
+    # mean.
+    proc entityFieldMinValue(ft: text) -> int:
+        let has = do entityFieldHasMin(ft)
+        if !has:
+            return -999999999
+        let raw = do entityFieldMinRaw(ft)
+        let ok = do isIntLiteralToken(raw)
+        if !ok:
+            return -999999999
+        return toInt(raw)
+
+    proc entityFieldTypeAfterMax(ft: text) -> text:
+        let f2 = do entityFieldTypeAfterMin(ft)
+        let r = do stripAtParenClause(f2, "@max(")
+        return r
+
+    proc entityFieldHasMax(ft: text) -> bool:
+        let f2 = do entityFieldTypeAfterMin(ft)
+        let r = do hasAtMarker(f2, "@max(")
+        return r
+
+    proc entityFieldMaxRaw(ft: text) -> text:
+        let f2 = do entityFieldTypeAfterMin(ft)
+        let r = do parenInnerRaw(f2, "@max(")
+        return r
+
+    proc entityFieldMaxValue(ft: text) -> int:
+        let has = do entityFieldHasMax(ft)
+        if !has:
+            return -999999999
+        let raw = do entityFieldMaxRaw(ft)
+        let ok = do isIntLiteralToken(raw)
+        if !ok:
+            return -999999999
+        return toInt(raw)
+
+    # --- STAGE 10c: `@requires(policy)` — the field READ-gate ---
+    proc entityFieldTypeAfterRequires(ft: text) -> text:
+        let f3 = do entityFieldTypeAfterMax(ft)
+        let r = do stripAtParenClause(f3, "@requires(")
+        return r
+
+    proc entityFieldHasRequires(ft: text) -> bool:
+        let f3 = do entityFieldTypeAfterMax(ft)
+        let r = do hasAtMarker(f3, "@requires(")
+        return r
+
+    proc entityFieldRequiresPolicy(ft: text) -> text:
+        let f3 = do entityFieldTypeAfterMax(ft)
+        let r = do parenInnerRaw(f3, "@requires(")
+        return r
+
+    # --- STAGE 10d: the six bare flags, fixed order ---
+    proc entityFieldSecret(ft: text) -> bool:
+        let f4 = do entityFieldTypeAfterRequires(ft)
+        let r = do hasAtMarker(f4, "@secret")
+        return r
+
+    proc entityFieldE2E(ft: text) -> bool:
+        let f4 = do entityFieldTypeAfterRequires(ft)
+        let r = do hasAtMarker(f4, "@e2e")
+        return r
+
+    proc entityFieldUnique(ft: text) -> bool:
+        let f4 = do entityFieldTypeAfterRequires(ft)
+        let r = do hasAtMarker(f4, "@unique")
+        return r
+
+    proc entityFieldRequired(ft: text) -> bool:
+        let f4 = do entityFieldTypeAfterRequires(ft)
+        let r = do hasAtMarker(f4, "@required")
+        return r
+
+    proc entityFieldRestrict(ft: text) -> bool:
+        let f4 = do entityFieldTypeAfterRequires(ft)
+        let r = do hasAtMarker(f4, "@restrict")
+        return r
+
+    proc entityFieldSetNull(ft: text) -> bool:
+        let f4 = do entityFieldTypeAfterRequires(ft)
+        let r = do hasAtMarker(f4, "@setNull")
+        return r
+
+    proc entityFieldTypeAfterFlags(ft: text) -> text:
+        let f4 = do entityFieldTypeAfterRequires(ft)
+        let f5 = do stripAtFlag(f4, "@secret")
+        let f6 = do stripAtFlag(f5, "@e2e")
+        let f7 = do stripAtFlag(f6, "@unique")
+        let f8 = do stripAtFlag(f7, "@required")
+        let f9 = do stripAtFlag(f8, "@restrict")
+        let f10 = do stripAtFlag(f9, "@setNull")
+        return f10
+
+    # --- STAGE 10e: the type core left once every modifier is stripped —
+    # reuses STAGE 3's typeCore/typeIsList/typeIsOptional VERBATIM (a
+    # record/entity field's `?`/`[...]` shape is the identical grammar a
+    # proc's own param/return type already has), rather than re-deriving
+    # `splitType` a second time.
+    # ============================================================
+    proc entityFieldCore(ft: text) -> text:
+        let clean = do entityFieldTypeAfterFlags(ft)
+        let r = do typeCore(clean)
+        return r
+
+    proc entityFieldIsList(ft: text) -> bool:
+        let clean = do entityFieldTypeAfterFlags(ft)
+        let r = do typeIsList(clean)
+        return r
+
+    proc entityFieldIsOptional(ft: text) -> bool:
+        let clean = do entityFieldTypeAfterFlags(ft)
+        let r = do typeIsOptional(clean)
+        return r
+
+    # entityFieldValid: every real rejection gate parseEntity's field loop
+    # has (parser.go lines 526-652), MINUS the `read:` clause's own
+    # expression validity (needs expr.fct's real parser — out of scope for
+    # this standalone file, same limitation checkStatementValid's own doc
+    # already states for `check`'s condition). A field named exactly `read`
+    # whose type-shaped text fails `isTypeName` is treated as the row-level
+    # read-policy clause, not a malformed field — Go's own `if fn == "read"
+    # { ...; continue }` fallback, restated as returning `true` here instead
+    # of skipping the field entirely (this proc only ever answers "is this
+    # LINE well-formed", never "collect the fields").
+    proc entityFieldValid(lineText: text) -> bool:
+        let c = do entityFieldColonIndex(lineText)
+        if c < 0:
+            return false
+        let fn = do entityFieldNameOf(lineText)
+        let idOk = do isIdentToken(fn)
+        if !idOk:
+            return false
+        let ft = do entityFieldTypeRawOf(lineText)
+        let isList = do entityFieldIsList(ft)
+        if isList:
+            return false
+        let core = do entityFieldCore(ft)
+        let typeOk = do isTypeNameToken(core)
+        if !typeOk:
+            return fn == "read"
+        let hasRequires = do entityFieldHasRequires(ft)
+        if hasRequires:
+            let policy = do entityFieldRequiresPolicy(ft)
+            let policyOk = do isIdentToken(policy)
+            if !policyOk:
+                return false
+        let hasMin = do entityFieldHasMin(ft)
+        if hasMin:
+            let minRaw = do entityFieldMinRaw(ft)
+            let minOk = do isIntLiteralToken(minRaw)
+            if !minOk:
+                return false
+        let hasMax = do entityFieldHasMax(ft)
+        if hasMax:
+            let maxRaw = do entityFieldMaxRaw(ft)
+            let maxOk = do isIntLiteralToken(maxRaw)
+            if !maxOk:
+                return false
+        let e2e = do entityFieldE2E(ft)
+        let secret = do entityFieldSecret(ft)
+        if e2e && secret:
+            return false
+        if e2e && core != "text":
+            return false
+        let hasMatches = do entityFieldHasMatches(ft)
+        if hasMatches && core != "text":
+            return false
+        let restrict = do entityFieldRestrict(ft)
+        let setNull = do entityFieldSetNull(ft)
+        if restrict && setNull:
+            return false
+        let optional = do entityFieldIsOptional(ft)
+        if setNull && !optional:
+            return false
+        return true
+
+    # ============================================================
+    # STAGE 11: parseState — `state name: Type [= default]
+    # [@client|@server|@private]` (parser.go lines 1207-1256, read fresh).
+    #
+    # `topLevelEqIndex` restates parser.go's own `splitTopByte(after, '=')`
+    # (parser.go lines 1261-1279) — the FIRST top-level (outside
+    # `(`/`{`/`[`/quotes) `=`, so a `[T]` list type or a quoted default
+    # containing its own `=` is never mistaken for the name/default
+    # separator. This is a genuinely NEW primitive versus every earlier
+    # STAGE in this file (STAGE 6's `checkMessageOpenIndex` scans backward
+    # for a single character; STAGE 4's colon/paren scans track no nesting
+    # depth at all) — ported here rather than shared with STAGE 12 (derive)
+    # because parseDerive does NOT use splitTopByte for its own `=` (see
+    # STAGE 12's own doc for why that is a deliberate, preserved quirk, not
+    # an oversight).
+    # ============================================================
+    proc stateRestOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "state")
+        return trim(stripped)
+
+    proc stateRestAfterClient(rest: text) -> text:
+        let has = do hasSuffixText(rest, "@client")
+        if has:
+            let s = do trimSuffixText(rest, "@client")
+            return trim(s)
+        return rest
+
+    proc stateRestAfterServer(rest: text) -> text:
+        let has = do hasSuffixText(rest, "@server")
+        if has:
+            let s = do trimSuffixText(rest, "@server")
+            return trim(s)
+        return rest
+
+    proc stateRestAfterPrivate(rest: text) -> text:
+        let has = do hasSuffixText(rest, "@private")
+        if has:
+            let s = do trimSuffixText(rest, "@private")
+            return trim(s)
+        return rest
+
+    # stateRestClean: the annotation-stripped `rest` colon-search actually
+    # runs against — parser.go's own placement loop runs to completion
+    # BEFORE `strings.IndexByte(rest, ':')` is ever called.
+    proc stateRestClean(lineText: text) -> text:
+        let r0 = do stateRestOf(lineText)
+        let r1 = do stateRestAfterClient(r0)
+        let r2 = do stateRestAfterServer(r1)
+        let r3 = do stateRestAfterPrivate(r2)
+        return r3
+
+    # statePlacement: Go's loop checks `@client`/`@server`/`@private` in
+    # that fixed order against `rest` AS IT STANDS at each step (so only one
+    # can ever actually match a real line) — restated as three independent
+    # checks, each against the stage immediately before ITS OWN strip would
+    # run, so the first one that matches names the real placement.
+    proc statePlacement(lineText: text) -> text:
+        let r0 = do stateRestOf(lineText)
+        let hasClient = do hasSuffixText(r0, "@client")
+        if hasClient:
+            return "client"
+        let r1 = do stateRestAfterClient(r0)
+        let hasServer = do hasSuffixText(r1, "@server")
+        if hasServer:
+            return "server"
+        let r2 = do stateRestAfterServer(r1)
+        let hasPrivate = do hasSuffixText(r2, "@private")
+        if hasPrivate:
+            return "private"
+        return "infer"
+
+    proc stateColonIndex(lineText: text) -> int:
+        let rest = do stateRestClean(lineText)
+        let r = do indexOf(rest, ":")
+        return r
+
+    proc stateNameOf(lineText: text) -> text:
+        let rest = do stateRestClean(lineText)
+        let c = do stateColonIndex(lineText)
+        if c < 0:
+            return ""
+        return trim(slice(rest, 0, c))
+
+    proc stateAfterColon(lineText: text) -> text:
+        let rest = do stateRestClean(lineText)
+        let c = do stateColonIndex(lineText)
+        if c < 0:
+            return ""
+        return trim(slice(rest, c + 1, len(rest)))
+
+    # topLevelEqIndex: parser.go's own splitTopByte(s, '='), specialized to
+    # the one separator byte this file needs it for. `!inStr` gates the
+    # whole depth-tracking/`=`-matching block in one branch rather than
+    # Go's `switch` with an empty `case inStr:` arm — the same "no legal
+    # no-op statement shape" constraint STAGE 6 already worked around for
+    # its own backward scan.
+    proc topLevelEqIndex(s: text) -> int:
+        let n = len(s)
+        let mut depth = 0
+        let mut inStr = false
+        let mut i = 0
+        let mut found = -1
+        loop i < n && found == -1:
+            let c = charAt(s, i)
+            if c == "\"":
+                inStr = !inStr
+            else:
+                if !inStr:
+                    if c == "(" || c == "{" || c == "[":
+                        depth = depth + 1
+                    else:
+                        if c == ")" || c == "}" || c == "]":
+                            depth = depth - 1
+                        else:
+                            if c == "=" && depth == 0:
+                                found = i
+            i = i + 1
+        return found
+
+    proc stateTypeRaw(lineText: text) -> text:
+        let after = do stateAfterColon(lineText)
+        let eq = do topLevelEqIndex(after)
+        if eq < 0:
+            return after
+        return trim(slice(after, 0, eq))
+
+    proc stateHasDefault(lineText: text) -> bool:
+        let after = do stateAfterColon(lineText)
+        let eq = do topLevelEqIndex(after)
+        return eq >= 0
+
+    proc stateDefaultRaw(lineText: text) -> text:
+        let after = do stateAfterColon(lineText)
+        let eq = do topLevelEqIndex(after)
+        if eq < 0:
+            return ""
+        return trim(slice(after, eq + 1, len(after)))
+
+    proc stateCore(lineText: text) -> text:
+        let typ = do stateTypeRaw(lineText)
+        let r = do typeCore(typ)
+        return r
+
+    proc stateIsList(lineText: text) -> bool:
+        let typ = do stateTypeRaw(lineText)
+        let r = do typeIsList(typ)
+        return r
+
+    proc stateIsOptional(lineText: text) -> bool:
+        let typ = do stateTypeRaw(lineText)
+        let r = do typeIsOptional(typ)
+        return r
+
+    # stateValid: parser.go's own `if colon < 0 { error }`, `if !isIdent
+    # (name) { error }`, `if !isTypeName(core) { error }` gates. The default
+    # expression's own validity (needs expr.fct) is out of scope, same as
+    # entityFieldValid's `read:` clause and checkStatementValid's condition.
+    proc stateValid(lineText: text) -> bool:
+        let c = do stateColonIndex(lineText)
+        if c < 0:
+            return false
+        let name = do stateNameOf(lineText)
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let core = do stateCore(lineText)
+        let r = do isTypeNameToken(core)
+        return r
+
+    # ============================================================
+    # STAGE 12: parseDerive — `derive name: Type = expr` (parser.go lines
+    # 1283-1308, read fresh). No placement annotation (a derivation's domain
+    # is always computed, never authored).
+    #
+    # `deriveEqIndex` is deliberately the PLAIN, non-nesting-aware
+    # `strings.IndexByte(after, '=')` — NOT `splitTopByte` — because that is
+    # exactly what parser.go's real parseDerive calls (contrast with
+    # parseState's own `splitTopByte`, STAGE 11, immediately above this
+    # one). Read fresh, not assumed: the two functions genuinely use two
+    # different scans for what looks like the identical "type = expr"
+    # shape. This can never actually diverge from a `splitTopByte` scan for
+    # a WELL-FORMED derive line, because a valid type token never contains
+    # `=`, `(`, `{`, `[`, or a quote before its own real assignment sign —
+    # so the naive first-`=` scan and a depth-aware one always agree on
+    # where the type ends. It is preserved anyway, per this port's
+    # established convention (source.fct's ragged-sibling-indent note;
+    # parser.fct's own imperfect-escape-check note; stmt.fct's
+    # firstEqIndex note) of matching the real algorithm's actual behavior,
+    # not a "more consistent" version of it.
+    # ============================================================
+    proc deriveRestOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "derive")
+        return trim(stripped)
+
+    proc deriveColonIndex(lineText: text) -> int:
+        let rest = do deriveRestOf(lineText)
+        let r = do indexOf(rest, ":")
+        return r
+
+    proc deriveNameOf(lineText: text) -> text:
+        let rest = do deriveRestOf(lineText)
+        let c = do deriveColonIndex(lineText)
+        if c < 0:
+            return ""
+        return trim(slice(rest, 0, c))
+
+    proc deriveAfterColon(lineText: text) -> text:
+        let rest = do deriveRestOf(lineText)
+        let c = do deriveColonIndex(lineText)
+        if c < 0:
+            return ""
+        return trim(slice(rest, c + 1, len(rest)))
+
+    proc deriveEqIndex(lineText: text) -> int:
+        let after = do deriveAfterColon(lineText)
+        let r = do indexOf(after, "=")
+        return r
+
+    proc deriveTypeRaw(lineText: text) -> text:
+        let after = do deriveAfterColon(lineText)
+        let eq = do deriveEqIndex(lineText)
+        if eq < 0:
+            return after
+        return trim(slice(after, 0, eq))
+
+    proc deriveExprRaw(lineText: text) -> text:
+        let after = do deriveAfterColon(lineText)
+        let eq = do deriveEqIndex(lineText)
+        if eq < 0:
+            return ""
+        return trim(slice(after, eq + 1, len(after)))
+
+    proc deriveCore(lineText: text) -> text:
+        let typ = do deriveTypeRaw(lineText)
+        let r = do typeCore(typ)
+        return r
+
+    # deriveValid: parser.go's own `if colon < 0 { error }`, `if !isIdent
+    # (name) { error }`, `if eq < 0 { error }`, `if !isTypeName(core) {
+    # error }` gates — the expression's own validity is out of scope
+    # (needs expr.fct; same limitation as stateValid/entityFieldValid/
+    # checkStatementValid above).
+    proc deriveValid(lineText: text) -> bool:
+        let c = do deriveColonIndex(lineText)
+        if c < 0:
+            return false
+        let name = do deriveNameOf(lineText)
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let eq = do deriveEqIndex(lineText)
+        if eq < 0:
+            return false
+        let core = do deriveCore(lineText)
+        let r = do isTypeNameToken(core)
+        return r
+
+    # ============================================================
+    # STAGE 13: quotedInner/hasQuotedText — a generic "the text between the
+    # FIRST pair of double quotes anywhere in s" primitive, generalizing the
+    # exact quote-scan idiom STAGE 10a's entityFieldMatches* family already
+    # used for one specific marker (`@matches("...")`) to a BARE quoted
+    # literal with no `@marker(` wrapper at all — the shape parseWebhook's
+    # own quoted path and parseService's own quoted base URL each are
+    # (parser.go lines 1543-1569 and 1491-1533, read fresh). Returns ""
+    # (no pair found) as the honest "absent" answer, the same convention
+    # parenInnerRaw already established. Like every other quote handling in
+    # this file (STAGE 6's checkMessageRaw, STAGE 10a's own matches
+    # pattern), this does not decode escapes — a webhook path or a service
+    # URL has no legitimate reason to contain a backslash escape, so the
+    # raw substring between the two quote characters is exactly the value a
+    # real caller wants. entityFieldMatches* itself is left untouched
+    # rather than refactored to call this — this is new surface area, not a
+    # rewrite of working code.
+    # ============================================================
+    proc quoteOpenIndex(s: text) -> int:
+        let r = do indexOf(s, "\"")
+        return r
+
+    proc quoteCloseIndexFrom(s: text, openIdx: int) -> int:
+        let rest = slice(s, openIdx + 1, len(s))
+        let r = do indexOf(rest, "\"")
+        if r < 0:
+            return -1
+        return openIdx + 1 + r
+
+    proc hasQuotedText(s: text) -> bool:
+        let open = do quoteOpenIndex(s)
+        if open < 0:
+            return false
+        let close = do quoteCloseIndexFrom(s, open)
+        return close >= 0
+
+    proc quotedInner(s: text) -> text:
+        let has = do hasQuotedText(s)
+        if !has:
+            return ""
+        let open = do quoteOpenIndex(s)
+        let close = do quoteCloseIndexFrom(s, open)
+        return slice(s, open + 1, close)
+
+    # ============================================================

@@ -34,6 +34,9 @@ func String(src string) (*ir.IR, error) {
 	if len(app.Imports) > 0 {
 		return nil, fmt.Errorf("import is only supported when compiling from a file (run `facet <command> <file.fct>`)")
 	}
+	if len(app.CSSFiles) > 0 {
+		return nil, fmt.Errorf("css from \"...\" is only supported when compiling from a file (run `facet <command> <file.fct>`)")
+	}
 	return ir.Build(app)
 }
 
@@ -112,8 +115,27 @@ func collectModules(abs string, visited map[string]bool, stack []string, res *re
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", filepath.Base(abs), err)
 	}
-	list := []*ast.App{app}
 	dir := filepath.Dir(abs)
+	// `css from "styles.css"` is the external-file counterpart of an inline
+	// `css:` block: a sibling stylesheet on disk, referenced by the same quoted
+	// path convention `import` uses. Resolved here (not in the parser, which has
+	// no file-system access) relative to this file's own directory — never
+	// fetched remotely, since a stylesheet is never a shared module — and its raw
+	// content is folded into app.CSS exactly like an inline block, so every
+	// downstream pass (placement, codegen) sees one stylesheet string regardless
+	// of which spelling the author used.
+	for _, ref := range app.CSSFiles {
+		cssAbs := ref.Path
+		if !filepath.IsAbs(cssAbs) {
+			cssAbs = filepath.Join(dir, ref.Path)
+		}
+		cssSrc, err := os.ReadFile(cssAbs)
+		if err != nil {
+			return nil, fmt.Errorf("%s:%d: css from %q: %w", filepath.Base(abs), ref.Line, ref.Path, err)
+		}
+		app.CSS = joinStylesheets(app.CSS, string(cssSrc))
+	}
+	list := []*ast.App{app}
 	for _, imp := range app.Imports {
 		// Resolve turns the import string into an absolute local path: a local ref
 		// joins against this file's dir; a remote github.com/ ref is fetched and
@@ -142,6 +164,8 @@ func collectModules(abs string, visited map[string]bool, stack []string, res *re
 func mergeInto(dst, src *ast.App) {
 	dst.Auth = dst.Auth || src.Auth
 	dst.Entities = append(dst.Entities, src.Entities...)
+	dst.Records = append(dst.Records, src.Records...)
+	dst.Structs = append(dst.Structs, src.Structs...)
 	dst.Enums = append(dst.Enums, src.Enums...)
 	dst.Types = append(dst.Types, src.Types...)
 	dst.Messages = append(dst.Messages, src.Messages...)
@@ -199,12 +223,18 @@ func checkDuplicates(app *ast.App) error {
 		return nil
 	}
 	var (
-		entities, enums, states, derives []string
-		policies, actions, procs, jobs   []string
-		components, layouts, views       []string
+		entities, records, structs, enums, states, derives []string
+		policies, actions, procs, jobs                     []string
+		components, layouts, views                         []string
 	)
 	for _, e := range app.Entities {
 		entities = append(entities, e.Name)
+	}
+	for _, r := range app.Records {
+		records = append(records, r.Name)
+	}
+	for _, s := range app.Structs {
+		structs = append(structs, s.Name)
 	}
 	for _, e := range app.Enums {
 		enums = append(enums, e.Name)
@@ -240,7 +270,8 @@ func checkDuplicates(app *ast.App) error {
 		kind  string
 		names []string
 	}{
-		{"entity", entities}, {"enum", enums}, {"state", states}, {"derive", derives},
+		{"entity", entities}, {"record", records}, {"struct", structs},
+		{"enum", enums}, {"state", states}, {"derive", derives},
 		{"policy", policies}, {"action", actions}, {"proc", procs}, {"job", jobs},
 		{"component", components}, {"layout", layouts}, {"view", views},
 	} {

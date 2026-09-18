@@ -536,21 +536,29 @@ app StorageSelfHost:
     # faithfully); it never performs one.
     #
     # ============================================================
-    # REPRESENTATION: `PagerInner`'s real fields are a `HashMap<u32,
-    # Entry>` (`cache`) plus a `BTreeMap<u64, u32>` ordered by tick
-    # (`order`) purely so eviction can find the globally oldest tick in
-    # O(log n) via `.iter().next()`. Neither a hash map nor an ordered
-    # map exists in this language (LANGUAGE.md's builtin list has no map
-    # type at all, only `[T]`), so — exactly like predicate.fct's row
-    # and this file's own PART ONE page body — the whole cache is
-    # threaded as parallel arrays, aligned by index, one entry per
-    # resident page:
-    #   ids:   [int]   the resident page id at index i
-    #   ticks: [int]   that page's last-access tick (bigger = newer)
-    #   dirty: [bool]  whether that page has unflushed writes
+    # REWRITE NOTE (struct milestone): `PagerInner`'s real fields are a
+    # `HashMap<u32, Entry>` (`cache`) plus a `BTreeMap<u64, u32>` ordered
+    # by tick (`order`) purely so eviction can find the globally oldest
+    # tick in O(log n) via `.iter().next()`. Neither a hash map nor an
+    # ordered map exists in this language (LANGUAGE.md's builtin list
+    # has no map type at all, only `[T]`), so this cache used to be
+    # threaded as three parallel arrays (`ids: [int]` / `ticks: [int]` /
+    # `dirty: [bool]`), aligned by hand-maintained index — exactly the
+    # shape predicate.fct's own header describes replacing. Now that a
+    # proc can declare a real `struct`, one resident page is a real
+    # `PagerEntry` value with named fields, and the cache is one
+    # `[PagerEntry]` array: `entries[i].tick` reads as what it is,
+    # `ticks[i]` (kept in sync with `ids[i]` only by convention) does
+    # not. This also collapses what used to be four near-identical
+    # "step" procs (`pagerCacheStepIds`/`Ticks`/`Dirty`) into one
+    # (`pagerCacheStep`, below), since a single page access now updates
+    # one struct's fields instead of three separately-threaded arrays —
+    # see that proc's own doc for why `pagerCacheStepEvicted` still has
+    # to stay a second, independent proc.
+    #
     # There is no `order` array at all: rather than keeping a second
     # structure sorted by tick, `pagerCacheLruVictimIndex` finds the
-    # minimum-tick index by a linear scan over `ticks` — the direct
+    # minimum-tick index by a linear scan over `entries` — the direct
     # restatement of what `order.iter().next()` returns (the entry with
     # the smallest key), reached by scanning instead of by a
     # pre-sorted map this language has no primitive for. Tick values are
@@ -560,40 +568,22 @@ app StorageSelfHost:
     # wrong either.
     #
     # As with PART ONE's page body, no field is ever set in place —
-    # `arr[i] = v` does not exist — so every "set"/"remove" below
-    # (`pagerCacheSetIntAt`, `pagerCacheRemoveIntAt`, ...) is a pure
-    # function returning a brand-new array, and every `do` result inside
-    # a loop is bound to its own fresh `let` before being folded into an
-    # accumulator with a plain, `do`-free reassignment — the same two
-    # restrictions PART ONE's own header already documents in full.
-    #
-    # ============================================================
-    # WHY FOUR "STEP" PROCS INSTEAD OF ONE: a proc returns exactly one
-    # typed value, and one page access can change three different
-    # arrays (`ids`/`ticks`/`dirty`) plus produce a fourth fact (which
-    # id, if any, got evicted) — so, following predicate.fct's own
-    # documented precedent for the identical constraint (`evalKind` vs.
-    # `evalNum`/`evalText`/`evalBool`), `pagerCacheStepIds` /
-    # `pagerCacheStepTicks` / `pagerCacheStepDirty` /
-    # `pagerCacheStepEvicted` are four independent, pure re-derivations
-    # of the SAME access decision, each returning one fact, guaranteed
-    # to agree by construction because all four are pure functions of
-    # the identical (ids, ticks, dirty, capacity, id, tick) input. Only
-    # `pagerCacheStepDirty` actually needs `dirty` or `isWrite` as
-    # input: whether an access is a read or a write never changes WHICH
-    # ids are resident or WHAT their tick becomes (`Pager::write`
-    # readmits exactly like a miss-then-admit, `Pager::read`'s hit path
-    # only ever bumps a tick) — it only changes whether the resulting
-    # entry is marked dirty. `pagerCacheStepIds`/`Ticks`/`Evicted`
-    # therefore take no `isWrite` parameter at all, rather than
-    # threading one through that nothing in their own logic reads.
-    proc pagerDemoEmptyInts() -> [int]:
+    # `arr[i] = v` does not exist for a struct array either — so every
+    # "set"/"remove" below (`pagerCacheSetEntryAt`,
+    # `pagerCacheRemoveEntryAt`) is a pure function returning a
+    # brand-new array, and every `do` result inside a loop is bound to
+    # its own fresh `let` before being folded into an accumulator with a
+    # plain, `do`-free reassignment — the same two restrictions PART
+    # ONE's own header already documents in full.
+    struct PagerEntry:
+        id: int
+        tick: int
+        dirty: bool
+
+    proc pagerDemoEmptyEntries() -> [PagerEntry]:
         return []
 
-    proc pagerDemoEmptyBools() -> [bool]:
-        return []
-
-    proc pagerSliceBools(buf: [bool], start: int, end: int) -> [bool]:
+    proc pagerSliceEntries(buf: [PagerEntry], start: int, end: int) -> [PagerEntry]:
         let mut out = []
         let mut i = start
         loop i < end:
@@ -601,7 +591,7 @@ app StorageSelfHost:
             i = i + 1
         return out
 
-    proc pagerConcatBools(a: [bool], b: [bool]) -> [bool]:
+    proc pagerConcatEntries(a: [PagerEntry], b: [PagerEntry]) -> [PagerEntry]:
         let mut out = a
         let n = len(b)
         let mut i = 0
@@ -611,234 +601,187 @@ app StorageSelfHost:
         return out
 
     # pagerCacheFindIndex: `self.cache.get(&id)` restated as a linear
-    # scan over the `ids` array — the direct analog of predicate.fct's
-    # own `rowFieldIndex`.
-    proc pagerCacheFindIndex(ids: [int], target: int) -> int:
-        let n = len(ids)
+    # scan over `entries` — the direct analog of predicate.fct's own
+    # `rowFieldIndex`.
+    proc pagerCacheFindIndex(entries: [PagerEntry], target: int) -> int:
+        let n = len(entries)
         let mut i = 0
         let mut found = -1
         loop i < n:
             if found == -1:
-                if ids[i] == target:
+                if entries[i].id == target:
                     found = i
             i = i + 1
         return found
 
-    proc pagerCacheSetIntAt(arr: [int], index: int, val: int) -> [int]:
-        let before = do sliceBytes(arr, 0, index)
-        let n = len(arr)
-        let after = do sliceBytes(arr, index + 1, n)
+    proc pagerCacheSetEntryAt(entries: [PagerEntry], index: int, val: PagerEntry) -> [PagerEntry]:
+        let before = do pagerSliceEntries(entries, 0, index)
+        let n = len(entries)
+        let after = do pagerSliceEntries(entries, index + 1, n)
         let withVal = append(before, val)
-        let result = do concatBytes(withVal, after)
+        let result = do pagerConcatEntries(withVal, after)
         return result
 
-    proc pagerCacheSetBoolAt(arr: [bool], index: int, val: bool) -> [bool]:
-        let before = do pagerSliceBools(arr, 0, index)
-        let n = len(arr)
-        let after = do pagerSliceBools(arr, index + 1, n)
-        let withVal = append(before, val)
-        let result = do pagerConcatBools(withVal, after)
-        return result
-
-    proc pagerCacheRemoveIntAt(arr: [int], index: int) -> [int]:
-        let before = do sliceBytes(arr, 0, index)
-        let n = len(arr)
-        let after = do sliceBytes(arr, index + 1, n)
-        let result = do concatBytes(before, after)
-        return result
-
-    proc pagerCacheRemoveBoolAt(arr: [bool], index: int) -> [bool]:
-        let before = do pagerSliceBools(arr, 0, index)
-        let n = len(arr)
-        let after = do pagerSliceBools(arr, index + 1, n)
-        let result = do pagerConcatBools(before, after)
+    proc pagerCacheRemoveEntryAt(entries: [PagerEntry], index: int) -> [PagerEntry]:
+        let before = do pagerSliceEntries(entries, 0, index)
+        let n = len(entries)
+        let after = do pagerSliceEntries(entries, index + 1, n)
+        let result = do pagerConcatEntries(before, after)
         return result
 
     # pagerCacheLruVictimIndex: `order.iter().next()` restated — the
     # index of the resident page with the SMALLEST tick, i.e. the one
     # least recently touched. Returns -1 for an empty cache (mirrors
     # `order.iter().next()` returning `None`).
-    proc pagerCacheLruVictimIndex(ids: [int], ticks: [int]) -> int:
-        let n = len(ids)
+    proc pagerCacheLruVictimIndex(entries: [PagerEntry]) -> int:
+        let n = len(entries)
         if n == 0:
             return -1
         let mut bestIdx = 0
-        let mut bestTick = ticks[0]
+        let mut bestTick = entries[0].tick
         let mut i = 1
         loop i < n:
-            if ticks[i] < bestTick:
-                bestTick = ticks[i]
+            if entries[i].tick < bestTick:
+                bestTick = entries[i].tick
                 bestIdx = i
             i = i + 1
         return bestIdx
 
+    # pagerEntryIds / pagerEntryTicks / pagerEntryDirtyFlags: project one
+    # field out of the whole cache as a plain array — used only by this
+    # file's own demo fixtures below, which report a scenario's final
+    # ids/ticks/dirty flags separately for the build-check view even
+    # though they now live in one struct array.
+    proc pagerEntryIds(entries: [PagerEntry]) -> [int]:
+        let n = len(entries)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, entries[i].id)
+            i = i + 1
+        return out
+
+    proc pagerEntryTicks(entries: [PagerEntry]) -> [int]:
+        let n = len(entries)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, entries[i].tick)
+            i = i + 1
+        return out
+
+    proc pagerEntryDirtyFlags(entries: [PagerEntry]) -> [bool]:
+        let n = len(entries)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, entries[i].dirty)
+            i = i + 1
+        return out
+
     # ============================================================
     # THE EVICTION LOOP — `PagerInner::admit`'s `while self.cache.len() >
-    # self.capacity { ... }`, restated three times (see the header's
-    # "WHY FOUR STEP PROCS" note) plus once more to trace which id, if
-    # any, was actually evicted. Every copy threads the SAME two facts
-    # (`curIds`/`curTicks`) to pick the same victim at each pass — the
-    # one Rust guards against evicting is the entry just admitted itself
-    # (`if victim_id == id { break }`, needed because a freshly admitted
-    # page always carries the newest tick and can only ever be its own
-    # cache's minimum when it is the cache's ONLY entry, e.g. a capacity
-    # of 0 — see demoScenario3 below for that exact edge case traced by
-    # hand).
+    # self.capacity { ... }`, restated once for the array result plus
+    # once more to trace which id, if any, was actually evicted (a proc
+    # returns exactly one typed value, and eviction produces both a new
+    # cache AND a "what got evicted" fact — the same two-independent-
+    # re-derivations shape this file's header already explains for
+    # `pagerCacheStep`/`pagerCacheStepEvicted`, below). Struct fields
+    # collapse what used to be three copies of this loop (one per
+    # `ids`/`ticks`/`dirty` array) into one: evicting an entry now means
+    # removing one `PagerEntry` at an index, not three parallel removes
+    # that had to be kept in lockstep by hand. The one Rust guards
+    # against evicting is the entry just admitted itself (`if victim_id
+    # == id { break }`, needed because a freshly admitted page always
+    # carries the newest tick and can only ever be its own cache's
+    # minimum when it is the cache's ONLY entry, e.g. a capacity of 0 —
+    # see demoScenario3 below for that exact edge case traced by hand).
     # ============================================================
-    proc pagerCacheEvictLoopIds(ids: [int], ticks: [int], capacity: int, justAdmittedId: int) -> [int]:
-        let mut curIds = ids
-        let mut curTicks = ticks
+    proc pagerCacheEvictLoop(entries: [PagerEntry], capacity: int, justAdmittedId: int) -> [PagerEntry]:
+        let mut cur = entries
         let mut looping = true
         loop looping:
-            let n = len(curIds)
+            let n = len(cur)
             if n <= capacity:
                 looping = false
             else:
-                let victimIdx = do pagerCacheLruVictimIndex(curIds, curTicks)
+                let victimIdx = do pagerCacheLruVictimIndex(cur)
                 if victimIdx == -1:
                     looping = false
                 else:
-                    let victimId = curIds[victimIdx]
+                    let victimId = cur[victimIdx].id
                     if victimId == justAdmittedId:
                         looping = false
                     else:
-                        let newIds = do pagerCacheRemoveIntAt(curIds, victimIdx)
-                        let newTicks = do pagerCacheRemoveIntAt(curTicks, victimIdx)
-                        curIds = newIds
-                        curTicks = newTicks
-        return curIds
+                        let newCur = do pagerCacheRemoveEntryAt(cur, victimIdx)
+                        cur = newCur
+        return cur
 
-    proc pagerCacheEvictLoopTicks(ids: [int], ticks: [int], capacity: int, justAdmittedId: int) -> [int]:
-        let mut curIds = ids
-        let mut curTicks = ticks
-        let mut looping = true
-        loop looping:
-            let n = len(curIds)
-            if n <= capacity:
-                looping = false
-            else:
-                let victimIdx = do pagerCacheLruVictimIndex(curIds, curTicks)
-                if victimIdx == -1:
-                    looping = false
-                else:
-                    let victimId = curIds[victimIdx]
-                    if victimId == justAdmittedId:
-                        looping = false
-                    else:
-                        let newIds = do pagerCacheRemoveIntAt(curIds, victimIdx)
-                        let newTicks = do pagerCacheRemoveIntAt(curTicks, victimIdx)
-                        curIds = newIds
-                        curTicks = newTicks
-        return curTicks
-
-    proc pagerCacheEvictLoopDirty(ids: [int], ticks: [int], dirty: [bool], capacity: int, justAdmittedId: int) -> [bool]:
-        let mut curIds = ids
-        let mut curTicks = ticks
-        let mut curDirty = dirty
-        let mut looping = true
-        loop looping:
-            let n = len(curIds)
-            if n <= capacity:
-                looping = false
-            else:
-                let victimIdx = do pagerCacheLruVictimIndex(curIds, curTicks)
-                if victimIdx == -1:
-                    looping = false
-                else:
-                    let victimId = curIds[victimIdx]
-                    if victimId == justAdmittedId:
-                        looping = false
-                    else:
-                        let newIds = do pagerCacheRemoveIntAt(curIds, victimIdx)
-                        let newTicks = do pagerCacheRemoveIntAt(curTicks, victimIdx)
-                        let newDirty = do pagerCacheRemoveBoolAt(curDirty, victimIdx)
-                        curIds = newIds
-                        curTicks = newTicks
-                        curDirty = newDirty
-        return curDirty
-
-    proc pagerCacheEvictLoopLastEvicted(ids: [int], ticks: [int], capacity: int, justAdmittedId: int) -> int:
-        let mut curIds = ids
-        let mut curTicks = ticks
+    proc pagerCacheEvictLoopLastEvicted(entries: [PagerEntry], capacity: int, justAdmittedId: int) -> int:
+        let mut cur = entries
         let mut lastEvicted = -1
         let mut looping = true
         loop looping:
-            let n = len(curIds)
+            let n = len(cur)
             if n <= capacity:
                 looping = false
             else:
-                let victimIdx = do pagerCacheLruVictimIndex(curIds, curTicks)
+                let victimIdx = do pagerCacheLruVictimIndex(cur)
                 if victimIdx == -1:
                     looping = false
                 else:
-                    let victimId = curIds[victimIdx]
+                    let victimId = cur[victimIdx].id
                     if victimId == justAdmittedId:
                         looping = false
                     else:
-                        let newIds = do pagerCacheRemoveIntAt(curIds, victimIdx)
-                        let newTicks = do pagerCacheRemoveIntAt(curTicks, victimIdx)
-                        curIds = newIds
-                        curTicks = newTicks
+                        let newCur = do pagerCacheRemoveEntryAt(cur, victimIdx)
+                        cur = newCur
                         lastEvicted = victimId
         return lastEvicted
 
     # ============================================================
-    # THE FOUR TOP-LEVEL STEP PROCS a real caller (a self-hosted Pager)
-    # would actually call once per page access.
+    # THE TWO TOP-LEVEL STEP PROCS a real caller (a self-hosted Pager)
+    # would actually call once per page access — down from four before
+    # this file's struct rewrite (`pagerCacheStepIds`/`Ticks`/`Dirty`
+    # collapse into the one `pagerCacheStep` below, since a single page
+    # access now updates one struct's fields instead of three separately
+    # -threaded arrays that had to be kept in sync by hand;
+    # `pagerCacheStepEvicted` stays independent for the same reason the
+    # eviction loop above does — a proc returns exactly one typed value,
+    # and "the updated cache" and "what got evicted" are two different
+    # facts about the same access).
     # ============================================================
-    # pagerCacheStepIds / pagerCacheStepTicks: `Pager::read`'s hit
-    # branch (bump tick, cache unchanged) merged with its miss branch
-    # (`admit(id, page, false, ...)`), and `Pager::write`'s branch
-    # (always `admit(id, page, true, ...)`) — since, per the header
-    # note, admitting on an existing id changes no resident id and
-    # always refreshes its tick, exactly like a hit does; only whether
-    # the entry is dirty differs, which these two procs do not track.
-    proc pagerCacheStepIds(ids: [int], ticks: [int], capacity: int, id: int, tick: int) -> [int]:
-        let idx = do pagerCacheFindIndex(ids, id)
+    # pagerCacheStep: `Pager::read`'s hit branch (bump tick, cache
+    # unchanged, dirty untouched) merged with its miss branch (`admit(id,
+    # page, false, ...)`), and `Pager::write`'s branch (always `admit(id,
+    # page, true, ...)`). Admitting on an existing id changes no resident
+    # id and always refreshes its tick, exactly like a hit does; only
+    # whether the entry is dirty differs — a read hit leaves it
+    # untouched, a write hit sets it true, and either kind of miss admits
+    # a fresh entry whose dirty flag is exactly `isWrite` (`false` from a
+    # page fault, `true` from writing a brand-new page).
+    proc pagerCacheStep(entries: [PagerEntry], capacity: int, id: int, tick: int, isWrite: bool) -> [PagerEntry]:
+        let idx = do pagerCacheFindIndex(entries, id)
         if idx != -1:
-            return ids
-        let appendedIds = append(ids, id)
-        let appendedTicks = append(ticks, tick)
-        let result = do pagerCacheEvictLoopIds(appendedIds, appendedTicks, capacity, id)
+            let existing = entries[idx]
+            let mut newDirty = existing.dirty
+            if isWrite:
+                newDirty = true
+            let updated = PagerEntry{id: existing.id, tick: tick, dirty: newDirty}
+            let result = do pagerCacheSetEntryAt(entries, idx, updated)
+            return result
+        let newEntry = PagerEntry{id: id, tick: tick, dirty: isWrite}
+        let appended = append(entries, newEntry)
+        let result = do pagerCacheEvictLoop(appended, capacity, id)
         return result
 
-    proc pagerCacheStepTicks(ids: [int], ticks: [int], capacity: int, id: int, tick: int) -> [int]:
-        let idx = do pagerCacheFindIndex(ids, id)
-        if idx != -1:
-            let updated = do pagerCacheSetIntAt(ticks, idx, tick)
-            return updated
-        let appendedIds = append(ids, id)
-        let appendedTicks = append(ticks, tick)
-        let result = do pagerCacheEvictLoopTicks(appendedIds, appendedTicks, capacity, id)
-        return result
-
-    proc pagerCacheStepEvicted(ids: [int], ticks: [int], capacity: int, id: int, tick: int) -> int:
-        let idx = do pagerCacheFindIndex(ids, id)
+    proc pagerCacheStepEvicted(entries: [PagerEntry], capacity: int, id: int, tick: int) -> int:
+        let idx = do pagerCacheFindIndex(entries, id)
         if idx != -1:
             return -1
-        let appendedIds = append(ids, id)
-        let appendedTicks = append(ticks, tick)
-        let result = do pagerCacheEvictLoopLastEvicted(appendedIds, appendedTicks, capacity, id)
-        return result
-
-    # pagerCacheStepDirty: the one proc `isWrite` reaches — a read hit
-    # leaves `dirty` untouched (`Pager::read`'s hit path never touches
-    # the dirty flag), a write hit sets it true in place (`admit`'s
-    # `dirty: bool` parameter, always `true` from `Pager::write`), and
-    # either kind of miss admits a fresh entry whose dirty flag is
-    # exactly `isWrite` (`false` from a page fault, `true` from writing
-    # a brand-new page).
-    proc pagerCacheStepDirty(ids: [int], ticks: [int], dirty: [bool], capacity: int, id: int, tick: int, isWrite: bool) -> [bool]:
-        let idx = do pagerCacheFindIndex(ids, id)
-        if idx != -1:
-            if isWrite:
-                let updated = do pagerCacheSetBoolAt(dirty, idx, true)
-                return updated
-            return dirty
-        let appendedIds = append(ids, id)
-        let appendedTicks = append(ticks, tick)
-        let appendedDirty = append(dirty, isWrite)
-        let result = do pagerCacheEvictLoopDirty(appendedIds, appendedTicks, appendedDirty, capacity, id)
+        let newEntry = PagerEntry{id: id, tick: tick, dirty: false}
+        let appended = append(entries, newEntry)
+        let result = do pagerCacheEvictLoopLastEvicted(appended, capacity, id)
         return result
 
     # ============================================================
@@ -867,124 +810,82 @@ app StorageSelfHost:
     # that guard. Expected final ids [1], evicted -1.
     # ============================================================
     proc pagerDemoScenario1EvictedTrace() -> [int]:
-        let ids0 = do pagerDemoEmptyInts()
-        let ticks0 = do pagerDemoEmptyInts()
-        let e1 = do pagerCacheStepEvicted(ids0, ticks0, 3, 1, 1)
-        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
-        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
-        let e2 = do pagerCacheStepEvicted(ids1, ticks1, 3, 2, 2)
-        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
-        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
-        let e3 = do pagerCacheStepEvicted(ids2, ticks2, 3, 3, 3)
-        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
-        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
-        let e4 = do pagerCacheStepEvicted(ids3, ticks3, 3, 1, 4)
-        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
-        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
-        let e5 = do pagerCacheStepEvicted(ids4, ticks4, 3, 4, 5)
+        let entries0 = do pagerDemoEmptyEntries()
+        let e1 = do pagerCacheStepEvicted(entries0, 3, 1, 1)
+        let entries1 = do pagerCacheStep(entries0, 3, 1, 1, false)
+        let e2 = do pagerCacheStepEvicted(entries1, 3, 2, 2)
+        let entries2 = do pagerCacheStep(entries1, 3, 2, 2, false)
+        let e3 = do pagerCacheStepEvicted(entries2, 3, 3, 3)
+        let entries3 = do pagerCacheStep(entries2, 3, 3, 3, false)
+        let e4 = do pagerCacheStepEvicted(entries3, 3, 1, 4)
+        let entries4 = do pagerCacheStep(entries3, 3, 1, 4, false)
+        let e5 = do pagerCacheStepEvicted(entries4, 3, 4, 5)
         return [e1, e2, e3, e4, e5]
 
+    # pagerDemoScenario1FinalEntries: the one chain scenario 1's own
+    # FinalIds/FinalTicks below both read from — a struct array is one
+    # value carrying both facts, so unlike the old parallel-array version
+    # (which had to rebuild an `ids` chain and a `ticks` chain
+    # separately even though they were always advanced together), there
+    # is now exactly one chain to build.
+    proc pagerDemoScenario1FinalEntries() -> [PagerEntry]:
+        let entries0 = do pagerDemoEmptyEntries()
+        let entries1 = do pagerCacheStep(entries0, 3, 1, 1, false)
+        let entries2 = do pagerCacheStep(entries1, 3, 2, 2, false)
+        let entries3 = do pagerCacheStep(entries2, 3, 3, 3, false)
+        let entries4 = do pagerCacheStep(entries3, 3, 1, 4, false)
+        let entries5 = do pagerCacheStep(entries4, 3, 4, 5, false)
+        return entries5
+
     proc pagerDemoScenario1FinalIds() -> [int]:
-        let ids0 = do pagerDemoEmptyInts()
-        let ticks0 = do pagerDemoEmptyInts()
-        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
-        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
-        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
-        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
-        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
-        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
-        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
-        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
-        let ids5 = do pagerCacheStepIds(ids4, ticks4, 3, 4, 5)
-        return ids5
+        let entries = do pagerDemoScenario1FinalEntries()
+        let ids = do pagerEntryIds(entries)
+        return ids
 
     proc pagerDemoScenario1FinalTicks() -> [int]:
-        let ids0 = do pagerDemoEmptyInts()
-        let ticks0 = do pagerDemoEmptyInts()
-        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
-        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
-        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
-        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
-        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
-        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
-        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
-        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
-        let ticks5 = do pagerCacheStepTicks(ids4, ticks4, 3, 4, 5)
-        return ticks5
+        let entries = do pagerDemoScenario1FinalEntries()
+        let ticks = do pagerEntryTicks(entries)
+        return ticks
+
+    # pagerDemoScenario2Entries6 / FinalEntries: scenario 2 continues
+    # scenario 1 with two writes — write(3) (a hit, step 6) then
+    # write(5) (a miss, step 7). Entries6 is kept as its own proc because
+    # `pagerCacheStepEvicted` needs the cache AS OF just before step 7,
+    # not after it.
+    proc pagerDemoScenario2Entries6() -> [PagerEntry]:
+        let entries5 = do pagerDemoScenario1FinalEntries()
+        let entries6 = do pagerCacheStep(entries5, 3, 3, 6, true)
+        return entries6
+
+    proc pagerDemoScenario2FinalEntries() -> [PagerEntry]:
+        let entries6 = do pagerDemoScenario2Entries6()
+        let entries7 = do pagerCacheStep(entries6, 3, 5, 7, true)
+        return entries7
 
     proc pagerDemoScenario2FinalIds() -> [int]:
-        let ids0 = do pagerDemoEmptyInts()
-        let ticks0 = do pagerDemoEmptyInts()
-        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
-        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
-        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
-        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
-        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
-        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
-        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
-        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
-        let ids5 = do pagerCacheStepIds(ids4, ticks4, 3, 4, 5)
-        let ticks5 = do pagerCacheStepTicks(ids4, ticks4, 3, 4, 5)
-        let ids6 = do pagerCacheStepIds(ids5, ticks5, 3, 3, 6)
-        let ticks6 = do pagerCacheStepTicks(ids5, ticks5, 3, 3, 6)
-        let ids7 = do pagerCacheStepIds(ids6, ticks6, 3, 5, 7)
-        return ids7
+        let entries = do pagerDemoScenario2FinalEntries()
+        let ids = do pagerEntryIds(entries)
+        return ids
 
     proc pagerDemoScenario2FinalDirty() -> [bool]:
-        let ids0 = do pagerDemoEmptyInts()
-        let ticks0 = do pagerDemoEmptyInts()
-        let dirty0 = do pagerDemoEmptyBools()
-        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
-        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
-        let dirty1 = do pagerCacheStepDirty(ids0, ticks0, dirty0, 3, 1, 1, false)
-        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
-        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
-        let dirty2 = do pagerCacheStepDirty(ids1, ticks1, dirty1, 3, 2, 2, false)
-        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
-        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
-        let dirty3 = do pagerCacheStepDirty(ids2, ticks2, dirty2, 3, 3, 3, false)
-        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
-        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
-        let dirty4 = do pagerCacheStepDirty(ids3, ticks3, dirty3, 3, 1, 4, false)
-        let ids5 = do pagerCacheStepIds(ids4, ticks4, 3, 4, 5)
-        let ticks5 = do pagerCacheStepTicks(ids4, ticks4, 3, 4, 5)
-        let dirty5 = do pagerCacheStepDirty(ids4, ticks4, dirty4, 3, 4, 5, false)
-        let ids6 = do pagerCacheStepIds(ids5, ticks5, 3, 3, 6)
-        let ticks6 = do pagerCacheStepTicks(ids5, ticks5, 3, 3, 6)
-        let dirty6 = do pagerCacheStepDirty(ids5, ticks5, dirty5, 3, 3, 6, true)
-        let ids7 = do pagerCacheStepIds(ids6, ticks6, 3, 5, 7)
-        let ticks7 = do pagerCacheStepTicks(ids6, ticks6, 3, 5, 7)
-        let dirty7 = do pagerCacheStepDirty(ids6, ticks6, dirty6, 3, 5, 7, true)
-        return dirty7
+        let entries = do pagerDemoScenario2FinalEntries()
+        let dirty = do pagerEntryDirtyFlags(entries)
+        return dirty
 
     proc pagerDemoScenario2EvictedAtStep7() -> int:
-        let ids0 = do pagerDemoEmptyInts()
-        let ticks0 = do pagerDemoEmptyInts()
-        let ids1 = do pagerCacheStepIds(ids0, ticks0, 3, 1, 1)
-        let ticks1 = do pagerCacheStepTicks(ids0, ticks0, 3, 1, 1)
-        let ids2 = do pagerCacheStepIds(ids1, ticks1, 3, 2, 2)
-        let ticks2 = do pagerCacheStepTicks(ids1, ticks1, 3, 2, 2)
-        let ids3 = do pagerCacheStepIds(ids2, ticks2, 3, 3, 3)
-        let ticks3 = do pagerCacheStepTicks(ids2, ticks2, 3, 3, 3)
-        let ids4 = do pagerCacheStepIds(ids3, ticks3, 3, 1, 4)
-        let ticks4 = do pagerCacheStepTicks(ids3, ticks3, 3, 1, 4)
-        let ids5 = do pagerCacheStepIds(ids4, ticks4, 3, 4, 5)
-        let ticks5 = do pagerCacheStepTicks(ids4, ticks4, 3, 4, 5)
-        let ids6 = do pagerCacheStepIds(ids5, ticks5, 3, 3, 6)
-        let ticks6 = do pagerCacheStepTicks(ids5, ticks5, 3, 3, 6)
-        let e7 = do pagerCacheStepEvicted(ids6, ticks6, 3, 5, 7)
-        return e7
+        let entries6 = do pagerDemoScenario2Entries6()
+        let evicted = do pagerCacheStepEvicted(entries6, 3, 5, 7)
+        return evicted
 
     proc pagerDemoScenario3FinalIds() -> [int]:
-        let ids0 = do pagerDemoEmptyInts()
-        let ticks0 = do pagerDemoEmptyInts()
-        let ids1 = do pagerCacheStepIds(ids0, ticks0, 0, 1, 1)
-        return ids1
+        let entries0 = do pagerDemoEmptyEntries()
+        let entries1 = do pagerCacheStep(entries0, 0, 1, 1, false)
+        let ids = do pagerEntryIds(entries1)
+        return ids
 
     proc pagerDemoScenario3Evicted() -> int:
-        let ids0 = do pagerDemoEmptyInts()
-        let ticks0 = do pagerDemoEmptyInts()
-        let e1 = do pagerCacheStepEvicted(ids0, ticks0, 0, 1, 1)
+        let entries0 = do pagerDemoEmptyEntries()
+        let e1 = do pagerCacheStepEvicted(entries0, 0, 1, 1)
         return e1
 
     state demoFreshOk: bool = false
@@ -1108,26 +1009,33 @@ app StorageSelfHost:
     # because the algorithm differs), so it is reused rather than
     # re-derived a third time in this same file.
     #
-    # A WAL record's fields relevant to the replay rule are threaded as
-    # parallel arrays, one element per record, exactly like PART TWO's
-    # cache (no map/struct-array type exists in this language):
-    #   seqs:    [int]  each record's `sequence`
-    #   opKinds: [int]  each record's `WalOperation` tag, COLLAPSED to
-    #                    0=Begin, 1=Commit, 2=Abort, or one shared code
-    #                    for every mutation variant (Insert/Delete/
-    #                    InsertEdge/DeleteEdge/Archive/...). This mirrors
-    #                    `classify_transaction`'s own `match`: it has a
-    #                    named arm for `Begin`/`Commit`/`Abort` and a
-    #                    single `_ =>` catch-all for every other variant,
-    #                    which treats them all identically ("mutations
-    #                    cannot occur before BEGIN" / "...after
-    #                    termination" — never which mutation). Demo data
-    #                    below still uses distinct codes (3=Insert,
-    #                    4=Delete, 5=InsertEdge, 6=DeleteEdge, 7=Archive)
-    #                    purely for readability; the replay-rule procs
-    #                    themselves only ever ask "is this 0, 1, 2, or
-    #                    something else."
-    # Both arrays are assumed already filtered to ONE transaction and
+    # REWRITE NOTE (struct milestone): a WAL record's fields relevant to
+    # the replay rule used to be threaded as two parallel arrays, one
+    # element per record — `seqs: [int]` and `opKinds: [int]`, aligned by
+    # hand-maintained index exactly like PART TWO's old cache arrays.
+    # That is exactly the kind of "several named facts about one entity"
+    # this language's `struct` now has a real answer for: one
+    # `WalRecordEntry` value per record, one `[WalRecordEntry]` array in
+    # place of the two arrays that a bug could silently desync (a
+    # `seqs`/`opKinds` pair built to different lengths, or reordered
+    # relative to each other, was never a type error before this — it is
+    # now impossible, because there is only one array to build).
+    #   seq:    int  the record's `sequence`
+    #   opKind: int  the record's `WalOperation` tag, COLLAPSED to
+    #                0=Begin, 1=Commit, 2=Abort, or one shared code for
+    #                every mutation variant (Insert/Delete/InsertEdge/
+    #                DeleteEdge/Archive/...). This mirrors
+    #                `classify_transaction`'s own `match`: it has a named
+    #                arm for `Begin`/`Commit`/`Abort` and a single `_ =>`
+    #                catch-all for every other variant, which treats them
+    #                all identically ("mutations cannot occur before
+    #                BEGIN" / "...after termination" — never which
+    #                mutation). Demo data below still uses distinct codes
+    #                (3=Insert, 4=Delete, 5=InsertEdge, 6=DeleteEdge,
+    #                7=Archive) purely for readability; the replay-rule
+    #                procs themselves only ever ask "is this 0, 1, 2, or
+    #                something else."
+    # The record array is assumed already filtered to ONE transaction and
     # already in ascending-sequence order. That is not a shortcut: every
     # real caller's input already has this shape before
     # `classify_transaction` runs — `classify_transactions` builds its
@@ -1149,17 +1057,19 @@ app StorageSelfHost:
     # transaction produces two independent facts — an outcome
     # (committed / discard / hard-error) and, only when committed, a
     # COMMIT sequence number — so, following PART TWO's own documented
-    # precedent for the identical constraint (four independent "step"
-    # procs re-deriving the same access decision), `walClassify
-    # TransactionOutcome` and `walClassifyTransactionCommitSequence`
-    # are two independent re-walks of the SAME control flow: every
-    # `return 2` (hard error) in the outcome proc has a line-for-line
-    # `return -1` at the identical branch in the commit-sequence proc,
-    # and the one branch that actually assigns a value (`commitSeq =
-    # seqs[i]` on a valid, final COMMIT) is the only place the two procs'
-    # final return values can differ from each other by more than "2 vs.
-    # -1" — guaranteeing agreement by construction rather than by
-    # cross-checking two independently-invented algorithms.
+    # precedent for the identical constraint, `walClassifyTransactionOutcome`
+    # and `walClassifyTransactionCommitSequence` are two independent
+    # re-walks of the SAME control flow: every `return 2` (hard error) in
+    # the outcome proc has a line-for-line `return -1` at the identical
+    # branch in the commit-sequence proc, and the one branch that
+    # actually assigns a value (`commitSeq = records[i].seq` on a valid,
+    # final COMMIT) is the only place the two procs' final return values
+    # can differ from each other by more than "2 vs. -1" — guaranteeing
+    # agreement by construction rather than by cross-checking two
+    # independently-invented algorithms.
+    struct WalRecordEntry:
+        seq: int
+        opKind: int
     proc walFrameMagicBytes() -> [int]:
         return [70, 81, 87, 49]
 
@@ -1245,14 +1155,14 @@ app StorageSelfHost:
         return true
 
     # ============================================================
-    # THE REPLAY RULE — `classify_transaction`, restated over the parallel
-    # (seqs, opKinds) arrays described in the header note.
+    # THE REPLAY RULE — `classify_transaction`, restated over the
+    # `[WalRecordEntry]` array described in the header note.
     # ============================================================
-    proc walClassifyTransactionOutcome(seqs: [int], opKinds: [int]) -> int:
-        let n = len(seqs)
+    proc walClassifyTransactionOutcome(records: [WalRecordEntry]) -> int:
+        let n = len(records)
         if n == 0:
             return 0
-        if opKinds[0] != 0:
+        if records[0].opKind != 0:
             # First surviving record isn't BEGIN. A COMMIT anywhere in
             # the set means the log asserts a commit whose opening
             # record is gone — a hard error, never a silent discard
@@ -1262,7 +1172,7 @@ app StorageSelfHost:
             let mut i = 0
             let mut hasCommit = false
             loop i < n:
-                if opKinds[i] == 1:
+                if records[i].opKind == 1:
                     hasCommit = true
                 i = i + 1
             if hasCommit:
@@ -1272,7 +1182,7 @@ app StorageSelfHost:
         let mut aborted = false
         let mut i = 0
         loop i < n:
-            let kind = opKinds[i]
+            let kind = records[i].opKind
             if kind == 0:
                 if i != 0:
                     return 2
@@ -1283,7 +1193,7 @@ app StorageSelfHost:
                     return 2
                 if i != n - 1:
                     return 2
-                commitSeq = seqs[i]
+                commitSeq = records[i].seq
             if kind == 2:
                 if commitSeq != -1:
                     return 2
@@ -1306,17 +1216,17 @@ app StorageSelfHost:
     # walk as `walClassifyTransactionOutcome`, returning -1 wherever that
     # proc returns 2 (hard error) or 0-via-no-commit (discard), and the
     # actual COMMIT sequence wherever it returns 1 (committed).
-    proc walClassifyTransactionCommitSequence(seqs: [int], opKinds: [int]) -> int:
-        let n = len(seqs)
+    proc walClassifyTransactionCommitSequence(records: [WalRecordEntry]) -> int:
+        let n = len(records)
         if n == 0:
             return -1
-        if opKinds[0] != 0:
+        if records[0].opKind != 0:
             return -1
         let mut commitSeq = -1
         let mut aborted = false
         let mut i = 0
         loop i < n:
-            let kind = opKinds[i]
+            let kind = records[i].opKind
             if kind == 0:
                 if i != 0:
                     return -1
@@ -1327,7 +1237,7 @@ app StorageSelfHost:
                     return -1
                 if i != n - 1:
                     return -1
-                commitSeq = seqs[i]
+                commitSeq = records[i].seq
             if kind == 2:
                 if commitSeq != -1:
                     return -1
@@ -1421,58 +1331,41 @@ app StorageSelfHost:
     # outcome 2 (hard error, NOT a silent discard) — the one case this
     # rule refuses to guess about.
     # ============================================================
-    proc walDemoScenarioCommittedSeqs() -> [int]:
-        return [10, 11, 12]
+    proc walDemoScenarioCommittedRecords() -> [WalRecordEntry]:
+        return [WalRecordEntry{seq: 10, opKind: 0}, WalRecordEntry{seq: 11, opKind: 3}, WalRecordEntry{seq: 12, opKind: 1}]
 
-    proc walDemoScenarioCommittedOps() -> [int]:
-        return [0, 3, 1]
+    proc walDemoScenarioNoCommitRecords() -> [WalRecordEntry]:
+        return [WalRecordEntry{seq: 20, opKind: 0}, WalRecordEntry{seq: 21, opKind: 3}]
 
-    proc walDemoScenarioNoCommitSeqs() -> [int]:
-        return [20, 21]
+    proc walDemoScenarioAbortedRecords() -> [WalRecordEntry]:
+        return [WalRecordEntry{seq: 30, opKind: 0}, WalRecordEntry{seq: 31, opKind: 3}, WalRecordEntry{seq: 32, opKind: 2}]
 
-    proc walDemoScenarioNoCommitOps() -> [int]:
-        return [0, 3]
-
-    proc walDemoScenarioAbortedSeqs() -> [int]:
-        return [30, 31, 32]
-
-    proc walDemoScenarioAbortedOps() -> [int]:
-        return [0, 3, 2]
-
-    proc walDemoScenarioHardErrorSeqs() -> [int]:
-        return [41, 42]
-
-    proc walDemoScenarioHardErrorOps() -> [int]:
-        return [3, 1]
+    proc walDemoScenarioHardErrorRecords() -> [WalRecordEntry]:
+        return [WalRecordEntry{seq: 41, opKind: 3}, WalRecordEntry{seq: 42, opKind: 1}]
 
     proc walDemoCommittedOutcome() -> int:
-        let seqs = do walDemoScenarioCommittedSeqs()
-        let ops = do walDemoScenarioCommittedOps()
-        let outcome = do walClassifyTransactionOutcome(seqs, ops)
+        let records = do walDemoScenarioCommittedRecords()
+        let outcome = do walClassifyTransactionOutcome(records)
         return outcome
 
     proc walDemoCommittedSeq() -> int:
-        let seqs = do walDemoScenarioCommittedSeqs()
-        let ops = do walDemoScenarioCommittedOps()
-        let seq = do walClassifyTransactionCommitSequence(seqs, ops)
+        let records = do walDemoScenarioCommittedRecords()
+        let seq = do walClassifyTransactionCommitSequence(records)
         return seq
 
     proc walDemoNoCommitOutcome() -> int:
-        let seqs = do walDemoScenarioNoCommitSeqs()
-        let ops = do walDemoScenarioNoCommitOps()
-        let outcome = do walClassifyTransactionOutcome(seqs, ops)
+        let records = do walDemoScenarioNoCommitRecords()
+        let outcome = do walClassifyTransactionOutcome(records)
         return outcome
 
     proc walDemoAbortedOutcome() -> int:
-        let seqs = do walDemoScenarioAbortedSeqs()
-        let ops = do walDemoScenarioAbortedOps()
-        let outcome = do walClassifyTransactionOutcome(seqs, ops)
+        let records = do walDemoScenarioAbortedRecords()
+        let outcome = do walClassifyTransactionOutcome(records)
         return outcome
 
     proc walDemoHardErrorOutcome() -> int:
-        let seqs = do walDemoScenarioHardErrorSeqs()
-        let ops = do walDemoScenarioHardErrorOps()
-        let outcome = do walClassifyTransactionOutcome(seqs, ops)
+        let records = do walDemoScenarioHardErrorRecords()
+        let outcome = do walClassifyTransactionOutcome(records)
         return outcome
 
     state demoWalCleanOutcome: int = -1

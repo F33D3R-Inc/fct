@@ -7,6 +7,49 @@ app NodesSelfHost:
     # `row`/`text`/`link`/... node lines beneath it) — into `.fct` `proc`s.
     #
     # ============================================================
+    # REWRITE NOTE (struct milestone): this file used to represent the
+    # view's own UI-node tree as a flat postorder `[int]` "arena" SHARED
+    # with expr.fct's own expression arena — 5 ints per row, a numeric kind
+    # tag (17 NodeBlock, 18 Box, 20 Text, 22 NodeSlot, 23 SegSlot, ...), with
+    # a `box`/`row`'s N children recovered via a NodeBlock/NodeSlot
+    # auxiliary-row chain and a `text`/`link`'s N literal-or-`{expr}`
+    # segments recovered via an identical SegSlot chain — see git history
+    # for the exact byte-for-byte encoding this file used to carry.
+    #
+    # Now that a proc can declare a real `struct` (see predicate.fct's own
+    # rewrite note and stmt.fct's own StmtResult/BlockResult precedent for
+    # the "pairing struct" technique this file reuses below), the whole
+    # NodeBlock/NodeSlot indirection collapses to one real field:
+    # `children: [UiNode]` — a `box`/`row`'s children ARE its children, not
+    # an index chased through a shared int array. The SegSlot indirection
+    # collapses the same way, to `segs: [Seg]` — and this rewrite goes one
+    # step further than the arena version could: `link`'s label/destination
+    # no longer need to be wrapped in their own synthetic "Text-shaped node"
+    # just to reuse ONE counting trick for both a bare `text` keyword and a
+    # link's two text-like payloads (the arena version's own kind 20 Text,
+    # shared by both). A struct has named fields, so `link` simply gets its
+    # own two named fields — `labelSegs: [Seg]` and `destSegs: [Seg]` —
+    # directly, with no intermediate node at all. This is named UiNode, not
+    # Node, specifically per this task's own instruction: expr.fct is not
+    # (as of this rewrite) struct-based, but predicate.fct's own `Node`
+    # struct is a completely different tree living in a different app, and
+    # a future merge of self-host files should never have to disambiguate
+    # "which Node" — so this file's own tree gets its own, unambiguous name
+    # from the start.
+    #
+    # As with stmt.fct, expr.fct itself is UNCHANGED by this rewrite — still
+    # int-arena-based, checked fresh rather than assumed — so a `{expr}`
+    # interpolation segment's own sub-expression is still parsed into, and
+    # referenced by a plain `int` root index into, the SAME shared `[int]`
+    # expression arena expr.fct's own `orNodes` already builds. This file
+    # reuses stmt.fct's own answer to "how does a proc, which returns
+    # exactly one value, hand back both a newly-built struct value AND the
+    # shared arena as extended while building it": a small pairing struct
+    # per builder (SegResult, NodeResult, NodeBlockResult — see their own
+    # doc, below) — the identical StmtResult/BlockResult shape, applied to
+    # this file's own UiNode/Seg types.
+    #
+    # ============================================================
     # WHY THIS IS A NEW FILE, NOT AN EXTENSION OF parser.fct
     # ============================================================
     # Read fresh before choosing: parser.fct already declares its own
@@ -46,134 +89,102 @@ app NodesSelfHost:
     # balanced, string-aware backward scan for a trailing `kw "value"`
     # pair, a genuinely separate feature from node-body parsing, and
     # porting it honestly would be its own round of work, not a bolt-on
-    # here.
+    # here. Unchanged by this rewrite.
     #
     # ============================================================
-    # IS stmt.fct's Block/StmtSlot MACHINERY REUSABLE FOR "A NODE WITH N
-    # CHILD NODES" THE SAME WAY IT WORKED FOR "A STATEMENT WITH N CHILD
-    # STATEMENTS"? YES, directly in SHAPE — a `box`/`row`'s children are
-    # exactly a sibling list recovered off source.fct's own
-    # parents/children convention, the identical shape a proc body's own
-    # statement list already was. This file's NodeBlock (kind 17) and
-    # NodeSlot (kind 22) are a straight rename of stmt.fct's Block (17) /
-    # StmtSlot (28) — same fields, same "build every child's subtree
-    # first, then append N pointer rows contiguously, then the Block/
-    # NodeBlock row itself" discipline, same `count = selfIdx - firstSlot`
-    # arithmetic. The kind NUMBERS are independent (this file never merges
-    # with stmt.fct, only with expr.fct, so there is no risk of collision
-    # with stmt.fct's own 17-29 range; they were kept numerically similar
-    # only for a reader's convenience in cross-referencing the two files).
-    #
-    # One real adaptation was needed, though, not just a rename: `link`'s
-    # label and destination are NOT child NODES the way a `box`'s children
-    # are — they are each a piece of TEXT (a run of literal characters and
-    # `{expr}` interpolations). This is a variable-arity shape on a NEW
-    # axis stmt.fct never needed (segments INSIDE one string, not sibling
-    # statements/nodes in a list), so it needed its own auxiliary-row
-    # family, SegSlot (kind 23) — ArgSlot's/StmtSlot's exact "N contiguous
-    # pointer rows, count recovered by idx-minus-first arithmetic" trick,
-    # generalized to point at an EXPRESSION's root instead of a
-    # statement's or a call argument's. And rather than give `Link` four
-    # separate facts (label-first-slot, label-count, dest-first-slot,
-    # dest-count — more than one row's four usable slots comfortably
-    # carry two of independently), this file applies stmt.fct's own `If`
-    # lesson one level further: `text`'s own shape (a firstSegSlot plus a
-    # lineIdx) is built as a small reusable node in its own right (kind 20,
-    # via nodeTextLikeNodes below) and `link` just stores the two
-    # resulting NODE INDICES (its label's Text-shaped node, its dest's) as
-    # its own two facts — collapsing "content plus content's own segment
-    # count" into one fact each, exactly the way wrapping an `if`
-    # branch's statements in their own Block collapsed "body plus
-    # body-count" into one fact in stmt.fct.
-    #
+    # THE UiNode / Seg STRUCTS
     # ============================================================
-    # THE ARENA: the SAME flat `[int]` array expr.fct's own arena uses (5
-    # ints per row: kind, then four payload slots), imported and threaded
-    # exactly the way stmt.fct threads it through expr.fct's own
-    # `orNodes`. Kinds 0-16 belong to expr.fct (Lit/Ref/Bin/.../AggMeta —
-    # read fresh from expr.fct before picking this file's own range, so
-    # there is no numeric overlap even though both live in the one array).
-    # This file's own kinds:
+    #   struct Seg — one literal-or-`{expr}` segment inside a `text`
+    #   keyword's content, OR inside `link`'s own label/destination (both
+    #   share this exact shape — see the REWRITE NOTE above for why this
+    #   version no longer needs to wrap that sharing in a synthetic node):
+    #     isExpr: bool   — true for a `{…}` interpolation, false for a
+    #                      literal run of characters.
+    #     text: text     — the literal run's own raw text (unescaped —
+    #                      matching the arena version's own documented
+    #                      scope, this is the raw source slice, not a
+    #                      decoded value); "" when isExpr is true.
+    #     exprIdx: int   — the interpolation's expression root index, INTO
+    #                      THE SHARED expr.fct ARENA (see the REWRITE NOTE
+    #                      above); -1 when isExpr is false.
     #
-    #   17 NodeBlock — a child-NODE list (a view's own top-level body, or
-    #                  a `box`/`row`'s own children). Slot1 = the index of
-    #                  this block's first NodeSlot row (-1 if empty),
-    #                  slots 2-4 unused. Count recovered the same
-    #                  idx-minus-firstSlot arithmetic every Block-shaped
-    #                  kind in this whole self-hosting effort already uses
-    #                  (see blockStmtCount's own doc in stmt.fct).
-    #   18 Box        — Slot1 = the NodeBlock index holding this box's
-    #                  children.
-    #   19 Row        — identical shape to Box; the kind number alone
-    #                  distinguishes them (the same "kind alone, no extra
-    #                  flag slot" convention expr.fct's own Lit(int) vs.
-    #                  Lit(float) split already established).
-    #   20 Text       — a (possibly empty, possibly segmented) piece of
-    #                  content: literal runs interleaved with `{expr}`
-    #                  interpolations. Slot1 = the index of this text's
-    #                  first SegSlot row (-1 if every segment is literal —
-    #                  including the common case of NO interpolation at
-    #                  all). Slot2 = lineIdx, the index of this node's own
-    #                  source line in the caller's `texts`/`parents`
-    #                  arrays (stmt.fct's own "recover a name on demand
-    #                  from texts[lineIdx] rather than storing it" idiom —
-    #                  see textInnerOf/linkLabelInnerOf/linkDestInnerOf
-    #                  below for exactly how a literal segment's own raw
-    #                  TEXT, never stored in the arena, is recovered from
-    #                  it). Built by nodeTextLikeNodes, shared verbatim by
-    #                  both the real `text` keyword AND `link`'s label/
-    #                  destination — see the header note above.
-    #   21 Link       — Slot1 = the label's own Text-shaped node index.
-    #                  Slot2 = the destination's own Text-shaped node
-    #                  index. Slot3 = lineIdx. Slot4 unused.
-    #   22 NodeSlot   — the auxiliary "pointer" row a NodeBlock's own
-    #                  variable-arity child list needs — stmt.fct's
-    #                  StmtSlot / expr.fct's ArgSlot, renamed: Slot1 =
-    #                  one child NODE's real root index, slots 2-4 unused.
-    #   23 SegSlot    — the auxiliary "pointer" row a Text-shaped node's
-    #                  own variable-arity EXPRESSION-segment list needs:
-    #                  Slot1 = one `{…}` segment's real expression root
-    #                  index (into this same shared arena — an ordinary
-    #                  expr.fct subtree), slots 2-4 unused. A LITERAL
-    #                  segment gets no SegSlot row at all (it carries no
-    #                  arena-representable value — its own raw text is
-    #                  recovered from source on demand, never stored),
-    #                  exactly mirroring how ArgSlot/StmtSlot only ever
-    #                  point at real, already-built subtrees.
-    #   25 Unsupported — a node-shaped line this file was not scoped to
-    #                  parse (any keyword besides box/row/text/link,
-    #                  reported honestly rather than crashing or guessing
-    #                  a wrong shape — the same convention every earlier
-    #                  file in this port already established for its own
-    #                  out-of-scope constructs). Slot1 = lineIdx.
+    #   struct UiNode — one node in the view's own child tree:
+    #     kind: text          — "box" | "row" | "text" | "link" |
+    #                           "unsupported".
+    #     lineIdx: int         — this node's own source line index (used by
+    #                           STAGE 10's demo; a box/row/unsupported node
+    #                           has no other content to recover from it).
+    #     children: [UiNode]   — a box/row's own child node list. `[]` for
+    #                           every other kind. Direct replacement for the
+    #                           old NodeBlock(17)/NodeSlot(22) pair: no
+    #                           first-slot index, no count arithmetic, just
+    #                           the children themselves.
+    #     segs: [Seg]          — a bare `text` keyword's own segments. `[]`
+    #                           for every other kind.
+    #     labelSegs: [Seg]     — a `link`'s label segments. `[]` otherwise.
+    #     destSegs: [Seg]      — a `link`'s destination segments. `[]`
+    #                           otherwise.
     #
-    # (Kind 24 is deliberately left unused — a placeholder the way
-    # stmt.fct's own kind numbering leaves gaps for a future node this
-    # round did not need, e.g. an `if`/`for` node's own condition/loop
-    # facts, which a later round could add without renumbering anything
-    # above.)
-    #
+    # (Every field is always present on every UiNode value — a struct
+    # literal must set every field — with only the ones its own `kind`
+    # actually uses ever non-empty, exactly predicate.fct's own Node
+    # convention.)
+    struct Seg:
+        isExpr: bool
+        text: text
+        exprIdx: int
+
+    struct UiNode:
+        kind: text
+        lineIdx: int
+        children: [UiNode]
+        segs: [Seg]
+        labelSegs: [Seg]
+        destSegs: [Seg]
+
+    # SegResult / NodeResult / NodeBlockResult: the same "pairing struct"
+    # technique stmt.fct's own StmtResult/BlockResult already established
+    # (see this file's REWRITE NOTE, above) — a proc that both builds a
+    # value (a [Seg] list, a UiNode, or a [UiNode] list) and extends the
+    # shared expr.fct arena while doing so returns ONE struct bundling
+    # both, since a proc can return only one value. Every caller continues
+    # from `.arena` before its own next call, the same discipline expr.fct's
+    # own FINDING 3 established for a bare `[int]` return.
+    struct SegResult:
+        segs: [Seg]
+        arena: [int]
+
+    struct NodeResult:
+        node: UiNode
+        arena: [int]
+
+    struct NodeBlockResult:
+        nodes: [UiNode]
+        arena: [int]
+
     # ============================================================
     # HAND-TRACED VERIFICATION (see this file's own closing report for the
-    # full row-by-row arithmetic): three real, multi-line view bodies —
-    # (1) a `box` with two plain `text "…"` children, (2) a `link` whose
-    # label is pure literal and whose destination is pure literal, and
-    # (3) a `text` line with a real `{name}` interpolation in the middle
-    # of two literal runs — were traced by hand against the algorithm
-    # below, confirming: a NodeBlock's own child count and each child's
-    # real root index are recoverable by pure arithmetic with no
-    # backpatching; a Text node's segment count and each segment's own
-    # literal text / expression root are both recoverable; and `link`'s
-    # label/destination each resolve, via their own Text-shaped node
-    # index, to the identical reader family `text` itself uses — no
-    # separate code path needed for "a link's label" versus "a bare text
-    # node".
+    # full walk): the same three real, multi-line view bodies this file was
+    # originally verified against — (1) a `box` with two plain `text "…"`
+    # children, (2) a `link` whose label is pure literal and whose
+    # destination is pure literal, and (3) a `text` line with a real
+    # `{name}` interpolation in the middle of two literal runs — re-traced
+    # against the struct design above: a NodeBlockResult's own `nodes`
+    # length and each child's own real UiNode value are direct array reads
+    # (no arithmetic); a Text-kind UiNode's `segs` length and each
+    # segment's own literal text / expression root are both direct field
+    # reads; and `link`'s `labelSegs`/`destSegs` are read by the identical
+    # Seg-list machinery `text` itself uses — still no separate code path
+    # for "a link's label" versus "a bare text node", now because both are
+    # literally the same [Seg] shape rather than because both funnel
+    # through one shared node kind.
     #
     # ============================================================
     # STAGE 1: generic text-surgery primitives — parser.fct's own STAGE 1
     # (hasPrefixText/trimPrefixText/trimSuffixText/indexOf), restated
     # locally under `node`-prefixed names (see the header above for why
-    # this file does not import parser.fct itself).
+    # this file does not import parser.fct itself). Unchanged by this
+    # rewrite.
     # ============================================================
     proc nodeHasPrefix(s: text, p: text) -> bool:
         let n = len(p)
@@ -221,6 +232,7 @@ app NodesSelfHost:
     # STAGE 2: closed-alphabet identifier classification — parser.fct's
     # own STAGE 2 (isDigitChar/isIdentStartChar/isIdentChar/isIdentToken),
     # restated locally; needed only for the view header's own name check.
+    # Unchanged by this rewrite.
     # ============================================================
     proc nodeIsDigitChar(c: text) -> bool:
         return c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
@@ -257,7 +269,8 @@ app NodesSelfHost:
     # ============================================================
     # STAGE 3: quote/brace scanning — the machinery `stripNodeMods`'s own
     # `endOfQuoted`/`endOfInterp` provide in parser.go, restated here in
-    # the narrower shape this file's own scope actually needs.
+    # the narrower shape this file's own scope actually needs. Unchanged
+    # by this rewrite.
     #
     # nodeSkipQuoted mirrors expr.fct's own string-literal tokenizer
     # branch (STAGE 1 there) exactly — the same "scan forward, a `\`
@@ -270,10 +283,8 @@ app NodesSelfHost:
     # counting, so `{f("}")}` closes where the author meant). This port's
     # version is honestly narrower: depth-counting only, no quote
     # awareness inside `{…}` — a `"` containing a literal `}` inside an
-    # interpolation is a genuine, documented gap (the same class of
-    # honestly-reported narrowing this whole self-hosting effort already
-    # uses elsewhere, e.g. expr.fct's own out-of-scope shift operators).
-    # Every hand-traced example below avoids that shape.
+    # interpolation is a genuine, documented gap. Every hand-traced example
+    # below avoids that shape.
     # ============================================================
     proc nodeSkipQuoted(s: text, openIdx: int) -> int:
         let n = len(s)
@@ -296,9 +307,8 @@ app NodesSelfHost:
     # unquoteText requirement for `text "…"`/a link's label or
     # destination) — "" for anything that does not even open with a
     # quote. Like every other quote handling in this whole self-hosting
-    # effort (parser.fct's STAGE 13 quotedInner, expr.fct's FINDING 7),
-    # this does not decode backslash escapes — the raw substring between
-    # the two quote characters is exactly what nodeSegLitAt/
+    # effort, this does not decode backslash escapes — the raw substring
+    # between the two quote characters is exactly what nodeSegLitAt/
     # nodeSegExprInnerAt below need, and decoding is left to whoever
     # ultimately renders the value.
     proc nodeQuotedSpan(s: text) -> text:
@@ -373,6 +383,7 @@ app NodesSelfHost:
     # same "position vs. data are separate pure families of procs" idiom
     # this whole self-hosting effort uses throughout, forced by a proc
     # never returning more than one value or a heterogeneous shape.
+    # Unchanged by this rewrite.
     # ============================================================
     proc nodeSegCount(inner: text) -> int:
         let n = len(inner)
@@ -471,33 +482,31 @@ app NodesSelfHost:
         let end = do nodeSegEndAt(inner, idx)
         return slice(inner, start + 1, end - 1)
 
-    proc nodeSegExprCount(inner: text) -> int:
-        let cnt = do nodeSegCount(inner)
-        let mut m = 0
-        let mut i = 0
-        loop i < cnt:
-            let isE = do nodeSegIsExprAt(inner, i)
-            if isE:
-                m = m + 1
-            i = i + 1
-        return m
-
     # ============================================================
-    # STAGE 5: nodeSegNodes — builds every expression segment's own
-    # subtree (via expr.fct's real `tokenKinds`/`tokenTexts`/`orNodes`,
-    # not a re-derived expression grammar), then appends one SegSlot row
-    # per expression segment, CONTIGUOUSLY, exactly mirroring expr.fct's
-    # own argListNodes (FINDING 8) / stmt.fct's own stmtBlockNodes: build
-    # every child subtree into a proc-LOCAL accumulator first (safe to
-    # grow with `append` since it never crosses a return-value boundary),
-    # then walk that accumulator once at the end to emit the pointer rows
-    # in order, so "the first SegSlot's index" is recoverable by the
-    # caller via pure arithmetic (idx-minus-count) afterward.
+    # STAGE 5: nodeSegNodes — builds every segment of an already-dequoted
+    # `inner` string into a real `[Seg]` list: a literal segment becomes
+    # Seg{isExpr: false, text: <its raw text>, exprIdx: -1} directly (no
+    # arena row of its own — same as the old SegSlot version, a literal
+    # segment carries no arena-representable value); an expression segment
+    # is parsed via expr.fct's real `tokenKinds`/`tokenTexts`/`orNodes` (not
+    # a re-derived expression grammar) and becomes Seg{isExpr: true, text:
+    # "", exprIdx: <its root index>}. Returns a SegResult (the [Seg] list
+    # plus the arena as extended by every expression segment parsed) — see
+    # this file's REWRITE NOTE for why a pairing struct, not a bare [int],
+    # is this proc's return type.
+    #
+    # This directly replaces the old nodeSegNodes (which only emitted
+    # SegSlot rows) AND nodeTextLikeNodes (which additionally wrapped the
+    # result in a synthetic Text node) in one step: since a `[Seg]` array
+    # already IS the exact value both `text` and `link` need, there is
+    # nothing left for a wrapping node to do — see the REWRITE NOTE's own
+    # closing paragraph on why that indirection existed only to reuse one
+    # counting trick the arena version needed and this version does not.
     # ============================================================
-    proc nodeSegNodes(inner: text, arena: [int]) -> [int]:
+    proc nodeSegNodes(inner: text, arena: [int]) -> SegResult:
         let cnt = do nodeSegCount(inner)
         let mut a = arena
-        let mut rootIdxs = []
+        let mut segs = []
         let mut i = 0
         loop i < cnt:
             let isE = do nodeSegIsExprAt(inner, i)
@@ -507,44 +516,20 @@ app NodesSelfHost:
                 let tx = do tokenTexts(innerExpr)
                 let a1 = do orNodes(k, tx, 0, a)
                 let rootIdx = (len(a1) / 5) - 1
-                rootIdxs = append(rootIdxs, rootIdx)
                 a = a1
+                segs = append(segs, Seg{isExpr: true, text: "", exprIdx: rootIdx})
+            else:
+                let lit = do nodeSegLitAt(inner, i)
+                segs = append(segs, Seg{isExpr: false, text: lit, exprIdx: -1})
             i = i + 1
-        let m = len(rootIdxs)
-        let mut k2 = 0
-        loop k2 < m:
-            a = append(a, 23)
-            a = append(a, rootIdxs[k2])
-            a = append(a, -1)
-            a = append(a, -1)
-            a = append(a, -1)
-            k2 = k2 + 1
-        return a
-
-    # nodeTextLikeNodes: appends one Text-shaped row (kind 20) built from
-    # `inner`'s own segments — shared, verbatim, by the real `text`
-    # keyword and by `link`'s own label/destination (see this file's
-    # header for why that sharing is the real design win here).
-    proc nodeTextLikeNodes(inner: text, lineIdx: int, arena: [int]) -> [int]:
-        let a1 = do nodeSegNodes(inner, arena)
-        let exprCount = do nodeSegExprCount(inner)
-        let mut first = -1
-        if exprCount > 0:
-            first = (len(a1) / 5) - exprCount
-        let mut a = a1
-        a = append(a, 20)
-        a = append(a, first)
-        a = append(a, lineIdx)
-        a = append(a, -1)
-        a = append(a, -1)
-        return a
+        return SegResult{segs: segs, arena: a}
 
     # ============================================================
     # STAGE 6: raw multi-line node-tree TEXT -> the two parallel arrays
     # (`texts`/`parents`) this file's node builder consumes — source.fct's
     # own algorithm, restated locally under `body`-prefixed names exactly
     # as stmt.fct already restated it (see this file's header for why
-    # source.fct itself is not imported).
+    # source.fct itself is not imported). Unchanged by this rewrite.
     # ============================================================
     proc bodyIsBlankOrComment(line: text) -> bool:
         let t = trim(line)
@@ -631,10 +616,10 @@ app NodesSelfHost:
 
     # ============================================================
     # STAGE 7: per-line recovery of a `text`/`link` line's own raw content
-    # substring — re-derived from `lineText` alone (never stored in the
-    # arena), the exact same "recover a name/value on demand from the
+    # substring — re-derived from `lineText` alone (never stored on a
+    # UiNode field), the exact same "recover a value on demand from the
     # source line" idiom stmt.fct's own letOrAssignName/bareDoProcName
-    # already established.
+    # already established. Unchanged by this rewrite.
     # ============================================================
     proc textInnerOf(lineText: text) -> text:
         let t = trim(lineText)
@@ -677,102 +662,61 @@ app NodesSelfHost:
         return r
 
     # ============================================================
-    # STAGE 8: nodeSingleNodes / nodeBlockNodes — the recursive tree
-    # builder itself, mirroring stmt.fct's singleStmtNodes/stmtBlockNodes
-    # split exactly (one proc per LINE, one proc per whole sibling list).
-    # No `if`/`else`-style sibling lookahead is needed for this file's own
-    # four keywords (unlike stmt.fct's `if`), so nodeBlockNodes is
-    # simpler than stmtBlockNodes in exactly that one respect.
+    # STAGE 8: nodeSingleNode / nodeBlockNodes — the recursive tree builder
+    # itself, mirroring stmt.fct's singleStmt/stmtBlockStmts split exactly
+    # (one proc per LINE, one proc per whole sibling list). No `if`/`else`-
+    # style sibling lookahead is needed for this file's own four keywords
+    # (unlike stmt.fct's `if`), so nodeBlockNodes is simpler than
+    # stmtBlockStmts in exactly that one respect. Each returns a pairing
+    # struct (NodeResult / NodeBlockResult — see their own doc, above)
+    # instead of an extended `[int]` arena: `box`/`row` no longer need a
+    # NodeBlock index at all, they just carry `children: [UiNode]` (the
+    # NodeBlockResult's own `.nodes`) directly.
     # ============================================================
-    proc nodeSingleNodes(texts: [text], parents: [int], lineIdx: int, arena: [int]) -> [int]:
+    proc nodeSingleNode(texts: [text], parents: [int], lineIdx: int, arena: [int]) -> NodeResult:
         let raw = trim(texts[lineIdx])
-        let mut a = arena
         if raw == "box:" || raw == "box":
-            let a1 = do nodeBlockNodes(texts, parents, lineIdx, a)
-            let childBlockIdx = (len(a1) / 5) - 1
-            a = a1
-            a = append(a, 18)
-            a = append(a, childBlockIdx)
-            a = append(a, -1)
-            a = append(a, -1)
-            a = append(a, -1)
-            return a
+            let childRes = do nodeBlockNodes(texts, parents, lineIdx, arena)
+            let n = UiNode{kind: "box", lineIdx: lineIdx, children: childRes.nodes, segs: [], labelSegs: [], destSegs: []}
+            return NodeResult{node: n, arena: childRes.arena}
         if raw == "row:" || raw == "row":
-            let a1 = do nodeBlockNodes(texts, parents, lineIdx, a)
-            let childBlockIdx = (len(a1) / 5) - 1
-            a = a1
-            a = append(a, 19)
-            a = append(a, childBlockIdx)
-            a = append(a, -1)
-            a = append(a, -1)
-            a = append(a, -1)
-            return a
+            let childRes = do nodeBlockNodes(texts, parents, lineIdx, arena)
+            let n = UiNode{kind: "row", lineIdx: lineIdx, children: childRes.nodes, segs: [], labelSegs: [], destSegs: []}
+            return NodeResult{node: n, arena: childRes.arena}
         let isText = do nodeHasPrefix(raw, "text ")
         if isText:
             let inner = do textInnerOf(raw)
-            let a1 = do nodeTextLikeNodes(inner, lineIdx, a)
-            return a1
+            let segRes = do nodeSegNodes(inner, arena)
+            let n = UiNode{kind: "text", lineIdx: lineIdx, children: [], segs: segRes.segs, labelSegs: [], destSegs: []}
+            return NodeResult{node: n, arena: segRes.arena}
         let isLink = do nodeHasPrefix(raw, "link ")
         if isLink:
             let hasArrow = do linkHasArrow(raw)
             if hasArrow:
                 let labelInner = do linkLabelInnerOf(raw)
                 let destInner = do linkDestInnerOf(raw)
-                let a1 = do nodeTextLikeNodes(labelInner, lineIdx, a)
-                let labelNodeIdx = (len(a1) / 5) - 1
-                let a2 = do nodeTextLikeNodes(destInner, lineIdx, a1)
-                let destNodeIdx = (len(a2) / 5) - 1
-                a = a2
-                a = append(a, 21)
-                a = append(a, labelNodeIdx)
-                a = append(a, destNodeIdx)
-                a = append(a, lineIdx)
-                a = append(a, -1)
-                return a
-            a = append(a, 25)
-            a = append(a, lineIdx)
-            a = append(a, -1)
-            a = append(a, -1)
-            a = append(a, -1)
-            return a
-        a = append(a, 25)
-        a = append(a, lineIdx)
-        a = append(a, -1)
-        a = append(a, -1)
-        a = append(a, -1)
-        return a
+                let labelRes = do nodeSegNodes(labelInner, arena)
+                let destRes = do nodeSegNodes(destInner, labelRes.arena)
+                let n = UiNode{kind: "link", lineIdx: lineIdx, children: [], segs: [], labelSegs: labelRes.segs, destSegs: destRes.segs}
+                return NodeResult{node: n, arena: destRes.arena}
+            let n = UiNode{kind: "unsupported", lineIdx: lineIdx, children: [], segs: [], labelSegs: [], destSegs: []}
+            return NodeResult{node: n, arena: arena}
+        let n = UiNode{kind: "unsupported", lineIdx: lineIdx, children: [], segs: [], labelSegs: [], destSegs: []}
+        return NodeResult{node: n, arena: arena}
 
-    proc nodeBlockNodes(texts: [text], parents: [int], node: int, arena: [int]) -> [int]:
+    proc nodeBlockNodes(texts: [text], parents: [int], node: int, arena: [int]) -> NodeBlockResult:
         let kids = do nodeChildrenOf(node, parents)
         let m = len(kids)
         let mut a = arena
-        let mut rootIdxs = []
+        let mut nodes = []
         let mut i = 0
         loop i < m:
             let lineIdx = kids[i]
-            let a1 = do nodeSingleNodes(texts, parents, lineIdx, a)
-            let rootIdx = (len(a1) / 5) - 1
-            rootIdxs = append(rootIdxs, rootIdx)
-            a = a1
+            let r = do nodeSingleNode(texts, parents, lineIdx, a)
+            nodes = append(nodes, r.node)
+            a = r.arena
             i = i + 1
-        let cnt = len(rootIdxs)
-        let mut k = 0
-        loop k < cnt:
-            a = append(a, 22)
-            a = append(a, rootIdxs[k])
-            a = append(a, -1)
-            a = append(a, -1)
-            a = append(a, -1)
-            k = k + 1
-        let mut first = -1
-        if cnt > 0:
-            first = (len(a) / 5) - cnt
-        a = append(a, 17)
-        a = append(a, first)
-        a = append(a, -1)
-        a = append(a, -1)
-        a = append(a, -1)
-        return a
+        return NodeBlockResult{nodes: nodes, arena: a}
 
     # nodeTreeSrc: the end-to-end driver for a view's own node-tree BODY
     # text (everything indented beneath the `view Name at "…":` line
@@ -781,12 +725,12 @@ app NodesSelfHost:
     # trees). The header line is handled entirely separately, below —
     # mirroring how the real parseView calls parseNodes(n.Children) on a
     # SEPARATE value from the header text it already consumed.
-    proc nodeTreeSrc(src: text) -> [int]:
+    proc nodeTreeSrc(src: text) -> NodeBlockResult:
         let indents = do bodyIndents(src)
         let parents = do bodyParents(indents)
         let texts = do bodyTexts(src)
-        let a = do nodeBlockNodes(texts, parents, -1, [])
-        return a
+        let r = do nodeBlockNodes(texts, parents, -1, [])
+        return r
 
     # ============================================================
     # STAGE 9: the view HEADER line — `view Name at "/path":` — parser.fct's
@@ -795,7 +739,9 @@ app NodesSelfHost:
     # instead of parser.fct's `quotedInner`). `at "/path"` is optional in
     # the real grammar (a view may have no route of its own — see
     # parser.go's parseView, read fresh: `name := head` before the `at`
-    # check ever runs), honored here as well.
+    # check ever runs), honored here as well. Unchanged by this rewrite —
+    # the view header carries no node-tree shape at all, so it needed no
+    # struct.
     # ============================================================
     proc viewHeadOf(lineText: text) -> text:
         let stripped = do nodeTrimPrefix(lineText, "view")
@@ -876,73 +822,88 @@ app NodesSelfHost:
         return r
 
     # ============================================================
-    # STAGE 10: reader/navigation helpers — proof the arena is actually
-    # walkable, not just buildable, mirroring stmt.fct's own STAGE 8.
+    # STAGE 10: describeUiNode/describeUiNodes/describeSegs — proof the
+    # real [UiNode] tree is actually walkable, not just buildable (this
+    # task's own verification ask), and the direct replacement for the old
+    # arena version's whole STAGE 10 reader family (nodeKindAt/
+    # nodeBlockChildCount/nodeBlockChildRootAt/boxChildBlockIdx/
+    # textFirstSegSlot/textSegExprRootAt/linkLabelNodeIdx/... — every one of
+    # those collapses into an ordinary field read now: `n.kind`,
+    # `len(n.children)`, `n.children[i]`, `n.segs`, `n.labelSegs`,
+    # `n.destSegs` directly). Renders a small, real text summary: a literal
+    # segment as its own text, an expression segment as `{<rootIdx>}`, a
+    # `box`/`row` recursing into its own real `children: [UiNode]` field, a
+    # `link` rendering both of its own real `labelSegs`/`destSegs` fields —
+    # exactly the "reads like what it is" improvement predicate.fct's own
+    # rewrite note already demonstrated one level down.
     # ============================================================
-    proc nodeKindAt(arena: [int], idx: int) -> int:
-        return arena[5 * idx]
+    proc describeSeg(s: Seg) -> text:
+        if s.isExpr:
+            return "{" + ("" + s.exprIdx) + "}"
+        return s.text
 
-    proc nodeBlockFirstSlot(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 1]
+    proc describeSegs(segs: [Seg]) -> text:
+        let n = len(segs)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let d = do describeSeg(segs[i])
+            out = out + d
+            i = i + 1
+        return out
 
-    proc nodeBlockChildCount(arena: [int], idx: int) -> int:
-        let first = do nodeBlockFirstSlot(arena, idx)
-        if first < 0:
-            return 0
-        return idx - first
+    proc describeUiNode(n: UiNode) -> text:
+        if n.kind == "box":
+            let inner = do describeUiNodes(n.children)
+            return "box(" + inner + ")"
+        if n.kind == "row":
+            let inner = do describeUiNodes(n.children)
+            return "row(" + inner + ")"
+        if n.kind == "text":
+            let inner = do describeSegs(n.segs)
+            return "text[" + inner + "]"
+        if n.kind == "link":
+            let label = do describeSegs(n.labelSegs)
+            let dest = do describeSegs(n.destSegs)
+            return "link[" + label + "->" + dest + "]"
+        return "unsupported"
 
-    proc nodeSlotChild(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 1]
+    proc describeUiNodes(nodes: [UiNode]) -> text:
+        let n = len(nodes)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let d = do describeUiNode(nodes[i])
+            if i > 0:
+                out = out + ","
+            out = out + d
+            i = i + 1
+        return out
 
-    proc nodeBlockChildRootAt(arena: [int], idx: int, i: int) -> int:
-        let first = do nodeBlockFirstSlot(arena, idx)
-        let slotIdx = first + i
-        let r = do nodeSlotChild(arena, slotIdx)
-        return r
+    proc describeNodeTree(src: text) -> text:
+        let r = do nodeTreeSrc(src)
+        let d = do describeUiNodes(r.nodes)
+        return d
 
-    proc boxChildBlockIdx(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 1]
-
-    proc rowChildBlockIdx(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 1]
-
-    proc textFirstSegSlot(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 1]
-
-    proc textLineOf(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 2]
-
-    proc textSegExprCountAt(arena: [int], idx: int) -> int:
-        let first = do textFirstSegSlot(arena, idx)
-        if first < 0:
-            return 0
-        return idx - first
-
-    proc textSegExprRootAt(arena: [int], idx: int, i: int) -> int:
-        let first = do textFirstSegSlot(arena, idx)
-        let slotIdx = first + i
-        let r = do nodeSlotChild(arena, slotIdx)
-        return r
-
-    proc linkLabelNodeIdx(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 1]
-
-    proc linkDestNodeIdx(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 2]
-
-    proc linkLineOf(arena: [int], idx: int) -> int:
-        return arena[5 * idx + 3]
-
-    proc nodeArenaNodeCount(arena: [int]) -> int:
-        return len(arena) / 5
+    proc topLevelNodeCount(src: text) -> int:
+        let r = do nodeTreeSrc(src)
+        return len(r.nodes)
 
     # ============================================================
-    # STAGE 11: the live HTTP-exercisable drivers.
+    # STAGE 11: the live HTTP-exercisable drivers. A struct value itself
+    # (UiNode/Seg/SegResult/NodeResult/NodeBlockResult) can never be a
+    # `state` cell — it is a proc-local value kind, the same restriction
+    # that already bars a map literal from state/entity/wire use (see
+    # ast.Struct's own doc) — so these actions call proc-land summary
+    # functions (describeNodeTree/topLevelNodeCount) that do the
+    # struct-walking INSIDE a proc and hand back only plain `text`/`int`,
+    # exactly the shape stmt.fct's own STAGE 10 already established.
     # ============================================================
     state viewHeaderNameResult: text = ""
     state viewHeaderPathResult: text = ""
     state viewHeaderValidResult: bool = false
-    state nodeArenaResult: [int] = []
+    state nodeTreeSummaryResult: text = ""
+    state nodeTreeCountResult: int = 0
 
     action runParseViewHeader(lineText: text):
         let n = do parseViewName(lineText)
@@ -953,10 +914,12 @@ app NodesSelfHost:
         viewHeaderValidResult = v
 
     action runParseViewNodeTree(src: text):
-        let r = do nodeTreeSrc(src)
-        nodeArenaResult = r
+        let d = do describeNodeTree(src)
+        let c = do topLevelNodeCount(src)
+        nodeTreeSummaryResult = d
+        nodeTreeCountResult = c
 
     view NodeViewHome at "/nodes":
         box:
             text "{viewHeaderNameResult} {viewHeaderPathResult} {viewHeaderValidResult}"
-            text "{nodeArenaResult}"
+            text "{nodeTreeCountResult} {nodeTreeSummaryResult}"

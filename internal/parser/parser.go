@@ -182,6 +182,11 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 		if css, err = parseCSS(c, comments); err == nil {
 			app.CSS = joinCSS(app.CSS, css)
 		}
+	case strings.HasPrefix(c.Line.Text, "css from "):
+		var path string
+		if path, err = parseCSSFrom(c.Line.Text, c.Line.No); err == nil {
+			app.CSSFiles = append(app.CSSFiles, ast.CSSFile{Path: path, Line: c.Line.No})
+		}
 	case strings.HasPrefix(c.Line.Text, "state "):
 		var s *ast.State
 		if s, err = parseState(c); err == nil {
@@ -276,6 +281,12 @@ func parsePlayground(n *source.Node, comments []source.Line) (*ast.App, error) {
 				return nil, err
 			}
 			app.CSS = joinCSS(app.CSS, css)
+		case strings.HasPrefix(t, "css from "):
+			path, err := parseCSSFrom(t, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			app.CSSFiles = append(app.CSSFiles, ast.CSSFile{Path: path, Line: c.Line.No})
 		case strings.HasPrefix(t, "mount "):
 			m, err := parseMount(t, c.Line.No)
 			if err != nil {
@@ -361,6 +372,12 @@ func parseWireframe(n *source.Node, comments []source.Line) (*ast.App, error) {
 				return nil, err
 			}
 			app.CSS = joinCSS(app.CSS, css)
+		case strings.HasPrefix(t, "css from "):
+			path, err := parseCSSFrom(t, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			app.CSSFiles = append(app.CSSFiles, ast.CSSFile{Path: path, Line: c.Line.No})
 		case strings.HasPrefix(t, "socket "):
 			sock, err := parseSocket(c)
 			if err != nil {
@@ -1265,6 +1282,26 @@ func checkCSSComments(from, to int, comments []source.Line) error {
 	}
 
 	return nil
+}
+
+// parseCSSFrom parses `css from "styles.css"` — a reference to a sibling
+// stylesheet, the external-file counterpart of an inline `css:` block. It
+// mirrors `import "..."`'s path syntax for consistency, but the path is never
+// resolved here: this package has no file-system access, and the same grammar
+// is used for embedded snippets that have no file to resolve against. The
+// compiler (internal/compile), which already resolves `import` paths relative
+// to the file on disk, resolves this one the same way and folds the file's raw
+// content into the app's CSS.
+func parseCSSFrom(t string, line int) (string, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(t, "css from"))
+	path, err := unquote(rest, line)
+	if err != nil {
+		return "", &Error{line, `css from needs a quoted path: css from "styles.css"`}
+	}
+	if path == "" {
+		return "", &Error{line, "css from path is empty"}
+	}
+	return path, nil
 }
 
 // joinCSS concatenates stylesheet fragments (one per `css:` block, across the

@@ -583,7 +583,7 @@ func isBuiltinCall(name string) bool {
 	case "now", "rand", // effectful (pinned to the authority)
 		"abs", "min", "max", "floor", "round", "money", // math / money
 		"toFloat", "toInt", // explicit int<->float conversion (toFloat is proc-only — see checkNoFloat)
-		"toMoney", // explicit text->money conversion — not proc-only, money is a real type everywhere
+		"toMoney",                                                                       // explicit text->money conversion — not proc-only, money is a real type everywhere
 		"len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", // string
 		"year", "month", "day", // date
 		"ago", "compact", "commas", // formatting (render-time text)
