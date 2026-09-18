@@ -107,18 +107,31 @@ func postExprJSON(t *testing.T, ts *httptest.Server, action string, args ...any)
 // in this file with a variable-length child list rather than a fixed
 // left/right pair, so `args`/`elems` are `[]*treeShape` rather than reusing
 // left/right.
+//
+// Round 5 adds a third `litKind` ("float", alongside "int"/"bool"/"text" —
+// ast.Lit already generalizes over any Kind string, so again no new
+// top-level `kind` was needed), plus two more top-level kinds: "entity"
+// (ast.EntityGet{Entity, Key, Field} / arena kind 12, `Entity(key).field` or
+// bare `Entity(key)` — `field` is "" when the real Field is absent, since a
+// real field name is never empty) and "map" (ast.MapLit{Keys, Vals} / arena
+// kind 14, `{k: v, ...}`) — the third variable-length-child shape, this one
+// with TWO parallel children lists (`mapKeys`/`mapVals`) rather than one,
+// since each entry is a key/value PAIR.
 type treeShape struct {
-	kind        string // "lit" | "ref" | "bin" | "un" | "get" | "index" | "call" | "list"
-	litKind     string // kind == "lit": "int" | "bool" | "text"
-	intVal      int    // kind == "lit" && litKind == "int"
-	boolVal     bool   // kind == "lit" && litKind == "bool"
-	textVal     string // kind == "lit" && litKind == "text"
-	name        string // kind == "ref" | "call" (the builtin name)
-	op          string // kind == "bin" | "un"
-	field       string // kind == "get"
+	kind        string  // "lit" | "ref" | "bin" | "un" | "get" | "index" | "call" | "list" | "entity" | "map"
+	litKind     string  // kind == "lit": "int" | "bool" | "text" | "float"
+	intVal      int     // kind == "lit" && litKind == "int"
+	boolVal     bool    // kind == "lit" && litKind == "bool"
+	textVal     string  // kind == "lit" && litKind == "text"
+	floatVal    float64 // kind == "lit" && litKind == "float"
+	name        string  // kind == "ref" | "call" | "entity" (entity's builtin/entity name)
+	op          string  // kind == "bin" | "un"
+	field       string  // kind == "get" | "entity" (entity: "" means no field)
 	left, right *treeShape
 	args        []*treeShape // kind == "call"
 	elems       []*treeShape // kind == "list"
+	mapKeys     []*treeShape // kind == "map"
+	mapVals     []*treeShape // kind == "map" (parallel to mapKeys)
 }
 
 func shapeFromGoExpr(t *testing.T, e ast.Expr) *treeShape {
@@ -132,6 +145,8 @@ func shapeFromGoExpr(t *testing.T, e ast.Expr) *treeShape {
 			return &treeShape{kind: "lit", litKind: "bool", boolVal: x.Val.(bool)}
 		case "text":
 			return &treeShape{kind: "lit", litKind: "text", textVal: x.Val.(string)}
+		case "float":
+			return &treeShape{kind: "lit", litKind: "float", floatVal: x.Val.(float64)}
 		default:
 			t.Fatalf("shapeFromGoExpr: unexpected literal kind %q (this subset covers int/bool/text literals)", x.Kind)
 			return nil
@@ -175,8 +190,24 @@ func shapeFromGoExpr(t *testing.T, e ast.Expr) *treeShape {
 			elems = append(elems, shapeFromGoExpr(t, el))
 		}
 		return &treeShape{kind: "list", elems: elems}
+	case ast.EntityGet:
+		return &treeShape{
+			kind:  "entity",
+			name:  x.Entity,
+			field: x.Field,
+			left:  shapeFromGoExpr(t, x.Key),
+		}
+	case ast.MapLit:
+		var keys, vals []*treeShape
+		for _, k := range x.Keys {
+			keys = append(keys, shapeFromGoExpr(t, k))
+		}
+		for _, v := range x.Vals {
+			vals = append(vals, shapeFromGoExpr(t, v))
+		}
+		return &treeShape{kind: "map", mapKeys: keys, mapVals: vals}
 	default:
-		t.Fatalf("shapeFromGoExpr: unexpected ast.Expr node %T (this subset only covers Lit(int/bool/text)/Ref/Bin/Un/Get/Index/Call/ListLit)", e)
+		t.Fatalf("shapeFromGoExpr: unexpected ast.Expr node %T (this subset only covers Lit(int/bool/text/float)/Ref/Bin/Un/Get/Index/Call/ListLit/EntityGet/MapLit)", e)
 		return nil
 	}
 }
@@ -292,6 +323,45 @@ func shapeFromArena(t *testing.T, arena []int, tokTexts []string, nodeIdx int) *
 			elems = append(elems, shapeFromArena(t, arena, tokTexts, elemRoot))
 		}
 		return &treeShape{kind: "list", elems: elems}
+	case 11: // Lit(float): valTok names the same NUM token an int would (int
+		// and float share one token kind — see expr.fct's ROUND 5 SCOPE
+		// NOTE); decoded with strconv.ParseFloat, the exact function
+		// internal/parser/expr.go's own parseAtom tNum-with-a-dot case calls.
+		raw := tokTexts[valTok]
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			t.Fatalf("shapeFromArena: bad float literal token %q at tok %d: %v", raw, valTok, err)
+		}
+		return &treeShape{kind: "lit", litKind: "float", floatVal: f}
+	case 12: // EntityGet: valTok = field name token (-1 if absent), opTok =
+		// entity name token, left = key expression's root node index.
+		field := ""
+		if valTok != -1 {
+			field = tokTexts[valTok]
+		}
+		return &treeShape{
+			kind:  "entity",
+			name:  tokTexts[opTok],
+			field: field,
+			left:  shapeFromArena(t, arena, tokTexts, left),
+		}
+	case 14: // MapLit: left = first MapPairSlot node index, right = pair
+		// count. Each MapPairSlot (kind 13) stores its OWN key/value root
+		// node indices directly in ITS left/right (not through a valTok
+		// indirection the way ArgSlot does for Call/ListLit) — see
+		// expr.fct's FINDING 10.
+		var keys, vals []*treeShape
+		for i := 0; i < right; i++ {
+			slotIdx := left + i
+			if slotIdx < 0 || slotIdx*5+4 >= len(arena) {
+				t.Fatalf("shapeFromArena: MapLit pair slot index %d out of range (node %d)", slotIdx, nodeIdx)
+			}
+			keyRoot := arena[slotIdx*5+3]
+			valRoot := arena[slotIdx*5+4]
+			keys = append(keys, shapeFromArena(t, arena, tokTexts, keyRoot))
+			vals = append(vals, shapeFromArena(t, arena, tokTexts, valRoot))
+		}
+		return &treeShape{kind: "map", mapKeys: keys, mapVals: vals}
 	default:
 		t.Fatalf("shapeFromArena: unknown node kind %d at node %d", kind, nodeIdx)
 		return nil
@@ -315,6 +385,8 @@ func shapesEqual(a, b *treeShape) bool {
 			return a.boolVal == b.boolVal
 		case "text":
 			return a.textVal == b.textVal
+		case "float":
+			return a.floatVal == b.floatVal
 		default: // "int"
 			return a.intVal == b.intVal
 		}
@@ -348,6 +420,23 @@ func shapesEqual(a, b *treeShape) bool {
 			}
 		}
 		return true
+	case "entity":
+		return a.name == b.name && a.field == b.field && shapesEqual(a.left, b.left)
+	case "map":
+		if len(a.mapKeys) != len(b.mapKeys) || len(a.mapVals) != len(b.mapVals) {
+			return false
+		}
+		for i := range a.mapKeys {
+			if !shapesEqual(a.mapKeys[i], b.mapKeys[i]) {
+				return false
+			}
+		}
+		for i := range a.mapVals {
+			if !shapesEqual(a.mapVals[i], b.mapVals[i]) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }
@@ -363,6 +452,8 @@ func shapeString(s *treeShape) string {
 			return "Lit(" + strconv.FormatBool(s.boolVal) + ")"
 		case "text":
 			return "Lit(" + strconv.Quote(s.textVal) + ")"
+		case "float":
+			return "Lit(" + strconv.FormatFloat(s.floatVal, 'g', -1, 64) + ")"
 		default: // "int"
 			return "Lit(" + itoa(s.intVal) + ")"
 		}
@@ -394,6 +485,21 @@ func shapeString(s *treeShape) string {
 			out += shapeString(el)
 		}
 		return out + "]"
+	case "entity":
+		out := s.name + "(" + shapeString(s.left) + ")"
+		if s.field != "" {
+			out += "." + s.field
+		}
+		return out
+	case "map":
+		out := "{"
+		for i := range s.mapKeys {
+			if i > 0 {
+				out += ", "
+			}
+			out += shapeString(s.mapKeys[i]) + ": " + shapeString(s.mapVals[i])
+		}
+		return out + "}"
 	}
 	return "?"
 }
@@ -1049,30 +1155,41 @@ func TestExprArenaMatchesGoParserRound4(t *testing.T) {
 	}
 }
 
-// TestCallDisambiguationAndOutOfScopeNames checks this round's one real,
-// documented divergence from the real Go parser directly (not via
-// shapesEqual against parser.ParseExpr, which would produce a genuinely
-// different AST — ast.EntityGet or ast.Agg — for these inputs): a name
-// immediately followed by `(` that is NOT in this port's builtin-call
-// allowlist (isCallNameTok) is honestly left UNCONSUMED, exactly like any
-// other out-of-scope construct in this file (see
-// TestParseExprConsumedAllDetectsTrailingGarbage for the established
-// pattern this mirrors) — never silently misparsed as a call, and never a
+// TestCallDisambiguationAndOutOfScopeNames checks the real, documented
+// divergences from the real Go parser directly (not via shapesEqual against
+// parser.ParseExpr, which would produce a genuinely different AST —
+// ast.Agg — for the min/max cases): a name immediately followed by `(` that
+// is NOT in this port's builtin-call allowlist (isCallNameTok) and IS one of
+// the reserved aggregate/action-state names (isEntityNameTok) is honestly
+// left UNCONSUMED, exactly like any other out-of-scope construct in this
+// file (see TestParseExprConsumedAllDetectsTrailingGarbage for the
+// established pattern this mirrors) — never silently misparsed, never a
 // crash.
 //
-//   - "foo(x)": "foo" is not a builtin name, so in the real grammar this is
-//     `Entity(key).field`-shaped (ast.EntityGet) syntax — out of scope here
-//     (see expr.fct's ROUND 4 SCOPE NOTE, finding 1). This port's
-//     isCallStartAt returns false for "foo", so postfixEnd/postfixNodes
-//     fall through to a plain Ref("foo") leaf, consuming only the "foo"
-//     token; "(x)" is left over, so consumedAll must be false.
-//   - "min(a, b)" / "max(x)": deliberately excluded from isCallNameTok
-//     (ROUND 4 SCOPE NOTE, finding 2) because the real grammar's own
+//   - "foo(x)": UPDATED in round 5 — "foo" is not a builtin name, but round
+//     5 now implements the real grammar's own fallback for exactly this case
+//     (`Entity(key).field`-shaped syntax, ast.EntityGet — see expr.fct's
+//     ROUND 5 SCOPE NOTE). This port's isEntityLookupStartAt now returns
+//     true for "foo(x)" (not a builtin, not a reserved aggregate/action-
+//     state name), so it IS now fully consumed, as a real EntityGet — the
+//     opposite of round 4's documented behavior for this exact input, and a
+//     deliberate, intentional change (not a regression): round 4's own
+//     SCOPE NOTE named this precise gap as what a future round would close.
+//     See TestEntityLookupDisambiguation, below, for the shape-level proof
+//     (cross-checked against the real Go parser) that this is now a genuine,
+//     correct ast.EntityGet, not a guess.
+//   - "min(a, b)" / "max(x)": deliberately excluded from BOTH isCallNameTok
+//     AND isEntityNameTok's entity-lookup candidacy (ROUND 4 SCOPE NOTE,
+//     finding 2, and ROUND 5 SCOPE NOTE) because the real grammar's own
 //     disambiguation for these two names (call vs. aggregate, decided by
 //     whether the argument list has a top-level comma) is itself out of
-//     scope — including them here would risk a WRONG tree shape for the
-//     no-comma case, not just an incomplete one, so both degrade the same
-//     honest "not consumed" way "foo(x)" does, regardless of arity.
+//     scope — including them here (as a call OR an entity lookup) would risk
+//     a WRONG tree shape, not just an incomplete one, so both keep degrading
+//     the same honest "not consumed" way, regardless of arity.
+//   - "count(x)" / "sum(Coll.field)" / "pending(action)": the OTHER reserved
+//     aggregate/action-state names (isEntityNameTok) — still unconsumed,
+//     confirming these did NOT accidentally start being treated as entity
+//     lookups just because they aren't builtin call names either.
 //   - "len" alone (no trailing `(`) and "len + x" both confirm the other
 //     direction: a builtin name NOT immediately followed by `(` is still
 //     just a bare Ref and IS fully consumed — isCallStartAt's lookahead
@@ -1083,12 +1200,15 @@ func TestCallDisambiguationAndOutOfScopeNames(t *testing.T) {
 		src  string
 		want bool
 	}{
-		{"foo(x)", false},    // non-builtin name + `(`: out of scope (real grammar: EntityGet)
-		{"min(a, b)", false}, // min/max deliberately excluded (aggregate ambiguity)
+		{"foo(x)", true},     // round 5: non-builtin, non-reserved name + `(` is now a real EntityGet
+		{"min(a, b)", false}, // min/max deliberately excluded (aggregate ambiguity) — unchanged
 		{"max(x)", false},
-		{"len", true},     // builtin name, no `(`: just a bare Ref, fully consumed
-		{"len + x", true}, // ditto, mid-expression
-		{"len(x)", true},  // builtin name + `(`: a real call, fully consumed
+		{"count(x)", false}, // reserved aggregate name: still out of scope, still unconsumed
+		{"sum(Coll.field)", false},
+		{"pending(action)", false}, // reserved action-state name: still out of scope, still unconsumed
+		{"len", true},              // builtin name, no `(`: just a bare Ref, fully consumed
+		{"len + x", true},          // ditto, mid-expression
+		{"len(x)", true},           // builtin name + `(`: a real call, fully consumed
 	}
 	for _, c := range cases {
 		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
@@ -1150,6 +1270,379 @@ func TestIndexVsListLitDisambiguation(t *testing.T) {
 			rootIdx := len(arena)/5 - 1
 			got := shapeFromArena(t, arena, texts, rootIdx)
 
+			if !shapesEqual(got, want) {
+				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
+			}
+			if consumedOK, _ := d["consumedAllResult"].(bool); !consumedOK {
+				t.Errorf("%q: parseExprConsumedAll = false, want true", src)
+			}
+		})
+	}
+}
+
+// ============================================================
+// Round 5: float literals, `Entity(key).field` lookups (including bare
+// `Entity(key)`, no field), and map literals (`{k: v, ...}`) — verified the
+// exact same way rounds 1/2/3/4 were: real expression strings, fed to both
+// the real, unmodified internal/parser.ParseExpr and expr.fct's own
+// tokenizer+parser (over HTTP), compared as the same treeShape.
+//
+// exprCasesRound5 covers, per the task's own priority order: float literals
+// individually and interacting with existing operators/postfixes/list
+// literals; entity lookups bare, with a single field, with chained access
+// afterward (`.field.other`, `[i]` on top of a bare lookup), with a complex
+// key expression, and the headline disambiguation case the task called out
+// by name — a non-builtin, non-reserved name followed by `(` (`foo(x)`,
+// `Widget(42).price`) now parsing as a real EntityGet, not staying
+// unconsumed the way round 4 left it; map literals empty/single/multi-entry,
+// with text and expression keys/values, nested inside list literals and
+// nested inside each other, and combined with postfix chaining
+// (`{1: 2}[1]`, `{1: 2}.field` — syntactically legal even though
+// semantically odd, exactly like round 4's own `trim(s)[0]` case already
+// established this file tests the GRAMMAR boundary, not semantic sense).
+var exprCasesRound5 = []string{
+	// float literals, individually
+	"3.14",
+	"0.5",
+	"1.0",
+	"100.001",
+	// float literals, interacting with existing operators/postfixes
+	"3.14 + 2.5",
+	"1.5 * 2.0",
+	"-2.5",
+	"a + 1.5",
+	"1.5 == 1.5",
+	"1.5 < 2.5 && 3.5 > 1.0",
+	"a.field + 1.5",
+	"(1.5 + 2.5) * 2.0",
+	// float literals inside round-4 constructs
+	"[1.5, 2.5, 3.5]",
+	"len([1.5, 2.5])",
+	"[1, 2.5, 3]",
+
+	// entity lookups: bare, with field, chained
+	"Post(id)",
+	"Post(id).title",
+	"Post(1).author.name",
+	"Post(a + b)",
+	"Post(id)[0]",
+	"Post(id).items[0]",
+	"Post(a).field + Post(b).other",
+	"Widget(42).price",
+	"Order(x).total == 0",
+	"-Post(id).amount",
+	"Post(id).amount + 1.5",
+	// the headline disambiguation case: a non-builtin, non-reserved name
+	// followed by `(` is a real entity lookup now (round 4 left this
+	// unconsumed — see TestCallDisambiguationAndOutOfScopeNames's own
+	// updated doc for the exact behavior change)
+	"foo(x)",
+
+	// map literals: empty, single, multi-entry
+	"{}",
+	"{1: 2}",
+	"{1: 2, 3: 4}",
+	`{"a": 1, "b": 2}`,
+	"{a: b}",
+	// map literals nested with round-4 constructs
+	"{1: [1, 2, 3]}",
+	"[{1: 2}, {3: 4}]",
+	"{1: {2: 3}}",
+	"{len(x): 1}",
+	"{1: len(x)}",
+	// map literal postfix interactions (grammar-legal, not semantically
+	// meaningful — same spirit as round 4's own `trim(s)[0]`)
+	"{1: 2}[1]",
+	"{1: 2}.field",
+	// precedence interactions inside map literal keys/values
+	"{1: a + b}",
+	"{a == b: 1}",
+	"{1: a && b}",
+}
+
+// TestExprArenaMatchesGoParserRound5 is TestExprArenaMatchesGoParser's exact
+// twin, run over exprCasesRound5 instead of exprCases — same real-Go-parser
+// cross-check, same shape comparison, same consumedAll assertion. Kept as a
+// separate test (rather than folded into exprCases/exprCasesRound2/
+// exprCasesRound3/exprCasesRound4) so a round-5 regression is reported
+// distinctly, per this file's own convention of never editing an
+// already-verified case list.
+func TestExprArenaMatchesGoParserRound5(t *testing.T) {
+	ts := loadExprApp(t)
+	for _, src := range exprCasesRound5 {
+		t.Run(src, func(t *testing.T) {
+			wantExpr, err := parser.ParseExpr(src)
+			if err != nil {
+				t.Fatalf("real Go parser.ParseExpr(%q): %v", src, err)
+			}
+			want := shapeFromGoExpr(t, wantExpr)
+
+			d := postExprJSON(t, ts, "runParseExpr", src)
+			arenaRaw, ok := d["arenaResult"].([]any)
+			if !ok {
+				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
+			}
+			arena := make([]int, len(arenaRaw))
+			for i, v := range arenaRaw {
+				arena[i] = int(v.(float64))
+			}
+			textsRaw, ok := d["tokenTextsResult"].([]any)
+			if !ok {
+				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
+			}
+			texts := make([]string, len(textsRaw))
+			for i, v := range textsRaw {
+				texts[i] = v.(string)
+			}
+			if len(arena)%5 != 0 || len(arena) == 0 {
+				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
+			}
+			rootIdx := len(arena)/5 - 1
+			got := shapeFromArena(t, arena, texts, rootIdx)
+
+			if !shapesEqual(got, want) {
+				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
+			}
+
+			if consumedOK, _ := d["consumedAllResult"].(bool); !consumedOK {
+				t.Errorf("%q: parseExprConsumedAll = false, want true (a fully valid expression in this subset)", src)
+			}
+		})
+	}
+}
+
+// TestTokenizeRound5FloatAndBraceTokens checks round 5's tokenization
+// directly: a float literal must be ONE token (`<digits>.<digits>`, not
+// split at the `.`), a bare trailing dot with no digit after it must NOT be
+// absorbed into the number (`3.` tokenizes as NUM("3") then its own `.`
+// operator token, mirroring expr.go's own tokenize rule exactly — see
+// expr.fct's tokenKinds/tokenTexts doc), and `{`/`}`/`:` must each tokenize
+// as their own single-character token (this file's ROUND 5 SCOPE NOTE: they
+// need no new tokenizer kind, the same "any operator character" fallthrough
+// FINDING 6 already established for `[`/`]`/`.`) — this test proves the
+// TOKENIZING side of both claims directly, independent of the parser/arena
+// side TestExprArenaMatchesGoParserRound5 already covers.
+func TestTokenizeRound5FloatAndBraceTokens(t *testing.T) {
+	ts := loadExprApp(t)
+	cases := []struct {
+		src  string
+		want []string
+	}{
+		{"3.14", []string{"3.14"}},
+		{"0.5", []string{"0.5"}},
+		{"100.001", []string{"100.001"}},
+		{"3.", []string{"3", "."}},             // trailing dot, no digit after: NOT a float
+		{"3.14.5", []string{"3.14", ".", "5"}}, // greedy float, then leftover `.5`-shaped tokens
+		{"a+3.14", []string{"a", "+", "3.14"}},
+		{"3.14+2", []string{"3.14", "+", "2"}},
+		{"{}", []string{"{", "}"}},
+		{"{1: 2}", []string{"{", "1", ":", "2", "}"}},
+		{"{1: 2, 3: 4}", []string{"{", "1", ":", "2", ",", "3", ":", "4", "}"}},
+		{"Post(id).field", []string{"Post", "(", "id", ")", ".", "field"}},
+	}
+	for _, c := range cases {
+		d := postExprJSON(t, ts, "runTokenTexts", c.src)
+		raw, ok := d["tokenTextsResult"].([]any)
+		if !ok {
+			t.Fatalf("%q: tokenTextsResult = %#v, want a list", c.src, d["tokenTextsResult"])
+		}
+		got := make([]string, len(raw))
+		for i, v := range raw {
+			got[i] = v.(string)
+		}
+		if len(got) != len(c.want) {
+			t.Fatalf("%q: got %d tokens %v, want %d tokens %v", c.src, len(got), got, len(c.want), c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%q: token %d = %q, want %q (full: got %v, want %v)", c.src, i, got[i], c.want[i], got, c.want)
+			}
+		}
+	}
+}
+
+// TestFloatTrailingDotConsumedAll checks "3." (trailing dot, no digit after
+// it) directly against the honest consumedAll signal, WITHOUT going through
+// shapeFromArena/parser.ParseExpr — real Go's ParseExpr actually ERRORS on
+// this input (parseBinary consumes NUM("3"), then the top-level parseExpr
+// check `p.pos != len(p.toks)` fails on the leftover `.` token, since `.` is
+// not a binary operator in binPrec), so this can't be a shapesEqual
+// cross-check case the way exprCasesRound5's well-formed inputs are — it
+// belongs here instead, alongside TestParseExprConsumedAllDetectsTrailingGarbage's
+// own established pattern for malformed input.
+func TestFloatTrailingDotConsumedAll(t *testing.T) {
+	ts := loadExprApp(t)
+	cases := []struct {
+		src  string
+		want bool
+	}{
+		{"3.14", true}, // a real float, fully consumed
+		{"3.", false},  // trailing dot with no digit after: NUM("3") then a
+		// leftover `.` token this subset's postfix loop tries to read a
+		// field name after (honestly degrading, not crashing — the same
+		// "optimistic advance past whatever token is there" convention
+		// factorEnd's unmatched `(` case and entityGetEnd already use),
+		// overshooting past the end of the token stream; consumedAll is
+		// false either way, since 2 real tokens exist and neither `*End`
+		// path leaves position 2 exactly.
+		{"3.14.5", true}, // SURPRISING but correct for this honest port: 3
+		// tokens ("3.14", ".", "5"), and postfixEnd's `.` case unconditionally
+		// advances 2 tokens for ANY `.` (this subset never validates that
+		// what follows a `.` is really an IDENT — a pre-existing round-3
+		// limitation of postfixEnd/postfixNodes' field-name handling,
+		// unrelated to floats specifically, just newly reachable via a
+		// float's own trailing-dot edge case): "3.14" then "." then "5" is
+		// formally fully consumed as Get(Lit(3.14), field="5"), even though
+		// "5" is a NUMBER token, not a real field-name IDENT. The real Go
+		// parser's fieldName() DOES check this and returns a real error
+		// ("expected a field name after `.`") — see this test's own doc for
+		// why "3.14.5" is therefore never used in a shapesEqual cross-check
+		// (parser.ParseExpr would fail with an error, not build a tree at
+		// all), only tested here for the honest-but-surprising consumedAll
+		// answer this port actually gives.
+	}
+	for _, c := range cases {
+		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
+		got, _ := d["consumedAllResult"].(bool)
+		if got != c.want {
+			t.Errorf("parseExprConsumedAll(%q) = %v, want %v", c.src, got, c.want)
+		}
+	}
+}
+
+// TestEntityLookupDisambiguation is this round's headline new-grammar-
+// boundary check, mirroring TestIndexVsListLitDisambiguation's own role for
+// round 4: a plain call-shaped name that is a builtin (`len(x)`), a reserved
+// aggregate/action-state name (`count(x)`, `pending(a)` — still out of scope,
+// still unconsumed), or neither (a real entity lookup, `Post(id)`) must never
+// be confused, cross-checked against the real Go parser's own ast.Expr where
+// that's meaningful (the reserved-name cases produce a DIFFERENT real AST —
+// ast.Agg/ast.ActState — so those are checked via consumedAll only, mirroring
+// TestCallDisambiguationAndOutOfScopeNames's own established split).
+func TestEntityLookupDisambiguation(t *testing.T) {
+	ts := loadExprApp(t)
+	shapeCases := []string{
+		"Post(id)",       // entity lookup: bare, no field
+		"Post(id).title", // entity lookup: with field
+		"len(x)",         // builtin call: unaffected by entity-lookup addition
+		"foo(x)",         // non-builtin, non-reserved: now a real entity lookup
+		"Widget(1).name",
+		"Order(a + b).total",
+	}
+	for _, src := range shapeCases {
+		t.Run(src, func(t *testing.T) {
+			wantExpr, err := parser.ParseExpr(src)
+			if err != nil {
+				t.Fatalf("real Go parser.ParseExpr(%q): %v", src, err)
+			}
+			want := shapeFromGoExpr(t, wantExpr)
+
+			d := postExprJSON(t, ts, "runParseExpr", src)
+			arenaRaw, ok := d["arenaResult"].([]any)
+			if !ok {
+				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
+			}
+			arena := make([]int, len(arenaRaw))
+			for i, v := range arenaRaw {
+				arena[i] = int(v.(float64))
+			}
+			textsRaw, ok := d["tokenTextsResult"].([]any)
+			if !ok {
+				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
+			}
+			texts := make([]string, len(textsRaw))
+			for i, v := range textsRaw {
+				texts[i] = v.(string)
+			}
+			if len(arena)%5 != 0 || len(arena) == 0 {
+				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
+			}
+			rootIdx := len(arena)/5 - 1
+			got := shapeFromArena(t, arena, texts, rootIdx)
+			if !shapesEqual(got, want) {
+				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
+			}
+			if consumedOK, _ := d["consumedAllResult"].(bool); !consumedOK {
+				t.Errorf("%q: parseExprConsumedAll = false, want true", src)
+			}
+		})
+	}
+
+	reservedCases := []struct {
+		src  string
+		want bool
+	}{
+		{"count(x)", false},
+		{"sum(Coll.field)", false},
+		{"exists(x)", false},
+		{"avg(Coll.field)", false},
+		{"min(a, b)", false},
+		{"max(x)", false},
+		{"pending(action)", false},
+		{"failed(action)", false},
+		{"dirty(x)", false},
+		{"touched(x)", false},
+	}
+	for _, c := range reservedCases {
+		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
+		got, _ := d["consumedAllResult"].(bool)
+		if got != c.want {
+			t.Errorf("parseExprConsumedAll(%q) = %v, want %v (reserved aggregate/action-state name — never an entity lookup)", c.src, got, c.want)
+		}
+	}
+}
+
+// TestMapLitDisambiguation is this round's other new-grammar-boundary check:
+// `{` starting a fresh atom (a map literal) must never be confused with
+// anything else — including an empty map (`{}`) vs. a map literal
+// immediately used as a postfix base (`{1:2}[1]`, `{1:2}.field`), and a map
+// literal nested inside a list literal or another map literal — cross-
+// checked against the real Go parser's own ast.Expr, exactly like
+// TestIndexVsListLitDisambiguation does for round 4's `[`/`]` boundary.
+// Folded into exprCasesRound5 too; kept as its own focused test so this
+// specific boundary is never accidentally diluted by an unrelated future
+// edit to exprCasesRound5.
+func TestMapLitDisambiguation(t *testing.T) {
+	ts := loadExprApp(t)
+	cases := []string{
+		"{}",
+		"{1: 2}",
+		"{1: 2}[1]",
+		"{1: 2}.field",
+		"[{1: 2}, {3: 4}]",
+		"{1: {2: 3}}",
+		"{1: [1, 2], 3: [4, 5]}",
+	}
+	for _, src := range cases {
+		t.Run(src, func(t *testing.T) {
+			wantExpr, err := parser.ParseExpr(src)
+			if err != nil {
+				t.Fatalf("real Go parser.ParseExpr(%q): %v", src, err)
+			}
+			want := shapeFromGoExpr(t, wantExpr)
+
+			d := postExprJSON(t, ts, "runParseExpr", src)
+			arenaRaw, ok := d["arenaResult"].([]any)
+			if !ok {
+				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
+			}
+			arena := make([]int, len(arenaRaw))
+			for i, v := range arenaRaw {
+				arena[i] = int(v.(float64))
+			}
+			textsRaw, ok := d["tokenTextsResult"].([]any)
+			if !ok {
+				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
+			}
+			texts := make([]string, len(textsRaw))
+			for i, v := range textsRaw {
+				texts[i] = v.(string)
+			}
+			if len(arena)%5 != 0 || len(arena) == 0 {
+				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
+			}
+			rootIdx := len(arena)/5 - 1
+			got := shapeFromArena(t, arena, texts, rootIdx)
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
 			}

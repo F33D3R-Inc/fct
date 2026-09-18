@@ -40,19 +40,28 @@ app ExprSelfHost:
     #     (`a.field.other`)
     #   - indexing (`[i]`), including chained/combined with member access
     #     (`a[i].field`, `a.field[i]`, `a[i][j]`)
-    # Round 4 (this pass) added function calls and list literals, the two
-    # remaining "primary atom" grammar positions round 3's own SCOPE note
-    # called out as needing new machinery (a builtin-name allowlist and a
-    # variable-arity node encoding) — see the ROUND 4 SCOPE NOTE and
-    # FINDING 8 below for the exact shape and the one real disambiguation
-    # subtlety (builtin calls only, not user-defined ones — this language
-    # has none in expression position — see FINDING 8).
+    # Round 4 added function calls and list literals, the two remaining
+    # "primary atom" grammar positions round 3's own SCOPE note called out as
+    # needing new machinery (a builtin-name allowlist and a variable-arity
+    # node encoding) — see the ROUND 4 SCOPE NOTE and FINDING 8 below for the
+    # exact shape and the one real disambiguation subtlety (builtin calls
+    # only, not user-defined ones — this language has none in expression
+    # position — see FINDING 8).
     #
-    # Still out of scope after round 4: float literals, aggregates
-    # (`sum`/`count`/etc.), `Entity(key).field` lookups, and map literals
-    # (`{k: v}`) — see this file's SCOPE note (bottom of this header) for
-    # exactly why each one is excluded and what it would take to add.
-    # Shifts were left out deliberately (see STAGE 1's
+    # Round 5 (this pass) closed three of round 4's four remaining gaps:
+    # float literals, `Entity(key).field` lookups, and map literals
+    # (`{k: v}`) — see the ROUND 5 SCOPE NOTE and FINDINGS 9/10 below for the
+    # exact shape of each. Aggregates (`sum`/`count`/`exists`/`avg`/`min`/
+    # `max` with an `in`/`where` clause) were attempted last, per the task's
+    # own priority order, and deliberately NOT landed this round — see the
+    # ROUND 5 SCOPE NOTE's own closing section for the specific architectural
+    # wall hit (an Agg node needs more distinct facts than this arena's
+    # 5-int/4-usable-slot width can hold without a new kind of auxiliary-row
+    # scheme this round didn't design), reported honestly rather than forced.
+    #
+    # Still out of scope after round 5: aggregates only, plus (lower
+    # priority, unchanged from earlier rounds) shifts (`<<`/`>>`), `%`, and
+    # `in`. Shifts were left out deliberately (see STAGE 1's
     # tokenizer doc below for why — they need a real three-way `<` vs `<=`
     # vs `<<` longest-match decision that would have been the ONLY thing
     # testing that specific ambiguity, whereas `==`/`!=`/`<=`/`>=`/`&&`/
@@ -148,8 +157,8 @@ app ExprSelfHost:
     # (argListEnd/argListCount/argListNodes, STAGE 2c below) existed for
     # calls to use too.
     #
-    # Not attempted this round (stretch goals per the task, genuinely out
-    # of scope, not just deferred): aggregates (`sum(x in E where cond)` —
+    # Not attempted round 4 (stretch goals per that round's task, genuinely
+    # out of scope, not just deferred): aggregates (`sum(x in E where cond)` —
     # a real, different grammar shape, an `in`/`where` clause inside the
     # parens, not a comma list — see expr.go's parseAgg, read fresh for
     # this round, for exactly how much bigger that grammar is), entity
@@ -162,7 +171,136 @@ app ExprSelfHost:
     # round's argList family in spirit but the arena would need a K/V pair
     # shape ArgSlot's single-child shape doesn't have — a genuine next
     # increment, not attempted here to keep this round's real verification
-    # effort focused).
+    # effort focused). Round 5 (below) closes the entity-lookup and map-
+    # literal gaps exactly the way this paragraph predicted; aggregates
+    # remain open — see the ROUND 5 SCOPE NOTE's own closing section.
+    #
+    # ============================================================
+    # ROUND 5 SCOPE NOTE (float literals, entity lookups, map literals,
+    # aggregates attempted-and-deferred — this pass):
+    # ============================================================
+    # Read fresh against expr.go's real tokenize/parseAtom/parsePostfix/
+    # parseAgg (this file, this round) before choosing scope, per the task's
+    # own stated priority order (float first, entity lookups second, map
+    # literals third, aggregates last/stretch).
+    #
+    # 1. FLOAT LITERALS needed no new token KIND at all — expr.go's own
+    #    tokenize produces exactly one tNum kind for both `42` and `3.14`
+    #    (tokenize's tNum case: scan a digit run, then optionally extend it
+    #    past a `.` IFF that `.` is immediately followed by another digit —
+    #    a bare trailing dot, as in `3.`, stays unconsumed, left as its own
+    #    `.` operator token). This port's tokenKinds/tokenTexts already had
+    #    exactly the shape to extend (STAGE 1, below): the existing digit-
+    #    scan loop just grows one more optional inner loop, tried against
+    #    the same isDigitChar helper it already uses, and still tags the
+    #    result as token kind 0 either way. The only real decision moved to
+    #    factorNodes' leaf-building step (renamed factorLeafNodes this round,
+    #    split out of factorNodes' own body — see its own doc, STAGE 2b,
+    #    below — purely for readability, not a behavior change): a NUMBER
+    #    token (kind 0) whose TEXT contains a `.` is arena kind 11
+    #    (Lit(float)); otherwise it's still kind 0 (Lit(int)), exactly
+    #    mirroring parseAtom's own `strings.Contains(t.text, ".")` check.
+    #    "Does this text contain a `.`" is answered with the real `contains`
+    #    builtin (already a verified, real language builtin — the same
+    #    "call it directly, don't re-port it" idiom this file's own
+    #    `len`/`charAt`/`append`/`slice` calls already use throughout,
+    #    unrelated to isCallNameTok's separate "which names are callable IN
+    #    THIS PORT'S OWN grammar" allowlist), not a hand-rolled character
+    #    loop — there was no reason to reinvent it.
+    #
+    # 2. ENTITY LOOKUPS (`Entity(key).field`, or bare `Entity(key)` — the
+    #    trailing `.field` is OPTIONAL in the real grammar, confirmed by
+    #    reading parsePostfix's `default:` case fresh: `field := ""` then
+    #    only overwritten if a `.` actually follows) slot into the EXACT
+    #    same dispatch point round 4's isCallStartAt already occupies
+    #    (postfixEnd/postfixNodes, right where parseAtom's Ref result is
+    #    inspected before the postfix loop starts) — confirmed directly from
+    #    expr.go's real switch statement, not assumed: `case ref.Name ==
+    #    "count" || ... : Agg; case ref.Name is pending/failed/dirty/touched:
+    #    ActState; case isBuiltinCall(ref.Name): Call; default: EntityGet`.
+    #    So the real disambiguation is a closed EXCLUSION list, not an
+    #    allowlist the way calls are: ANY name not covered by the other three
+    #    cases becomes an entity lookup. This port restates that as
+    #    isEntityLookupStartAt (STAGE 2d, below): true for a plain IDENT
+    #    immediately followed by `(` that is neither a builtin call name
+    #    (isCallNameTok, already existed) nor a reserved aggregate/action-
+    #    state name (isEntityNameTok, new this round: count/sum/exists/avg/
+    #    min/max/pending/failed/dirty/touched). `min`/`max` are explicitly
+    #    excluded from ENTITY-lookup candidacy too, not just from calls —
+    #    they can never be an entity name in the real grammar (always
+    #    Agg-or-Call, decided by the comma rule this port still doesn't
+    #    implement — round 4's own finding 2, unchanged), so `min(x)`/
+    #    `max(a, b)` keep degrading the same honest "not consumed" way they
+    #    already did before this round (see TestCallDisambiguationAndOutOfScopeNames's
+    #    established pattern, extended by this round's own
+    #    TestEntityLookupDisambiguation). The key expression inside the
+    #    parens is ONE full expression (orEnd/orNodes — the loosest level),
+    #    genuinely simpler than a call's comma-separated argument list, per
+    #    the task's own observation — no argList-family reuse needed here.
+    #    See FINDING 9, below, for why the arena encoding needed no
+    #    ArgSlot-style auxiliary row at all, unlike Call/ListLit.
+    #
+    # 3. MAP LITERALS (`{k: v, ...}`) are, like list literals in round 4, a
+    #    PRIMARY ATOM position (parseAtom's own `case t.text == "{":
+    #    p.parseMapLit()`), not a postfix — so they slot into factorEnd/
+    #    factorNodes' own dispatch, right alongside round 4's `[` case, not
+    #    into postfixEnd/postfixNodes at all. Tokenizer-wise, `{`/`}`/`:`
+    #    needed ZERO new handling, confirmed by reading tokenize fresh:
+    #    they fall straight into the same generic "operator character"
+    #    default case `[`/`]`/`.` already used before this round even
+    #    touched them (this file's own FINDING 6, round 3) — none of the
+    #    three appear in isTwoCharOp's set, so each tokenizes as its own
+    #    one-character tOp, exactly like `+`/`&`/etc. always have. The
+    #    genuinely new problem was the arena encoding for a variable-arity
+    #    node whose EACH entry carries two facts (a key root AND a value
+    #    root) instead of ArgSlot's one — see FINDING 10, below, for the
+    #    MapPairSlot design this round adds to solve it, and STAGE 2e for
+    #    the mapEmptyAt/mapPairListEnd/mapPairListCount/mapPairListNodes/
+    #    mapLitEnd/mapLitNodes family itself (argListEnd/argListCount/
+    #    argListNodes' own direct generalization, doubled per slot).
+    #
+    # 4. AGGREGATES (`count(x in Entity where cond)`, `sum(Entity.field)`,
+    #    etc.) were attempted last, per the task's own priority order, and a
+    #    real architectural wall was found — reported honestly here rather
+    #    than forcing a wrong-shaped implementation, exactly as the task
+    #    asked. Reading expr.go's real parseAgg fresh (this round) surfaces
+    #    an ast.Agg node with SIX independent facts: Op (which aggregate
+    #    name), Coll (the entity name), Field (a bare-field reduce, optional),
+    #    Var (the bound item variable name for the filtered form, optional),
+    #    Where (a filter sub-expression, optional), and Sel (a general
+    #    reduced-value sub-expression, optional, exclusive with Field) — not
+    #    counting the real grammar's own two-way disambiguation of WHICH of
+    #    those five optional fields apply, driven by run-time inspection of
+    #    what the parsed "head" expression turned out to be (a bare Ref vs. a
+    #    Get(Ref, field) vs. a general expression, walked by aggRowVar to
+    #    find its "row variable" when it's neither). This port's arena has
+    #    exactly FOUR usable per-node slots (valTok, opTok, left, right) — it
+    #    comfortably fits any node needing at most one token reference plus
+    #    up to two child indices (every kind through round 5's EntityGet,
+    #    FINDING 9's whole point), and Call/ListLit/MapLit's round 4/5
+    #    variable-ARITY workaround (ArgSlot/MapPairSlot auxiliary rows) fits
+    #    a UNIFORM list of same-shaped entries — but an Agg node needs a
+    #    FIXED, heterogeneous set of up to six facts, several of them
+    #    sub-expression trees in their own right (Where and Sel are both
+    #    full recursive orNodes subtrees, not scalar tokens), which is a
+    #    genuinely different shape neither existing workaround (ArgSlot's
+    #    "N identical single-int rows" or MapPairSlot's "N identical
+    #    double-int rows") was designed for — it would need something more
+    #    like a fixed-layout auxiliary row PER Agg node (a new "AggMeta" kind
+    #    storing, say, Var's token index and a bit-packed "which optional
+    #    fields are present" flag, plus Where's and Sel's root indices in
+    #    ITS OWN left/right, chained from the main Agg node the way a Get
+    #    node's opTok chains to a field token) — a real, designable next
+    #    increment, but a NEW auxiliary-row shape, not a reuse of this
+    #    round's MapPairSlot, and entangled with parsing at precedence floor
+    #    7 (precArith) and the run-time-shape-inspection disambiguation
+    #    (aggRowVar) that has no precedent anywhere else in this file's
+    #    design — different enough from "extend factorNodes/postfixNodes
+    #    with one more dispatch branch" (which is all rounds 4-5's other
+    #    three features needed) that landing it honestly would need its own
+    #    fully-scoped round, not a bolt-on to this one. Not attempted this
+    #    round; genuinely deferred, not disguised as "unsupported input"
+    #    the way `foo(x)`/`min(x)` already honestly are.
     #
     # ============================================================
     # Three findings this port surfaced, precise enough to matter to
@@ -412,6 +550,50 @@ app ExprSelfHost:
     # which is exactly what argListCount's independent recomputation
     # solves.
     #
+    # FINDING 9 (round 5) — a node with a FIXED, small number of facts (one
+    # child plus up to two token references) fits the existing 5-int arena
+    # with NO auxiliary row at all, confirming that FINDING 8's ArgSlot
+    # trick is only needed for genuinely VARIABLE arity, not for "more facts
+    # than a Bin node has." EntityGet (arena kind 12, STAGE 2d) needs three
+    # facts beyond its kind: the entity name's token index, the key
+    # expression's one child node index, and an OPTIONAL field-name token
+    # index — exactly three, and the existing valTok/opTok/left slots (right
+    # stays -1, unused, the same "-1 means absent" convention every other
+    # single-child kind's spare slot already uses) already have room for
+    # exactly three facts without inventing anything new. This is the
+    # opposite lesson from FINDING 10's MapPairSlot, immediately below: the
+    # deciding question for "does this new node kind need an auxiliary row"
+    # is never "how many facts does it have" in the abstract, it's "is the
+    # NUMBER of facts fixed by the grammar (one EntityGet always has exactly
+    # one key, one optional field) or does it scale with the input (a map
+    # literal's pair count is unbounded)" — only the second case needs
+    # FINDING 8's machinery at all.
+    #
+    # FINDING 10 (round 5) — FINDING 8's ArgSlot design generalizes cleanly
+    # from "one fact per variable-arity entry" to "two facts per
+    # variable-arity entry" by using an auxiliary row's left/right slots
+    # instead of its valTok, with no other change to the scheme: a map
+    # literal's Nth entry needs both a key root index AND a value root
+    # index, so MapPairSlot (arena kind 13) stores keyRootIdx in left and
+    # valRootIdx in right (valTok/opTok both -1, since it needs no token of
+    # its own) — otherwise built, counted, and consumed EXACTLY like ArgSlot
+    # (STAGE 2e's mapPairListNodes/mapPairListCount/mapPairListEnd mirror
+    # argListNodes/argListCount/argListEnd line for line, just with every
+    # "one orNodes call" doubled into "a key orNodes call, skip the `:`, a
+    # value orNodes call"). This confirms FINDING 8's own closing claim (the
+    # ArgSlot mechanism "needs no new arena WIDTH" for a call/list) extends
+    # one step further: it needs no new arena KIND SHAPE either, as long as
+    # the per-entry fact count stays inside the 4 usable slots a row already
+    # has (ArgSlot uses 1 of 4, MapPairSlot uses 2 of 4 — a THIRD per-entry
+    # fact, if some future construct ever needed one, would still fit,
+    # since valTok is also still free on a MapPairSlot row). Contrast with
+    # FINDING 9, above, and the ROUND 5 SCOPE NOTE's aggregate discussion,
+    # where the wall hit was never "too many facts for one row" but "the
+    # number of DISTINCT KINDS of fact (six, several of them full
+    # sub-expression trees) doesn't fit the two shapes (ArgSlot's list-of-
+    # one-fact, MapPairSlot's list-of-two-facts) this round's own machinery
+    # was designed to generalize.)
+    #
     # ============================================================
     # STAGE 0: character classification.
     # ============================================================
@@ -592,6 +774,37 @@ app ExprSelfHost:
                                             scanning = false
                                     else:
                                         scanning = false
+                                # Round 5: a `.` immediately followed by a
+                                # digit extends this int token into ONE float
+                                # token — expr.go's own tokenize rule (see this
+                                # file's header, ROUND 5 SCOPE NOTE) ported
+                                # exactly, including its "a bare trailing dot
+                                # with no digit after it is NOT consumed" edge
+                                # case (`3.` stays the int token "3" plus its
+                                # own separate "." operator token — tried by
+                                # this round's own exprCasesRound5 disambiguation
+                                # cases). tNum still needs no new KIND code
+                                # here — both int and float share kind 0,
+                                # exactly like the real tokenizer's own single
+                                # tNum kind; factorNodes (STAGE 2b) is the only
+                                # place that ever asks "does this token's TEXT
+                                # contain a dot" to tell them apart.
+                                if j < n:
+                                    if charAt(src, j) == ".":
+                                        if j + 1 < n:
+                                            let fracDigit = do isDigitChar(charAt(src, j + 1))
+                                            if fracDigit:
+                                                j = j + 1
+                                                let mut scanning2 = true
+                                                loop scanning2:
+                                                    if j < n:
+                                                        let dj2 = do isDigitChar(charAt(src, j))
+                                                        if dj2:
+                                                            j = j + 1
+                                                        else:
+                                                            scanning2 = false
+                                                    else:
+                                                        scanning2 = false
                                 kinds = append(kinds, 0)
                                 i = j
                             else:
@@ -692,6 +905,26 @@ app ExprSelfHost:
                                             scanning = false
                                     else:
                                         scanning = false
+                                # Round 5: mirrors tokenKinds' float-extension
+                                # branch exactly (same scan, same "trailing dot
+                                # with no digit after it stays unconsumed"
+                                # rule) — see tokenKinds' own doc, above.
+                                if j < n:
+                                    if charAt(src, j) == ".":
+                                        if j + 1 < n:
+                                            let fracDigit = do isDigitChar(charAt(src, j + 1))
+                                            if fracDigit:
+                                                j = j + 1
+                                                let mut scanning2 = true
+                                                loop scanning2:
+                                                    if j < n:
+                                                        let dj2 = do isDigitChar(charAt(src, j))
+                                                        if dj2:
+                                                            j = j + 1
+                                                        else:
+                                                            scanning2 = false
+                                                    else:
+                                                        scanning2 = false
                                 texts = append(texts, slice(src, i, j))
                                 i = j
                             else:
@@ -801,7 +1034,20 @@ app ExprSelfHost:
                     let listEnd = do listLitEnd(kinds, texts, pos)
                     return listEnd
                 else:
-                    return pos + 1
+                    if texts[pos] == "{":
+                        # Round 5: `{` starting a fresh atom is a map literal
+                        # (mapLitEnd, STAGE 2e below) — the same "new primary
+                        # atom, not a postfix" grammar position `[` already
+                        # established for list literals (round 4). No
+                        # tokenizer change was needed for `{`/`}`/`:` either
+                        # (this file's header, ROUND 5 SCOPE NOTE): they were
+                        # already falling into the generic operator branch,
+                        # kind 2, the same "any operator character" fallthrough
+                        # FINDING 6 already documented for `[`/`]`/`.`.
+                        let mapEnd = do mapLitEnd(kinds, texts, pos)
+                        return mapEnd
+                    else:
+                        return pos + 1
         else:
             return pos
 
@@ -834,15 +1080,36 @@ app ExprSelfHost:
     # no following `(`) still falls through to factorEnd exactly as before,
     # so `len` alone (not followed by `(`) still parses as Ref("len"), only
     # `len(...)` immediately adjacent parses as a call.
+    #
+    # Round 5: a THIRD case joins that same dispatch point — isEntityLookupStartAt
+    # (STAGE 2d below) — true iff the token at `pos` is a plain IDENT that is
+    # immediately followed by `(` AND is neither a builtin name
+    # (isCallNameTok) NOR one of the reserved aggregate/action-state names
+    # (isEntityNameTok: count/sum/exists/avg/min/max/pending/failed/dirty/
+    # touched, plus true/false). This is exactly expr.go's real `default:`
+    # case of the same switch isCallStartAt/isCallNameTok already restate
+    # (parsePostfix's `switch { case ref.Name == "count" || ...: ...; case
+    # isBuiltinCall(ref.Name): ...; default: ... entity lookup }`) — see this
+    # file's header ROUND 5 SCOPE NOTE for exactly why min/max stay excluded
+    # from entity-lookup candidacy too (they are never an entity name in the
+    # real grammar, always Agg-or-Call — both still out of scope here, so
+    # both forms of `min(...)`/`max(...)` keep degrading the same honest
+    # "not consumed" way they already did before this round, exactly like
+    # `count(...)`/`sum(...)`/etc. do).
     proc postfixEnd(kinds: [int], texts: [text], pos: int) -> int:
         let isCall = do isCallStartAt(kinds, texts, pos)
+        let isEntity = do isEntityLookupStartAt(kinds, texts, pos)
         let mut p0 = 0
         if isCall:
             let ce = do callEnd(kinds, texts, pos + 1)
             p0 = ce
         else:
-            let fe = do factorEnd(kinds, texts, pos)
-            p0 = fe
+            if isEntity:
+                let ee = do entityGetEnd(kinds, texts, pos + 1)
+                p0 = ee
+            else:
+                let fe = do factorEnd(kinds, texts, pos)
+                p0 = fe
         let mut p = p0
         let n = len(kinds)
         let mut cont = true
@@ -1050,23 +1317,44 @@ app ExprSelfHost:
     #                             referenced from a Call/ListLit's left/
     #                             right slots], 9 = Call [round 4,
     #                             `name(args...)`], 10 = ListLit [round 4,
-    #                             `[elems...]`])
+    #                             `[elems...]`], 11 = Lit(float) [round 5,
+    #                             `3.14`], 12 = EntityGet [round 5,
+    #                             `Entity(key).field`, or bare `Entity(key)`],
+    #                             13 = MapPairSlot [round 5, an internal
+    #                             "pointer" row like ArgSlot — see FINDING
+    #                             10 — only ever referenced from a MapLit's
+    #                             left/right slots], 14 = MapLit [round 5,
+    #                             `{k: v, ...}`])
     #   arena[5*i + 1] = valTok  (leaf only — Lit(int)/Lit(bool)/Lit(text)/
-    #                             Ref: token index of the NUM/IDENT/STR
-    #                             token this leaf reads its value/name from
-    #                             — the actual text lives in tokenTexts(src),
-    #                             looked up by this index, never duplicated
-    #                             into the arena itself — the same "store
-    #                             the reference, not a copy" choice
-    #                             childrenOf/subtreeSum already made for
-    #                             parents arrays in source.fct. A Lit(bool)
-    #                             leaf's valTok points at the "true"/"false"
-    #                             IDENT token; a Lit(text) leaf's valTok
-    #                             points at the STR token holding the RAW
-    #                             (still-quoted-and-escaped) source span —
-    #                             see this file's header FINDING 7 for why
-    #                             unescaping is left to the arena's
-    #                             consumer, not done here)
+    #                             Lit(float)/Ref: token index of the
+    #                             NUM/IDENT/STR token this leaf reads its
+    #                             value/name from — the actual text lives in
+    #                             tokenTexts(src), looked up by this index,
+    #                             never duplicated into the arena itself —
+    #                             the same "store the reference, not a copy"
+    #                             choice childrenOf/subtreeSum already made
+    #                             for parents arrays in source.fct. A
+    #                             Lit(bool) leaf's valTok points at the
+    #                             "true"/"false" IDENT token; a Lit(text)
+    #                             leaf's valTok points at the STR token
+    #                             holding the RAW (still-quoted-and-escaped)
+    #                             source span — see this file's header
+    #                             FINDING 7 for why unescaping is left to the
+    #                             arena's consumer, not done here; a
+    #                             Lit(float) leaf's valTok [round 5] points
+    #                             at the same NUM token a Lit(int) leaf would
+    #                             (int/float share one token kind — see the
+    #                             ROUND 5 SCOPE NOTE), decoded with the
+    #                             consumer's own float parse, mirroring
+    #                             int/text's identical "decode elsewhere"
+    #                             split. EntityGet [round 5]: the FIELD
+    #                             NAME's token index (the SAME "store the
+    #                             token index" mechanism a Get node's opTok
+    #                             already uses for a field name — FINDING 7
+    #                             — just living in valTok here since opTok is
+    #                             already taken by the entity name below), or
+    #                             -1 if no `.field` followed (a bare
+    #                             `Entity(key)`))
     #   arena[5*i + 2] = opTok   (Bin/Un: token index of the operator token
     #                             — any of `+ - * / == != < <= > >= & | ^
     #                             && || ! ~`; look up tokenTexts(src)
@@ -1075,7 +1363,9 @@ app ExprSelfHost:
     #                             token that followed the `.` — the SAME
     #                             "store the token index" mechanism, just
     #                             holding a field name instead of an
-    #                             operator symbol; see FINDING 7)
+    #                             operator symbol; see FINDING 7. EntityGet
+    #                             [round 5]: token index of the ENTITY NAME
+    #                             identifier)
     #   arena[5*i + 3] = left    (Bin/Get/Index: NODE index of the left/
     #                             object child, i.e. arena[5*left ..], not a
     #                             raw array offset; Un only: NODE index of
@@ -1091,7 +1381,14 @@ app ExprSelfHost:
     #                             the identical "right" slot, just holding a
     #                             different KIND's second child. Call/
     #                             ListLit [round 4]: the ARGUMENT COUNT N —
-    #                             not a node index at all, see below)
+    #                             not a node index at all, see below.
+    #                             EntityGet [round 5]: unused, -1 (one real
+    #                             child only — the key — held in left, the
+    #                             mirror image of Get's own left-only shape).
+    #                             MapPairSlot [round 5]: the VALUE root node
+    #                             index — see FINDING 10. MapLit [round 5]:
+    #                             the PAIR COUNT N, the identical Call/
+    #                             ListLit shape, just naming MapPairSlot rows)
     #
     # Round 4 (Call/ListLit, kinds 9/10) reuse left/right for a different
     # PAIR of facts than every earlier kind — not "two children" but "where
@@ -1104,7 +1401,14 @@ app ExprSelfHost:
     # kinds. A Call's opTok holds the builtin name's token index (the same
     # "store the token index, not the text" mechanism a Get node's opTok
     # already uses for a field name — FINDING 7); a ListLit has no name, so
-    # its opTok is -1 like everything else with nothing to name.
+    # its opTok is -1 like everything else with nothing to name. Round 5's
+    # MapLit (kind 14) reuses the identical left/right shape one level up
+    # (left = first MapPairSlot's node index, right = pair count N), and its
+    # own MapPairSlot rows (kind 13) reuse left/right for a THIRD purpose —
+    # not "child index + count" but "this pair's two children" (key root in
+    # left, value root in right) — see FINDING 10 for why this needed no new
+    # arena width, only a different pair of facts in an already-existing
+    # pair of slots.
     #
     # -1 fills whichever of valTok/opTok/left/right a node's kind doesn't
     # use (a Lit/Ref leaf has no opTok/left/right; a Bin node has no
@@ -1117,9 +1421,16 @@ app ExprSelfHost:
     # token of its own, only its two children; an ArgSlot row [round 4] has
     # only valTok — opTok/left/right all stay -1, since its one and only
     # job is naming another node's index; a ListLit [round 4] has no valTok
-    # and no opTok — both stay -1, same reasoning as Index) — the same "-1
-    # means absent" convention source.fct's parent-index arrays already use
-    # for "no parent"/"no open ancestor".
+    # and no opTok — both stay -1, same reasoning as Index; an EntityGet
+    # node [round 5] has no unused slot at all — it is the first kind to use
+    # all four (valTok for the optional field token, opTok for the entity
+    # name token, left for the key child, right left at -1 since there is no
+    # second child — see FINDING 9); a MapPairSlot row [round 5] has valTok
+    # and opTok both -1, the same reasoning as ArgSlot, just with left/right
+    # both in use instead of valTok alone; a MapLit node [round 5] has no
+    # valTok and no opTok — both stay -1, same reasoning as ListLit) — the
+    # same "-1 means absent" convention source.fct's parent-index arrays
+    # already use for "no parent"/"no open ancestor".
     #
     # factorNodes/unaryNodes/termNodes/exprNodes/comparisonNodes/
     # bitAndNodes/bitXorNodes/bitOrNodes/andNodes/orNodes mirror their
@@ -1155,34 +1466,59 @@ app ExprSelfHost:
                     let lit = do listLitNodes(kinds, texts, pos, arena)
                     return lit
                 else:
-                    # NUMBER / IDENT (Ref, or `true`/`false` -> Lit(bool)) / STR
-                    # leaf. Round 3 adds the STR case (arena kind 5, token kind
-                    # 5) and the `true`/`false` IDENT special case (arena kind
-                    # 4) — everything else (a plain IDENT) still falls through
-                    # to Ref (arena kind 1), unchanged from round 1.
-                    let mut a = arena
-                    let mut kindCode = 0
-                    if kinds[pos] == 0:
-                        kindCode = 0
+                    if texts[pos] == "{":
+                        # Round 5: `{` starting a fresh atom is a map literal
+                        # (mapLitNodes, STAGE 2e below) — see factorEnd's own
+                        # doc, just above.
+                        let mlit = do mapLitNodes(kinds, texts, pos, arena)
+                        return mlit
                     else:
-                        if kinds[pos] == 5:
-                            kindCode = 5
-                        else:
-                            if texts[pos] == "true":
-                                kindCode = 4
-                            else:
-                                if texts[pos] == "false":
-                                    kindCode = 4
-                                else:
-                                    kindCode = 1
-                    a = append(a, kindCode)
-                    a = append(a, pos)
-                    a = append(a, -1)
-                    a = append(a, -1)
-                    a = append(a, -1)
-                    return a
+                        let leaf = do factorLeafNodes(kinds, texts, pos, arena)
+                        return leaf
         else:
             return arena
+
+    # factorLeafNodes (round 5): split out of factorNodes' own body so the
+    # NUMBER/IDENT/STR leaf-building code (unchanged in substance from round
+    # 3, only the NUMBER case's kindCode decision is new) reads as its own
+    # small function rather than a fourth level of nested `if`/`else` inside
+    # factorNodes. NUMBER / IDENT (Ref, or `true`/`false` -> Lit(bool)) / STR
+    # leaf. Round 3 added the STR case (arena kind 5, token kind 5) and the
+    # `true`/`false` IDENT special case (arena kind 4). Round 5 adds the
+    # float case (arena kind 11): a NUMBER token (kind 0) whose TEXT contains
+    # a `.` (checked with the real `contains` builtin, not a hand-rolled
+    # loop — this is an ordinary, already-verified language builtin, the same
+    # "just call it" idiom this file's own `len`/`charAt`/`append`/`slice`
+    # calls already use, not a re-port of expr.go's own logic) is a float
+    # literal, exactly mirroring parseAtom's own `strings.Contains(t.text,
+    # ".")` decision (expr.go, read fresh for this round). An int-only NUMBER
+    # token still gets kindCode 0, unchanged.
+    proc factorLeafNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let mut a = arena
+        let mut kindCode = 0
+        if kinds[pos] == 0:
+            let isFloat = contains(texts[pos], ".")
+            if isFloat:
+                kindCode = 11
+            else:
+                kindCode = 0
+        else:
+            if kinds[pos] == 5:
+                kindCode = 5
+            else:
+                if texts[pos] == "true":
+                    kindCode = 4
+                else:
+                    if texts[pos] == "false":
+                        kindCode = 4
+                    else:
+                        kindCode = 1
+        a = append(a, kindCode)
+        a = append(a, pos)
+        a = append(a, -1)
+        a = append(a, -1)
+        a = append(a, -1)
+        return a
 
     # postfixNodes (round 3): the arena-building twin of postfixEnd. `.field`
     # contributes a Get node (arena kind 6): opTok holds the field-name
@@ -1209,23 +1545,45 @@ app ExprSelfHost:
     # after that (the `.`/`[` chaining loop) is completely unchanged: a
     # call's result is just another `objIdx`, so `len(x).field` or
     # `trim(s)[0]` (odd but grammatically legal) fall out for free too.
+    #
+    # Round 5: isEntityLookupStartAt joins the same dispatch (see postfixEnd's
+    # own doc, above, for the exact real-grammar reasoning) — if true, the
+    # atom is built by entityGetNodes instead, and the matching position
+    # advance is entityGetEnd. entityGetNodes/entityGetEnd (STAGE 2d below)
+    # already consume the construct's own OPTIONAL trailing `.field`
+    # internally (`Post(id)` alone is valid — no field — matching
+    # ast.EntityGet's own optional Field), so this loop's chained `.`/`[`
+    # handling below still applies normally ON TOP of an EntityGet result —
+    # `Post(id).a.b` is Get{Obj: EntityGet{...Field:"a"}, Field:"b"}, exactly
+    # like the real parser's own shared postfix loop (parsePostfix, read
+    # fresh for this round) continues past its `default:` case's own single
+    # `.field` consumption.
     proc postfixNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
         let isCall = do isCallStartAt(kinds, texts, pos)
+        let isEntity = do isEntityLookupStartAt(kinds, texts, pos)
         let mut a = arena
         if isCall:
             let a0 = do callNodes(kinds, texts, pos, pos + 1, arena)
             a = a0
         else:
-            let a0 = do factorNodes(kinds, texts, pos, arena)
-            a = a0
+            if isEntity:
+                let a0 = do entityGetNodes(kinds, texts, pos, pos + 1, arena)
+                a = a0
+            else:
+                let a0 = do factorNodes(kinds, texts, pos, arena)
+                a = a0
         let mut objIdx = (len(a) / 5) - 1
         let mut p = 0
         if isCall:
             let ce = do callEnd(kinds, texts, pos + 1)
             p = ce
         else:
-            let fe = do factorEnd(kinds, texts, pos)
-            p = fe
+            if isEntity:
+                let ee = do entityGetEnd(kinds, texts, pos + 1)
+                p = ee
+            else:
+                let fe = do factorEnd(kinds, texts, pos)
+                p = fe
         let n = len(kinds)
         let mut cont = true
         loop cont:
@@ -1560,6 +1918,116 @@ app ExprSelfHost:
                         return texts[pos + 1] == "("
         return false
 
+    # ============================================================
+    # STAGE 2d (round 5): `Entity(key).field` lookups. Read fresh against
+    # expr.go's real parsePostfix `default:` case (this file, this round) —
+    # see this file's header ROUND 5 SCOPE NOTE for the full disambiguation
+    # reasoning; short version: a plain IDENT immediately followed by `(`
+    # that is NEITHER a builtin call name (isCallNameTok, already used by
+    # isCallStartAt above) NOR one of the reserved aggregate/action-state
+    # names (isEntityNameTok, below) is entity-lookup syntax in the real
+    # grammar — a genuinely different node shape (ast.EntityGet: entity name
+    # + key expression + an OPTIONAL trailing `.field`) from a Call.
+    # ============================================================
+    #
+    # isEntityNameTok: the closed set of names that, immediately followed by
+    # `(`, are NEVER an entity name in the real grammar — always either an
+    # aggregate (count/sum/exists/avg, or min/max in the real grammar's own
+    # comma-based disambiguation — both forms out of scope here, see the
+    # header) or an action-state read (pending/failed/dirty/touched). `true`/
+    # `false` are included too, defensively: they can never actually reach
+    # this check in practice (factorNodes/factorLeafNodes special-case them
+    # into Lit(bool), never a Ref, before postfixNodes' isEntityLookupStartAt
+    # is ever consulted — see FINDING 9 below for why this belongs here
+    # anyway, restated as its own explicit exclusion rather than relying on
+    # that fact silently).
+    proc isEntityNameTok(texts: [text], n: int, pos: int) -> bool:
+        return texts[pos] == "count" || texts[pos] == "sum" || texts[pos] == "exists" || texts[pos] == "avg" || texts[pos] == "min" || texts[pos] == "max" || texts[pos] == "pending" || texts[pos] == "failed" || texts[pos] == "dirty" || texts[pos] == "touched" || texts[pos] == "true" || texts[pos] == "false"
+
+    # isEntityLookupStartAt: true iff the token at `pos` is a plain IDENT
+    # (kind 1) immediately followed by `(`, that is neither a builtin call
+    # name nor a reserved aggregate/action-state name. Mirrors
+    # isCallStartAt's own shape exactly, just with the opposite name-set
+    # test — the two are meant to be read side by side, since together they
+    # ARE expr.go's real three-way (Call / EntityGet / plain postfix) switch,
+    # minus the Agg/ActState arms this port still doesn't implement.
+    proc isEntityLookupStartAt(kinds: [int], texts: [text], pos: int) -> bool:
+        let n = len(kinds)
+        if pos < n:
+            if kinds[pos] == 1:
+                let reserved = do isEntityNameTok(texts, n, pos)
+                if reserved:
+                    return false
+                let isBuiltin = do isCallNameTok(texts, n, pos)
+                if isBuiltin:
+                    return false
+                if pos + 1 < n:
+                    return texts[pos + 1] == "("
+        return false
+
+    # entityGetEnd: `Entity(key).field` (or bare `Entity(key)`, field
+    # omitted — both real, see ast.EntityGet's optional Field). `parenPos` is
+    # the index of the `(` token itself (the caller — postfixEnd — always
+    # passes `nameTokPos + 1`, the identical convention callEnd already
+    # uses). The key is ONE full expression (orEnd — the loosest level,
+    # matching expr.go's own `p.parseBinary(0)` for the key), not a
+    # comma-separated list — genuinely simpler than a call's argument list,
+    # per the task's own framing. No error-checking on the closing `)` (this
+    # file's STAGE 2a doc: a proc can't return expr.go's `*Error`) — `keyEnd +
+    # 1` unconditionally skips whatever token is there, the same "honest,
+    # optimistic advance" factorEnd's own unmatched-`(` case already
+    # establishes. The optional `.field` is then consumed here too (2 more
+    # tokens, `.` plus the field IDENT) — this is the ONE piece of the
+    # construct genuinely different from a bare postfix `.field`: it belongs
+    # to the SAME grammar production as the entity lookup itself (expr.go's
+    # `default:` case consumes it inline, before ever reaching the shared
+    # postfix loop), not a separate chained access — though postfixEnd's own
+    # loop can still chain FURTHER `.`/`[` postfixes on top of the result,
+    # exactly as expr.go's real parsePostfix does (see postfixNodes' own doc
+    # for the `Post(id).a.b` example).
+    proc entityGetEnd(kinds: [int], texts: [text], parenPos: int) -> int:
+        let keyEnd = do orEnd(kinds, texts, parenPos + 1)
+        let mut p = keyEnd + 1
+        let n = len(kinds)
+        if p < n:
+            if texts[p] == ".":
+                p = p + 2
+        return p
+
+    # entityGetNodes: the arena-building twin. `nameTok` is the entity name's
+    # own token index (the caller — postfixNodes — always passes `pos`, the
+    # identifier's own position, mirroring callNodes' `nameTok` parameter).
+    # Arena kind 12 (EntityGet): valTok = the field-name token index, or -1
+    # if no `.field` followed (the "-1 means absent" convention every other
+    # optional slot in this arena already uses — see STAGE 2b's doc); opTok =
+    # the entity name's own token index (FINDING 7's "store the token index,
+    # not the text" mechanism, same as a Get node's field name or a Call
+    # node's builtin name); left = the key expression's NODE index (its one
+    # real child); right = -1 (unused — an EntityGet has exactly one child,
+    # the same "-1 fills the unused slot" shape a Get/Un node's own right
+    # slot already has). See FINDING 9 (this file's header) for why this
+    # needed no auxiliary ArgSlot-style row the way Call/ListLit did: unlike
+    # a variable-arity argument list, EntityGet has a FIXED, small number of
+    # facts (one child, two token references), which the existing 5-int
+    # width already has exactly enough spare slots for.
+    proc entityGetNodes(kinds: [int], texts: [text], nameTok: int, parenPos: int, arena: [int]) -> [int]:
+        let a0 = do orNodes(kinds, texts, parenPos + 1, arena)
+        let keyIdx = (len(a0) / 5) - 1
+        let keyEnd = do orEnd(kinds, texts, parenPos + 1)
+        let mut fieldTok = -1
+        let mut p = keyEnd + 1
+        let n = len(kinds)
+        if p < n:
+            if texts[p] == ".":
+                fieldTok = p + 1
+        let mut a = a0
+        a = append(a, 12)
+        a = append(a, fieldTok)
+        a = append(a, nameTok)
+        a = append(a, keyIdx)
+        a = append(a, -1)
+        return a
+
     # isArgSepTok / argListEmptyAt: the two small closed-alphabet checks
     # argListEnd/argListCount/argListNodes share below, written once rather
     # than inlined three times, exactly like isCompareOpTok etc. already
@@ -1721,6 +2189,174 @@ app ExprSelfHost:
         a2 = append(a2, -1)
         a2 = append(a2, first)
         a2 = append(a2, argCount)
+        return a2
+
+    # ============================================================
+    # STAGE 2e (round 5): map literals (`{k: v, ...}`, `{}` for empty). See
+    # this file's header ROUND 5 SCOPE NOTE and FINDING 10 for the arena-
+    # encoding design summary; the short version: this reuses FINDING 8's
+    # own "N contiguous auxiliary rows after every real subtree is built"
+    # trick, widened from ArgSlot's ONE int per entry (a single child's root
+    # index) to a new MapPairSlot kind that holds TWO node indices per entry
+    # (a key's root index AND a value's root index) — which the existing
+    # 5-int-per-node width already has room for, by storing them in the
+    # left/right slots instead of a single valTok, no arena WIDTH change
+    # needed, exactly like Call/ListLit needed none either.
+    #
+    # mapEmptyAt / mapPairListEnd / mapPairListCount / mapPairListNodes below
+    # are argListEmptyAt/argListEnd/argListCount/argListNodes' own direct
+    # generalization: every "one expression" step there becomes "one key
+    # expression, a `:`, one value expression" here, doubling the orEnd/
+    # orNodes calls per slot but changing nothing else about the shape (same
+    # comma-separated loop, same independent End/Nodes/Count re-derivation
+    # idiom FINDING 8 already established, just parameterized over pairs
+    # instead of singles).
+    # ============================================================
+    proc mapEmptyAt(texts: [text], n: int, pos: int) -> bool:
+        return pos < n && texts[pos] == "}"
+
+    # mapPairListEnd: `pos` is the token index right AFTER the opening `{`
+    # (the caller, mapLitEnd, always passes `bracePos + 1`). An empty map
+    # (`}` immediately) consumes just that one closing token. Otherwise:
+    # parse one key (orEnd), skip the `:` (no error-checking that it really
+    # is one — this file's established "honest, optimistic advance"
+    # convention, same as entityGetEnd/factorEnd's own unmatched-token
+    # cases), parse one value (orEnd), then loop consuming `, <key> : <value>`
+    # groups exactly like argListEnd loops over `, <expr>`. The final `p + 1`
+    # skips the closing `}`.
+    proc mapPairListEnd(kinds: [int], texts: [text], pos: int) -> int:
+        let n = len(kinds)
+        let empty = do mapEmptyAt(texts, n, pos)
+        if empty:
+            return pos + 1
+        let keyEnd0 = do orEnd(kinds, texts, pos)
+        let valStart0 = keyEnd0 + 1
+        let p0 = do orEnd(kinds, texts, valStart0)
+        let mut p = p0
+        let cont0 = do isArgSepTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let keyStartN = p + 1
+            let keyEndN = do orEnd(kinds, texts, keyStartN)
+            let valStartN = keyEndN + 1
+            let next = do orEnd(kinds, texts, valStartN)
+            p = next
+            let contNext = do isArgSepTok(texts, n, p)
+            cont = contNext
+        return p + 1
+
+    # mapPairListCount: mapPairListEnd's independent twin for the pair count
+    # N — the same third "Count" family FINDING 8 established for argList,
+    # re-derived rather than threaded through a return value, for the exact
+    # same reason (a proc returns exactly one value).
+    proc mapPairListCount(kinds: [int], texts: [text], pos: int) -> int:
+        let n = len(kinds)
+        let empty = do mapEmptyAt(texts, n, pos)
+        if empty:
+            return 0
+        let keyEnd0 = do orEnd(kinds, texts, pos)
+        let valStart0 = keyEnd0 + 1
+        let p0 = do orEnd(kinds, texts, valStart0)
+        let mut p = p0
+        let mut count = 1
+        let cont0 = do isArgSepTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let keyStartN = p + 1
+            let keyEndN = do orEnd(kinds, texts, keyStartN)
+            let valStartN = keyEndN + 1
+            let next = do orEnd(kinds, texts, valStartN)
+            p = next
+            count = count + 1
+            let contNext = do isArgSepTok(texts, n, p)
+            cont = contNext
+        return count
+
+    # mapPairListNodes: the arena-building twin. Builds each pair's key AND
+    # value subtrees via orNodes (full grammar, matching mapPairListEnd's own
+    # orEnd calls), accumulating both root indices into two parallel proc-
+    # LOCAL `[int]` accumulators (`keyRootIdxs`/`valRootIdxs` — safe to grow
+    # with `append` across the whole loop, exactly like argListNodes' own
+    # `rootIdxs`, for the identical reason: neither ever crosses a proc-call
+    # return-value boundary). Once every pair is built, a second loop appends
+    # one MapPairSlot row (kind 13) per entry, IN ORDER, contiguous — the
+    # same contiguity FINDING 8 established for ArgSlot, which is exactly
+    # what lets mapLitNodes compute "the first MapPairSlot's index" by pure
+    # arithmetic afterward. A MapPairSlot's OWN valTok/opTok stay -1 (it has
+    # no token of its own to name) — its two facts live in left (the key's
+    # root node index) and right (the value's root node index), the one real
+    # difference from ArgSlot's single-valTok shape (see FINDING 10).
+    proc mapPairListNodes(kinds: [int], texts: [text], pos: int, arena: [int]) -> [int]:
+        let n = len(kinds)
+        let empty = do mapEmptyAt(texts, n, pos)
+        if empty:
+            return arena
+        let mut a = arena
+        let mut keyRootIdxs = []
+        let mut valRootIdxs = []
+        let a0 = do orNodes(kinds, texts, pos, a)
+        let keyRoot0 = (len(a0) / 5) - 1
+        keyRootIdxs = append(keyRootIdxs, keyRoot0)
+        let keyEnd0 = do orEnd(kinds, texts, pos)
+        let valStart0 = keyEnd0 + 1
+        let a1 = do orNodes(kinds, texts, valStart0, a0)
+        let valRoot0 = (len(a1) / 5) - 1
+        valRootIdxs = append(valRootIdxs, valRoot0)
+        a = a1
+        let p0 = do orEnd(kinds, texts, valStart0)
+        let mut p = p0
+        let cont0 = do isArgSepTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let keyStartN = p + 1
+            let aK = do orNodes(kinds, texts, keyStartN, a)
+            let keyRootN = (len(aK) / 5) - 1
+            keyRootIdxs = append(keyRootIdxs, keyRootN)
+            let keyEndN = do orEnd(kinds, texts, keyStartN)
+            let valStartN = keyEndN + 1
+            let aV = do orNodes(kinds, texts, valStartN, aK)
+            let valRootN = (len(aV) / 5) - 1
+            valRootIdxs = append(valRootIdxs, valRootN)
+            a = aV
+            let next = do orEnd(kinds, texts, valStartN)
+            p = next
+            let contNext = do isArgSepTok(texts, n, p)
+            cont = contNext
+        let m = len(keyRootIdxs)
+        let mut k = 0
+        loop k < m:
+            a = append(a, 13)
+            a = append(a, -1)
+            a = append(a, -1)
+            a = append(a, keyRootIdxs[k])
+            a = append(a, valRootIdxs[k])
+            k = k + 1
+        return a
+
+    # mapLitEnd / mapLitNodes: `{k: v, ...}`. `bracePos` is the index of the
+    # `{` token itself (the caller — factorEnd/factorNodes — always passes
+    # its own `pos`). Otherwise identical in shape to listLitEnd/listLitNodes:
+    # a MapLit node (arena kind 14) stores left = the first MapPairSlot's
+    # node index (or -1 if the map is empty), right = the pair count N —
+    # the same "first auxiliary row's index, count" pair Call/ListLit already
+    # use, just naming MapPairSlot rows instead of ArgSlot ones. valTok/opTok
+    # stay -1 (a MapLit has no name and no single value of its own).
+    proc mapLitEnd(kinds: [int], texts: [text], bracePos: int) -> int:
+        let e = do mapPairListEnd(kinds, texts, bracePos + 1)
+        return e
+
+    proc mapLitNodes(kinds: [int], texts: [text], bracePos: int, arena: [int]) -> [int]:
+        let count = do mapPairListCount(kinds, texts, bracePos + 1)
+        let a1 = do mapPairListNodes(kinds, texts, bracePos + 1, arena)
+        let mut first = -1
+        if count > 0:
+            first = (len(a1) / 5) - count
+        let mut a2 = a1
+        a2 = append(a2, 14)
+        a2 = append(a2, -1)
+        a2 = append(a2, -1)
+        a2 = append(a2, first)
+        a2 = append(a2, count)
         return a2
 
     # ============================================================
