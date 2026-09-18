@@ -1,0 +1,569 @@
+import "parser_decl2.fct"
+
+app ParserDecl3SelfHost:
+    # Partial, honest self-hosting port of a THIRD slice of
+    # internal/parser/parser.go's declaration parsers into `.fct` `proc`s —
+    # parseTheme (parser.go lines 1206-1228), parseNamedTheme (1230-1245),
+    # and parseFile (1686-1721), the two smallest of the seven declaration
+    # kinds that had ZERO self-hosted parser infrastructure before this file
+    # (type/message/layout/theme/css/daemon/file — all seven read fresh from
+    # parser.go before picking these two; see this file's own bottom-level
+    # header note in the task report for the full landscape).
+    #
+    # Why theme + file, not type/message/layout/css/daemon: type (65 real
+    # lines: field list + wire-type/default-value grammar) and message (69
+    # real lines: tagged-union variants on top of the same wire-type/default
+    # grammar) are both meaningfully bigger than every other candidate.
+    # layout's OWN body (parser.go 1185-1204) is only ~20 lines, but it is a
+    # thin wrapper around parseNodes (the full view/node-tree grammar) and
+    # ast.SpliceLayout (a real tree-walk validator), NEITHER of which exists
+    # in this self-hosted subset yet — porting layout honestly would mean
+    # porting those first, which is a much bigger undertaking than the
+    # numbers for parseLayout alone suggest. css (parser.go 1247-1276 plus
+    # checkCSSComments, 1278-1311) needs the raw pre-tokenizer comment list
+    # threaded in from the caller — a scanner-level concept this self-hosted
+    # port's node tree does not carry at all — so honestly porting it means
+    # growing new lexer-level infrastructure, not just a new parser proc.
+    # daemon (parser.go 2476-2531, ~42 lines) is mid-size and doable, but
+    # needs parseProcBody (a full proc-body statement list) wired onto its
+    # tail — real, larger surface than the two here. theme (21 real lines)
+    # and file (28 real lines) are both fully self-contained: pure header/
+    # child-line text surgery over already-ported primitives, no
+    # expr.fct/stmt.fct/node-tree dependency at all. They are the true
+    # smallest, not "message" (the task brief's own guess, checked here by
+    # actually reading all seven bodies rather than trusting it).
+    #
+    # ============================================================
+    # WHY THIS IS A NEW FILE, NOT AN EXTENSION OF parser_decl2.fct/
+    # parser_service.fct/expr_tree.fct/decl_checks.fct/fabric_*.fct
+    # ============================================================
+    # Those files are being actively worked on elsewhere in this same round
+    # — editing any of them here would collide. This file only IMPORTS
+    # parser_decl2.fct (which itself imports parser_service.fct, which
+    # imports parser_entity.fct, which imports parser_proc.fct, which
+    # imports stmt.fct/expr.fct), so every primitive from that whole chain —
+    # trim/trimPrefixText/trimSuffixText/indexOf/isIdentToken/
+    # isIdentStartChar/isIdentChar/hasQuotedText/quotedInner/hasPrefixText —
+    # is available to `do` here exactly as if declared locally, the same
+    # cross-file composition convention parser_decl2.fct's own header
+    # documents and parser.fct's TestCrossFileDoCallComposition verified
+    # live. None of those files declares a `struct`/`state`/`view` this file
+    # reuses by name, so nothing here collides; this file's own `struct`s,
+    # `state`s, and its `view Home at "/decl3"` (a fresh path, unused
+    # anywhere in the import chain) are the only new declarations.
+    #
+    # ============================================================
+    # STRUCTS, NOT ARENAS — ThemeVar/ThemeDecl/NamedThemeDecl/FileDecl are
+    # each a real named `struct`, never a flat `[int]`/parallel-array
+    # kind-tag encoding, per this port's own established struct-milestone
+    # convention (parser_decl2.fct's own header explains the same choice
+    # for RecordDecl/StructDecl/EnumDecl/etc.).
+    # ============================================================
+
+    # ============================================================
+    # STAGE 29: parseTheme — a `theme:` (or `theme dark:`) block of
+    # `name "value"` lines, each becoming a CSS custom property (parser.go
+    # lines 1206-1228, read fresh):
+    #
+    #   func parseTheme(n *source.Node) ([]ast.ThemeVar, error) {
+    #       for _, c := range n.Children {
+    #           fields := strings.SplitN(strings.TrimSpace(c.Line.Text), " ", 2)
+    #           if len(fields) != 2 { error }
+    #           if !isThemeKey(fields[0]) { error }
+    #           val, err := unquote(strings.TrimSpace(fields[1]), c.Line.No)
+    #           out = append(out, ast.ThemeVar{Name: fields[0], Value: val, ...})
+    #       }
+    #       if len(out) == 0 { error "theme block is empty" }
+    #   }
+    #
+    # SplitN(s, " ", 2) is "split on the FIRST space only" — restated below
+    # as themeEntrySpaceIndex/themeEntryName/themeEntryValueRaw via indexOf,
+    # the same shape STAGE 1 of parser_proc.fct already uses for every other
+    # single-separator split in this port (webhookPathQuoted, jobHeadPart,
+    # etc.) rather than a generic N-way splitter.
+    #
+    # unquote's own real gate (parser.go's separate `unquote` func, line
+    # 4871: `len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"'`, THEN
+    # strconv.Unquote for escapes) is ported at the OUTER-quote-shape level
+    # only (themeValueIsQuoted/themeValueInner) — escape decoding itself is
+    # left as a naive strip, the same fidelity level parser_entity.fct's own
+    # quotedInner/hasQuotedText already established for webhook paths and
+    # service URLs elsewhere in this port (their own STAGE 13 header:
+    # "the raw substring between the two quote characters is exactly the
+    # value a real caller wants" — not a full unescape).
+    # ============================================================
+    struct ThemeVar:
+        name: text
+        value: text
+        valid: bool
+
+    struct ThemeDecl:
+        vars: [ThemeVar]
+        valid: bool
+
+    proc themeEntrySpaceIndex(s: text) -> int:
+        let r = do indexOf(s, " ")
+        return r
+
+    proc themeEntryHasTwoFields(s: text) -> bool:
+        let idx = do themeEntrySpaceIndex(s)
+        return idx >= 0
+
+    proc themeEntryName(s: text) -> text:
+        let idx = do themeEntrySpaceIndex(s)
+        if idx < 0:
+            return s
+        return slice(s, 0, idx)
+
+    proc themeEntryValueRaw(s: text) -> text:
+        let idx = do themeEntrySpaceIndex(s)
+        if idx < 0:
+            return ""
+        return trim(slice(s, idx + 1, len(s)))
+
+    # isThemeKeyToken: parser.go's own isThemeKey — non-empty, no leading or
+    # trailing `-`, and every `-` elsewhere in the name is a stand-in for
+    # `_` in an otherwise ordinary identifier (parser.go: `isIdent(strings.
+    # ReplaceAll(s, "-", "_"))`). Restated character-by-character below
+    # rather than calling a `replaceAll` builtin (none of this port's
+    # imported files expose one) — first character must satisfy
+    # isIdentStartChar exactly like any other identifier (a bare `-` there
+    # is already excluded by the leading-dash guard, and a digit was never
+    # legal at position 0 either way); every later character must be either
+    # `-` (always legal there once replaced by `_`) or pass isIdentChar.
+    proc isThemeKeyToken(s: text) -> bool:
+        let n = len(s)
+        if n == 0:
+            return false
+        let first = charAt(s, 0)
+        if first == "-":
+            return false
+        let last = charAt(s, n - 1)
+        if last == "-":
+            return false
+        let mut ok = true
+        let mut i = 0
+        loop i < n && ok:
+            let c = charAt(s, i)
+            if i == 0:
+                let st = do isIdentStartChar(c)
+                if !st:
+                    ok = false
+            else:
+                if c != "-":
+                    let ic = do isIdentChar(c)
+                    if !ic:
+                        ok = false
+            i = i + 1
+        return ok
+
+    proc themeValueIsQuoted(s: text) -> bool:
+        let n = len(s)
+        if n < 2:
+            return false
+        let first = charAt(s, 0)
+        if first != "\"":
+            return false
+        let last = charAt(s, n - 1)
+        return last == "\""
+
+    proc themeValueInner(s: text) -> text:
+        let ok = do themeValueIsQuoted(s)
+        if !ok:
+            return ""
+        let n = len(s)
+        return slice(s, 1, n - 1)
+
+    proc themeEntryValid(lineText: text) -> bool:
+        let t = trim(lineText)
+        let hasTwo = do themeEntryHasTwoFields(t)
+        if !hasTwo:
+            return false
+        let name = do themeEntryName(t)
+        let keyOk = do isThemeKeyToken(name)
+        if !keyOk:
+            return false
+        let valRaw = do themeEntryValueRaw(t)
+        let quotedOk = do themeValueIsQuoted(valRaw)
+        return quotedOk
+
+    proc buildThemeVar(lineText: text) -> ThemeVar:
+        let t = trim(lineText)
+        let name = do themeEntryName(t)
+        let valRaw = do themeEntryValueRaw(t)
+        let value = do themeValueInner(valRaw)
+        let ok = do themeEntryValid(lineText)
+        return ThemeVar{name: name, value: value, valid: ok}
+
+    proc buildThemeVars(lines: [text]) -> [ThemeVar]:
+        let n = len(lines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let v = do buildThemeVar(lines[i])
+            out = append(out, v)
+            i = i + 1
+        return out
+
+    proc themeVarsAllValid(vars: [ThemeVar]) -> bool:
+        let n = len(vars)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            if !vars[i].valid:
+                ok = false
+            i = i + 1
+        return ok
+
+    # buildThemeDecl: parser.go's own `len(out) == 0` empty-block rejection,
+    # ANDed with every entry's own validity (an independent `error` return
+    # per entry in Go; combined here since a boolean verdict cannot name
+    # WHICH line failed, the same convention recordDeclValid/structDeclValid
+    # already establish in parser_decl2.fct).
+    proc buildThemeDecl(lines: [text]) -> ThemeDecl:
+        let vars = do buildThemeVars(lines)
+        let mut valid = false
+        if len(vars) > 0:
+            let allOk = do themeVarsAllValid(vars)
+            valid = allOk
+        return ThemeDecl{vars: vars, valid: valid}
+
+    proc parseThemeDeclSrc(src: text) -> ThemeDecl:
+        let lines = split(src, "\n")
+        let d = do buildThemeDecl(lines)
+        return d
+
+    # ============================================================
+    # STAGE 30: parseNamedTheme — `theme <name>:` (parser.go lines
+    # 1230-1245), the alternate-palette sibling of the base `theme:`/
+    # `theme dark:` blocks above. Its own header name is validated with the
+    # SAME isThemeKey check STAGE 29 already ported for each entry's own
+    # name (parser.go literally reuses one function for both — read fresh,
+    # not assumed), so no new name-shape logic is needed here, only header
+    # text surgery plus composition with buildThemeVars/themeVarsAllValid.
+    #
+    # themeHeaderIsBase/themeHeaderIsDark/themeHeaderIsNamed restate
+    # parser.fct's own real dispatch gates for these three theme cases
+    # (parser.go lines 181-195: `c.Line.Text == "theme dark:" || ... ==
+    # "theme dark"`, `== "theme:" || == "theme"`, else
+    # `strings.HasPrefix(c.Line.Text, "theme ")`) — not exercised by any
+    # proc above, but included so a future program.fct wiring pass has the
+    # real classification ready-made rather than re-deriving it.
+    # ============================================================
+    struct NamedThemeDecl:
+        name: text
+        vars: [ThemeVar]
+        nameValid: bool
+        varsValid: bool
+        valid: bool
+
+    proc themeHeaderIsBase(lineText: text) -> bool:
+        let t = trim(lineText)
+        return t == "theme:" || t == "theme"
+
+    proc themeHeaderIsDark(lineText: text) -> bool:
+        let t = trim(lineText)
+        return t == "theme dark:" || t == "theme dark"
+
+    proc themeHeaderIsNamed(lineText: text) -> bool:
+        let t = trim(lineText)
+        let isBase = do themeHeaderIsBase(t)
+        if isBase:
+            return false
+        let isDark = do themeHeaderIsDark(t)
+        if isDark:
+            return false
+        let r = do hasPrefixText(t, "theme ")
+        return r
+
+    proc namedThemeHeadRest(lineText: text) -> text:
+        let t = trim(lineText)
+        let stripped = do trimPrefixText(t, "theme")
+        return trim(stripped)
+
+    proc namedThemeName(lineText: text) -> text:
+        let head = do namedThemeHeadRest(lineText)
+        let r = do trimSuffixText(head, ":")
+        return trim(r)
+
+    proc namedThemeNameValid(lineText: text) -> bool:
+        let name = do namedThemeName(lineText)
+        let r = do isThemeKeyToken(name)
+        return r
+
+    proc buildNamedThemeDecl(headerLineText: text, entryLines: [text]) -> NamedThemeDecl:
+        let name = do namedThemeName(headerLineText)
+        let nameOk = do namedThemeNameValid(headerLineText)
+        let vars = do buildThemeVars(entryLines)
+        let mut varsOk = false
+        if len(vars) > 0:
+            let allOk = do themeVarsAllValid(vars)
+            varsOk = allOk
+        let mut valid = false
+        if nameOk:
+            if varsOk:
+                valid = true
+        return NamedThemeDecl{name: name, vars: vars, nameValid: nameOk, varsValid: varsOk, valid: valid}
+
+    proc parseNamedThemeDeclSrc(src: text) -> NamedThemeDecl:
+        let lines = split(src, "\n")
+        let mut headerLine = ""
+        if len(lines) > 0:
+            headerLine = lines[0]
+        let entryLines = do linesFrom(lines, 1)
+        let d = do buildNamedThemeDecl(headerLine, entryLines)
+        return d
+
+    # ============================================================
+    # STAGE 31: parseFile — `file Name: Type at "path"`, a declared file
+    # resource (parser.go lines 1686-1721, read fresh):
+    #
+    #   func parseFile(n *source.Node) (*ast.File, error) {
+    #       if len(n.Children) > 0 { error "declares no body" }
+    #       rest := TrimSpace(TrimPrefix(n.Line.Text, "file"))
+    #       colon := IndexByte(rest, ':'); if colon < 0 { error }
+    #       name := TrimSpace(rest[:colon])
+    #       tail := TrimSpace(rest[colon+1:])
+    #       i := Index(tail, " at "); if i < 0 { error }
+    #       typ := TrimSpace(tail[:i])
+    #       path, err := unquote(TrimSpace(tail[i+len(" at "):]), ...)
+    #       if err != nil || path == "" { error }
+    #       if !isIdent(name) { error }
+    #       if typ != "text" && typ != "bytes" { error }
+    #   }
+    #
+    # Two details that matter and are easy to get wrong by analogy with
+    # other decl kinds: (1) a file's own NAME is checked with plain isIdent
+    # only — NOT also isUpper, unlike record/struct/enum/theme names (read
+    # fresh, confirmed: parser.go never calls isUpper anywhere in
+    # parseFile); (2) the real function takes the header's `n` node and
+    # rejects any indented child block outright (`read`/`write` are proc
+    # BODY statements elsewhere, never part of the declaration itself), so
+    # childCount is threaded in as a real int parameter exactly the way
+    # parser_decl2.fct's own buildPolicyDecl threads in bodyChildCount —
+    # this self-hosted subset has no direct access to a real child-node
+    # list at this layer, so the caller supplies the count it already
+    # has, the same honest workaround already used for policy's body shape.
+    #
+    # fileAtMarkerIndex/filePathQuotedOf/filePathRaw reuse indexOf/
+    # hasQuotedText/quotedInner verbatim, the identical " at "-marker plus
+    # quoted-tail shape parser_service.fct's own serviceAtMarkerIndex/
+    # serviceUrlQuotedOf/serviceUrlRaw already established for `service Name
+    # at "url"` — a file's own `Type at "path"` tail is the same grammar
+    # shape one level further into the header, after the `Name:` prefix is
+    # stripped first.
+    # ============================================================
+    struct FileDecl:
+        name: text
+        fileType: text
+        path: text
+        childCount: int
+        valid: bool
+
+    proc fileRestOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "file")
+        return trim(stripped)
+
+    proc fileColonIndex(rest: text) -> int:
+        let r = do indexOf(rest, ":")
+        return r
+
+    proc fileHasColon(rest: text) -> bool:
+        let idx = do fileColonIndex(rest)
+        return idx >= 0
+
+    proc fileNameOf(rest: text) -> text:
+        let idx = do fileColonIndex(rest)
+        if idx < 0:
+            return ""
+        return trim(slice(rest, 0, idx))
+
+    proc fileTailOf(rest: text) -> text:
+        let idx = do fileColonIndex(rest)
+        if idx < 0:
+            return ""
+        return trim(slice(rest, idx + 1, len(rest)))
+
+    proc fileAtMarkerIndex(tail: text) -> int:
+        let r = do indexOf(tail, " at ")
+        return r
+
+    proc fileHasAt(tail: text) -> bool:
+        let idx = do fileAtMarkerIndex(tail)
+        return idx >= 0
+
+    proc fileTypeOf(tail: text) -> text:
+        let idx = do fileAtMarkerIndex(tail)
+        if idx < 0:
+            return ""
+        return trim(slice(tail, 0, idx))
+
+    proc filePathQuotedOf(tail: text) -> text:
+        let idx = do fileAtMarkerIndex(tail)
+        if idx < 0:
+            return ""
+        return trim(slice(tail, idx + 4, len(tail)))
+
+    proc filePathRaw(tail: text) -> text:
+        let q = do filePathQuotedOf(tail)
+        let r = do quotedInner(q)
+        return r
+
+    proc fileTypeValid(typ: text) -> bool:
+        return typ == "text" || typ == "bytes"
+
+    proc filePathValid(tail: text) -> bool:
+        let hasAt = do fileHasAt(tail)
+        if !hasAt:
+            return false
+        let q = do filePathQuotedOf(tail)
+        let hasQ = do hasQuotedText(q)
+        if !hasQ:
+            return false
+        let path = do filePathRaw(tail)
+        return path != ""
+
+    # fileHeaderValid: every real rejection gate parseFile has, in parser.go's
+    # own order (children, colon, at-marker/quoted-path, name identifier,
+    # type keyword) — see this STAGE's own header for why this file's
+    # `name`-before-`path` ordering vs. Go's `path`-before-`name` never
+    # changes the ANDed boolean verdict this proc reports.
+    proc fileHeaderValid(lineText: text, childCount: int) -> bool:
+        if childCount > 0:
+            return false
+        let rest = do fileRestOf(lineText)
+        let hasColon = do fileHasColon(rest)
+        if !hasColon:
+            return false
+        let name = do fileNameOf(rest)
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let tail = do fileTailOf(rest)
+        let pathOk = do filePathValid(tail)
+        if !pathOk:
+            return false
+        let typ = do fileTypeOf(tail)
+        let typeOk = do fileTypeValid(typ)
+        return typeOk
+
+    proc buildFileDecl(lineText: text, childCount: int) -> FileDecl:
+        let rest = do fileRestOf(lineText)
+        let name = do fileNameOf(rest)
+        let tail = do fileTailOf(rest)
+        let typ = do fileTypeOf(tail)
+        let path = do filePathRaw(tail)
+        let ok = do fileHeaderValid(lineText, childCount)
+        return FileDecl{name: name, fileType: typ, path: path, childCount: childCount, valid: ok}
+
+    # ============================================================
+    # STAGE 32: describe*/summary procs — flatten each struct to plain
+    # text/int/bool for the `state`/`view` layer below, since a struct value
+    # can never be a `state` cell nor cross an action's own return boundary
+    # (nodes.fct's own STAGE 11 header and parser_decl2.fct's own STAGE 27
+    # header, both restated verbatim as the reason here — confirmed live in
+    # this port already, not re-derived).
+    # ============================================================
+    proc describeThemeVar(v: ThemeVar) -> text:
+        let mut s = v.name + " \"" + v.value + "\""
+        if !v.valid:
+            s = s + " (invalid)"
+        return s
+
+    proc describeThemeVars(vars: [ThemeVar]) -> text:
+        let n = len(vars)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let d = do describeThemeVar(vars[i])
+            if i > 0:
+                out = out + ", "
+            out = out + d
+            i = i + 1
+        return out
+
+    proc themeDeclSummaryVars(src: text) -> text:
+        let d = do parseThemeDeclSrc(src)
+        let r = do describeThemeVars(d.vars)
+        return r
+
+    proc themeDeclSummaryCount(src: text) -> int:
+        let d = do parseThemeDeclSrc(src)
+        return len(d.vars)
+
+    proc themeDeclSummaryValid(src: text) -> bool:
+        let d = do parseThemeDeclSrc(src)
+        return d.valid
+
+    proc namedThemeDeclSummaryName(src: text) -> text:
+        let d = do parseNamedThemeDeclSrc(src)
+        return d.name
+
+    proc namedThemeDeclSummaryVars(src: text) -> text:
+        let d = do parseNamedThemeDeclSrc(src)
+        let r = do describeThemeVars(d.vars)
+        return r
+
+    proc namedThemeDeclSummaryValid(src: text) -> bool:
+        let d = do parseNamedThemeDeclSrc(src)
+        return d.valid
+
+    proc describeFileDecl(d: FileDecl) -> text:
+        let mut s = d.name + ": " + d.fileType + " at \"" + d.path + "\""
+        if !d.valid:
+            s = s + " (invalid)"
+        return s
+
+    proc fileDeclSummaryText(lineText: text, childCount: int) -> text:
+        let d = do buildFileDecl(lineText, childCount)
+        let r = do describeFileDecl(d)
+        return r
+
+    proc fileDeclSummaryValid(lineText: text, childCount: int) -> bool:
+        let d = do buildFileDecl(lineText, childCount)
+        return d.valid
+
+    # ============================================================
+    # STAGE 33: the live HTTP-exercisable drivers, at a fresh view path
+    # ("/decl3") clear of every other file's own view path in this import
+    # chain. Each action calls only the scalar-returning summary procs
+    # above — never binds a struct itself, per STAGE 32's own header.
+    # ============================================================
+    state themeDeclVarsSummary: text = ""
+    state themeDeclVarCount: int = 0
+    state themeDeclValidResult: bool = false
+
+    state namedThemeDeclName: text = ""
+    state namedThemeDeclVarsSummary: text = ""
+    state namedThemeDeclValidResult: bool = false
+
+    state fileDeclSummary: text = ""
+    state fileDeclValidResult: bool = false
+
+    action runParseThemeDecl(src: text):
+        let vs = do themeDeclSummaryVars(src)
+        let c = do themeDeclSummaryCount(src)
+        let v = do themeDeclSummaryValid(src)
+        themeDeclVarsSummary = vs
+        themeDeclVarCount = c
+        themeDeclValidResult = v
+
+    action runParseNamedThemeDecl(src: text):
+        let n = do namedThemeDeclSummaryName(src)
+        let vs = do namedThemeDeclSummaryVars(src)
+        let v = do namedThemeDeclSummaryValid(src)
+        namedThemeDeclName = n
+        namedThemeDeclVarsSummary = vs
+        namedThemeDeclValidResult = v
+
+    action runParseFileDecl(lineText: text, childCount: int):
+        let s = do fileDeclSummaryText(lineText, childCount)
+        let v = do fileDeclSummaryValid(lineText, childCount)
+        fileDeclSummary = s
+        fileDeclValidResult = v
+
+    private view Home at "/decl3":
+        box:
+            text "{themeDeclVarsSummary} {themeDeclVarCount} {themeDeclValidResult}"
+            text "{namedThemeDeclName} {namedThemeDeclVarsSummary} {namedThemeDeclValidResult}"
+            text "{fileDeclSummary} {fileDeclValidResult}"

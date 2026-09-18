@@ -1,0 +1,645 @@
+import "fabric_telemetry.fct"
+
+app FabricStatsSelfHost:
+    # Self-hosting port of fabric/crates/fabric-facetql/src/sample.rs (606L)
+    # — turning two `GET /stats` reads into the rates Fabric's model runs
+    # on — plus the subset of fabric/crates/fabric-facetql/src/wire.rs
+    # (665L) that sample.rs's own types actually depend on. Both files read
+    # in full before writing a line here.
+    #
+    # ============================================================
+    # WHICH PART OF wire.rs (665L) IS PORTED, AND WHY
+    # ============================================================
+    # sample.rs's own `use` statement is exactly `use crate::wire::{CellStats,
+    # EngineStats};` — but `EngineStats` is not a leaf type: it is the WHOLE
+    # `GET /stats` wire response, and its fields (`kinds: Vec<KindCount>`,
+    # `storage: StorageStats`, `runtime: RuntimeStats` -> `requests:
+    # RequestStats` / `window: WindowStats` -> `read_latency`/`write_latency:
+    # LatencyStats` / `process: ProcessStats`, `cells: CellAttribution` ->
+    # `cells: Vec<CellStats>`) are ALL part of that one response shape —
+    # there is no smaller "just what sample.rs reads" struct to carve out
+    # without literally renaming fields out of the real wire contract, which
+    # this task's own root-solutions rule forbids (that would misrepresent
+    # what `GET /stats` actually returns). So the full stats-DTO subtree is
+    # ported below: KindCount, StorageStats, LatencyStats, WindowStats,
+    # RequestStats, ProcessStats, RuntimeStats, CellStats, CellAttribution,
+    # EngineStats — ten structs, all reachable from `EngineStats` alone.
+    #
+    # Deliberately EXCLUDED, as genuinely unrelated to `/stats`: `Coordinate`
+    # (FacetQL's 4-axis per-node tag — note `CellStats` does NOT nest this
+    # type, it carries its own flat `x`/`y`/`z`/`q`, so this exclusion costs
+    # nothing), `Visibility`, `Node`, `QueryPage`, `QueryRequest`,
+    # `CreateNodeRequest`, `Expect`, `TxOperation`, `TransactionRequest` —
+    # the node-CRUD/transaction wire contract for entirely different
+    # endpoints (`/nodes`, `/node`, `/transaction`), never referenced by
+    # `EngineStats` or by anything in sample.rs.
+    #
+    # ============================================================
+    # WHY `WorkloadMetrics`/`CellWorkloadMetrics` ARE IMPORTED, NOT REDECLARED
+    # ============================================================
+    # `sample.rs` also depends on `fabric_telemetry::{CellWorkloadMetrics,
+    # WorkloadMetrics}` — already ported field-for-field in
+    # fabric_telemetry.fct. That file's own header (read in full first)
+    # states this directory has "no cross-file `import`" — true when it was
+    # written, but superseded since: fabric_table.fct (read in full too)
+    # later confirmed a working `import "<file>.fct"` mechanism, real enough
+    # that it reuses fabric_replication.fct's `ReplGroup` and
+    # fabric_routing.fct's whole routing surface directly, and documents
+    # exactly when it fails (two imported files whose `private view Home at
+    # "/"` collide). Re-verified empirically in this round with a disposable
+    # scratch file before writing this one: `import "fabric_telemetry.fct"`
+    # plus calling its exported procs (`workloadKeyNew`, `replGroupNew`-style
+    # calls in general) compiles and runs cleanly, and fabric_telemetry.fct
+    # declares no view at all, so there is no `Home` collision to hit here.
+    # Given that, redeclaring `WorkloadMetrics`/`CellWorkloadMetrics` a
+    # second time in this file would be exactly the "duplicate a shape that
+    # is not actually independent" mistake fabric_telemetry.fct's own header
+    # warns against for its own two crates — so this file imports them
+    # instead, and reuses `workloadMetricsDefault`, `workloadMetricsIsHot`,
+    # `workloadMetricsIsQueueHot`, `workloadMetricsTotalOperations`, and
+    # `clampFloat` directly rather than re-deriving any of them.
+    #
+    # ============================================================
+    # THE TWO `now()`-FAMILY CALLS — THE ONE DELIBERATE APPROXIMATION IN THIS
+    # FILE, NAMED PRECISELY (same category as fabric_routing.fct's packed-int
+    # RoutingKey: a documented, honest simplification, not a silently
+    # dropped feature)
+    # ============================================================
+    # `StatsSample::take` stamps every sample with TWO real clock reads:
+    #
+    #   taken_at_ms: now_ms()       -- SystemTime::now(), wall clock, for
+    #                                  LABELLING an observation (epoch ms).
+    #   taken_at:    Instant::now() -- a MONOTONIC clock, for MEASURING
+    #                                  elapsed time between two samples; per
+    #                                  the real module's own docs, chosen
+    #                                  specifically because it "cannot jump
+    #                                  when NTP steps the clock."
+    #
+    # This language's only clock builtin is `now()` (`facet lang`'s own
+    # list), which reads `time.Now().Unix()` — a WALL-CLOCK read, in whole
+    # SECONDS, with none of `Instant`'s monotonicity guarantee. Both fields
+    # below are stamped from this one builtin, which is the documented,
+    # honest simplification this task asked for. Two real, named
+    # consequences follow, and both are accepted rather than hidden:
+    #
+    #   1. RESOLUTION: two samples taken less than one second apart alias to
+    #      the same `takenAt` value here, where real nanosecond-resolution
+    #      `Instant`s would not. This lands in exactly the branch the real
+    #      code already has for it: `statsSampleDifference` treats
+    #      `seconds <= 0.0` (a zero-length interval) as "no interval to
+    #      report" and returns `has: false` — the real
+    #      `a_zero_length_interval_is_not_a_rate` test's own case — so a
+    #      too-fast poll here degrades to "report nothing this round," never
+    #      to a fabricated infinite rate.
+    #   2. MONOTONICITY: if the wall clock is stepped BACKWARD between two
+    #      polls (the exact failure mode real `Instant` is immune to and the
+    #      real module's docs call out by name), `takenAt` can go backward
+    #      too. This is not separately guarded against because it does not
+    #      need to be: `next.takenAt - current.takenAt` then computes a
+    #      negative `seconds`, which the SAME `seconds <= 0.0` check above
+    #      already catches — a clock step is silently treated as "no
+    #      interval," never as a fabricated negative-time spike. (Real
+    #      `Instant::saturating_duration_since` clamps this to exactly zero
+    #      for the same reason, so the two implementations agree on the
+    #      outcome even though they reach it by different arithmetic.)
+    #
+    # `takenAtMs` (the label field) is `takenAt * 1000` — this multiplies a
+    # whole-second reading up into millisecond units to keep the FIELD's
+    # declared unit meaningful for a caller that compares it against a real
+    # millisecond timestamp, but it does NOT recover sub-second precision:
+    # it is honestly a second-granularity number wearing a millisecond
+    # label, never a claim of true millisecond resolution. The real
+    # `now_ms()`'s own "clock set before 1970 reads as 0" guard is not
+    # separately restated: this runtime's `now()` reads `time.Now().Unix()`
+    # on a real host clock, which cannot produce a pre-1970 value the way an
+    # arbitrary `SystemTime` subtraction hypothetically could.
+
+    # ============================================================
+    # wire.rs — the stats-DTO subtree, transcribed field-for-field.
+    # Every `Option<T>` becomes a `hasX: bool` + `x: T` pair (the
+    # `hasClaimedBy`/`claimedBy` convention core_types.fct's own `Node`
+    # already establishes for the identical reason: `x` is meaningless
+    # whenever `hasX` is false, exactly like `Option::None`'s absent
+    # payload) rather than a special sentinel value, so "absent" is never
+    # confused with a real zero.
+    # ============================================================
+    struct KindCount:
+        kind: text
+        count: int
+
+    struct StorageStats:
+        pageSize: int
+        segments: int
+        pages: int
+        obsoleteBytes: int
+
+    struct LatencyStats:
+        count: int
+        hasP50Us: bool
+        p50Us: int
+        hasP99Us: bool
+        p99Us: int
+        hasMaxUs: bool
+        maxUs: int
+
+    struct WindowStats:
+        durationMs: int
+        ageMs: int
+        hasCpuUtilization: bool
+        cpuUtilization: float
+        readLatency: LatencyStats
+        writeLatency: LatencyStats
+
+    struct RequestStats:
+        total: int
+        read: int
+        write: int
+        excluded: int
+        unclassified: int
+        inFlight: int
+        maxConcurrent: int
+        writeQueueDepth: int
+        writeQueueContendedTotal: int
+
+    struct ProcessStats:
+        hasCpuSecondsTotal: bool
+        cpuSecondsTotal: float
+        hasCpuCores: bool
+        cpuCores: int
+        hasResidentBytes: bool
+        residentBytes: int
+        hasMemoryLimitBytes: bool
+        memoryLimitBytes: int
+        hasMemoryLimitSource: bool
+        memoryLimitSource: text
+        hasMemoryUtilization: bool
+        memoryUtilization: float
+
+    struct RuntimeStats:
+        uptimeSeconds: int
+        requests: RequestStats
+        window: WindowStats
+        process: ProcessStats
+
+    struct CellStats:
+        x: int
+        y: int
+        z: int
+        q: int
+        reads: int
+        writes: int
+        bytesRead: int
+        bytesWritten: int
+
+    struct CellAttribution:
+        capacity: int
+        tracked: int
+        overflowReads: int
+        overflowWrites: int
+        unattributedWrites: int
+        cells: [CellStats]
+
+    struct EngineStats:
+        nodeCount: int
+        edgeCount: int
+        userCount: int
+        historyEntries: int
+        kinds: [KindCount]
+        readsTotal: int
+        writesTotal: int
+        storage: StorageStats
+        hasVersion: bool
+        version: text
+        runtime: RuntimeStats
+        cells: CellAttribution
+
+    # ============================================================
+    # sample.rs — StatsSample and its real derivation logic.
+    # `takenAt`/`takenAtMs` restate `Instant`/epoch-ms — see this file's
+    # header for the exact, named approximation both carry.
+    # ============================================================
+    struct StatsSample:
+        takenAtMs: int
+        takenAt: int
+        readsTotal: int
+        writesTotal: int
+        nodeCount: int
+        edgeCount: int
+        hasCpuSecondsTotal: bool
+        cpuSecondsTotal: float
+        hasCpuCores: bool
+        cpuCores: int
+        hasMemoryUtilization: bool
+        memoryUtilization: float
+        hasReadLatencyP99Us: bool
+        readLatencyP99Us: int
+        hasWriteLatencyP99Us: bool
+        writeLatencyP99Us: int
+        inFlight: int
+        maxConcurrent: int
+        cells: [CellStats]
+        overflowReads: int
+        overflowWrites: int
+
+    # statsSampleTake: `StatsSample::take` — every field a straight
+    # projection off the wire response, except the two clock stamps (see
+    # this file's header).
+    proc statsSampleTake(stats: EngineStats) -> StatsSample:
+        let takenAt = now()
+        let takenAtMs = takenAt * 1000
+        return StatsSample{takenAtMs: takenAtMs, takenAt: takenAt, readsTotal: stats.readsTotal, writesTotal: stats.writesTotal, nodeCount: stats.nodeCount, edgeCount: stats.edgeCount, hasCpuSecondsTotal: stats.runtime.process.hasCpuSecondsTotal, cpuSecondsTotal: stats.runtime.process.cpuSecondsTotal, hasCpuCores: stats.runtime.process.hasCpuCores, cpuCores: stats.runtime.process.cpuCores, hasMemoryUtilization: stats.runtime.process.hasMemoryUtilization, memoryUtilization: stats.runtime.process.memoryUtilization, hasReadLatencyP99Us: stats.runtime.window.readLatency.hasP99Us, readLatencyP99Us: stats.runtime.window.readLatency.p99Us, hasWriteLatencyP99Us: stats.runtime.window.writeLatency.hasP99Us, writeLatencyP99Us: stats.runtime.window.writeLatency.p99Us, inFlight: stats.runtime.requests.inFlight, maxConcurrent: stats.runtime.requests.maxConcurrent, cells: stats.cells.cells, overflowReads: stats.cells.overflowReads, overflowWrites: stats.cells.overflowWrites}
+
+    # statsSaturatingSub: `u64::saturating_sub`, the same `max(a - b, 0)`
+    # restatement fabric.fct's own `failoverSaturatingSub` already uses.
+    proc statsSaturatingSub(a: int, b: int) -> int:
+        return max(a - b, 0)
+
+    # statsCellIndexOf: linear search for the coordinate key `cell_breakdown`
+    # keys its `HashMap` by (`x`,`y`,`z`,`q`) — this directory's established
+    # no-native-map substitute (fabric_core.fct's `ShardStorage`,
+    # fabric_telemetry.fct's `WorkloadAnalyzer`), returning -1 for "not
+    # found" as those files' own index-of helpers do.
+    private proc statsCellIndexOf(cells: [CellStats], x: int, y: int, z: int, q: int) -> int:
+        let n = len(cells)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if cells[i].x == x && cells[i].y == y && cells[i].z == z && cells[i].q == q:
+                    found = i
+            i = i + 1
+        return found
+
+    # statsCellBusyness / statsSortCellBreakdownBusiestFirst: `cell_breakdown`'s
+    # `sort_by(|a,b| busy_b.partial_cmp(&busy_a))` — busiest first. No sort
+    # builtin exists in this language (`facet lang`'s own list), so this is
+    # the same hand-written STABLE insertion sort idiom query.fct's
+    # `sortRowsAscending` and fabric_replication.fct's
+    # `replRecordArraySortByNodeAscending` already establish: only swap
+    # strictly-out-of-order neighbors, which preserves relative order of
+    # ties exactly like Rust's own stable `sort_by`.
+    private proc statsCellBusyness(c: CellWorkloadMetrics) -> float:
+        return c.readsPerSecond + c.writesPerSecond
+
+    private proc statsSortCellBreakdownBusiestFirst(cells: [CellWorkloadMetrics]) -> [CellWorkloadMetrics]:
+        let mut xs = cells
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                let busyPrev = do statsCellBusyness(xs[j - 1])
+                let busyCur = do statsCellBusyness(xs[j])
+                if busyPrev < busyCur:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    struct CellBreakdownResult:
+        cells: [CellWorkloadMetrics]
+        partial: bool
+
+    # statsCellBreakdown: `cell_breakdown` verbatim — a coordinate present in
+    # `after` but not `before` deltas its WHOLE count (the table starts every
+    # coordinate at zero); `saturating_sub` throughout defends against a
+    # delta ever going backward, even though only the whole-process restart
+    # the caller already checks could cause that; overflow non-zero on
+    # `after` alone marks the whole breakdown partial, per the wire type's
+    # own "current state of completeness" docs.
+    private proc statsCellBreakdown(before: StatsSample, after: StatsSample, seconds: float) -> CellBreakdownResult:
+        let n = len(after.cells)
+        let mut i = 0
+        let mut cells = []
+        loop i < n:
+            let cell = after.cells[i]
+            let idx = do statsCellIndexOf(before.cells, cell.x, cell.y, cell.z, cell.q)
+            let mut prevReads = 0
+            let mut prevWrites = 0
+            let mut prevBytesRead = 0
+            let mut prevBytesWritten = 0
+            if idx != -1:
+                prevReads = before.cells[idx].reads
+                prevWrites = before.cells[idx].writes
+                prevBytesRead = before.cells[idx].bytesRead
+                prevBytesWritten = before.cells[idx].bytesWritten
+            let reads = do statsSaturatingSub(cell.reads, prevReads)
+            let writes = do statsSaturatingSub(cell.writes, prevWrites)
+            let bytesRead = do statsSaturatingSub(cell.bytesRead, prevBytesRead)
+            let bytesWritten = do statsSaturatingSub(cell.bytesWritten, prevBytesWritten)
+            let metrics = CellWorkloadMetrics{x: cell.x, y: cell.y, z: cell.z, q: cell.q, readsPerSecond: toFloat(reads) / seconds, writesPerSecond: toFloat(writes) / seconds, bytesReadPerSecond: toFloat(bytesRead) / seconds, bytesWrittenPerSecond: toFloat(bytesWritten) / seconds}
+            cells = append(cells, metrics)
+            i = i + 1
+        let sorted = do statsSortCellBreakdownBusiestFirst(cells)
+        let partial = after.overflowReads > 0 || after.overflowWrites > 0
+        return CellBreakdownResult{cells: sorted, partial: partial}
+
+    # statsCpuUtilization: `cpu_utilization` verbatim — absent inputs or a
+    # backwards counter (a restart the top-level check did not happen to
+    # catch) both read as 0.0, the module's own "absent reads as low
+    # pressure" convention; `clampFloat` is reused from the
+    # fabric_telemetry.fct import rather than redeclared.
+    private proc statsCpuUtilization(before: StatsSample, after: StatsSample, seconds: float) -> float:
+        if !before.hasCpuSecondsTotal || !after.hasCpuSecondsTotal || !after.hasCpuCores:
+            return 0.0
+        if after.cpuCores == 0:
+            return 0.0
+        let cpuSeconds = after.cpuSecondsTotal - before.cpuSecondsTotal
+        if cpuSeconds < 0.0:
+            return 0.0
+        let raw = cpuSeconds / (seconds * toFloat(after.cpuCores))
+        let clamped = do clampFloat(raw, 0.0, 1.0)
+        return clamped
+
+    # statsQueuePressureUnits: `queue_pressure_units` verbatim — projects
+    # `in_flight / max_concurrent` onto the 0..10_000 scale
+    # `calculate_pressure` already treats as queue pressure's abstract unit.
+    private proc statsQueuePressureUnits(inFlight: int, maxConcurrent: int) -> int:
+        if maxConcurrent == 0:
+            return 0
+        let raw = toFloat(inFlight) / toFloat(maxConcurrent)
+        let saturation = do clampFloat(raw, 0.0, 1.0)
+        let scaled = saturation * 10000.0
+        let rounded = round(scaled)
+        return rounded
+
+    struct WorkloadMetricsOption:
+        has: bool
+        metrics: WorkloadMetrics
+
+    # statsSampleDifference: `StatsSample::difference` verbatim — `has:
+    # false` covers both real "no interval" cases the real doc comment
+    # names: a counter gone backwards (a restart) and a non-positive elapsed
+    # time (a same-instant pair, OR — the one case only this port's clock
+    # approximation can hit — a stepped-backward wall clock; see this file's
+    # header). `readLatencyUs`/`writeLatencyUs`/`memoryUtilization` fall back
+    # to 0.0 on an absent optional, the same "absent reads as low pressure"
+    # convention `statsCpuUtilization` already uses.
+    proc statsSampleDifference(current: StatsSample, next: StatsSample) -> WorkloadMetricsOption:
+        let zero = do workloadMetricsDefault()
+        let none = WorkloadMetricsOption{has: false, metrics: zero}
+        if next.readsTotal < current.readsTotal || next.writesTotal < current.writesTotal:
+            return none
+        let elapsed = next.takenAt - current.takenAt
+        let seconds = toFloat(elapsed)
+        if seconds <= 0.0:
+            return none
+        let readsPerSecond = toFloat(next.readsTotal - current.readsTotal) / seconds
+        let writesPerSecond = toFloat(next.writesTotal - current.writesTotal) / seconds
+        let breakdown = do statsCellBreakdown(current, next, seconds)
+        let mut readLatencyUs = 0.0
+        if next.hasReadLatencyP99Us:
+            readLatencyUs = toFloat(next.readLatencyP99Us)
+        let mut writeLatencyUs = 0.0
+        if next.hasWriteLatencyP99Us:
+            writeLatencyUs = toFloat(next.writeLatencyP99Us)
+        let cpu = do statsCpuUtilization(current, next, seconds)
+        let mut memoryUtilization = 0.0
+        if next.hasMemoryUtilization:
+            memoryUtilization = next.memoryUtilization
+        let queueDepth = do statsQueuePressureUnits(next.inFlight, next.maxConcurrent)
+        let metrics = WorkloadMetrics{operationsPerSecond: readsPerSecond + writesPerSecond, readsPerSecond: readsPerSecond, writesPerSecond: writesPerSecond, readLatencyUs: readLatencyUs, writeLatencyUs: writeLatencyUs, cpuUtilization: cpu, memoryUtilization: memoryUtilization, storageBytesPerSecond: 0, networkInBytesPerSecond: 0, networkOutBytesPerSecond: 0, queueDepth: queueDepth, cellBreakdown: breakdown.cells, cellBreakdownPartial: breakdown.partial}
+        return WorkloadMetricsOption{has: true, metrics: metrics}
+
+    struct RatioPair:
+        read: float
+        write: float
+
+    # statsRatios: `ratios` verbatim — reuses the imported
+    # `workloadMetricsTotalOperations` rather than re-deriving
+    # `reads_per_second + writes_per_second` a second time.
+    proc statsRatios(metrics: WorkloadMetrics) -> RatioPair:
+        let total = do workloadMetricsTotalOperations(metrics)
+        if total > 0.0:
+            let readRatio = metrics.readsPerSecond / total
+            let writeRatio = metrics.writesPerSecond / total
+            return RatioPair{read: readRatio, write: writeRatio}
+        return RatioPair{read: 0.0, write: 0.0}
+
+    # ============================================================
+    # TEST FIXTURES restated as plain constructors — sample.rs's own
+    # `#[cfg(test)]` helpers `sample()`/`cell()`, verbatim.
+    # ============================================================
+    proc statsSampleFixture(takenAt: int, reads: int, writes: int) -> StatsSample:
+        return StatsSample{takenAtMs: 0, takenAt: takenAt, readsTotal: reads, writesTotal: writes, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
+
+    proc statsCellFixture(x: int, reads: int, writes: int, bytesRead: int, bytesWritten: int) -> CellStats:
+        return CellStats{x: x, y: 0, z: 0, q: 0, reads: reads, writes: writes, bytesRead: bytesRead, bytesWritten: bytesWritten}
+
+    private proc statsCellWorkloadIndexOfX(cells: [CellWorkloadMetrics], x: int) -> int:
+        let n = len(cells)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if cells[i].x == x:
+                    found = i
+            i = i + 1
+        return found
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — one per real `#[test]` in sample.rs,
+    # hand-traced against that test's own literal expectation, restated in
+    # this directory's established demo-proc convention (see
+    # fabric_telemetry.fct/fabric_table.fct).
+    # ============================================================
+
+    # two_samples_a_second_apart_are_a_rate
+    proc demoTwoSamplesASecondApartAreARate() -> bool:
+        let start = 1000
+        let first = do statsSampleFixture(start, 100, 10)
+        let second = do statsSampleFixture(start + 2, 300, 30)
+        let result = do statsSampleDifference(first, second)
+        let readsOk = result.metrics.readsPerSecond == 100.0
+        let writesOk = result.metrics.writesPerSecond == 10.0
+        let opsOk = result.metrics.operationsPerSecond == 110.0
+        let ratios = do statsRatios(result.metrics)
+        let readRatioOk = abs(ratios.read - (100.0 / 110.0)) < 0.000000000001
+        let writeRatioOk = abs(ratios.write - (10.0 / 110.0)) < 0.000000000001
+        return result.has && readsOk && writesOk && opsOk && readRatioOk && writeRatioOk
+
+    # nothing_facetql_does_not_measure_is_invented
+    proc demoNothingFacetqlDoesNotMeasureIsInvented() -> bool:
+        let start = 2000
+        let before = do statsSampleFixture(start, 0, 0)
+        let after = do statsSampleFixture(start + 1, 10, 0)
+        let result = do statsSampleDifference(before, after)
+        let cpuOk = result.metrics.cpuUtilization == 0.0
+        let memOk = result.metrics.memoryUtilization == 0.0
+        let queueOk = result.metrics.queueDepth == 0
+        let latencyOk = result.metrics.readLatencyUs == 0.0
+        let breakdownEmpty = len(result.metrics.cellBreakdown) == 0
+        let notPartial = !result.metrics.cellBreakdownPartial
+        let isHot = do workloadMetricsIsHot(result.metrics)
+        return result.has && cpuOk && memOk && queueOk && latencyOk && breakdownEmpty && notPartial && !isHot
+
+    # a_restart_drops_the_interval_instead_of_reporting_a_spike
+    proc demoARestartDropsTheInterval() -> bool:
+        let start = 3000
+        let before = do statsSampleFixture(start, 5000000, 1000)
+        let afterRestart = do statsSampleFixture(start + 1, 3, 0)
+        let result = do statsSampleDifference(before, afterRestart)
+        return !result.has
+
+    # a_zero_length_interval_is_not_a_rate
+    proc demoAZeroLengthIntervalIsNotARate() -> bool:
+        let start = 4000
+        let a = do statsSampleFixture(start, 0, 0)
+        let b = do statsSampleFixture(start, 10, 10)
+        let result = do statsSampleDifference(a, b)
+        return !result.has
+
+    # an_idle_interval_is_zero_traffic_not_all_reads
+    proc demoAnIdleIntervalIsZeroTrafficNotAllReads() -> bool:
+        let start = 5000
+        let before = do statsSampleFixture(start, 7, 7)
+        let after = do statsSampleFixture(start + 1, 7, 7)
+        let result = do statsSampleDifference(before, after)
+        let ratios = do statsRatios(result.metrics)
+        return result.has && result.metrics.operationsPerSecond == 0.0 && ratios.read == 0.0 && ratios.write == 0.0
+
+    # cpu_utilization_comes_from_the_monotonic_counter
+    proc demoCpuUtilizationComesFromTheMonotonicCounter() -> bool:
+        let start = 6000
+        let before = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: true, cpuSecondsTotal: 1.0, hasCpuCores: true, cpuCores: 2, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
+        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: true, cpuSecondsTotal: 2.0, hasCpuCores: true, cpuCores: 2, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
+        let result = do statsSampleDifference(before, after)
+        return result.has && abs(result.metrics.cpuUtilization - 0.5) < 0.000000001
+
+    # an_unclosed_window_and_a_measured_idle_window_agree_on_absence
+    proc demoAnUnclosedWindowAndAMeasuredIdleWindowAgreeOnAbsence() -> bool:
+        let start = 7000
+        let neverClosedBefore = do statsSampleFixture(start, 0, 0)
+        let neverClosedAfter = do statsSampleFixture(start + 1, 0, 0)
+        let neverClosed = do statsSampleDifference(neverClosedBefore, neverClosedAfter)
+        let neverClosedOk = neverClosed.has && neverClosed.metrics.cpuUtilization == 0.0
+        let idleBefore = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: true, cpuSecondsTotal: 5.0, hasCpuCores: true, cpuCores: 4, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
+        let idleAfter = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: true, cpuSecondsTotal: 5.0, hasCpuCores: true, cpuCores: 4, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
+        let idle = do statsSampleDifference(idleBefore, idleAfter)
+        let idleOk = idle.has && idle.metrics.cpuUtilization == 0.0
+        return neverClosedOk && idleOk
+
+    # a_saturated_engine_reports_maximum_queue_pressure
+    proc demoASaturatedEngineReportsMaximumQueuePressure() -> bool:
+        let start = 8000
+        let before = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 512, cells: [], overflowReads: 0, overflowWrites: 0}
+        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 512, maxConcurrent: 512, cells: [], overflowReads: 0, overflowWrites: 0}
+        let result = do statsSampleDifference(before, after)
+        let queueOk = result.metrics.queueDepth == 10000
+        let hot = do workloadMetricsIsQueueHot(result.metrics)
+        return result.has && queueOk && hot
+
+    # a_quiet_engine_reports_low_queue_pressure
+    proc demoAQuietEngineReportsLowQueuePressure() -> bool:
+        let start = 9000
+        let before = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 5, maxConcurrent: 512, cells: [], overflowReads: 0, overflowWrites: 0}
+        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 5, maxConcurrent: 512, cells: [], overflowReads: 0, overflowWrites: 0}
+        let result = do statsSampleDifference(before, after)
+        let low = result.metrics.queueDepth < 200
+        let hot = do workloadMetricsIsQueueHot(result.metrics)
+        return result.has && low && !hot
+
+    # per_cell_traffic_is_differenced_into_rates
+    proc demoPerCellTrafficIsDifferencedIntoRates() -> bool:
+        let start = 10000
+        let cellA1 = do statsCellFixture(1, 100, 10, 1000, 100)
+        let cellA2 = do statsCellFixture(2, 50, 5, 500, 50)
+        let before = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [cellA1, cellA2], overflowReads: 0, overflowWrites: 0}
+        let cellB1 = do statsCellFixture(1, 300, 10, 3000, 100)
+        let cellB2 = do statsCellFixture(2, 50, 25, 500, 250)
+        let cellB3 = do statsCellFixture(3, 40, 0, 400, 0)
+        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [cellB1, cellB2, cellB3], overflowReads: 0, overflowWrites: 0}
+        let result = do statsSampleDifference(before, after)
+        let breakdown = result.metrics.cellBreakdown
+        let lenOk = len(breakdown) == 3
+        let idx1 = do statsCellWorkloadIndexOfX(breakdown, 1)
+        let idx3 = do statsCellWorkloadIndexOfX(breakdown, 3)
+        let cell1 = breakdown[idx1]
+        let cell3 = breakdown[idx3]
+        let cell1Ok = cell1.readsPerSecond == 200.0 && cell1.writesPerSecond == 0.0 && cell1.bytesReadPerSecond == 2000.0
+        let cell3Ok = cell3.readsPerSecond == 40.0
+        let busiestFirst = breakdown[0].x == 1
+        let notPartial = !result.metrics.cellBreakdownPartial
+        return result.has && lenOk && cell1Ok && cell3Ok && busiestFirst && notPartial
+
+    # overflow_marks_the_breakdown_as_partial
+    proc demoOverflowMarksTheBreakdownAsPartial() -> bool:
+        let start = 11000
+        let before = do statsSampleFixture(start, 0, 0)
+        let cell1 = do statsCellFixture(1, 10, 0, 100, 0)
+        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [cell1], overflowReads: 3, overflowWrites: 0}
+        let result = do statsSampleDifference(before, after)
+        return result.has && result.metrics.cellBreakdownPartial
+
+    # statsSampleTake, exercised against the exact JSON values wire.rs's own
+    # `a_current_stats_response_decodes_every_added_field` test decodes —
+    # this port has no JSON layer, so this demo instead confirms the same
+    # values survive the wire-DTO -> StatsSample projection, plus the clock
+    # fields' documented approximation (takenAt > 0, takenAtMs == takenAt *
+    # 1000).
+    proc demoStatsSampleTakeProjectsWireFields() -> bool:
+        let latencyRead = LatencyStats{count: 10, hasP50Us: true, p50Us: 100, hasP99Us: true, p99Us: 900, hasMaxUs: true, maxUs: 950}
+        let latencyWrite = LatencyStats{count: 0, hasP50Us: false, p50Us: 0, hasP99Us: false, p99Us: 0, hasMaxUs: false, maxUs: 0}
+        let window = WindowStats{durationMs: 1000, ageMs: 5, hasCpuUtilization: true, cpuUtilization: 0.42, readLatency: latencyRead, writeLatency: latencyWrite}
+        let requests = RequestStats{total: 50, read: 30, write: 20, excluded: 1, unclassified: 0, inFlight: 400, maxConcurrent: 512, writeQueueDepth: 3, writeQueueContendedTotal: 9}
+        let process = ProcessStats{hasCpuSecondsTotal: true, cpuSecondsTotal: 12.5, hasCpuCores: true, cpuCores: 8, hasResidentBytes: true, residentBytes: 1048576, hasMemoryLimitBytes: true, memoryLimitBytes: 4194304, hasMemoryLimitSource: true, memoryLimitSource: "cgroup", hasMemoryUtilization: true, memoryUtilization: 0.25}
+        let runtime = RuntimeStats{uptimeSeconds: 120, requests: requests, window: window, process: process}
+        let cellA = CellStats{x: 1, y: 2, z: 3, q: 4, reads: 100, writes: 10, bytesRead: 1000, bytesWritten: 100}
+        let cellB = CellStats{x: 0, y: 0, z: 0, q: 0, reads: 5, writes: 1, bytesRead: 50, bytesWritten: 5}
+        let cellAttribution = CellAttribution{capacity: 256, tracked: 2, overflowReads: 0, overflowWrites: 0, unattributedWrites: 1, cells: [cellA, cellB]}
+        let kindCount = KindCount{kind: "Post", count: 3}
+        let storage = StorageStats{pageSize: 4096, segments: 1, pages: 9, obsoleteBytes: 0}
+        let stats = EngineStats{nodeCount: 3, edgeCount: 1, userCount: 2, historyEntries: 4, kinds: [kindCount], readsTotal: 10, writesTotal: 5, storage: storage, hasVersion: true, version: "1.2.3", runtime: runtime, cells: cellAttribution}
+        let sample = do statsSampleTake(stats)
+        let projOk = sample.readsTotal == 10 && sample.writesTotal == 5 && sample.nodeCount == 3 && sample.edgeCount == 1
+        let cpuOk = sample.hasCpuSecondsTotal && sample.cpuSecondsTotal == 12.5 && sample.hasCpuCores && sample.cpuCores == 8
+        let memOk = sample.hasMemoryUtilization && sample.memoryUtilization == 0.25
+        let latencyOk = sample.hasReadLatencyP99Us && sample.readLatencyP99Us == 900 && !sample.hasWriteLatencyP99Us
+        let requestsOk = sample.inFlight == 400 && sample.maxConcurrent == 512
+        let cellsOk = len(sample.cells) == 2 && sample.cells[0].x == 1
+        let overflowOk = sample.overflowReads == 0 && sample.overflowWrites == 0
+        let clockOk = sample.takenAt > 0 && sample.takenAtMs == sample.takenAt * 1000
+        return projOk && cpuOk && memOk && latencyOk && requestsOk && cellsOk && overflowOk && clockOk
+
+    state demoTwoSamplesASecondApartAreARate: bool = false
+    state demoNothingFacetqlDoesNotMeasureIsInvented: bool = false
+    state demoARestartDropsTheInterval: bool = false
+    state demoAZeroLengthIntervalIsNotARate: bool = false
+    state demoAnIdleIntervalIsZeroTrafficNotAllReads: bool = false
+    state demoCpuUtilizationComesFromTheMonotonicCounter: bool = false
+    state demoAnUnclosedWindowAndAMeasuredIdleWindowAgreeOnAbsence: bool = false
+    state demoASaturatedEngineReportsMaximumQueuePressure: bool = false
+    state demoAQuietEngineReportsLowQueuePressure: bool = false
+    state demoPerCellTrafficIsDifferencedIntoRates: bool = false
+    state demoOverflowMarksTheBreakdownAsPartial: bool = false
+    state demoStatsSampleTakeProjectsWireFields: bool = false
+
+    action runDemoStats():
+        let r1 = do demoTwoSamplesASecondApartAreARate()
+        let r2 = do demoNothingFacetqlDoesNotMeasureIsInvented()
+        let r3 = do demoARestartDropsTheInterval()
+        let r4 = do demoAZeroLengthIntervalIsNotARate()
+        let r5 = do demoAnIdleIntervalIsZeroTrafficNotAllReads()
+        let r6 = do demoCpuUtilizationComesFromTheMonotonicCounter()
+        let r7 = do demoAnUnclosedWindowAndAMeasuredIdleWindowAgreeOnAbsence()
+        let r8 = do demoASaturatedEngineReportsMaximumQueuePressure()
+        let r9 = do demoAQuietEngineReportsLowQueuePressure()
+        let r10 = do demoPerCellTrafficIsDifferencedIntoRates()
+        let r11 = do demoOverflowMarksTheBreakdownAsPartial()
+        let r12 = do demoStatsSampleTakeProjectsWireFields()
+        demoTwoSamplesASecondApartAreARate = r1
+        demoNothingFacetqlDoesNotMeasureIsInvented = r2
+        demoARestartDropsTheInterval = r3
+        demoAZeroLengthIntervalIsNotARate = r4
+        demoAnIdleIntervalIsZeroTrafficNotAllReads = r5
+        demoCpuUtilizationComesFromTheMonotonicCounter = r6
+        demoAnUnclosedWindowAndAMeasuredIdleWindowAgreeOnAbsence = r7
+        demoASaturatedEngineReportsMaximumQueuePressure = r8
+        demoAQuietEngineReportsLowQueuePressure = r9
+        demoPerCellTrafficIsDifferencedIntoRates = r10
+        demoOverflowMarksTheBreakdownAsPartial = r11
+        demoStatsSampleTakeProjectsWireFields = r12

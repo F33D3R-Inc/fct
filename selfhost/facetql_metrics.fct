@@ -1,0 +1,745 @@
+app FacetqlMetricsSelfHost:
+    # Self-hosting port of facetql/src/metrics.rs — read in full (1254L)
+    # before writing a line here. The task's own brief flagged this file as
+    # a likely repeat of a pattern already found once this project
+    # (fabric-facetql/sample.rs): a module whose module doc calls itself
+    # "operational metrics" / server instrumentation, but whose actual
+    # content is mostly pure aggregation math over already-collected
+    # numbers, with the real I/O confined to a few clearly separable spots.
+    # That is exactly what reading it in full confirmed.
+    #
+    # ============================================================
+    # WHAT WAS PORTED, AND WHY THE CUT LANDS WHERE IT DOES
+    # ============================================================
+    # Four self-contained, pure, crypto-free pieces, each a real algorithm
+    # metrics.rs itself carries a `#[cfg(test)]` for:
+    #
+    #   1. THE LATENCY HISTOGRAM (`Histogram`, `bucket_index`,
+    #      `bucket_upper_us`, `LatencyStats::from_delta`) — a fixed-size,
+    #      log-linear ("HdrHistogram-shaped") bucketing scheme and the
+    #      percentile read-out over it. `bucket_index`/`bucket_upper_us`
+    #      are pure integer arithmetic; `Histogram::record`/`snapshot` are
+    #      restated the way this whole directory restates a mutable
+    #      registry — a pure function over an immutable `[int]` array,
+    #      returning the new array, per core_types.fct's/reference.fct's
+    #      own established convention (no interior mutability, no atomics,
+    #      in this language). `LatencyStats::from_delta`'s quantile walk
+    #      is ported verbatim over a caller-supplied delta array.
+    #
+    #   2. REQUEST CLASSIFICATION (`classify`) — the pure `(Method, matched
+    #      path) -> RequestClass` route table, restated as plain `text`
+    #      tags ("read"/"write"/"excluded"/"unclassified"), matching
+    #      predicate.fct's/aggregate.fct's own convention of spelling an
+    #      enum out as its own wire-ish text rather than an opaque tag.
+    #
+    #   3. PER-CELL ATTRIBUTION (`CellTable` minus its atomics) — the
+    #      fixed-256-slot open-addressing table that charges reads/writes/
+    #      bytes to a `Coordinate`, with the exact same bounded-probe,
+    #      overflow-on-exhaustion behavior the real one has. `pack`/
+    #      `unpack`, `slot`, `record_read`/`record_write`/
+    #      `record_unattributed_write`, and `snapshot` (including its
+    #      busiest-first / coordinate-tiebreak sort) are all ported. The
+    #      `AtomicU64`/compare-exchange machinery around it is not needed
+    #      to port the ALGORITHM: this file has no concurrency at all, so
+    #      "claim the slot on first sight" is just "the slot was zero,
+    #      write into it", which is what a single-threaded pure function
+    #      already gives for free — there is no race to arbitrate.
+    #
+    #   4. THE REQUEST-CLASS ENUM'S SHAPE — `RequestClass` itself needs no
+    #      dedicated struct once restated as text; folded into (2).
+    #
+    # ============================================================
+    # WHAT WAS DEFERRED, AND WHY EACH PIECE IS GENUINELY I/O, NOT MERELY
+    # INCONVENIENT
+    # ============================================================
+    #   - `Registry`/`registry()`/`init()`, `observe` (the axum
+    #     middleware), `enter_write_queue`/`leave_write_queue`, `snapshot()`
+    #     (the whole-server rollup): all live, process-wide `AtomicU64`/
+    #     `AtomicUsize` state updated from a real HTTP request path,
+    #     wall-clock `Instant::now()` calls, and a call into
+    #     `crate::api::limits::in_flight_requests()`. There is no atomic/
+    #     shared-mutable-state primitive in this language and no live HTTP
+    #     request to instrument even if there were — this is the server's
+    #     own bookkeeping, not a computation over inputs.
+    #   - `Window`/`window_stats()` — the SAME histogram-delta math ported
+    #     in piece (1) above, but driven by a real wall-clock "has at least
+    #     one second passed" gate and a `Mutex<Window>` that only `GET
+    #     /stats` takes. `histogramDelta` below (new, not in the Rust
+    #     source under that name — see its own doc) is exactly the pure
+    #     half of what `window_stats` does with two histogram snapshots;
+    #     the timer-driven roll-or-don't-roll decision around it is live
+    #     process state and is not ported.
+    #   - `ProcessStats`/`cpu_seconds_total`/`resident_bytes`/
+    #     `memory_limit`/`probe_memory_limit` — `libc::getrusage`,
+    #     `/proc/self/statm`, `/proc/meminfo`, `/sys/fs/cgroup/*`: real
+    #     syscalls and real file reads, by construction impossible to
+    #     restate as pure computation because their entire content IS "ask
+    #     the OS".
+    #   - No crypto anywhere in this file, and none is needed here: nothing
+    #     in metrics.rs hashes, signs or encrypts anything.
+    #
+    # ============================================================
+    # REPRESENTATION CHOICES AND CONFIRMED LANGUAGE-GAP DIVERGENCES
+    # ============================================================
+    # `int` IS THIS LANGUAGE'S ONLY INTEGER TYPE, AND IT IS SIGNED 64-BIT
+    # (confirmed against runtime/eval.go's `shiftLeft`/`shiftRight`, which
+    # operate on a plain Go `int` — 64-bit two's complement). Rust's `u64`
+    # microsecond samples and `u32`-packed coordinates are both restated as
+    # plain `int` fields, the same substitution core_types.fct's own header
+    # already makes for `u8`/`u64` throughout this directory. Three
+    # concrete consequences, each confirmed by hand-tracing the actual
+    # runtime semantics rather than assumed:
+    #
+    #   * `bucket_index`'s `us.leading_zeros()` has no equivalent builtin
+    #     (grepped runtime/eval.go and internal/parser/expr.go's builtin
+    #     list — no `leadingZeros`/`clz`/`bitLength` of any kind, the exact
+    #     same gap index_text.fct's header already names for the unrelated
+    #     `f64::to_bits`). Restated below as `msbPosition`, a small
+    #     right-shift-until-1 loop computing the same "position of the
+    #     highest set bit" `63 - leading_zeros()` computes for any `us >=
+    #     8` (the only range `bucket_index` ever calls it for) — same
+    #     answer, different mechanism, not a narrowing.
+    #
+    #   * `u64::MAX` (18446744073709551615) is NOT representable as this
+    #     language's `int` at all — it is larger than `int64::MAX`
+    #     (9223372036854775807), a full extra bit. The real Rust test
+    #     `bucket_indexes_are_monotone_and_bounded` exercises `u64::MAX`
+    #     directly; this port's `demoBucketMonotoneAndBounded` below
+    #     substitutes `int64::MAX` as the largest representable stand-in
+    #     and says so at the call site — a genuine, confirmed, and
+    #     unavoidable width gap (the same one index_text.fct's header
+    #     already documents for `u64`-typed version counters), not
+    #     silently narrowed.
+    #
+    #   * `CellTable`'s Fibonacci-hashing multiply,
+    #     `key.wrapping_mul(0x9E3779B97F4A7C15) >> 32`, is where the
+    #     signed/unsigned split actually bites, not just annoys. Three
+    #     separate facts, each checked against the runtime source before
+    #     relying on it:
+    #       (a) `0x9E3779B97F4A7C15` (11400714819323198485 unsigned) has
+    #           its own top bit set, so it does not fit as a positive
+    #           `int` literal at all — it is written below as its exact
+    #           two's-complement negative equivalent,
+    #           `-7046029254386353131`. This does not change the
+    #           multiply's result: two's-complement multiplication
+    #           produces the identical 64-bit BIT PATTERN regardless of
+    #           which operand is "declared" signed vs. unsigned, and this
+    #           language's `*` (runtime/eval.go, `case "*"`) is a plain Go
+    #           `int * int`, which silently wraps on overflow exactly the
+    #           way `wrapping_mul` does — confirmed by reading the
+    #           evaluator, not assumed.
+    #       (b) `>>` on this language's `int` (runtime/eval.go's
+    #           `shiftRight`, a plain Go `x >> uint(n)` on a signed `int`)
+    #           is an ARITHMETIC shift — it sign-extends. Rust's `u64 >>`
+    #           is a LOGICAL shift — it fills with zero. When the multiply
+    #           above produces a bit pattern with bit 63 set (routine here:
+    #           it is a hash), shifting right by 32 the naive way would
+    #           smear 1-bits into the top of the result and corrupt it.
+    #       (c) The fix, proven bit-for-bit rather than guessed: an
+    #           arithmetic right shift by 32 reproduces exactly the same
+    #           low 32 bits a logical right shift by 32 would (shifting
+    #           right by 32 moves bits 32..63 into positions 0..31
+    #           regardless of what fills positions 32..63 above them), so
+    #           masking the arithmetic-shift result with `& 4294967295`
+    #           (`0xFFFFFFFF`) recovers precisely Rust's unsigned
+    #           `(key.wrapping_mul(...) >> 32) as usize` value, always
+    #           non-negative. `cellTableHashIndex` below does exactly
+    #           this: shift, then mask, then `% CELL_SLOTS` — documented
+    #           here rather than silently patched, per this file's own
+    #           standing rule.
+    #
+    # `Coordinate` is redeclared locally (`x`/`y`/`z`/`q`, all `int`)
+    # rather than imported from core_types.fct, for the same reason
+    # fabric_telemetry.fct's own header already gives for redeclaring the
+    # identical real-world type: this file's neighbors in this directory
+    # (reference.fct, location.fct, aggregate.fct) each restate whatever
+    # small shape they need rather than reach across files, and a
+    # metrics-specific `Coordinate` used only for packing/unpacking one
+    # `int` key has no reason to break that pattern.
+    #
+    # `RequestClass` is restated as plain `text` ("read"/"write"/
+    # "excluded"/"unclassified"), matching aggregate.fct's own
+    # `AggFunc`-as-text convention, rather than as a numeric tag.
+    #
+    # ============================================================
+    # VERIFICATION
+    # ============================================================
+    # Every demo below hand-traces (and, for the numeric ones,
+    # numerically restates) one of metrics.rs's own five `#[cfg(test)]`
+    # cases: `bucket_indexes_are_monotone_and_bounded`,
+    # `percentiles_bound_the_samples_they_summarize`,
+    # `an_empty_window_has_no_percentile`,
+    # `cells_are_attributed_to_their_own_coordinate`,
+    # `a_full_table_overflows_instead_of_growing`, and
+    # `reads_and_writes_are_classified_by_route_not_by_method`. All six
+    # were run live via `facet console` against a freshly rebuilt `facet`
+    # binary, with results captured into the `state` cells below (see
+    # `runDemoMetrics`/`Home`) — full transcript in the task report.
+    # `facet check` passes on this file standalone and the directory-wide
+    # sweep of `fct/selfhost/*.fct` was re-run clean after adding it.
+
+    struct Coordinate:
+        x: int
+        y: int
+        z: int
+        q: int
+
+    # ============================================================
+    # PART 1 — THE LATENCY HISTOGRAM
+    # ============================================================
+
+    struct Histogram:
+        buckets: [int]
+
+    # msbPosition: stands in for `63 - us.leading_zeros()` — see the
+    # header's language-gap note. Only ever called (by `bucketIndex`) for
+    # `us >= 8`, so `v` here is always positive and the loop always
+    # terminates with `pos` equal to the zero-based position of the
+    # highest set bit (e.g. msbPosition(8) == 3, matching leading_zeros
+    # of u64 8 == 60, 63-60 == 3).
+    proc msbPosition(v: int) -> int:
+        let mut x = v
+        let mut pos = 0
+        loop x > 1:
+            x = x >> 1
+            pos = pos + 1
+        return pos
+
+    # bucketIndex: `bucket_index` verbatim (SUB_BITS=3, SUB_BUCKETS=8,
+    # BUCKET_COUNT=512 inlined as their real values — this file has no
+    # `const`, matching every sibling file's own convention of inlining a
+    # Rust `const` at each use once its value is fixed).
+    proc bucketIndex(us: int) -> int:
+        if us < 8:
+            return us
+        let msb = do msbPosition(us)
+        let sub = (us >> (msb - 3)) & 7
+        let idx = (msb - 3 + 1) * 8 + sub
+        if idx > 511:
+            return 511
+        return idx
+
+    # bucketUpperUs: `bucket_upper_us` verbatim.
+    proc bucketUpperUs(index: int) -> int:
+        if index < 8:
+            return index
+        let octave = index / 8
+        let sub = index % 8
+        let msb = octave + 2
+        let shift = msb - 3
+        let width = 1 << shift
+        let base = (8 + sub) << shift
+        return base + width - 1
+
+    proc histogramNew() -> Histogram:
+        let mut buckets = []
+        let mut i = 0
+        loop i < 512:
+            buckets = append(buckets, 0)
+            i = i + 1
+        return Histogram{buckets: buckets}
+
+    # histogramRecord: `Histogram::record` — one sample, restated as the
+    # pure "return the new array" shape this whole directory uses in
+    # place of a mutable/atomic counter (see core_types.fct's own header
+    # on why: no interior mutability in this language).
+    proc histogramRecord(h: Histogram, us: int) -> Histogram:
+        let idx = do bucketIndex(us)
+        let mut buckets = h.buckets
+        buckets[idx] = buckets[idx] + 1
+        return Histogram{buckets: buckets}
+
+    # histogramDelta: NOT a name in the Rust source. It is the pure half
+    # of what `window_stats` does with `registry.read_latency.snapshot`
+    # and `window.read_at_open` — "subtract one histogram snapshot from a
+    # later one, per bucket, never negative" — split out here because
+    # this port has no live registry to snapshot FROM (see the header's
+    # deferred-pieces section); a caller with two `Histogram`s (e.g. one
+    # taken at window-open and one taken now) gets the same per-bucket
+    # deltas `window_stats`'s inline loop computes.
+    proc histogramDelta(now: Histogram, atOpen: Histogram) -> [int]:
+        let mut out = []
+        let mut i = 0
+        loop i < 512:
+            let diff = now.buckets[i] - atOpen.buckets[i]
+            if diff < 0:
+                out = append(out, 0)
+            if diff >= 0:
+                out = append(out, diff)
+            i = i + 1
+        return out
+
+    struct LatencyStats:
+        count: int
+        hasP50: bool
+        p50Us: int
+        hasP99: bool
+        p99Us: int
+        hasMax: bool
+        maxUs: int
+
+    struct LatencyQuantileResult:
+        has: bool
+        val: int
+
+    # latencyRank: the rank of the sample sitting at quantile `num/den`,
+    # 1-based, rounded UP — `((count as f64) * q).ceil().max(1.0)`
+    # restated in pure integer arithmetic (`ceil(a/b) == (a+b-1)/b` for
+    # positive integers) so this never needs `float`/`round`/`floor` at
+    # all: `latencyRank(count, 50, 100)` is p50's rank, `latencyRank(count,
+    # 99, 100)` is p99's. Exact for any count >= 1, which is the only
+    # range `latencyStatsFromDelta` ever calls it in (it returns early on
+    # count == 0).
+    proc latencyRank(count: int, num: int, den: int) -> int:
+        let a = count * num
+        let r = (a + den - 1) / den
+        if r < 1:
+            return 1
+        return r
+
+    # latencyQuantile: the smallest bucket whose cumulative count reaches
+    # `rank`, reported as that bucket's upper bound — `LatencyStats::
+    # from_delta`'s own `quantile` closure, verbatim.
+    proc latencyQuantile(delta: [int], rank: int) -> LatencyQuantileResult:
+        let mut seen = 0
+        let mut i = 0
+        loop i < 512:
+            seen = seen + delta[i]
+            if seen >= rank:
+                let upper = do bucketUpperUs(i)
+                return LatencyQuantileResult{has: true, val: upper}
+            i = i + 1
+        return LatencyQuantileResult{has: false, val: 0}
+
+    # latencyMax: `delta.iter().rposition(|&n| n > 0).map(bucket_upper_us)`
+    # — the upper bound of the highest occupied bucket.
+    proc latencyMax(delta: [int]) -> LatencyQuantileResult:
+        let mut i = 511
+        loop i >= 0:
+            if delta[i] > 0:
+                let upper = do bucketUpperUs(i)
+                return LatencyQuantileResult{has: true, val: upper}
+            i = i - 1
+        return LatencyQuantileResult{has: false, val: 0}
+
+    # latencyStatsFromDelta: `LatencyStats::from_delta` verbatim — an
+    # all-zero delta reports absence (count 0, every Option none), never a
+    # fabricated zero latency.
+    proc latencyStatsFromDelta(delta: [int]) -> LatencyStats:
+        let mut count = 0
+        let mut i = 0
+        loop i < 512:
+            count = count + delta[i]
+            i = i + 1
+        if count == 0:
+            return LatencyStats{count: 0, hasP50: false, p50Us: 0, hasP99: false, p99Us: 0, hasMax: false, maxUs: 0}
+        let rank50 = do latencyRank(count, 50, 100)
+        let rank99 = do latencyRank(count, 99, 100)
+        let p50 = do latencyQuantile(delta, rank50)
+        let p99 = do latencyQuantile(delta, rank99)
+        let m = do latencyMax(delta)
+        return LatencyStats{count: count, hasP50: p50.has, p50Us: p50.val, hasP99: p99.has, p99Us: p99.val, hasMax: m.has, maxUs: m.val}
+
+    # ============================================================
+    # PART 2 — REQUEST CLASSIFICATION
+    # ============================================================
+
+    # hasPrefixText: restated locally exactly as parser_proc.fct's own
+    # copy is (no cross-file import of it here — see this file's header
+    # on why every neighbor in this directory restates its own small
+    # helpers rather than reaching across files).
+    proc hasPrefixText(s: text, p: text) -> bool:
+        let n = len(p)
+        if n > len(s):
+            return false
+        return slice(s, 0, n) == p
+
+    # classifyRequest: `classify` verbatim, restated over plain `text`
+    # (matched route pattern, HTTP method) rather than `axum::http::
+    # Method`/a route enum. Returns one of "read"/"write"/"excluded"/
+    # "unclassified" — see the header's note on why this is text, not a
+    # tag.
+    proc classifyRequest(method: text, matched: text) -> text:
+        if matched == "/node":
+            if method == "POST":
+                return "write"
+            return "unclassified"
+
+        if matched == "/node/:address":
+            if method == "GET":
+                return "read"
+            if method == "PUT" || method == "DELETE":
+                return "write"
+            return "unclassified"
+
+        if matched == "/node/:address/history" || matched == "/node/:address/owned" || matched == "/node/:address/edges/out" || matched == "/node/:address/edges/in" || matched == "/nodes" || matched == "/nodes/multiget" || matched == "/nodes/query" || matched == "/nodes/count" || matched == "/nodes/count_by" || matched == "/nodes/aggregate" || matched == "/nodes/aggregate_by":
+            return "read"
+
+        if matched == "/node/:address/claim" || matched == "/sequence/:name/next" || matched == "/edge" || matched == "/transaction":
+            return "write"
+
+        if matched == "/publish" || matched == "/stats" || matched == "/" || matched == "/events" || matched == "/changes":
+            return "excluded"
+
+        let isAdminRoute = do hasPrefixText(matched, "/admin/")
+        if isAdminRoute:
+            return "excluded"
+
+        return "unclassified"
+
+    # ============================================================
+    # PART 3 — PER-CELL ATTRIBUTION
+    # ============================================================
+
+    struct CellStats:
+        x: int
+        y: int
+        z: int
+        q: int
+        reads: int
+        writes: int
+        bytesRead: int
+        bytesWritten: int
+
+    struct CellAttribution:
+        capacity: int
+        tracked: int
+        overflowReads: int
+        overflowWrites: int
+        unattributedWrites: int
+        cells: [CellStats]
+
+    struct CellTable:
+        keys: [int]
+        reads: [int]
+        writes: [int]
+        bytesRead: [int]
+        bytesWritten: [int]
+        overflowReads: int
+        overflowWrites: int
+        unattributedWrites: int
+
+    # packCoordinate: `pack` verbatim.
+    proc packCoordinate(c: Coordinate) -> int:
+        return (c.x << 24) | (c.y << 16) | (c.z << 8) | c.q
+
+    # unpackCoordinate: `unpack` verbatim — caller is responsible for
+    # masking off CELL_OCCUPIED (`& 4294967295`) first, exactly as the
+    # real `snapshot` does at its own call site.
+    proc unpackCoordinate(packed: int) -> Coordinate:
+        return Coordinate{x: (packed >> 24) & 255, y: (packed >> 16) & 255, z: (packed >> 8) & 255, q: packed & 255}
+
+    # cellTableHashIndex: `key.wrapping_mul(0x9E3779B97F4A7C15) >> 32) as
+    # usize) % CELL_SLOTS` — see the header's "Fibonacci-hashing multiply"
+    # note for exactly why the shift is followed by `& 4294967295` here
+    # where Rust needed nothing extra (unsigned `u64 >>` already zero-
+    # fills; this language's signed `>>` does not, and the mask recovers
+    # the identical unsigned result).
+    proc cellTableHashIndex(key: int) -> int:
+        let fib = -7046029254386353131
+        let mult = key * fib
+        let shifted = mult >> 32
+        let unsigned32 = shifted & 4294967295
+        return unsigned32 % 256
+
+    # cellTableFindSlot: `CellTable::slot`, minus the compare-exchange —
+    # see the header's part-3 note on why a single-threaded pure function
+    # already gives the same outcome as the real CAS loop with no race to
+    # arbitrate. Returns the index to read/claim, or -1 when the bounded
+    # 8-probe run (CELL_PROBES) is exhausted (the real `None` case —
+    # charge to overflow).
+    proc cellTableFindSlot(keys: [int], key: int) -> int:
+        let start = do cellTableHashIndex(key)
+        let mut index = start
+        let mut i = 0
+        loop i < 8:
+            let current = keys[index]
+            if current == key:
+                return index
+            if current == 0:
+                return index
+            index = (index + 1) % 256
+            i = i + 1
+        return -1
+
+    proc cellTableNew() -> CellTable:
+        let mut keys = []
+        let mut reads = []
+        let mut writes = []
+        let mut bytesRead = []
+        let mut bytesWritten = []
+        let mut i = 0
+        loop i < 256:
+            keys = append(keys, 0)
+            reads = append(reads, 0)
+            writes = append(writes, 0)
+            bytesRead = append(bytesRead, 0)
+            bytesWritten = append(bytesWritten, 0)
+            i = i + 1
+        return CellTable{keys: keys, reads: reads, writes: writes, bytesRead: bytesRead, bytesWritten: bytesWritten, overflowReads: 0, overflowWrites: 0, unattributedWrites: 0}
+
+    # cellTableRecordRead: `CellTable::record_read` — CELL_OCCUPIED
+    # (4294967296 == 1<<32) marks a slot occupied even for the all-zero
+    # coordinate, exactly as the real bit does.
+    proc cellTableRecordRead(table: CellTable, c: Coordinate, bytes: int) -> CellTable:
+        let packed = do packCoordinate(c)
+        let key = 4294967296 + packed
+        let slot = do cellTableFindSlot(table.keys, key)
+        if slot < 0:
+            return CellTable{keys: table.keys, reads: table.reads, writes: table.writes, bytesRead: table.bytesRead, bytesWritten: table.bytesWritten, overflowReads: table.overflowReads + 1, overflowWrites: table.overflowWrites, unattributedWrites: table.unattributedWrites}
+        let mut keys = table.keys
+        let mut reads = table.reads
+        let mut bytesRead = table.bytesRead
+        keys[slot] = key
+        reads[slot] = reads[slot] + 1
+        bytesRead[slot] = bytesRead[slot] + bytes
+        return CellTable{keys: keys, reads: reads, writes: table.writes, bytesRead: bytesRead, bytesWritten: table.bytesWritten, overflowReads: table.overflowReads, overflowWrites: table.overflowWrites, unattributedWrites: table.unattributedWrites}
+
+    # cellTableRecordWrite: `CellTable::record_write`, the mirror of the
+    # above.
+    proc cellTableRecordWrite(table: CellTable, c: Coordinate, bytes: int) -> CellTable:
+        let packed = do packCoordinate(c)
+        let key = 4294967296 + packed
+        let slot = do cellTableFindSlot(table.keys, key)
+        if slot < 0:
+            return CellTable{keys: table.keys, reads: table.reads, writes: table.writes, bytesRead: table.bytesRead, bytesWritten: table.bytesWritten, overflowReads: table.overflowReads, overflowWrites: table.overflowWrites + 1, unattributedWrites: table.unattributedWrites}
+        let mut keys = table.keys
+        let mut writes = table.writes
+        let mut bytesWritten = table.bytesWritten
+        keys[slot] = key
+        writes[slot] = writes[slot] + 1
+        bytesWritten[slot] = bytesWritten[slot] + bytes
+        return CellTable{keys: keys, reads: table.reads, writes: writes, bytesRead: table.bytesRead, bytesWritten: bytesWritten, overflowReads: table.overflowReads, overflowWrites: table.overflowWrites, unattributedWrites: table.unattributedWrites}
+
+    # cellTableRecordUnattributedWrite: `CellTable::record_unattributed_write`.
+    proc cellTableRecordUnattributedWrite(table: CellTable) -> CellTable:
+        return CellTable{keys: table.keys, reads: table.reads, writes: table.writes, bytesRead: table.bytesRead, bytesWritten: table.bytesWritten, overflowReads: table.overflowReads, overflowWrites: table.overflowWrites, unattributedWrites: table.unattributedWrites + 1}
+
+    # cellStatsInOrder: true when `a` may stay before `b` in the wire
+    # order `snapshot` produces — busiest (reads+writes) first, then
+    # ascending `(x, y, z, q)` as a deterministic tiebreak. Matches
+    # `cells.sort_by(...)` exactly.
+    proc cellStatsInOrder(a: CellStats, b: CellStats) -> bool:
+        let totalA = a.reads + a.writes
+        let totalB = b.reads + b.writes
+        if totalA > totalB:
+            return true
+        if totalA < totalB:
+            return false
+        if a.x != b.x:
+            return a.x < b.x
+        if a.y != b.y:
+            return a.y < b.y
+        if a.z != b.z:
+            return a.z < b.z
+        return a.q <= b.q
+
+    # cellStatsSortSnapshotOrder: hand-written insertion sort — no `sort`
+    # builtin in this language (the same idiom index_text.fct's
+    # `sortGramsAscending` and fabric_replication.fct's
+    # `replRecordArraySortByNodeAscending` already establish).
+    proc cellStatsSortSnapshotOrder(cells: [CellStats]) -> [CellStats]:
+        let mut xs = cells
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                let inOrder = do cellStatsInOrder(xs[j - 1], xs[j])
+                if !inOrder:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                if inOrder:
+                    break
+            i = i + 1
+        return xs
+
+    # cellTableSnapshot: `CellTable::snapshot` verbatim — gather every
+    # occupied slot, sort busiest-first, and report the honest overflow/
+    # unattributed counters alongside it.
+    proc cellTableSnapshot(table: CellTable) -> CellAttribution:
+        let mut cells = []
+        let mut i = 0
+        loop i < 256:
+            let key = table.keys[i]
+            if key != 0:
+                let masked = key & 4294967295
+                let c = do unpackCoordinate(masked)
+                let stats = CellStats{x: c.x, y: c.y, z: c.z, q: c.q, reads: table.reads[i], writes: table.writes[i], bytesRead: table.bytesRead[i], bytesWritten: table.bytesWritten[i]}
+                cells = append(cells, stats)
+            i = i + 1
+        let sorted = do cellStatsSortSnapshotOrder(cells)
+        return CellAttribution{capacity: 256, tracked: len(sorted), overflowReads: table.overflowReads, overflowWrites: table.overflowWrites, unattributedWrites: table.unattributedWrites, cells: sorted}
+
+    # ============================================================
+    # VERIFICATION DEMOS — one per real Rust `#[cfg(test)]` case named in
+    # the header's "VERIFICATION" section.
+    # ============================================================
+
+    proc demoBucketMonotoneAndBounded() -> bool:
+        # Rust's own sample list, with `u64::MAX` replaced by this
+        # language's largest representable `int` (int64::MAX) — see the
+        # header's confirmed width-gap note.
+        let samples = [0, 1, 7, 8, 15, 16, 31, 100, 1000, 1000000, 9223372036854775807]
+        let mut previous = 0
+        let mut i = 0
+        let n = len(samples)
+        loop i < n:
+            let us = samples[i]
+            let idx = do bucketIndex(us)
+            if idx >= 512:
+                return false
+            if idx < previous:
+                return false
+            let upper = do bucketUpperUs(idx)
+            if upper < us:
+                return false
+            previous = idx
+            i = i + 1
+        return true
+
+    proc demoPercentilesBoundSamples() -> bool:
+        let h0 = do histogramNew()
+        let mut h = h0
+        let mut us = 1
+        loop us <= 1000:
+            let updated = do histogramRecord(h, us)
+            h = updated
+            us = us + 1
+        let stats = do latencyStatsFromDelta(h.buckets)
+        if stats.count != 1000:
+            return false
+        if !stats.hasP50:
+            return false
+        if stats.p50Us < 500 || stats.p50Us > 563:
+            return false
+        if !stats.hasP99:
+            return false
+        if stats.p99Us < 990 || stats.p99Us > 1114:
+            return false
+        if !stats.hasMax:
+            return false
+        if stats.maxUs < 1000:
+            return false
+        return true
+
+    proc demoEmptyWindowHasNoPercentile() -> bool:
+        let zero = do histogramNew()
+        let stats = do latencyStatsFromDelta(zero.buckets)
+        if stats.count != 0:
+            return false
+        if stats.hasP50:
+            return false
+        if stats.hasMax:
+            return false
+        return true
+
+    proc demoCellsAttributedToOwnCoordinate() -> bool:
+        let table0 = do cellTableNew()
+        let mut table = table0
+        let afterRead1 = do cellTableRecordRead(table, Coordinate{x: 1, y: 2, z: 3, q: 4}, 100)
+        table = afterRead1
+        let afterRead2 = do cellTableRecordRead(table, Coordinate{x: 1, y: 2, z: 3, q: 4}, 100)
+        table = afterRead2
+        let afterWrite = do cellTableRecordWrite(table, Coordinate{x: 9, y: 9, z: 9, q: 9}, 7)
+        table = afterWrite
+        let afterUnattributed = do cellTableRecordUnattributedWrite(table)
+        table = afterUnattributed
+        let snapshot = do cellTableSnapshot(table)
+        if snapshot.tracked != 2:
+            return false
+        if snapshot.unattributedWrites != 1:
+            return false
+        if snapshot.overflowReads != 0:
+            return false
+        let busiest = snapshot.cells[0]
+        if busiest.x != 1 || busiest.y != 2 || busiest.z != 3 || busiest.q != 4:
+            return false
+        if busiest.reads != 2 || busiest.bytesRead != 200:
+            return false
+        let mut foundWritten = false
+        let mut i = 0
+        loop i < len(snapshot.cells):
+            let cell = snapshot.cells[i]
+            if cell.x == 9:
+                if cell.writes == 1 && cell.bytesWritten == 7:
+                    foundWritten = true
+            i = i + 1
+        return foundWritten
+
+    proc demoFullTableOverflows() -> bool:
+        let table0 = do cellTableNew()
+        let mut table = table0
+        let mut x = 0
+        loop x < 64:
+            let mut y = 0
+            loop y < 64:
+                let updated = do cellTableRecordRead(table, Coordinate{x: x, y: y, z: 0, q: 0}, 1)
+                table = updated
+                y = y + 1
+            x = x + 1
+        let snapshot = do cellTableSnapshot(table)
+        if snapshot.tracked > snapshot.capacity:
+            return false
+        if snapshot.overflowReads <= 0:
+            return false
+        let mut attributed = 0
+        let mut i = 0
+        loop i < len(snapshot.cells):
+            attributed = attributed + snapshot.cells[i].reads
+            i = i + 1
+        return attributed + snapshot.overflowReads == 4096
+
+    proc demoClassifyByRouteNotMethod() -> bool:
+        let c1 = do classifyRequest("POST", "/nodes/query")
+        if c1 != "read":
+            return false
+        let c2 = do classifyRequest("POST", "/nodes/count")
+        if c2 != "read":
+            return false
+        let c3 = do classifyRequest("POST", "/transaction")
+        if c3 != "write":
+            return false
+        let c4 = do classifyRequest("GET", "/node/:address")
+        if c4 != "read":
+            return false
+        let c5 = do classifyRequest("DELETE", "/node/:address")
+        if c5 != "write":
+            return false
+        let c6 = do classifyRequest("GET", "/stats")
+        if c6 != "excluded":
+            return false
+        let c7 = do classifyRequest("GET", "/admin/users")
+        if c7 != "excluded":
+            return false
+        let c8 = do classifyRequest("GET", "/something/new")
+        if c8 != "unclassified":
+            return false
+        return true
+
+    state demoBucketMonotoneAndBoundedResult: bool = false
+    state demoPercentilesBoundSamplesResult: bool = false
+    state demoEmptyWindowHasNoPercentileResult: bool = false
+    state demoCellsAttributedToOwnCoordinateResult: bool = false
+    state demoFullTableOverflowsResult: bool = false
+    state demoClassifyByRouteNotMethodResult: bool = false
+
+    action runDemoMetrics():
+        let r1 = do demoBucketMonotoneAndBounded()
+        let r2 = do demoPercentilesBoundSamples()
+        let r3 = do demoEmptyWindowHasNoPercentile()
+        let r4 = do demoCellsAttributedToOwnCoordinate()
+        let r5 = do demoFullTableOverflows()
+        let r6 = do demoClassifyByRouteNotMethod()
+        demoBucketMonotoneAndBoundedResult = r1
+        demoPercentilesBoundSamplesResult = r2
+        demoEmptyWindowHasNoPercentileResult = r3
+        demoCellsAttributedToOwnCoordinateResult = r4
+        demoFullTableOverflowsResult = r5
+        demoClassifyByRouteNotMethodResult = r6
+
+    private view Home at "/":
+        box:
+            text "bucketMonotoneAndBounded={demoBucketMonotoneAndBoundedResult} percentilesBoundSamples={demoPercentilesBoundSamplesResult} emptyWindowHasNoPercentile={demoEmptyWindowHasNoPercentileResult} cellsAttributedToOwnCoordinate={demoCellsAttributedToOwnCoordinateResult} fullTableOverflows={demoFullTableOverflowsResult} classifyByRouteNotMethod={demoClassifyByRouteNotMethodResult}"

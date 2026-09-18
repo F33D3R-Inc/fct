@@ -3126,6 +3126,17 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			}
 		case "toFloat":
 			return "float"
+		case "floatFromBits":
+			// floatFromBits(b) -> float, the IEEE-754 bit-cast inverse of
+			// floatBits(f) -> int — see checkNoFloat's doc for why this call
+			// itself (not just a float literal or toFloat()) must be barred
+			// outside a proc: it is a second way to produce a float value.
+			return "float"
+		case "floatBits":
+			// floatBits(f) -> int, the raw IEEE-754 bit pattern of f
+			// reinterpreted as a signed 64-bit int — always int-typed, the
+			// same as toInt/floor/round, regardless of the float's value.
+			return "int"
 		case "toInt", "floor", "round":
 			// floor/round always return int — see runtime/eval.go's callBuiltin
 			// doc for why a rounded value is int-typed regardless of whether the
@@ -5310,8 +5321,9 @@ func checkNoIndex(ex ast.Expr, line int) error {
 	return nil
 }
 
-// checkNoFloat rejects a float literal (`3.14`) or a `toFloat(...)` call
-// anywhere outside a proc body, the same way checkNoBitwise rejects a bitwise
+// checkNoFloat rejects a float literal (`3.14`) or a `toFloat(...)`/
+// `floatFromBits(...)` call — both float-producing — anywhere outside a proc
+// body, the same way checkNoBitwise rejects a bitwise
 // operator there and for the same underlying reason: a float value has
 // exactly one interpreter today, runtime/eval.go's applyBin/evalInFrame/
 // callBuiltin, which only ever runs on the server — assets/facet.js has no
@@ -5336,8 +5348,8 @@ func checkNoFloat(ex ast.Expr, line int) error {
 			return &BuildError{line, "a float literal is only available inside a proc — a proc always runs on the server, but this expression may run on the client too, and the client has no float representation (see LANGUAGE.md's `proc` section)"}
 		}
 	case ast.Call:
-		if t.Name == "toFloat" {
-			return &BuildError{line, "toFloat(...) is only available inside a proc — it produces a float, which is only available inside a proc (see LANGUAGE.md's `proc` section)"}
+		if t.Name == "toFloat" || t.Name == "floatFromBits" {
+			return &BuildError{line, fmt.Sprintf("%s(...) is only available inside a proc — it produces a float, which is only available inside a proc (see LANGUAGE.md's `proc` section)", t.Name)}
 		}
 		for _, a := range t.Args {
 			if err := checkNoFloat(a, line); err != nil {
@@ -6111,7 +6123,7 @@ func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
 		"ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney",
-		"textToBytes", "bytesToText", "byteLen":
+		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits":
 		return 1, true
 	case "print":
 		// print(value): a debugging aid, not real arithmetic/string/date

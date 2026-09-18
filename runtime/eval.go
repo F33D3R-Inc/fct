@@ -1083,6 +1083,25 @@ func callBuiltin(name string, argVals []any) any {
 		return toFloat(arg(0))
 	case "toInt":
 		return toInt(arg(0))
+	case "floatBits":
+		// The raw IEEE-754 bit pattern of a float, reinterpreted as a signed
+		// 64-bit int — a bit-cast, not a numeric conversion (contrast
+		// toInt, which truncates the VALUE). This is exactly Go's own
+		// math.Float64bits, so a program can predict this builtin's answer
+		// from Go's documentation alone, the same stance round() already
+		// takes on math.Round (see its doc above). int is this runtime's
+		// only integer width (see toInt), so the uint64 result is
+		// reinterpreted as int64 and handed back as int with no value
+		// change — the top bit (the float's sign bit) survives as int's
+		// sign bit, which is exactly what an order-preserving encoder
+		// (this builtin's motivating caller — see selfhost/index_text.fct)
+		// needs to detect and flip.
+		return int(int64(math.Float64bits(toFloat(arg(0)))))
+	case "floatFromBits":
+		// floatBits' exact inverse: reinterpret an int's bit pattern as
+		// IEEE-754 and return the float it spells, via Go's own
+		// math.Float64frombits — see floatBits' doc above.
+		return math.Float64frombits(uint64(toInt(arg(0))))
 	case "toMoney":
 		n, _ := parseMoneyText(toStr(arg(0)))
 		return n

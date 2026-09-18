@@ -584,6 +584,7 @@ func isBuiltinCall(name string) bool {
 		"print", // debug output (server-only, but callable from action AND proc bodies — see internal/ir/build.go's printCap)
 		"abs", "min", "max", "floor", "round", "money", // math / money
 		"toFloat", "toInt", // explicit int<->float conversion (toFloat is proc-only — see checkNoFloat)
+		"floatBits", "floatFromBits", // IEEE-754 bit-cast float<->int (floatFromBits is proc-only — see checkNoFloat)
 		"toMoney",                                                                       // explicit text->money conversion — not proc-only, money is a real type everywhere
 		"len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", // string
 		"textToBytes", "bytesToText", "byteLen", // UTF-8 <-> raw byte buffer conversion (proc-only, same reason "bytes" is)
