@@ -444,8 +444,15 @@ type Proc struct {
 	Params  []Param
 	Ret     string // return type core ("" = no return)
 	RetList bool   // the return is a list of Ret (`-> [T]`)
-	Body    []Stmt
-	Line    int
+	// Uses is the proc's declared I/O capability set — `uses io.file, io.net`,
+	// trailing the header the same way `requires <policy>` trails a mount/view
+	// header (see parseMount/parseView). Empty means the proc's body may not
+	// call any capability-gated builtin (readFile/writeFile/httpGet/httpPost);
+	// internal/ir/build.go's checkProcCapabilities is what actually enforces
+	// this against what the body calls.
+	Uses []string
+	Body []Stmt
+	Line int
 }
 
 // Service is an external service (a "brain") fct can call over HTTP: a base URL
@@ -709,6 +716,49 @@ type Do struct {
 	Line int
 }
 
+// ExprStmt is a bare builtin call used as its own statement, purely for its
+// side effect, its result discarded — the counterpart to Do's fire-and-forget
+// form, but for a builtin (writeFile/httpPost/...) instead of a proc. Needed
+// because a proc's statement grammar otherwise has no "call for effect, don't
+// bind" shape for anything but `do`: `writeFile(path, content)` on its own
+// line has no `=` and isn't a `do`, so without this it would fall through to
+// parseProcBody's "unknown statement" case. Proc-only, like Do.
+type ExprStmt struct {
+	Call Call
+	Line int
+}
+
+// Spawn runs a proc call concurrently — a real Go goroutine under the hood —
+// and immediately yields a task handle: `let h = spawn ProcName(args)`.
+// Unlike Do, spawn has NO fire-and-forget form: Bind is never "". A spawned
+// goroutine with no handle would be a goroutine nothing could ever wait on,
+// which is exactly the fire-and-forget leak structured concurrency forbids —
+// so the grammar itself has no way to write one (see parseProcBody, which
+// rejects a bare `spawn ProcName(args)` statement outright). The handle
+// itself is a write-once, use-once value: internal/ir/build.go's procBlock
+// tags it with the pseudo-type taskType and refuses every use of it except
+// `join` (checkNoTaskUse), and requires it be joined before the enclosing
+// statement block ends (checkSpawnsJoined) — see that file for why "same
+// block" is the enforcement boundary this milestone chose.
+type Spawn struct {
+	Proc string
+	Args []Expr
+	Bind string // the handle's local name (never "")
+	Line int
+}
+
+// Join blocks until a previously `spawn`ed task finishes, consuming its
+// handle: `join h` (fire-and-forget — still a real barrier, since it blocks
+// until the goroutine finishes, but the result is discarded) or, bound,
+// `let r = join h`. Handle names the local Spawn bound; a handle may be
+// joined exactly once (internal/ir/build.go's procBlock tracks this per
+// statement block, the same scope a spawn's handle is confined to).
+type Join struct {
+	Handle string
+	Bind   string // "" = fire-and-forget (still blocks; result discarded)
+	Line   int
+}
+
 func (Assign) stmt()      {}
 func (ServiceCall) stmt() {}
 func (Establish) stmt()   {}
@@ -724,6 +774,9 @@ func (Loop) stmt()        {}
 func (IfStmt) stmt()      {}
 func (Break) stmt()       {}
 func (Continue) stmt()    {}
+func (ExprStmt) stmt()    {}
+func (Spawn) stmt()       {}
+func (Join) stmt()        {}
 
 // View is one `view Name [at "/path"]:` projection of state into a UI node tree.
 // A view is a page, served at its route; Path defaults are filled in by the
@@ -1292,7 +1345,11 @@ func (SlotRef) node()   {}
 // serialized IR form.
 type Expr interface{ expr() }
 
-// Lit is an int, text, or bool literal.
+// Lit is an int, text, bool, or float literal. A float literal (Kind
+// "float") is real only inside a proc body — internal/ir/build.go's
+// checkNoFloat rejects one everywhere else, the same way checkNoBitwise
+// rejects a bitwise operator outside a proc — see LANGUAGE.md's `proc`
+// section.
 type Lit struct {
 	Kind string
 	Val  any

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"regexp"
 	"strconv"
@@ -79,7 +80,13 @@ func (f *frame) set(name string, v any) {
 // runtime/server.go's execProcBlock/execProcLoop, the same way a `do` call's
 // own failure already does, and ends the request as a clean 5xx rather than a
 // Go panic reaching the HTTP layer.
-func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
+//
+// A Server method (not a free function, unlike eval()) because the "call"
+// case below may reach one of the I/O capability builtins (readFile/
+// writeFile/httpGet/httpPost — runtime/io.go), which need the server's
+// sandboxed data-directory root and HTTP client config; every other proc
+// builtin ignores s entirely.
+func (s *Server) evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 	if e == nil {
 		return nil, nil
 	}
@@ -89,7 +96,7 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 	case "list":
 		out := make([]any, len(e.Args))
 		for i, el := range e.Args {
-			v, err := evalInFrame(el, fr)
+			v, err := s.evalInFrame(el, fr)
 			if err != nil {
 				return nil, err
 			}
@@ -104,7 +111,7 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 		// only when it is later read or overwritten.
 		out := make(map[any]any, len(e.Args))
 		for i, valExpr := range e.Args {
-			kv, err := evalInFrame(e.Keys[i], fr)
+			kv, err := s.evalInFrame(e.Keys[i], fr)
 			if err != nil {
 				return nil, err
 			}
@@ -112,7 +119,7 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			v, err := evalInFrame(valExpr, fr)
+			v, err := s.evalInFrame(valExpr, fr)
 			if err != nil {
 				return nil, err
 			}
@@ -123,11 +130,11 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 		v, _ := fr.get(e.Name)
 		return v, nil
 	case "index":
-		obj, err := evalInFrame(e.Obj, fr)
+		obj, err := s.evalInFrame(e.Obj, fr)
 		if err != nil {
 			return nil, err
 		}
-		idxV, err := evalInFrame(e.Key, fr)
+		idxV, err := s.evalInFrame(e.Key, fr)
 		if err != nil {
 			return nil, err
 		}
@@ -164,7 +171,7 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 			return nil, fmt.Errorf("cannot index a value that is not an array or map")
 		}
 	case "un":
-		x, err := evalInFrame(e.X, fr)
+		x, err := s.evalInFrame(e.X, fr)
 		if err != nil {
 			return nil, err
 		}
@@ -172,16 +179,16 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 		case "!":
 			return !truthy(x), nil
 		case "-":
-			return -toInt(x), nil
+			return negate(x), nil
 		case "~":
 			return ^toInt(x), nil
 		}
 	case "bin":
-		l, err := evalInFrame(e.L, fr)
+		l, err := s.evalInFrame(e.L, fr)
 		if err != nil {
 			return nil, err
 		}
-		r, err := evalInFrame(e.R, fr)
+		r, err := s.evalInFrame(e.R, fr)
 		if err != nil {
 			return nil, err
 		}
@@ -189,13 +196,13 @@ func evalInFrame(e *ir.Expr, fr *frame) (any, error) {
 	case "call":
 		args := make([]any, len(e.Args))
 		for i, a := range e.Args {
-			v, err := evalInFrame(a, fr)
+			v, err := s.evalInFrame(a, fr)
 			if err != nil {
 				return nil, err
 			}
 			args[i] = v
 		}
-		return callBuiltin(e.Name, args), nil
+		return s.callProcBuiltin(e.Name, args)
 	}
 	return nil, nil
 }
@@ -549,7 +556,7 @@ func evalRest(e *ir.Expr, scope map[string]any) any {
 		case "!":
 			return !truthy(x)
 		case "-":
-			return -toInt(x)
+			return negate(x)
 		case "~":
 			return ^toInt(x)
 		}
@@ -577,17 +584,44 @@ func applyBin(op string, l, r any) any {
 		if rs, ok := r.(string); ok {
 			return toStr(l) + rs
 		}
+		if isFloatVal(l) || isFloatVal(r) {
+			return toFloat(l) + toFloat(r)
+		}
 		return toInt(l) + toInt(r)
 	case "-":
+		if isFloatVal(l) || isFloatVal(r) {
+			return toFloat(l) - toFloat(r)
+		}
 		return toInt(l) - toInt(r)
 	case "*":
+		if isFloatVal(l) || isFloatVal(r) {
+			return toFloat(l) * toFloat(r)
+		}
 		return toInt(l) * toInt(r)
 	case "/":
+		// Float division follows IEEE 754 exactly as Go's own `/` does — a
+		// finite/0 divide is +/-Inf and 0/0 is NaN, not the int-only "0"
+		// sentinel a few lines below. This is a deliberate divergence from
+		// int's zero-guard, not an oversight: int division by zero would
+		// otherwise panic (Go's own runtime behavior for integer division),
+		// which this total runtime has always caught with the 0 sentinel, but
+		// float division by zero already can't panic — Go defines it, and a
+		// real numeric algorithm (this milestone's whole reason for existing)
+		// needs to see the same Inf/NaN Go's own math package would produce
+		// for the identical expression, not a silently-substituted 0. See
+		// runtime/float_test.go's cross-check against Go's own math for why
+		// this has to match exactly.
+		if isFloatVal(l) || isFloatVal(r) {
+			return toFloat(l) / toFloat(r)
+		}
 		if toInt(r) == 0 {
 			return 0
 		}
 		return toInt(l) / toInt(r)
 	case "%":
+		// int-only (see checkNumericTypes, which refuses a float operand here
+		// at compile time in a proc body) — this int-modulo fallback is only
+		// ever reached for two genuine ints; kept exactly as it was.
 		if toInt(r) == 0 {
 			return 0
 		}
@@ -597,12 +631,24 @@ func applyBin(op string, l, r any) any {
 	case "!=":
 		return !equal(l, r)
 	case "<":
+		if isFloatVal(l) || isFloatVal(r) {
+			return toFloat(l) < toFloat(r)
+		}
 		return toInt(l) < toInt(r)
 	case "<=":
+		if isFloatVal(l) || isFloatVal(r) {
+			return toFloat(l) <= toFloat(r)
+		}
 		return toInt(l) <= toInt(r)
 	case ">":
+		if isFloatVal(l) || isFloatVal(r) {
+			return toFloat(l) > toFloat(r)
+		}
 		return toInt(l) > toInt(r)
 	case ">=":
+		if isFloatVal(l) || isFloatVal(r) {
+			return toFloat(l) >= toFloat(r)
+		}
 		return toInt(l) >= toInt(r)
 	case "in":
 		// Extends the existing array-membership operator to map key presence
@@ -684,6 +730,44 @@ func evalCall(e *ir.Expr, scope map[string]any) any {
 	return callBuiltin(e.Name, args)
 }
 
+// callProcBuiltin dispatches a proc-body builtin call, exactly like callBuiltin
+// below, except that it also recognizes the four I/O capability builtins
+// (readFile/writeFile/httpGet/httpPost — see runtime/io.go), which callBuiltin
+// itself cannot: they need the server's sandboxed data-directory root and
+// HTTP client config, and — unlike every builtin callBuiltin handles — they
+// can fail for reasons outside the program's control (missing file,
+// permission, unreachable host, non-2xx response), so this returns an error
+// where callBuiltin never does. Only evalInFrame's "call" case reaches this;
+// callBuiltin itself stays the single dispatch table for eval()/evalCall's
+// flat-scope (action/view) path, which can never be asked to run one of
+// these four (internal/ir/build.go's checkNoIO bars them from ever reaching
+// action/view/policy/derive source in the first place).
+func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
+	arg := func(i int) any {
+		if i < len(argVals) {
+			return argVals[i]
+		}
+		return nil
+	}
+	switch name {
+	case "readFile":
+		return s.ioReadFile(toStr(arg(0)))
+	case "writeFile":
+		return s.ioWriteFile(toStr(arg(0)), toStr(arg(1)))
+	case "httpGet":
+		return s.ioHTTPGet(toStr(arg(0)))
+	case "httpPost":
+		return s.ioHTTPPost(toStr(arg(0)), toStr(arg(1)))
+	case "channel":
+		return s.channels.create(), nil
+	case "send":
+		return s.channels.send(toInt(arg(0)), toStr(arg(1)))
+	case "recv":
+		return s.channels.recv(toInt(arg(0)))
+	}
+	return callBuiltin(name, argVals), nil
+}
+
 // callBuiltin dispatches a builtin over its already-evaluated arguments. Split
 // out of evalCall the same way applyBin is split out of evalRest's "bin" case:
 // evalInFrame has no flat scope map to hand eval, but a proc body may still call
@@ -705,25 +789,81 @@ func callBuiltin(name string, argVals []any) any {
 		}
 		return rand.Intn(n)
 	case "abs":
+		// Preserves whichever numeric flavour it is handed — abs(-2.5) is a
+		// float, abs(-2) is an int — matching internal/ir/build.go's
+		// inferProcType (which types abs() the same way for the compiler).
+		if isFloatVal(arg(0)) {
+			return math.Abs(toFloat(arg(0)))
+		}
 		if n := toInt(arg(0)); n < 0 {
 			return -n
 		} else {
 			return n
 		}
 	case "min":
+		// Compile time (internal/ir/build.go's checkNumericTypes) already
+		// refuses a proc calling min/max with one int and one float argument,
+		// so by the time this runs both agree — this only has to decide
+		// WHICH arithmetic to run, not reconcile a mismatch.
+		if isFloatVal(arg(0)) || isFloatVal(arg(1)) {
+			a, b := toFloat(arg(0)), toFloat(arg(1))
+			if a < b {
+				return a
+			}
+			return b
+		}
 		a, b := toInt(arg(0)), toInt(arg(1))
 		if a < b {
 			return a
 		}
 		return b
 	case "max":
+		if isFloatVal(arg(0)) || isFloatVal(arg(1)) {
+			a, b := toFloat(arg(0)), toFloat(arg(1))
+			if a > b {
+				return a
+			}
+			return b
+		}
 		a, b := toInt(arg(0)), toInt(arg(1))
 		if a > b {
 			return a
 		}
 		return b
-	case "floor", "round":
-		// integers only (no floats in the language), so these are identity.
+	case "floor":
+		// int input is unchanged (identity — this builtin's entire pre-float
+		// behavior, preserved exactly for backward compatibility: no existing
+		// .fct source could ever have passed floor() anything but an int
+		// before this milestone). A float input rounds toward negative
+		// infinity and the fractional part is genuinely gone, so the result
+		// is int-typed, not a float with a zero fraction — matching
+		// internal/ir/build.go's inferProcType ("floor/round always return
+		// int") and this milestone's stated design choice: a rounded value's
+		// declared type follows what it now IS (a whole number), the same
+		// way this language already lets a computed value's type follow its
+		// computation elsewhere (internal/ir/types.go's arith).
+		if isFloatVal(arg(0)) {
+			return int(math.Floor(toFloat(arg(0))))
+		}
+		return toInt(arg(0))
+	case "round":
+		// Round-half-away-from-zero (Go's math.Round: round(2.5) == 3,
+		// round(-2.5) == -3) — not round-half-to-even/banker's rounding.
+		// Chosen because it is Go's own math.Round semantics (this runtime's
+		// float arithmetic is defined to match Go's exactly — see applyBin's
+		// "/" case — so round() matching it too means a program can predict
+		// this builtin's answer from Go's documentation alone) and it is the
+		// convention most people mean by "round" absent a specific reason to
+		// want banker's rounding. See runtime/float_test.go for the explicit
+		// round(2.5)==3 / round(-2.5)==-3 proof. Same identity-for-int,
+		// int-typed-result-for-float shape as floor, above.
+		if isFloatVal(arg(0)) {
+			return int(math.Round(toFloat(arg(0))))
+		}
+		return toInt(arg(0))
+	case "toFloat":
+		return toFloat(arg(0))
+	case "toInt":
 		return toInt(arg(0))
 	case "money":
 		return formatMoney(toInt(arg(0)))
@@ -825,6 +965,17 @@ func litValue(e *ir.Expr) any {
 	switch e.VType {
 	case "int":
 		return toInt(e.Val)
+	case "float":
+		// A float literal's Val is already a Go float64 — the parser
+		// (internal/parser/expr.go's parseAtom) produces it via
+		// strconv.ParseFloat, and internal/ir/build.go's lower() copies it
+		// through unchanged — so this is a plain type assertion, not a
+		// conversion: there is no "numeric text" fallback the way toInt has
+		// one, because a float literal can only ever reach here already typed
+		// (checkNoFloat bars a float literal everywhere but a proc body,
+		// where every literal is compiler-generated, never boundary input).
+		f, _ := e.Val.(float64)
+		return f
 	case "bool":
 		b, _ := e.Val.(bool)
 		return b
@@ -839,6 +990,8 @@ func truthy(v any) bool {
 		return t
 	case int:
 		return t != 0
+	case float64:
+		return t != 0
 	case string:
 		return t != ""
 	// Text from a driver — empty is empty, however it arrived. See toStr.
@@ -852,6 +1005,57 @@ func truthy(v any) bool {
 		return false
 	}
 	return true
+}
+
+// isFloatVal reports whether v is a genuine runtime float value (a Go
+// float64) — applyBin's switch on this, rather than always converting both
+// operands with toInt, is what makes `+ - * / < <= > >=` compute the correct
+// float64 result for a float operand instead of silently truncating it
+// through toInt first. Compile time (checkNumericTypes) already refuses an
+// int/float mix in a proc body, so in practice both operands agree by the
+// time this runs; this is what lets the one operand that IS a float decide
+// the arithmetic even in a defensive/unchecked path.
+func isFloatVal(v any) bool { _, ok := v.(float64); return ok }
+
+// negate implements unary `-`: float-preserving for a float64 operand (so
+// `-3.14` is a float, not toInt(3.14) truncated to 0 and then negated to 0),
+// int otherwise — shared by evalInFrame's and evalRest's "un" cases so they
+// cannot disagree, the same reason applyBin is factored out for "bin".
+func negate(x any) any {
+	if isFloatVal(x) {
+		return -toFloat(x)
+	}
+	return -toInt(x)
+}
+
+// toFloat is toInt's float64 counterpart: a total conversion from whatever
+// shape a numeric value might arrive in (a proc's own float64, a Go int this
+// runtime never mixes with a float without an explicit toFloat()/toInt() —
+// see checkNumericTypes — but which a defensive runtime path may still hand
+// this, a number written as text, or the driver's []byte shape of one) to a
+// float64 — 0 for anything not interpretable as a number, the same "total,
+// never panics" stance toInt already takes.
+func toFloat(v any) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case int:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case bool:
+		if t {
+			return 1
+		}
+		return 0
+	case string:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		return f
+	case []byte:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(string(t)), 64)
+		return f
+	}
+	return 0
 }
 
 // numericText is what both interpreters accept as "a number written as text":
@@ -984,6 +1188,20 @@ func equal(a, b any) bool {
 	}
 	if ab, ok := a.(bool); ok {
 		return ab == truthy(b)
+	}
+	// A float on either side must compare as a float, not through toInt —
+	// toInt(2.5) truncates to 2, which would make 2.5 == 2 report true, the
+	// exact kind of silent lie this runtime's total conversions otherwise
+	// refuse (see internal/ir/types.go's doc on what toInt("sold out") == 0
+	// already means for text). Compile time already refuses `2.5 == 2` in a
+	// proc body (checkNumericTypes), so this branch is a defensive backstop —
+	// reached only through a path static checking couldn't see through — not
+	// the primary guard.
+	if _, ok := a.(float64); ok {
+		return toFloat(a) == toFloat(b)
+	}
+	if _, ok := b.(float64); ok {
+		return toFloat(a) == toFloat(b)
 	}
 	return toInt(a) == toInt(b)
 }

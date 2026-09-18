@@ -66,6 +66,15 @@ type procSig struct {
 	retList bool
 }
 
+// spawnedTask is procBlock's own record of one still-outstanding `spawn`
+// (Milestone 5) — the spawned proc's name (for a clear diagnostic) plus its
+// signature (so `join`'s optional bind knows what type it's receiving),
+// keyed by handle name in pendingSpawns.
+type spawnedTask struct {
+	proc string
+	sig  procSig
+}
+
 // opRet is a service operation's declared return type ("" core = no return).
 type opRet struct {
 	ret  string
@@ -185,6 +194,9 @@ func Build(app *ast.App) (*IR, error) {
 			if _, dup := fields[f.Name]; dup {
 				return nil, &BuildError{f.Line, fmt.Sprintf("record %q has duplicate field %q", rc.Name, f.Name)}
 			}
+			if f.Type == "float" {
+				return nil, &BuildError{f.Line, fmt.Sprintf("record field %q: float is only supported inside a proc body (a parameter, a `let`/`let mut` local, or a return type) — not yet in a record, which a service reply may carry across the wire", f.Name)}
+			}
 			// A record is flat: its field is a primitive or an enum, never another
 			// record or an entity — so `v.field` is always a single-level, typed read.
 			if !isPrimitive(f.Type) {
@@ -230,6 +242,8 @@ func Build(app *ast.App) (*IR, error) {
 			wf.Default = *f.Default
 		}
 		switch {
+		case f.Type == "float":
+			return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q: float is only supported inside a proc body — not yet on a wire type/message, which has no float encoding", declName, f.Name)}
 		case f.Type == "json", f.Type == "number", isPrimitive(f.Type):
 			// inline scalar
 		case wireNames[f.Type]:
@@ -433,6 +447,10 @@ func Build(app *ast.App) (*IR, error) {
 				}
 				continue
 			}
+			if f.Type == "float" {
+				return nil, &BuildError{0, fmt.Sprintf(
+					"field %q: float is only supported inside a proc body (a parameter, a `let`/`let mut` local, or a return type) — not yet on an entity, which has no database column type for it", f.Name)}
+			}
 			if !e.entities[f.Type] {
 				return nil, &BuildError{0, fmt.Sprintf(
 					"field %q has unknown type %q (use int, text, bool, or an entity name)", f.Name, f.Type)}
@@ -471,6 +489,9 @@ func Build(app *ast.App) (*IR, error) {
 		core := s.Type
 		if s.List {
 			core = s.Elem
+		}
+		if core == "float" {
+			return nil, &BuildError{s.Line, fmt.Sprintf("state %q: float is only supported inside a proc body (a parameter, a `let`/`let mut` local, or a return type) — not yet on state, which has no client-side (assets/facet.js) representation for it", s.Name)}
 		}
 		if !isPrimitive(core) {
 			if _, isEnum := e.enums[core]; !isEnum {
@@ -657,6 +678,9 @@ func Build(app *ast.App) (*IR, error) {
 				return nil, &BuildError{cm.Line, fmt.Sprintf("component %q has duplicate parameter %q", cm.Name, p.Name)}
 			}
 			pseen[p.Name] = true
+			if p.Type == "float" {
+				return nil, &BuildError{cm.Line, fmt.Sprintf("component %q parameter %q: float is only supported inside a proc body — not yet on a component parameter, which assets/facet.js may also have to render", cm.Name, p.Name)}
+			}
 			// A cell parameter names a state cell, so its declared type is the cell's
 			// type and must be one the language has.
 			if p.Ref == ast.RefCell && !isPrimitive(p.Type) {
@@ -748,6 +772,9 @@ func Build(app *ast.App) (*IR, error) {
 			// A declared return type must resolve: a primitive, an enum, or a record
 			// (the structured-reply case). A bare capitalized name the parser accepted
 			// is only valid here if it names a real record/enum.
+			if op.Ret == "float" {
+				return nil, &BuildError{op.Line, fmt.Sprintf("%s.%s: float is only supported inside a proc body — a service op cannot return one, since its JSON reply crosses the wire and a `let`-bound service result is usable from an action, which floats are not", sv.Name, op.Name)}
+			}
 			if op.Ret != "" && !isPrimitive(op.Ret) {
 				_, isEnum := e.enums[op.Ret]
 				_, isRec := e.records[op.Ret]
@@ -785,12 +812,30 @@ func Build(app *ast.App) (*IR, error) {
 		if _, dup := e.services[p.Name]; dup {
 			return nil, &BuildError{p.Line, fmt.Sprintf("proc %q collides with a service name", p.Name)}
 		}
-		if p.Ret != "" && !isPrimitive(p.Ret) {
+		// A proc's return type may additionally be "float" — the one type
+		// position in the language where float is real (see isPrimitive's doc
+		// and LANGUAGE.md's `proc` section): a proc is unconditionally
+		// server-executed, so it has no client mirror to disagree with.
+		if p.Ret != "" && p.Ret != "float" && !isPrimitive(p.Ret) {
 			_, isEnum := e.enums[p.Ret]
 			_, isRec := e.records[p.Ret]
 			if !isEnum && !isRec {
 				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q returns unknown type %q", p.Name, p.Ret)}
 			}
+		}
+		// A `uses` clause may only name a capability the runtime actually
+		// implements (see knownCapabilities) — a typo here (`uses io.fiel`)
+		// would otherwise compile clean and simply never satisfy
+		// checkProcCapabilities, an unhelpful way to discover it.
+		seenUse := map[string]bool{}
+		for _, u := range p.Uses {
+			if !knownCapabilities[u] {
+				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q declares unknown capability %q — known capabilities: io.file, io.net", p.Name, u)}
+			}
+			if seenUse[u] {
+				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q declares capability %q more than once", p.Name, u)}
+			}
+			seenUse[u] = true
 		}
 		e.procSigs[p.Name] = procSig{params: p.Params, ret: p.Ret, retList: p.RetList}
 	}
@@ -1574,6 +1619,24 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	paramSet := map[string]bool{}   // this action's parameter names
 	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true, "session": true}
 	for _, p := range a.Params {
+		// An action's parameter arrives over HTTP (a form post, a JSON body, a
+		// route parameter) and its value is then a plain reference usable
+		// anywhere in the body — checkNoFloat (called from check(), below)
+		// only catches a float LITERAL or a toFloat() call by its syntactic
+		// shape, not a reference to a parameter that merely happens to be
+		// float-typed, so that path has to be closed here instead, at the
+		// one place an action's own parameter list is built. (Every other
+		// scalar type is unvalidated here today — a pre-existing gap outside
+		// this feature's scope — but float specifically needs its own gate:
+		// unlike a bogus/unknown type name, which coerce/coerceParam already
+		// handle by leaving the value untouched, "float" is a type this
+		// runtime DOES know how to coerce (coerce's own "float" case), so
+		// without this check a float-typed action parameter would silently
+		// work at the boundary and only misbehave later, e.g. `text "{x}"`
+		// truncating it via toStr's float64 case.)
+		if p.Type == "float" {
+			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q parameter %q: float is only supported inside a proc body — not yet on an action parameter, which arrives from an HTTP request and may be re-evaluated by the client", a.Name, p.Name)}
+		}
 		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type})
 		loc[p.Name] = true
 		paramSet[p.Name] = true
@@ -1899,6 +1962,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				if sig.ret == "" {
 					return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type (`proc %s(...) -> Type`) to bind it", st.Proc, st.Proc)}
 				}
+				if sig.ret == "float" {
+					return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q returns float, which is only usable inside another proc — an action cannot bind it (no client-side representation exists for a float; see LANGUAGE.md's `proc` section). Convert it inside the proc first (e.g. `return round(x)`) and give %q an int/text/bool/money/date return type instead", st.Proc, st.Proc)}
+				}
 				if loc[st.Bind] {
 					return Action{}, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
 				}
@@ -2161,6 +2227,43 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 	locals = cloneNameSet(locals)
 	mutable = cloneNameSet(mutable)
 	types = cloneTypeMap(types)
+	// pendingSpawns is checkSpawnsJoined's own state: every `spawn`-bound
+	// handle declared IN THIS EXACT BLOCK that hasn't been `join`ed yet,
+	// keyed by handle name to the spawned proc's signature (join needs it to
+	// type its bound result). Deliberately NOT cloned/threaded like locals/
+	// mutable/types above — a handle's whole lifetime (spawn to join) must
+	// fit inside one statement list, never spanning into or out of a nested
+	// loop/if block, so each procBlock call starts this fresh and checks it
+	// empty before returning. See ast.Spawn's doc for why "same block" is
+	// this milestone's chosen structured-concurrency enforcement boundary.
+	pendingSpawns := map[string]spawnedTask{}
+	// noPendingSpawns is checked before any statement that can transfer
+	// control non-sequentially (if/loop/break/continue/return): every one of
+	// those can — on some path, however deeply nested inside it — skip
+	// straight over the rest of this block (a `return` unwinds the whole
+	// proc; even a one-armed `if` with no `return` inside it can still run
+	// zero or one of two different continuations). A join sitting later in
+	// this same block only actually guarantees the goroutine is waited on if
+	// every statement between the spawn and it is guaranteed to run — so
+	// once a spawn is outstanding, the only statements allowed before its
+	// join are ones that cannot skip ahead (let/assign/indexset/do/exprstmt/
+	// another spawn/another join). This is more conservative than strictly
+	// necessary (see stmtsReturnComplete's own doc for this codebase's
+	// standing preference for a simple, provably sound rule over a precise
+	// one) but it is what makes "spawn, then join before this block ends"
+	// airtight rather than just usually true.
+	noPendingSpawns := func(line int, what string) error {
+		if len(pendingSpawns) == 0 {
+			return nil
+		}
+		names := make([]string, 0, len(pendingSpawns))
+		for n := range pendingSpawns {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		return &BuildError{line, fmt.Sprintf(
+			"proc %q has a spawned task handle %q still unjoined — `join %s` before %s can run, since %s might exit this block before the join is reached", p.Name, names[0], names[0], what, what)}
+	}
 	var out []Stmt
 	for i, s := range stmts {
 		last := i == len(stmts)-1
@@ -2169,7 +2272,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if locals[st.Name] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is already declared in proc %q", st.Name, p.Name)}
 			}
-			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			locals[st.Name] = true
@@ -2189,7 +2292,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if !mutable[st.Target] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to reassign it", st.Target, st.Target)}
 			}
-			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
@@ -2213,10 +2316,10 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if ty := types[st.Target]; ty != "" && ty != arrayType && ty != bytesType && ty != mapType {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not an array or map (its type is %s) — index assignment (`%s[...] = …`) needs an array, map, or byte-buffer local", st.Target, ty, st.Target)}
 			}
-			if err := e.checkProcExpr(st.Index, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Index, locals, types, st.Line); err != nil {
 				return nil, err
 			}
-			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			// The key-type restriction (int/text only) applies to a map SET too —
@@ -2252,7 +2355,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			ds := Stmt{Op: "do", Service: st.Proc}
 			for _, arg := range st.Args {
-				if err := e.checkProcExpr(arg, locals, types, st.Line); err != nil {
+				if err := e.checkProcExpr(p, arg, locals, types, st.Line); err != nil {
 					return nil, err
 				}
 				ds.Args = append(ds.Args, e.low(arg))
@@ -2271,8 +2374,84 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				ds.RetList = sig.retList
 			}
 			out = append(out, ds)
+		case ast.Spawn:
+			// `let h = spawn ProcName(args)` — parseProcBody guarantees Bind is
+			// never "" (spawn has no fire-and-forget form; see ast.Spawn's doc),
+			// so this is `do`'s own arity/argument checking plus: the handle is
+			// tagged taskType (never a real value — see checkNoTaskUse) instead
+			// of the proc's return type, and recorded in pendingSpawns so this
+			// exact block is checked, before it ends, to have joined it.
+			sig, ok := e.procSigs[st.Proc]
+			if !ok {
+				return nil, &BuildError{st.Line, fmt.Sprintf("spawn calls unknown proc %q", st.Proc)}
+			}
+			if len(st.Args) != len(sig.params) {
+				return nil, &BuildError{st.Line, fmt.Sprintf("proc %q expects %d argument(s), got %d", st.Proc, len(sig.params), len(st.Args))}
+			}
+			sp := Stmt{Op: "spawn", Target: st.Bind, Service: st.Proc}
+			for _, arg := range st.Args {
+				if err := e.checkProcExpr(p, arg, locals, types, st.Line); err != nil {
+					return nil, err
+				}
+				sp.Args = append(sp.Args, e.low(arg))
+			}
+			if locals[st.Bind] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the spawned task handle", st.Bind)}
+			}
+			locals[st.Bind] = true
+			types[st.Bind] = taskType
+			pendingSpawns[st.Bind] = spawnedTask{proc: st.Proc, sig: sig}
+			out = append(out, sp)
+		case ast.Join:
+			// `join h` / `let r = join h` — consumes a handle pendingSpawns is
+			// tracking for THIS block. Three distinct failure shapes, each with
+			// its own message: never declared at all, declared but not a task
+			// handle (a plain local reused by mistake), and a real handle that
+			// either isn't pending in this block (already joined here, or —
+			// impossible to write given checkNoTaskUse plus the scoping rules,
+			// but checked anyway — spawned in a different block).
+			if !locals[st.Handle] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("join of undeclared local %q — expected a handle from `let %s = spawn ProcName(args)`", st.Handle, st.Handle)}
+			}
+			if types[st.Handle] != taskType {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not a spawned task handle — join needs a `let h = spawn ProcName(args)` result", st.Handle)}
+			}
+			task, ok := pendingSpawns[st.Handle]
+			if !ok {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q was already joined — a task handle can only be joined once, and only in the same block it was spawned in", st.Handle)}
+			}
+			delete(pendingSpawns, st.Handle)
+			js := Stmt{Op: "join", Target: st.Handle}
+			if st.Bind != "" {
+				if locals[st.Bind] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the joined result", st.Bind)}
+				}
+				if task.sig.ret == "" {
+					return nil, &BuildError{st.Line, fmt.Sprintf("spawned proc %q returns nothing — declare a return type to bind its joined result", task.proc)}
+				}
+				locals[st.Bind] = true
+				types[st.Bind] = task.sig.ret
+				js.Bind = st.Bind
+				js.Ret = task.sig.ret
+				js.RetList = task.sig.retList
+			}
+			out = append(out, js)
+		case ast.ExprStmt:
+			// A bare builtin call for its side effect alone (writeFile/httpPost/
+			// …), result discarded — `do`'s counterpart for a builtin instead of
+			// a proc (see ast.ExprStmt's doc). checkProcExpr covers everything a
+			// call needs checked: known-builtin/arity (checkBuiltins), and —
+			// since this is exactly the position a capability-gated builtin is
+			// used for its effect rather than its value — the capability check.
+			if err := e.checkProcExpr(p, st.Call, locals, types, st.Line); err != nil {
+				return nil, err
+			}
+			out = append(out, Stmt{Op: "exprstmt", Value: e.low(st.Call)})
 		case ast.Loop:
-			if err := e.checkProcExpr(st.Cond, locals, types, st.Line); err != nil {
+			if err := noPendingSpawns(st.Line, "a loop"); err != nil {
+				return nil, err
+			}
+			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			kids, err := e.procBlock(p, st.Body, locals, mutable, types, loopDepth+1)
@@ -2281,7 +2460,10 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "loop", Value: e.low(st.Cond), Body: kids})
 		case ast.IfStmt:
-			if err := e.checkProcExpr(st.Cond, locals, types, st.Line); err != nil {
+			if err := noPendingSpawns(st.Line, "an if"); err != nil {
+				return nil, err
+			}
+			if err := e.checkProcExpr(p, st.Cond, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			then, err := e.procBlock(p, st.Then, locals, mutable, types, loopDepth)
@@ -2297,6 +2479,9 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "if", Value: e.low(st.Cond), Body: then, Else: els})
 		case ast.Break:
+			if err := noPendingSpawns(st.Line, "break"); err != nil {
+				return nil, err
+			}
 			if loopDepth == 0 {
 				return nil, &BuildError{st.Line, fmt.Sprintf("break outside a loop in proc %q", p.Name)}
 			}
@@ -2305,6 +2490,9 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "break"})
 		case ast.Continue:
+			if err := noPendingSpawns(st.Line, "continue"); err != nil {
+				return nil, err
+			}
 			if loopDepth == 0 {
 				return nil, &BuildError{st.Line, fmt.Sprintf("continue outside a loop in proc %q", p.Name)}
 			}
@@ -2313,6 +2501,9 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			}
 			out = append(out, Stmt{Op: "continue"})
 		case ast.Return:
+			if err := noPendingSpawns(st.Line, "return"); err != nil {
+				return nil, err
+			}
 			if !last {
 				return nil, &BuildError{st.Line, "return must be the last statement of its block"}
 			}
@@ -2326,13 +2517,27 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if st.Value == nil {
 				return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, so `return` needs a value", p.Name, p.Ret)}
 			}
-			if err := e.checkProcExpr(st.Value, locals, types, st.Line); err != nil {
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line); err != nil {
 				return nil, err
 			}
 			out = append(out, Stmt{Op: "return", Value: e.low(st.Value)})
 		default:
 			return nil, &BuildError{p.Line, fmt.Sprintf("unsupported statement in proc %q", p.Name)}
 		}
+	}
+	// checkSpawnsJoined's backstop: every per-statement noPendingSpawns guard
+	// above catches a spawn left outstanding across an if/loop/break/continue/
+	// return, but a block that spawns and then simply ENDS — no further
+	// statement of any kind, so no guard ever ran — needs its own check here,
+	// once, after every statement in it has been processed.
+	if len(pendingSpawns) > 0 {
+		names := make([]string, 0, len(pendingSpawns))
+		for n := range pendingSpawns {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		return nil, &BuildError{p.Line, fmt.Sprintf(
+			"proc %q spawns a task into %q but never joins it in the same block — every spawn must be joined with `join %s` before this block ends", p.Name, names[0], names[0])}
 	}
 	return out, nil
 }
@@ -2384,9 +2589,12 @@ func stmtsReturnComplete(body []Stmt) bool {
 // checkProcExpr's own addition on top of what action/view checking does,
 // because only a proc body has any static type information to check against
 // (see checkBitwiseTypes). checkProcExpr deliberately does NOT call check()
-// (the action/view funnel that runs checkNoBitwise): a proc is where bitwise
-// operators are allowed.
-func (e *env) checkProcExpr(ex ast.Expr, locals map[string]bool, types map[string]string, line int) error {
+// (the action/view funnel that runs checkNoBitwise/checkNoIO): a proc is
+// where bitwise operators and the I/O builtins are allowed — subject to
+// checkProcCapabilities, below, which is this function's own funnel for the
+// I/O capability system (p is threaded through only for that: its name, for
+// the diagnostic, and its declared `uses` set).
+func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, types map[string]string, line int) error {
 	for n := range freeNames(ex) {
 		if !locals[n] {
 			return &BuildError{line, fmt.Sprintf(
@@ -2402,7 +2610,16 @@ func (e *env) checkProcExpr(ex ast.Expr, locals map[string]bool, types map[strin
 	if err := checkIndexTypes(ex, types, line); err != nil {
 		return err
 	}
-	return checkMapKeyTypes(ex, types, line)
+	if err := checkNumericTypes(ex, types, line); err != nil {
+		return err
+	}
+	if err := checkMapKeyTypes(ex, types, line); err != nil {
+		return err
+	}
+	if err := checkNoTaskUse(ex, types, line); err != nil {
+		return err
+	}
+	return checkProcCapabilities(p, ex, line)
 }
 
 // arrayType is inferProcType/checkIndexTypes's type tag for an array-valued
@@ -2442,6 +2659,20 @@ const bytesType = "bytes"
 // catch the statically-provable cases before that.
 const mapType = "map"
 
+// taskType is inferProcType/checkNoTaskUse's type tag for a `spawn`-bound
+// task handle (Milestone 5: structured concurrency) — the local a `let h =
+// spawn ProcName(args)` statement declares. Unlike arrayType/bytesType/
+// mapType, which describe real values a proc may compute with, a task
+// handle is deliberately NOT a value at all from the type checker's point of
+// view: it exists purely to be consumed by exactly one `join`, so
+// checkNoTaskUse refuses it everywhere else (arithmetic, an argument, a
+// return, a container element — anything but a bare `join h`). This is what
+// makes the enforcement in checkSpawnsJoined (see procBlock) sound: since a
+// handle can never be copied, aliased, stashed in an array, or passed to
+// another proc, the only way to ever "do something" with one is the single
+// `join` procBlock is already watching for.
+const taskType = "task"
+
 // inferProcType statically infers the type of an expression inside a proc
 // body from literal kinds and the declared/inferred types of the locals it
 // names — "" when it cannot be determined (an unknown, not an error). It is
@@ -2452,6 +2683,14 @@ const mapType = "map"
 // unchecked) whenever it isn't sure, the same stance every other static check
 // in this builder takes: flag what can be proven wrong, stay silent on what
 // can't be proven either way.
+//
+// A float literal's Kind is already "float" (ast.Lit's t.Kind case handles it
+// for free, same as "int"/"text"/"bool"), so every one of the numeric cases
+// below has to say explicitly which of int/float it accepts and produces —
+// there is no automatic int/float promotion in this language (see
+// checkNumericTypes), so `int op float` is never one of the cases that
+// produces a type here: it is a compile error checkNumericTypes raises before
+// inferProcType's answer would ever be used for it.
 func inferProcType(ex ast.Expr, types map[string]string) string {
 	switch t := ex.(type) {
 	case ast.Lit:
@@ -2463,11 +2702,56 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 	case ast.Ref:
 		return types[t.Name]
 	case ast.Call:
-		if t.Name == "append" {
+		switch t.Name {
+		case "append":
 			return arrayType
-		}
-		if t.Name == "bytes" {
+		case "bytes":
 			return bytesType
+		case "readFile", "httpGet", "httpPost":
+			return "text"
+		case "channel":
+			// A channel value is, deliberately, just an int handle — see
+			// runtime/channel.go's doc for why that needs no new type anywhere
+			// in this type system at all (a channel can be a proc parameter,
+			// a `let` local, an array element... simply by already being int).
+			return "int"
+		case "recv":
+			return "text" // channels are text-only in this milestone — see LANGUAGE.md
+		case "send":
+			return "bool"
+		case "writeFile":
+			// true on success — a failure (missing dir, permission, disk full)
+			// never reaches here at all: it is a runtime error that aborts the
+			// proc, the same "clean error, not a silent wrong answer" stance an
+			// out-of-bounds array read already takes (see runtime/io.go).
+			return "bool"
+		case "toFloat":
+			return "float"
+		case "toInt", "floor", "round":
+			// floor/round always return int — see runtime/eval.go's callBuiltin
+			// doc for why a rounded value is int-typed regardless of whether the
+			// input was int (identity, preserving this builtin's pre-float
+			// behavior) or float (the fractional part is genuinely gone).
+			return "int"
+		case "abs":
+			// abs preserves whichever numeric flavour it was handed (int stays
+			// int, float stays float) — unlike floor/round, it never changes
+			// whether the value has a fractional part.
+			if len(t.Args) == 1 {
+				if at := inferProcType(t.Args[0], types); at == "int" || at == "float" {
+					return at
+				}
+			}
+		case "min", "max":
+			// Preserve the flavour only when both arguments already agree —
+			// same reasoning as abs. A provable int/float mismatch is a
+			// compile error raised by checkNumericTypes, not answered here.
+			if len(t.Args) == 2 {
+				at, bt := inferProcType(t.Args[0], types), inferProcType(t.Args[1], types)
+				if at == bt && (at == "int" || at == "float") {
+					return at
+				}
+			}
 		}
 	case ast.Un:
 		switch t.Op {
@@ -2484,8 +2768,8 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return "int"
 		case "+":
 			// `+` also concatenates text (see applyBin in runtime/eval.go); only
-			// call the result "int" when neither side could be text, otherwise
-			// stay unknown rather than guess.
+			// call the result "int"/"float" when neither side could be text,
+			// otherwise stay unknown rather than guess.
 			lt, rt := inferProcType(t.L, types), inferProcType(t.R, types)
 			if lt == "text" || rt == "text" {
 				return "text"
@@ -2493,7 +2777,20 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			if lt == "int" && rt == "int" {
 				return "int"
 			}
-		case "-", "*", "/", "%":
+			if lt == "float" && rt == "float" {
+				return "float"
+			}
+		case "-", "*", "/":
+			lt, rt := inferProcType(t.L, types), inferProcType(t.R, types)
+			if lt == "int" && rt == "int" {
+				return "int"
+			}
+			if lt == "float" && rt == "float" {
+				return "float"
+			}
+		case "%":
+			// int-only (see checkNumericTypes) — a float operand here is
+			// already a compile error, so this case never needs a float branch.
 			if lt, rt := inferProcType(t.L, types), inferProcType(t.R, types); lt == "int" && rt == "int" {
 				return "int"
 			}
@@ -2511,13 +2808,24 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 // *declared* type in this list: bit-shifting a monetary amount is a silent
 // unit error even though the machine would happily compute an answer, and
 // this check runs at compile time against the declared type, not the runtime
-// value, so it can catch that where a runtime type switch could not.
+// value, so it can catch that where a runtime type switch could not. `float`
+// is refused for a sharper reason than `money`: it is a genuinely different
+// runtime representation (a Go `float64`, not an `int`), so `~`/`<<`/etc.
+// could not even be computed on one without first truncating it — there is
+// no "silent unit error" reading to have an opinion about, it is simply not
+// an integer.
 func isIntType(t string) bool { return t == "" || t == "int" }
 
 // isMapKeyType reports whether t is a legal map-key type under this
 // milestone's restriction (see ast.MapLit's doc): int or text, the two
 // scalar types with obvious, unambiguous equality/hashing — never bool,
-// money, date, array, map, or bytes. "" (unknown — inferProcType could not
+// money, date, array, map, or bytes. `float` is refused for the same reason
+// bool/money/date are — no good equality/hashing story (a Go float64 is a
+// famously bad map/hash key: 0.1+0.2 != 0.3) — and additionally, unlike
+// bool/money/date, has a genuinely different runtime representation (a
+// float64 alongside int's int) that mapKey (runtime/eval.go) has no case for
+// at all, so an unchecked float key would be a runtime error there rather
+// than a silently wrong answer. "" (unknown — inferProcType could not
 // determine it, e.g. a proc parameter or a `do`-bound result) is treated as
 // legal here, the same "stay silent on what can't be proven" stance every
 // other static check in this builder takes; runtime/eval.go's mapKey is the
@@ -2582,6 +2890,116 @@ func checkBitwiseTypes(ex ast.Expr, types map[string]string, line int) error {
 			return err
 		}
 		return checkBitwiseTypes(t.Idx, types, line)
+	}
+	return nil
+}
+
+// isNumericFlavor reports whether t is one of the two numeric flavours this
+// language's `float` design distinguishes: "int" or "float". Anything
+// else — "text", "bool", the composite tags (arrayType/bytesType/mapType), or
+// "" (unknown) — is not, and checkNumericTypes leaves those alone entirely
+// (an existing, non-float type mismatch, e.g. int + bool, is a pre-existing
+// gap this milestone does not newly police — see checkNumericTypes's doc).
+func isNumericFlavor(t string) bool { return t == "int" || t == "float" }
+
+// checkNumericTypes is checkBitwiseTypes's counterpart for `+ - * / %` and the
+// six comparison operators (`== != < <= > >=`): it rejects an int operand
+// against a float one (in either order), the language's one hard rule about
+// the two numeric types (see LANGUAGE.md's `proc` section and this file's
+// float design note above isPrimitive).
+//
+// This language's only sanctioned widening is int/money/date's shared
+// int-representation identity and the "anything converts to text" rule
+// (internal/ir/types.go's doc) — never a genuine cross-representation
+// promotion, since int is a Go `int` and float is a Go `float64`, distinct
+// machine representations with no single obviously-correct implicit
+// direction. So `1 + 2.5` is a compile error here, not a silently-promoted
+// 3.5 — the same "flag what can be proven wrong" stance checkBitwiseTypes
+// already takes for a bitwise operand, applied to the boundary this
+// milestone actually introduces. `toFloat`/`toInt` make the conversion
+// explicit wherever a program genuinely needs to cross it.
+//
+// `+` keeps its existing text-concatenation exception (see inferProcType):
+// the check only fires when NEITHER side could be text. `%` is int-only
+// outright (see runtime/eval.go's applyBin) — a float on either side of it is
+// rejected regardless of what the other side is, matching this milestone's
+// design decision that a fractional modulus is a compile-time error, not a
+// runtime one (LANGUAGE.md's `proc` section).
+//
+// Only the shapes that provably disagree are rejected: when either operand's
+// type can't be inferred (e.g. it flows through a `do`-bound call whose
+// result inferProcType cannot see through, or a proc parameter — no, proc
+// parameters ARE typed, but a nested unanalyzable expression still can be —
+// "" from inferProcType), this stays silent, the same "stay silent on what
+// can't be proven" stance every other static check in this builder takes;
+// runtime/eval.go's applyBin is written to still behave sensibly (never
+// panic) if a mismatch nonetheless reaches it.
+func checkNumericTypes(ex ast.Expr, types map[string]string, line int) error {
+	mismatch := func(op, lt, rt string) error {
+		return &BuildError{line, fmt.Sprintf(
+			"%s needs matching numeric types; left is %s, right is %s — there is no automatic int/float promotion, convert one side explicitly with toFloat()/toInt()", op, lt, rt)}
+	}
+	switch t := ex.(type) {
+	case ast.Bin:
+		switch t.Op {
+		case "%":
+			lt, rt := inferProcType(t.L, types), inferProcType(t.R, types)
+			if lt == "float" {
+				return &BuildError{line, "% needs int operands; left side is float (% is int-only — there is no fractional modulus in this language)"}
+			}
+			if rt == "float" {
+				return &BuildError{line, "% needs int operands; right side is float (% is int-only — there is no fractional modulus in this language)"}
+			}
+		case "+":
+			lt, rt := inferProcType(t.L, types), inferProcType(t.R, types)
+			if lt != "text" && rt != "text" && isNumericFlavor(lt) && isNumericFlavor(rt) && lt != rt {
+				return mismatch(t.Op, lt, rt)
+			}
+		case "-", "*", "/", "==", "!=", "<", "<=", ">", ">=":
+			lt, rt := inferProcType(t.L, types), inferProcType(t.R, types)
+			if isNumericFlavor(lt) && isNumericFlavor(rt) && lt != rt {
+				return mismatch(t.Op, lt, rt)
+			}
+		}
+		if err := checkNumericTypes(t.L, types, line); err != nil {
+			return err
+		}
+		return checkNumericTypes(t.R, types, line)
+	case ast.Un:
+		return checkNumericTypes(t.X, types, line)
+	case ast.Call:
+		if (t.Name == "min" || t.Name == "max") && len(t.Args) == 2 {
+			at, bt := inferProcType(t.Args[0], types), inferProcType(t.Args[1], types)
+			if isNumericFlavor(at) && isNumericFlavor(bt) && at != bt {
+				return &BuildError{line, fmt.Sprintf(
+					"%s needs matching numeric types; got %s and %s — there is no automatic int/float promotion, convert one side explicitly with toFloat()/toInt()", t.Name, at, bt)}
+			}
+		}
+		for _, a := range t.Args {
+			if err := checkNumericTypes(a, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkNumericTypes(el, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := checkNumericTypes(k, types, line); err != nil {
+				return err
+			}
+			if err := checkNumericTypes(t.Vals[i], types, line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if err := checkNumericTypes(t.Obj, types, line); err != nil {
+			return err
+		}
+		return checkNumericTypes(t.Idx, types, line)
 	}
 	return nil
 }
@@ -2699,6 +3117,60 @@ func checkMapKeyTypes(ex ast.Expr, types map[string]string, line int) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// checkNoTaskUse walks a proc expression for a bare reference to a `spawn`-
+// bound task handle (types[name] == taskType) used anywhere but the one place
+// a handle is allowed to appear: as `join h`'s Handle field, which is a plain
+// string carried on the Join statement, never an ast.Expr — so it never
+// reaches this walk at all. Every other appearance (an arithmetic operand, a
+// `do`/`spawn` argument, a `return`, an array/map element, a plain `let` copy)
+// is refused: this is what makes checkSpawnsJoined's "must join in this same
+// block" rule airtight (see procBlock) — a handle can never be smuggled out
+// through an alias, an argument, or a container, so the only way to ever
+// observe it again is the `join` procBlock is already watching for.
+func checkNoTaskUse(ex ast.Expr, types map[string]string, line int) error {
+	switch t := ex.(type) {
+	case ast.Ref:
+		if types[t.Name] == taskType {
+			return &BuildError{line, fmt.Sprintf(
+				"%q is a spawned task handle — it can only be consumed by `join %s`, not used as a value", t.Name, t.Name)}
+		}
+	case ast.Bin:
+		if err := checkNoTaskUse(t.L, types, line); err != nil {
+			return err
+		}
+		return checkNoTaskUse(t.R, types, line)
+	case ast.Un:
+		return checkNoTaskUse(t.X, types, line)
+	case ast.Call:
+		for _, a := range t.Args {
+			if err := checkNoTaskUse(a, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkNoTaskUse(el, types, line); err != nil {
+				return err
+			}
+		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := checkNoTaskUse(k, types, line); err != nil {
+				return err
+			}
+			if err := checkNoTaskUse(t.Vals[i], types, line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if err := checkNoTaskUse(t.Obj, types, line); err != nil {
+			return err
+		}
+		return checkNoTaskUse(t.Idx, types, line)
 	}
 	return nil
 }
@@ -4056,6 +4528,15 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 	if err := checkNoIndex(ex, line); err != nil {
 		return err
 	}
+	if err := checkNoFloat(ex, line); err != nil {
+		return err
+	}
+	if err := checkNoIO(ex, line); err != nil {
+		return err
+	}
+	if err := checkNoConcurrency(ex, line); err != nil {
+		return err
+	}
 	for n := range freeNames(ex) {
 		if !e.resolves(n, locals) {
 			return &BuildError{line, fmt.Sprintf("unknown reference %q", n)}
@@ -4189,6 +4670,218 @@ func checkNoIndex(ex ast.Expr, line int) error {
 			return err
 		}
 		return checkNoIndex(t.Sel, line)
+	}
+	return nil
+}
+
+// checkNoFloat rejects a float literal (`3.14`) or a `toFloat(...)` call
+// anywhere outside a proc body, the same way checkNoBitwise rejects a bitwise
+// operator there and for the same underlying reason: a float value has
+// exactly one interpreter today, runtime/eval.go's applyBin/evalInFrame/
+// callBuiltin, which only ever runs on the server — assets/facet.js has no
+// float-typed state, no wire encoding for one, and would either silently
+// truncate it (toStr's existing float64 case, kept for an unrelated reason —
+// see its doc) or diverge outright. An action or view expression may be
+// placed on, or re-evaluated by, the client, so a float reaching one there
+// would be exactly the kind of server/browser disagreement checkNoBitwise
+// already exists to rule out for bitwise operators.
+//
+// This is a syntactic barrier (like checkNoBitwise/checkNoIndex), not a
+// value-flow one: it stops a float from ever being *written* into
+// action/view/policy/derive source, which combined with the proc-return
+// check in action() (an action's `do` cannot bind a float-returning proc's
+// result — see its own doc) means a float value can never reach eval()'s flat
+// scope map at all. checkProcExpr (proc bodies) never calls check(), so a
+// proc may use float literals and toFloat() freely.
+func checkNoFloat(ex ast.Expr, line int) error {
+	switch t := ex.(type) {
+	case ast.Lit:
+		if t.Kind == "float" {
+			return &BuildError{line, "a float literal is only available inside a proc — a proc always runs on the server, but this expression may run on the client too, and the client has no float representation (see LANGUAGE.md's `proc` section)"}
+		}
+	case ast.Call:
+		if t.Name == "toFloat" {
+			return &BuildError{line, "toFloat(...) is only available inside a proc — it produces a float, which is only available inside a proc (see LANGUAGE.md's `proc` section)"}
+		}
+		for _, a := range t.Args {
+			if err := checkNoFloat(a, line); err != nil {
+				return err
+			}
+		}
+	case ast.Bin:
+		if err := checkNoFloat(t.L, line); err != nil {
+			return err
+		}
+		return checkNoFloat(t.R, line)
+	case ast.Un:
+		return checkNoFloat(t.X, line)
+	case ast.Get:
+		return checkNoFloat(t.Obj, line)
+	case ast.EntityGet:
+		return checkNoFloat(t.Key, line)
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkNoFloat(el, line); err != nil {
+				return err
+			}
+		}
+	case ast.MapLit:
+		// Reachable only via checkNoIndex's own error for the map literal
+		// itself; walked anyway so a float nested inside one that somehow got
+		// this far is still caught, the same defensive-depth stance
+		// checkNoBitwise takes for the same node kind.
+		for i, k := range t.Keys {
+			if err := checkNoFloat(k, line); err != nil {
+				return err
+			}
+			if err := checkNoFloat(t.Vals[i], line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if err := checkNoFloat(t.Obj, line); err != nil {
+			return err
+		}
+		return checkNoFloat(t.Idx, line)
+	case ast.Agg:
+		if err := checkNoFloat(t.Where, line); err != nil {
+			return err
+		}
+		return checkNoFloat(t.Sel, line)
+	}
+	return nil
+}
+
+// ioBuiltins is the set of capability-gated I/O builtins (see builtinCapability)
+// — proc-only, the same way bitwise operators and float are, and for the same
+// underlying reason (checkNoBitwise/checkNoFloat's docs): each has exactly one
+// interpreter, runtime/io.go, which only ever runs on the server inside a
+// proc's own frame (runtime/eval.go's evalInFrame), so an action/view/policy/
+// derive expression — which may be placed on or re-evaluated by the client —
+// must never be able to write one into source at all. checkNoIO is the
+// syntactic barrier that guarantees that, exactly mirroring checkNoBitwise/
+// checkNoFloat's shape and its single call site inside check().
+var ioBuiltins = map[string]bool{"readFile": true, "writeFile": true, "httpGet": true, "httpPost": true}
+
+// checkNoIO rejects a call to readFile/writeFile/httpGet/httpPost anywhere
+// outside a proc body. checkProcExpr (proc bodies) never calls check(), so a
+// proc may call these freely, subject only to checkProcCapabilities proving
+// the proc declared the capability each one requires.
+func checkNoIO(ex ast.Expr, line int) error {
+	switch t := ex.(type) {
+	case ast.Call:
+		if ioBuiltins[t.Name] {
+			cap, _ := builtinCapability(t.Name)
+			return &BuildError{line, fmt.Sprintf(
+				"%s(...) is only available inside a proc that declares `uses %s` — it is a real I/O effect, and only a proc is unconditionally server-executed with no client mirror to disagree with it", t.Name, cap)}
+		}
+		for _, a := range t.Args {
+			if err := checkNoIO(a, line); err != nil {
+				return err
+			}
+		}
+	case ast.Bin:
+		if err := checkNoIO(t.L, line); err != nil {
+			return err
+		}
+		return checkNoIO(t.R, line)
+	case ast.Un:
+		return checkNoIO(t.X, line)
+	case ast.Get:
+		return checkNoIO(t.Obj, line)
+	case ast.EntityGet:
+		return checkNoIO(t.Key, line)
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkNoIO(el, line); err != nil {
+				return err
+			}
+		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := checkNoIO(k, line); err != nil {
+				return err
+			}
+			if err := checkNoIO(t.Vals[i], line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if err := checkNoIO(t.Obj, line); err != nil {
+			return err
+		}
+		return checkNoIO(t.Idx, line)
+	case ast.Agg:
+		if err := checkNoIO(t.Where, line); err != nil {
+			return err
+		}
+		return checkNoIO(t.Sel, line)
+	}
+	return nil
+}
+
+// concurrencyBuiltins is channel/send/recv — Milestone 5's minimal channel
+// primitive — proc-only for the same reason ioBuiltins is: it is real,
+// blocking, in-process concurrency machinery (runtime/channel.go) with
+// exactly one interpreter, reached only from a proc's own frame
+// (runtime/eval.go's evalInFrame), so an action/view/policy/derive
+// expression — which the client may itself evaluate, or the server may
+// re-evaluate outside any proc call — must never be able to write one into
+// source at all. checkNoConcurrency is ioBuiltins/checkNoIO's exact shape,
+// applied to this set instead.
+var concurrencyBuiltins = map[string]bool{"channel": true, "send": true, "recv": true}
+
+// checkNoConcurrency rejects a call to channel/send/recv anywhere outside a
+// proc body, mirroring checkNoIO exactly (see its doc) — checkProcExpr (proc
+// bodies) never calls check(), so a proc may call these freely.
+func checkNoConcurrency(ex ast.Expr, line int) error {
+	switch t := ex.(type) {
+	case ast.Call:
+		if concurrencyBuiltins[t.Name] {
+			return &BuildError{line, fmt.Sprintf(
+				"%s(...) is only available inside a proc body — it is real, blocking concurrency machinery, and only a proc is unconditionally server-executed with no client mirror to disagree with it", t.Name)}
+		}
+		for _, a := range t.Args {
+			if err := checkNoConcurrency(a, line); err != nil {
+				return err
+			}
+		}
+	case ast.Bin:
+		if err := checkNoConcurrency(t.L, line); err != nil {
+			return err
+		}
+		return checkNoConcurrency(t.R, line)
+	case ast.Un:
+		return checkNoConcurrency(t.X, line)
+	case ast.Get:
+		return checkNoConcurrency(t.Obj, line)
+	case ast.EntityGet:
+		return checkNoConcurrency(t.Key, line)
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := checkNoConcurrency(el, line); err != nil {
+				return err
+			}
+		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			if err := checkNoConcurrency(k, line); err != nil {
+				return err
+			}
+			if err := checkNoConcurrency(t.Vals[i], line); err != nil {
+				return err
+			}
+		}
+	case ast.Index:
+		if err := checkNoConcurrency(t.Obj, line); err != nil {
+			return err
+		}
+		return checkNoConcurrency(t.Idx, line)
+	case ast.Agg:
+		if err := checkNoConcurrency(t.Where, line); err != nil {
+			return err
+		}
+		return checkNoConcurrency(t.Sel, line)
 	}
 	return nil
 }
@@ -4354,6 +5047,26 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 1 {
 				return &BuildError{line, "rand(n) takes exactly one argument (an exclusive upper bound)"}
 			}
+		case "readFile", "httpGet":
+			if len(t.Args) != 1 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
+			}
+		case "writeFile", "httpPost":
+			if len(t.Args) != 2 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
+			}
+		case "channel":
+			if len(t.Args) != 0 {
+				return &BuildError{line, "channel() takes no arguments"}
+			}
+		case "recv":
+			if len(t.Args) != 1 {
+				return &BuildError{line, "recv(ch) takes exactly one argument (the channel)"}
+			}
+		case "send":
+			if len(t.Args) != 2 {
+				return &BuildError{line, "send(ch, value) takes exactly two arguments"}
+			}
 		default:
 			// A pure standard-library builtin (string/date/math): fixed arity.
 			n, ok := pureBuiltinArity(t.Name)
@@ -4432,49 +5145,136 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 	return nil
 }
 
-// hasImpure reports whether ex invokes an effectful builtin. now/rand are the
-// only nondeterministic calls; the standard-library builtins (string/math/date)
-// are pure and may appear in any context.
-func hasImpure(ex ast.Expr) bool {
-	switch t := ex.(type) {
-	case ast.Call:
-		if t.Name == "now" || t.Name == "rand" {
-			return true
-		}
-		for _, a := range t.Args {
-			if hasImpure(a) {
-				return true
-			}
-		}
-		return false
-	case ast.Get:
-		return hasImpure(t.Obj)
-	case ast.EntityGet:
-		return hasImpure(t.Key)
-	case ast.ListLit:
-		for _, el := range t.Elems {
-			if hasImpure(el) {
-				return true
-			}
-		}
-		return false
-	case ast.MapLit:
-		for i, k := range t.Keys {
-			if hasImpure(k) || hasImpure(t.Vals[i]) {
-				return true
-			}
-		}
-		return false
-	case ast.Bin:
-		return hasImpure(t.L) || hasImpure(t.R)
-	case ast.Un:
-		return hasImpure(t.X)
-	case ast.Agg:
-		return (t.Where != nil && hasImpure(t.Where)) || (t.Sel != nil && hasImpure(t.Sel))
-	case ast.Index:
-		return hasImpure(t.Obj) || hasImpure(t.Idx)
+// builtinCapability names the declared `uses` capability a builtin requires,
+// and whether it requires one at all. now/rand are deliberately NOT here —
+// they are effectful (nondeterministic) but need no declaration; they force
+// server placement instead (see impureCap, procCapabilities). Only the real
+// I/O builtins — file access and outbound HTTP — are gated behind a capability
+// a proc must opt into on its own header.
+func builtinCapability(name string) (string, bool) {
+	switch name {
+	case "readFile", "writeFile":
+		return "io.file", true
+	case "httpGet", "httpPost":
+		return "io.net", true
 	}
-	return false
+	return "", false
+}
+
+// knownCapabilities is every capability name a proc's `uses` clause may
+// declare — the set builtinCapability's second return value ranges over.
+// Checked against at proc-registration time (see e.proc's caller) so a typo
+// (`uses io.fiel`) is a clear compile error instead of a capability that can
+// never be satisfied.
+var knownCapabilities = map[string]bool{"io.file": true, "io.net": true}
+
+// impureCap is the internal (never user-declared) capability key
+// procCapabilities uses to flag now()/rand() — the nondeterminism that forces
+// an action onto the server, tracked in the very same walk as the declared
+// I/O capabilities so the two mechanisms share one tree-walker instead of
+// drifting apart as two parallel ones. It is never checked against a proc's
+// declared `uses` set (checkProcCapabilities skips it): now/rand need no
+// declaration, only placement.
+const impureCap = "impure"
+
+// procCapabilities walks ex and collects every capability its builtin calls
+// require, keyed by capability name to one builtin call that needed it (for a
+// clear diagnostic — see checkProcCapabilities). This is hasImpure's exact
+// former walk (same node kinds, same recursive shape), generalized from a
+// single bool to a named set: hasImpure(ex) is now simply "does this set
+// contain impureCap", so the two effectful-builtin questions this builder
+// answers — "does this force server placement" (now/rand) and "does this
+// require a proc to declare a capability" (readFile/writeFile/httpGet/
+// httpPost) — are one mechanism, not two that could silently disagree about
+// which calls in ex they found.
+func procCapabilities(ex ast.Expr) map[string]string {
+	caps := map[string]string{}
+	var walk func(ast.Expr)
+	walk = func(ex ast.Expr) {
+		switch t := ex.(type) {
+		case ast.Call:
+			if t.Name == "now" || t.Name == "rand" {
+				caps[impureCap] = t.Name
+			} else if cap, ok := builtinCapability(t.Name); ok {
+				caps[cap] = t.Name
+			}
+			for _, a := range t.Args {
+				walk(a)
+			}
+		case ast.Get:
+			walk(t.Obj)
+		case ast.EntityGet:
+			walk(t.Key)
+		case ast.ListLit:
+			for _, el := range t.Elems {
+				walk(el)
+			}
+		case ast.MapLit:
+			for i, k := range t.Keys {
+				walk(k)
+				walk(t.Vals[i])
+			}
+		case ast.Bin:
+			walk(t.L)
+			walk(t.R)
+		case ast.Un:
+			walk(t.X)
+		case ast.Agg:
+			if t.Where != nil {
+				walk(t.Where)
+			}
+			if t.Sel != nil {
+				walk(t.Sel)
+			}
+		case ast.Index:
+			walk(t.Obj)
+			walk(t.Idx)
+		}
+	}
+	walk(ex)
+	return caps
+}
+
+// hasImpure reports whether ex invokes an effectful builtin that forces server
+// placement (now/rand). Every other kind of effect (readFile/writeFile/
+// httpGet/httpPost) is barred from ever reaching an action/view/policy/derive
+// expression at all by checkNoIO, so by the time hasImpure's two call sites
+// (action placement, checkPure) run, procCapabilities(ex) can only ever
+// contain impureCap or nothing — this is not a narrower check than the old
+// hand-written boolean walk, just the same answer computed off the shared set.
+func hasImpure(ex ast.Expr) bool {
+	_, ok := procCapabilities(ex)[impureCap]
+	return ok
+}
+
+// checkProcCapabilities rejects a proc expression that calls a capability-
+// gated builtin (readFile/writeFile/httpGet/httpPost) the proc did not declare
+// in its own `uses` clause — the static enforcement side of the capability
+// system (builtinCapability/procCapabilities do the walking; parseProc/
+// ast.Proc.Uses do the declaring). Capability names are sorted before being
+// walked so a proc missing more than one reports the same one first on every
+// build, not whichever a Go map iteration happened to visit.
+func checkProcCapabilities(p *ast.Proc, ex ast.Expr, line int) error {
+	caps := procCapabilities(ex)
+	names := make([]string, 0, len(caps))
+	for cap := range caps {
+		if cap != impureCap {
+			names = append(names, cap)
+		}
+	}
+	sort.Strings(names)
+	uses := map[string]bool{}
+	for _, u := range p.Uses {
+		uses[u] = true
+	}
+	for _, cap := range names {
+		if !uses[cap] {
+			return &BuildError{line, fmt.Sprintf(
+				"proc %q calls %s(...), which requires capability %q — declare it on the proc header (e.g. `proc %s(...) -> ... uses %s:`)",
+				p.Name, caps[cap], cap, p.Name, cap)}
+		}
+	}
+	return nil
 }
 
 // pureBuiltinArity gives the fixed argument count of a pure standard-library
@@ -4482,7 +5282,7 @@ func hasImpure(ex ast.Expr) bool {
 func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
-		"ago", "compact", "commas", "bytes":
+		"ago", "compact", "commas", "bytes", "toFloat", "toInt":
 		return 1, true
 	case "append":
 		return 2, true
@@ -4492,6 +5292,21 @@ func pureBuiltinArity(name string) (int, bool) {
 	return 0, false
 }
 
+// isPrimitive is the set of scalar types real everywhere in the language: an
+// entity field, a record field, a state cell, a component parameter, a
+// service op's return type, and (via the separate isProcScalar-shaped checks
+// in e.proc/procBlock) a proc's own parameters/locals/return type.
+//
+// "float" is deliberately NOT in this set, even though the parser's isType
+// (internal/parser/parser.go) accepts it as a syntactically valid type name —
+// it is real only inside a proc (a parameter, a `let`/`let mut` local, or a
+// return type), which is why every one of isPrimitive's callers below rejects
+// it with its own dedicated, clearer error instead of silently accepting a
+// type with no database column, no client-side (assets/facet.js)
+// representation, and no wire encoding. A proc's own return-type check
+// (e.app-building's procSeen loop) explicitly allows "float" alongside this
+// function's answer instead of adding it here, precisely so every OTHER
+// caller keeps rejecting it unchanged.
 func isPrimitive(t string) bool {
 	switch t {
 	case "int", "text", "bool", "money", "date":

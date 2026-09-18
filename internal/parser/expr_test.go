@@ -60,6 +60,73 @@ func TestBitwiseTokenization(t *testing.T) {
 	}
 }
 
+// TestFloatLiteralTokenization proves the tokenizer's `<digits>.<digits>`
+// rule for a float literal (see tokenize's numeric-literal case): a genuine
+// decimal point followed by a digit extends an int literal into a float one,
+// distinct at the ast.Lit level ("float" vs "int"); ordinary member access
+// (`.field`) and a bare int are both completely unaffected, since neither
+// shape has a digit on both sides of a `.`.
+func TestFloatLiteralTokenization(t *testing.T) {
+	cases := []struct {
+		src      string
+		wantKind string
+		wantVal  any
+	}{
+		{"3.14", "float", 3.14},
+		{"0.5", "float", 0.5},
+		{"10.0", "float", 10.0},
+		{"3", "int", 3},
+		{"42", "int", 42},
+	}
+	for _, c := range cases {
+		t.Run(c.src, func(t *testing.T) {
+			e, err := ParseExpr(c.src)
+			if err != nil {
+				t.Fatalf("ParseExpr(%q): %v", c.src, err)
+			}
+			lit, ok := e.(ast.Lit)
+			if !ok {
+				t.Fatalf("ParseExpr(%q) = %#v, want an ast.Lit", c.src, e)
+			}
+			if lit.Kind != c.wantKind {
+				t.Errorf("ParseExpr(%q).Kind = %q, want %q", c.src, lit.Kind, c.wantKind)
+			}
+			if lit.Val != c.wantVal {
+				t.Errorf("ParseExpr(%q).Val = %#v (%T), want %#v (%T)", c.src, lit.Val, lit.Val, c.wantVal, c.wantVal)
+			}
+		})
+	}
+
+	// Unary minus over a float literal must produce a Un wrapping a float Lit
+	// (`-2.0`), not silently truncate anything at parse time — evaluation of
+	// the negation itself is runtime/eval.go's job (see runtime/float_test.go).
+	e, err := ParseExpr("-2.5")
+	if err != nil {
+		t.Fatalf("ParseExpr(-2.5): %v", err)
+	}
+	un, ok := e.(ast.Un)
+	if !ok || un.Op != "-" {
+		t.Fatalf("ParseExpr(-2.5) = %#v, want a unary - node", e)
+	}
+	inner, ok := un.X.(ast.Lit)
+	if !ok || inner.Kind != "float" || inner.Val != 2.5 {
+		t.Fatalf("ParseExpr(-2.5)'s operand = %#v, want ast.Lit{Kind: \"float\", Val: 2.5}", un.X)
+	}
+
+	// A member access after a parenthesized/entity-lookup expression must
+	// still work — the tokenizer's float rule only fires within a single
+	// contiguous digit run, so `Post(1).field`-shaped source (no digit
+	// immediately after the `.`) is never affected.
+	e2, err := ParseExpr("a.b")
+	if err != nil {
+		t.Fatalf("ParseExpr(a.b): %v", err)
+	}
+	get, ok := e2.(ast.Get)
+	if !ok || get.Field != "b" {
+		t.Fatalf("ParseExpr(a.b) = %#v, want ast.Get{Field: \"b\"}", e2)
+	}
+}
+
 // TestBitwisePrecedence pins down the exact precedence table chosen for `&
 // | ^ << >>` and unary `~`: loosest to tightest, `|| , && , | , ^ , & ,
 // comparison , << >> , + - , * / %` — the same relative order most C-family

@@ -216,16 +216,136 @@ read:
   place. There's no `call` or `set`/`add`/`remove`/`clear` inside a proc at
   all — parameters plus locals are the entire vocabulary.
 
+### `float`: a second numeric type, proc-only
+
+`3.14`, `0.5`, `-2.0` are `float` literals — a real scalar type, a Go
+`float64` under the hood, alongside `int | text | bool | money | date`. It is
+usable as a proc parameter, a `let`/`let mut` local, a return type, and an
+array/map element value (never a map *key* — see below) — and nowhere else
+yet: not an entity field, not a `state` cell, not a record field, not a
+component or action parameter. Every one of those gives a clear compile
+error naming the reason (no database column, no client-side representation
+in `assets/facet.js`, no wire encoding) rather than silently accepting it.
+
+```
+proc weightedAverage() -> int:
+    let xs = [1.5, 2.5, 3.5]        # a float array literal
+    let mut total = 0.0
+    let mut i = 0
+    loop i < len(xs):
+        total = total + xs[i]        # float + float
+        i = i + 1
+    return round(total / 3.0)        # -> int, crossing back to an action
+```
+
+**No automatic int/float promotion.** `1 + 2.5` is a compile error, not a
+silently-computed `3.5` — every arithmetic operator (`+ - * /`) and every
+comparison (`== != < <= > >=`) requires both operands to already be the same
+numeric type. This is the choice consistent with the rest of the language:
+the *only* implicit widening anywhere is "anything converts to text"
+(interpolation) — int and money and date already share one representation
+rather than being "promoted" into each other — so int and float, which are
+two genuinely different machine representations (`int` vs `float64`), get no
+special-cased crossing either. `toFloat(n)` and `toInt(x)` convert
+explicitly wherever a program needs to cross the boundary — `toInt` truncates
+toward zero. `%` (modulo) is int-only outright: a fractional modulus is a
+compile error, not a runtime one.
+
+`floor(x)` and `round(x)` always return an **int** — the natural reading of
+"I rounded, so now it's a whole number" — while an int input passes through
+unchanged (their pre-float identity behavior, preserved exactly).
+`round` uses round-half-away-from-zero (`round(2.5) == 3`, `round(-2.5) ==
+-3`, matching Go's own `math.Round` — not round-half-to-even). `abs(x)`
+instead *preserves* whichever flavor it's handed (`abs(-2.5)` is a float,
+`abs(-2)` is an int), since taking an absolute value never changes whether a
+number has a fraction.
+
+A float cannot be used with the bitwise operators (`& | ^ << >> ~`, already
+int-only) or as a map key (alongside bool/money/date, which are refused for
+the same "no good equality/hashing story" reason — `0.1 + 0.2 != 0.3` is
+float's own version of that problem).
+
+Because a proc is unconditionally server-executed but the *action* that
+calls one is not necessarily — and `assets/facet.js` has no float
+representation — an action may not bind a float-returning proc's result
+(`let x = do FloatProc()` is refused); a fire-and-forget `do FloatProc()`
+(the result discarded) is fine, and float values flow freely between procs
+calling each other.
+
+### I/O capabilities: `uses`, and real file/HTTP effects
+
+A proc's header may declare the I/O capabilities its body is allowed to use,
+trailing the return type (or the parameter list, for a proc with none) the
+same way `requires <policy>` trails a `mount`/`view` header:
+
+```
+proc readConfig(path: text) -> text uses io.file:
+    return readFile(path)
+
+proc notifyAndLog(url: text, path: text, msg: text) uses io.net, io.file:
+    httpPost(url, msg)     # a bare call — the effect is the point, result discarded
+    writeFile(path, msg)
+```
+
+Two capabilities exist today: **`io.file`** gates `readFile(path: text) ->
+text` and `writeFile(path: text, content: text) -> bool`; **`io.net`** gates
+`httpGet(url: text) -> text` and `httpPost(url: text, body: text) -> text`.
+All four are ordinary builtins usable anywhere an expression is (bound with
+`let`, returned, passed as an argument) or, fire-and-forget, as a bare
+statement on their own line when only the side effect matters — the same
+shape `do ProcName(args)` already has for a proc call, but for a builtin.
+
+A proc that calls one of these four without declaring the matching capability
+is a **compile error** naming both the missing capability and the builtin
+that needed it — this is checked statically, the same "catch it before it
+runs" stance every other proc restriction in this section takes, not a
+runtime permission check. Declaring `io.net` does not grant `io.file` or vice
+versa; each is checked independently against exactly what the proc's own body
+calls (not what any proc it `do`-calls uses). Like bitwise operators and
+`float`, all four builtins are proc-only — calling one from an action, view,
+policy, or derive is refused outright, because only a proc is unconditionally
+server-executed with no client mirror that would have to agree with a real
+file or network effect.
+
+**Sandboxing.** `readFile`/`writeFile` resolve `path` against a single
+configured root directory (`FACET_DATA_DIR`, defaulting to `./facet-data`
+beside the running server) — the same "one configured root, no escaping it"
+convention `FACET_UPLOAD_DIR` already uses for uploaded files. An absolute
+path is refused outright; a relative path is cleaned and resolved, and if the
+result would land outside that root (a `../../` climb, however many levels)
+it is refused too — a proc can never read or write outside its sandbox by
+construction. `writeFile` creates any missing parent directories inside the
+sandbox and overwrites an existing file at `path`; it returns `true` on
+success.
+
+**HTTP.** `httpGet`/`httpPost` use a real `net/http` client with a 5-second
+timeout — matching this codebase's existing convention for the authority's
+own outbound calls to a declared `service` brain (`call Service.op(...)`),
+since calling out from a proc is the same shape of egress to an
+author-supplied URL. A non-2xx response is a clean runtime error naming the
+status code, not the error page's body masquerading as a real answer.
+
+**Errors.** Every way one of these four can fail for reasons outside the
+program's control — file not found, permission denied, a path escaping the
+sandbox, an unreachable host, a timeout, a non-2xx response — surfaces as a
+clean runtime error that aborts the proc (and whatever action called it, via
+`do`'s existing failure path), never a crash: the same "clean error, not
+silent corruption" contract an out-of-bounds array read or an out-of-range
+byte write already has.
+
 ## Built-in functions
 
 `facet lang` lists these live; as of this page: `abs, ago, commas, compact,
-contains, day, floor, len, lower, max, min, money, month, now, rand, round,
-take, trim, upper, year`. This is deliberately small and pure — there is no
+contains, day, floor, httpGet, httpPost, len, lower, max, min, money, month,
+now, rand, readFile, round, take, toFloat, toInt, trim, upper, writeFile,
+year`. Most of this list is deliberately small and pure — there is no
 `replace`/`split`/`slugify`, so anything that needs one (like turning a title
 into a URL slug) is written by hand rather than derived, and `check` enforces
 whatever invariant that leaves. If you're looking for a string-manipulation
 function and it's not in that list, it doesn't exist yet — that's a real gap,
-not something you're missing.
+not something you're missing. `readFile`/`writeFile`/`httpGet`/`httpPost` are
+the exception to "pure": real, capability-gated I/O effects, proc-only — see
+the `uses` subsection above.
 
 ## The `@` modifiers
 

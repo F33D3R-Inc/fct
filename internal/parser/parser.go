@@ -1621,6 +1621,49 @@ func parseDo(s string, line int) (ast.Do, error) {
 	return d, nil
 }
 
+// parseSpawn parses `ProcName(arg, ...)` — the argument-list half of
+// `let h = spawn ProcName(args)` — identical shape to parseDo (a proc call is
+// a proc call; spawn only changes how the runtime executes it, not how it's
+// written), kept as its own function rather than shared so the two grammars
+// can diverge freely (e.g. if spawn ever grows spawn-specific syntax) the way
+// parseDo/parseCall already are two separate functions for the same reason.
+func parseSpawn(s string, line int) (ast.Spawn, error) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return ast.Spawn{}, &Error{line, "spawn needs arguments: spawn ProcName(args)"}
+	}
+	name := strings.TrimSpace(s[:open])
+	if !isIdent(name) {
+		return ast.Spawn{}, &Error{line, fmt.Sprintf("invalid proc name %q", name)}
+	}
+	closeP := strings.LastIndexByte(s, ')')
+	if closeP < open {
+		return ast.Spawn{}, &Error{line, "missing `)` in spawn"}
+	}
+	sp := ast.Spawn{Proc: name, Line: line}
+	if inner := strings.TrimSpace(s[open+1 : closeP]); inner != "" {
+		for _, a := range splitTop(inner, ',') {
+			e, err := parseExpr(strings.TrimSpace(a), line)
+			if err != nil {
+				return ast.Spawn{}, err
+			}
+			sp.Args = append(sp.Args, e)
+		}
+	}
+	return sp, nil
+}
+
+// parseJoin parses the handle name half of `join h` / `let r = join h` — a
+// bare local name, never a call: a join consumes an already-spawned handle,
+// it doesn't invoke anything new.
+func parseJoin(s string, line int) (ast.Join, error) {
+	h := strings.TrimSpace(s)
+	if !isIdent(h) {
+		return ast.Join{}, &Error{line, fmt.Sprintf("join needs a spawned task handle: join <handle>, got %q", h)}
+	}
+	return ast.Join{Handle: h, Line: line}, nil
+}
+
 // parseProc parses `proc Name(params) -> RetType:` (the arrow and its type are
 // optional — a proc may return nothing) plus a body, delegating the body itself
 // to parseProcBody. Unlike parseAction, a proc isn't policy-gated or optimistic
@@ -1628,6 +1671,26 @@ func parseDo(s string, line int) (ast.Do, error) {
 // statement vocabulary is deliberately smaller — see parseProcBody.
 func parseProc(n *source.Node) (*ast.Proc, error) {
 	head := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text, "proc")), ":")
+	// `uses io.file, io.net` — the capability clause — trails the return type
+	// when there is one, or the parameter list when there isn't; either way it
+	// is the last thing before the header's `:`, so it is pulled off first
+	// (mirroring how parseMount/parseView pull " requires " off before parsing
+	// the rest of their own headers).
+	var uses []string
+	if i := strings.Index(head, " uses "); i >= 0 {
+		usesPart := strings.TrimSpace(head[i+len(" uses "):])
+		head = strings.TrimSpace(head[:i])
+		if usesPart == "" {
+			return nil, &Error{n.Line.No, "uses needs at least one capability (e.g. `uses io.file`)"}
+		}
+		for _, c := range splitTop(usesPart, ',') {
+			c = strings.TrimSpace(c)
+			if !isCapabilityName(c) {
+				return nil, &Error{n.Line.No, fmt.Sprintf("invalid capability %q in uses clause (expected a dotted name like io.file)", c)}
+			}
+			uses = append(uses, c)
+		}
+	}
 	var ret string
 	var retList bool
 	if arrow := strings.Index(head, "->"); arrow >= 0 {
@@ -1643,7 +1706,7 @@ func parseProc(n *source.Node) (*ast.Proc, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &ast.Proc{Name: name, Params: params, Ret: ret, RetList: retList, Line: n.Line.No}
+	p := &ast.Proc{Name: name, Params: params, Ret: ret, RetList: retList, Uses: uses, Line: n.Line.No}
 	body, err := parseProcBody(n.Children, fmt.Sprintf("proc %q", name))
 	if err != nil {
 		return nil, err
@@ -1754,6 +1817,20 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				return nil, err
 			}
 			body = append(body, d)
+		case strings.HasPrefix(t, "spawn "):
+			// A bare `spawn ProcName(args)`, its handle discarded, has no legal
+			// reading: structured concurrency requires every spawned task be
+			// joined (see ast.Spawn's doc), and a discarded handle can never be
+			// joined by anything — so, unlike `do`, spawn has no fire-and-forget
+			// form at all. Caught here, at parse time, with a message that says
+			// so rather than falling through to the generic "unknown statement".
+			return nil, &Error{c.Line.No, "spawn has no fire-and-forget form — bind its handle with `let h = spawn " + strings.TrimSpace(t[len("spawn "):]) + "` and `join h` before this proc returns, or the goroutine could outlive it"}
+		case strings.HasPrefix(t, "join "):
+			j, err := parseJoin(strings.TrimSpace(t[len("join "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, j)
 		case strings.HasPrefix(t, "let "):
 			rest := strings.TrimSpace(t[len("let "):])
 			mut := false
@@ -1782,15 +1859,53 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				body = append(body, d)
 				continue
 			}
+			if strings.HasPrefix(rhs, "spawn ") {
+				if mut {
+					return nil, &Error{c.Line.No, "`let mut` can't bind a `spawn` handle — a task handle is joined once and never reassigned; bind it plainly with `let`"}
+				}
+				sp, err := parseSpawn(strings.TrimSpace(rhs[len("spawn "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				sp.Bind = lname
+				body = append(body, sp)
+				continue
+			}
+			if strings.HasPrefix(rhs, "join ") {
+				if mut {
+					return nil, &Error{c.Line.No, "`let mut` can't bind a `join` result yet — bind it plainly, then use it to compute a `let mut` local if you need to mutate it"}
+				}
+				j, err := parseJoin(strings.TrimSpace(rhs[len("join "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				j.Bind = lname
+				body = append(body, j)
+				continue
+			}
 			val, err := parseExpr(rhs, c.Line.No)
 			if err != nil {
 				return nil, err
 			}
 			body = append(body, ast.Let{Name: lname, Mut: mut, Value: val, Line: c.Line.No})
+		case isBareCallStmt(t):
+			// A builtin call for its side effect alone, its result discarded —
+			// `writeFile(path, content)` rather than `let ok = writeFile(...)`.
+			// See ast.ExprStmt's doc for why the grammar needs this shape
+			// distinct from `do` (which is proc-to-proc, not builtin-to-proc).
+			ex, err := parseExpr(t, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			call, ok := ex.(ast.Call)
+			if !ok {
+				return nil, &Error{c.Line.No, fmt.Sprintf("%q is not a valid statement on its own", t)}
+			}
+			body = append(body, ast.ExprStmt{Call: call, Line: c.Line.No})
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {
-				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
+				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/spawn/join/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
 			}
 			target := strings.TrimSpace(t[:eq])
 			val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)
@@ -3879,9 +3994,19 @@ func firstWord(s string) string {
 // isType reports whether s names a built-in scalar type. Enum names and entity
 // relations are also valid type positions but are validated later, in the IR,
 // once every declaration is known.
+//
+// `float` is accepted here — at the syntax level, a type name — the same as
+// every other primitive, but it is real only inside a proc: a proc parameter,
+// `let`/`let mut` local, or return type. internal/ir/build.go rejects it
+// everywhere else (an entity field, a record field, a state cell, a component
+// parameter, a service op's return type) with a dedicated error, since none
+// of those has a database column, a client-side (assets/facet.js) runtime
+// representation, or a wire encoding for it yet — see isPrimitive, which
+// deliberately does NOT include "float", and each of those sites' explicit
+// float check. See LANGUAGE.md's `proc` section for the full design.
 func isType(s string) bool {
 	switch s {
-	case "int", "text", "bool", "money", "date":
+	case "int", "text", "bool", "money", "date", "float":
 		return true
 	}
 	return false
@@ -3910,6 +4035,42 @@ func isTypeName(s string) bool {
 }
 
 func isUpper(s string) bool { return s != "" && s[0] >= 'A' && s[0] <= 'Z' }
+
+// isCapabilityName reports whether s is syntactically a valid capability name
+// for a proc's `uses` clause: one or more dot-separated identifiers (`io.file`,
+// `io.net`). This only checks shape — whether the name is actually one of the
+// language's known capabilities is a build.go concern (validCapability),
+// exactly the same division of labor parseRequire/policyPasses already have
+// for a `requires` policy name (syntax here, existence/meaning at build time).
+func isCapabilityName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, part := range strings.Split(s, ".") {
+		if !isIdent(part) {
+			return false
+		}
+	}
+	return true
+}
+
+// isBareCallStmt reports whether t is a bare builtin call written as its own
+// statement — `writeFile(path, content)` rather than `let ok = writeFile(...)`
+// or `name = writeFile(...)` — the shape ast.ExprStmt exists for (see its
+// doc). Told apart from a reassignment by having no top-level `=` at all
+// (splitTopByte, so `x = a == b` is never mistaken for one) and from every
+// other statement keyword by starting with an identifier immediately followed
+// by `(` and ending the line at the matching `)`.
+func isBareCallStmt(t string) bool {
+	if splitTopByte(t, '=') >= 0 {
+		return false
+	}
+	open := strings.IndexByte(t, '(')
+	if open <= 0 || !strings.HasSuffix(t, ")") {
+		return false
+	}
+	return isIdent(strings.TrimSpace(t[:open]))
+}
 
 func isIdent(s string) bool {
 	if s == "" {
@@ -3968,6 +4129,13 @@ func defaultFor(typ string) ast.Expr {
 		return ast.Lit{Kind: "int", Val: 0}
 	case "bool":
 		return ast.Lit{Kind: "bool", Val: false}
+	case "float":
+		// Unreachable for a state cell today (internal/ir/build.go's state
+		// check rejects a `float`-typed one before this default would ever be
+		// read), but defaultFor is typ-total the same way every other
+		// conversion in this codebase is, so a future proc-only default-value
+		// position finds a real zero value here rather than the wrong text one.
+		return ast.Lit{Kind: "float", Val: 0.0}
 	default:
 		return ast.Lit{Kind: "text", Val: ""}
 	}

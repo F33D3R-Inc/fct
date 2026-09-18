@@ -45,6 +45,8 @@ type Server struct {
 	apiRead     map[string]entityRead   // entity -> its JSON-API read rule; ABSENT MEANS REFUSED (see apiread.go)
 	privateNm   map[string]bool         // @private state names — never shipped to a client
 	uploadDir   string                  // directory uploaded files are written to and served from
+	dataDir     string                  // sandbox root for a proc's readFile/writeFile (io.file) — see runtime/io.go
+	channels    *channelRegistry        // backs the `channel()`/`send`/`recv` builtins — see runtime/channel.go
 
 	uploadMu       sync.Mutex                // guards uploadSessions
 	uploadSessions map[string]*uploadSession // in-flight resumable uploads, keyed by session id
@@ -173,6 +175,8 @@ func newServer(graph *ir.IR) *Server {
 		gated:       map[string][]gatedField{},
 		privateNm:   map[string]bool{},
 		uploadDir:   uploadDirFromEnv(),
+		dataDir:     dataDirFromEnv(),
+		channels:    newChannelRegistry(),
 
 		uploadSessions: map[string]*uploadSession{},
 		idem:           map[string]*idemRecord{},
@@ -1898,7 +1902,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			// cloneCompositeValue: see its doc — a `let` is a new variable taking
 			// on a value, so an array or map value is copied here rather than
 			// aliased.
-			v, err := evalInFrame(st.Value, fr)
+			v, err := s.evalInFrame(st.Value, fr)
 			if err != nil {
 				return ctlSignal{}, err
 			}
@@ -1911,7 +1915,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			// across iterations instead of resetting. cloneCompositeValue for the
 			// same reason as "let": the local is taking on a freshly-computed
 			// value.
-			v, err := evalInFrame(st.Value, fr)
+			v, err := s.evalInFrame(st.Value, fr)
 			if err != nil {
 				return ctlSignal{}, err
 			}
@@ -1932,7 +1936,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			case []any:
 				// The index itself is only bounds-checked here, at runtime (see
 				// ast.Index's doc for why it cannot be checked earlier).
-				idxV, err := evalInFrame(st.Key, fr)
+				idxV, err := s.evalInFrame(st.Key, fr)
 				if err != nil {
 					return ctlSignal{}, err
 				}
@@ -1940,7 +1944,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 				if idx < 0 || idx >= len(coll) {
 					return ctlSignal{}, fmt.Errorf("array index %d out of bounds (length %d) assigning to %q", idx, len(coll), st.Target)
 				}
-				val, err := evalInFrame(st.Value, fr)
+				val, err := s.evalInFrame(st.Value, fr)
 				if err != nil {
 					return ctlSignal{}, err
 				}
@@ -1958,7 +1962,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 				}
 				coll[idx] = val
 			case map[any]any:
-				idxV, err := evalInFrame(st.Key, fr)
+				idxV, err := s.evalInFrame(st.Key, fr)
 				if err != nil {
 					return ctlSignal{}, err
 				}
@@ -1966,7 +1970,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 				if err != nil {
 					return ctlSignal{}, err
 				}
-				val, err := evalInFrame(st.Value, fr)
+				val, err := s.evalInFrame(st.Value, fr)
 				if err != nil {
 					return ctlSignal{}, err
 				}
@@ -1984,7 +1988,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			}
 			subArgs := make([]any, len(st.Args))
 			for i, a := range st.Args {
-				v, err := evalInFrame(a, fr)
+				v, err := s.evalInFrame(a, fr)
 				if err != nil {
 					return ctlSignal{}, err
 				}
@@ -1997,8 +2001,76 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			if st.Bind != "" {
 				fr.vars[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
 			}
+		case "exprstmt":
+			// A bare builtin call for its side effect alone (writeFile/httpPost/
+			// …), its result discarded — the "do" case above, but for a builtin
+			// instead of a proc (internal/ir/build.go's ast.ExprStmt). A failing
+			// I/O call (missing file, unreachable host, non-2xx…) surfaces here
+			// exactly like any other proc-body failure.
+			if _, err := s.evalInFrame(st.Value, fr); err != nil {
+				return ctlSignal{}, err
+			}
+		case "spawn":
+			// `let h = spawn ProcName(args)` (Milestone 5: structured
+			// concurrency) — internal/ir/build.go's checkSpawnsJoined already
+			// proved this handle is joined before this exact block ends, so the
+			// goroutine launched here can never outlive the proc call that
+			// started it (join, below, blocks until it finishes).
+			sub := s.byProc[st.Service]
+			if sub == nil {
+				return ctlSignal{}, fmt.Errorf("spawn calls unknown proc %q", st.Service)
+			}
+			subArgs := make([]any, len(st.Args))
+			for i, a := range st.Args {
+				v, err := s.evalInFrame(a, fr)
+				if err != nil {
+					return ctlSignal{}, err
+				}
+				// Cloned HERE, synchronously, before the goroutine starts — not
+				// left to runProcLocked's own per-parameter clone (which still
+				// happens too, redundantly but harmlessly). An array/map
+				// argument, evaluated above, is still an alias of whatever the
+				// spawning frame holds; the spawning proc keeps running once
+				// this statement returns (its own `join` is still ahead of it
+				// in this block) and could mutate that same local via an
+				// "indexset" before the new goroutine gets around to cloning
+				// its own copy. Cloning on this side of the `go` statement —
+				// while still the only goroutine touching the value — is what
+				// makes the two frames genuinely independent from the first
+				// instant the child exists, with no window for a data race.
+				subArgs[i] = cloneCompositeValue(v)
+			}
+			// s.byProc, s.dataDir, and ioHTTPClient are all read-only after
+			// server startup (see runtime/io.go's doc and newServer), and
+			// runProcLocked/execProcBlock never touch s.mu (the durable-store
+			// lock) at all — a proc is pure computation plus, at most, the I/O
+			// capability builtins (runtime/io.go), which are already
+			// concurrency-safe on their own terms. So running this on a fresh
+			// goroutine, concurrently with whatever the spawning call does
+			// next, touches no state the spawning call (or any other request)
+			// could race against.
+			fr.vars[st.Target] = spawnTask(func() (any, error) {
+				return s.runProcLocked(sub, subArgs)
+			})
+		case "join":
+			// `join h` / `let r = join h`: block until the spawned goroutine
+			// finishes, then propagate its outcome exactly like a `do` call's
+			// own failure path — a clean error through execProcBlock's normal
+			// return, never a panic reaching further up.
+			hv, _ := fr.get(st.Target)
+			h, ok := hv.(*taskHandle)
+			if !ok {
+				return ctlSignal{}, fmt.Errorf("%q is not a spawned task handle", st.Target)
+			}
+			res, err := h.join()
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			if st.Bind != "" {
+				fr.vars[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
+			}
 		case "return":
-			v, err := evalInFrame(st.Value, fr)
+			v, err := s.evalInFrame(st.Value, fr)
 			if err != nil {
 				return ctlSignal{}, err
 			}
@@ -2019,7 +2091,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			// whatever follows the loop in this block.
 		case "if":
 			branch := st.Else
-			cond, err := evalInFrame(st.Value, fr)
+			cond, err := s.evalInFrame(st.Value, fr)
 			if err != nil {
 				return ctlSignal{}, err
 			}
@@ -2059,7 +2131,7 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 // condition check.
 func (s *Server) execProcLoop(st ir.Stmt, fr *frame) (ctlSignal, error) {
 	for {
-		cond, err := evalInFrame(st.Value, fr)
+		cond, err := s.evalInFrame(st.Value, fr)
 		if err != nil {
 			return ctlSignal{}, err
 		}
@@ -3756,6 +3828,19 @@ func coerce(v any, typ string) any {
 	switch typ {
 	case "int", "money", "date":
 		return toInt(v)
+	case "float":
+		// Canonicalizes to a genuine Go float64 regardless of what actually
+		// produced v — e.g. a `do`-bound proc-to-proc call's return value
+		// (runtime/server.go's execProcBlock "do" case calls coerceRet, which
+		// calls this) should already be a float64 by construction, but
+		// running it through toFloat anyway guarantees it, the same
+		// belt-and-suspenders canonicalization "int"/"money"/"date" get from
+		// toInt above. Without this, a value that reached here as a Go int
+		// (which nothing in a well-typed program should produce for a
+		// float-declared return, but coerce is not itself a type checker)
+		// would silently carry the wrong Go type forward, and applyBin's
+		// isFloatVal-based dispatch would then take the wrong branch for it.
+		return toFloat(v)
 	case "bool":
 		return truthy(v)
 	case "text":
@@ -3853,6 +3938,14 @@ func zero(typ string) any {
 	switch typ {
 	case "int", "money", "date":
 		return 0
+	case "float":
+		// A proc parameter's zero value when a `do` call omits a trailing
+		// argument (runProcLocked) — float64(0), a real Go float, not the int
+		// 0 int/money/date share: a float-typed proc local must always carry
+		// a float64 at runtime (see coerce's own "float" case), or arithmetic
+		// against it (applyBin's isFloatVal checks) would silently take the
+		// int path instead.
+		return 0.0
 	case "bool":
 		return false
 	default:

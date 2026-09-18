@@ -13,10 +13,20 @@ import (
 func ParseExpr(src string) (ast.Expr, error) { return parseExpr(src, 1) }
 
 // parseExpr parses a Facet expression: identifiers, member access (`p.field`),
-// entity lookup (`Entity(key).field`), int/text/bool literals, unary ! - and ~,
-// arithmetic (+ - * / %), comparison (== != < <= > >=), boolean (&& ||) and
-// bitwise (& | ^ << >>) operators, with parentheses. Precedence-climbing;
-// produces an ast.Expr every executor interprets identically.
+// entity lookup (`Entity(key).field`), int/text/bool/float literals, unary
+// ! - and ~, arithmetic (+ - * / %), comparison (== != < <= > >=), boolean
+// (&& ||) and bitwise (& | ^ << >>) operators, with parentheses.
+// Precedence-climbing; produces an ast.Expr every executor interprets
+// identically.
+//
+// A float literal (`3.14`) parses everywhere, same as a bitwise operator (see
+// below) — but internal/ir/build.go's checkNoFloat rejects one outside a
+// `proc` body at compile time, for the same reason checkNoBitwise does: a
+// float has no representation in assets/facet.js today (no float-typed state,
+// no wire encoding), so an action/view expression — which facet.js may
+// re-evaluate on the client — must never see one. See LANGUAGE.md's `proc`
+// section for the full float design (no automatic int/float promotion;
+// `toFloat`/`toInt` convert explicitly).
 //
 // The bitwise operators parse everywhere (there is no syntactic distinction
 // between a proc expression and an action/view one at this layer), but
@@ -84,6 +94,21 @@ func tokenize(s string) []token {
 			j := i
 			for j < len(s) && s[j] >= '0' && s[j] <= '9' {
 				j++
+			}
+			// A decimal point followed by at least one digit extends an int
+			// literal into a float one (`3.14`, `0.5`) — the lexer's only float
+			// shape; see parseAtom's tNum case for where "does it contain a
+			// dot" decides int vs float. A bare trailing dot with no digit
+			// after it (`3.`) is deliberately NOT consumed here: it is left as
+			// its own `.` token, so `Post(3).field`-style member access (which
+			// can never actually precede a bare integer, but this keeps the
+			// lexer's rule simple and total) and any other `.` usage are
+			// unaffected — only `<digits>.<digits>` is a float.
+			if j < len(s) && s[j] == '.' && j+1 < len(s) && s[j+1] >= '0' && s[j+1] <= '9' {
+				j++
+				for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+					j++
+				}
 			}
 			toks = append(toks, token{tNum, s[i:j]})
 			i = j
@@ -541,11 +566,15 @@ func isBuiltinCall(name string) bool {
 	switch name {
 	case "now", "rand", // effectful (pinned to the authority)
 		"abs", "min", "max", "floor", "round", "money", // math / money
+		"toFloat", "toInt", // explicit int<->float conversion (proc-only — see checkNoFloat)
 		"len", "upper", "lower", "trim", "contains", "take", // string
 		"year", "month", "day", // date
 		"ago", "compact", "commas", // formatting (render-time text)
-		"append", // array (proc-only — see internal/ir/build.go's checkBuiltins)
-		"bytes":  // byte-buffer constructor (proc-only, same reason as append)
+		"append",                // array (proc-only — see internal/ir/build.go's checkBuiltins)
+		"bytes",                 // byte-buffer constructor (proc-only, same reason as append)
+		"readFile", "writeFile", // file I/O (proc-only, capability-gated — see checkNoIO/checkProcCapabilities)
+		"httpGet", "httpPost", // HTTP client (proc-only, capability-gated — same as above)
+		"channel", "send", "recv": // structured concurrency's channel primitive (proc-only — see checkNoConcurrency)
 		return true
 	}
 	return false
@@ -604,7 +633,19 @@ func (p *exprParser) parseAtom() (ast.Expr, error) {
 	case tNum:
 		p.pos++
 		if strings.Contains(t.text, ".") {
-			return nil, &Error{p.line, "floats are not supported yet; use int"}
+			// A float literal (`3.14`, `0.5`) — the tokenizer only ever produces
+			// this shape for `<digits>.<digits>` (see tokenize), so ParseFloat
+			// cannot fail here. `float` is a real scalar type, distinct from
+			// `int`, usable only inside a proc body (see internal/ir/build.go's
+			// checkNoFloat) — no automatic int/float promotion anywhere in this
+			// language (internal/ir/build.go's checkNumericTypes), matching
+			// this language's one-widening-only-into-text philosophy
+			// (internal/ir/types.go).
+			f, err := strconv.ParseFloat(t.text, 64)
+			if err != nil {
+				return nil, &Error{p.line, fmt.Sprintf("bad number %q", t.text)}
+			}
+			return ast.Lit{Kind: "float", Val: f}, nil
 		}
 		n, err := strconv.Atoi(t.text)
 		if err != nil {

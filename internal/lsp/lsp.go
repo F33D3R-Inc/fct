@@ -464,12 +464,17 @@ var keywords = []string{
 	"at", "desc", "asc", "on", "start", "every",
 }
 
-var typeNames = []string{"int", "text", "bool", "money", "date"}
+// "float" is a real type only inside a proc (a parameter, a `let`/`let mut`
+// local, or a return type) — see LANGUAGE.md's `proc` section — but it is
+// listed here alongside the others anyway, the same way this file lists
+// every keyword regardless of which construct it belongs to; completion does
+// not attempt to be context-sensitive about where a type name is legal.
+var typeNames = []string{"int", "text", "bool", "money", "date", "float"}
 
 var builtins = []string{
 	"now", "rand", "count", "sum", "abs", "min", "max", "floor", "round", "money",
 	"len", "upper", "lower", "trim", "year", "month", "day", "actor", "role", "verified",
-	"route", "session",
+	"route", "session", "toFloat", "toInt",
 }
 
 func builtinDoc(name string) string {
@@ -478,9 +483,13 @@ func builtinDoc(name string) string {
 		"rand":    "`rand(n)` → int — a server random in [0, n). Effectful.",
 		"count":   "`count(Entity)` → int — number of rows.",
 		"sum":     "`sum(Entity.field)` → int — total of a numeric field.",
-		"abs":     "`abs(n)` → int — absolute value.",
-		"min":     "`min(a, b)` → int — the smaller of two values.",
-		"max":     "`max(a, b)` → int — the larger of two values.",
+		"abs":     "`abs(n)` → int or float — absolute value, preserving whichever numeric flavor n is.",
+		"min":     "`min(a, b)` → int or float — the smaller of two values (both must be the same numeric type — no int/float promotion).",
+		"max":     "`max(a, b)` → int or float — the larger of two values (both must be the same numeric type — no int/float promotion).",
+		"floor":   "`floor(x)` → int — round toward negative infinity (proc-only for a float x; identity for an int).",
+		"round":   "`round(x)` → int — round-half-away-from-zero (proc-only for a float x; identity for an int).",
+		"toFloat": "`toFloat(n)` → float — explicit int→float conversion (proc-only; no automatic promotion).",
+		"toInt":   "`toInt(x)` → int — explicit float→int conversion, truncating toward zero (proc-only).",
 		"len":     "`len(x)` → int — length of a string or list.",
 		"upper":   "`upper(s)` → text — uppercased.",
 		"lower":   "`lower(s)` → text — lowercased.",

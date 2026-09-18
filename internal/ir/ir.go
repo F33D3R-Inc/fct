@@ -403,7 +403,7 @@ type Trigger struct {
 
 // Stmt is one action or proc statement.
 // Op ∈ assign | add | set | remove | clear | call | check | establish | let |
-// return | do | loop | if | break | continue | indexset.
+// return | do | loop | if | break | continue | indexset | spawn | join.
 //
 // let/return/loop/if/break/continue/indexset are proc-only (a proc's own
 // local-variable model, control flow, and result); do calls a proc — from
@@ -427,6 +427,17 @@ type Trigger struct {
 // Else is if's optional `else` branch (nil = none — loop never sets it). A
 // runtime interpreter (runtime/server.go execProcBlock) walks Body/Else
 // recursively; break/continue carry no payload beyond Op itself.
+//
+// spawn/join (Milestone 5: structured concurrency) are proc-only, like
+// let/return/loop/if/break/continue/indexset above. spawn runs Service (the
+// proc name) with Args as a real goroutine and stores its handle into Target
+// (the same field "let" uses for a local's name — a handle IS a local, just
+// one internal/ir/build.go's checkNoTaskUse refuses every other use of).
+// join blocks on the handle named by Target, and — like do/call — binds its
+// result into Bind (coerced per Ret/RetList) when Bind is non-empty.
+// internal/ir/build.go's procBlock (checkSpawnsJoined) proves every spawn is
+// joined before its own enclosing statement block ends; runtime/server.go's
+// execProcBlock is the interpreter for both.
 type Stmt struct {
 	Op      string      `json:"op"`
 	Target  string      `json:"target,omitempty"`  // assign (action: a state cell; proc: a `let mut` local); let: the local's name
