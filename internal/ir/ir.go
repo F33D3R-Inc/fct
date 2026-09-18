@@ -531,7 +531,7 @@ type Binding struct {
 
 // Node is one view node in the neutral tree.
 type Node struct {
-	Kind     string `json:"kind"` // box|row|text|heading|image|icon|video|richtext|badge|button|list|if|match|case|else|input|textarea|checkbox|radio|link|select|form|upload|use|slot|tabs|tab|overlay|typeahead|option|options|stage|sprite
+	Kind     string `json:"kind"` // box|row|text|heading|image|icon|video|richtext|badge|button|list|if|match|case|else|input|textarea|checkbox|radio|link|select|form|upload|use|slot|tabs|tab|overlay|popover|typeahead|option|options|stage|sprite
 	Children []Node `json:"children,omitempty"`
 
 	// Segs is the node's own interpolated value: a text/badge leaf's words, an

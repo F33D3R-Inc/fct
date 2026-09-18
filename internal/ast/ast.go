@@ -1300,6 +1300,20 @@ type Overlay struct {
 	Body []Node
 }
 
+// Popover is an anchored layer shown while its bound boolean client cell is
+// truthy: `popover bind menuOpen:`. Unlike Overlay, it is not centered over the
+// page — it is positioned beside whatever rendered immediately before it in the
+// same sibling list (a button, a chip, a row), the way a "…" menu hangs off the
+// control that opened it rather than taking over the screen. An invisible
+// full-page catcher still closes it on an outside click, same contract as
+// Overlay's backdrop; there is just nothing dimmed. Because "beside" means
+// beside a real rendered sibling, a `popover` written as the first node in its
+// block is rejected at parse time rather than silently anchoring to nothing.
+type Popover struct {
+	Bind string
+	Body []Node
+}
+
 // Typeahead is a text input that suggests existing values of an entity field as
 // the actor types: `typeahead bind q from Tag.name`. It binds the chosen text to a
 // client cell and offers a native completion list drawn from the collection.
@@ -1517,6 +1531,7 @@ func (Stage) node()     {}
 func (If) node()        {}
 func (Input) node()     {}
 func (Overlay) node()   {}
+func (Popover) node()   {}
 func (Typeahead) node() {}
 func (Link) node()      {}
 func (Select) node()    {}

@@ -4586,6 +4586,33 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			node.Children = kids
 			out = append(out, node)
 
+		case ast.Popover:
+			// Same state contract as Overlay, checked the same way, for the same
+			// reason: a popover toggles client-side, so only a @client bool cell
+			// may back it.
+			p, ok := c.e.states[t.Bind]
+			if !ok {
+				return nil, &BuildError{0, fmt.Sprintf("popover binds unknown state %q", t.Bind)}
+			}
+			if p != Client {
+				return nil, &BuildError{0, fmt.Sprintf("popover binds %q, which is authoritative; a popover toggles client-side, so it needs a @client state", t.Bind)}
+			}
+			if c.e.stateTypes[t.Bind] != "bool" {
+				return nil, &BuildError{0, fmt.Sprintf("popover binds %q, which is not a bool; a popover is shown while a bool cell is true", t.Bind)}
+			}
+			node := Node{Kind: "popover", Bind: t.Bind}
+			if !sc.inRegion {
+				node.ID = c.id("f", c.nf)
+				c.nf++
+				c.addDep(t.Bind, node.ID)
+			}
+			kids, err := c.nodes(t.Body, sc.region())
+			if err != nil {
+				return nil, err
+			}
+			node.Children = kids
+			out = append(out, node)
+
 		case ast.Typeahead:
 			p, ok := c.e.states[t.Bind]
 			if !ok {

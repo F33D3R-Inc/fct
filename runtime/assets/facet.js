@@ -205,7 +205,7 @@
     inputById = {};
     function collect(nodes) {
       for (const n of list(nodes)) {
-        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs" || n.kind === "match" || n.kind === "overlay" || n.kind === "stage") && n.id) regionById[n.id] = n;
+        if ((n.kind === "list" || n.kind === "if" || n.kind === "use" || n.kind === "tabs" || n.kind === "match" || n.kind === "overlay" || n.kind === "popover" || n.kind === "stage") && n.id) regionById[n.id] = n;
         // A control whose choices come from data is a region too, under the id it
         // already has: the collection behind it changes, so its options must.
         if (optionsRegionId(n)) regionById[n.id] = n;
@@ -1016,6 +1016,12 @@
         fillOverlay(d, node, sc, path);
         return d;
       }
+      case "popover": {
+        const d = el("div");
+        if (node.id) d.setAttribute("data-fa-region", node.id);
+        fillPopover(d, node, sc, path);
+        return d;
+      }
       case "typeahead": {
         const frag = document.createDocumentFragment();
         const i = el("input", "fa-typeahead");
@@ -1410,6 +1416,7 @@
   function fillFor(kind) {
     return kind === "list" ? fillList : kind === "use" ? fillUse : kind === "tabs" ? fillTabs
       : kind === "match" ? fillMatch : kind === "overlay" ? fillOverlay
+      : kind === "popover" ? fillPopover
       : kind === "stage" ? fillStage
       : kind === "select" || kind === "radio" ? fillOptions : fillIf;
   }
@@ -1448,6 +1455,83 @@
     backdrop.appendChild(panel);
     container.appendChild(backdrop);
   }
+
+  // openPopovers tracks every currently-open popover's region container, panel
+  // and anchor element, so a window resize can reposition all of them without
+  // walking the whole tree. An entry lives here exactly as long as its panel is
+  // in the DOM — added at the end of fillPopover's open branch, deleted at the
+  // top of every fillPopover call (its close branch, and the first line of a
+  // reopen that is about to add a fresh entry back).
+  const openPopovers = new Map(); // container element -> { panel, anchor }
+
+  // positionPopover is the one piece of real anchor positioning this runtime
+  // does: this codebase's CSS otherwise never depends on the browser's own
+  // `anchor-name`/`position-anchor` (too new for the "renders legibly anywhere"
+  // baseCSS aims for), so a popover is placed the older, universally-supported
+  // way — measure the anchor with getBoundingClientRect, then set the panel's
+  // own `position: fixed` left/top from that measurement. It prefers directly
+  // below the anchor's left edge, flips above when there is not enough room
+  // below but is above the fold, and is clamped on every edge so it can never
+  // render off-screen (the "reasonable viewport-edge handling" this feature is
+  // for). The panel starts `visibility: hidden` (baseCSS) so a mis-measured
+  // first frame is never visible; this function is what reveals it.
+  const FA_POPOVER_GAP = 6, FA_POPOVER_MARGIN = 8;
+  function positionPopover(panel, anchor) {
+    if (!anchor || typeof anchor.getBoundingClientRect !== "function") {
+      // No previous sibling rendered an element (e.g. it was an untracked `if`
+      // that is currently false) — nothing to anchor beside, so the panel is
+      // pinned near the viewport's corner rather than left invisible.
+      panel.style.top = FA_POPOVER_MARGIN + "px";
+      panel.style.left = FA_POPOVER_MARGIN + "px";
+      panel.style.visibility = "visible";
+      return;
+    }
+    const a = anchor.getBoundingClientRect();
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    const p = panel.getBoundingClientRect(); // laid out (visibility:hidden keeps it out of the paint, not out of layout)
+    let top = a.bottom + FA_POPOVER_GAP;
+    const fitsBelow = top + p.height <= vh - FA_POPOVER_MARGIN;
+    const fitsAbove = a.top - p.height - FA_POPOVER_GAP >= FA_POPOVER_MARGIN;
+    if (!fitsBelow && fitsAbove) top = a.top - p.height - FA_POPOVER_GAP;
+    top = Math.min(Math.max(top, FA_POPOVER_MARGIN), Math.max(FA_POPOVER_MARGIN, vh - p.height - FA_POPOVER_MARGIN));
+    let left = Math.min(Math.max(a.left, FA_POPOVER_MARGIN), Math.max(FA_POPOVER_MARGIN, vw - p.width - FA_POPOVER_MARGIN));
+    panel.style.top = top + "px";
+    panel.style.left = left + "px";
+    panel.style.visibility = "visible";
+  }
+
+  // A popover shows an anchored layer while its bound cell is truthy: an
+  // invisible full-page catcher (click closes it, same as overlay's backdrop)
+  // plus a panel placed beside whatever rendered immediately before this
+  // region in the DOM — its anchor. Positioning needs the anchor laid out
+  // (getBoundingClientRect on a detached node answers all zeros), so it is
+  // deferred to the next animation frame: by then `mount()` has already
+  // swapped its whole detached fragment into `root` (mount's synchronous code
+  // finishes before any rAF callback runs), so even a popover open from a
+  // page's very first paint has a laid-out anchor to measure by the time this
+  // runs, exactly as an ordinary open-on-click one does.
+  function fillPopover(container, node, sc, path) {
+    container.textContent = "";
+    curPath = path; // this region's own expressions are addressed from here
+    openPopovers.delete(container);
+    if (!truthy(sc[node.bind])) return;
+    const backdrop = el("div", "fa-popover-backdrop");
+    backdrop.setAttribute("data-fa-close", node.bind);
+    const panel = el("div", "fa-popover-panel");
+    renderKids(panel, node.children, sc, path);
+    container.appendChild(backdrop);
+    container.appendChild(panel);
+    const anchor = container.previousElementSibling;
+    openPopovers.set(container, { panel: panel, anchor: anchor });
+    requestAnimationFrame(function () {
+      if (openPopovers.get(container) && openPopovers.get(container).panel === panel) positionPopover(panel, anchor);
+    });
+  }
+  window.addEventListener("resize", function () {
+    for (const v of openPopovers.values()) positionPopover(v.panel, v.anchor);
+  });
+
   // typeaheadValues are the unique, non-empty values of the source field across the
   // bound collection — the native completion list the input offers.
   function typeaheadValues(node, sc) {

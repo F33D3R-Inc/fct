@@ -2858,6 +2858,22 @@ func parseNodes(children []*source.Node) ([]ast.Node, error) {
 				return nil, err
 			}
 			out = append(out, ov)
+		case strings.HasPrefix(t, "popover "):
+			// `before` is how many nodes this same block has already emitted, in
+			// document order, independent of any `class`/`style`/`anchor` a
+			// sibling carries — which is exactly "does a previous sibling exist
+			// to anchor beside." Checked here, not in internal/ir/build.go: a
+			// `class`-modified popover is lowered through a nested, single-node
+			// call there (see ast.Modified), so that call's own node list is
+			// always empty and cannot answer this question.
+			if before == 0 {
+				return nil, &Error{c.Line.No, "popover has no previous sibling to anchor beside — write it directly after the button (or other element) it opens beside"}
+			}
+			pv, err := parsePopover(c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, pv)
 		case strings.HasPrefix(t, "typeahead "):
 			ta, err := parseTypeahead(strings.TrimSpace(t[len("typeahead "):]), c.Line.No)
 			if err != nil {
@@ -3571,6 +3587,27 @@ func parseOverlay(n *source.Node) (ast.Node, error) {
 		return nil, err
 	}
 	return ast.Overlay{Bind: bind, Body: kids}, nil
+}
+
+// parsePopover: `popover bind <cell>:`, same shape as `overlay bind <cell>:`
+// (see parseOverlay) but for a layer anchored beside its previous sibling
+// instead of centered over the page. The "has a previous sibling" rule itself
+// is enforced by the caller (parseNodes), which is the one place that still
+// knows this node's position among its true siblings.
+func parsePopover(n *source.Node) (ast.Node, error) {
+	head := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(n.Line.Text[len("popover"):]), ":"))
+	if !strings.HasPrefix(head, "bind ") {
+		return nil, &Error{n.Line.No, "popover needs a bound cell: popover bind <cell>:"}
+	}
+	bind := strings.TrimSpace(head[len("bind "):])
+	if !isIdent(bind) {
+		return nil, &Error{n.Line.No, fmt.Sprintf("invalid popover binding %q", bind)}
+	}
+	kids, err := parseNodes(n.Children)
+	if err != nil {
+		return nil, err
+	}
+	return ast.Popover{Bind: bind, Body: kids}, nil
 }
 
 // parseTypeahead: `typeahead bind <cell> from <Entity>.<field> [placeholder "…"]`.

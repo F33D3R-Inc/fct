@@ -1,0 +1,988 @@
+app BTreeSelfHost:
+    # Self-hosting port of a piece of facetql/src/storage/btree.rs — the
+    # copy-on-write B+tree every FacetQL index (and therefore every access
+    # path in the engine) is built on. Read in full before writing this
+    # file, along with selfhost/storage.fct (which already ports Page's
+    # layout+CRC and the Pager's LRU cache, and whose header notes on the
+    # language's real constraints — no indexed array assignment, and the
+    # `do`-call restriction — apply here identically; see below).
+    #
+    # ============================================================
+    # WHAT WAS PORTED, AND WHY THE CUT LANDS WHERE IT DOES:
+    # ============================================================
+    # This file ports the tree's SHAPE and its four core algorithms —
+    # search (`get_at`/`descend`), leaf/branch routing (`branch_child_for`/
+    # `leaf_search`), split-on-overflow (`insert_into_leaf`/
+    # `insert_into_branch`'s split arms, `split_point`), and full
+    # insert/remove (`put`/`insert_into`, `remove`/`remove_from`) — with the
+    # copy-on-write discipline the module's own header describes: "modifying
+    # a page copies it to a newly allocated page id... and then modifies
+    # that copy in place for the rest of the generation." This port has no
+    # "rest of the generation" (see below), so it takes the strongest
+    # reading of that sentence: EVERY node on a mutation's root-to-leaf path
+    # is copied to a fresh arena slot, every time, exactly matching the
+    # task's own framing ("a mutation creates new nodes up to the root
+    # rather than mutating in place").
+    #
+    # Deliberately NOT ported, per the task's own scope: the real Pager
+    # (page allocation/read/write is modeled here as an in-memory
+    # `[BTreeNode]` array — see REPRESENTATION below), the meta-page
+    # generation/commit protocol (`TreeState`/`MetaState`/`commit`), the
+    # two-generations-back free-list reuse rule (`allocate`/`release`/
+    # `cow`'s `dirty` set — collapsed here into "always copy," which is
+    # `cow` restricted to its own first-touch-in-a-generation branch, since
+    # a generation boundary is exactly the thing this port has no
+    # representation for), snapshots/readers/pinning (`Snapshot`,
+    # `oldest_reader`), and `seek`/`for_each_range` (range scans — genuinely
+    # separate machinery layered on top of the same node shape, not part of
+    # what makes a B+tree a B+tree per the task's own framing). No crypto
+    # is involved anywhere in btree.rs itself (it calls neither
+    # `crypto::encrypt` nor `crypto::decrypt` — the Pager underneath it
+    # does, one layer down, exactly like storage.fct's PART ONE/TWO already
+    # found for `Page`/`PagerInner`), so there is no crypto boundary to draw
+    # here at all, unlike storage.fct's PART THREE (`wal.rs`).
+    #
+    # ============================================================
+    # REPRESENTATION — the arena, and why the node itself is a struct:
+    # ============================================================
+    # A "page id" here is a plain `int`: an index into one `[BTreeNode]`
+    # array, the arena — source.fct's own documented "arena/bump allocator
+    # of nodes referenced by index rather than pointer" convention
+    # (source.fct's STAGE 3 header), used for exactly the reason it gives:
+    # this language has no pointers and a struct cannot self-reference
+    # through a field typed as itself, only through an array of itself one
+    # level removed (`Node.children: [Node]` in predicate.fct) — which is
+    # fine for an owned subtree, but wrong here, because a B+tree's child
+    # "pointer" is NOT ownership: two branches never share a child in
+    # predicate.fct's `Node.children` sense, but the whole POINT of
+    # copy-on-write is that a freshly-copied ancestor and the still-live
+    # previous generation's ancestor can (briefly, conceptually) both name
+    # the same untouched child. An int arena index is the honest restatement
+    # of a page id doing exactly that job — this is the task's own
+    # instruction ("children: [int]... indices into a node array standing
+    # in for page addresses") and source.fct's own precedent, not a
+    # workaround.
+    #
+    # The NODE ITSELF, though, is a real `struct` — the one thing the task
+    # is explicit must not be a flat int encoding. `BTreeNode.isLeaf`
+    # decides which of the remaining three fields is meaningful, the same
+    # single-struct-many-shapes discriminant predicate.fct's own `Node.kind`
+    # already established (there `kind` picks among num/bool/text/null/set/
+    # ref/get/un/bin; here `isLeaf` picks between exactly two, matching
+    # btree.rs's own two `PageKind`s a tree body ever descends into, `Leaf`
+    # and `Branch`):
+    #   isLeaf: bool
+    #   keys:     [int]   sorted ascending, always meaningful.
+    #                      Leaf:   one entry per stored key.
+    #                      Branch: the n separator keys (btree.rs's own
+    #                              `branch_cell`'s key half).
+    #   values:   [int]   Leaf only: values[i] is the value stored under
+    #                      keys[i]. Empty (`[]`) on a branch.
+    #   children: [int]   Branch only: n+1 arena indices. children[0] is
+    #                      btree.rs's `page.extra()` (the leftmost pointer,
+    #                      no separator to its left); children[i+1] for
+    #                      i < n is cell i's child (btree.rs's
+    #                      `branch_child`). Folding `extra` into
+    #                      children[0] rather than keeping it a separate
+    #                      field (as `Page`/`branch_cell` do, because a
+    #                      real page's cell list genuinely cannot hold a
+    #                      keyless entry) is a real, deliberate
+    #                      simplification a page-free struct can afford:
+    #                      it makes every split/remove below pure
+    #                      `sliceInts`/`removeIntAt` arithmetic over ONE
+    #                      array instead of one array plus a special-cased
+    #                      scalar always kept in lockstep with it — see
+    #                      the split/remove procs' own comments for where
+    #                      this concretely pays off. Empty (`[]`) on a
+    #                      leaf.
+    #   The invariant `len(children) == len(keys) + 1` on every branch (and
+    #   its corollary, `len(keys) == 0 => len(children) == 1`) is exactly
+    #   btree.rs's own "n separators route to n+1 children" shape and is
+    #   relied on by `btreeCollapseRoot` below.
+    #
+    # A "tree" is one `BTreeHandle{arena: [BTreeNode], root: int}` — the
+    # pure-functional stand-in for what `BTree.state.root` plus `BTree.pager`
+    # together name in the real engine. Every mutation below takes one
+    # `BTreeHandle`-shaped pair in and returns a new one out; nothing is
+    # ever mutated in place, both because this language has no in-place
+    # array mutation to reach for (storage.fct's header note 1, restated
+    # for struct arrays by its own PagerEntry section: "arr[i] = v does not
+    # exist for a struct array either") and because that is copy-on-write's
+    # actual meaning.
+    #
+    # ============================================================
+    # TWO LANGUAGE FACTS THIS FILE'S SHAPE IS BUILT AROUND (both already
+    # established by storage.fct's header, restated here because every
+    # proc below leans on them constantly):
+    # ============================================================
+    # 1. No indexed assignment, for a struct array any more than for a
+    #    byte buffer. Every "update the node at index i" below (replacing a
+    #    child pointer, inserting a promoted separator) is `sliceInts`/
+    #    `concatInts`-style pure array-rebuilding, restated here for `int`
+    #    arrays generically (`sliceInts`/`concatInts`/`insertIntAt`/
+    #    `removeIntAt`/`replaceIntAt`) since a node's keys/values/children
+    #    are all `[int]`. "Allocating a fresh page" is `append(arena,
+    #    newNode)` — the arena only ever grows; nothing is reused, which is
+    #    the correct restatement of `cow`'s always-copy branch (see above)
+    #    and costs this port nothing, since it never runs a second
+    #    generation to reclaim space in.
+    # 2. `do ProcName(args)` may only appear as a bare statement or as the
+    #    RHS of a FRESH `let name = do ProcName(args)` binding — never a
+    #    loop-body or plain reassignment of an existing name, never nested
+    #    inside another expression. Every proc below binds each `do` result
+    #    to its own fresh `let`, exactly like storage.fct's own procs do.
+    #    Self-recursion (a proc calling itself via `do`) is separately
+    #    proven live (source.fct's `subtreeSum`/`subtreeDepth`/
+    #    `subtreeCount`, and runtime/proc_test.go's factorial test) and is
+    #    the ONLY recursion shape this file uses — `btreeInsertInto`,
+    #    `btreeRemoveFrom`, and `btreeCollapseRoot` each call themselves,
+    #    never each other, specifically so no mutual-recursion claim (never
+    #    proven anywhere in this codebase) is relied on. This is why leaf
+    #    and branch handling are both inlined into one recursive proc per
+    #    algorithm instead of split into `...Leaf`/`...Branch` halves that
+    #    would need to call each other.
+    #
+    # ============================================================
+    # WHY InsertResult/RemoveResult ARE STRUCTS, NOT A TWIN-PROC PAIR:
+    # ============================================================
+    # storage.fct's PagerEntry section returns "the new cache" and "what
+    # got evicted" from two independently re-walked procs
+    # (`pagerCacheStep`/`pagerCacheStepEvicted`) rather than one struct
+    # bundling both, and says why: a proc returns exactly one typed value,
+    # and it chose to get two facts out of one flat, non-recursive loop by
+    # re-deriving it twice line-for-line. That precedent does not extend
+    # here. `btreeInsertInto`/`btreeRemoveFrom` are RECURSIVE — re-deriving
+    # "the new arena" and "what happened to this subtree" as two separate
+    # top-to-bottom re-walks would mean two independently-recursing copies
+    # of the entire insert/remove algorithm, each free to drift from the
+    # other as branch/split/merge logic is added, which is a strictly
+    # WORSE correctness story than one recursion computing one value, not a
+    # better one. A struct already IS "exactly one typed value" — `Node`
+    # (predicate.fct) and `PagerEntry` itself are proof a struct can be
+    # that value — so `InsertResult{arena, split, keptNode, sepKey,
+    # rightNode}` (the direct restatement of btree.rs's own `enum Insert`,
+    # with a discriminant field standing in for the enum tag, same as
+    # `Node.kind` already stands in for predicate.rs's own tree of Rust
+    # enums) and `RemoveResult{arena, node, removed, empty}` (already a
+    # named Rust struct, `Removal`, ported field-for-field) are one
+    # recursive walk each, computing one value each. Every other
+    # "two-facts" case in THIS file that is not naturally one struct (the
+    # leaf binary search's index/found pair) is handled the composed way
+    # instead of the twin-proc way — see `leafFoundAt`/`leafIndexOf`'s own
+    # comment for why that is strictly stronger than re-deriving twice.
+    #
+    # ============================================================
+    # DEMO / HAND-VERIFICATION SCOPE:
+    # ============================================================
+    # `maxKeys` (a node's capacity) is a plain parameter, not a hardcoded
+    # constant — a real page's capacity is byte-size-derived in btree.rs
+    # (`MAX_CELL_LEN`/`fits`), which this port has no bytes to size against
+    # (see task scope: "treat page allocation... as an abstract operation");
+    # a fixed key-count capacity is the direct, honest restatement for a
+    # struct-of-ints node, and threading it as a parameter (rather than a
+    # `btreeMaxKeys()`-style constant proc, storage.fct's own convention for
+    # a truly fixed constant like PAGE_SIZE) keeps the algorithm itself
+    # generic over capacity, which the hand-verification below exercises at
+    # maxKeys=3 specifically because a tiny capacity is what makes splits
+    # happen after only a few inserts — small enough to trace by hand, per
+    # the task's own instruction.
+
+    struct BTreeNode:
+        isLeaf: bool
+        keys: [int]
+        values: [int]
+        children: [int]
+
+    struct BTreeHandle:
+        arena: [BTreeNode]
+        root: int
+
+    # InsertResult: btree.rs's `enum Insert`, restated as a discriminated
+    # struct (see header). `split == false`: `keptNode` is this subtree's
+    # (possibly freshly copied) root; `sepKey`/`rightNode` are unused
+    # (0/-1, matching this codebase's established "-1 means absent"
+    # sentinel, e.g. `pagerCacheFindIndex`). `split == true`: `keptNode`
+    # is the left half, `rightNode` the right half, `sepKey` the separator
+    # to insert into the parent — btree.rs's own "the separator key is the
+    # smallest key in the right half."
+    struct InsertResult:
+        arena: [BTreeNode]
+        split: bool
+        keptNode: int
+        sepKey: int
+        rightNode: int
+
+    # RemoveResult: btree.rs's `struct Removal`, field-for-field (`page` ->
+    # `node`, `removed`, `empty`), plus the arena a caller needs because
+    # nothing here mutates one in place.
+    struct RemoveResult:
+        arena: [BTreeNode]
+        node: int
+        removed: bool
+        empty: bool
+
+    # ============================================================
+    # GENERIC [int] ARRAY HELPERS — storage.fct's `sliceBytes`/
+    # `concatBytes`/`replaceBytesRange` restated for a node's keys/values/
+    # children (all `[int]`), plus the two more shapes a tree's structural
+    # edits need that a page's flat byte buffer never did: inserting and
+    # removing ONE element at an arbitrary position (a page's own
+    # `insert_cell`/`remove_cell` do the analogous job by shifting the slot
+    # directory, deliberately not ported by storage.fct's own PART ONE as
+    # "a page-mutation/allocation POLICY... a genuinely separate,
+    # well-scoped piece of its own" — restated here, for the arena's plain
+    # int arrays rather than a page's byte-and-slot layout, because a
+    # tree's insert/split/remove cannot be written at all without it).
+    # ============================================================
+    proc sliceInts(arr: [int], start: int, end: int) -> [int]:
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            out = append(out, arr[i])
+            i = i + 1
+        return out
+
+    proc concatInts(a: [int], b: [int]) -> [int]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc insertIntAt(arr: [int], index: int, val: int) -> [int]:
+        let before = do sliceInts(arr, 0, index)
+        let n = len(arr)
+        let after = do sliceInts(arr, index, n)
+        let withVal = append(before, val)
+        let result = do concatInts(withVal, after)
+        return result
+
+    proc removeIntAt(arr: [int], index: int) -> [int]:
+        let before = do sliceInts(arr, 0, index)
+        let n = len(arr)
+        let after = do sliceInts(arr, index + 1, n)
+        let result = do concatInts(before, after)
+        return result
+
+    proc replaceIntAt(arr: [int], index: int, val: int) -> [int]:
+        let before = do sliceInts(arr, 0, index)
+        let n = len(arr)
+        let after = do sliceInts(arr, index + 1, n)
+        let withVal = append(before, val)
+        let result = do concatInts(withVal, after)
+        return result
+
+    # ============================================================
+    # ROUTING / SEARCH — btree.rs's `leaf_search` and `branch_child_for`,
+    # both binary searches over a sorted `[int]` (btree.rs searches sorted
+    # byte-string keys; this port's keys are plain `int`, so `<`/`<=`
+    # replace `.cmp()`, otherwise the same algorithm).
+    # ============================================================
+    # lowerBoundInts: the first index i with keys[i] >= target (len(keys)
+    # if none) — exactly `leaf_search`'s own binary search, MINUS the
+    # early-return-on-equal branch. That branch is not lost: `leafFoundAt`
+    # below recovers it in one O(1) equality check on the index this
+    # already computes, rather than re-running a second, independently
+    # written binary search to look for it — which is a STRONGER agreement
+    # guarantee than storage.fct's twin-proc convention (see header): the
+    # two facts here are not two re-derivations that could in principle
+    # diverge, they are one computation and a provably-equivalent
+    # restatement of the other (i < len(keys) && keys[i] == target is
+    # exactly when a lower-bound search would have hit an exact match).
+    proc lowerBoundInts(keys: [int], target: int) -> int:
+        let mut low = 0
+        let mut high = len(keys)
+        loop low < high:
+            let mid = (low + high) / 2
+            if keys[mid] < target:
+                low = mid + 1
+            else:
+                high = mid
+        return low
+
+    proc leafIndexOf(node: BTreeNode, key: int) -> int:
+        let idx = do lowerBoundInts(node.keys, key)
+        return idx
+
+    proc leafFoundAt(node: BTreeNode, key: int) -> bool:
+        let idx = do lowerBoundInts(node.keys, key)
+        let n = len(node.keys)
+        if idx < n && node.keys[idx] == key:
+            return true
+        return false
+
+    # upperBoundInts: the first index i with keys[i] > target — equivalently
+    # the count of keys[i] <= target, which is exactly `branch_child_for`'s
+    # own `slot` (its loop advances `slot = index + 1` for as long as
+    # `branch_key(cell) <= key`, i.e. counts separators not exceeding the
+    # search key). `node.children[upperBoundInts(node.keys, key)]` is
+    # therefore the direct restatement of `branch_child_for`'s returned
+    # `(slot, child)` pair — no twin proc needed here either, since `child`
+    # is a trivial one-array-index derivation from `slot`, not an
+    # independent fact.
+    proc upperBoundInts(keys: [int], target: int) -> int:
+        let mut low = 0
+        let mut high = len(keys)
+        loop low < high:
+            let mid = (low + high) / 2
+            if keys[mid] <= target:
+                low = mid + 1
+            else:
+                high = mid
+        return low
+
+    # btreeDescendToLeaf: `descend` — walk from `nodeIndex` to the leaf
+    # `key` belongs in. `depth` restates `descend`'s own `for _ in
+    # 0..MAX_TREE_DEPTH` bound (btree.rs's guard against a cyclic/impossible
+    # child pointer spinning forever); a proc has no `Result` to fail with,
+    # so exceeding it returns -1, a value no real arena index ever is.
+    proc btreeDescendToLeaf(arena: [BTreeNode], nodeIndex: int, key: int, depth: int) -> int:
+        if depth >= 64:
+            return -1
+        let node = arena[nodeIndex]
+        if node.isLeaf:
+            return nodeIndex
+        let slot = do upperBoundInts(node.keys, key)
+        let child = node.children[slot]
+        let result = do btreeDescendToLeaf(arena, child, key, depth + 1)
+        return result
+
+    # btreeGet: `get_at` — the value stored under `key`, or -1 if absent
+    # (this port's values are plain non-negative demo ints, so -1 is a safe
+    # "not found" sentinel, matching `pagerCacheFindIndex`'s own
+    # convention; a real port would need a found flag alongside it, exactly
+    # like `leafFoundAt` provides for the leaf-local case).
+    proc btreeGet(arena: [BTreeNode], rootIndex: int, key: int) -> int:
+        let leafIdx = do btreeDescendToLeaf(arena, rootIndex, key, 0)
+        if leafIdx == -1:
+            return -1
+        let leaf = arena[leafIdx]
+        let found = do leafFoundAt(leaf, key)
+        if !found:
+            return -1
+        let idx = do leafIndexOf(leaf, key)
+        return leaf.values[idx]
+
+    proc btreeLookup(tree: BTreeHandle, key: int) -> int:
+        let v = do btreeGet(tree.arena, tree.root, key)
+        return v
+
+    # ============================================================
+    # SPLIT-ON-OVERFLOW — `split_point` plus the leaf/branch rebuild halves
+    # of `insert_into_leaf`/`insert_into_branch`'s split arms. Each is
+    # exercised standalone by this file's own demo procs below (not just
+    # indirectly through insert), per the task's own framing of this as
+    # its own well-scoped piece.
+    # ============================================================
+    # btreeSplitPoint: `split_point`'s own balanced-midpoint choice,
+    # simplified from btree.rs's variable-length-cell search (which walks
+    # outward from the midpoint hunting for a byte-size-feasible cut) to a
+    # plain floor-half of a FIXED key count — the same simplification
+    # `maxKeys`-as-int-count makes everywhere else in this file, and always
+    # a valid, non-empty cut for any n >= 2 (an overflowing node always has
+    # n = maxKeys + 1 >= 2 for any maxKeys >= 1).
+    proc btreeSplitPoint(n: int) -> int:
+        return n / 2
+
+    # btreeBuildLeafHalf: one half of a leaf split — `keys[start:end]` and
+    # the matching `values[start:end]`, packaged as a fresh (not yet
+    # arena-allocated) `BTreeNode`.
+    proc btreeBuildLeafHalf(keys: [int], values: [int], start: int, end: int) -> BTreeNode:
+        let ks = do sliceInts(keys, start, end)
+        let vs = do sliceInts(values, start, end)
+        return BTreeNode{isLeaf: true, keys: ks, values: vs, children: []}
+
+    proc btreeSplitLeafLeft(keys: [int], values: [int]) -> BTreeNode:
+        let n = len(keys)
+        let mid = do btreeSplitPoint(n)
+        let node = do btreeBuildLeafHalf(keys, values, 0, mid)
+        return node
+
+    proc btreeSplitLeafRight(keys: [int], values: [int]) -> BTreeNode:
+        let n = len(keys)
+        let mid = do btreeSplitPoint(n)
+        let node = do btreeBuildLeafHalf(keys, values, mid, n)
+        return node
+
+    # btreeBuildBranchHalf: one half of a branch split — `keys[keyStart:
+    # keyEnd]` and `children[childStart:childEnd]`. Because this file
+    # folds btree.rs's separate `extra` field into `children[0]` (see
+    # REPRESENTATION above), a branch half is EXACTLY a contiguous slice of
+    # each array — there is no separate "what is the right half's new
+    # leftmost pointer" step the way `insert_into_branch` needs
+    # (`branch_child(&cells[point])`), because slicing `children` from
+    # `point + 1` already carries that pointer in as its own first element.
+    proc btreeBuildBranchHalf(keys: [int], children: [int], keyStart: int, keyEnd: int, childStart: int, childEnd: int) -> BTreeNode:
+        let ks = do sliceInts(keys, keyStart, keyEnd)
+        let cs = do sliceInts(children, childStart, childEnd)
+        return BTreeNode{isLeaf: false, keys: ks, values: [], children: cs}
+
+    proc btreeSplitBranchLeft(keys: [int], children: [int]) -> BTreeNode:
+        let n = len(keys)
+        let point = do btreeSplitPoint(n)
+        let node = do btreeBuildBranchHalf(keys, children, 0, point, 0, point + 1)
+        return node
+
+    proc btreeSplitBranchRight(keys: [int], children: [int]) -> BTreeNode:
+        let n = len(keys)
+        let point = do btreeSplitPoint(n)
+        let node = do btreeBuildBranchHalf(keys, children, point + 1, n, point + 1, n + 1)
+        return node
+
+    # btreeSplitBranchPromotedKey: the separator that moves UP to the
+    # parent rather than staying in either half — btree.rs's own "the
+    # separator at the split point moves up rather than staying in either
+    # half." Recomputing `point` here the same one-line way the two procs
+    # above do is not duplicated logic in the risky sense (there is nothing
+    # for it to diverge from — `btreeSplitPoint` is a pure function of `n`
+    # alone, called identically in all three places).
+    proc btreeSplitBranchPromotedKey(keys: [int]) -> int:
+        let n = len(keys)
+        let point = do btreeSplitPoint(n)
+        return keys[point]
+
+    # ============================================================
+    # INSERT — `put`/`insert_into`/`insert_into_leaf`/`insert_into_branch`,
+    # collapsed into one self-recursive proc (see header note on why no
+    # mutual recursion is used) plus the leaf base case as its own
+    # non-recursive helper.
+    # ============================================================
+    proc btreeInsertIntoLeaf(arena: [BTreeNode], nodeIndex: int, key: int, value: int, maxKeys: int) -> InsertResult:
+        let node = arena[nodeIndex]
+        let idx = do lowerBoundInts(node.keys, key)
+        let n = len(node.keys)
+
+        # Exact key match: replace the value in place (still copy-on-write
+        # at the node level — a fresh node is allocated either way).
+        if idx < n && node.keys[idx] == key:
+            let newValues = do replaceIntAt(node.values, idx, value)
+            let newNode = BTreeNode{isLeaf: true, keys: node.keys, values: newValues, children: []}
+            let newArena = append(arena, newNode)
+            let newIndex = len(arena)
+            return InsertResult{arena: newArena, split: false, keptNode: newIndex, sepKey: 0, rightNode: -1}
+
+        let newKeys = do insertIntAt(node.keys, idx, key)
+        let newValues2 = do insertIntAt(node.values, idx, value)
+
+        # In-capacity fast path — btree.rs's own "check capacity before
+        # mutating" shape, restated as "check capacity before allocating."
+        if len(newKeys) <= maxKeys:
+            let newNode2 = BTreeNode{isLeaf: true, keys: newKeys, values: newValues2, children: []}
+            let newArena2 = append(arena, newNode2)
+            let newIndex2 = len(arena)
+            return InsertResult{arena: newArena2, split: false, keptNode: newIndex2, sepKey: 0, rightNode: -1}
+
+        # Overflow: split.
+        let leftNode = do btreeSplitLeafLeft(newKeys, newValues2)
+        let rightNode = do btreeSplitLeafRight(newKeys, newValues2)
+        let arena1 = append(arena, leftNode)
+        let leftIndex = len(arena)
+        let arena2 = append(arena1, rightNode)
+        let rightIndex = len(arena1)
+        let separator = rightNode.keys[0]
+        return InsertResult{arena: arena2, split: true, keptNode: leftIndex, sepKey: separator, rightNode: rightIndex}
+
+    # btreeInsertInto: the shared recursive walk. `depth` mirrors
+    # `insert_into`'s own `MAX_TREE_DEPTH` guard; exceeding it returns a
+    # no-op `Kept(nodeIndex)` (a proc has no error to raise, so this bails
+    # out leaving the subtree exactly as handed in, rather than guessing at
+    # a structural change — the same "fail safe, not silently wrong" spirit
+    # as `xs[i]`'s own out-of-range behavior, LANGUAGE.md's proc section).
+    proc btreeInsertInto(arena: [BTreeNode], nodeIndex: int, key: int, value: int, maxKeys: int, depth: int) -> InsertResult:
+        if depth >= 64:
+            return InsertResult{arena: arena, split: false, keptNode: nodeIndex, sepKey: 0, rightNode: -1}
+
+        let node = arena[nodeIndex]
+
+        if node.isLeaf:
+            let leafResult = do btreeInsertIntoLeaf(arena, nodeIndex, key, value, maxKeys)
+            return leafResult
+
+        let slot = do upperBoundInts(node.keys, key)
+        let child = node.children[slot]
+        let childResult = do btreeInsertInto(arena, child, key, value, maxKeys, depth + 1)
+
+        if !childResult.split:
+            let newChildren = do replaceIntAt(node.children, slot, childResult.keptNode)
+            let newNode = BTreeNode{isLeaf: false, keys: node.keys, values: [], children: newChildren}
+            let newArena = append(childResult.arena, newNode)
+            let newIndex = len(childResult.arena)
+            return InsertResult{arena: newArena, split: false, keptNode: newIndex, sepKey: 0, rightNode: -1}
+
+        # Child split: route the new (separator, right-child) pair into
+        # this branch, exactly like `insert_into_branch` does before
+        # checking whether THIS page now overflows in turn.
+        let childrenAfterUpdate = do replaceIntAt(node.children, slot, childResult.keptNode)
+        let childrenWithNew = do insertIntAt(childrenAfterUpdate, slot + 1, childResult.rightNode)
+        let keysWithNew = do insertIntAt(node.keys, slot, childResult.sepKey)
+
+        if len(keysWithNew) <= maxKeys:
+            let newNode2 = BTreeNode{isLeaf: false, keys: keysWithNew, values: [], children: childrenWithNew}
+            let newArena2 = append(childResult.arena, newNode2)
+            let newIndex2 = len(childResult.arena)
+            return InsertResult{arena: newArena2, split: false, keptNode: newIndex2, sepKey: 0, rightNode: -1}
+
+        # This branch itself overflows: split it and promote its middle
+        # separator one level further up.
+        let leftBranch = do btreeSplitBranchLeft(keysWithNew, childrenWithNew)
+        let rightBranch = do btreeSplitBranchRight(keysWithNew, childrenWithNew)
+        let promoted = do btreeSplitBranchPromotedKey(keysWithNew)
+        let arenaAfterLeft = append(childResult.arena, leftBranch)
+        let leftIndex = len(childResult.arena)
+        let arenaAfterRight = append(arenaAfterLeft, rightBranch)
+        let rightIndex = len(arenaAfterLeft)
+        return InsertResult{arena: arenaAfterRight, split: true, keptNode: leftIndex, sepKey: promoted, rightNode: rightIndex}
+
+    # btreeInsert / btreeEmpty: `put`'s own top level — grow a new root
+    # exactly when the whole tree's root split, by wrapping the two halves
+    # in a fresh one-separator branch (`put`'s own "a fresh root page" arm).
+    proc btreeInsert(tree: BTreeHandle, key: int, value: int, maxKeys: int) -> BTreeHandle:
+        let result = do btreeInsertInto(tree.arena, tree.root, key, value, maxKeys, 0)
+        if !result.split:
+            return BTreeHandle{arena: result.arena, root: result.keptNode}
+        let rootKeys = [result.sepKey]
+        let rootChildren = [result.keptNode, result.rightNode]
+        let newRoot = BTreeNode{isLeaf: false, keys: rootKeys, values: [], children: rootChildren}
+        let newArena = append(result.arena, newRoot)
+        let newRootIndex = len(result.arena)
+        return BTreeHandle{arena: newArena, root: newRootIndex}
+
+    proc btreeEmpty() -> BTreeHandle:
+        let rootNode = BTreeNode{isLeaf: true, keys: [], values: [], children: []}
+        let arena = [rootNode]
+        return BTreeHandle{arena: arena, root: 0}
+
+    # ============================================================
+    # REMOVE — `remove`/`remove_from`, collapsed into one self-recursive
+    # proc (again, no mutual recursion) plus the root-collapse loop
+    # `remove`'s own top level runs afterward.
+    # ============================================================
+    proc btreeRemoveFrom(arena: [BTreeNode], nodeIndex: int, key: int, depth: int) -> RemoveResult:
+        if depth >= 64:
+            return RemoveResult{arena: arena, node: nodeIndex, removed: false, empty: false}
+
+        let node = arena[nodeIndex]
+
+        if node.isLeaf:
+            let found = do leafFoundAt(node, key)
+            if !found:
+                return RemoveResult{arena: arena, node: nodeIndex, removed: false, empty: false}
+            let idx = do leafIndexOf(node, key)
+            let newKeys = do removeIntAt(node.keys, idx)
+            let newValues = do removeIntAt(node.values, idx)
+            let newNode = BTreeNode{isLeaf: true, keys: newKeys, values: newValues, children: []}
+            let newArena = append(arena, newNode)
+            let newIndex = len(arena)
+            let isEmpty = len(newKeys) == 0
+            return RemoveResult{arena: newArena, node: newIndex, removed: true, empty: isEmpty}
+
+        let slot = do upperBoundInts(node.keys, key)
+        let child = node.children[slot]
+        let childOutcome = do btreeRemoveFrom(arena, child, key, depth + 1)
+
+        if !childOutcome.removed:
+            return RemoveResult{arena: childOutcome.arena, node: nodeIndex, removed: false, empty: false}
+
+        if childOutcome.empty:
+            # The child holds nothing: drop the pointer to it rather than
+            # keeping an empty subtree reachable forever — `remove_from`'s
+            # own branch arm. Because `children[0]` already IS this file's
+            # "leftmost pointer" (see REPRESENTATION), dropping the
+            # leftmost child and promoting the next one into its place is
+            # nothing more than removing index 0 from BOTH `keys` and
+            # `children` — contrast with `remove_from`'s own Rust, which
+            # has to separately `set_extra(promoted)` AND `remove_cell(0)`
+            # because its leftmost pointer is a field, not element 0 of the
+            # same array its separators index into.
+            if slot == 0:
+                if len(node.keys) == 0:
+                    # This branch had exactly one child (itself) and it
+                    # just emptied: this branch is now empty too. Per the
+                    # header's REPRESENTATION note, this state can only
+                    # ever be handed UP to a caller that will drop the
+                    # pointer to it without reading its `children` — see
+                    # `btreeDelete`'s own comment for why the true root
+                    # can never be the node this fires on.
+                    let emptyNode = BTreeNode{isLeaf: false, keys: [], values: [], children: []}
+                    let arenaE = append(childOutcome.arena, emptyNode)
+                    let idxE = len(childOutcome.arena)
+                    return RemoveResult{arena: arenaE, node: idxE, removed: true, empty: true}
+
+                let newKeys2 = do removeIntAt(node.keys, 0)
+                let newChildren2 = do removeIntAt(node.children, 0)
+                let newNode2 = BTreeNode{isLeaf: false, keys: newKeys2, values: [], children: newChildren2}
+                let arena2 = append(childOutcome.arena, newNode2)
+                let idx2 = len(childOutcome.arena)
+                return RemoveResult{arena: arena2, node: idx2, removed: true, empty: false}
+
+            # slot > 0: the emptied child is children[slot]; the separator
+            # immediately to its left, keys[slot-1], is the one that named
+            # it (see this proc's own header note on the children[i+1]
+            # <-> keys[i] pairing) and is dropped along with it.
+            let newKeys3 = do removeIntAt(node.keys, slot - 1)
+            let newChildren3 = do removeIntAt(node.children, slot)
+            let newNode3 = BTreeNode{isLeaf: false, keys: newKeys3, values: [], children: newChildren3}
+            let arena3 = append(childOutcome.arena, newNode3)
+            let idx3 = len(childOutcome.arena)
+            return RemoveResult{arena: arena3, node: idx3, removed: true, empty: false}
+
+        # Child kept (not emptied): just repoint this branch at its
+        # (possibly freshly copied) new child.
+        let newChildren4 = do replaceIntAt(node.children, slot, childOutcome.node)
+        let newNode4 = BTreeNode{isLeaf: false, keys: node.keys, values: [], children: newChildren4}
+        let arena4 = append(childOutcome.arena, newNode4)
+        let idx4 = len(childOutcome.arena)
+        return RemoveResult{arena: arena4, node: idx4, removed: true, empty: false}
+
+    # btreeCollapseRoot: `remove`'s own post-removal loop — "a root branch
+    # that has lost every separator is one indirection with no information
+    # in it; drop it so the tree does not grow a permanent spine of
+    # single-child branches." Safe to call on ANY node (not just an actual
+    # post-removal root) because a leaf, or a branch that still holds a
+    # separator, is returned unchanged on the first check — restated
+    # recursively (self-recursion again) rather than as `remove`'s own
+    # `for _ in 0..MAX_TREE_DEPTH` counted loop, since a proc's `loop` has
+    # no counted form and this shape needs one `do`-bound step per level
+    # regardless of which looks like.
+    proc btreeCollapseRoot(arena: [BTreeNode], root: int, depth: int) -> int:
+        if depth >= 64:
+            return root
+        let node = arena[root]
+        if node.isLeaf:
+            return root
+        if len(node.keys) > 0:
+            return root
+        # A zero-key branch always has exactly one child (the invariant
+        # `len(children) == len(keys) + 1`) — safe to read `children[0]`
+        # unconditionally. The true root can never be the "0 keys AND 0
+        # children" marker `btreeRemoveFrom` builds above, because that
+        # marker is only ever built for a PARENT that already had 0 keys
+        # BEFORE this delete call started, and every previous
+        # `btreeDelete` call already ran this exact collapse on the root it
+        # returned — so the root handed into any given `btreeDelete` call
+        # is always either a leaf or a branch with >= 1 key.
+        let child = node.children[0]
+        let collapsed = do btreeCollapseRoot(arena, child, depth + 1)
+        return collapsed
+
+    proc btreeDelete(tree: BTreeHandle, key: int) -> BTreeHandle:
+        let outcome = do btreeRemoveFrom(tree.arena, tree.root, key, 0)
+        if !outcome.removed:
+            return BTreeHandle{arena: outcome.arena, root: tree.root}
+        let collapsed = do btreeCollapseRoot(outcome.arena, outcome.node, 0)
+        return BTreeHandle{arena: outcome.arena, root: collapsed}
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — three hand-traced scenarios (full
+    # arithmetic in the task report). All three use maxKeys=3 (a node may
+    # hold at most 3 keys before it must split) specifically because that
+    # capacity is small enough to force a split after only 4 inserts into
+    # one leaf, per the task's own "small-capacity tree" framing.
+    #
+    # Scenario 1 — insert 10,20,30,40,50 (values = key*10) one at a time
+    # into an empty tree. The first three fit in the root leaf; the fourth
+    # (40) overflows it (4 keys > maxKeys=3) and splits: left=[10,20],
+    # right=[30,40], separator=30, new root = branch{keys:[30]}. The fifth
+    # (50) descends into the right leaf (30 <= 50), which still has room
+    # ([30,40,50], 3 keys). Expected final shape: root is a branch with
+    # keys=[30] and exactly 2 children; left child leaf=[10,20]; right
+    # child leaf=[30,40,50]. Expected lookups: get(10)=100, get(30)=300,
+    # get(50)=500 (all hits); get(25)=-1, get(60)=-1 (misses either side
+    # of the routing boundary).
+    #
+    # Scenario 2 — continues scenario 1 with 60,70,80,90,100 inserted in
+    # turn. 60 and 70 fill the rightmost leaf to [30,40,50]/[50,60,70]
+    # without another split; 80 overflows [50,60,70,70? ]... (full
+    # per-step arithmetic, including the two further leaf splits at 80 and
+    # 100 and the resulting root separators [30,50] then [30,50,70], is in
+    # the task report) — the last insert (100) overflows the rightmost
+    # leaf a third time AND, because the root already holds 3 separators
+    # ([30,50,70]), promoting a 4th ([30,50,70,90]) overflows the ROOT
+    # too, so the root itself splits and the tree grows a third level.
+    # Expected final shape: root is a branch with keys=[70] and 2
+    # children; its left child is a branch with keys=[30,50] and 3
+    # children (leaves [10,20]/[30,40]/[50,60]); its right child is a
+    # branch with keys=[90] and 2 children (leaves [70,80]/[90,100]).
+    # Expected lookups: get(60)=600, get(90)=900 (hits through the new
+    # 3-level path on both sides of the new root separator); get(45)=-1,
+    # get(15)=-1 (misses).
+    #
+    # Scenario 3 — starting fresh from scenario 1's 5-entry tree
+    # (root branch keys=[30], leaves [10,20]/[30,40,50]): delete(10)
+    # leaves the left leaf at [20] (not empty, ordinary shrink);
+    # delete(20) then empties the left leaf entirely. Since the left leaf
+    # is children[0] of a branch holding 1 separator (not 0), the branch
+    # drops it by removing index 0 from both its keys and children
+    # (btreeRemoveFrom's slot==0 arm) as ITS OWN update, coming back
+    # non-empty — but now shaped keys=[]/children=[rightLeafIndex], which
+    # `btreeCollapseRoot` immediately collapses straight down to the right
+    # leaf itself. Expected: after these two deletes the tree's root IS
+    # the original right leaf, [30,40,50] — a branch-to-leaf collapse, not
+    # just a shrink. get(10)=-1, get(20)=-1 (both gone); get(30)=300
+    # (survives the collapse). A further delete(30)/delete(40)/delete(50)
+    # empties that leaf down to keys=[]; get(anything) is then -1 and a
+    # delete of an already-absent key (delete(999) at any point) leaves
+    # the tree completely unchanged (removed=false path).
+    # ============================================================
+    proc demoMaxKeys() -> int:
+        return 3
+
+    proc demoScenario1Tree() -> BTreeHandle:
+        let m = do demoMaxKeys()
+        let t0 = do btreeEmpty()
+        let t1 = do btreeInsert(t0, 10, 100, m)
+        let t2 = do btreeInsert(t1, 20, 200, m)
+        let t3 = do btreeInsert(t2, 30, 300, m)
+        let t4 = do btreeInsert(t3, 40, 400, m)
+        let t5 = do btreeInsert(t4, 50, 500, m)
+        return t5
+
+    proc demoScenario1RootKeys() -> [int]:
+        let tree = do demoScenario1Tree()
+        let root = tree.arena[tree.root]
+        return root.keys
+
+    proc demoScenario1RootChildCount() -> int:
+        let tree = do demoScenario1Tree()
+        let root = tree.arena[tree.root]
+        let n = len(root.children)
+        return n
+
+    proc demoScenario1LeftLeafKeys() -> [int]:
+        let tree = do demoScenario1Tree()
+        let root = tree.arena[tree.root]
+        let leftIdx = root.children[0]
+        let left = tree.arena[leftIdx]
+        return left.keys
+
+    proc demoScenario1RightLeafKeys() -> [int]:
+        let tree = do demoScenario1Tree()
+        let root = tree.arena[tree.root]
+        let rightIdx = root.children[1]
+        let right = tree.arena[rightIdx]
+        return right.keys
+
+    proc demoScenario1Get10() -> int:
+        let tree = do demoScenario1Tree()
+        let v = do btreeLookup(tree, 10)
+        return v
+
+    proc demoScenario1Get30() -> int:
+        let tree = do demoScenario1Tree()
+        let v = do btreeLookup(tree, 30)
+        return v
+
+    proc demoScenario1Get50() -> int:
+        let tree = do demoScenario1Tree()
+        let v = do btreeLookup(tree, 50)
+        return v
+
+    proc demoScenario1Get25() -> int:
+        let tree = do demoScenario1Tree()
+        let v = do btreeLookup(tree, 25)
+        return v
+
+    proc demoScenario1Get60() -> int:
+        let tree = do demoScenario1Tree()
+        let v = do btreeLookup(tree, 60)
+        return v
+
+    proc demoScenario2Tree() -> BTreeHandle:
+        let m = do demoMaxKeys()
+        let t5 = do demoScenario1Tree()
+        let t6 = do btreeInsert(t5, 60, 600, m)
+        let t7 = do btreeInsert(t6, 70, 700, m)
+        let t8 = do btreeInsert(t7, 80, 800, m)
+        let t9 = do btreeInsert(t8, 90, 900, m)
+        let t10 = do btreeInsert(t9, 100, 1000, m)
+        return t10
+
+    proc demoScenario2RootKeys() -> [int]:
+        let tree = do demoScenario2Tree()
+        let root = tree.arena[tree.root]
+        return root.keys
+
+    proc demoScenario2RootChildCount() -> int:
+        let tree = do demoScenario2Tree()
+        let root = tree.arena[tree.root]
+        let n = len(root.children)
+        return n
+
+    proc demoScenario2LeftBranchKeys() -> [int]:
+        let tree = do demoScenario2Tree()
+        let root = tree.arena[tree.root]
+        let leftIdx = root.children[0]
+        let left = tree.arena[leftIdx]
+        return left.keys
+
+    proc demoScenario2RightBranchKeys() -> [int]:
+        let tree = do demoScenario2Tree()
+        let root = tree.arena[tree.root]
+        let rightIdx = root.children[1]
+        let right = tree.arena[rightIdx]
+        return right.keys
+
+    proc demoScenario2Get60() -> int:
+        let tree = do demoScenario2Tree()
+        let v = do btreeLookup(tree, 60)
+        return v
+
+    proc demoScenario2Get90() -> int:
+        let tree = do demoScenario2Tree()
+        let v = do btreeLookup(tree, 90)
+        return v
+
+    proc demoScenario2Get45() -> int:
+        let tree = do demoScenario2Tree()
+        let v = do btreeLookup(tree, 45)
+        return v
+
+    proc demoScenario2Get15() -> int:
+        let tree = do demoScenario2Tree()
+        let v = do btreeLookup(tree, 15)
+        return v
+
+    proc demoScenario3AfterTwoDeletes() -> BTreeHandle:
+        let tree = do demoScenario1Tree()
+        let afterFirst = do btreeDelete(tree, 10)
+        let afterSecond = do btreeDelete(afterFirst, 20)
+        return afterSecond
+
+    proc demoScenario3RootIsLeaf() -> bool:
+        let tree = do demoScenario3AfterTwoDeletes()
+        let root = tree.arena[tree.root]
+        return root.isLeaf
+
+    proc demoScenario3RootKeys() -> [int]:
+        let tree = do demoScenario3AfterTwoDeletes()
+        let root = tree.arena[tree.root]
+        return root.keys
+
+    proc demoScenario3Get10() -> int:
+        let tree = do demoScenario3AfterTwoDeletes()
+        let v = do btreeLookup(tree, 10)
+        return v
+
+    proc demoScenario3Get20() -> int:
+        let tree = do demoScenario3AfterTwoDeletes()
+        let v = do btreeLookup(tree, 20)
+        return v
+
+    proc demoScenario3Get30() -> int:
+        let tree = do demoScenario3AfterTwoDeletes()
+        let v = do btreeLookup(tree, 30)
+        return v
+
+    proc demoScenario3EmptiedTree() -> BTreeHandle:
+        let tree = do demoScenario3AfterTwoDeletes()
+        let after30 = do btreeDelete(tree, 30)
+        let after40 = do btreeDelete(after30, 40)
+        let after50 = do btreeDelete(after40, 50)
+        return after50
+
+    proc demoScenario3EmptiedRootKeys() -> [int]:
+        let tree = do demoScenario3EmptiedTree()
+        let root = tree.arena[tree.root]
+        return root.keys
+
+    proc demoScenario3DeleteMissingUnchanged() -> bool:
+        let tree = do demoScenario3AfterTwoDeletes()
+        let after = do btreeDelete(tree, 999)
+        let beforeKeys = tree.arena[tree.root].keys
+        let afterKeys = after.arena[after.root].keys
+        let beforeLen = len(beforeKeys)
+        let afterLen = len(afterKeys)
+        if beforeLen != afterLen:
+            return false
+        let sameRoot = tree.root == after.root
+        return sameRoot
+
+    state s1RootKeys: [int] = []
+    state s1RootChildCount: int = 0
+    state s1LeftLeafKeys: [int] = []
+    state s1RightLeafKeys: [int] = []
+    state s1Get10: int = -1
+    state s1Get30: int = -1
+    state s1Get50: int = -1
+    state s1Get25: int = -1
+    state s1Get60: int = -1
+
+    state s2RootKeys: [int] = []
+    state s2RootChildCount: int = 0
+    state s2LeftBranchKeys: [int] = []
+    state s2RightBranchKeys: [int] = []
+    state s2Get60: int = -1
+    state s2Get90: int = -1
+    state s2Get45: int = -1
+    state s2Get15: int = -1
+
+    state s3RootIsLeaf: bool = false
+    state s3RootKeys: [int] = []
+    state s3Get10: int = -1
+    state s3Get20: int = -1
+    state s3Get30: int = -1
+    state s3EmptiedRootKeys: [int] = []
+    state s3DeleteMissingUnchanged: bool = false
+
+    action runDemoBtree():
+        let rk1 = do demoScenario1RootKeys()
+        let rc1 = do demoScenario1RootChildCount()
+        let ll1 = do demoScenario1LeftLeafKeys()
+        let rl1 = do demoScenario1RightLeafKeys()
+        let g10 = do demoScenario1Get10()
+        let g30 = do demoScenario1Get30()
+        let g50 = do demoScenario1Get50()
+        let g25 = do demoScenario1Get25()
+        let g60 = do demoScenario1Get60()
+
+        let rk2 = do demoScenario2RootKeys()
+        let rc2 = do demoScenario2RootChildCount()
+        let lb2 = do demoScenario2LeftBranchKeys()
+        let rb2 = do demoScenario2RightBranchKeys()
+        let g602 = do demoScenario2Get60()
+        let g902 = do demoScenario2Get90()
+        let g452 = do demoScenario2Get45()
+        let g152 = do demoScenario2Get15()
+
+        let isLeaf3 = do demoScenario3RootIsLeaf()
+        let rk3 = do demoScenario3RootKeys()
+        let g103 = do demoScenario3Get10()
+        let g203 = do demoScenario3Get20()
+        let g303 = do demoScenario3Get30()
+        let emptied3 = do demoScenario3EmptiedRootKeys()
+        let missingUnchanged3 = do demoScenario3DeleteMissingUnchanged()
+
+        s1RootKeys = rk1
+        s1RootChildCount = rc1
+        s1LeftLeafKeys = ll1
+        s1RightLeafKeys = rl1
+        s1Get10 = g10
+        s1Get30 = g30
+        s1Get50 = g50
+        s1Get25 = g25
+        s1Get60 = g60
+
+        s2RootKeys = rk2
+        s2RootChildCount = rc2
+        s2LeftBranchKeys = lb2
+        s2RightBranchKeys = rb2
+        s2Get60 = g602
+        s2Get90 = g902
+        s2Get45 = g452
+        s2Get15 = g152
+
+        s3RootIsLeaf = isLeaf3
+        s3RootKeys = rk3
+        s3Get10 = g103
+        s3Get20 = g203
+        s3Get30 = g303
+        s3EmptiedRootKeys = emptied3
+        s3DeleteMissingUnchanged = missingUnchanged3
+
+    view Home at "/":
+        box:
+            text "s1: rootKeys={s1RootKeys} rootChildren={s1RootChildCount} left={s1LeftLeafKeys} right={s1RightLeafKeys} get10={s1Get10} get30={s1Get30} get50={s1Get50} get25={s1Get25} get60={s1Get60}"
+            text "s2: rootKeys={s2RootKeys} rootChildren={s2RootChildCount} leftBranch={s2LeftBranchKeys} rightBranch={s2RightBranchKeys} get60={s2Get60} get90={s2Get90} get45={s2Get45} get15={s2Get15}"
+            text "s3: rootIsLeaf={s3RootIsLeaf} rootKeys={s3RootKeys} get10={s3Get10} get20={s3Get20} get30={s3Get30} emptiedRootKeys={s3EmptiedRootKeys} deleteMissingUnchanged={s3DeleteMissingUnchanged}"

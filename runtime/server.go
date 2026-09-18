@@ -2967,6 +2967,27 @@ func (rd *renderer) overlay(b *strings.Builder, n ir.Node, scope map[string]any,
 	b.WriteString(`</div></div>`)
 }
 
+// popover writes an anchored layer: the same outside-click-closes contract as
+// overlay (a full-page catcher tagged with the bound cell), but nothing is
+// dimmed, and the panel is a sibling of the catcher rather than nested inside
+// it — there is no page-centering box to nest it in. Where it actually sits
+// beside its anchor is not something this render can compute: the anchor is a
+// sibling element, sized and placed by the rest of the page's layout, which
+// only exists once a browser has laid the page out. So the panel is written
+// `position: fixed; visibility: hidden` (baseCSS) and left there; hydrating,
+// runtime/assets/facet.js's positionPopover measures the anchor and reveals it
+// at the right spot. A reader with no script never has a way to open one in the
+// first place — nothing but a control write can flip the bound cell true, and
+// every control write goes through the client's own dispatch — so there is no
+// no-JS state for this markup to serve, unlike overlay's fixed/centered CSS,
+// which needs no measurement and so still means something before JS runs.
+func (rd *renderer) popover(b *strings.Builder, n ir.Node, scope map[string]any, path string) {
+	fmt.Fprintf(b, `<div class="fa-popover-backdrop" data-fa-close="%s"></div><div class="fa-popover-panel">`,
+		html.EscapeString(n.Bind))
+	rd.children(b, n.Children, scope, path)
+	b.WriteString(`</div>`)
+}
+
 // distinctFieldValues collects the unique, non-empty string values of one field
 // across an entity's rows — the suggestion set a typeahead offers.
 func distinctFieldValues(rows any, field string) []string {
@@ -3369,6 +3390,12 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 		fmt.Fprintf(b, `<div%s>`, regionAttrs("", n.ID, n))
 		if truthy(scope[n.Bind]) {
 			rd.overlay(b, n, scope, path)
+		}
+		b.WriteString(`</div>`)
+	case "popover":
+		fmt.Fprintf(b, `<div%s>`, regionAttrs("", n.ID, n))
+		if truthy(scope[n.Bind]) {
+			rd.popover(b, n, scope, path)
 		}
 		b.WriteString(`</div>`)
 	case "typeahead":
@@ -4096,6 +4123,16 @@ const baseCSS = `
   .fa-overlay-panel { background: var(--fa-bg); color: var(--fa-fg); border-radius: calc(var(--fa-radius) + 4px);
     border: 1px solid var(--fa-card-border); padding: 1.1rem 1.25rem; max-width: 32rem; width: 100%;
     max-height: 85vh; overflow: auto; box-shadow: 0 12px 40px rgba(0,0,0,.3); }
+  /* popover: an anchored layer beside a sibling instead of centered — nothing
+     dimmed, a catcher the same size as overlay's backdrop for the outside
+     click, and a panel that starts hidden at a neutral spot until
+     runtime/assets/facet.js measures its anchor and places it (see
+     positionPopover there and server.go's popover/rd.popover comments). */
+  .fa-popover-backdrop { position: fixed; inset: 0; z-index: 50; }
+  .fa-popover-panel { position: fixed; top: 0; left: 0; visibility: hidden; z-index: 51;
+    background: var(--fa-bg); color: var(--fa-fg); border-radius: var(--fa-radius);
+    border: 1px solid var(--fa-card-border); padding: .5rem; min-width: 10rem; max-width: 20rem;
+    max-height: 70vh; overflow: auto; box-shadow: 0 12px 32px rgba(0,0,0,.28); }
   .fa-typeahead { width: 100%; }
   /* controls: a textarea fills its row; a checkbox/toggle/radio option is a
      clickable label whose box sits before its words. */
