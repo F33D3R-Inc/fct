@@ -103,35 +103,53 @@ app IndexTextSelfHost:
     # time here would be rework of a piece the task did not ask for.
     #
     # ============================================================
-    # DEFERRED, HONESTLY: THE NUMERIC ARM OF `encode_order_value`.
+    # THE NUMERIC ARM OF `encode_order_value` — NOW PORTED.
     # ============================================================
     # `encode_value_body`'s `Value::Number` arm needs `f64::to_bits` — a
     # bit-for-bit reinterpretation of a float's IEEE-754 representation
     # as an integer, then a sign-bit flip/complement to make the byte
-    # order match numeric order. This language DOES have real bitwise
-    # integer operators (`&`, `|`, `^`, `<<`, `>>`, `~` — confirmed
-    # already exercised by storage.fct's own CRC-32 port), but it has NO
-    # builtin that turns a `float` into the integer holding its bit
-    # pattern: `toInt`/`toFloat` (`facet lang`'s builtin list, confirmed
-    # directly against `internal/parser/expr.go`'s `isBuiltinCall`
-    # alongside `textToBytes`/`bytesToText`/`byteLen` — the only three
-    # additions this session made) are ARITHMETIC conversions (rounding/
-    # truncating a value), not bit-casts, and no `floatBits`/
-    # `reinterpret`-style builtin exists anywhere in that list. That is a
-    # real, different, still-open gap from the one this session closed —
-    # closing THIS one would need a fifth builtin, not just using the
-    # three that already landed.
+    # order match numeric order. That bit-cast is exactly what
+    # `floatBits(f: float) -> int`/`floatFromBits(b: int) -> float`
+    # (`facet lang`'s builtin list, confirmed directly against
+    # `internal/parser/expr.go`'s `isBuiltinCall` and `runtime/eval.go`'s
+    # implementation — `floatBits` is Go's own `math.Float64bits`
+    # reinterpreted as a signed `int64`, `floatFromBits` its exact
+    # inverse) now provide — a real, later addition on top of the
+    # `textToBytes`/`bytesToText`/`byteLen` trio a previous round closed.
     #
-    # So `DataValue` below models exactly the four cases whose byte
-    # encoding needs no numeric bit-cast — `"null"`, `"bool"`, `"text"`,
-    # `"absent"` — and there is no `"num"` case at all, by construction:
-    # not a stubbed-out arm that silently produces a wrong (non-order-
-    # preserving, payload-free) encoding, but a value this file's own
-    # type cannot be asked to build. A caller with a genuinely numeric
-    # `data` field cannot get an order-preserving key out of this port;
-    # every other JSON type (including the ones a `data` index actually
-    # sees most, `null`/absent/text and the common case of a boolean
-    # flag) gets the real encoding, verified byte-for-byte below.
+    # `DataValue` now models the real Rust `Value::Number` arm as a
+    # `"num"` case (a `numVal: float` field) alongside `"null"`/`"bool"`/
+    # `"text"`/`"absent"`. `encodeValueBody`'s `"num"` branch restates
+    # `encode_value_body`'s own arm exactly:
+    #   let bits = floatBits(v.numVal)          # f.to_bits()
+    #   ordered = if bits < 0 { ~bits }          # is_sign_negative(): the
+    #             else { bits ^ (1 << 63) }      # IEEE sign bit is bit 63,
+    #                                            # so a raw bit-cast int64
+    #                                            # is negative in two's
+    #                                            # complement iff that bit
+    #                                            # is set — exactly
+    #                                            # `f.is_sign_negative()`
+    #   then `ordered`'s 8 bytes, big-endian (`writeU64BEBytes`, already
+    #   in this file for `indexHistoryKey`'s version suffix — reused, not
+    #   reinvented), same as Rust's `ordered.to_be_bytes()`.
+    # `~` (bitwise NOT) is a real operator here — confirmed against
+    # `internal/ir/build.go`'s `checkBitwiseTypes`/`runtime/eval.go`'s
+    # `^toInt(x)` — a full 64-bit complement, exactly `!bits` on a `u64`.
+    #
+    # Order-preservation (the actual point of this encoding, not just
+    # round-trip fidelity) was verified live via `facet console` across
+    # -100.5, -1.0, -0.001, 0.0, 0.0 negated (`-0.0`), 0.001, 1.0, 100.5 —
+    # see the task report for the full byte-for-byte trace. One real,
+    # expected wrinkle inherited unchanged from the Rust source: `-0.0`'s
+    # IEEE sign bit is set (`f.is_sign_negative()` is true for it, same
+    # as Rust), so it encodes by the *negative* branch and its bytes sort
+    # strictly before `0.0`'s — a known, accepted property of this exact
+    # bit-cast trick (the module doc's own `compare_order_values`, the
+    # in-memory comparator, treats `0.0 == -0.0` via `partial_cmp`, but
+    # that is a claim about decoded `f64` values, not about this
+    # bytewise encoding of them; nothing in `encode_value_body`'s own doc
+    # comment claims the two encode identically). Every other pair here
+    # sorts in exact numeric order.
     #
     # `int`, this language's only integer type, is also signed 64-bit —
     # there is no `u64`. `indexHistoryKey`'s `version` parameter is
@@ -211,6 +229,35 @@ app IndexTextSelfHost:
         let head = do sliceBytes(buf, 0, np)
         let eq = do bytesEqual(head, prefix)
         return eq
+
+    # compareBytesLex: plain lexicographic byte-string comparison
+    # (-1/0/1), the same ordering `compare_order_values`'s own doc says
+    # this file's key encodings must agree with byte-for-byte. Needed
+    # below to PROVE the numeric encoding is order-preserving, not just
+    # round-trippable — a shorter buffer that is a byte-prefix of a
+    # longer one still compares as "less", matching `append_escaped`'s
+    # own terminator reasoning.
+    proc compareBytesLex(a: [int], b: [int]) -> int:
+        let na = len(a)
+        let nb = len(b)
+        let mut n = na
+        if nb < n:
+            n = nb
+        let mut i = 0
+        let mut result = 0
+        loop i < n:
+            if result == 0:
+                if a[i] < b[i]:
+                    result = -1
+                if a[i] > b[i]:
+                    result = 1
+            i = i + 1
+        if result == 0:
+            if na < nb:
+                result = -1
+            if na > nb:
+                result = 1
+        return result
 
     # writeU16BEBytes: `(bytes.len() as u16).to_be_bytes()` — the `as u16`
     # truncation is restated as an explicit `& 65535` mask so the same
@@ -453,30 +500,35 @@ app IndexTextSelfHost:
         kind: text
         boolVal: bool
         textVal: text
+        numVal: float
 
     proc absentDataValue() -> DataValue:
-        return DataValue{kind: "absent", boolVal: false, textVal: ""}
+        return DataValue{kind: "absent", boolVal: false, textVal: "", numVal: 0.0}
 
     proc nullDataValue() -> DataValue:
-        return DataValue{kind: "null", boolVal: false, textVal: ""}
+        return DataValue{kind: "null", boolVal: false, textVal: "", numVal: 0.0}
 
     proc boolDataValue(b: bool) -> DataValue:
-        return DataValue{kind: "bool", boolVal: b, textVal: ""}
+        return DataValue{kind: "bool", boolVal: b, textVal: "", numVal: 0.0}
 
     proc textDataValue(t: text) -> DataValue:
-        return DataValue{kind: "text", boolVal: false, textVal: t}
+        return DataValue{kind: "text", boolVal: false, textVal: t, numVal: 0.0}
 
-    # dataValueTypeRank: `type_rank`. The "num"/"composite" ranks (0x30,
-    # 0x50) are named here for the record — the full ordering `data`
-    # values fall into — even though `DataValue` itself can never hold
-    # either: `"num"` is the deferred case, and a JSON array/object was
-    # already out of scope before this file (query.fct's `OrderValue`
-    # never introduced one either).
+    proc numDataValue(n: float) -> DataValue:
+        return DataValue{kind: "num", boolVal: false, textVal: "", numVal: n}
+
+    # dataValueTypeRank: `type_rank`. The "composite" rank (0x50) is
+    # named here for the record — the full ordering `data` values fall
+    # into — even though `DataValue` itself can never hold one: a JSON
+    # array/object was already out of scope before this file (query.fct's
+    # `OrderValue` never introduced one either).
     proc dataValueTypeRank(v: DataValue) -> int:
         if v.kind == "null":
             return 16
         if v.kind == "bool":
             return 32
+        if v.kind == "num":
+            return 48
         if v.kind == "text":
             return 64
         return 240
@@ -500,8 +552,8 @@ app IndexTextSelfHost:
         acc = append(acc, 0)
         return acc
 
-    # encodeValueBody: `encode_value_body`, minus the `Value::Number` arm
-    # (deferred — see header).
+    # encodeValueBody: `encode_value_body`, now including the
+    # `Value::Number` arm — see the header for the exact bit trick.
     proc encodeValueBody(v: DataValue) -> [int]:
         let rank = do dataValueTypeRank(v)
         let mut out = [rank]
@@ -510,6 +562,16 @@ app IndexTextSelfHost:
                 out = append(out, 1)
             else:
                 out = append(out, 0)
+        if v.kind == "num":
+            let bits = floatBits(v.numVal)
+            let mut ordered = 0
+            if bits < 0:
+                ordered = ~bits
+            else:
+                ordered = bits ^ (1 << 63)
+            let orderedBytes = do writeU64BEBytes(ordered)
+            let withNum = do concatBytes(out, orderedBytes)
+            out = withNum
         if v.kind == "text":
             let bytes = textToBytes(v.textVal)
             let withText = do concatBytes(out, bytes)
@@ -870,6 +932,88 @@ app IndexTextSelfHost:
         let full = do encodeOrderValue(helloVal)
         let isPrefix = do bytesHasPrefix(full, prefix)
         return isPrefix
+
+    # data_key numeric arm — rank byte hand-traced: `type_rank` gives
+    # `Value::Number` 0x30 = 48, and a non-negative float's body is
+    # `bits ^ (1 << 63)`'s 8 big-endian bytes. 1.0's bits are
+    # 0x3FF0000000000000; XOR the sign bit gives 0xBFF0000000000000 =
+    # [191, 240, 0, 0, 0, 0, 0, 0] — hand-verified against Go's own
+    # `math.Float64bits(1.0)` (the exact value `floatBits` is defined to
+    # return) before writing this fixture.
+    proc demoNumericEncodingOk() -> bool:
+        let v = do numDataValue(1.0)
+        let body = do encodeValueBody(v)
+        let expect = [48, 191, 240, 0, 0, 0, 0, 0, 0]
+        let eq = do bytesEqual(body, expect)
+        return eq
+
+    # data_key numeric arm — round trip through the address lookup, same
+    # shape as demoDataKeyEscapingOk, proving the numeric body survives
+    # append_escaped/addressFromDataKey exactly like text does (no 0x00
+    # byte happens to appear in 1.0's encoding above, so this also
+    # exercises a case where none of the escaping logic fires at all).
+    proc demoNumericDataKeyRoundTripOk() -> bool:
+        let v = do numDataValue(100.5)
+        let address = "N1"
+        let k = do dataKey(v, address)
+        let lookup = do addressFromDataKey(k)
+        let recoveredAddr = bytesToText(lookup.address)
+        return lookup.found && recoveredAddr == address
+
+    # data_key numeric arm — ORDER PRESERVATION, the actual point of
+    # `encode_value_body`'s bit trick (not just successful round-
+    # tripping): encode_order_value (rank · ordered bits · escape ·
+    # terminator, the exact bytes a real data-index key carries) for
+    # eight values spanning negative, zero, and positive magnitudes, and
+    # confirm consecutive pairs compare in the SAME order as the
+    # underlying `float` values, byte-for-byte via compareBytesLex.
+    # `-0.0` is deliberately included right where `0.0` is expected: its
+    # IEEE sign bit is set, so it hits the *negative* branch and its key
+    # sorts strictly before `0.0`'s — the one accepted wrinkle of this
+    # exact bit-cast trick, inherited unchanged from the Rust source (see
+    # the header's note on `compare_order_values` vs this byte encoding).
+    # Every other adjacent pair sorts in exact numeric order.
+    proc demoNumericOrderPreservationOk() -> bool:
+        let vNeg1005 = do numDataValue(-100.5)
+        let vNeg1 = do numDataValue(-1.0)
+        let vNeg0001 = do numDataValue(-0.001)
+        let vNegZero = do numDataValue(-0.0)
+        let vZero = do numDataValue(0.0)
+        let vPos0001 = do numDataValue(0.001)
+        let vPos1 = do numDataValue(1.0)
+        let vPos1005 = do numDataValue(100.5)
+
+        let kNeg1005 = do encodeOrderValue(vNeg1005)
+        let kNeg1 = do encodeOrderValue(vNeg1)
+        let kNeg0001 = do encodeOrderValue(vNeg0001)
+        let kNegZero = do encodeOrderValue(vNegZero)
+        let kZero = do encodeOrderValue(vZero)
+        let kPos0001 = do encodeOrderValue(vPos0001)
+        let kPos1 = do encodeOrderValue(vPos1)
+        let kPos1005 = do encodeOrderValue(vPos1005)
+
+        let c1 = do compareBytesLex(kNeg1005, kNeg1)
+        let c2 = do compareBytesLex(kNeg1, kNeg0001)
+        let c3 = do compareBytesLex(kNeg0001, kNegZero)
+        let c4 = do compareBytesLex(kNegZero, kZero)
+        let c5 = do compareBytesLex(kZero, kPos0001)
+        let c6 = do compareBytesLex(kPos0001, kPos1)
+        let c7 = do compareBytesLex(kPos1, kPos1005)
+
+        return c1 < 0 && c2 < 0 && c3 < 0 && c4 < 0 && c5 < 0 && c6 < 0 && c7 < 0
+
+    # data_key numeric arm — a `"num"` value's rank (48) sorts strictly
+    # between `"bool"` (32) and `"text"` (64), matching `type_rank`'s own
+    # ordering, and floatFromBits(floatBits(f)) == f (already proven for
+    # the bare builtins) still holds for a value that has gone through
+    # `numDataValue`/`encodeValueBody`'s own field plumbing, not just the
+    # builtins in isolation.
+    proc demoNumericTypeRankAndFidelityOk() -> bool:
+        let v = do numDataValue(-0.001)
+        let rank = do dataValueTypeRank(v)
+        let bits = floatBits(v.numVal)
+        let back = floatFromBits(bits)
+        return rank == 48 && rank > 32 && rank < 64 && back == v.numVal
 
     # fold_into's OWN Rust test, restated verbatim (input and expected
     # output both copied from

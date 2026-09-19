@@ -1,3 +1,6 @@
+import "fabric_core.fct"
+import "fabric_telemetry.fct"
+
 app FabricProtocolSelfHost:
     # Self-hosting port of fabric/crates/fabric-protocol/src/ — the fleet
     # control-plane wire protocol: message.rs (52L: ProtocolVersion,
@@ -72,16 +75,24 @@ app FabricProtocolSelfHost:
     # ============================================================
     # REPRESENTATION CHOICES
     # ============================================================
-    # `Coordinate`/`Shard`/`DbmsId`/`CellWorkloadMetrics` are restated here
-    # field-for-field, the same way every other file in this directory
-    # restates its own copy of a cross-crate type it needs (fabric_core.fct
-    # and fabric_telemetry.fct's own headers give the identical reasoning).
-    # `Shard` here is deliberately the WIRE subset only — `id`+
+    # `Coordinate`/`DbmsId`/`CellWorkloadMetrics` are reused directly via
+    # `import "fabric_core.fct"`/`import "fabric_telemetry.fct"` (their
+    # canonical declarations) rather than restated locally — cross-file
+    # struct/proc reuse is confirmed to work fully in this directory; the
+    # earlier "every file must restate its own copy" convention was a stale
+    # over-generalization from an unrelated view-route collision, corrected
+    # this round.
+    #
+    # `ProtocolShard` (this file's own name — real Rust type is `Shard`,
+    # renamed here only to avoid colliding with fabric_core.fct's own,
+    # differently-shaped `Shard` struct now that both are reachable from one
+    # compile unit) is deliberately the WIRE subset only — `id`+
     # `workload_domain` — because the real `#[derive(Serialize)] pub struct
     # Shard` has `#[serde(skip)]` on both `grid`/`storage`
     # (fabric-core/src/shard.rs): those two fields never exist on the wire
-    # at all, so this file's `Shard` has no fields for them, rather than
-    # inventing a full `Grid`/`ShardStorage` no message here ever carries.
+    # at all, so this file's `ProtocolShard` has no fields for them, rather
+    # than inventing a full `Grid`/`ShardStorage` no message here ever
+    # carries.
     # `DbmsId(pub String)` is a derived-Serialize newtype struct, which
     # serde's default `serialize_newtype_struct` forwards transparently — it
     # is a bare JSON STRING on the wire, never `{"0": "..."}` — confirmed by
@@ -155,28 +166,13 @@ app FabricProtocolSelfHost:
     # ============================================================
     # WIRE DATA MODEL
     # ============================================================
-    struct Coordinate:
-        x: int
-        y: int
-
-    struct DbmsId:
-        value: text
-
-    # Shard: the WIRE subset only (`grid`/`storage` are `#[serde(skip)]` in
-    # the real source — see header).
-    struct Shard:
+    # ProtocolShard: the WIRE subset only (`grid`/`storage` are
+    # `#[serde(skip)]` in the real source — see header). Renamed from the
+    # real Rust type's own name, `Shard`, only to avoid a struct-name
+    # collision with fabric_core.fct's own, differently-shaped `Shard`.
+    struct ProtocolShard:
         id: int
         workloadDomain: text
-
-    struct CellWorkloadMetrics:
-        x: int
-        y: int
-        z: int
-        q: int
-        readsPerSecond: float
-        writesPerSecond: float
-        bytesReadPerSecond: float
-        bytesWrittenPerSecond: float
 
     struct ProtocolVersion:
         major: int
@@ -226,7 +222,7 @@ app FabricProtocolSelfHost:
     struct TelemetryBatch:
         timestampMs: int
         nodeId: DbmsId
-        shard: Shard
+        shard: ProtocolShard
         samples: [TelemetrySample]
 
     struct WorkloadObservation:
@@ -269,7 +265,7 @@ app FabricProtocolSelfHost:
         let emptyReg = NodeRegistration{protocol: "", nodeId: emptyId, softwareVersion: "", region: ""}
         let emptyHb = NodeHeartbeat{nodeId: emptyId, timestampMs: 0, healthy: false}
         let emptyTopo = TopologyReport{nodeId: emptyId, timestampMs: 0, placements: []}
-        let emptyShard = Shard{id: 0, workloadDomain: ""}
+        let emptyShard = ProtocolShard{id: 0, workloadDomain: ""}
         let emptyTelemetry = TelemetryBatch{timestampMs: 0, nodeId: emptyId, shard: emptyShard, samples: []}
         let emptyWorkload = WorkloadObservation{nodeId: "", coordinate: emptyCoord, timestampMs: 0, operationsPerSecond: 0.0, readRatio: 0.0, writeRatio: 0.0}
         return FabricMessage{kind: "", registerNode: emptyReg, heartbeat: emptyHb, topology: emptyTopo, telemetry: emptyTelemetry, workload: emptyWorkload}
@@ -789,17 +785,17 @@ app FabricProtocolSelfHost:
 
     struct ProtoShardResult:
         ok: bool
-        value: Shard
+        value: ProtocolShard
 
     proc protoParseShard(s: text) -> ProtoShardResult:
         let idf = do protoJsonObjectNumberField(s, "id")
         if !idf.ok:
-            return ProtoShardResult{ok: false, value: Shard{id: 0, workloadDomain: ""}}
+            return ProtoShardResult{ok: false, value: ProtocolShard{id: 0, workloadDomain: ""}}
         let wdf = do protoJsonObjectStringField(s, "workload_domain")
         if !wdf.ok:
-            return ProtoShardResult{ok: false, value: Shard{id: 0, workloadDomain: ""}}
+            return ProtoShardResult{ok: false, value: ProtocolShard{id: 0, workloadDomain: ""}}
         let idv = toInt(idf.raw)
-        return ProtoShardResult{ok: true, value: Shard{id: idv, workloadDomain: wdf.value}}
+        return ProtoShardResult{ok: true, value: ProtocolShard{id: idv, workloadDomain: wdf.value}}
 
     struct ProtoCellMetricsResult:
         ok: bool
@@ -1054,7 +1050,7 @@ app FabricProtocolSelfHost:
         value: TelemetryBatch
 
     proc protoParseTelemetryBatch(s: text) -> ProtoTelemetryBatchResult:
-        let zero = TelemetryBatch{timestampMs: 0, nodeId: DbmsId{value: ""}, shard: Shard{id: 0, workloadDomain: ""}, samples: []}
+        let zero = TelemetryBatch{timestampMs: 0, nodeId: DbmsId{value: ""}, shard: ProtocolShard{id: 0, workloadDomain: ""}, samples: []}
         let tsF = do protoJsonObjectNumberField(s, "timestamp_ms")
         if !tsF.ok:
             return ProtoTelemetryBatchResult{ok: false, value: zero}

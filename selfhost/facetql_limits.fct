@@ -1,0 +1,809 @@
+app FacetqlLimitsSelfHost:
+    # Self-hosting port of facetql/src/api/limits.rs (1032L) — read in full
+    # before writing a line here. The module doc frames the whole file as
+    # "resource guards", but most of its guards (connection_permit,
+    # body_limit_layer, concurrency, subscriber_permit, request_timeout_layer,
+    # overloaded) are thin wrappers around a single live
+    # `std::sync::{Arc, Mutex, OnceLock}`/`tokio::sync::Semaphore`/
+    # `std::time::Instant::now()`/axum `Request`/`Next`/`Response` — real
+    # process-wide shared mutable state and real HTTP middleware, not
+    # computation over inputs. There is no atomic/mutex/semaphore primitive
+    # and no live HTTP request in this language, so none of that is portable,
+    # and none of it is faked here.
+    #
+    # What IS portable, and is ported below in full, is the one genuinely
+    # pure, crypto-free algorithm this file contains: the rate limiter's
+    # actual arithmetic and decision table —
+    #
+    #   1. `EndpointClass` and `EndpointClass::of` — the pure `(method, path)
+    #      -> cost class` table (`endpointClassOf` below), matched on path
+    #      segments exactly like the real function.
+    #   2. `EndpointClass::default_rate`/`env_var` — the per-class
+    #      `(burst, refill)` defaults and the config env-var name for each
+    #      class (`endpointClassDefaultRate`/`endpointClassEnvVar`).
+    #   3. `parse_rate_from` — the config-string grammar
+    #      (`burst[:refill]` | `off`, case-insensitive, garbage falls back to
+    #      the default rather than to "unlimited") — `parseRateFrom` below,
+    #      verbatim.
+    #   4. `Bucket::full`/`take`/`is_full` — the actual token-bucket refill
+    #      math — `bucketFull`/`bucketTake`/`bucketIsFull` below, verbatim,
+    #      taking `now` as an explicit `float` (elapsed seconds against some
+    #      caller-chosen, consistently-increasing reference) parameter rather
+    #      than reading a live clock, per this task's own instruction and
+    #      fabric_stats.fct's established precedent (see that file's header
+    #      on why: this runtime's only clock builtin is `now()`, a
+    #      whole-second wall clock with none of `Instant`'s monotonicity
+    #      guarantee — so the pure math is kept provably deterministic and
+    #      the "what is `now`" question is left entirely to the caller, live
+    #      or in a demo).
+    #   5. `Buckets::take` — the per-`(owner, class)` bucket lookup,
+    #      lazy-creation, and the `MAX_TRACKED_BUCKETS` eviction-of-refilled-
+    #      entries-or-refuse behavior — `bucketsTake`/`bucketsEvictFull`
+    #      below, verbatim. `MAX_TRACKED_BUCKETS` (10_000 in the real code) is
+    #      threaded through as an explicit `maxTracked: int` parameter rather
+    #      than inlined, specifically so a demo below can exercise the
+    #      eviction and table-full branches without allocating ten thousand
+    #      buckets — the real deployment default is still 10_000; nothing
+    #      about the algorithm changes by taking it as a parameter instead of
+    #      a compile-time constant.
+    #
+    # ============================================================
+    # WHAT IS DEFERRED, AND WHY EACH PIECE IS GENUINELY LIVE STATE, NOT
+    # MERELY INCONVENIENT
+    # ============================================================
+    #   - `max_body_bytes`/`body_limit_layer`, `request_timeout`/
+    #     `request_timeout_layer`, `max_concurrent_requests`/
+    #     `request_slots`/`in_flight_requests`/`concurrency`,
+    #     `connection_permit`, `subscriber_permit`, `overloaded`,
+    #     `env_usize`/`env_u64`: every one of these either reads the process
+    #     environment, holds a `OnceLock`/`Arc<Semaphore>` for the life of the
+    #     server, or is literally an axum middleware function taking a
+    #     `Request`/`Next` and returning a `Response`. None of that is
+    #     computation over inputs — it IS the live server. No `uses`
+    #     capability in this language reaches a `tokio::sync::Semaphore` or
+    #     an axum middleware stage, so there is nothing to restate short of
+    #     faking it, which this task forbids.
+    #   - `configured_rate`/`parse_rate` — the `OnceLock<HashMap<...>>` that
+    #     caches each class's resolved rate by reading `std::env::var` once
+    #     per process. The cache and the env read are live process state;
+    #     the parse they wrap (`parse_rate_from`) is fully ported at (3)
+    #     above, and the resolved-table SHAPE that `configured_rate` would
+    #     hand a caller is restated as the explicit `RateTable` struct below
+    #     (`rateTableDefault`, and any caller-assembled `RateTable`), so
+    #     `bucketsEvictFull`'s per-class rate lookup — the one place
+    #     `Buckets::take` actually consults `configured_rate` — has a real,
+    #     testable, non-opaque input instead of a hidden global.
+    #   - `buckets()`/the `Mutex<Buckets>` and `rate_limit` itself — the
+    #     process-wide singleton and the axum middleware function that reads
+    #     `request.extensions().get::<AuthIdentity>()`, calls
+    #     `buckets().lock()`, and builds the 429 `Response` (with its
+    #     `Retry-After` header). All three are live HTTP/mutex state; the
+    #     decision table underneath (`Buckets::take`) is ported in full at
+    #     (5) above, so the ALGORITHM `rate_limit` calls is not faked, only
+    #     the wiring around it.
+    #   - No crypto anywhere in this file, and none is needed here: nothing
+    #     in limits.rs hashes, signs, or encrypts anything.
+    #
+    # ============================================================
+    # `AuthIdentity` — REDECLARED LOCALLY, NOT IMPORTED
+    # ============================================================
+    # `rate_limit`'s only use of `crate::auth::AuthIdentity` is
+    # `identity.owner.clone()` — the bucket key. The real struct
+    # (facetql/src/auth.rs:20) is `pub struct AuthIdentity { pub owner:
+    # String, pub role: Role }`, and `Role` (facetql/src/core/user.rs:10) is
+    # a bare two-variant enum, `User`/`Admin` — small enough, on both counts,
+    # to restate locally rather than reach into an unrelated module for it,
+    # matching this directory's own established convention for a small
+    # cross-crate dependency type (see e.g. nodes.fct's locally-restated
+    # STAGE 2 character classifiers, or facetql_metrics.fct's own
+    # `hasPrefixText`). Checked against facetql_metrics.fct and reference.fct
+    # first, since the task flagged them as the other facetql-main-crate
+    # ports most likely to already carry an equivalent type — neither
+    # declares `AuthIdentity` or `Role` in any form, so there is nothing to
+    # import here instead of restating. `role` is restated as `text`
+    # ("user"/"admin"), this directory's own established stand-in for a
+    # closed Rust enum (see `EndpointClass` below, or `RequestClass` in
+    # facetql_metrics.fct) even though nothing in the ported logic below
+    # reads it — it is kept so the struct is the type's REAL shape, not a
+    # field trimmed down to only what today's callers happen to touch.
+    struct AuthIdentity:
+        owner: text
+        role: text
+
+    # ============================================================
+    # PART 1 — ENDPOINT CLASSIFICATION (`EndpointClass`, `EndpointClass::of`)
+    # ============================================================
+    # `EndpointClass` itself needs no dedicated struct once restated as
+    # text — same call facetql_metrics.fct's own header makes for
+    # `RequestClass`. One of "read" / "write" / "bulk" / "admin" /
+    # "subscribe".
+
+    proc limitsIsDigitChar(c: text) -> bool:
+        return c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+    # endpointClassOf: `EndpointClass::of` verbatim — split the raw request
+    # path on `/`, drop empty segments (so `/nodes/` and `/nodes` classify
+    # the same way, matching `planDecodeSegments`'s identical convention in
+    # fabric_plan.fct), and match on the segment shape exactly as the real
+    # function's `match segments.as_slice()` does, arm for arm and in the
+    # same order (order matters: `["admin", ..]` must be checked before the
+    # narrower arms below it, since a real `_` wildcard would otherwise let a
+    # later, more specific arm shadow it — here, checking the wildcard first
+    # gets the identical result without needing wildcard patterns at all).
+    proc endpointClassOf(method: text, path: text) -> text:
+        let raw = split(path, "/")
+        let rawN = len(raw)
+        let mut segs = []
+        let mut i = 0
+        loop i < rawN:
+            if len(raw[i]) > 0:
+                segs = append(segs, raw[i])
+            i = i + 1
+
+        let n = len(segs)
+
+        # `[]` — outside the protected router in the real server, so
+        # unreachable from that middleware; classified anyway so the
+        # function is total, exactly as the real one's own comment says.
+        if n == 0:
+            return "read"
+
+        # `["admin", ..]` | `["stats"]`
+        if segs[0] == "admin":
+            return "admin"
+        if n == 1 && segs[0] == "stats":
+            return "admin"
+
+        # `["events"]`
+        if n == 1 && segs[0] == "events":
+            return "subscribe"
+
+        # `["nodes", "multiget"|"query"|"count"|"count_by"|"aggregate"|
+        #   "aggregate_by"]` | `["transaction"]`
+        if n == 2 && segs[0] == "nodes" && (segs[1] == "multiget" || segs[1] == "query" || segs[1] == "count" || segs[1] == "count_by" || segs[1] == "aggregate" || segs[1] == "aggregate_by"):
+            return "bulk"
+        if n == 1 && segs[0] == "transaction":
+            return "bulk"
+
+        # `["changes"]` — a WAL scan, same disproportionate-cost bucket as
+        # `/nodes/query`/`/transaction` (see the real function's own comment).
+        if n == 1 && segs[0] == "changes":
+            return "bulk"
+
+        # `["publish"]` | `["edge"]`
+        if n == 1 && (segs[0] == "publish" || segs[0] == "edge"):
+            return "write"
+
+        # `["node"]`
+        if n == 1 && segs[0] == "node":
+            return "write"
+
+        # `["node", _, "claim"]`
+        if n == 3 && segs[0] == "node" && segs[2] == "claim":
+            return "write"
+
+        # `["sequence", _, "next"]`
+        if n == 3 && segs[0] == "sequence" && segs[2] == "next":
+            return "write"
+
+        # `["nodes"]` | `["node", _, "history"]` | `["node", _, "owned"]` |
+        # `["node", _, "edges", _]`
+        if n == 1 && segs[0] == "nodes":
+            return "read"
+        if n == 3 && segs[0] == "node" && segs[2] == "history":
+            return "read"
+        if n == 3 && segs[0] == "node" && segs[2] == "owned":
+            return "read"
+        if n == 4 && segs[0] == "node" && segs[2] == "edges":
+            return "read"
+
+        # `["node", _]` — the one place the method decides.
+        if n == 2 && segs[0] == "node":
+            if method == "GET":
+                return "read"
+            return "write"
+
+        return "admin"
+
+    proc endpointClassEnvVar(class: text) -> text:
+        if class == "read":
+            return "FACETQL_RATE_READ"
+        if class == "write":
+            return "FACETQL_RATE_WRITE"
+        if class == "bulk":
+            return "FACETQL_RATE_BULK"
+        if class == "admin":
+            return "FACETQL_RATE_ADMIN"
+        return "FACETQL_RATE_SUBSCRIBE"
+
+    struct RateLimit:
+        burst: float
+        refill: float
+
+    # endpointClassDefaultRate: `EndpointClass::default_rate` verbatim — the
+    # real numbers from the real deployment reasoning in the header comment
+    # there (burst is double the sustained rate in every class).
+    proc endpointClassDefaultRate(class: text) -> RateLimit:
+        if class == "read":
+            return RateLimit{burst: 600.0, refill: 300.0}
+        if class == "write":
+            return RateLimit{burst: 300.0, refill: 150.0}
+        if class == "bulk":
+            return RateLimit{burst: 120.0, refill: 60.0}
+        if class == "admin":
+            return RateLimit{burst: 60.0, refill: 30.0}
+        return RateLimit{burst: 30.0, refill: 5.0}
+
+    # ============================================================
+    # PART 2 — CONFIG-STRING PARSING (`parse_rate_from`)
+    # ============================================================
+
+    # limitsIsPlainDecimalText: the syntactic gate this port uses in place of
+    # `str::parse::<f64>()`'s error return, following exactly the division of
+    # labour fabric_routing.fct's own `isUnsignedIntText` header documents
+    # (validate the shape here, let the real `toFloat` builtin decode the
+    # digits). Accepts an optional leading `+`/`-`, then digits, optionally
+    # with one `.` among them (`"10"`, `"-5"`, `"10.5"`, `".5"`, `"10."`).
+    # Deliberately narrower than real `f64::parse` — no exponent notation
+    # (`"1e5"`), no `"inf"`/`"nan"` — the same kind of honest, narrow,
+    # explicitly-noted gap `isUnsignedIntText`'s own header takes for `u64`
+    # magnitude overflow: no rate-limit config in this engine has ever used
+    # scientific notation or a non-finite rate, and a value that fails this
+    # gate falls back to the class default exactly like a real unparseable
+    # one does, so the gap costs nothing except a diagnosis, never a
+    # dropped bound.
+    proc limitsIsPlainDecimalText(s: text) -> bool:
+        let n = len(s)
+        if n == 0:
+            return false
+        let mut i = 0
+        if charAt(s, 0) == "+" || charAt(s, 0) == "-":
+            i = 1
+        if i >= n:
+            return false
+        let mut sawDigit = false
+        let mut sawDot = false
+        let mut ok = true
+        loop i < n:
+            let c = charAt(s, i)
+            let isDigit = do limitsIsDigitChar(c)
+            if isDigit:
+                sawDigit = true
+            else:
+                if c == "." && !sawDot:
+                    sawDot = true
+                else:
+                    ok = false
+            i = i + 1
+        if !ok:
+            return false
+        return sawDigit
+
+    # limitsJoinFromColon: restates `split_once(':')`'s "everything after the
+    # FIRST colon, colons and all" half — `split(s, ":")` in this language
+    # splits on every colon (matching Go's `strings.Split`, see this
+    # runtime's own doc), so a value like `"10:2:3"` must have its `refill`
+    # half rejoined from `parts[1:]` rather than read as `parts[1]` alone, or
+    # `"2:3"` (which real `"2:3".parse::<f64>()` rejects, falling back to the
+    # default) would wrongly parse as `2`.
+    proc limitsJoinFromColon(parts: [text], startIdx: int) -> text:
+        let n = len(parts)
+        let mut out = ""
+        let mut i = startIdx
+        loop i < n:
+            if i == startIdx:
+                out = parts[i]
+            else:
+                out = out + ":" + parts[i]
+            i = i + 1
+        return out
+
+    struct ParsedRate:
+        off: bool
+        burst: float
+        refill: float
+
+    # parseRateFrom: `parse_rate_from` verbatim. `hasRaw`/`raw` restate
+    # `raw: Option<&str>` — `hasRaw == false` is `None` (env var unset,
+    # yields the class default), `hasRaw == true` is `Some(raw)`.
+    proc parseRateFrom(class: text, hasRaw: bool, raw: text) -> ParsedRate:
+        if !hasRaw:
+            let d = do endpointClassDefaultRate(class)
+            return ParsedRate{off: false, burst: d.burst, refill: d.refill}
+
+        let trimmed = trim(raw)
+
+        if lower(trimmed) == "off":
+            return ParsedRate{off: true, burst: 0.0, refill: 0.0}
+
+        let parts = split(trimmed, ":")
+        let mut burstText = trimmed
+        let mut hasRefillText = false
+        let mut refillText = ""
+        if len(parts) >= 2:
+            burstText = trim(parts[0])
+            let refillJoined = do limitsJoinFromColon(parts, 1)
+            refillText = trim(refillJoined)
+            hasRefillText = true
+
+        let burstSyntaxOk = do limitsIsPlainDecimalText(burstText)
+        if !burstSyntaxOk:
+            let d = do endpointClassDefaultRate(class)
+            return ParsedRate{off: false, burst: d.burst, refill: d.refill}
+        let burst = toFloat(burstText)
+        if burst <= 0.0:
+            let d = do endpointClassDefaultRate(class)
+            return ParsedRate{off: false, burst: d.burst, refill: d.refill}
+
+        if !hasRefillText:
+            return ParsedRate{off: false, burst: burst, refill: burst}
+
+        let refillSyntaxOk = do limitsIsPlainDecimalText(refillText)
+        if !refillSyntaxOk:
+            let d = do endpointClassDefaultRate(class)
+            return ParsedRate{off: false, burst: d.burst, refill: d.refill}
+        let refill = toFloat(refillText)
+        if refill <= 0.0:
+            let d = do endpointClassDefaultRate(class)
+            return ParsedRate{off: false, burst: d.burst, refill: d.refill}
+
+        return ParsedRate{off: false, burst: burst, refill: refill}
+
+    # rateTableDefault: the shape `configured_rate`'s `OnceLock<HashMap<...>>`
+    # would hand a caller when no operator has set any `FACETQL_RATE_*`
+    # variable at all — every class at its real default, never "off". A
+    # caller wiring this to a live process instead builds a `RateTable` from
+    # five real `parseRateFrom` calls against the five real env vars
+    # (`endpointClassEnvVar`'s names) — that env read itself is the deferred
+    # piece, not this struct's shape.
+    struct RateTable:
+        read: ParsedRate
+        write: ParsedRate
+        bulk: ParsedRate
+        admin: ParsedRate
+        subscribe: ParsedRate
+
+    proc rateTableDefault() -> RateTable:
+        let r = do endpointClassDefaultRate("read")
+        let w = do endpointClassDefaultRate("write")
+        let b = do endpointClassDefaultRate("bulk")
+        let a = do endpointClassDefaultRate("admin")
+        let s = do endpointClassDefaultRate("subscribe")
+        return RateTable{read: ParsedRate{off: false, burst: r.burst, refill: r.refill}, write: ParsedRate{off: false, burst: w.burst, refill: w.refill}, bulk: ParsedRate{off: false, burst: b.burst, refill: b.refill}, admin: ParsedRate{off: false, burst: a.burst, refill: a.refill}, subscribe: ParsedRate{off: false, burst: s.burst, refill: s.refill}}
+
+    proc rateTableFor(rates: RateTable, class: text) -> ParsedRate:
+        if class == "read":
+            return rates.read
+        if class == "write":
+            return rates.write
+        if class == "bulk":
+            return rates.bulk
+        if class == "admin":
+            return rates.admin
+        return rates.subscribe
+
+    # ============================================================
+    # PART 3 — THE TOKEN BUCKET (`Bucket::full`/`take`/`is_full`)
+    # ============================================================
+    # `updated`/`now` are seconds against any single caller-chosen,
+    # consistently-increasing reference (a real deployment's live wall clock,
+    # or a demo's own hand-picked sequence below) — never read internally,
+    # per this task's own instruction and fabric_stats.fct's identical
+    # precedent for `takenAt`/`takenAtMs`. `elapsed` is clamped to zero
+    # rather than allowed to go negative, restating
+    # `Instant::saturating_duration_since`'s own defensiveness against a
+    # `now` that (in the real code) could never move backward but (here,
+    # over a caller-supplied float) is not guaranteed to.
+    struct Bucket:
+        tokens: float
+        updated: float
+
+    proc bucketFull(burst: float, now: float) -> Bucket:
+        return Bucket{tokens: burst, updated: now}
+
+    # limitsCeilPositiveSeconds: `f64::ceil()` restated for the one place
+    # `Bucket::take` needs it — computing a whole-second `Retry-After` from a
+    # strictly positive elapsed-seconds value (this builtin set has `floor`/
+    # `round` but no `ceil`; see the real function's own comment on why
+    # rounding must go UP here, never down). Never called except on a
+    # positive `x` (see `bucketTake` below), so the "positive" in the name is
+    # a precondition, not a defensive check.
+    proc limitsCeilPositiveSeconds(x: float) -> int:
+        let f = floor(x)
+        if toFloat(f) == x:
+            return f
+        return f + 1
+
+    struct BucketTakeResult:
+        allow: bool
+        hasRetry: bool
+        retrySecs: int
+        bucket: Bucket
+
+    # bucketTake: `Bucket::take` verbatim — refill from elapsed time, capped
+    # at `burst`; spend one token if there is one, otherwise report the
+    # whole-second `Retry-After` hint. Returns the bucket's new state
+    # alongside the decision (this directory's usual "pure function returns
+    # the new value" shape in place of `&mut self`).
+    proc bucketTake(b: Bucket, burst: float, refill: float, now: float) -> BucketTakeResult:
+        let elapsed = max(now - b.updated, 0.0)
+        let tokens = min(b.tokens + elapsed * refill, burst)
+
+        if tokens >= 1.0:
+            return BucketTakeResult{allow: true, hasRetry: false, retrySecs: 0, bucket: Bucket{tokens: tokens - 1.0, updated: now}}
+
+        let retrySecs = do limitsCeilPositiveSeconds((1.0 - tokens) / refill)
+        return BucketTakeResult{allow: false, hasRetry: true, retrySecs: retrySecs, bucket: Bucket{tokens: tokens, updated: now}}
+
+    # bucketIsFull: `Bucket::is_full` verbatim.
+    proc bucketIsFull(b: Bucket, burst: float, refill: float, now: float) -> bool:
+        let elapsed = max(now - b.updated, 0.0)
+        return b.tokens + elapsed * refill >= burst
+
+    # ============================================================
+    # PART 4 — MULTI-BUCKET COORDINATION (`Buckets::take`)
+    # ============================================================
+    # `HashMap<(String, EndpointClass), Bucket>` restated as a linear
+    # `[BucketEntry]` plus `bucketsIndexOf`, the same `HashMap::insert`/
+    # lookup shape `fabric_telemetry.fct`'s `WorkloadAnalyzer`/
+    # `workloadAnalyzerIndexOf`/`workloadAnalyzerObserve` already use for an
+    # identical "restate a small live map as a linear entries array" problem.
+    struct BucketEntry:
+        owner: text
+        class: text
+        bucket: Bucket
+
+    struct Buckets:
+        entries: [BucketEntry]
+
+    proc bucketsNew() -> Buckets:
+        return Buckets{entries: []}
+
+    proc bucketsIndexOf(entries: [BucketEntry], owner: text, class: text) -> int:
+        let n = len(entries)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if entries[i].owner == owner && entries[i].class == class:
+                    found = i
+            i = i + 1
+        return found
+
+    # bucketsEvictFull: the body of `Buckets::take`'s `self.buckets.retain(...)`
+    # closure, restated as "build the kept list" instead of "remove in
+    # place" (same functional-update convention as everywhere else in this
+    # directory). An entry is dropped when its class has been explicitly
+    # turned off (`rate.off` — `configured_rate` returning `None`, which the
+    # real closure's `return false` maps to unconditionally) or when its
+    # bucket has fully refilled (`bucketIsFull`); kept otherwise. Dropping a
+    # fully-refilled entry is provably free: recreating it on the next
+    # request produces the identical state, per the real function's own
+    # comment.
+    proc bucketsEvictFull(entries: [BucketEntry], now: float, rates: RateTable) -> [BucketEntry]:
+        let n = len(entries)
+        let mut i = 0
+        let mut kept = []
+        loop i < n:
+            let e = entries[i]
+            let rate = do rateTableFor(rates, e.class)
+            if !rate.off:
+                let full = do bucketIsFull(e.bucket, rate.burst, rate.refill, now)
+                if !full:
+                    kept = append(kept, e)
+            i = i + 1
+        return kept
+
+    struct BucketsTakeResult:
+        allow: bool
+        hasRetry: bool
+        retrySecs: int
+        tableFull: bool
+        buckets: Buckets
+
+    # bucketsTake: `Buckets::take` verbatim. `tableFull` is the real
+    # function's `Decision::Deny(None)` — reached only when the tracked-
+    # bucket cap is hit AND eviction freed nothing, meaning every tracked
+    # identity is actively rate-limited right now (the real function's other
+    # `Deny(None)` path, a poisoned `Mutex`, has no counterpart here: there
+    # is no live mutex in this pure restatement to poison).
+    proc bucketsTake(bkts: Buckets, owner: text, class: text, burst: float, refill: float, now: float, maxTracked: int, rates: RateTable) -> BucketsTakeResult:
+        let idx = do bucketsIndexOf(bkts.entries, owner, class)
+        if idx != -1:
+            let existing = bkts.entries[idx].bucket
+            let r = do bucketTake(existing, burst, refill, now)
+            let mut entries = bkts.entries
+            entries[idx] = BucketEntry{owner: owner, class: class, bucket: r.bucket}
+            return BucketsTakeResult{allow: r.allow, hasRetry: r.hasRetry, retrySecs: r.retrySecs, tableFull: false, buckets: Buckets{entries: entries}}
+
+        let mut entries = bkts.entries
+        if len(entries) >= maxTracked:
+            let survivors = do bucketsEvictFull(entries, now, rates)
+            entries = survivors
+            if len(entries) >= maxTracked:
+                return BucketsTakeResult{allow: false, hasRetry: false, retrySecs: 0, tableFull: true, buckets: Buckets{entries: entries}}
+
+        let fresh = do bucketFull(burst, now)
+        let r = do bucketTake(fresh, burst, refill, now)
+        let grown = append(entries, BucketEntry{owner: owner, class: class, bucket: r.bucket})
+        return BucketsTakeResult{allow: r.allow, hasRetry: r.hasRetry, retrySecs: r.retrySecs, tableFull: false, buckets: Buckets{entries: grown}}
+
+    # ============================================================
+    # VERIFICATION DEMOS — one per real Rust `#[cfg(test)]` case this port
+    # covers, named to match. `a_subscriber_permit_is_returned_when_dropped`
+    # (the live `Semaphore` pool test) has no counterpart here — it exercises
+    # exactly the deferred live-permit piece this file's header explains.
+    # `every_declared_route_classifies_as_the_table_says` also has no
+    # counterpart — it drives the real `ROUTES` table, which lives in
+    # `routes.rs` and is not part of this file or ported elsewhere;
+    # `demoEndpointClassRepresentativeSamples` below instead checks a
+    # representative sample of the same route table by hand, honestly a
+    # narrower check than the exhaustive real one.
+    # ============================================================
+
+    proc demoTheNodePathIsClassifiedByMethod() -> bool:
+        let c1 = do endpointClassOf("GET", "/node/thing:1")
+        if c1 != "read":
+            return false
+        let c2 = do endpointClassOf("PUT", "/node/thing:1")
+        if c2 != "write":
+            return false
+        let c3 = do endpointClassOf("DELETE", "/node/thing:1")
+        if c3 != "write":
+            return false
+        return true
+
+    proc demoAnUnknownPathFallsIntoTheTightestBucket() -> bool:
+        let c = do endpointClassOf("GET", "/something/nobody/registered")
+        return c == "admin"
+
+    proc demoEndpointClassRepresentativeSamples() -> bool:
+        let c1 = do endpointClassOf("GET", "/admin/users")
+        if c1 != "admin":
+            return false
+        let c2 = do endpointClassOf("GET", "/stats")
+        if c2 != "admin":
+            return false
+        let c3 = do endpointClassOf("GET", "/events")
+        if c3 != "subscribe":
+            return false
+        let c4 = do endpointClassOf("POST", "/nodes/query")
+        if c4 != "bulk":
+            return false
+        let c5 = do endpointClassOf("POST", "/transaction")
+        if c5 != "bulk":
+            return false
+        let c6 = do endpointClassOf("GET", "/changes")
+        if c6 != "bulk":
+            return false
+        let c7 = do endpointClassOf("POST", "/edge")
+        if c7 != "write":
+            return false
+        let c8 = do endpointClassOf("POST", "/node")
+        if c8 != "write":
+            return false
+        let c9 = do endpointClassOf("POST", "/node/thing:1/claim")
+        if c9 != "write":
+            return false
+        let c10 = do endpointClassOf("POST", "/sequence/orders/next")
+        if c10 != "write":
+            return false
+        let c11 = do endpointClassOf("GET", "/nodes")
+        if c11 != "read":
+            return false
+        let c12 = do endpointClassOf("GET", "/node/thing:1/history")
+        if c12 != "read":
+            return false
+        let c13 = do endpointClassOf("GET", "/node/thing:1/owned")
+        if c13 != "read":
+            return false
+        let c14 = do endpointClassOf("GET", "/node/thing:1/edges/out")
+        if c14 != "read":
+            return false
+        let c15 = do endpointClassOf("GET", "/")
+        if c15 != "read":
+            return false
+        return true
+
+    proc demoAnUnparseableRateFallsBackToTheDefaultNotToUnlimited() -> bool:
+        let default = do endpointClassDefaultRate("bulk")
+        let garbage = ["", "  ", "banana", "0", "-5", "10:banana", "10:0"]
+        let n = len(garbage)
+        let mut i = 0
+        loop i < n:
+            let parsed = do parseRateFrom("bulk", true, garbage[i])
+            if parsed.off:
+                return false
+            if parsed.burst != default.burst || parsed.refill != default.refill:
+                return false
+            i = i + 1
+        return true
+
+    proc demoARateCanBeTurnedOffExplicitlyAndOnlyExplicitly() -> bool:
+        let off1 = do parseRateFrom("read", true, "off")
+        if !off1.off:
+            return false
+        let off2 = do parseRateFrom("read", true, "OFF")
+        if !off2.off:
+            return false
+        return true
+
+    proc demoARateParsesBurstAndRefill() -> bool:
+        let p1 = do parseRateFrom("read", true, "10:2")
+        if p1.off || p1.burst != 10.0 || p1.refill != 2.0:
+            return false
+        let p2 = do parseRateFrom("read", true, "10")
+        if p2.off || p2.burst != 10.0 || p2.refill != 10.0:
+            return false
+        return true
+
+    proc demoABucketAllowsItsBurstAndThenRefuses() -> bool:
+        let rates = do rateTableDefault()
+        let now = 1000.0
+        let bkts0 = do bucketsNew()
+        let mut bkts = bkts0
+        let mut i = 0
+        loop i < 3:
+            let r = do bucketsTake(bkts, "alice", "read", 3.0, 1.0, now, 10000, rates)
+            if !r.allow:
+                return false
+            bkts = r.buckets
+            i = i + 1
+        let r4 = do bucketsTake(bkts, "alice", "read", 3.0, 1.0, now, 10000, rates)
+        if r4.allow:
+            return false
+        if !r4.hasRetry:
+            return false
+        if r4.retrySecs < 1:
+            return false
+        return true
+
+    proc demoABucketRefillsOverTime() -> bool:
+        let rates = do rateTableDefault()
+        let now = 1000.0
+        let bkts0 = do bucketsNew()
+        let mut bkts = bkts0
+
+        let r1 = do bucketsTake(bkts, "alice", "read", 1.0, 1.0, now, 10000, rates)
+        if !r1.allow:
+            return false
+        bkts = r1.buckets
+
+        let r2 = do bucketsTake(bkts, "alice", "read", 1.0, 1.0, now, 10000, rates)
+        if r2.allow:
+            return false
+        bkts = r2.buckets
+
+        let later = now + 2.0
+        let r3 = do bucketsTake(bkts, "alice", "read", 1.0, 1.0, later, 10000, rates)
+        if !r3.allow:
+            return false
+        return true
+
+    proc demoBucketsArePerIdentity() -> bool:
+        let rates = do rateTableDefault()
+        let now = 1000.0
+        let bkts0 = do bucketsNew()
+        let mut bkts = bkts0
+
+        let r1 = do bucketsTake(bkts, "alice", "read", 1.0, 1.0, now, 10000, rates)
+        if !r1.allow:
+            return false
+        bkts = r1.buckets
+
+        let r2 = do bucketsTake(bkts, "alice", "read", 1.0, 1.0, now, 10000, rates)
+        if r2.allow:
+            return false
+        bkts = r2.buckets
+
+        let r3 = do bucketsTake(bkts, "bob", "read", 1.0, 1.0, now, 10000, rates)
+        if !r3.allow:
+            return false
+        return true
+
+    proc demoBucketsArePerClass() -> bool:
+        let rates = do rateTableDefault()
+        let now = 1000.0
+        let bkts0 = do bucketsNew()
+        let mut bkts = bkts0
+
+        let r1 = do bucketsTake(bkts, "alice", "bulk", 1.0, 1.0, now, 10000, rates)
+        if !r1.allow:
+            return false
+        bkts = r1.buckets
+
+        let r2 = do bucketsTake(bkts, "alice", "bulk", 1.0, 1.0, now, 10000, rates)
+        if r2.allow:
+            return false
+        bkts = r2.buckets
+
+        let r3 = do bucketsTake(bkts, "alice", "read", 1.0, 1.0, now, 10000, rates)
+        if !r3.allow:
+            return false
+        return true
+
+    # demoBucketsEvictsFullEntriesAtCapacity: not a real Rust test by name
+    # (the real suite never shrinks `MAX_TRACKED_BUCKETS` to 10_000's own
+    # boundary), but it is the same `retain`-then-recheck code path
+    # `bucketsTake`/`bucketsEvictFull` restate from `Buckets::take`, and it
+    # is real, non-trivial logic worth exercising directly: fill a 2-entry
+    # table, let time pass so both entries fully refill (making them free to
+    # evict), then confirm a third identity's request still gets admitted —
+    # proof the eviction branch actually ran rather than the request being
+    # refused outright.
+    proc demoBucketsEvictsFullEntriesAtCapacity() -> bool:
+        let rates = do rateTableDefault()
+        let now = 1000.0
+        let bkts0 = do bucketsNew()
+        let mut bkts = bkts0
+
+        let r1 = do bucketsTake(bkts, "alice", "read", 1.0, 1.0, now, 2, rates)
+        if !r1.allow:
+            return false
+        bkts = r1.buckets
+
+        let r2 = do bucketsTake(bkts, "bob", "read", 1.0, 1.0, now, 2, rates)
+        if !r2.allow:
+            return false
+        bkts = r2.buckets
+
+        if len(bkts.entries) != 2:
+            return false
+
+        # Both buckets are now fully drained (burst 1.0, one token taken
+        # each) but not yet refilled at `now` — a third identity arriving
+        # at the same instant must be refused: the table is at capacity and
+        # nothing is evictable yet.
+        let r3Blocked = do bucketsTake(bkts, "carol", "read", 1.0, 1.0, now, 2, rates)
+        if !r3Blocked.tableFull:
+            return false
+
+        # Advance time far enough that both tracked buckets are provably
+        # full again, then retry: eviction must free a slot and admit carol.
+        let later = now + 10.0
+        let r3 = do bucketsTake(bkts, "carol", "read", 1.0, 1.0, later, 2, rates)
+        if !r3.allow:
+            return false
+        if len(r3.buckets.entries) > 2:
+            return false
+        return true
+
+    state demoTheNodePathIsClassifiedByMethodResult: bool = false
+    state demoAnUnknownPathFallsIntoTheTightestBucketResult: bool = false
+    state demoEndpointClassRepresentativeSamplesResult: bool = false
+    state demoAnUnparseableRateFallsBackToTheDefaultNotToUnlimitedResult: bool = false
+    state demoARateCanBeTurnedOffExplicitlyAndOnlyExplicitlyResult: bool = false
+    state demoARateParsesBurstAndRefillResult: bool = false
+    state demoABucketAllowsItsBurstAndThenRefusesResult: bool = false
+    state demoABucketRefillsOverTimeResult: bool = false
+    state demoBucketsArePerIdentityResult: bool = false
+    state demoBucketsArePerClassResult: bool = false
+    state demoBucketsEvictsFullEntriesAtCapacityResult: bool = false
+
+    action runDemoLimits():
+        let r1 = do demoTheNodePathIsClassifiedByMethod()
+        let r2 = do demoAnUnknownPathFallsIntoTheTightestBucket()
+        let r3 = do demoEndpointClassRepresentativeSamples()
+        let r4 = do demoAnUnparseableRateFallsBackToTheDefaultNotToUnlimited()
+        let r5 = do demoARateCanBeTurnedOffExplicitlyAndOnlyExplicitly()
+        let r6 = do demoARateParsesBurstAndRefill()
+        let r7 = do demoABucketAllowsItsBurstAndThenRefuses()
+        let r8 = do demoABucketRefillsOverTime()
+        let r9 = do demoBucketsArePerIdentity()
+        let r10 = do demoBucketsArePerClass()
+        let r11 = do demoBucketsEvictsFullEntriesAtCapacity()
+        demoTheNodePathIsClassifiedByMethodResult = r1
+        demoAnUnknownPathFallsIntoTheTightestBucketResult = r2
+        demoEndpointClassRepresentativeSamplesResult = r3
+        demoAnUnparseableRateFallsBackToTheDefaultNotToUnlimitedResult = r4
+        demoARateCanBeTurnedOffExplicitlyAndOnlyExplicitlyResult = r5
+        demoARateParsesBurstAndRefillResult = r6
+        demoABucketAllowsItsBurstAndThenRefusesResult = r7
+        demoABucketRefillsOverTimeResult = r8
+        demoBucketsArePerIdentityResult = r9
+        demoBucketsArePerClassResult = r10
+        demoBucketsEvictsFullEntriesAtCapacityResult = r11
+
+    private view Home at "/facetql_limits":
+        box:
+            text "theNodePathIsClassifiedByMethod={demoTheNodePathIsClassifiedByMethodResult} anUnknownPathFallsIntoTheTightestBucket={demoAnUnknownPathFallsIntoTheTightestBucketResult} endpointClassRepresentativeSamples={demoEndpointClassRepresentativeSamplesResult} anUnparseableRateFallsBackToTheDefault={demoAnUnparseableRateFallsBackToTheDefaultNotToUnlimitedResult} aRateCanBeTurnedOffExplicitly={demoARateCanBeTurnedOffExplicitlyAndOnlyExplicitlyResult} aRateParsesBurstAndRefill={demoARateParsesBurstAndRefillResult} aBucketAllowsItsBurstAndThenRefuses={demoABucketAllowsItsBurstAndThenRefusesResult} aBucketRefillsOverTime={demoABucketRefillsOverTimeResult} bucketsArePerIdentity={demoBucketsArePerIdentityResult} bucketsArePerClass={demoBucketsArePerClassResult} bucketsEvictsFullEntriesAtCapacity={demoBucketsEvictsFullEntriesAtCapacityResult}"
