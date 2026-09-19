@@ -1,0 +1,638 @@
+import "fabric_core.fct"
+import "fabric_routing.fct"
+
+app FabricControllerTargetSelfHost:
+    # Self-hosting port of fabric-controller's first genuine leaf slice —
+    # target.rs (82L), policy.rs (76L), fleet.rs (192L), 350 real Rust
+    # lines total, zero async/tokio/net/fs (confirmed by reading all three
+    # files in full) — chosen per this task's own brief as the one corner
+    # of fabric-controller's 3757L (11 files) that depends on nothing else
+    # in that crate, only on already-shipped ports: `fabric_core::Coordinate`
+    # (target.rs) and `fabric_core::DbmsId` + `fabric_topology::
+    # TopologyRegistry` (fleet.rs). policy.rs depends on neither — it is
+    # plain `serde`-derived data.
+    #
+    # ============================================================
+    # IMPORTS — both are safe together, confirmed empirically before
+    # writing a line of real logic below
+    # ============================================================
+    # `import "fabric_core.fct"` gives the real `Coordinate`/`coordinateNew`/
+    # `coordinateIsValid`/`coordinateIndex` and the real `DbmsId`/
+    # `dbmsIdNew` directly. `import "fabric_routing.fct"` gives the real
+    # `TopologyRegistry` port (registry.rs) fleet.rs's `ControlPlaneView`
+    # holds by reference. fabric_routing.fct's OWN first line is itself
+    # `import "fabric_core.fct"` (read directly, confirmed) and it reuses
+    # that file's `Coordinate`/`coordinateIsValid`/`coordinateIndex` rather
+    # than redeclaring them (its own line ~130 comment says so explicitly:
+    # "coordinateIsValid/coordinateIndex are fabric_core.fct's own"). So
+    # this file's two imports do not each bring their own independent copy
+    # of `Coordinate` into collision — there is exactly one real
+    # declaration of it in the merged program, reached by two paths to the
+    # same file. Verified directly, not assumed: a throwaway two-import
+    # scratch file (`import "fabric_core.fct"` + `import
+    # "fabric_routing.fct"`, nothing else) was written to this directory,
+    # checked clean with `facet check` ("ok (0 entities, 2 actions, 1
+    # views)" — the 2 actions and 1 view being fabric_core.fct's and
+    # fabric_routing.fct's own pre-existing demo/Home declarations, not a
+    # collision), and deleted before this file's own real content was
+    # written. This is a narrower, and different, situation from
+    # fabric_table.fct's own header (which found the SAME two-import
+    # combination fails for `fabric.fct` + `fabric_routing.fct`, over the
+    # unrelated `private view Home at "/"` path literal both of THOSE two
+    # files hard-code) — this file imports neither `fabric.fct` nor
+    # declares any view of its own, so that specific collision does not
+    # apply here.
+    #
+    # Because `DbmsId` is reachable directly (not only transitively) and
+    # without any collision risk, `fleet.rs`'s `NodeStatus.id: DbmsId` is
+    # ported as the real `DbmsId` struct below, not flattened to plain
+    # `text` — a closer restatement of the real Rust field than
+    # fabric_table.fct's own `dbmsId: text` choice, which that file made
+    # only because it could not safely reach `fabric_core.fct` at all (see
+    # its own header).
+    #
+    # ============================================================
+    # WHY policy.rs's OWN VALIDATION-FACING DOC COMMENTS ARE NOT LOGIC TO
+    # PORT
+    # ============================================================
+    # policy.rs's module doc says "every rule in crate::validation reads
+    # its limit from here" — but `crate::validation` is `validation.rs`
+    # (402L), a separate file nowhere in this slice's scope (nor in slice
+    # 2's, per this task's own brief). Read in full, policy.rs itself
+    # contains exactly one struct and one `impl Default` — no method, no
+    # validation, no conversion. Ported as exactly that: data plus its
+    # default.
+    #
+    # ============================================================
+    # NO `cargo test` EXISTS FOR ANY OF THE THREE FILES — confirmed by
+    # reading each in full (no `#[cfg(test)]` module in target.rs, policy.rs,
+    # or fleet.rs) and by running `cargo test -p fabric-controller --lib
+    # target::` / `policy::` / `fleet::` from fabric/, each reporting
+    # "0 passed; 0 failed; ... 9 filtered out" (the 9 filtered-out tests
+    # belong to fabric-controller's OTHER files, e.g. plan.rs/execution.rs,
+    # untouched by this slice). Every demo proc below is hand-traced
+    # directly against the Rust source method body it names, the same
+    # fallback this directory already established for untested files
+    # (fabric_core.fct's own header, fabric_routing.fct's registry.rs/
+    # placement.rs section).
+    #
+    # ============================================================
+    # THE Ord/PartialOrd RESTATEMENT — this language has no sort builtin
+    # ============================================================
+    # `ActionTarget`'s hand-written `impl Ord` (shard_id first, then
+    # `coordinate.index()`) exists, per its own doc comment, so that
+    # "every listing... comes out in a stable order without a sort at the
+    # call site" once a future caller keys a `BTreeMap<ActionTarget, _>` by
+    # it (slice 2's `plan.rs`, per this task's own brief). Restated as
+    # `actionTargetLess` (a `Less`-only predicate over the same two fields,
+    # in the same priority order `then_with` encodes) plus
+    # `actionTargetArraySortAscending`, a hand-written stable insertion
+    # sort built on it — the exact idiom this directory already uses
+    # everywhere a real `BTreeMap`'s ascending-key order needs restating
+    # with no native sort or map (`fabric_optimizer.fct`'s
+    # `fleetNodeArraySortByIdAscending`, `fabric_table.fct`'s
+    # `tableSortTextAscending`, both cited by name in their own comments as
+    # "the same hand-written stable insertion sort idiom"). `ActionId`'s
+    # derived `Ord` (a bare `u64` compare) is restated the same way,
+    # `actionIdLess`, for the identical reason.
+    #
+    # `PartialEq`/`Eq`/`Hash` (both `ActionTarget` and `ActionId` derive
+    # all three) are restated as `actionTargetEquals`/`actionIdEquals` —
+    # this directory's established stand-in for a derived equality check
+    # used as a map key (`topologyRegistryIndexOf`'s own (shardId,
+    # coordinate) tuple compare is the same shape, one level up).
+    #
+    # ============================================================
+    # WHAT IS READY FOR A FUTURE plan.rs + outcome.rs SLICE (per this
+    # task's own brief: do not attempt that slice, just land this one so
+    # it is ready)
+    # ============================================================
+    # `ActionTarget`, `ActionId`, and `NodeCondition` (the tag values
+    # "healthy"/"degraded"/"unreachable"/"draining") are exactly the three
+    # real names that slice was told to expect, and are the only new types
+    # this slice introduces. `ControllerPolicy`, `NodeStatus`, `FleetView`,
+    # and `ControlPlaneView` are also here in full, since plan.rs/outcome.rs
+    # both take a `ControlPlaneView` (topology + fleet + clock) as their
+    # real validation/execution input.
+
+    # ============================================================
+    # target.rs (82L) — ActionTarget: the logical location a control
+    # action operates on. A bare Coordinate is not addressable (the same
+    # (x,y) cell exists in every shard), hence the (shardId, coordinate)
+    # pair.
+    # ============================================================
+    struct ActionTarget:
+        shardId: int
+        coordinate: Coordinate
+
+    proc actionTargetNew(shardId: int, coordinate: Coordinate) -> ActionTarget:
+        return ActionTarget{shardId: shardId, coordinate: coordinate}
+
+    # actionTargetIsValid: `ActionTarget::is_valid` — whether this target
+    # names a cell that can exist at all, delegating straight to the
+    # coordinate.
+    proc actionTargetIsValid(t: ActionTarget) -> bool:
+        let valid = do coordinateIsValid(t.coordinate)
+        return valid
+
+    # actionTargetLess: `impl Ord for ActionTarget` — shard_id first, then
+    # coordinate.index() as the tiebreaker (see this file's header for why
+    # this shape and idiom).
+    proc actionTargetLess(a: ActionTarget, b: ActionTarget) -> bool:
+        if a.shardId != b.shardId:
+            return a.shardId < b.shardId
+        let ai = do coordinateIndex(a.coordinate)
+        let bi = do coordinateIndex(b.coordinate)
+        return ai < bi
+
+    # actionTargetEquals: stands in for the derived `PartialEq`/`Eq`/`Hash`
+    # (see this file's header).
+    proc actionTargetEquals(a: ActionTarget, b: ActionTarget) -> bool:
+        return a.shardId == b.shardId && a.coordinate.x == b.coordinate.x && a.coordinate.y == b.coordinate.y
+
+    # actionTargetArraySortAscending: restates the real guarantee the Ord
+    # impl exists for — a `BTreeMap<ActionTarget, _>`'s ascending-key
+    # iteration order (see this file's header) — as a hand-written stable
+    # insertion sort using `actionTargetLess` in place of a single inlined
+    # field compare, since the key here is composite.
+    proc actionTargetArraySortAscending(targets: [ActionTarget]) -> [ActionTarget]:
+        let mut xs = targets
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                let swap = do actionTargetLess(xs[j], xs[j - 1])
+                if swap:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    # actionTargetDisplay: `impl Display` — "shard {shard_id} ({x},{y})".
+    proc actionTargetDisplay(t: ActionTarget) -> text:
+        return "shard " + t.shardId + " (" + t.coordinate.x + "," + t.coordinate.y + ")"
+
+    # ActionId: `pub struct ActionId(pub u64)` — identity of one admitted
+    # control action, monotonic within a controller instance. `value`
+    # restates the tuple's single field.
+    struct ActionId:
+        value: int
+
+    proc actionIdNew(value: int) -> ActionId:
+        return ActionId{value: value}
+
+    # actionIdLess: the derived `Ord`/`PartialOrd` — a bare u64 compare.
+    proc actionIdLess(a: ActionId, b: ActionId) -> bool:
+        return a.value < b.value
+
+    proc actionIdEquals(a: ActionId, b: ActionId) -> bool:
+        return a.value == b.value
+
+    # actionIdDisplay: `impl Display` — "action-{}".
+    proc actionIdDisplay(id: ActionId) -> text:
+        return "action-" + id.value
+
+    # ============================================================
+    # policy.rs (76L) — ControllerPolicy: pure threshold data plus its
+    # `Default` (see this file's header for why no other logic exists here
+    # to port).
+    # ============================================================
+    struct ControllerPolicy:
+        maxDecisionAgeMs: int
+        minConfidence: float
+        minReplicas: int
+        maxNodeUtilization: float
+        maxConcurrentActions: int
+        maxActionsPerNode: int
+        phaseTimeoutMs: int
+        measurementSettleMs: int
+        measurementDeadlineMs: int
+        outcomeNoiseFloor: float
+
+    # controllerPolicyDefault: `impl Default for ControllerPolicy` — every
+    # literal restated verbatim from the Rust source.
+    proc controllerPolicyDefault() -> ControllerPolicy:
+        return ControllerPolicy{maxDecisionAgeMs: 15000, minConfidence: 0.80, minReplicas: 1, maxNodeUtilization: 0.85, maxConcurrentActions: 8, maxActionsPerNode: 2, phaseTimeoutMs: 60000, measurementSettleMs: 30000, measurementDeadlineMs: 300000, outcomeNoiseFloor: 0.02}
+
+    # ============================================================
+    # fleet.rs (192L) — NodeCondition, NodeStatus, FleetView,
+    # ControlPlaneView: the controller's read-only picture of the fleet at
+    # the instant it decides. `DbmsId`/`Coordinate`/`TopologyRegistry` are
+    # the real types from this file's two imports, not restated.
+    # ============================================================
+
+    # NodeCondition: a 4-variant, zero-payload enum, restated as plain
+    # `text` rather than this directory's usual `kind`-tagged struct
+    # (predicate.fct's `Field`, fabric_routing.fct's `ReadPreference`) —
+    # that convention exists for enums where some variant carries a
+    # payload, forcing every field to always be present even when
+    # meaningless for the current tag. `NodeCondition` carries no payload
+    # on any variant, the same reason `RouteKind`
+    # (`fabric_routing.fct`'s `routeIntentKind`) is already restated as a
+    # bare "Read"/"Write" text return rather than a wrapping struct. Tag
+    # values used throughout this file: "healthy" | "degraded" |
+    # "unreachable" | "draining" — chosen to already equal `label()`'s own
+    # four return values (see `nodeConditionLabel` below).
+    #
+    # nodeConditionAcceptsPlacement: `NodeCondition::accepts_placement` —
+    # `matches!(self, Self::Healthy)`.
+    proc nodeConditionAcceptsPlacement(condition: text) -> bool:
+        return condition == "healthy"
+
+    # nodeConditionLabel: `NodeCondition::label`. Because this port's own
+    # tag strings were chosen to already equal the real method's four
+    # return values, this restates to plain identity — noted explicitly
+    # rather than left silently unported.
+    proc nodeConditionLabel(condition: text) -> text:
+        return condition
+
+    # NodeStatus: `id: DbmsId` is the real struct imported above, not
+    # flattened to text (see this file's header for why that is safe
+    # here).
+    struct NodeStatus:
+        id: DbmsId
+        region: text
+        condition: text
+        hostedPlacements: int
+        placementCapacity: int
+        cpuUtilization: float
+        memoryUtilization: float
+
+    # nodeStatusNew: `NodeStatus::new` — "every field is required: there is
+    # no safe default for how loaded this machine is" — hosted_placements/
+    # cpu/memory always start at zero, everything else is a required
+    # parameter, matching the real constructor exactly.
+    proc nodeStatusNew(id: DbmsId, region: text, condition: text, placementCapacity: int) -> NodeStatus:
+        return NodeStatus{id: id, region: region, condition: condition, hostedPlacements: 0, placementCapacity: placementCapacity, cpuUtilization: 0.0, memoryUtilization: 0.0}
+
+    # nodeStatusWithLoad: `NodeStatus::with_load` — a `mut self` builder in
+    # Rust; a `proc` has no receiver to mutate, so this returns the new
+    # value instead (this directory's established functional-update
+    # convention, e.g. `topologyRegistryPlace`). `placement_capacity` is
+    # untouched, matching the real method (which never reassigns it).
+    proc nodeStatusWithLoad(status: NodeStatus, hostedPlacements: int, cpuUtilization: float, memoryUtilization: float) -> NodeStatus:
+        return NodeStatus{id: status.id, region: status.region, condition: status.condition, hostedPlacements: hostedPlacements, placementCapacity: status.placementCapacity, cpuUtilization: cpuUtilization, memoryUtilization: memoryUtilization}
+
+    # nodeStatusUtilization: "the binding resource pressure: a node is as
+    # loaded as its worst axis" — `cpu_utilization.max(memory_utilization)`.
+    proc nodeStatusUtilization(status: NodeStatus) -> float:
+        return max(status.cpuUtilization, status.memoryUtilization)
+
+    # nodeStatusHeadroom: `placement_capacity.saturating_sub(hosted_placements)`
+    # — this directory's established `max(a - b, 0)` restatement
+    # (fabric_stats.fct's `statsSaturatingSub`).
+    proc nodeStatusHeadroom(status: NodeStatus) -> int:
+        return max(status.placementCapacity - status.hostedPlacements, 0)
+
+    proc nodeStatusIsFull(status: NodeStatus) -> bool:
+        return status.hostedPlacements >= status.placementCapacity
+
+    # FleetView: `nodes: BTreeMap<String, NodeStatus>` keyed by `id.0` (the
+    # DbmsId's inner string) — this directory's established
+    # array-backed-map substitute (`topologyRegistryPlace`'s own
+    # "HashMap::insert semantics, index-of-then-append-or-overwrite"
+    # shape). Unlike `topologyRegistryPlacements`' own (real HashMap,
+    # genuinely unordered) array, the real map here is a `BTreeMap`
+    # specifically so ascending-key iteration is a guarantee callers rely
+    # on — `fleetViewNodesSortedById` below restates that guarantee
+    # directly rather than leaving it as an incidental array order.
+    struct FleetView:
+        generation: int
+        nodes: [NodeStatus]
+
+    proc fleetViewNew(generation: int) -> FleetView:
+        return FleetView{generation: generation, nodes: []}
+
+    proc fleetViewIndexOf(nodes: [NodeStatus], id: DbmsId) -> int:
+        let n = len(nodes)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if nodes[i].id.value == id.value:
+                    found = i
+            i = i + 1
+        return found
+
+    # fleetViewInsert: `FleetView::insert` — `BTreeMap::insert`'s own
+    # semantics, overwrite-or-append by key.
+    proc fleetViewInsert(view: FleetView, status: NodeStatus) -> FleetView:
+        let idx = do fleetViewIndexOf(view.nodes, status.id)
+        if idx == -1:
+            let grown = append(view.nodes, status)
+            return FleetView{generation: view.generation, nodes: grown}
+        let mut nodes = view.nodes
+        nodes[idx] = status
+        return FleetView{generation: view.generation, nodes: nodes}
+
+    struct FleetViewGetResult:
+        found: bool
+        status: NodeStatus
+
+    # fleetViewGet: `FleetView::get`.
+    proc fleetViewGet(view: FleetView, id: DbmsId) -> FleetViewGetResult:
+        let idx = do fleetViewIndexOf(view.nodes, id)
+        if idx == -1:
+            return FleetViewGetResult{found: false, status: NodeStatus{id: DbmsId{value: ""}, region: "", condition: "", hostedPlacements: 0, placementCapacity: 0, cpuUtilization: 0.0, memoryUtilization: 0.0}}
+        return FleetViewGetResult{found: true, status: view.nodes[idx]}
+
+    # fleetViewNodesSortedById: `.nodes()` — "Every node, in DbmsId order",
+    # a real `BTreeMap` guarantee, restated as a hand-written stable
+    # insertion sort (same shape as `fabric_optimizer.fct`'s
+    # `fleetNodeArraySortByIdAscending`).
+    proc fleetViewNodesSortedById(view: FleetView) -> [NodeStatus]:
+        let mut xs = view.nodes
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                if xs[j - 1].id.value > xs[j].id.value:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    proc fleetViewGeneration(view: FleetView) -> int:
+        return view.generation
+
+    proc fleetViewLen(view: FleetView) -> int:
+        return len(view.nodes)
+
+    proc fleetViewIsEmpty(view: FleetView) -> bool:
+        let n = len(view.nodes)
+        return n == 0
+
+    # ControlPlaneView: bundles topology + fleet + clock so a validation
+    # and the execution step that follows it answer to the same instant.
+    # Rust holds `&'a TopologyRegistry`/`&'a FleetView` by reference; a
+    # `proc` has no references, so this holds both by value, matching this
+    # directory's universal by-value convention for every other
+    # struct-of-structs.
+    struct ControlPlaneView:
+        topology: TopologyRegistry
+        fleet: FleetView
+        nowMs: int
+
+    proc controlPlaneViewNew(topology: TopologyRegistry, fleet: FleetView, nowMs: int) -> ControlPlaneView:
+        return ControlPlaneView{topology: topology, fleet: fleet, nowMs: nowMs}
+
+    # ============================================================
+    # DEMO / HAND-TRACE FIXTURES — no `cargo test` exists for any of the
+    # three files this slice ports (see this file's header). Each demo is
+    # traced directly against the Rust source method body it names.
+    # ============================================================
+
+    # D1: same shard (3), coordinates (7,3) index=3*12+7=43 and (0,5)
+    # index=5*12+0=60 — actionTargetLess picks the smaller index.
+    proc demoActionTargetLessSameShard() -> bool:
+        let ca = do coordinateNew(7, 3)
+        let cb = do coordinateNew(0, 5)
+        let a = do actionTargetNew(3, ca)
+        let b = do actionTargetNew(3, cb)
+        let aLessB = do actionTargetLess(a, b)
+        return aLessB
+
+    # D2: shard 1 (coordinate index 155, the grid's own maximum, 11+12*12)
+    # vs shard 2 (coordinate index 0, the grid's own minimum) — shard_id
+    # wins regardless of index.
+    proc demoActionTargetLessDifferentShard() -> bool:
+        let cc = do coordinateNew(11, 12)
+        let cd = do coordinateNew(0, 0)
+        let c = do actionTargetNew(1, cc)
+        let d = do actionTargetNew(2, cd)
+        let cLessD = do actionTargetLess(c, d)
+        return cLessD
+
+    proc demoActionTargetIsValid() -> bool:
+        let ct = do coordinateNew(7, 3)
+        let t = do actionTargetNew(0, ct)
+        let valid = do actionTargetIsValid(t)
+        return valid
+
+    # D3: off-grid coordinate (99,99) -> is_valid false, delegated straight
+    # from Coordinate::is_valid.
+    proc demoActionTargetIsValidRejectsOffGrid() -> bool:
+        let ct = do coordinateNew(99, 99)
+        let t = do actionTargetNew(0, ct)
+        let valid = do actionTargetIsValid(t)
+        return valid
+
+    proc demoActionTargetEquals() -> bool:
+        let ce = do coordinateNew(2, 2)
+        let cf = do coordinateNew(2, 2)
+        let e = do actionTargetNew(5, ce)
+        let f = do actionTargetNew(5, cf)
+        let eq = do actionTargetEquals(e, f)
+        return eq
+
+    # D4: three targets — t1(shard2,idx13), t2(shard1,idx155), t3(shard2,
+    # idx0) — sorted ascending must come out [t2, t3, t1]: shard 1 first
+    # regardless of its own large index, then shard 2's two entries in
+    # index order (0 before 13).
+    proc demoActionTargetSortAscending() -> bool:
+        let c1 = do coordinateNew(1, 1)
+        let c2 = do coordinateNew(11, 12)
+        let c3 = do coordinateNew(0, 0)
+        let t1 = do actionTargetNew(2, c1)
+        let t2 = do actionTargetNew(1, c2)
+        let t3 = do actionTargetNew(2, c3)
+        let unsorted = [t1, t2, t3]
+        let sorted = do actionTargetArraySortAscending(unsorted)
+        let firstOk = do actionTargetEquals(sorted[0], t2)
+        let secondOk = do actionTargetEquals(sorted[1], t3)
+        let thirdOk = do actionTargetEquals(sorted[2], t1)
+        return firstOk && secondOk && thirdOk
+
+    proc demoActionTargetDisplay() -> text:
+        let ct = do coordinateNew(2, 5)
+        let t = do actionTargetNew(7, ct)
+        let s = do actionTargetDisplay(t)
+        return s
+
+    proc demoActionIdLess() -> bool:
+        let id1 = do actionIdNew(5)
+        let id2 = do actionIdNew(10)
+        let lessOk = do actionIdLess(id1, id2)
+        let notReversed = do actionIdLess(id2, id1)
+        return lessOk && !notReversed
+
+    proc demoActionIdDisplay() -> text:
+        let id = do actionIdNew(5)
+        let s = do actionIdDisplay(id)
+        return s
+
+    # D5: default policy fields, verbatim against the Rust `Default` impl.
+    proc demoControllerPolicyDefault() -> bool:
+        let p = do controllerPolicyDefault()
+        let ageOk = p.maxDecisionAgeMs == 15000
+        let confOk = abs(p.minConfidence - 0.80) < 0.000000000001
+        let replicasOk = p.minReplicas == 1
+        let utilOk = abs(p.maxNodeUtilization - 0.85) < 0.000000000001
+        let concurrentOk = p.maxConcurrentActions == 8
+        let perNodeOk = p.maxActionsPerNode == 2
+        let phaseOk = p.phaseTimeoutMs == 60000
+        let settleOk = p.measurementSettleMs == 30000
+        let deadlineOk = p.measurementDeadlineMs == 300000
+        let noiseOk = abs(p.outcomeNoiseFloor - 0.02) < 0.000000000001
+        return ageOk && confOk && replicasOk && utilOk && concurrentOk && perNodeOk && phaseOk && settleOk && deadlineOk && noiseOk
+
+    proc demoNodeConditionAcceptsPlacement() -> bool:
+        let healthyOk = do nodeConditionAcceptsPlacement("healthy")
+        let degradedOk = do nodeConditionAcceptsPlacement("degraded")
+        let unreachableOk = do nodeConditionAcceptsPlacement("unreachable")
+        let drainingOk = do nodeConditionAcceptsPlacement("draining")
+        return healthyOk && !degradedOk && !unreachableOk && !drainingOk
+
+    proc demoNodeConditionLabel() -> bool:
+        let a = do nodeConditionLabel("healthy")
+        let b = do nodeConditionLabel("degraded")
+        let c = do nodeConditionLabel("unreachable")
+        let d = do nodeConditionLabel("draining")
+        return a == "healthy" && b == "degraded" && c == "unreachable" && d == "draining"
+
+    # D6: capacity 10, hosted 7 -> headroom 3, not full; then hosted 10 ->
+    # headroom 0 (saturating, not negative), full; utilization is the max
+    # of the two axes (0.9, not 0.4).
+    proc demoNodeStatusUtilizationAndHeadroom() -> bool:
+        let id1 = do dbmsIdNew("node-1")
+        let base = do nodeStatusNew(id1, "us-east", "healthy", 10)
+        let loaded = do nodeStatusWithLoad(base, 7, 0.4, 0.9)
+        let loadedHeadroom = do nodeStatusHeadroom(loaded)
+        let headroomOk = loadedHeadroom == 3
+        let notFullOk = do nodeStatusIsFull(loaded)
+        let util = do nodeStatusUtilization(loaded)
+        let utilOk = abs(util - 0.9) < 0.000000000001
+        let full = do nodeStatusWithLoad(base, 10, 0.4, 0.9)
+        let isFullOk = do nodeStatusIsFull(full)
+        let fullHeadroom = do nodeStatusHeadroom(full)
+        let fullHeadroomOk = fullHeadroom == 0
+        return headroomOk && !notFullOk && utilOk && isFullOk && fullHeadroomOk
+
+    # D7: insert two nodes, get one back, overwrite it with new load,
+    # confirm the overwrite replaced rather than duplicated (len stays 2).
+    proc demoFleetViewInsertGetOverwrite() -> bool:
+        let v0 = do fleetViewNew(1)
+        let id1 = do dbmsIdNew("node-1")
+        let id2 = do dbmsIdNew("node-2")
+        let n1 = do nodeStatusNew(id1, "us-east", "healthy", 5)
+        let n2 = do nodeStatusNew(id2, "us-west", "draining", 5)
+        let v1 = do fleetViewInsert(v0, n1)
+        let v2 = do fleetViewInsert(v1, n2)
+        let gen = do fleetViewGeneration(v2)
+        let genOk = gen == 1
+        let l2 = do fleetViewLen(v2)
+        let lenOk = l2 == 2
+        let notEmptyOk = do fleetViewIsEmpty(v2)
+        let idLookup1 = do dbmsIdNew("node-1")
+        let got = do fleetViewGet(v2, idLookup1)
+        let foundOk = got.found
+        let regionOk = got.status.region == "us-east"
+        let overwritten = do nodeStatusWithLoad(n1, 3, 0.5, 0.5)
+        let v3 = do fleetViewInsert(v2, overwritten)
+        let l3 = do fleetViewLen(v3)
+        let lenStillOk = l3 == 2
+        let idLookup2 = do dbmsIdNew("node-1")
+        let got2 = do fleetViewGet(v3, idLookup2)
+        let hostedOk = got2.status.hostedPlacements == 3
+        return genOk && lenOk && !notEmptyOk && foundOk && regionOk && lenStillOk && hostedOk
+
+    # D8: insert nodes out of id order — sorted-by-id must come back
+    # node-1, node-2, node-3 regardless of insertion order (the BTreeMap
+    # guarantee `.nodes()` restates).
+    proc demoFleetViewSortedById() -> bool:
+        let v0 = do fleetViewNew(0)
+        let id3 = do dbmsIdNew("node-3")
+        let id1 = do dbmsIdNew("node-1")
+        let id2 = do dbmsIdNew("node-2")
+        let n3 = do nodeStatusNew(id3, "us-east", "healthy", 5)
+        let n1 = do nodeStatusNew(id1, "us-east", "healthy", 5)
+        let n2 = do nodeStatusNew(id2, "us-east", "healthy", 5)
+        let v1 = do fleetViewInsert(v0, n3)
+        let v2 = do fleetViewInsert(v1, n1)
+        let v3 = do fleetViewInsert(v2, n2)
+        let sorted = do fleetViewNodesSortedById(v3)
+        let firstOk = sorted[0].id.value == "node-1"
+        let secondOk = sorted[1].id.value == "node-2"
+        let thirdOk = sorted[2].id.value == "node-3"
+        return firstOk && secondOk && thirdOk
+
+    proc demoControlPlaneViewConstruction() -> bool:
+        let topo = do topologyRegistryNew()
+        let fleet = do fleetViewNew(0)
+        let view = do controlPlaneViewNew(topo, fleet, 1234)
+        let topoOk = len(view.topology.placements) == 0
+        let fleetGen = do fleetViewGeneration(view.fleet)
+        let fleetOk = fleetGen == 0
+        let nowOk = view.nowMs == 1234
+        return topoOk && fleetOk && nowOk
+
+    # ============================================================
+    # LIVE CONSOLE VERIFICATION — same pattern fabric_core.fct's own header
+    # establishes for a pure-logic port with no entities/actions of its
+    # own to call a demo proc against directly from `facet console`'s bare
+    # expression evaluator: one `action` runs every demo above and latches
+    # each result into a `state` cell, then `:run runFabricControllerTargetDemo()`
+    # followed by `:state` in `facet console` prints the real, executed
+    # results for direct comparison against the hand-traced expectations
+    # documented next to each demo proc above.
+    # ============================================================
+    state demoActionTargetLessSameShardResult: bool = false
+    state demoActionTargetLessDifferentShardResult: bool = false
+    state demoActionTargetIsValidResult: bool = false
+    state demoActionTargetIsValidRejectsOffGridResult: bool = true
+    state demoActionTargetEqualsResult: bool = false
+    state demoActionTargetSortAscendingResult: bool = false
+    state demoActionTargetDisplayResult: text = ""
+    state demoActionIdLessResult: bool = false
+    state demoActionIdDisplayResult: text = ""
+    state demoControllerPolicyDefaultResult: bool = false
+    state demoNodeConditionAcceptsPlacementResult: bool = false
+    state demoNodeConditionLabelResult: bool = false
+    state demoNodeStatusUtilizationAndHeadroomResult: bool = false
+    state demoFleetViewInsertGetOverwriteResult: bool = false
+    state demoFleetViewSortedByIdResult: bool = false
+    state demoControlPlaneViewConstructionResult: bool = false
+
+    action runFabricControllerTargetDemo():
+        let r1 = do demoActionTargetLessSameShard()
+        let r2 = do demoActionTargetLessDifferentShard()
+        let r3 = do demoActionTargetIsValid()
+        let r4 = do demoActionTargetIsValidRejectsOffGrid()
+        let r5 = do demoActionTargetEquals()
+        let r6 = do demoActionTargetSortAscending()
+        let r7 = do demoActionTargetDisplay()
+        let r8 = do demoActionIdLess()
+        let r9 = do demoActionIdDisplay()
+        let r10 = do demoControllerPolicyDefault()
+        let r11 = do demoNodeConditionAcceptsPlacement()
+        let r12 = do demoNodeConditionLabel()
+        let r13 = do demoNodeStatusUtilizationAndHeadroom()
+        let r14 = do demoFleetViewInsertGetOverwrite()
+        let r15 = do demoFleetViewSortedById()
+        let r16 = do demoControlPlaneViewConstruction()
+        demoActionTargetLessSameShardResult = r1
+        demoActionTargetLessDifferentShardResult = r2
+        demoActionTargetIsValidResult = r3
+        demoActionTargetIsValidRejectsOffGridResult = r4
+        demoActionTargetEqualsResult = r5
+        demoActionTargetSortAscendingResult = r6
+        demoActionTargetDisplayResult = r7
+        demoActionIdLessResult = r8
+        demoActionIdDisplayResult = r9
+        demoControllerPolicyDefaultResult = r10
+        demoNodeConditionAcceptsPlacementResult = r11
+        demoNodeConditionLabelResult = r12
+        demoNodeStatusUtilizationAndHeadroomResult = r13
+        demoFleetViewInsertGetOverwriteResult = r14
+        demoFleetViewSortedByIdResult = r15
+        demoControlPlaneViewConstructionResult = r16

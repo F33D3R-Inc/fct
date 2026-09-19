@@ -1681,3 +1681,323 @@ app ParserDecl2SelfHost:
             text "{policyDeclName} {policyDeclHeaderValidResult} {policyDeclBodyShapeValidResult} {policyDeclValidResult}"
             text "{entityFieldDeclSummary} {entityFieldDeclValidResult}"
             text "{typeDeclName} {typeDeclIsQueryResult} {typeDeclFieldsSummary} {typeDeclFieldCount} {typeDeclValidResult}"
+
+    # ============================================================
+    # STAGE 30: parseMessage (parser.go:1091-1159, read fresh) — `message
+    # Name:` then one or more `| variant_name(field: type, ...)` children,
+    # the tagged-union sibling of `type` (STAGE 29) and `record` (STAGE 19).
+    # A variant's own field grammar is BYTE-FOR-BYTE the same wire-field
+    # grammar `type` uses — confirmed fresh: parser.go:1139 calls the exact
+    # same splitWireDefault, and parser.go:1144 the exact same
+    # isWireTypeName, that parseType's own field loop (parser.go:1058/1060)
+    # calls — so a variant field reuses this file's own STAGE 29
+    # buildTypeFields/typeFieldsAllValid (and, through them,
+    # buildTypeField/typeFieldSpecValid/wireFieldTypeRest/
+    # wireFieldDefaultRaw/isWireTypeNameToken) verbatim, never forked. What
+    # genuinely IS new here, ported fresh below:
+    #   - the message header itself (`message Name:`, no inline body — a
+    #     message's variants live ONLY on `|`-prefixed children, unlike
+    #     record/type which also allow an inline `Name: f: t, ...` form).
+    #   - a per-child `|`-prefix requirement (parser.go:1100-1102).
+    #   - paren-matched `variant_name(fields)` splitting (parser.go:
+    #     1104-1115) — the identical `IndexByte('(')`/`LastIndexByte(')')`
+    #     technique this same file's own sibling parser_proc.fct already
+    #     uses for a signature's own parens (sigOpenParenIndex/
+    #     sigCloseParenIndex, confirmed by reading that STAGE fresh),
+    #     restated here as two small local wrappers over the same
+    #     indexOf/lastCharIndex primitives.
+    #   - a lowercase-variant-name gate (parser.go:1116-1118) — the exact
+    #     INVERSE of isUpperName, the same gate recordDeclValid/
+    #     typeHeaderNameValid already use the right way up for a decl name.
+    #   - a duplicate-variant-name gate (parser.go:1119-1122's `seen` map),
+    #     restated as a small array-scan helper following triggers.fct's
+    #     own containsText idiom (this file's import chain carries no such
+    #     generic helper, so it is written fresh, locally, in that style).
+    #   - a zero-variant rejection (parser.go:1155-1157).
+    # None of STAGE 19/20/29's own record/struct/type content above is
+    # touched by anything below — every proc/struct/state/action/view here
+    # is new.
+    # ============================================================
+
+    struct MessageVariant:
+        name: text
+        fields: [RecordField]
+        valid: bool
+
+    struct MessageDecl:
+        name: text
+        variants: [MessageVariant]
+        valid: bool
+
+    # messageVariantOpenParenIndex/messageVariantCloseParenIndex: local
+    # wrappers over indexOf/lastCharIndex, following parser_proc.fct's own
+    # sigOpenParenIndex/sigCloseParenIndex exactly (same technique, applied
+    # to a variant's post-`|` body instead of a signature's head).
+    proc messageVariantOpenParenIndex(body: text) -> int:
+        let r = do indexOf(body, "(")
+        return r
+
+    proc messageVariantCloseParenIndex(body: text) -> int:
+        let r = do lastCharIndex(body, ")")
+        return r
+
+    # messageVariantParensValid: parser.go's own `if close < open { error
+    # missing ")" }` (parser.go:1109-1111) — vacuously true when there are
+    # no parens at all (a zero-field variant written bare, no `()`).
+    proc messageVariantParensValid(body: text) -> bool:
+        let open = do messageVariantOpenParenIndex(body)
+        if open < 0:
+            return true
+        let close = do messageVariantCloseParenIndex(body)
+        return close >= open
+
+    proc messageVariantNameRaw(body: text) -> text:
+        let open = do messageVariantOpenParenIndex(body)
+        if open < 0:
+            return trim(body)
+        return trim(slice(body, 0, open))
+
+    # messageVariantInner: the text strictly between the matched parens —
+    # "" both when there are no parens at all AND when the parens are
+    # unmatched (that second case is already an error the overall `valid`
+    # flag below captures separately, via messageVariantParensValid).
+    proc messageVariantInner(body: text) -> text:
+        let open = do messageVariantOpenParenIndex(body)
+        if open < 0:
+            return ""
+        let parensOk = do messageVariantParensValid(body)
+        if !parensOk:
+            return ""
+        let close = do messageVariantCloseParenIndex(body)
+        return trim(slice(body, open + 1, close))
+
+    # messageVariantLineHasPipe/messageVariantBody: parser.go's own
+    # `strings.HasPrefix(line, "|")` gate (parser.go:1100-1102) and the
+    # `strings.TrimSpace(strings.TrimPrefix(line, "|"))` that follows once
+    # the prefix check has already passed.
+    proc messageVariantLineHasPipe(line: text) -> bool:
+        let trimmed = trim(line)
+        let r = do hasPrefixText(trimmed, "|")
+        return r
+
+    proc messageVariantBody(line: text) -> text:
+        let trimmed = trim(line)
+        let stripped = do trimPrefixText(trimmed, "|")
+        return trim(stripped)
+
+    # messageVariantNameValid: parser.go's own `!isIdent(vname) ||
+    # isUpper(vname)` gate (parser.go:1116-1118), inverted to a positive
+    # "is valid" — the identical isUpperName gate typeHeaderNameValid/
+    # recordDeclValid already use for a decl NAME, applied the opposite way
+    # up here since a variant name is the wire discriminant and must stay
+    # lowercase.
+    proc messageVariantNameValid(name: text) -> bool:
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let upOk = do isUpperName(name)
+        return !upOk
+
+    proc messageVariantFieldSpecs(inner: text) -> [text]:
+        if inner == "":
+            return []
+        return split(inner, ",")
+
+    # buildMessageVariant: one full `| variant_name(field: type, ...)` child
+    # line in, one MessageVariant out — reuses STAGE 29's own
+    # buildTypeFields/typeFieldsAllValid verbatim for the field list, since
+    # a variant field is the identical wire-field grammar (this STAGE's own
+    # header explains why).
+    proc buildMessageVariant(line: text) -> MessageVariant:
+        let hasPipe = do messageVariantLineHasPipe(line)
+        let body = do messageVariantBody(line)
+        let parensOk = do messageVariantParensValid(body)
+        let vname = do messageVariantNameRaw(body)
+        let inner = do messageVariantInner(body)
+        let specs = do messageVariantFieldSpecs(inner)
+        let fields = do buildTypeFields(specs)
+        let nameOk = do messageVariantNameValid(vname)
+        let fieldsOk = do typeFieldsAllValid(fields)
+        let mut ok = true
+        if !hasPipe:
+            ok = false
+        if !parensOk:
+            ok = false
+        if !nameOk:
+            ok = false
+        if !fieldsOk:
+            ok = false
+        return MessageVariant{name: vname, fields: fields, valid: ok}
+
+    # buildMessageVariants: one child line per variant, in source order — a
+    # blank line (the trailing artifact of `split(src, "\n")` on a dedented
+    # block ending in a newline) is skipped, never turned into a phantom
+    # invalid variant, the same "empty spec is silently skipped" tolerance
+    # buildRecordFields/buildTypeFields already establish for their own
+    # (differently-shaped) trailing-comma case.
+    proc buildMessageVariants(lines: [text]) -> [MessageVariant]:
+        let n = len(lines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let t = trim(lines[i])
+            if t != "":
+                let v = do buildMessageVariant(lines[i])
+                out = append(out, v)
+            i = i + 1
+        return out
+
+    # messageVariantNameSeenBefore/messageVariantsHaveDuplicate:
+    # parser.go's own `seen` map (parser.go:1097/1119-1122), restated as an
+    # O(n^2) array scan following triggers.fct's own containsText idiom
+    # (this file's import chain carries no such generic helper, so it is
+    # written fresh here in that same style).
+    proc messageVariantNameSeenBefore(variants: [MessageVariant], idx: int) -> bool:
+        let mut found = false
+        let mut i = 0
+        loop i < idx:
+            if variants[i].name == variants[idx].name:
+                found = true
+            i = i + 1
+        return found
+
+    proc messageVariantsHaveDuplicate(variants: [MessageVariant]) -> bool:
+        let n = len(variants)
+        let mut dup = false
+        let mut i = 0
+        loop i < n:
+            let seen = do messageVariantNameSeenBefore(variants, i)
+            if seen:
+                dup = true
+            i = i + 1
+        return dup
+
+    proc messageVariantsAllValid(variants: [MessageVariant]) -> bool:
+        let n = len(variants)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            if !variants[i].valid:
+                ok = false
+            i = i + 1
+        return ok
+
+    # --- message header (`message Name:`, no inline body — parser.go's own
+    # `strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(n.Line.Text,
+    # "message")), ":")` leaves nothing behind but the bare name) ---
+    proc messageHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "message")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc messageHeaderName(head: text) -> text:
+        return trim(head)
+
+    proc messageHeaderNameValid(head: text) -> bool:
+        let name = do messageHeaderName(head)
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let upOk = do isUpperName(name)
+        return upOk
+
+    # messageDeclValid: parser.go's own three real gates — capitalized
+    # ident name (parser.go:1093-1095), at least one variant
+    # (parser.go:1155-1157), and every variant independently valid AND
+    # mutually distinct (parser.go:1119-1122 folded into each variant's own
+    # error path in real Go, restated here as a separate whole-list gate
+    # since this port's per-variant `valid` cannot depend on its
+    # neighbors).
+    proc messageDeclValid(head: text, variants: [MessageVariant]) -> bool:
+        let nameOk = do messageHeaderNameValid(head)
+        if !nameOk:
+            return false
+        if len(variants) == 0:
+            return false
+        let allOk = do messageVariantsAllValid(variants)
+        if !allOk:
+            return false
+        let dup = do messageVariantsHaveDuplicate(variants)
+        return !dup
+
+    proc buildMessageDecl(head: text, lines: [text]) -> MessageDecl:
+        let name = do messageHeaderName(head)
+        let variants = do buildMessageVariants(lines)
+        let v = do messageDeclValid(head, variants)
+        return MessageDecl{name: name, variants: variants, valid: v}
+
+    # parseMessageDeclSrc: the end-to-end driver, same "whole dedented src
+    # blob" convention parseTypeDeclSrc/parseRecordDeclSrc/
+    # parseStructDeclSrc/parseEnumDeclSrc above already use — a message has
+    # no inline field form at all (unlike record/type), so every variant
+    # comes from a child line, never from the header itself.
+    proc parseMessageDeclSrc(src: text) -> MessageDecl:
+        let lines = split(src, "\n")
+        let headerLine = do firstLineOf(lines)
+        let childLines = do linesFrom(lines, 1)
+        let head = do messageHeadOf(headerLine)
+        let d = do buildMessageDecl(head, childLines)
+        return d
+
+    # --- describe*/summary procs + a live driver, at a FRESH view path
+    # ("/decl2/message") — none of STAGE 26/27/28's own existing content
+    # (record/struct/enum/component/trigger/policy/entityField/type) is
+    # touched; this only reuses their already-ported describeRecordFields
+    # for a variant's own field list text. ---
+    proc describeMessageVariant(v: MessageVariant) -> text:
+        let mut s = v.name
+        let fieldsText = do describeRecordFields(v.fields)
+        if fieldsText != "":
+            s = s + "(" + fieldsText + ")"
+        if !v.valid:
+            s = s + "(invalid)"
+        return s
+
+    proc describeMessageVariants(variants: [MessageVariant]) -> text:
+        let n = len(variants)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let d = do describeMessageVariant(variants[i])
+            if i > 0:
+                out = out + " | "
+            out = out + d
+            i = i + 1
+        return out
+
+    proc messageDeclSummaryName(src: text) -> text:
+        let d = do parseMessageDeclSrc(src)
+        return d.name
+
+    proc messageDeclSummaryVariants(src: text) -> text:
+        let d = do parseMessageDeclSrc(src)
+        let r = do describeMessageVariants(d.variants)
+        return r
+
+    proc messageDeclSummaryCount(src: text) -> int:
+        let d = do parseMessageDeclSrc(src)
+        return len(d.variants)
+
+    proc messageDeclSummaryValid(src: text) -> bool:
+        let d = do parseMessageDeclSrc(src)
+        return d.valid
+
+    state messageDeclName: text = ""
+    state messageDeclVariantsSummary: text = ""
+    state messageDeclVariantCount: int = 0
+    state messageDeclValidResult: bool = false
+
+    action runParseMessageDecl(src: text):
+        let n = do messageDeclSummaryName(src)
+        let vs = do messageDeclSummaryVariants(src)
+        let c = do messageDeclSummaryCount(src)
+        let v = do messageDeclSummaryValid(src)
+        messageDeclName = n
+        messageDeclVariantsSummary = vs
+        messageDeclVariantCount = c
+        messageDeclValidResult = v
+
+    private view Decl2MessageHome at "/decl2/message":
+        box:
+            text "{messageDeclName} {messageDeclVariantsSummary} {messageDeclVariantCount} {messageDeclValidResult}"

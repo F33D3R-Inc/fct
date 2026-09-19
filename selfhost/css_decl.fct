@@ -1,0 +1,417 @@
+import "source.fct"
+
+app CssDeclSelfHost:
+    # Real, honest self-hosting port of internal/parser/parser.go's CSS
+    # side-channel — `checkCSSComments` (~lines 1278-1313) and
+    # `parseCSS`/`parseCSSFrom` (~lines 1247-1276, 1315-1333) — into `.fct`
+    # `proc`s. This is the piece source.fct's own top-of-file status notes
+    # used to call blocked: it needs `source.fct`'s `Comments`-equivalent
+    # side-channel (now `parsedComments`, appended to that file this round)
+    # plus a real multi-line split (`split`/`slice`/`charAt`, likewise no
+    # longer missing). Nothing here is a placeholder: every proc below is
+    # hand-traced against the real Go source read fresh for this port (see
+    # each proc's own header for exactly which lines it restates).
+    #
+    # ============================================================
+    # WHAT THE REAL GO CODE DOES (read fresh, in full, before porting)
+    # ============================================================
+    #   func parseCSS(n *source.Node, comments []source.Line) (string, error) {
+    #       var lines []string
+    #       last := n.Line.No
+    #       var walk func(ns []*source.Node)
+    #       walk = func(ns []*source.Node) {
+    #           for _, c := range ns {
+    #               lines = append(lines, c.Line.Text)
+    #               if c.Line.No > last { last = c.Line.No }
+    #               walk(c.Children)
+    #           }
+    #       }
+    #       walk(n.Children)
+    #       if len(lines) == 0 { return "", &Error{n.Line.No, "css block is empty"} }
+    #       if err := checkCSSComments(n.Line.No, last, comments); err != nil {
+    #           return "", err
+    #       }
+    #       return strings.Join(lines, "\n"), nil
+    #   }
+    #
+    #   func checkCSSComments(from, to int, comments []source.Line) error {
+    #       for _, c := range comments {
+    #           if c.No <= from || c.No > to { continue }
+    #           if !strings.Contains(c.Text, "{") { continue }
+    #           return &Error{c.No, "this looks like a CSS rule, but `#` starts
+    #               a comment in this language, so the line is discarded and
+    #               the rule never reaches the page: ..."}
+    #       }
+    #       return nil
+    #   }
+    #
+    #   func parseCSSFrom(t string, line int) (string, error) {
+    #       rest := strings.TrimSpace(strings.TrimPrefix(t, "css from"))
+    #       path, err := unquote(rest, line)
+    #       if err != nil { return "", &Error{line, `css from needs a quoted path: css from "styles.css"`} }
+    #       if path == "" { return "", &Error{line, "css from path is empty"} }
+    #       return path, nil
+    #   }
+    #
+    # `n` is the `css:` HEADER node (source.Node), and `n.Children` is the
+    # SAME offside-rule indentation tree source.fct's own STAGE 1/2
+    # (`parentIndexForIndents`/`childrenOf`) already builds elsewhere in
+    # this codebase — NOT the UI-node tree `nodes.fct`'s `UiNode`/`Seg`
+    # represent (that is `parseNodes`'s own recursive `box`/`row`/`text`
+    # tree, a completely different structure used only for `view`/
+    # `component` bodies). checkCSSComments/parseCSS never touch a UiNode,
+    # so this file does NOT import nodes.fct — confirmed by reading
+    # parseCSS fresh above: it walks `*source.Node`/`.Children`, never
+    # `ast.Node`/UiNode. (This also sidesteps nodes.fct's own transitive
+    # `import "expr.fct"`, which — like source.fct — declares its own `view
+    # Home at "/"`; importing both here would hit the exact same
+    # duplicate-view collision stmt.fct/parser_proc.fct/program.fct already
+    # documented for source.fct+expr.fct, so avoiding an unneeded import is
+    # also what keeps this file collision-free.)
+    #
+    # A KEY SIMPLIFICATION, PROVEN, NOT ASSUMED: `walk` above is a preorder
+    # traversal of a tree that `source.go`'s own `build()` constructs from a
+    # single, already-in-document-order, already-filtered (blank/comment
+    # lines dropped before build() ever runs) list of lines, by nesting
+    # each line under its nearest strictly-shallower-indent PRECEDING line
+    # (source.fct's own STAGE 2 header explains this "nearest preceding
+    # shallower ancestor" rule in detail). Nesting a sequential list into a
+    # tree this way and then reading it back out in preorder always
+    # reproduces the ORIGINAL sequence — every line still appears exactly
+    # once, in the same relative order it started in, because build() only
+    # ever partitions a contiguous run into "this line" then "its
+    # children" then "the next sibling and on", never reorders. So `walk`'s
+    # own output — the ordered list of every kept line's `.Text` inside the
+    # css: block, regardless of how deeply CSS content happens to be
+    # indented — is IDENTICAL to simply taking every kept (non-blank,
+    # non-`#`-comment) raw line between the `css:` header and the point
+    # indentation drops back to the header's own level, in raw document
+    # order. That is exactly `parsedTexts` (source.fct, STAGE 1) applied to
+    # that span's own raw text — so this port never needs to build or walk
+    # a tree at all for `parseCSS` itself; it only needs the SPAN (where the
+    # block starts and ends), which `cssBodySrcOf` below computes directly
+    # from indentation, the same primitive source.fct's own `indentOf`/
+    # `isBlankOrComment` already provide.
+    #
+    # This file therefore needs only ONE import: `source.fct`, for
+    # `parsedComments` (this round's new addition), `parsedTexts`,
+    # `parsedSkipFlags`, `indentOf`, and `isBlankOrComment` — all reused
+    # directly by their existing names (calling an imported proc, not
+    # declaring a second `view Home`, is what the duplicate-view rule
+    # actually forbids — see source.fct's own STAGE 4 header for the
+    # confirmation that a struct TYPE and a proc both cross an `import`
+    # cleanly).
+
+    # ============================================================
+    # STAGE 1: small text-surgery primitives `parseCSSFrom` needs, restated
+    # locally (not imported) for the same reason program.fct/stmt.fct/
+    # nodes.fct each restate source.fct's own tiny primitives locally
+    # instead of pulling in a whole transitive import chain for a handful
+    # of lines — `css`-prefixed here so a future merge can never collide
+    # with parser_proc.fct's own identically-shaped (but differently
+    # scoped) hasPrefixText/trimPrefixText.
+    # ============================================================
+    proc cssHasPrefixText(s: text, p: text) -> bool:
+        let n = len(p)
+        if n > len(s):
+            return false
+        return slice(s, 0, n) == p
+
+    proc cssTrimPrefixText(s: text, p: text) -> text:
+        let has = do cssHasPrefixText(s, p)
+        if has:
+            return slice(s, len(p), len(s))
+        return s
+
+    # cssIsQuotedWhole/cssUnquoteWhole restate real Go `unquote(s, line)`'s
+    # own gate — `len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"'` — which
+    # requires the ENTIRE string to be one quoted span, start to end, not
+    # merely to CONTAIN a quoted substring somewhere (that looser search is
+    # `quotedInner`'s own job, in parser_entity.fct, used for a different
+    # call shape elsewhere in this port). `css from "a.css" junk` must be
+    # REJECTED, exactly as real Go's `unquote` rejects it (its own
+    # `s[len(s)-1] != '"'` check fails once `rest` is `"a.css" junk`), so
+    # the whole-string check matters here and is not interchangeable with
+    # quotedInner's leniency.
+    #
+    # Like every other quote handling already established in this codebase
+    # (parser_entity.fct's own `quotedInner` docstring: "this does not
+    # decode escapes — ... has no legitimate reason to contain a backslash
+    # escape, so the raw substring between the two quote characters is
+    # exactly the value a real caller wants"), this does not run Go's
+    # `strconv.Unquote` escape decoding either: a CSS file path is exactly
+    # the same class of value (a path, not interpolated text), so the same
+    # deliberate simplification applies for the same reason, restated here
+    # rather than re-derived.
+    proc cssIsQuotedWhole(s: text) -> bool:
+        if len(s) < 2:
+            return false
+        return take(s, 1) == "\"" && slice(s, len(s) - 1, len(s)) == "\""
+
+    proc cssUnquoteWhole(s: text) -> text:
+        let ok = do cssIsQuotedWhole(s)
+        if !ok:
+            return ""
+        return slice(s, 1, len(s) - 1)
+
+    # parseCSSFrom: real parser.go's own name and shape, kept identical.
+    # Go's two distinct error returns ("css from needs a quoted path" for a
+    # missing/malformed quote pair, "css from path is empty" for `css from
+    # ""`) collapse to the one honest "" sentinel this codebase already
+    # established for "absent" (parser_entity.fct's `quotedInner`) — a real
+    # non-error path can never legitimately be "" (an empty CSS path is
+    # never useful, matching Go's own explicit rejection of it), so the
+    # sentinel is unambiguous.
+    proc parseCSSFrom(t: text, line: int) -> text:
+        let rest0 = do cssTrimPrefixText(t, "css from")
+        let rest = trim(rest0)
+        let path = do cssUnquoteWhole(rest)
+        return path
+
+    # ============================================================
+    # STAGE 2: locating the `css:` header and its own body SPAN inside a
+    # raw multi-line source snippet — the self-hosted stand-in for already
+    # having a `*source.Node` handed to you (a real caller like a future
+    # `parseWireframe`/`parseFacet` port already has `c` in hand from its
+    # own tree walk; this file, taken alone, still needs to find it).
+    # ============================================================
+
+    # cssHeaderLineNo: the first RAW line (1-based, matching source.go's
+    # own `i+1` convention throughout) whose TRIMMED text is exactly "css:"
+    # or "css" — the identical dispatch condition real `parseWireframe`/
+    # `parsePlayground`/`parseDecl` all use (`t == "css:" || t == "css"`,
+    # confirmed by reading each fresh). Returns -1 if no such line exists —
+    # source.fct's own established "no valid answer" sentinel for an `int`
+    # result (parentIndexForIndents' own -1 "no parent" convention).
+    #
+    # Scope note, stated honestly: this finds the FIRST `css:` block only.
+    # Real Go allows several `css:` blocks in one app and concatenates them
+    # (`app.CSS = joinCSS(app.CSS, css)`, called once per block found by
+    # `parseDecl`'s own top-level dispatch loop) — that dispatch loop lives
+    # in parser_decl2.fct/program.fct territory (multi-declaration
+    # assembly), out of this file's scope, which is specifically
+    # checkCSSComments/parseCSS/parseCSSFrom themselves, not the surrounding
+    # declaration dispatcher.
+    proc cssHeaderLineNo(fullSrc: text) -> int:
+        let rawLines = split(fullSrc, "\n")
+        let n = len(rawLines)
+        let mut found = -1
+        let mut i = 0
+        loop i < n && found == -1:
+            let t = trim(rawLines[i])
+            if t == "css:" || t == "css":
+                found = i + 1
+            i = i + 1
+        return found
+
+    # cssBodySrcOf: the raw text of every line strictly inside the `css:`
+    # block, from just after the header through the line before indentation
+    # drops back to (or below) the header's own indent — i.e. exactly the
+    # span source.go's own `build()` would attach as `n.Children` (and
+    # everything nested under them), restated directly over indentation
+    # instead of building a tree first (see this file's own header for why
+    # that tree was never needed for parseCSS's own output). A blank or
+    # `#`-comment raw line NEVER ends the block and its own indentation is
+    # NEVER consulted — exactly source.go's Parse gate (`text == "" ||
+    # HasPrefix(text, "#")` is checked BEFORE indent even matters for tree
+    # membership), so such a line is always folded into the body text
+    # regardless of its column, to be independently re-dropped later by
+    # `parsedTexts`/`parsedSkipFlags`, the same "kept lines only" pass every
+    # other STAGE 1 proc in source.fct already relies on.
+    proc cssBodySrcOf(fullSrc: text, headerLineNo: int) -> text:
+        let rawLines = split(fullSrc, "\n")
+        let n = len(rawLines)
+        let headerIdx = headerLineNo - 1
+        let headerIndent = do indentOf(rawLines[headerIdx])
+        let mut bodyLines = []
+        let mut i = headerIdx + 1
+        let mut stop = false
+        loop i < n && !stop:
+            let raw = rawLines[i]
+            let skip = do isBlankOrComment(raw)
+            if skip:
+                bodyLines = append(bodyLines, raw)
+                i = i + 1
+            else:
+                let ind = do indentOf(raw)
+                if ind > headerIndent:
+                    bodyLines = append(bodyLines, raw)
+                    i = i + 1
+                else:
+                    stop = true
+        let joined = do cssJoinLines(bodyLines)
+        return joined
+
+    # cssJoinLines: `strings.Join(lines, "\n")`, restated (program.fct's own
+    # `progJoinLines` already establishes this exact idiom; restated here
+    # under a local name for the same collision-avoidance reason as STAGE 1
+    # above, not because the algorithm differs at all).
+    proc cssJoinLines(lines: [text]) -> text:
+        let n = len(lines)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + "\n"
+            out = out + lines[i]
+            i = i + 1
+        return out
+
+    # ============================================================
+    # STAGE 3: checkCSSComments and parseCSS themselves.
+    # ============================================================
+
+    # cssLastKeptLineNo: source.go's own `last` accumulator — `n.Line.No`
+    # initially, then the highest `.No` among every KEPT (real-content)
+    # line the walk visits. Since kept lines are visited in strictly
+    # ascending original line-number order (STAGE 2's own equivalence
+    # note), "the highest" is simply "the last one" — this proc walks
+    # `bodySrc`'s own raw lines once, using `parsedSkipFlags` (source.fct)
+    # to tell which raw offsets were kept, and maps a kept offset `i` (0-
+    # based, within bodySrc) back to its ABSOLUTE line number in the whole
+    # file as `headerLineNo + 1 + i` — valid because `bodySrc` (built by
+    # cssBodySrcOf above) is always the exact CONTIGUOUS run of raw lines
+    # starting immediately after the header, with no gaps.
+    #
+    # A real, honest quirk this restates faithfully rather than "fixing":
+    # if the very last raw line(s) of the block are themselves blank/
+    # comment lines (dropped, never kept), `last` stops advancing at the
+    # PRIOR kept line — exactly Go's own behavior, since `c.Line.No` is
+    # only ever read from `n.Children` (real content only), never from a
+    # dropped line. A trailing `#`-comment therefore sits OUTSIDE
+    # `(from, to]` even though it is still indented under the css: block,
+    # and checkCSSComments below will not inspect it — a direct, provable
+    # consequence of reading source.go's `last` update fresh, not a bug
+    # introduced by this port.
+    proc cssLastKeptLineNo(bodySrc: text, headerLineNo: int) -> int:
+        let flags = do parsedSkipFlags(bodySrc)
+        let n = len(flags)
+        let mut last = headerLineNo
+        let mut i = 0
+        loop i < n:
+            if !flags[i]:
+                last = headerLineNo + 1 + i
+            i = i + 1
+        return last
+
+    # cssBlockIsEmpty: real Go's `len(lines) == 0` gate — true iff the
+    # block has no real-content line at all (every raw line in it, if any,
+    # was blank or a `#`-comment).
+    proc cssBlockIsEmpty(bodySrc: text) -> bool:
+        let kept = do parsedTexts(bodySrc)
+        return len(kept) == 0
+
+    # checkCSSComments: real parser.go's own name and shape, kept
+    # identical (from/to/comments, in that order). Returns the OFFENDING
+    # comment's own absolute line number, or -1 if none of `comments`
+    # violate the rule — source.fct's own established "no match" sentinel
+    # (parentIndexForIndents' -1, indexOf's -1 elsewhere in this codebase),
+    # standing in for Go's `error`/`nil` return the same way
+    # `parsedTabError`'s own `bool` already stands in for `Parse`'s error
+    # elsewhere in source.fct. `comments` is scanned in its own given
+    # order and this returns on the FIRST match — since `parsedComments`
+    # (source.fct) always appends in ascending raw-line order (identical
+    # to Go's own `Comments`, which does too), "first in list order" and
+    # "first by line number" are the same comment, exactly matching Go's
+    # own `for _, c := range comments { ...; return ... }` early return.
+    proc checkCSSComments(from: int, to: int, comments: [Line]) -> int:
+        let n = len(comments)
+        let mut i = 0
+        let mut bad = -1
+        loop i < n && bad == -1:
+            let c = comments[i]
+            if c.no > from && c.no <= to:
+                if contains(c.text, "{"):
+                    bad = c.no
+            i = i + 1
+        return bad
+
+    # parseCSSSrc: the `Src`-suffixed self-hosted shape of real `parseCSS`
+    # (the same naming convention stmt.fct's `parseProcBodySrc` and
+    # nodes.fct's `nodeTreeSrc` already use for "the Node-taking real
+    # function, restated to take pre-split raw text instead"). Takes
+    # `bodySrc`/`headerLineNo` (STAGE 2's own outputs) plus the SAME
+    # `comments` list a caller already computed once via
+    # `parsedComments(fullSrc)` over the WHOLE file — exactly Go's own
+    # `Parse` (parser.go:36, `comments := source.Comments(src)`), computed
+    # ONCE per file and threaded into every declaration parser, never
+    # recomputed per declaration.
+    #
+    # Go's two distinct error returns ("css block is empty" / the
+    # checkCSSComments error) collapse to the one "" sentinel — a
+    # non-error result can never legitimately be "" here, because
+    # `cssBlockIsEmpty` already being false guarantees at least one
+    # non-blank trimmed kept line, so `cssJoinLines` always has real
+    # content to return in that case. A caller that needs to tell the two
+    # error cases apart calls `cssBlockIsEmpty`/`checkCSSComments`
+    # directly, exactly the "separate sibling proc call carries the real
+    # status" convention source.fct's own `parsedTabError` already
+    # established for `parseSourceToParents`.
+    proc parseCSSSrc(bodySrc: text, headerLineNo: int, comments: [Line]) -> text:
+        let empty = do cssBlockIsEmpty(bodySrc)
+        if empty:
+            return ""
+        let to = do cssLastKeptLineNo(bodySrc, headerLineNo)
+        let bad = do checkCSSComments(headerLineNo, to, comments)
+        if bad >= 0:
+            return ""
+        let kept = do parsedTexts(bodySrc)
+        let joined = do cssJoinLines(kept)
+        return joined
+
+    # ============================================================
+    # STAGE 4: end-to-end drivers, raw full-source text in — the exact
+    # shape a hand-traced example or `facet console` call can exercise
+    # directly, with no caller-side tree-building needed at all.
+    # ============================================================
+
+    # cssBlockCSS: locate the (first) `css:` block in `fullSrc`, and return
+    # its real, reconstructed stylesheet text, or "" if there is no `css:`
+    # block at all, the block is empty, or a comment inside it is rejected.
+    proc cssBlockCSS(fullSrc: text) -> text:
+        let h = do cssHeaderLineNo(fullSrc)
+        if h < 0:
+            return ""
+        let body = do cssBodySrcOf(fullSrc, h)
+        let comments = do parsedComments(fullSrc)
+        let r = do parseCSSSrc(body, h, comments)
+        return r
+
+    # cssBlockBadCommentLine: the same end-to-end drive, but returning
+    # checkCSSComments' own verdict directly (the offending absolute line
+    # number, or -1) — the honest "which error, and where" signal
+    # `cssBlockCSS`'s own "" sentinel alone cannot distinguish from "the
+    # block was simply empty" or "there is no css: block here at all".
+    proc cssBlockBadCommentLine(fullSrc: text) -> int:
+        let h = do cssHeaderLineNo(fullSrc)
+        if h < 0:
+            return -1
+        let body = do cssBodySrcOf(fullSrc, h)
+        let comments = do parsedComments(fullSrc)
+        let to = do cssLastKeptLineNo(body, h)
+        let bad = do checkCSSComments(h, to, comments)
+        return bad
+
+    state cssHeaderLineResult: int = -1
+    state cssResult: text = ""
+    state cssBadCommentLine: bool = false
+    state cssBadCommentLineNo: int = -1
+    state cssFromPathResult: text = ""
+
+    action runCssBlock(fullSrc: text):
+        let h = do cssHeaderLineNo(fullSrc)
+        let r = do cssBlockCSS(fullSrc)
+        let bad = do cssBlockBadCommentLine(fullSrc)
+        cssHeaderLineResult = h
+        cssResult = r
+        cssBadCommentLineNo = bad
+        cssBadCommentLine = bad >= 0
+
+    action runParseCSSFrom(t: text, line: int):
+        let r = do parseCSSFrom(t, line)
+        cssFromPathResult = r
+
+    private view CssHome at "/css":
+        box:
+            text "{cssHeaderLineResult} {cssResult}"
+            text "{cssBadCommentLine} {cssBadCommentLineNo} {cssFromPathResult}"

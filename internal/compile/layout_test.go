@@ -159,6 +159,48 @@ app A:
 	}
 }
 
+// A `slot` inside a `popover bind <cell>:` is exactly as findable and spliceable
+// as one inside `overlay bind <cell>:` — spliceInto's Popover case must recurse
+// into the popover's body the same way, not fall through to its default (leave
+// the node alone) branch. A layout whose only slot sat inside a popover used to
+// report the confusing "must contain a `slot`" error despite one being written,
+// and a layout with one slot outside a popover and one buried inside it would
+// pass validation (count==1) while silently shipping the buried slot unspliced.
+func TestALayoutSlotMaySitInsideAPopover(t *testing.T) {
+	g := mustCompile(t, `
+app A:
+    state menuOpen: bool = false @client
+    layout L:
+        box:
+            toggle bind menuOpen label "…"
+            popover bind menuOpen:
+                slot
+    view V at "/" in L:
+        text "VIEW-CONTENT"
+`)
+	if len(g.Pages) != 1 {
+		t.Fatalf("expected one page, got %d", len(g.Pages))
+	}
+	var found bool
+	var walk func([]ir.Node)
+	walk = func(ns []ir.Node) {
+		for _, n := range ns {
+			for _, segs := range n.SegLists() {
+				for _, sg := range segs {
+					if sg.Lit == "VIEW-CONTENT" {
+						found = true
+					}
+				}
+			}
+			walk(n.Children)
+		}
+	}
+	walk(g.Pages[0].View)
+	if !found {
+		t.Fatalf("expected the routed view's text to be spliced inside the popover, but it did not appear anywhere in the page tree")
+	}
+}
+
 func collectRefs(x *ir.Expr, out *[]string) {
 	if x == nil {
 		return

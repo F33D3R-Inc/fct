@@ -642,3 +642,78 @@ app SourceSelfHost:
             text "{indentResult} {tabResult} {blankResult} {textResult} {parentsResult} {parentsResult2}"
             text "{indentsResult} {textsResult} {skipFlagsResult} {tabErrorResult} {parentsResult3}"
             text "{forestSumResult} {forestMaxDepthResult} {forestNodeCountResult}"
+
+    # ============================================================
+    # STAGE 4 (NEW): source.go's `Comments` — the comment side-channel
+    # `checkCSSComments`/`parseCSS` (internal/parser/parser.go, ~lines
+    # 1251-1333) need to tell a legitimate `#`-prefixed CSS id selector
+    # inside a `css:` block from a genuine dropped-by-the-scanner CSS rule.
+    # `Comments(src)` is fully independent of `Parse`'s own tree-building
+    # pass — source.go itself re-scans `strings.Split(src, "\n")` a SECOND
+    # time, collecting exactly the lines Parse's own loop DROPS (the
+    # `continue` at source.go line 70), instead of building nodes from the
+    # ones it keeps:
+    #
+    #   func Comments(src string) []Line {
+    #       var out []Line
+    #       for i, raw := range strings.Split(src, "\n") {
+    #           text := strings.TrimSpace(raw)
+    #           if strings.HasPrefix(text, "#") {
+    #               out = append(out, Line{
+    #                   Indent: len(raw) - len(strings.TrimLeft(raw, " ")),
+    #                   Text:   text,
+    #                   No:     i + 1,
+    #               })
+    #           }
+    #       }
+    #       return out
+    #   }
+    #
+    # This is the mirror image of parsedIndents/parsedTexts/parsedSkipFlags
+    # above: same `split(src, "\n")`, same per-line trim, opposite keep/drop
+    # condition (KEEP a line here iff it WOULD have been dropped there).
+    #
+    # A proc still cannot return a bare tuple, but this port no longer needs
+    # the parallel-arrays workaround STAGE 1's own header above required
+    # when it was written: a proc can now declare and return a real named
+    # `struct`, and a real `[Struct]` array of them (see parser_decl2.fct's
+    # RecordField/RecordDecl, StructField/StructDecl, etc., and
+    # predicate.fct's/nodes.fct's own rewrite notes — nodes.fct's own `Seg`
+    # struct even holds a cross-file struct type, `expr: ExprNode` from
+    # imported expr.fct, confirming a struct TYPE — not just a struct's own
+    # procs — is visible and usable across an `import`). So `Line` here is
+    # a genuine named struct, and `parsedComments` returns a genuine
+    # `[Line]`, exactly matching source.go's own `[]Line` return, field for
+    # field (Indent/Text/No -> indent/text/no, lowercase per this
+    # codebase's own struct-field convention).
+    struct Line:
+        indent: int
+        text: text
+        no: int
+
+    # parsedComments: source.go's `Comments(src) []Line`, restated exactly —
+    # same split, same per-line trim (via lineText, already proven identical
+    # to strings.TrimSpace above), same `strings.HasPrefix(text, "#")` gate
+    # (via `take(t, 1) == "#"`, the same one-candidate membership test
+    # isBlankOrComment already uses for the same real prefix check), same
+    # `Indent: len(raw) - len(strings.TrimLeft(raw, " "))` (via indentOf,
+    # applied to the RAW line, not the trimmed text — indentOf already takes
+    # the raw line for exactly this reason in every other STAGE 1 proc
+    # above). No filtering beyond that one gate: unlike Parse, a comment
+    # line is never itself required to be non-blank first — an all-`#` line
+    # like "#" alone still counts, matching Go's
+    # `strings.HasPrefix("#", "#") == true` with nothing more required.
+    proc parsedComments(src: text) -> [Line]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let raw = rawLines[i]
+            let t = do lineText(raw)
+            let isComment = take(t, 1) == "#"
+            if isComment:
+                let ind = do indentOf(raw)
+                out = append(out, Line{indent: ind, text: t, no: i + 1})
+            i = i + 1
+        return out

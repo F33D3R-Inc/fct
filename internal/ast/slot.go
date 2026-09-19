@@ -92,6 +92,13 @@ func spliceInto(nodes []Node, inLoop bool, fill func(marker Node, inLoop bool) (
 			}
 			t.Body = body
 			out = append(out, t)
+		case Popover:
+			body, err := spliceInto(t.Body, inLoop, fill)
+			if err != nil {
+				return nil, err
+			}
+			t.Body = body
+			out = append(out, t)
 		case Form:
 			body, err := spliceInto(t.Body, inLoop, fill)
 			if err != nil {
