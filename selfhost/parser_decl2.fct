@@ -13,7 +13,13 @@ app ParserDecl2SelfHost:
     # ONE named value instead of many parallel results (see that STAGE's
     # own header for why the flat-result shape was chosen there — this file
     # simply demonstrates the struct-milestone alternative on top of it,
-    # without touching parser_entity.fct itself).
+    # without touching parser_entity.fct itself), and (STAGE 29, added in a
+    # later pass) parseType (parser.go:1022-1086) plus its two real helpers
+    # isWireTypeName (981) and splitWireDefault (997-1016) — reusing this
+    # file's own RecordField (extended in place with hasDefault/defaultRaw,
+    # matching real ast.RecordField's own Default field) rather than
+    # forking a separate field struct, since real Go itself shares
+    # ast.RecordField verbatim across Record/Type/Message.
     #
     # ============================================================
     # WHY THIS IS A NEW FILE, NOT AN EXTENSION OF parser.fct/parser_proc.fct/
@@ -128,11 +134,31 @@ app ParserDecl2SelfHost:
     # piece already has), exactly the way parsePolicyParamsValid already
     # reuses those same three procs for an unrelated declaration kind.
     # ============================================================
+    # RecordField's hasDefault/defaultRaw: the same field-shape real
+    # ast.RecordField already carries (internal/ast/ast.go:224-240) — it is
+    # ONE struct real Go shares verbatim across Record/Type/Message
+    # (confirmed fresh: parser.go:1067's parseType and parser.go:1150's
+    # parseMessage both literally construct `ast.RecordField{...}`, the
+    # exact same Go type parseRecord itself builds at parser.go:879 — so
+    # this file's own pre-existing RecordField, used today for `record`
+    # only, is extended in place rather than forked). Default is
+    # wire-schema-only real Go's own comment says so directly: a plain
+    # `record`'s field-building closure (parseRecord, parser.go:826-879)
+    # never calls splitWireDefault and never sets Default, leaving it nil
+    # (Go zero value) on every record field, always. Ported the same way
+    # here: hasDefault/defaultRaw are additive fields buildRecordField
+    # (record's own builder, unchanged below) always sets to false/""; only
+    # STAGE 29's new buildTypeField (type's own builder) ever sets
+    # hasDefault: true. defaultRaw mirrors Go's `*string` raw literal text
+    # verbatim — quotes still attached for a quoted-string default
+    # (`"item"`, not `item`), exactly what splitWireDefault itself stores.
     struct RecordField:
         name: text
         typeCore: text
         isList: bool
         isOptional: bool
+        hasDefault: bool
+        defaultRaw: text
         valid: bool
 
     struct RecordDecl:
@@ -153,6 +179,11 @@ app ParserDecl2SelfHost:
         let typeOk = do isTypeNameToken(core)
         return typeOk
 
+    # buildRecordField: unchanged real logic, plus the two new fields pinned
+    # to false/"" — real parseRecord's own `add` closure never calls
+    # splitWireDefault at all, so a record field can never have a default;
+    # this is the literal, honest translation of that omission, not a
+    # placeholder.
     proc buildRecordField(spec: text) -> RecordField:
         let fn = do paramNameOf(spec)
         let ft = do paramTypeRawOf(spec)
@@ -160,7 +191,7 @@ app ParserDecl2SelfHost:
         let isL = do typeIsList(ft)
         let isOpt = do typeIsOptional(ft)
         let ok = do recordFieldSpecValid(spec)
-        return RecordField{name: fn, typeCore: core, isList: isL, isOptional: isOpt, valid: ok}
+        return RecordField{name: fn, typeCore: core, isList: isL, isOptional: isOpt, hasDefault: false, defaultRaw: "", valid: ok}
 
     # buildRecordFields: parser.go's own `add` closure applied over every
     # spec — an EMPTY (all-whitespace) spec is silently skipped (Go's own
@@ -909,11 +940,346 @@ app ParserDecl2SelfHost:
         return EntityFieldDecl{name: name, typeCore: core, isList: isL, isOptional: isOpt, secret: secret, e2e: e2e, unique: unique, required: required, onDeleteRestrict: restrict, onDeleteSetNull: setNull, hasMin: hasMin, minValue: minValue, hasMax: hasMax, maxValue: maxValue, hasRequiresPolicy: hasReq, requiresPolicy: reqPolicy, matchesPattern: matches, valid: ok}
 
     # ============================================================
+    # STAGE 29: parseType (parser.go:1022-1086, read fresh) — `type Name
+    # [query]: field: core [= default], ...`, the wire-schema sibling of
+    # `record` (STAGE 19) whose field grammar is BYTE-FOR-BYTE the same
+    # RecordField shape, confirmed by parser.go:1067 constructing the exact
+    # same `ast.RecordField{...}` literal parseRecord itself builds. What a
+    # `type` field adds on top of a `record` field, ported here as real,
+    # separate logic rather than folded silently into STAGE 19's own
+    # record-only builder:
+    #   - isWireTypeName (parser.go:981): a field's core may additionally be
+    #     `json` or `number`, neither of which isTypeName/isTypeNameToken
+    #     ever accepts (deliberately scoped to type/message fields only —
+    #     parser.go's own comment on isWireTypeName says so directly).
+    #   - splitWireDefault (parser.go:997-1016): a field's raw type text may
+    #     carry a trailing ` = literal` clause; the literal must be
+    #     true/false/[]/{}, a double-quoted string, or a bare (optionally
+    #     signed) integer, or it is rejected at parse time. A field can
+    #     never be both optional (`?`) and defaulted (parser.go:1064-1066).
+    # Also unlike a record/struct header, a `type` header may carry a
+    # trailing ` query` marker on the NAME (before the header's own colon;
+    # parser.go:1030-1037) marking it as bound from a URL query string
+    # rather than a JSON body — ast.Type.Query, plumbed through here as
+    # TypeDecl.isQuery.
+    # ============================================================
+
+    # isWireTypeNameToken: parser.go's own isWireTypeName, verbatim —
+    # `json`/`number` on top of whatever isTypeNameToken (STAGE 2 of
+    # parser_proc.fct, already `do`-callable here) already accepts.
+    proc isWireTypeNameToken(s: text) -> bool:
+        if s == "json":
+            return true
+        if s == "number":
+            return true
+        let r = do isTypeNameToken(s)
+        return r
+
+    # wireDefaultMarkerIndex/wireFieldHasDefault/wireFieldTypeRest/
+    # wireFieldDefaultRaw: splitWireDefault's own `strings.Index(ft, " = ")`
+    # split, restated as parallel query procs over the field's raw
+    # (post-colon, pre-splitType) type text — the same "no shared pass"
+    # convention typeIsOptional/typeIsList/typeCore (parser_proc.fct STAGE
+    # 3) already established for splitType itself.
+    proc wireDefaultMarkerIndex(ft: text) -> int:
+        let r = do indexOf(ft, " = ")
+        return r
+
+    proc wireFieldHasDefault(ft: text) -> bool:
+        let idx = do wireDefaultMarkerIndex(ft)
+        return idx >= 0
+
+    proc wireFieldTypeRest(ft: text) -> text:
+        let idx = do wireDefaultMarkerIndex(ft)
+        if idx < 0:
+            return trim(ft)
+        return trim(slice(ft, 0, idx))
+
+    # wireFieldDefaultRaw: `" = "` is 3 bytes, matching splitWireDefault's
+    # own `idx+len(" = ")` slice start.
+    proc wireFieldDefaultRaw(ft: text) -> text:
+        let idx = do wireDefaultMarkerIndex(ft)
+        if idx < 0:
+            return ""
+        return trim(slice(ft, idx + 3, len(ft)))
+
+    # wireDefaultIntLiteralValid: splitWireDefault's own
+    # `strconv.ParseInt(lit, 10, 64)` check, restated as a character scan —
+    # NOT a reuse of parser_proc.fct's own isIntLiteralToken (STAGE 9),
+    # which only accepts a leading `-`, never a leading `+`. Real
+    # strconv.ParseInt with an explicit base 10 accepts EITHER optional
+    # sign (no underscores, no base prefix — those are ParseInt-with-base-0
+    # features, not in play here since splitWireDefault hardcodes base 10),
+    # so this file's own copy honestly matches that instead of quietly
+    # inheriting the entity-side helper's narrower `@min`/`@max` behavior.
+    proc wireDefaultIntLiteralValid(s: text) -> bool:
+        let n = len(s)
+        if n == 0:
+            return false
+        let mut start = 0
+        let c0 = charAt(s, 0)
+        if c0 == "-":
+            start = 1
+        if c0 == "+":
+            start = 1
+        if start >= n:
+            return false
+        let mut ok = true
+        let mut i = start
+        loop i < n:
+            let d = do isDigitChar(charAt(s, i))
+            if !d:
+                ok = false
+            i = i + 1
+        return ok
+
+    # wireDefaultQuotedStringValid: splitWireDefault's own `lit[0] == '"' &&
+    # len(lit) >= 2 && lit[len(lit)-1] == '"'` — the ENTIRE literal must be
+    # one quoted span, not merely contain one (the same distinction STAGE
+    # 21's own enumValueWireQuoted already draws for an unrelated `as
+    # "Wire"` clause).
+    proc wireDefaultQuotedStringValid(lit: text) -> bool:
+        let n = len(lit)
+        if n < 2:
+            return false
+        let first = charAt(lit, 0)
+        let last = charAt(lit, n - 1)
+        return first == "\"" && last == "\""
+
+    # wireDefaultLiteralValid: splitWireDefault's own five-way literal
+    # gate — true/false/[]/{}, else (only when non-empty) a quoted string
+    # or a signed integer, else rejected. An empty literal (`field: int =
+    # ` with nothing after) is real Go's own explicit reject too — none of
+    # the branches fire, valid stays false.
+    proc wireDefaultLiteralValid(lit: text) -> bool:
+        if lit == "true":
+            return true
+        if lit == "false":
+            return true
+        if lit == "[]":
+            return true
+        if lit == "{}":
+            return true
+        if lit == "":
+            return false
+        let quoted = do wireDefaultQuotedStringValid(lit)
+        if quoted:
+            return true
+        let intOk = do wireDefaultIntLiteralValid(lit)
+        return intOk
+
+    # wireFieldDefaultValid: splitWireDefault's own overall verdict for a
+    # field's raw type text — vacuously valid when there is no ` = ...`
+    # clause at all (real Go returns `rest, nil, nil` with no error in that
+    # case), otherwise the literal itself must pass wireDefaultLiteralValid.
+    proc wireFieldDefaultValid(ft: text) -> bool:
+        let has = do wireFieldHasDefault(ft)
+        if !has:
+            return true
+        let lit = do wireFieldDefaultRaw(ft)
+        let r = do wireDefaultLiteralValid(lit)
+        return r
+
+    # --- type field spec (`name: core [= default]`), reusing STAGE 4's own
+    # paramHasColon/paramNameOf/paramTypeRawOf exactly like STAGE 19's own
+    # record field does, plus the wire-only pieces above ---
+    proc typeFieldRawTypeOf(spec: text) -> text:
+        let r = do paramTypeRawOf(spec)
+        return r
+
+    proc typeFieldTypeRest(spec: text) -> text:
+        let ft = do typeFieldRawTypeOf(spec)
+        let r = do wireFieldTypeRest(ft)
+        return r
+
+    proc typeFieldHasDefault(spec: text) -> bool:
+        let ft = do typeFieldRawTypeOf(spec)
+        let r = do wireFieldHasDefault(ft)
+        return r
+
+    proc typeFieldDefaultRaw(spec: text) -> text:
+        let ft = do typeFieldRawTypeOf(spec)
+        let r = do wireFieldDefaultRaw(ft)
+        return r
+
+    proc typeFieldDefaultValid(spec: text) -> bool:
+        let ft = do typeFieldRawTypeOf(spec)
+        let r = do wireFieldDefaultValid(ft)
+        return r
+
+    proc typeFieldCore(spec: text) -> text:
+        let rest = do typeFieldTypeRest(spec)
+        let r = do typeCore(rest)
+        return r
+
+    proc typeFieldIsList(spec: text) -> bool:
+        let rest = do typeFieldTypeRest(spec)
+        let r = do typeIsList(rest)
+        return r
+
+    proc typeFieldIsOptional(spec: text) -> bool:
+        let rest = do typeFieldTypeRest(spec)
+        let r = do typeIsOptional(rest)
+        return r
+
+    # typeFieldSpecValid: parser.go's own per-field gates in order — colon
+    # required, name a valid ident, the default literal (if any) valid,
+    # the core a valid wire type name, and optional+default mutually
+    # exclusive (parser.go:1064-1066).
+    proc typeFieldSpecValid(spec: text) -> bool:
+        let hasColon = do paramHasColon(spec)
+        if !hasColon:
+            return false
+        let fn = do paramNameOf(spec)
+        let idOk = do isIdentToken(fn)
+        if !idOk:
+            return false
+        let defOk = do typeFieldDefaultValid(spec)
+        if !defOk:
+            return false
+        let core = do typeFieldCore(spec)
+        let typeOk = do isWireTypeNameToken(core)
+        if !typeOk:
+            return false
+        let isOpt = do typeFieldIsOptional(spec)
+        let hasDef = do typeFieldHasDefault(spec)
+        if isOpt:
+            if hasDef:
+                return false
+        return true
+
+    proc buildTypeField(spec: text) -> RecordField:
+        let fn = do paramNameOf(spec)
+        let core = do typeFieldCore(spec)
+        let isL = do typeFieldIsList(spec)
+        let isOpt = do typeFieldIsOptional(spec)
+        let hasDef = do typeFieldHasDefault(spec)
+        let defRaw = do typeFieldDefaultRaw(spec)
+        let ok = do typeFieldSpecValid(spec)
+        return RecordField{name: fn, typeCore: core, isList: isL, isOptional: isOpt, hasDefault: hasDef, defaultRaw: defRaw, valid: ok}
+
+    # buildTypeFields: mirrors buildRecordFields' own empty-spec skip — a
+    # trailing comma in the inline field list is silently tolerated, same
+    # as every other declaration kind's own `add` closure.
+    proc buildTypeFields(specs: [text]) -> [RecordField]:
+        let n = len(specs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let t = trim(specs[i])
+            if t != "":
+                let f = do buildTypeField(specs[i])
+                out = append(out, f)
+            i = i + 1
+        return out
+
+    proc typeFieldsAllValid(fields: [RecordField]) -> bool:
+        let n = len(fields)
+        let mut ok = true
+        let mut i = 0
+        loop i < n:
+            if !fields[i].valid:
+                ok = false
+            i = i + 1
+        return ok
+
+    # --- type header (`type Name [query]:`), reusing STAGE 18's own
+    # declHeadName/declHeadInline verbatim, plus the ` query` marker check
+    # parser.go:1034 applies to the NAME half only ---
+    struct TypeDecl:
+        name: text
+        isQuery: bool
+        fields: [RecordField]
+        valid: bool
+
+    proc typeHeadOf(lineText: text) -> text:
+        let stripped = do trimPrefixText(lineText, "type")
+        let trimmed = trim(stripped)
+        let r = do trimSuffixText(trimmed, ":")
+        return r
+
+    proc typeHeaderRawName(head: text) -> text:
+        let r = do declHeadName(head)
+        return r
+
+    proc typeHeaderInline(head: text) -> text:
+        let r = do declHeadInline(head)
+        return r
+
+    # typeHeaderIsQuery: parser.go's own `trimmed := TrimSuffix(name, "
+    # query"); trimmed != name` — true exactly when the suffix was actually
+    # present and stripped.
+    proc typeHeaderIsQuery(head: text) -> bool:
+        let rawName = do typeHeaderRawName(head)
+        let stripped = do trimSuffixText(rawName, " query")
+        return stripped != rawName
+
+    proc typeHeaderName(head: text) -> text:
+        let rawName = do typeHeaderRawName(head)
+        let isQ = do typeHeaderIsQuery(head)
+        if isQ:
+            let stripped = do trimSuffixText(rawName, " query")
+            return trim(stripped)
+        return rawName
+
+    proc typeInlineSpecs(head: text) -> [text]:
+        let raw = do typeHeaderInline(head)
+        if raw == "":
+            return []
+        return split(raw, ",")
+
+    proc typeHeaderNameValid(head: text) -> bool:
+        let name = do typeHeaderName(head)
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return false
+        let upOk = do isUpperName(name)
+        return upOk
+
+    # typeDeclValid: parser.go's own three real gates — capitalized ident
+    # name, at least one field (parser.go:1082-1084's `len(t.Fields) == 0`
+    # error), and every field independently valid.
+    proc typeDeclValid(head: text, fields: [RecordField]) -> bool:
+        let nameOk = do typeHeaderNameValid(head)
+        if !nameOk:
+            return false
+        if len(fields) == 0:
+            return false
+        let allOk = do typeFieldsAllValid(fields)
+        return allOk
+
+    proc buildTypeDecl(head: text, specs: [text]) -> TypeDecl:
+        let name = do typeHeaderName(head)
+        let isQ = do typeHeaderIsQuery(head)
+        let fields = do buildTypeFields(specs)
+        let v = do typeDeclValid(head, fields)
+        return TypeDecl{name: name, isQuery: isQ, fields: fields, valid: v}
+
+    # parseTypeDeclSrc: the end-to-end driver, same "whole dedented block as
+    # one src blob" shape as parseRecordDeclSrc/parseStructDeclSrc/
+    # parseEnumDeclSrc above — inline fields first, then each child line, in
+    # source order.
+    proc parseTypeDeclSrc(src: text) -> TypeDecl:
+        let lines = split(src, "\n")
+        let headerLine = do firstLineOf(lines)
+        let childLines = do linesFrom(lines, 1)
+        let head = do typeHeadOf(headerLine)
+        let inlineSpecs = do typeInlineSpecs(head)
+        let specs = do concatText(inlineSpecs, childLines)
+        let d = do buildTypeDecl(head, specs)
+        return d
+
+    # ============================================================
     # STAGE 26: describe* — flatten each struct tree above to plain text/int
     # for the `state`/`view` layer below, since a struct value itself can
     # never be a `state` cell (nodes.fct's own STAGE 11 header, restated
     # verbatim as the reason here).
     # ============================================================
+    # describeRecordField: a record field's own hasDefault is always false
+    # (buildRecordField pins it), so this new `= ...` clause never fires for
+    # a real `record`/`struct` demo — added here, not in a forked copy,
+    # because it is also reused by STAGE 29's own type-field summaries
+    # below, where hasDefault can genuinely be true.
     proc describeRecordField(f: RecordField) -> text:
         let mut s = f.name + ": "
         if f.isList:
@@ -922,6 +1288,8 @@ app ParserDecl2SelfHost:
             s = s + f.typeCore
         if f.isOptional:
             s = s + "?"
+        if f.hasDefault:
+            s = s + " = " + f.defaultRaw
         if !f.valid:
             s = s + "(invalid)"
         return s
@@ -1162,6 +1530,27 @@ app ParserDecl2SelfHost:
         let d = do buildEntityFieldDecl(lineText)
         return d.valid
 
+    proc typeDeclSummaryName(src: text) -> text:
+        let d = do parseTypeDeclSrc(src)
+        return d.name
+
+    proc typeDeclSummaryIsQuery(src: text) -> bool:
+        let d = do parseTypeDeclSrc(src)
+        return d.isQuery
+
+    proc typeDeclSummaryFields(src: text) -> text:
+        let d = do parseTypeDeclSrc(src)
+        let r = do describeRecordFields(d.fields)
+        return r
+
+    proc typeDeclSummaryCount(src: text) -> int:
+        let d = do parseTypeDeclSrc(src)
+        return len(d.fields)
+
+    proc typeDeclSummaryValid(src: text) -> bool:
+        let d = do parseTypeDeclSrc(src)
+        return d.valid
+
     # ============================================================
     # STAGE 28: the live HTTP-exercisable drivers, at a fresh view path
     # ("/decl2") clear of parser.fct's own "/" and nodes.fct's own "/nodes".
@@ -1199,6 +1588,12 @@ app ParserDecl2SelfHost:
 
     state entityFieldDeclSummary: text = ""
     state entityFieldDeclValidResult: bool = false
+
+    state typeDeclName: text = ""
+    state typeDeclIsQueryResult: bool = false
+    state typeDeclFieldsSummary: text = ""
+    state typeDeclFieldCount: int = 0
+    state typeDeclValidResult: bool = false
 
     action runParseRecordDecl(src: text):
         let n = do recordDeclSummaryName(src)
@@ -1264,6 +1659,18 @@ app ParserDecl2SelfHost:
         entityFieldDeclSummary = s
         entityFieldDeclValidResult = v
 
+    action runParseTypeDecl(src: text):
+        let n = do typeDeclSummaryName(src)
+        let q = do typeDeclSummaryIsQuery(src)
+        let f = do typeDeclSummaryFields(src)
+        let c = do typeDeclSummaryCount(src)
+        let v = do typeDeclSummaryValid(src)
+        typeDeclName = n
+        typeDeclIsQueryResult = q
+        typeDeclFieldsSummary = f
+        typeDeclFieldCount = c
+        typeDeclValidResult = v
+
     private view Home at "/decl2":
         box:
             text "{recordDeclName} {recordDeclFieldsSummary} {recordDeclFieldCount} {recordDeclValidResult}"
@@ -1273,3 +1680,4 @@ app ParserDecl2SelfHost:
             text "{triggerOnActionResult} {triggerReactionActionResult} {triggerValidResult}"
             text "{policyDeclName} {policyDeclHeaderValidResult} {policyDeclBodyShapeValidResult} {policyDeclValidResult}"
             text "{entityFieldDeclSummary} {entityFieldDeclValidResult}"
+            text "{typeDeclName} {typeDeclIsQueryResult} {typeDeclFieldsSummary} {typeDeclFieldCount} {typeDeclValidResult}"

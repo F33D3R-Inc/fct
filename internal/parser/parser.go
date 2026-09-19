@@ -3734,12 +3734,20 @@ func parseLink(s string, line int) (ast.Node, error) {
 }
 
 func parseInput(s string, line int) (ast.Node, error) {
-	// `input bind name [placeholder "text"]`
+	// `input bind name [placeholder "text"] [on change -> Action(args) [debounce <duration>]]`
 	if !strings.HasPrefix(s, "bind ") {
 		return nil, &Error{line, `input needs a binding: input bind stateName`}
 	}
 	rest := strings.TrimSpace(s[len("bind "):])
 	in := ast.Input{}
+	// `on change` is pulled off the tail first, via indexTop so a quoted
+	// placeholder that happens to contain the literal words is left alone —
+	// the same reason placeholder's own scan below is indexTop, not Index.
+	var onChange string
+	if oc := indexTop(rest, " on change"); oc >= 0 {
+		onChange = strings.TrimSpace(rest[oc+len(" on change"):])
+		rest = strings.TrimSpace(rest[:oc])
+	}
 	if ph := indexTop(rest, "placeholder "); ph >= 0 {
 		p, err := parseText(strings.TrimSpace(rest[ph+len("placeholder "):]), line)
 		if err != nil {
@@ -3752,7 +3760,72 @@ func parseInput(s string, line int) (ast.Node, error) {
 		return nil, &Error{line, fmt.Sprintf("invalid input binding %q", rest)}
 	}
 	in.Bind = rest
+	if onChange != "" {
+		ca, err := parseControlAction(onChange, line)
+		if err != nil {
+			return nil, err
+		}
+		in.OnChange = ca
+	}
 	return in, nil
+}
+
+// defaultDebounceMS is the on-change dispatch delay a control gets when the
+// author writes no `debounce` clause: long enough that a fast typist doesn't
+// fire one request per keystroke, short enough that a typing indicator or
+// live search still reads as "live." It is a plain constant, not a value
+// parsed from source, because parseDuration's finest unit is a whole second —
+// far coarser than what a responsive debounce needs — so there is no duration
+// literal that could spell this default without inventing a sub-second unit
+// the rest of the grammar (after/job/daemon) doesn't have and doesn't need.
+const defaultDebounceMS = 400
+
+// parseControlAction parses the clause after `on change`: `-> Action(args)
+// [debounce <duration>]`. The action-call half is exactly parseButton's arrow
+// grammar (name, optional parenthesized args) reused rather than duplicated;
+// the optional `debounce` half reuses parseDuration — the same `30s`/`5m`/`2h`
+// grammar `after`/`job`/`daemon` already parse — converting its seconds to
+// milliseconds, rather than inventing a second duration parser for it.
+func parseControlAction(s string, line int) (*ast.ControlAction, error) {
+	if !strings.HasPrefix(s, "->") {
+		return nil, &Error{line, "`on change` needs a reaction: `on change -> actionName(args)`"}
+	}
+	call := strings.TrimSpace(s[len("->"):])
+
+	debounceMS := defaultDebounceMS
+	if di := indexTop(call, " debounce "); di >= 0 {
+		durS := strings.TrimSpace(call[di+len(" debounce "):])
+		call = strings.TrimSpace(call[:di])
+		secs, err := parseDuration(durS, line)
+		if err != nil {
+			return nil, err
+		}
+		debounceMS = secs * 1000
+	}
+
+	name := call
+	var args []ast.Expr
+	if open := strings.IndexByte(call, '('); open >= 0 {
+		name = strings.TrimSpace(call[:open])
+		closeP := strings.LastIndexByte(call, ')')
+		if closeP < open {
+			return nil, &Error{line, "missing `)` in action call"}
+		}
+		inner := strings.TrimSpace(call[open+1 : closeP])
+		if inner != "" {
+			for _, a := range splitTop(inner, ',') {
+				e, err := parseExpr(strings.TrimSpace(a), line)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, e)
+			}
+		}
+	}
+	if !isIdent(name) {
+		return nil, &Error{line, fmt.Sprintf("invalid action reference %q", name)}
+	}
+	return &ast.ControlAction{Action: name, Args: args, DebounceMS: debounceMS, Line: line}, nil
 }
 
 // parseOverlay: `overlay bind <cell>:` with a child node tree shown while the cell

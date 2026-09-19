@@ -975,6 +975,14 @@
         i.setAttribute("data-fa-input", node.bind);
         i.placeholder = attrText(node.placeholder, sc);
         i.value = toStr(sc[node.bind]);
+        // `on change -> Action(args) [debounce …]` (ast.ControlAction): carried
+        // on the element itself, exactly like a button's `__fa`, so controlWrite
+        // can find it from the element the "input" event actually fired on with
+        // no separate id-keyed table to keep in sync.
+        if (node.action) {
+          i.setAttribute("data-fa-action", node.action);
+          i.__faOnChange = { action: node.action, args: node.args || [], debounce: node.debounce, scope: sc };
+        }
         return i;
       }
       case "select": {
@@ -1799,7 +1807,18 @@
   }
 
   // ── dispatch: the compiler already chose where each action runs ──────────────
-  async function dispatch(action, args, sc, source) {
+  //
+  // opts.noLock skips the disabled-while-in-flight guard below. Every other
+  // dispatch source (a button click, a form submit, `more`) is a discrete,
+  // one-shot gesture the guard protects from a double-submit; a control's
+  // on-change dispatch (scheduleOnChangeDispatch) is neither — it fires while
+  // the actor may still be actively typing, so disabling its own source
+  // element mid-flight would drop focus and lock the field under their
+  // fingers. setPending still runs either way, so `pending(action)` stays a
+  // true reactive signal a view can show busy state from; what's skipped is
+  // specifically touching the control's own `disabled`/`aria-busy`.
+  async function dispatch(action, args, sc, source, opts) {
+    opts = opts || {};
     clearError(source);
     const act = actions[action];
     if (!act) return;
@@ -1822,7 +1841,8 @@
     let snapshot = null, predicted = null;
     if (act.optimistic) { snapshot = Object.assign({}, store); predicted = predict(act, vals); }
     setPending(action, true, "");          // reactive: pending(action) is now true
-    if (source) { source.setAttribute("aria-busy", "true"); source.disabled = true; } // no double-submit
+    const lock = source && !opts.noLock;
+    if (lock) { source.setAttribute("aria-busy", "true"); source.disabled = true; } // no double-submit
     let res;
     try {
       res = await fetch("/event", {
@@ -1830,7 +1850,7 @@
         body: JSON.stringify({ action, args: vals }),
       });
     } finally {
-      if (source) { source.removeAttribute("aria-busy"); source.disabled = false; }
+      if (lock) { source.removeAttribute("aria-busy"); source.disabled = false; }
     }
     if (!res.ok) {
       if (snapshot) { for (const k of predicted) store[k] = snapshot[k]; refresh(predicted); }
@@ -1867,6 +1887,36 @@
       }
       if (changed.length) refresh(changed);
     }, Math.max(0, (node.seconds || 0) * 1000));
+  }
+
+  // scheduleOnChangeDispatch arms (or re-arms) a control's on-change dispatch:
+  // `input bind cell on change -> Action(args) [debounce …]`. Called from
+  // controlWrite on every keystroke, which is what makes it a debounce with no
+  // separate "has this fired yet" bookkeeping — each new keystroke clears
+  // whatever timer the previous one armed before it could fire, so the action
+  // only actually dispatches once typing has stopped for the configured
+  // window.
+  //
+  // The timer lives on the element itself (t.__faDebounceTimer), not in a
+  // table keyed by bind name or node id: the element IS the control instance,
+  // so this needs no key to collide on if two controls ever bind the same
+  // cell, and nothing to clean up by hand if the element is later discarded —
+  // an orphaned timer's own dispatch is harmless (the actor is gone) and the
+  // property goes with the element to garbage collection.
+  //
+  // `oc.scope` was captured at render time, but for a top-level control it IS
+  // `store` — mutated in place by every keystroke since — so evaluating the
+  // action's args only when the timer actually fires reads the value the
+  // actor has typed by NOW, the same "now, not when scheduled" rule
+  // scheduleAfter's body already follows.
+  function scheduleOnChangeDispatch(t, oc) {
+    if (t.__faDebounceTimer) clearTimeout(t.__faDebounceTimer);
+    t.__faDebounceTimer = setTimeout(function () {
+      t.__faDebounceTimer = null;
+      // noLock: dispatch must not disable the field the actor may still be
+      // typing into — see dispatch()'s own doc for why.
+      dispatch(oc.action, oc.args, oc.scope, t, { noLock: true });
+    }, Math.max(0, oc.debounce || 0));
   }
 
   function runClient(act, vals) {
@@ -2154,6 +2204,7 @@
     if (store[name] === v) return; // the same event arriving twice changes nothing
     store[name] = v;
     refresh([name]);
+    if (t.__faOnChange) scheduleOnChangeDispatch(t, t.__faOnChange);
   }
   root.addEventListener("input", controlWrite);
   root.addEventListener("change", function (e) {

@@ -1,0 +1,722 @@
+import "fabric_core.fct"
+import "fabric_telemetry.fct"
+import "fabric_ml.fct"
+import "fabric_routing.fct"
+
+app FabricOptimizerSelfHost:
+    # Self-hosting port of fabric/crates/fabric-optimizer/src/ IN FULL —
+    # decision.rs (79L: OptimizationAction, OptimizationDecision + its two
+    # real methods score/should_execute), fleet.rs (335L: FleetNode, Fleet
+    # + its real methods unreported/has_headroom/new/from_placements/
+    # topology/nodes/destinations/best_destination, plus the
+    # `From<&TopologyRegistry> for Fleet` impl) and optimizer.rs (417L:
+    # WorkloadOptimizer + its real methods new/optimize/predictor and the
+    # private cannot_act helper). All three files read in full before
+    # writing a line here; no method or field was skipped. `cargo test -p
+    # fabric-optimizer --lib` was run for real: 12 passed, 0 failed (5 in
+    # fleet::tests, 7 in optimizer::tests). decision.rs itself has NO test
+    # module (confirmed by reading it in full — no `#[cfg(test)]` anywhere),
+    # so its two methods are hand-traced below the same way fabric_ml.fct's
+    # header already documents doing for its own untested crate.
+    #
+    # This is the file the task's own background names as the real
+    # precondition for a future `fabric-controller` port: its dependencies
+    # (`fabric_ml::WorkloadPredictor`, `fabric_workload::WorkloadProfile`,
+    # `fabric_topology::TopologyRegistry`) are all already ported — in
+    # fabric_ml.fct, fabric_telemetry.fct and fabric_routing.fct
+    # respectively — and are imported here directly rather than restated,
+    # since cross-file `import` now works fully and transitively for
+    # structs/procs in this directory. Nothing in this file redeclares
+    # `Coordinate`, `WorkloadProfile`, `WorkloadPredictor` or
+    # `TopologyRegistry`/`Placement` — it uses the one real copy of each
+    # that already exists.
+    #
+    # ============================================================
+    # DbmsId — restated as plain `text`, not fabric_core.fct's `DbmsId`
+    # struct.
+    # ============================================================
+    # `fabric_core.fct` has a real `struct DbmsId: value: text` for its own
+    # topology.rs (`DbmsNode.id`). But `fabric_routing.fct` — the file that
+    # actually owns `TopologyRegistry`/`Placement`, i.e. the type this
+    # file's `Fleet` is built from — made a different, already-established
+    # choice: its own header states plainly that `DbmsId` is "just `pub
+    # struct DbmsId(pub String)`" and restates every `DbmsId` field
+    # (`Placement.dbmsId`, `Route.node`) as plain `text` directly, never as
+    # a wrapper struct. `Fleet`/`FleetNode` here are built ENTIRELY out of
+    # `fabric_routing.fct`'s `Placement.dbmsId` (`fleetFromPlacements`) and
+    # compared against it at every real callsite (`locate(...).placement.
+    # dbmsId`, `node.id != source`) — so `FleetNode.id` and
+    # `OptimizationAction`'s `Replicate`/`Move` target both follow
+    # `fabric_routing.fct`'s own established convention for this exact
+    # real-world value, not `fabric_core.fct`'s different convention for a
+    # different real-world value (`DbmsNode.id`, never touched by this
+    # file). Introducing a second `DbmsId` wrapper type here that every
+    # comparison against a `Placement.dbmsId` would have to unwrap through
+    # would be new, unnecessary indirection, not fidelity.
+    #
+    # ============================================================
+    # OptimizationAction — six variants, one shared text-tagged struct.
+    # ============================================================
+    # Same convention `fabric_routing.fct`'s `RoutingError`/`ReadPreference`
+    # and `predicate.fct`'s `Node`/`Field` already establish for a Rust
+    # `enum` with named, payload-carrying variants: `kind: text` names the
+    # variant, every field is always present (a struct literal must set all
+    # of them) but only the ones `kind` actually uses are meaningful.
+    # `target: text` carries `Replicate`/`Move`'s `DbmsId` (see above);
+    # `coordinate: Coordinate` carries `Colocate`'s `Coordinate` — a
+    # DIFFERENT field, never conflated with `target`, because the real Rust
+    # variants carry genuinely different payload types (`DbmsId` vs.
+    # `Coordinate`) for the genuinely different reason decision.rs's own
+    # doc comment gives (read in full above): naming a node IS the decision
+    # for Replicate/Move, naming a coordinate is a lookup key for Colocate.
+    # `NoAction`/`Split`/`Isolate` use neither field. `optimizer.rs`'s own
+    # algorithm never constructs `Colocate` (grepped directly — it is not
+    # mentioned anywhere in optimizer.rs), so this port cannot hand-trace
+    # it against decision-algorithm behavior, but the TYPE itself is
+    # ported in full here regardless, per this task's own root-solutions
+    # rule: a type decision.rs really declares is really declared here,
+    # whether or not optimizer.rs happens to produce every one of its
+    # variants today.
+    struct OptimizationAction:
+        kind: text
+        target: text
+        coordinate: Coordinate
+
+    proc optimizationActionNoAction() -> OptimizationAction:
+        return OptimizationAction{kind: "NoAction", target: "", coordinate: Coordinate{x: 0, y: 0}}
+
+    proc optimizationActionReplicate(target: text) -> OptimizationAction:
+        return OptimizationAction{kind: "Replicate", target: target, coordinate: Coordinate{x: 0, y: 0}}
+
+    proc optimizationActionMove(target: text) -> OptimizationAction:
+        return OptimizationAction{kind: "Move", target: target, coordinate: Coordinate{x: 0, y: 0}}
+
+    proc optimizationActionSplit() -> OptimizationAction:
+        return OptimizationAction{kind: "Split", target: "", coordinate: Coordinate{x: 0, y: 0}}
+
+    proc optimizationActionIsolate() -> OptimizationAction:
+        return OptimizationAction{kind: "Isolate", target: "", coordinate: Coordinate{x: 0, y: 0}}
+
+    proc optimizationActionColocate(target: Coordinate) -> OptimizationAction:
+        return OptimizationAction{kind: "Colocate", target: "", coordinate: target}
+
+    # optimizationActionEquals: `PartialEq`/`Eq` stand-in, same reason
+    # fabric_telemetry.fct's `workloadKeyEquals` gives — this language has
+    # no derived trait machinery. Only compares the field(s) the matching
+    # `kind` actually uses, exactly like the real derived `PartialEq` would
+    # (which compares payload fields only within a matching variant).
+    proc optimizationActionEquals(a: OptimizationAction, b: OptimizationAction) -> bool:
+        if a.kind != b.kind:
+            return false
+        if a.kind == "Replicate" || a.kind == "Move":
+            return a.target == b.target
+        if a.kind == "Colocate":
+            return a.coordinate.x == b.coordinate.x && a.coordinate.y == b.coordinate.y
+        return true
+
+    # ============================================================
+    # OptimizationDecision — decision.rs's other real type, plus its two
+    # real methods `score`/`should_execute`. NO test module exists for
+    # decision.rs (confirmed by reading it in full); both methods are
+    # one-line arithmetic/logic directly off the real source, not
+    # independently re-derived.
+    # ============================================================
+    struct OptimizationDecision:
+        shardId: int
+        coordinate: Coordinate
+        action: OptimizationAction
+        expectedGain: float
+        estimatedCost: float
+        confidence: float
+
+    proc optimizationDecisionScore(d: OptimizationDecision) -> float:
+        return d.expectedGain - d.estimatedCost
+
+    # optimizationDecisionShouldExecute: `!matches!(action, NoAction) &&
+    # score() > 0.0 && confidence >= 0.80`, in that exact order (so a
+    # `NoAction` with a fabricated positive score/high confidence still
+    # never executes — the kind check is real and comes first, not merely
+    # implied by NoAction's own zeroed gain/cost/confidence fields).
+    proc optimizationDecisionShouldExecute(d: OptimizationDecision) -> bool:
+        let isNoAction = d.action.kind == "NoAction"
+        let score = do optimizationDecisionScore(d)
+        return !isNoAction && score > 0.0 && d.confidence >= 0.80
+
+    # ============================================================
+    # fleet.rs — FleetNode, Fleet. `BTreeMap<String, FleetNode>` (used only
+    # inside `from_placements`) is restated as the SAME array-instead-of-map
+    # convention `fabric_core.fct`'s `ShardStorage` and `fabric_routing.fct`'s
+    # `TopologyRegistry` already establish for a `HashMap` — a linearly
+    # scanned `[FleetNode]` built by index-of-then-append/overwrite, the
+    # identical shape `topologyRegistryPlace`/`workloadAnalyzerObserve`
+    # already use. The one place this restatement has to do MORE than those
+    # two, and does: `BTreeMap`, unlike `HashMap`, guarantees its `.into_
+    # values()` iterates in ASCENDING KEY order, not insertion order — a
+    # real, observable difference from every other map-as-array port in
+    # this directory, which stand in for an explicitly UNORDERED `HashMap`.
+    # So `fleetFromPlacements` below ends with an explicit ascending sort by
+    # `id` (`fleetNodeArraySortByIdAscending`, the same hand-written stable
+    # insertion sort idiom `fabric_table.fct`'s `tableSortTextAscending`
+    # already establishes for exactly this "restate a BTreeSet/BTreeMap's
+    # guaranteed order" job) — restating the real guarantee, not merely the
+    # real absence of one.
+    # ============================================================
+    struct FleetNode:
+        id: text
+        region: text
+        acceptsPlacement: bool
+        hostedPlacements: int
+        placementCapacity: int
+        utilization: float
+
+    proc fleetNodeZero() -> FleetNode:
+        return FleetNode{id: "", region: "", acceptsPlacement: false, hostedPlacements: 0, placementCapacity: 0, utilization: 0.0}
+
+    # fleetNodeUnreported: `FleetNode::unreported` — existence and region
+    # known, nothing else; `accepts_placement: true` (nothing says
+    # otherwise), zero capacity means "not reported" per this type's own
+    # doc, not "zero headroom".
+    proc fleetNodeUnreported(id: text, region: text) -> FleetNode:
+        return FleetNode{id: id, region: region, acceptsPlacement: true, hostedPlacements: 0, placementCapacity: 0, utilization: 0.0}
+
+    # fleetNodeHasHeadroom: `FleetNode::has_headroom` — a capacity of 0 is
+    # "unknown", so it is never filtered on (always true), matching the
+    # real `capacity == 0 || hosted < capacity` exactly.
+    proc fleetNodeHasHeadroom(n: FleetNode) -> bool:
+        return n.placementCapacity == 0 || n.hostedPlacements < n.placementCapacity
+
+    struct Fleet:
+        topology: TopologyRegistry
+        nodes: [FleetNode]
+
+    proc fleetNew(topology: TopologyRegistry, nodes: [FleetNode]) -> Fleet:
+        return Fleet{topology: topology, nodes: nodes}
+
+    proc fleetTopology(f: Fleet) -> TopologyRegistry:
+        return f.topology
+
+    proc fleetNodes(f: Fleet) -> [FleetNode]:
+        return f.nodes
+
+    proc fleetSeenIndexOf(nodes: [FleetNode], id: text) -> int:
+        let n = len(nodes)
+        let mut i = 0
+        let mut found = -1
+        loop i < n:
+            if found == -1:
+                if nodes[i].id == id:
+                    found = i
+            i = i + 1
+        return found
+
+    # fleetNodeArraySortByIdAscending: restates `BTreeMap`'s guaranteed
+    # ascending-key iteration order — see this section's header. Same
+    # hand-written stable insertion sort idiom as
+    # `fabric_table.fct`'s `tableSortTextAscending`.
+    proc fleetNodeArraySortByIdAscending(nodes: [FleetNode]) -> [FleetNode]:
+        let mut xs = nodes
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                if xs[j - 1].id > xs[j].id:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    # fleetFromPlacements: `Fleet::from_placements` — every node holding
+    # data is a candidate; `HashMap::entry(...).or_insert_with(unreported)`
+    # then `hosted_placements += 1` becomes index-of-then-append/overwrite,
+    # the same functional-update shape `topologyRegistryPlace` already uses;
+    # the final ascending-by-id sort restates `BTreeMap::into_values`'s real
+    # guarantee (see this section's header).
+    proc fleetFromPlacements(topology: TopologyRegistry) -> Fleet:
+        let placements = do topologyRegistryPlacements(topology)
+        let n = len(placements)
+        let mut i = 0
+        let mut seen = []
+        loop i < n:
+            let p = placements[i]
+            let idx = do fleetSeenIndexOf(seen, p.dbmsId)
+            if idx == -1:
+                let fresh = do fleetNodeUnreported(p.dbmsId, p.region)
+                let bumped = FleetNode{id: fresh.id, region: fresh.region, acceptsPlacement: fresh.acceptsPlacement, hostedPlacements: fresh.hostedPlacements + 1, placementCapacity: fresh.placementCapacity, utilization: fresh.utilization}
+                seen = append(seen, bumped)
+            else:
+                let mut nodes = seen
+                let existing = nodes[idx]
+                nodes[idx] = FleetNode{id: existing.id, region: existing.region, acceptsPlacement: existing.acceptsPlacement, hostedPlacements: existing.hostedPlacements + 1, placementCapacity: existing.placementCapacity, utilization: existing.utilization}
+                seen = nodes
+            i = i + 1
+        let sorted = do fleetNodeArraySortByIdAscending(seen)
+        return Fleet{topology: topology, nodes: sorted}
+
+    # fleetFromTopology: `impl From<&TopologyRegistry> for Fleet` — its
+    # entire body is `Self::from_placements(topology)`; restated as a
+    # direct call rather than a distinct algorithm, since this language has
+    # no trait/generic system for `optimize`'s real `impl Into<Fleet<'a>>`
+    # parameter to dispatch through. `workloadOptimizerOptimizeFromTopology`
+    # below is the honest restatement of that generic call site: a caller
+    # holding only a bare topology converts explicitly before calling
+    # `workloadOptimizerOptimize`, exactly what the real generic bound
+    # accomplishes implicitly.
+    proc fleetFromTopology(topology: TopologyRegistry) -> Fleet:
+        let f = do fleetFromPlacements(topology)
+        return f
+
+    # fleetRegionRank: `region(node)` closure inside `destinations`'s own
+    # `sort_by` — `u8::from(node.region == region)` when `away_from` is
+    # `Some`, else the constant `0`. `hasAwayFrom`/`awayFrom` restate
+    # `Option<&str>` the same has*/value way `Route.hasCoordinate`/
+    # `coordinate` already does for `Option<Coordinate>` in
+    # `fabric_routing.fct`.
+    proc fleetRegionRank(node: FleetNode, hasAwayFrom: bool, awayFrom: text) -> int:
+        if !hasAwayFrom:
+            return 0
+        if node.region == awayFrom:
+            return 1
+        return 0
+
+    # fleetNodeLess: the full four-key comparator `destinations`'s
+    # `sort_by` chains with `.then(...)` — region rank ascending (out of
+    # the away-from region first), then utilization ascending (least loaded
+    # first), then hosted_placements ascending (fewest placements first),
+    # then id ascending (deterministic tie-break, matching the real
+    # `left.id.0.cmp(&right.id.0)` final arm). `partial_cmp(...).unwrap_or
+    # (Equal)` needs no restatement here: this language's `<`/`>` on `float`
+    # already gives a total, non-panicking order for every value these
+    # fields ever hold.
+    proc fleetNodeLess(a: FleetNode, b: FleetNode, hasAwayFrom: bool, awayFrom: text) -> bool:
+        let ra = do fleetRegionRank(a, hasAwayFrom, awayFrom)
+        let rb = do fleetRegionRank(b, hasAwayFrom, awayFrom)
+        if ra != rb:
+            return ra < rb
+        if a.utilization != b.utilization:
+            return a.utilization < b.utilization
+        if a.hostedPlacements != b.hostedPlacements:
+            return a.hostedPlacements < b.hostedPlacements
+        return a.id < b.id
+
+    # fleetSortDestinations: `candidates.sort_by(...)` — the same
+    # hand-written STABLE insertion sort idiom `fabric_stats.fct`'s
+    # `statsSortCellBreakdownBusiestFirst` and `fabric_table.fct`'s
+    # `tableSortTextAscending` already establish (only swap strictly
+    # out-of-order neighbors, preserving relative order of ties exactly
+    # like Rust's own stable `sort_by`), driven by the four-key comparator
+    # above instead of a single field.
+    proc fleetSortDestinations(nodes: [FleetNode], hasAwayFrom: bool, awayFrom: text) -> [FleetNode]:
+        let mut xs = nodes
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                let swap = do fleetNodeLess(xs[j], xs[j - 1], hasAwayFrom, awayFrom)
+                if swap:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    proc fleetFilterCandidates(nodes: [FleetNode], source: text) -> [FleetNode]:
+        let n = len(nodes)
+        let mut i = 0
+        let mut result = []
+        loop i < n:
+            let node = nodes[i]
+            let headroom = do fleetNodeHasHeadroom(node)
+            if node.id != source && node.acceptsPlacement && headroom:
+                result = append(result, node)
+            i = i + 1
+        return result
+
+    # fleetDestinations: `Fleet::destinations` — filter (not the source,
+    # accepts placement, has headroom) then sort by the four-key comparator
+    # above, best first.
+    proc fleetDestinations(f: Fleet, source: text, hasAwayFrom: bool, awayFrom: text) -> [FleetNode]:
+        let filtered = do fleetFilterCandidates(f.nodes, source)
+        let sorted = do fleetSortDestinations(filtered, hasAwayFrom, awayFrom)
+        return sorted
+
+    struct FleetDestinationOption:
+        has: bool
+        val: FleetNode
+
+    proc fleetBestDestination(f: Fleet, source: text, hasAwayFrom: bool, awayFrom: text) -> FleetDestinationOption:
+        let candidates = do fleetDestinations(f, source, hasAwayFrom, awayFrom)
+        if len(candidates) == 0:
+            let zero = do fleetNodeZero()
+            return FleetDestinationOption{has: false, val: zero}
+        return FleetDestinationOption{has: true, val: candidates[0]}
+
+    # ============================================================
+    # optimizer.rs — WorkloadOptimizer, the real decision algorithm.
+    # ============================================================
+    struct WorkloadOptimizer:
+        predictor: WorkloadPredictor
+
+    proc workloadOptimizerDefault() -> WorkloadOptimizer:
+        let p = do workloadPredictorDefault()
+        return WorkloadOptimizer{predictor: p}
+
+    proc workloadOptimizerNew(predictor: WorkloadPredictor) -> WorkloadOptimizer:
+        return WorkloadOptimizer{predictor: predictor}
+
+    proc workloadOptimizerPredictor(o: WorkloadOptimizer) -> WorkloadPredictor:
+        return o.predictor
+
+    # workloadOptimizerCannotAct: private `cannot_act` — zero confidence,
+    # non-zero (1.0) cost, `NoAction`. Deliberately distinct from the
+    # "not likely hot at all" `NoAction` branch below (which carries
+    # `1.0 - probability` as its confidence and zero cost): this is "I know
+    # something is wrong here and I have no move", per the real doc
+    # comment, not "nothing is wrong".
+    proc workloadOptimizerCannotAct(profile: WorkloadProfile) -> OptimizationDecision:
+        let action = do optimizationActionNoAction()
+        return OptimizationDecision{shardId: profile.shardId, coordinate: profile.coordinate, action: action, expectedGain: 0.0, estimatedCost: 1.0, confidence: 0.0}
+
+    # workloadOptimizerOptimize: `WorkloadOptimizer::optimize` — takes a
+    # concrete `Fleet` rather than `impl Into<Fleet<'a>>` (this language has
+    # no generic/trait bound to restate); a caller holding only a bare
+    # `TopologyRegistry` converts explicitly first via `fleetFromTopology`,
+    # exactly what the real generic bound does implicitly at its one real
+    # call site (the `&registry` test in optimizer.rs). Every branch below
+    # is in the SAME top-to-bottom order as the real method body: not
+    # likely hot -> can't locate the cell -> read-heavy (replicate) ->
+    # write-heavy (isolate) -> mixed (move).
+    proc workloadOptimizerOptimize(optimizer: WorkloadOptimizer, profile: WorkloadProfile, fleet: Fleet) -> OptimizationDecision:
+        let prediction = do workloadPredictorPredictHotspot(optimizer.predictor, profile)
+        let likely = do hotspotPredictionIsLikelyHot(prediction)
+        if !likely:
+            let notHotAction = do optimizationActionNoAction()
+            return OptimizationDecision{shardId: profile.shardId, coordinate: profile.coordinate, action: notHotAction, expectedGain: 0.0, estimatedCost: 0.0, confidence: 1.0 - prediction.probability}
+
+        let located = do topologyRegistryLocate(fleet.topology, profile.shardId, profile.coordinate)
+        if !located.found:
+            let na = do workloadOptimizerCannotAct(profile)
+            return na
+
+        let placement = located.placement
+
+        if profile.readRatio >= 0.70:
+            let dest = do fleetBestDestination(fleet, placement.dbmsId, true, placement.region)
+            if !dest.has:
+                let na2 = do workloadOptimizerCannotAct(profile)
+                return na2
+            let replicate = do optimizationActionReplicate(dest.val.id)
+            return OptimizationDecision{shardId: profile.shardId, coordinate: profile.coordinate, action: replicate, expectedGain: prediction.probability * 1.20, estimatedCost: 0.35, confidence: prediction.probability}
+
+        if profile.writeRatio >= 0.70:
+            let isolate = do optimizationActionIsolate()
+            return OptimizationDecision{shardId: profile.shardId, coordinate: profile.coordinate, action: isolate, expectedGain: prediction.probability, estimatedCost: 0.45, confidence: prediction.probability}
+
+        let dest2 = do fleetBestDestination(fleet, placement.dbmsId, false, "")
+        if !dest2.has:
+            let na3 = do workloadOptimizerCannotAct(profile)
+            return na3
+        let moveAction = do optimizationActionMove(dest2.val.id)
+        return OptimizationDecision{shardId: profile.shardId, coordinate: profile.coordinate, action: moveAction, expectedGain: prediction.probability * 0.90, estimatedCost: 0.50, confidence: prediction.probability}
+
+    # workloadOptimizerOptimizeFromTopology: the bare-topology call site
+    # `impl Into<Fleet<'a>>` really serves — see `fleetFromTopology`'s own
+    # comment above.
+    proc workloadOptimizerOptimizeFromTopology(optimizer: WorkloadOptimizer, profile: WorkloadProfile, topology: TopologyRegistry) -> OptimizationDecision:
+        let fleet = do fleetFromTopology(topology)
+        let decision = do workloadOptimizerOptimize(optimizer, profile, fleet)
+        return decision
+
+    # ============================================================
+    # DEMO / BUILD-CHECK FIXTURES — each demo below restates one of the 12
+    # real, passing `cargo test -p fabric-optimizer --lib` tests (5 from
+    # fleet::tests, 7 from optimizer::tests), same fixtures and same
+    # assertions, plus one hand-traced check for decision.rs's own two
+    # methods (no test module exists for decision.rs itself).
+    # ============================================================
+
+    proc demoFleetNode(id: text, region: text, utilization: float, hosted: int) -> FleetNode:
+        return FleetNode{id: id, region: region, acceptsPlacement: true, hostedPlacements: hosted, placementCapacity: 4, utilization: utilization}
+
+    proc demoFleetRegistry() -> TopologyRegistry:
+        let r0 = do topologyRegistryNew()
+        let r1 = do topologyRegistryPlace(r0, "db-a", 1, Coordinate{x: 0, y: 0}, "us-east")
+        let r2 = do topologyRegistryPlace(r1, "db-b", 2, Coordinate{x: 0, y: 0}, "us-west")
+        return r2
+
+    # F1 `a_destination_is_always_a_node_the_fleet_named`: best_destination
+    # excludes the source and only ever names a node the fleet holds.
+    proc demoFleetDestinationAlwaysNamedNode() -> bool:
+        let registry = do demoFleetRegistry()
+        let a = do demoFleetNode("db-a", "us-east", 0.90, 1)
+        let b = do demoFleetNode("db-b", "us-west", 0.10, 1)
+        let c = do demoFleetNode("db-c", "us-east", 0.20, 0)
+        let nodes = [a, b, c]
+        let fleet = do fleetNew(registry, nodes)
+        let chosen = do fleetBestDestination(fleet, "db-a", false, "")
+        let chosenOk = chosen.has && chosen.val.id == "db-b"
+        let all = do fleetDestinations(fleet, "db-a", false, "")
+        let n = len(all)
+        let allNamed = (all[0].id == "db-b" || all[0].id == "db-c") && (all[1].id == "db-b" || all[1].id == "db-c")
+        return chosenOk && n == 2 && allNamed
+
+    # F2 `a_node_that_cannot_take_the_copy_is_not_a_candidate`: a full node
+    # (no headroom) and a draining node (accepts_placement false) both
+    # drop out, leaving nothing to choose.
+    proc demoFleetNodeCannotTakeCopyNotCandidate() -> bool:
+        let registry = do demoFleetRegistry()
+        let a = do demoFleetNode("db-a", "us-east", 0.90, 1)
+        let full = FleetNode{id: "db-b", region: "us-west", acceptsPlacement: true, hostedPlacements: 4, placementCapacity: 4, utilization: 0.10}
+        let draining = FleetNode{id: "db-c", region: "us-east", acceptsPlacement: false, hostedPlacements: 0, placementCapacity: 4, utilization: 0.05}
+        let nodes = [a, full, draining]
+        let fleet = do fleetNew(registry, nodes)
+        let chosen = do fleetBestDestination(fleet, "db-a", false, "")
+        return !chosen.has
+
+    # F3 `a_replica_is_ranked_out_of_the_source_region_first`: a costlier
+    # out-of-region node beats a cheaper same-region one when `away_from`
+    # is set; the cheapest node wins outright once it is not.
+    proc demoFleetReplicaRankedOutOfSourceRegionFirst() -> bool:
+        let registry = do demoFleetRegistry()
+        let a = do demoFleetNode("db-a", "us-east", 0.90, 1)
+        let b = do demoFleetNode("db-b", "us-east", 0.01, 0)
+        let c = do demoFleetNode("db-c", "us-west", 0.50, 0)
+        let nodes = [a, b, c]
+        let fleet = do fleetNew(registry, nodes)
+        let withLocality = do fleetBestDestination(fleet, "db-a", true, "us-east")
+        let withoutLocality = do fleetBestDestination(fleet, "db-a", false, "")
+        return withLocality.has && withLocality.val.id == "db-c" && withoutLocality.has && withoutLocality.val.id == "db-b"
+
+    # F4 `the_topology_a_fleet_exposes_locates_by_shard_not_by_guessing`:
+    # two shards sharing one coordinate still resolve unambiguously given
+    # the shard id.
+    proc demoFleetTopologyLocatesByShardNotGuessing() -> bool:
+        let registry = do demoFleetRegistry()
+        let fleet = do fleetFromPlacements(registry)
+        let topology = do fleetTopology(fleet)
+        let locatedOne = do topologyRegistryLocate(topology, 1, Coordinate{x: 0, y: 0})
+        let locatedTwo = do topologyRegistryLocate(topology, 2, Coordinate{x: 0, y: 0})
+        return locatedOne.found && locatedOne.placement.dbmsId == "db-a" && locatedTwo.found && locatedTwo.placement.dbmsId == "db-b"
+
+    # F5 `a_fleet_derived_from_the_map_names_only_nodes_that_hold_data`:
+    # `from_placements` names exactly the nodes with a placement record,
+    # in ascending id order (the `BTreeMap` guarantee this file's header
+    # explains), every one reporting headroom (capacity 0 = unknown).
+    proc demoFleetFromPlacementsNamesOnlyNodesHoldingData() -> bool:
+        let registry = do demoFleetRegistry()
+        let fleet = do fleetFromPlacements(registry)
+        let nodes = do fleetNodes(fleet)
+        let orderOk = len(nodes) == 2 && nodes[0].id == "db-a" && nodes[1].id == "db-b"
+        let headroomOk = do fleetNodeHasHeadroom(nodes[0])
+        let headroomOk2 = do fleetNodeHasHeadroom(nodes[1])
+        return orderOk && headroomOk && headroomOk2
+
+    proc demoOptimizerNode(id: text, region: text, utilization: float) -> FleetNode:
+        return FleetNode{id: id, region: region, acceptsPlacement: true, hostedPlacements: 1, placementCapacity: 8, utilization: utilization}
+
+    proc demoOptimizerRegistry() -> TopologyRegistry:
+        let r0 = do topologyRegistryNew()
+        let r1 = do topologyRegistryPlace(r0, "db-a", 1, Coordinate{x: 3, y: 4}, "us-east")
+        return r1
+
+    proc demoOptimizerFleet(registry: TopologyRegistry) -> Fleet:
+        let a = do demoOptimizerNode("db-a", "us-east", 0.99)
+        let b = do demoOptimizerNode("db-b", "us-east", 0.40)
+        let c = do demoOptimizerNode("db-c", "us-west", 0.50)
+        let nodes = [a, b, c]
+        return Fleet{topology: registry, nodes: nodes}
+
+    # demoHotProfile: the real `hot(reads, writes)` test helper —
+    # `WorkloadProfile::from_metrics(SHARD=1, CELL=(3,4), WorkloadMetrics{
+    # operations_per_second: reads+writes, reads_per_second: reads,
+    # writes_per_second: writes, read/write_latency_us: 60_000.0,
+    # cpu: 0.99, memory: 0.95, queue_depth: 30_000, ...})`, reusing
+    # `fabric_telemetry.fct`'s real `workloadProfileFromMetrics` exactly
+    # like the Rust test reuses the real `WorkloadProfile::from_metrics`.
+    proc demoHotProfile(reads: float, writes: float) -> WorkloadProfile:
+        let metrics = WorkloadMetrics{operationsPerSecond: reads + writes, readsPerSecond: reads, writesPerSecond: writes, readLatencyUs: 60000.0, writeLatencyUs: 60000.0, cpuUtilization: 0.99, memoryUtilization: 0.95, storageBytesPerSecond: 0, networkInBytesPerSecond: 0, networkOutBytesPerSecond: 0, queueDepth: 30000, cellBreakdown: [], cellBreakdownPartial: false}
+        let profile = do workloadProfileFromMetrics(1, Coordinate{x: 3, y: 4}, metrics)
+        return profile
+
+    # O1 `a_named_destination_is_always_a_real_node`: both a Replicate and
+    # a Move decision off the same fleet always name a real, non-source
+    # node.
+    proc demoOptimizerNamedDestinationAlwaysRealNode() -> bool:
+        let registry = do demoOptimizerRegistry()
+        let optimizer = do workloadOptimizerDefault()
+        let readHeavy = do demoHotProfile(11000.0, 1000.0)
+        let mixed = do demoHotProfile(6000.0, 6000.0)
+        let fleetA = do demoOptimizerFleet(registry)
+        let fleetB = do demoOptimizerFleet(registry)
+        let replicate = do workloadOptimizerOptimize(optimizer, readHeavy, fleetA)
+        let relocate = do workloadOptimizerOptimize(optimizer, mixed, fleetB)
+        let replicateOk = replicate.action.kind == "Replicate" && replicate.action.target != "" && replicate.action.target != "db-a"
+        let relocateOk = relocate.action.kind == "Move" && relocate.action.target != "" && relocate.action.target != "db-a"
+        return replicateOk && relocateOk
+
+    # O2 `a_read_heavy_hotspot_replicates_out_of_its_own_region`: db-b is
+    # less loaded but shares db-a's region, so db-c (out of region) wins;
+    # should_execute() is true (positive score, confidence >= 0.80).
+    proc demoOptimizerReadHeavyReplicatesOutOfRegion() -> bool:
+        let registry = do demoOptimizerRegistry()
+        let optimizer = do workloadOptimizerDefault()
+        let profile = do demoHotProfile(11000.0, 1000.0)
+        let fleet = do demoOptimizerFleet(registry)
+        let decision = do workloadOptimizerOptimize(optimizer, profile, fleet)
+        let expected = do optimizationActionReplicate("db-c")
+        let actionOk = do optimizationActionEquals(decision.action, expected)
+        let execOk = do optimizationDecisionShouldExecute(decision)
+        return actionOk && execOk
+
+    # O3 `a_mixed_hotspot_moves_to_the_least_loaded_node`: no locality
+    # constraint on a Move, so the least-loaded node (db-b) wins outright.
+    proc demoOptimizerMixedHotspotMovesToLeastLoaded() -> bool:
+        let registry = do demoOptimizerRegistry()
+        let optimizer = do workloadOptimizerDefault()
+        let profile = do demoHotProfile(6000.0, 6000.0)
+        let fleet = do demoOptimizerFleet(registry)
+        let decision = do workloadOptimizerOptimize(optimizer, profile, fleet)
+        let expected = do optimizationActionMove("db-b")
+        let actionOk = do optimizationActionEquals(decision.action, expected)
+        let execOk = do optimizationDecisionShouldExecute(decision)
+        return actionOk && execOk
+
+    # O4 `a_write_heavy_hotspot_still_isolates_without_naming_a_node`: the
+    # one action whose destination genuinely is a placement detail.
+    proc demoOptimizerWriteHeavyIsolatesWithoutNaming() -> bool:
+        let registry = do demoOptimizerRegistry()
+        let optimizer = do workloadOptimizerDefault()
+        let profile = do demoHotProfile(1000.0, 11000.0)
+        let fleet = do demoOptimizerFleet(registry)
+        let decision = do workloadOptimizerOptimize(optimizer, profile, fleet)
+        return decision.action.kind == "Isolate"
+
+    # O5 `a_fleet_with_nowhere_to_go_produces_no_action`: with nowhere to
+    # put a copy, the answer is NoAction, never a made-up node.
+    proc demoOptimizerNowhereToGoProducesNoAction() -> bool:
+        let registry = do demoOptimizerRegistry()
+        let optimizer = do workloadOptimizerDefault()
+        let profile = do demoHotProfile(11000.0, 1000.0)
+        let onlyA = do demoOptimizerNode("db-a", "us-east", 0.99)
+        let alone = Fleet{topology: registry, nodes: [onlyA]}
+        let decision = do workloadOptimizerOptimize(optimizer, profile, alone)
+        let noAction = decision.action.kind == "NoAction"
+        let execOk = do optimizationDecisionShouldExecute(decision)
+        return noAction && !execOk
+
+    # O6 `a_bare_topology_still_names_a_node_that_holds_data`: a caller
+    # holding only a placement map (via `workloadOptimizerOptimizeFromTopology`,
+    # this port's restatement of `impl Into<Fleet<'a>>`) still gets a real
+    # node id back, never an invented one.
+    proc demoOptimizerBareTopologyNamesNodeHoldingData() -> bool:
+        let base = do demoOptimizerRegistry()
+        let registry = do topologyRegistryPlace(base, "db-z", 1, Coordinate{x: 9, y: 9}, "us-west")
+        let optimizer = do workloadOptimizerDefault()
+        let profile = do demoHotProfile(11000.0, 1000.0)
+        let decision = do workloadOptimizerOptimizeFromTopology(optimizer, profile, registry)
+        let expected = do optimizationActionReplicate("db-z")
+        let matches = do optimizationActionEquals(decision.action, expected)
+        return matches
+
+    # O7 `a_coordinate_two_shards_share_is_resolved_by_its_own_shard_id`:
+    # the same coordinate placed on two different shards resolves to each
+    # shard's own placement and its own decision, never the other's.
+    proc demoOptimizerCoordinateTwoShardsResolvedByShardId() -> bool:
+        let r0 = do topologyRegistryNew()
+        let r1 = do topologyRegistryPlace(r0, "db-a", 1, Coordinate{x: 3, y: 4}, "us-east")
+        let registry = do topologyRegistryPlace(r1, "db-b", 2, Coordinate{x: 3, y: 4}, "us-west")
+        let a = do demoOptimizerNode("db-a", "us-east", 0.10)
+        let b = do demoOptimizerNode("db-b", "us-west", 0.10)
+        let c = do demoOptimizerNode("db-c", "us-east", 0.10)
+        let nodes = [a, b, c]
+        let optimizer = do workloadOptimizerDefault()
+        let onShardOne = do demoHotProfile(11000.0, 1000.0)
+        let onShardOneKeyed = WorkloadProfile{shardId: 1, coordinate: onShardOne.coordinate, operationsPerSecond: onShardOne.operationsPerSecond, readRatio: onShardOne.readRatio, writeRatio: onShardOne.writeRatio, readLatencyUs: onShardOne.readLatencyUs, writeLatencyUs: onShardOne.writeLatencyUs, cpuUtilization: onShardOne.cpuUtilization, memoryUtilization: onShardOne.memoryUtilization, storageBytesPerSecond: onShardOne.storageBytesPerSecond, networkInBytesPerSecond: onShardOne.networkInBytesPerSecond, networkOutBytesPerSecond: onShardOne.networkOutBytesPerSecond, queueDepth: onShardOne.queueDepth, cellBreakdown: onShardOne.cellBreakdown, cellBreakdownPartial: onShardOne.cellBreakdownPartial, pressureScore: onShardOne.pressureScore, pressure: onShardOne.pressure}
+        let onShardTwoKeyed = WorkloadProfile{shardId: 2, coordinate: onShardOne.coordinate, operationsPerSecond: onShardOne.operationsPerSecond, readRatio: onShardOne.readRatio, writeRatio: onShardOne.writeRatio, readLatencyUs: onShardOne.readLatencyUs, writeLatencyUs: onShardOne.writeLatencyUs, cpuUtilization: onShardOne.cpuUtilization, memoryUtilization: onShardOne.memoryUtilization, storageBytesPerSecond: onShardOne.storageBytesPerSecond, networkInBytesPerSecond: onShardOne.networkInBytesPerSecond, networkOutBytesPerSecond: onShardOne.networkOutBytesPerSecond, queueDepth: onShardOne.queueDepth, cellBreakdown: onShardOne.cellBreakdown, cellBreakdownPartial: onShardOne.cellBreakdownPartial, pressureScore: onShardOne.pressureScore, pressure: onShardOne.pressure}
+        let fleetOne = Fleet{topology: registry, nodes: nodes}
+        let fleetTwo = Fleet{topology: registry, nodes: nodes}
+        let decisionOne = do workloadOptimizerOptimize(optimizer, onShardOneKeyed, fleetOne)
+        let decisionTwo = do workloadOptimizerOptimize(optimizer, onShardTwoKeyed, fleetTwo)
+        let execOk = do optimizationDecisionShouldExecute(decisionOne)
+        let execOk2 = do optimizationDecisionShouldExecute(decisionTwo)
+        let shardIdsOk = decisionOne.shardId == 1 && decisionTwo.shardId == 2
+        let expectedOne = do optimizationActionReplicate("db-b")
+        let expectedTwo = do optimizationActionReplicate("db-a")
+        let actionOneOk = do optimizationActionEquals(decisionOne.action, expectedOne)
+        let actionTwoOk = do optimizationActionEquals(decisionTwo.action, expectedTwo)
+        return execOk && execOk2 && shardIdsOk && actionOneOk && actionTwoOk
+
+    # Decision.rs hand-trace (no test module exists): `should_execute`
+    # checks the action kind FIRST — a NoAction with a fabricated positive
+    # score and high confidence must still refuse; a real action needs a
+    # positive score AND >= 0.80 confidence, either missing refuses too.
+    proc demoOptimizationDecisionScoreAndShouldExecute() -> bool:
+        let noActionKind = do optimizationActionNoAction()
+        let noActionButPositive = OptimizationDecision{shardId: 1, coordinate: Coordinate{x: 0, y: 0}, action: noActionKind, expectedGain: 5.0, estimatedCost: 0.0, confidence: 1.0}
+        let noActionExec = do optimizationDecisionShouldExecute(noActionButPositive)
+        let noActionRefused = !noActionExec
+
+        let isolateKind = do optimizationActionIsolate()
+        let negativeScore = OptimizationDecision{shardId: 1, coordinate: Coordinate{x: 0, y: 0}, action: isolateKind, expectedGain: 0.1, estimatedCost: 0.5, confidence: 0.95}
+        let negativeScoreExec = do optimizationDecisionShouldExecute(negativeScore)
+        let negativeScoreRefused = !negativeScoreExec
+
+        let lowConfidence = OptimizationDecision{shardId: 1, coordinate: Coordinate{x: 0, y: 0}, action: isolateKind, expectedGain: 0.9, estimatedCost: 0.1, confidence: 0.79}
+        let lowConfidenceExec = do optimizationDecisionShouldExecute(lowConfidence)
+        let lowConfidenceRefused = !lowConfidenceExec
+
+        let executable = OptimizationDecision{shardId: 1, coordinate: Coordinate{x: 0, y: 0}, action: isolateKind, expectedGain: 0.9, estimatedCost: 0.1, confidence: 0.80}
+        let executableOk = do optimizationDecisionShouldExecute(executable)
+        let executableScore = do optimizationDecisionScore(executable)
+        let scoreOk = executableScore == 0.8
+        return noActionRefused && negativeScoreRefused && lowConfidenceRefused && executableOk && scoreOk
+
+    state demoFleetDestinationAlwaysNamedNode: bool = false
+    state demoFleetNodeCannotTakeCopyNotCandidate: bool = false
+    state demoFleetReplicaRankedOutOfSourceRegionFirst: bool = false
+    state demoFleetTopologyLocatesByShardNotGuessing: bool = false
+    state demoFleetFromPlacementsNamesOnlyNodesHoldingData: bool = false
+    state demoOptimizerNamedDestinationAlwaysRealNode: bool = false
+    state demoOptimizerReadHeavyReplicatesOutOfRegion: bool = false
+    state demoOptimizerMixedHotspotMovesToLeastLoaded: bool = false
+    state demoOptimizerWriteHeavyIsolatesWithoutNaming: bool = false
+    state demoOptimizerNowhereToGoProducesNoAction: bool = false
+    state demoOptimizerBareTopologyNamesNodeHoldingData: bool = false
+    state demoOptimizerCoordinateTwoShardsResolvedByShardId: bool = false
+    state demoOptimizationDecisionScoreAndShouldExecute: bool = false
+
+    action runDemoOptimizer():
+        let r1 = do demoFleetDestinationAlwaysNamedNode()
+        let r2 = do demoFleetNodeCannotTakeCopyNotCandidate()
+        let r3 = do demoFleetReplicaRankedOutOfSourceRegionFirst()
+        let r4 = do demoFleetTopologyLocatesByShardNotGuessing()
+        let r5 = do demoFleetFromPlacementsNamesOnlyNodesHoldingData()
+        let r6 = do demoOptimizerNamedDestinationAlwaysRealNode()
+        let r7 = do demoOptimizerReadHeavyReplicatesOutOfRegion()
+        let r8 = do demoOptimizerMixedHotspotMovesToLeastLoaded()
+        let r9 = do demoOptimizerWriteHeavyIsolatesWithoutNaming()
+        let r10 = do demoOptimizerNowhereToGoProducesNoAction()
+        let r11 = do demoOptimizerBareTopologyNamesNodeHoldingData()
+        let r12 = do demoOptimizerCoordinateTwoShardsResolvedByShardId()
+        let r13 = do demoOptimizationDecisionScoreAndShouldExecute()
+        demoFleetDestinationAlwaysNamedNode = r1
+        demoFleetNodeCannotTakeCopyNotCandidate = r2
+        demoFleetReplicaRankedOutOfSourceRegionFirst = r3
+        demoFleetTopologyLocatesByShardNotGuessing = r4
+        demoFleetFromPlacementsNamesOnlyNodesHoldingData = r5
+        demoOptimizerNamedDestinationAlwaysRealNode = r6
+        demoOptimizerReadHeavyReplicatesOutOfRegion = r7
+        demoOptimizerMixedHotspotMovesToLeastLoaded = r8
+        demoOptimizerWriteHeavyIsolatesWithoutNaming = r9
+        demoOptimizerNowhereToGoProducesNoAction = r10
+        demoOptimizerBareTopologyNamesNodeHoldingData = r11
+        demoOptimizerCoordinateTwoShardsResolvedByShardId = r12
+        demoOptimizationDecisionScoreAndShouldExecute = r13

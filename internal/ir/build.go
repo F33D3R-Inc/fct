@@ -1252,7 +1252,13 @@ func Build(app *ast.App) (*IR, error) {
 			return nil, &BuildError{0, fmt.Sprintf("%s references unknown action %q", ref.source(), ref.name)}
 		}
 		if len(act.Params) != ref.argc {
-			if ref.via != "" {
+			// `more` (infinite scroll) always calls its action with zero arguments —
+			// there is no argument list an author could write for it — so a mismatch
+			// there means the action itself takes arguments, explained accordingly.
+			// Every other source (button, form, on-change) has a real argument list
+			// at the call site, so its mismatch is the ordinary arity message, just
+			// attributed to what actually named it.
+			if ref.via == "`more`" {
 				return nil, &BuildError{0, fmt.Sprintf("%s names action %q, which takes %d argument(s); loading the next page invokes a zero-argument action", ref.source(), ref.name, len(act.Params))}
 			}
 			return nil, &BuildError{0, fmt.Sprintf("action %q takes %d argument(s), got %d", ref.name, len(act.Params), ref.argc)}
@@ -3854,7 +3860,7 @@ func enumHas(members []string, v string) bool {
 type call struct {
 	name string
 	argc int
-	via  string // what named it, for the diagnostic: "button" (the default) or "`more`"
+	via  string // what named it, for the diagnostic: "button" (the default), "`more`", or "`on change`"
 }
 
 func (c call) source() string {
@@ -4676,7 +4682,24 @@ func (c *viewCtx) nodes(in []ast.Node, sc scope) ([]Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, Node{Kind: "input", Bind: t.Bind, Placeholder: ph, ID: id})
+			node := Node{Kind: "input", Bind: t.Bind, Placeholder: ph, ID: id}
+			// `on change -> Action(args) [debounce …]`: the same action-call lowering
+			// Button gets (checkView each arg, then c.e.low it), just fired by the
+			// client's own debounce timer instead of a click. Validated against the
+			// action table with the rest of allCalls below, with its own `via` so a
+			// wrong arity is explained as an on-change dispatch, not "button".
+			if t.OnChange != nil {
+				for _, arg := range t.OnChange.Args {
+					if err := c.checkView(arg, sc, t.OnChange.Line, "a view"); err != nil {
+						return nil, err
+					}
+					node.Args = append(node.Args, c.e.low(arg))
+				}
+				node.Action = t.OnChange.Action
+				node.Debounce = t.OnChange.DebounceMS
+				c.calls = append(c.calls, call{name: t.OnChange.Action, argc: len(t.OnChange.Args), via: "`on change`"})
+			}
+			out = append(out, node)
 
 		// Every control in ast.Controls lowers here, once. A control is a cell
 		// plus a way to write it, so what the compiler has to establish is the

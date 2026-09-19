@@ -576,8 +576,15 @@ type Node struct {
 	// interpolation entirely. One representation, one flattening, one escaper —
 	// see Server.attrText / facet.js segsToStr.
 	Label  []Seg   `json:"label,omitempty"`  // upload/form submit/tab/link/checkbox
-	Action string  `json:"action,omitempty"` // button/form
-	Args   []*Expr `json:"args,omitempty"`   // button/form/use
+	Action string  `json:"action,omitempty"` // button/form/input (on-change dispatch)
+	Args   []*Expr `json:"args,omitempty"`   // button/form/use/input (on-change dispatch)
+
+	// Debounce is an input's on-change dispatch delay in milliseconds — set
+	// only when Action is also set (an `on change -> …` clause was written).
+	// The client (assets/facet.js) waits this long after the last keystroke
+	// with no further input before actually calling dispatch(), rather than
+	// firing the action on every keystroke; see ast.ControlAction.
+	Debounce int `json:"debounce,omitempty"`
 
 	ID    string `json:"id,omitempty"`    // list/if: dynamic region id
 	Var   string `json:"var,omitempty"`   // list: item variable

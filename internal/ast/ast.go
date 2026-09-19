@@ -1380,9 +1380,35 @@ type After struct {
 
 // Input is a text control two-way bound to a client state cell. The placeholder
 // is interpolated segments, so a reusable field component can be handed its hint.
+//
+// OnChange is the control's optional server dispatch: `on change -> Action(args)
+// [debounce <duration>]`. Before this, a two-way control could only ever change
+// server state LATER, when some other button/form read the same cell — there
+// was no way for the act of typing itself to invoke an action (a typing
+// indicator, live search-as-you-type, autosave). OnChange is nil when the
+// author wrote no such clause, which is the entire existing behavior.
 type Input struct {
 	Bind        string
 	Placeholder []Seg
+	OnChange    *ControlAction
+}
+
+// ControlAction is a control's on-change dispatch clause: `on change ->
+// Action(args) [debounce <duration>]`. It reuses exactly the action-call-with-
+// args shape Button already has (Action + Args, lowered the same way in
+// internal/ir/build.go) — an on-change dispatch is still "call this action
+// with these arguments," just fired by typing instead of a click. DebounceMS
+// is always a concrete value by the time the parser hands this back: either
+// what the author wrote after `debounce` (reusing parseDuration, the same
+// `30s`/`5m`/`2h` grammar `after`/`job`/`daemon` already share, converted to
+// milliseconds) or the language's own default when the clause was omitted —
+// see parser.defaultDebounceMS for why the default itself is finer-grained
+// than that grammar can express.
+type ControlAction struct {
+	Action     string
+	Args       []Expr
+	DebounceMS int
+	Line       int
 }
 
 // Overlay is a modal layer shown while its bound boolean client cell is truthy:

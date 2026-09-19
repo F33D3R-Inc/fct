@@ -1,0 +1,85 @@
+# Typing Indicator — a chat-shaped proof of `input`'s new on-change dispatch:
+#
+#   input bind draft placeholder "message" on change -> typingChanged(draft) debounce 1s
+#
+# Before this, a two-way control could only ever change server state LATER,
+# when some button/form got clicked and happened to read the same cell —
+# there was no way for the act of typing itself to invoke a server action. A
+# typing indicator needs exactly that: the OTHER person's screen has to learn
+# "they are typing" the moment typing starts, not after somebody submits.
+#
+# `after` — the language's other client-only timer — is deliberately NOT used
+# to clear the indicator for the other viewer: its body may only assign a
+# @client cell (ast.After's own doc: no entity access, no call/do, nothing
+# that could reach the authority), so it has no way to make a Typing row
+# disappear for anyone but the typer's own browser, and "so-and-so is typing"
+# is by definition a fact the OTHER person's client can only learn from the
+# server. So the clear side reuses `job … every Ns`, the language's other
+# existing timer, the same way examples/inbox.fct already ages rows out on a
+# schedule: `tickTyping` counts a live typer down once a second, and whoever's
+# `typingChanged` dispatch stops arriving (because they stopped typing) simply
+# stops resetting the count, so it runs out and the row is removed. No clock
+# comparison anywhere — which matters, because a `remove/set … where`
+# predicate must be pure (no `now()`, checked by internal/ir/build.go's
+# checkPure), and a ticking counter never needs one.
+#
+#   facet dev examples/typing_indicator.fct
+#
+# Try it as two people, two tabs: /?as=ada and /?as=bo. Type in ada's box —
+# bo's screen shows "ada is typing…" within ~1s of the keystroke (debounced:
+# one dispatch per pause, not one per character), and it clears a few seconds
+# after ada stops. Neither tab's input field ever disables or loses focus
+# while its own actor is typing through it.
+
+app TypingIndicator:
+    entity Message:
+        id: int
+        author: text
+        body: text
+        created: int
+
+    # @ephemeral: never touches the durable store (see examples/zones.fct) —
+    # exactly right for "is typing," which nobody wants a history of. `read:`
+    # hides an actor's own row from themselves (there's no reason to tell
+    # someone they are typing) and, composed with the SSE fanout every other
+    # `read:`-gated entity already gets, is the entire mechanism by which the
+    # OTHER tab sees this live.
+    entity Typing @ephemeral:
+        id: int
+        who: text
+        ticksLeft: int
+        read: who != actor
+
+    state draft: text = "" @client
+
+    action send(body: text):
+        remove t in Typing where t.who == actor
+        add Message { author: actor, body: body, created: now() }
+
+    # Fired (debounced) by the input itself as the actor types — the dispatch
+    # this file exists to prove. Upserts one row per typer and resets its
+    # countdown; someone who keeps typing keeps resetting it before it can
+    # ever reach zero.
+    action typingChanged(draft: text):
+        remove t in Typing where t.who == actor
+        add Typing { who: actor, ticksLeft: 3 }
+
+    # The clock-driven half of "clears when they stop": no more keystrokes
+    # means no more typingChanged dispatches to reset the count, so three
+    # seconds after the last one this reaches zero and the row is removed.
+    action tickTyping():
+        set t in Typing where true:
+            ticksLeft = t.ticksLeft - 1
+        remove t in Typing where t.ticksLeft <= 0
+
+    job TickTyping every 1s -> tickTyping
+
+    view Main at "/":
+        box:
+            text "signed in as {actor}"
+            for m in Message by created limit 50:
+                text "{m.author}: {m.body}"
+            for t in Typing:
+                text "{t.who} is typing…"
+            input bind draft placeholder "message" on change -> typingChanged(draft) debounce 1s
+            button "send" -> send(draft)

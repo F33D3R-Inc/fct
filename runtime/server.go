@@ -3370,8 +3370,18 @@ func (rd *renderer) node(b *strings.Builder, n ir.Node, scope map[string]any, pa
 		if n.Value != "" {
 			secret = fmt.Sprintf(` type="password" autocomplete="%s"`, html.EscapeString(n.Value))
 		}
-		fmt.Fprintf(b, `<input%s%s data-fa-input="%s" value="%s" placeholder="%s">`,
-			nodeAttrs("", n), secret, n.Bind, val, s.attrText(n.Placeholder, scope))
+		// An `on change -> Action(args) [debounce …]` clause (ast.ControlAction)
+		// carries through as two more attributes, present only when the author
+		// wrote the clause. They are inert without JS — dispatching is always a
+		// fetch() — but written here anyway so the server-rendered markup states
+		// the same fact assets/facet.js's render0 "input" arm reads off node.action/
+		// node.debounce, the same way data-fa-action already does for a button.
+		onchange := ""
+		if n.Action != "" {
+			onchange = fmt.Sprintf(` data-fa-action="%s" data-fa-debounce="%d"`, html.EscapeString(n.Action), n.Debounce)
+		}
+		fmt.Fprintf(b, `<input%s%s data-fa-input="%s" value="%s" placeholder="%s"%s>`,
+			nodeAttrs("", n), secret, n.Bind, val, s.attrText(n.Placeholder, scope), onchange)
 	// The four controls added alongside `input` render here. Each is the same
 	// three facts — which cell, what it currently holds, how the actor changes it
 	// — written as the markup a browser already knows how to operate, so the
