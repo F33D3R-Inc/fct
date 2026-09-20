@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"math"
 	"testing"
 
 	"facet/internal/compile"
@@ -235,5 +236,64 @@ app C:
 	v := eval(act.Body[0].Value, store)
 	if v != 5 {
 		t.Fatalf("count after inc: got %v want 5", v)
+	}
+}
+
+// TestItoaHandlesMinInt64 locks in a real bug found while porting
+// facetql's aggregate.rs sum semantics into selfhost/aggregate.fct: a
+// plain `n = -n` cannot negate math.MinInt64 (its magnitude has no
+// positive int64 representation, so the negation overflows right back to
+// MinInt64 itself), which used to leave itoa's digit loop never running
+// and the function returning a bare "-" with no digits — silently wrong,
+// not a panic, so nothing caught it until a real numeric value produced
+// exactly this int.
+func TestItoaHandlesMinInt64(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{
+		{0, "0"},
+		{5, "5"},
+		{-5, "-5"},
+		{math.MaxInt64, "9223372036854775807"},
+		{math.MinInt64, "-9223372036854775808"},
+		{math.MinInt64 + 1, "-9223372036854775807"},
+	}
+	for _, c := range cases {
+		if got := itoa(c.n); got != c.want {
+			t.Errorf("itoa(%d) = %q, want %q", c.n, got, c.want)
+		}
+	}
+}
+
+// TestToStrFloatOutsideInt64RangeDoesNotOverflow locks in the sibling
+// half of the same bug: toStr's whole-number-float fast path used to cast
+// straight to int with no range check, so a genuine proc `float` holding a
+// whole number outside int64 range (e.g. summing two i64::MAX-scale
+// values, exactly what selfhost/aggregate.fct's
+// an_integer_sum_wider_than_i64_is_still_right test does) silently hit
+// Go's implementation-defined float-to-int overflow instead of ever
+// reaching the decimal-rendering fallback below it.
+func TestToStrFloatOutsideInt64RangeDoesNotOverflow(t *testing.T) {
+	const twoToThe63 = 9223372036854775808.0 // exactly representable in float64
+
+	if got := toStr(twoToThe63); got != "9.223372036854776e+18" {
+		t.Errorf("toStr(2^63) = %q, want the decimal-rendering fallback, not an int-overflow artifact", got)
+	}
+	if got := toStr(twoToThe63 * 2); got != "1.8446744073709552e+19" {
+		t.Errorf("toStr(2^64) = %q", got)
+	}
+	// Still exact and still on the fast int path for anything that
+	// genuinely fits — this fix must not regress the common case. Note
+	// math.MaxInt64 itself is NOT exactly representable in float64 (it
+	// rounds up to 2^63, one past the end, same as twoToThe63 above); 2^62
+	// is the largest convenient power-of-two boundary that both fits
+	// int64 and is exact in float64.
+	const twoToThe62 = 4611686018427387904.0
+	if got := toStr(twoToThe62); got != "4611686018427387904" {
+		t.Errorf("toStr(2^62) = %q, want the exact int64 fast path", got)
+	}
+	if got := toStr(-twoToThe63); got != "-9223372036854775808" {
+		t.Errorf("toStr(-2^63) = %q, want the exact int64 fast path (MinInt64 is in range)", got)
 	}
 }

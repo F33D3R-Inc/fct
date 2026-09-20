@@ -440,6 +440,57 @@ app AggregateSelfHost:
         return AggResult{ok: true, err: "", result: finished, rows: acc.rows}
 
     # ============================================================
+    # TEXT ENCODING FOR `[FieldValue]` — an action parameter can only be
+    # scalar (see LANGUAGE.md's proc section: a list-typed parameter is
+    # the one thing besides a proc's own return type that stays proc-only),
+    # so `aggregateOverValues`'s own `values: [FieldValue]` cannot be an
+    # action's parameter directly. This is the same "encode the list as one
+    # delimited text parameter, decode it in a proc" bridge expr.fct's own
+    # `runParseExpr(src: text)` already uses for its own single-string
+    # input — restated here for a genuinely LIST-shaped input instead of a
+    # single expression string. Format: entries joined by `|`, each entry
+    # `kind:payload` (`num:1.5`, `text:pear`, `bool:true`, `null:`,
+    # `absent:`) — an empty overall string means an empty list, not a
+    # one-entry list of one empty spec, exactly matching
+    # `fold_all(func, &[])`'s real Rust test case.
+    # ============================================================
+    proc parseOneFieldValue(spec: text) -> FieldValue:
+        let parts = split(spec, ":")
+        let kind = parts[0]
+        let mut payload = ""
+        if len(parts) > 1:
+            payload = parts[1]
+
+        if kind == "num":
+            let n = toFloat(payload)
+            let v = do numValue(n)
+            return v
+        if kind == "text":
+            let v2 = do textValue(payload)
+            return v2
+        if kind == "bool":
+            let b = payload == "true"
+            let v3 = do boolValue(b)
+            return v3
+        if kind == "absent":
+            let v4 = do absentValue()
+            return v4
+        let v5 = do nullValue()
+        return v5
+
+    proc parseFieldValuesText(s: text) -> [FieldValue]:
+        if s == "":
+            return []
+        let specs = split(s, "|")
+        let mut out = []
+        let mut i = 0
+        loop i < len(specs):
+            let v = do parseOneFieldValue(specs[i])
+            out = append(out, v)
+            i = i + 1
+        return out
+
+    # ============================================================
     # DEMO / BUILD-CHECK FIXTURE — each proc below hand-traces one of
     # aggregate.rs's own `#[test]`s, by name in the comment, so a
     # divergence from the real Rust value (there is exactly one,
@@ -583,6 +634,91 @@ app AggregateSelfHost:
     state demoSpecValidationResult: bool = false
     state demoParseUnknownResult: bool = false
 
+    # General-purpose, arbitrary-input result state — what
+    # runAggregateOverValues below sets, as opposed to the fixed demo
+    # fixtures above (each of which hand-traces one specific real Rust
+    # #[test] by name). This is what lets a Go test drive this port with
+    # its OWN battery of cases, the same real-vs-ported cross-check
+    # expr_test.go/parser_test.go/source_test.go already do for their own
+    # files, rather than only re-asserting the fixed demo values.
+    state aggOkResult: bool = false
+    state aggErrResult: text = ""
+    state aggResultKind: text = ""
+    state aggResultNum: text = ""
+    state aggResultText: text = ""
+    state aggResultBool: bool = false
+    state aggRowsResult: int = 0
+
+    # numToText: `state` has no `float` representation yet (no client-side
+    # mirror for it — see LANGUAGE.md's `float` section), so the numeric
+    # result crosses into `state` as `text`, the same "stringify with `+`"
+    # bridge `tag(...)` in LANGUAGE.md's own proc section demonstrates for
+    # exactly this reason.
+    proc numToText(n: float) -> text:
+        return "" + n
+
+    # runAggregateForFuncFieldValues: the one full parse-and-aggregate
+    # pipeline, called seven times below — one per scalar field the action
+    # needs out of it. An action cannot bind AggResult/FieldValue directly
+    # (struct values are proc-local; see this file's own header and
+    # LANGUAGE.md's `proc` section), so each field is read out INSIDE a
+    # proc that redoes the same small computation and returns just that one
+    # scalar — the same "each proc independently redoes the shared
+    # computation, extracts one field" shape expr.fct's own
+    # demoRootKind/demoRootOp/demoShapeOk already use for the identical
+    # reason.
+    proc aggOkOf(func: text, field: text, valuesText: text) -> bool:
+        let values = do parseFieldValuesText(valuesText)
+        let r = do aggregateOverValues(func, field, values)
+        return r.ok
+
+    proc aggErrOf(func: text, field: text, valuesText: text) -> text:
+        let values = do parseFieldValuesText(valuesText)
+        let r = do aggregateOverValues(func, field, values)
+        return r.err
+
+    proc aggResultKindOf(func: text, field: text, valuesText: text) -> text:
+        let values = do parseFieldValuesText(valuesText)
+        let r = do aggregateOverValues(func, field, values)
+        return r.result.kind
+
+    proc aggResultNumTextOf(func: text, field: text, valuesText: text) -> text:
+        let values = do parseFieldValuesText(valuesText)
+        let r = do aggregateOverValues(func, field, values)
+        let numText = do numToText(r.result.numVal)
+        return numText
+
+    proc aggResultTextOf(func: text, field: text, valuesText: text) -> text:
+        let values = do parseFieldValuesText(valuesText)
+        let r = do aggregateOverValues(func, field, values)
+        return r.result.textVal
+
+    proc aggResultBoolOf(func: text, field: text, valuesText: text) -> bool:
+        let values = do parseFieldValuesText(valuesText)
+        let r = do aggregateOverValues(func, field, values)
+        return r.result.boolVal
+
+    proc aggRowsOf(func: text, field: text, valuesText: text) -> int:
+        let values = do parseFieldValuesText(valuesText)
+        let r = do aggregateOverValues(func, field, values)
+        return r.rows
+
+    action runAggregateOverValues(func: text, field: text, valuesText: text):
+        let ok = do aggOkOf(func, field, valuesText)
+        let err = do aggErrOf(func, field, valuesText)
+        let kind = do aggResultKindOf(func, field, valuesText)
+        let numText = do aggResultNumTextOf(func, field, valuesText)
+        let textVal = do aggResultTextOf(func, field, valuesText)
+        let boolVal = do aggResultBoolOf(func, field, valuesText)
+        let rows = do aggRowsOf(func, field, valuesText)
+        aggOkResult = ok
+        aggErrResult = err
+        aggResultKind = kind
+        aggResultNum = numText
+        aggResultText = textVal
+        aggResultBool = boolVal
+        aggRowsResult = rows
+
     action runDemoAggregate():
         let a1 = do demoSumIntegers()
         let a2 = do demoSumMixed()
@@ -614,3 +750,4 @@ app AggregateSelfHost:
     private view Home at "/":
         box:
             text "{demoSumIntegersResult} {demoSumMixedResult} {demoEmptySumResult} {demoEmptyAvgIsNullResult} {demoEmptyMinIsNullResult} {demoEmptyCountResult} {demoAvgSkipsMissingResult} {demoCountCountsEverythingResult} {demoSumOverTextRefusedResult} {demoMinMaxOverTextResult} {demoMinMaxOverNumbersResult} {demoSpecValidationResult} {demoParseUnknownResult}"
+            text "{aggOkResult} {aggErrResult} {aggResultKind} {aggResultNum} {aggResultText} {aggResultBool} {aggRowsResult}"

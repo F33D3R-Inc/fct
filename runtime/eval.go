@@ -1623,7 +1623,25 @@ func toStr(v any) string {
 		// falls through to a real decimal rendering, the same
 		// `strconv.FormatFloat(t, 'g', -1, 64)` formatDebugValue already
 		// uses for exactly this type one function up.
-		if !math.IsNaN(t) && !math.IsInf(t, 0) && t == math.Trunc(t) {
+		//
+		// The magnitude bounds guard a real bug this file used to have: a
+		// wire int/date/money value is never outside int64 range, but a
+		// genuine proc `float` can be (e.g. a `sum` accumulator over
+		// values near i64::MAX) — `int(t)` for a float64 that doesn't fit
+		// int64 is an out-of-range conversion Go leaves
+		// implementation-defined, and on this platform it silently
+		// produces `math.MinInt64`, which `itoa`'s own `n = -n` then
+		// cannot negate back (`-math.MinInt64` overflows right back to
+		// `math.MinInt64`), rendering a bare `"-"` with no digits at all
+		// — found via aggregate.fct's own port of a real Rust test
+		// (`an_integer_sum_wider_than_i64_is_still_right`) exercising
+		// exactly this case. `9223372036854775808.0` (2^63) is exactly
+		// representable in float64, so this comparison is exact, not an
+		// approximation — the fast int-rendering path is skipped only for
+		// the (astronomically rare in practice) values it was never
+		// actually safe for.
+		if !math.IsNaN(t) && !math.IsInf(t, 0) && t == math.Trunc(t) &&
+			t >= -9223372036854775808.0 && t < 9223372036854775808.0 {
 			return itoa(int(t))
 		}
 		return strconv.FormatFloat(t, 'g', -1, 64)
@@ -1687,15 +1705,26 @@ func itoa(n int) string {
 		return "0"
 	}
 	neg := n < 0
+	// A plain `n = -n` overflows right back to n itself for exactly one
+	// value, math.MinInt64 — its magnitude has no positive int64
+	// representation — which used to leave the digit loop below never
+	// running (n stayed negative) and this function returning a bare
+	// "-". Working in uint64 sidesteps that: `-(n+1)` is always safely
+	// representable as an int64 (n+1 undoes MinInt64's own one-past-the-end
+	// asymmetry), and adding the 1 back after widening to uint64 lands on
+	// the exact right magnitude for every negative n, MinInt64 included.
+	var mag uint64
 	if neg {
-		n = -n
+		mag = uint64(-(n + 1)) + 1
+	} else {
+		mag = uint64(n)
 	}
 	var buf [20]byte
 	i := len(buf)
-	for n > 0 {
+	for mag > 0 {
 		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
+		buf[i] = byte('0' + mag%10)
+		mag /= 10
 	}
 	if neg {
 		i--
