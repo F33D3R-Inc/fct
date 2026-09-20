@@ -52,6 +52,78 @@ app ExprSelfHost:
         let endPos = do orEnd(kinds, texts, 0)
         return endPos == len(kinds)
 
+    # appendAllText: `+` has no list+list case (see runtime/eval.go's
+    # applyBin — only string/float/int) so two `[text]` lists are joined
+    # by copying one element at a time via `append`, not `+`.
+    proc appendAllText(base: [text], extra: [text]) -> [text]:
+        let mut out = base
+        let mut i = 0
+        loop i < len(extra):
+            out = append(out, extra[i])
+            i = i + 1
+        return out
+
+    # serializeExprNode: a preorder, self-describing flattening of a real
+    # `ExprNode` tree into a `[text]` list — the ONLY way a tree built by
+    # this file's struct-based parser can cross the HTTP/state boundary,
+    # since `state` cannot hold a struct or struct-list value (see this
+    # file's own header) and a proc has no interpolation to stringify one
+    # by hand. Each node contributes a fixed 9-field header (kind, text,
+    # field, itemVar, coll, then the 4 child-list lengths as text via `+`'s
+    # own int-stringify — see LANGUAGE.md's proc section) followed by,
+    # in this fixed order: every `children` node (recursively), then every
+    # `pairs` entry as key-then-value, then every `whereClause` node, then
+    # every `sel` node — the same order a decoder must walk the flat list
+    # back in to reconstruct the tree, using the header's own counts to
+    # know how many elements of the flat list each nested call consumed.
+    proc serializeExprNode(n: ExprNode) -> [text]:
+        let mut out = []
+        out = append(out, n.kind)
+        out = append(out, n.text)
+        out = append(out, n.field)
+        out = append(out, n.itemVar)
+        out = append(out, n.coll)
+        out = append(out, "" + len(n.children))
+        out = append(out, "" + len(n.pairs))
+        out = append(out, "" + len(n.whereClause))
+        out = append(out, "" + len(n.sel))
+        let mut i = 0
+        loop i < len(n.children):
+            let sub = do serializeExprNode(n.children[i])
+            let merged = do appendAllText(out, sub)
+            out = merged
+            i = i + 1
+        let mut j = 0
+        loop j < len(n.pairs):
+            let keySer = do serializeExprNode(n.pairs[j].key)
+            let mergedKey = do appendAllText(out, keySer)
+            out = mergedKey
+            let valSer = do serializeExprNode(n.pairs[j].value)
+            let mergedVal = do appendAllText(out, valSer)
+            out = mergedVal
+            j = j + 1
+        let mut k = 0
+        loop k < len(n.whereClause):
+            let sub2 = do serializeExprNode(n.whereClause[k])
+            let merged2 = do appendAllText(out, sub2)
+            out = merged2
+            k = k + 1
+        let mut m = 0
+        loop m < len(n.sel):
+            let sub3 = do serializeExprNode(n.sel[m])
+            let merged3 = do appendAllText(out, sub3)
+            out = merged3
+            m = m + 1
+        return out
+
+    # serializeParsedExpr: parseExprTree(src) + serializeExprNode(tree) in
+    # one call, the same "combined driver" shape runParseExpr's action
+    # already wants for a single HTTP round trip.
+    proc serializeParsedExpr(src: text) -> [text]:
+        let tree = do parseExprTree(src)
+        let ser = do serializeExprNode(tree)
+        return ser
+
     # ============================================================
     # DEMO / BUILD-CHECK FIXTURE. Per this file's header, an action cannot
     # bind a struct (or struct-list) proc result at all, so — exactly like
@@ -114,6 +186,7 @@ app ExprSelfHost:
     state rootKindResult: text = ""
     state rootOpResult: text = ""
     state shapeOkResult: bool = false
+    state treeSerialized: [text] = []
 
     action runTokenKinds(src: text):
         let r = do tokenKinds(src)
@@ -128,15 +201,18 @@ app ExprSelfHost:
         consumedAllResult = r
 
     # runParseExpr: the combined, one-HTTP-call driver expr_test.go mostly
-    # uses — tokens (both arrays) and the consumed-all status, from one
-    # `src`.
+    # uses — tokens (both arrays), the consumed-all status, and the full
+    # parsed tree (flattened via serializeExprNode, since a struct-typed
+    # tree itself can never be bound to `state`) from one `src`.
     action runParseExpr(src: text):
         let k = do tokenKinds(src)
         let t = do tokenTexts(src)
         let ok = do parseExprConsumedAll(src)
+        let ser = do serializeParsedExpr(src)
         tokenKindsResult = k
         tokenTextsResult = t
         consumedAllResult = ok
+        treeSerialized = ser
 
     # runDemoShape: parses this file's own hand-verified fixture
     # (`1 + 2 * 3`) and exposes the root's kind/operator plus the full
@@ -152,4 +228,4 @@ app ExprSelfHost:
 
     private view Home at "/":
         box:
-            text "{tokenKindsResult} {tokenTextsResult} {consumedAllResult} {rootKindResult} {rootOpResult} {shapeOkResult}"
+            text "{tokenKindsResult} {tokenTextsResult} {consumedAllResult} {rootKindResult} {rootOpResult} {shapeOkResult} {treeSerialized}"

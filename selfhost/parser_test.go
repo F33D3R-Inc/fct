@@ -548,37 +548,46 @@ app Consumer:
 // TestCrossFileDoCallsRealExprFct is the SPECIFIC proof this task's brief
 // asked for: not a generic double() stand-in, but the actual, current,
 // unmodified selfhost/expr.fct, imported into a brand-new proc in a second
-// file, calling its real parseExprArena. This is the exact composition a
-// future statement-level port (a `let name = <expr>` or `check <cond>
+// file, calling its real serializeParsedExpr. This is the exact composition
+// a future statement-level port (a `let name = <expr>` or `check <cond>
 // "msg"` statement, both of which this file's own procs stop just short of
 // full expression parsing on, by design — see this file's header) would
-// need. selfhost/expr.fct's own current content is copied into the
-// t.TempDir() byte-for-byte (os.ReadFile from the real file, os.WriteFile
-// into the temp dir) rather than imported in place from selfhost/ itself, so
-// this test's outcome reflects exactly what expr.fct provides AT THE TIME
-// THIS TEST RUNS without creating a standing dependency of this file's own
-// checked-in test suite on expr.fct's exact future proc surface (a
-// concurrent effort is actively extending it in parallel with this task).
+// need. expr.fct now imports expr_tokens.fct/expr_tree.fct (the STAGE 0-2f
+// split; expr.fct itself only has the driver/demo layer), so all three are
+// copied into the t.TempDir() byte-for-byte (os.ReadFile from the real
+// files, os.WriteFile into the temp dir) rather than imported in place from
+// selfhost/ itself, so this test's outcome reflects exactly what expr.fct
+// provides AT THE TIME THIS TEST RUNS without creating a standing
+// dependency of this file's own checked-in test suite on expr.fct's exact
+// future proc surface (a concurrent effort is actively extending it in
+// parallel with this task). `parseExprArena` (the old int-arena API this
+// test used to call) no longer exists — expr.fct's parser now builds real
+// `struct ExprNode` values, and serializeParsedExpr is the proc that
+// flattens one into an HTTP/state-safe `[text]` list (see expr.fct's own
+// serializeExprNode doc for why a struct can't cross that boundary
+// directly); this test calls that current API instead of the arena one.
 func TestCrossFileDoCallsRealExprFct(t *testing.T) {
-	realExpr, err := os.ReadFile(filepath.Join("expr.fct"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "expr.fct"), realExpr, 0o644); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"expr.fct", "expr_tokens.fct", "expr_tree.fct"} {
+		raw, err := os.ReadFile(filepath.Join(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	consumer := `import "expr.fct"
 
 app Consumer2:
-    proc arenaLen(src: text) -> int:
-        let a = do parseExprArena(src)
-        return len(a)
+    proc serializedLen(src: text) -> int:
+        let s = do serializeParsedExpr(src)
+        return len(s)
 
     state result: int = 0
 
-    action runArenaLen(src: text):
-        let r = do arenaLen(src)
+    action runSerializedLen(src: text):
+        let r = do serializedLen(src)
         result = r
 
     view Home2 at "/c2":
@@ -599,9 +608,11 @@ app Consumer2:
 	}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	d := postParserJSON(t, ts, "runArenaLen", "1 + 2 * 3")
-	// 5 nodes (Lit 1, Lit 2, Lit 3, Bin *, Bin +) * 5 ints/node = 25.
-	if got := int(d["result"].(float64)); got != 25 {
-		t.Errorf("cross-file do-call into the real expr.fct's parseExprArena(\"1 + 2 * 3\") arena length = %d, want 25", got)
+	d := postParserJSON(t, ts, "runSerializedLen", "1 + 2 * 3")
+	// "1 + 2 * 3" parses to Bin("+", Lit(1), Bin("*", Lit(2), Lit(3))) — 5
+	// nodes (3 int leaves + 2 bins), none carrying pairs/whereClause/sel,
+	// each contributing a fixed 9-field header: 5 * 9 = 45.
+	if got := int(d["result"].(float64)); got != 45 {
+		t.Errorf("cross-file do-call into the real expr.fct's serializeParsedExpr(\"1 + 2 * 3\") flat length = %d, want 45", got)
 	}
 }

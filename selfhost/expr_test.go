@@ -211,160 +211,149 @@ func shapeFromGoExpr(t *testing.T, e ast.Expr) *treeShape {
 	}
 }
 
-// shapeFromArena decodes expr.fct's own flat [kind,valTok,opTok,left,right]
-// arena (5 ints per node, see expr.fct's STAGE 2b doc for the exact layout)
-// back into the same treeShape, given the tokenTexts array the arena's
-// valTok/opTok fields index into. nodeIdx is a NODE index (row number), not
-// a raw array offset.
+// shapeFromSerialized decodes expr.fct's `treeSerialized` result: a
+// preorder, self-describing flattening of the real ExprNode struct tree
+// (see expr.fct's serializeExprNode doc) — NOT the old flat int arena this
+// decoder used to read (expr.fct's parser was rewritten to build real
+// `struct ExprNode` values instead of an int-tagged arena; this decoder was
+// rewritten to match, rather than leaving the arena format's assumptions
+// baked into the test after the code it described no longer exists).
 //
-// Round 3 kinds: 4 (Lit(bool)) decodes valTok's token text directly
-// ("true"/"false", the only two IDENT spellings factorNodes ever tags this
-// way). 5 (Lit(text)) decodes valTok's token text with strconv.Unquote — the
-// EXACT function internal/parser/expr.go's own parseAtom tStr case calls
-// (see expr.go line ~657) — since expr.fct's tokenizer deliberately keeps a
-// string token's text RAW (quotes and backslash escapes intact; see this
-// file's own header FINDING 7), leaving the actual escape decoding to
-// whoever consumes the arena, exactly as expr.go's own tokenize/parseAtom
-// split (tokenize captures the raw span, parseAtom decodes it) already does.
-// 6 (Get) and 7 (Index) recurse into their object/index children the same
-// way Bin/Un already do.
-//
-// 9 (Call) and 10 (ListLit) are the first variable-arity kinds: `left` is
-// the NODE index of the first of N contiguous ArgSlot rows (arena kind 8,
-// or -1 when `right` (the count N) is 0), never a second child directly —
-// see expr.fct's header FINDING 8 for why. Each argument/element is
-// recovered by reading ArgSlot row `left+i`'s OWN valTok (its only real
-// field), which names that argument's true root node index, then
-// recursing into shapeFromArena on THAT index — one extra indirection hop
-// this decoder mirrors exactly, argument by argument, in order.
-func shapeFromArena(t *testing.T, arena []int, tokTexts []string, nodeIdx int) *treeShape {
+// Each node contributes a fixed 9-field header — kind, text, field,
+// itemVar, coll, then 4 counts (children/pairs/whereClause/sel lengths,
+// each stringified) — followed by that many recursively-serialized child
+// nodes, in the fixed order children, then pairs (key, value, key, value,
+// ...), then whereClause, then sel. pos is the flat-list index the node's
+// header starts at; the return value is (shape, index just past everything
+// this node consumed), so a caller can walk siblings in sequence.
+func shapeFromSerialized(t *testing.T, flat []string, pos int) (*treeShape, int) {
 	t.Helper()
-	if nodeIdx < 0 || nodeIdx*5+4 >= len(arena) {
-		t.Fatalf("shapeFromArena: node index %d out of range (arena has %d nodes)", nodeIdx, len(arena)/5)
+	need := func(n int) {
+		if pos+n > len(flat) {
+			t.Fatalf("shapeFromSerialized: need %d more fields at pos %d, only %d in flat list", n, pos, len(flat))
+		}
 	}
-	kind := arena[nodeIdx*5+0]
-	valTok := arena[nodeIdx*5+1]
-	opTok := arena[nodeIdx*5+2]
-	left := arena[nodeIdx*5+3]
-	right := arena[nodeIdx*5+4]
+	need(9)
+	kind := flat[pos]
+	text := flat[pos+1]
+	field := flat[pos+2]
+	// itemVar, coll (flat[pos+3], flat[pos+4]) are agg-only fields; this
+	// subset's treeShape has no "agg" case (see shapeFromGoExpr's own
+	// comment), so they're read past but not used here.
+	numChildren := mustAtoi(t, flat[pos+5])
+	numPairs := mustAtoi(t, flat[pos+6])
+	numWhere := mustAtoi(t, flat[pos+7])
+	numSel := mustAtoi(t, flat[pos+8])
+	pos += 9
+
+	var children []*treeShape
+	for i := 0; i < numChildren; i++ {
+		var c *treeShape
+		c, pos = shapeFromSerialized(t, flat, pos)
+		children = append(children, c)
+	}
+	var pairKeys, pairVals []*treeShape
+	for i := 0; i < numPairs; i++ {
+		var k, v *treeShape
+		k, pos = shapeFromSerialized(t, flat, pos)
+		v, pos = shapeFromSerialized(t, flat, pos)
+		pairKeys = append(pairKeys, k)
+		pairVals = append(pairVals, v)
+	}
+	for i := 0; i < numWhere; i++ {
+		_, pos = shapeFromSerialized(t, flat, pos) // whereClause: unused by this subset's treeShape
+	}
+	for i := 0; i < numSel; i++ {
+		_, pos = shapeFromSerialized(t, flat, pos) // sel: unused by this subset's treeShape
+	}
+
 	switch kind {
-	case 0: // Lit(int)
-		n := 0
-		for i, c := range tokTexts[valTok] {
-			_ = i
-			if c < '0' || c > '9' {
-				t.Fatalf("shapeFromArena: leaf token %q at tok %d is not all digits", tokTexts[valTok], valTok)
-			}
-		}
-		for _, c := range tokTexts[valTok] {
-			n = n*10 + int(c-'0')
-		}
-		return &treeShape{kind: "lit", litKind: "int", intVal: n}
-	case 1: // Ref
-		return &treeShape{kind: "ref", name: tokTexts[valTok]}
-	case 2: // Bin
-		return &treeShape{
-			kind:  "bin",
-			op:    tokTexts[opTok],
-			left:  shapeFromArena(t, arena, tokTexts, left),
-			right: shapeFromArena(t, arena, tokTexts, right),
-		}
-	case 3: // Un
-		return &treeShape{
-			kind: "un",
-			op:   tokTexts[opTok],
-			left: shapeFromArena(t, arena, tokTexts, left),
-		}
-	case 4: // Lit(bool)
-		raw := tokTexts[valTok]
-		if raw != "true" && raw != "false" {
-			t.Fatalf("shapeFromArena: bool literal token %q at tok %d is neither \"true\" nor \"false\"", raw, valTok)
-		}
-		return &treeShape{kind: "lit", litKind: "bool", boolVal: raw == "true"}
-	case 5: // Lit(text)
-		raw := tokTexts[valTok]
-		dec, err := strconv.Unquote(raw)
+	case "int":
+		n, err := strconv.Atoi(text)
 		if err != nil {
-			t.Fatalf("shapeFromArena: bad string literal token %q at tok %d: %v", raw, valTok, err)
+			t.Fatalf("shapeFromSerialized: bad int literal text %q: %v", text, err)
 		}
-		return &treeShape{kind: "lit", litKind: "text", textVal: dec}
-	case 6: // Get
-		return &treeShape{
-			kind:  "get",
-			field: tokTexts[opTok],
-			left:  shapeFromArena(t, arena, tokTexts, left),
-		}
-	case 7: // Index
-		return &treeShape{
-			kind:  "index",
-			left:  shapeFromArena(t, arena, tokTexts, left),
-			right: shapeFromArena(t, arena, tokTexts, right),
-		}
-	case 9: // Call: opTok = name token, left = first ArgSlot node index, right = argCount
-		var args []*treeShape
-		for i := 0; i < right; i++ {
-			slotIdx := left + i
-			if slotIdx < 0 || slotIdx*5+4 >= len(arena) {
-				t.Fatalf("shapeFromArena: Call arg slot index %d out of range (node %d)", slotIdx, nodeIdx)
-			}
-			argRoot := arena[slotIdx*5+1] // ArgSlot's valTok: the real argument's root node index
-			args = append(args, shapeFromArena(t, arena, tokTexts, argRoot))
-		}
-		return &treeShape{kind: "call", name: tokTexts[opTok], args: args}
-	case 10: // ListLit: left = first ArgSlot node index, right = element count
-		var elems []*treeShape
-		for i := 0; i < right; i++ {
-			slotIdx := left + i
-			if slotIdx < 0 || slotIdx*5+4 >= len(arena) {
-				t.Fatalf("shapeFromArena: ListLit elem slot index %d out of range (node %d)", slotIdx, nodeIdx)
-			}
-			elemRoot := arena[slotIdx*5+1]
-			elems = append(elems, shapeFromArena(t, arena, tokTexts, elemRoot))
-		}
-		return &treeShape{kind: "list", elems: elems}
-	case 11: // Lit(float): valTok names the same NUM token an int would (int
-		// and float share one token kind — see expr.fct's ROUND 5 SCOPE
-		// NOTE); decoded with strconv.ParseFloat, the exact function
-		// internal/parser/expr.go's own parseAtom tNum-with-a-dot case calls.
-		raw := tokTexts[valTok]
-		f, err := strconv.ParseFloat(raw, 64)
+		return &treeShape{kind: "lit", litKind: "int", intVal: n}, pos
+	case "float":
+		f, err := strconv.ParseFloat(text, 64)
 		if err != nil {
-			t.Fatalf("shapeFromArena: bad float literal token %q at tok %d: %v", raw, valTok, err)
+			t.Fatalf("shapeFromSerialized: bad float literal text %q: %v", text, err)
 		}
-		return &treeShape{kind: "lit", litKind: "float", floatVal: f}
-	case 12: // EntityGet: valTok = field name token (-1 if absent), opTok =
-		// entity name token, left = key expression's root node index.
-		field := ""
-		if valTok != -1 {
-			field = tokTexts[valTok]
+		return &treeShape{kind: "lit", litKind: "float", floatVal: f}, pos
+	case "bool":
+		if text != "true" && text != "false" {
+			t.Fatalf("shapeFromSerialized: bool literal text %q is neither \"true\" nor \"false\"", text)
 		}
-		return &treeShape{
-			kind:  "entity",
-			name:  tokTexts[opTok],
-			field: field,
-			left:  shapeFromArena(t, arena, tokTexts, left),
+		return &treeShape{kind: "lit", litKind: "bool", boolVal: text == "true"}, pos
+	case "text":
+		// text carries the RAW token (quotes/escapes intact, same as the
+		// old arena's valTok) — decoded with strconv.Unquote, the exact
+		// function internal/parser/expr.go's own parseAtom tStr case calls.
+		dec, err := strconv.Unquote(text)
+		if err != nil {
+			t.Fatalf("shapeFromSerialized: bad string literal text %q: %v", text, err)
 		}
-	case 14: // MapLit: left = first MapPairSlot node index, right = pair
-		// count. Each MapPairSlot (kind 13) stores its OWN key/value root
-		// node indices directly in ITS left/right (not through a valTok
-		// indirection the way ArgSlot does for Call/ListLit) — see
-		// expr.fct's FINDING 10.
-		var keys, vals []*treeShape
-		for i := 0; i < right; i++ {
-			slotIdx := left + i
-			if slotIdx < 0 || slotIdx*5+4 >= len(arena) {
-				t.Fatalf("shapeFromArena: MapLit pair slot index %d out of range (node %d)", slotIdx, nodeIdx)
-			}
-			keyRoot := arena[slotIdx*5+3]
-			valRoot := arena[slotIdx*5+4]
-			keys = append(keys, shapeFromArena(t, arena, tokTexts, keyRoot))
-			vals = append(vals, shapeFromArena(t, arena, tokTexts, valRoot))
-		}
-		return &treeShape{kind: "map", mapKeys: keys, mapVals: vals}
+		return &treeShape{kind: "lit", litKind: "text", textVal: dec}, pos
+	case "ref":
+		return &treeShape{kind: "ref", name: text}, pos
+	case "bin":
+		return &treeShape{kind: "bin", op: text, left: children[0], right: children[1]}, pos
+	case "un":
+		return &treeShape{kind: "un", op: text, left: children[0]}, pos
+	case "get":
+		return &treeShape{kind: "get", field: text, left: children[0]}, pos
+	case "index":
+		return &treeShape{kind: "index", left: children[0], right: children[1]}, pos
+	case "call":
+		return &treeShape{kind: "call", name: text, args: children}, pos
+	case "list":
+		return &treeShape{kind: "list", elems: children}, pos
+	case "entityGet":
+		return &treeShape{kind: "entity", name: text, field: field, left: children[0]}, pos
+	case "map":
+		return &treeShape{kind: "map", mapKeys: pairKeys, mapVals: pairVals}, pos
 	default:
-		t.Fatalf("shapeFromArena: unknown node kind %d at node %d", kind, nodeIdx)
-		return nil
+		t.Fatalf("shapeFromSerialized: unknown node kind %q", kind)
+		return nil, pos
 	}
+}
+
+func mustAtoi(t *testing.T, s string) int {
+	t.Helper()
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		t.Fatalf("shapeFromSerialized: expected an int count, got %q: %v", s, err)
+	}
+	return n
+}
+
+// treeShapeFromResult reads runParseExpr's `treeSerialized` delta (a JSON
+// array of strings) and decodes it into a treeShape via
+// shapeFromSerialized, asserting the whole flat list was consumed by
+// exactly one root node — the single shared decode step every arena-shape
+// test below used to repeat inline against the old `arenaResult` field.
+func treeShapeFromResult(t *testing.T, d map[string]any) *treeShape {
+	t.Helper()
+	flatRaw, ok := d["treeSerialized"].([]any)
+	if !ok {
+		t.Fatalf("treeSerialized = %#v, want a list", d["treeSerialized"])
+	}
+	flat := make([]string, len(flatRaw))
+	for i, v := range flatRaw {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("treeSerialized[%d] = %#v, want a string", i, v)
+		}
+		flat[i] = s
+	}
+	if len(flat) == 0 {
+		t.Fatalf("treeSerialized is empty, want at least one node")
+	}
+	got, end := shapeFromSerialized(t, flat, 0)
+	if end != len(flat) {
+		t.Fatalf("treeSerialized: decoding the root consumed %d of %d fields — trailing data left over", end, len(flat))
+	}
+	return got
 }
 
 func shapesEqual(a, b *treeShape) bool {
@@ -570,27 +559,7 @@ func TestExprArenaMatchesGoParser(t *testing.T) {
 			want := shapeFromGoExpr(t, wantExpr)
 
 			d := postExprJSON(t, ts, "runParseExpr", src)
-			arenaRaw, ok := d["arenaResult"].([]any)
-			if !ok {
-				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
-			}
-			arena := make([]int, len(arenaRaw))
-			for i, v := range arenaRaw {
-				arena[i] = int(v.(float64))
-			}
-			textsRaw, ok := d["tokenTextsResult"].([]any)
-			if !ok {
-				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
-			}
-			texts := make([]string, len(textsRaw))
-			for i, v := range textsRaw {
-				texts[i] = v.(string)
-			}
-			if len(arena)%5 != 0 || len(arena) == 0 {
-				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
-			}
-			rootIdx := len(arena)/5 - 1
-			got := shapeFromArena(t, arena, texts, rootIdx)
+			got := treeShapeFromResult(t, d)
 
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
@@ -774,27 +743,7 @@ func TestExprArenaMatchesGoParserRound2(t *testing.T) {
 			want := shapeFromGoExpr(t, wantExpr)
 
 			d := postExprJSON(t, ts, "runParseExpr", src)
-			arenaRaw, ok := d["arenaResult"].([]any)
-			if !ok {
-				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
-			}
-			arena := make([]int, len(arenaRaw))
-			for i, v := range arenaRaw {
-				arena[i] = int(v.(float64))
-			}
-			textsRaw, ok := d["tokenTextsResult"].([]any)
-			if !ok {
-				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
-			}
-			texts := make([]string, len(textsRaw))
-			for i, v := range textsRaw {
-				texts[i] = v.(string)
-			}
-			if len(arena)%5 != 0 || len(arena) == 0 {
-				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
-			}
-			rootIdx := len(arena)/5 - 1
-			got := shapeFromArena(t, arena, texts, rootIdx)
+			got := treeShapeFromResult(t, d)
 
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
@@ -937,27 +886,7 @@ func TestExprArenaMatchesGoParserRound3(t *testing.T) {
 			want := shapeFromGoExpr(t, wantExpr)
 
 			d := postExprJSON(t, ts, "runParseExpr", src)
-			arenaRaw, ok := d["arenaResult"].([]any)
-			if !ok {
-				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
-			}
-			arena := make([]int, len(arenaRaw))
-			for i, v := range arenaRaw {
-				arena[i] = int(v.(float64))
-			}
-			textsRaw, ok := d["tokenTextsResult"].([]any)
-			if !ok {
-				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
-			}
-			texts := make([]string, len(textsRaw))
-			for i, v := range textsRaw {
-				texts[i] = v.(string)
-			}
-			if len(arena)%5 != 0 || len(arena) == 0 {
-				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
-			}
-			rootIdx := len(arena)/5 - 1
-			got := shapeFromArena(t, arena, texts, rootIdx)
+			got := treeShapeFromResult(t, d)
 
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
@@ -1121,27 +1050,7 @@ func TestExprArenaMatchesGoParserRound4(t *testing.T) {
 			want := shapeFromGoExpr(t, wantExpr)
 
 			d := postExprJSON(t, ts, "runParseExpr", src)
-			arenaRaw, ok := d["arenaResult"].([]any)
-			if !ok {
-				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
-			}
-			arena := make([]int, len(arenaRaw))
-			for i, v := range arenaRaw {
-				arena[i] = int(v.(float64))
-			}
-			textsRaw, ok := d["tokenTextsResult"].([]any)
-			if !ok {
-				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
-			}
-			texts := make([]string, len(textsRaw))
-			for i, v := range textsRaw {
-				texts[i] = v.(string)
-			}
-			if len(arena)%5 != 0 || len(arena) == 0 {
-				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
-			}
-			rootIdx := len(arena)/5 - 1
-			got := shapeFromArena(t, arena, texts, rootIdx)
+			got := treeShapeFromResult(t, d)
 
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
@@ -1201,10 +1110,10 @@ func TestCallDisambiguationAndOutOfScopeNames(t *testing.T) {
 	}{
 		{"foo(x)", true},     // round 5: non-builtin, non-reserved name + `(` is now a real EntityGet
 		{"min(a, b)", false}, // min/max deliberately excluded (aggregate ambiguity) — unchanged
-		{"max(x)", false},
-		{"count(x)", false}, // reserved aggregate name: still out of scope, still unconsumed
-		{"sum(Coll.field)", false},
-		{"pending(action)", false}, // reserved action-state name: still out of scope, still unconsumed
+		{"max(x)", false},    // real Go: "max needs a field: max(x.field)" — numericAgg with no field/sel is a hard error, so this port refuses to start the agg here too (isAggStartAt)
+		{"count(x)", true},   // real Go: valid whole-collection Agg{Op:"count",Coll:"x"} — count/exists never need a field, so this IS in scope, not "still unconsumed" (an earlier round's comment here was stale)
+		{"sum(Coll.field)", true}, // real Go: valid Agg{Op:"sum",Coll:"Coll",Field:"field"} — the field IS present, so numericAgg's field requirement is satisfied
+		{"pending(action)", false}, // reserved action-state name: still genuinely out of scope — no ActState grammar exists anywhere in this port yet (unlike aggregates, which now do)
 		{"len", true},              // builtin name, no `(`: just a bare Ref, fully consumed
 		{"len + x", true},          // ditto, mid-expression
 		{"len(x)", true},           // builtin name + `(`: a real call, fully consumed
@@ -1247,27 +1156,7 @@ func TestIndexVsListLitDisambiguation(t *testing.T) {
 			want := shapeFromGoExpr(t, wantExpr)
 
 			d := postExprJSON(t, ts, "runParseExpr", src)
-			arenaRaw, ok := d["arenaResult"].([]any)
-			if !ok {
-				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
-			}
-			arena := make([]int, len(arenaRaw))
-			for i, v := range arenaRaw {
-				arena[i] = int(v.(float64))
-			}
-			textsRaw, ok := d["tokenTextsResult"].([]any)
-			if !ok {
-				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
-			}
-			texts := make([]string, len(textsRaw))
-			for i, v := range textsRaw {
-				texts[i] = v.(string)
-			}
-			if len(arena)%5 != 0 || len(arena) == 0 {
-				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
-			}
-			rootIdx := len(arena)/5 - 1
-			got := shapeFromArena(t, arena, texts, rootIdx)
+			got := treeShapeFromResult(t, d)
 
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
@@ -1377,27 +1266,7 @@ func TestExprArenaMatchesGoParserRound5(t *testing.T) {
 			want := shapeFromGoExpr(t, wantExpr)
 
 			d := postExprJSON(t, ts, "runParseExpr", src)
-			arenaRaw, ok := d["arenaResult"].([]any)
-			if !ok {
-				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
-			}
-			arena := make([]int, len(arenaRaw))
-			for i, v := range arenaRaw {
-				arena[i] = int(v.(float64))
-			}
-			textsRaw, ok := d["tokenTextsResult"].([]any)
-			if !ok {
-				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
-			}
-			texts := make([]string, len(textsRaw))
-			for i, v := range textsRaw {
-				texts[i] = v.(string)
-			}
-			if len(arena)%5 != 0 || len(arena) == 0 {
-				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
-			}
-			rootIdx := len(arena)/5 - 1
-			got := shapeFromArena(t, arena, texts, rootIdx)
+			got := treeShapeFromResult(t, d)
 
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
@@ -1537,27 +1406,7 @@ func TestEntityLookupDisambiguation(t *testing.T) {
 			want := shapeFromGoExpr(t, wantExpr)
 
 			d := postExprJSON(t, ts, "runParseExpr", src)
-			arenaRaw, ok := d["arenaResult"].([]any)
-			if !ok {
-				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
-			}
-			arena := make([]int, len(arenaRaw))
-			for i, v := range arenaRaw {
-				arena[i] = int(v.(float64))
-			}
-			textsRaw, ok := d["tokenTextsResult"].([]any)
-			if !ok {
-				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
-			}
-			texts := make([]string, len(textsRaw))
-			for i, v := range textsRaw {
-				texts[i] = v.(string)
-			}
-			if len(arena)%5 != 0 || len(arena) == 0 {
-				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
-			}
-			rootIdx := len(arena)/5 - 1
-			got := shapeFromArena(t, arena, texts, rootIdx)
+			got := treeShapeFromResult(t, d)
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
 			}
@@ -1567,26 +1416,38 @@ func TestEntityLookupDisambiguation(t *testing.T) {
 		})
 	}
 
+	// reservedCases checks that count/sum/exists/avg/min/max/pending/
+	// failed/dirty/touched immediately followed by `(` are NEVER
+	// misparsed as an entity lookup (isEntityNameTok) — but "never an
+	// entity lookup" does not mean "never a valid expression at all": once
+	// this port's aggregate grammar (isAggStartAt/aggEnd/aggNodes) can
+	// actually build a valid Agg node, `want` is `true`, matching what the
+	// real Go parser.ParseExpr accepts with no error; it's `false` only
+	// where the real parser itself errors (numericAgg missing a field —
+	// see TestCallDisambiguationAndOutOfScopeNames's own `max(x)` case) or
+	// where this port has no grammar for the shape yet at all (action-state
+	// reads: pending/failed/dirty/touched have no ActState port anywhere
+	// in this file, unlike aggregates).
 	reservedCases := []struct {
 		src  string
 		want bool
 	}{
-		{"count(x)", false},
-		{"sum(Coll.field)", false},
-		{"exists(x)", false},
-		{"avg(Coll.field)", false},
-		{"min(a, b)", false},
-		{"max(x)", false},
-		{"pending(action)", false},
-		{"failed(action)", false},
-		{"dirty(x)", false},
-		{"touched(x)", false},
+		{"count(x)", true},          // real Go: valid Agg{Op:"count",Coll:"x"} — count never needs a field
+		{"sum(Coll.field)", true},   // real Go: valid Agg{Op:"sum",Coll:"Coll",Field:"field"} — field present
+		{"exists(x)", true},         // real Go: valid Agg{Op:"exists",Coll:"x"} — exists never needs a field
+		{"avg(Coll.field)", true},   // real Go: valid Agg{Op:"avg",Coll:"Coll",Field:"field"} — field present
+		{"min(a, b)", false},        // min/max deliberately excluded from this port's call grammar (aggregate ambiguity) — unchanged
+		{"max(x)", false},           // real Go: "max needs a field: max(x.field)" — a genuine parse error, not just out of scope
+		{"pending(action)", false},  // no ActState grammar in this port at all — genuinely still out of scope
+		{"failed(action)", false},   // ditto
+		{"dirty(x)", false},         // ditto
+		{"touched(x)", false},       // ditto
 	}
 	for _, c := range reservedCases {
 		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
 		got, _ := d["consumedAllResult"].(bool)
 		if got != c.want {
-			t.Errorf("parseExprConsumedAll(%q) = %v, want %v (reserved aggregate/action-state name — never an entity lookup)", c.src, got, c.want)
+			t.Errorf("parseExprConsumedAll(%q) = %v, want %v", c.src, got, c.want)
 		}
 	}
 }
@@ -1621,27 +1482,7 @@ func TestMapLitDisambiguation(t *testing.T) {
 			want := shapeFromGoExpr(t, wantExpr)
 
 			d := postExprJSON(t, ts, "runParseExpr", src)
-			arenaRaw, ok := d["arenaResult"].([]any)
-			if !ok {
-				t.Fatalf("arenaResult = %#v, want a list", d["arenaResult"])
-			}
-			arena := make([]int, len(arenaRaw))
-			for i, v := range arenaRaw {
-				arena[i] = int(v.(float64))
-			}
-			textsRaw, ok := d["tokenTextsResult"].([]any)
-			if !ok {
-				t.Fatalf("tokenTextsResult = %#v, want a list", d["tokenTextsResult"])
-			}
-			texts := make([]string, len(textsRaw))
-			for i, v := range textsRaw {
-				texts[i] = v.(string)
-			}
-			if len(arena)%5 != 0 || len(arena) == 0 {
-				t.Fatalf("arena length = %d, want a positive multiple of 5", len(arena))
-			}
-			rootIdx := len(arena)/5 - 1
-			got := shapeFromArena(t, arena, texts, rootIdx)
+			got := treeShapeFromResult(t, d)
 			if !shapesEqual(got, want) {
 				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
 			}

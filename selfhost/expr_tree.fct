@@ -863,6 +863,22 @@ app ExprTreeSelfHost:
     # isCallStartAt/isEntityLookupStartAt in postfixEnd/postfixNodes, since
     # aggregate names are reserved in call position first, exactly like
     # expr.go's own real switch order.
+    #
+    # Also enforces expr.go's own numericAgg field rule (its parseAgg,
+    # after building Field/Sel): `sum`/`avg`/`min`/`max` reduce a FIELD (or
+    # a general per-row expression, i.e. a non-empty `sel`) — bare
+    # `sum(x)`/`max(x)` is a real Go parse error ("sum needs a field:
+    # sum(x.field)"), never a valid expression, so this port must refuse to
+    # start an agg there too rather than silently accepting one with an
+    # empty field. `count`/`exists` are the opposite: they range over ROWS,
+    # so a field or sel on either is equally invalid ("count ranges over
+    # rows, not a field — drop the `.field`"). Building the actual node via
+    # aggNodes here (rather than re-deriving field/sel by hand) reuses the
+    # one place that logic already lives, at the cost of building it twice
+    # for a genuine agg start (once here to validate, once in
+    # postfixNodes/factorNodes' own aggNodes call) — an accepted, already-
+    # established tradeoff in this file (isEntityLookupStartAt/
+    # isCallStartAt already re-scan rather than memoize).
     proc isAggStartAt(kinds: [text], texts: [text], pos: int) -> bool:
         let n = len(kinds)
         if pos < n:
@@ -874,7 +890,21 @@ app ExprTreeSelfHost:
                             let isMinMax = texts[pos] == "min" || texts[pos] == "max"
                             if isMinMax:
                                 let hasComma = do hasTopLevelCommaAt(kinds, texts, pos + 1)
-                                return !hasComma
+                                if hasComma:
+                                    return false
+                            let node = do aggNodes(kinds, texts, pos, pos + 1)
+                            let hasField = node.field != ""
+                            let hasSel = len(node.sel) > 0
+                            let isNumeric = texts[pos] == "sum" || texts[pos] == "avg" || texts[pos] == "min" || texts[pos] == "max"
+                            if isNumeric:
+                                if !hasField:
+                                    if !hasSel:
+                                        return false
+                            else:
+                                if hasField:
+                                    return false
+                                if hasSel:
+                                    return false
                             return true
         return false
 
