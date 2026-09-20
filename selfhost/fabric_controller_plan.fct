@@ -1,0 +1,1025 @@
+import "fabric_optimizer.fct"
+import "fabric_controller_target.fct"
+
+app FabricControllerPlanSelfHost:
+    # ============================================================
+    # NAME COLLISION WARNING — READ BEFORE TOUCHING THIS FILE OR
+    # `fabric_plan.fct`
+    # ============================================================
+    # This file is UNRELATED to the pre-existing `fabric_plan.fct` in this
+    # same directory. `fabric_plan.fct` ports `fabric-facetql`'s own
+    # `frontdoor/plan.rs` — the request-ROUTING planner (query plans,
+    # keyspace resolution). THIS file ports `fabric-controller`'s own
+    # `plan.rs` — a completely different crate's PLACEMENT/ACTION planner
+    # (how a topology change is sequenced into phases and executed). The
+    # two `plan.rs` files share nothing but a filename in the real Rust
+    # tree (`fabric/crates/fabric-facetql/src/frontdoor/plan.rs` vs.
+    # `fabric/crates/fabric-controller/src/plan.rs`). Do not merge, do not
+    # cross-reference types between the two — every type below is scoped
+    # to `fabric-controller` only.
+    #
+    # Self-hosting port of `fabric-controller`'s `plan.rs` (407L) and
+    # `outcome.rs` (225L), both read in full. This is slice 2 of that
+    # crate's port, built on slice 1 (`fabric_controller_target.fct` —
+    # `target.rs`/`policy.rs`/`fleet.rs`, real `ActionTarget`/`ActionId`).
+    #
+    # ============================================================
+    # IMPORTS — empirically confirmed collision-free before any real
+    # content was written here
+    # ============================================================
+    # `import "fabric_optimizer.fct"` gives the real `OptimizationAction`
+    # (decision.rs) and `OptimizationDecision`, and transitively
+    # `fabric_core.fct`, `fabric_telemetry.fct` (`PressureLevel`-as-text,
+    # `WorkloadProfile`), `fabric_ml.fct`, and `fabric_routing.fct`
+    # (`Placement`, `TopologyRegistry`, `joinTextArray`, reused below
+    # rather than restated). `import "fabric_controller_target.fct"` gives
+    # the real `ActionTarget`, `ActionId`, and `DbmsId` (via ITS OWN
+    # `fabric_core.fct`/`fabric_routing.fct` imports). A throwaway
+    # two-file scratch check (`import "fabric_optimizer.fct"` + `import
+    # "fabric_controller_target.fct"`, one trivial proc, nothing else) was
+    # written to this directory and checked clean with `facet check`
+    # ("ok (0 entities, 6 actions, 1 views)" — the 6 actions/1 view being
+    # the pre-existing demo/Home declarations both imported files already
+    # carry, not a collision), then deleted before this file's real content
+    # was written. Every real name declared below
+    # (`PlanPhase`/`PlanScope`/`PlanRequest`/`PlacementPlan`/`PlanError`/
+    # `PhaseProgress`/`ExecutionFault`/`RollbackOutcome`/
+    # `MeasurementSnapshot`/`OutcomeVerdict`/`ExecutionOutcome`/
+    # `OutcomeReport`) was grepped across every file this one imports
+    # (directly and transitively) before being written — none exist
+    # anywhere else in this directory.
+    #
+    # ============================================================
+    # THE `Placement.dbmsId` FLATTENING DIVERGENCE — noted, not fixed
+    # ============================================================
+    # The real `plan.rs` declares `pub source: Placement` inside
+    # `PlanRequest`, where the real `fabric_topology::Placement` (and the
+    # real `fabric_core::DbmsId` it names) is a `pub struct
+    # DbmsId(pub String)` wrapper. `fabric_routing.fct`'s own port of
+    # `Placement` — an EARLIER round's simplification, documented in that
+    # file's own header — already flattened `Placement.dbmsId` straight to
+    # plain `text`, not the wrapper struct. That earlier choice is
+    # imported here as-is: `PlanRequest.source.dbmsId` is `text` (via
+    # `fabric_routing.fct`'s `Placement`), while every OTHER `DbmsId` in
+    # this file (`PlanRequest.destination`/`replicas`,
+    # `PlacementPlan.adds`/`removes`/`touched_nodes()`,
+    # `ExecutionFault.DestinationLost.node`) is the real `DbmsId` struct
+    # from `fabric_core.fct`, reached directly and without collision (the
+    # same choice slice 1's `fabric_controller_target.fct` already made for
+    # `NodeStatus.id`). This file does not touch or "fix"
+    # `fabric_routing.fct` — per this task's own instructions, only new
+    # files are written here — it simply documents that one field inside
+    # one imported struct (`Placement.dbmsId`) is text where the real Rust
+    # source at that exact field would be the wrapper type, while every new
+    # field this file itself declares uses the real wrapper.
+    #
+    # ============================================================
+    # THE `PlacementExecutor` TRAIT (plan.rs lines ~368-407) — intentionally
+    # NOT ported, not faked
+    # ============================================================
+    # `PlacementExecutor` is a Rust trait: `name`/`supports`/`plan`/
+    # `begin_phase`/`poll_phase`/`abort`, meant to be implemented by
+    # separate mechanism crates (routing, replication, migration) and
+    # invoked through dynamic dispatch (`&dyn PlacementExecutor` or a
+    # generic bound) by a caller this slice's scope does not include
+    # (`fabric-controller`'s own `execution.rs`, a different file). This
+    # language has no interfaces, no trait objects, and no dynamic
+    # dispatch of any kind (confirmed against `facet lang`) — there is no
+    # mechanism here by which a `proc` could be handed "some
+    # `PlacementExecutor`, whichever one the caller has" and invoke methods
+    # on it without knowing which concrete type it is. Faking this with an
+    # arena of function-pointer-like indices or a magic dispatch tag over a
+    # closed, hard-coded set of mechanisms would invent behavior — genuine
+    # runtime polymorphism over mechanisms not yet written — the real Rust
+    # trait does not have and this task's own rules forbid (no
+    # arena-of-ints/magic-number-tag tricks standing in for a real
+    # abstraction; no faking a gap). Every CONCRETE type the trait's methods
+    # pass or return (`PlanRequest`, `PlacementPlan`, `PlanPhase`,
+    # `PhaseProgress`, `PlanError`, `ExecutionFault`, `RollbackOutcome`) is
+    # ported below in full — only the trait boundary itself, which asks for
+    # a capability this language does not have, is left undone and flagged
+    # here rather than silently dropped or simulated.
+    #
+    # ============================================================
+    # NO `cargo test` EXISTS FOR EITHER FILE — confirmed by reading both in
+    # full (no `#[cfg(test)]` module in plan.rs or outcome.rs) and by
+    # running `cargo test -p fabric-controller --lib plan::` and `outcome::`
+    # from `fabric/`, each reporting "0 passed; 0 failed; ... 9 filtered
+    # out" (the 9 filtered-out tests belong to fabric-controller's OTHER
+    # files — target.rs/policy.rs/fleet.rs have none either, per slice 1's
+    # own header — none belong to plan.rs or outcome.rs). Every demo proc
+    # below is hand-traced directly against the Rust source method body it
+    # names, the same fallback slice 1 and `fabric_core.fct` already
+    # established for untested files.
+    #
+    # ============================================================
+    # RESTATEMENT CONVENTIONS REUSED FROM THIS DIRECTORY, NOT REINVENTED
+    # ============================================================
+    # - A zero-payload enum (`PlanScope`, `OutcomeVerdict`) is plain `text`
+    #   (`NodeCondition`'s convention). A payload-carrying enum
+    #   (`PlanError`, `ExecutionFault`, `RollbackOutcome`, `PhaseProgress`)
+    #   is a `kind`-tagged struct with every payload field always present
+    #   (`OptimizationAction`'s convention) — never an arena-of-ints tag.
+    # - `Option<T>` is a `hasX: bool` field alongside `x: T` on a struct
+    #   (`fabric_core.fct`'s header names this "this directory's other
+    #   established Option convention"), or a `struct XOption: has: bool,
+    #   val: T` for a function's return type (`fabric_optimizer.fct`'s
+    #   `FleetDestinationOption`).
+    # - `Result<T, E>` is a `struct XResult: ok: bool, value: T, err: E`
+    #   (`fabric_routing.fct`'s `RoutingKeyResult`).
+    # - Derived `PartialEq`/`Eq` is restated as an explicit `xEquals` proc
+    #   comparing only the fields the matching `kind` uses
+    #   (`optimizationActionEquals`).
+    # - A `BTreeMap`/`BTreeSet`'s guaranteed ascending order, or a `Vec`
+    #   that must be sorted, is a hand-written stable insertion sort
+    #   (`fleetNodeArraySortByIdAscending`); `Vec::dedup_by`'s
+    #   consecutive-only dedup is a linear scan comparing each element only
+    #   to the last one kept.
+    # - `.join(sep)` over a `[text]` reuses `fabric_routing.fct`'s own
+    #   `joinTextArray`, already reachable through this file's imports,
+    #   rather than being restated a second time.
+
+    # ============================================================
+    # plan.rs — action_label: a stable name for an optimizer action, for
+    # logs, errors and feedback. Named `controllerPlanActionLabel` (not
+    # bare `actionLabel`) to stay clearly distinct from
+    # `OutcomeReport.actionLabel` below, a data field, not a function.
+    # ============================================================
+    proc controllerPlanActionLabel(action: OptimizationAction) -> text:
+        if action.kind == "NoAction":
+            return "no-action"
+        if action.kind == "Replicate":
+            return "replicate"
+        if action.kind == "Move":
+            return "move"
+        if action.kind == "Split":
+            return "split"
+        if action.kind == "Isolate":
+            return "isolate"
+        return "colocate"
+
+    # ============================================================
+    # plan.rs — PlanPhase: one stage of a placement change. Restated as
+    # plain `text` (NodeCondition's convention — zero-payload, and this
+    # port's own tag strings are chosen to already equal `label()`'s own
+    # four return values, exactly as `fabric_controller_target.fct`'s
+    # `NodeCondition` already does). Tag values: "prepare" | "transfer" |
+    # "cutover" | "cleanup".
+    # ============================================================
+
+    # planPhaseOrder: `PlanPhase::ORDER` — this language has no top-level
+    # `const` array (confirmed against `facet lang` and every other file in
+    # this directory, none declares one), so the fixed 4-element ordering
+    # is restated as a proc returning a fresh array, the same way
+    # `controllerPolicyDefault` restates a `const`-shaped `Default` impl as
+    # a proc.
+    proc planPhaseOrder() -> [text]:
+        return ["prepare", "transfer", "cutover", "cleanup"]
+
+    proc planPhaseRank(phase: text) -> int:
+        if phase == "prepare":
+            return 0
+        if phase == "transfer":
+            return 1
+        if phase == "cutover":
+            return 2
+        return 3
+
+    # planPhaseIsReversible: `rank() < Cutover.rank()`.
+    proc planPhaseIsReversible(phase: text) -> bool:
+        let r = do planPhaseRank(phase)
+        let cutoverRank = do planPhaseRank("cutover")
+        return r < cutoverRank
+
+    # planPhaseLabel: `PlanPhase::label` — identity, since this port's own
+    # tags already equal the real method's four return values (see above,
+    # same note `nodeConditionLabel` makes for the identical reason).
+    proc planPhaseLabel(phase: text) -> text:
+        return phase
+
+    proc planPhaseEquals(a: text, b: text) -> bool:
+        return a == b
+
+    # planPhaseArrayContains: `[PlanPhase].contains(&PlanPhase::X)` — used
+    # by both `PlacementPlan::new` (removes-without-cutover check) and
+    # `changes_authority`.
+    proc planPhaseArrayContains(phases: [text], phase: text) -> bool:
+        let n = len(phases)
+        let mut i = 0
+        let mut found = false
+        loop i < n:
+            if phases[i] == phase:
+                found = true
+            i = i + 1
+        return found
+
+    # planPhasesOrdered: `phases.windows(2).all(|pair| pair[0].rank() <
+    # pair[1].rank())`. Vacuously true for 0 or 1 phases, matching
+    # `windows(2)` on a slice shorter than 2 (an empty iterator, so `.all`
+    # returns true) exactly.
+    proc planPhasesOrdered(phases: [text]) -> bool:
+        let n = len(phases)
+        let mut i = 1
+        let mut ordered = true
+        loop i < n:
+            let prevRank = do planPhaseRank(phases[i - 1])
+            let curRank = do planPhaseRank(phases[i])
+            if prevRank >= curRank:
+                ordered = false
+            i = i + 1
+        return ordered
+
+    # ============================================================
+    # plan.rs — PlanScope: how much of the data space a plan disturbs.
+    # Zero-payload, 2-variant — plain `text`: "coordinate" | "shard"
+    # (lowercased from the real variant names `Coordinate`/`Shard`, the
+    # same lowercasing convention `NodeCondition`'s tags already use).
+    # ============================================================
+
+    # ============================================================
+    # plan.rs — PlanRequest: what the controller hands a mechanism when
+    # asking it to plan. `destination: Option<DbmsId>` is `hasDestination:
+    # bool` + `destination: DbmsId` (this directory's established Option
+    # convention). No `impl` block exists on `PlanRequest` in the real
+    # source (plain `serde`-derived data, built only via struct-literal at
+    # every real call site) — `planRequestNew` below is this directory's
+    # usual constructor-per-struct convenience, not a restatement of a real
+    # method.
+    # ============================================================
+    struct PlanRequest:
+        target: ActionTarget
+        action: OptimizationAction
+        source: Placement
+        hasDestination: bool
+        destination: DbmsId
+        replicas: [DbmsId]
+        requestedAtMs: int
+
+    proc planRequestNew(target: ActionTarget, action: OptimizationAction, source: Placement, hasDestination: bool, destination: DbmsId, replicas: [DbmsId], requestedAtMs: int) -> PlanRequest:
+        return PlanRequest{target: target, action: action, source: source, hasDestination: hasDestination, destination: destination, replicas: replicas, requestedAtMs: requestedAtMs}
+
+    # ============================================================
+    # plan.rs — PlacementPlan: a validated, executable sequence of phases.
+    # `phases` is a private field in the real source, reached only through
+    # `phases()`/`first_phase()`/`phase_after()` — kept as an ordinary
+    # public field here (this directory never restates Rust's
+    # private/public field visibility, e.g. `FleetView.nodes`), with the
+    # same three accessor procs provided alongside it so real call sites
+    # are ported faithfully regardless.
+    # ============================================================
+    struct PlacementPlan:
+        target: ActionTarget
+        action: OptimizationAction
+        scope: text
+        phases: [text]
+        adds: [DbmsId]
+        removes: [DbmsId]
+        estimatedBytes: int
+        estimatedDurationMs: int
+
+    struct PlacementPlanNewResult:
+        ok: bool
+        value: PlacementPlan
+        err: PlanError
+
+    # placementPlanZero: the placeholder `PlacementPlan` `new`'s error path
+    # returns alongside a `PlanError` — the same "found: false" placeholder
+    # idiom `fabric_controller_target.fct`'s `fleetViewGet` already
+    # establishes for a Result/Option's unused-value slot.
+    proc placementPlanZero() -> PlacementPlan:
+        let zeroTarget = ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}
+        let zeroAction = do optimizationActionNoAction()
+        return PlacementPlan{target: zeroTarget, action: zeroAction, scope: "coordinate", phases: [], adds: [], removes: [], estimatedBytes: 0, estimatedDurationMs: 0}
+
+    # placementPlanNew: `PlacementPlan::new` — rejects an empty plan, an
+    # out-of-order plan, and a plan that removes a copy without ever
+    # cutting over, in that exact order.
+    proc placementPlanNew(target: ActionTarget, action: OptimizationAction, scope: text, phases: [text], adds: [DbmsId], removes: [DbmsId]) -> PlacementPlanNewResult:
+        if len(phases) == 0:
+            let zero1 = do placementPlanZero()
+            let err1 = do planErrorEmptyPlan()
+            return PlacementPlanNewResult{ok: false, value: zero1, err: err1}
+        let ordered = do planPhasesOrdered(phases)
+        if !ordered:
+            let zero2 = do placementPlanZero()
+            let err2 = do planErrorPhasesOutOfOrder(phases)
+            return PlacementPlanNewResult{ok: false, value: zero2, err: err2}
+        let hasCutover = do planPhaseArrayContains(phases, "cutover")
+        if len(removes) > 0 && !hasCutover:
+            let zero3 = do placementPlanZero()
+            let err3 = do planErrorInfeasible("a plan that removes a copy must cut over first")
+            return PlacementPlanNewResult{ok: false, value: zero3, err: err3}
+        let plan = PlacementPlan{target: target, action: action, scope: scope, phases: phases, adds: adds, removes: removes, estimatedBytes: 0, estimatedDurationMs: 0}
+        let noErr = do planErrorEmptyPlan()
+        return PlacementPlanNewResult{ok: true, value: plan, err: noErr}
+
+    # placementPlanWithEstimate: `mut self` builder — restated as a
+    # functional update returning the new value (`nodeStatusWithLoad`'s
+    # convention), since a `proc` has no receiver to mutate.
+    proc placementPlanWithEstimate(plan: PlacementPlan, bytes: int, durationMs: int) -> PlacementPlan:
+        return PlacementPlan{target: plan.target, action: plan.action, scope: plan.scope, phases: plan.phases, adds: plan.adds, removes: plan.removes, estimatedBytes: bytes, estimatedDurationMs: durationMs}
+
+    proc placementPlanPhases(plan: PlacementPlan) -> [text]:
+        return plan.phases
+
+    proc placementPlanFirstPhase(plan: PlacementPlan) -> text:
+        return plan.phases[0]
+
+    struct PlanPhaseOption:
+        has: bool
+        val: text
+
+    # placementPlanPhaseAfter: `phase_after` — the phase after `phase`, or
+    # `None` if `phase` is the last one, or if `phase` is not in the plan
+    # at all (`position(...)?` short-circuits on either).
+    proc placementPlanPhaseAfter(plan: PlacementPlan, phase: text) -> PlanPhaseOption:
+        let n = len(plan.phases)
+        let mut position = -1
+        let mut i = 0
+        loop i < n:
+            if position == -1:
+                if plan.phases[i] == phase:
+                    position = i
+            i = i + 1
+        if position == -1:
+            return PlanPhaseOption{has: false, val: ""}
+        if position + 1 >= n:
+            return PlanPhaseOption{has: false, val: ""}
+        return PlanPhaseOption{has: true, val: plan.phases[position + 1]}
+
+    proc placementPlanChangesAuthority(plan: PlacementPlan) -> bool:
+        let has = do planPhaseArrayContains(plan.phases, "cutover")
+        return has
+
+    # placementPlanDbmsIdArraySortAscending / ...DedupConsecutive: restate
+    # `touched_nodes`'s own `sort_by(...)` + `dedup_by(...)` pair — a
+    # hand-written stable insertion sort (this directory's established
+    # idiom) followed by a linear scan that only ever compares an element
+    # to the LAST ONE KEPT, matching `Vec::dedup_by`'s consecutive-only
+    # semantics exactly (it does not deduplicate non-adjacent duplicates,
+    # which is why the sort must run first).
+    proc placementPlanDbmsIdArraySortAscending(ids: [DbmsId]) -> [DbmsId]:
+        let mut xs = ids
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                if xs[j - 1].value > xs[j].value:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    proc placementPlanDbmsIdArrayDedupConsecutive(ids: [DbmsId]) -> [DbmsId]:
+        let n = len(ids)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            if i == 0:
+                result = append(result, ids[i])
+            else:
+                let last = result[len(result) - 1]
+                if last.value != ids[i].value:
+                    result = append(result, ids[i])
+            i = i + 1
+        return result
+
+    # placementPlanTouchedNodes: `touched_nodes` — `adds.chain(removes)`,
+    # sorted, deduped.
+    proc placementPlanTouchedNodes(plan: PlacementPlan) -> [DbmsId]:
+        let mut combined = plan.adds
+        let m = len(plan.removes)
+        let mut i = 0
+        loop i < m:
+            combined = append(combined, plan.removes[i])
+            i = i + 1
+        let sorted = do placementPlanDbmsIdArraySortAscending(combined)
+        let deduped = do placementPlanDbmsIdArrayDedupConsecutive(sorted)
+        return deduped
+
+    # ============================================================
+    # plan.rs — PlanError: why a mechanism could not produce a plan, plus
+    # its `Display` impl, restated arm for arm in the exact order the real
+    # `fmt` match declares them.
+    # ============================================================
+    struct PlanError:
+        kind: text
+        action: text
+        reason: text
+        phases: [text]
+
+    proc planErrorUnsupportedAction(action: text) -> PlanError:
+        return PlanError{kind: "UnsupportedAction", action: action, reason: "", phases: []}
+
+    proc planErrorEmptyPlan() -> PlanError:
+        return PlanError{kind: "EmptyPlan", action: "", reason: "", phases: []}
+
+    proc planErrorPhasesOutOfOrder(phases: [text]) -> PlanError:
+        return PlanError{kind: "PhasesOutOfOrder", action: "", reason: "", phases: phases}
+
+    proc planErrorInfeasible(reason: text) -> PlanError:
+        return PlanError{kind: "Infeasible", action: "", reason: reason, phases: []}
+
+    proc planErrorTextArrayEquals(a: [text], b: [text]) -> bool:
+        let n = len(a)
+        if n != len(b):
+            return false
+        let mut i = 0
+        let mut equal = true
+        loop i < n:
+            if a[i] != b[i]:
+                equal = false
+            i = i + 1
+        return equal
+
+    proc planErrorEquals(a: PlanError, b: PlanError) -> bool:
+        if a.kind != b.kind:
+            return false
+        if a.kind == "UnsupportedAction":
+            return a.action == b.action
+        if a.kind == "PhasesOutOfOrder":
+            let eq = do planErrorTextArrayEquals(a.phases, b.phases)
+            return eq
+        if a.kind == "Infeasible":
+            return a.reason == b.reason
+        return true
+
+    proc planErrorDisplay(e: PlanError) -> text:
+        if e.kind == "UnsupportedAction":
+            return "mechanism does not implement action '" + e.action + "'"
+        if e.kind == "EmptyPlan":
+            return "plan contains no phases"
+        if e.kind == "PhasesOutOfOrder":
+            let joined = do joinTextArray(e.phases, ", ")
+            return "plan phases are out of order: [" + joined + "]"
+        return "plan is infeasible: " + e.reason
+
+    # ============================================================
+    # plan.rs — PhaseProgress: how far a running phase has got.
+    # `Running{fraction}` / `Complete`.
+    # ============================================================
+    struct PhaseProgress:
+        kind: text
+        fraction: float
+
+    proc phaseProgressRunning(fraction: float) -> PhaseProgress:
+        return PhaseProgress{kind: "Running", fraction: fraction}
+
+    proc phaseProgressComplete() -> PhaseProgress:
+        return PhaseProgress{kind: "Complete", fraction: 0.0}
+
+    proc phaseProgressEquals(a: PhaseProgress, b: PhaseProgress) -> bool:
+        if a.kind != b.kind:
+            return false
+        if a.kind == "Running":
+            return a.fraction == b.fraction
+        return true
+
+    # ============================================================
+    # plan.rs — ExecutionFault: a mechanism's report that execution went
+    # wrong, plus its `Display` impl, restated arm for arm.
+    # ============================================================
+    struct ExecutionFault:
+        kind: text
+        phase: text
+        reason: text
+        node: DbmsId
+
+    proc executionFaultPhaseFailed(phase: text, reason: text) -> ExecutionFault:
+        return ExecutionFault{kind: "PhaseFailed", phase: phase, reason: reason, node: DbmsId{value: ""}}
+
+    proc executionFaultDestinationLost(node: DbmsId) -> ExecutionFault:
+        return ExecutionFault{kind: "DestinationLost", phase: "", reason: "", node: node}
+
+    proc executionFaultNotStarted(phase: text) -> ExecutionFault:
+        return ExecutionFault{kind: "NotStarted", phase: phase, reason: "", node: DbmsId{value: ""}}
+
+    proc executionFaultInternal(reason: text) -> ExecutionFault:
+        return ExecutionFault{kind: "Internal", phase: "", reason: reason, node: DbmsId{value: ""}}
+
+    proc executionFaultEquals(a: ExecutionFault, b: ExecutionFault) -> bool:
+        if a.kind != b.kind:
+            return false
+        if a.kind == "PhaseFailed":
+            return a.phase == b.phase && a.reason == b.reason
+        if a.kind == "DestinationLost":
+            return a.node.value == b.node.value
+        if a.kind == "NotStarted":
+            return a.phase == b.phase
+        return a.reason == b.reason
+
+    proc executionFaultDisplay(f: ExecutionFault) -> text:
+        if f.kind == "PhaseFailed":
+            let label = do planPhaseLabel(f.phase)
+            return "phase '" + label + "' failed: " + f.reason
+        if f.kind == "DestinationLost":
+            return "destination '" + f.node.value + "' was lost mid-flight"
+        if f.kind == "NotStarted":
+            let label = do planPhaseLabel(f.phase)
+            return "phase '" + label + "' was polled before it began"
+        return "mechanism error: " + f.reason
+
+    # ============================================================
+    # plan.rs — RollbackOutcome: what an abort actually achieved.
+    # `Restored` / `Irreversible{reason}`. NO `Display` impl exists for
+    # this type in the real source (only `Debug`/`Clone`/`PartialEq`/`Eq`/
+    # `Serialize`/`Deserialize` are derived) — so, per this task's own
+    # rule against faking a gap, no display proc is invented for it here;
+    # only the derived `PartialEq`/`Eq` is restated, the same as every
+    # other derive-only type in this file.
+    # ============================================================
+    struct RollbackOutcome:
+        kind: text
+        reason: text
+
+    proc rollbackOutcomeRestored() -> RollbackOutcome:
+        return RollbackOutcome{kind: "Restored", reason: ""}
+
+    proc rollbackOutcomeIrreversible(reason: text) -> RollbackOutcome:
+        return RollbackOutcome{kind: "Irreversible", reason: reason}
+
+    proc rollbackOutcomeEquals(a: RollbackOutcome, b: RollbackOutcome) -> bool:
+        if a.kind != b.kind:
+            return false
+        if a.kind == "Irreversible":
+            return a.reason == b.reason
+        return true
+
+    # ============================================================
+    # outcome.rs — MeasurementSnapshot: the state of a target at one
+    # instant, taken from its workload profile. `pressure: text` matches
+    # `fabric_telemetry.fct`'s own `WorkloadProfile.pressure` convention
+    # exactly (both restate the same real `PressureLevel` type the same
+    # way), copied field for field, not re-derived.
+    # ============================================================
+    struct MeasurementSnapshot:
+        takenAtMs: int
+        operationsPerSecond: float
+        readRatio: float
+        writeRatio: float
+        readLatencyUs: float
+        writeLatencyUs: float
+        cpuUtilization: float
+        memoryUtilization: float
+        queueDepth: int
+        pressureScore: float
+        pressure: text
+
+    proc measurementSnapshotZero() -> MeasurementSnapshot:
+        return MeasurementSnapshot{takenAtMs: 0, operationsPerSecond: 0.0, readRatio: 0.0, writeRatio: 0.0, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, queueDepth: 0, pressureScore: 0.0, pressure: "normal"}
+
+    proc measurementSnapshotFromProfile(profile: WorkloadProfile, takenAtMs: int) -> MeasurementSnapshot:
+        return MeasurementSnapshot{takenAtMs: takenAtMs, operationsPerSecond: profile.operationsPerSecond, readRatio: profile.readRatio, writeRatio: profile.writeRatio, readLatencyUs: profile.readLatencyUs, writeLatencyUs: profile.writeLatencyUs, cpuUtilization: profile.cpuUtilization, memoryUtilization: profile.memoryUtilization, queueDepth: profile.queueDepth, pressureScore: profile.pressureScore, pressure: profile.pressure}
+
+    # measurementSnapshotWorstLatencyUs: "the worse of the two latencies,
+    # which is the one a client notices" — `read_latency_us.max(write_latency_us)`.
+    proc measurementSnapshotWorstLatencyUs(snapshot: MeasurementSnapshot) -> float:
+        return max(snapshot.readLatencyUs, snapshot.writeLatencyUs)
+
+    # ============================================================
+    # outcome.rs — OutcomeVerdict: the verdict on an action, and the value
+    # fed back to the learning loop. Zero-payload, 6-variant —
+    # `NodeCondition`'s plain-`text` convention. Tag values already equal
+    # `label()`'s own six return values: "improved" | "unchanged" |
+    # "regressed" | "rolled-back" | "failed" | "not-measured".
+    # ============================================================
+    proc outcomeVerdictIsSuccess(verdict: text) -> bool:
+        return verdict == "improved"
+
+    proc outcomeVerdictIsMeasured(verdict: text) -> bool:
+        return verdict == "improved" || verdict == "unchanged" || verdict == "regressed"
+
+    proc outcomeVerdictLabel(verdict: text) -> text:
+        return verdict
+
+    # ============================================================
+    # outcome.rs — ExecutionOutcome: a before/after pair and what it says
+    # about the decision.
+    # ============================================================
+    struct ExecutionOutcome:
+        before: MeasurementSnapshot
+        after: MeasurementSnapshot
+        expectedGain: float
+        realizedGain: float
+        gainRatio: float
+        latencyDeltaUs: float
+        throughputDelta: float
+        verdict: text
+
+    proc executionOutcomeZero() -> ExecutionOutcome:
+        let z = do measurementSnapshotZero()
+        return ExecutionOutcome{before: z, after: z, expectedGain: 0.0, realizedGain: 0.0, gainRatio: 0.0, latencyDeltaUs: 0.0, throughputDelta: 0.0, verdict: "not-measured"}
+
+    # executionOutcomeEvaluate: `ExecutionOutcome::evaluate` — scored on
+    # *pressure*, the same quantity the optimizer reasons about, in the
+    # exact same order the real method computes it.
+    proc executionOutcomeEvaluate(before: MeasurementSnapshot, after: MeasurementSnapshot, decision: OptimizationDecision, noiseFloor: float) -> ExecutionOutcome:
+        let realizedGain = before.pressureScore - after.pressureScore
+        let mut gainRatio = 0.0
+        if decision.expectedGain > 0.0:
+            gainRatio = realizedGain / decision.expectedGain
+        let mut verdict = "unchanged"
+        if realizedGain > noiseFloor:
+            verdict = "improved"
+        else:
+            if realizedGain < 0.0 - noiseFloor:
+                verdict = "regressed"
+        let beforeWorst = do measurementSnapshotWorstLatencyUs(before)
+        let afterWorst = do measurementSnapshotWorstLatencyUs(after)
+        let latencyDeltaUs = afterWorst - beforeWorst
+        let throughputDelta = after.operationsPerSecond - before.operationsPerSecond
+        return ExecutionOutcome{before: before, after: after, expectedGain: decision.expectedGain, realizedGain: realizedGain, gainRatio: gainRatio, latencyDeltaUs: latencyDeltaUs, throughputDelta: throughputDelta, verdict: verdict}
+
+    # ============================================================
+    # outcome.rs — OutcomeReport: one row of the learning loop's training
+    # signal. `Option<ExecutionOutcome>`/`Option<String>` are `hasX: bool`
+    # + `x: T` pairs (this directory's established Option convention).
+    # ============================================================
+    struct OutcomeReport:
+        actionId: ActionId
+        target: ActionTarget
+        action: OptimizationAction
+        actionLabel: text
+        mechanism: text
+        confidence: float
+        expectedGain: float
+        estimatedCost: float
+        realizedGain: float
+        gainRatio: float
+        verdict: text
+        admittedAtMs: int
+        concludedAtMs: int
+        hasMeasurement: bool
+        measurement: ExecutionOutcome
+        hasFailure: bool
+        failure: text
+
+    proc outcomeReportNew(actionId: ActionId, target: ActionTarget, action: OptimizationAction, mechanism: text, confidence: float, expectedGain: float, estimatedCost: float, realizedGain: float, gainRatio: float, verdict: text, admittedAtMs: int, concludedAtMs: int, hasMeasurement: bool, measurement: ExecutionOutcome, hasFailure: bool, failure: text) -> OutcomeReport:
+        let label = do controllerPlanActionLabel(action)
+        return OutcomeReport{actionId: actionId, target: target, action: action, actionLabel: label, mechanism: mechanism, confidence: confidence, expectedGain: expectedGain, estimatedCost: estimatedCost, realizedGain: realizedGain, gainRatio: gainRatio, verdict: verdict, admittedAtMs: admittedAtMs, concludedAtMs: concludedAtMs, hasMeasurement: hasMeasurement, measurement: measurement, hasFailure: hasFailure, failure: failure}
+
+    # outcomeReportPredictionError: "how wrong the optimizer was" —
+    # `realized_gain - expected_gain`.
+    proc outcomeReportPredictionError(report: OutcomeReport) -> float:
+        return report.realizedGain - report.expectedGain
+
+    proc outcomeReportIsSuccess(report: OutcomeReport) -> bool:
+        let ok = do outcomeVerdictIsSuccess(report.verdict)
+        return ok
+
+    # ============================================================
+    # DEMO / HAND-TRACE FIXTURES — no `cargo test` exists for either file
+    # this slice ports (see this file's header). Each demo is traced
+    # directly against the Rust source method body it names.
+    # ============================================================
+
+    # D1: PlanPhase ordering/rank/reversibility/label, checked against
+    # `ORDER`/`rank`/`is_reversible`/`label` directly.
+    proc demoPlanPhaseBasics() -> bool:
+        let order = do planPhaseOrder()
+        let orderOk = order[0] == "prepare" && order[1] == "transfer" && order[2] == "cutover" && order[3] == "cleanup"
+        let r0 = do planPhaseRank("prepare")
+        let r1 = do planPhaseRank("transfer")
+        let r2 = do planPhaseRank("cutover")
+        let r3 = do planPhaseRank("cleanup")
+        let rankOk = r0 == 0 && r1 == 1 && r2 == 2 && r3 == 3
+        let prepareRev = do planPhaseIsReversible("prepare")
+        let transferRev = do planPhaseIsReversible("transfer")
+        let cutoverRev = do planPhaseIsReversible("cutover")
+        let cleanupRev = do planPhaseIsReversible("cleanup")
+        let reversibleOk = prepareRev && transferRev && !cutoverRev && !cleanupRev
+        let cutoverLabel = do planPhaseLabel("cutover")
+        let labelOk = cutoverLabel == "cutover"
+        return orderOk && rankOk && reversibleOk && labelOk
+
+    # D2: a full, valid 4-phase plan that both adds and removes a copy —
+    # `new` must accept it (removes non-empty, but cutover is present).
+    proc demoPlacementPlanNewSuccess() -> bool:
+        let ct = do coordinateNew(2, 3)
+        let target = do actionTargetNew(1, ct)
+        let action = do optimizationActionMove("node-2")
+        let phases = ["prepare", "transfer", "cutover", "cleanup"]
+        let node2 = do dbmsIdNew("node-2")
+        let node1 = do dbmsIdNew("node-1")
+        let result = do placementPlanNew(target, action, "coordinate", phases, [node2], [node1])
+        let okFlag = result.ok
+        let phasesOk = do planErrorTextArrayEquals(result.value.phases, phases)
+        let firstPhase = do placementPlanFirstPhase(result.value)
+        let firstOk = firstPhase == "prepare"
+        let afterPrepare = do placementPlanPhaseAfter(result.value, "prepare")
+        let afterPrepareOk = afterPrepare.has && afterPrepare.val == "transfer"
+        let afterCleanup = do placementPlanPhaseAfter(result.value, "cleanup")
+        let afterCleanupOk = !afterCleanup.has
+        let changesOk = do placementPlanChangesAuthority(result.value)
+        let touched = do placementPlanTouchedNodes(result.value)
+        let touchedOk = len(touched) == 2 && touched[0].value == "node-1" && touched[1].value == "node-2"
+        return okFlag && phasesOk && firstOk && afterPrepareOk && afterCleanupOk && changesOk && touchedOk
+
+    # D3: an empty phase list is rejected — `PlanError::EmptyPlan`.
+    proc demoPlacementPlanNewEmptyPlan() -> bool:
+        let ct = do coordinateNew(0, 0)
+        let target = do actionTargetNew(0, ct)
+        let action = do optimizationActionSplit()
+        let result = do placementPlanNew(target, action, "shard", [], [], [])
+        let rejectedOk = !result.ok
+        let kindOk = result.err.kind == "EmptyPlan"
+        let msg = do planErrorDisplay(result.err)
+        let msgOk = msg == "plan contains no phases"
+        return rejectedOk && kindOk && msgOk
+
+    # D4: phases listed out of rank order — `PlanError::PhasesOutOfOrder`,
+    # carrying the phases exactly as given.
+    proc demoPlacementPlanNewOutOfOrder() -> bool:
+        let ct = do coordinateNew(0, 0)
+        let target = do actionTargetNew(0, ct)
+        let action = do optimizationActionMove("node-2")
+        let phases = ["transfer", "prepare"]
+        let result = do placementPlanNew(target, action, "coordinate", phases, [], [])
+        let rejectedOk = !result.ok
+        let kindOk = result.err.kind == "PhasesOutOfOrder"
+        let phasesOk = do planErrorTextArrayEquals(result.err.phases, phases)
+        let msg = do planErrorDisplay(result.err)
+        let msgOk = msg == "plan phases are out of order: [transfer, prepare]"
+        return rejectedOk && kindOk && phasesOk && msgOk
+
+    # D5: a plan that removes a copy but never cuts over —
+    # `PlanError::Infeasible`.
+    proc demoPlacementPlanNewInfeasible() -> bool:
+        let ct = do coordinateNew(0, 0)
+        let target = do actionTargetNew(0, ct)
+        let action = do optimizationActionMove("node-2")
+        let node1 = do dbmsIdNew("node-1")
+        let result = do placementPlanNew(target, action, "coordinate", ["prepare", "transfer"], [], [node1])
+        let rejectedOk = !result.ok
+        let kindOk = result.err.kind == "Infeasible"
+        let msg = do planErrorDisplay(result.err)
+        let msgOk = msg == "plan is infeasible: a plan that removes a copy must cut over first"
+        return rejectedOk && kindOk && msgOk
+
+    # D6: `with_estimate` overwrites only the two estimate fields.
+    proc demoPlacementPlanWithEstimate() -> bool:
+        let ct = do coordinateNew(0, 0)
+        let target = do actionTargetNew(0, ct)
+        let action = do optimizationActionSplit()
+        let result = do placementPlanNew(target, action, "shard", ["prepare", "cutover"], [], [])
+        let estimated = do placementPlanWithEstimate(result.value, 1024, 5000)
+        let bytesOk = estimated.estimatedBytes == 1024
+        let durationOk = estimated.estimatedDurationMs == 5000
+        let scopeOk = estimated.scope == "shard"
+        return bytesOk && durationOk && scopeOk
+
+    # D7: touched_nodes sorts and dedups across BOTH adds and removes, out
+    # of insertion order, with an overlapping id appearing in both.
+    proc demoPlacementPlanTouchedNodesDedup() -> bool:
+        let ct = do coordinateNew(0, 0)
+        let target = do actionTargetNew(0, ct)
+        let action = do optimizationActionMove("node-2")
+        let node2 = do dbmsIdNew("node-2")
+        let node1a = do dbmsIdNew("node-1")
+        let node1b = do dbmsIdNew("node-1")
+        let node3 = do dbmsIdNew("node-3")
+        let result = do placementPlanNew(target, action, "coordinate", ["prepare", "cutover"], [node2, node1a], [node1b, node3])
+        let touched = do placementPlanTouchedNodes(result.value)
+        return len(touched) == 3 && touched[0].value == "node-1" && touched[1].value == "node-2" && touched[2].value == "node-3"
+
+    # D8: PlanError::UnsupportedAction display.
+    proc demoPlanErrorUnsupportedActionDisplay() -> bool:
+        let e = do planErrorUnsupportedAction("split")
+        let msg = do planErrorDisplay(e)
+        return msg == "mechanism does not implement action 'split'"
+
+    # D9: PhaseProgress construction and derived-equality restatement.
+    proc demoPhaseProgress() -> bool:
+        let r1 = do phaseProgressRunning(0.5)
+        let r2 = do phaseProgressRunning(0.5)
+        let r3 = do phaseProgressRunning(0.6)
+        let c1 = do phaseProgressComplete()
+        let c2 = do phaseProgressComplete()
+        let sameRunningOk = do phaseProgressEquals(r1, r2)
+        let r1r3Eq = do phaseProgressEquals(r1, r3)
+        let diffRunningOk = !r1r3Eq
+        let sameCompleteOk = do phaseProgressEquals(c1, c2)
+        let r1c1Eq = do phaseProgressEquals(r1, c1)
+        let crossOk = !r1c1Eq
+        return sameRunningOk && diffRunningOk && sameCompleteOk && crossOk
+
+    # D10: ExecutionFault display, all four variants, arm order matching
+    # the real `fmt` match.
+    proc demoExecutionFaultDisplays() -> bool:
+        let node9 = do dbmsIdNew("node-9")
+        let f1 = do executionFaultPhaseFailed("transfer", "disk full")
+        let f2 = do executionFaultDestinationLost(node9)
+        let f3 = do executionFaultNotStarted("cutover")
+        let f4 = do executionFaultInternal("panic")
+        let m1 = do executionFaultDisplay(f1)
+        let m2 = do executionFaultDisplay(f2)
+        let m3 = do executionFaultDisplay(f3)
+        let m4 = do executionFaultDisplay(f4)
+        let ok1 = m1 == "phase 'transfer' failed: disk full"
+        let ok2 = m2 == "destination 'node-9' was lost mid-flight"
+        let ok3 = m3 == "phase 'cutover' was polled before it began"
+        let ok4 = m4 == "mechanism error: panic"
+        return ok1 && ok2 && ok3 && ok4
+
+    # D11: RollbackOutcome construction and derived-equality restatement
+    # (no Display exists for this type in the real source — see this
+    # file's header).
+    proc demoRollbackOutcome() -> bool:
+        let r1 = do rollbackOutcomeRestored()
+        let r2 = do rollbackOutcomeRestored()
+        let i1 = do rollbackOutcomeIrreversible("moved to node-3")
+        let i2 = do rollbackOutcomeIrreversible("moved to node-3")
+        let i3 = do rollbackOutcomeIrreversible("moved to node-4")
+        let restoredEqOk = do rollbackOutcomeEquals(r1, r2)
+        let irrevEqOk = do rollbackOutcomeEquals(i1, i2)
+        let i1i3Eq = do rollbackOutcomeEquals(i1, i3)
+        let irrevDiffOk = !i1i3Eq
+        let r1i1Eq = do rollbackOutcomeEquals(r1, i1)
+        let crossOk = !r1i1Eq
+        return restoredEqOk && irrevEqOk && irrevDiffOk && crossOk
+
+    # D12: action_label for all six real OptimizationAction variants.
+    proc demoControllerPlanActionLabel() -> bool:
+        let noAction = do optimizationActionNoAction()
+        let replicate = do optimizationActionReplicate("node-1")
+        let move = do optimizationActionMove("node-2")
+        let split = do optimizationActionSplit()
+        let isolate = do optimizationActionIsolate()
+        let colocateTarget = do coordinateNew(1, 1)
+        let colocate = do optimizationActionColocate(colocateTarget)
+        let l1 = do controllerPlanActionLabel(noAction)
+        let l2 = do controllerPlanActionLabel(replicate)
+        let l3 = do controllerPlanActionLabel(move)
+        let l4 = do controllerPlanActionLabel(split)
+        let l5 = do controllerPlanActionLabel(isolate)
+        let l6 = do controllerPlanActionLabel(colocate)
+        return l1 == "no-action" && l2 == "replicate" && l3 == "move" && l4 == "split" && l5 == "isolate" && l6 == "colocate"
+
+    # D13: PlanRequest construction round-trips its Option<DbmsId>
+    # destination both set and unset.
+    proc demoPlanRequestConstruction() -> bool:
+        let ct = do coordinateNew(4, 4)
+        let target = do actionTargetNew(0, ct)
+        let action = do optimizationActionMove("node-5")
+        let source = do placementNew("node-1", 0, ct, "us-east")
+        let dest = do dbmsIdNew("node-5")
+        let replica = do dbmsIdNew("node-1")
+        let withDest = do planRequestNew(target, action, source, true, dest, [replica], 1000)
+        let withoutDest = do planRequestNew(target, action, source, false, DbmsId{value: ""}, [replica], 1000)
+        let withDestOk = withDest.hasDestination && withDest.destination.value == "node-5"
+        let withoutDestOk = !withoutDest.hasDestination
+        let replicasOk = len(withDest.replicas) == 1 && withDest.replicas[0].value == "node-1"
+        let sourceOk = withDest.source.dbmsId == "node-1"
+        return withDestOk && withoutDestOk && replicasOk && sourceOk
+
+    # D14: MeasurementSnapshot::from_profile copies every field verbatim
+    # and worst_latency_us picks the larger of the two latencies.
+    proc demoMeasurementSnapshotFromProfile() -> bool:
+        let profile = WorkloadProfile{shardId: 2, coordinate: Coordinate{x: 1, y: 1}, operationsPerSecond: 100.0, readRatio: 0.6, writeRatio: 0.4, readLatencyUs: 200.0, writeLatencyUs: 350.0, cpuUtilization: 0.5, memoryUtilization: 0.4, storageBytesPerSecond: 0, networkInBytesPerSecond: 0, networkOutBytesPerSecond: 0, queueDepth: 10, cellBreakdown: [], cellBreakdownPartial: false, pressureScore: 0.6, pressure: "elevated"}
+        let snap = do measurementSnapshotFromProfile(profile, 1000)
+        let fieldsOk = snap.takenAtMs == 1000 && snap.operationsPerSecond == 100.0 && snap.readRatio == 0.6 && snap.writeRatio == 0.4 && snap.cpuUtilization == 0.5 && snap.memoryUtilization == 0.4 && snap.queueDepth == 10
+        let pressureOk = abs(snap.pressureScore - 0.6) < 0.000000000001 && snap.pressure == "elevated"
+        let worst = do measurementSnapshotWorstLatencyUs(snap)
+        let worstOk = abs(worst - 350.0) < 0.000000000001
+        return fieldsOk && pressureOk && worstOk
+
+    # D15: ExecutionOutcome::evaluate — pressure fell by more than the
+    # noise floor, so the verdict is Improved; gain_ratio and the two
+    # deltas are checked against the exact arithmetic the real method
+    # performs.
+    proc demoExecutionOutcomeEvaluateImproved() -> bool:
+        let before = MeasurementSnapshot{takenAtMs: 1000, operationsPerSecond: 100.0, readRatio: 0.6, writeRatio: 0.4, readLatencyUs: 200.0, writeLatencyUs: 350.0, cpuUtilization: 0.5, memoryUtilization: 0.4, queueDepth: 10, pressureScore: 0.6, pressure: "elevated"}
+        let after = MeasurementSnapshot{takenAtMs: 2000, operationsPerSecond: 150.0, readRatio: 0.6, writeRatio: 0.4, readLatencyUs: 180.0, writeLatencyUs: 300.0, cpuUtilization: 0.3, memoryUtilization: 0.3, queueDepth: 5, pressureScore: 0.3, pressure: "normal"}
+        let colocateTarget = do coordinateNew(0, 0)
+        let moveAction = do optimizationActionMove("node-2")
+        let decision = OptimizationDecision{shardId: 0, coordinate: colocateTarget, action: moveAction, expectedGain: 0.25, estimatedCost: 0.05, confidence: 0.9}
+        let outcome = do executionOutcomeEvaluate(before, after, decision, 0.02)
+        let gainOk = abs(outcome.realizedGain - 0.3) < 0.000000000001
+        let ratioOk = abs(outcome.gainRatio - 1.2) < 0.000000001
+        let verdictOk = outcome.verdict == "improved"
+        let latencyOk = abs(outcome.latencyDeltaUs - (0.0 - 50.0)) < 0.000000000001
+        let throughputOk = abs(outcome.throughputDelta - 50.0) < 0.000000000001
+        return gainOk && ratioOk && verdictOk && latencyOk && throughputOk
+
+    # D16: within the noise floor -> Unchanged; beyond it in the other
+    # direction -> Regressed.
+    proc demoExecutionOutcomeEvaluateUnchangedAndRegressed() -> bool:
+        let beforeA = MeasurementSnapshot{takenAtMs: 0, operationsPerSecond: 0.0, readRatio: 0.0, writeRatio: 0.0, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, queueDepth: 0, pressureScore: 0.5, pressure: "elevated"}
+        let afterA = MeasurementSnapshot{takenAtMs: 0, operationsPerSecond: 0.0, readRatio: 0.0, writeRatio: 0.0, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, queueDepth: 0, pressureScore: 0.49, pressure: "elevated"}
+        let splitAction = do optimizationActionSplit()
+        let decision = OptimizationDecision{shardId: 0, coordinate: Coordinate{x: 0, y: 0}, action: splitAction, expectedGain: 0.1, estimatedCost: 0.0, confidence: 0.9}
+        let unchanged = do executionOutcomeEvaluate(beforeA, afterA, decision, 0.02)
+        let unchangedOk = unchanged.verdict == "unchanged"
+        let beforeB = MeasurementSnapshot{takenAtMs: 0, operationsPerSecond: 0.0, readRatio: 0.0, writeRatio: 0.0, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, queueDepth: 0, pressureScore: 0.3, pressure: "normal"}
+        let afterB = MeasurementSnapshot{takenAtMs: 0, operationsPerSecond: 0.0, readRatio: 0.0, writeRatio: 0.0, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, queueDepth: 0, pressureScore: 0.5, pressure: "elevated"}
+        let regressed = do executionOutcomeEvaluate(beforeB, afterB, decision, 0.02)
+        let regressedOk = regressed.verdict == "regressed"
+        return unchangedOk && regressedOk
+
+    # D17: OutcomeVerdict's three helper predicates across all six tags.
+    proc demoOutcomeVerdictHelpers() -> bool:
+        let successOk = do outcomeVerdictIsSuccess("improved")
+        let unchangedSuccess = do outcomeVerdictIsSuccess("unchanged")
+        let notSuccessOk = !unchangedSuccess
+        let measuredImproved = do outcomeVerdictIsMeasured("improved")
+        let measuredUnchanged = do outcomeVerdictIsMeasured("unchanged")
+        let measuredRegressed = do outcomeVerdictIsMeasured("regressed")
+        let rolledBackMeasured = do outcomeVerdictIsMeasured("rolled-back")
+        let notMeasuredRolledBack = !rolledBackMeasured
+        let failedMeasured = do outcomeVerdictIsMeasured("failed")
+        let notMeasuredFailed = !failedMeasured
+        let notMeasuredMeasured = do outcomeVerdictIsMeasured("not-measured")
+        let notMeasuredNotMeasured = !notMeasuredMeasured
+        let verdictLabelRaw = do outcomeVerdictLabel("rolled-back")
+        let labelOk = verdictLabelRaw == "rolled-back"
+        return successOk && notSuccessOk && measuredImproved && measuredUnchanged && measuredRegressed && notMeasuredRolledBack && notMeasuredFailed && notMeasuredNotMeasured && labelOk
+
+    # D18: OutcomeReport::prediction_error and is_success, one successful
+    # row and one failed row.
+    proc demoOutcomeReport() -> bool:
+        let ct = do coordinateNew(0, 0)
+        let target = do actionTargetNew(0, ct)
+        let action = do optimizationActionMove("node-2")
+        let actionId = do actionIdNew(7)
+        let zeroOutcome = do executionOutcomeZero()
+        let improved = do outcomeReportNew(actionId, target, action, "routing", 0.9, 0.25, 0.05, 0.3, 1.2, "improved", 1000, 2000, false, zeroOutcome, false, "")
+        let predErr = do outcomeReportPredictionError(improved)
+        let predOk = abs(predErr - 0.05) < 0.000000000001
+        let successOk = do outcomeReportIsSuccess(improved)
+        let labelOk = improved.actionLabel == "move"
+        let failed = do outcomeReportNew(actionId, target, action, "routing", 0.9, 0.25, 0.05, 0.0, 0.0, "failed", 1000, 2000, false, zeroOutcome, true, "destination unreachable")
+        let failedSuccess = do outcomeReportIsSuccess(failed)
+        let failedNotSuccessOk = !failedSuccess
+        let failureOk = failed.hasFailure && failed.failure == "destination unreachable"
+        return predOk && successOk && labelOk && failedNotSuccessOk && failureOk
+
+    # ============================================================
+    # LIVE CONSOLE VERIFICATION — same pattern `fabric_controller_target.fct`'s
+    # own header establishes: one `action` runs every demo above and
+    # latches each result into a `state` cell, then `:run
+    # runFabricControllerPlanDemo()` followed by `:state` in `facet
+    # console` prints the real, executed results for direct comparison
+    # against the hand-traced expectations documented next to each demo
+    # proc above.
+    # ============================================================
+    state demoPlanPhaseBasicsResult: bool = false
+    state demoPlacementPlanNewSuccessResult: bool = false
+    state demoPlacementPlanNewEmptyPlanResult: bool = false
+    state demoPlacementPlanNewOutOfOrderResult: bool = false
+    state demoPlacementPlanNewInfeasibleResult: bool = false
+    state demoPlacementPlanWithEstimateResult: bool = false
+    state demoPlacementPlanTouchedNodesDedupResult: bool = false
+    state demoPlanErrorUnsupportedActionDisplayResult: bool = false
+    state demoPhaseProgressResult: bool = false
+    state demoExecutionFaultDisplaysResult: bool = false
+    state demoRollbackOutcomeResult: bool = false
+    state demoControllerPlanActionLabelResult: bool = false
+    state demoPlanRequestConstructionResult: bool = false
+    state demoMeasurementSnapshotFromProfileResult: bool = false
+    state demoExecutionOutcomeEvaluateImprovedResult: bool = false
+    state demoExecutionOutcomeEvaluateUnchangedAndRegressedResult: bool = false
+    state demoOutcomeVerdictHelpersResult: bool = false
+    state demoOutcomeReportResult: bool = false
+
+    action runFabricControllerPlanDemo():
+        let r1 = do demoPlanPhaseBasics()
+        let r2 = do demoPlacementPlanNewSuccess()
+        let r3 = do demoPlacementPlanNewEmptyPlan()
+        let r4 = do demoPlacementPlanNewOutOfOrder()
+        let r5 = do demoPlacementPlanNewInfeasible()
+        let r6 = do demoPlacementPlanWithEstimate()
+        let r7 = do demoPlacementPlanTouchedNodesDedup()
+        let r8 = do demoPlanErrorUnsupportedActionDisplay()
+        let r9 = do demoPhaseProgress()
+        let r10 = do demoExecutionFaultDisplays()
+        let r11 = do demoRollbackOutcome()
+        let r12 = do demoControllerPlanActionLabel()
+        let r13 = do demoPlanRequestConstruction()
+        let r14 = do demoMeasurementSnapshotFromProfile()
+        let r15 = do demoExecutionOutcomeEvaluateImproved()
+        let r16 = do demoExecutionOutcomeEvaluateUnchangedAndRegressed()
+        let r17 = do demoOutcomeVerdictHelpers()
+        let r18 = do demoOutcomeReport()
+        demoPlanPhaseBasicsResult = r1
+        demoPlacementPlanNewSuccessResult = r2
+        demoPlacementPlanNewEmptyPlanResult = r3
+        demoPlacementPlanNewOutOfOrderResult = r4
+        demoPlacementPlanNewInfeasibleResult = r5
+        demoPlacementPlanWithEstimateResult = r6
+        demoPlacementPlanTouchedNodesDedupResult = r7
+        demoPlanErrorUnsupportedActionDisplayResult = r8
+        demoPhaseProgressResult = r9
+        demoExecutionFaultDisplaysResult = r10
+        demoRollbackOutcomeResult = r11
+        demoControllerPlanActionLabelResult = r12
+        demoPlanRequestConstructionResult = r13
+        demoMeasurementSnapshotFromProfileResult = r14
+        demoExecutionOutcomeEvaluateImprovedResult = r15
+        demoExecutionOutcomeEvaluateUnchangedAndRegressedResult = r16
+        demoOutcomeVerdictHelpersResult = r17
+        demoOutcomeReportResult = r18

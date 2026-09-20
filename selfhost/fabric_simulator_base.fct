@@ -1,0 +1,753 @@
+import "fabric_core.fct"
+import "fabric_controller_target.fct"
+
+app FabricSimulatorBaseSelfHost:
+    # Self-hosting port of fabric-simulator's four leaf files — clock.rs
+    # (51L), fault.rs (80L), rng.rs (109L), workload.rs (113L), 353 real
+    # Rust lines total — grepped directly for `crate::` before writing a
+    # line here: zero internal fabric-simulator dependencies among the
+    # four. The only two outside types they touch are already-shipped
+    # ports: `fabric_controller::ActionTarget` (fabric_controller_target.fct,
+    # `target.rs`) and `fabric_core::DbmsId` (fabric_core.fct, `topology.rs`).
+    # `fabric_core::WorkloadClass` is NOT reached through an import — see
+    # "WORKLOAD CLASS" below for why this file restates it as the exact
+    # same plain-text tag fabric_core.fct's own header already establishes
+    # for it, rather than depending on a value fabric_core.fct only
+    # produces via zero-arg tag procs.
+    #
+    # ============================================================
+    # IMPORTS
+    # ============================================================
+    # `import "fabric_core.fct"` gives the real `DbmsId`/`dbmsIdNew` and
+    # `Coordinate`/`coordinateNew` directly. `import
+    # "fabric_controller_target.fct"` gives the real `ActionTarget`/
+    # `actionTargetNew`/`actionTargetDisplay`, and itself imports
+    # `fabric_core.fct` (confirmed by reading its own first line) — the
+    # same diamond shape that file's own header already proved safe for
+    # `fabric_core.fct` + `fabric_routing.fct` ("reached by two paths to
+    # the same file" — one real declaration in the merged program, not a
+    # collision). `facet check` below on this file, and the full-directory
+    # sweep, are the actual proof for THIS diamond rather than an assumed
+    # analogy.
+    #
+    # ============================================================
+    # NO TUPLE RETURN, SO *Outcome STRUCTS — clock.rs's `advance(&mut
+    # self)` and every `Rng` method mutate `self` AND return a value. This
+    # language's `proc` returns exactly one scalar/struct/list (confirmed
+    # against LANGUAGE.md's `proc` section — no record/tuple return), so
+    # every such method is restated as a proc taking the old struct by
+    # value and returning a small `*Outcome` struct bundling the new
+    # struct alongside the drawn value — the exact convention heap.fct's
+    # `AppendOutcome` (arena + page + slot + length) already establishes
+    # for "returns a new struct plus a scalar". The caller re-binds both
+    # fields, exactly like a Rust caller would see both `self`'s new state
+    # and the method's return value after a `&mut self` call.
+    #
+    # ============================================================
+    # RNG — SplitMix64, the load-bearing piece
+    # ============================================================
+    # `rng.rs`'s own real cargo tests (`the_same_seed_gives_the_same_
+    # sequence`, `different_seeds_diverge_immediately`,
+    # `floats_stay_in_the_unit_interval`) assert properties, not concrete
+    # numbers, so a reference sequence was computed independently — a
+    # direct Python re-transcription of the exact same algorithm rng.rs
+    # declares (`state = state.wrapping_add(GOLDEN); z = (z^(z>>30))
+    # .wrapping_mul(A); z = (z^(z>>27)).wrapping_mul(B); z^(z>>31)`), using
+    # Python's arbitrary-precision ints explicitly masked to 64 bits at
+    # every step to emulate `wrapping_add`/`wrapping_mul` bit-for-bit — and
+    # cross-checked line-by-line against rng.rs itself before trusting a
+    # single digit. The demo procs below hardcode that reference
+    # sequence's values (see each proc's own comment for the exact seed
+    # and draw index) and compare this port's own output against them with
+    # `==`/`floatApproxEquals`, not merely "two copies of my own code
+    # agree with each other".
+    #
+    # Three real facts about this language's operators had to be checked
+    # against `runtime/eval.go` (not assumed) before the port could be
+    # trusted, all of them the same three `facetql_metrics.fct`'s own
+    # header already established for its own, narrower use of this exact
+    # golden-ratio constant:
+    #   (a) `0x9E3779B97F4A7C15`/`0xBF58476D1CE4E5B9`/`0x94D049BB133111EB`
+    #       all have their own top bit set, so none fits as a positive
+    #       `int` literal — each is written below as its exact two's-
+    #       complement negative equivalent (`-7046029254386353131`,
+    #       `-4658895280553007687`, `-7723592293110705685` respectively,
+    #       independently recomputed and cross-checked against
+    #       `facetql_metrics.fct`'s own `-7046029254386353131` for the
+    #       first constant, which is the identical `0x9E3779B97F4A7C15`).
+    #   (b) `*` and `+` on this language's `int` (`runtime/eval.go`'s
+    #       `case "*"`/`case "+"`, both plain Go `int` ops) silently wrap
+    #       on overflow exactly the way `wrapping_mul`/`wrapping_add` do —
+    #       confirmed by reading the evaluator.
+    #   (c) `>>` (`runtime/eval.go`'s `shiftRight`, a plain Go `x >>
+    #       uint(n)` on a signed `int`) is an ARITHMETIC shift — it sign-
+    #       extends — whereas Rust's `u64 >>` is a LOGICAL shift that
+    #       fills with zero. `facetql_metrics.fct` proved the fix for its
+    #       own single case (shift-by-32, `& 4294967295`): an arithmetic
+    #       right shift by `n` reproduces the exact same low `64-n` bits a
+    #       logical shift by `n` would, so masking off the top `n` bits
+    #       (`& ((1 << (64-n)) - 1)`) recovers the true logical-shift
+    #       value, always non-negative, for ANY shift amount `n` in
+    #       `1..64` — not just 32. `shiftRightLogical64` below is that
+    #       same proven trick generalized (proof: arithmetic shift and
+    #       logical shift of the same value differ ONLY in what fills
+    #       positions `64-n..63`; masking those `n` bits to zero after
+    #       either shift produces the same, correct low `64-n` bits
+    #       either way), used for `next_u64`'s three internal shifts
+    #       (30, 27, 31) and `next_f64`'s own (11).
+    #
+    # A FOURTH fact `facetql_metrics.fct` never had to face, because its
+    # own hashed value was already masked into a non-negative 32-bit range
+    # before its one `% CELL_SLOTS`: `Rng::below(n)` computes `self
+    # .next_u64() % n as u64` over the FULL, un-masked 64-bit draw, which
+    # is negative (as this language's signed `int`) roughly half the time
+    # (any draw with its top bit set — confirmed empirically: seed 42's
+    # own 5th draw below is exactly such a case). Plain `%` on a negative
+    # `int` uses Go's truncating-toward-zero remainder (same sign as the
+    # dividend), which is NOT `u64 %` — so `below` needs its own real fix,
+    # `unsignedMod64`, not a re-use of the shift trick: for a non-negative
+    # `x` it is plain `x % n`; for negative `x` (true unsigned value `x +
+    # 2^64`), it uses the modular identity `(x + 2^64) mod n == ((x mod n)
+    # + (2^64 mod n)) mod n`, computing `2^64 mod n` via `pow2ModN` (64
+    # repeated doubling-and-mod steps, never needing the literal `2^64` or
+    # `2^63` — both unrepresentable as a positive `int` — at all) and
+    # normalizing the sum back into `[0, n)` with a single conditional
+    # `+ n` (proof the single adjustment always suffices: `x mod n` from
+    # Go's `%` lies in `(-n, 0]` and `pow2ModN` always lies in `[0, n)`, so
+    # their sum always lies in `(-n, n)`, one width short of needing a
+    # second wrap).
+    struct Rng:
+        state: int
+
+    proc rngNew(seed: int) -> Rng:
+        let golden = -7046029254386353131
+        return Rng{state: seed ^ golden}
+
+    # shiftRightLogical64: see this file's header, fact (c). `n` is always
+    # a small positive shift count in this file (11, 27, 30, 31); a
+    # non-positive `n` returns `z` unchanged rather than computing a
+    # bogus mask, since `1 << 64` (what `n <= 0` would ask for) is not a
+    # shift this proc is ever asked to perform for real.
+    proc shiftRightLogical64(z: int, n: int) -> int:
+        if n <= 0:
+            return z
+        let shifted = z >> n
+        let mask = (1 << (64 - n)) - 1
+        return shifted & mask
+
+    struct RngU64Outcome:
+        rng: Rng
+        value: int
+
+    # rngNextU64: `Rng::next_u64` verbatim — state update first, then the
+    # three-round SplitMix64 mix, each round's shift routed through
+    # `shiftRightLogical64` per this file's header fact (c).
+    proc rngNextU64(r: Rng) -> RngU64Outcome:
+        let golden = -7046029254386353131
+        let mulA = -4658895280553007687
+        let mulB = -7723592293110705685
+        let newState = r.state + golden
+        let shift1 = do shiftRightLogical64(newState, 30)
+        let mixed1 = newState ^ shift1
+        let z1 = mixed1 * mulA
+        let shift2 = do shiftRightLogical64(z1, 27)
+        let mixed2 = z1 ^ shift2
+        let z2 = mixed2 * mulB
+        let shift3 = do shiftRightLogical64(z2, 31)
+        let result = z2 ^ shift3
+        return RngU64Outcome{rng: Rng{state: newState}, value: result}
+
+    struct RngF64Outcome:
+        rng: Rng
+        value: float
+
+    # rngNextF64: `(self.next_u64() >> 11) as f64 * (1.0 /
+    # 9_007_199_254_740_992.0)` verbatim — the `>> 11` is a LOGICAL shift
+    # of a full 64-bit draw (fact (c) again), so it goes through
+    # `shiftRightLogical64` too, then a bit-identical float multiply.
+    proc rngNextF64(r: Rng) -> RngF64Outcome:
+        let drawn = do rngNextU64(r)
+        let shifted = do shiftRightLogical64(drawn.value, 11)
+        let asFloat = toFloat(shifted)
+        let scale = 1.0 / 9007199254740992.0
+        let value = asFloat * scale
+        return RngF64Outcome{rng: drawn.rng, value: value}
+
+    # rngRange: `low + (high - low) * self.next_f64()` verbatim, same
+    # operand order (so the float rounding matches bit-for-bit).
+    proc rngRange(r: Rng, low: float, high: float) -> RngF64Outcome:
+        let drawn = do rngNextF64(r)
+        let width = high - low
+        let scaled = width * drawn.value
+        let value = low + scaled
+        return RngF64Outcome{rng: drawn.rng, value: value}
+
+    # pow2ModN: see this file's header, the `below` fix. Computes `2^exp
+    # mod n` via `exp` repeated doubling-and-mod steps, staying in `[0,
+    # n)` throughout, so it never needs `2^exp` itself as a value.
+    proc pow2ModN(exp: int, n: int) -> int:
+        let mut result = 1 % n
+        let mut i = 0
+        loop i < exp:
+            result = (result * 2) % n
+            i = i + 1
+        return result
+
+    # unsignedMod64: `x` as this language's signed `int` bit-pattern
+    # standing in for an unsigned 64-bit value; returns that unsigned
+    # value modulo `n` (`n > 0`). See this file's header for the proof.
+    proc unsignedMod64(x: int, n: int) -> int:
+        if x >= 0:
+            return x % n
+        let wraparound = do pow2ModN(64, n)
+        let mut combined = (x % n) + wraparound
+        if combined < 0:
+            combined = combined + n
+        return combined
+
+    # rngBelow: `if n == 0 { 0 } else { (self.next_u64() % n as u64) as
+    # usize }` verbatim, `%` routed through `unsignedMod64`.
+    proc rngBelow(r: Rng, n: int) -> RngU64Outcome:
+        if n == 0:
+            return RngU64Outcome{rng: r, value: 0}
+        let drawn = do rngNextU64(r)
+        let idx = do unsignedMod64(drawn.value, n)
+        return RngU64Outcome{rng: drawn.rng, value: idx}
+
+    struct RngChanceOutcome:
+        rng: Rng
+        value: bool
+
+    # rngChance: `self.next_f64() < probability` verbatim.
+    proc rngChance(r: Rng, probability: float) -> RngChanceOutcome:
+        let drawn = do rngNextF64(r)
+        let hit = drawn.value < probability
+        return RngChanceOutcome{rng: drawn.rng, value: hit}
+
+    struct RngForkOutcome:
+        rng: Rng
+        forked: Rng
+
+    # rngFork: `Self::new(self.next_u64())` verbatim — draws one u64 from
+    # `self` (mutating it, like every other method here), then seeds a
+    # brand-new independent stream from that draw.
+    proc rngFork(r: Rng) -> RngForkOutcome:
+        let drawn = do rngNextU64(r)
+        let child = do rngNew(drawn.value)
+        return RngForkOutcome{rng: drawn.rng, forked: child}
+
+    # ============================================================
+    # clock.rs — SimClock
+    # ============================================================
+    struct SimClock:
+        startMs: int
+        tickMs: int
+        ticks: int
+
+    # simClockNew: `tick_ms.max(1)` verbatim — a zero tick length would
+    # make every timestamp identical, per the real source's own comment.
+    proc simClockNew(startMs: int, tickMs: int) -> SimClock:
+        let mut clampedTickMs = tickMs
+        if clampedTickMs < 1:
+            clampedTickMs = 1
+        return SimClock{startMs: startMs, tickMs: clampedTickMs, ticks: 0}
+
+    proc simClockNowMs(c: SimClock) -> int:
+        return c.startMs + c.ticks * c.tickMs
+
+    proc simClockStartMs(c: SimClock) -> int:
+        return c.startMs
+
+    proc simClockTickMs(c: SimClock) -> int:
+        return c.tickMs
+
+    proc simClockTicks(c: SimClock) -> int:
+        return c.ticks
+
+    struct SimClockAdvanceOutcome:
+        clock: SimClock
+        nowMs: int
+
+    # simClockAdvance: `self.ticks += 1; self.now_ms()` verbatim.
+    proc simClockAdvance(c: SimClock) -> SimClockAdvanceOutcome:
+        let advanced = SimClock{startMs: c.startMs, tickMs: c.tickMs, ticks: c.ticks + 1}
+        let now = do simClockNowMs(advanced)
+        return SimClockAdvanceOutcome{clock: advanced, nowMs: now}
+
+    # ============================================================
+    # fault.rs — Fault, a 5-variant Rust enum with per-variant payload
+    # fields (`NodeLoss`/`NodeRecovery` carry a `DbmsId`; `PartitionRegion`/
+    # `HealRegion` carry a `String`; `HotShard` carries an `ActionTarget` +
+    # `f64` + `u64`). Restated below as ONE `kind: text`-discriminated
+    # struct carrying the union of every variant's fields, matching this
+    # directory's established convention for a Rust `enum` with named,
+    # payload-carrying variants (`fabric_optimizer.fct`'s
+    # `OptimizationAction`, `action_stmt.fct`'s `ActionStmt` — both read
+    # before writing this) rather than an arena-of-ints/magic-number tag:
+    # every field is always present in a literal, but only the ones the
+    # matching `kind` actually uses are meaningful; unused fields on a
+    # constructor are zero-valued placeholders (`DbmsId{value: ""}`, `""`,
+    # a zeroed `ActionTarget`, `0.0`, `0`), never read back for that kind.
+    # ============================================================
+    struct Fault:
+        kind: text
+        node: DbmsId
+        region: text
+        target: ActionTarget
+        multiplier: float
+        durationMs: int
+
+    proc faultNodeLoss(node: DbmsId) -> Fault:
+        return Fault{kind: "NodeLoss", node: node, region: "", target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, multiplier: 0.0, durationMs: 0}
+
+    proc faultNodeRecovery(node: DbmsId) -> Fault:
+        return Fault{kind: "NodeRecovery", node: node, region: "", target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, multiplier: 0.0, durationMs: 0}
+
+    proc faultPartitionRegion(region: text) -> Fault:
+        return Fault{kind: "PartitionRegion", node: DbmsId{value: ""}, region: region, target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, multiplier: 0.0, durationMs: 0}
+
+    proc faultHealRegion(region: text) -> Fault:
+        return Fault{kind: "HealRegion", node: DbmsId{value: ""}, region: region, target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, multiplier: 0.0, durationMs: 0}
+
+    proc faultHotShard(target: ActionTarget, multiplier: float, durationMs: int) -> Fault:
+        return Fault{kind: "HotShard", node: DbmsId{value: ""}, region: "", target: target, multiplier: multiplier, durationMs: durationMs}
+
+    # faultLabel: `Fault::label` verbatim, same five literal strings.
+    proc faultLabel(f: Fault) -> text:
+        if f.kind == "NodeLoss":
+            return "node-loss"
+        if f.kind == "NodeRecovery":
+            return "node-recovery"
+        if f.kind == "PartitionRegion":
+            return "partition"
+        if f.kind == "HealRegion":
+            return "heal"
+        return "hot-shard"
+
+    # pow10/textPadLeftChar/floatFixed: `{:.1}`-style fixed-decimal float
+    # formatting, needed only for `HotShard`'s Display arm below. This
+    # language's `+` concatenation stringifies a float via this runtime's
+    # own shortest round-trip `toStr` (confirmed against
+    # `fabric_cli_render.fct`'s own header, which reads `runtime/eval.go`
+    # for exactly this fact), not `{:.N}`, so the real formatting logic is
+    # ported here rather than approximated — the same real gap, and the
+    # same fix, `fabric_cli_render.fct`'s own header already documents in
+    # full (scale by `10^decimals`, round, split int/fraction, zero-pad
+    # the fraction), restated locally here for this file's one call site
+    # rather than importing that file for one helper.
+    proc pow10(n: int) -> int:
+        let mut result = 1
+        let mut i = 0
+        loop i < n:
+            result = result * 10
+            i = i + 1
+        return result
+
+    proc textPadLeftChar(s: text, width: int, padChar: text) -> text:
+        let mut result = s
+        loop len(result) < width:
+            result = padChar + result
+        return result
+
+    proc floatFixed(v: float, decimals: int) -> text:
+        let neg = v < 0.0
+        let av = abs(v)
+        let scale = do pow10(decimals)
+        let scaleFloat = toFloat(scale)
+        let scaledFloat = av * scaleFloat
+        let scaled = round(scaledFloat)
+        let intPart = scaled / scale
+        let fracPart = scaled % scale
+        let fracRaw = "" + fracPart
+        let fracText = do textPadLeftChar(fracRaw, decimals, "0")
+        let mut result = "" + intPart
+        if decimals > 0:
+            result = result + "." + fracText
+        if neg:
+            result = "-" + result
+        return result
+
+    # faultDisplay: `impl Display for Fault` verbatim, arm by arm. The
+    # `HotShard` arm delegates to `actionTargetDisplay`
+    # (fabric_controller_target.fct's own `ActionTarget` Display port,
+    # "shard {shard_id} ({x},{y})" — verified against target.rs's own
+    # `impl Display for ActionTarget` before reuse, not assumed) exactly
+    # as the real `{target}` interpolation delegates to `ActionTarget`'s
+    # own `Display` impl.
+    proc faultDisplay(f: Fault) -> text:
+        if f.kind == "NodeLoss":
+            return "node '" + f.node.value + "' lost"
+        if f.kind == "NodeRecovery":
+            return "node '" + f.node.value + "' recovered"
+        if f.kind == "PartitionRegion":
+            return "region '" + f.region + "' partitioned from the Fabric"
+        if f.kind == "HealRegion":
+            return "region '" + f.region + "' rejoined the Fabric"
+        let targetText = do actionTargetDisplay(f.target)
+        let multiplierText = do floatFixed(f.multiplier, 1)
+        return targetText + " running " + multiplierText + "x for " + f.durationMs + "ms"
+
+    # ============================================================
+    # workload.rs — ClassProfile, class_profile, diurnal.
+    # ============================================================
+    # WORKLOAD CLASS: `fabric_core::WorkloadClass` is a 7-variant,
+    # no-payload Rust enum, and `fabric_core.fct` already restates it (its
+    # own header, "workload.rs — WorkloadClass") as plain-text tags via
+    # `workloadClassReadHeavy()`/`workloadClassWriteHeavy()`/
+    # `workloadClassMixed()`/`workloadClassEventHeavy()`/
+    # `workloadClassMedia()`/`workloadClassRealtime()`/
+    # `workloadClassUnknown()`, each returning its own literal variant
+    # name as text ("ReadHeavy", "WriteHeavy", …). `classProfile` below
+    # takes that same text tag directly (`class: text`) rather than
+    # calling those zero-arg procs itself, so a caller already holding one
+    # of fabric_core.fct's own tag values (or a `Workload.class` field,
+    # itself `text` in that file's own `Workload` struct) can pass it
+    # straight through with no wrapper needed.
+    struct ClassProfile:
+        baseOps: float
+        readRatio: float
+        readLatencyUs: float
+        writeLatencyUs: float
+        bytesPerOp: int
+
+    proc classProfileWriteRatio(p: ClassProfile) -> float:
+        return 1.0 - p.readRatio
+
+    # classProfile: `const fn class_profile` verbatim, all seven arms in
+    # the real source's own order, all seven numeric literals copied
+    # directly from workload.rs (re-read line by line against this
+    # proc before trusting it, not retyped from memory). This language's
+    # `proc` control flow has no `match` (that keyword is a VIEW node,
+    # LANGUAGE.md's node table, not proc statement syntax) so the real
+    # exhaustive match is restated as an if-chain, the same convention
+    # `fabric_optimizer.fct`'s `optimizationActionEquals` already
+    # establishes for a text-tag discriminant: six explicit `kind`
+    # checks, and the seventh (`Unknown`) as the unconditional final
+    # `return` — exhaustive over the seven real tag strings
+    # fabric_core.fct's own `workloadClass*` procs produce, though (being
+    # plain text, not a compiler-checked enum) an arbitrary caller-
+    # supplied string outside those seven also falls through to that same
+    # final branch, an honest, narrow consequence of the text-tag
+    # convention fabric_core.fct's own header already chose, not a new
+    # gap this file introduces.
+    proc classProfile(class: text) -> ClassProfile:
+        if class == "ReadHeavy":
+            return ClassProfile{baseOps: 800.0, readRatio: 0.92, readLatencyUs: 400.0, writeLatencyUs: 1200.0, bytesPerOp: 512}
+        if class == "WriteHeavy":
+            return ClassProfile{baseOps: 400.0, readRatio: 0.15, readLatencyUs: 900.0, writeLatencyUs: 2500.0, bytesPerOp: 1024}
+        if class == "Mixed":
+            return ClassProfile{baseOps: 500.0, readRatio: 0.55, readLatencyUs: 600.0, writeLatencyUs: 1500.0, bytesPerOp: 768}
+        if class == "EventHeavy":
+            return ClassProfile{baseOps: 1200.0, readRatio: 0.35, readLatencyUs: 300.0, writeLatencyUs: 800.0, bytesPerOp: 256}
+        if class == "Media":
+            return ClassProfile{baseOps: 150.0, readRatio: 0.85, readLatencyUs: 2500.0, writeLatencyUs: 9000.0, bytesPerOp: 65536}
+        if class == "Realtime":
+            return ClassProfile{baseOps: 2000.0, readRatio: 0.60, readLatencyUs: 150.0, writeLatencyUs: 400.0, bytesPerOp: 128}
+        return ClassProfile{baseOps: 100.0, readRatio: 0.50, readLatencyUs: 1000.0, writeLatencyUs: 1000.0, bytesPerOp: 512}
+
+    # diurnal: `now_ms.wrapping_add(offset_ms) % period` then an exact
+    # integer triangle wave verbatim. The one honest, negligible
+    # divergence: `+` here wraps on overflow exactly like `wrapping_add`
+    # (this file's header, fact (b)), but for `now_ms`/`offset_ms`
+    # magnitudes that are real millisecond timestamps (nowhere near
+    # 2^63 ms, ~292 million years), that wrap is never reached in
+    # practice — the same category of "real but astronomically remote"
+    # divergence `fabric_routing.fct`'s own header already flags rather
+    # than defends against, not a fake gap.
+    proc diurnal(nowMs: int, periodMs: int, offsetMs: int) -> float:
+        let mut period = periodMs
+        if period < 1:
+            period = 1
+        let position = (nowMs + offsetMs) % period
+        let phase = toFloat(position) / toFloat(period)
+        let raw = 2.0 * phase - 1.0
+        let triangle = 1.0 - abs(raw)
+        return 0.6 + 0.8 * triangle
+
+    # ============================================================
+    # DEMOS — each hand-traces this port against either the real Rust
+    # source's own logic (Fault/SimClock/ClassProfile/diurnal) or a
+    # reference sequence independently computed from rng.rs's own exact
+    # algorithm (Rng) — see this file's header for how that reference was
+    # produced. `floatApproxEquals` mirrors `fabric_ml.fct`'s own helper
+    # of the same name/epsilon.
+    # ============================================================
+    proc floatApproxEquals(a: float, b: float) -> bool:
+        let diff = abs(a - b)
+        return diff < 0.0000001
+
+    state demoSimClockResult: bool = false
+
+    # demoSimClock: `SimClock::new(1000, 250)` then three `advance()`
+    # calls — `now_ms` = 1000 + n*250 at each step, `tick_ms(0)` clamps to
+    # 1 (`SimClock::new(0, 0)`).
+    proc demoSimClock() -> bool:
+        let c0 = do simClockNew(1000, 250)
+        let startOk = c0.startMs == 1000 && c0.tickMs == 250 && c0.ticks == 0
+        let a1 = do simClockAdvance(c0)
+        let a2 = do simClockAdvance(a1.clock)
+        let a3 = do simClockAdvance(a2.clock)
+        let seqOk = a1.nowMs == 1250 && a2.nowMs == 1500 && a3.nowMs == 1750 && a3.clock.ticks == 3
+        let zeroTick = do simClockNew(0, 0)
+        let clampOk = zeroTick.tickMs == 1 && zeroTick.startMs == 0
+        return startOk && seqOk && clampOk
+
+    state demoFaultResult: bool = false
+
+    # demoFault: one instance of each of the five variants, `label()` and
+    # `Display` checked against the exact strings fault.rs's own source
+    # produces for the same field values.
+    # Every `do Foo(args)` below is bound to its own fresh `let` and
+    # compared on a SEPARATE statement, never `let x = do Foo(args) ==
+    # "literal"` inline — confirmed against `storage.fct`'s own header
+    # ("`do ProcName(args)` may only appear as a bare fire-and-forget
+    # statement, or as the RHS of a FRESH `let name = do ProcName(args)`
+    # binding — never as a loop-body reassignment, and never nested
+    # inside another expression") and confirmed empirically against THIS
+    # `facet` binary: `let x = do Foo(args) == "literal"` fails to parse
+    # ("unexpected \")\" in expression"/"unexpected <name> in expression"
+    # depending on the literal), the same documented constraint, not a
+    # new gap.
+    proc demoFault() -> bool:
+        let n1 = do dbmsIdNew("n1")
+        let loss = do faultNodeLoss(n1)
+        let lossLabel = do faultLabel(loss)
+        let lossOk = lossLabel == "node-loss"
+        let lossDisplayText = do faultDisplay(loss)
+        let lossDisplayOk = lossDisplayText == "node 'n1' lost"
+        let recovery = do faultNodeRecovery(n1)
+        let recoveryLabel = do faultLabel(recovery)
+        let recoveryOk = recoveryLabel == "node-recovery"
+        let recoveryDisplayText = do faultDisplay(recovery)
+        let recoveryDisplayOk = recoveryDisplayText == "node 'n1' recovered"
+        let partition = do faultPartitionRegion("us-east")
+        let partitionLabel = do faultLabel(partition)
+        let partitionOk = partitionLabel == "partition"
+        let partitionDisplayText = do faultDisplay(partition)
+        let partitionDisplayOk = partitionDisplayText == "region 'us-east' partitioned from the Fabric"
+        let heal = do faultHealRegion("us-east")
+        let healLabel = do faultLabel(heal)
+        let healOk = healLabel == "heal"
+        let healDisplayText = do faultDisplay(heal)
+        let healDisplayOk = healDisplayText == "region 'us-east' rejoined the Fabric"
+        let target = do actionTargetNew(3, Coordinate{x: 7, y: 2})
+        let hot = do faultHotShard(target, 2.5, 4000)
+        let hotLabel = do faultLabel(hot)
+        let hotOk = hotLabel == "hot-shard"
+        let hotDisplayText = do faultDisplay(hot)
+        let hotDisplayOk = hotDisplayText == "shard 3 (7,2) running 2.5x for 4000ms"
+        return lossOk && lossDisplayOk && recoveryOk && recoveryDisplayOk && partitionOk && partitionDisplayOk && healOk && healDisplayOk && hotOk && hotDisplayOk
+
+    state demoRngSeed42SequenceResult: bool = false
+
+    # demoRngSeed42Sequence: `Rng::new(42)`, five `next_u64()` draws,
+    # compared against the independently computed reference sequence (see
+    # this file's header) — the fifth draw (`16015981125662989062`
+    # unsigned, `-2430762948046562554` as this language's signed `int`)
+    # has its top bit set, the exact case `shiftRightLogical64` and this
+    # file's header fact (c) exist for.
+    proc demoRngSeed42Sequence() -> bool:
+        let r0 = do rngNew(42)
+        let d1 = do rngNextU64(r0)
+        let d2 = do rngNextU64(d1.rng)
+        let d3 = do rngNextU64(d2.rng)
+        let d4 = do rngNextU64(d3.rng)
+        let d5 = do rngNextU64(d4.rng)
+        let v1Ok = d1.value == 2949826092126892291
+        let v2Ok = d2.value == 5139283748462763858
+        let v3Ok = d3.value == 6349198060258255764
+        let v4Ok = d4.value == 701532786141963250
+        let v5Ok = d5.value == -2430762948046562554
+        return v1Ok && v2Ok && v3Ok && v4Ok && v5Ok
+
+    state demoRngSameSeedSameSequenceResult: bool = false
+
+    # demoRngSameSeedSameSequence: `the_same_seed_gives_the_same_sequence`
+    # verbatim — two independent `Rng::new(42)` streams, 1000 draws each,
+    # every draw must match.
+    proc demoRngSameSeedSameSequence() -> bool:
+        let a0 = do rngNew(42)
+        let b0 = do rngNew(42)
+        let mut a = a0
+        let mut b = b0
+        let mut allMatch = true
+        let mut i = 0
+        loop i < 1000:
+            let da = do rngNextU64(a)
+            let db = do rngNextU64(b)
+            if da.value != db.value:
+                allMatch = false
+            a = da.rng
+            b = db.rng
+            i = i + 1
+        return allMatch
+
+    state demoRngDifferentSeedsDivergeResult: bool = false
+
+    # demoRngDifferentSeedsDiverge: `different_seeds_diverge_immediately`
+    # verbatim, cross-checked against the reference sequence's own
+    # seed-1/seed-2 first-draw values too.
+    proc demoRngDifferentSeedsDiverge() -> bool:
+        let ra = do rngNew(1)
+        let rb = do rngNew(2)
+        let da = do rngNextU64(ra)
+        let db = do rngNextU64(rb)
+        let referenceOk = da.value == -1612297016619662647 && db.value == -4627371582388691390
+        return da.value != db.value && referenceOk
+
+    state demoRngFloatsStayInUnitIntervalResult: bool = false
+
+    # demoRngFloatsStayInUnitInterval: `floats_stay_in_the_unit_interval`
+    # verbatim (10,000 draws from seed 7, every value in `[0.0, 1.0)`),
+    # plus the reference sequence's own first five seed-7 values compared
+    # exactly.
+    proc demoRngFloatsStayInUnitInterval() -> bool:
+        let r0 = do rngNew(7)
+        let f1 = do rngNextF64(r0)
+        let f2 = do rngNextF64(f1.rng)
+        let f3 = do rngNextF64(f2.rng)
+        let f4 = do rngNextF64(f3.rng)
+        let f5 = do rngNextF64(f4.rng)
+        let ref1 = do floatApproxEquals(f1.value, 0.9237001069304558)
+        let ref2 = do floatApproxEquals(f2.value, 0.995512885175621)
+        let ref3 = do floatApproxEquals(f3.value, 0.43603040534905735)
+        let ref4 = do floatApproxEquals(f4.value, 0.1486813431554158)
+        let ref5 = do floatApproxEquals(f5.value, 0.03193655805714979)
+        let mut rng = f5.rng
+        let mut inRange = true
+        let mut i = 0
+        loop i < 10000:
+            let drawn = do rngNextF64(rng)
+            if drawn.value < 0.0 || drawn.value >= 1.0:
+                inRange = false
+            rng = drawn.rng
+            i = i + 1
+        return ref1 && ref2 && ref3 && ref4 && ref5 && inRange
+
+    state demoRngBelowResult: bool = false
+
+    # demoRngBelow: seed 42, four draws discarded, the 5th draw
+    # (`16015981125662989062` unsigned — top bit set, same draw
+    # `demoRngSeed42Sequence` already isolates) fed into `below(1000)`.
+    # The reference computation (real Python arbitrary-precision `%`, no
+    # sign ambiguity) gives `62` — the value `unsignedMod64` must
+    # reproduce despite the raw draw being negative as this language's
+    # signed `int`.
+    proc demoRngBelow() -> bool:
+        let r0 = do rngNew(42)
+        let d1 = do rngNextU64(r0)
+        let d2 = do rngNextU64(d1.rng)
+        let d3 = do rngNextU64(d2.rng)
+        let d4 = do rngNextU64(d3.rng)
+        let belowOutcome = do rngBelow(d4.rng, 1000)
+        let zero = do rngBelow(d4.rng, 0)
+        return belowOutcome.value == 62 && zero.value == 0
+
+    state demoRngRangeResult: bool = false
+
+    # demoRngRange: `Rng::new(99).range(10.0, 20.0)` first draw, reference
+    # value `18.1170249885434`.
+    proc demoRngRange() -> bool:
+        let r0 = do rngNew(99)
+        let drawn = do rngRange(r0, 10.0, 20.0)
+        let ok = do floatApproxEquals(drawn.value, 18.1170249885434)
+        return ok
+
+    state demoRngChanceResult: bool = false
+
+    # demoRngChance: `Rng::new(5)`'s first `next_f64()` is
+    # `0.5575480192032958`, so `chance(0.5)` must be false (the value is
+    # not `< 0.5`) and `chance(0.6)` must be true.
+    proc demoRngChance() -> bool:
+        let r0 = do rngNew(5)
+        let low = do rngChance(r0, 0.5)
+        let high = do rngChance(r0, 0.6)
+        return low.value == false && high.value == true
+
+    state demoRngForkResult: bool = false
+
+    # demoRngFork: `Rng::new(42).fork()` — the parent's post-draw state
+    # (`4354685564936845396`), the child's freshly-seeded state
+    # (`-5271293442898752234`), and the child's own first draw
+    # (`5113007443819495584`), all from the independently computed
+    # reference.
+    proc demoRngFork() -> bool:
+        let r0 = do rngNew(42)
+        let outcome = do rngFork(r0)
+        let parentOk = outcome.rng.state == 4354685564936845396
+        let childSeedOk = outcome.forked.state == -5271293442898752234
+        let childDraw = do rngNextU64(outcome.forked)
+        let childDrawOk = childDraw.value == 5113007443819495584
+        return parentOk && childSeedOk && childDrawOk
+
+    state demoClassProfileResult: bool = false
+
+    # demoClassProfile: all seven arms' `base_ops`/`read_ratio`/
+    # `*_latency_us`/`bytes_per_op` checked against workload.rs's own
+    # literals, plus `write_ratio()` for two of them.
+    proc demoClassProfile() -> bool:
+        let readHeavy = do classProfile("ReadHeavy")
+        let readHeavyOk = readHeavy.baseOps == 800.0 && readHeavy.readRatio == 0.92 && readHeavy.readLatencyUs == 400.0 && readHeavy.writeLatencyUs == 1200.0 && readHeavy.bytesPerOp == 512
+        let readHeavyWriteRatio = do classProfileWriteRatio(readHeavy)
+        let readHeavyWriteRatioOk = do floatApproxEquals(readHeavyWriteRatio, 0.08)
+        let writeHeavy = do classProfile("WriteHeavy")
+        let writeHeavyOk = writeHeavy.baseOps == 400.0 && writeHeavy.readRatio == 0.15 && writeHeavy.readLatencyUs == 900.0 && writeHeavy.writeLatencyUs == 2500.0 && writeHeavy.bytesPerOp == 1024
+        let mixed = do classProfile("Mixed")
+        let mixedOk = mixed.baseOps == 500.0 && mixed.readRatio == 0.55 && mixed.bytesPerOp == 768
+        let eventHeavy = do classProfile("EventHeavy")
+        let eventHeavyOk = eventHeavy.baseOps == 1200.0 && eventHeavy.readRatio == 0.35 && eventHeavy.bytesPerOp == 256
+        let media = do classProfile("Media")
+        let mediaOk = media.baseOps == 150.0 && media.readRatio == 0.85 && media.writeLatencyUs == 9000.0 && media.bytesPerOp == 65536
+        let realtime = do classProfile("Realtime")
+        let realtimeOk = realtime.baseOps == 2000.0 && realtime.readRatio == 0.60 && realtime.bytesPerOp == 128
+        let unknown = do classProfile("Unknown")
+        let unknownOk = unknown.baseOps == 100.0 && unknown.readRatio == 0.50 && unknown.readLatencyUs == 1000.0 && unknown.writeLatencyUs == 1000.0 && unknown.bytesPerOp == 512
+        let unknownWriteRatio = do classProfileWriteRatio(unknown)
+        let unknownWriteRatioOk = do floatApproxEquals(unknownWriteRatio, 0.50)
+        return readHeavyOk && readHeavyWriteRatioOk && writeHeavyOk && mixedOk && eventHeavyOk && mediaOk && realtimeOk && unknownOk && unknownWriteRatioOk
+
+    state demoDiurnalResult: bool = false
+
+    # demoDiurnal: four hand-computed points on the triangle wave —
+    # trough at `position == 0` (`0.6`), peak at `position == period/2`
+    # (`1.4`), the exact midpoint of the rising edge (`1.0`), and the
+    # offset wraparound (`now_ms + offset_ms == period`, wraps to position
+    # 0, so `0.6` again) — plus `period_ms == 0` clamped to 1.
+    proc demoDiurnal() -> bool:
+        let trough = do diurnal(0, 1000, 0)
+        let peak = do diurnal(500, 1000, 0)
+        let midRise = do diurnal(250, 1000, 0)
+        let wraps = do diurnal(999, 1000, 1)
+        let clamped = do diurnal(5, 0, 0)
+        let troughOk = do floatApproxEquals(trough, 0.6)
+        let peakOk = do floatApproxEquals(peak, 1.4)
+        let midRiseOk = do floatApproxEquals(midRise, 1.0)
+        let wrapsOk = do floatApproxEquals(wraps, 0.6)
+        let clampedOk = do floatApproxEquals(clamped, 0.6)
+        return troughOk && peakOk && midRiseOk && wrapsOk && clampedOk
+
+    action runFabricSimulatorBaseDemo():
+        let r1 = do demoSimClock()
+        let r2 = do demoFault()
+        let r3 = do demoRngSeed42Sequence()
+        let r4 = do demoRngSameSeedSameSequence()
+        let r5 = do demoRngDifferentSeedsDiverge()
+        let r6 = do demoRngFloatsStayInUnitInterval()
+        let r7 = do demoRngBelow()
+        let r8 = do demoRngRange()
+        let r9 = do demoRngChance()
+        let r10 = do demoRngFork()
+        let r11 = do demoClassProfile()
+        let r12 = do demoDiurnal()
+        demoSimClockResult = r1
+        demoFaultResult = r2
+        demoRngSeed42SequenceResult = r3
+        demoRngSameSeedSameSequenceResult = r4
+        demoRngDifferentSeedsDivergeResult = r5
+        demoRngFloatsStayInUnitIntervalResult = r6
+        demoRngBelowResult = r7
+        demoRngRangeResult = r8
+        demoRngChanceResult = r9
+        demoRngForkResult = r10
+        demoClassProfileResult = r11
+        demoDiurnalResult = r12

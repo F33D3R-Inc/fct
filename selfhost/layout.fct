@@ -21,9 +21,9 @@ app LayoutSelfHost:
     # of match cases. A layout's own body is a strictly WIDER grammar
     # (parser.go's real parseNodes switch also handles if/for/match/tabs/
     # overlay/popover/use/slot — every one of which spliceInto in
-    # internal/ast/slot.go recurses through, except Popover — see the note
-    # on that below, it is real and load-bearing, not an oversight in this
-    # port). Extending UiNode with fields for all of that would mean editing
+    # internal/ast/slot.go recurses through, popover included — see the
+    # note on that below). Extending UiNode with fields for all of that
+    # would mean editing
     # nodes.fct, which is off-limits, so this file declares its own real,
     # named struct — LayoutNode — wide enough for the kinds spliceInto
     # actually cares about, while still reusing every one of nodes.fct's
@@ -55,27 +55,22 @@ app LayoutSelfHost:
     # through — a real gap, flagged rather than silently approximated.
     #
     # ============================================================
-    # THE REAL GRAMMAR SUBTLETY THIS PORT FOUND
+    # THE REAL GRAMMAR SUBTLETY THIS PORT FOUND (since fixed upstream)
     # ============================================================
     # internal/ast/slot.go's spliceInto switch (read line by line) has cases
-    # for Slot, SlotRef, Modified, Box, Row, If, For, Overlay, Form, Use,
-    # Tabs, Match, and then `default: out = append(out, n)`. There is NO
-    # `case Popover` anywhere in that file, even though ast.Popover is a
-    # real, separate node type (internal/ast/ast.go, distinct from Overlay
-    # only in how it anchors visually) with its own `Body []Node`. A
-    # Popover therefore falls to `default` in the real, shipped compiler: it
-    # is appended to the output completely UNRECURSED, its original Body
-    # untouched. The consequence, traced against SpliceLayout's own rules:
-    # a `slot` written inside a `popover bind x:` block in a layout is never
-    # found by this traversal AT ALL — not spliced, not counted toward
-    # "exactly one slot", not flagged as "slot inside a for" even when the
-    # popover itself sits under a `for`. That is not a bug this port
-    # introduces; it is a real, load-bearing property of the actual Go
-    # traversal being ported, so `layoutSpliceIntoNodes` below reproduces it
-    # exactly (see its own `popover` branch): a popover node is pushed
-    # through completely unrecursed. Every one of the other listed kinds
-    # (Box/Row/If/For/Overlay/Use/Tabs/Match) IS ported here with real
-    # recursion, matching the switch exactly.
+    # for Slot, SlotRef, Modified, Box, Row, If, For, Overlay, Popover, Form,
+    # Use, Tabs, Match, and then `default: out = append(out, n)`. This port
+    # originally found NO `case Popover` in that file at all, even though
+    # ast.Popover is a real, separate node type (internal/ast/ast.go,
+    # distinct from Overlay only in how it anchors visually) with its own
+    # `Body []Node` — so a Popover fell to `default`, appended completely
+    # unrecursed, and a `slot` written inside a `popover bind x:` block in a
+    # layout was never found by this traversal at all. That real gap in the
+    # shipped Go compiler has SINCE BEEN FIXED (slot.go now has a real `case
+    # Popover:`, identical in shape to `case Overlay:`: recurse into
+    # `t.Body`, rebuild), and this port has been updated to match: every one
+    # of the listed kinds (Box/Row/If/For/Overlay/Popover/Use/Tabs/Match) IS
+    # ported here with real recursion, matching the switch exactly.
     #
     # ============================================================
     # NO CLOSURES: WHY THE SHAPE HERE DIFFERS FROM spliceInto's SIGNATURE
@@ -332,11 +327,9 @@ app LayoutSelfHost:
             let head = trim(head0s)
             let bindRaw = do nodeTrimPrefix(head, "bind ")
             let bindSrc = trim(bindRaw)
-            # Its children ARE parsed (needed so this node can be described/
-            # reconstructed faithfully — real ast.Popover really does carry
-            # a Body), but see this file's header note: layoutSpliceIntoNodes
-            # below deliberately never recurses INTO them, matching real
-            # spliceInto's missing `case Popover`.
+            # Its children are parsed and, per the header note above,
+            # layoutSpliceIntoNodes below now recurses into them too,
+            # matching real spliceInto's `case Popover:`.
             let kids = do layoutBlockNodes(texts, parents, lineIdx)
             return LayoutNode{kind: "popover", lineIdx: lineIdx, children: kids, segs: [], labelSegs: [], destSegs: [], condSrc: "", rangeSrc: "", bindSrc: bindSrc, useHeadSrc: "", slotName: "", matchExprSrc: "", tabs: [], cases: [], elseBody: [], hasElse: false}
         let isUse = do nodeHasPrefix(raw, "use ")
@@ -582,9 +575,7 @@ app LayoutSelfHost:
     # internal/ast/slot.go's spliceInto, ported as three independent
     # structural walks (see this file's header note on why: no closures in
     # fct). Each walks EXACTLY the node-kind set the real switch recurses
-    # through — Box/Row/If/For/Overlay/Use/Tabs/Match — and none of them
-    # ever look inside a `popover`'s children, matching the real missing
-    # `case Popover` exactly (see header).
+    # through — Box/Row/If/For/Overlay/Popover/Use/Tabs/Match.
     # ============================================================
 
     # layoutCountSlots: the total number of anonymous `slot` markers
@@ -601,7 +592,7 @@ app LayoutSelfHost:
             if nd.kind == "slot":
                 count = count + 1
             else:
-                let recurses = nd.kind == "box" || nd.kind == "row" || nd.kind == "if" || nd.kind == "for" || nd.kind == "overlay" || nd.kind == "use"
+                let recurses = nd.kind == "box" || nd.kind == "row" || nd.kind == "if" || nd.kind == "for" || nd.kind == "overlay" || nd.kind == "popover" || nd.kind == "use"
                 if recurses:
                     let c = do layoutCountSlots(nd.children)
                     count = count + c
@@ -614,10 +605,11 @@ app LayoutSelfHost:
                             let c1 = do layoutCountSlotsInCases(nd.cases)
                             let c2 = do layoutCountSlots(nd.elseBody)
                             count = count + c1 + c2
-                        # popover/text/link/slotref/unsupported: real
-                        # spliceInto never recurses into any of these
-                        # (popover per the header's real-gap note; the rest
-                        # because they are true leaves in the real Go AST).
+                        # text/link/slotref/unsupported: real spliceInto
+                        # never recurses into any of these — true leaves
+                        # in the real Go AST (popover now recurses above,
+                        # alongside box/row/if/for/overlay/use — see the
+                        # header, this is no longer a gap).
             i = i + 1
         return count
 
@@ -653,7 +645,7 @@ app LayoutSelfHost:
             if nd.kind == "slotref":
                 found = true
             else:
-                let recurses = nd.kind == "box" || nd.kind == "row" || nd.kind == "if" || nd.kind == "for" || nd.kind == "overlay" || nd.kind == "use"
+                let recurses = nd.kind == "box" || nd.kind == "row" || nd.kind == "if" || nd.kind == "for" || nd.kind == "overlay" || nd.kind == "popover" || nd.kind == "use"
                 if recurses:
                     let r = do layoutUsesSlotRef(nd.children)
                     if r:
@@ -720,7 +712,7 @@ app LayoutSelfHost:
                     if r:
                         found = true
                 else:
-                    let recurses = nd.kind == "box" || nd.kind == "row" || nd.kind == "if" || nd.kind == "overlay" || nd.kind == "use"
+                    let recurses = nd.kind == "box" || nd.kind == "row" || nd.kind == "if" || nd.kind == "overlay" || nd.kind == "popover" || nd.kind == "use"
                     if recurses:
                         let r = do layoutSlotInLoopWalk(nd.children, inLoop)
                         if r:
@@ -845,14 +837,14 @@ app LayoutSelfHost:
                                     out = append(out, LayoutNode{kind: "overlay", lineIdx: nd.lineIdx, children: body, segs: [], labelSegs: [], destSegs: [], condSrc: "", rangeSrc: "", bindSrc: nd.bindSrc, useHeadSrc: "", slotName: "", matchExprSrc: "", tabs: [], cases: [], elseBody: [], hasElse: false})
                                 else:
                                     if nd.kind == "popover":
-                                        # Real gap, reproduced exactly (see
-                                        # this file's header): no `case
-                                        # Popover` in real spliceInto, so it
-                                        # falls to `default: out =
-                                        # append(out, n)` — pushed through
-                                        # completely unrecursed, its own
-                                        # children never walked or rebuilt.
-                                        out = append(out, nd)
+                                        # real slot.go now has `case Popover:`
+                                        # (added after this port was first
+                                        # written — see header), identical in
+                                        # shape to `case Overlay:` just above:
+                                        # recurse into its own Body and
+                                        # rebuild.
+                                        let body = do layoutSpliceIntoNodes(nd.children, view)
+                                        out = append(out, LayoutNode{kind: "popover", lineIdx: nd.lineIdx, children: body, segs: [], labelSegs: [], destSegs: [], condSrc: "", rangeSrc: "", bindSrc: nd.bindSrc, useHeadSrc: "", slotName: "", matchExprSrc: "", tabs: [], cases: [], elseBody: [], hasElse: false})
                                     else:
                                         if nd.kind == "use":
                                             let body = do layoutSpliceIntoNodes(nd.children, view)

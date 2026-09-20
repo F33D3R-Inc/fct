@@ -1,0 +1,919 @@
+app FacetqlCliSelfHost:
+    # Self-hosting port of facetql/src/cli/error.rs (86L) and
+    # facetql/src/cli/output.rs (through its non-`render_routes` functions,
+    # ~230L) — both read in full before writing this file.
+    #
+    # ============================================================
+    # PART 1 — error.rs: `CliError`, verified against its own real tests
+    # ============================================================
+    # `cargo test --bin facetql cli::error` (this crate has no library
+    # target — `mod cli` is declared in main.rs, not lib.rs, confirmed by
+    # reading Cargo.toml/lib.rs/main.rs directly, so `--lib` finds 0 tests
+    # while `--bin facetql` finds the real 3) was run for real and passed:
+    #   test cli::error::tests::api_error_empty_body ... ok
+    #   test cli::error::tests::exit_codes_are_distinct_and_nonzero ... ok
+    #   test cli::error::tests::api_error_trims_and_formats ... ok
+    # confirming the exact shape given at task start: `MissingToken`,
+    # `InvalidInput(String)`, `Request(String)`, `Api{status:u16,
+    # message:String}`, `Aborted`, in that order, with exit codes 2/2/1/1/3
+    # and `api()`'s trim-on-construction.
+    #
+    # This language has no payload-carrying enum. `CliError` is restated
+    # using the exact convention `fabric_optimizer.fct`'s own header
+    # establishes for a Rust "enum with named, payload-carrying variants":
+    # one struct, a `kind: text` tag naming the variant, and one field per
+    # DISTINCT payload type any variant carries (`message: text` for
+    # `InvalidInput`/`Request`/`Api`, `status: int` for `Api` alone) — every
+    # field always present on every value, only the ones the matching
+    # `kind` actually uses are meaningful, exactly as `OptimizationAction`
+    # does for `target`/`coordinate`.
+    #
+    # `trim(s)` (this language's builtin, confirmed against runtime/eval.go:
+    # `case "trim": return strings.TrimSpace(toStr(arg(0)))`) is Unicode
+    # whitespace trimming from both ends — the same class of guarantee
+    # Rust's `str::trim()` makes (both trim the same Unicode `White_Space`
+    # set from both ends). `cliErrorApi` below calls it directly, matching
+    # `CliError::api`'s own `message.trim().to_string()` exactly — not an
+    # approximation.
+    struct CliError:
+        kind: text
+        message: text
+        status: int
+
+    proc cliErrorMissingToken() -> CliError:
+        return CliError{kind: "MissingToken", message: "", status: 0}
+
+    proc cliErrorInvalidInput(msg: text) -> CliError:
+        return CliError{kind: "InvalidInput", message: msg, status: 0}
+
+    proc cliErrorRequest(msg: text) -> CliError:
+        return CliError{kind: "Request", message: msg, status: 0}
+
+    # cliErrorApi: `CliError::api` verbatim — trims the server's response
+    # body at construction, same as the real constructor (never at
+    # display-time), so a `CliError` built this way already carries the
+    # trimmed message everywhere it is read.
+    proc cliErrorApi(status: int, message: text) -> CliError:
+        let trimmed = trim(message)
+        return CliError{kind: "Api", message: trimmed, status: status}
+
+    proc cliErrorAborted() -> CliError:
+        return CliError{kind: "Aborted", message: "", status: 0}
+
+    # cliErrorExitCode: `CliError::exit_code` verbatim, same variant order
+    # and same three exit codes (2/1/3).
+    proc cliErrorExitCode(e: CliError) -> int:
+        if e.kind == "MissingToken" || e.kind == "InvalidInput":
+            return 2
+        if e.kind == "Request" || e.kind == "Api":
+            return 1
+        if e.kind == "Aborted":
+            return 3
+        return 1
+
+    # cliErrorDisplay: the `Display` impl verbatim, including the exact
+    # wording and the em dash in `MissingToken`'s message, and `Api`'s own
+    # empty-vs-nonempty-message branch.
+    proc cliErrorDisplay(e: CliError) -> text:
+        if e.kind == "MissingToken":
+            return "no admin token provided — pass --token or set FACETQL_TOKEN"
+        if e.kind == "InvalidInput":
+            return e.message
+        if e.kind == "Request":
+            return e.message
+        if e.kind == "Api":
+            if e.message == "":
+                return "server returned HTTP " + e.status
+            return "server returned HTTP " + e.status + ": " + e.message
+        if e.kind == "Aborted":
+            return "aborted"
+        return ""
+
+    # ============================================================
+    # PART 2 — output.rs: the 8 pure `Value -> String` functions.
+    # `render_routes` is EXPLICITLY OUT OF SCOPE (not silently dropped): it
+    # takes `&[crate::api::routes::RouteSpec]`, which is unported this
+    # session, and this file does not invent a stand-in for it.
+    #
+    # ============================================================
+    # SCOPING DECISION — why purpose-built structs, not a generic Value
+    # ============================================================
+    # This codebase has no generic/dynamic JSON `Value` type (confirmed
+    # across 50+ files ported this session, same conclusion this task's own
+    # brief already states) and none is invented here. Every real function
+    # below reads a KNOWN, BOUNDED set of fields from its `&Value` argument
+    # — `render_node` reads exactly address/kind/owner/visibility/
+    # claimed_by/coordinate/data and nothing else, `render_users` reads
+    # exactly owner/role, `render_indexes` reads exactly name/kind/field/
+    # mode, `render_references` reads exactly name/kind/field/parent_kind/
+    # parent_field/on_delete — so each gets its own real, named
+    # `struct X: field: type` matching that exact shape, the same choice
+    # `fabric_cli_render.fct`'s own `StatusSummary`/`PredictionRow`/
+    # `NodeRow`/`ValidationIssue` already made for the analogous
+    # `render.rs`. This is a root solution, not a narrowing: nothing this
+    # file's functions read is left unmodeled, and nothing not read is
+    # fabricated.
+    #
+    # THE "-" DEFAULT, PRESERVED EXACTLY: every field these functions read
+    # via `.get(k).and_then(Value::as_str).unwrap_or(fallback)` — call this
+    # `field`/`cell` in the real source — treats an ABSENT key, an EXPLICIT
+    # JSON `null`, and a PRESENT-BUT-NON-STRING value identically: all
+    # three collapse to `None` (`Value::as_str` returns `None` for
+    # anything but a string, `null` included), so all three render as the
+    # fallback. That three-way collapse is restated here as a single
+    # `hasX: bool` / `x: text` pair per field (`hasX` false covers all
+    # three real cases at once, exactly as the real closure already does),
+    # resolved at render time by the shared `textOrDefault(has, value,
+    # fallback)` helper below — one proc standing in for both `field`
+    # (always falls back to "-") and `cell` (a configurable fallback,
+    # "ordered" for `render_indexes`' MODE column), since the real source's
+    # two closures are themselves the same one-liner with a different
+    # fallback argument.
+    #
+    # ONE FIELD GENUINELY NEEDS A THREE-WAY SPLIT, NOT A COLLAPSE:
+    # `visibility()` and `role_str()` are NOT `field`/`cell` — they
+    # distinguish "present as a JSON string" (cloned verbatim) from
+    # "present as anything else" (`other.to_string()` — a JSON
+    # re-serialization of whatever the value is) from "absent" ("-"), and
+    # a non-string present value is NOT defaulted away, unlike everywhere
+    # else in this file. Restated as `hasX: bool` / `xIsString: bool` /
+    # `xText: text`: the branch structure (present+string / present+other
+    # / absent) is ported for real in `visibilityText`/`roleStr` below;
+    # the sub-problem of turning an arbitrary non-string JSON value into
+    # its own JSON text (`other.to_string()`) is the same documented,
+    # already-established generic-serializer gap this session's other
+    # files hit (`fabric_cli_render.fct`'s header on why the `json: bool`
+    # branches were dropped) — so the caller is required to supply that
+    # text already computed, exactly as `NodeRecord.coordinateText` below
+    # does for the one genuinely-arbitrary-shaped field (`coordinate`).
+    #
+    # `coordinate` ITSELF (render_node's `if let Some(coord) = ... { {} }`
+    # line) is the other place a real, unbounded JSON value shows up. It is
+    # modeled as `hasCoordinate: bool` / `coordinateText: text`, where
+    # `coordinateText` is the EXACT compact JSON text `coord`'s `Display`
+    # impl would already print (serde_json::Value's `Display` is always
+    # compact, never pretty — confirmed against serde_json's own docs —
+    # so this is not a narrowing versus the real human-readable render,
+    # which is already compact there too). `hasCoordinate` mirrors `Some`
+    # vs `None` exactly (unlike the `field`/`cell` fields, a `null`
+    # coordinate still counts as `Some` and still prints a line — restated
+    # faithfully, not collapsed to the `field`-style three-way default).
+    #
+    # ============================================================
+    # json_pretty — SCOPING DECISION, stated explicitly per this task's
+    # own instruction, not silently narrowed
+    # ============================================================
+    # The real `json_pretty(value: &Value) -> String` is ONE function
+    # polymorphic over any JSON shape (`serde_json::to_string_pretty`).
+    # With no generic Value/serializer in this language (the same
+    # confirmed, named gap as above), the honest port is not one
+    # polymorphic function but one MONOMORPHIC pretty-printer per
+    # purpose-built struct this file already owns — `jsonPrettyNode`/
+    # `jsonPrettyNodes`/`jsonPrettyUsers`/`jsonPrettyIndexes`/
+    # `jsonPrettyReferences` — each a real, working 2-space-indent JSON
+    # encoder (not a stub) for its own bounded, known shape, the same
+    # "hand-written encoder for a closed set of shapes I own outright, not
+    # a generic serializer" choice `fabric_protocol.fct`'s own header
+    # already made and justified for its wire messages. Two real, named
+    # divergences from byte-exact `serde_json::to_string_pretty`, neither
+    # exercised by the real `json_pretty_is_valid_json` test (which only
+    # checks round-trip validity of a small fixture, not exact formatting):
+    #   1. `coordinate`'s value is spliced in as its already-compact text
+    #      (see above) rather than recursively re-indented — real
+    #      `to_string_pretty` would indent a nested object at every level;
+    #      this keeps it on one line. Still valid JSON, just not
+    #      recursively pretty past that one field.
+    #   2. String escaping (`jsonEscapeText` below) covers `"`, `\`, and
+    #      the three control characters realistically present in this
+    #      file's own `data` field (a JSON-encoded blob that can contain
+    #      real newlines/tabs) — `\n`/`\r`/`\t` — a wider scope than
+    #      `fabric_protocol.fct`'s own narrower "only `"`/`\`" choice
+    #      because `data` is arbitrary stored JSON text, not a short
+    #      protocol identifier. Remaining control characters (` `-
+    #      `` minus those three) are NOT escaped: this language has
+    #      no codepoint/ordinal builtin (grepped `internal/parser/expr.go`'s
+    #      builtin list — no `ord`/`codePoint`/`charCode` of any kind), so
+    #      testing a `text` value for "is this some other control
+    #      character" cannot be done at all, only equality against a
+    #      specific known character. A real, confirmed, bounded gap, named
+    #      here rather than silently left unhandled.
+    # A future dedicated JSON-encoding pass, if undertaken for this
+    # directory, is the right place to close the generic-serializer gap
+    # for good — not something to fake per-function here.
+    # ============================================================
+
+    struct NodeRecord:
+        hasAddress: bool
+        address: text
+        hasKind: bool
+        kind: text
+        hasOwner: bool
+        owner: text
+        hasVisibility: bool
+        visibilityIsString: bool
+        visibilityText: text
+        hasClaimedBy: bool
+        claimedBy: text
+        hasCoordinate: bool
+        coordinateText: text
+        hasData: bool
+        data: text
+
+    struct UserRecord:
+        hasOwner: bool
+        owner: text
+        hasRole: bool
+        roleIsString: bool
+        roleText: text
+
+    struct IndexRecord:
+        hasName: bool
+        name: text
+        hasKind: bool
+        kind: text
+        hasField: bool
+        field: text
+        hasMode: bool
+        mode: text
+
+    struct ReferenceRecord:
+        hasName: bool
+        name: text
+        hasKind: bool
+        kind: text
+        hasField: bool
+        field: text
+        hasParentKind: bool
+        parentKind: text
+        hasParentField: bool
+        parentField: text
+        hasOnDelete: bool
+        onDelete: text
+
+    # ============================================================
+    # SHARED HELPERS — restated locally per this directory's own
+    # established convention (every file restates its own small helpers
+    # rather than importing across files for a handful of one-liners; see
+    # e.g. `facetql_metrics.fct`'s `hasPrefixText`).
+    # ============================================================
+
+    # textOrDefault: `field`/`cell` verbatim (the same one-liner closure,
+    # called with a different fallback argument at each real call site).
+    proc textOrDefault(has: bool, value: text, fallback: text) -> text:
+        if has:
+            return value
+        return fallback
+
+    # textPadRight: `{:<N}` — left-justify with spaces, minimum width,
+    # never truncates.
+    proc textPadRight(s: text, width: int) -> text:
+        let mut result = s
+        loop len(result) < width:
+            result = result + " "
+        return result
+
+    # visibilityText: `visibility()` verbatim over `NodeRecord`'s three-way
+    # field (see this file's header on the present+string / present+other
+    # / absent split).
+    proc visibilityText(n: NodeRecord) -> text:
+        if !n.hasVisibility:
+            return "-"
+        return n.visibilityText
+
+    # roleStr: `role_str()` verbatim, same three-way split, over
+    # `UserRecord`.
+    proc roleStr(u: UserRecord) -> text:
+        if !u.hasRole:
+            return "-"
+        return u.roleText
+
+    # ============================================================
+    # render_node / render_nodes
+    # ============================================================
+    proc renderNode(n: NodeRecord) -> text:
+        let addressText = do textOrDefault(n.hasAddress, n.address, "-")
+        let kindText = do textOrDefault(n.hasKind, n.kind, "-")
+        let ownerText = do textOrDefault(n.hasOwner, n.owner, "-")
+        let visibility = do visibilityText(n)
+        let claimedByText = do textOrDefault(n.hasClaimedBy, n.claimedBy, "-")
+        let dataText = do textOrDefault(n.hasData, n.data, "-")
+        let mut out = "address:    " + addressText + "\n"
+        out = out + "kind:       " + kindText + "\n"
+        out = out + "owner:      " + ownerText + "\n"
+        out = out + "visibility: " + visibility + "\n"
+        out = out + "claimed_by: " + claimedByText + "\n"
+        if n.hasCoordinate:
+            out = out + "coordinate: " + n.coordinateText + "\n"
+        out = out + "data:       " + dataText
+        return out
+
+    proc renderNodes(nodes: [NodeRecord]) -> text:
+        let n = len(nodes)
+        if n == 0:
+            return "(no rows)"
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + "\n---\n"
+            let one = do renderNode(nodes[i])
+            out = out + one
+            i = i + 1
+        out = out + "\n\n" + n + " row(s)"
+        return out
+
+    # ============================================================
+    # render_users
+    # ============================================================
+    proc renderUsers(users: [UserRecord]) -> text:
+        let n = len(users)
+        if n == 0:
+            return "(no users)"
+        let mut ownerWidth = 5
+        let mut i = 0
+        loop i < n:
+            let u = users[i]
+            if u.hasOwner:
+                if len(u.owner) > ownerWidth:
+                    ownerWidth = len(u.owner)
+            i = i + 1
+        let headerPad = do textPadRight("OWNER", ownerWidth)
+        let mut out = headerPad + "  ROLE\n"
+        i = 0
+        loop i < n:
+            let u = users[i]
+            let ownerText = do textOrDefault(u.hasOwner, u.owner, "-")
+            let roleText = do roleStr(u)
+            let ownerPadded = do textPadRight(ownerText, ownerWidth)
+            out = out + ownerPadded + "  " + roleText + "\n"
+            i = i + 1
+        out = out + "\n" + n + " user(s)"
+        return out
+
+    # ============================================================
+    # render_indexes — MODE column defaults a missing key to "ordered",
+    # not "-" (a server predating the ordered/text distinction only ever
+    # has ordered indexes, per the real source's own doc comment).
+    # ============================================================
+    proc renderIndexes(indexes: [IndexRecord]) -> text:
+        let n = len(indexes)
+        if n == 0:
+            return "(no indexes declared)"
+        let mut nameWidth = 4
+        let mut kindWidth = 4
+        let mut fieldWidth = 5
+        let mut i = 0
+        loop i < n:
+            let idx = indexes[i]
+            let nameText = do textOrDefault(idx.hasName, idx.name, "-")
+            let kindText = do textOrDefault(idx.hasKind, idx.kind, "-")
+            let fieldText = do textOrDefault(idx.hasField, idx.field, "-")
+            if len(nameText) > nameWidth:
+                nameWidth = len(nameText)
+            if len(kindText) > kindWidth:
+                kindWidth = len(kindText)
+            if len(fieldText) > fieldWidth:
+                fieldWidth = len(fieldText)
+            i = i + 1
+        let namePad = do textPadRight("NAME", nameWidth)
+        let kindPad = do textPadRight("KIND", kindWidth)
+        let fieldPad = do textPadRight("FIELD", fieldWidth)
+        let mut out = namePad + "  " + kindPad + "  " + fieldPad + "  MODE\n"
+        i = 0
+        loop i < n:
+            let idx = indexes[i]
+            let nameText = do textOrDefault(idx.hasName, idx.name, "-")
+            let kindText = do textOrDefault(idx.hasKind, idx.kind, "-")
+            let fieldText = do textOrDefault(idx.hasField, idx.field, "-")
+            let modeText = do textOrDefault(idx.hasMode, idx.mode, "ordered")
+            let namePadded = do textPadRight(nameText, nameWidth)
+            let kindPadded = do textPadRight(kindText, kindWidth)
+            let fieldPadded = do textPadRight(fieldText, fieldWidth)
+            out = out + namePadded + "  " + kindPadded + "  " + fieldPadded + "  " + modeText + "\n"
+            i = i + 1
+        out = out + "\n" + n + " index(es)"
+        return out
+
+    # ============================================================
+    # render_references — the rule as one arrow, `referenceRule` is the
+    # real source's own inline `rule` closure.
+    # ============================================================
+    proc referenceRule(r: ReferenceRecord) -> text:
+        let kindText = do textOrDefault(r.hasKind, r.kind, "-")
+        let fieldText = do textOrDefault(r.hasField, r.field, "-")
+        let parentKindText = do textOrDefault(r.hasParentKind, r.parentKind, "-")
+        let mut parent = parentKindText
+        if r.hasParentField:
+            parent = parentKindText + "." + r.parentField
+        return kindText + "." + fieldText + " -> " + parent
+
+    proc renderReferences(refs: [ReferenceRecord]) -> text:
+        let n = len(refs)
+        if n == 0:
+            return "(no references declared)"
+        let mut nameWidth = 4
+        let mut ruleWidth = 9
+        let mut i = 0
+        loop i < n:
+            let r = refs[i]
+            let nameText = do textOrDefault(r.hasName, r.name, "-")
+            let rule = do referenceRule(r)
+            if len(nameText) > nameWidth:
+                nameWidth = len(nameText)
+            if len(rule) > ruleWidth:
+                ruleWidth = len(rule)
+            i = i + 1
+        let namePad = do textPadRight("NAME", nameWidth)
+        let rulePad = do textPadRight("REFERENCE", ruleWidth)
+        let mut out = namePad + "  " + rulePad + "  ON DELETE\n"
+        i = 0
+        loop i < n:
+            let r = refs[i]
+            let nameText = do textOrDefault(r.hasName, r.name, "-")
+            let rule = do referenceRule(r)
+            let onDeleteText = do textOrDefault(r.hasOnDelete, r.onDelete, "-")
+            let namePadded = do textPadRight(nameText, nameWidth)
+            let rulePadded = do textPadRight(rule, ruleWidth)
+            out = out + namePadded + "  " + rulePadded + "  " + onDeleteText + "\n"
+            i = i + 1
+        out = out + "\n" + n + " reference(s)"
+        return out
+
+    # ============================================================
+    # json_pretty family — see this file's header for the scoping
+    # decision. `jsonEscapeText`/`jsonQuoted` are the real, working
+    # encoder primitives; `jsonJoinFields`/`jsonJoinArray` are the shared
+    # "assemble a 2-space-indented `{...}`/`[...]` from already-rendered
+    # `"key": value` / element fragments" primitives every per-struct
+    # pretty-printer below is built from.
+    # ============================================================
+    proc jsonEscapeText(s: text) -> text:
+        let n = len(s)
+        let mut i = 0
+        let mut out = ""
+        loop i < n:
+            let c = charAt(s, i)
+            if c == "\"":
+                out = out + "\\\""
+            else:
+                if c == "\\":
+                    out = out + "\\\\"
+                else:
+                    if c == "\n":
+                        out = out + "\\n"
+                    else:
+                        if c == "\r":
+                            out = out + "\\r"
+                        else:
+                            if c == "\t":
+                                out = out + "\\t"
+                            else:
+                                out = out + c
+            i = i + 1
+        return out
+
+    proc jsonQuoted(s: text) -> text:
+        let escaped = do jsonEscapeText(s)
+        return "\"" + escaped + "\""
+
+    # jsonJoinFields: assembles `{\n  "k": v,\n  "k2": v2\n}` (at the given
+    # base `indent`) from a list of already-rendered `"key": value`
+    # fragments, or the compact `{}` an empty object gets (matching
+    # serde_json's own empty-object pretty form).
+    proc jsonJoinFields(fields: [text], indent: text) -> text:
+        let n = len(fields)
+        if n == 0:
+            return "{}"
+        let mut out = "{\n"
+        let mut i = 0
+        loop i < n:
+            out = out + indent + "  " + fields[i]
+            if i < n - 1:
+                out = out + ","
+            out = out + "\n"
+            i = i + 1
+        out = out + indent + "}"
+        return out
+
+    proc jsonJoinArray(items: [text], indent: text) -> text:
+        let n = len(items)
+        if n == 0:
+            return "[]"
+        let mut out = "[\n"
+        let mut i = 0
+        loop i < n:
+            out = out + indent + "  " + items[i]
+            if i < n - 1:
+                out = out + ","
+            out = out + "\n"
+            i = i + 1
+        out = out + indent + "]"
+        return out
+
+    # jsonScalarField: `"key": value` for a plain always-string field
+    # (address/kind/owner/claimed_by/data/name/field/mode/parent_kind/
+    # parent_field/on_delete) that is simply omitted when absent —
+    # matching the real Value's own key presence exactly, since
+    # `json_pretty` serializes the RAW parsed value, not the
+    # human-rendering's defaulted-to-"-" text.
+    proc jsonScalarField(key: text, value: text) -> text:
+        let quoted = do jsonQuoted(value)
+        return "\"" + key + "\": " + quoted
+
+    # jsonThreeWayField: `"key": value` for a `visibility`/`role`-shaped
+    # field — quoted when the original value was a JSON string, emitted
+    # verbatim (already-valid JSON text, per this file's header) when it
+    # was some other JSON value.
+    proc jsonThreeWayField(key: text, isString: bool, text_: text) -> text:
+        if isString:
+            let quoted = do jsonQuoted(text_)
+            return "\"" + key + "\": " + quoted
+        return "\"" + key + "\": " + text_
+
+    proc jsonPrettyNodeAt(n: NodeRecord, indent: text) -> text:
+        let mut fields = []
+        if n.hasAddress:
+            let f = do jsonScalarField("address", n.address)
+            fields = append(fields, f)
+        if n.hasKind:
+            let f = do jsonScalarField("kind", n.kind)
+            fields = append(fields, f)
+        if n.hasOwner:
+            let f = do jsonScalarField("owner", n.owner)
+            fields = append(fields, f)
+        if n.hasVisibility:
+            let f = do jsonThreeWayField("visibility", n.visibilityIsString, n.visibilityText)
+            fields = append(fields, f)
+        if n.hasClaimedBy:
+            let f = do jsonScalarField("claimed_by", n.claimedBy)
+            fields = append(fields, f)
+        if n.hasCoordinate:
+            let f = "\"coordinate\": " + n.coordinateText
+            fields = append(fields, f)
+        if n.hasData:
+            let f = do jsonScalarField("data", n.data)
+            fields = append(fields, f)
+        let result = do jsonJoinFields(fields, indent)
+        return result
+
+    proc jsonPrettyNode(n: NodeRecord) -> text:
+        let result = do jsonPrettyNodeAt(n, "")
+        return result
+
+    proc jsonPrettyNodes(nodes: [NodeRecord]) -> text:
+        let n = len(nodes)
+        let mut items = []
+        let mut i = 0
+        loop i < n:
+            let item = do jsonPrettyNodeAt(nodes[i], "  ")
+            items = append(items, item)
+            i = i + 1
+        let result = do jsonJoinArray(items, "")
+        return result
+
+    proc jsonPrettyUserAt(u: UserRecord, indent: text) -> text:
+        let mut fields = []
+        if u.hasOwner:
+            let f = do jsonScalarField("owner", u.owner)
+            fields = append(fields, f)
+        if u.hasRole:
+            let f = do jsonThreeWayField("role", u.roleIsString, u.roleText)
+            fields = append(fields, f)
+        let result = do jsonJoinFields(fields, indent)
+        return result
+
+    proc jsonPrettyUsers(users: [UserRecord]) -> text:
+        let n = len(users)
+        let mut items = []
+        let mut i = 0
+        loop i < n:
+            let item = do jsonPrettyUserAt(users[i], "  ")
+            items = append(items, item)
+            i = i + 1
+        let result = do jsonJoinArray(items, "")
+        return result
+
+    proc jsonPrettyIndexAt(idx: IndexRecord, indent: text) -> text:
+        let mut fields = []
+        if idx.hasName:
+            let f = do jsonScalarField("name", idx.name)
+            fields = append(fields, f)
+        if idx.hasKind:
+            let f = do jsonScalarField("kind", idx.kind)
+            fields = append(fields, f)
+        if idx.hasField:
+            let f = do jsonScalarField("field", idx.field)
+            fields = append(fields, f)
+        if idx.hasMode:
+            let f = do jsonScalarField("mode", idx.mode)
+            fields = append(fields, f)
+        let result = do jsonJoinFields(fields, indent)
+        return result
+
+    proc jsonPrettyIndexes(indexes: [IndexRecord]) -> text:
+        let n = len(indexes)
+        let mut items = []
+        let mut i = 0
+        loop i < n:
+            let item = do jsonPrettyIndexAt(indexes[i], "  ")
+            items = append(items, item)
+            i = i + 1
+        let result = do jsonJoinArray(items, "")
+        return result
+
+    proc jsonPrettyReferenceAt(r: ReferenceRecord, indent: text) -> text:
+        let mut fields = []
+        if r.hasName:
+            let f = do jsonScalarField("name", r.name)
+            fields = append(fields, f)
+        if r.hasKind:
+            let f = do jsonScalarField("kind", r.kind)
+            fields = append(fields, f)
+        if r.hasField:
+            let f = do jsonScalarField("field", r.field)
+            fields = append(fields, f)
+        if r.hasParentKind:
+            let f = do jsonScalarField("parent_kind", r.parentKind)
+            fields = append(fields, f)
+        if r.hasParentField:
+            let f = do jsonScalarField("parent_field", r.parentField)
+            fields = append(fields, f)
+        if r.hasOnDelete:
+            let f = do jsonScalarField("on_delete", r.onDelete)
+            fields = append(fields, f)
+        let result = do jsonJoinFields(fields, indent)
+        return result
+
+    proc jsonPrettyReferences(refs: [ReferenceRecord]) -> text:
+        let n = len(refs)
+        let mut items = []
+        let mut i = 0
+        loop i < n:
+            let item = do jsonPrettyReferenceAt(refs[i], "  ")
+            items = append(items, item)
+            i = i + 1
+        let result = do jsonJoinArray(items, "")
+        return result
+
+    # ============================================================
+    # VERIFICATION DEMOS
+    # ============================================================
+    # CliError: restates all 3 real `cli::error::tests::*` cases, run live
+    # via `cargo test --bin facetql cli::error` before writing this file
+    # (3 passed, 0 failed — see this file's header).
+    proc demoExitCodesDistinct() -> bool:
+        let e1 = do cliErrorMissingToken()
+        let e2 = do cliErrorInvalidInput("x")
+        let e3 = do cliErrorRequest("x")
+        let e4 = do cliErrorApi(500, "x")
+        let e5 = do cliErrorAborted()
+        let c1 = do cliErrorExitCode(e1)
+        let c2 = do cliErrorExitCode(e2)
+        let c3 = do cliErrorExitCode(e3)
+        let c4 = do cliErrorExitCode(e4)
+        let c5 = do cliErrorExitCode(e5)
+        return c1 == 2 && c2 == 2 && c3 == 1 && c4 == 1 && c5 == 3
+
+    proc demoApiErrorTrimsAndFormats() -> bool:
+        let e = do cliErrorApi(404, "  node not found\n")
+        let s = do cliErrorDisplay(e)
+        return s == "server returned HTTP 404: node not found"
+
+    proc demoApiErrorEmptyBody() -> bool:
+        let e = do cliErrorApi(403, "")
+        let s = do cliErrorDisplay(e)
+        return s == "server returned HTTP 403"
+
+    # render_node: restates `render_node_includes_key_fields` exactly —
+    # address/kind/owner present-string, visibility present-string
+    # ("Private"), claimed_by present-as-JSON-null (collapses to "-" via
+    # `hasClaimedBy: false`, same as absent), data present-string, no
+    # coordinate key at all.
+    proc demoRenderNodeIncludesKeyFields() -> bool:
+        let n = NodeRecord{hasAddress: true, address: "pg_client_1", hasKind: true, kind: "Client", hasOwner: true, owner: "alice", hasVisibility: true, visibilityIsString: true, visibilityText: "Private", hasClaimedBy: false, claimedBy: "", hasCoordinate: false, coordinateText: "", hasData: true, data: "{\"name\":\"Acme\"}"}
+        let out = do renderNode(n)
+        let hasAddr = contains(out, "address:    pg_client_1")
+        let hasKind = contains(out, "kind:       Client")
+        let hasOwner = contains(out, "owner:      alice")
+        let hasVis = contains(out, "visibility: Private")
+        let hasData = contains(out, "data:       {\"name\":\"Acme\"}")
+        return hasAddr && hasKind && hasOwner && hasVis && hasData
+
+    # Additional hand-trace (no direct real test covers a present
+    # `coordinate` key): a node with every field present, including a
+    # nested coordinate object, prints all 7 lines in order.
+    proc demoRenderNodeAllFieldsPresent() -> bool:
+        let n = NodeRecord{hasAddress: true, address: "pg_client_2", hasKind: true, kind: "Client", hasOwner: true, owner: "bob", hasVisibility: true, visibilityIsString: true, visibilityText: "Public", hasClaimedBy: true, claimedBy: "carol", hasCoordinate: true, coordinateText: "{\"x\":1,\"y\":2}", hasData: true, data: "{}"}
+        let out = do renderNode(n)
+        let hasCoordLine = contains(out, "coordinate: {\"x\":1,\"y\":2}")
+        let hasClaimed = contains(out, "claimed_by: carol")
+        let hasOwner = contains(out, "owner:      bob")
+        return hasCoordLine && hasClaimed && hasOwner
+
+    # Hand-trace for the "-" default and the absent-coordinate-omits-line
+    # behavior: every field absent.
+    proc demoRenderNodeAllFieldsAbsent() -> bool:
+        let n = NodeRecord{hasAddress: false, address: "", hasKind: false, kind: "", hasOwner: false, owner: "", hasVisibility: false, visibilityIsString: false, visibilityText: "", hasClaimedBy: false, claimedBy: "", hasCoordinate: false, coordinateText: "", hasData: false, data: ""}
+        let out = do renderNode(n)
+        let hasAddrDash = contains(out, "address:    -")
+        let hasVisDash = contains(out, "visibility: -")
+        let hasDataDash = contains(out, "data:       -")
+        let noCoordLine = !contains(out, "coordinate:")
+        return hasAddrDash && hasVisDash && hasDataDash && noCoordLine
+
+    proc demoRenderNodesEmptyIsNoRows() -> bool:
+        let empty = []
+        let out = do renderNodes(empty)
+        return out == "(no rows)"
+
+    proc demoRenderNodesCountsRows() -> bool:
+        let a = NodeRecord{hasAddress: true, address: "a", hasKind: true, kind: "K", hasOwner: true, owner: "o", hasVisibility: false, visibilityIsString: false, visibilityText: "", hasClaimedBy: false, claimedBy: "", hasCoordinate: false, coordinateText: "", hasData: false, data: ""}
+        let b = NodeRecord{hasAddress: true, address: "b", hasKind: true, kind: "K", hasOwner: true, owner: "o", hasVisibility: false, visibilityIsString: false, visibilityText: "", hasClaimedBy: false, claimedBy: "", hasCoordinate: false, coordinateText: "", hasData: false, data: ""}
+        let nodes = [a, b]
+        let out = do renderNodes(nodes)
+        let hasCount = contains(out, "2 row(s)")
+        let hasSep = contains(out, "---")
+        return hasCount && hasSep
+
+    proc demoRenderUsersAlignsAndCounts() -> bool:
+        let u1 = UserRecord{hasOwner: true, owner: "alice", hasRole: true, roleIsString: true, roleText: "User"}
+        let u2 = UserRecord{hasOwner: true, owner: "root", hasRole: true, roleIsString: true, roleText: "Admin"}
+        let users = [u1, u2]
+        let out = do renderUsers(users)
+        let hasHeader = contains(out, "OWNER")
+        let hasAlice = contains(out, "alice")
+        let hasAdmin = contains(out, "Admin")
+        let hasCount = contains(out, "2 user(s)")
+        return hasHeader && hasAlice && hasAdmin && hasCount
+
+    proc demoRenderUsersEmpty() -> bool:
+        let empty = []
+        let out = do renderUsers(empty)
+        return out == "(no users)"
+
+    # Hand-trace: a role present but not a JSON string (e.g. a bare
+    # number) — `role_str`'s "Some(other) => other.to_string()" branch.
+    # The caller pre-stringifies (see this file's header); the port
+    # itself still exercises the present+non-string branch, not the
+    # present+string one.
+    proc demoRoleNonStringValue() -> bool:
+        let u = UserRecord{hasOwner: true, owner: "svc", hasRole: true, roleIsString: false, roleText: "7"}
+        let s = do roleStr(u)
+        return s == "7"
+
+    proc demoVisibilityAbsentIsDash() -> bool:
+        let n = NodeRecord{hasAddress: false, address: "", hasKind: false, kind: "", hasOwner: false, owner: "", hasVisibility: false, visibilityIsString: false, visibilityText: "", hasClaimedBy: false, claimedBy: "", hasCoordinate: false, coordinateText: "", hasData: false, data: ""}
+        let v = do visibilityText(n)
+        return v == "-"
+
+    proc demoRenderIndexesAlignsAndCounts() -> bool:
+        let i1 = IndexRecord{hasName: true, name: "post_created", hasKind: true, kind: "Post", hasField: true, field: "created_at", hasMode: true, mode: "ordered"}
+        let i2 = IndexRecord{hasName: true, name: "s_exp", hasKind: true, kind: "__session", hasField: true, field: "_expires_unix", hasMode: true, mode: "ordered"}
+        let indexes = [i1, i2]
+        let out = do renderIndexes(indexes)
+        let hasName = contains(out, "NAME")
+        let hasKind = contains(out, "KIND")
+        let hasField = contains(out, "FIELD")
+        let hasPostCreated = contains(out, "post_created")
+        let hasExpires = contains(out, "_expires_unix")
+        let hasCount = contains(out, "2 index(es)")
+        return hasName && hasKind && hasField && hasPostCreated && hasExpires && hasCount
+
+    proc demoRenderIndexesDefaultsMissingModeToOrdered() -> bool:
+        let i1 = IndexRecord{hasName: true, name: "post_created", hasKind: true, kind: "Post", hasField: true, field: "created_at", hasMode: false, mode: ""}
+        let i2 = IndexRecord{hasName: true, name: "post_body", hasKind: true, kind: "Post", hasField: true, field: "body", hasMode: true, mode: "text"}
+        let indexes = [i1, i2]
+        let out = do renderIndexes(indexes)
+        let hasOrdered = contains(out, "ordered")
+        let hasText = contains(out, "text")
+        return hasOrdered && hasText
+
+    proc demoRenderIndexesEmpty() -> bool:
+        let empty = []
+        let out = do renderIndexes(empty)
+        return out == "(no indexes declared)"
+
+    proc demoRenderReferencesShowsRuleAsOneArrow() -> bool:
+        let r1 = ReferenceRecord{hasName: true, name: "post_comments", hasKind: true, kind: "Comment", hasField: true, field: "post", hasParentKind: true, parentKind: "Post", hasParentField: false, parentField: "", hasOnDelete: true, onDelete: "cascade"}
+        let r2 = ReferenceRecord{hasName: true, name: "author", hasKind: true, kind: "Post", hasField: true, field: "author_id", hasParentKind: true, parentKind: "User", hasParentField: true, parentField: "id", hasOnDelete: true, onDelete: "restrict"}
+        let refs = [r1, r2]
+        let out = do renderReferences(refs)
+        let hasArrow1 = contains(out, "Comment.post -> Post")
+        let hasArrow2 = contains(out, "Post.author_id -> User.id")
+        let hasCascade = contains(out, "cascade")
+        let hasRestrict = contains(out, "restrict")
+        let hasCount = contains(out, "2 reference(s)")
+        return hasArrow1 && hasArrow2 && hasCascade && hasRestrict && hasCount
+
+    proc demoRenderReferencesEmpty() -> bool:
+        let empty = []
+        let out = do renderReferences(empty)
+        return out == "(no references declared)"
+
+    # json_pretty family: structural hand-traces (no generic JSON parser
+    # in this language to round-trip through, so validity is checked by
+    # shape/content rather than by re-parsing — see this file's header).
+    proc demoJsonPrettyNodeStructure() -> bool:
+        let n = NodeRecord{hasAddress: true, address: "pg_client_1", hasKind: true, kind: "Client", hasOwner: true, owner: "alice", hasVisibility: true, visibilityIsString: true, visibilityText: "Private", hasClaimedBy: false, claimedBy: "", hasCoordinate: false, coordinateText: "", hasData: true, data: "{\"name\":\"Acme\"}"}
+        let out = do jsonPrettyNode(n)
+        let hasAddr = contains(out, "\"address\": \"pg_client_1\"")
+        let hasKind = contains(out, "\"kind\": \"Client\"")
+        let hasVis = contains(out, "\"visibility\": \"Private\"")
+        let hasData = contains(out, "\"data\": \"{\\\"name\\\":\\\"Acme\\\"}\"")
+        let noClaimedBy = !contains(out, "claimed_by")
+        let startsBrace = charAt(out, 0) == "{"
+        let endsBrace = charAt(out, len(out) - 1) == "}"
+        return hasAddr && hasKind && hasVis && hasData && noClaimedBy && startsBrace && endsBrace
+
+    proc demoJsonPrettyNodesIsArray() -> bool:
+        let a = NodeRecord{hasAddress: true, address: "a", hasKind: false, kind: "", hasOwner: false, owner: "", hasVisibility: false, visibilityIsString: false, visibilityText: "", hasClaimedBy: false, claimedBy: "", hasCoordinate: false, coordinateText: "", hasData: false, data: ""}
+        let b = NodeRecord{hasAddress: true, address: "b", hasKind: false, kind: "", hasOwner: false, owner: "", hasVisibility: false, visibilityIsString: false, visibilityText: "", hasClaimedBy: false, claimedBy: "", hasCoordinate: false, coordinateText: "", hasData: false, data: ""}
+        let nodes = [a, b]
+        let out = do jsonPrettyNodes(nodes)
+        let startsBracket = charAt(out, 0) == "["
+        let endsBracket = charAt(out, len(out) - 1) == "]"
+        let hasA = contains(out, "\"address\": \"a\"")
+        let hasB = contains(out, "\"address\": \"b\"")
+        return startsBracket && endsBracket && hasA && hasB
+
+    proc demoJsonPrettyEmptyCollections() -> bool:
+        let emptyUsers = []
+        let emptyUsersOut = do jsonPrettyUsers(emptyUsers)
+        let emptyIndexes = []
+        let emptyIndexesOut = do jsonPrettyIndexes(emptyIndexes)
+        let emptyRefs = []
+        let emptyRefsOut = do jsonPrettyReferences(emptyRefs)
+        return emptyUsersOut == "[]" && emptyIndexesOut == "[]" && emptyRefsOut == "[]"
+
+    state demoExitCodesDistinctResult: bool = false
+    state demoApiErrorTrimsAndFormatsResult: bool = false
+    state demoApiErrorEmptyBodyResult: bool = false
+    state demoRenderNodeIncludesKeyFieldsResult: bool = false
+    state demoRenderNodeAllFieldsPresentResult: bool = false
+    state demoRenderNodeAllFieldsAbsentResult: bool = false
+    state demoRenderNodesEmptyIsNoRowsResult: bool = false
+    state demoRenderNodesCountsRowsResult: bool = false
+    state demoRenderUsersAlignsAndCountsResult: bool = false
+    state demoRenderUsersEmptyResult: bool = false
+    state demoRoleNonStringValueResult: bool = false
+    state demoVisibilityAbsentIsDashResult: bool = false
+    state demoRenderIndexesAlignsAndCountsResult: bool = false
+    state demoRenderIndexesDefaultsMissingModeToOrderedResult: bool = false
+    state demoRenderIndexesEmptyResult: bool = false
+    state demoRenderReferencesShowsRuleAsOneArrowResult: bool = false
+    state demoRenderReferencesEmptyResult: bool = false
+    state demoJsonPrettyNodeStructureResult: bool = false
+    state demoJsonPrettyNodesIsArrayResult: bool = false
+    state demoJsonPrettyEmptyCollectionsResult: bool = false
+
+    action runDemoFacetqlCli():
+        let r1 = do demoExitCodesDistinct()
+        let r2 = do demoApiErrorTrimsAndFormats()
+        let r3 = do demoApiErrorEmptyBody()
+        let r4 = do demoRenderNodeIncludesKeyFields()
+        let r5 = do demoRenderNodeAllFieldsPresent()
+        let r6 = do demoRenderNodeAllFieldsAbsent()
+        let r7 = do demoRenderNodesEmptyIsNoRows()
+        let r8 = do demoRenderNodesCountsRows()
+        let r9 = do demoRenderUsersAlignsAndCounts()
+        let r10 = do demoRenderUsersEmpty()
+        let r11 = do demoRoleNonStringValue()
+        let r12 = do demoVisibilityAbsentIsDash()
+        let r13 = do demoRenderIndexesAlignsAndCounts()
+        let r14 = do demoRenderIndexesDefaultsMissingModeToOrdered()
+        let r15 = do demoRenderIndexesEmpty()
+        let r16 = do demoRenderReferencesShowsRuleAsOneArrow()
+        let r17 = do demoRenderReferencesEmpty()
+        let r18 = do demoJsonPrettyNodeStructure()
+        let r19 = do demoJsonPrettyNodesIsArray()
+        let r20 = do demoJsonPrettyEmptyCollections()
+        demoExitCodesDistinctResult = r1
+        demoApiErrorTrimsAndFormatsResult = r2
+        demoApiErrorEmptyBodyResult = r3
+        demoRenderNodeIncludesKeyFieldsResult = r4
+        demoRenderNodeAllFieldsPresentResult = r5
+        demoRenderNodeAllFieldsAbsentResult = r6
+        demoRenderNodesEmptyIsNoRowsResult = r7
+        demoRenderNodesCountsRowsResult = r8
+        demoRenderUsersAlignsAndCountsResult = r9
+        demoRenderUsersEmptyResult = r10
+        demoRoleNonStringValueResult = r11
+        demoVisibilityAbsentIsDashResult = r12
+        demoRenderIndexesAlignsAndCountsResult = r13
+        demoRenderIndexesDefaultsMissingModeToOrderedResult = r14
+        demoRenderIndexesEmptyResult = r15
+        demoRenderReferencesShowsRuleAsOneArrowResult = r16
+        demoRenderReferencesEmptyResult = r17
+        demoJsonPrettyNodeStructureResult = r18
+        demoJsonPrettyNodesIsArrayResult = r19
+        demoJsonPrettyEmptyCollectionsResult = r20
+
+    private view Home at "/facetql_cli":
+        box:
+            text "exitCodesDistinct={demoExitCodesDistinctResult} apiErrorTrimsAndFormats={demoApiErrorTrimsAndFormatsResult} apiErrorEmptyBody={demoApiErrorEmptyBodyResult}"
+            text "renderNodeIncludesKeyFields={demoRenderNodeIncludesKeyFieldsResult} renderNodeAllFieldsPresent={demoRenderNodeAllFieldsPresentResult} renderNodeAllFieldsAbsent={demoRenderNodeAllFieldsAbsentResult}"
+            text "renderNodesEmptyIsNoRows={demoRenderNodesEmptyIsNoRowsResult} renderNodesCountsRows={demoRenderNodesCountsRowsResult}"
+            text "renderUsersAlignsAndCounts={demoRenderUsersAlignsAndCountsResult} renderUsersEmpty={demoRenderUsersEmptyResult} roleNonStringValue={demoRoleNonStringValueResult} visibilityAbsentIsDash={demoVisibilityAbsentIsDashResult}"
+            text "renderIndexesAlignsAndCounts={demoRenderIndexesAlignsAndCountsResult} renderIndexesDefaultsMissingModeToOrdered={demoRenderIndexesDefaultsMissingModeToOrderedResult} renderIndexesEmpty={demoRenderIndexesEmptyResult}"
+            text "renderReferencesShowsRuleAsOneArrow={demoRenderReferencesShowsRuleAsOneArrowResult} renderReferencesEmpty={demoRenderReferencesEmptyResult}"
+            text "jsonPrettyNodeStructure={demoJsonPrettyNodeStructureResult} jsonPrettyNodesIsArray={demoJsonPrettyNodesIsArrayResult} jsonPrettyEmptyCollections={demoJsonPrettyEmptyCollectionsResult}"
