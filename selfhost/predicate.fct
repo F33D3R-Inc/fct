@@ -652,6 +652,282 @@ app PredicateSelfHost:
         demoOkResult = ok
         demoMatchResult = matched
 
+    # ============================================================
+    # GENERAL-PURPOSE SCENARIO SURFACE — one action, dispatching by name to
+    # a battery of hand-built (tree, row) fixtures, each verifying one
+    # specific real-predicate.rs behavior this port's own header claims to
+    # match: type-mismatch equality, `truthy`'s real special-casing (only
+    # Bool/Null, everything else — including 0 and "" — is true), missing-
+    # field reads as null, &&/|| short-circuiting the SIDE EFFECT of never
+    # surfacing an error the skipped branch would have raised, comparison's
+    # both-sides-numeric requirement, recursive arithmetic/string-concat
+    # evaluation (checked by wrapping the expression in `== <expected>` so
+    # valuesEqual actually calls evalNum/evalText on it — evalPredicateResult
+    # alone only reports TRUTHINESS, not a non-bool value, exactly like
+    # predicate.rs's own `truthy` never inspects a Number/String's payload
+    # either), division/modulo by zero, in/not-in set membership plus its
+    # 1000-element bound, and starts_with/ends_with/contains. This is the
+    # same "one action, dispatch by name" shape aggregate.fct would have
+    # needed had its own inputs not fit a flat text encoding — Node's real
+    # recursion makes a generic text format enough extra machinery (a whole
+    # second small parser) that per-scenario builder procs, the same
+    # convention demoPredicateTree/demoRow already established, are the
+    # right amount of code for what this task needs.
+    # ============================================================
+    proc emptyRow() -> [Field]:
+        return []
+
+    proc setNode(children: [Node]) -> Node:
+        return Node{kind: "set", name: "", op: "", numVal: 0.0, boolVal: false, textVal: "", children: children}
+
+    # -- scenario tree builders --------------------------------------
+
+    proc treeTypeMismatchNeverEqual() -> Node:
+        let a = do numNode(1.0)
+        let b = do textNode("1")
+        let t = do binNode("==", a, b)
+        return t
+
+    proc treeZeroIsTruthy() -> Node:
+        let t = do numNode(0.0)
+        return t
+
+    proc treeEmptyTextIsTruthy() -> Node:
+        let t = do textNode("")
+        return t
+
+    proc treeNullIsFalsy() -> Node:
+        let t = do nullNode()
+        return t
+
+    proc treeFieldAccessPresent() -> Node:
+        let ref1 = do refNode("item")
+        let g = do getNode(ref1, "status")
+        let lit = do textNode("active")
+        let t = do binNode("==", g, lit)
+        return t
+
+    proc rowFieldAccessPresent() -> [Field]:
+        let f = Field{name: "status", kind: "text", num: 0.0, text: "active", bool: false}
+        return [f]
+
+    proc treeFieldAccessMissingIsNull() -> Node:
+        let ref1 = do refNode("item")
+        let g = do getNode(ref1, "missing")
+        let n = do nullNode()
+        let t = do binNode("==", g, n)
+        return t
+
+    proc treeAndShortCircuitsRight() -> Node:
+        let f = do boolNode(false)
+        let one = do numNode(1.0)
+        let zero = do numNode(0.0)
+        let divByZero = do binNode("/", one, zero)
+        let t = do binNode("&&", f, divByZero)
+        return t
+
+    proc treeOrShortCircuitsRight() -> Node:
+        let tr = do boolNode(true)
+        let one = do numNode(1.0)
+        let zero = do numNode(0.0)
+        let divByZero = do binNode("/", one, zero)
+        let t = do binNode("||", tr, divByZero)
+        return t
+
+    proc treeComparisonRequiresNumericBothSides() -> Node:
+        let five = do textNode("5")
+        let three = do numNode(3.0)
+        let t = do binNode(">", five, three)
+        return t
+
+    proc treeGreaterThanNumeric() -> Node:
+        let five = do numNode(5.0)
+        let three = do numNode(3.0)
+        let t = do binNode(">", five, three)
+        return t
+
+    proc treeArithmeticPrecedenceViaEquality() -> Node:
+        let two = do numNode(2.0)
+        let three = do numNode(3.0)
+        let mul = do binNode("*", two, three)
+        let one = do numNode(1.0)
+        let add = do binNode("+", one, mul)
+        let seven = do numNode(7.0)
+        let t = do binNode("==", add, seven)
+        return t
+
+    proc treeStringConcatCorrectValue() -> Node:
+        let foo = do textNode("foo")
+        let bar = do textNode("bar")
+        let cat = do binNode("+", foo, bar)
+        let foobar = do textNode("foobar")
+        let t = do binNode("==", cat, foobar)
+        return t
+
+    proc treeDivisionByZeroIsError() -> Node:
+        let one = do numNode(1.0)
+        let zero = do numNode(0.0)
+        let div = do binNode("/", one, zero)
+        let nines = do numNode(999.0)
+        let t = do binNode("==", div, nines)
+        return t
+
+    proc treeModuloByZeroIsError() -> Node:
+        let one = do numNode(1.0)
+        let zero = do numNode(0.0)
+        let m = do binNode("%", one, zero)
+        let zero2 = do numNode(0.0)
+        let t = do binNode("==", m, zero2)
+        return t
+
+    proc treeInSetMembership() -> Node:
+        let n1 = do numNode(1.0)
+        let n2 = do numNode(2.0)
+        let n3 = do numNode(3.0)
+        let set = do setNode([n1, n2, n3])
+        let two = do numNode(2.0)
+        let t = do binNode("in", two, set)
+        return t
+
+    proc treeNotInSetMembership() -> Node:
+        let n1 = do numNode(1.0)
+        let n2 = do numNode(2.0)
+        let n3 = do numNode(3.0)
+        let set = do setNode([n1, n2, n3])
+        let five = do numNode(5.0)
+        let t = do binNode("not in", five, set)
+        return t
+
+    # treeInSetSizeLimitExceeded: 1001 elements — one past evalBinKind's own
+    # `if len(r.children) > 1000: return "error"` bound.
+    proc treeInSetSizeLimitExceeded() -> Node:
+        let mut children = []
+        let mut i = 0
+        loop i < 1001:
+            let iFloat = toFloat(i)
+            let n = do numNode(iFloat)
+            children = append(children, n)
+            i = i + 1
+        let set = do setNode(children)
+        let zero = do numNode(0.0)
+        let t = do binNode("in", zero, set)
+        return t
+
+    proc treeStartsWith() -> Node:
+        let hay = do textNode("hello world")
+        let needle = do textNode("hello")
+        let t = do binNode("starts_with", hay, needle)
+        return t
+
+    proc treeEndsWith() -> Node:
+        let hay = do textNode("hello world")
+        let needle = do textNode("world")
+        let t = do binNode("ends_with", hay, needle)
+        return t
+
+    proc treeContains() -> Node:
+        let hay = do textNode("hello world")
+        let needle = do textNode("lo wo")
+        let t = do binNode("contains", hay, needle)
+        return t
+
+    # -- dispatch ------------------------------------------------------
+
+    proc scenarioOk(name: text) -> bool:
+        let row = do emptyRow()
+        if name == "fieldAccessPresent":
+            let r2 = do rowFieldAccessPresent()
+            let t2 = do treeFieldAccessPresent()
+            let ok2 = do evalPredicateOk(r2, "item", t2)
+            return ok2
+        let tree = do scenarioTree(name)
+        let ok = do evalPredicateOk(row, "item", tree)
+        return ok
+
+    proc scenarioResult(name: text) -> bool:
+        let row = do emptyRow()
+        if name == "fieldAccessPresent":
+            let r2 = do rowFieldAccessPresent()
+            let t2 = do treeFieldAccessPresent()
+            let result2 = do evalPredicateResult(r2, "item", t2)
+            return result2
+        let tree = do scenarioTree(name)
+        let result = do evalPredicateResult(row, "item", tree)
+        return result
+
+    # scenarioTree: every scenario whose row is empty — pulled into one
+    # shared dispatch so scenarioOk/scenarioResult don't each repeat the
+    # same 18-way name match twice.
+    proc scenarioTree(name: text) -> Node:
+        if name == "typeMismatchNeverEqual":
+            let t = do treeTypeMismatchNeverEqual()
+            return t
+        if name == "zeroIsTruthy":
+            let t = do treeZeroIsTruthy()
+            return t
+        if name == "emptyTextIsTruthy":
+            let t = do treeEmptyTextIsTruthy()
+            return t
+        if name == "nullIsFalsy":
+            let t = do treeNullIsFalsy()
+            return t
+        if name == "fieldAccessMissingIsNull":
+            let t = do treeFieldAccessMissingIsNull()
+            return t
+        if name == "andShortCircuitsRight":
+            let t = do treeAndShortCircuitsRight()
+            return t
+        if name == "orShortCircuitsRight":
+            let t = do treeOrShortCircuitsRight()
+            return t
+        if name == "comparisonRequiresNumericBothSides":
+            let t = do treeComparisonRequiresNumericBothSides()
+            return t
+        if name == "greaterThanNumeric":
+            let t = do treeGreaterThanNumeric()
+            return t
+        if name == "arithmeticPrecedenceViaEquality":
+            let t = do treeArithmeticPrecedenceViaEquality()
+            return t
+        if name == "stringConcatCorrectValue":
+            let t = do treeStringConcatCorrectValue()
+            return t
+        if name == "divisionByZeroIsError":
+            let t = do treeDivisionByZeroIsError()
+            return t
+        if name == "moduloByZeroIsError":
+            let t = do treeModuloByZeroIsError()
+            return t
+        if name == "inSetMembership":
+            let t = do treeInSetMembership()
+            return t
+        if name == "notInSetMembership":
+            let t = do treeNotInSetMembership()
+            return t
+        if name == "inSetSizeLimitExceeded":
+            let t = do treeInSetSizeLimitExceeded()
+            return t
+        if name == "startsWith":
+            let t = do treeStartsWith()
+            return t
+        if name == "endsWith":
+            let t = do treeEndsWith()
+            return t
+        if name == "contains":
+            let t = do treeContains()
+            return t
+        let n = do nullNode()
+        return n
+
+    state scenarioOkResult: bool = false
+    state scenarioResultResult: bool = false
+
+    action runPredicateScenario(name: text):
+        let ok = do scenarioOk(name)
+        let result = do scenarioResult(name)
+        scenarioOkResult = ok
+        scenarioResultResult = result
+
     private view Home at "/":
         box:
-            text "{demoOkResult} {demoMatchResult}"
+            text "{demoOkResult} {demoMatchResult} {scenarioOkResult} {scenarioResultResult}"
