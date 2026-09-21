@@ -1825,7 +1825,6 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	callsService := false       // calls an external service (an effect)
 	callsProc := false          // calls a proc (`do`) — unconditionally server-executed
 	establishesID := false      // sets the session identity (`establish`)
-	mutated := false            // a state/entity mutation has run — checks/lets must precede it
 
 	// readExprIn validates an expression against a named scope and records what it
 	// reads: the state cells (for placement soundness) and whether it reached an
@@ -1850,312 +1849,410 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		}
 		return nil
 	}
-	readExpr := func(ex ast.Expr, line int) error { return readExprIn(ex, loc, line) }
 
-	// Validation (`check`) and request→response binds (`let`) must come before any
-	// mutation, so a failed check or a brain error aborts with nothing committed and
-	// no partial in-memory write to unwind.
-	mustValidateFirst := func(kind string, line int) error {
-		if mutated {
-			return &BuildError{line, fmt.Sprintf("%s must come before any mutation (add/set/remove/clear/assign/establish), so a failure rolls back nothing — move it above the first mutation", kind)}
+	// bindLocal admits a new action-local name into a block's scope: a `let`, a
+	// `for`'s item variable, or a bound call/proc/add result. It must be fresh
+	// (not a parameter, a builtin, or an earlier local of this block or an
+	// enclosing one) and must not shadow a state cell or an entity — a local
+	// named like a state cell would make a later `name = expr` ambiguous
+	// between "reassign the local" (which an action cannot do) and "write the
+	// cell" (which it can), and one named like an entity would hide the
+	// collection from every expression after it.
+	bindLocal := func(name string, locals map[string]bool, what string, line int) error {
+		if locals[name] {
+			return &BuildError{line, fmt.Sprintf("%q is already in scope — pick another name for %s", name, what)}
 		}
+		if _, isState := e.states[name]; isState {
+			return &BuildError{line, fmt.Sprintf("%s %q would shadow the state cell of the same name — pick another name", what, name)}
+		}
+		if e.entities[name] {
+			return &BuildError{line, fmt.Sprintf("%s %q would shadow the entity of the same name — pick another name", what, name)}
+		}
+		locals[name] = true
 		return nil
 	}
 
-	for _, s := range a.Body {
-		switch st := s.(type) {
-		case ast.Check:
-			if err := mustValidateFirst("a check", st.Line); err != nil {
-				return Action{}, err
-			}
-			if err := e.checkPure(st.Cond, loc, st.Line, "a check"); err != nil {
-				return Action{}, err
-			}
-			if err := e.checkLiteral(st.Msg, loc, st.Line, "a check message",
-				"a check message is literal text the authority sends back when the guard fails — it has no scope to interpolate against, because it is written before the values it would read are known to be valid; "+
-					"state the rule instead of the value"); err != nil {
-				return Action{}, err
-			}
-			act.Body = append(act.Body, Stmt{Op: "check", Value: e.low(st.Cond), Msg: st.Msg})
-		case ast.Assign:
-			p, ok := e.states[st.Target]
-			if !ok {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("assignment to unknown state %q", st.Target)}
-			}
-			_ = p
-			if err := readExpr(st.Value, st.Line); err != nil {
-				return Action{}, err
-			}
-			writes[st.Target] = true
-			mutated = true
-			act.Body = append(act.Body, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
-		case ast.Add:
-			if !e.entities[st.Entity] {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("add to unknown entity %q", st.Entity)}
-			}
-			entWrite = true
-			mutated = true
-			out := Stmt{Op: "add", Entity: st.Entity}
-			for _, fi := range st.Fields {
-				if e.entityDerives[st.Entity][fi.Name] {
-					return Action{}, &BuildError{st.Line, fmt.Sprintf(
-						"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set in `add`", st.Entity, fi.Name)}
+	// block lowers one statement list — the action's own body, or the nested
+	// body of a `for`/`if`/`else` — against loc, the names in scope there. A
+	// nested block gets a copy of its parent's scope widened by what the
+	// statement binds (a `for`'s item variable), and the names a block's own
+	// `let`s introduce never leak back out of it. Every flag the placement
+	// switch below reads (writes/reads/entWrite/impure/…) is a closure over this
+	// function's frame, so a write three blocks deep counts exactly as a
+	// top-level one does — placement is a property of the whole body, however
+	// it is nested.
+	//
+	// There is no "checks before mutations" ordering rule any more. A `check`
+	// may sit anywhere — after a `let`, inside a `for` body, in an `else` —
+	// because runtime/server.go rolls the whole action back (runtime/undo.go)
+	// when one fails, so a check placed after a write is a guard on a
+	// transaction, not a hole in one. That is what lets a per-row guard
+	// ("enough stock for THIS line?") live next to the per-row write.
+	var block func(stmts []ast.Stmt, loc map[string]bool) ([]Stmt, error)
+	block = func(stmts []ast.Stmt, loc map[string]bool) ([]Stmt, error) {
+		var body []Stmt
+		readExpr := func(ex ast.Expr, line int) error { return readExprIn(ex, loc, line) }
+		for _, s := range stmts {
+			switch st := s.(type) {
+			case ast.Check:
+				if err := e.checkPure(st.Cond, loc, st.Line, "a check"); err != nil {
+					return nil, err
 				}
-				isE2E, err := e2eWrite(st.Entity, fi.Name, fi.Expr, st.Line)
-				if err != nil {
-					return Action{}, err
+				if err := e.checkLiteral(st.Msg, loc, st.Line, "a check message",
+					"a check message is literal text the authority sends back when the guard fails — it has no scope to interpolate against, because it is written before the values it would read are known to be valid; "+
+						"state the rule instead of the value"); err != nil {
+					return nil, err
 				}
-				// A sealed value is opaque ciphertext to the authority: don't read it (it
-				// is a validated parameter), just carry the ref so the row stores it.
-				if !isE2E {
-					if err := readExpr(fi.Expr, st.Line); err != nil {
-						return Action{}, err
-					}
+				body = append(body, Stmt{Op: "check", Value: e.low(st.Cond), Msg: st.Msg})
+			case ast.Assign:
+				p, ok := e.states[st.Target]
+				if !ok {
+					return nil, &BuildError{st.Line, fmt.Sprintf("assignment to unknown state %q", st.Target)}
 				}
-				out.Fields = append(out.Fields, FieldInit{Name: fi.Name, Expr: e.low(fi.Expr)})
-			}
-			act.Body = append(act.Body, out)
-		case ast.Set:
-			if !e.entities[st.Entity] {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("set on unknown entity %q", st.Entity)}
-			}
-			entWrite = true
-			mutated = true
-			if st.Where != nil {
-				// Filtered update: a pure predicate over the item var + action scope,
-				// and a block of assignments evaluated against the row it matched. The
-				// same shape as `remove … where`, which is why it reuses `Op: "set"`
-				// with Where set rather than becoming an opcode of its own — one
-				// statement, two addressing modes, exactly as remove has.
-				wl := map[string]bool{st.Var: true}
-				for k := range loc {
-					wl[k] = true
+				_ = p
+				if err := readExpr(st.Value, st.Line); err != nil {
+					return nil, err
 				}
-				if err := e.checkPure(st.Where, wl, st.Line, "a `set … where` filter"); err != nil {
-					return Action{}, err
+				writes[st.Target] = true
+				body = append(body, Stmt{Op: "assign", Target: st.Target, Value: e.low(st.Value)})
+			case ast.Add:
+				if !e.entities[st.Entity] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("add to unknown entity %q", st.Entity)}
 				}
-				lw := e.low(st.Where)
-				for n := range e.depsIR(lw) {
-					if _, isState := e.states[n]; isState {
-						reads[n] = true
-					}
-				}
-				out := Stmt{Op: "set", Entity: st.Entity, Var: st.Var, Where: lw}
-
+				entWrite = true
+				out := Stmt{Op: "add", Entity: st.Entity}
 				for _, fi := range st.Fields {
 					if e.entityDerives[st.Entity][fi.Name] {
-						return Action{}, &BuildError{st.Line, fmt.Sprintf(
-							"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set", st.Entity, fi.Name)}
+						return nil, &BuildError{st.Line, fmt.Sprintf(
+							"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set in `add`", st.Entity, fi.Name)}
 					}
-					if !e.entityFields[st.Entity][fi.Name] {
-						return Action{}, &BuildError{st.Line, fmt.Sprintf(
-							"entity %q has no field %q to set", st.Entity, fi.Name)}
+					isE2E, err := e2eWrite(st.Entity, fi.Name, fi.Expr, st.Line)
+					if err != nil {
+						return nil, err
 					}
-					if e.entE2E[st.Entity][fi.Name] {
-						// An @e2e field is sealed on the client from one action parameter, so
-						// it has exactly one writable shape and a bulk update is not it: the
-						// same ciphertext across every matching row is not the same value.
-						return Action{}, &BuildError{st.Line, fmt.Sprintf(
-							"@e2e field %s.%s cannot be written by a filtered set — a sealed value is encrypted per row on the client, so it can only be written straight from an action parameter to one row", st.Entity, fi.Name)}
-					}
-					// The assignment itself is an ordinary action value: it may read the
-					// row, the action's parameters and the clock, exactly as the by-id
-					// `set` may. Only the *predicate* has to be pure — it is what decides
-					// which rows are touched, and a store has to be able to agree.
-					if err := readExprIn(fi.Expr, wl, st.Line); err != nil {
-						return Action{}, err
+					// A sealed value is opaque ciphertext to the authority: don't read it (it
+					// is a validated parameter), just carry the ref so the row stores it.
+					if !isE2E {
+						if err := readExpr(fi.Expr, st.Line); err != nil {
+							return nil, err
+						}
 					}
 					out.Fields = append(out.Fields, FieldInit{Name: fi.Name, Expr: e.low(fi.Expr)})
 				}
-				act.Body = append(act.Body, out)
-				break
-			}
-			if e.entityDerives[st.Entity][st.Field] {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf(
-					"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set", st.Entity, st.Field)}
-			}
-			if err := readExpr(st.Key, st.Line); err != nil {
-				return Action{}, err
-			}
-			isE2E, err := e2eWrite(st.Entity, st.Field, st.Value, st.Line)
-			if err != nil {
-				return Action{}, err
-			}
-			if !isE2E {
-				if err := readExpr(st.Value, st.Line); err != nil {
-					return Action{}, err
+				if st.Bind != "" {
+					// `let id = add Entity { … }`: the new row's id, for the rest of
+					// this block — the way a second write names the row the first
+					// one just created.
+					if err := bindLocal(st.Bind, loc, "the new row's id", st.Line); err != nil {
+						return nil, err
+					}
+					out.Bind = st.Bind
 				}
-			}
-			act.Body = append(act.Body, Stmt{Op: "set", Entity: st.Entity, Field: st.Field,
-				Key: e.low(st.Key), Value: e.low(st.Value)})
-		case ast.Remove:
-			if !e.entities[st.Entity] {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("remove on unknown entity %q", st.Entity)}
-			}
-			entWrite = true
-			mutated = true
-			if st.Where != nil {
-				// Filtered delete: a pure predicate over the item var + action scope.
-				wl := map[string]bool{st.Var: true}
-				for k := range loc {
-					wl[k] = true
+				body = append(body, out)
+			case ast.Set:
+				if !e.entities[st.Entity] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("set on unknown entity %q", st.Entity)}
 				}
-				if err := e.checkPure(st.Where, wl, st.Line, "a `remove … where` filter"); err != nil {
-					return Action{}, err
+				entWrite = true
+				if st.Where != nil {
+					// Filtered update: a pure predicate over the item var + action scope,
+					// and a block of assignments evaluated against the row it matched. The
+					// same shape as `remove … where`, which is why it reuses `Op: "set"`
+					// with Where set rather than becoming an opcode of its own — one
+					// statement, two addressing modes, exactly as remove has.
+					wl := map[string]bool{st.Var: true}
+					for k := range loc {
+						wl[k] = true
+					}
+					if err := e.checkPure(st.Where, wl, st.Line, "a `set … where` filter"); err != nil {
+						return nil, err
+					}
+					lw := e.low(st.Where)
+					for n := range e.depsIR(lw) {
+						if _, isState := e.states[n]; isState {
+							reads[n] = true
+						}
+					}
+					out := Stmt{Op: "set", Entity: st.Entity, Var: st.Var, Where: lw}
+
+					for _, fi := range st.Fields {
+						if e.entityDerives[st.Entity][fi.Name] {
+							return nil, &BuildError{st.Line, fmt.Sprintf(
+								"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set", st.Entity, fi.Name)}
+						}
+						if !e.entityFields[st.Entity][fi.Name] {
+							return nil, &BuildError{st.Line, fmt.Sprintf(
+								"entity %q has no field %q to set", st.Entity, fi.Name)}
+						}
+						if e.entE2E[st.Entity][fi.Name] {
+							// An @e2e field is sealed on the client from one action parameter, so
+							// it has exactly one writable shape and a bulk update is not it: the
+							// same ciphertext across every matching row is not the same value.
+							return nil, &BuildError{st.Line, fmt.Sprintf(
+								"@e2e field %s.%s cannot be written by a filtered set — a sealed value is encrypted per row on the client, so it can only be written straight from an action parameter to one row", st.Entity, fi.Name)}
+						}
+						// The assignment itself is an ordinary action value: it may read the
+						// row, the action's parameters and the clock, exactly as the by-id
+						// `set` may. Only the *predicate* has to be pure — it is what decides
+						// which rows are touched, and a store has to be able to agree.
+						if err := readExprIn(fi.Expr, wl, st.Line); err != nil {
+							return nil, err
+						}
+						out.Fields = append(out.Fields, FieldInit{Name: fi.Name, Expr: e.low(fi.Expr)})
+					}
+					body = append(body, out)
+					break
 				}
-				lw := e.low(st.Where)
-				// track state reads for soundness (the authority can't read @client state)
-				for n := range e.depsIR(lw) {
-					if _, isState := e.states[n]; isState {
-						reads[n] = true
+				if e.entityDerives[st.Entity][st.Field] {
+					return nil, &BuildError{st.Line, fmt.Sprintf(
+						"entity %q's %q is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set", st.Entity, st.Field)}
+				}
+				if err := readExpr(st.Key, st.Line); err != nil {
+					return nil, err
+				}
+				isE2E, err := e2eWrite(st.Entity, st.Field, st.Value, st.Line)
+				if err != nil {
+					return nil, err
+				}
+				if !isE2E {
+					if err := readExpr(st.Value, st.Line); err != nil {
+						return nil, err
 					}
 				}
-				act.Body = append(act.Body, Stmt{Op: "remove", Entity: st.Entity, Var: st.Var, Where: lw})
-			} else {
-				if err := readExpr(st.Key, st.Line); err != nil {
-					return Action{}, err
+				body = append(body, Stmt{Op: "set", Entity: st.Entity, Field: st.Field,
+					Key: e.low(st.Key), Value: e.low(st.Value)})
+			case ast.Remove:
+				if !e.entities[st.Entity] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("remove on unknown entity %q", st.Entity)}
 				}
-				act.Body = append(act.Body, Stmt{Op: "remove", Entity: st.Entity, Key: e.low(st.Key)})
-			}
-		case ast.Clear:
-			if !e.entities[st.Entity] {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("clear on unknown entity %q", st.Entity)}
-			}
-			entWrite = true
-			mutated = true
-			act.Body = append(act.Body, Stmt{Op: "clear", Entity: st.Entity})
-		case ast.ServiceCall:
-			ops, ok := e.services[st.Service]
-			if !ok {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("call to unknown service %q", st.Service)}
-			}
-			argc, ok := ops[st.Op]
-			if !ok {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("service %q has no operation %q", st.Service, st.Op)}
-			}
-			if len(st.Args) != argc {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("%s.%s expects %d argument(s), got %d", st.Service, st.Op, argc, len(st.Args))}
-			}
-			callsService = true
-			cs := Stmt{Op: "call", Service: st.Service, Field: st.Op}
-			for _, arg := range st.Args {
-				if err := readExpr(arg, st.Line); err != nil {
-					return Action{}, err
+				entWrite = true
+				if st.Where != nil {
+					// Filtered delete: a pure predicate over the item var + action scope.
+					wl := map[string]bool{st.Var: true}
+					for k := range loc {
+						wl[k] = true
+					}
+					if err := e.checkPure(st.Where, wl, st.Line, "a `remove … where` filter"); err != nil {
+						return nil, err
+					}
+					lw := e.low(st.Where)
+					// track state reads for soundness (the authority can't read @client state)
+					for n := range e.depsIR(lw) {
+						if _, isState := e.states[n]; isState {
+							reads[n] = true
+						}
+					}
+					body = append(body, Stmt{Op: "remove", Entity: st.Entity, Var: st.Var, Where: lw})
+				} else {
+					if err := readExpr(st.Key, st.Line); err != nil {
+						return nil, err
+					}
+					body = append(body, Stmt{Op: "remove", Entity: st.Entity, Key: e.low(st.Key)})
 				}
-				cs.Args = append(cs.Args, e.low(arg))
+			case ast.Clear:
+				if !e.entities[st.Entity] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("clear on unknown entity %q", st.Entity)}
+				}
+				entWrite = true
+				body = append(body, Stmt{Op: "clear", Entity: st.Entity})
+			case ast.ServiceCall:
+				ops, ok := e.services[st.Service]
+				if !ok {
+					return nil, &BuildError{st.Line, fmt.Sprintf("call to unknown service %q", st.Service)}
+				}
+				argc, ok := ops[st.Op]
+				if !ok {
+					return nil, &BuildError{st.Line, fmt.Sprintf("service %q has no operation %q", st.Service, st.Op)}
+				}
+				if len(st.Args) != argc {
+					return nil, &BuildError{st.Line, fmt.Sprintf("%s.%s expects %d argument(s), got %d", st.Service, st.Op, argc, len(st.Args))}
+				}
+				callsService = true
+				cs := Stmt{Op: "call", Service: st.Service, Field: st.Op}
+				for _, arg := range st.Args {
+					if err := readExpr(arg, st.Line); err != nil {
+						return nil, err
+					}
+					cs.Args = append(cs.Args, e.low(arg))
+				}
+				// Request→response: `let x = call …` binds the typed result into a local
+				// so the rest of the body can use it (e.g. assign it into a state cell).
+				if st.Bind != "" {
+					ret := e.serviceRets[st.Service][st.Op]
+					if ret.ret == "" {
+						return nil, &BuildError{st.Line, fmt.Sprintf("%s.%s returns nothing — declare a return type (`%s(…) -> Type`) to bind it", st.Service, st.Op, st.Op)}
+					}
+					if err := bindLocal(st.Bind, loc, "the bound result", st.Line); err != nil {
+						return nil, err
+					}
+					cs.Bind = st.Bind
+					cs.Ret = ret.ret
+					cs.RetList = ret.list
+					// If the op returns a record, remember the bind's record type so a later
+					// `v.field` is checked (and a list-of-record bind reports that you must
+					// iterate it before a field access).
+					if _, isRec := e.records[ret.ret]; isRec {
+						e.locRecords[st.Bind] = recBind{rec: ret.ret, list: ret.list}
+					}
+				}
+				body = append(body, cs)
+			case ast.Do:
+				// A proc call: same-process, in-binary, synchronous — not egress like a
+				// service call, so it is not the reason placement below forces the
+				// server (see the placement switch, `case callsProc`). It still can only
+				// ever run on the authority, because a proc is unconditionally
+				// server-executed (no client mirror exists, or ever will, for it — see
+				// ROADMAP.md), so an action that calls one has to be server-placed too:
+				// a client-placed action runs in facet.js, which cannot run proc code.
+				sig, ok := e.procSigs[st.Proc]
+				if !ok {
+					return nil, &BuildError{st.Line, fmt.Sprintf("do calls unknown proc %q", st.Proc)}
+				}
+				if len(st.Args) != len(sig.params) {
+					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q expects %d argument(s), got %d", st.Proc, len(sig.params), len(st.Args))}
+				}
+				callsProc = true
+				ds := Stmt{Op: "do", Service: st.Proc}
+				for _, arg := range st.Args {
+					if err := readExpr(arg, st.Line); err != nil {
+						return nil, err
+					}
+					ds.Args = append(ds.Args, e.low(arg))
+				}
+				if st.Bind != "" {
+					if sig.ret == "" {
+						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type (`proc %s(...) -> Type`) to bind it", st.Proc, st.Proc)}
+					}
+					if sig.ret == "float" {
+						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns float, which is only usable inside another proc — an action cannot bind it (no client-side representation exists for a float; see LANGUAGE.md's `proc` section). Convert it inside the proc first (e.g. `return round(x)`) and give %q an int/text/bool/money/date return type instead", st.Proc, st.Proc)}
+					}
+					if e.structs[sig.ret] != nil {
+						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, a struct type usable only inside another proc — an action cannot bind it (structs are proc-local values, with no schema/wire representation yet; see LANGUAGE.md's `proc` section). Read its fields inside the proc and give %q a scalar/list return type instead", st.Proc, sig.ret, st.Proc)}
+					}
+					if err := bindLocal(st.Bind, loc, "the bound result", st.Line); err != nil {
+						return nil, err
+					}
+					ds.Bind = st.Bind
+					ds.Ret = sig.ret
+					ds.RetList = sig.retList
+					if _, isRec := e.records[sig.ret]; isRec {
+						e.locRecords[st.Bind] = recBind{rec: sig.ret, list: sig.retList}
+					}
+				}
+				body = append(body, ds)
+			case ast.Establish:
+				// Adopt a custom session identity. Setting who you are is the authority's
+				// job, so it forces server placement; the actor/role exprs are reads.
+				establishesID = true
+				if err := readExpr(st.Actor, st.Line); err != nil {
+					return nil, err
+				}
+				// actor/role become the renderable session identity, so they cannot be a
+				// @private value — that would copy the secret key into a renderable slot.
+				if err := e.checkNoPrivate(st.Actor); err != nil {
+					return nil, &BuildError{st.Line, "establish actor sets the renderable identity, so it cannot be a @private value — establish the handle and key policies on the @private UUID instead"}
+				}
+				es := Stmt{Op: "establish", Value: e.low(st.Actor)}
+				if st.Role != nil {
+					if err := readExpr(st.Role, st.Line); err != nil {
+						return nil, err
+					}
+					if err := e.checkNoPrivate(st.Role); err != nil {
+						return nil, &BuildError{st.Line, "establish role cannot be a @private value"}
+					}
+					es.Role = e.low(st.Role)
+				}
+				body = append(body, es)
+			case ast.ExprStmt:
+				// A bare builtin call for its side effect alone, its result discarded —
+				// print(...) on its own line, the action-body counterpart to procBlock's
+				// identical ast.ExprStmt case. Not print-specific machinery: readExpr's
+				// e.check funnel already refuses any builtin that doesn't belong in an
+				// action body (readFile/writeFile/httpGet/httpPost/channel/bitwise/float
+				// all stay proc-only via checkNoIO/checkNoConcurrency/checkNoBitwise/
+				// checkNoFloat), so print is simply the one builtin this shape is
+				// actually useful for today.
+				if err := readExpr(st.Call, st.Line); err != nil {
+					return nil, err
+				}
+				body = append(body, Stmt{Op: "exprstmt", Value: e.low(st.Call)})
+			case ast.Let:
+				// `let name = expr`: an action-local bound once, visible for the rest
+				// of this block. The value is an ordinary action expression — it may
+				// read rows, parameters, state, and the clock — so it goes through the
+				// same read bookkeeping every other value does.
+				if err := readExpr(st.Value, st.Line); err != nil {
+					return nil, err
+				}
+				if err := bindLocal(st.Name, loc, "the local", st.Line); err != nil {
+					return nil, err
+				}
+				body = append(body, Stmt{Op: "let", Target: st.Name, Value: e.low(st.Value)})
+			case ast.IfStmt:
+				if err := readExpr(st.Cond, st.Line); err != nil {
+					return nil, err
+				}
+				then, err := block(st.Then, cloneNameSet(loc))
+				if err != nil {
+					return nil, err
+				}
+				var els []Stmt
+				if len(st.Else) > 0 {
+					if els, err = block(st.Else, cloneNameSet(loc)); err != nil {
+						return nil, err
+					}
+				}
+				body = append(body, Stmt{Op: "if", Value: e.low(st.Cond), Body: then, Else: els})
+			case ast.ForStmt:
+				// `for item in Entity [where cond] [by field] [limit n]:` over a block of
+				// action statements. The predicate is pure, exactly as a `set … where`/
+				// `remove … where` filter is — it decides which rows the body sees, and
+				// a store has to be able to agree — while the body is ordinary action
+				// code with the item variable in scope.
+				if !e.entities[st.Coll] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("`for` in an action walks an entity's rows; %q is not an entity", st.Coll)}
+				}
+				wl := cloneNameSet(loc)
+				if err := bindLocal(st.Var, wl, "the loop variable", st.Line); err != nil {
+					return nil, err
+				}
+				out := Stmt{Op: "for", Entity: st.Coll, Var: st.Var, Order: st.Order, Desc: st.Desc}
+				if st.Where != nil {
+					if err := e.checkPure(st.Where, wl, st.Line, "a `for … where` filter"); err != nil {
+						return nil, err
+					}
+					out.Where = e.low(st.Where)
+					for n := range e.depsIR(out.Where) {
+						if _, isState := e.states[n]; isState {
+							reads[n] = true
+						}
+					}
+				}
+				if st.Order != "" && !e.entityFields[st.Coll][st.Order] && st.Order != "id" {
+					return nil, &BuildError{st.Line, fmt.Sprintf("entity %q has no field %q to order by", st.Coll, st.Order)}
+				}
+				if st.Limit != nil {
+					if err := readExpr(st.Limit, st.Line); err != nil {
+						return nil, err
+					}
+					out.Limit = e.low(st.Limit)
+				}
+				kids, err := block(st.Body, wl)
+				if err != nil {
+					return nil, err
+				}
+				out.Body = kids
+				body = append(body, out)
 			}
-			// Request→response: `let x = call …` binds the typed result into a local
-			// so the rest of the body can use it (e.g. assign it into a state cell).
-			if st.Bind != "" {
-				if err := mustValidateFirst("a `let` bind", st.Line); err != nil {
-					return Action{}, err
-				}
-				ret := e.serviceRets[st.Service][st.Op]
-				if ret.ret == "" {
-					return Action{}, &BuildError{st.Line, fmt.Sprintf("%s.%s returns nothing — declare a return type (`%s(…) -> Type`) to bind it", st.Service, st.Op, st.Op)}
-				}
-				if loc[st.Bind] {
-					return Action{}, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
-				}
-				loc[st.Bind] = true // visible to the rest of the action body
-				cs.Bind = st.Bind
-				cs.Ret = ret.ret
-				cs.RetList = ret.list
-				// If the op returns a record, remember the bind's record type so a later
-				// `v.field` is checked (and a list-of-record bind reports that you must
-				// iterate it before a field access).
-				if _, isRec := e.records[ret.ret]; isRec {
-					e.locRecords[st.Bind] = recBind{rec: ret.ret, list: ret.list}
-				}
-			}
-			act.Body = append(act.Body, cs)
-		case ast.Do:
-			// A proc call: same-process, in-binary, synchronous — not egress like a
-			// service call, so it is not the reason placement below forces the
-			// server (see the placement switch, `case callsProc`). It still can only
-			// ever run on the authority, because a proc is unconditionally
-			// server-executed (no client mirror exists, or ever will, for it — see
-			// ROADMAP.md), so an action that calls one has to be server-placed too:
-			// a client-placed action runs in facet.js, which cannot run proc code.
-			sig, ok := e.procSigs[st.Proc]
-			if !ok {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("do calls unknown proc %q", st.Proc)}
-			}
-			if len(st.Args) != len(sig.params) {
-				return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q expects %d argument(s), got %d", st.Proc, len(sig.params), len(st.Args))}
-			}
-			callsProc = true
-			ds := Stmt{Op: "do", Service: st.Proc}
-			for _, arg := range st.Args {
-				if err := readExpr(arg, st.Line); err != nil {
-					return Action{}, err
-				}
-				ds.Args = append(ds.Args, e.low(arg))
-			}
-			if st.Bind != "" {
-				if err := mustValidateFirst("a `let` bind", st.Line); err != nil {
-					return Action{}, err
-				}
-				if sig.ret == "" {
-					return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type (`proc %s(...) -> Type`) to bind it", st.Proc, st.Proc)}
-				}
-				if sig.ret == "float" {
-					return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q returns float, which is only usable inside another proc — an action cannot bind it (no client-side representation exists for a float; see LANGUAGE.md's `proc` section). Convert it inside the proc first (e.g. `return round(x)`) and give %q an int/text/bool/money/date return type instead", st.Proc, st.Proc)}
-				}
-				if e.structs[sig.ret] != nil {
-					return Action{}, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, a struct type usable only inside another proc — an action cannot bind it (structs are proc-local values, with no schema/wire representation yet; see LANGUAGE.md's `proc` section). Read its fields inside the proc and give %q a scalar/list return type instead", st.Proc, sig.ret, st.Proc)}
-				}
-				if loc[st.Bind] {
-					return Action{}, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
-				}
-				loc[st.Bind] = true
-				ds.Bind = st.Bind
-				ds.Ret = sig.ret
-				ds.RetList = sig.retList
-				if _, isRec := e.records[sig.ret]; isRec {
-					e.locRecords[st.Bind] = recBind{rec: sig.ret, list: sig.retList}
-				}
-			}
-			act.Body = append(act.Body, ds)
-		case ast.Establish:
-			// Adopt a custom session identity. Setting who you are is the authority's
-			// job, so it forces server placement; the actor/role exprs are reads.
-			establishesID = true
-			mutated = true
-			if err := readExpr(st.Actor, st.Line); err != nil {
-				return Action{}, err
-			}
-			// actor/role become the renderable session identity, so they cannot be a
-			// @private value — that would copy the secret key into a renderable slot.
-			if err := e.checkNoPrivate(st.Actor); err != nil {
-				return Action{}, &BuildError{st.Line, "establish actor sets the renderable identity, so it cannot be a @private value — establish the handle and key policies on the @private UUID instead"}
-			}
-			es := Stmt{Op: "establish", Value: e.low(st.Actor)}
-			if st.Role != nil {
-				if err := readExpr(st.Role, st.Line); err != nil {
-					return Action{}, err
-				}
-				if err := e.checkNoPrivate(st.Role); err != nil {
-					return Action{}, &BuildError{st.Line, "establish role cannot be a @private value"}
-				}
-				es.Role = e.low(st.Role)
-			}
-			act.Body = append(act.Body, es)
-		case ast.ExprStmt:
-			// A bare builtin call for its side effect alone, its result discarded —
-			// print(...) on its own line, the action-body counterpart to procBlock's
-			// identical ast.ExprStmt case. Not print-specific machinery: readExpr's
-			// e.check funnel already refuses any builtin that doesn't belong in an
-			// action body (readFile/writeFile/httpGet/httpPost/channel/bitwise/float
-			// all stay proc-only via checkNoIO/checkNoConcurrency/checkNoBitwise/
-			// checkNoFloat), so print is simply the one builtin this shape is
-			// actually useful for today.
-			if err := readExpr(st.Call, st.Line); err != nil {
-				return Action{}, err
-			}
-			act.Body = append(act.Body, Stmt{Op: "exprstmt", Value: e.low(st.Call)})
 		}
+		return body, nil
 	}
+
+	lowered, err := block(a.Body, loc)
+	if err != nil {
+		return Action{}, err
+	}
+	act.Body = lowered
 
 	// @e2e dataflow guarantee: a parameter that seals into an @e2e field is
 	// ciphertext to the authority. It may therefore appear ONLY as that sealed
@@ -2170,10 +2267,17 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				used[n] = true
 			}
 		}
-		for _, s := range a.Body {
+		walkActionStmts(a.Body, func(s ast.Stmt) {
 			switch st := s.(type) {
 			case ast.Check:
 				collect(st.Cond)
+			case ast.Let:
+				collect(st.Value)
+			case ast.IfStmt:
+				collect(st.Cond)
+			case ast.ForStmt:
+				collect(st.Where)
+				collect(st.Limit)
 			case ast.Assign:
 				collect(st.Value)
 			case ast.Add:
@@ -2209,7 +2313,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			case ast.ExprStmt:
 				collect(st.Call)
 			}
-		}
+		})
 		for _, r := range a.Requires {
 			for _, arg := range r.Args {
 				collect(arg)
@@ -2404,6 +2508,23 @@ func (e *env) daemon(d *ast.Daemon, actionSigs map[string]actionSig) (Daemon, er
 // declarations (`let`) without those leaking back into the caller's scope once
 // the block ends, while still seeing everything the caller had already
 // declared (the copy starts as a full snapshot of it).
+// walkActionStmts visits every statement of an action body in source order,
+// descending into the nested blocks a `for`/`if`/`else` carries, so a pass that
+// needs to see every statement (the @e2e seal-dataflow walk) sees one three
+// levels down exactly as it sees one at the top.
+func walkActionStmts(body []ast.Stmt, visit func(ast.Stmt)) {
+	for _, s := range body {
+		visit(s)
+		switch st := s.(type) {
+		case ast.ForStmt:
+			walkActionStmts(st.Body, visit)
+		case ast.IfStmt:
+			walkActionStmts(st.Then, visit)
+			walkActionStmts(st.Else, visit)
+		}
+	}
+}
+
 func cloneNameSet(m map[string]bool) map[string]bool {
 	out := make(map[string]bool, len(m))
 	for k, v := range m {
@@ -6145,7 +6266,7 @@ func requireProcCapability(p *ast.Proc, cap, what string, line int) error {
 func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
-		"ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney",
+		"ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney", "slug",
 		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits":
 		return 1, true
 	case "print":
@@ -6160,7 +6281,7 @@ func pureBuiltinArity(name string) (int, bool) {
 		return 2, true
 	case "min", "max", "contains", "take", "split", "charAt":
 		return 2, true
-	case "slice":
+	case "slice", "replace":
 		return 3, true
 	}
 	return 0, false

@@ -1476,18 +1476,14 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		return nil, err
 	}
 	a := &ast.Action{Name: name, Params: params, Optimistic: optimistic, Line: n.Line.No}
+	// `requires` is a header-level clause of the action — a policy gate that
+	// runs before the body — so it is pulled out here, in source order, and
+	// everything else is the body. A `requires` written inside a nested block
+	// falls through to parseActionBody's "unknown statement" case.
+	var body []*source.Node
 	for _, c := range n.Children {
 		t := c.Line.Text
-		switch {
-		case strings.HasPrefix(t, "check "):
-			// A check is a body statement in source order, so it can validate a value
-			// bound earlier by `let` (e.g. a request→response result).
-			chk, err := parseCheck(strings.TrimSpace(t[len("check "):]), c.Line.No)
-			if err != nil {
-				return nil, err
-			}
-			a.Body = append(a.Body, chk)
-		case strings.HasPrefix(t, "requires "):
+		if strings.HasPrefix(t, "requires ") {
 			// `requires admin` or, for row-level checks, `requires owns(id), admin`.
 			for _, p := range splitTop(strings.TrimSpace(t[len("requires "):]), ',') {
 				req, err := parseRequire(strings.TrimSpace(p), c.Line.No)
@@ -1496,49 +1492,165 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 				}
 				a.Requires = append(a.Requires, req)
 			}
+			continue
+		}
+		body = append(body, c)
+	}
+	stmts, err := parseActionBody(body, fmt.Sprintf("action %q", name))
+	if err != nil {
+		return nil, err
+	}
+	a.Body = stmts
+	if len(a.Body) == 0 {
+		return nil, &Error{n.Line.No, fmt.Sprintf("action %q has no body", name)}
+	}
+	return a, nil
+}
+
+// parseActionBody recursively parses one statement block inside an action: the
+// action's own top-level body, or a `for`/`if`/`else` statement's nested Body.
+// ctx names the enclosing construct for error messages ("action %q", "a for
+// body", "an if body", "an else body").
+//
+// It is the action counterpart of parseProcBody, and the two are deliberately
+// separate functions rather than one with a mode flag: the statement
+// vocabularies overlap (`let`, `if`/`else`, `do`, a bare builtin call) but the
+// halves that differ are the point of each — a proc has `loop`/`return`/`let
+// mut`/`spawn`/`join` and no entity access, an action has `add`/`set`/`remove`/
+// `clear`/`check`/`establish`/`call` and `for` over an entity's rows, and no
+// return. Sharing one function would mean every case carrying "but not in the
+// other mode" checks.
+//
+// The nesting shapes are `for <range>:` (ast.ForStmt — the same Range header a
+// view's `for` parses, so `where`/`by`/`limit` read identically in both places)
+// and `if <cond>:` with an optional sibling `else:` (ast.IfStmt). `let name =
+// expr` binds an action-local for the rest of its block; its right-hand side
+// may also be `call Service.op(args)`, `do ProcName(args)`, or `add Entity {…}`
+// (which binds the new row's id — see ast.Add.Bind). `check` is legal anywhere,
+// including inside a loop body: at runtime a failed check aborts the whole
+// action and rolls back every write it already made (runtime/undo.go), so
+// "check before you mutate" is no longer a grammar rule, it is a transactional
+// guarantee.
+func parseActionBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
+	var body []ast.Stmt
+	for i := 0; i < len(children); i++ {
+		c := children[i]
+		t := c.Line.Text
+		switch {
+		case strings.HasPrefix(t, "check "):
+			// A check is a body statement in source order, so it can validate a value
+			// bound earlier by `let` (e.g. a request→response result), or one row of
+			// a `for` it sits inside.
+			chk, err := parseCheck(strings.TrimSpace(t[len("check "):]), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, chk)
 		case strings.HasPrefix(t, "add "):
 			s, err := parseAdd(c)
 			if err != nil {
 				return nil, err
 			}
-			a.Body = append(a.Body, s)
+			body = append(body, s)
 		case strings.HasPrefix(t, "set "):
 			s, err := parseSet(c)
 			if err != nil {
 				return nil, err
 			}
-			a.Body = append(a.Body, s)
+			body = append(body, s)
 		case strings.HasPrefix(t, "remove "):
 			s, err := parseRemove(c)
 			if err != nil {
 				return nil, err
 			}
-			a.Body = append(a.Body, s)
+			body = append(body, s)
 		case strings.HasPrefix(t, "clear "):
 			ent := strings.TrimSpace(t[len("clear "):])
 			if !isIdent(ent) {
 				return nil, &Error{c.Line.No, fmt.Sprintf("invalid entity %q", ent)}
 			}
-			a.Body = append(a.Body, ast.Clear{Entity: ent, Line: c.Line.No})
+			body = append(body, ast.Clear{Entity: ent, Line: c.Line.No})
 		case strings.HasPrefix(t, "call "):
 			cl, err := parseCall(strings.TrimSpace(t[len("call "):]), c.Line.No)
 			if err != nil {
 				return nil, err
 			}
-			a.Body = append(a.Body, cl)
+			body = append(body, cl)
 		case strings.HasPrefix(t, "do "):
 			d, err := parseDo(strings.TrimSpace(t[len("do "):]), c.Line.No)
 			if err != nil {
 				return nil, err
 			}
-			a.Body = append(a.Body, d)
+			body = append(body, d)
+		case strings.HasPrefix(t, "for "):
+			// `for item in Entity [where cond] [by field desc|asc] [limit n]:` — the
+			// exact header a view's `for` has (parseRange), over a block of action
+			// statements instead of view nodes.
+			if !strings.HasSuffix(strings.TrimSpace(t), ":") {
+				return nil, &Error{c.Line.No, "a `for` in an action takes a block: end the line with `:` and indent its statements under it"}
+			}
+			rg, err := parseRange(strings.TrimSuffix(strings.TrimSpace(t[len("for "):]), ":"), c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			if rg.More != "" {
+				return nil, &Error{c.Line.No, "`more` is a view's paging control (it names the action that loads the next page) and has no meaning in an action's own `for` — use `limit n` alone"}
+			}
+			kids, err := parseActionBody(c.Children, "a for body")
+			if err != nil {
+				return nil, err
+			}
+			if len(kids) == 0 {
+				return nil, &Error{c.Line.No, "for has no body"}
+			}
+			body = append(body, ast.ForStmt{Range: rg, Body: kids, Line: c.Line.No})
+		case strings.HasPrefix(t, "if "):
+			condS := strings.TrimSuffix(strings.TrimSpace(t[len("if "):]), ":")
+			if condS == "" {
+				return nil, &Error{c.Line.No, "if needs a condition: if <cond>:"}
+			}
+			if !strings.HasSuffix(strings.TrimSpace(t), ":") {
+				return nil, &Error{c.Line.No, "an `if` in an action takes a block: end the line with `:` and indent its statements under it"}
+			}
+			cond, err := parseExpr(condS, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			then, err := parseActionBody(c.Children, "an if body")
+			if err != nil {
+				return nil, err
+			}
+			if len(then) == 0 {
+				return nil, &Error{c.Line.No, "if has no body"}
+			}
+			var els []ast.Stmt
+			if i+1 < len(children) {
+				nt := strings.TrimSpace(children[i+1].Line.Text)
+				if nt == "else:" || nt == "else" {
+					els, err = parseActionBody(children[i+1].Children, "an else body")
+					if err != nil {
+						return nil, err
+					}
+					if len(els) == 0 {
+						return nil, &Error{children[i+1].Line.No, "else has no body"}
+					}
+					i++ // consume the sibling `else:` node
+				}
+			}
+			body = append(body, ast.IfStmt{Cond: cond, Then: then, Else: els, Line: c.Line.No})
+		case t == "else:" || t == "else":
+			return nil, &Error{c.Line.No, "`else` with no matching `if`"}
 		case strings.HasPrefix(t, "let "):
-			// Request→response bind: `let name = call Service.op(args)` or
-			// `let name = do ProcName(args)`.
+			// `let name = <rhs>`: a request→response bind (`call Service.op(args)`),
+			// a proc call (`do ProcName(args)`), a row insert whose id is wanted
+			// (`add Entity { … }`), or any expression.
 			rest := strings.TrimSpace(t[len("let "):])
+			if strings.HasPrefix(rest, "mut ") {
+				return nil, &Error{c.Line.No, "`let mut` is proc-only — an action local is bound once; a value that changes across an action's statements is a state cell (`state name: type`)"}
+			}
 			eq := strings.IndexByte(rest, '=')
 			if eq < 0 {
-				return nil, &Error{c.Line.No, "let needs `let name = call Service.op(args)` or `let name = do ProcName(args)`"}
+				return nil, &Error{c.Line.No, "let needs `let name = expr`, `let name = call Service.op(args)`, `let name = do ProcName(args)` or `let name = add Entity { … }`"}
 			}
 			name := strings.TrimSpace(rest[:eq])
 			if !isIdent(name) {
@@ -1552,16 +1664,27 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 					return nil, err
 				}
 				cl.Bind = name
-				a.Body = append(a.Body, cl)
+				body = append(body, cl)
 			case strings.HasPrefix(rhs, "do "):
 				d, err := parseDo(strings.TrimSpace(rhs[len("do "):]), c.Line.No)
 				if err != nil {
 					return nil, err
 				}
 				d.Bind = name
-				a.Body = append(a.Body, d)
+				body = append(body, d)
+			case strings.HasPrefix(rhs, "add "):
+				s, err := parseAddText(strings.TrimSpace(rhs[len("add "):]), c)
+				if err != nil {
+					return nil, err
+				}
+				s.Bind = name
+				body = append(body, s)
 			default:
-				return nil, &Error{c.Line.No, "let binds a service call or a proc call: `let name = call Service.op(args)` or `let name = do ProcName(args)`"}
+				val, err := parseExpr(rhs, c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				body = append(body, ast.Let{Name: name, Value: val, Line: c.Line.No})
 			}
 		case strings.HasPrefix(t, "establish "):
 			// `establish actor <expr> [role <expr>]` — adopt a custom session identity.
@@ -1587,7 +1710,7 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 				}
 				est.Role = roleExpr
 			}
-			a.Body = append(a.Body, est)
+			body = append(body, est)
 		case isBareCallStmt(t):
 			// A builtin call for its side effect alone, its result discarded —
 			// `print(x)` on its own line, the action-body counterpart to
@@ -1600,11 +1723,11 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 			if !ok {
 				return nil, &Error{c.Line.No, fmt.Sprintf("%q is not a valid statement on its own", t)}
 			}
-			a.Body = append(a.Body, ast.ExprStmt{Call: call, Line: c.Line.No})
+			body = append(body, ast.ExprStmt{Call: call, Line: c.Line.No})
 		default:
 			eq := strings.IndexByte(t, '=')
 			if eq < 0 {
-				return nil, unknownActionStatementError(c.Line.No, firstWord(t))
+				return nil, unknownActionStatementError(c.Line.No, firstWord(t), ctx)
 			}
 			target := strings.TrimSpace(t[:eq])
 			if !isIdent(target) {
@@ -1614,27 +1737,24 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 			if err != nil {
 				return nil, err
 			}
-			a.Body = append(a.Body, ast.Assign{Target: target, Value: val, Line: c.Line.No})
+			body = append(body, ast.Assign{Target: target, Value: val, Line: c.Line.No})
 		}
 	}
-	if len(a.Body) == 0 {
-		return nil, &Error{n.Line.No, fmt.Sprintf("action %q has no body", name)}
-	}
-	return a, nil
+	return body, nil
 }
 
 // unknownActionStatementError builds the diagnostic for an action-body line
 // that is neither one of the recognized statement keywords nor an
 // `name = expr` assignment. As with unknownViewNodeError, the "expected one
-// of" list is read live off this file's own parseAction switch via
+// of" list is read live off this file's own parseActionBody switch via
 // switchCaseKeywords rather than retyped, so it cannot drift from what the
-// switch actually accepts.
-func unknownActionStatementError(line int, word string) *Error {
-	kws, ok := switchCaseKeywords("parseAction")
+// switch actually accepts. ctx names the enclosing block (see parseActionBody).
+func unknownActionStatementError(line int, word, ctx string) *Error {
+	kws, ok := switchCaseKeywords("parseActionBody")
 	if !ok || len(kws) == 0 {
-		return &Error{line, fmt.Sprintf("unknown statement %q", word)}
+		return &Error{line, fmt.Sprintf("unknown statement %q in %s", word, ctx)}
 	}
-	return &Error{line, fmt.Sprintf("unknown statement %q — expected one of: %s, or an assignment (`name = expr`)", word, strings.Join(kws, ", "))}
+	return &Error{line, fmt.Sprintf("unknown statement %q in %s — expected one of: %s, or an assignment (`name = expr`)", word, ctx, strings.Join(kws, ", "))}
 }
 
 // parseService parses `service Name at "url":` plus a block of typed operation
@@ -2599,19 +2719,27 @@ func parseSignature(head string, line int, allowList, allowRef bool) (string, []
 }
 
 func parseAdd(n *source.Node) (ast.Stmt, error) {
-	rest := strings.TrimSpace(n.Line.Text[len("add "):])
+	return parseAddText(strings.TrimSpace(n.Line.Text[len("add "):]), n)
+}
+
+// parseAddText parses the text after the `add ` keyword — `Entity { f: expr,
+// ... }` — against the node n it came from (whose children hold any continuation
+// lines of a multi-line record, see closeAddRecord). Split out of parseAdd so
+// the bound form, `let id = add Entity { … }`, can hand over the same text
+// from after its `=` and get the same statement back.
+func parseAddText(rest string, n *source.Node) (ast.Add, error) {
 	rest, err := closeAddRecord(rest, n)
 	if err != nil {
-		return nil, err
+		return ast.Add{}, err
 	}
 	open := strings.IndexByte(rest, '{')
 	close := strings.LastIndexByte(rest, '}')
 	if open < 0 || close < open {
-		return nil, &Error{n.Line.No, "add needs a record: `add Entity { f: expr, ... }`"}
+		return ast.Add{}, &Error{n.Line.No, "add needs a record: `add Entity { f: expr, ... }`"}
 	}
 	ent := strings.TrimSpace(rest[:open])
 	if !isIdent(ent) {
-		return nil, &Error{n.Line.No, fmt.Sprintf("invalid entity %q", ent)}
+		return ast.Add{}, &Error{n.Line.No, fmt.Sprintf("invalid entity %q", ent)}
 	}
 	add := ast.Add{Entity: ent, Line: n.Line.No}
 	body := strings.TrimSpace(rest[open+1 : close])
@@ -2619,12 +2747,12 @@ func parseAdd(n *source.Node) (ast.Stmt, error) {
 		for _, part := range splitTop(body, ',') {
 			colon := strings.IndexByte(part, ':')
 			if colon < 0 {
-				return nil, &Error{n.Line.No, fmt.Sprintf("field init %q needs `name: expr`", part)}
+				return ast.Add{}, &Error{n.Line.No, fmt.Sprintf("field init %q needs `name: expr`", part)}
 			}
 			fn := strings.TrimSpace(part[:colon])
 			e, err := parseExpr(strings.TrimSpace(part[colon+1:]), n.Line.No)
 			if err != nil {
-				return nil, err
+				return ast.Add{}, err
 			}
 			add.Fields = append(add.Fields, ast.FieldInit{Name: fn, Expr: e})
 		}

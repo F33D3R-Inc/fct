@@ -124,7 +124,9 @@ func TestServiceBindErrors(t *testing.T) {
 	cases := []struct{ name, body, want string }{
 		{"bind a no-return op", "let x = call Brain.report(1)", "returns nothing"},
 		{"bind unknown service", "let x = call Nope.answer(1)", "unknown service"},
-		{"let without call", "let x = result", "service call"},
+		// `let x = <expr>` is a plain action-local now (see ast.Let); what a let
+		// still cannot do in an action is declare a mutable local.
+		{"let mut in an action", "let mut x = result", "proc-only"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -257,7 +257,7 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 
 	case ast.Call:
 		switch t.Name {
-		case "upper", "lower", "trim", "ago", "compact", "commas", "take":
+		case "upper", "lower", "trim", "ago", "compact", "commas", "take", "replace", "slug":
 			return vtype{core: "text"}
 		case "money":
 			// money() is the *formatter*: it renders int cents as text. The `money`

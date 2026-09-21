@@ -43,17 +43,22 @@ func TestCheckValidatesBoundResult(t *testing.T) {
 	}
 }
 
-func TestValidationMustPrecedeMutation(t *testing.T) {
+// A check no longer has to precede every mutation: the runtime rolls the whole
+// action back when one fails (runtime/undo.go), so a guard written after a write
+// — or inside a `for` body, next to the per-row write it guards — is a guard on a
+// transaction, not a hole in one. Both shapes the old ordering rule refused now
+// compile, and lower in the order they were written.
+func TestValidationMayFollowMutation(t *testing.T) {
 	cases := []struct{ name, body, want string }{
 		{
 			"check after a mutation",
 			"add Account { handle: handle, pid: \"x\" }\n        check handle != \"\" \"bad\"",
-			"must come before any mutation",
+			"add,check",
 		},
 		{
 			"let after a mutation",
 			"add Account { handle: handle, pid: \"x\" }\n        let uuid = call Verity.verify(handle, sig)",
-			"must come before any mutation",
+			"add,call",
 		},
 	}
 	for _, c := range cases {
@@ -61,9 +66,20 @@ func TestValidationMustPrecedeMutation(t *testing.T) {
 			src := strings.Replace(postBindApp,
 				"let uuid = call Verity.verify(handle, sig)\n        check uuid != \"\" \"device signature rejected\"\n        add Account { handle: handle, pid: uuid }",
 				c.body, 1)
-			_, err := String(src)
-			if err == nil || !strings.Contains(err.Error(), c.want) {
-				t.Fatalf("want %q, got %v", c.want, err)
+			g, err := String(src)
+			if err != nil {
+				t.Fatalf("should compile now that a failed check rolls the action back, got: %v", err)
+			}
+			var ops []string
+			for _, a := range g.Actions {
+				if a.Name == "enroll" {
+					for _, st := range a.Body {
+						ops = append(ops, st.Op)
+					}
+				}
+			}
+			if got := strings.Join(ops, ","); got != c.want {
+				t.Fatalf("body op order = %s, want %s", got, c.want)
 			}
 		})
 	}

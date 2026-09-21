@@ -1494,312 +1494,32 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		}
 	}
 
-	deltas := map[string]any{}
-	entChanged := map[string]bool{}
 	ses := s.sessions[sid] // ensureSession guaranteed it exists, with the right actor
 	sess := ses.state
-	var ops []durOp // durable writes, replayed in one transaction at the end
-	// What this action changes in the working set, recorded as it changes it, so a
-	// refused commit can be undone rather than merely reported (runtime/undo.go).
-	undo := newUndoLog(ses)
-	for _, st := range act.Body {
-		switch st.Op {
-		case "check":
-			// Validation in body order — runs after any earlier `let` bind so it can
-			// validate a brain result. The compiler guarantees checks precede every
-			// mutation, so a failure here has applied nothing to roll back.
-			if !truthy(eval(st.Value, scope)) {
-				s.recordAudit(actor, act.Name, false, "check failed: "+st.Msg)
-				s.obs.metrics.observeAction(act.Name, "invalid")
-				return nil, http.StatusUnprocessableEntity, st.Msg
-			}
-		case "assign":
-			v := eval(st.Value, scope)
-			if !sameValue(sess[st.Target], v) {
-				undo.state(sess, st.Target)
-				sess[st.Target] = v
-				scope[st.Target] = v
-				if !s.privateNm[st.Target] {
-					deltas[st.Target] = v // a @private cell is server-only — never shipped
-				}
-			}
-		case "establish":
-			// Adopt a custom session identity (PIAL): set the session actor (and
-			// optionally role) in place — effective for every later request — and
-			// echo it as a delta so a reactive {actor} updates and clustering syncs.
-			na := toStr(eval(st.Value, scope))
-			ses.actor = na
-			scope["actor"] = na
-			deltas["actor"] = na
-			if st.Role != nil {
-				nr := toStr(eval(st.Role, scope))
-				ses.role = nr
-				scope["role"] = nr
-				deltas["role"] = nr
-			}
-		case "add":
-			row := record{}
-			for _, fi := range st.Fields {
-				row[fi.Name] = eval(fi.Expr, scope)
-			}
-			// Declarative constraints (@required/@unique/@min/@max/@matches) are
-			// enforced before the row lands, so invalid data never reaches the store.
-			if msg := s.constraintError(st.Entity, row, "", nil); msg != "" {
-				s.recordAudit(actor, act.Name, false, "constraint: "+msg)
-				s.obs.metrics.observeAction(act.Name, "invalid")
-				return nil, http.StatusUnprocessableEntity, msg
-			}
-			undo.entity(s, st.Entity)
-			s.nextID[st.Entity]++
-			row["id"] = s.nextID[st.Entity]
-			s.entities[st.Entity] = append(s.entities[st.Entity], row)
-			ops = append(ops, durOp{kind: "save", entity: st.Entity, row: row})
-			entChanged[st.Entity] = true
-		case "set":
-			if st.Where != nil {
-				// Filtered update: apply the block of assignments to every row the
-				// predicate accepts, with the item variable bound to each row (the same
-				// traversal `remove … where` makes, writing instead of deleting).
-				//
-				// It is N row updates, and it says so: there is no engine primitive for
-				// a predicated update behind `Tx.Save`, so the honest lowering is one
-				// save per matching row. What makes it a single change rather than a
-				// loop that pretends to be one is `ops` — every save lands in the one
-				// transaction `commit` replays at the end of the action, so either all
-				// the rows move or none of them do, and a constraint violation on row
-				// nine returns the action's error with rows one through eight unwritten.
-				prev, had := scope[st.Var]
-				matched := false
-				for _, r := range s.entities[st.Entity] {
-					m, ok := r.(record)
-					if !ok {
-						continue
-					}
-					scope[st.Var] = m
-					if !truthy(eval(st.Where, scope)) {
-						continue
-					}
-					// Every assignment is evaluated against the row as it was *before* this
-					// statement, so the block reads one consistent row: `stock = p.stock - 1`
-					// and `low = p.stock - 1 < 5` see the same `p.stock`.
-					cand := record{}
-					for k, v := range m {
-						cand[k] = v
-					}
-					for _, fi := range st.Fields {
-						cand[fi.Name] = eval(fi.Expr, scope)
-					}
-					// Every field this statement writes is validated, not just the last
-					// one: constraintError narrows to the column it is handed, so a block
-					// that moves three columns asks three questions.
-					bad := ""
-					for _, fi := range st.Fields {
-						if bad = s.constraintError(st.Entity, cand, fi.Name, m["id"]); bad != "" {
-							break
-						}
-					}
-					if bad != "" {
-						if had {
-							scope[st.Var] = prev
-						} else {
-							delete(scope, st.Var)
-						}
-						s.recordAudit(actor, act.Name, false, "constraint: "+bad)
-						s.obs.metrics.observeAction(act.Name, "invalid")
-						return nil, http.StatusUnprocessableEntity, bad
-					}
-					for _, fi := range st.Fields {
-						undo.field(m, fi.Name)
-						m[fi.Name] = cand[fi.Name]
-					}
-					ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
-					matched = true
-				}
-				if had {
-					scope[st.Var] = prev
-				} else {
-					delete(scope, st.Var)
-				}
-				if matched {
-					entChanged[st.Entity] = true
-				}
-				break
-			}
-			key := eval(st.Key, scope)
-			for _, r := range s.entities[st.Entity] {
-				if m, ok := r.(record); ok && equal(m["id"], key) {
-					nv := eval(st.Value, scope)
-					// Validate the proposed value (a @unique scan ignores this row).
-					cand := record{}
-					for k, v := range m {
-						cand[k] = v
-					}
-					cand[st.Field] = nv
-					if msg := s.constraintError(st.Entity, cand, st.Field, m["id"]); msg != "" {
-						s.recordAudit(actor, act.Name, false, "constraint: "+msg)
-						s.obs.metrics.observeAction(act.Name, "invalid")
-						return nil, http.StatusUnprocessableEntity, msg
-					}
-					undo.field(m, st.Field)
-					m[st.Field] = nv
-					ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
-					entChanged[st.Entity] = true
-					break
-				}
-			}
-		case "remove":
-			soft := s.softDel[st.Entity]
-			if st.Where != nil {
-				// Filtered delete: remove every row the predicate accepts, with the
-				// item variable bound to each row (mirrors the filtered-agg fold). For a
-				// @softdelete entity a match is archived (flagged + persisted) rather than
-				// dropped, and is hidden from the live set either way.
-				rows := s.entities[st.Entity]
-				prev, had := scope[st.Var]
-				kept := make([]any, 0, len(rows))
-				removed := map[int]bool{}
-				for _, r := range rows {
-					m, ok := r.(record)
-					if !ok {
-						kept = append(kept, r)
-						continue
-					}
-					scope[st.Var] = m
-					if truthy(eval(st.Where, scope)) {
-						id := m["id"]
-						if soft {
-							undo.field(m, "archived")
-							m["archived"] = true
-							ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
-						} else {
-							ops = append(ops, durOp{kind: "delete", entity: st.Entity, id: id})
-						}
-						removed[toInt(id)] = true
-					} else {
-						kept = append(kept, r)
-					}
-				}
-				if had {
-					scope[st.Var] = prev
-				} else {
-					delete(scope, st.Var)
-				}
-				if len(removed) > 0 {
-					undo.entity(s, st.Entity)
-					s.entities[st.Entity] = kept
-					entChanged[st.Entity] = true
-					// A hard delete cascades to children; an archive leaves the row (and so
-					// its children's foreign keys) intact, so it does not.
-					if !soft {
-						s.cascadeMem(st.Entity, removed, entChanged, undo)
-					}
-				}
-				break
-			}
-			key := eval(st.Key, scope)
-			rows := s.entities[st.Entity]
-			for i, r := range rows {
-				if m, ok := r.(record); ok && equal(m["id"], key) {
-					undo.entity(s, st.Entity)
-					s.entities[st.Entity] = append(rows[:i:i], rows[i+1:]...)
-					if soft {
-						undo.field(m, "archived")
-						m["archived"] = true
-						ops = append(ops, durOp{kind: "save", entity: st.Entity, row: m})
-					} else {
-						ops = append(ops, durOp{kind: "delete", entity: st.Entity, id: key})
-						// the database cascades the delete to children; mirror it in memory.
-						s.cascadeMem(st.Entity, map[int]bool{toInt(key): true}, entChanged, undo)
-					}
-					entChanged[st.Entity] = true
-					break
-				}
-			}
-		case "clear":
-			removed := map[int]bool{}
-			for _, r := range s.entities[st.Entity] {
-				if m, ok := r.(record); ok {
-					removed[toInt(m["id"])] = true
-				}
-			}
-			undo.entity(s, st.Entity)
-			s.entities[st.Entity] = []any{}
-			ops = append(ops, durOp{kind: "clear", entity: st.Entity})
-			entChanged[st.Entity] = true
-			s.cascadeMem(st.Entity, removed, entChanged, undo)
-		case "call":
-			// An external-service effect. The compiler proved this action is
-			// server-placed, so we are on the authority — post the named arguments
-			// to the brain.
-			if sv := s.byService[st.Service]; sv != nil {
-				var params []string
-				for _, op := range sv.Ops {
-					if op.Name == st.Field {
-						params = op.Params
-						break
-					}
-				}
-				body := map[string]any{}
-				for i, arg := range st.Args {
-					key := fmt.Sprintf("arg%d", i)
-					if i < len(params) {
-						key = params[i]
-					}
-					body[key] = eval(arg, scope)
-				}
-				if st.Bind != "" {
-					// Request→response: wait for the brain's typed answer and bind it
-					// into scope so the rest of the body can use it. A failed call
-					// aborts the action (surfaces via failed(<action>)).
-					res, err := s.callServiceSync(sv.URL, st.Field, body)
-					if err != nil {
-						s.obs.metrics.observeAction(act.Name, "service_error")
-						return nil, http.StatusBadGateway, fmt.Sprintf("%s.%s unavailable", st.Service, st.Field)
-					}
-					scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
-				} else {
-					s.callService(sv.URL, st.Field, body) // fire-and-forget
-				}
-			}
-		case "do":
-			// A proc call: same-process, synchronous, in-binary — not a network
-			// round-trip like "call" above, so there is no URL to post to and
-			// nothing to fail on unavailability. The compiler proved this action
-			// (and the proc itself) run on the authority.
-			if p := s.byProc[st.Service]; p != nil {
-				argVals := make([]any, len(st.Args))
-				for i, arg := range st.Args {
-					argVals[i] = eval(arg, scope)
-				}
-				res, err := s.runProcLocked(p, argVals)
-				if err != nil {
-					s.obs.metrics.observeAction(act.Name, "proc_error")
-					return nil, http.StatusInternalServerError, fmt.Sprintf("%s: proc %s failed: %v", act.Name, st.Service, err)
-				}
-				if st.Bind != "" {
-					// The bound result joins the ACTION's own scope, exactly like a
-					// service call's bind — it is not written into sess/deltas unless
-					// a later statement explicitly assigns it into a state cell. The
-					// proc's OWN internal `let` locals never reach here at all: they
-					// lived only in the frame runProcLocked built and discarded.
-					scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
-				}
-			}
-		case "exprstmt":
-			// A bare builtin call for its side effect alone — print(...), its
-			// result discarded. Mirrors execProcBlock's identical "exprstmt" case
-			// below, using eval() (this action's flat scope) instead of
-			// evalInFrame (a proc's frame chain) — internal/ir/build.go's
-			// action() builder already proved this is a builtin the language
-			// allows in an action body (readExpr's e.check funnel), so there is
-			// nothing left to fail on here.
-			eval(st.Value, scope)
-		}
-		// keep entity collections in scope fresh for later statements.
-		for ent := range entChanged {
-			scope[ent] = s.entities[ent]
-		}
+	ar := &actionRun{
+		act:        act,
+		actor:      actor,
+		scope:      scope,
+		ses:        ses,
+		sess:       sess,
+		deltas:     map[string]any{},
+		entChanged: map[string]bool{},
+		// What this action changes in the working set, recorded as it changes it,
+		// so a failure anywhere in the body — a check that fails after a write, a
+		// refused commit, a proc that errors — can be undone rather than merely
+		// reported (runtime/undo.go).
+		undo: newUndoLog(ses),
 	}
+	if status, msg := s.execActionBlock(act.Body, ar); status != http.StatusOK {
+		// The body stopped part-way. Whatever it had already written to the
+		// working set comes back out, so the action either happened in full or
+		// not at all — in memory exactly as in the store below. (A check or a
+		// policy that fails before the first write has nothing to undo, and the
+		// rollback of an empty log is a no-op.)
+		ar.undo.rollback(s, ses, sess)
+		return nil, status, msg
+	}
+	deltas, entChanged, ops, undo := ar.deltas, ar.entChanged, ar.ops, ar.undo
 
 	// Persist the whole action atomically: every write rides one transaction, so
 	// the database never holds a half-applied action.
@@ -1833,6 +1553,428 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 	s.recordAudit(actor, act.Name, true, "")
 	s.obs.metrics.observeAction(act.Name, "ok")
 	return deltas, http.StatusOK, ""
+}
+
+// actionRun is the frame one action body executes in: the scope every
+// expression evaluates against, the session it writes, and the three things
+// the body accumulates — per-session deltas for the reply, the entities whose
+// rows moved (for the SSE fan-out), and the durable writes to replay in one
+// transaction — plus the undo log that lets any failure put the working set
+// back. One value, passed down through every nested block, so a `set` inside a
+// `for` inside an `if` lands in exactly the same batch a top-level one does.
+type actionRun struct {
+	act        *ir.Action
+	actor      string
+	scope      map[string]any
+	ses        *sessionState
+	sess       map[string]any
+	deltas     map[string]any
+	entChanged map[string]bool
+	ops        []durOp // durable writes, replayed in one transaction at the end
+	undo       *undoLog
+}
+
+// execActionBlock runs one statement list of an action body — the body itself,
+// or the nested block of a `for`/`if`/`else` — and answers an HTTP status and
+// message the way runActionLocked's callers expect: 200 with "" when every
+// statement ran, or the first failure's status and message. It is recursive
+// for the two statements that carry a block (`for`, `if`), mirroring
+// execProcBlock's shape for a proc body.
+//
+// Locals a block binds (`let`, a bound `add`) live in the action's one flat
+// scope map for the rest of that block and are removed when it ends; a `for`'s
+// item variable is bound per iteration the same way `set … where` binds its
+// own, with whatever the name held before restored after. The compiler refused
+// every name that could collide (internal/ir/build.go's bindLocal), so these
+// are plain sets and deletes, never a shadowing question.
+func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
+	var bound []string // names this block's own statements bound, dropped on exit
+	defer func() {
+		for _, n := range bound {
+			delete(ar.scope, n)
+		}
+	}()
+	for _, st := range body {
+		switch st.Op {
+		case "check":
+			// Validation in body order — after a `let` bind so it can validate the
+			// bound value, or inside a `for` so it can guard the row in hand. A
+			// failure here is a failed action: runActionLocked rolls back every
+			// write the body already made (runtime/undo.go), so nothing this
+			// check found wrong is left standing.
+			if !truthy(eval(st.Value, ar.scope)) {
+				s.recordAudit(ar.actor, ar.act.Name, false, "check failed: "+st.Msg)
+				s.obs.metrics.observeAction(ar.act.Name, "invalid")
+				return http.StatusUnprocessableEntity, st.Msg
+			}
+		case "assign":
+			v := eval(st.Value, ar.scope)
+			if !sameValue(ar.sess[st.Target], v) {
+				ar.undo.state(ar.sess, st.Target)
+				ar.sess[st.Target] = v
+				ar.scope[st.Target] = v
+				if !s.privateNm[st.Target] {
+					ar.deltas[st.Target] = v // a @private cell is server-only — never shipped
+				}
+			}
+		case "establish":
+			// Adopt a custom session identity (PIAL): set the session actor (and
+			// optionally role) in place — effective for every later request — and
+			// echo it as a delta so a reactive {actor} updates and clustering syncs.
+			na := toStr(eval(st.Value, ar.scope))
+			ar.ses.actor = na
+			ar.scope["actor"] = na
+			ar.deltas["actor"] = na
+			if st.Role != nil {
+				nr := toStr(eval(st.Role, ar.scope))
+				ar.ses.role = nr
+				ar.scope["role"] = nr
+				ar.deltas["role"] = nr
+			}
+		case "add":
+			row := record{}
+			for _, fi := range st.Fields {
+				row[fi.Name] = eval(fi.Expr, ar.scope)
+			}
+			// Declarative constraints (@required/@unique/@min/@max/@matches) are
+			// enforced before the row lands, so invalid data never reaches the store.
+			if msg := s.constraintError(st.Entity, row, "", nil); msg != "" {
+				s.recordAudit(ar.actor, ar.act.Name, false, "constraint: "+msg)
+				s.obs.metrics.observeAction(ar.act.Name, "invalid")
+				return http.StatusUnprocessableEntity, msg
+			}
+			ar.undo.entity(s, st.Entity)
+			s.nextID[st.Entity]++
+			row["id"] = s.nextID[st.Entity]
+			s.entities[st.Entity] = append(s.entities[st.Entity], row)
+			ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: row})
+			ar.entChanged[st.Entity] = true
+			if st.Bind != "" {
+				// `let id = add …`: the new row's id, for the rest of this block.
+				ar.scope[st.Bind] = row["id"]
+				bound = append(bound, st.Bind)
+			}
+		case "set":
+			if st.Where != nil {
+				// Filtered update: apply the block of assignments to every row the
+				// predicate accepts, with the item variable bound to each row (the same
+				// traversal `remove … where` makes, writing instead of deleting).
+				//
+				// It is N row updates, and it says so: there is no engine primitive for
+				// a predicated update behind `Tx.Save`, so the honest lowering is one
+				// save per matching row. What makes it a single change rather than a
+				// loop that pretends to be one is `ops` — every save lands in the one
+				// transaction `commit` replays at the end of the action, so either all
+				// the rows move or none of them do, and a constraint violation on row
+				// nine returns the action's error with rows one through eight unwritten.
+				prev, had := ar.scope[st.Var]
+				matched := false
+				for _, r := range s.entities[st.Entity] {
+					m, ok := r.(record)
+					if !ok {
+						continue
+					}
+					ar.scope[st.Var] = m
+					if !truthy(eval(st.Where, ar.scope)) {
+						continue
+					}
+					// Every assignment is evaluated against the row as it was *before* this
+					// statement, so the block reads one consistent row: `stock = p.stock - 1`
+					// and `low = p.stock - 1 < 5` see the same `p.stock`.
+					cand := record{}
+					for k, v := range m {
+						cand[k] = v
+					}
+					for _, fi := range st.Fields {
+						cand[fi.Name] = eval(fi.Expr, ar.scope)
+					}
+					// Every field this statement writes is validated, not just the last
+					// one: constraintError narrows to the column it is handed, so a block
+					// that moves three columns asks three questions.
+					bad := ""
+					for _, fi := range st.Fields {
+						if bad = s.constraintError(st.Entity, cand, fi.Name, m["id"]); bad != "" {
+							break
+						}
+					}
+					if bad != "" {
+						if had {
+							ar.scope[st.Var] = prev
+						} else {
+							delete(ar.scope, st.Var)
+						}
+						s.recordAudit(ar.actor, ar.act.Name, false, "constraint: "+bad)
+						s.obs.metrics.observeAction(ar.act.Name, "invalid")
+						return http.StatusUnprocessableEntity, bad
+					}
+					for _, fi := range st.Fields {
+						ar.undo.field(m, fi.Name)
+						m[fi.Name] = cand[fi.Name]
+					}
+					ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: m})
+					matched = true
+				}
+				if had {
+					ar.scope[st.Var] = prev
+				} else {
+					delete(ar.scope, st.Var)
+				}
+				if matched {
+					ar.entChanged[st.Entity] = true
+				}
+				break
+			}
+			key := eval(st.Key, ar.scope)
+			for _, r := range s.entities[st.Entity] {
+				if m, ok := r.(record); ok && equal(m["id"], key) {
+					nv := eval(st.Value, ar.scope)
+					// Validate the proposed value (a @unique scan ignores this row).
+					cand := record{}
+					for k, v := range m {
+						cand[k] = v
+					}
+					cand[st.Field] = nv
+					if msg := s.constraintError(st.Entity, cand, st.Field, m["id"]); msg != "" {
+						s.recordAudit(ar.actor, ar.act.Name, false, "constraint: "+msg)
+						s.obs.metrics.observeAction(ar.act.Name, "invalid")
+						return http.StatusUnprocessableEntity, msg
+					}
+					ar.undo.field(m, st.Field)
+					m[st.Field] = nv
+					ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: m})
+					ar.entChanged[st.Entity] = true
+					break
+				}
+			}
+		case "remove":
+			soft := s.softDel[st.Entity]
+			if st.Where != nil {
+				// Filtered delete: remove every row the predicate accepts, with the
+				// item variable bound to each row (mirrors the filtered-agg fold). For a
+				// @softdelete entity a match is archived (flagged + persisted) rather than
+				// dropped, and is hidden from the live set either way.
+				rows := s.entities[st.Entity]
+				prev, had := ar.scope[st.Var]
+				kept := make([]any, 0, len(rows))
+				removed := map[int]bool{}
+				for _, r := range rows {
+					m, ok := r.(record)
+					if !ok {
+						kept = append(kept, r)
+						continue
+					}
+					ar.scope[st.Var] = m
+					if truthy(eval(st.Where, ar.scope)) {
+						id := m["id"]
+						if soft {
+							ar.undo.field(m, "archived")
+							m["archived"] = true
+							ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: m})
+						} else {
+							ar.ops = append(ar.ops, durOp{kind: "delete", entity: st.Entity, id: id})
+						}
+						removed[toInt(id)] = true
+					} else {
+						kept = append(kept, r)
+					}
+				}
+				if had {
+					ar.scope[st.Var] = prev
+				} else {
+					delete(ar.scope, st.Var)
+				}
+				if len(removed) > 0 {
+					ar.undo.entity(s, st.Entity)
+					s.entities[st.Entity] = kept
+					ar.entChanged[st.Entity] = true
+					// A hard delete cascades to children; an archive leaves the row (and so
+					// its children's foreign keys) intact, so it does not.
+					if !soft {
+						s.cascadeMem(st.Entity, removed, ar.entChanged, ar.undo)
+					}
+				}
+				break
+			}
+			key := eval(st.Key, ar.scope)
+			rows := s.entities[st.Entity]
+			for i, r := range rows {
+				if m, ok := r.(record); ok && equal(m["id"], key) {
+					ar.undo.entity(s, st.Entity)
+					s.entities[st.Entity] = append(rows[:i:i], rows[i+1:]...)
+					if soft {
+						ar.undo.field(m, "archived")
+						m["archived"] = true
+						ar.ops = append(ar.ops, durOp{kind: "save", entity: st.Entity, row: m})
+					} else {
+						ar.ops = append(ar.ops, durOp{kind: "delete", entity: st.Entity, id: key})
+						// the database cascades the delete to children; mirror it in memory.
+						s.cascadeMem(st.Entity, map[int]bool{toInt(key): true}, ar.entChanged, ar.undo)
+					}
+					ar.entChanged[st.Entity] = true
+					break
+				}
+			}
+		case "clear":
+			removed := map[int]bool{}
+			for _, r := range s.entities[st.Entity] {
+				if m, ok := r.(record); ok {
+					removed[toInt(m["id"])] = true
+				}
+			}
+			ar.undo.entity(s, st.Entity)
+			s.entities[st.Entity] = []any{}
+			ar.ops = append(ar.ops, durOp{kind: "clear", entity: st.Entity})
+			ar.entChanged[st.Entity] = true
+			s.cascadeMem(st.Entity, removed, ar.entChanged, ar.undo)
+		case "call":
+			// An external-service effect. The compiler proved this action is
+			// server-placed, so we are on the authority — post the named arguments
+			// to the brain.
+			if sv := s.byService[st.Service]; sv != nil {
+				var params []string
+				for _, op := range sv.Ops {
+					if op.Name == st.Field {
+						params = op.Params
+						break
+					}
+				}
+				body := map[string]any{}
+				for i, arg := range st.Args {
+					key := fmt.Sprintf("arg%d", i)
+					if i < len(params) {
+						key = params[i]
+					}
+					body[key] = eval(arg, ar.scope)
+				}
+				if st.Bind != "" {
+					// Request→response: wait for the brain's typed answer and bind it
+					// into ar.scope so the rest of the body can use it. A failed call
+					// aborts the action (surfaces via failed(<action>)).
+					res, err := s.callServiceSync(sv.URL, st.Field, body)
+					if err != nil {
+						s.obs.metrics.observeAction(ar.act.Name, "service_error")
+						return http.StatusBadGateway, fmt.Sprintf("%s.%s unavailable", st.Service, st.Field)
+					}
+					ar.scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
+				} else {
+					s.callService(sv.URL, st.Field, body) // fire-and-forget
+				}
+			}
+		case "do":
+			// A proc call: same-process, synchronous, in-binary — not a network
+			// round-trip like "call" above, so there is no URL to post to and
+			// nothing to fail on unavailability. The compiler proved this action
+			// (and the proc itself) run on the authority.
+			if p := s.byProc[st.Service]; p != nil {
+				argVals := make([]any, len(st.Args))
+				for i, arg := range st.Args {
+					argVals[i] = eval(arg, ar.scope)
+				}
+				res, err := s.runProcLocked(p, argVals)
+				if err != nil {
+					s.obs.metrics.observeAction(ar.act.Name, "proc_error")
+					return http.StatusInternalServerError, fmt.Sprintf("%s: proc %s failed: %v", ar.act.Name, st.Service, err)
+				}
+				if st.Bind != "" {
+					// The bound result joins the ACTION's own ar.scope, exactly like a
+					// service call's bind — it is not written into ar.sess/ar.deltas unless
+					// a later statement explicitly assigns it into a state cell. The
+					// proc's OWN internal `let` locals never reach here at all: they
+					// lived only in the frame runProcLocked built and discarded.
+					ar.scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
+				}
+			}
+		case "exprstmt":
+			// A bare builtin call for its side effect alone — print(...), its
+			// result discarded. Mirrors execProcBlock's identical "exprstmt" case
+			// below, using eval() (this action's flat ar.scope) instead of
+			// evalInFrame (a proc's frame chain) — internal/ir/build.go's
+			// action() builder already proved this is a builtin the language
+			// allows in an action body (readExpr's e.check funnel), so there is
+			// nothing left to fail on here.
+			eval(st.Value, ar.scope)
+		case "let":
+			// `let name = expr`: bound into the action's flat scope for the rest
+			// of this block, and dropped when the block ends. The compiler proved
+			// the name is fresh (no state cell, entity, parameter or earlier
+			// local), so there is nothing here to shadow or restore.
+			ar.scope[st.Target] = eval(st.Value, ar.scope)
+			bound = append(bound, st.Target)
+		case "if":
+			branch := st.Else
+			if truthy(eval(st.Value, ar.scope)) {
+				branch = st.Body
+			}
+			if branch == nil {
+				break // the untaken side of a one-armed `if`
+			}
+			if status, msg := s.execActionBlock(branch, ar); status != http.StatusOK {
+				return status, msg
+			}
+		case "for":
+			// `for item in Entity [where …] [by …] [limit …]:` — the rows are
+			// chosen up front, against the working set as it stands when the loop
+			// starts, and the body runs once per chosen row with the item variable
+			// bound to it. Choosing first is what makes a body that adds to or
+			// removes from the same entity well-defined: a row the body inserts is
+			// never visited, and one it removes is simply gone by the time a
+			// later statement looks for it. The rows themselves are the live
+			// records, so a `set` in iteration one is visible to iteration two —
+			// the same in-place mutation every other statement makes.
+			//
+			// Selection is the view's own vocabulary (where/order/limit) with the
+			// view's own helpers (sortRows), so `for … limit 1` in an action
+			// picks exactly the row `for … limit 1` in a view would show first.
+			prev, had := ar.scope[st.Var]
+			var picked []any
+			for _, row := range s.entities[st.Entity] {
+				m, ok := row.(record)
+				if !ok {
+					continue
+				}
+				ar.scope[st.Var] = m
+				if st.Where == nil || truthy(eval(st.Where, ar.scope)) {
+					picked = append(picked, m)
+				}
+			}
+			if had {
+				ar.scope[st.Var] = prev
+			} else {
+				delete(ar.scope, st.Var)
+			}
+			picked = sortRows(picked, st.Order, st.Desc)
+			if st.Limit != nil {
+				lim := toInt(eval(st.Limit, ar.scope))
+				if lim <= 0 {
+					picked = nil
+				} else if len(picked) > lim {
+					picked = picked[:lim]
+				}
+			}
+			for _, m := range picked {
+				ar.scope[st.Var] = m
+				status, msg := s.execActionBlock(st.Body, ar)
+				if status != http.StatusOK {
+					if had {
+						ar.scope[st.Var] = prev
+					} else {
+						delete(ar.scope, st.Var)
+					}
+					return status, msg
+				}
+			}
+			if had {
+				ar.scope[st.Var] = prev
+			} else {
+				delete(ar.scope, st.Var)
+			}
+		}
+		// keep entity collections in scope fresh for later statements.
+		for ent := range ar.entChanged {
+			ar.scope[ent] = s.entities[ent]
+		}
+	}
+	return http.StatusOK, ""
 }
 
 // runProcLocked runs a proc synchronously, in-process, under the caller's lock

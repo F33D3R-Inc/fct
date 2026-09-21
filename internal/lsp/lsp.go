@@ -461,7 +461,7 @@ var keywords = []string{
 	"if", "box", "text", "button", "input", "textarea", "checkbox", "toggle", "radio",
 	"select", "option", "form", "upload",
 	"use", "slot", "link", "add", "set", "remove", "clear", "requires", "check",
-	"at", "desc", "asc", "on", "start", "every",
+	"let", "else", "at", "desc", "asc", "on", "start", "every",
 }
 
 // "float" is a real type only inside a proc (a parameter, a `let`/`let mut`
@@ -473,7 +473,7 @@ var typeNames = []string{"int", "text", "bool", "money", "date", "float"}
 
 var builtins = []string{
 	"now", "rand", "count", "sum", "abs", "min", "max", "floor", "round", "money",
-	"len", "upper", "lower", "trim", "year", "month", "day", "actor", "role", "verified",
+	"len", "upper", "lower", "trim", "replace", "slug", "year", "month", "day", "actor", "role", "verified",
 	"route", "session", "toFloat", "toInt", "toMoney",
 }
 
@@ -495,6 +495,8 @@ func builtinDoc(name string) string {
 		"upper":   "`upper(s)` → text — uppercased.",
 		"lower":   "`lower(s)` → text — lowercased.",
 		"trim":    "`trim(s)` → text — whitespace-trimmed.",
+		"replace": "`replace(s, old, new)` → text — every occurrence of old replaced by new.",
+		"slug":    "`slug(s)` → text — a URL path segment: lower-cased, runs of non a-z/0-9 collapsed to `-`, no leading/trailing `-`.",
 		"money":   "`money(cents)` → text — format integer minor units as a 2-decimal string.",
 		"year":    "`year(t)` → int — UTC year of a date (unix seconds).",
 		"month":   "`month(t)` → int — UTC month (1–12).",

@@ -469,6 +469,8 @@
       case "lower": return toStr(a(0)).toLowerCase();
       case "trim": return toStr(a(0)).trim();
       case "contains": return toStr(a(0)).includes(toStr(a(1)));
+      case "replace": return toStr(a(0)).replaceAll(toStr(a(1)), toStr(a(2)));
+      case "slug": return toStr(a(0)).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
       case "ago": return ago(toInt(a(0)), Math.floor(Date.now() / 1000));
       case "compact": return compact(toInt(a(0)));
       case "commas": return commas(toInt(a(0)));
@@ -1832,7 +1834,7 @@
       }
     }
     if (act.placement === "client") {
-      runClient(act, vals);
+      runClient(act, vals, action, source);
       return;
     }
     // Optimistic update: predict the effect locally for instant feedback, then let
@@ -1919,74 +1921,136 @@
     }, Math.max(0, oc.debounce || 0));
   }
 
-  function runClient(act, vals) {
+  // execBody interprets an action body against `work`, a copy of the store the
+  // statements write to, binding locals into `scope` as they go and recording
+  // in `changed` every cell or collection the body touched. It answers false the
+  // moment a `check` fails (ctx.error carries its message) and true otherwise —
+  // the caller decides what to do with the copy, which is what makes a failed
+  // check leave the real store exactly as it found it. It is one interpreter
+  // for both a client-placed action (runClient) and an optimistic prediction
+  // of a server one (predict; ctx.predict, where entity writes get temporary
+  // negative ids): runtime/server.go's execActionBlock, statement for statement,
+  // so the browser and the authority agree about what a body does.
+  function execBody(body, scope, work, changed, ctx) {
+    const mark = (k) => { if (changed.indexOf(k) < 0) changed.push(k); };
+    for (const st of list(body)) {
+      switch (st.op) {
+        case "check":
+          if (!truthy(ev(st.value, scope))) { ctx.error = st.msg || "Something went wrong."; return false; }
+          break;
+        case "let":
+          scope[st.target] = ev(st.value, scope);
+          break;
+        case "if": {
+          const branch = truthy(ev(st.value, scope)) ? st.body : st.else;
+          if (branch && !execBody(branch, scope, work, changed, ctx)) return false;
+          break;
+        }
+        case "for": {
+          // The rows are chosen up front (the authority does the same), with the
+          // view's own selectRows so where/order/limit read identically here.
+          const rows = selectRows(work[st.entity] || [], { var: st.var, where: st.where, order: st.order, desc: st.desc, limit: st.limit }, scope);
+          const had = Object.prototype.hasOwnProperty.call(scope, st.var);
+          const prev = scope[st.var];
+          let ok = true;
+          for (const r of rows) { scope[st.var] = r; if (!execBody(st.body, scope, work, changed, ctx)) { ok = false; break; } }
+          if (had) scope[st.var] = prev; else delete scope[st.var];
+          if (!ok) return false;
+          break;
+        }
+        case "assign": {
+          const v = ev(st.value, scope);
+          if (work[st.target] !== v || ctx.predict) { work[st.target] = v; scope[st.target] = v; mark(st.target); }
+          break;
+        }
+        case "add": {
+          const row = { id: ctx.tempId-- };
+          for (const fi of list(st.fields)) row[fi.name] = ev(fi.expr, scope);
+          work[st.entity] = (work[st.entity] || []).concat([row]);
+          scope[st.entity] = work[st.entity]; mark(st.entity);
+          if (st.bind) scope[st.bind] = row.id;
+          break;
+        }
+        case "set": {
+          if (st.where) {
+            // Filtered update: apply the block to every row the predicate accepts,
+            // item var bound — runtime/server.go's "set" with st.Where, same order.
+            const had = Object.prototype.hasOwnProperty.call(scope, st.var);
+            const prev = scope[st.var];
+            work[st.entity] = (work[st.entity] || []).map((r) => {
+              scope[st.var] = r;
+              if (!truthy(ev(st.where, scope))) return r;
+              const next = Object.assign({}, r);
+              // Every assignment reads the row as it was before this statement, so
+              // the block sees one consistent row (the authority does the same).
+              for (const fi of list(st.fields)) next[fi.name] = ev(fi.expr, scope);
+              return next;
+            });
+            if (had) scope[st.var] = prev; else delete scope[st.var];
+          } else {
+            const key = ev(st.key, scope);
+            work[st.entity] = (work[st.entity] || []).map((r) =>
+              eq(r.id, key) ? Object.assign({}, r, { [st.field]: ev(st.value, scope) }) : r);
+          }
+          scope[st.entity] = work[st.entity]; mark(st.entity);
+          break;
+        }
+        case "remove": {
+          if (st.where) {
+            // Filtered delete: drop every row the predicate accepts, item var bound.
+            const had = Object.prototype.hasOwnProperty.call(scope, st.var);
+            const prev = scope[st.var];
+            work[st.entity] = (work[st.entity] || []).filter((r) => {
+              scope[st.var] = r; return !truthy(ev(st.where, scope));
+            });
+            if (had) scope[st.var] = prev; else delete scope[st.var];
+          } else {
+            const key = ev(st.key, scope);
+            work[st.entity] = (work[st.entity] || []).filter((r) => !eq(r.id, key));
+          }
+          scope[st.entity] = work[st.entity]; mark(st.entity);
+          break;
+        }
+        case "clear":
+          work[st.entity] = []; scope[st.entity] = work[st.entity]; mark(st.entity);
+          break;
+      }
+    }
+    return true;
+  }
+
+  // runClient runs a client-placed action entirely in the browser. A failed
+  // `check` surfaces exactly as the authority's refusal of a server action
+  // would — on the control that fired it, and as failed(action) — and applies
+  // nothing, because the body ran against a copy.
+  function runClient(act, vals, action, source) {
+    const work = Object.assign({}, store);
     const scope = Object.assign({}, store);
     list(act.params).forEach((p, i) => (scope[p.name] = vals[i]));
     const changed = [];
-    for (const st of list(act.body)) if (st.op === "assign") {
-      const v = ev(st.value, scope);
-      if (store[st.target] !== v) { store[st.target] = v; scope[st.target] = v; changed.push(st.target); }
+    const ctx = { predict: false, tempId: -Date.now(), error: "" };
+    if (!execBody(act.body, scope, work, changed, ctx)) {
+      showError(source, ctx.error);
+      setPending(action, false, ctx.error);
+      return;
     }
+    for (const k of changed) store[k] = work[k];
     refresh(changed);
   }
 
   // predict applies a server action's body to local state for an optimistic paint.
   // Entity adds get a temporary negative id; the authoritative SSE snapshot then
-  // replaces the whole collection, swapping the prediction for the real row.
+  // replaces the whole collection, swapping the prediction for the real row. A
+  // body whose `check` fails here would be refused by the authority too, so
+  // nothing is painted for it.
   function predict(act, vals) {
+    const work = Object.assign({}, store);
     const scope = Object.assign({}, store);
     list(act.params).forEach((p, i) => (scope[p.name] = vals[i]));
     const changed = [];
-    let tempId = -Date.now();
-    for (const st of list(act.body)) {
-      if (st.op === "assign") {
-        const v = ev(st.value, scope);
-        store[st.target] = v; scope[st.target] = v; changed.push(st.target);
-      } else if (st.op === "add") {
-        const row = { id: tempId-- };
-        for (const fi of list(st.fields)) row[fi.name] = ev(fi.expr, scope);
-        store[st.entity] = (store[st.entity] || []).concat([row]);
-        scope[st.entity] = store[st.entity]; changed.push(st.entity);
-      } else if (st.op === "set") {
-        if (st.where) {
-          // Filtered update: apply the block to every row the predicate accepts,
-          // item var bound — runtime/server.go's "set" with st.Where, same order.
-          const had = Object.prototype.hasOwnProperty.call(scope, st.var);
-          const prev = scope[st.var];
-          store[st.entity] = (store[st.entity] || []).map((r) => {
-            scope[st.var] = r;
-            if (!truthy(ev(st.where, scope))) return r;
-            const next = Object.assign({}, r);
-            // Every assignment reads the row as it was before this statement, so
-            // the block sees one consistent row (the authority does the same).
-            for (const fi of list(st.fields)) next[fi.name] = ev(fi.expr, scope);
-            return next;
-          });
-          if (had) scope[st.var] = prev; else delete scope[st.var];
-        } else {
-          const key = ev(st.key, scope);
-          store[st.entity] = (store[st.entity] || []).map((r) =>
-            eq(r.id, key) ? Object.assign({}, r, { [st.field]: ev(st.value, scope) }) : r);
-        }
-        scope[st.entity] = store[st.entity]; changed.push(st.entity);
-      } else if (st.op === "remove") {
-        if (st.where) {
-          // Filtered delete: drop every row the predicate accepts, item var bound.
-          const had = Object.prototype.hasOwnProperty.call(scope, st.var);
-          const prev = scope[st.var];
-          store[st.entity] = (store[st.entity] || []).filter((r) => {
-            scope[st.var] = r; return !truthy(ev(st.where, scope));
-          });
-          if (had) scope[st.var] = prev; else delete scope[st.var];
-        } else {
-          const key = ev(st.key, scope);
-          store[st.entity] = (store[st.entity] || []).filter((r) => !eq(r.id, key));
-        }
-        scope[st.entity] = store[st.entity]; changed.push(st.entity);
-      } else if (st.op === "clear") {
-        store[st.entity] = []; scope[st.entity] = store[st.entity]; changed.push(st.entity);
-      }
-    }
+    const ctx = { predict: true, tempId: -Date.now(), error: "" };
+    if (!execBody(act.body, scope, work, changed, ctx)) return [];
+    for (const k of changed) store[k] = work[k];
     refresh(changed);
     return changed;
   }

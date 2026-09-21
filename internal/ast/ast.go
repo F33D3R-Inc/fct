@@ -551,8 +551,11 @@ type Action struct {
 	Requires   []Require
 	Optimistic bool // @optimistic — the client predicts the result before the round-trip
 	// Body holds every statement in source order, including `check` validations —
-	// so a check may run after a `let` bind and validate the bound result. Checks
-	// (and lets) must precede any mutation, so a failed check rolls back nothing.
+	// so a check may run after a `let` bind and validate the bound result, or
+	// inside a `for` and guard the row in hand. A failed check (or any other
+	// failure part-way through) rolls the whole action back — runtime/undo.go —
+	// so statements need no particular order to be safe. Body nests: a ForStmt
+	// or IfStmt carries its own statement list.
 	Body []Stmt
 	Line int
 }
@@ -801,10 +804,14 @@ type Assign struct {
 }
 
 // Add inserts a row into an entity: `add Entity { f: expr, ... }`. The server
-// assigns the row's id.
+// assigns the row's id. In its bound form, `let name = add Entity { ... }`,
+// Bind names the action-local the new row's id lands in, so a second write in
+// the same action can reference the row it just created (a Position for a new
+// Player, a Line for a new Order) without re-finding it by a natural key.
 type Add struct {
 	Entity string
 	Fields []FieldInit
+	Bind   string // "" = the id is not bound
 	Line   int
 }
 
@@ -854,11 +861,39 @@ type Clear struct {
 	Line   int
 }
 
-// Let declares a proc-local variable: `let name = expr` (immutable) or
-// `let mut name = expr` (a genuinely reassignable local, written back to with a
-// plain `name = expr` — see Assign). Proc-only: an action's `let` instead binds a
-// service/proc call's result (ServiceCall.Bind / Do.Bind), since an action has no
-// general local-variable model.
+// ForStmt is an action-body loop over entity rows:
+//
+//	for l in CartLine where l.owner == actor:
+//	    set Product(l.product).stock = Product(l.product).stock - l.qty
+//	    add Order { buyer: actor, product: l.product, qty: l.qty }
+//
+// Its header is the same Range a view's `for` parses (parseRange), so the row
+// selection vocabulary — `where`, `by field desc|asc`, `limit n` — is one
+// grammar in both places; only `more` (a view's paging control) has no meaning
+// here and is refused. Body is a nested action statement list: every statement
+// an action body accepts, including another ForStmt, an IfStmt, a Let, and a
+// `check` (which aborts and rolls back the whole action, see runtime/undo.go).
+// Var is bound to each matching row in turn; the rows are snapshotted before
+// the first iteration, so a body that adds to or removes from the same entity
+// neither revisits nor skips.
+//
+// This is what closes the "an action body has no loop" gap: a whole-cart
+// checkout, one receipt per line, a weighted pick over N candidate rows — every
+// shape that needs "for each matching row, a different write" and previously
+// had to be one request per row.
+type ForStmt struct {
+	Range
+	Body []Stmt
+	Line int
+}
+
+// Let declares a local variable: `let name = expr` (immutable) or, in a proc
+// only, `let mut name = expr` (a genuinely reassignable local, written back to
+// with a plain `name = expr` — see Assign). In an action body the immutable
+// form binds any expression for the rest of its block — a computed damage roll
+// read by three later `set`s, a row looked up once — alongside the call-shaped
+// binds an action already had (ServiceCall.Bind / Do.Bind / Add.Bind). `let
+// mut` stays proc-only: an action's changing values are state cells.
 type Let struct {
 	Name  string
 	Mut   bool
@@ -904,11 +939,12 @@ type Loop struct {
 	Line int
 }
 
-// If is a proc-only if-as-statement: Then runs when Cond is truthy, Else runs
+// IfStmt is an if-as-statement: Then runs when Cond is truthy, Else runs
 // otherwise (nil = no else clause). Distinct from the UI node of the same name
 // (ast.If, above) — that one is a pure view-rendering conditional with no
-// statement body; this one is proc control flow, written `if <cond>: ... [else:
-// ...]` with each branch a nested, recursive statement list.
+// statement body; this one is statement control flow, written `if <cond>: ...
+// [else: ...]` with each branch a nested, recursive statement list. Valid in a
+// proc body and, since actions grew control flow, in an action body too.
 type IfStmt struct {
 	Cond Expr
 	Then []Stmt
@@ -1013,6 +1049,7 @@ func (Add) stmt()         {}
 func (Set) stmt()         {}
 func (Remove) stmt()      {}
 func (Clear) stmt()       {}
+func (ForStmt) stmt()     {}
 func (Let) stmt()         {}
 func (IndexAssign) stmt() {}
 func (Return) stmt()      {}

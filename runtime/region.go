@@ -1248,19 +1248,37 @@ func (s *Server) clientColls(pg *ir.Page) map[string]*collRead {
 		if a.Placement != ir.Client {
 			continue
 		}
-		for _, st := range a.Body {
+		walkStmtExprs(a.Body, func(st ir.Stmt) {
 			collect(st.Value)
 			collect(st.Key)
 			collect(st.Where)
+			collect(st.Limit)
 			for _, f := range st.Fields {
 				collect(f.Expr)
 			}
 			for _, arg := range st.Args {
 				collect(arg)
 			}
-		}
+			if st.Op == "for" {
+				// The loop walks the whole collection: a bare read of it, whose
+				// use we cannot narrow.
+				collect(&ir.Expr{Kind: "ref", Name: st.Entity})
+			}
+		})
 	}
 	return out
+}
+
+// walkStmtExprs visits every statement in body, recursing into the nested
+// blocks an action body can carry (`for`'s Body, `if`'s Body and Else), so a
+// collection read inside a loop or a branch is seen exactly as one at the top
+// level is.
+func walkStmtExprs(body []ir.Stmt, visit func(ir.Stmt)) {
+	for _, st := range body {
+		visit(st)
+		walkStmtExprs(st.Body, visit)
+		walkStmtExprs(st.Else, visit)
+	}
 }
 
 // walkNodeExprs collects the collection reads a *rendered* node tree still needs

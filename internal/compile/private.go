@@ -66,8 +66,8 @@ func manglePrivate(app *ast.App, abs string) {
 	}
 }
 
-// rewriteProcCalls walks a statement list, recursing into Loop/IfStmt bodies
-// (the only nesting a proc/action/daemon body has), rewriting every Do/Spawn
+// rewriteProcCalls walks a statement list, recursing into Loop/ForStmt/IfStmt
+// bodies (the only nesting a proc/action/daemon body has), rewriting every Do/Spawn
 // that names a proc in renamed to its mangled name. ast.Stmt values are
 // stored by value in a []Stmt (see parser.go's ast.Do{}/ast.Spawn{}
 // construction), so a rewritten Do/Spawn is written back to body[i]
@@ -88,6 +88,8 @@ func rewriteProcCalls(body []ast.Stmt, renamed map[string]string) {
 				body[i] = st
 			}
 		case ast.Loop:
+			rewriteProcCalls(st.Body, renamed)
+		case ast.ForStmt:
 			rewriteProcCalls(st.Body, renamed)
 		case ast.IfStmt:
 			rewriteProcCalls(st.Then, renamed)

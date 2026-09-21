@@ -48,46 +48,44 @@ app QuerySelfHost:
     # itself. Same standard prior facetql ports in this repo have used.
     #
     # ============================================================
-    # TWO SCOPE DECISIONS, BOTH FORCED BY CONFIRMED LANGUAGE GAPS
+    # ONE SCOPE DECISION FORCED BY A LANGUAGE GAP, PLUS ONE CORRECTION
     # ============================================================
-    # 1. NO LEXICOGRAPHIC `<`/`<=` ON `text`. This is not a gap discovered
-    #    by this port — it's already documented twice in this exact
-    #    selfhost directory (fabric.fct's `failoverBestCandidateIndex`,
-    #    and expr_tokens.fct's own note), and confirmed the same way here:
-    #    LANGUAGE.md's builtin list has no `ord`/codepoint function and no
-    #    string-order builtin, and `facet lang`'s comparison operators
-    #    coerce through `toInt`/`toFloat`, not byte order. Two places in
-    #    the source need exactly that ordering:
-    #      a. The address tiebreak. `node.address` is an opaque string in
-    #         engine.rs, compared with `str::cmp` (real lexicographic byte
-    #         order) purely to give the keyset cursor a well-defined
-    #         position when `order_key` values repeat. This port follows
-    #         fabric.fct's own precedent for the identical problem
-    #         ("leaning on an invariant the SOURCE crate already
-    #         upholds, rather than one this port invents"): every access
-    #         path `query_where` can hand `query_sorted` a candidate list
-    #         from — `scan_candidates`, an index range scan, a text
-    #         posting list — already enumerates in address order (see
-    #         `query_where`'s own comment: "Entries under one prefix are
-    #         ordered by address"). So "this row's position in address
-    #         order" is a fact already true of the input BEFORE this
-    #         file's logic ever runs, and `Row.seq` below just names that
-    #         fact directly, as a plain `int`, instead of re-deriving it
-    #         from string comparison this language cannot perform. `seq`
-    #         is never read as a value anywhere below — only ever compared
-    #         to another row's `seq` — which is the one property
-    #         `node.address` itself actually needs to have.
-    #      b. Sorting BY a text-valued `data` field (`order by name`,
-    #         say). `compareOrderValues`'s "text" arm below answers `0`
-    #         (equal, for ordering purposes) whenever two order values are
-    #         both text and are not byte-identical — a deliberate,
-    #         documented simplification in exactly the spirit of
-    #         predicate.fct's own "two `in`-sets always compare unequal"
-    #         simplification: named where it happens, not hidden, and not
-    #         a silent wrong answer, because equality (`==`) — which this
-    #         language DOES have on `text` — is still exact. A caller
-    #         ordering by a numeric field (this file's fully hand-verified
-    #         case, see the demo below) never touches this arm at all.
+    # 1. `Row.seq` STANDS IN FOR `node.address` STRING COMPARISON — kept as
+    #    a scope decision even though the reason below (that `text` had no
+    #    lexicographic order) turned out to be wrong; see the correction
+    #    below. The address tiebreak: `node.address` is an opaque string in
+    #    engine.rs, compared with `str::cmp` purely to give the keyset
+    #    cursor a well-defined position when `order_key` values repeat.
+    #    This port follows fabric.fct's own precedent for the identical
+    #    problem ("leaning on an invariant the SOURCE crate already
+    #    upholds, rather than one this port invents"): every access path
+    #    `query_where` can hand `query_sorted` a candidate list from —
+    #    `scan_candidates`, an index range scan, a text posting list —
+    #    already enumerates in address order (see `query_where`'s own
+    #    comment: "Entries under one prefix are ordered by address"). So
+    #    "this row's position in address order" is a fact already true of
+    #    the input BEFORE this file's logic ever runs, and `Row.seq` below
+    #    just names that fact directly, as a plain `int`, rather than
+    #    asking every caller to also hand in the real address string. `seq`
+    #    is never read as a value anywhere below — only ever compared to
+    #    another row's `seq` — which is the one property `node.address`
+    #    itself actually needs to have.
+    #
+    # CORRECTION (this file's own header used to be wrong here): this
+    # section originally claimed no lexicographic `<`/`<=` exists on
+    # `text` in this language, citing fabric.fct's/expr_tokens.fct's own
+    # (also since-corrected) notes, and had `compareOrderValues`'s "text"
+    # arm answer `0` (equal) for any two non-identical text values as a
+    # result — meaning `order by <text field>` would have silently left
+    # rows in scan order instead of alphabetical order. That claim does
+    # not hold against this build (see reference.fct's own correction,
+    # confirmed independently here too): `<`/`>` on two `text` operands
+    # compile and execute as genuine byte-wise comparison. Fixed below to
+    # a real comparison, and verified by this file's own
+    # scenarioTextOrderingAsc test — apple/banana/cherry sort
+    # alphabetically, not in the scan order (banana/apple/cherry) an
+    # always-0 comparator's stable sort would have produced instead.
+    #
     # 2. NO `sort` BUILTIN. `facet lang`'s builtin list (checked against
     #    LANGUAGE.md's "Built-in functions" section) has no sort/map
     #    primitive, matching this same selfhost directory's own established
@@ -580,6 +578,121 @@ app QuerySelfHost:
         addrPage1Result = n1
         addrPage2Result = n2
 
+    # ============================================================
+    # EXTRA SCENARIOS beyond the hand-traced demo above: absent-sorts-last
+    # (type_rank's 0xF0, never exercised by demoRows — every row there has
+    # the "score" field), real text ordering (now-confirmed-working `<`/
+    # `>`, not the stale "always equal" the header used to describe), and
+    # offset-based pagination with no cursor at or past the end
+    # (clampOffset's own boundary). Dispatch-by-name, one action, the same
+    # shape predicate.fct's runPredicateScenario uses for the identical
+    # reason: a `[Row]` fixture can't cross into an action's parameters
+    # directly (struct-list values are proc-local).
+    # ============================================================
+    proc rowsAbsentSortsLast() -> [Row]:
+        let withField = Row{seq: 0, fields: [Field{name: "score", kind: "num", num: 5.0, text: "", bool: false}]}
+        let withoutField = Row{seq: 1, fields: []}
+        let withField2 = Row{seq: 2, fields: [Field{name: "score", kind: "num", num: 1.0, text: "", bool: false}]}
+        return [withField, withoutField, withField2]
+
+    proc scenarioAbsentSortsLastAsc() -> text:
+        let rows = do rowsAbsentSortsLast()
+        let ec = do emptyCursor()
+        let page = do computeQueryPage(rows, true, "score", false, false, ec, 10, 0)
+        # ascending: 1(seq2), 5(seq0), then the absent row (seq1) last.
+        let s = do rowsToSummary(page.rows, "score")
+        return s
+
+    proc scenarioAbsentSortsLastDesc() -> text:
+        let rows = do rowsAbsentSortsLast()
+        let ec = do emptyCursor()
+        let page = do computeQueryPage(rows, true, "score", true, false, ec, 10, 0)
+        # descending is the ascending run reversed whole, so absent (last
+        # ascending) comes out FIRST, not last, when desc reverses it.
+        let s = do rowsToSummary(page.rows, "score")
+        return s
+
+    proc rowsTextOrdering() -> [Row]:
+        let a = Row{seq: 0, fields: [Field{name: "name", kind: "text", num: 0.0, text: "banana", bool: false}]}
+        let b = Row{seq: 1, fields: [Field{name: "name", kind: "text", num: 0.0, text: "apple", bool: false}]}
+        let c = Row{seq: 2, fields: [Field{name: "name", kind: "text", num: 0.0, text: "cherry", bool: false}]}
+        return [a, b, c]
+
+    proc rowsTextSummary(rows: [Row]) -> text:
+        let n = len(rows)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let ov = do orderKey(rows[i].fields, "name")
+            out = out + ov.textVal
+            i = i + 1
+        return out
+
+    # Real alphabetical order proves compareOrderValues' text arm is the
+    # confirmed-working `<`/`>` comparison, not the header's older,
+    # now-stale "always equal" fallback: apple, banana, cherry — not
+    # left in scan/seq order (banana, apple, cherry), which is what an
+    # always-0 comparator's stable sort would have produced instead.
+    proc scenarioTextOrderingAsc() -> text:
+        let rows = do rowsTextOrdering()
+        let ec = do emptyCursor()
+        let page = do computeQueryPage(rows, true, "name", false, false, ec, 10, 0)
+        let s = do rowsTextSummary(page.rows)
+        return s
+
+    proc rowsOffsetBoundary() -> [Row]:
+        let r0 = Row{seq: 0, fields: []}
+        let r1 = Row{seq: 1, fields: []}
+        return [r0, r1]
+
+    # clampOffset's own boundary: an offset at or past the row count
+    # clamps to the end (an empty page, hasNext false), never a negative
+    # slice or an out-of-range read.
+    proc scenarioOffsetAtEnd() -> text:
+        let rows = do rowsOffsetBoundary()
+        let ec = do emptyCursor()
+        let page = do computeQueryPage(rows, false, "x", false, false, ec, 10, 2)
+        let s = do pageSummaryText(page, "x")
+        return s
+
+    proc scenarioOffsetPastEnd() -> text:
+        let rows = do rowsOffsetBoundary()
+        let ec = do emptyCursor()
+        let page = do computeQueryPage(rows, false, "x", false, false, ec, 10, 999)
+        let s = do pageSummaryText(page, "x")
+        return s
+
+    # extraScenarioDispatch: the branching itself lives in a proc (an
+    # action's own body grammar has no `else`/chained-`if` — see
+    # predicate.fct's identical scenarioTree/scenarioOk/scenarioResult
+    # split for the same reason), so the action below just calls this one
+    # proc and assigns its result.
+    proc extraScenarioDispatch(name: text) -> text:
+        if name == "absentSortsLastAsc":
+            let s1 = do scenarioAbsentSortsLastAsc()
+            return s1
+        if name == "absentSortsLastDesc":
+            let s2 = do scenarioAbsentSortsLastDesc()
+            return s2
+        if name == "textOrderingAsc":
+            let s3 = do scenarioTextOrderingAsc()
+            return s3
+        if name == "offsetAtEnd":
+            let s4 = do scenarioOffsetAtEnd()
+            return s4
+        if name == "offsetPastEnd":
+            let s5 = do scenarioOffsetPastEnd()
+            return s5
+        return "unknown-scenario"
+
+    state extraScenarioResult: text = ""
+
+    action runQueryExtraScenario(name: text):
+        let s = do extraScenarioDispatch(name)
+        extraScenarioResult = s
+
     private view Home at "/":
         box:
-            text "{ascPage1Result} | {ascPage2Result} | {ascPage3Result} | {descPage1Result} | {descPage2Result} | {addrPage1Result} | {addrPage2Result}"
+            text "{ascPage1Result} | {ascPage2Result} | {ascPage3Result} | {descPage1Result} | {descPage2Result} | {addrPage1Result} | {addrPage2Result} | {extraScenarioResult}"

@@ -529,14 +529,17 @@ type Stmt struct {
 	Fields  []FieldInit `json:"fields,omitempty"`  // add
 	Service string      `json:"service,omitempty"` // call: the service name; do: the proc name
 	Args    []*Expr     `json:"args,omitempty"`    // call/do: the arguments
-	Var     string      `json:"var,omitempty"`     // remove (filtered): item variable
-	Where   *Expr       `json:"where,omitempty"`   // remove (filtered): predicate (nil = by-id)
-	Bind    string      `json:"bind,omitempty"`    // call/do (request→response): local the result binds to
+	Var     string      `json:"var,omitempty"`     // remove/set (filtered), for: item variable
+	Where   *Expr       `json:"where,omitempty"`   // remove/set (filtered), for: predicate (nil = by-id / every row)
+	Order   string      `json:"order,omitempty"`   // for (action): sort field ("" = insertion order)
+	Desc    bool        `json:"desc,omitempty"`    // for (action): descending
+	Limit   *Expr       `json:"limit,omitempty"`   // for (action): max rows (nil = every match)
+	Bind    string      `json:"bind,omitempty"`    // call/do (request→response): local the result binds to; add: local the new row's id binds to
 	Ret     string      `json:"ret,omitempty"`     // call/do (request→response): result type core, for decode/coerce
 	RetList bool        `json:"retList,omitempty"` // call/do (request→response): result is a list of Ret
 	Role    *Expr       `json:"role,omitempty"`    // establish: optional new session role (Value holds the new actor)
 	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
-	Body    []Stmt      `json:"body,omitempty"`    // loop: the repeated body; if: the `then` branch
+	Body    []Stmt      `json:"body,omitempty"`    // loop/for: the repeated body; if: the `then` branch
 	Else    []Stmt      `json:"else,omitempty"`    // if: the `else` branch (nil = none)
 	Bytes   bool        `json:"bytes,omitempty"`   // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int; fileread/filewrite: the file resource is `bytes`-typed rather than `text`
 	File    string      `json:"file,omitempty"`    // fileread/filewrite: the declared `file` resource's name (for a clear runtime error)

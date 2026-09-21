@@ -1219,6 +1219,14 @@ func callBuiltin(name string, argVals []any) any {
 		return strings.TrimSpace(toStr(arg(0)))
 	case "contains":
 		return strings.Contains(toStr(arg(0)), toStr(arg(1)))
+	case "replace":
+		// replace(s, old, new): every non-overlapping occurrence, exactly Go's
+		// strings.ReplaceAll — including its empty-`old` case, which inserts
+		// `new` at every rune boundary ("abc" → "-a-b-c-"); the client's
+		// String.prototype.replaceAll with a string pattern does the same.
+		return strings.ReplaceAll(toStr(arg(0)), toStr(arg(1)), toStr(arg(2)))
+	case "slug":
+		return slug(toStr(arg(0)))
 	case "ago":
 		return ago(toInt(arg(0)), int(clock().Unix()))
 	case "compact":
@@ -1304,6 +1312,31 @@ func callBuiltin(name string, argVals []any) any {
 
 // formatMoney renders integer minor units (cents) as a fixed two-decimal string,
 // the canonical text form of the money type. Mirrors facet.js exactly.
+// slug turns free text into a URL path segment: lower-cased, every run of
+// characters outside a-z/0-9 collapsed to one `-`, and no leading or trailing
+// `-`. "Hello, World!" → "hello-world". Deliberately ASCII-only on the keep
+// side — a letter outside a-z becomes a separator rather than being
+// transliterated — because the client (assets/facet.js's evCall "slug") must
+// produce the identical string from the identical input, and one regex over
+// [a-z0-9] is the whole rule on both sides.
+func slug(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	dash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			if dash && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			dash = false
+			b.WriteRune(r)
+			continue
+		}
+		dash = true
+	}
+	return b.String()
+}
+
 func formatMoney(cents int) string {
 	neg := cents < 0
 	if neg {

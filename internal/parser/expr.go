@@ -265,12 +265,23 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 				}
 				atom = cl
 			default:
+				// Anything else in call position is an entity lookup, `Post(id)` —
+				// including a lower-case name, which the self-hosted parser
+				// (selfhost/) parses to the same shape and the builder then
+				// rejects as an unknown entity. What differs for a lower-case name
+				// is only the diagnostic when the lookup fails to close: an entity
+				// is capitalized by convention, so `replace(s, a, b)` is a
+				// function this language does not have, and saying so beats
+				// reporting a `)` missing from a lookup the author never wrote.
 				p.pos++
 				key, err := p.parseBinary(0)
 				if err != nil {
 					return nil, err
 				}
 				if c, ok := p.peek(); !ok || c.kind != tRParen {
+					if !isUpper(ref.Name) {
+						return nil, &Error{p.line, fmt.Sprintf("unknown function %q — see `facet lang` for the builtins", ref.Name)}
+					}
 					return nil, &Error{p.line, "missing `)` in entity lookup"}
 				}
 				p.pos++
@@ -581,12 +592,12 @@ func (p *exprParser) parseCall(name string) (ast.Expr, error) {
 func isBuiltinCall(name string) bool {
 	switch name {
 	case "now", "rand", // effectful (pinned to the authority)
-		"print", // debug output (server-only, but callable from action AND proc bodies — see internal/ir/build.go's printCap)
+		"print",                                        // debug output (server-only, but callable from action AND proc bodies — see internal/ir/build.go's printCap)
 		"abs", "min", "max", "floor", "round", "money", // math / money
 		"toFloat", "toInt", // explicit int<->float conversion (toFloat is proc-only — see checkNoFloat)
 		"floatBits", "floatFromBits", // IEEE-754 bit-cast float<->int (floatFromBits is proc-only — see checkNoFloat)
-		"toMoney",                                                                       // explicit text->money conversion — not proc-only, money is a real type everywhere
-		"len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", // string
+		"toMoney",                                                                                          // explicit text->money conversion — not proc-only, money is a real type everywhere
+		"len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", "replace", "slug", // string
 		"textToBytes", "bytesToText", "byteLen", // UTF-8 <-> raw byte buffer conversion (proc-only, same reason "bytes" is)
 		"year", "month", "day", // date
 		"ago", "compact", "commas", // formatting (render-time text)
