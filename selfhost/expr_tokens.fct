@@ -52,20 +52,24 @@ app ExprTokensSelfHost:
     # `"rparen"`, `"str"`), the same "the value says what it means, not a
     # number that means it" fix applied everywhere else in this file.
     #
-    # The GRAMMAR covered is unchanged from the arena version (a genuine
-    # subset of expr.go's real grammar, grown over six rounds — see git
-    # history for that round-by-round story if it's ever needed): every
-    # precedence level from `||` down to unary `- ! ~`, member access and
-    # indexing (including chains), int/float/bool/text literals, list and
-    # map literals, builtin calls, `Entity(key).field` lookups, and the full
+    # The GRAMMAR covered is now expr.go's WHOLE expression grammar (grown
+    # over seven rounds — see git history for the round-by-round story):
+    # every precedence level from `||` down to unary `- ! ~` — including
+    # the shift level (`<<`/`>>`, binPrec 7, between comparison and `+`/
+    # `-`), `%` at the `*`/`/` level, and the general binPrec-6 `in`
+    # MEMBERSHIP operator (the one word-shaped operator, distinct from an
+    # aggregate's own `in`/`where` keywords, which this file has always
+    # covered) — member access and indexing (including chains), int/float/
+    # bool/text literals, list and map literals, struct literals
+    # (`Name{f: v, ...}`), builtin calls (the full isBuiltinCall list,
+    # including two-argument `min`/`max`), `Entity(key).field` lookups, the
+    # action-state reads `pending`/`failed`/`dirty`/`touched`, and the full
     # `count`/`sum`/`exists`/`avg`/`min`/`max` aggregate grammar (`<value>
-    # in Coll [where <cond>]`, or a bare `Coll`/`Coll.field`). Still out of
-    # scope, unchanged: shifts (`<<`/`>>`), `%`, and the general binPrec-6
-    # `in` MEMBERSHIP operator (as opposed to an aggregate's own `in`/`where`
-    # keywords, which this file has always fully covered). Only the
-    # REPRESENTATION changed — see STAGE 2b's own doc for the struct design
-    # itself, and this file's git history for the byte-for-byte arena
-    # version if a comparison is ever needed.
+    # in Coll [where <cond>]`, or a bare `Coll`/`Coll.field`). The only
+    # atom expr.go has that this port does not build is `asset from "..."`
+    # (ast.Asset, a compile-time file inlining). See STAGE 2b's own doc for
+    # the struct design itself, and this file's git history for the
+    # byte-for-byte arena version if a comparison is ever needed.
     #
     # FINDINGS FROM THE ARENA ERA THAT STILL MATTER (trimmed to what a
     # reader of the CURRENT code needs; the full round-by-round essay lives
@@ -104,10 +108,13 @@ app ExprTokensSelfHost:
     #   argument list has a top-level comma; single-argument `min(x)` is
     #   always the AGGREGATE form (`min(Order.amount)`) instead —
     #   disambiguated by `hasTopLevelCommaAt` (STAGE 2f), expr.go's own
-    #   `argListHasComma` restated. This is also why `min`/`max` are
-    #   excluded from both `isCallNameTok` and `isEntityNameTok`'s name
-    #   sets: they can never be a plain call or an entity lookup, only
-    #   Agg-or-Call, and that split is resolved once, in `isAggStartAt`.
+    #   `argListHasComma` restated. `isAggStartAt` refuses a `min`/`max`
+    #   whose argument list HAS a comma, and `isCallStartAt` refuses one
+    #   whose argument list has NONE — the same one-token decision expr.go's
+    #   parsePostfix makes, split across the two dispatch checks. They are
+    #   listed in `isEntityNameTok` so a `min(...)` that is neither (which
+    #   is a real Go parse error, e.g. `max(x)` with no field) never falls
+    #   through to an entity lookup either.
     #
     # ============================================================
     # THE STRUCT DESIGN
@@ -124,8 +131,9 @@ app ExprTokensSelfHost:
     #       a bare variable/field-name reference. `text` is the name.
     #   kind == "bin"
     #       a binary operator. `text` is the operator symbol (any of `&&
-    #       || | ^ & == != < <= > >= + - * /`); `children` is `[left,
-    #       right]`.
+    #       || | ^ & == != < <= > >= in << >> + - * / %`); `children` is
+    #       `[left, right]`. `in` (membership) is the one word-shaped
+    #       operator, exactly as in expr.go's binPrec table.
     #   kind == "un"
     #       a unary operator. `text` is `- ! ~`; `children` is `[operand]`.
     #   kind == "get"
@@ -149,6 +157,24 @@ app ExprTokensSelfHost:
     #       list, in order (see `Pair`, below); every other field (`text`,
     #       `field`, `itemVar`, `coll`, `children`, `whereClause`, `sel`)
     #       is unused.
+    #   kind == "struct"
+    #       a struct literal, `Name{f1: v1, f2: v2}` (ast.StructLit). `text`
+    #       is the capitalized type name; `pairs` REUSES the map literal's
+    #       own `[Pair]` shape, one entry per field in source order, where
+    #       each entry's `key` is a `"ref"` node whose `text` is the FIELD
+    #       NAME (a real identifier, never an arbitrary key expression —
+    #       parseStructLit reads a bare IDENT there, unlike parseMapLit's
+    #       full key expression) and `value` is the field's initializer
+    #       sub-expression. Never has zero pairs: expr.go rejects `Name{}`
+    #       outright, and this port does not recognize it as a struct
+    #       literal at all (see isStructLitStartAt, expr_tree.fct).
+    #   kind == "astate"
+    #       an action-state read, `pending(a)`/`failed(a)`/`dirty(s)`/
+    #       `touched(s)` (ast.ActState). `text` is the op (one of those four
+    #       names); `field` is the bare target name it reads — an action
+    #       name for `pending`/`failed`, a state cell name for `dirty`/
+    #       `touched` (ast.ActState.Action holds both). No children: the
+    #       argument is always exactly one IDENT, never an expression.
     #   kind == "agg"
     #       an aggregate: `count`/`sum`/`exists`/`avg`/`min`/`max`. `text`
     #       is the aggregate's own name; `itemVar` is the bound item
@@ -260,6 +286,17 @@ app ExprTokensSelfHost:
     proc aggNode(op: text, itemVar: text, coll: text, fieldName: text, whereClause: [ExprNode], sel: [ExprNode]) -> ExprNode:
         return ExprNode{kind: "agg", text: op, field: fieldName, itemVar: itemVar, coll: coll, children: [], pairs: [], whereClause: whereClause, sel: sel}
 
+    # structLitNode: `Name{f1: v1, ...}`. `fields` is the `[Pair]` list
+    # described under kind == "struct" above — each key a `ref` node naming
+    # the field, each value that field's initializer.
+    proc structLitNode(typeName: text, fields: [Pair]) -> ExprNode:
+        return ExprNode{kind: "struct", text: typeName, field: "", itemVar: "", coll: "", children: [], pairs: fields, whereClause: [], sel: []}
+
+    # actStateNode: `pending(target)`-style reads — `op` is one of pending/
+    # failed/dirty/touched, `target` the bare action or state-cell name.
+    proc actStateNode(op: text, target: text) -> ExprNode:
+        return ExprNode{kind: "astate", text: op, field: target, itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
     # ============================================================
     # STAGE 0: character classification.
     # ============================================================
@@ -277,6 +314,13 @@ app ExprTokensSelfHost:
     proc isIdentStartChar(c: text) -> bool:
         return c in ["_", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
 
+    # isUpperChar: parser.go's own `isUpper` (first byte in 'A'..'Z'),
+    # applied by the caller to a name's first character — the capitalized-
+    # name convention that tells a struct literal's `Name{` apart from a
+    # lower-case identifier followed by `{` (which stays a syntax error).
+    proc isUpperChar(c: text) -> bool:
+        return c in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+
     proc isIdentChar(c: text) -> bool:
         let startOk = do isIdentStartChar(c)
         if startOk:
@@ -288,11 +332,12 @@ app ExprTokensSelfHost:
         return c == " " || c == "\t"
 
     # isTwoCharOp: the real tokenizer's own longest-match rule, restated as
-    # a closed-alphabet membership test. `<<`/`>>` are deliberately NOT in
-    # this set (shifts are out of scope — see this file's header), so a
-    # bare `<`/`>` always tokenizes as its own one-character operator here.
+    # a closed-alphabet membership test — exactly expr.go tokenize's own
+    # eight-entry `case` list, including the shifts `<<`/`>>`. A bare `<`/
+    # `>` not followed by `=`/itself still tokenizes as its own one-
+    # character operator.
     proc isTwoCharOp(combo: text) -> bool:
-        return combo in ["==", "!=", "<=", ">=", "&&", "||"]
+        return combo in ["==", "!=", "<=", ">=", "&&", "||", "<<", ">>"]
 
     # ============================================================
     # STAGE 1: the tokenizer — expr.go's own `tokenize(s string) []token`,
@@ -315,7 +360,7 @@ app ExprTokensSelfHost:
     #             is the only place that asks "does this token's TEXT
     #             contain a `.`" to tell them apart.
     #   "ident"   an identifier: isIdentStartChar then isIdentChar*.
-    #   "op"      `+ - * / ! < > = & | ^ ~ . [ ] { } :`, one- or
+    #   "op"      `+ - * / % ! < > = & | ^ ~ . [ ] { } : ,`, one- or
     #             two-character (see isTwoCharOp) — every consumer below
     #             dispatches on the token TEXT, never a finer-grained kind,
     #             so one kind covers every operator this subset has.

@@ -1,0 +1,437 @@
+import "ir_stmt.fct"
+
+app IRJSONSelfHost:
+    # Self-hosting port of the READ side of the IR: the JSON the real
+    # compiler emits (`facet ir`, the `#fa-ir` script a page carries, the
+    # graph runtime.New loads) parsed back into ir_expr.fct's IRExpr and
+    # ir_stmt.fct's IRStmt. A self-hosted runtime has to load the compiler's
+    # output before it can interpret it, and this is that loader for the two
+    # recursive shapes; the flat declaration shapes (entities, states,
+    # routes, nodes) are a later, separate port.
+    #
+    # PART ONE is a small, complete JSON parser (objects, arrays, strings
+    # with every escape encoding/json produces including \uXXXX, numbers,
+    # true/false/null) into a generic `JVal` tree — `kind`-discriminated,
+    # with an object's keys and values as index-parallel lists (the same
+    # parallel-list convention every other port uses in place of a map).
+    # A malformed document degrades to a "none" value at the point of the
+    # fault rather than crashing, the established honest-degrade convention.
+    #
+    # PART TWO maps a JVal into IRExpr / IRStmt by the exact key names
+    # encoding/json gives ir.Expr / ir.Stmt, so `irExprJSON(irExprFromJSON(j))
+    # == j` for every j the real compiler produces — the round trip the Go
+    # test pins.
+    struct JVal:
+        kind: text
+        s: text
+        keys: [text]
+        vals: [JVal]
+
+    proc jNone() -> JVal:
+        return JVal{kind: "none", s: "", keys: [], vals: []}
+
+    # jGet: the value under key k of an object, or none.
+    proc jGet(v: JVal, k: text) -> JVal:
+        let n = len(v.keys)
+        let mut i = 0
+        loop i < n:
+            if v.keys[i] == k:
+                return v.vals[i]
+            i = i + 1
+        let none = do jNone()
+        return none
+
+    proc jHas(v: JVal, k: text) -> bool:
+        let n = len(v.keys)
+        let mut i = 0
+        loop i < n:
+            if v.keys[i] == k:
+                return true
+            i = i + 1
+        return false
+
+    # jStr: a string value's text, "" when absent or not a string.
+    proc jStr(v: JVal, k: text) -> text:
+        let x = do jGet(v, k)
+        if x.kind == "str":
+            return x.s
+        return ""
+
+    proc jBool(v: JVal, k: text) -> bool:
+        let x = do jGet(v, k)
+        return x.kind == "bool" && x.s == "true"
+
+    # ── PART ONE: the JSON parser ───────────────────────────────────────────
+    # ParseState threads the cursor through the recursive descent: `pos` is
+    # where the next value starts after this one was read. A proc cannot
+    # return two values, so every reader returns the value with the new
+    # cursor tucked into a wrapper struct.
+    struct JRead:
+        val: JVal
+        pos: int
+
+    private proc jIsWs(c: text) -> bool:
+        return c == " " || c == "\n" || c == "\t" || c == "\r"
+
+    private proc jSkipWs(s: text, pos: int) -> int:
+        let n = len(s)
+        let mut i = pos
+        let mut go = true
+        loop i < n && go:
+            let ws = do jIsWs(charAt(s, i))
+            if ws:
+                i = i + 1
+            else:
+                go = false
+        return i
+
+    private proc jHexVal(c: text) -> int:
+        if c == "0":
+            return 0
+        if c == "1":
+            return 1
+        if c == "2":
+            return 2
+        if c == "3":
+            return 3
+        if c == "4":
+            return 4
+        if c == "5":
+            return 5
+        if c == "6":
+            return 6
+        if c == "7":
+            return 7
+        if c == "8":
+            return 8
+        if c == "9":
+            return 9
+        if c == "a" || c == "A":
+            return 10
+        if c == "b" || c == "B":
+            return 11
+        if c == "c" || c == "C":
+            return 12
+        if c == "d" || c == "D":
+            return 13
+        if c == "e" || c == "E":
+            return 14
+        if c == "f" || c == "F":
+            return 15
+        return 0
+
+    # jCharOf: the one-character text for a code point below 128 — the only
+    # range encoding/json's \uXXXX escapes ever cover for the characters it
+    # escapes (<, >, &, and control characters). Built through a one-byte
+    # buffer, since the language has no code-point-to-text builtin.
+    private proc jCharOf(code: int) -> text:
+        let mut buf = bytes(1)
+        buf[0] = code
+        let t = bytesToText(buf)
+        return t
+
+    # jReadString: s[pos] is the opening quote; returns the decoded text and
+    # the position after the closing quote.
+    private proc jReadString(s: text, pos: int) -> JRead:
+        let n = len(s)
+        let mut i = pos + 1
+        let mut out = ""
+        let mut closed = false
+        loop i < n && !closed:
+            let c = charAt(s, i)
+            if c == "\"":
+                closed = true
+                i = i + 1
+            else:
+                if c == "\\" && i + 1 < n:
+                    let e = charAt(s, i + 1)
+                    if e == "n":
+                        out = out + "\n"
+                        i = i + 2
+                    else:
+                        if e == "t":
+                            out = out + "\t"
+                            i = i + 2
+                        else:
+                            if e == "r":
+                                out = out + "\r"
+                                i = i + 2
+                            else:
+                                if e == "u" && i + 5 < n:
+                                    let h1 = do jHexVal(charAt(s, i + 2))
+                                    let h2 = do jHexVal(charAt(s, i + 3))
+                                    let h3 = do jHexVal(charAt(s, i + 4))
+                                    let h4 = do jHexVal(charAt(s, i + 5))
+                                    let code = h1 * 4096 + h2 * 256 + h3 * 16 + h4
+                                    let ch = do jCharOf(code)
+                                    out = out + ch
+                                    i = i + 6
+                                else:
+                                    # \" \\ \/ and anything else: the character itself
+                                    out = out + e
+                                    i = i + 2
+                else:
+                    out = out + c
+                    i = i + 1
+        if !closed:
+            let none = do jNone()
+            return JRead{val: none, pos: n}
+        return JRead{val: JVal{kind: "str", s: out, keys: [], vals: []}, pos: i}
+
+    private proc jIsNumChar(c: text) -> bool:
+        return c == "-" || c == "+" || c == "." || c == "e" || c == "E" || c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+
+    private proc jReadNumber(s: text, pos: int) -> JRead:
+        let n = len(s)
+        let mut i = pos
+        let mut go = true
+        loop i < n && go:
+            let ok = do jIsNumChar(charAt(s, i))
+            if ok:
+                i = i + 1
+            else:
+                go = false
+        return JRead{val: JVal{kind: "num", s: slice(s, pos, i), keys: [], vals: []}, pos: i}
+
+    # jReadValue: one JSON value starting at pos (whitespace allowed before
+    # it); the recursion for arrays and objects.
+    proc jReadValue(s: text, pos0: int) -> JRead:
+        let n = len(s)
+        let pos = do jSkipWs(s, pos0)
+        if pos >= n:
+            let none = do jNone()
+            return JRead{val: none, pos: n}
+        let c = charAt(s, pos)
+        if c == "\"":
+            let r = do jReadString(s, pos)
+            return r
+        if c == "{":
+            let mut keys = []
+            let mut vals = []
+            let mut i = pos + 1
+            let mut done = false
+            let mut bad = false
+            loop !done && !bad:
+                let ni = do jSkipWs(s, i)
+                i = ni
+                if i >= n:
+                    bad = true
+                else:
+                    if charAt(s, i) == "}":
+                        done = true
+                        i = i + 1
+                    else:
+                        if charAt(s, i) == ",":
+                            i = i + 1
+                        else:
+                            if charAt(s, i) != "\"":
+                                bad = true
+                            else:
+                                let kr = do jReadString(s, i)
+                                let colon = do jSkipWs(s, kr.pos)
+                                if colon >= n || charAt(s, colon) != ":":
+                                    bad = true
+                                else:
+                                    let vr = do jReadValue(s, colon + 1)
+                                    keys = append(keys, kr.val.s)
+                                    vals = append(vals, vr.val)
+                                    i = vr.pos
+            if bad:
+                let none = do jNone()
+                return JRead{val: none, pos: n}
+            return JRead{val: JVal{kind: "obj", s: "", keys: keys, vals: vals}, pos: i}
+        if c == "[":
+            let mut items = []
+            let mut i = pos + 1
+            let mut done = false
+            let mut bad = false
+            loop !done && !bad:
+                let ni = do jSkipWs(s, i)
+                i = ni
+                if i >= n:
+                    bad = true
+                else:
+                    if charAt(s, i) == "]":
+                        done = true
+                        i = i + 1
+                    else:
+                        if charAt(s, i) == ",":
+                            i = i + 1
+                        else:
+                            let vr = do jReadValue(s, i)
+                            if vr.val.kind == "none":
+                                bad = true
+                            else:
+                                items = append(items, vr.val)
+                                i = vr.pos
+            if bad:
+                let none = do jNone()
+                return JRead{val: none, pos: n}
+            return JRead{val: JVal{kind: "arr", s: "", keys: [], vals: items}, pos: i}
+        if slice(s, pos, min(pos + 4, n)) == "true":
+            return JRead{val: JVal{kind: "bool", s: "true", keys: [], vals: []}, pos: pos + 4}
+        if slice(s, pos, min(pos + 5, n)) == "false":
+            return JRead{val: JVal{kind: "bool", s: "false", keys: [], vals: []}, pos: pos + 5}
+        if slice(s, pos, min(pos + 4, n)) == "null":
+            return JRead{val: JVal{kind: "null", s: "", keys: [], vals: []}, pos: pos + 4}
+        let isNum = do jIsNumChar(c)
+        if isNum:
+            let r = do jReadNumber(s, pos)
+            return r
+        let none = do jNone()
+        return JRead{val: none, pos: n}
+
+    proc jsonParse(s: text) -> JVal:
+        let r = do jReadValue(s, 0)
+        return r.val
+
+    # ── PART TWO: JVal → IR ─────────────────────────────────────────────────
+    # jExprOpt: the 0-or-1-element child list for an optional expression key.
+    private proc jExprOpt(v: JVal, k: text) -> [IRExpr]:
+        let has = do jHas(v, k)
+        if !has:
+            return []
+        let x = do jGet(v, k)
+        let e = do irExprFromJVal(x)
+        return [e]
+
+    private proc jExprList(v: JVal, k: text) -> [IRExpr]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let e = do irExprFromJVal(x.vals[i])
+            out = append(out, e)
+            i = i + 1
+        return out
+
+    private proc jTextList(v: JVal, k: text) -> [text]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, x.vals[i].s)
+            i = i + 1
+        return out
+
+    # irExprFromJVal: the inverse of ir_expr.fct's irExprJSON, key for key.
+    # A literal's `val` keeps its JSON spelling (a number's digits, a bool's
+    # word, a string's decoded text), which is what irExprJSON re-emits.
+    proc irExprFromJVal(v: JVal) -> IRExpr:
+        let hasVal = do jHas(v, "val")
+        let valV = do jGet(v, "val")
+        let mut valText = valV.s
+        let kind = do jStr(v, "kind")
+        let vtype = do jStr(v, "vtype")
+        let name = do jStr(v, "name")
+        let field = do jStr(v, "field")
+        let obj = do jExprOpt(v, "obj")
+        let key = do jExprOpt(v, "key")
+        let op = do jStr(v, "op")
+        let args = do jExprList(v, "args")
+        let keys = do jExprList(v, "keys")
+        let fields = do jTextList(v, "fields")
+        let l = do jExprOpt(v, "l")
+        let r = do jExprOpt(v, "r")
+        let x = do jExprOpt(v, "x")
+        let itemVar = do jStr(v, "var")
+        let where = do jExprOpt(v, "where")
+        let sel = do jExprOpt(v, "sel")
+        let order = do jStr(v, "order")
+        let desc = do jBool(v, "desc")
+        let limit = do jExprOpt(v, "limit")
+        return IRExpr{kind: kind, hasVal: hasVal, val: valText, vtype: vtype, name: name, field: field, obj: obj, key: key, op: op, args: args, keys: keys, fields: fields, l: l, r: r, x: x, itemVar: itemVar, where: where, sel: sel, order: order, desc: desc, limit: limit}
+
+    proc irExprFromJSON(s: text) -> IRExpr:
+        let v = do jsonParse(s)
+        let e = do irExprFromJVal(v)
+        return e
+
+    private proc jStmtList(v: JVal, k: text) -> [IRStmt]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let st = do irStmtFromJVal(x.vals[i])
+            out = append(out, st)
+            i = i + 1
+        return out
+
+    # irStmtFromJVal: the inverse of ir_stmt.fct's irStmtJSON. `fields` (Go's
+    # []FieldInit of {name, expr}) unzips into the parallel fieldNames/
+    # fieldExprs lists.
+    proc irStmtFromJVal(v: JVal) -> IRStmt:
+        let op = do jStr(v, "op")
+        let target = do jStr(v, "target")
+        let entity = do jStr(v, "entity")
+        let field = do jStr(v, "field")
+        let key = do jExprOpt(v, "key")
+        let value = do jExprOpt(v, "value")
+        let fi = do jGet(v, "fields")
+        let fn = len(fi.vals)
+        let mut fieldNames = []
+        let mut fieldExprs = []
+        let mut i = 0
+        loop i < fn:
+            let nm = do jStr(fi.vals[i], "name")
+            let ex = do jGet(fi.vals[i], "expr")
+            let e = do irExprFromJVal(ex)
+            fieldNames = append(fieldNames, nm)
+            fieldExprs = append(fieldExprs, e)
+            i = i + 1
+        let service = do jStr(v, "service")
+        let args = do jExprList(v, "args")
+        let itemVar = do jStr(v, "var")
+        let where = do jExprOpt(v, "where")
+        let order = do jStr(v, "order")
+        let desc = do jBool(v, "desc")
+        let limit = do jExprOpt(v, "limit")
+        let bind = do jStr(v, "bind")
+        let ret = do jStr(v, "ret")
+        let retList = do jBool(v, "retList")
+        let role = do jExprOpt(v, "role")
+        let msg = do jStr(v, "msg")
+        let stV = do jGet(v, "status")
+        let mut status = 0
+        if stV.kind == "num":
+            status = toInt(stV.s)
+        let body = do jStmtList(v, "body")
+        let elseBody = do jStmtList(v, "else")
+        let bytesFlag = do jBool(v, "bytes")
+        let file = do jStr(v, "file")
+        let path = do jStr(v, "path")
+        return IRStmt{op: op, target: target, entity: entity, field: field, key: key, value: value, fieldNames: fieldNames, fieldExprs: fieldExprs, service: service, args: args, itemVar: itemVar, where: where, order: order, desc: desc, limit: limit, bind: bind, ret: ret, retList: retList, role: role, msg: msg, status: status, body: body, elseBody: elseBody, bytesFlag: bytesFlag, file: file, path: path}
+
+    proc irStmtFromJSON(s: text) -> IRStmt:
+        let v = do jsonParse(s)
+        let st = do irStmtFromJVal(v)
+        return st
+
+    # ── live drivers: round trips ───────────────────────────────────────────
+    proc irExprRoundTrip(s: text) -> text:
+        let e = do irExprFromJSON(s)
+        let j = do irExprJSON(e)
+        return j
+
+    proc irStmtRoundTrip(s: text) -> text:
+        let st = do irStmtFromJSON(s)
+        let j = do irStmtJSON(st)
+        return j
+
+    state irExprBack: text = ""
+    state irStmtBack: text = ""
+
+    action runIRExprRoundTrip(src: text):
+        let j = do irExprRoundTrip(src)
+        irExprBack = j
+
+    action runIRStmtRoundTrip(src: text):
+        let j = do irStmtRoundTrip(src)
+        irStmtBack = j
+
+    private view IRJSONHome at "/ir_json":
+        box:
+            text "{irExprBack} {irStmtBack}"

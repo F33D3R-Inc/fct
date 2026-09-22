@@ -404,7 +404,7 @@ func TestCheckStatementMatchesGoParser(t *testing.T) {
 // rejects: no trailing quoted message at all, and a condition-only message
 // with nothing before it.
 var invalidCheckStatements = []string{
-	`check x > 0`,     // no message at all
+	`check x > 0`, // no message at all
 	`check "just a message with no condition before it"`,
 }
 
@@ -431,30 +431,30 @@ func TestCheckStatementRejectsInvalidLikeGoParser(t *testing.T) {
 // keyword parseDecl itself would dispatch on for it — read fresh off
 // parseDecl's actual switch (internal/parser/parser.go), not assumed.
 var declKeywordCases = map[string]string{
-	"entity Post:":              "entity",
-	"record Address:":           "record",
+	"entity Post:":               "entity",
+	"record Address:":            "record",
 	"enum Status:":               "enum",
-	"type Money2:":              "type",
-	"message Ping:":             "message",
-	"component Card(x: int):":   "component",
-	"layout Main:":              "layout",
-	"theme:":                    "theme",
-	"theme dark:":               "theme",
-	"theme Retro:":              "theme",
-	"css:":                      "css",
-	"state count: int = 0":      "state",
-	"derive total: int = 0":     "derive",
-	"policy admin:":             "policy",
-	"action doThing():":         "action",
-	"proc helper():":            "proc",
+	"type Money2:":               "type",
+	"message Ping:":              "message",
+	"component Card(x: int):":    "component",
+	"layout Main:":               "layout",
+	"theme:":                     "theme",
+	"theme dark:":                "theme",
+	"theme Retro:":               "theme",
+	"css:":                       "css",
+	"state count: int = 0":       "state",
+	"derive total: int = 0":      "derive",
+	"policy admin:":              "policy",
+	"action doThing():":          "action",
+	"proc helper():":             "proc",
 	"job cleanup every 30s -> x": "job",
-	"service Payments:":         "service",
-	"webhook stripe -> handle":  "webhook",
-	"on user.created -> notify": "on",
-	"view Home at \"/\":":       "view",
-	"auth":                      "auth",
-	"auth:":                     "auth",
-	"not a keyword at all":      "",
+	"service Payments:":          "service",
+	"webhook stripe -> handle":   "webhook",
+	"on user.created -> notify":  "on",
+	"view Home at \"/\":":        "view",
+	"auth":                       "auth",
+	"auth:":                      "auth",
+	"not a keyword at all":       "",
 }
 
 // TestDeclKeywordDispatchMatchesParseDecl verifies declKeywordOf's prefix

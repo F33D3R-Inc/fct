@@ -1,0 +1,2676 @@
+import "fabric_controller_plan.fct"
+
+app FabricControllerCoreSelfHost:
+    # Self-hosting port of the REST of fabric/crates/fabric-controller/src/
+    # — the five files the two earlier slices (fabric_controller_target.fct:
+    # target.rs/policy.rs/fleet.rs; fabric_controller_plan.fct: plan.rs/
+    # outcome.rs) left unported, read in full before writing a line here:
+    #   decision.rs   (139L)  DecisionEnvelope, ValidatedDecision
+    #   validation.rs (402L)  ValidationError, MeasurementError, AbortReason
+    #                         + all three Display impls
+    #   replica.rs    (158L)  ReplicaLedger
+    #   execution.rs  (533L)  ExecutionState, PlacementChange,
+    #                         ExecutionRecord, ActionRegistry
+    #   controller.rs (1422L, ~880L non-test) FabricController: validate /
+    #                         check_node_load / resolve_destination /
+    #                         validate_plan / submit / advance / tick /
+    #                         abort / node_loss / abort_with / measure /
+    #                         awaiting_measurement /
+    #                         check_measurement_deadline, plus the
+    #                         accessors (mechanisms/policy/actions/ledger/
+    #                         seed_replicas/record/in_flight/reports/
+    #                         placement_changes/register_executor)
+    # lib.rs (121L) is doc comment + `pub mod`/`pub use` only — nothing to
+    # port. Total: ~1 700 real Rust lines, the crate's actual state
+    # machine: validate -> plan -> validate the plan -> admit -> execute ->
+    # measure. No async, no tokio, no net, no fs, no clock of its own
+    # (every timestamp is a `now_ms` argument on the ControlPlaneView),
+    # confirmed by grepping all five files, not assumed from their doc
+    # comments.
+    #
+    # ============================================================
+    # WHY THIS MODULE — AND WHAT WAS REJECTED
+    # ============================================================
+    # Audit of every fabric/crates/**/*.rs against every selfhost/fabric_*
+    # header, by line count, largest first:
+    #   fabric-routing/table.rs 1598L      -> already fabric_table.fct
+    #   fabric-runtime/mechanism.rs 1521L  -> rejected: a thin orchestration
+    #      over fabric-runtime/placement.rs's `PlacementFabric` (805L),
+    #      which composes RoutingTable + ReplicaSet + Migration +
+    #      NodeRegistry across FOUR ports (fabric_table.fct,
+    #      fabric_replication.fct, fabric.fct, and an unported registry.rs)
+    #      that this directory has already documented cannot all be
+    #      imported into one program (fabric_table.fct's own header:
+    #      `import "fabric.fct"` was tried and is unfixable). Porting it
+    #      "faithfully" would mean re-deriving PlacementFabric on top of
+    #      restated copies of three other crates — the opposite of a port.
+    #   fabric-daemon/control.rs 1516L     -> rejected: 42 async/await
+    #      sites, HTTP clients, process plumbing. Not logic.
+    #   fabric-controller/controller.rs 1422L (+ execution/validation/
+    #      decision/replica) -> CHOSEN. Pure, self-contained, its every
+    #      dependency is already ported and importable through ONE line
+    #      (`import "fabric_controller_plan.fct"`, which chains to
+    #      fabric_controller_target.fct -> fabric_core.fct +
+    #      fabric_routing.fct, and fabric_optimizer.fct ->
+    #      fabric_telemetry.fct + fabric_ml.fct), and it ships 9 real unit
+    #      tests (`controller::tests`) plus a StubExecutor that make a
+    #      genuine behavioural check possible.
+    #   fabric-facetql/mover.rs 1367L, frontdoor.rs 991L, poller.rs,
+    #      client.rs, proxy.rs -> rejected: socket/SSE/HTTP I/O (fabric.fct's
+    #      own header already reached the same verdict).
+    #   fabric-daemon/config.rs 1037L      -> rejected: serde/toml
+    #      deserialisation + SocketAddr/Path parsing — validation of a
+    #      config file format, mostly derive-driven, not an algorithm.
+    #   fabric-simulator/simulation.rs 979L + cluster.rs + executor.rs
+    #      -> rejected FOR NOW: they implement `PlacementExecutor` and
+    #      drive `FabricController` — i.e. they depend on THIS port
+    #      existing first. They are the natural next slice.
+    #
+    # ============================================================
+    # WHAT IS PORTED, FUNCTION FOR FUNCTION
+    # ============================================================
+    # decision.rs: DecisionEnvelope::new/action/action_label/
+    #   named_destination; ValidatedDecision::new + every accessor.
+    # validation.rs: ValidationError (all 21 variants, every payload field
+    #   kept under its own name), MeasurementError (3 variants),
+    #   AbortReason (4 variants), and the three `impl Display` bodies
+    #   restated arm for arm, format string for format string.
+    # replica.rs: ReplicaLedger::new/seed_from_topology/ensure_seeded/add/
+    #   remove/holds/count/replicas/projected/apply/targets/len/is_empty.
+    # execution.rs: ExecutionState::is_active/is_terminal/label;
+    #   PlacementChange::apply; ExecutionRecord::new + every accessor +
+    #   has_cut_over/placement_change/report + the pub(crate) mutators
+    #   begin_phase/set_fraction/complete_phase/phase_elapsed_ms/commit/
+    #   conclude_measured/conclude_unmeasured/conclude_aborted;
+    #   ActionRegistry::new/next_id/admit/retire/get/get_mut/records/
+    #   active/active_ids/active_len/holder_of/shard_holder/shard_is_busy/
+    #   node_load/len/is_empty.
+    # controller.rs: everything listed at the top of this header, plus the
+    #   test module's own `StubExecutor` (name "stub": supports every action
+    #   but NoAction; plans Prepare/Transfer/Cutover/Cleanup at Coordinate
+    #   scope with adds=[destination] and removes=[source] unless
+    #   `dropping(...)` overrode them; completes a phase on the first poll
+    #   whose at_ms is strictly after the phase began; rollback is
+    #   Irreversible("authority already moved") once Cutover completed,
+    #   Restored otherwise) — ported verbatim because it is the one
+    #   `PlacementExecutor` this crate itself ships, and the thing its own
+    #   tests drive the controller with.
+    #
+    # ============================================================
+    # DELIBERATE SIMPLIFICATIONS — every one named, none silent
+    # ============================================================
+    # 1. `Vec<Box<dyn PlacementExecutor>>` — a trait object — has no
+    #    analogue in a language with no dynamic dispatch. `Executor` below
+    #    is a CLOSED struct dispatched on `kind`; the one kind implemented
+    #    is "stub" (above). `executorPlan/BeginPhase/PollPhase/Abort` are
+    #    the trait's four methods; an unknown `kind` degrades to an
+    #    `Internal` fault / `UnsupportedAction` rather than crashing. The
+    #    real production mechanism (fabric-runtime's PlacementMechanism) is
+    #    NOT here — see "rejected" above. Adding a kind is adding one arm to
+    #    each of those four procs; the controller never inspects `kind`.
+    # 2. `&mut self` everywhere -> functional update. Every mutator returns
+    #    the new value, and every controller entry point that mutates
+    #    returns a result struct carrying the updated `controller` (this
+    #    directory's universal convention: `nodeStatusWithLoad`,
+    #    `topologyRegistryPlace`). A proc returning a struct cannot be
+    #    bound from an action, so the demo procs at the bottom return
+    #    scalar `text` summaries instead.
+    # 3. `BTreeMap<u64, ExecutionRecord>` -> `[ExecutionRecord]` kept
+    #    sorted by id on insert (`actionRegistryInsertRecord`);
+    #    `BTreeMap<ActionTarget, u64>` / `BTreeMap<u64, BTreeSet<u64>>` /
+    #    `BTreeMap<String, BTreeSet<u64>>` -> flat arrays of (key, id)
+    #    pairs (`TargetHold`/`ShardHold`/`NodeHold`), which makes "the set
+    #    became empty, drop the key" implicit. `shard_is_busy`'s
+    #    `set.iter().next()` (the SMALLEST id) is restated as an explicit
+    #    minimum scan. `BTreeSet<String>` (the ledger) -> a `[text]` kept
+    #    sorted and unique by `replicaTextSetInsert` (real lexicographic
+    #    `<` on text — confirmed in runtime/eval.go's applyBin).
+    # 4. `Option<T>` -> `hasX: bool` + `x: T` pairs, or a two-field
+    #    `{has, val}` struct for returns (this directory's convention).
+    # 5. `ExecutionState::Running { phase, fraction }` carries payload; the
+    #    other five variants do not. The record stores `execState: text`
+    #    (tag values already equal `label()`'s six strings: "admitted" |
+    #    "running" | "awaiting-measurement" | "completed" | "rolled-back" |
+    #    "failed") plus `runningPhase`/`runningFraction`, meaningful only
+    #    while `execState == "running"`.
+    # 6. Field renames forced by the grammar, noted so a reader can map
+    #    back: `state` -> `execState`, `from`/`to` -> `fromNode`/`toNode`,
+    #    `abort` -> `abortReason`, and ValidationError's two differently
+    #    typed `limit` payloads -> `limitUtilization: float` /
+    #    `limitCount: int`.
+    # 7. `{:.3}` float formatting -> `ctrlFloatFixed` (the same restatement
+    #    fabric_cli_render.fct/fabric_simulator_base.fct already use):
+    #    `round()` here is round-half-away-from-zero, Rust's is
+    #    round-half-to-even; no value in any test below sits on a .0005
+    #    boundary, so the outputs are identical for everything checked.
+    # 8. `Debug`/`Serialize`/`Deserialize`/`Default` derives are trait
+    #    machinery, not logic; `Default for FabricController` IS logic
+    #    (`new(ControllerPolicy::default())`) and is `fabricControllerDefault`.
+    # 9. `usize::saturating_sub` -> `max(a - b, 0)` (fabric_stats.fct's
+    #    `statsSaturatingSub` precedent). Iterator-returning accessors
+    #    (`records()`, `active()`, `in_flight()`, `targets()`) return
+    #    arrays.
+    # 10. `ActionRegistry::get_mut` (a mutable borrow) has no analogue; the
+    #    controller reads a record with `actionRegistryGet`, rebuilds it,
+    #    and writes it back with `actionRegistrySetRecord` (BTreeMap
+    #    insert-by-id, i.e. `records.insert(id, record)`).
+    #
+    # Everything imported is used at its real shape: `Coordinate`/`DbmsId`
+    # (fabric_core.fct), `Placement`/`TopologyRegistry` (fabric_routing.fct,
+    # where `Placement.dbmsId` is a bare `text` — every `source.dbms_id`
+    # read below wraps it as `DbmsId{value: ...}`), `WorkloadProfile`/
+    # `WorkloadMetrics` (fabric_telemetry.fct), `OptimizationAction`/
+    # `OptimizationDecision` (fabric_optimizer.fct), `ActionTarget`/
+    # `ActionId`/`ControllerPolicy`/`NodeStatus`/`FleetView`/
+    # `ControlPlaneView` (fabric_controller_target.fct), and
+    # `PlacementPlan`/`PlanRequest`/`PlanError`/`PhaseProgress`/
+    # `ExecutionFault`/`RollbackOutcome`/`MeasurementSnapshot`/
+    # `ExecutionOutcome`/`OutcomeReport` + `controllerPlanActionLabel`
+    # (fabric_controller_plan.fct). Nothing is redeclared.
+
+    # ============================================================
+    # small text helpers — `{:.N}` and its padding, local to this file
+    # ============================================================
+    proc ctrlPow10(n: int) -> int:
+        let mut result = 1
+        let mut i = 0
+        loop i < n:
+            result = result * 10
+            i = i + 1
+        return result
+
+    proc ctrlPadLeftZero(s: text, width: int) -> text:
+        let mut result = s
+        loop len(result) < width:
+            result = "0" + result
+        return result
+
+    # ctrlFloatFixed: `{:.N}` — see simplification 7 in this file's header.
+    proc ctrlFloatFixed(v: float, decimals: int) -> text:
+        let neg = v < 0.0
+        let av = abs(v)
+        let scale = do ctrlPow10(decimals)
+        let scaleFloat = toFloat(scale)
+        let scaled = round(av * scaleFloat)
+        let intPart = scaled / scale
+        let fracPart = scaled % scale
+        let fracRaw = "" + fracPart
+        let fracText = do ctrlPadLeftZero(fracRaw, decimals)
+        let mut result = "" + intPart
+        if decimals > 0:
+            result = result + "." + fracText
+        if neg:
+            result = "-" + result
+        return result
+
+    proc ctrlJoinText(items: [text], sep: text) -> text:
+        let n = len(items)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + sep
+            out = out + items[i]
+            i = i + 1
+        return out
+
+    # ============================================================
+    # decision.rs — DecisionEnvelope: an optimizer decision bound to WHEN
+    # it was true. `target` is built from the decision's own shard_id/
+    # coordinate, never taken from the caller ("there is exactly one place
+    # that says which cell a decision is about").
+    # ============================================================
+    struct DecisionEnvelope:
+        decision: OptimizationDecision
+        target: ActionTarget
+        observedAtMs: int
+        topologyGeneration: int
+
+    proc decisionEnvelopeNew(decision: OptimizationDecision, observedAtMs: int, topologyGeneration: int) -> DecisionEnvelope:
+        let target = do actionTargetNew(decision.shardId, decision.coordinate)
+        return DecisionEnvelope{decision: decision, target: target, observedAtMs: observedAtMs, topologyGeneration: topologyGeneration}
+
+    proc optimizationDecisionZero() -> OptimizationDecision:
+        let noAction = do optimizationActionNoAction()
+        return OptimizationDecision{shardId: 0, coordinate: Coordinate{x: 0, y: 0}, action: noAction, expectedGain: 0.0, estimatedCost: 0.0, confidence: 0.0}
+
+    proc decisionEnvelopeZero() -> DecisionEnvelope:
+        let decision = do optimizationDecisionZero()
+        return DecisionEnvelope{decision: decision, target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, observedAtMs: 0, topologyGeneration: 0}
+
+    proc decisionEnvelopeAction(e: DecisionEnvelope) -> OptimizationAction:
+        return e.decision.action
+
+    proc decisionEnvelopeActionLabel(e: DecisionEnvelope) -> text:
+        let label = do controllerPlanActionLabel(e.decision.action)
+        return label
+
+    struct DbmsIdOption:
+        has: bool
+        val: DbmsId
+
+    # decisionEnvelopeNamedDestination: Replicate/Move name a node; Split/
+    # Isolate name none by construction; Colocate names a COORDINATE, so
+    # its node is resolved from the topology during validation instead.
+    proc decisionEnvelopeNamedDestination(e: DecisionEnvelope) -> DbmsIdOption:
+        let kind = e.decision.action.kind
+        if kind == "Replicate" || kind == "Move":
+            return DbmsIdOption{has: true, val: DbmsId{value: e.decision.action.target}}
+        return DbmsIdOption{has: false, val: DbmsId{value: ""}}
+
+    # ValidatedDecision: "validated is a thing the compiler can see" —
+    # only `fabricControllerValidate` below builds one, and only
+    # `fabricControllerSubmit` consumes one. `destination`/
+    # `destination_region` are `Option`s (simplification 4).
+    struct ValidatedDecision:
+        envelope: DecisionEnvelope
+        source: Placement
+        hasDestination: bool
+        destination: DbmsId
+        hasDestinationRegion: bool
+        destinationRegion: text
+        validatedAtMs: int
+
+    proc validatedDecisionNew(envelope: DecisionEnvelope, source: Placement, hasDestination: bool, destination: DbmsId, hasDestinationRegion: bool, destinationRegion: text, validatedAtMs: int) -> ValidatedDecision:
+        return ValidatedDecision{envelope: envelope, source: source, hasDestination: hasDestination, destination: destination, hasDestinationRegion: hasDestinationRegion, destinationRegion: destinationRegion, validatedAtMs: validatedAtMs}
+
+    proc validatedDecisionZero() -> ValidatedDecision:
+        let envelope = do decisionEnvelopeZero()
+        return ValidatedDecision{envelope: envelope, source: Placement{dbmsId: "", shardId: 0, coordinate: Coordinate{x: 0, y: 0}, region: ""}, hasDestination: false, destination: DbmsId{value: ""}, hasDestinationRegion: false, destinationRegion: "", validatedAtMs: 0}
+
+    proc validatedDecisionTarget(v: ValidatedDecision) -> ActionTarget:
+        return v.envelope.target
+
+    proc validatedDecisionDecision(v: ValidatedDecision) -> OptimizationDecision:
+        return v.envelope.decision
+
+    proc validatedDecisionSourceId(v: ValidatedDecision) -> DbmsId:
+        return DbmsId{value: v.source.dbmsId}
+
+    # ============================================================
+    # validation.rs — ValidationError: every reason the controller will
+    # refuse to act, typed and carrying its evidence. One struct, a `kind`
+    # discriminant (the real variant name) plus every payload field any
+    # variant carries, each under its own real name (simplification 6 for
+    # the two renames). Unused fields sit at their zero.
+    # ============================================================
+    struct ValidationError:
+        kind: text
+        score: float
+        confidence: float
+        minConfidence: float
+        coordinate: Coordinate
+        observedAtMs: int
+        nowMs: int
+        ageMs: int
+        maxAgeMs: int
+        decisionGeneration: int
+        currentGeneration: int
+        target: ActionTarget
+        node: DbmsId
+        condition: text
+        hosted: int
+        capacity: int
+        utilization: float
+        limitUtilization: float
+        shardId: int
+        existing: ActionId
+        existingAction: text
+        inFlight: int
+        limitCount: int
+        remaining: int
+        minimum: int
+        action: text
+        planError: PlanError
+
+    proc validationErrorZero() -> ValidationError:
+        let noErr = do planErrorEmptyPlan()
+        return ValidationError{kind: "", score: 0.0, confidence: 0.0, minConfidence: 0.0, coordinate: Coordinate{x: 0, y: 0}, observedAtMs: 0, nowMs: 0, ageMs: 0, maxAgeMs: 0, decisionGeneration: 0, currentGeneration: 0, target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, node: DbmsId{value: ""}, condition: "", hosted: 0, capacity: 0, utilization: 0.0, limitUtilization: 0.0, shardId: 0, existing: ActionId{value: 0}, existingAction: "", inFlight: 0, limitCount: 0, remaining: 0, minimum: 0, action: "", planError: noErr}
+
+    proc validationErrorNoActionRequested() -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "NoActionRequested", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorBelowExecutionThreshold(score: float, confidence: float, minConfidence: float) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "BelowExecutionThreshold", score: score, confidence: confidence, minConfidence: minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorInvalidCoordinate(coordinate: Coordinate) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "InvalidCoordinate", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorStaleDecision(observedAtMs: int, nowMs: int, ageMs: int, maxAgeMs: int) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "StaleDecision", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: observedAtMs, nowMs: nowMs, ageMs: ageMs, maxAgeMs: maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorDecisionFromTheFuture(observedAtMs: int, nowMs: int) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "DecisionFromTheFuture", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: observedAtMs, nowMs: nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorTopologySuperseded(decisionGeneration: int, currentGeneration: int) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "TopologySuperseded", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: decisionGeneration, currentGeneration: currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorUnknownPlacement(target: ActionTarget) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "UnknownPlacement", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorUnknownDestination(node: DbmsId) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "UnknownDestination", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorDestinationUnhealthy(node: DbmsId, condition: text) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "DestinationUnhealthy", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: node, condition: condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorDestinationAtCapacity(node: DbmsId, hosted: int, capacity: int) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "DestinationAtCapacity", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: node, condition: z.condition, hosted: hosted, capacity: capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorDestinationSaturated(node: DbmsId, utilization: float, limitUtilization: float) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "DestinationSaturated", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: utilization, limitUtilization: limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorDestinationIsSource(node: DbmsId) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "DestinationIsSource", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorColocationTargetMissing(shardId: int, coordinate: Coordinate) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "ColocationTargetMissing", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorConflictingAction(target: ActionTarget, existing: ActionId, existingAction: text) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "ConflictingAction", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: existing, existingAction: existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorShardBusy(shardId: int, existing: ActionId) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "ShardBusy", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: shardId, existing: existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorNodeBusy(node: DbmsId, inFlight: int, limitCount: int) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "NodeBusy", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: inFlight, limitCount: limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorTooManyInFlight(inFlight: int, limitCount: int) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "TooManyInFlight", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: inFlight, limitCount: limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorWouldDropLastReplica(target: ActionTarget, remaining: int, minimum: int) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "WouldDropLastReplica", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: remaining, minimum: minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorRemovesUnheldCopy(target: ActionTarget, node: DbmsId) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "RemovesUnheldCopy", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: target, node: node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: z.planError}
+
+    proc validationErrorNoMechanism(action: text) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "NoMechanism", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: action, planError: z.planError}
+
+    proc validationErrorPlanRejected(error: PlanError) -> ValidationError:
+        let z = do validationErrorZero()
+        return ValidationError{kind: "PlanRejected", score: z.score, confidence: z.confidence, minConfidence: z.minConfidence, coordinate: z.coordinate, observedAtMs: z.observedAtMs, nowMs: z.nowMs, ageMs: z.ageMs, maxAgeMs: z.maxAgeMs, decisionGeneration: z.decisionGeneration, currentGeneration: z.currentGeneration, target: z.target, node: z.node, condition: z.condition, hosted: z.hosted, capacity: z.capacity, utilization: z.utilization, limitUtilization: z.limitUtilization, shardId: z.shardId, existing: z.existing, existingAction: z.existingAction, inFlight: z.inFlight, limitCount: z.limitCount, remaining: z.remaining, minimum: z.minimum, action: z.action, planError: error}
+
+    # validationErrorDisplay: `impl Display for ValidationError`, arm for
+    # arm in the real match's order, each format string restated verbatim.
+    proc validationErrorDisplay(e: ValidationError) -> text:
+        if e.kind == "NoActionRequested":
+            return "decision requests no action"
+        if e.kind == "BelowExecutionThreshold":
+            let s = do ctrlFloatFixed(e.score, 3)
+            let c = do ctrlFloatFixed(e.confidence, 3)
+            let m = do ctrlFloatFixed(e.minConfidence, 3)
+            return "decision below execution threshold: score " + s + ", confidence " + c + " (minimum " + m + ")"
+        if e.kind == "InvalidCoordinate":
+            return "coordinate (" + e.coordinate.x + "," + e.coordinate.y + ") is outside the 12x13 grid"
+        if e.kind == "StaleDecision":
+            return "decision is stale: observed at " + e.observedAtMs + ", now " + e.nowMs + " (" + e.ageMs + "ms old, limit " + e.maxAgeMs + "ms)"
+        if e.kind == "DecisionFromTheFuture":
+            return "decision claims observation at " + e.observedAtMs + ", ahead of the control plane clock at " + e.nowMs
+        if e.kind == "TopologySuperseded":
+            return "decision was computed against topology generation " + e.decisionGeneration + "; the fleet is now at " + e.currentGeneration
+        if e.kind == "UnknownPlacement":
+            let t = do actionTargetDisplay(e.target)
+            return "no placement is recorded for " + t
+        if e.kind == "UnknownDestination":
+            return "destination '" + e.node.value + "' is not a registered node"
+        if e.kind == "DestinationUnhealthy":
+            let label = do nodeConditionLabel(e.condition)
+            return "destination '" + e.node.value + "' is " + label + " and may not receive placements"
+        if e.kind == "DestinationAtCapacity":
+            return "destination '" + e.node.value + "' is at capacity: " + e.hosted + "/" + e.capacity + " placements"
+        if e.kind == "DestinationSaturated":
+            let u = do ctrlFloatFixed(e.utilization, 3)
+            let l = do ctrlFloatFixed(e.limitUtilization, 3)
+            return "destination '" + e.node.value + "' is saturated at " + u + " utilization (limit " + l + ")"
+        if e.kind == "DestinationIsSource":
+            return "destination '" + e.node.value + "' already holds the target"
+        if e.kind == "ColocationTargetMissing":
+            return "colocation target shard " + e.shardId + " (" + e.coordinate.x + "," + e.coordinate.y + ") is not placed"
+        if e.kind == "ConflictingAction":
+            let existing = do actionIdDisplay(e.existing)
+            let t = do actionTargetDisplay(e.target)
+            return existing + " (" + e.existingAction + ") is already executing on " + t
+        if e.kind == "ShardBusy":
+            let existing = do actionIdDisplay(e.existing)
+            return "shard " + e.shardId + " is held by a shard-wide " + existing
+        if e.kind == "NodeBusy":
+            return "node '" + e.node.value + "' already has " + e.inFlight + " action(s) in flight (limit " + e.limitCount + ")"
+        if e.kind == "TooManyInFlight":
+            return "" + e.inFlight + " actions already in flight (limit " + e.limitCount + ")"
+        if e.kind == "WouldDropLastReplica":
+            let t = do actionTargetDisplay(e.target)
+            return "plan would leave " + t + " with " + e.remaining + " copies (minimum " + e.minimum + ")"
+        if e.kind == "RemovesUnheldCopy":
+            let t = do actionTargetDisplay(e.target)
+            return "plan removes a copy of " + t + " from '" + e.node.value + "', which holds none"
+        if e.kind == "NoMechanism":
+            return "no registered mechanism implements '" + e.action + "'"
+        let inner = do planErrorDisplay(e.planError)
+        return inner
+
+    # ============================================================
+    # validation.rs — MeasurementError: why the controller refused to
+    # record an after-measurement. Tags: "UnknownAction" |
+    # "NotAwaitingMeasurement" | "TooSoon".
+    # ============================================================
+    struct MeasurementError:
+        kind: text
+        id: ActionId
+        execState: text
+        elapsedMs: int
+        settleMs: int
+
+    proc measurementErrorZero() -> MeasurementError:
+        return MeasurementError{kind: "", id: ActionId{value: 0}, execState: "", elapsedMs: 0, settleMs: 0}
+
+    proc measurementErrorUnknownAction(id: ActionId) -> MeasurementError:
+        return MeasurementError{kind: "UnknownAction", id: id, execState: "", elapsedMs: 0, settleMs: 0}
+
+    proc measurementErrorNotAwaitingMeasurement(id: ActionId, execState: text) -> MeasurementError:
+        return MeasurementError{kind: "NotAwaitingMeasurement", id: id, execState: execState, elapsedMs: 0, settleMs: 0}
+
+    proc measurementErrorTooSoon(id: ActionId, elapsedMs: int, settleMs: int) -> MeasurementError:
+        return MeasurementError{kind: "TooSoon", id: id, execState: "", elapsedMs: elapsedMs, settleMs: settleMs}
+
+    proc measurementErrorDisplay(e: MeasurementError) -> text:
+        let id = do actionIdDisplay(e.id)
+        if e.kind == "UnknownAction":
+            return id + " is not known to this controller"
+        if e.kind == "NotAwaitingMeasurement":
+            return id + " is " + e.execState + ", not awaiting measurement"
+        return id + " committed " + e.elapsedMs + "ms ago; the system settles for " + e.settleMs + "ms before a measurement counts"
+
+    # ============================================================
+    # validation.rs — AbortReason: why an in-flight action was torn down.
+    # Tags: "Requested" | "Fault" | "PhaseTimeout" | "NodeLost".
+    # ============================================================
+    struct AbortReason:
+        kind: text
+        fault: ExecutionFault
+        phase: text
+        elapsedMs: int
+        limitMs: int
+        node: DbmsId
+        condition: text
+
+    proc abortReasonRequested() -> AbortReason:
+        let noFault = do executionFaultInternal("")
+        return AbortReason{kind: "Requested", fault: noFault, phase: "", elapsedMs: 0, limitMs: 0, node: DbmsId{value: ""}, condition: ""}
+
+    proc abortReasonFault(fault: ExecutionFault) -> AbortReason:
+        return AbortReason{kind: "Fault", fault: fault, phase: "", elapsedMs: 0, limitMs: 0, node: DbmsId{value: ""}, condition: ""}
+
+    proc abortReasonPhaseTimeout(phase: text, elapsedMs: int, limitMs: int) -> AbortReason:
+        let noFault = do executionFaultInternal("")
+        return AbortReason{kind: "PhaseTimeout", fault: noFault, phase: phase, elapsedMs: elapsedMs, limitMs: limitMs, node: DbmsId{value: ""}, condition: ""}
+
+    proc abortReasonNodeLost(node: DbmsId, condition: text) -> AbortReason:
+        let noFault = do executionFaultInternal("")
+        return AbortReason{kind: "NodeLost", fault: noFault, phase: "", elapsedMs: 0, limitMs: 0, node: node, condition: condition}
+
+    proc abortReasonDisplay(r: AbortReason) -> text:
+        if r.kind == "Requested":
+            return "abort requested"
+        if r.kind == "Fault":
+            let inner = do executionFaultDisplay(r.fault)
+            return inner
+        if r.kind == "PhaseTimeout":
+            let label = do planPhaseLabel(r.phase)
+            return "phase '" + label + "' ran " + r.elapsedMs + "ms without completing (limit " + r.limitMs + "ms)"
+        let condition = do nodeConditionLabel(r.condition)
+        return "node '" + r.node.value + "' became " + condition + " mid-flight"
+
+    # ============================================================
+    # replica.rs — ReplicaLedger: who holds a copy of what. `BTreeMap<
+    # ActionTarget, BTreeSet<String>>` -> `[ReplicaHolding]`, each holding
+    # a sorted, unique `[text]` (simplification 3).
+    # ============================================================
+    struct ReplicaHolding:
+        target: ActionTarget
+        nodes: [text]
+
+    struct ReplicaLedger:
+        entries: [ReplicaHolding]
+
+    proc replicaLedgerNew() -> ReplicaLedger:
+        return ReplicaLedger{entries: []}
+
+    # replicaTextSetInsert / Remove / Contains: `BTreeSet<String>`'s
+    # insert/remove/contains over a sorted unique array.
+    proc replicaTextSetInsert(xs: [text], s: text) -> [text]:
+        let n = len(xs)
+        let mut result = []
+        let mut inserted = false
+        let mut i = 0
+        loop i < n:
+            if !inserted && s < xs[i]:
+                result = append(result, s)
+                inserted = true
+            if xs[i] == s:
+                inserted = true
+            result = append(result, xs[i])
+            i = i + 1
+        if !inserted:
+            result = append(result, s)
+        return result
+
+    proc replicaTextSetRemove(xs: [text], s: text) -> [text]:
+        let n = len(xs)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            if xs[i] != s:
+                result = append(result, xs[i])
+            i = i + 1
+        return result
+
+    proc replicaTextSetContains(xs: [text], s: text) -> bool:
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if xs[i] == s:
+                return true
+            i = i + 1
+        return false
+
+    proc replicaLedgerIndexOf(entries: [ReplicaHolding], target: ActionTarget) -> int:
+        let n = len(entries)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(entries[i].target, target)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    proc replicaHoldingArrayRemoveAt(entries: [ReplicaHolding], idx: int) -> [ReplicaHolding]:
+        let n = len(entries)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            if i != idx:
+                result = append(result, entries[i])
+            i = i + 1
+        return result
+
+    # replicaLedgerInsertNode: `self.replicas.entry(target).or_default()
+    # .insert(node)` — the one write every adding path shares.
+    proc replicaLedgerInsertNode(ledger: ReplicaLedger, target: ActionTarget, node: text) -> ReplicaLedger:
+        let idx = do replicaLedgerIndexOf(ledger.entries, target)
+        if idx == -1:
+            let fresh = ReplicaHolding{target: target, nodes: [node]}
+            let grown = append(ledger.entries, fresh)
+            return ReplicaLedger{entries: grown}
+        let mut entries = ledger.entries
+        let nodes = do replicaTextSetInsert(entries[idx].nodes, node)
+        entries[idx] = ReplicaHolding{target: entries[idx].target, nodes: nodes}
+        return ReplicaLedger{entries: entries}
+
+    # replicaLedgerSeedFromTopology: additive — "copies the controller
+    # created and the registry does not model are not silently forgotten".
+    proc replicaLedgerSeedFromTopology(ledger: ReplicaLedger, topology: TopologyRegistry) -> ReplicaLedger:
+        let placements = do topologyRegistryPlacements(topology)
+        let n = len(placements)
+        let mut result = ledger
+        let mut i = 0
+        loop i < n:
+            let target = do actionTargetNew(placements[i].shardId, placements[i].coordinate)
+            let next = do replicaLedgerInsertNode(result, target, placements[i].dbmsId)
+            result = next
+            i = i + 1
+        return result
+
+    # replicaLedgerEnsureSeeded: record `node` only if NOTHING is known
+    # about the target yet.
+    proc replicaLedgerEnsureSeeded(ledger: ReplicaLedger, target: ActionTarget, node: DbmsId) -> ReplicaLedger:
+        let idx = do replicaLedgerIndexOf(ledger.entries, target)
+        if idx != -1:
+            return ledger
+        let seeded = do replicaLedgerInsertNode(ledger, target, node.value)
+        return seeded
+
+    proc replicaLedgerAdd(ledger: ReplicaLedger, target: ActionTarget, node: DbmsId) -> ReplicaLedger:
+        let added = do replicaLedgerInsertNode(ledger, target, node.value)
+        return added
+
+    # replicaLedgerRemove: drop the node; drop the whole entry once its set
+    # is empty (`if set.is_empty() { self.replicas.remove(&target) }`).
+    proc replicaLedgerRemove(ledger: ReplicaLedger, target: ActionTarget, node: DbmsId) -> ReplicaLedger:
+        let idx = do replicaLedgerIndexOf(ledger.entries, target)
+        if idx == -1:
+            return ledger
+        let nodes = do replicaTextSetRemove(ledger.entries[idx].nodes, node.value)
+        if len(nodes) == 0:
+            let shrunk = do replicaHoldingArrayRemoveAt(ledger.entries, idx)
+            return ReplicaLedger{entries: shrunk}
+        let mut entries = ledger.entries
+        entries[idx] = ReplicaHolding{target: entries[idx].target, nodes: nodes}
+        return ReplicaLedger{entries: entries}
+
+    proc replicaLedgerHolds(ledger: ReplicaLedger, target: ActionTarget, node: DbmsId) -> bool:
+        let idx = do replicaLedgerIndexOf(ledger.entries, target)
+        if idx == -1:
+            return false
+        let has = do replicaTextSetContains(ledger.entries[idx].nodes, node.value)
+        return has
+
+    proc replicaLedgerCount(ledger: ReplicaLedger, target: ActionTarget) -> int:
+        let idx = do replicaLedgerIndexOf(ledger.entries, target)
+        if idx == -1:
+            return 0
+        return len(ledger.entries[idx].nodes)
+
+    # replicaLedgerReplicas: holders of `target`, in node-id order — the
+    # set's own ascending order, already maintained by every insert.
+    proc replicaLedgerReplicas(ledger: ReplicaLedger, target: ActionTarget) -> [DbmsId]:
+        let idx = do replicaLedgerIndexOf(ledger.entries, target)
+        let mut result = []
+        if idx == -1:
+            return result
+        let nodes = ledger.entries[idx].nodes
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            result = append(result, DbmsId{value: nodes[i]})
+            i = i + 1
+        return result
+
+    # replicaLedgerProjected: the holder set the plan would leave behind —
+    # computed as a SET (adds inserted, then removes removed), never by
+    # counting, so a node named in both lists is not double-counted.
+    proc replicaLedgerProjected(ledger: ReplicaLedger, plan: PlacementPlan) -> [text]:
+        let idx = do replicaLedgerIndexOf(ledger.entries, plan.target)
+        let mut projected = []
+        if idx != -1:
+            projected = ledger.entries[idx].nodes
+        let na = len(plan.adds)
+        let mut i = 0
+        loop i < na:
+            let withAdd = do replicaTextSetInsert(projected, plan.adds[i].value)
+            projected = withAdd
+            i = i + 1
+        let nr = len(plan.removes)
+        let mut j = 0
+        loop j < nr:
+            let withoutRemove = do replicaTextSetRemove(projected, plan.removes[j].value)
+            projected = withoutRemove
+            j = j + 1
+        return projected
+
+    # replicaLedgerApply: a plan's declared effect, once it has run to
+    # completion. An empty projection removes the entry outright.
+    proc replicaLedgerApply(ledger: ReplicaLedger, plan: PlacementPlan) -> ReplicaLedger:
+        let projected = do replicaLedgerProjected(ledger, plan)
+        let idx = do replicaLedgerIndexOf(ledger.entries, plan.target)
+        if len(projected) == 0:
+            if idx == -1:
+                return ledger
+            let shrunk = do replicaHoldingArrayRemoveAt(ledger.entries, idx)
+            return ReplicaLedger{entries: shrunk}
+        if idx == -1:
+            let grown = append(ledger.entries, ReplicaHolding{target: plan.target, nodes: projected})
+            return ReplicaLedger{entries: grown}
+        let mut entries = ledger.entries
+        entries[idx] = ReplicaHolding{target: plan.target, nodes: projected}
+        return ReplicaLedger{entries: entries}
+
+    # replicaLedgerTargets: `self.replicas.keys()` — a BTreeMap's keys come
+    # out ascending, restated with fabric_controller_target.fct's own
+    # `actionTargetArraySortAscending`.
+    proc replicaLedgerTargets(ledger: ReplicaLedger) -> [ActionTarget]:
+        let n = len(ledger.entries)
+        let mut targets = []
+        let mut i = 0
+        loop i < n:
+            targets = append(targets, ledger.entries[i].target)
+            i = i + 1
+        let sorted = do actionTargetArraySortAscending(targets)
+        return sorted
+
+    proc replicaLedgerLen(ledger: ReplicaLedger) -> int:
+        return len(ledger.entries)
+
+    proc replicaLedgerIsEmpty(ledger: ReplicaLedger) -> bool:
+        let n = len(ledger.entries)
+        return n == 0
+
+    # ============================================================
+    # execution.rs — ExecutionState (simplification 5: plain text tags
+    # equal to `label()`'s six strings; Running's payload lives on the
+    # record).
+    # ============================================================
+    proc executionStateIsActive(execState: text) -> bool:
+        return execState == "admitted" || execState == "running" || execState == "awaiting-measurement"
+
+    proc executionStateIsTerminal(execState: text) -> bool:
+        let active = do executionStateIsActive(execState)
+        return !active
+
+    proc executionStateLabel(execState: text) -> text:
+        return execState
+
+    # ============================================================
+    # execution.rs — PlacementChange: the placement-map edit an executed
+    # action implies. The controller never mutates TopologyRegistry; the
+    # map's owner applies this. `from`/`to` -> `fromNode`/`toNode`
+    # (simplification 6).
+    # ============================================================
+    struct PlacementChange:
+        target: ActionTarget
+        fromNode: DbmsId
+        toNode: DbmsId
+        toRegion: text
+
+    proc placementChangeZero() -> PlacementChange:
+        return PlacementChange{target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, fromNode: DbmsId{value: ""}, toNode: DbmsId{value: ""}, toRegion: ""}
+
+    # placementChangeApply: `topology.move_coordinate(...)` — `moved: false`
+    # means the registry had no placement for the target.
+    proc placementChangeApply(change: PlacementChange, topology: TopologyRegistry) -> TopologyMoveResult:
+        let r = do topologyRegistryMoveCoordinate(topology, change.target.shardId, change.target.coordinate, change.toNode.value, change.toRegion)
+        return r
+
+    # ============================================================
+    # execution.rs — ExecutionRecord: everything known about one admitted
+    # action, from validation to verdict. Every `Option<T>` is a has/val
+    # pair; `state` is `execState` + `runningPhase`/`runningFraction`.
+    # ============================================================
+    struct ExecutionRecord:
+        id: ActionId
+        envelope: DecisionEnvelope
+        plan: PlacementPlan
+        mechanism: text
+        source: DbmsId
+        hasDestination: bool
+        destination: DbmsId
+        hasDestinationRegion: bool
+        destinationRegion: text
+        admittedAtMs: int
+        phaseStartedAtMs: int
+        hasCommittedAtMs: bool
+        committedAtMs: int
+        hasConcludedAtMs: bool
+        concludedAtMs: int
+        completedPhases: [text]
+        execState: text
+        runningPhase: text
+        runningFraction: float
+        baseline: MeasurementSnapshot
+        hasOutcome: bool
+        outcome: ExecutionOutcome
+        hasVerdict: bool
+        verdict: text
+        hasAbortReason: bool
+        abortReason: AbortReason
+        hasRollback: bool
+        rollback: RollbackOutcome
+
+    proc executionRecordZero() -> ExecutionRecord:
+        let envelope = do decisionEnvelopeZero()
+        let plan = do placementPlanZero()
+        let snapshot = do measurementSnapshotZero()
+        let outcome = do executionOutcomeZero()
+        let reason = do abortReasonRequested()
+        let rollback = do rollbackOutcomeRestored()
+        return ExecutionRecord{id: ActionId{value: 0}, envelope: envelope, plan: plan, mechanism: "", source: DbmsId{value: ""}, hasDestination: false, destination: DbmsId{value: ""}, hasDestinationRegion: false, destinationRegion: "", admittedAtMs: 0, phaseStartedAtMs: 0, hasCommittedAtMs: false, committedAtMs: 0, hasConcludedAtMs: false, concludedAtMs: 0, completedPhases: [], execState: "admitted", runningPhase: "", runningFraction: 0.0, baseline: snapshot, hasOutcome: false, outcome: outcome, hasVerdict: false, verdict: "", hasAbortReason: false, abortReason: reason, hasRollback: false, rollback: rollback}
+
+    # executionRecordNew: `ExecutionRecord::new` — `phase_started_at_ms`
+    # starts equal to `admitted_at_ms`, state `Admitted`, everything
+    # optional `None`.
+    proc executionRecordNew(id: ActionId, validated: ValidatedDecision, plan: PlacementPlan, mechanism: text, baseline: MeasurementSnapshot, admittedAtMs: int) -> ExecutionRecord:
+        let source = do validatedDecisionSourceId(validated)
+        let outcome = do executionOutcomeZero()
+        let reason = do abortReasonRequested()
+        let rollback = do rollbackOutcomeRestored()
+        return ExecutionRecord{id: id, envelope: validated.envelope, plan: plan, mechanism: mechanism, source: source, hasDestination: validated.hasDestination, destination: validated.destination, hasDestinationRegion: validated.hasDestinationRegion, destinationRegion: validated.destinationRegion, admittedAtMs: admittedAtMs, phaseStartedAtMs: admittedAtMs, hasCommittedAtMs: false, committedAtMs: 0, hasConcludedAtMs: false, concludedAtMs: 0, completedPhases: [], execState: "admitted", runningPhase: "", runningFraction: 0.0, baseline: baseline, hasOutcome: false, outcome: outcome, hasVerdict: false, verdict: "", hasAbortReason: false, abortReason: reason, hasRollback: false, rollback: rollback}
+
+    # executionRecordRebuild: the one place a record's MUTABLE fields are
+    # rewritten (simplification 10). Every immutable field is copied from
+    # `r`; every pub(crate) mutator below is a call to this with exactly
+    # the fields the real method assigns changed.
+    proc executionRecordRebuild(r: ExecutionRecord, execState: text, runningPhase: text, runningFraction: float, phaseStartedAtMs: int, hasCommittedAtMs: bool, committedAtMs: int, hasConcludedAtMs: bool, concludedAtMs: int, completedPhases: [text], hasOutcome: bool, outcome: ExecutionOutcome, hasVerdict: bool, verdict: text, hasAbortReason: bool, abortReason: AbortReason, hasRollback: bool, rollback: RollbackOutcome) -> ExecutionRecord:
+        return ExecutionRecord{id: r.id, envelope: r.envelope, plan: r.plan, mechanism: r.mechanism, source: r.source, hasDestination: r.hasDestination, destination: r.destination, hasDestinationRegion: r.hasDestinationRegion, destinationRegion: r.destinationRegion, admittedAtMs: r.admittedAtMs, phaseStartedAtMs: phaseStartedAtMs, hasCommittedAtMs: hasCommittedAtMs, committedAtMs: committedAtMs, hasConcludedAtMs: hasConcludedAtMs, concludedAtMs: concludedAtMs, completedPhases: completedPhases, execState: execState, runningPhase: runningPhase, runningFraction: runningFraction, baseline: r.baseline, hasOutcome: hasOutcome, outcome: outcome, hasVerdict: hasVerdict, verdict: verdict, hasAbortReason: hasAbortReason, abortReason: abortReason, hasRollback: hasRollback, rollback: rollback}
+
+    proc executionRecordTarget(r: ExecutionRecord) -> ActionTarget:
+        return r.envelope.target
+
+    # executionRecordHasCutOver: `completed_phases.contains(&Cutover)`.
+    proc executionRecordHasCutOver(r: ExecutionRecord) -> bool:
+        let has = do planPhaseArrayContains(r.completedPhases, "cutover")
+        return has
+
+    struct PlacementChangeOption:
+        has: bool
+        val: PlacementChange
+
+    # executionRecordPlacementChange: Some only if authority moved AND the
+    # record knows a destination and its region (`?` on both Options).
+    proc executionRecordPlacementChange(r: ExecutionRecord) -> PlacementChangeOption:
+        let zero = do placementChangeZero()
+        let cutOver = do executionRecordHasCutOver(r)
+        if !cutOver:
+            return PlacementChangeOption{has: false, val: zero}
+        if !r.hasDestination || !r.hasDestinationRegion:
+            return PlacementChangeOption{has: false, val: zero}
+        return PlacementChangeOption{has: true, val: PlacementChange{target: r.envelope.target, fromNode: r.source, toNode: r.destination, toRegion: r.destinationRegion}}
+
+    # executionRecordReport: the feedback row. `failure` is the abort
+    # reason's Display if one exists, else an Irreversible rollback's
+    # reason, else None — `.map(...).or_else(...)` restated in that order.
+    proc executionRecordReport(r: ExecutionRecord) -> OutcomeReport:
+        let decision = r.envelope.decision
+        let mut hasFailure = false
+        let mut failure = ""
+        if r.hasAbortReason:
+            hasFailure = true
+            let reasonText = do abortReasonDisplay(r.abortReason)
+            failure = reasonText
+        else:
+            if r.hasRollback && r.rollback.kind == "Irreversible":
+                hasFailure = true
+                failure = r.rollback.reason
+        let mut realizedGain = 0.0
+        let mut gainRatio = 0.0
+        if r.hasOutcome:
+            realizedGain = r.outcome.realizedGain
+            gainRatio = r.outcome.gainRatio
+        let mut verdict = "not-measured"
+        if r.hasVerdict:
+            verdict = r.verdict
+        let mut concludedAtMs = r.admittedAtMs
+        if r.hasConcludedAtMs:
+            concludedAtMs = r.concludedAtMs
+        let report = do outcomeReportNew(r.id, r.envelope.target, decision.action, r.mechanism, decision.confidence, decision.expectedGain, decision.estimatedCost, realizedGain, gainRatio, verdict, r.admittedAtMs, concludedAtMs, r.hasOutcome, r.outcome, hasFailure, failure)
+        return report
+
+    # --- the pub(crate) mutators, each a functional update ---
+    proc executionRecordBeginPhase(r: ExecutionRecord, phase: text, atMs: int) -> ExecutionRecord:
+        let out = do executionRecordRebuild(r, "running", phase, 0.0, atMs, r.hasCommittedAtMs, r.committedAtMs, r.hasConcludedAtMs, r.concludedAtMs, r.completedPhases, r.hasOutcome, r.outcome, r.hasVerdict, r.verdict, r.hasAbortReason, r.abortReason, r.hasRollback, r.rollback)
+        return out
+
+    # executionRecordSetFraction: `fraction.clamp(0.0, 1.0)`.
+    proc executionRecordSetFraction(r: ExecutionRecord, phase: text, fraction: float) -> ExecutionRecord:
+        let clamped = do clampFloat(fraction, 0.0, 1.0)
+        let out = do executionRecordRebuild(r, "running", phase, clamped, r.phaseStartedAtMs, r.hasCommittedAtMs, r.committedAtMs, r.hasConcludedAtMs, r.concludedAtMs, r.completedPhases, r.hasOutcome, r.outcome, r.hasVerdict, r.verdict, r.hasAbortReason, r.abortReason, r.hasRollback, r.rollback)
+        return out
+
+    proc executionRecordCompletePhase(r: ExecutionRecord, phase: text) -> ExecutionRecord:
+        let already = do planPhaseArrayContains(r.completedPhases, phase)
+        if already:
+            return r
+        let grown = append(r.completedPhases, phase)
+        let out = do executionRecordRebuild(r, r.execState, r.runningPhase, r.runningFraction, r.phaseStartedAtMs, r.hasCommittedAtMs, r.committedAtMs, r.hasConcludedAtMs, r.concludedAtMs, grown, r.hasOutcome, r.outcome, r.hasVerdict, r.verdict, r.hasAbortReason, r.abortReason, r.hasRollback, r.rollback)
+        return out
+
+    # executionRecordPhaseElapsedMs: `now_ms.saturating_sub(phase_started_at_ms)`.
+    proc executionRecordPhaseElapsedMs(r: ExecutionRecord, nowMs: int) -> int:
+        return max(nowMs - r.phaseStartedAtMs, 0)
+
+    proc executionRecordCommit(r: ExecutionRecord, atMs: int) -> ExecutionRecord:
+        let out = do executionRecordRebuild(r, "awaiting-measurement", "", 0.0, r.phaseStartedAtMs, true, atMs, r.hasConcludedAtMs, r.concludedAtMs, r.completedPhases, r.hasOutcome, r.outcome, r.hasVerdict, r.verdict, r.hasAbortReason, r.abortReason, r.hasRollback, r.rollback)
+        return out
+
+    proc executionRecordConcludeMeasured(r: ExecutionRecord, outcome: ExecutionOutcome, atMs: int) -> ExecutionRecord:
+        let out = do executionRecordRebuild(r, "completed", "", 0.0, r.phaseStartedAtMs, r.hasCommittedAtMs, r.committedAtMs, true, atMs, r.completedPhases, true, outcome, true, outcome.verdict, r.hasAbortReason, r.abortReason, r.hasRollback, r.rollback)
+        return out
+
+    proc executionRecordConcludeUnmeasured(r: ExecutionRecord, atMs: int) -> ExecutionRecord:
+        let out = do executionRecordRebuild(r, "completed", "", 0.0, r.phaseStartedAtMs, r.hasCommittedAtMs, r.committedAtMs, true, atMs, r.completedPhases, r.hasOutcome, r.outcome, true, "not-measured", r.hasAbortReason, r.abortReason, r.hasRollback, r.rollback)
+        return out
+
+    # executionRecordConcludeAborted: Restored -> RolledBack/rolled-back;
+    # anything else -> Failed/failed.
+    proc executionRecordConcludeAborted(r: ExecutionRecord, reason: AbortReason, rollback: RollbackOutcome, atMs: int) -> ExecutionRecord:
+        let restored = rollback.kind == "Restored"
+        let mut execState = "failed"
+        let mut verdict = "failed"
+        if restored:
+            execState = "rolled-back"
+            verdict = "rolled-back"
+        let out = do executionRecordRebuild(r, execState, "", 0.0, r.phaseStartedAtMs, r.hasCommittedAtMs, r.committedAtMs, true, atMs, r.completedPhases, r.hasOutcome, r.outcome, true, verdict, true, reason, true, rollback)
+        return out
+
+    # ============================================================
+    # execution.rs — ActionRegistry: the in-flight interlock plus the
+    # history behind it (simplification 3 for every map).
+    # ============================================================
+    struct TargetHold:
+        target: ActionTarget
+        id: int
+
+    struct ShardHold:
+        shardId: int
+        id: int
+
+    struct NodeHold:
+        node: text
+        id: int
+
+    struct ActionRegistry:
+        records: [ExecutionRecord]
+        activeTargets: [TargetHold]
+        activeShards: [ShardHold]
+        activeNodes: [NodeHold]
+        shardWide: [ShardHold]
+        nextId: int
+
+    proc actionRegistryNew() -> ActionRegistry:
+        return ActionRegistry{records: [], activeTargets: [], activeShards: [], activeNodes: [], shardWide: [], nextId: 1}
+
+    proc actionRegistryNextId(reg: ActionRegistry) -> ActionId:
+        return ActionId{value: reg.nextId}
+
+    proc actionRegistryRecordIndexOf(records: [ExecutionRecord], id: int) -> int:
+        let n = len(records)
+        let mut i = 0
+        loop i < n:
+            if records[i].id.value == id:
+                return i
+            i = i + 1
+        return -1
+
+    # actionRegistryInsertRecord: `BTreeMap::insert` — replace the record
+    # with this id, or insert it at its ascending-id position.
+    proc actionRegistryInsertRecord(records: [ExecutionRecord], record: ExecutionRecord) -> [ExecutionRecord]:
+        let n = len(records)
+        let mut result = []
+        let mut placed = false
+        let mut i = 0
+        loop i < n:
+            if records[i].id.value == record.id.value:
+                result = append(result, record)
+                placed = true
+            else:
+                if !placed && record.id.value < records[i].id.value:
+                    result = append(result, record)
+                    placed = true
+                result = append(result, records[i])
+            i = i + 1
+        if !placed:
+            result = append(result, record)
+        return result
+
+    proc targetHoldIndexOf(holds: [TargetHold], target: ActionTarget) -> int:
+        let n = len(holds)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(holds[i].target, target)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    proc shardHoldIndexOf(holds: [ShardHold], shardId: int) -> int:
+        let n = len(holds)
+        let mut i = 0
+        loop i < n:
+            if holds[i].shardId == shardId:
+                return i
+            i = i + 1
+        return -1
+
+    proc shardHoldContains(holds: [ShardHold], shardId: int, id: int) -> bool:
+        let n = len(holds)
+        let mut i = 0
+        loop i < n:
+            if holds[i].shardId == shardId && holds[i].id == id:
+                return true
+            i = i + 1
+        return false
+
+    proc nodeHoldContains(holds: [NodeHold], node: text, id: int) -> bool:
+        let n = len(holds)
+        let mut i = 0
+        loop i < n:
+            if holds[i].node == node && holds[i].id == id:
+                return true
+            i = i + 1
+        return false
+
+    # nodeHoldInsert: `active_nodes.entry(node).or_default().insert(id)`.
+    proc nodeHoldInsert(holds: [NodeHold], node: text, id: int) -> [NodeHold]:
+        let has = do nodeHoldContains(holds, node, id)
+        if has:
+            return holds
+        let grown = append(holds, NodeHold{node: node, id: id})
+        return grown
+
+    # actionRegistryAdmit: file an admitted action and take its interlocks
+    # — target, shard, shard-wide (if scope is "shard"), every touched
+    # node, and the source node. Returns the new registry; the admitted id
+    # is `record.id` (what the real method returns).
+    proc actionRegistryAdmit(reg: ActionRegistry, record: ExecutionRecord) -> ActionRegistry:
+        let id = record.id.value
+        let nextId = max(reg.nextId, id + 1)
+        let target = do executionRecordTarget(record)
+        let mut activeTargets = reg.activeTargets
+        let tidx = do targetHoldIndexOf(activeTargets, target)
+        if tidx == -1:
+            activeTargets = append(activeTargets, TargetHold{target: target, id: id})
+        else:
+            activeTargets[tidx] = TargetHold{target: target, id: id}
+        let mut activeShards = reg.activeShards
+        let shardHeld = do shardHoldContains(activeShards, target.shardId, id)
+        if !shardHeld:
+            activeShards = append(activeShards, ShardHold{shardId: target.shardId, id: id})
+        let mut shardWide = reg.shardWide
+        if record.plan.scope == "shard":
+            let widx = do shardHoldIndexOf(shardWide, target.shardId)
+            if widx == -1:
+                shardWide = append(shardWide, ShardHold{shardId: target.shardId, id: id})
+            else:
+                shardWide[widx] = ShardHold{shardId: target.shardId, id: id}
+        let mut activeNodes = reg.activeNodes
+        let touched = do placementPlanTouchedNodes(record.plan)
+        let n = len(touched)
+        let mut i = 0
+        loop i < n:
+            let withNode = do nodeHoldInsert(activeNodes, touched[i].value, id)
+            activeNodes = withNode
+            i = i + 1
+        let withSource = do nodeHoldInsert(activeNodes, record.source.value, id)
+        activeNodes = withSource
+        let records = do actionRegistryInsertRecord(reg.records, record)
+        return ActionRegistry{records: records, activeTargets: activeTargets, activeShards: activeShards, activeNodes: activeNodes, shardWide: shardWide, nextId: nextId}
+
+    # actionRegistryRetire: release the interlocks of a terminal action;
+    # the record itself is kept ("history is the input to the learning
+    # loop"). Unknown id: no-op.
+    proc actionRegistryRetire(reg: ActionRegistry, id: ActionId) -> ActionRegistry:
+        let ridx = do actionRegistryRecordIndexOf(reg.records, id.value)
+        if ridx == -1:
+            return reg
+        let target = do executionRecordTarget(reg.records[ridx])
+        let mut activeTargets = []
+        let nt = len(reg.activeTargets)
+        let mut i = 0
+        loop i < nt:
+            let same = do actionTargetEquals(reg.activeTargets[i].target, target)
+            if !(same && reg.activeTargets[i].id == id.value):
+                activeTargets = append(activeTargets, reg.activeTargets[i])
+            i = i + 1
+        let mut activeShards = []
+        let ns = len(reg.activeShards)
+        let mut j = 0
+        loop j < ns:
+            if !(reg.activeShards[j].shardId == target.shardId && reg.activeShards[j].id == id.value):
+                activeShards = append(activeShards, reg.activeShards[j])
+            j = j + 1
+        let mut shardWide = []
+        let nw = len(reg.shardWide)
+        let mut k = 0
+        loop k < nw:
+            if !(reg.shardWide[k].shardId == target.shardId && reg.shardWide[k].id == id.value):
+                shardWide = append(shardWide, reg.shardWide[k])
+            k = k + 1
+        let mut activeNodes = []
+        let nn = len(reg.activeNodes)
+        let mut m = 0
+        loop m < nn:
+            if reg.activeNodes[m].id != id.value:
+                activeNodes = append(activeNodes, reg.activeNodes[m])
+            m = m + 1
+        return ActionRegistry{records: reg.records, activeTargets: activeTargets, activeShards: activeShards, activeNodes: activeNodes, shardWide: shardWide, nextId: reg.nextId}
+
+    struct ExecutionRecordOption:
+        has: bool
+        val: ExecutionRecord
+
+    proc actionRegistryGet(reg: ActionRegistry, id: ActionId) -> ExecutionRecordOption:
+        let idx = do actionRegistryRecordIndexOf(reg.records, id.value)
+        if idx == -1:
+            let zero = do executionRecordZero()
+            return ExecutionRecordOption{has: false, val: zero}
+        return ExecutionRecordOption{has: true, val: reg.records[idx]}
+
+    # actionRegistrySetRecord: the write-back half of `get_mut`
+    # (simplification 10).
+    proc actionRegistrySetRecord(reg: ActionRegistry, record: ExecutionRecord) -> ActionRegistry:
+        let records = do actionRegistryInsertRecord(reg.records, record)
+        return ActionRegistry{records: records, activeTargets: reg.activeTargets, activeShards: reg.activeShards, activeNodes: reg.activeNodes, shardWide: reg.shardWide, nextId: reg.nextId}
+
+    proc actionRegistryRecords(reg: ActionRegistry) -> [ExecutionRecord]:
+        return reg.records
+
+    proc actionRegistryActive(reg: ActionRegistry) -> [ExecutionRecord]:
+        let n = len(reg.records)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            let active = do executionStateIsActive(reg.records[i].execState)
+            if active:
+                result = append(result, reg.records[i])
+            i = i + 1
+        return result
+
+    proc actionRegistryActiveIds(reg: ActionRegistry) -> [ActionId]:
+        let active = do actionRegistryActive(reg)
+        let n = len(active)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            result = append(result, active[i].id)
+            i = i + 1
+        return result
+
+    proc actionRegistryActiveLen(reg: ActionRegistry) -> int:
+        return len(reg.activeTargets)
+
+    proc actionRegistryHolderOf(reg: ActionRegistry, target: ActionTarget) -> ExecutionRecordOption:
+        let tidx = do targetHoldIndexOf(reg.activeTargets, target)
+        if tidx == -1:
+            let zero = do executionRecordZero()
+            return ExecutionRecordOption{has: false, val: zero}
+        let got = do actionRegistryGet(reg, ActionId{value: reg.activeTargets[tidx].id})
+        return got
+
+    struct ActionIdOption:
+        has: bool
+        val: ActionId
+
+    proc actionRegistryShardHolder(reg: ActionRegistry, shardId: int) -> ActionIdOption:
+        let widx = do shardHoldIndexOf(reg.shardWide, shardId)
+        if widx == -1:
+            return ActionIdOption{has: false, val: ActionId{value: 0}}
+        return ActionIdOption{has: true, val: ActionId{value: reg.shardWide[widx].id}}
+
+    # actionRegistryShardIsBusy: `set.iter().next()` on a BTreeSet<u64> is
+    # its SMALLEST id — an explicit minimum scan here.
+    proc actionRegistryShardIsBusy(reg: ActionRegistry, shardId: int) -> ActionIdOption:
+        let n = len(reg.activeShards)
+        let mut found = false
+        let mut best = 0
+        let mut i = 0
+        loop i < n:
+            if reg.activeShards[i].shardId == shardId:
+                if !found || reg.activeShards[i].id < best:
+                    best = reg.activeShards[i].id
+                    found = true
+            i = i + 1
+        return ActionIdOption{has: found, val: ActionId{value: best}}
+
+    proc actionRegistryNodeLoad(reg: ActionRegistry, node: DbmsId) -> int:
+        let n = len(reg.activeNodes)
+        let mut count = 0
+        let mut i = 0
+        loop i < n:
+            if reg.activeNodes[i].node == node.value:
+                count = count + 1
+            i = i + 1
+        return count
+
+    proc actionRegistryLen(reg: ActionRegistry) -> int:
+        return len(reg.records)
+
+    proc actionRegistryIsEmpty(reg: ActionRegistry) -> bool:
+        let n = len(reg.records)
+        return n == 0
+
+    # ============================================================
+    # controller.rs — the `PlacementExecutor` trait, as a closed struct
+    # (simplification 1). `kind` selects the implementation; "stub" is the
+    # crate's own test mechanism. `startedPhases`/`startedAtMs` are the
+    # stub's `BTreeMap<PlanPhase, u64>` as parallel arrays.
+    # ============================================================
+    struct Executor:
+        kind: text
+        name: text
+        removes: [DbmsId]
+        startedPhases: [text]
+        startedAtMs: [int]
+
+    proc stubExecutorNew() -> Executor:
+        return Executor{kind: "stub", name: "stub", removes: [], startedPhases: [], startedAtMs: []}
+
+    # stubExecutorDropping: `StubExecutor::dropping(removes)` — a mechanism
+    # whose plans remove exactly these nodes instead of the source.
+    proc stubExecutorDropping(removes: [DbmsId]) -> Executor:
+        return Executor{kind: "stub", name: "stub", removes: removes, startedPhases: [], startedAtMs: []}
+
+    proc executorName(ex: Executor) -> text:
+        return ex.name
+
+    # executorSupports: stub — `!matches!(action, NoAction)`.
+    proc executorSupports(ex: Executor, action: OptimizationAction) -> bool:
+        if ex.kind == "stub":
+            return action.kind != "NoAction"
+        return false
+
+    # executorPlan: stub — needs a named destination; Prepare/Transfer/
+    # Cutover/Cleanup at Coordinate scope; adds=[destination]; removes=
+    # [source] unless `dropping` overrode them.
+    proc executorPlan(ex: Executor, request: PlanRequest) -> PlacementPlanNewResult:
+        if ex.kind != "stub":
+            let label = do controllerPlanActionLabel(request.action)
+            let unsupported = do planErrorUnsupportedAction(label)
+            let zero = do placementPlanZero()
+            return PlacementPlanNewResult{ok: false, value: zero, err: unsupported}
+        if !request.hasDestination:
+            let infeasible = do planErrorInfeasible("stub needs a named destination")
+            let zero2 = do placementPlanZero()
+            return PlacementPlanNewResult{ok: false, value: zero2, err: infeasible}
+        let mut removes = ex.removes
+        if len(removes) == 0:
+            removes = [DbmsId{value: request.source.dbmsId}]
+        let planned = do placementPlanNew(request.target, request.action, "coordinate", ["prepare", "transfer", "cutover", "cleanup"], [request.destination], removes)
+        return planned
+
+    proc executorStartedIndexOf(phases: [text], phase: text) -> int:
+        let n = len(phases)
+        let mut i = 0
+        loop i < n:
+            if phases[i] == phase:
+                return i
+            i = i + 1
+        return -1
+
+    struct ExecutorBeginResult:
+        ok: bool
+        fault: ExecutionFault
+        executor: Executor
+
+    # executorBeginPhase: stub — `started.insert(phase, at_ms)`; Ok(()).
+    proc executorBeginPhase(ex: Executor, plan: PlacementPlan, phase: text, atMs: int) -> ExecutorBeginResult:
+        if ex.kind != "stub":
+            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
+            return ExecutorBeginResult{ok: false, fault: fault, executor: ex}
+        let idx = do executorStartedIndexOf(ex.startedPhases, phase)
+        let mut phases = ex.startedPhases
+        let mut times = ex.startedAtMs
+        if idx == -1:
+            phases = append(phases, phase)
+            times = append(times, atMs)
+        else:
+            times[idx] = atMs
+        let noFault = do executionFaultInternal("")
+        return ExecutorBeginResult{ok: true, fault: noFault, executor: Executor{kind: ex.kind, name: ex.name, removes: ex.removes, startedPhases: phases, startedAtMs: times}}
+
+    struct ExecutorPollResult:
+        ok: bool
+        progress: PhaseProgress
+        fault: ExecutionFault
+        executor: Executor
+
+    # executorPollPhase: stub — NotStarted if the phase never began;
+    # Complete once `at_ms > started`, else Running{0.5}.
+    proc executorPollPhase(ex: Executor, plan: PlacementPlan, phase: text, atMs: int) -> ExecutorPollResult:
+        let complete = do phaseProgressComplete()
+        if ex.kind != "stub":
+            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
+            return ExecutorPollResult{ok: false, progress: complete, fault: fault, executor: ex}
+        let idx = do executorStartedIndexOf(ex.startedPhases, phase)
+        if idx == -1:
+            let notStarted = do executionFaultNotStarted(phase)
+            return ExecutorPollResult{ok: false, progress: complete, fault: notStarted, executor: ex}
+        let noFault = do executionFaultInternal("")
+        if atMs > ex.startedAtMs[idx]:
+            return ExecutorPollResult{ok: true, progress: complete, fault: noFault, executor: ex}
+        let running = do phaseProgressRunning(0.5)
+        return ExecutorPollResult{ok: true, progress: running, fault: noFault, executor: ex}
+
+    struct ExecutorAbortResult:
+        ok: bool
+        outcome: RollbackOutcome
+        fault: ExecutionFault
+        executor: Executor
+
+    # executorAbort: stub — Irreversible("authority already moved") once
+    # Cutover is among the completed phases, Restored otherwise.
+    proc executorAbort(ex: Executor, plan: PlacementPlan, completed: [text], atMs: int) -> ExecutorAbortResult:
+        let restored = do rollbackOutcomeRestored()
+        if ex.kind != "stub":
+            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
+            return ExecutorAbortResult{ok: false, outcome: restored, fault: fault, executor: ex}
+        let noFault = do executionFaultInternal("")
+        let cutOver = do planPhaseArrayContains(completed, "cutover")
+        if cutOver:
+            let irreversible = do rollbackOutcomeIrreversible("authority already moved")
+            return ExecutorAbortResult{ok: true, outcome: irreversible, fault: noFault, executor: ex}
+        return ExecutorAbortResult{ok: true, outcome: restored, fault: noFault, executor: ex}
+
+    # ============================================================
+    # controller.rs — FabricController: holds no topology, performs no IO;
+    # everything it knows arrives as a ControlPlaneView, everything it does
+    # goes through an Executor.
+    # ============================================================
+    struct FabricController:
+        policy: ControllerPolicy
+        executors: [Executor]
+        actions: ActionRegistry
+        ledger: ReplicaLedger
+
+    proc fabricControllerNew(policy: ControllerPolicy) -> FabricController:
+        let actions = do actionRegistryNew()
+        let ledger = do replicaLedgerNew()
+        return FabricController{policy: policy, executors: [], actions: actions, ledger: ledger}
+
+    # fabricControllerDefault: `impl Default` — `new(ControllerPolicy::default())`.
+    proc fabricControllerDefault() -> FabricController:
+        let policy = do controllerPolicyDefault()
+        let c = do fabricControllerNew(policy)
+        return c
+
+    # fabricControllerRegisterExecutor: order matters only in that the first
+    # mechanism claiming an action gets it.
+    proc fabricControllerRegisterExecutor(c: FabricController, ex: Executor) -> FabricController:
+        let grown = append(c.executors, ex)
+        return FabricController{policy: c.policy, executors: grown, actions: c.actions, ledger: c.ledger}
+
+    proc fabricControllerMechanisms(c: FabricController) -> [text]:
+        let n = len(c.executors)
+        let mut names = []
+        let mut i = 0
+        loop i < n:
+            names = append(names, c.executors[i].name)
+            i = i + 1
+        return names
+
+    proc fabricControllerPolicy(c: FabricController) -> ControllerPolicy:
+        return c.policy
+
+    proc fabricControllerActions(c: FabricController) -> ActionRegistry:
+        return c.actions
+
+    proc fabricControllerLedger(c: FabricController) -> ReplicaLedger:
+        return c.ledger
+
+    proc fabricControllerSeedReplicas(c: FabricController, topology: TopologyRegistry) -> FabricController:
+        let ledger = do replicaLedgerSeedFromTopology(c.ledger, topology)
+        return FabricController{policy: c.policy, executors: c.executors, actions: c.actions, ledger: ledger}
+
+    proc fabricControllerRecord(c: FabricController, id: ActionId) -> ExecutionRecordOption:
+        let got = do actionRegistryGet(c.actions, id)
+        return got
+
+    proc fabricControllerInFlight(c: FabricController) -> [ExecutionRecord]:
+        let active = do actionRegistryActive(c.actions)
+        return active
+
+    # fabricControllerReports: the feedback rows for every CONCLUDED action,
+    # oldest first.
+    proc fabricControllerReports(c: FabricController) -> [OutcomeReport]:
+        let n = len(c.actions.records)
+        let mut reports = []
+        let mut i = 0
+        loop i < n:
+            let terminal = do executionStateIsTerminal(c.actions.records[i].execState)
+            if terminal:
+                let report = do executionRecordReport(c.actions.records[i])
+                reports = append(reports, report)
+            i = i + 1
+        return reports
+
+    proc fabricControllerPlacementChanges(c: FabricController) -> [PlacementChange]:
+        let n = len(c.actions.records)
+        let mut changes = []
+        let mut i = 0
+        loop i < n:
+            let change = do executionRecordPlacementChange(c.actions.records[i])
+            if change.has:
+                changes = append(changes, change.val)
+            i = i + 1
+        return changes
+
+    proc fabricControllerExecutorIndexByName(executors: [Executor], name: text) -> int:
+        let n = len(executors)
+        let mut i = 0
+        loop i < n:
+            if executors[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc fabricControllerExecutorIndexSupporting(executors: [Executor], action: OptimizationAction) -> int:
+        let n = len(executors)
+        let mut i = 0
+        loop i < n:
+            let supports = do executorSupports(executors[i], action)
+            if supports:
+                return i
+            i = i + 1
+        return -1
+
+    struct ValidationErrorOption:
+        has: bool
+        err: ValidationError
+
+    # fabricControllerCheckNodeLoad: `check_node_load` — NodeBusy once a
+    # node's in-flight count reaches `max_actions_per_node`.
+    proc fabricControllerCheckNodeLoad(c: FabricController, node: DbmsId) -> ValidationErrorOption:
+        let inFlight = do actionRegistryNodeLoad(c.actions, node)
+        if inFlight >= c.policy.maxActionsPerNode:
+            let err = do validationErrorNodeBusy(node, inFlight, c.policy.maxActionsPerNode)
+            return ValidationErrorOption{has: true, err: err}
+        let zero = do validationErrorZero()
+        return ValidationErrorOption{has: false, err: zero}
+
+    struct ResolveDestinationResult:
+        ok: bool
+        has: bool
+        destination: DbmsId
+        err: ValidationError
+
+    # fabricControllerResolveDestination: `resolve_destination` — Replicate/
+    # Move name a node; Colocate names a coordinate, resolved through the
+    # topology (ColocationTargetMissing if unplaced); Split/Isolate leave
+    # the choice to the mechanism (None); NoAction is refused.
+    proc fabricControllerResolveDestination(c: FabricController, envelope: DecisionEnvelope, view: ControlPlaneView) -> ResolveDestinationResult:
+        let zero = do validationErrorZero()
+        let kind = envelope.decision.action.kind
+        if kind == "Replicate" || kind == "Move":
+            return ResolveDestinationResult{ok: true, has: true, destination: DbmsId{value: envelope.decision.action.target}, err: zero}
+        if kind == "Colocate":
+            let shardId = envelope.target.shardId
+            let coordinate = envelope.decision.action.coordinate
+            let located = do topologyRegistryLocate(view.topology, shardId, coordinate)
+            if !located.found:
+                let missing = do validationErrorColocationTargetMissing(shardId, coordinate)
+                return ResolveDestinationResult{ok: false, has: false, destination: DbmsId{value: ""}, err: missing}
+            return ResolveDestinationResult{ok: true, has: true, destination: DbmsId{value: located.placement.dbmsId}, err: zero}
+        if kind == "Split" || kind == "Isolate":
+            return ResolveDestinationResult{ok: true, has: false, destination: DbmsId{value: ""}, err: zero}
+        let noAction = do validationErrorNoActionRequested()
+        return ResolveDestinationResult{ok: false, has: false, destination: DbmsId{value: ""}, err: noAction}
+
+    struct ValidateResult:
+        ok: bool
+        value: ValidatedDecision
+        err: ValidationError
+
+    proc validateResultErr(err: ValidationError) -> ValidateResult:
+        let zero = do validatedDecisionZero()
+        return ValidateResult{ok: false, value: zero, err: err}
+
+    # fabricControllerValidate: `validate` — check a decision against the
+    # world without changing anything, every rule in the real method's
+    # exact order: NoAction, coordinate, threshold (re-derived, not
+    # `should_execute`), future, stale, generation, in-flight cap, target
+    # held, shard held, placement known, source node load, destination
+    # resolved, then (if a destination) registered / not source or already
+    # a holder / healthy / headroom / not saturated / node load.
+    proc fabricControllerValidate(c: FabricController, envelope: DecisionEnvelope, view: ControlPlaneView) -> ValidateResult:
+        let decision = envelope.decision
+        let target = envelope.target
+        let nowMs = view.nowMs
+        if decision.action.kind == "NoAction":
+            let e1 = do validationErrorNoActionRequested()
+            let r1 = do validateResultErr(e1)
+            return r1
+        let valid = do actionTargetIsValid(target)
+        if !valid:
+            let e2 = do validationErrorInvalidCoordinate(target.coordinate)
+            let r2 = do validateResultErr(e2)
+            return r2
+        let score = do optimizationDecisionScore(decision)
+        if decision.confidence < c.policy.minConfidence || score <= 0.0:
+            let e3 = do validationErrorBelowExecutionThreshold(score, decision.confidence, c.policy.minConfidence)
+            let r3 = do validateResultErr(e3)
+            return r3
+        if envelope.observedAtMs > nowMs:
+            let e4 = do validationErrorDecisionFromTheFuture(envelope.observedAtMs, nowMs)
+            let r4 = do validateResultErr(e4)
+            return r4
+        let ageMs = max(nowMs - envelope.observedAtMs, 0)
+        if ageMs > c.policy.maxDecisionAgeMs:
+            let e5 = do validationErrorStaleDecision(envelope.observedAtMs, nowMs, ageMs, c.policy.maxDecisionAgeMs)
+            let r5 = do validateResultErr(e5)
+            return r5
+        let generation = do fleetViewGeneration(view.fleet)
+        if envelope.topologyGeneration != generation:
+            let e6 = do validationErrorTopologySuperseded(envelope.topologyGeneration, generation)
+            let r6 = do validateResultErr(e6)
+            return r6
+        let inFlight = do actionRegistryActiveLen(c.actions)
+        if inFlight >= c.policy.maxConcurrentActions:
+            let e7 = do validationErrorTooManyInFlight(inFlight, c.policy.maxConcurrentActions)
+            let r7 = do validateResultErr(e7)
+            return r7
+        let holder = do actionRegistryHolderOf(c.actions, target)
+        if holder.has:
+            let existingLabel = do controllerPlanActionLabel(holder.val.envelope.decision.action)
+            let e8 = do validationErrorConflictingAction(target, holder.val.id, existingLabel)
+            let r8 = do validateResultErr(e8)
+            return r8
+        let shardHolder = do actionRegistryShardHolder(c.actions, target.shardId)
+        if shardHolder.has:
+            let e9 = do validationErrorShardBusy(target.shardId, shardHolder.val)
+            let r9 = do validateResultErr(e9)
+            return r9
+        let located = do topologyRegistryLocate(view.topology, target.shardId, target.coordinate)
+        if !located.found:
+            let e10 = do validationErrorUnknownPlacement(target)
+            let r10 = do validateResultErr(e10)
+            return r10
+        let source = located.placement
+        let sourceId = DbmsId{value: source.dbmsId}
+        let sourceLoad = do fabricControllerCheckNodeLoad(c, sourceId)
+        if sourceLoad.has:
+            let r11 = do validateResultErr(sourceLoad.err)
+            return r11
+        let resolved = do fabricControllerResolveDestination(c, envelope, view)
+        if !resolved.ok:
+            let r12 = do validateResultErr(resolved.err)
+            return r12
+        let mut hasRegion = false
+        let mut region = ""
+        if resolved.has:
+            let node = resolved.destination
+            let got = do fleetViewGet(view.fleet, node)
+            if !got.found:
+                let e13 = do validationErrorUnknownDestination(node)
+                let r13 = do validateResultErr(e13)
+                return r13
+            let status = got.status
+            let holds = do replicaLedgerHolds(c.ledger, target, node)
+            if node.value == source.dbmsId || holds:
+                let e14 = do validationErrorDestinationIsSource(node)
+                let r14 = do validateResultErr(e14)
+                return r14
+            let accepts = do nodeConditionAcceptsPlacement(status.condition)
+            if !accepts:
+                let e15 = do validationErrorDestinationUnhealthy(node, status.condition)
+                let r15 = do validateResultErr(e15)
+                return r15
+            let full = do nodeStatusIsFull(status)
+            if full:
+                let e16 = do validationErrorDestinationAtCapacity(node, status.hostedPlacements, status.placementCapacity)
+                let r16 = do validateResultErr(e16)
+                return r16
+            let utilization = do nodeStatusUtilization(status)
+            if utilization > c.policy.maxNodeUtilization:
+                let e17 = do validationErrorDestinationSaturated(node, utilization, c.policy.maxNodeUtilization)
+                let r17 = do validateResultErr(e17)
+                return r17
+            let destinationLoad = do fabricControllerCheckNodeLoad(c, node)
+            if destinationLoad.has:
+                let r18 = do validateResultErr(destinationLoad.err)
+                return r18
+            hasRegion = true
+            region = status.region
+        let validated = do validatedDecisionNew(envelope, source, resolved.has, resolved.destination, hasRegion, region, nowMs)
+        let zero = do validationErrorZero()
+        return ValidateResult{ok: true, value: validated, err: zero}
+
+    # fabricControllerValidatePlan: `validate_plan` — the mechanism, not the
+    # optimizer, decides which nodes gain and lose copies, so the plan is
+    # checked again: target agreement, shard-wide busy, every add
+    # (registered / healthy / — unless already a holder — headroom /
+    # saturation), every remove held, replica floor on the PROJECTED set,
+    # node load on every touched node.
+    proc fabricControllerValidatePlan(c: FabricController, plan: PlacementPlan, validated: ValidatedDecision, view: ControlPlaneView) -> ValidationErrorOption:
+        let zero = do validationErrorZero()
+        let target = do validatedDecisionTarget(validated)
+        let sameTarget = do actionTargetEquals(plan.target, target)
+        if !sameTarget:
+            let planText = do actionTargetDisplay(plan.target)
+            let targetText = do actionTargetDisplay(target)
+            let infeasible = do planErrorInfeasible("plan targets " + planText + " but the decision targets " + targetText)
+            let e1 = do validationErrorPlanRejected(infeasible)
+            return ValidationErrorOption{has: true, err: e1}
+        if plan.scope == "shard":
+            let busy = do actionRegistryShardIsBusy(c.actions, target.shardId)
+            if busy.has:
+                let e2 = do validationErrorShardBusy(target.shardId, busy.val)
+                return ValidationErrorOption{has: true, err: e2}
+        let na = len(plan.adds)
+        let mut i = 0
+        loop i < na:
+            let node = plan.adds[i]
+            let got = do fleetViewGet(view.fleet, node)
+            if !got.found:
+                let e3 = do validationErrorUnknownDestination(node)
+                return ValidationErrorOption{has: true, err: e3}
+            let status = got.status
+            let accepts = do nodeConditionAcceptsPlacement(status.condition)
+            if !accepts:
+                let e4 = do validationErrorDestinationUnhealthy(node, status.condition)
+                return ValidationErrorOption{has: true, err: e4}
+            let holds = do replicaLedgerHolds(c.ledger, target, node)
+            if !holds:
+                let full = do nodeStatusIsFull(status)
+                if full:
+                    let e5 = do validationErrorDestinationAtCapacity(node, status.hostedPlacements, status.placementCapacity)
+                    return ValidationErrorOption{has: true, err: e5}
+                let utilization = do nodeStatusUtilization(status)
+                if utilization > c.policy.maxNodeUtilization:
+                    let e6 = do validationErrorDestinationSaturated(node, utilization, c.policy.maxNodeUtilization)
+                    return ValidationErrorOption{has: true, err: e6}
+            i = i + 1
+        let nr = len(plan.removes)
+        let mut j = 0
+        loop j < nr:
+            let held = do replicaLedgerHolds(c.ledger, target, plan.removes[j])
+            if !held:
+                let e7 = do validationErrorRemovesUnheldCopy(target, plan.removes[j])
+                return ValidationErrorOption{has: true, err: e7}
+            j = j + 1
+        let projected = do replicaLedgerProjected(c.ledger, plan)
+        let remaining = len(projected)
+        if remaining < c.policy.minReplicas:
+            let e8 = do validationErrorWouldDropLastReplica(target, remaining, c.policy.minReplicas)
+            return ValidationErrorOption{has: true, err: e8}
+        let touched = do placementPlanTouchedNodes(plan)
+        let nt = len(touched)
+        let mut k = 0
+        loop k < nt:
+            let load = do fabricControllerCheckNodeLoad(c, touched[k])
+            if load.has:
+                return load
+            k = k + 1
+        return ValidationErrorOption{has: false, err: zero}
+
+    struct SubmitResult:
+        ok: bool
+        id: ActionId
+        err: ValidationError
+        controller: FabricController
+
+    # fabricControllerSubmit: `submit` — validate, find the first mechanism
+    # supporting the action (NoMechanism otherwise), seed the ledger from
+    # the placement that justified the action, plan, validate the plan,
+    # admit. The ledger seeding happens BEFORE planning and is kept even if
+    # planning fails, exactly as the real `&mut self` sequence leaves it.
+    proc fabricControllerSubmit(c: FabricController, envelope: DecisionEnvelope, baseline: WorkloadProfile, view: ControlPlaneView) -> SubmitResult:
+        let validated = do fabricControllerValidate(c, envelope, view)
+        if !validated.ok:
+            return SubmitResult{ok: false, id: ActionId{value: 0}, err: validated.err, controller: c}
+        let target = do validatedDecisionTarget(validated.value)
+        let index = do fabricControllerExecutorIndexSupporting(c.executors, envelope.decision.action)
+        if index == -1:
+            let label = do decisionEnvelopeActionLabel(envelope)
+            let noMechanism = do validationErrorNoMechanism(label)
+            return SubmitResult{ok: false, id: ActionId{value: 0}, err: noMechanism, controller: c}
+        let sourceId = do validatedDecisionSourceId(validated.value)
+        let ledger = do replicaLedgerEnsureSeeded(c.ledger, target, sourceId)
+        let seeded = FabricController{policy: c.policy, executors: c.executors, actions: c.actions, ledger: ledger}
+        let replicas = do replicaLedgerReplicas(ledger, target)
+        let request = do planRequestNew(target, envelope.decision.action, validated.value.source, validated.value.hasDestination, validated.value.destination, replicas, view.nowMs)
+        let planned = do executorPlan(seeded.executors[index], request)
+        if !planned.ok:
+            let rejected = do validationErrorPlanRejected(planned.err)
+            return SubmitResult{ok: false, id: ActionId{value: 0}, err: rejected, controller: seeded}
+        let planCheck = do fabricControllerValidatePlan(seeded, planned.value, validated.value, view)
+        if planCheck.has:
+            return SubmitResult{ok: false, id: ActionId{value: 0}, err: planCheck.err, controller: seeded}
+        let id = do actionRegistryNextId(seeded.actions)
+        let mechanism = seeded.executors[index].name
+        let snapshot = do measurementSnapshotFromProfile(baseline, envelope.observedAtMs)
+        let record = do executionRecordNew(id, validated.value, planned.value, mechanism, snapshot, view.nowMs)
+        let actions = do actionRegistryAdmit(seeded.actions, record)
+        let zero = do validationErrorZero()
+        return SubmitResult{ok: true, id: id, err: zero, controller: FabricController{policy: seeded.policy, executors: seeded.executors, actions: actions, ledger: seeded.ledger}}
+
+    struct ControllerStateResult:
+        execState: text
+        controller: FabricController
+
+    # fabricControllerAbortWith: `abort_with` — ask the mechanism to roll
+    # back (an Err from it, or a mechanism that is no longer registered,
+    # counts as Irreversible); if authority had already moved and the
+    # rollback could not restore it, the ledger takes the plan's effect so
+    # it agrees with reality; conclude the record; release the interlocks.
+    proc fabricControllerAbortWith(c: FabricController, id: ActionId, reason: AbortReason, nowMs: int) -> ControllerStateResult:
+        let got = do actionRegistryGet(c.actions, id)
+        if !got.has:
+            return ControllerStateResult{execState: "failed", controller: c}
+        let record = got.val
+        let index = do fabricControllerExecutorIndexByName(c.executors, record.mechanism)
+        let mut executors = c.executors
+        let unregistered = do rollbackOutcomeIrreversible("mechanism is no longer registered")
+        let mut rollback = unregistered
+        if index != -1:
+            let aborted = do executorAbort(executors[index], record.plan, record.completedPhases, nowMs)
+            executors[index] = aborted.executor
+            if aborted.ok:
+                rollback = aborted.outcome
+            else:
+                let faultText = do executionFaultDisplay(aborted.fault)
+                let irreversible = do rollbackOutcomeIrreversible(faultText)
+                rollback = irreversible
+        let mut ledger = c.ledger
+        let cutOver = do executionRecordHasCutOver(record)
+        if cutOver && rollback.kind == "Irreversible":
+            let applied = do replicaLedgerApply(ledger, record.plan)
+            ledger = applied
+        let concluded = do executionRecordConcludeAborted(record, reason, rollback, nowMs)
+        let written = do actionRegistrySetRecord(c.actions, concluded)
+        let retired = do actionRegistryRetire(written, id)
+        return ControllerStateResult{execState: concluded.execState, controller: FabricController{policy: c.policy, executors: executors, actions: retired, ledger: ledger}}
+
+    # fabricControllerCheckMeasurementDeadline: an action nobody measured
+    # within `measurement_deadline_ms` of its commit concludes as
+    # NotMeasured — Completed, never "success".
+    proc fabricControllerCheckMeasurementDeadline(c: FabricController, id: ActionId, nowMs: int) -> ControllerStateResult:
+        let got = do actionRegistryGet(c.actions, id)
+        let mut committedAtMs = nowMs
+        if got.has && got.val.hasCommittedAtMs:
+            committedAtMs = got.val.committedAtMs
+        if max(nowMs - committedAtMs, 0) <= c.policy.measurementDeadlineMs:
+            return ControllerStateResult{execState: "awaiting-measurement", controller: c}
+        let mut actions = c.actions
+        if got.has:
+            let concluded = do executionRecordConcludeUnmeasured(got.val, nowMs)
+            let written = do actionRegistrySetRecord(actions, concluded)
+            actions = written
+        let retired = do actionRegistryRetire(actions, id)
+        return ControllerStateResult{execState: "completed", controller: FabricController{policy: c.policy, executors: c.executors, actions: retired, ledger: c.ledger}}
+
+    struct AbortReasonOption:
+        has: bool
+        val: AbortReason
+
+    # fabricControllerNodeLoss: the controller's OWN liveness check on a
+    # running plan, independent of the mechanism — any node the plan adds
+    # that is no longer accepting placements (or is missing from the fleet
+    # view entirely, read as Unreachable) tears the action down.
+    proc fabricControllerNodeLoss(c: FabricController, id: ActionId, view: ControlPlaneView) -> AbortReasonOption:
+        let none = do abortReasonRequested()
+        let got = do actionRegistryGet(c.actions, id)
+        if !got.has:
+            return AbortReasonOption{has: false, val: none}
+        let record = got.val
+        if record.execState != "running":
+            return AbortReasonOption{has: false, val: none}
+        let n = len(record.plan.adds)
+        let mut i = 0
+        loop i < n:
+            let node = record.plan.adds[i]
+            let status = do fleetViewGet(view.fleet, node)
+            if !status.found:
+                let lost = do abortReasonNodeLost(node, "unreachable")
+                return AbortReasonOption{has: true, val: lost}
+            let accepts = do nodeConditionAcceptsPlacement(status.status.condition)
+            if !accepts:
+                let lost2 = do abortReasonNodeLost(node, status.status.condition)
+                return AbortReasonOption{has: true, val: lost2}
+            i = i + 1
+        return AbortReasonOption{has: false, val: none}
+
+    struct AdvanceResult:
+        known: bool
+        execState: text
+        controller: FabricController
+
+    # fabricControllerAdvance: `advance` — drive one action by one step.
+    # Terminal: unchanged. AwaitingMeasurement: deadline check. Node loss
+    # and phase timeout abort. Otherwise Admitted begins the first phase;
+    # Running polls it, and on Complete either begins the next phase or —
+    # with none left — applies the plan to the ledger and commits. Every
+    # fault is absorbed into an abort rather than returned.
+    proc fabricControllerAdvance(c: FabricController, id: ActionId, view: ControlPlaneView) -> AdvanceResult:
+        let nowMs = view.nowMs
+        let got = do actionRegistryGet(c.actions, id)
+        if !got.has:
+            return AdvanceResult{known: false, execState: "", controller: c}
+        let record0 = got.val
+        let terminal = do executionStateIsTerminal(record0.execState)
+        if terminal:
+            return AdvanceResult{known: true, execState: record0.execState, controller: c}
+        if record0.execState == "awaiting-measurement":
+            let deadline = do fabricControllerCheckMeasurementDeadline(c, id, nowMs)
+            return AdvanceResult{known: true, execState: deadline.execState, controller: deadline.controller}
+        let loss = do fabricControllerNodeLoss(c, id, view)
+        if loss.has:
+            let lostResult = do fabricControllerAbortWith(c, id, loss.val, nowMs)
+            return AdvanceResult{known: true, execState: lostResult.execState, controller: lostResult.controller}
+        if record0.execState == "running":
+            let elapsed = do executionRecordPhaseElapsedMs(record0, nowMs)
+            if elapsed > c.policy.phaseTimeoutMs:
+                let timeout = do abortReasonPhaseTimeout(record0.runningPhase, elapsed, c.policy.phaseTimeoutMs)
+                let timedOut = do fabricControllerAbortWith(c, id, timeout, nowMs)
+                return AdvanceResult{known: true, execState: timedOut.execState, controller: timedOut.controller}
+        let index = do fabricControllerExecutorIndexByName(c.executors, record0.mechanism)
+        if index == -1:
+            let missing = do executionFaultInternal("mechanism '" + record0.mechanism + "' is no longer registered")
+            let missingReason = do abortReasonFault(missing)
+            let missingResult = do fabricControllerAbortWith(c, id, missingReason, nowMs)
+            return AdvanceResult{known: true, execState: missingResult.execState, controller: missingResult.controller}
+        let mut executors = c.executors
+        let mut record = record0
+        let mut ledger = c.ledger
+        let mut hasFault = false
+        let noFault = do executionFaultInternal("")
+        let mut fault = noFault
+        if record0.execState == "admitted":
+            let phase = do placementPlanFirstPhase(record0.plan)
+            let began = do executorBeginPhase(executors[index], record0.plan, phase, nowMs)
+            executors[index] = began.executor
+            if began.ok:
+                let started = do executionRecordBeginPhase(record, phase, nowMs)
+                record = started
+            else:
+                hasFault = true
+                fault = began.fault
+        else:
+            if record0.execState == "running":
+                let phase = record0.runningPhase
+                let polled = do executorPollPhase(executors[index], record0.plan, phase, nowMs)
+                executors[index] = polled.executor
+                if !polled.ok:
+                    hasFault = true
+                    fault = polled.fault
+                else:
+                    if polled.progress.kind == "Running":
+                        let fractioned = do executionRecordSetFraction(record, phase, polled.progress.fraction)
+                        record = fractioned
+                    else:
+                        let completed = do executionRecordCompletePhase(record, phase)
+                        record = completed
+                        let next = do placementPlanPhaseAfter(record.plan, phase)
+                        if next.has:
+                            let began2 = do executorBeginPhase(executors[index], record.plan, next.val, nowMs)
+                            executors[index] = began2.executor
+                            if began2.ok:
+                                let started2 = do executionRecordBeginPhase(record, next.val, nowMs)
+                                record = started2
+                            else:
+                                hasFault = true
+                                fault = began2.fault
+                        else:
+                            let applied = do replicaLedgerApply(ledger, record.plan)
+                            ledger = applied
+                            let committed = do executionRecordCommit(record, nowMs)
+                            record = committed
+        let actions = do actionRegistrySetRecord(c.actions, record)
+        let stepped = FabricController{policy: c.policy, executors: executors, actions: actions, ledger: ledger}
+        if hasFault:
+            let faultReason = do abortReasonFault(fault)
+            let faulted = do fabricControllerAbortWith(stepped, id, faultReason, nowMs)
+            return AdvanceResult{known: true, execState: faulted.execState, controller: faulted.controller}
+        return AdvanceResult{known: true, execState: record.execState, controller: stepped}
+
+    struct TickResult:
+        ids: [ActionId]
+        states: [text]
+        controller: FabricController
+
+    # fabricControllerTick: drive every in-flight action by one step.
+    proc fabricControllerTick(c: FabricController, view: ControlPlaneView) -> TickResult:
+        let ids = do actionRegistryActiveIds(c.actions)
+        let n = len(ids)
+        let mut current = c
+        let mut outIds = []
+        let mut outStates = []
+        let mut i = 0
+        loop i < n:
+            let advanced = do fabricControllerAdvance(current, ids[i], view)
+            current = advanced.controller
+            if advanced.known:
+                outIds = append(outIds, ids[i])
+                outStates = append(outStates, advanced.execState)
+            i = i + 1
+        return TickResult{ids: outIds, states: outStates, controller: current}
+
+    # fabricControllerAbort: tear down an in-flight action on request; a
+    # terminal one is left as it is.
+    proc fabricControllerAbort(c: FabricController, id: ActionId, view: ControlPlaneView) -> AdvanceResult:
+        let got = do actionRegistryGet(c.actions, id)
+        if !got.has:
+            return AdvanceResult{known: false, execState: "", controller: c}
+        let terminal = do executionStateIsTerminal(got.val.execState)
+        if terminal:
+            return AdvanceResult{known: true, execState: got.val.execState, controller: c}
+        let requested = do abortReasonRequested()
+        let aborted = do fabricControllerAbortWith(c, id, requested, view.nowMs)
+        return AdvanceResult{known: true, execState: aborted.execState, controller: aborted.controller}
+
+    struct MeasureResult:
+        ok: bool
+        outcome: ExecutionOutcome
+        err: MeasurementError
+        controller: FabricController
+
+    # fabricControllerMeasure: `measure` — README §7's step: refused for an
+    # unknown id, for an action not awaiting measurement, and for one that
+    # has not settled for `measurement_settle_ms` since commit; otherwise
+    # the outcome is evaluated against the baseline, the record concludes
+    # Completed with the verdict, and the interlocks are released.
+    proc fabricControllerMeasure(c: FabricController, id: ActionId, after: WorkloadProfile, view: ControlPlaneView) -> MeasureResult:
+        let nowMs = view.nowMs
+        let zeroOutcome = do executionOutcomeZero()
+        let got = do actionRegistryGet(c.actions, id)
+        if !got.has:
+            let e1 = do measurementErrorUnknownAction(id)
+            return MeasureResult{ok: false, outcome: zeroOutcome, err: e1, controller: c}
+        let record = got.val
+        if record.execState != "awaiting-measurement":
+            let label = do executionStateLabel(record.execState)
+            let e2 = do measurementErrorNotAwaitingMeasurement(id, label)
+            return MeasureResult{ok: false, outcome: zeroOutcome, err: e2, controller: c}
+        let mut committedAtMs = nowMs
+        if record.hasCommittedAtMs:
+            committedAtMs = record.committedAtMs
+        let elapsedMs = max(nowMs - committedAtMs, 0)
+        if elapsedMs < c.policy.measurementSettleMs:
+            let e3 = do measurementErrorTooSoon(id, elapsedMs, c.policy.measurementSettleMs)
+            return MeasureResult{ok: false, outcome: zeroOutcome, err: e3, controller: c}
+        let afterSnapshot = do measurementSnapshotFromProfile(after, nowMs)
+        let outcome = do executionOutcomeEvaluate(record.baseline, afterSnapshot, record.envelope.decision, c.policy.outcomeNoiseFloor)
+        let concluded = do executionRecordConcludeMeasured(record, outcome, nowMs)
+        let written = do actionRegistrySetRecord(c.actions, concluded)
+        let retired = do actionRegistryRetire(written, id)
+        let noErr = do measurementErrorZero()
+        return MeasureResult{ok: true, outcome: outcome, err: noErr, controller: FabricController{policy: c.policy, executors: c.executors, actions: retired, ledger: c.ledger}}
+
+    proc fabricControllerAwaitingMeasurement(c: FabricController) -> [ExecutionRecord]:
+        let n = len(c.actions.records)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            if c.actions.records[i].execState == "awaiting-measurement":
+                result = append(result, c.actions.records[i])
+            i = i + 1
+        return result
+
+    # ============================================================
+    # DEMO / GROUND-TRUTH FIXTURES — `controller::tests` (9 tests, `cargo
+    # test -p fabric-controller --lib`) translated input for input, plus
+    # hand-traced cases for every branch those tests leave uncovered. Each
+    # scenario returns one `|`-joined text summary so an action can bind
+    # it; fabric_controller_core_test.go compares each against values
+    # taken from the Rust source.
+    # ============================================================
+    proc ctrlBoolText(b: bool) -> text:
+        if b:
+            return "true"
+        return "false"
+
+    proc ctrlDbmsIdsText(ids: [DbmsId]) -> text:
+        let n = len(ids)
+        let mut names = []
+        let mut i = 0
+        loop i < n:
+            names = append(names, ids[i].value)
+            i = i + 1
+        let joined = do ctrlJoinText(names, ",")
+        return joined
+
+    # demoWorldTopology: `world()` — one cell, shard 7 (3,4), on db-a in
+    # us-east.
+    proc demoWorldTopology() -> TopologyRegistry:
+        let empty = do topologyRegistryNew()
+        let placed = do topologyRegistryPlace(empty, "db-a", 7, Coordinate{x: 3, y: 4}, "us-east")
+        return placed
+
+    proc demoWorldTopologyThree() -> TopologyRegistry:
+        let one = do demoWorldTopology()
+        let two = do topologyRegistryPlace(one, "db-a", 7, Coordinate{x: 5, y: 5}, "us-east")
+        let three = do topologyRegistryPlace(two, "db-a", 7, Coordinate{x: 6, y: 6}, "us-east")
+        return three
+
+    # demoWorldFleet: `world()` — generation 1; db-a healthy cap 10 with
+    # load (4, 0.5, 0.4); db-b healthy cap 10 with load (1, 0.2, 0.2).
+    proc demoWorldFleet() -> FleetView:
+        let empty = do fleetViewNew(1)
+        let a0 = do nodeStatusNew(DbmsId{value: "db-a"}, "us-east", "healthy", 10)
+        let a = do nodeStatusWithLoad(a0, 4, 0.5, 0.4)
+        let withA = do fleetViewInsert(empty, a)
+        let b0 = do nodeStatusNew(DbmsId{value: "db-b"}, "us-west", "healthy", 10)
+        let b = do nodeStatusWithLoad(b0, 1, 0.2, 0.2)
+        let withB = do fleetViewInsert(withA, b)
+        return withB
+
+    # demoFleetWithB: the tests' `fleet.insert(NodeStatus::new(db-b, ...)
+    # .with_load(...))` overwrite.
+    proc demoFleetWithB(condition: text, hosted: int, cpu: float, memory: float) -> FleetView:
+        let base = do demoWorldFleet()
+        let b0 = do nodeStatusNew(DbmsId{value: "db-b"}, "us-west", condition, 10)
+        let b = do nodeStatusWithLoad(b0, hosted, cpu, memory)
+        let fleet = do fleetViewInsert(base, b)
+        return fleet
+
+    # demoProfile: `profile(pressure_cpu)` — 1000 ops (900 reads, 100
+    # writes), 1000us latencies, cpu = memory = pressure_cpu, rest zero.
+    proc demoProfile(pressureCpu: float) -> WorkloadProfile:
+        let metrics = WorkloadMetrics{operationsPerSecond: 1000.0, readsPerSecond: 900.0, writesPerSecond: 100.0, readLatencyUs: 1000.0, writeLatencyUs: 1000.0, cpuUtilization: pressureCpu, memoryUtilization: pressureCpu, storageBytesPerSecond: 0, networkInBytesPerSecond: 0, networkOutBytesPerSecond: 0, queueDepth: 0, cellBreakdown: [], cellBreakdownPartial: false}
+        let profile = do workloadProfileFromMetrics(7, Coordinate{x: 3, y: 4}, metrics)
+        return profile
+
+    # demoEnvelopeFull: `envelope(action, observed_at_ms)` generalised —
+    # the tests' decision is {shard 7, (3,4), gain 1.0, cost 0.3,
+    # confidence 0.9} at generation 1.
+    proc demoEnvelopeFull(action: OptimizationAction, observedAtMs: int, shardId: int, coordinate: Coordinate, expectedGain: float, estimatedCost: float, confidence: float, generation: int) -> DecisionEnvelope:
+        let decision = OptimizationDecision{shardId: shardId, coordinate: coordinate, action: action, expectedGain: expectedGain, estimatedCost: estimatedCost, confidence: confidence}
+        let envelope = do decisionEnvelopeNew(decision, observedAtMs, generation)
+        return envelope
+
+    proc demoEnvelope(action: OptimizationAction, observedAtMs: int) -> DecisionEnvelope:
+        let envelope = do demoEnvelopeFull(action, observedAtMs, 7, Coordinate{x: 3, y: 4}, 1.0, 0.3, 0.9, 1)
+        return envelope
+
+    proc demoMoveToB(observedAtMs: int) -> DecisionEnvelope:
+        let move = do optimizationActionMove("db-b")
+        let envelope = do demoEnvelope(move, observedAtMs)
+        return envelope
+
+    # demoControllerWithStub: `FabricController::default()` +
+    # `register_executor(StubExecutor::new())` + `seed_replicas(&topology)`.
+    proc demoControllerWithStub(topology: TopologyRegistry) -> FabricController:
+        let base = do fabricControllerDefault()
+        let stub = do stubExecutorNew()
+        let withStub = do fabricControllerRegisterExecutor(base, stub)
+        let seeded = do fabricControllerSeedReplicas(withStub, topology)
+        return seeded
+
+    struct DemoDrive:
+        controller: FabricController
+        nowMs: int
+        lastState: text
+
+    # demoAdvanceTimes: the tests' `for _ in 0..N { now += 1_000; advance }`.
+    proc demoAdvanceTimes(c: FabricController, id: ActionId, topology: TopologyRegistry, fleet: FleetView, startMs: int, count: int) -> DemoDrive:
+        let mut current = c
+        let mut now = startMs
+        let mut lastState = ""
+        let mut i = 0
+        loop i < count:
+            now = now + 1000
+            let view = do controlPlaneViewNew(topology, fleet, now)
+            let advanced = do fabricControllerAdvance(current, id, view)
+            current = advanced.controller
+            lastState = advanced.execState
+            i = i + 1
+        return DemoDrive{controller: current, nowMs: now, lastState: lastState}
+
+    # S1: a_stale_decision_is_refused_with_its_evidence — observed 1_000,
+    # now 100_000 -> StaleDecision{age_ms: 99_000}.
+    proc demoStaleDecision() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do fabricControllerDefault()
+        let view = do controlPlaneViewNew(topology, fleet, 100000)
+        let envelope = do demoMoveToB(1000)
+        let r = do fabricControllerValidate(c, envelope, view)
+        let display = do validationErrorDisplay(r.err)
+        let ok = do ctrlBoolText(r.ok)
+        return ok + "|" + r.err.kind + "|" + r.err.ageMs + "|" + display
+
+    # S2: a_decision_computed_against_an_older_fleet_is_refused —
+    # topology_generation 0 against a fleet at 1.
+    proc demoOlderFleet() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do fabricControllerDefault()
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let move = do optimizationActionMove("db-b")
+        let stale = do demoEnvelopeFull(move, 1000, 7, Coordinate{x: 3, y: 4}, 1.0, 0.3, 0.9, 0)
+        let r = do fabricControllerValidate(c, stale, view)
+        let display = do validationErrorDisplay(r.err)
+        return r.err.kind + "|" + r.err.decisionGeneration + "|" + r.err.currentGeneration + "|" + display
+
+    # S3: an_unhealthy_destination_is_refused — db-b Degraded.
+    proc demoUnhealthyDestination() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoFleetWithB("degraded", 1, 0.2, 0.2)
+        let c = do fabricControllerDefault()
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let envelope = do demoMoveToB(1000)
+        let r = do fabricControllerValidate(c, envelope, view)
+        let display = do validationErrorDisplay(r.err)
+        return r.err.kind + "|" + r.err.node.value + "|" + r.err.condition + "|" + display
+
+    # S4: a_saturated_destination_is_refused_even_with_headroom — db-b
+    # with_load(1, 0.95, 0.3): headroom 9 but utilization 0.95 > 0.85.
+    proc demoSaturatedDestination() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoFleetWithB("healthy", 1, 0.95, 0.3)
+        let c = do fabricControllerDefault()
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let envelope = do demoMoveToB(1000)
+        let r = do fabricControllerValidate(c, envelope, view)
+        let display = do validationErrorDisplay(r.err)
+        return r.err.kind + "|" + display
+
+    # S5: two_actions_cannot_run_on_one_target — a Move is admitted
+    # (action-1); a Replicate on the same target is ConflictingAction.
+    proc demoTwoActionsOneTarget() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let first = do demoMoveToB(1000)
+        let s1 = do fabricControllerSubmit(c, first, baseline, view)
+        let replicate = do optimizationActionReplicate("db-b")
+        let second = do demoEnvelope(replicate, 1000)
+        let s2 = do fabricControllerSubmit(s1.controller, second, baseline, view)
+        let display = do validationErrorDisplay(s2.err)
+        let activeLen = do actionRegistryActiveLen(s2.controller.actions)
+        let mechanisms = do fabricControllerMechanisms(s2.controller)
+        let mechText = do ctrlJoinText(mechanisms, ",")
+        let ok1 = do ctrlBoolText(s1.ok)
+        let ok2 = do ctrlBoolText(s2.ok)
+        return ok1 + "|" + s1.id.value + "|" + ok2 + "|" + s2.err.kind + "|" + display + "|" + activeLen + "|" + mechText
+
+    # S6: a_plan_that_would_drop_the_last_copy_is_refused — a mechanism
+    # dropping [db-a, db-b] is caught by RemovesUnheldCopy (db-b holds
+    # nothing yet) before the replica floor is even reached.
+    proc demoDropLastCopy() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let base = do fabricControllerDefault()
+        let dropping = do stubExecutorDropping([DbmsId{value: "db-a"}, DbmsId{value: "db-b"}])
+        let withStub = do fabricControllerRegisterExecutor(base, dropping)
+        let c = do fabricControllerSeedReplicas(withStub, topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let display = do validationErrorDisplay(s.err)
+        return s.err.kind + "|" + display
+
+    # S7: an_executed_action_is_not_complete_until_it_is_measured — 16
+    # ticks drive the stub through all four phases (commit lands on the
+    # 5th tick, at 6_000); measuring at 17_000 is TooSoon (11_000 <
+    # 30_000); at 77_000 the cpu 0.95 -> 0.2 profile is Improved.
+    proc demoExecutedNotCompleteUntilMeasured() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.95)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let driven = do demoAdvanceTimes(s.controller, s.id, topology, fleet, 1000, 16)
+        let record = do fabricControllerRecord(driven.controller, s.id)
+        let change = do executionRecordPlacementChange(record.val)
+        let target = do actionTargetNew(7, Coordinate{x: 3, y: 4})
+        let count = do replicaLedgerCount(driven.controller.ledger, target)
+        let holdsB = do replicaLedgerHolds(driven.controller.ledger, target, DbmsId{value: "db-b"})
+        let early = do controlPlaneViewNew(topology, fleet, driven.nowMs)
+        let after = do demoProfile(0.2)
+        let tooSoon = do fabricControllerMeasure(driven.controller, s.id, after, early)
+        let tooSoonText = do measurementErrorDisplay(tooSoon.err)
+        let settledMs = driven.nowMs + 60000
+        let settled = do controlPlaneViewNew(topology, fleet, settledMs)
+        let measured = do fabricControllerMeasure(tooSoon.controller, s.id, after, settled)
+        let gainScaled = round(measured.outcome.realizedGain * 10000.0)
+        let reports = do fabricControllerReports(measured.controller)
+        let success = do outcomeReportIsSuccess(reports[0])
+        let activeLen = do actionRegistryActiveLen(measured.controller.actions)
+        let hasChange = do ctrlBoolText(change.has)
+        let holdsBText = do ctrlBoolText(holdsB)
+        let successText = do ctrlBoolText(success)
+        return record.val.execState + "|" + len(record.val.completedPhases) + "|" + hasChange + "|" + change.val.fromNode.value + "|" + change.val.toNode.value + "|" + change.val.toRegion + "|" + count + "|" + holdsBText + "|" + tooSoon.err.kind + "|" + tooSoonText + "|" + measured.outcome.verdict + "|" + gainScaled + "|" + len(reports) + "|" + successText + "|" + reports[0].admittedAtMs + "|" + reports[0].concludedAtMs + "|" + activeLen
+
+    # S8: an_action_that_helped_nothing_is_reported_as_such — same
+    # pressure after as before -> Unchanged, not a success.
+    proc demoHelpedNothing() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let driven = do demoAdvanceTimes(s.controller, s.id, topology, fleet, 1000, 16)
+        let settledMs = driven.nowMs + 60000
+        let settled = do controlPlaneViewNew(topology, fleet, settledMs)
+        let measured = do fabricControllerMeasure(driven.controller, s.id, baseline, settled)
+        let gainScaled = round(measured.outcome.realizedGain * 10000.0)
+        let reports = do fabricControllerReports(measured.controller)
+        let success = do outcomeReportIsSuccess(reports[0])
+        let successText = do ctrlBoolText(success)
+        let hasFailure = do ctrlBoolText(reports[0].hasFailure)
+        return measured.outcome.verdict + "|" + gainScaled + "|" + successText + "|" + hasFailure
+
+    # S9: losing_the_destination_mid_flight_tears_the_action_down — plus
+    # the interlocks the registry holds while the action is admitted, and
+    # their release afterwards.
+    proc demoLosingDestination() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let loadA = do actionRegistryNodeLoad(s.controller.actions, DbmsId{value: "db-a"})
+        let loadB = do actionRegistryNodeLoad(s.controller.actions, DbmsId{value: "db-b"})
+        let target = do actionTargetNew(7, Coordinate{x: 3, y: 4})
+        let holder = do actionRegistryHolderOf(s.controller.actions, target)
+        let busy = do actionRegistryShardIsBusy(s.controller.actions, 7)
+        let wide = do actionRegistryShardHolder(s.controller.actions, 7)
+        let view2 = do controlPlaneViewNew(topology, fleet, 2000)
+        let a1 = do fabricControllerAdvance(s.controller, s.id, view2)
+        let broken = do demoFleetWithB("unreachable", 1, 0.2, 0.2)
+        let view3 = do controlPlaneViewNew(topology, broken, 3000)
+        let a2 = do fabricControllerAdvance(a1.controller, s.id, view3)
+        let record = do fabricControllerRecord(a2.controller, s.id)
+        let change = do executionRecordPlacementChange(record.val)
+        let reasonText = do abortReasonDisplay(record.val.abortReason)
+        let activeLen = do actionRegistryActiveLen(a2.controller.actions)
+        let loadAAfter = do actionRegistryNodeLoad(a2.controller.actions, DbmsId{value: "db-a"})
+        let reports = do fabricControllerReports(a2.controller)
+        let holderText = do ctrlBoolText(holder.has)
+        let wideText = do ctrlBoolText(wide.has)
+        let changeText = do ctrlBoolText(change.has)
+        let failureText = do ctrlBoolText(reports[0].hasFailure)
+        return loadA + "|" + loadB + "|" + holderText + "|" + busy.val.value + "|" + wideText + "|" + a1.execState + "|" + a2.execState + "|" + changeText + "|" + record.val.abortReason.kind + "|" + reasonText + "|" + activeLen + "|" + loadAAfter + "|" + reports[0].verdict + "|" + failureText + "|" + reports[0].failure
+
+    # S10 (hand-traced): the refusals `validate` makes before it ever
+    # looks at the fleet — NoAction, off-grid coordinate, confidence and
+    # score floors, a decision from the future, an unplaced target.
+    proc demoRefusalsBeforeTheFleet() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do fabricControllerDefault()
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let noAction = do optimizationActionNoAction()
+        let e1 = do demoEnvelope(noAction, 1000)
+        let r1 = do fabricControllerValidate(c, e1, view)
+        let d1 = do validationErrorDisplay(r1.err)
+        let move = do optimizationActionMove("db-b")
+        let e2 = do demoEnvelopeFull(move, 1000, 7, Coordinate{x: 12, y: 0}, 1.0, 0.3, 0.9, 1)
+        let r2 = do fabricControllerValidate(c, e2, view)
+        let d2 = do validationErrorDisplay(r2.err)
+        let e3 = do demoEnvelopeFull(move, 1000, 7, Coordinate{x: 3, y: 4}, 1.0, 0.3, 0.5, 1)
+        let r3 = do fabricControllerValidate(c, e3, view)
+        let d3 = do validationErrorDisplay(r3.err)
+        let e4 = do demoEnvelopeFull(move, 1000, 7, Coordinate{x: 3, y: 4}, 0.2, 0.3, 0.9, 1)
+        let r4 = do fabricControllerValidate(c, e4, view)
+        let d4 = do validationErrorDisplay(r4.err)
+        let e5 = do demoMoveToB(2000)
+        let r5 = do fabricControllerValidate(c, e5, view)
+        let d5 = do validationErrorDisplay(r5.err)
+        let e6 = do demoEnvelopeFull(move, 1000, 8, Coordinate{x: 3, y: 4}, 1.0, 0.3, 0.9, 1)
+        let r6 = do fabricControllerValidate(c, e6, view)
+        let d6 = do validationErrorDisplay(r6.err)
+        return r1.err.kind + "|" + d1 + "|" + r2.err.kind + "|" + d2 + "|" + r3.err.kind + "|" + d3 + "|" + r4.err.kind + "|" + d4 + "|" + r5.err.kind + "|" + d5 + "|" + r6.err.kind + "|" + d6
+
+    # S11 (hand-traced): destination resolution and the mechanism gate —
+    # NoMechanism with nothing registered; Colocate onto the target's own
+    # holder (DestinationIsSource) and onto an unplaced cell
+    # (ColocationTargetMissing); an unregistered node; Isolate through
+    # the stub (PlanRejected: it needs a named destination); a full node.
+    proc demoNoMechanismAndDestinations() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let bare = do fabricControllerDefault()
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let e1 = do demoMoveToB(1000)
+        let s1 = do fabricControllerSubmit(bare, e1, baseline, view)
+        let d1 = do validationErrorDisplay(s1.err)
+        let colocateSelf = do optimizationActionColocate(Coordinate{x: 3, y: 4})
+        let e2 = do demoEnvelope(colocateSelf, 1000)
+        let r2 = do fabricControllerValidate(bare, e2, view)
+        let d2 = do validationErrorDisplay(r2.err)
+        let colocateAway = do optimizationActionColocate(Coordinate{x: 5, y: 5})
+        let e3 = do demoEnvelope(colocateAway, 1000)
+        let r3 = do fabricControllerValidate(bare, e3, view)
+        let d3 = do validationErrorDisplay(r3.err)
+        let moveZ = do optimizationActionMove("db-z")
+        let e4 = do demoEnvelope(moveZ, 1000)
+        let r4 = do fabricControllerValidate(bare, e4, view)
+        let d4 = do validationErrorDisplay(r4.err)
+        let c = do demoControllerWithStub(topology)
+        let isolate = do optimizationActionIsolate()
+        let e5 = do demoEnvelope(isolate, 1000)
+        let s5 = do fabricControllerSubmit(c, e5, baseline, view)
+        let d5 = do validationErrorDisplay(s5.err)
+        let full = do demoFleetWithB("healthy", 10, 0.2, 0.2)
+        let fullView = do controlPlaneViewNew(topology, full, 1000)
+        let e6 = do demoMoveToB(1000)
+        let r6 = do fabricControllerValidate(c, e6, fullView)
+        let d6 = do validationErrorDisplay(r6.err)
+        return s1.err.kind + "|" + d1 + "|" + r2.err.kind + "|" + d2 + "|" + r3.err.kind + "|" + d3 + "|" + r4.err.kind + "|" + d4 + "|" + s5.err.kind + "|" + d5 + "|" + r6.err.kind + "|" + d6
+
+    # S12 (hand-traced): a phase that runs past `phase_timeout_ms`
+    # (60_000) is torn down — Prepare began at 2_000, polled at 62_001.
+    proc demoPhaseTimeout() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let view2 = do controlPlaneViewNew(topology, fleet, 2000)
+        let a1 = do fabricControllerAdvance(s.controller, s.id, view2)
+        let r1 = do fabricControllerRecord(a1.controller, s.id)
+        let view3 = do controlPlaneViewNew(topology, fleet, 62001)
+        let a2 = do fabricControllerAdvance(a1.controller, s.id, view3)
+        let r2 = do fabricControllerRecord(a2.controller, s.id)
+        let reasonText = do abortReasonDisplay(r2.val.abortReason)
+        let reports = do fabricControllerReports(a2.controller)
+        return a1.execState + "|" + r1.val.runningPhase + "|" + a2.execState + "|" + r2.val.abortReason.kind + "|" + reasonText + "|" + reports[0].verdict + "|" + reports[0].failure
+
+    # S13 (hand-traced): an abort AFTER cutover is Irreversible — the
+    # record fails, the ledger takes the plan's effect (db-b holds, db-a
+    # does not), the report's failure is the abort reason, and a second
+    # abort on the terminal record changes nothing.
+    proc demoAbortAfterCutover() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let driven = do demoAdvanceTimes(s.controller, s.id, topology, fleet, 1000, 4)
+        let mid = do fabricControllerRecord(driven.controller, s.id)
+        let cutOver = do executionRecordHasCutOver(mid.val)
+        let abortView = do controlPlaneViewNew(topology, fleet, 5500)
+        let aborted = do fabricControllerAbort(driven.controller, s.id, abortView)
+        let record = do fabricControllerRecord(aborted.controller, s.id)
+        let target = do actionTargetNew(7, Coordinate{x: 3, y: 4})
+        let count = do replicaLedgerCount(aborted.controller.ledger, target)
+        let holdsB = do replicaLedgerHolds(aborted.controller.ledger, target, DbmsId{value: "db-b"})
+        let holdsA = do replicaLedgerHolds(aborted.controller.ledger, target, DbmsId{value: "db-a"})
+        let reports = do fabricControllerReports(aborted.controller)
+        let change = do executionRecordPlacementChange(record.val)
+        let changes = do fabricControllerPlacementChanges(aborted.controller)
+        let again = do fabricControllerAbort(aborted.controller, s.id, abortView)
+        let cutOverText = do ctrlBoolText(cutOver)
+        let holdsBText = do ctrlBoolText(holdsB)
+        let holdsAText = do ctrlBoolText(holdsA)
+        let changeText = do ctrlBoolText(change.has)
+        return driven.lastState + "|" + mid.val.runningPhase + "|" + len(mid.val.completedPhases) + "|" + cutOverText + "|" + aborted.execState + "|" + record.val.rollback.kind + "|" + record.val.rollback.reason + "|" + count + "|" + holdsBText + "|" + holdsAText + "|" + reports[0].verdict + "|" + reports[0].failure + "|" + changeText + "|" + len(changes) + "|" + again.execState
+
+    # S14 (hand-traced): nobody measures within `measurement_deadline_ms`
+    # (300_000) of the 6_000 commit — still awaiting at 306_000, concluded
+    # NotMeasured at 306_001, after which a measurement is refused.
+    proc demoMeasurementDeadline() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let driven = do demoAdvanceTimes(s.controller, s.id, topology, fleet, 1000, 5)
+        let waiting = do fabricControllerAwaitingMeasurement(driven.controller)
+        let onDeadline = do controlPlaneViewNew(topology, fleet, 306000)
+        let a1 = do fabricControllerAdvance(driven.controller, s.id, onDeadline)
+        let pastDeadline = do controlPlaneViewNew(topology, fleet, 306001)
+        let a2 = do fabricControllerAdvance(a1.controller, s.id, pastDeadline)
+        let reports = do fabricControllerReports(a2.controller)
+        let activeLen = do actionRegistryActiveLen(a2.controller.actions)
+        let waitingAfter = do fabricControllerAwaitingMeasurement(a2.controller)
+        let after = do demoProfile(0.2)
+        let late = do fabricControllerMeasure(a2.controller, s.id, after, pastDeadline)
+        let lateText = do measurementErrorDisplay(late.err)
+        let failureText = do ctrlBoolText(reports[0].hasFailure)
+        return driven.lastState + "|" + len(waiting) + "|" + a1.execState + "|" + a2.execState + "|" + reports[0].verdict + "|" + failureText + "|" + activeLen + "|" + len(waitingAfter) + "|" + late.err.kind + "|" + lateText
+
+    # S15 (hand-traced): NodeBusy — `max_actions_per_node` is 2, so a
+    # third move off db-a is refused on the SOURCE node's load, and
+    # `tick` drives both admitted actions.
+    proc demoNodeBusy() -> text:
+        let topology = do demoWorldTopologyThree()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let move = do optimizationActionMove("db-b")
+        let e1 = do demoMoveToB(1000)
+        let s1 = do fabricControllerSubmit(c, e1, baseline, view)
+        let e2 = do demoEnvelopeFull(move, 1000, 7, Coordinate{x: 5, y: 5}, 1.0, 0.3, 0.9, 1)
+        let s2 = do fabricControllerSubmit(s1.controller, e2, baseline, view)
+        let e3 = do demoEnvelopeFull(move, 1000, 7, Coordinate{x: 6, y: 6}, 1.0, 0.3, 0.9, 1)
+        let s3 = do fabricControllerSubmit(s2.controller, e3, baseline, view)
+        let d3 = do validationErrorDisplay(s3.err)
+        let view2 = do controlPlaneViewNew(topology, fleet, 2000)
+        let ticked = do fabricControllerTick(s3.controller, view2)
+        let statesText = do ctrlJoinText(ticked.states, ",")
+        let activeLen = do actionRegistryActiveLen(ticked.controller.actions)
+        let loadA = do actionRegistryNodeLoad(ticked.controller.actions, DbmsId{value: "db-a"})
+        let loadB = do actionRegistryNodeLoad(ticked.controller.actions, DbmsId{value: "db-b"})
+        let ledgerLen = do replicaLedgerLen(ticked.controller.ledger)
+        let inFlight = do fabricControllerInFlight(ticked.controller)
+        return s1.id.value + "|" + s2.id.value + "|" + s3.err.kind + "|" + d3 + "|" + statesText + "|" + activeLen + "|" + loadA + "|" + loadB + "|" + ledgerLen + "|" + len(inFlight)
+
+    # S16 (hand-traced): ReplicaLedger — seeding, sorted holders, removal
+    # dropping an emptied entry, set-wise projection of a plan naming one
+    # node in both lists, apply, ensure_seeded's only-if-unknown rule,
+    # and ascending target order.
+    proc demoReplicaLedger() -> text:
+        let topology = do demoWorldTopologyThree()
+        let empty = do replicaLedgerNew()
+        let seeded = do replicaLedgerSeedFromTopology(empty, topology)
+        let len0 = do replicaLedgerLen(seeded)
+        let t34 = do actionTargetNew(7, Coordinate{x: 3, y: 4})
+        let t55 = do actionTargetNew(7, Coordinate{x: 5, y: 5})
+        let t66 = do actionTargetNew(7, Coordinate{x: 6, y: 6})
+        let holdsA = do replicaLedgerHolds(seeded, t34, DbmsId{value: "db-a"})
+        let count0 = do replicaLedgerCount(seeded, t34)
+        let withC = do replicaLedgerAdd(seeded, t34, DbmsId{value: "db-c"})
+        let withB = do replicaLedgerAdd(withC, t34, DbmsId{value: "db-b"})
+        let replicas = do replicaLedgerReplicas(withB, t34)
+        let replicasText = do ctrlDbmsIdsText(replicas)
+        let count3 = do replicaLedgerCount(withB, t34)
+        let lessA = do replicaLedgerRemove(withB, t34, DbmsId{value: "db-a"})
+        let count2 = do replicaLedgerCount(lessA, t34)
+        let lessB = do replicaLedgerRemove(lessA, t34, DbmsId{value: "db-b"})
+        let none = do replicaLedgerRemove(lessB, t34, DbmsId{value: "db-c"})
+        let countGone = do replicaLedgerCount(none, t34)
+        let lenGone = do replicaLedgerLen(none)
+        let move = do optimizationActionMove("db-b")
+        let phases = ["prepare", "transfer", "cutover", "cleanup"]
+        let both = do placementPlanNew(t55, move, "coordinate", phases, [DbmsId{value: "db-b"}], [DbmsId{value: "db-b"}])
+        let projected = do replicaLedgerProjected(none, both.value)
+        let projectedText = do ctrlJoinText(projected, ",")
+        let swap = do placementPlanNew(t66, move, "coordinate", phases, [DbmsId{value: "db-b"}], [DbmsId{value: "db-a"}])
+        let applied = do replicaLedgerApply(none, swap.value)
+        let after66 = do replicaLedgerReplicas(applied, t66)
+        let after66Text = do ctrlDbmsIdsText(after66)
+        let reseeded = do replicaLedgerEnsureSeeded(applied, t34, DbmsId{value: "db-z"})
+        let count34 = do replicaLedgerCount(reseeded, t34)
+        let holdsZ = do replicaLedgerHolds(reseeded, t34, DbmsId{value: "db-z"})
+        let unchanged = do replicaLedgerEnsureSeeded(reseeded, t55, DbmsId{value: "db-z"})
+        let count55 = do replicaLedgerCount(unchanged, t55)
+        let targets = do replicaLedgerTargets(unchanged)
+        let n = len(targets)
+        let mut targetTexts = []
+        let mut i = 0
+        loop i < n:
+            let t = do actionTargetDisplay(targets[i])
+            targetTexts = append(targetTexts, t)
+            i = i + 1
+        let targetsText = do ctrlJoinText(targetTexts, ",")
+        let holdsAText = do ctrlBoolText(holdsA)
+        let holdsZText = do ctrlBoolText(holdsZ)
+        return len0 + "|" + holdsAText + "|" + count0 + "|" + replicasText + "|" + count3 + "|" + count2 + "|" + countGone + "|" + lenGone + "|" + projectedText + "|" + after66Text + "|" + count34 + "|" + holdsZText + "|" + count55 + "|" + targetsText
+
+    # S17 (hand-traced): `abort` on request — an Admitted action rolls
+    # back (Restored), a terminal one is left alone, an unknown id is
+    # None, and the interlock is released.
+    proc demoAbortRequested() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let view2 = do controlPlaneViewNew(topology, fleet, 1500)
+        let a1 = do fabricControllerAbort(s.controller, s.id, view2)
+        let record = do fabricControllerRecord(a1.controller, s.id)
+        let reasonText = do abortReasonDisplay(record.val.abortReason)
+        let a2 = do fabricControllerAbort(a1.controller, s.id, view2)
+        let a3 = do fabricControllerAbort(a2.controller, ActionId{value: 42}, view2)
+        let activeLen = do actionRegistryActiveLen(a3.controller.actions)
+        let knownText = do ctrlBoolText(a3.known)
+        return a1.execState + "|" + reasonText + "|" + record.val.rollback.kind + "|" + a2.execState + "|" + knownText + "|" + activeLen
+
+    # S18: ExecutionState::is_active over all six labels.
+    proc demoExecutionStateHelpers() -> text:
+        let labels = ["admitted", "running", "awaiting-measurement", "completed", "rolled-back", "failed"]
+        let n = len(labels)
+        let mut parts = []
+        let mut i = 0
+        loop i < n:
+            let active = do executionStateIsActive(labels[i])
+            let t = do ctrlBoolText(active)
+            parts = append(parts, t)
+            i = i + 1
+        let joined = do ctrlJoinText(parts, ",")
+        return joined
+
+    # S19: PlacementChange::apply — true and the map moves for a placed
+    # target, false for an unplaced one.
+    proc demoPlacementChangeApply() -> text:
+        let topology = do demoWorldTopology()
+        let t34 = do actionTargetNew(7, Coordinate{x: 3, y: 4})
+        let change = PlacementChange{target: t34, fromNode: DbmsId{value: "db-a"}, toNode: DbmsId{value: "db-b"}, toRegion: "us-west"}
+        let moved = do placementChangeApply(change, topology)
+        let located = do topologyRegistryLocate(moved.registry, 7, Coordinate{x: 3, y: 4})
+        let t99 = do actionTargetNew(7, Coordinate{x: 9, y: 9})
+        let missing = PlacementChange{target: t99, fromNode: DbmsId{value: "db-a"}, toNode: DbmsId{value: "db-b"}, toRegion: "us-west"}
+        let notMoved = do placementChangeApply(missing, topology)
+        let movedText = do ctrlBoolText(moved.moved)
+        let notMovedText = do ctrlBoolText(notMoved.moved)
+        return movedText + "|" + located.placement.dbmsId + "|" + located.placement.region + "|" + notMovedText
+
+    # S20: DecisionEnvelope::named_destination per variant, action_label,
+    # and the target built from the decision's own shard/coordinate.
+    proc demoDecisionEnvelope() -> text:
+        let replicate = do optimizationActionReplicate("db-b")
+        let move = do optimizationActionMove("db-b")
+        let isolate = do optimizationActionIsolate()
+        let colocate = do optimizationActionColocate(Coordinate{x: 5, y: 5})
+        let split = do optimizationActionSplit()
+        let noAction = do optimizationActionNoAction()
+        let actions = [replicate, move, isolate, colocate, split, noAction]
+        let n = len(actions)
+        let mut parts = []
+        let mut i = 0
+        loop i < n:
+            let envelope = do demoEnvelope(actions[i], 1000)
+            let named = do decisionEnvelopeNamedDestination(envelope)
+            if named.has:
+                parts = append(parts, named.val.value)
+            else:
+                parts = append(parts, "none")
+            i = i + 1
+        let moveEnvelope = do demoEnvelope(move, 1000)
+        let label = do decisionEnvelopeActionLabel(moveEnvelope)
+        let targetText = do actionTargetDisplay(moveEnvelope.target)
+        let joined = do ctrlJoinText(parts, "|")
+        return joined + "|" + label + "|" + targetText
+
+    # S21 (hand-traced): MeasurementError — an unknown id, and an action
+    # that is Admitted rather than awaiting measurement.
+    proc demoMeasurementErrors() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let after = do demoProfile(0.2)
+        let unknown = do fabricControllerMeasure(c, ActionId{value: 99}, after, view)
+        let unknownText = do measurementErrorDisplay(unknown.err)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let early = do fabricControllerMeasure(s.controller, s.id, after, view)
+        let earlyText = do measurementErrorDisplay(early.err)
+        return unknown.err.kind + "|" + unknownText + "|" + early.err.kind + "|" + earlyText
+
+    # S22 (hand-traced): a mechanism that is no longer registered when its
+    # action is advanced — an Internal fault, absorbed into an abort whose
+    # rollback is Irreversible("mechanism is no longer registered").
+    proc demoMechanismUnregistered() -> text:
+        let topology = do demoWorldTopology()
+        let fleet = do demoWorldFleet()
+        let c = do demoControllerWithStub(topology)
+        let view = do controlPlaneViewNew(topology, fleet, 1000)
+        let baseline = do demoProfile(0.9)
+        let envelope = do demoMoveToB(1000)
+        let s = do fabricControllerSubmit(c, envelope, baseline, view)
+        let stripped = FabricController{policy: s.controller.policy, executors: [], actions: s.controller.actions, ledger: s.controller.ledger}
+        let view2 = do controlPlaneViewNew(topology, fleet, 2000)
+        let a = do fabricControllerAdvance(stripped, s.id, view2)
+        let record = do fabricControllerRecord(a.controller, s.id)
+        let reasonText = do abortReasonDisplay(record.val.abortReason)
+        return a.execState + "|" + record.val.abortReason.kind + "|" + reasonText + "|" + record.val.rollback.kind + "|" + record.val.rollback.reason
+
+    state demoStaleDecisionResult: text = ""
+    state demoOlderFleetResult: text = ""
+    state demoUnhealthyDestinationResult: text = ""
+    state demoSaturatedDestinationResult: text = ""
+    state demoTwoActionsOneTargetResult: text = ""
+    state demoDropLastCopyResult: text = ""
+    state demoExecutedNotCompleteUntilMeasuredResult: text = ""
+    state demoHelpedNothingResult: text = ""
+    state demoLosingDestinationResult: text = ""
+    state demoRefusalsBeforeTheFleetResult: text = ""
+    state demoNoMechanismAndDestinationsResult: text = ""
+    state demoPhaseTimeoutResult: text = ""
+    state demoAbortAfterCutoverResult: text = ""
+    state demoMeasurementDeadlineResult: text = ""
+    state demoNodeBusyResult: text = ""
+    state demoReplicaLedgerResult: text = ""
+    state demoAbortRequestedResult: text = ""
+    state demoExecutionStateHelpersResult: text = ""
+    state demoPlacementChangeApplyResult: text = ""
+    state demoDecisionEnvelopeResult: text = ""
+    state demoMeasurementErrorsResult: text = ""
+    state demoMechanismUnregisteredResult: text = ""
+
+    action runFabricControllerCoreDemo():
+        let r1 = do demoStaleDecision()
+        let r2 = do demoOlderFleet()
+        let r3 = do demoUnhealthyDestination()
+        let r4 = do demoSaturatedDestination()
+        let r5 = do demoTwoActionsOneTarget()
+        let r6 = do demoDropLastCopy()
+        let r7 = do demoExecutedNotCompleteUntilMeasured()
+        let r8 = do demoHelpedNothing()
+        let r9 = do demoLosingDestination()
+        let r10 = do demoRefusalsBeforeTheFleet()
+        let r11 = do demoNoMechanismAndDestinations()
+        let r12 = do demoPhaseTimeout()
+        let r13 = do demoAbortAfterCutover()
+        let r14 = do demoMeasurementDeadline()
+        let r15 = do demoNodeBusy()
+        let r16 = do demoReplicaLedger()
+        let r17 = do demoAbortRequested()
+        let r18 = do demoExecutionStateHelpers()
+        let r19 = do demoPlacementChangeApply()
+        let r20 = do demoDecisionEnvelope()
+        let r21 = do demoMeasurementErrors()
+        let r22 = do demoMechanismUnregistered()
+        demoStaleDecisionResult = r1
+        demoOlderFleetResult = r2
+        demoUnhealthyDestinationResult = r3
+        demoSaturatedDestinationResult = r4
+        demoTwoActionsOneTargetResult = r5
+        demoDropLastCopyResult = r6
+        demoExecutedNotCompleteUntilMeasuredResult = r7
+        demoHelpedNothingResult = r8
+        demoLosingDestinationResult = r9
+        demoRefusalsBeforeTheFleetResult = r10
+        demoNoMechanismAndDestinationsResult = r11
+        demoPhaseTimeoutResult = r12
+        demoAbortAfterCutoverResult = r13
+        demoMeasurementDeadlineResult = r14
+        demoNodeBusyResult = r15
+        demoReplicaLedgerResult = r16
+        demoAbortRequestedResult = r17
+        demoExecutionStateHelpersResult = r18
+        demoPlacementChangeApplyResult = r19
+        demoDecisionEnvelopeResult = r20
+        demoMeasurementErrorsResult = r21
+        demoMechanismUnregisteredResult = r22

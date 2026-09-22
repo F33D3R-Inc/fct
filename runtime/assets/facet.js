@@ -245,7 +245,7 @@
     function expr(e) {
       if (!e) return;
       if (e.kind === "agg" || e.kind === "eget") e.__faAgg = n++;
-      expr(e.l); expr(e.r); expr(e.x); expr(e.obj); expr(e.key); expr(e.where); expr(e.sel);
+      expr(e.l); expr(e.r); expr(e.x); expr(e.obj); expr(e.key); expr(e.where); expr(e.sel); expr(e.limit);
       for (const a of list(e.args)) expr(a);
     }
     function nodes(ns) {
@@ -273,6 +273,12 @@
         return toStr(e.val);
       case "list":
         return (e.args || []).map((a) => ev(a, sc));
+      case "struct": {
+        // A wire-type literal: a plain object, as runtime/eval.go builds it.
+        const o = {};
+        list(e.fields).forEach((f, i) => { o[f] = ev(e.args[i], sc); });
+        return o;
+      }
       case "ref":
         return sc[e.name];
       case "get": {
@@ -300,6 +306,18 @@
         }
         if (e.op === "exists") return rows.length > 0;
         if (e.op === "count") return rows.length;
+        if (e.op === "list") {
+          // The rows, ordered/capped/shaped exactly as runtime/eval.go's "list".
+          let out = rows.slice();
+          if (e.order) out.sort((a, b) => { const c = cmpVal(a[e.order], b[e.order]); return e.desc ? -c : c; });
+          if (e.limit) { const lim = toInt(ev(e.limit, sc)); if (lim >= 0 && out.length > lim) out = out.slice(0, lim); }
+          if (!e.sel) return out;
+          const had = Object.prototype.hasOwnProperty.call(sc, e.var);
+          const prev = sc[e.var];
+          out = out.map((r) => { sc[e.var] = r; return evRow(e.sel, sc); });
+          if (had) sc[e.var] = prev; else delete sc[e.var];
+          return out;
+        }
         // sum/avg/min/max reduce a numeric value over the (filtered) rows: a bare
         // column, or — `sum(l.qty * l.unitPrice in CartLine …)` — an expression
         // evaluated once per row with the item var bound to it, exactly as

@@ -172,6 +172,7 @@ type persistedSession struct {
 	Actor      string         `json:"actor"`
 	Role       string         `json:"role"`
 	Verified   bool           `json:"verified"`
+	Visitor    string         `json:"visitor,omitempty"` // the stable `session` key (sessionState.visitor)
 	PendingMFA string         `json:"pendingMFA"`
 	State      map[string]any `json:"state"`
 	Expires    time.Time      `json:"expires"`

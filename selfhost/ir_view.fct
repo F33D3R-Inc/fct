@@ -1,0 +1,566 @@
+import "ir_decl.fct"
+
+app IRViewSelfHost:
+    # Self-hosting port of the VIEW half of internal/ir/ir.go — Node (one
+    # element of the neutral view tree, every one of its 45 fields), Seg
+    # (one piece of an interpolated value), Option, Binding, Route and Page —
+    # read from the compiler's JSON (ir_json.fct's parser) and spelled back
+    # exactly as encoding/json spells them. With ir_decl.fct this completes
+    # the loader for a compiled app: a self-hosted runtime can now read every
+    # page the real compiler emits. Components, services, jobs, daemons,
+    # files, webhooks, triggers, themes and assets remain for a later slice.
+    #
+    # The Node reader and emitter are GENERATED from one field table (see the
+    # generator's note in the session that produced this file): ir.go's field
+    # order is the emitter's key order, and every field is read by the one
+    # helper its kind needs — so the two cannot drift from each other, and a
+    # new Node field is one table row.
+    struct IRSeg:
+        lit: text
+        bind: text
+        expr: [IRExpr]
+        e2e: bool
+
+    struct IROption:
+        label: [IRSeg]
+        value: text
+
+    struct IRNode:
+        kind: text
+        children: [IRNode]
+        segs: [IRSeg]
+        label: [IRSeg]
+        action: text
+        args: [IRExpr]
+        debounce: int
+        id: text
+        itemVar: text
+        coll: text
+        where: [IRExpr]
+        order: text
+        desc: bool
+        limit: [IRExpr]
+        more: text
+        cond: [IRExpr]
+        seconds: int
+        body: [IRStmt]
+        level: [IRExpr]
+        bind: text
+        placeholder: [IRSeg]
+        alt: [IRSeg]
+        poster: [IRSeg]
+        autoplay: bool
+        loopFlag: bool
+        muted: bool
+        path: text
+        pathSegs: [IRSeg]
+        route: bool
+        external: bool
+        name: text
+        options: [IROption]
+        value: text
+        val: [IRExpr]
+        class: text
+        style: text
+        classSegs: [IRSeg]
+        anchor: text
+        width: int
+        height: int
+        tiles: [IRExpr]
+        x: [IRExpr]
+        y: [IRExpr]
+        facing: [IRExpr]
+        image: [IRExpr]
+
+    struct IRBinding:
+        id: text
+        expr: [IRExpr]
+        deps: [text]
+
+    struct IRRoute:
+        path: text
+        requires: text
+
+    # depGraph is a map name -> [binding ids]; carried as parallel lists in
+    # the order the compiler wrote them (Go sorts a map's keys on encode).
+    struct IRPage:
+        name: text
+        path: text
+        params: [text]
+        requires: text
+        screen: bool
+        view: [IRNode]
+        bindings: [IRBinding]
+        depKeys: [text]
+        depVals: [text]
+        title: [IRSeg]
+        desc: [IRSeg]
+
+    # ── readers ─────────────────────────────────────────────────────────────
+    # jNumV / jExprOptV: ir_decl.fct keeps its own copies private (a
+    # `private proc` is file-local), so this file carries the same two.
+    private proc jNumV(v: JVal, k: text) -> int:
+        let x = do jGet(v, k)
+        if x.kind == "num":
+            return toInt(x.s)
+        return 0
+
+    private proc jExprOptV(v: JVal, k: text) -> [IRExpr]:
+        let has = do jHas(v, k)
+        if !has:
+            return []
+        let x = do jGet(v, k)
+        if x.kind != "obj":
+            return []
+        let e = do irExprFromJVal(x)
+        return [e]
+
+    private proc jExprListOf(v: JVal, k: text) -> [IRExpr]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let e = do irExprFromJVal(x.vals[i])
+            out = append(out, e)
+            i = i + 1
+        return out
+
+    private proc jStmtListOf(v: JVal, k: text) -> [IRStmt]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let st = do irStmtFromJVal(x.vals[i])
+            out = append(out, st)
+            i = i + 1
+        return out
+
+    proc irSegFromJVal(v: JVal) -> IRSeg:
+        let lit = do jStr(v, "lit")
+        let bind = do jStr(v, "bind")
+        let expr = do jExprOptV(v, "expr")
+        let e2e = do jBool(v, "e2e")
+        return IRSeg{lit: lit, bind: bind, expr: expr, e2e: e2e}
+
+    proc irSegsFromJVal(v: JVal, k: text) -> [IRSeg]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let s = do irSegFromJVal(x.vals[i])
+            out = append(out, s)
+            i = i + 1
+        return out
+
+    proc irOptionsFromJVal(v: JVal, k: text) -> [IROption]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let label = do irSegsFromJVal(x.vals[i], "label")
+            let value = do jStr(x.vals[i], "value")
+            out = append(out, IROption{label: label, value: value})
+            i = i + 1
+        return out
+
+    proc irNodesFromJVal(v: JVal, k: text) -> [IRNode]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let nd = do irNodeFromJVal(x.vals[i])
+            out = append(out, nd)
+            i = i + 1
+        return out
+
+    proc irNodeFromJVal(v: JVal) -> IRNode:
+        let f_kind = do jStr(v, "kind")
+        let f_children = do irNodesFromJVal(v, "children")
+        let f_segs = do irSegsFromJVal(v, "segs")
+        let f_label = do irSegsFromJVal(v, "label")
+        let f_action = do jStr(v, "action")
+        let f_args = do jExprListOf(v, "args")
+        let f_debounce = do jNumV(v, "debounce")
+        let f_id = do jStr(v, "id")
+        let f_itemVar = do jStr(v, "var")
+        let f_coll = do jStr(v, "coll")
+        let f_where = do jExprOptV(v, "where")
+        let f_order = do jStr(v, "order")
+        let f_desc = do jBool(v, "desc")
+        let f_limit = do jExprOptV(v, "limit")
+        let f_more = do jStr(v, "more")
+        let f_cond = do jExprOptV(v, "cond")
+        let f_seconds = do jNumV(v, "seconds")
+        let f_body = do jStmtListOf(v, "body")
+        let f_level = do jExprOptV(v, "level")
+        let f_bind = do jStr(v, "bind")
+        let f_placeholder = do irSegsFromJVal(v, "placeholder")
+        let f_alt = do irSegsFromJVal(v, "alt")
+        let f_poster = do irSegsFromJVal(v, "poster")
+        let f_autoplay = do jBool(v, "autoplay")
+        let f_loopFlag = do jBool(v, "loop")
+        let f_muted = do jBool(v, "muted")
+        let f_path = do jStr(v, "path")
+        let f_pathSegs = do irSegsFromJVal(v, "pathSegs")
+        let f_route = do jBool(v, "route")
+        let f_external = do jBool(v, "external")
+        let f_name = do jStr(v, "name")
+        let f_options = do irOptionsFromJVal(v, "options")
+        let f_value = do jStr(v, "value")
+        let f_val = do jExprOptV(v, "val")
+        let f_class = do jStr(v, "class")
+        let f_style = do jStr(v, "style")
+        let f_classSegs = do irSegsFromJVal(v, "classSegs")
+        let f_anchor = do jStr(v, "anchor")
+        let f_width = do jNumV(v, "width")
+        let f_height = do jNumV(v, "height")
+        let f_tiles = do jExprOptV(v, "tiles")
+        let f_x = do jExprOptV(v, "x")
+        let f_y = do jExprOptV(v, "y")
+        let f_facing = do jExprOptV(v, "facing")
+        let f_image = do jExprOptV(v, "image")
+        return IRNode{kind: f_kind, children: f_children, segs: f_segs, label: f_label, action: f_action, args: f_args, debounce: f_debounce, id: f_id, itemVar: f_itemVar, coll: f_coll, where: f_where, order: f_order, desc: f_desc, limit: f_limit, more: f_more, cond: f_cond, seconds: f_seconds, body: f_body, level: f_level, bind: f_bind, placeholder: f_placeholder, alt: f_alt, poster: f_poster, autoplay: f_autoplay, loopFlag: f_loopFlag, muted: f_muted, path: f_path, pathSegs: f_pathSegs, route: f_route, external: f_external, name: f_name, options: f_options, value: f_value, val: f_val, class: f_class, style: f_style, classSegs: f_classSegs, anchor: f_anchor, width: f_width, height: f_height, tiles: f_tiles, x: f_x, y: f_y, facing: f_facing, image: f_image}
+
+    proc irBindingFromJVal(v: JVal) -> IRBinding:
+        let id = do jStr(v, "id")
+        let expr = do jExprOptV(v, "expr")
+        let deps = do jTextListOf(v, "deps")
+        return IRBinding{id: id, expr: expr, deps: deps}
+
+    proc irRouteFromJVal(v: JVal) -> IRRoute:
+        let path = do jStr(v, "path")
+        let requires = do jStr(v, "requires")
+        return IRRoute{path: path, requires: requires}
+
+    proc irPageFromJVal(v: JVal) -> IRPage:
+        let name = do jStr(v, "name")
+        let path = do jStr(v, "path")
+        let params = do jTextListOf(v, "params")
+        let requires = do jStr(v, "requires")
+        let screen = do jBool(v, "screen")
+        let view = do irNodesFromJVal(v, "view")
+        let bv = do jGet(v, "bindings")
+        let bn = len(bv.vals)
+        let mut bindings = []
+        let mut i = 0
+        loop i < bn:
+            let b = do irBindingFromJVal(bv.vals[i])
+            bindings = append(bindings, b)
+            i = i + 1
+        let dg = do jGet(v, "depGraph")
+        let dn = len(dg.keys)
+        let mut depKeys = []
+        let mut depVals = []
+        let mut j = 0
+        loop j < dn:
+            depKeys = append(depKeys, dg.keys[j])
+            let ids = do textListJSONOf(dg.vals[j])
+            depVals = append(depVals, ids)
+            j = j + 1
+        let title = do irSegsFromJVal(v, "title")
+        let desc = do irSegsFromJVal(v, "desc")
+        return IRPage{name: name, path: path, params: params, requires: requires, screen: screen, view: view, bindings: bindings, depKeys: depKeys, depVals: depVals, title: title, desc: desc}
+
+    # textListJSONOf: a JSON string array re-spelled as JSON (a depGraph
+    # value), so the page keeps it verbatim.
+    private proc textListJSONOf(x: JVal) -> text:
+        let n = len(x.vals)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let q = do jsonQuote(x.vals[i].s)
+            out = out + q
+            i = i + 1
+        return out + "]"
+
+    # ── emitters ────────────────────────────────────────────────────────────
+    proc irSegJSON(s: IRSeg) -> text:
+        let mut out = "{"
+        let mut first = true
+        if s.lit != "":
+            let q = do jsonQuote(s.lit)
+            out = out + "\"lit\":" + q
+            first = false
+        if s.bind != "":
+            if !first:
+                out = out + ","
+            let q = do jsonQuote(s.bind)
+            out = out + "\"bind\":" + q
+            first = false
+        if len(s.expr) > 0:
+            if !first:
+                out = out + ","
+            let j = do irExprJSON(s.expr[0])
+            out = out + "\"expr\":" + j
+            first = false
+        if s.e2e:
+            if !first:
+                out = out + ","
+            out = out + "\"e2e\":true"
+        return out + "}"
+
+    proc irSegsJSON(xs: [IRSeg]) -> text:
+        let n = len(xs)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let j = do irSegJSON(xs[i])
+            out = out + j
+            i = i + 1
+        return out + "]"
+
+    proc irOptionsJSON(xs: [IROption]) -> text:
+        let n = len(xs)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let lj = do irSegsJSON(xs[i].label)
+            let vq = do jsonQuote(xs[i].value)
+            out = out + "{\"label\":" + lj + ",\"value\":" + vq + "}"
+            i = i + 1
+        return out + "]"
+
+    proc irNodesJSON(xs: [IRNode]) -> text:
+        let n = len(xs)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let j = do irNodeJSON(xs[i])
+            out = out + j
+            i = i + 1
+        return out + "]"
+
+    proc irNodeJSON(n: IRNode) -> text:
+        let kq = do jsonQuote(n.kind)
+        let mut out = "{\"kind\":" + kq
+        if len(n.children) > 0:
+            let j_children = do irNodesJSON(n.children)
+            out = out + ",\"children\":" + j_children
+        if len(n.segs) > 0:
+            let j_segs = do irSegsJSON(n.segs)
+            out = out + ",\"segs\":" + j_segs
+        if len(n.label) > 0:
+            let j_label = do irSegsJSON(n.label)
+            out = out + ",\"label\":" + j_label
+        if n.action != "":
+            let q_action = do jsonQuote(n.action)
+            out = out + ",\"action\":" + q_action
+        if len(n.args) > 0:
+            let j_args = do irListJSON(n.args)
+            out = out + ",\"args\":" + j_args
+        if n.debounce != 0:
+            out = out + ",\"debounce\":" + n.debounce
+        if n.id != "":
+            let q_id = do jsonQuote(n.id)
+            out = out + ",\"id\":" + q_id
+        if n.itemVar != "":
+            let q_itemVar = do jsonQuote(n.itemVar)
+            out = out + ",\"var\":" + q_itemVar
+        if n.coll != "":
+            let q_coll = do jsonQuote(n.coll)
+            out = out + ",\"coll\":" + q_coll
+        if len(n.where) > 0:
+            let j_where = do irExprJSON(n.where[0])
+            out = out + ",\"where\":" + j_where
+        if n.order != "":
+            let q_order = do jsonQuote(n.order)
+            out = out + ",\"order\":" + q_order
+        if n.desc:
+            out = out + ",\"desc\":true"
+        if len(n.limit) > 0:
+            let j_limit = do irExprJSON(n.limit[0])
+            out = out + ",\"limit\":" + j_limit
+        if n.more != "":
+            let q_more = do jsonQuote(n.more)
+            out = out + ",\"more\":" + q_more
+        if len(n.cond) > 0:
+            let j_cond = do irExprJSON(n.cond[0])
+            out = out + ",\"cond\":" + j_cond
+        if n.seconds != 0:
+            out = out + ",\"seconds\":" + n.seconds
+        if len(n.body) > 0:
+            let j_body = do irStmtListJSON(n.body)
+            out = out + ",\"body\":" + j_body
+        if len(n.level) > 0:
+            let j_level = do irExprJSON(n.level[0])
+            out = out + ",\"level\":" + j_level
+        if n.bind != "":
+            let q_bind = do jsonQuote(n.bind)
+            out = out + ",\"bind\":" + q_bind
+        if len(n.placeholder) > 0:
+            let j_placeholder = do irSegsJSON(n.placeholder)
+            out = out + ",\"placeholder\":" + j_placeholder
+        if len(n.alt) > 0:
+            let j_alt = do irSegsJSON(n.alt)
+            out = out + ",\"alt\":" + j_alt
+        if len(n.poster) > 0:
+            let j_poster = do irSegsJSON(n.poster)
+            out = out + ",\"poster\":" + j_poster
+        if n.autoplay:
+            out = out + ",\"autoplay\":true"
+        if n.loopFlag:
+            out = out + ",\"loop\":true"
+        if n.muted:
+            out = out + ",\"muted\":true"
+        if n.path != "":
+            let q_path = do jsonQuote(n.path)
+            out = out + ",\"path\":" + q_path
+        if len(n.pathSegs) > 0:
+            let j_pathSegs = do irSegsJSON(n.pathSegs)
+            out = out + ",\"pathSegs\":" + j_pathSegs
+        if n.route:
+            out = out + ",\"route\":true"
+        if n.external:
+            out = out + ",\"external\":true"
+        if n.name != "":
+            let q_name = do jsonQuote(n.name)
+            out = out + ",\"name\":" + q_name
+        if len(n.options) > 0:
+            let j_options = do irOptionsJSON(n.options)
+            out = out + ",\"options\":" + j_options
+        if n.value != "":
+            let q_value = do jsonQuote(n.value)
+            out = out + ",\"value\":" + q_value
+        if len(n.val) > 0:
+            let j_val = do irExprJSON(n.val[0])
+            out = out + ",\"val\":" + j_val
+        if n.class != "":
+            let q_class = do jsonQuote(n.class)
+            out = out + ",\"class\":" + q_class
+        if n.style != "":
+            let q_style = do jsonQuote(n.style)
+            out = out + ",\"style\":" + q_style
+        if len(n.classSegs) > 0:
+            let j_classSegs = do irSegsJSON(n.classSegs)
+            out = out + ",\"classSegs\":" + j_classSegs
+        if n.anchor != "":
+            let q_anchor = do jsonQuote(n.anchor)
+            out = out + ",\"anchor\":" + q_anchor
+        if n.width != 0:
+            out = out + ",\"width\":" + n.width
+        if n.height != 0:
+            out = out + ",\"height\":" + n.height
+        if len(n.tiles) > 0:
+            let j_tiles = do irExprJSON(n.tiles[0])
+            out = out + ",\"tiles\":" + j_tiles
+        if len(n.x) > 0:
+            let j_x = do irExprJSON(n.x[0])
+            out = out + ",\"x\":" + j_x
+        if len(n.y) > 0:
+            let j_y = do irExprJSON(n.y[0])
+            out = out + ",\"y\":" + j_y
+        if len(n.facing) > 0:
+            let j_facing = do irExprJSON(n.facing[0])
+            out = out + ",\"facing\":" + j_facing
+        if len(n.image) > 0:
+            let j_image = do irExprJSON(n.image[0])
+            out = out + ",\"image\":" + j_image
+        return out + "}"
+
+    proc irBindingJSON(b: IRBinding) -> text:
+        let iq = do jsonQuote(b.id)
+        let mut out = "{\"id\":" + iq + ",\"expr\":"
+        if len(b.expr) > 0:
+            let ej = do irExprJSON(b.expr[0])
+            out = out + ej
+        else:
+            out = out + "null"
+        let dj = do textListJSON(b.deps)
+        return out + ",\"deps\":" + dj + "}"
+
+    proc irRouteJSON(r: IRRoute) -> text:
+        let pq = do jsonQuote(r.path)
+        let mut out = "{\"path\":" + pq
+        if r.requires != "":
+            let rq = do jsonQuote(r.requires)
+            out = out + ",\"requires\":" + rq
+        return out + "}"
+
+    proc irPageJSON(p: IRPage) -> text:
+        let nq = do jsonQuote(p.name)
+        let pq = do jsonQuote(p.path)
+        let mut out = "{\"name\":" + nq + ",\"path\":" + pq
+        if len(p.params) > 0:
+            let prj = do textListJSON(p.params)
+            out = out + ",\"params\":" + prj
+        if p.requires != "":
+            let rq = do jsonQuote(p.requires)
+            out = out + ",\"requires\":" + rq
+        if p.screen:
+            out = out + ",\"screen\":true"
+        let vj = do irNodesJSON(p.view)
+        out = out + ",\"view\":" + vj + ",\"bindings\":"
+        let bn = len(p.bindings)
+        if bn == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < bn:
+                if i > 0:
+                    out = out + ","
+                let bj = do irBindingJSON(p.bindings[i])
+                out = out + bj
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"depGraph\":{"
+        let dn = len(p.depKeys)
+        let mut j = 0
+        loop j < dn:
+            if j > 0:
+                out = out + ","
+            let kq = do jsonQuote(p.depKeys[j])
+            out = out + kq + ":" + p.depVals[j]
+            j = j + 1
+        out = out + "}"
+        if len(p.title) > 0:
+            let tj = do irSegsJSON(p.title)
+            out = out + ",\"title\":" + tj
+        if len(p.desc) > 0:
+            let dj = do irSegsJSON(p.desc)
+            out = out + ",\"desc\":" + dj
+        return out + "}"
+
+    # ── live driver ─────────────────────────────────────────────────────────
+    proc irViewRoundTrip(kind: text, src: text) -> text:
+        let v = do jsonParse(src)
+        if kind == "node":
+            let n = do irNodeFromJVal(v)
+            let j = do irNodeJSON(n)
+            return j
+        if kind == "page":
+            let p = do irPageFromJVal(v)
+            let j = do irPageJSON(p)
+            return j
+        if kind == "route":
+            let r = do irRouteFromJVal(v)
+            let j = do irRouteJSON(r)
+            return j
+        if kind == "binding":
+            let b = do irBindingFromJVal(v)
+            let j = do irBindingJSON(b)
+            return j
+        return ""
+
+    state irViewBack: text = ""
+
+    action runIRViewRoundTrip(kind: text, src: text):
+        let j = do irViewRoundTrip(kind, src)
+        irViewBack = j
+
+    private view IRViewHome at "/ir_view":
+        box:
+            text "{irViewBack}"

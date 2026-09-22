@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,6 +17,18 @@ import (
 const defaultRatePerMin = 600 // generous default; tune with FACET_RATE_LIMIT
 
 // rateLimitFromEnv reads FACET_RATE_LIMIT (requests per minute per IP).
+// rateLimitFromEnvClass reads FACET_RATE_LIMIT_<CLASS> (READ/WRITE/AUTH), the
+// per-minute budget of one declared-api rate class, falling back to the
+// global FACET_RATE_LIMIT.
+func rateLimitFromEnvClass(class string) int {
+	if v := os.Getenv("FACET_RATE_LIMIT_" + strings.ToUpper(class)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return rateLimitFromEnv()
+}
+
 func rateLimitFromEnv() int {
 	if v := os.Getenv("FACET_RATE_LIMIT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

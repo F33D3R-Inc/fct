@@ -1,0 +1,534 @@
+import "ir_json.fct"
+
+app IRDeclSelfHost:
+    # Self-hosting port of the flat declaration shapes of internal/ir/ir.go —
+    # Entity/Field, State, Derive, Policy, Param, Require, Action, Proc and
+    # Enum — read from the JSON the real compiler emits (ir_json.fct's
+    # parser) and spelled back exactly as encoding/json spells them, so a
+    # self-hosted runtime can load a compiled app and a Go test can pin the
+    # round trip byte for byte. Pages, view nodes, bindings, components,
+    # services, jobs, daemons, files, webhooks, triggers, themes and assets
+    # are not here yet; they are the next slice.
+    #
+    # Two encoding facts are mirrored deliberately rather than tracked: a
+    # non-`omitempty` slice the Go builder leaves nil when empty (an action's
+    # `params`/`requires`, a proc's or policy's `params`) prints as `null`,
+    # while one it always allocates (an action's `writes`/`reads`, a derive's
+    # `deps`, via sortedKeys) prints as `[]`. The emitters below know which
+    # is which, the same way ir_expr.fct's emitter knows Go's key order.
+    struct IRField:
+        name: text
+        type: text
+        ref: text
+        enumName: text
+        index: bool
+        secret: bool
+        e2e: bool
+        readPolicy: text
+        optional: bool
+        unique: bool
+        required: bool
+        hasMin: bool
+        min: int
+        hasMax: bool
+        max: int
+        matches: text
+        onDelete: text
+
+    struct IREntity:
+        name: text
+        softDelete: bool
+        ephemeral: bool
+        fields: [IRField]
+        read: [IRExpr]
+        derives: [IRDerive]
+
+    struct IRState:
+        name: text
+        type: text
+        elem: text
+        list: bool
+        optional: bool
+        placement: text
+        private: bool
+        init: [IRExpr]
+
+    struct IRDerive:
+        name: text
+        type: text
+        expr: [IRExpr]
+        deps: [text]
+
+    struct IRParam:
+        name: text
+        type: text
+        optional: bool
+        list: bool
+
+    struct IRPolicy:
+        name: text
+        params: [IRParam]
+        expr: [IRExpr]
+
+    struct IRRequire:
+        name: text
+        args: [IRExpr]
+
+    struct IRAction:
+        name: text
+        params: [IRParam]
+        requires: [IRRequire]
+        optimistic: bool
+        ret: text
+        retList: bool
+        placement: text
+        reason: text
+        writes: [text]
+        reads: [text]
+        seal: [text]
+        body: [IRStmt]
+
+    struct IRProc:
+        name: text
+        params: [IRParam]
+        ret: text
+        retList: bool
+        body: [IRStmt]
+
+    struct IREnum:
+        name: text
+        values: [text]
+        wireNames: [text]
+
+    # ── readers ─────────────────────────────────────────────────────────────
+    private proc jNum(v: JVal, k: text) -> int:
+        let x = do jGet(v, k)
+        if x.kind == "num":
+            return toInt(x.s)
+        return 0
+
+    proc irFieldFromJVal(v: JVal) -> IRField:
+        let name = do jStr(v, "name")
+        let type = do jStr(v, "type")
+        let ref = do jStr(v, "ref")
+        let enumName = do jStr(v, "enum")
+        let index = do jBool(v, "index")
+        let secret = do jBool(v, "secret")
+        let e2e = do jBool(v, "e2e")
+        let readPolicy = do jStr(v, "readPolicy")
+        let optional = do jBool(v, "optional")
+        let unique = do jBool(v, "unique")
+        let required = do jBool(v, "required")
+        let hasMin = do jHas(v, "min")
+        let min = do jNum(v, "min")
+        let hasMax = do jHas(v, "max")
+        let max = do jNum(v, "max")
+        let matches = do jStr(v, "matches")
+        let onDelete = do jStr(v, "onDelete")
+        return IRField{name: name, type: type, ref: ref, enumName: enumName, index: index, secret: secret, e2e: e2e, readPolicy: readPolicy, optional: optional, unique: unique, required: required, hasMin: hasMin, min: min, hasMax: hasMax, max: max, matches: matches, onDelete: onDelete}
+
+    proc irParamsFromJVal(v: JVal, k: text) -> [IRParam]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let p = x.vals[i]
+            let name = do jStr(p, "name")
+            let type = do jStr(p, "type")
+            let optional = do jBool(p, "optional")
+            let list = do jBool(p, "list")
+            out = append(out, IRParam{name: name, type: type, optional: optional, list: list})
+            i = i + 1
+        return out
+
+    proc irDeriveFromJVal(v: JVal) -> IRDerive:
+        let name = do jStr(v, "name")
+        let type = do jStr(v, "type")
+        let hasExpr = do jHas(v, "expr")
+        let mut expr = []
+        if hasExpr:
+            let ev = do jGet(v, "expr")
+            if ev.kind == "obj":
+                let e = do irExprFromJVal(ev)
+                expr = [e]
+        let deps = do jTextListOf(v, "deps")
+        return IRDerive{name: name, type: type, expr: expr, deps: deps}
+
+    # jTextListOf: a string array under k ([] when absent or null).
+    proc jTextListOf(v: JVal, k: text) -> [text]:
+        let x = do jGet(v, k)
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, x.vals[i].s)
+            i = i + 1
+        return out
+
+    private proc jExprOptOf(v: JVal, k: text) -> [IRExpr]:
+        let has = do jHas(v, k)
+        if !has:
+            return []
+        let x = do jGet(v, k)
+        if x.kind != "obj":
+            return []
+        let e = do irExprFromJVal(x)
+        return [e]
+
+    proc irEntityFromJVal(v: JVal) -> IREntity:
+        let name = do jStr(v, "name")
+        let softDelete = do jBool(v, "softDelete")
+        let ephemeral = do jBool(v, "ephemeral")
+        let fv = do jGet(v, "fields")
+        let fn = len(fv.vals)
+        let mut fields = []
+        let mut i = 0
+        loop i < fn:
+            let f = do irFieldFromJVal(fv.vals[i])
+            fields = append(fields, f)
+            i = i + 1
+        let read = do jExprOptOf(v, "read")
+        let dv = do jGet(v, "derives")
+        let dn = len(dv.vals)
+        let mut derives = []
+        let mut j = 0
+        loop j < dn:
+            let d = do irDeriveFromJVal(dv.vals[j])
+            derives = append(derives, d)
+            j = j + 1
+        return IREntity{name: name, softDelete: softDelete, ephemeral: ephemeral, fields: fields, read: read, derives: derives}
+
+    proc irStateFromJVal(v: JVal) -> IRState:
+        let name = do jStr(v, "name")
+        let type = do jStr(v, "type")
+        let elem = do jStr(v, "elem")
+        let list = do jBool(v, "list")
+        let optional = do jBool(v, "optional")
+        let placement = do jStr(v, "placement")
+        let private = do jBool(v, "private")
+        let init = do jExprOptOf(v, "init")
+        return IRState{name: name, type: type, elem: elem, list: list, optional: optional, placement: placement, private: private, init: init}
+
+    proc irPolicyFromJVal(v: JVal) -> IRPolicy:
+        let name = do jStr(v, "name")
+        let params = do irParamsFromJVal(v, "params")
+        let expr = do jExprOptOf(v, "expr")
+        return IRPolicy{name: name, params: params, expr: expr}
+
+    proc irActionFromJVal(v: JVal) -> IRAction:
+        let name = do jStr(v, "name")
+        let params = do irParamsFromJVal(v, "params")
+        let rv = do jGet(v, "requires")
+        let rn = len(rv.vals)
+        let mut reqs = []
+        let mut i = 0
+        loop i < rn:
+            let r = rv.vals[i]
+            let rname = do jStr(r, "name")
+            let av = do jGet(r, "args")
+            let an = len(av.vals)
+            let mut args = []
+            let mut j = 0
+            loop j < an:
+                let e = do irExprFromJVal(av.vals[j])
+                args = append(args, e)
+                j = j + 1
+            reqs = append(reqs, IRRequire{name: rname, args: args})
+            i = i + 1
+        let optimistic = do jBool(v, "optimistic")
+        let ret = do jStr(v, "ret")
+        let retList = do jBool(v, "retList")
+        let placement = do jStr(v, "placement")
+        let reason = do jStr(v, "reason")
+        let writes = do jTextListOf(v, "writes")
+        let reads = do jTextListOf(v, "reads")
+        let seal = do jTextListOf(v, "seal")
+        let bv = do jGet(v, "body")
+        let bn = len(bv.vals)
+        let mut body = []
+        let mut k = 0
+        loop k < bn:
+            let st = do irStmtFromJVal(bv.vals[k])
+            body = append(body, st)
+            k = k + 1
+        return IRAction{name: name, params: params, requires: reqs, optimistic: optimistic, ret: ret, retList: retList, placement: placement, reason: reason, writes: writes, reads: reads, seal: seal, body: body}
+
+    proc irProcFromJVal(v: JVal) -> IRProc:
+        let name = do jStr(v, "name")
+        let params = do irParamsFromJVal(v, "params")
+        let ret = do jStr(v, "ret")
+        let retList = do jBool(v, "retList")
+        let bv = do jGet(v, "body")
+        let bn = len(bv.vals)
+        let mut body = []
+        let mut k = 0
+        loop k < bn:
+            let st = do irStmtFromJVal(bv.vals[k])
+            body = append(body, st)
+            k = k + 1
+        return IRProc{name: name, params: params, ret: ret, retList: retList, body: body}
+
+    proc irEnumFromJVal(v: JVal) -> IREnum:
+        let name = do jStr(v, "name")
+        let values = do jTextListOf(v, "values")
+        let wireNames = do jTextListOf(v, "wireNames")
+        return IREnum{name: name, values: values, wireNames: wireNames}
+
+    # ── emitters ────────────────────────────────────────────────────────────
+    proc irFieldJSON(f: IRField) -> text:
+        let nq = do jsonQuote(f.name)
+        let tq = do jsonQuote(f.type)
+        let mut out = "{\"name\":" + nq + ",\"type\":" + tq
+        if f.ref != "":
+            let q = do jsonQuote(f.ref)
+            out = out + ",\"ref\":" + q
+        if f.enumName != "":
+            let q = do jsonQuote(f.enumName)
+            out = out + ",\"enum\":" + q
+        if f.index:
+            out = out + ",\"index\":true"
+        if f.secret:
+            out = out + ",\"secret\":true"
+        if f.e2e:
+            out = out + ",\"e2e\":true"
+        if f.readPolicy != "":
+            let q = do jsonQuote(f.readPolicy)
+            out = out + ",\"readPolicy\":" + q
+        if f.optional:
+            out = out + ",\"optional\":true"
+        if f.unique:
+            out = out + ",\"unique\":true"
+        if f.required:
+            out = out + ",\"required\":true"
+        if f.hasMin:
+            out = out + ",\"min\":" + f.min
+        if f.hasMax:
+            out = out + ",\"max\":" + f.max
+        if f.matches != "":
+            let q = do jsonQuote(f.matches)
+            out = out + ",\"matches\":" + q
+        if f.onDelete != "":
+            let q = do jsonQuote(f.onDelete)
+            out = out + ",\"onDelete\":" + q
+        return out + "}"
+
+    proc irParamsJSON(ps: [IRParam]) -> text:
+        let n = len(ps)
+        if n == 0:
+            return "null"
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let nq = do jsonQuote(ps[i].name)
+            let tq = do jsonQuote(ps[i].type)
+            out = out + "{\"name\":" + nq + ",\"type\":" + tq
+            if ps[i].optional:
+                out = out + ",\"optional\":true"
+            if ps[i].list:
+                out = out + ",\"list\":true"
+            out = out + "}"
+            i = i + 1
+        return out + "]"
+
+    # irDeriveJSON: `inEntity` says which builder made it — a top-level
+    # derive's deps come from sortedKeys (an allocated `[]` even when empty);
+    # an entity derive's are never computed (nil, so `null`).
+    proc irDeriveJSON(d: IRDerive, inEntity: bool) -> text:
+        let nq = do jsonQuote(d.name)
+        let tq = do jsonQuote(d.type)
+        let mut out = "{\"name\":" + nq + ",\"type\":" + tq + ",\"expr\":"
+        if len(d.expr) > 0:
+            let ej = do irExprJSON(d.expr[0])
+            out = out + ej
+        else:
+            out = out + "null"
+        if inEntity && len(d.deps) == 0:
+            return out + ",\"deps\":null}"
+        let dj = do textListJSON(d.deps)
+        return out + ",\"deps\":" + dj + "}"
+
+    proc irEntityJSON(e: IREntity) -> text:
+        let nq = do jsonQuote(e.name)
+        let mut out = "{\"name\":" + nq
+        if e.softDelete:
+            out = out + ",\"softDelete\":true"
+        if e.ephemeral:
+            out = out + ",\"ephemeral\":true"
+        out = out + ",\"fields\":["
+        let fn = len(e.fields)
+        let mut i = 0
+        loop i < fn:
+            if i > 0:
+                out = out + ","
+            let fj = do irFieldJSON(e.fields[i])
+            out = out + fj
+            i = i + 1
+        out = out + "]"
+        if len(e.read) > 0:
+            let rj = do irExprJSON(e.read[0])
+            out = out + ",\"read\":" + rj
+        let dn = len(e.derives)
+        if dn > 0:
+            out = out + ",\"derives\":["
+            let mut j = 0
+            loop j < dn:
+                if j > 0:
+                    out = out + ","
+                let dj = do irDeriveJSON(e.derives[j], true)
+                out = out + dj
+                j = j + 1
+            out = out + "]"
+        return out + "}"
+
+    proc irStateJSON(s: IRState) -> text:
+        let nq = do jsonQuote(s.name)
+        let tq = do jsonQuote(s.type)
+        let mut out = "{\"name\":" + nq + ",\"type\":" + tq
+        if s.elem != "":
+            let q = do jsonQuote(s.elem)
+            out = out + ",\"elem\":" + q
+        if s.list:
+            out = out + ",\"list\":true"
+        if s.optional:
+            out = out + ",\"optional\":true"
+        let pq = do jsonQuote(s.placement)
+        out = out + ",\"placement\":" + pq
+        if s.private:
+            out = out + ",\"private\":true"
+        out = out + ",\"init\":"
+        if len(s.init) > 0:
+            let ij = do irExprJSON(s.init[0])
+            out = out + ij
+        else:
+            out = out + "null"
+        return out + "}"
+
+    proc irPolicyJSON(p: IRPolicy) -> text:
+        let nq = do jsonQuote(p.name)
+        let mut out = "{\"name\":" + nq
+        if len(p.params) > 0:
+            let pj = do irParamsJSON(p.params)
+            out = out + ",\"params\":" + pj
+        out = out + ",\"expr\":"
+        if len(p.expr) > 0:
+            let ej = do irExprJSON(p.expr[0])
+            out = out + ej
+        else:
+            out = out + "null"
+        return out + "}"
+
+    proc irActionJSON(a: IRAction) -> text:
+        let nq = do jsonQuote(a.name)
+        let pj = do irParamsJSON(a.params)
+        let mut out = "{\"name\":" + nq + ",\"params\":" + pj + ",\"requires\":"
+        let rn = len(a.requires)
+        if rn == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < rn:
+                if i > 0:
+                    out = out + ","
+                let rq = do jsonQuote(a.requires[i].name)
+                out = out + "{\"name\":" + rq
+                if len(a.requires[i].args) > 0:
+                    let aj = do irListJSON(a.requires[i].args)
+                    out = out + ",\"args\":" + aj
+                out = out + "}"
+                i = i + 1
+            out = out + "]"
+        if a.optimistic:
+            out = out + ",\"optimistic\":true"
+        if a.ret != "":
+            let retq = do jsonQuote(a.ret)
+            out = out + ",\"ret\":" + retq
+        if a.retList:
+            out = out + ",\"retList\":true"
+        let plq = do jsonQuote(a.placement)
+        out = out + ",\"placement\":" + plq
+        if a.reason != "":
+            let rsq = do jsonQuote(a.reason)
+            out = out + ",\"reason\":" + rsq
+        # A built-in auth action (authActions() in build.go: login, logout,
+        # signup, …) is the one action with no body, and the builder leaves
+        # its writes/reads/body nil — `null` — where an author's action always
+        # has sortedKeys' `[]` and a non-empty body.
+        if len(a.body) == 0:
+            out = out + ",\"writes\":null,\"reads\":null"
+            if len(a.seal) > 0:
+                let sj0 = do textListJSON(a.seal)
+                out = out + ",\"seal\":" + sj0
+            return out + ",\"body\":null}"
+        let wj = do textListJSON(a.writes)
+        let rdj = do textListJSON(a.reads)
+        out = out + ",\"writes\":" + wj + ",\"reads\":" + rdj
+        if len(a.seal) > 0:
+            let sj = do textListJSON(a.seal)
+            out = out + ",\"seal\":" + sj
+        let bj = do irStmtListJSON(a.body)
+        return out + ",\"body\":" + bj + "}"
+
+    proc irProcJSON(p: IRProc) -> text:
+        let nq = do jsonQuote(p.name)
+        let pj = do irParamsJSON(p.params)
+        let mut out = "{\"name\":" + nq + ",\"params\":" + pj
+        if p.ret != "":
+            let rq = do jsonQuote(p.ret)
+            out = out + ",\"ret\":" + rq
+        if p.retList:
+            out = out + ",\"retList\":true"
+        let bj = do irStmtListJSON(p.body)
+        return out + ",\"body\":" + bj + "}"
+
+    proc irEnumJSON(e: IREnum) -> text:
+        let nq = do jsonQuote(e.name)
+        let vj = do textListJSON(e.values)
+        let wj = do textListJSON(e.wireNames)
+        return "{\"name\":" + nq + ",\"values\":" + vj + ",\"wireNames\":" + wj + "}"
+
+    # ── live driver: round trip one declaration of a given kind ────────────
+    proc irDeclRoundTrip(kind: text, src: text) -> text:
+        let v = do jsonParse(src)
+        if kind == "entity":
+            let e = do irEntityFromJVal(v)
+            let j = do irEntityJSON(e)
+            return j
+        if kind == "state":
+            let s = do irStateFromJVal(v)
+            let j = do irStateJSON(s)
+            return j
+        if kind == "derive":
+            let d = do irDeriveFromJVal(v)
+            let j = do irDeriveJSON(d, false)
+            return j
+        if kind == "policy":
+            let p = do irPolicyFromJVal(v)
+            let j = do irPolicyJSON(p)
+            return j
+        if kind == "action":
+            let a = do irActionFromJVal(v)
+            let j = do irActionJSON(a)
+            return j
+        if kind == "proc":
+            let p = do irProcFromJVal(v)
+            let j = do irProcJSON(p)
+            return j
+        if kind == "enum":
+            let e = do irEnumFromJVal(v)
+            let j = do irEnumJSON(e)
+            return j
+        return ""
+
+    state irDeclBack: text = ""
+
+    action runIRDeclRoundTrip(kind: text, src: text):
+        let j = do irDeclRoundTrip(kind, src)
+        irDeclBack = j
+
+    private view IRDeclHome at "/ir_decl":
+        box:
+            text "{irDeclBack}"

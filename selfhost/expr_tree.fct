@@ -12,16 +12,22 @@ app ExprTreeSelfHost:
     #   bitOr      := bitXor (('|') bitXor)*
     #   bitXor     := bitAnd (('^') bitAnd)*
     #   bitAnd     := comparison (('&') comparison)*
-    #   comparison := expr (('==' | '!=' | '<' | '<=' | '>' | '>=') expr)*
+    #   comparison := shift (('==' | '!=' | '<' | '<=' | '>' | '>=' | 'in') shift)*
+    #   shift      := expr (('<<' | '>>') expr)*
     #   expr       := term (('+' | '-') term)*
-    #   term       := unary (('*' | '/') unary)*
+    #   term       := unary (('*' | '/' | '%') unary)*
     #   unary      := ('-' | '!' | '~') unary | postfix
     #   postfix    := atom (('.' IDENT) | ('[' or ']'))*
     #   atom       := NUMBER | IDENT | STRING | '(' or ')' | '[' args ']' |
-    #                 '{' pairs '}' | agg | call | entityGet
+    #                 '{' pairs '}' | structLit | agg | actState | call |
+    #                 entityGet
     #
-    # This is exactly expr.go's real precedence table minus shifts and `%`/
-    # the general `in` operator (this file's header explains why). Every
+    # This is exactly expr.go's real binPrec precedence table, level for
+    # level (`||` 1, `&&` 2, `|` 3, `^` 4, `&` 5, comparison + `in` 6,
+    # shifts 7, `+ -` 8, `* / %` 9), with `in` — the one word-shaped
+    # operator, an IDENT token rather than an "op" one — admitted at the
+    # comparison level exactly as parseBinary's own `t.kind == tIdent &&
+    # t.text == "in"` case does. Every
     # `*End` proc below is mutually recursive with its neighbors exactly the
     # way `*Nodes` (STAGE 2b) is — both walk the identical grammar, so the
     # number of tokens either family consumes always agrees with the
@@ -57,34 +63,46 @@ app ExprTreeSelfHost:
     # postfixEnd: the position twin of expr.go's parsePostfix — sits between
     # a primary atom (factorEnd) and unary (unaryEnd), so `.field`/`[index]`
     # bind TIGHTER than every unary/binary operator. Before falling through
-    # to factorEnd, checks (in the same order expr.go's real switch does)
-    # whether the token at `pos` starts an aggregate (isAggStartAt), a
-    # builtin call (isCallStartAt), or an entity lookup
-    # (isEntityLookupStartAt) — see each helper's own doc, STAGE 2c/2d/2f,
-    # for the exact disambiguation. `.field` always advances exactly 2
+    # to factorEnd, checks (in the same order expr.go's real if/switch
+    # does) whether the token at `pos` starts a struct literal
+    # (isStructLitStartAt — a capitalized name followed by `{`), an
+    # aggregate (isAggStartAt), an action-state read (isActStateStartAt),
+    # a builtin call (isCallStartAt), or an entity lookup
+    # (isEntityLookupStartAt) — see each helper's own doc, STAGE 2c/2d/2f/
+    # 2g/2h, for the exact disambiguation. `.field` always advances exactly 2
     # tokens (the `.` plus the field-name IDENT); `[index]` advances past
     # `[`, a FULL sub-expression (orEnd — the loosest level, matching
     # parsePostfix's own `p.parseBinary(0)` for the index), and the closing
     # `]`. Both loop, so chained postfixes fall out for free.
     proc postfixEnd(kinds: [text], texts: [text], pos: int) -> int:
+        let isStruct = do isStructLitStartAt(kinds, texts, pos)
         let isAgg = do isAggStartAt(kinds, texts, pos)
+        let isAct = do isActStateStartAt(kinds, texts, pos)
         let isCall = do isCallStartAt(kinds, texts, pos)
         let isEntity = do isEntityLookupStartAt(kinds, texts, pos)
         let mut p0 = 0
-        if isAgg:
-            let ae = do aggEnd(kinds, texts, pos + 1)
-            p0 = ae
+        if isStruct:
+            let se = do structLitEnd(kinds, texts, pos + 1)
+            p0 = se
         else:
-            if isCall:
-                let ce = do callEnd(kinds, texts, pos + 1)
-                p0 = ce
+            if isAgg:
+                let ae = do aggEnd(kinds, texts, pos + 1)
+                p0 = ae
             else:
-                if isEntity:
-                    let ee = do entityGetEnd(kinds, texts, pos + 1)
-                    p0 = ee
+                if isAct:
+                    let ase = do actStateEnd(kinds, texts, pos + 1)
+                    p0 = ase
                 else:
-                    let fe = do factorEnd(kinds, texts, pos)
-                    p0 = fe
+                    if isCall:
+                        let ce = do callEnd(kinds, texts, pos + 1)
+                        p0 = ce
+                    else:
+                        if isEntity:
+                            let ee = do entityGetEnd(kinds, texts, pos + 1)
+                            p0 = ee
+                        else:
+                            let fe = do factorEnd(kinds, texts, pos)
+                            p0 = fe
         let mut p = p0
         let n = len(kinds)
         let mut cont = true
@@ -123,22 +141,21 @@ app ExprTreeSelfHost:
             let atEnd = do postfixEnd(kinds, texts, pos)
             return atEnd
 
+    # isTermOpTok: `* / %` — binPrec's tightest binary level (9).
+    proc isTermOpTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && (texts[p] == "*" || texts[p] == "/" || texts[p] == "%")
+
     proc termEnd(kinds: [text], texts: [text], pos: int) -> int:
         let p0 = do unaryEnd(kinds, texts, pos)
         let mut p = p0
         let n = len(kinds)
-        let mut cont = true
+        let cont0 = do isTermOpTok(texts, n, p)
+        let mut cont = cont0
         loop cont:
-            cont = false
-            if p < n:
-                if texts[p] == "*":
-                    cont = true
-                else:
-                    if texts[p] == "/":
-                        cont = true
-            if cont:
-                let next = do unaryEnd(kinds, texts, p + 1)
-                p = next
+            let next = do unaryEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isTermOpTok(texts, n, p)
+            cont = contNext
         return p
 
     proc exprEnd(kinds: [text], texts: [text], pos: int) -> int:
@@ -160,20 +177,50 @@ app ExprTreeSelfHost:
         return p
 
     # ------------------------------------------------------------
-    # Six more precedence levels, loosest at the bottom (`or`), each a
+    # Seven more precedence levels, loosest at the bottom (`or`), each a
     # direct generalization of termEnd/exprEnd above.
     # ------------------------------------------------------------
+    # isShiftOpTok: `<<`/`>>` — binPrec 7, tighter than a comparison
+    # (`x << 1 == y` is `(x << 1) == y`) but looser than `+ - * / %`
+    # (`a + b << 1` is `(a + b) << 1`), C's own placement. Both are single
+    # two-character "op" tokens (expr_tokens.fct's isTwoCharOp), so a plain
+    # text compare suffices here.
+    proc isShiftOpTok(texts: [text], n: int, p: int) -> bool:
+        return p < n && (texts[p] == "<<" || texts[p] == ">>")
+
+    proc shiftEnd(kinds: [text], texts: [text], pos: int) -> int:
+        let p0 = do exprEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isShiftOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do exprEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isShiftOpTok(texts, n, p)
+            cont = contNext
+        return p
+
+    # isCompareOpTok: the six symbolic comparisons plus `in` (membership),
+    # all binPrec 6. `in` is matched by TEXT alone: the tokenizer can only
+    # ever produce the text `in` for an IDENT token (a string literal keeps
+    # its quotes, an "op" token is never letters), so this is exactly
+    # parseBinary's `t.kind == tIdent && t.text == "in"` test. Note that an
+    # aggregate's own `in` is never seen here: aggEnd/aggNodes parse the
+    # reduced value at the SHIFT level (precArith = 7), one level tighter
+    # than this one, precisely so the `in` that separates it from its
+    # collection is left for them — the same floor expr.go's parseAgg uses.
     proc isCompareOpTok(texts: [text], n: int, p: int) -> bool:
-        return p < n && (texts[p] == "==" || texts[p] == "!=" || texts[p] == "<" || texts[p] == "<=" || texts[p] == ">" || texts[p] == ">=")
+        return p < n && (texts[p] == "==" || texts[p] == "!=" || texts[p] == "<" || texts[p] == "<=" || texts[p] == ">" || texts[p] == ">=" || texts[p] == "in")
 
     proc comparisonEnd(kinds: [text], texts: [text], pos: int) -> int:
-        let p0 = do exprEnd(kinds, texts, pos)
+        let p0 = do shiftEnd(kinds, texts, pos)
         let mut p = p0
         let n = len(kinds)
         let cont0 = do isCompareOpTok(texts, n, p)
         let mut cont = cont0
         loop cont:
-            let next = do exprEnd(kinds, texts, p + 1)
+            let next = do shiftEnd(kinds, texts, p + 1)
             p = next
             let contNext = do isCompareOpTok(texts, n, p)
             cont = contNext
@@ -331,47 +378,66 @@ app ExprTreeSelfHost:
     # a running `obj` local to the postfix node just built before looping
     # again — exactly what makes chained postfixes (`a.field.other`,
     # `a[i][j]`, `a.field[i]`, `a[i].field`) fall out for free. Before
-    # building the primary atom, checks the same three dispatch conditions
-    # postfixEnd checks, in the same order, delegating to aggNodes/
-    # callNodes/entityGetNodes instead of factorNodes when one applies —
+    # building the primary atom, checks the same five dispatch conditions
+    # postfixEnd checks, in the same order, delegating to structLitNodes/
+    # aggNodes/actStateNodes/callNodes/entityGetNodes instead of
+    # factorNodes when one applies —
     # the result is just another `obj` either way, so `len(x).field` or
     # `count(x in Coll ...).field` (odd but grammatically legal) fall out
     # for free too.
     proc postfixNodes(kinds: [text], texts: [text], pos: int) -> ExprNode:
+        let isStruct = do isStructLitStartAt(kinds, texts, pos)
         let isAgg = do isAggStartAt(kinds, texts, pos)
+        let isAct = do isActStateStartAt(kinds, texts, pos)
         let isCall = do isCallStartAt(kinds, texts, pos)
         let isEntity = do isEntityLookupStartAt(kinds, texts, pos)
         let obj0 = do emptyNode()
         let mut obj = obj0
-        if isAgg:
-            let a0 = do aggNodes(kinds, texts, pos, pos + 1)
-            obj = a0
+        if isStruct:
+            let s0 = do structLitNodes(kinds, texts, pos, pos + 1)
+            obj = s0
         else:
-            if isCall:
-                let c0 = do callNodes(kinds, texts, pos, pos + 1)
-                obj = c0
+            if isAgg:
+                let a0 = do aggNodes(kinds, texts, pos, pos + 1)
+                obj = a0
             else:
-                if isEntity:
-                    let e0 = do entityGetNodes(kinds, texts, pos, pos + 1)
-                    obj = e0
+                if isAct:
+                    let as0 = do actStateNodes(kinds, texts, pos, pos + 1)
+                    obj = as0
                 else:
-                    let f0 = do factorNodes(kinds, texts, pos)
-                    obj = f0
+                    if isCall:
+                        let c0 = do callNodes(kinds, texts, pos, pos + 1)
+                        obj = c0
+                    else:
+                        if isEntity:
+                            let e0 = do entityGetNodes(kinds, texts, pos, pos + 1)
+                            obj = e0
+                        else:
+                            let f0 = do factorNodes(kinds, texts, pos)
+                            obj = f0
         let mut p = 0
-        if isAgg:
-            let ae = do aggEnd(kinds, texts, pos + 1)
-            p = ae
+        if isStruct:
+            let se = do structLitEnd(kinds, texts, pos + 1)
+            p = se
         else:
-            if isCall:
-                let ce = do callEnd(kinds, texts, pos + 1)
-                p = ce
+            if isAgg:
+                let ae = do aggEnd(kinds, texts, pos + 1)
+                p = ae
             else:
-                if isEntity:
-                    let ee = do entityGetEnd(kinds, texts, pos + 1)
-                    p = ee
+                if isAct:
+                    let ase = do actStateEnd(kinds, texts, pos + 1)
+                    p = ase
                 else:
-                    let fe = do factorEnd(kinds, texts, pos)
-                    p = fe
+                    if isCall:
+                        let ce = do callEnd(kinds, texts, pos + 1)
+                        p = ce
+                    else:
+                        if isEntity:
+                            let ee = do entityGetEnd(kinds, texts, pos + 1)
+                            p = ee
+                        else:
+                            let fe = do factorEnd(kinds, texts, pos)
+                            p = fe
         let n = len(kinds)
         let mut cont = true
         loop cont:
@@ -413,22 +479,17 @@ app ExprTreeSelfHost:
         let p0 = do unaryEnd(kinds, texts, pos)
         let mut p = p0
         let n = len(kinds)
-        let mut cont = true
+        let cont0 = do isTermOpTok(texts, n, p)
+        let mut cont = cont0
         loop cont:
-            cont = false
-            if p < n:
-                if texts[p] == "*":
-                    cont = true
-                else:
-                    if texts[p] == "/":
-                        cont = true
-            if cont:
-                let opText = texts[p]
-                let right = do unaryNodes(kinds, texts, p + 1)
-                let combined = do binNode(opText, left, right)
-                left = combined
-                let next = do unaryEnd(kinds, texts, p + 1)
-                p = next
+            let opText = texts[p]
+            let right = do unaryNodes(kinds, texts, p + 1)
+            let combined = do binNode(opText, left, right)
+            left = combined
+            let next = do unaryEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isTermOpTok(texts, n, p)
+            cont = contNext
         return left
 
     proc exprNodes(kinds: [text], texts: [text], pos: int) -> ExprNode:
@@ -456,20 +517,20 @@ app ExprTreeSelfHost:
         return left
 
     # ------------------------------------------------------------
-    # Six more precedence levels, the tree-building twins of the *End
+    # Seven more precedence levels, the tree-building twins of the *End
     # levels above — each one builds the tighter operand, remembers it as
     # `left`, then for each same-level operator found: builds the next
     # operand, combines it with `left` via binNode, and makes THAT the new
     # `left` — left-associative chaining, the same shape termNodes/
     # exprNodes above already use.
     # ------------------------------------------------------------
-    proc comparisonNodes(kinds: [text], texts: [text], pos: int) -> ExprNode:
+    proc shiftNodes(kinds: [text], texts: [text], pos: int) -> ExprNode:
         let left0 = do exprNodes(kinds, texts, pos)
         let mut left = left0
         let p0 = do exprEnd(kinds, texts, pos)
         let mut p = p0
         let n = len(kinds)
-        let cont0 = do isCompareOpTok(texts, n, p)
+        let cont0 = do isShiftOpTok(texts, n, p)
         let mut cont = cont0
         loop cont:
             let opText = texts[p]
@@ -477,6 +538,25 @@ app ExprTreeSelfHost:
             let combined = do binNode(opText, left, right)
             left = combined
             let next = do exprEnd(kinds, texts, p + 1)
+            p = next
+            let contNext = do isShiftOpTok(texts, n, p)
+            cont = contNext
+        return left
+
+    proc comparisonNodes(kinds: [text], texts: [text], pos: int) -> ExprNode:
+        let left0 = do shiftNodes(kinds, texts, pos)
+        let mut left = left0
+        let p0 = do shiftEnd(kinds, texts, pos)
+        let mut p = p0
+        let n = len(kinds)
+        let cont0 = do isCompareOpTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let opText = texts[p]
+            let right = do shiftNodes(kinds, texts, p + 1)
+            let combined = do binNode(opText, left, right)
+            left = combined
+            let next = do shiftEnd(kinds, texts, p + 1)
             p = next
             let contNext = do isCompareOpTok(texts, n, p)
             cont = contNext
@@ -588,14 +668,26 @@ app ExprTreeSelfHost:
     # ============================================================
     #
     # isCallNameTok: the closed builtin-name allowlist expr.go's own
-    # isBuiltinCall switch defines, MINUS `min`/`max` (see this file's
-    # header on why they can never be a plain call in this port's grammar).
-    # Every other name isBuiltinCall accepts must appear here too.
+    # isBuiltinCall switch defines, restated name for name and in the same
+    # order (effectful clock/RNG, print, math/money, int<->float and
+    # bit-cast conversions, toMoney, string, bytes, date, formatting,
+    # array, byte-buffer, file I/O, HTTP, inbound TCP, channels) — a
+    # closed-alphabet `in` test rather than a `||` chain, so adding a name
+    # is one token. Includes `min`/`max`: they ARE builtin calls in
+    # isBuiltinCall, and isCallStartAt (below) adds the comma gate that
+    # keeps the single-argument aggregate form away from here.
     proc isCallNameTok(texts: [text], n: int, pos: int) -> bool:
-        return pos < n && (texts[pos] == "len" || texts[pos] == "upper" || texts[pos] == "lower" || texts[pos] == "trim" || texts[pos] == "abs" || texts[pos] == "floor" || texts[pos] == "round" || texts[pos] == "money" || texts[pos] == "toFloat" || texts[pos] == "toInt" || texts[pos] == "toMoney" || texts[pos] == "contains" || texts[pos] == "take" || texts[pos] == "split" || texts[pos] == "slice" || texts[pos] == "charAt" || texts[pos] == "textToBytes" || texts[pos] == "bytesToText" || texts[pos] == "byteLen" || texts[pos] == "year" || texts[pos] == "month" || texts[pos] == "day" || texts[pos] == "ago" || texts[pos] == "compact" || texts[pos] == "commas" || texts[pos] == "append" || texts[pos] == "bytes" || texts[pos] == "readFile" || texts[pos] == "writeFile" || texts[pos] == "httpGet" || texts[pos] == "httpPost" || texts[pos] == "listen" || texts[pos] == "accept" || texts[pos] == "readBytes" || texts[pos] == "writeBytes" || texts[pos] == "closeConn" || texts[pos] == "channel" || texts[pos] == "send" || texts[pos] == "recv" || texts[pos] == "now" || texts[pos] == "rand" || texts[pos] == "print")
+        return pos < n && texts[pos] in ["now", "rand", "print", "abs", "min", "max", "floor", "round", "money", "toFloat", "toInt", "floatBits", "floatFromBits", "toMoney", "len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", "replace", "slug", "textToBytes", "bytesToText", "byteLen", "year", "month", "day", "ago", "compact", "commas", "append", "bytes", "readFile", "writeFile", "httpGet", "httpPost", "listen", "accept", "readBytes", "writeBytes", "closeConn", "channel", "send", "recv"]
 
     # isCallStartAt: true iff the token at `pos` is a plain IDENT naming a
-    # builtin, immediately followed by `(`.
+    # builtin, immediately followed by `(` — with one gate: `min`/`max` are
+    # a call only when their argument list has a top-level comma
+    # (hasTopLevelCommaAt, STAGE 2f — expr.go's argListHasComma). Without
+    # one, expr.go's parsePostfix routes them to parseAgg unconditionally
+    # (and `max(x)`, a numeric aggregate with no field, is then a real parse
+    # error) — so this port never turns a comma-less `min(...)`/`max(...)`
+    # into a Call either: isAggStartAt either accepts it as an aggregate or
+    # it stays unconsumed, the honest degrade for what Go rejects.
     proc isCallStartAt(kinds: [text], texts: [text], pos: int) -> bool:
         let n = len(kinds)
         if pos < n:
@@ -603,7 +695,12 @@ app ExprTreeSelfHost:
                 let nameOk = do isCallNameTok(texts, n, pos)
                 if nameOk:
                     if pos + 1 < n:
-                        return texts[pos + 1] == "("
+                        if texts[pos + 1] == "(":
+                            let isMinMax = texts[pos] == "min" || texts[pos] == "max"
+                            if isMinMax:
+                                let hasComma = do hasTopLevelCommaAt(kinds, texts, pos + 1)
+                                return hasComma
+                            return true
         return false
 
     # isArgSepTok / argListEmptyAt: the two small closed-alphabet checks
@@ -690,11 +787,13 @@ app ExprTreeSelfHost:
     # ============================================================
     #
     # isEntityNameTok: the closed set of names that, immediately followed
-    # by `(`, are NEVER an entity name — always either an aggregate or an
-    # action-state read. `true`/`false` are included defensively (they can
-    # never actually reach this check in practice, since factorLeafNodes
-    # special-cases them into Lit(bool) before postfixNodes ever consults
-    # this).
+    # by `(`, are NEVER an entity name — always either an aggregate
+    # (STAGE 2f) or an action-state read (STAGE 2h); when neither of those
+    # accepts the shape (expr.go's parseAgg/parseActState would error), the
+    # name stays an ordinary `ref` and the `(` is left unconsumed. `true`/
+    # `false` are included defensively (they can never actually reach this
+    # check in practice, since factorLeafNodes special-cases them into
+    # Lit(bool) before postfixNodes ever consults this).
     proc isEntityNameTok(texts: [text], n: int, pos: int) -> bool:
         return texts[pos] == "count" || texts[pos] == "sum" || texts[pos] == "exists" || texts[pos] == "avg" || texts[pos] == "min" || texts[pos] == "max" || texts[pos] == "pending" || texts[pos] == "failed" || texts[pos] == "dirty" || texts[pos] == "touched" || texts[pos] == "true" || texts[pos] == "false"
 
@@ -960,13 +1059,14 @@ app ExprTreeSelfHost:
         return ""
 
     # aggEnd: the position twin. `parenPos` is the index of the `(` token
-    # itself. The reduced value (`head`) is parsed at exprEnd's level —
-    # this port's equivalent of real precArith (admits `+`/`-`/`*`/`/`/
+    # itself. The reduced value (`head`) is parsed at shiftEnd's level —
+    # exactly real precArith (7): admits shifts, `+`/`-`/`*`/`/`/`%` and
     # unary, stops before comparison — leaving `in` free for this proc to
-    # see). `in`/`where` are matched by plain TEXT equality against IDENT
-    # tokens, no new tokenizer support needed.
+    # see rather than for isCompareOpTok's membership operator to swallow.
+    # `in`/`where` are matched by plain TEXT equality against IDENT tokens,
+    # no new tokenizer support needed.
     proc aggEnd(kinds: [text], texts: [text], parenPos: int) -> int:
-        let headEnd = do exprEnd(kinds, texts, parenPos + 1)
+        let headEnd = do shiftEnd(kinds, texts, parenPos + 1)
         let n = len(kinds)
         let mut p = headEnd
         if p < n:
@@ -981,8 +1081,8 @@ app ExprTreeSelfHost:
     # aggNodes: the tree-building twin. `nameTok` is the aggregate name's
     # own token index.
     #
-    # Step 1: build `head` (the reduced value) via exprNodes, at the same
-    # floor aggEnd's own exprEnd call uses, and inspect its own `.kind` to
+    # Step 1: build `head` (the reduced value) via shiftNodes, at the same
+    # floor aggEnd's own shiftEnd call uses, and inspect its own `.kind` to
     # replicate expr.go's real three-way shape dispatch — now a direct
     # field read, not an arena-index-and-kind-lookup:
     #   - "ref" (e.g. `l` in `count(l in CartLine ...)`): the value IS the
@@ -1003,8 +1103,8 @@ app ExprTreeSelfHost:
     # Step 3: an optional `where <cond>` is built via orNodes regardless of
     # which form preceded it.
     proc aggNodes(kinds: [text], texts: [text], nameTok: int, parenPos: int) -> ExprNode:
-        let head = do exprNodes(kinds, texts, parenPos + 1)
-        let headEnd = do exprEnd(kinds, texts, parenPos + 1)
+        let head = do shiftNodes(kinds, texts, parenPos + 1)
+        let headEnd = do shiftEnd(kinds, texts, parenPos + 1)
         let n = len(kinds)
         let mut itemVar = ""
         let mut coll = ""
@@ -1053,3 +1153,122 @@ app ExprTreeSelfHost:
         let node = do aggNode(texts[nameTok], itemVar, coll, fieldName, whereClause, sel)
         return node
 
+    # ============================================================
+    # STAGE 2g: struct literals — `Name{f1: v1, f2: v2}` (ast.StructLit,
+    # expr.go's parseStructLit). Recognized in postfixEnd/postfixNodes'
+    # dispatch, BEFORE the call-position checks, exactly where parsePostfix
+    # tests `t.text == "{" && isUpper(ref.Name)` on a freshly-parsed Ref:
+    # a capitalized IDENT immediately followed by `{`. A bare `{` starting
+    # a fresh atom is still the map literal (STAGE 2e) — the two can never
+    # collide, since a struct literal's `{` always FOLLOWS a name. The
+    # field list reuses the map literal's `[Pair]` shape (expr_tokens.fct's
+    # kind == "struct" doc): each key is a `ref` node holding the field
+    # name, because parseStructLit reads a bare IDENT there, not a key
+    # expression.
+    # ============================================================
+    #
+    # isStructLitStartAt: `IDENT-starting-with-A..Z` `{` `IDENT` — the
+    # third token is required too, because expr.go rejects both `Name{}`
+    # ("literal has no fields") and `Name{1: 2}` ("expected a field name"):
+    # refusing to START a struct literal there leaves `Name` as a plain ref
+    # with the `{...}` unconsumed — this port's honest degrade for a real
+    # parse error, the same convention isAggStartAt uses for `max(x)`.
+    # A lower-case name followed by `{` is likewise not started (expr.go
+    # leaves it a syntax error).
+    proc isStructLitStartAt(kinds: [text], texts: [text], pos: int) -> bool:
+        let n = len(kinds)
+        if pos + 2 < n:
+            if kinds[pos] == "ident":
+                let upper = do isUpperChar(charAt(texts[pos], 0))
+                if upper:
+                    if texts[pos + 1] == "{":
+                        return kinds[pos + 2] == "ident"
+        return false
+
+    # structFieldListEnd: `pos` is the token index right AFTER the opening
+    # `{`, on the first field name. Each entry is exactly IDENT `:` value
+    # — two fixed tokens then one full sub-expression (orEnd, matching
+    # parseStructLit's `p.parseBinary(0)` for the value) — separated by
+    # `,`, closed by `}`. Returns the index just past the `}`.
+    proc structFieldListEnd(kinds: [text], texts: [text], pos: int) -> int:
+        let n = len(kinds)
+        let p0 = do orEnd(kinds, texts, pos + 2)
+        let mut p = p0
+        let cont0 = do isArgSepTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let next = do orEnd(kinds, texts, p + 3)
+            p = next
+            let contNext = do isArgSepTok(texts, n, p)
+            cont = contNext
+        return p + 1
+
+    # structFieldListNodes: the tree-building twin — accumulates one
+    # `Pair{key: ref(fieldName), value: <expr>}` per field, in order.
+    proc structFieldListNodes(kinds: [text], texts: [text], pos: int) -> [Pair]:
+        let n = len(kinds)
+        let key0 = do refNode(texts[pos])
+        let val0 = do orNodes(kinds, texts, pos + 2)
+        let mut fields = [Pair{key: key0, value: val0}]
+        let p0 = do orEnd(kinds, texts, pos + 2)
+        let mut p = p0
+        let cont0 = do isArgSepTok(texts, n, p)
+        let mut cont = cont0
+        loop cont:
+            let keyN = do refNode(texts[p + 1])
+            let valN = do orNodes(kinds, texts, p + 3)
+            fields = append(fields, Pair{key: keyN, value: valN})
+            let next = do orEnd(kinds, texts, p + 3)
+            p = next
+            let contNext = do isArgSepTok(texts, n, p)
+            cont = contNext
+        return fields
+
+    # structLitEnd / structLitNodes: `Name{fields...}`. `bracePos` is the
+    # index of the `{` token itself; `nameTok` the type name's own token.
+    proc structLitEnd(kinds: [text], texts: [text], bracePos: int) -> int:
+        let e = do structFieldListEnd(kinds, texts, bracePos + 1)
+        return e
+
+    proc structLitNodes(kinds: [text], texts: [text], nameTok: int, bracePos: int) -> ExprNode:
+        let fields = do structFieldListNodes(kinds, texts, bracePos + 1)
+        let node = do structLitNode(texts[nameTok], fields)
+        return node
+
+    # ============================================================
+    # STAGE 2h: action-state reads — `pending(action)`, `failed(action)`,
+    # `dirty(cell)`, `touched(cell)` (ast.ActState, expr.go's
+    # parseActState). Checked in postfixEnd/postfixNodes' dispatch right
+    # after the aggregate check and before the builtin-call one, the same
+    # slot parsePostfix's switch gives them. The argument is exactly one
+    # bare IDENT, never an expression.
+    # ============================================================
+    #
+    # isActStateNameTok: the closed four-name alphabet.
+    proc isActStateNameTok(texts: [text], n: int, pos: int) -> bool:
+        return pos < n && texts[pos] in ["pending", "failed", "dirty", "touched"]
+
+    # isActStateStartAt: name `(` IDENT `)` — all four tokens are required,
+    # because parseActState errors on anything else ("pending needs an
+    # action name" / "missing `)`"); refusing to start the read there leaves
+    # the name a plain ref with the `(...)` unconsumed, the honest degrade
+    # for a real parse error (see isStructLitStartAt / isAggStartAt).
+    proc isActStateStartAt(kinds: [text], texts: [text], pos: int) -> bool:
+        let n = len(kinds)
+        if pos + 3 < n:
+            if kinds[pos] == "ident":
+                let nameOk = do isActStateNameTok(texts, n, pos)
+                if nameOk:
+                    if texts[pos + 1] == "(":
+                        if kinds[pos + 2] == "ident":
+                            return texts[pos + 3] == ")"
+        return false
+
+    # actStateEnd / actStateNodes: `parenPos` is the index of the `(`
+    # token itself; the read always spans exactly `(` IDENT `)`.
+    proc actStateEnd(kinds: [text], texts: [text], parenPos: int) -> int:
+        return parenPos + 3
+
+    proc actStateNodes(kinds: [text], texts: [text], nameTok: int, parenPos: int) -> ExprNode:
+        let node = do actStateNode(texts[nameTok], texts[parenPos + 1])
+        return node

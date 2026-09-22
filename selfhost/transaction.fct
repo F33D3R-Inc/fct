@@ -1,0 +1,1813 @@
+import "core_types.fct"
+import "index_text.fct"
+import "reference.fct"
+
+app TransactionSelfHost:
+    # Self-hosting port of facetql/src/storage/transaction.rs (the resolved
+    # `Operation` set, `Operation::validate`, `Transaction` and its
+    # `commit` driver) and facetql/src/storage/commit.rs (`StagedCommit`:
+    # the BEGIN … COMMIT staging frame, its checkpoint fence and its
+    # drop-guard). Read both Rust files in full before editing this file,
+    # then the three files imported above — every type and every
+    # admissibility check this port needs already lives in one of them
+    # and is reused, not restated:
+    #   core_types.fct  Node / Edge / EdgeId / HistoryEntry / UserRecord —
+    #                   the payloads an Operation carries (nodeNew,
+    #                   edgeNew, edgeIdNew, historyEntryMake, coordinateNew).
+    #   index_text.fct  the key-admissibility gate `Operation::validate`
+    #                   delegates to: checkNodeKeys / checkHistoryKeys /
+    #                   checkEdgeKeys / checkIndexKeyAdmissible /
+    #                   checkIndexComponent, the constants (indexMaxKeyLen
+    #                   1024, indexMaxIndexValueLen 512, textIndexGramLen 3,
+    #                   textIndexMaxTextValueLen 16384), and the `data`
+    #                   value encoders (DataValue, encodeOrderValue,
+    #                   appendEscaped, concatBytes) plus `CheckResult`, the
+    #                   `Result<(), String>` shape every check returns.
+    #   reference.fct   ReferenceDef + referenceDefValidate + referenceDefNew
+    #                   + referenceNameIsValid (the index-name alphabet is,
+    #                   by reference.rs's own doc, the same alphabet).
+    # changes.fct (the ported replay rule) is NOT imported although it
+    # would have been useful: it and core_types.fct both declare `view
+    # Home at "/"`, and the compiler refuses two views at one path. The
+    # replay consequence of every frame this file writes is therefore
+    # asserted by transaction_test.go against the record sequences
+    # recovery inspects, straight from commit.rs's own crash table.
+    #
+    # ============================================================
+    # WHAT WAS PORTED (exact Rust items -> procs below)
+    # ============================================================
+    # transaction.rs
+    #   `enum Operation` (13 variants)       -> struct Operation (tag +
+    #                                           payload fields) and the
+    #                                           opArchive/opInsert/opDelete/
+    #                                           opInsertEdge/opDeleteEdge/
+    #                                           opInsertUser/opRevokeUser/
+    #                                           opCreateIndex/opDropIndex/
+    #                                           opCreateReference/
+    #                                           opDropReference/
+    #                                           opCreateTextIndex/
+    #                                           opDropTextIndex constructors
+    #   `Operation::validate`                -> operationValidate
+    #   `Operation::to_wal`                  -> operationWalTag (see
+    #                                           simplification 4)
+    #   `Transaction::new`                   -> transactionNew
+    #   `Transaction::from_operations`       -> transactionFromOperations
+    #   `Transaction::commit` (steps 1-5,
+    #     both failure classes, the empty
+    #     no-op)                             -> transactionCommit
+    # commit.rs
+    #   `StagedCommit` (transaction_id,
+    #     begin_sequence, commit_sequence)   -> struct StagedCommit
+    #   `StagedCommit::open`                 -> stagedCommitOpen
+    #   `StagedCommit::stage`                -> stagedCommitStage
+    #   `StagedCommit::commit`               -> stagedCommitCommit
+    #   `StagedCommit::settle`               -> stagedCommitSettle
+    #   `impl Drop for StagedCommit`         -> stagedCommitDrop
+    # wal.rs (only what the frame calls — the counters and the three
+    # control-record writers, with their `STANDALONE_TRANSACTION_ID`
+    # guards and messages verbatim)
+    #   `next_sequence`/`next_operation_id`/
+    #     `next_transaction_id` (AtomicU64
+    #     fetch_add(1), initial value 1,
+    #     pre-increment value returned)      -> the WalLog counters
+    #   `WalRecord::new`                     -> WalEntry
+    #   `wal::begin`/`wal::commit`/
+    #     `wal::abort`                       -> walBegin/walCommit/walAbort
+    #   `wal::append`                        -> walAppend (simplification 2)
+    # checkpoint.rs (only what the frame calls)
+    #   `begin_fence`/`release_fence`
+    #     (a BTreeSet<u64>)                  -> checkpointBeginFence /
+    #                                           checkpointReleaseFence over
+    #                                           a sorted [int]
+    #   `ceiling` (min_fence - 1, else
+    #     unbounded)                         -> checkpointCeiling
+    # index.rs / text.rs (the two definition validators and the two
+    # per-node loops `Operation::validate` calls that index_text.fct's
+    # header explicitly left unported)
+    #   `IndexDef` + `IndexDef::validate`    -> struct IndexDef +
+    #                                           indexDefValidate
+    #   `TextIndexDef` +
+    #     `TextIndexDef::validate`           -> struct TextIndexDef +
+    #                                           textIndexDefValidate
+    #   `Declared` + `data_for`/`text_for`   -> struct Declared +
+    #                                           declaredDataFor/
+    #                                           declaredTextFor
+    #   `check_data_keys` (the loop, with
+    #     its message verbatim)              -> checkDataKeys
+    #   `check_text_keys` + `indexed_text`   -> checkTextKeys
+    #   `serde_json::from_str(data).ok()`
+    #     + `Value::get(field)`              -> jsonParseObject /
+    #                                           jsonObjectGet (simplification 5)
+    #
+    # ============================================================
+    # DELIBERATE SIMPLIFICATIONS (each named, none hidden)
+    # ============================================================
+    #   1. The WAL, the checkpoint fence set and the three id counters —
+    #      process-wide statics in Rust — are one value, `WalLog`,
+    #      threaded through every proc and returned updated (procs are
+    #      pure). `entries` is the log in append order; the counters hold
+    #      the value the next `fetch_add` returns. Every allocation the
+    #      Rust code makes BEFORE an append (a sequence + operation id for
+    #      each record, a transaction id per frame) is made here at the
+    #      same point, so a failed append burns exactly the numbers the
+    #      Rust one burns — wal.rs's "GAPS ARE INTENTIONAL" contract.
+    #   2. File I/O is the out-of-scope seam: `walAppend` never touches a
+    #      disk. What it does port is the DECISION around the write: the
+    #      caller names the seam ("begin", "stage:<i>", "commit",
+    #      "abort", and transactionCommit's own "apply:<i>"), and a
+    #      `failAt` list (comma-separated seam names) makes that one
+    #      append return an io error instead — so every branch of
+    #      commit.rs's crash table ("before COMMIT is durable" / "after")
+    #      and transaction.rs's two failure classes is reachable and
+    #      checked. fsync placement (BEGIN and staged records written but
+    #      not synced, one sync at COMMIT, ABORT never synced) is a
+    #      property of the seam and is recorded here only as commentary.
+    #   3. `io::Error` is (errKind: text, err: text): "InvalidInput" and
+    #      "Other" are the two kinds the Rust code constructs itself (with
+    #      their messages verbatim), and "Io" stands for whatever the OS
+    #      would have handed back through a failed append.
+    #   4. `Operation::to_wal` clones the payload into a `WalOperation`
+    #      of the same variant. Here the WAL entry carries the Operation
+    #      value itself (a copy, since nothing here is shared) under
+    #      `opTag`, and the three control variants Begin/Commit/Abort are
+    #      the tags "begin"/"commit"/"abort" — which is exactly what
+    #      `stage`'s control-record guard has to recognise.
+    #   5. This language has no JSON decoder, so `check_data_keys`/
+    #      `check_text_keys` bring a minimal one: `jsonParseObject` reads a
+    #      top-level JSON object into (key, value) members with every
+    #      scalar decoded (strings unescaped, incl. \uXXXX and surrogate
+    #      pairs; numbers via toFloat; true/false/null) and every nested
+    #      array/object kept as a "composite" `DataValue` holding its
+    #      source text with the whitespace outside strings removed — the
+    #      shape `Value::to_string()` would serialise it back to, up to
+    #      escape normalisation and number reformatting inside the
+    #      composite (the only residual divergence, and only in the
+    #      byte-length a composite value contributes). Anything that is
+    #      not one well-formed top-level object decodes to "every field
+    #      absent", which is what `serde_json::from_str(..).ok()` +
+    #      `Value::get` give for the same inputs. Duplicate keys: last one
+    #      wins, as in serde_json's map. Number syntax is not validated
+    #      as strictly as serde ("01" is accepted); a number only ever
+    #      contributes its fixed 8-byte encoding, so this cannot change a
+    #      length check's answer.
+    #   6. `Transaction::commit`'s `apply` closure is the engine's
+    #      `apply_committed`, which writes heap + indexes. Its one
+    #      observable contract here — it either succeeds or returns a
+    #      String — is modelled by the "apply:<i>" seam; `applied` lists
+    #      the operations that were applied before it stopped.
+    #   7. `u64::MAX` (checkpoint.rs's "no fence, unbounded" ceiling) is
+    #      the sentinel -1 in checkpointCeiling; `int` is signed 64-bit.
+    #   8. `StagedCommit::settle(self)` on an uncommitted frame returns
+    #      the error AND, because `self` was moved in and is dropped on
+    #      that early return, runs the drop-guard (fence released, ABORT
+    #      written). stagedCommitSettle reproduces both.
+    #   9. Rust's enum makes an unknown Operation variant impossible;
+    #      here an unknown tag degrades to a validation refusal naming
+    #      the tag, never a crash.
+    #  10. reference.fct's `referenceDefValidate` is reused as-is for
+    #      `CreateReference`. Two wording divergences from reference.rs
+    #      live in that file, not this one: its name-length message says
+    #      "1..64" where Rust says "1..=64", and its component bound
+    #      counts runes where Rust counts bytes. The index/text-index
+    #      validators below use the Rust wording ("1..=64") and byteLen.
+    #
+    # No I/O anywhere in this file: every proc is a pure function over
+    # its arguments. The actions at the bottom expose scalar/list drivers
+    # for transaction_test.go, decoding their inputs from tab/newline
+    # separated scripts because an action takes scalars only.
+
+    # ============================================================
+    # PART ONE — index.rs / text.rs: the two definitions Operation
+    # carries, their validators, and `Declared`.
+    # ============================================================
+    struct IndexDef:
+        name: text
+        kind: text
+        field: text
+        unique: bool
+
+    struct TextIndexDef:
+        name: text
+        kind: text
+        field: text
+
+    # `Declared { data: Vec<IndexDef>, text: Vec<TextIndexDef> }`.
+    struct Declared:
+        dataDefs: [IndexDef]
+        textDefs: [TextIndexDef]
+
+    proc indexDefNew(name: text, kind: text, field: text, unique: bool) -> IndexDef:
+        return IndexDef{name: name, kind: kind, field: field, unique: unique}
+
+    proc textIndexDefNew(name: text, kind: text, field: text) -> TextIndexDef:
+        return TextIndexDef{name: name, kind: kind, field: field}
+
+    proc declaredEmpty() -> Declared:
+        return Declared{dataDefs: [], textDefs: []}
+
+    # `MAX_INDEX_NAME_LEN` — the name becomes a filename suffix.
+    proc indexMaxIndexNameLen() -> int:
+        return 64
+
+    # `IndexDef::validate` and `TextIndexDef::validate` have the same
+    # body, line for line, in the Rust source; this is that body once.
+    # `self.name.len()` is a byte count, hence byteLen. The alphabet
+    # check is reference.fct's `referenceNameIsValid`: reference.rs's own
+    # doc says a reference name is "restricted to the same alphabet as
+    # an index name", and a non-ASCII rune fails it exactly as its
+    # non-ASCII bytes fail Rust's `is_ascii_alphanumeric`.
+    private proc indexDefinitionValidate(name: text, kind: text, field: text) -> CheckResult:
+        let nameBytes = byteLen(name)
+        let maxNameLen = do indexMaxIndexNameLen()
+        if name == "" || nameBytes > maxNameLen:
+            let msg = "index name must be 1..=" + maxNameLen + " bytes"
+            return CheckResult{ok: false, err: msg}
+        let nameOk = do referenceNameIsValid(name)
+        if !nameOk:
+            return CheckResult{ok: false, err: "index name may contain only letters, digits, '_' and '-'"}
+        if kind == "":
+            return CheckResult{ok: false, err: "index kind must not be empty"}
+        if field == "":
+            return CheckResult{ok: false, err: "index field must not be empty"}
+        let kindCheck = do checkIndexComponent("index kind", kind)
+        if !kindCheck.ok:
+            return kindCheck
+        let fieldCheck = do checkIndexComponent("index field", field)
+        if !fieldCheck.ok:
+            return fieldCheck
+        return CheckResult{ok: true, err: ""}
+
+    proc indexDefValidate(def: IndexDef) -> CheckResult:
+        let r = do indexDefinitionValidate(def.name, def.kind, def.field)
+        return r
+
+    proc textIndexDefValidate(def: TextIndexDef) -> CheckResult:
+        let r = do indexDefinitionValidate(def.name, def.kind, def.field)
+        return r
+
+    # `Declared::data_for` / `Declared::text_for` — the declarations
+    # covering one kind, in declaration order.
+    proc declaredDataFor(declared: Declared, kind: text) -> [IndexDef]:
+        let defs = declared.dataDefs
+        let n = len(defs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if defs[i].kind == kind:
+                out = append(out, defs[i])
+            i = i + 1
+        return out
+
+    proc declaredTextFor(declared: Declared, kind: text) -> [TextIndexDef]:
+        let defs = declared.textDefs
+        let n = len(defs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if defs[i].kind == kind:
+                out = append(out, defs[i])
+            i = i + 1
+        return out
+
+    # ============================================================
+    # PART TWO — a minimal JSON object reader (simplification 5).
+    # ============================================================
+    # `jsonScan` values: `pos` is the rune index just past what was
+    # consumed; `ok` false means the document is malformed (and the whole
+    # decode is then "None", as serde's would be).
+    struct JsonScan:
+        ok: bool
+        pos: int
+        value: DataValue
+
+    struct JsonMember:
+        key: text
+        value: DataValue
+
+    struct JsonObject:
+        ok: bool
+        members: [JsonMember]
+
+    private proc quoteChar() -> text:
+        return bytesToText([34])
+
+    private proc backslashChar() -> text:
+        return bytesToText([92])
+
+    private proc jsonIsWs(c: text) -> bool:
+        return c == " " || c == "\t" || c == "\n" || c == "\r"
+
+    private proc jsonSkipWs(s: text, n: int, pos: int) -> int:
+        let mut p = pos
+        let mut going = true
+        loop going:
+            if p < n:
+                let c = charAt(s, p)
+                let ws = do jsonIsWs(c)
+                if ws:
+                    p = p + 1
+                else:
+                    going = false
+            else:
+                going = false
+        return p
+
+    private proc hexDigitValue(c: text) -> int:
+        if c == "0":
+            return 0
+        if c == "1":
+            return 1
+        if c == "2":
+            return 2
+        if c == "3":
+            return 3
+        if c == "4":
+            return 4
+        if c == "5":
+            return 5
+        if c == "6":
+            return 6
+        if c == "7":
+            return 7
+        if c == "8":
+            return 8
+        if c == "9":
+            return 9
+        if c == "a" || c == "A":
+            return 10
+        if c == "b" || c == "B":
+            return 11
+        if c == "c" || c == "C":
+            return 12
+        if c == "d" || c == "D":
+            return 13
+        if c == "e" || c == "E":
+            return 14
+        if c == "f" || c == "F":
+            return 15
+        return -1
+
+    # Four hex digits at `pos`, or -1.
+    private proc jsonHex4(s: text, n: int, pos: int) -> int:
+        if pos + 4 > n:
+            return -1
+        let mut v = 0
+        let mut i = 0
+        loop i < 4:
+            let c = charAt(s, pos + i)
+            let d = do hexDigitValue(c)
+            if d < 0:
+                return -1
+            v = v * 16 + d
+            i = i + 1
+        return v
+
+    # A code point as its UTF-8 bytes.
+    private proc utf8Encode(cp: int) -> [int]:
+        if cp < 128:
+            return [cp]
+        if cp < 2048:
+            return [192 + cp / 64, 128 + cp % 64]
+        if cp < 65536:
+            return [224 + cp / 4096, 128 + (cp / 64) % 64, 128 + cp % 64]
+        return [240 + cp / 262144, 128 + (cp / 4096) % 64, 128 + (cp / 64) % 64, 128 + cp % 64]
+
+    # A JSON string starting at the opening quote; the value is the
+    # unescaped text.
+    private proc jsonScanString(s: text, n: int, pos: int) -> JsonScan:
+        let absent = do absentDataValue()
+        let q = do quoteChar()
+        let bs = do backslashChar()
+        let mut p = pos + 1
+        let mut acc = ""
+        let mut going = true
+        let mut closed = false
+        let mut bad = false
+        loop going:
+            if p >= n:
+                going = false
+            else:
+                let c = charAt(s, p)
+                if c == q:
+                    closed = true
+                    going = false
+                    p = p + 1
+                else:
+                    if c == bs:
+                        if p + 1 >= n:
+                            bad = true
+                            going = false
+                        else:
+                            let e = charAt(s, p + 1)
+                            if e == "u":
+                                let cp = do jsonHex4(s, n, p + 2)
+                                if cp < 0:
+                                    bad = true
+                                    going = false
+                                else:
+                                    let mut code = cp
+                                    let mut used = 6
+                                    if cp >= 55296 && cp < 56320:
+                                        # a high surrogate: pair it with a
+                                        # following \uDC00..\uDFFF
+                                        if p + 11 < n + 0:
+                                            let bs2 = charAt(s, p + 6)
+                                            let u2 = charAt(s, p + 7)
+                                            if bs2 == bs && u2 == "u":
+                                                let lo = do jsonHex4(s, n, p + 8)
+                                                if lo >= 56320 && lo < 57344:
+                                                    code = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                                                    used = 12
+                                    let encoded = do utf8Encode(code)
+                                    let piece = bytesToText(encoded)
+                                    acc = acc + piece
+                                    p = p + used
+                            else:
+                                let mut piece = ""
+                                let mut known = true
+                                if e == q:
+                                    piece = q
+                                if e == bs:
+                                    piece = bs
+                                if e == "/":
+                                    piece = "/"
+                                if e == "n":
+                                    piece = "\n"
+                                if e == "t":
+                                    piece = "\t"
+                                if e == "r":
+                                    piece = "\r"
+                                if e == "b":
+                                    piece = bytesToText([8])
+                                if e == "f":
+                                    piece = bytesToText([12])
+                                if piece == "":
+                                    known = false
+                                if known:
+                                    acc = acc + piece
+                                    p = p + 2
+                                else:
+                                    bad = true
+                                    going = false
+                    else:
+                        acc = acc + c
+                        p = p + 1
+        if bad || !closed:
+            return JsonScan{ok: false, pos: p, value: absent}
+        let v = do textDataValue(acc)
+        return JsonScan{ok: true, pos: p, value: v}
+
+    private proc jsonIsNumberChar(c: text) -> bool:
+        return c in ["-", "+", ".", "e", "E", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+    private proc jsonScanNumber(s: text, n: int, pos: int) -> JsonScan:
+        let absent = do absentDataValue()
+        let mut p = pos
+        let mut going = true
+        let mut digits = 0
+        loop going:
+            if p < n:
+                let c = charAt(s, p)
+                let numeric = do jsonIsNumberChar(c)
+                if numeric:
+                    if c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]:
+                        digits = digits + 1
+                    p = p + 1
+                else:
+                    going = false
+            else:
+                going = false
+        if digits == 0:
+            return JsonScan{ok: false, pos: p, value: absent}
+        let raw = slice(s, pos, p)
+        let f = toFloat(raw)
+        let v = do numDataValue(f)
+        return JsonScan{ok: true, pos: p, value: v}
+
+    # A nested array/object: consumed as a balanced run, string-aware,
+    # and kept as a "composite" DataValue holding its compact source
+    # text (whitespace outside strings dropped).
+    private proc jsonScanComposite(s: text, n: int, pos: int) -> JsonScan:
+        let absent = do absentDataValue()
+        let q = do quoteChar()
+        let bs = do backslashChar()
+        let mut p = pos
+        let mut depth = 0
+        let mut inString = false
+        let mut acc = ""
+        let mut going = true
+        let mut closed = false
+        loop going:
+            if p >= n:
+                going = false
+            else:
+                let c = charAt(s, p)
+                if inString:
+                    acc = acc + c
+                    if c == bs:
+                        if p + 1 < n:
+                            let e = charAt(s, p + 1)
+                            acc = acc + e
+                        p = p + 2
+                    else:
+                        if c == q:
+                            inString = false
+                        p = p + 1
+                else:
+                    let ws = do jsonIsWs(c)
+                    if !ws:
+                        acc = acc + c
+                    if c == q:
+                        inString = true
+                    if c == "{" || c == "[":
+                        depth = depth + 1
+                    if c == "}" || c == "]":
+                        depth = depth - 1
+                        if depth == 0:
+                            closed = true
+                            going = false
+                    p = p + 1
+        if !closed:
+            return JsonScan{ok: false, pos: p, value: absent}
+        let v = DataValue{kind: "composite", boolVal: false, textVal: acc, numVal: 0.0}
+        return JsonScan{ok: true, pos: p, value: v}
+
+    private proc jsonScanValue(s: text, n: int, pos: int) -> JsonScan:
+        let absent = do absentDataValue()
+        if pos >= n:
+            return JsonScan{ok: false, pos: pos, value: absent}
+        let c = charAt(s, pos)
+        let q = do quoteChar()
+        if c == q:
+            let r = do jsonScanString(s, n, pos)
+            return r
+        if c == "{" || c == "[":
+            let r2 = do jsonScanComposite(s, n, pos)
+            return r2
+        if slice(s, pos, pos + 4) == "true":
+            let vt = do boolDataValue(true)
+            return JsonScan{ok: true, pos: pos + 4, value: vt}
+        if slice(s, pos, pos + 5) == "false":
+            let vf = do boolDataValue(false)
+            return JsonScan{ok: true, pos: pos + 5, value: vf}
+        if slice(s, pos, pos + 4) == "null":
+            let vn = do nullDataValue()
+            return JsonScan{ok: true, pos: pos + 4, value: vn}
+        let numeric = do jsonIsNumberChar(c)
+        if numeric:
+            let r3 = do jsonScanNumber(s, n, pos)
+            return r3
+        return JsonScan{ok: false, pos: pos, value: absent}
+
+    # `serde_json::from_str(data).ok()` restricted to what `Value::get`
+    # can then serve: a top-level object, fully validated (a malformed
+    # tail after a good member still makes the whole decode fail, as it
+    # does for serde).
+    proc jsonParseObject(s: text) -> JsonObject:
+        let n = len(s)
+        let q = do quoteChar()
+        let mut members = []
+        let p0 = do jsonSkipWs(s, n, 0)
+        if p0 >= n || charAt(s, p0) != "{":
+            return JsonObject{ok: false, members: []}
+        let mut p = p0 + 1
+        let afterOpen = do jsonSkipWs(s, n, p)
+        if afterOpen < n && charAt(s, afterOpen) == "}":
+            let tail = do jsonSkipWs(s, n, afterOpen + 1)
+            if tail != n:
+                return JsonObject{ok: false, members: []}
+            return JsonObject{ok: true, members: []}
+        let mut going = true
+        let mut bad = false
+        let mut closed = false
+        loop going:
+            let pk = do jsonSkipWs(s, n, p)
+            if pk >= n || charAt(s, pk) != q:
+                bad = true
+                going = false
+            else:
+                let keyScan = do jsonScanString(s, n, pk)
+                if !keyScan.ok:
+                    bad = true
+                    going = false
+                else:
+                    let pc = do jsonSkipWs(s, n, keyScan.pos)
+                    if pc >= n || charAt(s, pc) != ":":
+                        bad = true
+                        going = false
+                    else:
+                        let pv = do jsonSkipWs(s, n, pc + 1)
+                        let valScan = do jsonScanValue(s, n, pv)
+                        if !valScan.ok:
+                            bad = true
+                            going = false
+                        else:
+                            let keyVal = keyScan.value
+                            let member = JsonMember{key: keyVal.textVal, value: valScan.value}
+                            members = append(members, member)
+                            let pn = do jsonSkipWs(s, n, valScan.pos)
+                            if pn >= n:
+                                bad = true
+                                going = false
+                            else:
+                                let sep = charAt(s, pn)
+                                if sep == ",":
+                                    p = pn + 1
+                                else:
+                                    if sep == "}":
+                                        closed = true
+                                        going = false
+                                        p = pn + 1
+                                    else:
+                                        bad = true
+                                        going = false
+        if bad || !closed:
+            return JsonObject{ok: false, members: []}
+        let tail2 = do jsonSkipWs(s, n, p)
+        if tail2 != n:
+            return JsonObject{ok: false, members: []}
+        return JsonObject{ok: true, members: members}
+
+    # `decoded.as_ref().and_then(|d| d.get(field))` — absent when the
+    # decode failed or the key is missing; the last duplicate wins.
+    proc jsonObjectGet(obj: JsonObject, field: text) -> DataValue:
+        let absent = do absentDataValue()
+        if !obj.ok:
+            return absent
+        let members = obj.members
+        let n = len(members)
+        let mut found = absent
+        let mut i = 0
+        loop i < n:
+            if members[i].key == field:
+                found = members[i].value
+            i = i + 1
+        return found
+
+    # ============================================================
+    # PART THREE — `check_data_keys` / `check_text_keys`, the two loops.
+    # ============================================================
+    # `encode_order_value` for every DataValue index_text.fct's encoder
+    # knows, plus the composite arm it never needed: rank 0x50 and the
+    # serialised bytes, escaped and terminated like every other body.
+    proc encodeDataValueForKey(v: DataValue) -> [int]:
+        if v.kind == "composite":
+            let raw = textToBytes(v.textVal)
+            let body = do concatBytes([80], raw)
+            let out = do appendEscaped([], body)
+            return out
+        let out2 = do encodeOrderValue(v)
+        return out2
+
+    proc checkDataKeys(defs: [IndexDef], address: text, data: text) -> CheckResult:
+        let decoded = do jsonParseObject(data)
+        let maxValLen = do indexMaxIndexValueLen()
+        let addrBytes = textToBytes(address)
+        let n = len(defs)
+        let mut i = 0
+        loop i < n:
+            let def = defs[i]
+            let value = do jsonObjectGet(decoded, def.field)
+            let encoded = do encodeDataValueForKey(value)
+            let encodedLen = len(encoded)
+            if encodedLen > maxValLen:
+                let msg = "field '" + def.field + "' is " + encodedLen + " bytes encoded, over the " + maxValLen + "-byte maximum for index '" + def.name + "'"
+                return CheckResult{ok: false, err: msg}
+            let key = do concatBytes(encoded, addrBytes)
+            let keyCheck = do checkIndexKeyAdmissible("'" + def.name + "'", key)
+            if !keyCheck.ok:
+                return keyCheck
+            i = i + 1
+        return CheckResult{ok: true, err: ""}
+
+    # `check_text_keys`: `indexed_text` admits only a JSON string
+    # (`as_str`), so every other type is skipped, never refused. The
+    # document is decoded lazily — only once there is a def to serve.
+    proc checkTextKeys(defs: [TextIndexDef], address: text, data: text) -> CheckResult:
+        let n = len(defs)
+        if n == 0:
+            return CheckResult{ok: true, err: ""}
+        let decoded = do jsonParseObject(data)
+        let maxTextLen = do textIndexMaxTextValueLen()
+        let gramLen = do textIndexGramLen()
+        let maxKeyLen = do indexMaxKeyLen()
+        let addrLen = byteLen(address)
+        let mut i = 0
+        loop i < n:
+            let def = defs[i]
+            let value = do jsonObjectGet(decoded, def.field)
+            if value.kind == "text":
+                let textLen = byteLen(value.textVal)
+                if textLen > maxTextLen:
+                    let msg = "field '" + def.field + "' holds " + textLen + " bytes of text, over the " + maxTextLen + "-byte maximum for the inverted index '" + def.name + "'. Every byte is a posting, so the bound is a bound on how much index writing one request may impose."
+                    return CheckResult{ok: false, err: msg}
+                let keyLen = gramLen + addrLen
+                if keyLen > maxKeyLen:
+                    let msg2 = "the '" + def.name + "' index key would be " + keyLen + " bytes; the maximum is " + maxKeyLen
+                    return CheckResult{ok: false, err: msg2}
+            i = i + 1
+        return CheckResult{ok: true, err: ""}
+
+    # ============================================================
+    # PART FOUR — transaction.rs: `Operation`.
+    # ============================================================
+    # tag: "archive" | "insert" | "delete" | "insert_edge" | "delete_edge"
+    #    | "insert_user" | "revoke_user" | "create_index" | "drop_index"
+    #    | "create_reference" | "drop_reference" | "create_text_index"
+    #    | "drop_text_index"
+    # Only the payload field the tag names is meaningful; `name` carries
+    # the String payload of Delete (an address), RevokeUser (a token
+    # hash) and the four Drop* variants (a definition name).
+    struct Operation:
+        tag: text
+        entry: HistoryEntry
+        node: Node
+        name: text
+        edge: Edge
+        edgeId: EdgeId
+        user: UserRecord
+        indexDef: IndexDef
+        reference: ReferenceDef
+        textIndexDef: TextIndexDef
+
+    private proc emptyNode() -> Node:
+        let c = do coordinateNew(0, 0, 0, 0)
+        let n = do nodeNew(c, "", "", "")
+        return n
+
+    private proc emptyEntry() -> HistoryEntry:
+        let n = do emptyNode()
+        let e = do historyEntryMake(n, 0, 0)
+        return e
+
+    private proc emptyUser() -> UserRecord:
+        let role = do roleUser()
+        return UserRecord{tokenHash: "", owner: "", role: role}
+
+    private proc emptyReference() -> ReferenceDef:
+        let r = do referenceDefNew("", "", "", "", false, "", "cascade")
+        return r
+
+    # A blank operation of a tag: every payload at its zero value.
+    proc operationBlank(tag: text) -> Operation:
+        let entry = do emptyEntry()
+        let node = do emptyNode()
+        let edge = do edgeNew("", "", "", "")
+        let edgeId = do edgeIdNew("", "", "")
+        let user = do emptyUser()
+        let indexDef = do indexDefNew("", "", "", false)
+        let reference = do emptyReference()
+        let textIndexDef = do textIndexDefNew("", "", "")
+        return Operation{tag: tag, entry: entry, node: node, name: "", edge: edge, edgeId: edgeId, user: user, indexDef: indexDef, reference: reference, textIndexDef: textIndexDef}
+
+    proc opArchive(entry: HistoryEntry) -> Operation:
+        let b = do operationBlank("archive")
+        return Operation{tag: "archive", entry: entry, node: b.node, name: "", edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opInsert(node: Node) -> Operation:
+        let b = do operationBlank("insert")
+        return Operation{tag: "insert", entry: b.entry, node: node, name: "", edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opDelete(address: text) -> Operation:
+        let b = do operationBlank("delete")
+        return Operation{tag: "delete", entry: b.entry, node: b.node, name: address, edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opInsertEdge(edge: Edge) -> Operation:
+        let b = do operationBlank("insert_edge")
+        return Operation{tag: "insert_edge", entry: b.entry, node: b.node, name: "", edge: edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opDeleteEdge(id: EdgeId) -> Operation:
+        let b = do operationBlank("delete_edge")
+        return Operation{tag: "delete_edge", entry: b.entry, node: b.node, name: "", edge: b.edge, edgeId: id, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opInsertUser(user: UserRecord) -> Operation:
+        let b = do operationBlank("insert_user")
+        return Operation{tag: "insert_user", entry: b.entry, node: b.node, name: "", edge: b.edge, edgeId: b.edgeId, user: user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opRevokeUser(tokenHash: text) -> Operation:
+        let b = do operationBlank("revoke_user")
+        return Operation{tag: "revoke_user", entry: b.entry, node: b.node, name: tokenHash, edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opCreateIndex(def: IndexDef) -> Operation:
+        let b = do operationBlank("create_index")
+        return Operation{tag: "create_index", entry: b.entry, node: b.node, name: "", edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: def, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opDropIndex(name: text) -> Operation:
+        let b = do operationBlank("drop_index")
+        return Operation{tag: "drop_index", entry: b.entry, node: b.node, name: name, edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opCreateReference(def: ReferenceDef) -> Operation:
+        let b = do operationBlank("create_reference")
+        return Operation{tag: "create_reference", entry: b.entry, node: b.node, name: "", edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: def, textIndexDef: b.textIndexDef}
+
+    proc opDropReference(name: text) -> Operation:
+        let b = do operationBlank("drop_reference")
+        return Operation{tag: "drop_reference", entry: b.entry, node: b.node, name: name, edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    proc opCreateTextIndex(def: TextIndexDef) -> Operation:
+        let b = do operationBlank("create_text_index")
+        return Operation{tag: "create_text_index", entry: b.entry, node: b.node, name: "", edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: def}
+
+    proc opDropTextIndex(name: text) -> Operation:
+        let b = do operationBlank("drop_text_index")
+        return Operation{tag: "drop_text_index", entry: b.entry, node: b.node, name: name, edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    # `Operation::validate` — refuse a mutation whose durable keys the
+    # indexes could not accept, BEFORE it is written to the WAL. Arm for
+    # arm with the Rust `match`.
+    proc operationValidate(op: Operation, declared: Declared) -> CheckResult:
+        if op.tag == "archive":
+            let entry = op.entry
+            let archived = entry.node
+            let r = do checkHistoryKeys(entry.address, archived.address, archived.kind, archived.owner)
+            return r
+        if op.tag == "insert":
+            let node = op.node
+            let nodeCheck = do checkNodeKeys(node.address, node.kind, node.owner)
+            if !nodeCheck.ok:
+                return nodeCheck
+            let dataDefs = do declaredDataFor(declared, node.kind)
+            let dataCheck = do checkDataKeys(dataDefs, node.address, node.data)
+            if !dataCheck.ok:
+                return dataCheck
+            let textDefs = do declaredTextFor(declared, node.kind)
+            let textCheck = do checkTextKeys(textDefs, node.address, node.data)
+            return textCheck
+        if op.tag == "delete":
+            let addrBytes = textToBytes(op.name)
+            let r2 = do checkIndexKeyAdmissible("primary", addrBytes)
+            return r2
+        if op.tag == "insert_edge":
+            let edge = op.edge
+            let r3 = do checkEdgeKeys(edge.from, edge.to, edge.kind)
+            return r3
+        if op.tag == "delete_edge":
+            let id = op.edgeId
+            let r4 = do checkEdgeKeys(id.from, id.to, id.kind)
+            return r4
+        # Users live in their own flat log, not in an index, so there is
+        # no key to admit.
+        if op.tag == "insert_user" || op.tag == "revoke_user":
+            return CheckResult{ok: true, err: ""}
+        if op.tag == "create_index":
+            let r5 = do indexDefValidate(op.indexDef)
+            return r5
+        if op.tag == "drop_index":
+            return CheckResult{ok: true, err: ""}
+        if op.tag == "create_reference":
+            let rr = do referenceDefValidate(op.reference)
+            return CheckResult{ok: rr.ok, err: rr.err}
+        if op.tag == "drop_reference":
+            return CheckResult{ok: true, err: ""}
+        if op.tag == "create_text_index":
+            let r6 = do textIndexDefValidate(op.textIndexDef)
+            return r6
+        if op.tag == "drop_text_index":
+            return CheckResult{ok: true, err: ""}
+        return CheckResult{ok: false, err: "unknown operation '" + op.tag + "'"}
+
+    # `Operation::to_wal` — variant for variant, so the WAL tag is the
+    # operation's own tag (simplification 4).
+    proc operationWalTag(op: Operation) -> text:
+        return op.tag
+
+    # A one-line identity for an operation's payload, for the drivers.
+    proc operationPayloadKey(op: Operation) -> text:
+        if op.tag == "archive":
+            let entry = op.entry
+            return entry.address + "@" + entry.version
+        if op.tag == "insert":
+            let node = op.node
+            return node.address
+        if op.tag == "insert_edge":
+            let edge = op.edge
+            return edge.from + "->" + edge.to + ":" + edge.kind
+        if op.tag == "delete_edge":
+            let id = op.edgeId
+            return id.from + "->" + id.to + ":" + id.kind
+        if op.tag == "insert_user":
+            let user = op.user
+            return user.tokenHash
+        if op.tag == "create_index":
+            let d = op.indexDef
+            return d.name
+        if op.tag == "create_reference":
+            let rd = op.reference
+            return rd.name
+        if op.tag == "create_text_index":
+            let td = op.textIndexDef
+            return td.name
+        return op.name
+
+    # ============================================================
+    # PART FIVE — wal.rs / checkpoint.rs: the log, its counters, the
+    # control records and the fence set (simplifications 1, 2, 3, 7).
+    # ============================================================
+    struct WalEntry:
+        sequence: int
+        transactionId: int
+        operationId: int
+        opTag: text
+        operation: Operation
+
+    struct WalLog:
+        entries: [WalEntry]
+        nextSequence: int
+        nextOperationId: int
+        nextTransactionId: int
+        fences: [int]
+
+    struct WalAppendOutcome:
+        ok: bool
+        errKind: text
+        err: text
+        sequence: int
+        wal: WalLog
+
+    proc walLogNew(nextSequence: int, nextOperationId: int, nextTransactionId: int) -> WalLog:
+        return WalLog{entries: [], nextSequence: nextSequence, nextOperationId: nextOperationId, nextTransactionId: nextTransactionId, fences: []}
+
+    # The three statics at process start: `AtomicU64::new(1)` each.
+    proc walLogFresh() -> WalLog:
+        let w = do walLogNew(1, 1, 1)
+        return w
+
+    # `STANDALONE_TRANSACTION_ID`.
+    proc walStandaloneTransactionId() -> int:
+        return 0
+
+    private proc walWithCounters(wal: WalLog, nextSequence: int, nextOperationId: int, nextTransactionId: int) -> WalLog:
+        return WalLog{entries: wal.entries, nextSequence: nextSequence, nextOperationId: nextOperationId, nextTransactionId: nextTransactionId, fences: wal.fences}
+
+    private proc walWithEntries(wal: WalLog, entries: [WalEntry]) -> WalLog:
+        return WalLog{entries: entries, nextSequence: wal.nextSequence, nextOperationId: wal.nextOperationId, nextTransactionId: wal.nextTransactionId, fences: wal.fences}
+
+    private proc walWithFences(wal: WalLog, fences: [int]) -> WalLog:
+        return WalLog{entries: wal.entries, nextSequence: wal.nextSequence, nextOperationId: wal.nextOperationId, nextTransactionId: wal.nextTransactionId, fences: fences}
+
+    # `next_sequence()` / `next_operation_id()` / `next_transaction_id()`:
+    # fetch_add(1) — the caller reads the pre-increment value off the log
+    # first, then applies the matching bump.
+    proc walBumpSequence(wal: WalLog) -> WalLog:
+        let w = do walWithCounters(wal, wal.nextSequence + 1, wal.nextOperationId, wal.nextTransactionId)
+        return w
+
+    proc walBumpOperationId(wal: WalLog) -> WalLog:
+        let w = do walWithCounters(wal, wal.nextSequence, wal.nextOperationId + 1, wal.nextTransactionId)
+        return w
+
+    proc walBumpTransactionId(wal: WalLog) -> WalLog:
+        let w = do walWithCounters(wal, wal.nextSequence, wal.nextOperationId, wal.nextTransactionId + 1)
+        return w
+
+    # Does the caller's fault list name this seam?
+    proc failAtMatches(failAt: text, seam: text) -> bool:
+        if failAt == "":
+            return false
+        let parts = split(failAt, ",")
+        let n = len(parts)
+        let mut i = 0
+        loop i < n:
+            if trim(parts[i]) == seam:
+                return true
+            i = i + 1
+        return false
+
+    # `wal::append` (simplification 2): the record lands in the log, or
+    # the named seam fails with an io error and the log is untouched.
+    proc walAppend(wal: WalLog, entry: WalEntry, failAt: text, seam: text) -> WalAppendOutcome:
+        let fails = do failAtMatches(failAt, seam)
+        if fails:
+            return WalAppendOutcome{ok: false, errKind: "Io", err: "injected I/O failure at " + seam, sequence: entry.sequence, wal: wal}
+        let entries = append(wal.entries, entry)
+        let w = do walWithEntries(wal, entries)
+        return WalAppendOutcome{ok: true, errKind: "", err: "", sequence: entry.sequence, wal: w}
+
+    # `WalRecord::begin/commit/abort` + `wal::append`: allocate a
+    # sequence and an operation id (both burned whether or not the append
+    # succeeds), then append.
+    private proc walControl(wal: WalLog, transactionId: int, tag: text, failAt: text, seam: text) -> WalAppendOutcome:
+        let sequence = wal.nextSequence
+        let w1 = do walBumpSequence(wal)
+        let operationId = w1.nextOperationId
+        let w2 = do walBumpOperationId(w1)
+        let blank = do operationBlank(tag)
+        let entry = WalEntry{sequence: sequence, transactionId: transactionId, operationId: operationId, opTag: tag, operation: blank}
+        let r = do walAppend(w2, entry, failAt, seam)
+        return r
+
+    # `wal::begin`.
+    proc walBegin(wal: WalLog, transactionId: int, failAt: text) -> WalAppendOutcome:
+        let standalone = do walStandaloneTransactionId()
+        if transactionId == standalone:
+            return WalAppendOutcome{ok: false, errKind: "InvalidInput", err: "transaction ID 0 is reserved for standalone operations", sequence: 0, wal: wal}
+        let r = do walControl(wal, transactionId, "begin", failAt, "begin")
+        return r
+
+    # `wal::commit` — the one record whose append is followed by the
+    # frame's single fsync.
+    proc walCommit(wal: WalLog, transactionId: int, failAt: text) -> WalAppendOutcome:
+        let standalone = do walStandaloneTransactionId()
+        if transactionId == standalone:
+            return WalAppendOutcome{ok: false, errKind: "InvalidInput", err: "transaction ID 0 cannot be committed", sequence: 0, wal: wal}
+        let r = do walControl(wal, transactionId, "commit", failAt, "commit")
+        return r
+
+    # `wal::abort` — deliberately never synced.
+    proc walAbort(wal: WalLog, transactionId: int, failAt: text) -> WalAppendOutcome:
+        let standalone = do walStandaloneTransactionId()
+        if transactionId == standalone:
+            return WalAppendOutcome{ok: false, errKind: "InvalidInput", err: "transaction ID 0 cannot be aborted", sequence: 0, wal: wal}
+        let r = do walControl(wal, transactionId, "abort", failAt, "abort")
+        return r
+
+    # `checkpoint::begin_fence` — BTreeSet insert, kept sorted.
+    proc checkpointBeginFence(wal: WalLog, beginSequence: int) -> WalLog:
+        let fences = wal.fences
+        let n = len(fences)
+        let mut out = []
+        let mut placed = false
+        let mut i = 0
+        loop i < n:
+            let f = fences[i]
+            if f == beginSequence:
+                placed = true
+            if f > beginSequence && !placed:
+                out = append(out, beginSequence)
+                placed = true
+            out = append(out, f)
+            i = i + 1
+        if !placed:
+            out = append(out, beginSequence)
+        let w = do walWithFences(wal, out)
+        return w
+
+    # `checkpoint::release_fence` — BTreeSet remove.
+    proc checkpointReleaseFence(wal: WalLog, beginSequence: int) -> WalLog:
+        let fences = wal.fences
+        let n = len(fences)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if fences[i] != beginSequence:
+                out = append(out, fences[i])
+            i = i + 1
+        let w = do walWithFences(wal, out)
+        return w
+
+    # `checkpoint::ceiling`: `min_fence - 1`, or unbounded (-1 here for
+    # `u64::MAX`) when no frame is open.
+    proc checkpointCeiling(wal: WalLog) -> int:
+        let fences = wal.fences
+        if len(fences) == 0:
+            return -1
+        let lowest = fences[0]
+        if lowest == 0:
+            return 0
+        return lowest - 1
+
+    # ============================================================
+    # PART SIX — commit.rs: `StagedCommit`.
+    # ============================================================
+    struct StagedCommit:
+        transactionId: int
+        beginSequence: int
+        hasCommitSequence: bool
+        commitSequence: int
+
+    # Every frame step returns one of these: `sequence` is the WAL
+    # sequence the Rust method returns on Ok (BEGIN's for open, the
+    # record's for stage, COMMIT's for commit and settle).
+    struct FrameOutcome:
+        ok: bool
+        errKind: text
+        err: text
+        sequence: int
+        frame: StagedCommit
+        wal: WalLog
+
+    private proc frameBlank() -> StagedCommit:
+        return StagedCommit{transactionId: 0, beginSequence: 0, hasCommitSequence: false, commitSequence: 0}
+
+    # `StagedCommit::open`: allocate the transaction id, append BEGIN
+    # (written, not synced), then register the fence BEFORE the first
+    # staged mutation can advance the checkpoint. A failed BEGIN returns
+    # before any frame exists — no fence, no drop-guard, no ABORT.
+    proc stagedCommitOpen(wal: WalLog, failAt: text) -> FrameOutcome:
+        let transactionId = wal.nextTransactionId
+        let w1 = do walBumpTransactionId(wal)
+        let begin = do walBegin(w1, transactionId, failAt)
+        let blank = do frameBlank()
+        if !begin.ok:
+            return FrameOutcome{ok: false, errKind: begin.errKind, err: begin.err, sequence: 0, frame: blank, wal: begin.wal}
+        let w2 = do checkpointBeginFence(begin.wal, begin.sequence)
+        let frame = StagedCommit{transactionId: transactionId, beginSequence: begin.sequence, hasCommitSequence: false, commitSequence: 0}
+        return FrameOutcome{ok: true, errKind: "", err: "", sequence: begin.sequence, frame: frame, wal: w2}
+
+    # `StagedCommit::stage`: a mutation framed under this transaction's
+    # id. `seam` is the name the caller gives this append for fault
+    # injection (transactionCommit uses "stage:<i>").
+    proc stagedCommitStage(frame: StagedCommit, wal: WalLog, op: Operation, failAt: text, seam: text) -> FrameOutcome:
+        let tag = do operationWalTag(op)
+        if tag == "begin" || tag == "commit" || tag == "abort":
+            return FrameOutcome{ok: false, errKind: "InvalidInput", err: "transaction control records cannot be staged as mutations", sequence: 0, frame: frame, wal: wal}
+        if frame.hasCommitSequence:
+            return FrameOutcome{ok: false, errKind: "InvalidInput", err: "cannot stage a mutation after the frame has committed", sequence: 0, frame: frame, wal: wal}
+        let sequence = wal.nextSequence
+        let w1 = do walBumpSequence(wal)
+        let operationId = w1.nextOperationId
+        let w2 = do walBumpOperationId(w1)
+        let entry = WalEntry{sequence: sequence, transactionId: frame.transactionId, operationId: operationId, opTag: tag, operation: op}
+        let r = do walAppend(w2, entry, failAt, seam)
+        if !r.ok:
+            return FrameOutcome{ok: false, errKind: r.errKind, err: r.err, sequence: sequence, frame: frame, wal: r.wal}
+        return FrameOutcome{ok: true, errKind: "", err: "", sequence: sequence, frame: frame, wal: r.wal}
+
+    # `StagedCommit::commit`: the atomic commit point. The checkpoint is
+    # deliberately NOT advanced here.
+    proc stagedCommitCommit(frame: StagedCommit, wal: WalLog, failAt: text) -> FrameOutcome:
+        if frame.hasCommitSequence:
+            return FrameOutcome{ok: false, errKind: "InvalidInput", err: "transaction already committed", sequence: 0, frame: frame, wal: wal}
+        let r = do walCommit(wal, frame.transactionId, failAt)
+        if !r.ok:
+            return FrameOutcome{ok: false, errKind: r.errKind, err: r.err, sequence: r.sequence, frame: frame, wal: r.wal}
+        let committed = StagedCommit{transactionId: frame.transactionId, beginSequence: frame.beginSequence, hasCommitSequence: true, commitSequence: r.sequence}
+        return FrameOutcome{ok: true, errKind: "", err: "", sequence: r.sequence, frame: committed, wal: r.wal}
+
+    # `impl Drop for StagedCommit`: an uncommitted frame releases its
+    # fence and writes a best-effort ABORT (its failure is ignored); a
+    # frame that COMMITted but was never settled KEEPS its fence — the
+    # SEAM comment in commit.rs — so the checkpoint can never move past a
+    # committed batch physical storage does not yet reflect.
+    proc stagedCommitDrop(frame: StagedCommit, wal: WalLog, failAt: text) -> WalLog:
+        if frame.hasCommitSequence:
+            return wal
+        let w1 = do checkpointReleaseFence(wal, frame.beginSequence)
+        let aborted = do walAbort(w1, frame.transactionId, failAt)
+        return aborted.wal
+
+    # `StagedCommit::settle`: release the fence and hand back the COMMIT
+    # sequence. On an uncommitted frame the error is returned and, since
+    # `self` was consumed, the drop-guard runs too (simplification 8).
+    proc stagedCommitSettle(frame: StagedCommit, wal: WalLog, failAt: text) -> FrameOutcome:
+        if !frame.hasCommitSequence:
+            let dropped = do stagedCommitDrop(frame, wal, failAt)
+            return FrameOutcome{ok: false, errKind: "InvalidInput", err: "cannot settle a transaction that has not committed", sequence: 0, frame: frame, wal: dropped}
+        let w1 = do checkpointReleaseFence(wal, frame.beginSequence)
+        return FrameOutcome{ok: true, errKind: "", err: "", sequence: frame.commitSequence, frame: frame, wal: w1}
+
+    # ============================================================
+    # PART SEVEN — transaction.rs: `Transaction` and `commit`.
+    # ============================================================
+    struct Transaction:
+        operations: [Operation]
+
+    proc transactionNew() -> Transaction:
+        return Transaction{operations: []}
+
+    proc transactionFromOperations(operations: [Operation]) -> Transaction:
+        return Transaction{operations: operations}
+
+    # stage: "empty" | "rejected" | "open_failed" | "stage_failed" |
+    #        "commit_failed" | "apply_failed" | "settled"
+    # durable: the COMMIT record reached the log — from then on a crash
+    #          replays the frame in full.
+    # applied: the operations `apply` was given, in order, until it
+    #          stopped.
+    struct CommitOutcome:
+        ok: bool
+        errKind: text
+        err: text
+        sequence: int
+        stage: text
+        durable: bool
+        applied: [int]
+        wal: WalLog
+
+    # The validate-all pass `commit` runs before opening a frame: the
+    # first refusal rejects the batch as a unit.
+    proc operationsValidate(operations: [Operation], declared: Declared) -> CheckResult:
+        let n = len(operations)
+        let mut i = 0
+        loop i < n:
+            let r = do operationValidate(operations[i], declared)
+            if !r.ok:
+                return r
+            i = i + 1
+        return CheckResult{ok: true, err: ""}
+
+    # `Transaction::commit`, steps 1-5 in order, with both failure
+    # classes: before COMMIT the frame is dropped (fence released, ABORT
+    # written, recovery discards it); after COMMIT the frame is dropped
+    # WITHOUT settling (fence kept, no ABORT, recovery replays it). An
+    # empty transaction opens no frame and returns sequence 0.
+    proc transactionCommit(tx: Transaction, declared: Declared, wal: WalLog, failAt: text) -> CommitOutcome:
+        let operations = tx.operations
+        let n = len(operations)
+        if n == 0:
+            return CommitOutcome{ok: true, errKind: "", err: "", sequence: 0, stage: "empty", durable: false, applied: [], wal: wal}
+
+        let admissible = do operationsValidate(operations, declared)
+        if !admissible.ok:
+            return CommitOutcome{ok: false, errKind: "InvalidInput", err: admissible.err, sequence: 0, stage: "rejected", durable: false, applied: [], wal: wal}
+
+        # Step 1.
+        let opened = do stagedCommitOpen(wal, failAt)
+        if !opened.ok:
+            return CommitOutcome{ok: false, errKind: opened.errKind, err: opened.err, sequence: 0, stage: "open_failed", durable: false, applied: [], wal: opened.wal}
+        let frame = opened.frame
+        let mut w = opened.wal
+
+        # Step 2: durably log the full intent before touching state.
+        let mut i = 0
+        loop i < n:
+            let staged = do stagedCommitStage(frame, w, operations[i], failAt, "stage:" + i)
+            if !staged.ok:
+                let droppedAtStage = do stagedCommitDrop(frame, staged.wal, failAt)
+                return CommitOutcome{ok: false, errKind: staged.errKind, err: staged.err, sequence: 0, stage: "stage_failed", durable: false, applied: [], wal: droppedAtStage}
+            w = staged.wal
+            i = i + 1
+
+        # Step 3: the atomic commit point.
+        let committed = do stagedCommitCommit(frame, w, failAt)
+        if !committed.ok:
+            let droppedAtCommit = do stagedCommitDrop(frame, committed.wal, failAt)
+            return CommitOutcome{ok: false, errKind: committed.errKind, err: committed.err, sequence: 0, stage: "commit_failed", durable: false, applied: [], wal: droppedAtCommit}
+        let committedFrame = committed.frame
+        w = committed.wal
+
+        # Step 4: make it visible. A failure here is NOT rolled back —
+        # the frame is dropped unsettled so recovery replays it.
+        let mut applied = []
+        let mut j = 0
+        loop j < n:
+            let applyFails = do failAtMatches(failAt, "apply:" + j)
+            if applyFails:
+                let droppedAtApply = do stagedCommitDrop(committedFrame, w, failAt)
+                return CommitOutcome{ok: false, errKind: "Other", err: "injected apply failure at operation " + j, sequence: 0, stage: "apply_failed", durable: true, applied: applied, wal: droppedAtApply}
+            applied = append(applied, j)
+            j = j + 1
+
+        # Step 5: release the fence and report how far the checkpoint may
+        # eventually move.
+        let settled = do stagedCommitSettle(committedFrame, w, failAt)
+        return CommitOutcome{ok: true, errKind: "", err: "", sequence: settled.sequence, stage: "settled", durable: true, applied: applied, wal: settled.wal}
+
+    # ============================================================
+    # PART EIGHT — script decoding for the drivers. Records are separated
+    # by "\n", fields by "\t"; a missing field reads as "".
+    # ============================================================
+    private proc fieldAt(parts: [text], i: int) -> text:
+        if i < len(parts):
+            return parts[i]
+        return ""
+
+    private proc textToBool(s: text) -> bool:
+        return s == "true" || s == "1"
+
+    private proc scriptNode(address: text, kind: text, owner: text, data: text, visibility: text) -> Node:
+        let c = do coordinateNew(0, 0, 0, 0)
+        let mut vis = visibility
+        if vis == "":
+            vis = "private"
+        return Node{address: address, coordinate: c, value: 0, kind: kind, data: data, owner: owner, hasClaimedBy: false, claimedBy: "", visibility: vis}
+
+    # One operation line:
+    #   archive    address version nodeAddress kind owner data visibility
+    #   insert     address kind owner data visibility
+    #   delete     address
+    #   insert_edge from to kind owner
+    #   delete_edge from to kind
+    #   insert_user tokenHash owner role
+    #   revoke_user tokenHash
+    #   create_index name kind field unique
+    #   drop_index  name
+    #   create_reference name kind field parentKind hasParentField parentField onDelete
+    #   drop_reference name
+    #   create_text_index name kind field
+    #   drop_text_index name
+    proc parseOperationLine(line: text) -> Operation:
+        let parts = split(line, "\t")
+        let tag = do fieldAt(parts, 0)
+        let f1 = do fieldAt(parts, 1)
+        let f2 = do fieldAt(parts, 2)
+        let f3 = do fieldAt(parts, 3)
+        let f4 = do fieldAt(parts, 4)
+        let f5 = do fieldAt(parts, 5)
+        let f6 = do fieldAt(parts, 6)
+        let f7 = do fieldAt(parts, 7)
+        if tag == "archive":
+            let archivedNode = do scriptNode(f3, f4, f5, f6, f7)
+            let version = toInt(f2)
+            let entry = HistoryEntry{address: f1, archivedAtUnix: 0, node: archivedNode, version: version}
+            let opA = do opArchive(entry)
+            return opA
+        if tag == "insert":
+            let node = do scriptNode(f1, f2, f3, f4, f5)
+            let opI = do opInsert(node)
+            return opI
+        if tag == "delete":
+            let opD = do opDelete(f1)
+            return opD
+        if tag == "insert_edge":
+            let edge = do edgeNew(f1, f2, f3, f4)
+            let opE = do opInsertEdge(edge)
+            return opE
+        if tag == "delete_edge":
+            let id = do edgeIdNew(f1, f2, f3)
+            let opDE = do opDeleteEdge(id)
+            return opDE
+        if tag == "insert_user":
+            let user = UserRecord{tokenHash: f1, owner: f2, role: f3}
+            let opU = do opInsertUser(user)
+            return opU
+        if tag == "revoke_user":
+            let opR = do opRevokeUser(f1)
+            return opR
+        if tag == "create_index":
+            let unique = do textToBool(f4)
+            let def = do indexDefNew(f1, f2, f3, unique)
+            let opCI = do opCreateIndex(def)
+            return opCI
+        if tag == "drop_index":
+            let opDI = do opDropIndex(f1)
+            return opDI
+        if tag == "create_reference":
+            let hasParentField = do textToBool(f5)
+            let rdef = do referenceDefNew(f1, f2, f3, f4, hasParentField, f6, f7)
+            let opCR = do opCreateReference(rdef)
+            return opCR
+        if tag == "drop_reference":
+            let opDR = do opDropReference(f1)
+            return opDR
+        if tag == "create_text_index":
+            let tdef = do textIndexDefNew(f1, f2, f3)
+            let opCT = do opCreateTextIndex(tdef)
+            return opCT
+        if tag == "drop_text_index":
+            let opDT = do opDropTextIndex(f1)
+            return opDT
+        let blank = do operationBlank(tag)
+        return blank
+
+    proc parseOperations(script: text) -> [Operation]:
+        let lines = split(script, "\n")
+        let n = len(lines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if lines[i] != "":
+                let op = do parseOperationLine(lines[i])
+                out = append(out, op)
+            i = i + 1
+        return out
+
+    # Declared-index lines: `data name kind field unique` /
+    # `text name kind field`.
+    proc parseDeclared(script: text) -> Declared:
+        let lines = split(script, "\n")
+        let n = len(lines)
+        let mut dataDefs = []
+        let mut textDefs = []
+        let mut i = 0
+        loop i < n:
+            let parts = split(lines[i], "\t")
+            let mode = do fieldAt(parts, 0)
+            let f1 = do fieldAt(parts, 1)
+            let f2 = do fieldAt(parts, 2)
+            let f3 = do fieldAt(parts, 3)
+            let f4 = do fieldAt(parts, 4)
+            if mode == "data":
+                let unique = do textToBool(f4)
+                let d = do indexDefNew(f1, f2, f3, unique)
+                dataDefs = append(dataDefs, d)
+            if mode == "text":
+                let t = do textIndexDefNew(f1, f2, f3)
+                textDefs = append(textDefs, t)
+            i = i + 1
+        return Declared{dataDefs: dataDefs, textDefs: textDefs}
+
+    # ============================================================
+    # PART NINE — scalar/list projections of a CommitOutcome for the
+    # drivers (an action cannot bind a struct-valued proc).
+    # ============================================================
+    proc txRun(opsScript: text, declaredScript: text, failAt: text, nextSequence: int, nextOperationId: int, nextTransactionId: int) -> CommitOutcome:
+        let ops = do parseOperations(opsScript)
+        let declared = do parseDeclared(declaredScript)
+        let tx = do transactionFromOperations(ops)
+        let wal = do walLogNew(nextSequence, nextOperationId, nextTransactionId)
+        let outcome = do transactionCommit(tx, declared, wal, failAt)
+        return outcome
+
+    proc txRunOk(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> bool:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        return r.ok
+
+    proc txRunErrKind(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> text:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        return r.errKind
+
+    proc txRunErr(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> text:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        return r.err
+
+    proc txRunSequence(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> int:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        return r.sequence
+
+    proc txRunStage(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> text:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        return r.stage
+
+    proc txRunDurable(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> bool:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        return r.durable
+
+    proc txRunApplied(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> [int]:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        return r.applied
+
+    proc walEntrySequences(wal: WalLog) -> [int]:
+        let entries = wal.entries
+        let n = len(entries)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, entries[i].sequence)
+            i = i + 1
+        return out
+
+    proc walEntryTransactionIds(wal: WalLog) -> [int]:
+        let entries = wal.entries
+        let n = len(entries)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, entries[i].transactionId)
+            i = i + 1
+        return out
+
+    proc walEntryOperationIds(wal: WalLog) -> [int]:
+        let entries = wal.entries
+        let n = len(entries)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, entries[i].operationId)
+            i = i + 1
+        return out
+
+    proc walEntryTags(wal: WalLog) -> [text]:
+        let entries = wal.entries
+        let n = len(entries)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, entries[i].opTag)
+            i = i + 1
+        return out
+
+    proc walEntryPayloads(wal: WalLog) -> [text]:
+        let entries = wal.entries
+        let n = len(entries)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let key = do operationPayloadKey(entries[i].operation)
+            out = append(out, key)
+            i = i + 1
+        return out
+
+    proc walCounters(wal: WalLog) -> [int]:
+        return [wal.nextSequence, wal.nextOperationId, wal.nextTransactionId]
+
+    proc txRunWalSequences(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> [int]:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        let xs = do walEntrySequences(r.wal)
+        return xs
+
+    proc txRunWalTransactionIds(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> [int]:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        let xs = do walEntryTransactionIds(r.wal)
+        return xs
+
+    proc txRunWalOperationIds(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> [int]:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        let xs = do walEntryOperationIds(r.wal)
+        return xs
+
+    proc txRunWalTags(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> [text]:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        let xs = do walEntryTags(r.wal)
+        return xs
+
+    proc txRunWalPayloads(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> [text]:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        let xs = do walEntryPayloads(r.wal)
+        return xs
+
+    proc txRunFences(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> [int]:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        let w = r.wal
+        return w.fences
+
+    proc txRunCeiling(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> int:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        let c = do checkpointCeiling(r.wal)
+        return c
+
+    proc txRunCounters(opsScript: text, declaredScript: text, failAt: text, s: int, o: int, t: int) -> [int]:
+        let r = do txRun(opsScript, declaredScript, failAt, s, o, t)
+        let xs = do walCounters(r.wal)
+        return xs
+
+    # ============================================================
+    # PART TEN — a frame-script interpreter, so every StagedCommit method
+    # is reachable directly: steps separated by ";" —
+    #   open | stage <tag> | commit | settle | drop
+    # ("stage begin" is how the control-record guard is reached.) After
+    # settle/drop the frame is consumed; a step with no frame open is the
+    # driver's own error "no open frame".
+    # ============================================================
+    struct FrameScriptResult:
+        oks: [bool]
+        errKinds: [text]
+        errs: [text]
+        sequences: [int]
+        wal: WalLog
+
+    proc frameScriptRun(script: text, failAt: text) -> FrameScriptResult:
+        let steps = split(script, ";")
+        let n = len(steps)
+        let fresh = do walLogFresh()
+        let blank = do frameBlank()
+        let mut wal = fresh
+        let mut frame = blank
+        let mut open = false
+        let mut oks = []
+        let mut errKinds = []
+        let mut errs = []
+        let mut sequences = []
+        let mut stagedCount = 0
+        let mut i = 0
+        loop i < n:
+            let step = trim(steps[i])
+            let words = split(step, " ")
+            let verb = do fieldAt(words, 0)
+            let arg = do fieldAt(words, 1)
+            let mut ok = false
+            let mut errKind = ""
+            let mut err = ""
+            let mut sequence = 0
+            if verb == "open":
+                let opened = do stagedCommitOpen(wal, failAt)
+                ok = opened.ok
+                errKind = opened.errKind
+                err = opened.err
+                sequence = opened.sequence
+                wal = opened.wal
+                if opened.ok:
+                    frame = opened.frame
+                    open = true
+            else:
+                if !open:
+                    errKind = "Driver"
+                    err = "no open frame"
+                else:
+                    if verb == "stage":
+                        let op = do operationBlank(arg)
+                        let staged = do stagedCommitStage(frame, wal, op, failAt, "stage:" + stagedCount)
+                        stagedCount = stagedCount + 1
+                        ok = staged.ok
+                        errKind = staged.errKind
+                        err = staged.err
+                        sequence = staged.sequence
+                        wal = staged.wal
+                    if verb == "commit":
+                        let committed = do stagedCommitCommit(frame, wal, failAt)
+                        ok = committed.ok
+                        errKind = committed.errKind
+                        err = committed.err
+                        sequence = committed.sequence
+                        wal = committed.wal
+                        frame = committed.frame
+                    if verb == "settle":
+                        let settled = do stagedCommitSettle(frame, wal, failAt)
+                        ok = settled.ok
+                        errKind = settled.errKind
+                        err = settled.err
+                        sequence = settled.sequence
+                        wal = settled.wal
+                        open = false
+                    if verb == "drop":
+                        let dropped = do stagedCommitDrop(frame, wal, failAt)
+                        ok = true
+                        wal = dropped
+                        open = false
+            oks = append(oks, ok)
+            errKinds = append(errKinds, errKind)
+            errs = append(errs, err)
+            sequences = append(sequences, sequence)
+            i = i + 1
+        return FrameScriptResult{oks: oks, errKinds: errKinds, errs: errs, sequences: sequences, wal: wal}
+
+    proc frameScriptOks(script: text, failAt: text) -> [bool]:
+        let r = do frameScriptRun(script, failAt)
+        return r.oks
+
+    proc frameScriptErrKinds(script: text, failAt: text) -> [text]:
+        let r = do frameScriptRun(script, failAt)
+        return r.errKinds
+
+    proc frameScriptErrs(script: text, failAt: text) -> [text]:
+        let r = do frameScriptRun(script, failAt)
+        return r.errs
+
+    proc frameScriptSequences(script: text, failAt: text) -> [int]:
+        let r = do frameScriptRun(script, failAt)
+        return r.sequences
+
+    proc frameScriptWalTags(script: text, failAt: text) -> [text]:
+        let r = do frameScriptRun(script, failAt)
+        let xs = do walEntryTags(r.wal)
+        return xs
+
+    proc frameScriptWalSequences(script: text, failAt: text) -> [int]:
+        let r = do frameScriptRun(script, failAt)
+        let xs = do walEntrySequences(r.wal)
+        return xs
+
+    proc frameScriptWalTransactionIds(script: text, failAt: text) -> [int]:
+        let r = do frameScriptRun(script, failAt)
+        let xs = do walEntryTransactionIds(r.wal)
+        return xs
+
+    proc frameScriptFences(script: text, failAt: text) -> [int]:
+        let r = do frameScriptRun(script, failAt)
+        let w = r.wal
+        return w.fences
+
+    proc frameScriptCounters(script: text, failAt: text) -> [int]:
+        let r = do frameScriptRun(script, failAt)
+        let xs = do walCounters(r.wal)
+        return xs
+
+    # Scalar projections for the validation / JSON drivers.
+    proc validateScriptOk(opsScript: text, declaredScript: text) -> bool:
+        let ops = do parseOperations(opsScript)
+        let declared = do parseDeclared(declaredScript)
+        let r = do operationsValidate(ops, declared)
+        return r.ok
+
+    proc validateScriptErr(opsScript: text, declaredScript: text) -> text:
+        let ops = do parseOperations(opsScript)
+        let declared = do parseDeclared(declaredScript)
+        let r = do operationsValidate(ops, declared)
+        return r.err
+
+    proc jsonFieldKind(data: text, field: text) -> text:
+        let obj = do jsonParseObject(data)
+        let v = do jsonObjectGet(obj, field)
+        return v.kind
+
+    proc jsonFieldText(data: text, field: text) -> text:
+        let obj = do jsonParseObject(data)
+        let v = do jsonObjectGet(obj, field)
+        return v.textVal
+
+    # The number's IEEE-754 bit pattern (state has no float type; the
+    # Go test compares it against math.Float64bits).
+    proc jsonFieldNumBits(data: text, field: text) -> int:
+        let obj = do jsonParseObject(data)
+        let v = do jsonObjectGet(obj, field)
+        return floatBits(v.numVal)
+
+    proc jsonFieldBool(data: text, field: text) -> bool:
+        let obj = do jsonParseObject(data)
+        let v = do jsonObjectGet(obj, field)
+        return v.boolVal
+
+    proc jsonDocumentOk(data: text) -> bool:
+        let obj = do jsonParseObject(data)
+        return obj.ok
+
+    proc jsonFieldEncodedLen(data: text, field: text) -> int:
+        let obj = do jsonParseObject(data)
+        let v = do jsonObjectGet(obj, field)
+        let encoded = do encodeDataValueForKey(v)
+        return len(encoded)
+
+    # ============================================================
+    # STATE + ACTIONS — the HTTP surface transaction_test.go drives
+    # ============================================================
+    state validateOk: bool = false
+    state validateErr: text = ""
+
+    action runValidate(opsScript: text, declaredScript: text):
+        let ok = do validateScriptOk(opsScript, declaredScript)
+        let err = do validateScriptErr(opsScript, declaredScript)
+        validateOk = ok
+        validateErr = err
+
+    state jsonOk: bool = false
+    state jsonKind: text = ""
+    state jsonText: text = ""
+    state jsonNumBits: int = 0
+    state jsonBool: bool = false
+    state jsonEncodedLen: int = 0
+
+    action runJsonField(data: text, field: text):
+        let ok = do jsonDocumentOk(data)
+        let kind = do jsonFieldKind(data, field)
+        let t = do jsonFieldText(data, field)
+        let f = do jsonFieldNumBits(data, field)
+        let b = do jsonFieldBool(data, field)
+        let n = do jsonFieldEncodedLen(data, field)
+        jsonOk = ok
+        jsonKind = kind
+        jsonText = t
+        jsonNumBits = f
+        jsonBool = b
+        jsonEncodedLen = n
+
+    state commitOk: bool = false
+    state commitErrKind: text = ""
+    state commitErr: text = ""
+    state commitSequence: int = 0
+    state commitStage: text = ""
+    state commitDurable: bool = false
+    state commitApplied: [int] = []
+    state walSequences: [int] = []
+    state walTransactionIds: [int] = []
+    state walOperationIds: [int] = []
+    state walTags: [text] = []
+    state walPayloads: [text] = []
+    state walFences: [int] = []
+    state walCeiling: int = 0
+    state walCountersAfter: [int] = []
+
+    action runCommit(opsScript: text, declaredScript: text, failAt: text, nextSequence: int, nextOperationId: int, nextTransactionId: int):
+        let ok = do txRunOk(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let errKind = do txRunErrKind(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let err = do txRunErr(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let sequence = do txRunSequence(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let stage = do txRunStage(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let durable = do txRunDurable(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let applied = do txRunApplied(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let seqs = do txRunWalSequences(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let txIds = do txRunWalTransactionIds(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let opIds = do txRunWalOperationIds(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let tags = do txRunWalTags(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let payloads = do txRunWalPayloads(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let fences = do txRunFences(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let ceiling = do txRunCeiling(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        let counters = do txRunCounters(opsScript, declaredScript, failAt, nextSequence, nextOperationId, nextTransactionId)
+        commitOk = ok
+        commitErrKind = errKind
+        commitErr = err
+        commitSequence = sequence
+        commitStage = stage
+        commitDurable = durable
+        commitApplied = applied
+        walSequences = seqs
+        walTransactionIds = txIds
+        walOperationIds = opIds
+        walTags = tags
+        walPayloads = payloads
+        walFences = fences
+        walCeiling = ceiling
+        walCountersAfter = counters
+
+    state frameOks: [bool] = []
+    state frameErrKinds: [text] = []
+    state frameErrs: [text] = []
+    state frameSequences: [int] = []
+    state frameWalTags: [text] = []
+    state frameWalSequences: [int] = []
+    state frameWalTransactionIds: [int] = []
+    state frameFences: [int] = []
+    state frameCounters: [int] = []
+
+    action runFrameScript(script: text, failAt: text):
+        let oks = do frameScriptOks(script, failAt)
+        let errKinds = do frameScriptErrKinds(script, failAt)
+        let errs = do frameScriptErrs(script, failAt)
+        let seqs = do frameScriptSequences(script, failAt)
+        let tags = do frameScriptWalTags(script, failAt)
+        let walSeqs = do frameScriptWalSequences(script, failAt)
+        let txIds = do frameScriptWalTransactionIds(script, failAt)
+        let fences = do frameScriptFences(script, failAt)
+        let counters = do frameScriptCounters(script, failAt)
+        frameOks = oks
+        frameErrKinds = errKinds
+        frameErrs = errs
+        frameSequences = seqs
+        frameWalTags = tags
+        frameWalSequences = walSeqs
+        frameWalTransactionIds = txIds
+        frameFences = fences
+        frameCounters = counters
+
+    private view TransactionHome at "/transaction":
+        box:
+            text "{validateOk} {validateErr} {commitStage} {commitSequence} {jsonKind}"

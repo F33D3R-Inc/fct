@@ -195,11 +195,19 @@ func (s *Server) apiPublished() []string {
 // person's own `GET /api/<Entity>` could end up authorized differently for
 // identical identities.
 func (s *Server) sidForRequest(r *http.Request) string {
-	c, err := r.Cookie("fa_sid")
-	if err != nil {
+	// A native client carries the session as `Authorization: Bearer <token>`,
+	// where the token is exactly the signed value the cookie would carry (the
+	// login reply hands it out as `token`); a browser carries the cookie.
+	raw := ""
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		raw = strings.TrimSpace(h[len("Bearer "):])
+	} else if c, err := r.Cookie("fa_sid"); err == nil {
+		raw = c.Value
+	}
+	if raw == "" {
 		return ""
 	}
-	sid, ok := verifySigned(c.Value)
+	sid, ok := verifySigned(raw)
 	if !ok {
 		return ""
 	}

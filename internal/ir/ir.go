@@ -31,6 +31,8 @@ type IR struct {
 	Services   []Service                    `json:"services,omitempty"`   // external services (brains) actions may call
 	Files      []File                       `json:"files,omitempty"`      // declared file resources a proc may read/write (io.file)
 	Webhooks   []Webhook                    `json:"webhooks,omitempty"`   // inbound endpoints external systems POST to
+	APIs       []API                        `json:"apis,omitempty"`       // declared typed HTTP endpoints (the app's contract; see API)
+	Streams    []Stream                     `json:"streams,omitempty"`    // named event streams (see Stream)
 	Triggers   []Trigger                    `json:"triggers,omitempty"`   // event reactions: an action's success runs another action
 	Theme      map[string]string            `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
 	ThemeDark  map[string]string            `json:"themeDark,omitempty"`  // dark-mode token overrides (prefers-color-scheme: dark)
@@ -354,6 +356,8 @@ type Action struct {
 	Params     []Param   `json:"params"`
 	Requires   []Require `json:"requires"`
 	Optimistic bool      `json:"optimistic,omitempty"` // client predicts the result pre-round-trip
+	Ret        string    `json:"ret,omitempty"`        // return type core ("" = no reply value); see ast.Action.Ret
+	RetList    bool      `json:"retList,omitempty"`    // the reply value is a list of Ret
 	Placement  string    `json:"placement"`
 	Reason     string    `json:"reason,omitempty"` // why the compiler placed it here (for `facet explain`)
 	Writes     []string  `json:"writes"`
@@ -376,6 +380,33 @@ type Proc struct {
 	Ret     string  `json:"ret,omitempty"`     // return type core ("" = no return)
 	RetList bool    `json:"retList,omitempty"` // the return is a list of Ret
 	Body    []Stmt  `json:"body"`
+}
+
+// API is one declared HTTP endpoint (ast.API), resolved: Params are the
+// `{name}` path segments in order, Auth is "session" when the action carries
+// a `requires` gate and "none" otherwise, Ret/RetList are the bound action's
+// reply type (the response schema), Status defaults to 200.
+type API struct {
+	Method  string   `json:"method"`
+	Path    string   `json:"path"`
+	Params  []string `json:"params,omitempty"`
+	Action  string   `json:"action"`
+	Status  int      `json:"status"`
+	Rate    string   `json:"rate,omitempty"`
+	Since   string   `json:"since,omitempty"`
+	Auth    string   `json:"auth"`
+	Ret     string   `json:"ret,omitempty"`
+	RetList bool     `json:"retList,omitempty"`
+}
+
+// Stream is one declared event stream (ast.Stream): Events are the wire type
+// names it carries; Auth is "session" when it requires a policy (Requires
+// names it), "none" otherwise.
+type Stream struct {
+	Path     string   `json:"path"`
+	Events   []string `json:"events"`
+	Requires string   `json:"requires,omitempty"`
+	Auth     string   `json:"auth"`
 }
 
 // Require is one resolved permission check on an action: the policy name plus the
@@ -521,7 +552,7 @@ type Trigger struct {
 // call, not the daemon's own lifetime.
 type Stmt struct {
 	Op      string      `json:"op"`
-	Target  string      `json:"target,omitempty"`  // assign (action: a state cell; proc: a `let mut` local); let: the local's name
+	Target  string      `json:"target,omitempty"`  // assign (action: a state cell; proc: a `let mut` local); let: the local's name; do: the `let mut` local a `name = do …` reassigns; fieldset: the struct local
 	Entity  string      `json:"entity,omitempty"`  // add/set/remove/clear
 	Field   string      `json:"field,omitempty"`   // set; for a call, the operation name
 	Key     *Expr       `json:"key,omitempty"`     // set/remove
@@ -539,6 +570,7 @@ type Stmt struct {
 	RetList bool        `json:"retList,omitempty"` // call/do (request→response): result is a list of Ret
 	Role    *Expr       `json:"role,omitempty"`    // establish: optional new session role (Value holds the new actor)
 	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
+	Status  int         `json:"status,omitempty"`  // check: the HTTP status a declared api answers with on failure (0 = 422)
 	Body    []Stmt      `json:"body,omitempty"`    // loop/for: the repeated body; if: the `then` branch
 	Else    []Stmt      `json:"else,omitempty"`    // if: the `else` branch (nil = none)
 	Bytes   bool        `json:"bytes,omitempty"`   // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int; fileread/filewrite: the file resource is `bytes`-typed rather than `text`
@@ -854,6 +886,9 @@ type Expr struct {
 	Var    string   `json:"var,omitempty"`   // agg: item variable for the filtered form
 	Where  *Expr    `json:"where,omitempty"` // agg: filter predicate (nil = whole collection)
 	Sel    *Expr    `json:"sel,omitempty"`   // agg: the value reduced over each row (nil = the bare Field)
+	Order  string   `json:"order,omitempty"` // agg (list): sort field
+	Desc   bool     `json:"desc,omitempty"`  // agg (list): descending
+	Limit  *Expr    `json:"limit,omitempty"` // agg (list): max rows
 }
 
 // Kids is every sub-expression hanging off this one, in the order both renderers
@@ -874,7 +909,7 @@ func (e *Expr) Kids() []*Expr {
 	if e == nil {
 		return nil
 	}
-	kids := []*Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where, e.Sel}
+	kids := []*Expr{e.L, e.R, e.X, e.Obj, e.Key, e.Where, e.Sel, e.Limit}
 	kids = append(kids, e.Keys...)
 	return append(kids, e.Args...)
 }

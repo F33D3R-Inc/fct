@@ -224,11 +224,11 @@ func goParentIndex(t *testing.T, indents []int) []int {
 // required to share the same indent, despite lines 88-92's comment).
 func TestParentIndexMatchesGoBuild(t *testing.T) {
 	cases := [][]int{
-		{0, 4, 8, 4, 0},          // a clean two-level nest, back to root
-		{0, 2, 4, 6, 2},          // a deep chain, then back up several levels
-		{0, 4, 2, 4, 0},          // ragged siblings under one parent (the quirk)
-		{0, 0, 0},                // flat siblings, no nesting at all
-		{2, 4, 2, 4},             // starts indented (still must resolve sanely)
+		{0, 4, 8, 4, 0}, // a clean two-level nest, back to root
+		{0, 2, 4, 6, 2}, // a deep chain, then back up several levels
+		{0, 4, 2, 4, 0}, // ragged siblings under one parent (the quirk)
+		{0, 0, 0},       // flat siblings, no nesting at all
+		{2, 4, 2, 4},    // starts indented (still must resolve sanely)
 	}
 	for _, indents := range cases {
 		want := goParentIndex(t, indents)
@@ -395,9 +395,9 @@ func strSliceFromAny(t *testing.T, v any) []string {
 // what the text means; the original source_test.go's own goParentIndex
 // helper already relies on this by feeding it bare "x" lines).
 var realSources = map[string]string{
-	"small nested app with a blank line": "app A:\n    state count: int = 0\n\n    view Home at \"/\":\n        text \"{count}\"\n",
+	"small nested app with a blank line":                 "app A:\n    state count: int = 0\n\n    view Home at \"/\":\n        text \"{count}\"\n",
 	"app with comments interspersed at multiple indents": "app A:\n    # a top comment\n    proc classify(x: int, limit: int) -> text:\n        if x > limit:\n            return \"high\"\n        else:\n            return \"low\"\n\n    # another comment\n    state result: text = \"\"\n",
-	"ragged/deep indentation, no fixed sibling level": "root1\n    childA\n        grandchild\n    childB\nsiblingRoot\n        deepButInconsistent\n    shallowerButStillNested\n",
+	"ragged/deep indentation, no fixed sibling level":    "root1\n    childA\n        grandchild\n    childB\nsiblingRoot\n        deepButInconsistent\n    shallowerButStillNested\n",
 }
 
 // TestParsedStageMatchesGoParse verifies stage 1 alone (source.fct's new

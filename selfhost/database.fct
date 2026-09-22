@@ -1,0 +1,732 @@
+app DatabaseSelfHost:
+    # Self-hosting port of facetql/src/database.rs — the pure-logic half of
+    # the crate's top-level `Database` module: startup-failure
+    # classification (`DatabaseError`), the live-event visibility rule
+    # (`Audience`), and the resumable in-memory event ring (`EventFeed` /
+    # `FeedState` / `LiveEvent` / `ResumeTooOld`). Read database.rs in full
+    # before editing this file.
+    #
+    # ============================================================
+    # WHY THIS MODULE (and what was rejected)
+    # ============================================================
+    # An audit of facetql/src/**/*.rs against every selfhost/*.fct header
+    # (grepping for the literal "facetql/src/<path>") left these Rust
+    # modules with no port at all: database.rs (1015L), storage/recovery.rs
+    # (1077L — but its whole decision core, `classify_transaction(s)`, is
+    # already ported by storage.fct PART THREE and changes.fct, and what
+    # remains is `apply_recovery_operation`, a mutation dispatcher over the
+    # real StorageEngine), storage/checkpoint.rs (463L — a fence set behind
+    # a process-wide `OnceLock<Mutex>` plus a tmp-file+rename write path),
+    # storage/transaction.rs (408L — its `Operation::validate` is real
+    # logic but has no Rust tests to check against), storage/commit.rs
+    # (327L — WAL staging I/O), config.rs (286L — env/OnceLock, one small
+    # `deployment_from` rule), crypto.rs (248L — AES-GCM + a key parser),
+    # storage/cache.rs (148L — a mutex'd map), main.rs/tls_server.rs/
+    # api/routes.rs/cli/client.rs (HTTP/TLS/process plumbing). database.rs
+    # is the LARGEST of those, and once its tokio/Arc/Mutex wrapper
+    # (`Database`, `with_engine`, `with_engine_mut`, `poisoned`) is set
+    # aside, what is left is exactly the kind of thing this directory
+    # ports: a classification table, a two-line visibility rule, and a
+    # bounded replay ring with a horizon — all covered by TEN real Rust
+    # unit tests in the same file (`audience_tests`, `event_feed_tests`),
+    # every one of which database_test.go re-runs against this port.
+    #
+    # ============================================================
+    # WHAT WAS PORTED (exact Rust items -> procs below)
+    # ============================================================
+    #   `DatabaseError::exit_code`          -> databaseErrorExitCode
+    #   `DatabaseError::loading`            -> databaseErrorLoading
+    #   `DatabaseError::recovering`         -> databaseErrorRecovering
+    #   `DatabaseError::detail`/`cause`     -> databaseErrorDetail
+    #   `impl Display for DatabaseError`    -> databaseErrorMessage
+    #   `is_access_failure`                 -> isAccessFailure
+    #   `integrity_failure`                 -> integrityFailureClass
+    #   `EXIT_ENGINE_POISONED` (6)          -> databaseExitEnginePoisoned
+    #   `BROADCAST_CAPACITY` (1024)         -> broadcastCapacity
+    #   `EVENT_REPLAY_CAPACITY` (1024)      -> eventReplayCapacity
+    #   `Audience::admits`                  -> audienceAdmits
+    #   `Audience::for_node`                -> audienceForNode
+    #   `EventFeed::new`                    -> eventFeedNew /
+    #                                          eventFeedNewWithCapacity
+    #   `EventFeed::emit`                   -> eventFeedEmit
+    #   `EventFeed::emit_json`              -> eventFeedEmitJson
+    #   `EventFeed::emit_with` (the ring
+    #     append + eviction + horizon step) -> eventFeedPush
+    #   `EventFeed::subscribe`              -> eventFeedSubscribe
+    #   `impl Display for ResumeTooOld`     -> resumeTooOldMessage
+    #   routes.rs's `event.audience.admits(&owner, is_admin)` filter over
+    #     a subscribe backlog                -> backlogAdmitted
+    #
+    # ============================================================
+    # DELIBERATE SIMPLIFICATIONS (each named, none hidden)
+    # ============================================================
+    #   1. `io::ErrorKind` is a text: `isAccessFailure` takes the variant's
+    #      own name ("NotFound", "PermissionDenied", "InvalidData", ...).
+    #      The rule is Rust's inverted `!matches!(...)` verbatim — four
+    #      named content kinds are NOT access failures, everything else
+    #      IS, so an unknown/unanticipated kind lands on the access side
+    #      exactly as the Rust comment says it must.
+    #   2. `io::Error` is carried as (kind: text, detail: text) — the same
+    #      two facts `loading`/`recovering` actually read from it
+    #      (`source.kind()` and `source.to_string()`).
+    #   3. `integrity_failure`'s `Option<bool>` is an int: 0 = None,
+    #      1 = Some(false) (verification), 2 = Some(true) (authentication).
+    #      The two word lists are copied verbatim and checked in the same
+    #      order (AUTHENTICATION first, then VERIFICATION) over the
+    #      lowercased detail.
+    #   4. The WAL operation-id counter (`wal::next_operation_id`, an
+    #      `AtomicU64::fetch_add(1)` that returns the PRE-increment value,
+    #      initial value 1) is the feed's own `nextPosition` field.
+    #      `eventFeedNew(counter)` performs `EventFeed::new`'s mint against
+    #      a counter currently reading `counter`: `earliestResumable =
+    #      counter`, and the next emit gets `counter + 1`. Rust's
+    #      documented "positions are not contiguous" property (the WAL
+    #      burns numbers on the same counter) is reproduced by
+    #      `eventFeedBurn(feed, n)`, which advances the counter by n
+    #      without publishing anything — the tests use it to prove
+    #      `after=` is "strictly greater than", never "the next one".
+    #   5. `emit_json`'s structured insert of `seq` into a
+    #      `serde_json::Value::Object` is `jsonObjectWithSeq`: a body that
+    #      (after trimming) starts with `{` and ends with `}` is treated as
+    #      an object and gets `"seq":N` appended as its last member; any
+    #      other body is returned verbatim (Rust re-serializes it, which
+    #      can only normalise whitespace). Two things serde would do that
+    #      this does NOT: overwrite an existing "seq" key, and re-sort the
+    #      keys. Nothing in the crate publishes a body that already has a
+    #      "seq" key, and key order is not observable through
+    #      `serde_json::from_str` (the way the Rust test reads it back).
+    #   6. The tokio `broadcast` channel — the LIVE delivery half of
+    #      `emit_with` (`self.sender.send(event)`) and of `subscribe` (the
+    #      returned `Receiver`) — is process plumbing with no meaning in a
+    #      pure proc and is not modelled. What IS modelled is everything
+    #      that decides what a subscriber gets: the replay ring, its
+    #      eviction/horizon step, the refusal, and the backlog.
+    #   7. `Database` itself (`new`/`attach`/`with_engine`/
+    #      `with_engine_mut`/`publish`/`publish_opaque`), `poisoned` /
+    #      `engine_task_panicked` (process exit) and the `impl
+    #      std::error::Error` glue are not ported: they are an Arc/Mutex/
+    #      tokio wrapper around the storage engine, not computation.
+    #      `publish`/`publish_opaque` are one-line delegations to
+    #      `emit_json`/`emit`, which ARE ported.
+    #   8. `subscribe(after: Option<u64>)` is `eventFeedSubscribe(feed,
+    #      hasAfter, after)`; `Result<(Vec<LiveEvent>, Receiver),
+    #      ResumeTooOld>` is `SubscribeOutcome` with `ok` and both halves'
+    #      fields always present (proc-has-no-Result convention used by
+    #      changes.fct's `ScanOutcome`).
+    #
+    # No crypto and no I/O anywhere in this file: every proc is a pure
+    # function over its arguments. Every "mutate the feed" operation
+    # returns a new `EventFeed` (procs are pure), and a proc that returns
+    # a struct is only ever bound inside another proc — the actions at the
+    # bottom expose scalar/list drivers for database_test.go.
+
+    # ============================================================
+    # PART ONE — DatabaseError
+    # ============================================================
+    # kind: "Storage" | "Integrity" | "WalRecovery" (the three variants).
+    # phase: meaningful for "Storage" only ("" otherwise).
+    # authentication: meaningful for "Integrity" only (false otherwise).
+    # detail: the underlying io::Error's own text, kept verbatim — the
+    #   thing the Rust doc comment says is "the most valuable thing we
+    #   have".
+    struct DatabaseError:
+        kind: text
+        phase: text
+        authentication: bool
+        detail: text
+
+    # EXIT_ENGINE_POISONED: continues the 1/4/5 numbering below and
+    # cli::error's 2/3.
+    proc databaseExitEnginePoisoned() -> int:
+        return 6
+
+    # `DatabaseError::exit_code`: Storage 1, Integrity 4, WalRecovery 5.
+    # An unknown kind degrades to 1 (the "ordinary runtime failure" code)
+    # rather than crashing.
+    proc databaseErrorExitCode(e: DatabaseError) -> int:
+        if e.kind == "Integrity":
+            return 4
+        if e.kind == "WalRecovery":
+            return 5
+        return 1
+
+    proc databaseErrorDetail(e: DatabaseError) -> text:
+        return e.detail
+
+    # `is_access_failure`, inverted exactly as in Rust: the four kinds the
+    # storage layer raises for content it has already read are NOT access
+    # failures; every other kind (NotFound, PermissionDenied, StorageFull,
+    # ..., and any kind nobody anticipated) IS.
+    proc isAccessFailure(kind: text) -> bool:
+        if kind == "InvalidData":
+            return false
+        if kind == "UnexpectedEof":
+            return false
+        if kind == "InvalidInput":
+            return false
+        if kind == "Other":
+            return false
+        return true
+
+    # `integrity_failure`: 0 = None, 1 = Some(false), 2 = Some(true).
+    # The AUTHENTICATION list is consulted first, then VERIFICATION, over
+    # the ASCII-lowercased detail — same words, same order as the Rust
+    # constants.
+    proc integrityFailureClass(detail: text) -> int:
+        let d = lower(detail)
+        if contains(d, "decrypt"):
+            return 2
+        if contains(d, "authentication"):
+            return 2
+        if contains(d, "master key"):
+            return 2
+        if contains(d, "master_key"):
+            return 2
+        if contains(d, "checksum"):
+            return 1
+        if contains(d, "crc"):
+            return 1
+        if contains(d, "corrupt"):
+            return 1
+        if contains(d, "deserialize"):
+            return 1
+        if contains(d, "invalid record"):
+            return 1
+        if contains(d, "valid hex"):
+            return 1
+        if contains(d, "magic"):
+            return 1
+        if contains(d, "truncated"):
+            return 1
+        if contains(d, "format version"):
+            return 1
+        return 0
+
+    # `DatabaseError::loading`: an access failure is Storage (phase
+    # "loading the storage files"); anything else is Integrity, with
+    # `authentication = integrity_failure(...).unwrap_or(false)`.
+    proc databaseErrorLoading(kind: text, detail: text) -> DatabaseError:
+        let access = do isAccessFailure(kind)
+        if access:
+            return DatabaseError{kind: "Storage", phase: "loading the storage files", authentication: false, detail: detail}
+        let cls = do integrityFailureClass(detail)
+        return DatabaseError{kind: "Integrity", phase: "", authentication: cls == 2, detail: detail}
+
+    # `DatabaseError::recovering`: an access failure is Storage (phase
+    # "recovering the write-ahead log"); a detail naming bad bytes is
+    # Integrity (authentication iff the AUTHENTICATION list matched); a
+    # detail naming neither is one of recovery's own rules violated —
+    # WalRecovery.
+    proc databaseErrorRecovering(kind: text, detail: text) -> DatabaseError:
+        let access = do isAccessFailure(kind)
+        if access:
+            return DatabaseError{kind: "Storage", phase: "recovering the write-ahead log", authentication: false, detail: detail}
+        let cls = do integrityFailureClass(detail)
+        if cls == 0:
+            return DatabaseError{kind: "WalRecovery", phase: "", authentication: false, detail: detail}
+        return DatabaseError{kind: "Integrity", phase: "", authentication: cls == 2, detail: detail}
+
+    # `impl Display for DatabaseError`, the four sentences verbatim (the
+    # Integrity-with-authentication one deliberately names the wrong key
+    # before corruption, as the Rust comment explains).
+    proc databaseErrorMessage(e: DatabaseError) -> text:
+        if e.kind == "Storage":
+            return "storage is unreachable while " + e.phase + ": " + e.detail
+        if e.kind == "Integrity":
+            if e.authentication:
+                return "a stored record failed authentication: " + e.detail + " — most likely the wrong FACETQL_MASTER_KEY, otherwise the file is corrupt"
+            return "a stored record failed its integrity check: " + e.detail
+        return "the write-ahead log describes a history that cannot be replayed: " + e.detail
+
+    # ============================================================
+    # PART TWO — Audience
+    # ============================================================
+    # `Audience::Everyone` is everyone=true (owner ignored, kept "");
+    # `Audience::Owner(s)` is everyone=false, owner=s.
+    struct Audience:
+        everyone: bool
+        owner: text
+
+    proc audienceEveryone() -> Audience:
+        return Audience{everyone: true, owner: ""}
+
+    proc audienceOwner(owner: text) -> Audience:
+        return Audience{everyone: false, owner: owner}
+
+    # `Audience::admits`: Everyone => true; Owner(only) => is_admin ||
+    # only == owner.
+    proc audienceAdmits(a: Audience, owner: text, isAdmin: bool) -> bool:
+        if a.everyone:
+            return true
+        if isAdmin:
+            return true
+        return a.owner == owner
+
+    # `Audience::for_node`: a public node is announced to everyone, a
+    # private one only to its owner — the same rule as Node::can_read.
+    # (`Node` is reduced to the two fields the function reads.)
+    proc audienceForNode(isPublic: bool, nodeOwner: text) -> Audience:
+        if isPublic:
+            return Audience{everyone: true, owner: ""}
+        return Audience{everyone: false, owner: nodeOwner}
+
+    # ============================================================
+    # PART THREE — LiveEvent / EventFeed / subscribe
+    # ============================================================
+    struct LiveEvent:
+        seq: int
+        payload: text
+        audience: Audience
+
+    # EventFeed = FeedState + the shared WAL operation-id counter (see
+    # simplification 4) + the replay capacity as a field (so a test can
+    # exercise eviction without 1025 emits; the real default is
+    # eventReplayCapacity()).
+    struct EventFeed:
+        retained: [LiveEvent]
+        earliestResumable: int
+        nextPosition: int
+        capacity: int
+
+    struct EmitOutcome:
+        feed: EventFeed
+        seq: int
+
+    # `Result<(Vec<LiveEvent>, Receiver), ResumeTooOld>`: ok=true carries
+    # `backlog`; ok=false carries ResumeTooOld's three fields.
+    struct SubscribeOutcome:
+        ok: bool
+        backlog: [LiveEvent]
+        requested: int
+        earliest: int
+        retained: int
+
+    proc broadcastCapacity() -> int:
+        return 1024
+
+    # EVENT_REPLAY_CAPACITY = BROADCAST_CAPACITY, deliberately.
+    proc eventReplayCapacity() -> int:
+        let cap = do broadcastCapacity()
+        return cap
+
+    # `EventFeed::new` against a counter currently reading `counter`:
+    # `earliest_resumable = next_operation_id()` takes the pre-increment
+    # value and advances the counter, so the first emit lands at
+    # counter + 1 and `after = counter` resumes from the very start.
+    proc eventFeedNewWithCapacity(counter: int, capacity: int) -> EventFeed:
+        return EventFeed{retained: [], earliestResumable: counter, nextPosition: counter + 1, capacity: capacity}
+
+    proc eventFeedNew(counter: int) -> EventFeed:
+        let cap = do eventReplayCapacity()
+        let f = do eventFeedNewWithCapacity(counter, cap)
+        return f
+
+    # The WAL writing n records on the shared counter: n positions are
+    # consumed and never appear in the feed.
+    proc eventFeedBurn(feed: EventFeed, n: int) -> EventFeed:
+        if n <= 0:
+            return feed
+        return EventFeed{retained: feed.retained, earliestResumable: feed.earliestResumable, nextPosition: feed.nextPosition + n, capacity: feed.capacity}
+
+    proc sliceLiveEvents(buf: [LiveEvent], start: int, end: int) -> [LiveEvent]:
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            out = append(out, buf[i])
+            i = i + 1
+        return out
+
+    # `emit_with`'s ring step, minus the broadcast send: while the ring is
+    # full, the oldest event leaves and the horizon moves up to ITS
+    # position (`after=<evicted.seq>` stays answerable); then the new
+    # event is appended. Rust's `None => break` (pop_front on an empty
+    # ring) is the `n > 0` guard, so a capacity of 0 still holds one
+    # event exactly as the Rust loop would.
+    proc eventFeedPush(feed: EventFeed, event: LiveEvent) -> EventFeed:
+        let mut retained = feed.retained
+        let mut earliest = feed.earliestResumable
+        let mut n = len(retained)
+        loop n >= feed.capacity && n > 0:
+            let evicted = retained[0]
+            earliest = evicted.seq
+            let rest = do sliceLiveEvents(retained, 1, n)
+            retained = rest
+            n = len(retained)
+        let grown = append(retained, event)
+        return EventFeed{retained: grown, earliestResumable: earliest, nextPosition: feed.nextPosition + 1, capacity: feed.capacity}
+
+    # `EventFeed::emit`: the payload verbatim, the position minted from
+    # the counter inside the same step as the append.
+    proc eventFeedEmit(feed: EventFeed, audience: Audience, payload: text) -> EmitOutcome:
+        let seq = feed.nextPosition
+        let event = LiveEvent{seq: seq, payload: payload, audience: audience}
+        let next = do eventFeedPush(feed, event)
+        return EmitOutcome{feed: next, seq: seq}
+
+    # `emit_json`: the body is a JSON object -> `seq` inserted into it;
+    # anything else is published as it is. See simplification 5.
+    proc eventFeedEmitJson(feed: EventFeed, audience: Audience, body: text) -> EmitOutcome:
+        let seq = feed.nextPosition
+        let rendered = do jsonObjectWithSeq(body, seq)
+        let event = LiveEvent{seq: seq, payload: rendered, audience: audience}
+        let next = do eventFeedPush(feed, event)
+        return EmitOutcome{feed: next, seq: seq}
+
+    # jsonObjectWithSeq: `{...}` -> `{...,"seq":N}` (`{}` -> `{"seq":N}`);
+    # a non-object body is returned unchanged.
+    proc jsonObjectWithSeq(body: text, seq: int) -> text:
+        let t = trim(body)
+        let n = len(t)
+        if n < 2:
+            return body
+        let first = charAt(t, 0)
+        let last = charAt(t, n - 1)
+        if first != "{" || last != "}":
+            return body
+        let inner = trim(slice(t, 1, n - 1))
+        if inner == "":
+            return "{\"seq\":" + seq + "}"
+        return "{" + inner + ",\"seq\":" + seq + "}"
+
+    # `EventFeed::subscribe`: no `after` -> empty backlog (the live edge);
+    # `after < earliest_resumable` -> ResumeTooOld{requested, earliest,
+    # retained}; otherwise every retained event with seq > after, oldest
+    # first. The audience filter is NOT applied here (Rust returns
+    # everything, exactly as the broadcast does) — see backlogAdmitted.
+    proc eventFeedSubscribe(feed: EventFeed, hasAfter: bool, after: int) -> SubscribeOutcome:
+        let count = len(feed.retained)
+        if !hasAfter:
+            return SubscribeOutcome{ok: true, backlog: [], requested: 0, earliest: feed.earliestResumable, retained: count}
+        if after < feed.earliestResumable:
+            return SubscribeOutcome{ok: false, backlog: [], requested: after, earliest: feed.earliestResumable, retained: count}
+        let mut backlog = []
+        let mut i = 0
+        loop i < count:
+            let e = feed.retained[i]
+            if e.seq > after:
+                backlog = append(backlog, e)
+            i = i + 1
+        return SubscribeOutcome{ok: true, backlog: backlog, requested: after, earliest: feed.earliestResumable, retained: count}
+
+    # routes.rs's own use of `Audience::admits` over the backlog: the
+    # subscriber authenticated as `owner`/`isAdmin` sees only what admits
+    # it.
+    proc backlogAdmitted(backlog: [LiveEvent], owner: text, isAdmin: bool) -> [LiveEvent]:
+        let mut out = []
+        let n = len(backlog)
+        let mut i = 0
+        loop i < n:
+            let e = backlog[i]
+            let ok = do audienceAdmits(e.audience, owner, isAdmin)
+            if ok:
+                out = append(out, e)
+            i = i + 1
+        return out
+
+    # `impl Display for ResumeTooOld`, verbatim.
+    proc resumeTooOldMessage(requested: int, earliest: int, retained: int, capacity: int) -> text:
+        return "cannot resume the event feed from " + requested + ": the oldest position still available is " + earliest + " (" + retained + " of at most " + capacity + " events retained, in memory only — nothing published before this process started is retained at all). The events between those two positions are gone from the feed and this server will not pretend otherwise by starting from the live edge. Reconcile from a full read instead."
+
+    # ============================================================
+    # PART FOUR — script driver (test plumbing, not a port of anything)
+    # ============================================================
+    # A feed script is `;`-separated items applied in order to a fresh
+    # feed:
+    #   e:<payload>            emit opaque, Audience::Everyone
+    #   o:<owner>:<payload>    emit opaque, Audience::Owner(owner)
+    #   j:<json>               emit_json, Audience::Everyone
+    #   r:<n>:<prefix>         n opaque emits "<prefix><i>", i = 0..n-1
+    #   b:<n>                  burn n counter positions (WAL writes)
+    # An item that fits none of these is ignored (degrade, never crash).
+    struct ScriptResult:
+        feed: EventFeed
+        seqs: [int]
+
+    proc textIndexOf(s: text, ch: text) -> int:
+        let n = len(s)
+        let mut i = 0
+        loop i < n:
+            if charAt(s, i) == ch:
+                return i
+            i = i + 1
+        return -1
+
+    proc feedScriptApplyItem(state: ScriptResult, item: text) -> ScriptResult:
+        let colon = do textIndexOf(item, ":")
+        if colon < 0:
+            return state
+        let kind = slice(item, 0, colon)
+        let rest = slice(item, colon + 1, len(item))
+        let everyone = do audienceEveryone()
+        if kind == "e":
+            let out = do eventFeedEmit(state.feed, everyone, rest)
+            return ScriptResult{feed: out.feed, seqs: append(state.seqs, out.seq)}
+        if kind == "j":
+            let out = do eventFeedEmitJson(state.feed, everyone, rest)
+            return ScriptResult{feed: out.feed, seqs: append(state.seqs, out.seq)}
+        if kind == "b":
+            let burned = do eventFeedBurn(state.feed, toInt(rest))
+            return ScriptResult{feed: burned, seqs: state.seqs}
+        if kind == "o":
+            let c2 = do textIndexOf(rest, ":")
+            if c2 < 0:
+                return state
+            let owner = slice(rest, 0, c2)
+            let payload = slice(rest, c2 + 1, len(rest))
+            let aud = do audienceOwner(owner)
+            let out = do eventFeedEmit(state.feed, aud, payload)
+            return ScriptResult{feed: out.feed, seqs: append(state.seqs, out.seq)}
+        if kind == "r":
+            let c2 = do textIndexOf(rest, ":")
+            if c2 < 0:
+                return state
+            let count = toInt(slice(rest, 0, c2))
+            let prefix = slice(rest, c2 + 1, len(rest))
+            let mut feed = state.feed
+            let mut seqs = state.seqs
+            let mut i = 0
+            loop i < count:
+                let out = do eventFeedEmit(feed, everyone, prefix + i)
+                feed = out.feed
+                seqs = append(seqs, out.seq)
+                i = i + 1
+            return ScriptResult{feed: feed, seqs: seqs}
+        return state
+
+    proc feedScriptRun(script: text, counter: int, capacity: int) -> ScriptResult:
+        let fresh = do eventFeedNewWithCapacity(counter, capacity)
+        let mut state = ScriptResult{feed: fresh, seqs: []}
+        let items = split(script, ";")
+        let n = len(items)
+        let mut i = 0
+        loop i < n:
+            let item = items[i]
+            if item != "":
+                let next = do feedScriptApplyItem(state, item)
+                state = next
+            i = i + 1
+        return state
+
+    proc feedScriptSeqs(script: text, counter: int, capacity: int) -> [int]:
+        let r = do feedScriptRun(script, counter, capacity)
+        return r.seqs
+
+    # [ok(0/1), requested, earliest, retained, feed.earliestResumable,
+    #  len(feed.retained), feed.nextPosition, visibleCount]
+    proc feedScriptSummary(script: text, counter: int, capacity: int, hasAfter: bool, after: int, owner: text, isAdmin: bool) -> [int]:
+        let r = do feedScriptRun(script, counter, capacity)
+        let sub = do eventFeedSubscribe(r.feed, hasAfter, after)
+        let visible = do backlogAdmitted(sub.backlog, owner, isAdmin)
+        let mut okInt = 0
+        if sub.ok:
+            okInt = 1
+        return [okInt, sub.requested, sub.earliest, sub.retained, r.feed.earliestResumable, len(r.feed.retained), r.feed.nextPosition, len(visible)]
+
+    # summary[idx], for an action (which cannot index a list itself).
+    proc feedScriptSummaryAt(script: text, counter: int, capacity: int, hasAfter: bool, after: int, owner: text, isAdmin: bool, idx: int) -> int:
+        let summary = do feedScriptSummary(script, counter, capacity, hasAfter, after, owner, isAdmin)
+        if idx < 0 || idx >= len(summary):
+            return -1
+        return summary[idx]
+
+    proc feedScriptBacklogSeqs(script: text, counter: int, capacity: int, hasAfter: bool, after: int) -> [int]:
+        let r = do feedScriptRun(script, counter, capacity)
+        let sub = do eventFeedSubscribe(r.feed, hasAfter, after)
+        let mut out = []
+        let n = len(sub.backlog)
+        let mut i = 0
+        loop i < n:
+            out = append(out, sub.backlog[i].seq)
+            i = i + 1
+        return out
+
+    proc feedScriptBacklogPayloads(script: text, counter: int, capacity: int, hasAfter: bool, after: int) -> [text]:
+        let r = do feedScriptRun(script, counter, capacity)
+        let sub = do eventFeedSubscribe(r.feed, hasAfter, after)
+        let mut out = []
+        let n = len(sub.backlog)
+        let mut i = 0
+        loop i < n:
+            out = append(out, sub.backlog[i].payload)
+            i = i + 1
+        return out
+
+    proc feedScriptVisibleSeqs(script: text, counter: int, capacity: int, hasAfter: bool, after: int, owner: text, isAdmin: bool) -> [int]:
+        let r = do feedScriptRun(script, counter, capacity)
+        let sub = do eventFeedSubscribe(r.feed, hasAfter, after)
+        let visible = do backlogAdmitted(sub.backlog, owner, isAdmin)
+        let mut out = []
+        let n = len(visible)
+        let mut i = 0
+        loop i < n:
+            out = append(out, visible[i].seq)
+            i = i + 1
+        return out
+
+    proc feedScriptMessage(script: text, counter: int, capacity: int, hasAfter: bool, after: int) -> text:
+        let r = do feedScriptRun(script, counter, capacity)
+        let sub = do eventFeedSubscribe(r.feed, hasAfter, after)
+        if sub.ok:
+            return ""
+        let msg = do resumeTooOldMessage(sub.requested, sub.earliest, sub.retained, r.feed.capacity)
+        return msg
+
+    # capacity <= 0 means "the real EVENT_REPLAY_CAPACITY".
+    proc effectiveCapacity(capacity: int) -> int:
+        if capacity <= 0:
+            let real = do eventReplayCapacity()
+            return real
+        return capacity
+
+    # Scalar drivers for the error/audience parts.
+    proc errorKindOf(loading: bool, kind: text, detail: text) -> text:
+        if loading:
+            let e = do databaseErrorLoading(kind, detail)
+            return e.kind
+        let e2 = do databaseErrorRecovering(kind, detail)
+        return e2.kind
+
+    proc errorPhaseOf(loading: bool, kind: text, detail: text) -> text:
+        if loading:
+            let e = do databaseErrorLoading(kind, detail)
+            return e.phase
+        let e2 = do databaseErrorRecovering(kind, detail)
+        return e2.phase
+
+    proc errorAuthOf(loading: bool, kind: text, detail: text) -> bool:
+        if loading:
+            let e = do databaseErrorLoading(kind, detail)
+            return e.authentication
+        let e2 = do databaseErrorRecovering(kind, detail)
+        return e2.authentication
+
+    proc errorExitOf(loading: bool, kind: text, detail: text) -> int:
+        if loading:
+            let e = do databaseErrorLoading(kind, detail)
+            let code = do databaseErrorExitCode(e)
+            return code
+        let e2 = do databaseErrorRecovering(kind, detail)
+        let code2 = do databaseErrorExitCode(e2)
+        return code2
+
+    proc errorMessageOf(loading: bool, kind: text, detail: text) -> text:
+        if loading:
+            let e = do databaseErrorLoading(kind, detail)
+            let msg = do databaseErrorMessage(e)
+            return msg
+        let e2 = do databaseErrorRecovering(kind, detail)
+        let msg2 = do databaseErrorMessage(e2)
+        return msg2
+
+    proc audienceForNodeAdmits(isPublic: bool, nodeOwner: text, requester: text, isAdmin: bool) -> bool:
+        let a = do audienceForNode(isPublic, nodeOwner)
+        let ok = do audienceAdmits(a, requester, isAdmin)
+        return ok
+
+    proc audienceEveryoneAdmits(requester: text, isAdmin: bool) -> bool:
+        let a = do audienceEveryone()
+        let ok = do audienceAdmits(a, requester, isAdmin)
+        return ok
+
+    # ============================================================
+    # STATE + ACTIONS — the HTTP surface database_test.go drives
+    # ============================================================
+    state errKind: text = ""
+    state errPhase: text = ""
+    state errAuthentication: bool = false
+    state errExitCode: int = 0
+    state errMessage: text = ""
+    state exitEnginePoisoned: int = 0
+
+    # loading=true -> DatabaseError::loading, false -> ::recovering.
+    action runDatabaseError(loading: bool, kind: text, detail: text):
+        let k = do errorKindOf(loading, kind, detail)
+        let p = do errorPhaseOf(loading, kind, detail)
+        let a = do errorAuthOf(loading, kind, detail)
+        let x = do errorExitOf(loading, kind, detail)
+        let m = do errorMessageOf(loading, kind, detail)
+        let poisoned = do databaseExitEnginePoisoned()
+        errKind = k
+        errPhase = p
+        errAuthentication = a
+        errExitCode = x
+        errMessage = m
+        exitEnginePoisoned = poisoned
+
+    state accessFailure: bool = false
+    state integrityClass: int = -1
+
+    action runIsAccessFailure(kind: text):
+        let r = do isAccessFailure(kind)
+        accessFailure = r
+
+    action runIntegrityFailure(detail: text):
+        let r = do integrityFailureClass(detail)
+        integrityClass = r
+
+    state admits: bool = false
+
+    action runAudienceForNode(isPublic: bool, nodeOwner: text, requester: text, isAdmin: bool):
+        let r = do audienceForNodeAdmits(isPublic, nodeOwner, requester, isAdmin)
+        admits = r
+
+    action runAudienceEveryone(requester: text, isAdmin: bool):
+        let r = do audienceEveryoneAdmits(requester, isAdmin)
+        admits = r
+
+    state replayCapacity: int = 0
+    state seqs: [int] = []
+    state subOk: bool = false
+    state subRequested: int = -1
+    state subEarliest: int = -1
+    state subRetained: int = -1
+    state feedEarliest: int = -1
+    state feedRetained: int = -1
+    state feedNext: int = -1
+    state visibleCount: int = -1
+    state backlogSeqs: [int] = []
+    state backlogPayloads: [text] = []
+    state visibleSeqs: [int] = []
+    state subMessage: text = ""
+
+    # capacity <= 0 means "the real EVENT_REPLAY_CAPACITY".
+    action runFeedScript(script: text, counter: int, capacity: int, hasAfter: bool, after: int, owner: text, isAdmin: bool):
+        let realCap = do eventReplayCapacity()
+        let cap = do effectiveCapacity(capacity)
+        let s = do feedScriptSeqs(script, counter, cap)
+        let s0 = do feedScriptSummaryAt(script, counter, cap, hasAfter, after, owner, isAdmin, 0)
+        let s1 = do feedScriptSummaryAt(script, counter, cap, hasAfter, after, owner, isAdmin, 1)
+        let s2 = do feedScriptSummaryAt(script, counter, cap, hasAfter, after, owner, isAdmin, 2)
+        let s3 = do feedScriptSummaryAt(script, counter, cap, hasAfter, after, owner, isAdmin, 3)
+        let s4 = do feedScriptSummaryAt(script, counter, cap, hasAfter, after, owner, isAdmin, 4)
+        let s5 = do feedScriptSummaryAt(script, counter, cap, hasAfter, after, owner, isAdmin, 5)
+        let s6 = do feedScriptSummaryAt(script, counter, cap, hasAfter, after, owner, isAdmin, 6)
+        let s7 = do feedScriptSummaryAt(script, counter, cap, hasAfter, after, owner, isAdmin, 7)
+        let bs = do feedScriptBacklogSeqs(script, counter, cap, hasAfter, after)
+        let bp = do feedScriptBacklogPayloads(script, counter, cap, hasAfter, after)
+        let vs = do feedScriptVisibleSeqs(script, counter, cap, hasAfter, after, owner, isAdmin)
+        let msg = do feedScriptMessage(script, counter, cap, hasAfter, after)
+        replayCapacity = realCap
+        seqs = s
+        subOk = s0 == 1
+        subRequested = s1
+        subEarliest = s2
+        subRetained = s3
+        feedEarliest = s4
+        feedRetained = s5
+        feedNext = s6
+        visibleCount = s7
+        backlogSeqs = bs
+        backlogPayloads = bp
+        visibleSeqs = vs
+        subMessage = msg
+
+    state jsonWithSeq: text = ""
+
+    action runJsonObjectWithSeq(body: text, seq: int):
+        let r = do jsonObjectWithSeq(body, seq)
+        jsonWithSeq = r
+
+    private view Home at "/":
+        box:
+            text "{errKind} {errExitCode} {admits} {subOk} {subEarliest} {feedRetained} {jsonWithSeq}"

@@ -173,7 +173,9 @@ func (s *Server) authLogin(w http.ResponseWriter, sid, username, password string
 	s.mu.Unlock()
 	s.persistSession(sid)
 	s.recordAudit(username, "login", true, "")
-	reloadResponse(w)
+	// `token` is the bearer credential a native client keeps: the same signed
+	// session value the cookie carries (see sidForRequest).
+	writeJSON(w, map[string]any{"reload": true, "token": signValue(sid)})
 }
 
 // authLoginMFA completes a login that required a second factor.

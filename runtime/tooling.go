@@ -40,6 +40,11 @@ func (s *Server) toolSession(actor, role string, verified bool) {
 		role = "guest"
 	}
 	ses.actor, ses.role, ses.verified = actor, role, verified
+	// Each identity the tooling speaks as is its own browser as far as
+	// `session` is concerned: a test that adds to a cart as ada and then acts
+	// as bob must not find bob holding ada's lines. State cells stay in the
+	// one tool session, as before.
+	ses.visitor = "tool:" + actor
 }
 
 // Run executes an action under the tool session with the given identity. It
@@ -61,6 +66,21 @@ func (s *Server) Run(actor, role string, verified bool, action string, args []an
 		return nil, fmt.Errorf("%s", msg)
 	}
 	return deltas, nil
+}
+
+// RunValue is Run for an action that declares a return type: it answers the
+// action's reply value (`return expr`) instead of its deltas.
+func (s *Server) RunValue(actor, role string, verified bool, action string, args []any) (any, error) {
+	s.toolSession(actor, role, verified)
+	act := s.byAction[action]
+	if act == nil {
+		return nil, fmt.Errorf("unknown action %q", action)
+	}
+	_, value, status, msg := s.runActionValue(toolSID, act, args)
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%s", msg)
+	}
+	return value, nil
 }
 
 // EvalExpr evaluates a compiled expression against the tool session: the entity

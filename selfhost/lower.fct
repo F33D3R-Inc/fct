@@ -1,0 +1,329 @@
+import "ir_expr.fct"
+import "expr.fct"
+
+app LowerSelfHost:
+    # Self-hosting port of internal/ir/build.go's `lower(ex ast.Expr, inline
+    # map[string]*Expr, enums map[string][]string) *Expr` — the one function
+    # that turns a parsed expression into its serializable IR form — plus
+    # its helper `cloneExpr`. The INPUT is expr.fct's `ExprNode` tree (the
+    # self-hosted parser's AST, imported via expr.fct -> expr_tokens.fct/
+    # expr_tree.fct), the OUTPUT is ir_expr.fct's `IRExpr` (the port of
+    # ir.Expr), and `irExprJSON` spells the result exactly as encoding/json
+    # spells the real compiler's ir.Expr, so lower_test.go can compare the
+    # two byte-for-byte-equivalent trees with reflect.DeepEqual.
+    #
+    # Go's two maps become parallel lists, since a proc has no map-typed
+    # parameter: `inline` is (inlineNames, inlineExprs) — index-parallel,
+    # a name's ALREADY-LOWERED replacement at the same index, exactly the
+    # `e.inline[name] = p.Expr // already lowered` table envFromIR builds —
+    # and `enums` is just its key set `enumNames` (lower() only ever asks
+    # `_, isEnum := enums[r.Name]`; the member list is never read here).
+    #
+    # Every ExprNode kind the self-hosted parser can produce is lowered,
+    # case by case as lower()'s own type switch does:
+    #   int/float/bool/text -> lit, vtype "int"/"float"/"bool"/"text"
+    #       (ast.Lit.Kind's own names). The parser keeps a literal's RAW
+    #       token text, so this file does the decoding parseAtom does:
+    #       strconv.Atoi for an int (leading zeros dropped), the shortest
+    #       round-trip spelling encoding/json gives a float64 (trailing
+    #       fraction zeros and a bare `.` dropped — `2.50` -> 2.5, `2.0`
+    #       -> 2), and strconv.Unquote for a text literal (surrounding
+    #       quotes removed, `\n \t \r \" \\` decoded; any other escape is
+    #       kept as the escaped character itself — `\x`/`\u`/octal escapes
+    #       are out of scope, the tokenizer never sees them in practice).
+    #       An exponent-form float spelling (1e+23) is likewise out of
+    #       scope: the tokenizer only produces `<digits>.<digits>`.
+    #   ref   -> ref, UNLESS the name is in inlineNames: then a deep copy
+    #       (lowerCloneExpr, the port of cloneExpr) of the matching
+    #       inlineExprs entry — the policy/derive inlining that makes the
+    #       same value compute identically wherever it is read.
+    #   bin   -> bin (op, l, r);  un -> un (op, x)
+    #   get   -> lit(text) when the object is a bare ref naming an enum
+    #       (`Status.active` folds to "active" — checked BEFORE the ref
+    #       would be inline-substituted, as the Go `t.Obj.(ast.Ref)` test
+    #       is), else get(obj, field).
+    #   entityGet -> eget (entity, key, field — "" when bare `Entity(k)`)
+    #   index -> index (obj, key);  call -> call (name, args)
+    #   list  -> list (args);  map -> map (keys, args parallel)
+    #   agg   -> agg (op, coll, field, var, where?, sel?) — where/sel are
+    #       0-or-1-element lists on both sides, lowered when present.
+    #
+    # Out of scope, because the self-hosted parser cannot produce the node
+    # (not because this file could not lower it): ast.StructLit
+    # (`Name{f: v}` — expr_tree.fct has no struct-literal atom), ast.Asset
+    # (`asset("...")`, a compile-time file inlining with no parser support
+    # here), ast.ActState (`pending(action)`-style action-state reads),
+    # and every operator the parser's own header lists as unsupported
+    # (`%`, `<<`/`>>`, membership `in`). Anything that reaches lowerNode
+    # with a kind outside the list above degrades to ir_expr.fct's
+    # `emptyIR()` sentinel (kind "") — the honest "unsupported" answer this
+    # directory's ports use instead of a crash, since a proc has no error
+    # channel; lower() itself returns nil there.
+    #
+    # The test driver at the bottom follows action_stmt.fct's
+    # runParseActionBody shape: an action cannot take a list parameter or
+    # bind a struct result, so the HTTP entry points take newline-separated
+    # text lists and store the emitted JSON in a text state cell.
+
+    # lowerFindName: the index of `name` in `names`, -1 when absent — the
+    # `_, ok := inline[name]` / `_, isEnum := enums[name]` lookup over a
+    # parallel list.
+    proc lowerFindName(names: [text], name: text) -> int:
+        let n = len(names)
+        let mut i = 0
+        loop i < n:
+            if names[i] == name:
+                return i
+            i = i + 1
+        return -1
+
+    # lowerIntText: strconv.Atoi's effect on the spelling — leading zeros
+    # go, a lone "0" stays.
+    proc lowerIntText(raw: text) -> text:
+        let mut s = raw
+        loop len(s) > 1 && charAt(s, 0) == "0":
+            s = slice(s, 1, len(s))
+        return s
+
+    # lowerFloatText: the shortest spelling encoding/json emits for the
+    # float64 strconv.ParseFloat reads from `<digits>.<digits>` — drop
+    # trailing fraction zeros, then a trailing `.`, then leading zeros of
+    # the integer part (`00.5` -> `0.5`).
+    proc lowerFloatText(raw: text) -> text:
+        let mut s = raw
+        if contains(s, "."):
+            loop len(s) > 1 && charAt(s, len(s) - 1) == "0":
+                s = slice(s, 0, len(s) - 1)
+            if charAt(s, len(s) - 1) == ".":
+                s = slice(s, 0, len(s) - 1)
+        loop len(s) > 1 && charAt(s, 0) == "0" && charAt(s, 1) != ".":
+            s = slice(s, 1, len(s))
+        return s
+
+    # lowerUnquote: strconv.Unquote over the tokenizer's raw `"..."` token.
+    proc lowerUnquote(raw: text) -> text:
+        let n = len(raw)
+        let mut start = 0
+        let mut end = n
+        if n > 0 && charAt(raw, 0) == "\"":
+            start = 1
+        if n > 1 && charAt(raw, n - 1) == "\"":
+            end = n - 1
+        let mut out = ""
+        let mut i = start
+        loop i < end:
+            let c = charAt(raw, i)
+            if c == "\\" && i + 1 < end:
+                let e = charAt(raw, i + 1)
+                if e == "n":
+                    out = out + "\n"
+                else:
+                    if e == "t":
+                        out = out + "\t"
+                    else:
+                        if e == "r":
+                            out = out + "\r"
+                        else:
+                            out = out + e
+                i = i + 2
+            else:
+                out = out + c
+                i = i + 1
+        return out
+
+    # lowerCloneExpr: cloneExpr — a deep copy of an IRExpr. Go copies the
+    # struct and re-clones each child pointer (L/R/X/Obj/Key/Where, and
+    # every Args/Keys element); here every child list is rebuilt node by
+    # node so the substituted copy shares nothing with the inline table's
+    # entry. (Go's cloneExpr leaves Sel and Fields shared — a serialized
+    # tree cannot tell the difference, so this copies those too.)
+    proc lowerCloneList(xs: [IRExpr]) -> [IRExpr]:
+        let n = len(xs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let c = do lowerCloneExpr(xs[i])
+            out = append(out, c)
+            i = i + 1
+        return out
+
+    proc lowerCloneExpr(e: IRExpr) -> IRExpr:
+        let obj = do lowerCloneList(e.obj)
+        let key = do lowerCloneList(e.key)
+        let args = do lowerCloneList(e.args)
+        let keys = do lowerCloneList(e.keys)
+        let l = do lowerCloneList(e.l)
+        let r = do lowerCloneList(e.r)
+        let x = do lowerCloneList(e.x)
+        let where = do lowerCloneList(e.where)
+        let sel = do lowerCloneList(e.sel)
+        return IRExpr{kind: e.kind, hasVal: e.hasVal, val: e.val, vtype: e.vtype, name: e.name, field: e.field, obj: obj, key: key, op: e.op, args: args, keys: keys, fields: e.fields, l: l, r: r, x: x, itemVar: e.itemVar, where: where, sel: sel, order: "", desc: false, limit: []}
+
+    # lowerNodeList: lower() mapped over a child list (a call's args, a
+    # list's elements, a map's keys/values, an agg's 0-or-1 where/sel).
+    proc lowerNodeList(ns: [ExprNode], inlineNames: [text], inlineExprs: [IRExpr], enumNames: [text]) -> [IRExpr]:
+        let n = len(ns)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let e = do lowerNode(ns[i], inlineNames, inlineExprs, enumNames)
+            out = append(out, e)
+            i = i + 1
+        return out
+
+    # lowerNode: lower(), case by case (see the header for the table).
+    proc lowerNode(n: ExprNode, inlineNames: [text], inlineExprs: [IRExpr], enumNames: [text]) -> IRExpr:
+        if n.kind == "int":
+            let iv = do lowerIntText(n.text)
+            let ilit = do irLit(iv, "int")
+            return ilit
+        if n.kind == "float":
+            let fv = do lowerFloatText(n.text)
+            let flit = do irLit(fv, "float")
+            return flit
+        if n.kind == "bool":
+            let blit = do irLit(n.text, "bool")
+            return blit
+        if n.kind == "text":
+            let tv = do lowerUnquote(n.text)
+            let tlit = do irLit(tv, "text")
+            return tlit
+        if n.kind == "ref":
+            let at = do lowerFindName(inlineNames, n.text)
+            if at >= 0:
+                let copied = do lowerCloneExpr(inlineExprs[at])
+                return copied
+            let ref = do irRef(n.text)
+            return ref
+        if n.kind == "bin":
+            let bl = do lowerNode(n.children[0], inlineNames, inlineExprs, enumNames)
+            let br = do lowerNode(n.children[1], inlineNames, inlineExprs, enumNames)
+            let bin = do irBin(n.text, bl, br)
+            return bin
+        if n.kind == "un":
+            let ux = do lowerNode(n.children[0], inlineNames, inlineExprs, enumNames)
+            let un = do irUn(n.text, ux)
+            return un
+        if n.kind == "get":
+            let gobj = n.children[0]
+            if gobj.kind == "ref":
+                let enumAt = do lowerFindName(enumNames, gobj.text)
+                if enumAt >= 0:
+                    let member = do irLit(n.text, "text")
+                    return member
+            let gl = do lowerNode(gobj, inlineNames, inlineExprs, enumNames)
+            let get = do irGet(gl, n.text)
+            return get
+        if n.kind == "entityGet":
+            let ek = do lowerNode(n.children[0], inlineNames, inlineExprs, enumNames)
+            let eget = do irEGet(n.text, ek, n.field)
+            return eget
+        if n.kind == "index":
+            let xo = do lowerNode(n.children[0], inlineNames, inlineExprs, enumNames)
+            let xk = do lowerNode(n.children[1], inlineNames, inlineExprs, enumNames)
+            let index = do irIndex(xo, xk)
+            return index
+        if n.kind == "call":
+            let cargs = do lowerNodeList(n.children, inlineNames, inlineExprs, enumNames)
+            let call = do irCall(n.text, cargs)
+            return call
+        if n.kind == "list":
+            let elems = do lowerNodeList(n.children, inlineNames, inlineExprs, enumNames)
+            let list = do irList(elems)
+            return list
+        if n.kind == "map":
+            let np = len(n.pairs)
+            let mut mkeys = []
+            let mut mvals = []
+            let mut pi = 0
+            loop pi < np:
+                let mk = do lowerNode(n.pairs[pi].key, inlineNames, inlineExprs, enumNames)
+                let mv = do lowerNode(n.pairs[pi].value, inlineNames, inlineExprs, enumNames)
+                mkeys = append(mkeys, mk)
+                mvals = append(mvals, mv)
+                pi = pi + 1
+            let map = do irMap(mkeys, mvals)
+            return map
+        if n.kind == "agg":
+            let aw = do lowerNodeList(n.whereClause, inlineNames, inlineExprs, enumNames)
+            let asel = do lowerNodeList(n.sel, inlineNames, inlineExprs, enumNames)
+            let agg = do irAgg(n.text, n.coll, n.field, n.itemVar, aw, asel)
+            return agg
+        let unsupported = do emptyIR()
+        return unsupported
+
+    # ── whole-expression drivers ────────────────────────────────────────
+    # lowerSrcJSON: parse `src` with the self-hosted parser, lower it with
+    # no inline table, and spell the IR as encoding/json would.
+    proc lowerSrcJSON(src: text, enumNames: [text]) -> text:
+        let tree = do parseExprTree(src)
+        let noNames = []
+        let noExprs = []
+        let e = do lowerNode(tree, noNames, noExprs, enumNames)
+        let j = do irExprJSON(e)
+        return j
+
+    # lowerInlineTable: each inline source is parsed and lowered in turn —
+    # with the entries lowered so far in scope, exactly as the real build
+    # lowers each policy/derive against the table built up before it — and
+    # the result is the index-parallel `[IRExpr]` half of the inline table.
+    proc lowerInlineTable(inlineNames: [text], inlineSrcs: [text], enumNames: [text]) -> [IRExpr]:
+        let n = len(inlineSrcs)
+        let mut exprs = []
+        let mut names = []
+        let mut i = 0
+        loop i < n:
+            let tree = do parseExprTree(inlineSrcs[i])
+            let e = do lowerNode(tree, names, exprs, enumNames)
+            exprs = append(exprs, e)
+            names = append(names, inlineNames[i])
+            i = i + 1
+        return exprs
+
+    proc lowerSrcWithInlineJSON(src: text, inlineNames: [text], inlineSrcs: [text], enumNames: [text]) -> text:
+        let exprs = do lowerInlineTable(inlineNames, inlineSrcs, enumNames)
+        let tree = do parseExprTree(src)
+        let e = do lowerNode(tree, inlineNames, exprs, enumNames)
+        let j = do irExprJSON(e)
+        return j
+
+    # ── HTTP driver ─────────────────────────────────────────────────────
+    # lowerSplitLines: a newline-separated text list -> [text], "" -> []
+    # (strings.Split("", sep) would give one empty entry, which is not an
+    # empty table).
+    proc lowerSplitLines(s: text) -> [text]:
+        if s == "":
+            return []
+        let parts = split(s, "\n")
+        return parts
+
+    proc lowerSrcLinesJSON(src: text, enumLines: text) -> text:
+        let enums = do lowerSplitLines(enumLines)
+        let j = do lowerSrcJSON(src, enums)
+        return j
+
+    proc lowerSrcWithInlineLinesJSON(src: text, nameLines: text, srcLines: text, enumLines: text) -> text:
+        let names = do lowerSplitLines(nameLines)
+        let srcs = do lowerSplitLines(srcLines)
+        let enums = do lowerSplitLines(enumLines)
+        let j = do lowerSrcWithInlineJSON(src, names, srcs, enums)
+        return j
+
+    state lowerResult: text = ""
+
+    # runLowerSrc: POST {"args": [src, "Enum1\nEnum2"]} -> lowerResult is
+    # the IR JSON.
+    action runLowerSrc(src: text, enumLines: text):
+        let j = do lowerSrcLinesJSON(src, enumLines)
+        lowerResult = j
+
+    # runLowerSrcWithInline: POST {"args": [src, "name1\nname2",
+    # "src1\nsrc2", "Enum1"]} — inline sources are one per line, index-
+    # parallel to the names.
+    action runLowerSrcWithInline(src: text, nameLines: text, srcLines: text, enumLines: text):
+        let j = do lowerSrcWithInlineLinesJSON(src, nameLines, srcLines, enumLines)
+        lowerResult = j
+
+    private view LowerHome at "/lower":
+        box:
+            text "{lowerResult}"

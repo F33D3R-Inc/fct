@@ -241,7 +241,7 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 			atom = sl
 		} else if t, ok := p.peek(); ok && t.kind == tLParen {
 			switch {
-			case ref.Name == "count" || ref.Name == "sum" || ref.Name == "exists" || ref.Name == "avg" ||
+			case ref.Name == "count" || ref.Name == "sum" || ref.Name == "exists" || ref.Name == "avg" || ref.Name == "list" ||
 				((ref.Name == "min" || ref.Name == "max") && !p.argListHasComma()):
 				// count/sum/exists/avg are always aggregates. `min`/`max` are also scalar
 				// builtins (`min(a, b)`) — they are an aggregate only in the single-argument
@@ -416,6 +416,11 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 			// `count(x in Coll …)` / `exists(x in Coll …)`: the value is the row itself.
 			itemVar = h.Name
 		case ast.Get:
+			if op == "list" {
+				// `list(x.name in Coll …)` yields one value per row — the
+				// expression form, not a numeric column read.
+				break
+			}
 			if r, isRef := h.Obj.(ast.Ref); isRef {
 				itemVar, field = r.Name, h.Field // `sum(x.field in Coll …)`
 			}
@@ -428,10 +433,13 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 			// name if it does not, so a wrong guess is a compile error rather than a
 			// wrong answer.
 			itemVar = aggRowVar(head)
-			if itemVar == "" {
+			if itemVar == "" && op != "list" {
 				return nil, &Error{p.line, fmt.Sprintf(
 					"%s(... in %s ...) reduces a value read off each row, so the value must read one: %s(x.field * x.other in %s where …)", op, coll, op, coll)}
 			}
+			// A list's value need not read the row at all (`list(D{a: 1} in Item
+			// where i.n > 0)` yields one constant per matching row); its item
+			// variable is then taken from the filter, below.
 			sel = head
 		}
 	} else {
@@ -456,7 +464,7 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 		}
 		return nil, &Error{p.line, fmt.Sprintf("%s needs a field: %s(%s.field)", op, op, coll)}
 	}
-	if !numericAgg(op) {
+	if op != "list" && !numericAgg(op) {
 		if field != "" {
 			return nil, &Error{p.line, fmt.Sprintf("%s ranges over rows, not a field — drop the `.%s`", op, field)}
 		}
@@ -473,6 +481,40 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 			return nil, err
 		}
 		where = cond
+		if itemVar == "" && op == "list" {
+			itemVar = aggRowVar(where)
+		}
+	}
+
+	// `list(...)`'s own clauses, in the order a view's `for` takes them:
+	// `by field [desc|asc]`, then `limit expr`.
+	var order string
+	var desc bool
+	var limit ast.Expr
+	if op == "list" {
+		if b, ok := p.peek(); ok && b.kind == tIdent && b.text == "by" {
+			p.pos++
+			f, ok := p.peek()
+			if !ok || f.kind != tIdent {
+				return nil, &Error{p.line, "list(...) ordering is `by field [desc|asc]`"}
+			}
+			order = f.text
+			p.pos++
+			if d, ok := p.peek(); ok && d.kind == tIdent && (d.text == "desc" || d.text == "asc") {
+				desc = d.text == "desc"
+				p.pos++
+			}
+		}
+		if l, ok := p.peek(); ok && l.kind == tIdent && l.text == "limit" {
+			p.pos++
+			lim, err := p.parseBinary(0)
+			if err != nil {
+				return nil, err
+			}
+			limit = lim
+		}
+	} else if b, ok := p.peek(); ok && b.kind == tIdent && (b.text == "by" || b.text == "limit") {
+		return nil, &Error{p.line, fmt.Sprintf("`%s` is a clause of list(...) — %s reduces every matching row, so it takes no ordering or limit", b.text, op)}
 	}
 
 	c, ok := p.peek()
@@ -480,7 +522,7 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 		return nil, &Error{p.line, fmt.Sprintf("missing `)` in %s(...)", op)}
 	}
 	p.pos++
-	return ast.Agg{Op: op, Coll: coll, Field: field, Var: itemVar, Where: where, Sel: sel}, nil
+	return ast.Agg{Op: op, Coll: coll, Field: field, Var: itemVar, Where: where, Sel: sel, Order: order, Desc: desc, Limit: limit}, nil
 }
 
 // aggRowVar reports the name an aggregate's reduced value reads its row through:
@@ -497,6 +539,21 @@ func aggRowVar(ex ast.Expr) string {
 		return aggRowVar(t.Obj)
 	case ast.EntityGet:
 		return aggRowVar(t.Key)
+	case ast.StructLit:
+		// A DTO shaped from the row: the first field that reads it names it.
+		for _, fi := range t.Fields {
+			if v := aggRowVar(fi.Expr); v != "" {
+				return v
+			}
+		}
+	case ast.Agg:
+		// A nested aggregate's own item variable is its own; the outer row is
+		// whatever its filter or value reads besides that.
+		for _, sub := range []ast.Expr{t.Where, t.Sel} {
+			if v := aggRowVar(sub); v != "" && v != t.Var {
+				return v
+			}
+		}
 	case ast.Bin:
 		if v := aggRowVar(t.L); v != "" {
 			return v

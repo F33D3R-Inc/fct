@@ -1,0 +1,1006 @@
+import "ir_view.fct"
+
+app IRGraphSelfHost:
+    # Self-hosting port of the WHOLE compiled graph — internal/ir/ir.go's `IR`
+    # and every declaration shape ir_decl.fct and ir_view.fct did not yet
+    # carry (Record, Struct, WireType, WireMessage, Job, Daemon, Component,
+    # Service, File, Webhook, Trigger, Asset, the theme maps, the CSS) — read
+    # from the compiler's JSON and spelled back exactly as encoding/json
+    # spells `ir.IR`. With this, a self-hosted runtime can load any app the
+    # real compiler produces in full, and the Go test proves it by round-
+    # tripping every example app byte for byte.
+    #
+    # Two conventions carried over from ir_decl.fct: a non-`omitempty` slice
+    # the Go builder leaves nil when empty prints `null` (entities, states,
+    # derives, policies, actions, jobs, pages, bindings, view when an app has
+    # none), and a map whose key order Go sorts on encode is kept in the
+    # order it was read (the compiler already wrote it sorted). The theme
+    # maps, the asset table and the dependency graph are carried as the
+    # generic JVal they parsed to and re-spelled verbatim by `jvalJSON`, since
+    # a runtime consumes them as plain tables rather than typed shapes.
+    #
+    # The seven small record shapes' readers and emitters are GENERATED from
+    # one field table (the same approach ir_view.fct's Node takes).
+    struct IRRecordField:
+        name: text
+        type: text
+        list: bool
+        optional: bool
+
+    struct IRWireField:
+        name: text
+        type: text
+        list: bool
+        optional: bool
+        ref: bool
+        default: text
+
+    struct IRJob:
+        name: text
+        action: text
+        every: int
+        onStart: bool
+
+    struct IRServiceOp:
+        name: text
+        params: [text]
+        ret: text
+        retList: bool
+
+    struct IRFile:
+        name: text
+        type: text
+        path: text
+
+    struct IRWebhook:
+        path: text
+        action: text
+        secret: text
+
+    struct IRTrigger:
+        on: text
+        action: text
+
+    struct IRRecord:
+        name: text
+        fields: [IRRecordField]
+
+    struct IRWireType:
+        name: text
+        query: bool
+        fields: [IRWireField]
+
+    struct IRWireVariant:
+        name: text
+        fields: [IRWireField]
+
+    struct IRWireMessage:
+        name: text
+        variants: [IRWireVariant]
+
+    struct IRDaemon:
+        name: text
+        every: int
+        body: [IRStmt]
+
+    struct IRComponent:
+        name: text
+        params: [IRParam]
+        view: [IRNode]
+
+    struct IRService:
+        name: text
+        url: text
+        ops: [IRServiceOp]
+
+    struct IRGraph:
+        app: text
+        auth: bool
+        entities: [IREntity]
+        records: [IRRecord]
+        structs: [IRRecord]
+        enums: [IREnum]
+        types: [IRWireType]
+        messages: [IRWireMessage]
+        states: [IRState]
+        derives: [IRDerive]
+        policies: [IRPolicy]
+        actions: [IRAction]
+        procs: [IRProc]
+        jobs: [IRJob]
+        daemons: [IRDaemon]
+        components: [IRComponent]
+        services: [IRService]
+        files: [IRFile]
+        webhooks: [IRWebhook]
+        triggers: [IRTrigger]
+        theme: JVal
+        themeDark: JVal
+        themes: JVal
+        css: text
+        assets: JVal
+        routes: [IRRoute]
+        pages: [IRPage]
+        bindings: [IRBinding]
+        view: [IRNode]
+        depGraph: JVal
+
+    # ── generic JVal re-spelling ────────────────────────────────────────────
+    # jvalJSON: any parsed value back to JSON, keys in stored order.
+    proc jvalJSON(v: JVal) -> text:
+        if v.kind == "str":
+            let q = do jsonQuote(v.s)
+            return q
+        if v.kind == "num" || v.kind == "bool":
+            return v.s
+        if v.kind == "null":
+            return "null"
+        if v.kind == "arr":
+            let n = len(v.vals)
+            let mut out = "["
+            let mut i = 0
+            loop i < n:
+                if i > 0:
+                    out = out + ","
+                let j = do jvalJSON(v.vals[i])
+                out = out + j
+                i = i + 1
+            return out + "]"
+        if v.kind == "obj":
+            let n = len(v.keys)
+            let mut out = "{"
+            let mut i = 0
+            loop i < n:
+                if i > 0:
+                    out = out + ","
+                let kq = do jsonQuote(v.keys[i])
+                let j = do jvalJSON(v.vals[i])
+                out = out + kq + ":" + j
+                i = i + 1
+            return out + "}"
+        return "null"
+
+    private proc jNumG(v: JVal, k: text) -> int:
+        let x = do jGet(v, k)
+        if x.kind == "num":
+            return toInt(x.s)
+        return 0
+
+    # ── readers ─────────────────────────────────────────────────────────────
+    proc irRecordFieldFromJVal(v: JVal) -> IRRecordField:
+        let f_name = do jStr(v, "name")
+        let f_type = do jStr(v, "type")
+        let f_list = do jBool(v, "list")
+        let f_optional = do jBool(v, "optional")
+        return IRRecordField{name: f_name, type: f_type, list: f_list, optional: f_optional}
+
+    proc irWireFieldFromJVal(v: JVal) -> IRWireField:
+        let f_name = do jStr(v, "name")
+        let f_type = do jStr(v, "type")
+        let f_list = do jBool(v, "list")
+        let f_optional = do jBool(v, "optional")
+        let f_ref = do jBool(v, "ref")
+        let f_default = do jStr(v, "default")
+        return IRWireField{name: f_name, type: f_type, list: f_list, optional: f_optional, ref: f_ref, default: f_default}
+
+    proc irJobFromJVal(v: JVal) -> IRJob:
+        let f_name = do jStr(v, "name")
+        let f_action = do jStr(v, "action")
+        let f_every = do jNumG(v, "every")
+        let f_onStart = do jBool(v, "onStart")
+        return IRJob{name: f_name, action: f_action, every: f_every, onStart: f_onStart}
+
+    proc irServiceOpFromJVal(v: JVal) -> IRServiceOp:
+        let f_name = do jStr(v, "name")
+        let f_params = do jTextListOf(v, "params")
+        let f_ret = do jStr(v, "ret")
+        let f_retList = do jBool(v, "retList")
+        return IRServiceOp{name: f_name, params: f_params, ret: f_ret, retList: f_retList}
+
+    proc irFileFromJVal(v: JVal) -> IRFile:
+        let f_name = do jStr(v, "name")
+        let f_type = do jStr(v, "type")
+        let f_path = do jStr(v, "path")
+        return IRFile{name: f_name, type: f_type, path: f_path}
+
+    proc irWebhookFromJVal(v: JVal) -> IRWebhook:
+        let f_path = do jStr(v, "path")
+        let f_action = do jStr(v, "action")
+        let f_secret = do jStr(v, "secret")
+        return IRWebhook{path: f_path, action: f_action, secret: f_secret}
+
+    proc irTriggerFromJVal(v: JVal) -> IRTrigger:
+        let f_on = do jStr(v, "on")
+        let f_action = do jStr(v, "action")
+        return IRTrigger{on: f_on, action: f_action}
+
+    proc irRecordFieldsFromJVal(v: JVal) -> [IRRecordField]:
+        let x = do jGet(v, "fields")
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let f = do irRecordFieldFromJVal(x.vals[i])
+            out = append(out, f)
+            i = i + 1
+        return out
+
+    proc irRecordFromJVal(v: JVal) -> IRRecord:
+        let name = do jStr(v, "name")
+        let fields = do irRecordFieldsFromJVal(v)
+        return IRRecord{name: name, fields: fields}
+
+    proc irWireFieldsFromJVal(v: JVal) -> [IRWireField]:
+        let x = do jGet(v, "fields")
+        let n = len(x.vals)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let f = do irWireFieldFromJVal(x.vals[i])
+            out = append(out, f)
+            i = i + 1
+        return out
+
+    proc irWireTypeFromJVal(v: JVal) -> IRWireType:
+        let name = do jStr(v, "name")
+        let query = do jBool(v, "query")
+        let fields = do irWireFieldsFromJVal(v)
+        return IRWireType{name: name, query: query, fields: fields}
+
+    proc irWireMessageFromJVal(v: JVal) -> IRWireMessage:
+        let name = do jStr(v, "name")
+        let x = do jGet(v, "variants")
+        let n = len(x.vals)
+        let mut variants = []
+        let mut i = 0
+        loop i < n:
+            let vn = do jStr(x.vals[i], "name")
+            let vf = do irWireFieldsFromJVal(x.vals[i])
+            variants = append(variants, IRWireVariant{name: vn, fields: vf})
+            i = i + 1
+        return IRWireMessage{name: name, variants: variants}
+
+    proc irDaemonFromJVal(v: JVal) -> IRDaemon:
+        let name = do jStr(v, "name")
+        let every = do jNumG(v, "every")
+        let bv = do jGet(v, "body")
+        let bn = len(bv.vals)
+        let mut body = []
+        let mut i = 0
+        loop i < bn:
+            let st = do irStmtFromJVal(bv.vals[i])
+            body = append(body, st)
+            i = i + 1
+        return IRDaemon{name: name, every: every, body: body}
+
+    proc irComponentFromJVal(v: JVal) -> IRComponent:
+        let name = do jStr(v, "name")
+        let params = do irParamsFromJVal(v, "params")
+        let view = do irNodesFromJVal(v, "view")
+        return IRComponent{name: name, params: params, view: view}
+
+    proc irServiceFromJVal(v: JVal) -> IRService:
+        let name = do jStr(v, "name")
+        let url = do jStr(v, "url")
+        let x = do jGet(v, "ops")
+        let n = len(x.vals)
+        let mut ops = []
+        let mut i = 0
+        loop i < n:
+            let op = do irServiceOpFromJVal(x.vals[i])
+            ops = append(ops, op)
+            i = i + 1
+        return IRService{name: name, url: url, ops: ops}
+
+    proc irGraphFromJVal(v: JVal) -> IRGraph:
+        let app = do jStr(v, "app")
+        let auth = do jBool(v, "auth")
+        let ev = do jGet(v, "entities")
+        let mut entities = []
+        let mut i = 0
+        loop i < len(ev.vals):
+            let e = do irEntityFromJVal(ev.vals[i])
+            entities = append(entities, e)
+            i = i + 1
+        let rv = do jGet(v, "records")
+        let mut records = []
+        i = 0
+        loop i < len(rv.vals):
+            let r = do irRecordFromJVal(rv.vals[i])
+            records = append(records, r)
+            i = i + 1
+        let sv = do jGet(v, "structs")
+        let mut structs = []
+        i = 0
+        loop i < len(sv.vals):
+            let r = do irRecordFromJVal(sv.vals[i])
+            structs = append(structs, r)
+            i = i + 1
+        let env = do jGet(v, "enums")
+        let mut enums = []
+        i = 0
+        loop i < len(env.vals):
+            let e = do irEnumFromJVal(env.vals[i])
+            enums = append(enums, e)
+            i = i + 1
+        let tv = do jGet(v, "types")
+        let mut types = []
+        i = 0
+        loop i < len(tv.vals):
+            let t = do irWireTypeFromJVal(tv.vals[i])
+            types = append(types, t)
+            i = i + 1
+        let mv = do jGet(v, "messages")
+        let mut messages = []
+        i = 0
+        loop i < len(mv.vals):
+            let m = do irWireMessageFromJVal(mv.vals[i])
+            messages = append(messages, m)
+            i = i + 1
+        let stv = do jGet(v, "states")
+        let mut states = []
+        i = 0
+        loop i < len(stv.vals):
+            let s = do irStateFromJVal(stv.vals[i])
+            states = append(states, s)
+            i = i + 1
+        let dv = do jGet(v, "derives")
+        let mut derives = []
+        i = 0
+        loop i < len(dv.vals):
+            let d = do irDeriveFromJVal(dv.vals[i])
+            derives = append(derives, d)
+            i = i + 1
+        let pv = do jGet(v, "policies")
+        let mut policies = []
+        i = 0
+        loop i < len(pv.vals):
+            let p = do irPolicyFromJVal(pv.vals[i])
+            policies = append(policies, p)
+            i = i + 1
+        let av = do jGet(v, "actions")
+        let mut actions = []
+        i = 0
+        loop i < len(av.vals):
+            let a = do irActionFromJVal(av.vals[i])
+            actions = append(actions, a)
+            i = i + 1
+        let prv = do jGet(v, "procs")
+        let mut procs = []
+        i = 0
+        loop i < len(prv.vals):
+            let p = do irProcFromJVal(prv.vals[i])
+            procs = append(procs, p)
+            i = i + 1
+        let jv = do jGet(v, "jobs")
+        let mut jobs = []
+        i = 0
+        loop i < len(jv.vals):
+            let j = do irJobFromJVal(jv.vals[i])
+            jobs = append(jobs, j)
+            i = i + 1
+        let dmv = do jGet(v, "daemons")
+        let mut daemons = []
+        i = 0
+        loop i < len(dmv.vals):
+            let d = do irDaemonFromJVal(dmv.vals[i])
+            daemons = append(daemons, d)
+            i = i + 1
+        let cv = do jGet(v, "components")
+        let mut components = []
+        i = 0
+        loop i < len(cv.vals):
+            let c = do irComponentFromJVal(cv.vals[i])
+            components = append(components, c)
+            i = i + 1
+        let svv = do jGet(v, "services")
+        let mut services = []
+        i = 0
+        loop i < len(svv.vals):
+            let s = do irServiceFromJVal(svv.vals[i])
+            services = append(services, s)
+            i = i + 1
+        let fv = do jGet(v, "files")
+        let mut files = []
+        i = 0
+        loop i < len(fv.vals):
+            let f = do irFileFromJVal(fv.vals[i])
+            files = append(files, f)
+            i = i + 1
+        let wv = do jGet(v, "webhooks")
+        let mut webhooks = []
+        i = 0
+        loop i < len(wv.vals):
+            let w = do irWebhookFromJVal(wv.vals[i])
+            webhooks = append(webhooks, w)
+            i = i + 1
+        let trv = do jGet(v, "triggers")
+        let mut triggers = []
+        i = 0
+        loop i < len(trv.vals):
+            let t = do irTriggerFromJVal(trv.vals[i])
+            triggers = append(triggers, t)
+            i = i + 1
+        let theme = do jGet(v, "theme")
+        let themeDark = do jGet(v, "themeDark")
+        let themes = do jGet(v, "themes")
+        let css = do jStr(v, "css")
+        let assets = do jGet(v, "assets")
+        let rtv = do jGet(v, "routes")
+        let mut routes = []
+        i = 0
+        loop i < len(rtv.vals):
+            let r = do irRouteFromJVal(rtv.vals[i])
+            routes = append(routes, r)
+            i = i + 1
+        let pgv = do jGet(v, "pages")
+        let mut pages = []
+        i = 0
+        loop i < len(pgv.vals):
+            let p = do irPageFromJVal(pgv.vals[i])
+            pages = append(pages, p)
+            i = i + 1
+        let bv = do jGet(v, "bindings")
+        let mut bindings = []
+        i = 0
+        loop i < len(bv.vals):
+            let b = do irBindingFromJVal(bv.vals[i])
+            bindings = append(bindings, b)
+            i = i + 1
+        let view = do irNodesFromJVal(v, "view")
+        let depGraph = do jGet(v, "depGraph")
+        return IRGraph{app: app, auth: auth, entities: entities, records: records, structs: structs, enums: enums, types: types, messages: messages, states: states, derives: derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: daemons, components: components, services: services, files: files, webhooks: webhooks, triggers: triggers, theme: theme, themeDark: themeDark, themes: themes, css: css, assets: assets, routes: routes, pages: pages, bindings: bindings, view: view, depGraph: depGraph}
+
+    # ── emitters ────────────────────────────────────────────────────────────
+    proc irRecordFieldJSON(x: IRRecordField) -> text:
+        let mut out = "{"
+        let mut first = true
+        if !first:
+            out = out + ","
+        let q_name = do jsonQuote(x.name)
+        out = out + "\"name\":" + q_name
+        first = false
+        if !first:
+            out = out + ","
+        let q_type = do jsonQuote(x.type)
+        out = out + "\"type\":" + q_type
+        first = false
+        if x.list:
+                if !first:
+                    out = out + ","
+                if x.list:
+                    out = out + "\"list\":true"
+                else:
+                    out = out + "\"list\":false"
+                first = false
+        if x.optional:
+                if !first:
+                    out = out + ","
+                if x.optional:
+                    out = out + "\"optional\":true"
+                else:
+                    out = out + "\"optional\":false"
+                first = false
+        return out + "}"
+
+    proc irWireFieldJSON(x: IRWireField) -> text:
+        let mut out = "{"
+        let mut first = true
+        if !first:
+            out = out + ","
+        let q_name = do jsonQuote(x.name)
+        out = out + "\"name\":" + q_name
+        first = false
+        if !first:
+            out = out + ","
+        let q_type = do jsonQuote(x.type)
+        out = out + "\"type\":" + q_type
+        first = false
+        if x.list:
+                if !first:
+                    out = out + ","
+                if x.list:
+                    out = out + "\"list\":true"
+                else:
+                    out = out + "\"list\":false"
+                first = false
+        if x.optional:
+                if !first:
+                    out = out + ","
+                if x.optional:
+                    out = out + "\"optional\":true"
+                else:
+                    out = out + "\"optional\":false"
+                first = false
+        if x.ref:
+                if !first:
+                    out = out + ","
+                if x.ref:
+                    out = out + "\"ref\":true"
+                else:
+                    out = out + "\"ref\":false"
+                first = false
+        if x.default != "":
+                if !first:
+                    out = out + ","
+                let q_default = do jsonQuote(x.default)
+                out = out + "\"default\":" + q_default
+                first = false
+        return out + "}"
+
+    proc irJobJSON(x: IRJob) -> text:
+        let mut out = "{"
+        let mut first = true
+        if !first:
+            out = out + ","
+        let q_name = do jsonQuote(x.name)
+        out = out + "\"name\":" + q_name
+        first = false
+        if !first:
+            out = out + ","
+        let q_action = do jsonQuote(x.action)
+        out = out + "\"action\":" + q_action
+        first = false
+        if x.every != 0:
+                if !first:
+                    out = out + ","
+                out = out + "\"every\":" + x.every
+                first = false
+        if x.onStart:
+                if !first:
+                    out = out + ","
+                if x.onStart:
+                    out = out + "\"onStart\":true"
+                else:
+                    out = out + "\"onStart\":false"
+                first = false
+        return out + "}"
+
+    proc irServiceOpJSON(x: IRServiceOp) -> text:
+        let mut out = "{"
+        let mut first = true
+        if !first:
+            out = out + ","
+        let q_name = do jsonQuote(x.name)
+        out = out + "\"name\":" + q_name
+        first = false
+        if len(x.params) > 0:
+                if !first:
+                    out = out + ","
+                let l_params = do textListJSON(x.params)
+                out = out + "\"params\":" + l_params
+                first = false
+        if x.ret != "":
+                if !first:
+                    out = out + ","
+                let q_ret = do jsonQuote(x.ret)
+                out = out + "\"ret\":" + q_ret
+                first = false
+        if x.retList:
+                if !first:
+                    out = out + ","
+                if x.retList:
+                    out = out + "\"retList\":true"
+                else:
+                    out = out + "\"retList\":false"
+                first = false
+        return out + "}"
+
+    proc irFileJSON(x: IRFile) -> text:
+        let mut out = "{"
+        let mut first = true
+        if !first:
+            out = out + ","
+        let q_name = do jsonQuote(x.name)
+        out = out + "\"name\":" + q_name
+        first = false
+        if !first:
+            out = out + ","
+        let q_type = do jsonQuote(x.type)
+        out = out + "\"type\":" + q_type
+        first = false
+        if !first:
+            out = out + ","
+        let q_path = do jsonQuote(x.path)
+        out = out + "\"path\":" + q_path
+        first = false
+        return out + "}"
+
+    proc irWebhookJSON(x: IRWebhook) -> text:
+        let mut out = "{"
+        let mut first = true
+        if !first:
+            out = out + ","
+        let q_path = do jsonQuote(x.path)
+        out = out + "\"path\":" + q_path
+        first = false
+        if !first:
+            out = out + ","
+        let q_action = do jsonQuote(x.action)
+        out = out + "\"action\":" + q_action
+        first = false
+        if x.secret != "":
+                if !first:
+                    out = out + ","
+                let q_secret = do jsonQuote(x.secret)
+                out = out + "\"secret\":" + q_secret
+                first = false
+        return out + "}"
+
+    proc irTriggerJSON(x: IRTrigger) -> text:
+        let mut out = "{"
+        let mut first = true
+        if !first:
+            out = out + ","
+        let q_on = do jsonQuote(x.on)
+        out = out + "\"on\":" + q_on
+        first = false
+        if !first:
+            out = out + ","
+        let q_action = do jsonQuote(x.action)
+        out = out + "\"action\":" + q_action
+        first = false
+        return out + "}"
+
+    proc irRecordFieldsJSON(fs: [IRRecordField]) -> text:
+        let n = len(fs)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let j = do irRecordFieldJSON(fs[i])
+            out = out + j
+            i = i + 1
+        return out + "]"
+
+    proc irRecordJSON(r: IRRecord) -> text:
+        let nq = do jsonQuote(r.name)
+        let fj = do irRecordFieldsJSON(r.fields)
+        return "{\"name\":" + nq + ",\"fields\":" + fj + "}"
+
+    proc irWireFieldsJSON(fs: [IRWireField]) -> text:
+        let n = len(fs)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let j = do irWireFieldJSON(fs[i])
+            out = out + j
+            i = i + 1
+        return out + "]"
+
+    proc irWireTypeJSON(t: IRWireType) -> text:
+        let nq = do jsonQuote(t.name)
+        let mut out = "{\"name\":" + nq
+        if t.query:
+            out = out + ",\"query\":true"
+        let fj = do irWireFieldsJSON(t.fields)
+        return out + ",\"fields\":" + fj + "}"
+
+    proc irWireMessageJSON(m: IRWireMessage) -> text:
+        let nq = do jsonQuote(m.name)
+        let mut out = "{\"name\":" + nq + ",\"variants\":["
+        let n = len(m.variants)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let vq = do jsonQuote(m.variants[i].name)
+            let fj = do irWireFieldsJSON(m.variants[i].fields)
+            out = out + "{\"name\":" + vq + ",\"fields\":" + fj + "}"
+            i = i + 1
+        return out + "]}"
+
+    proc irDaemonJSON(d: IRDaemon) -> text:
+        let nq = do jsonQuote(d.name)
+        let mut out = "{\"name\":" + nq
+        if d.every != 0:
+            out = out + ",\"every\":" + d.every
+        let bj = do irStmtListJSON(d.body)
+        return out + ",\"body\":" + bj + "}"
+
+    proc irComponentJSON(c: IRComponent) -> text:
+        let nq = do jsonQuote(c.name)
+        let pj = do irParamsJSON(c.params)
+        let vj = do irNodesJSON(c.view)
+        return "{\"name\":" + nq + ",\"params\":" + pj + ",\"view\":" + vj + "}"
+
+    proc irServiceJSON(s: IRService) -> text:
+        let nq = do jsonQuote(s.name)
+        let uq = do jsonQuote(s.url)
+        let mut out = "{\"name\":" + nq + ",\"url\":" + uq + ",\"ops\":["
+        let n = len(s.ops)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let oj = do irServiceOpJSON(s.ops[i])
+            out = out + oj
+            i = i + 1
+        return out + "]}"
+
+    # irGraphJSON: encoding/json over ir.IR, key for key. A helper per list
+    # keeps the body readable: `nullable` lists print `null` when empty (the
+    # non-omitempty slices the builder leaves nil), `optional` ones are left
+    # out entirely when empty (omitempty).
+    proc irGraphJSON(g: IRGraph) -> text:
+        let aq = do jsonQuote(g.app)
+        let mut out = "{\"app\":" + aq
+        if g.auth:
+            out = out + ",\"auth\":true"
+        out = out + ",\"entities\":"
+        if len(g.entities) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.entities):
+                if i > 0:
+                    out = out + ","
+                let j = do irEntityJSON(g.entities[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.records) > 0:
+            out = out + ",\"records\":["
+            let mut i = 0
+            loop i < len(g.records):
+                if i > 0:
+                    out = out + ","
+                let j = do irRecordJSON(g.records[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.structs) > 0:
+            out = out + ",\"structs\":["
+            let mut i = 0
+            loop i < len(g.structs):
+                if i > 0:
+                    out = out + ","
+                let j = do irRecordJSON(g.structs[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.enums) > 0:
+            out = out + ",\"enums\":["
+            let mut i = 0
+            loop i < len(g.enums):
+                if i > 0:
+                    out = out + ","
+                let j = do irEnumJSON(g.enums[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.types) > 0:
+            out = out + ",\"types\":["
+            let mut i = 0
+            loop i < len(g.types):
+                if i > 0:
+                    out = out + ","
+                let j = do irWireTypeJSON(g.types[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.messages) > 0:
+            out = out + ",\"messages\":["
+            let mut i = 0
+            loop i < len(g.messages):
+                if i > 0:
+                    out = out + ","
+                let j = do irWireMessageJSON(g.messages[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"states\":"
+        if len(g.states) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.states):
+                if i > 0:
+                    out = out + ","
+                let j = do irStateJSON(g.states[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"derives\":"
+        if len(g.derives) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.derives):
+                if i > 0:
+                    out = out + ","
+                let j = do irDeriveJSON(g.derives[i], false)
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"policies\":"
+        if len(g.policies) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.policies):
+                if i > 0:
+                    out = out + ","
+                let j = do irPolicyJSON(g.policies[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"actions\":"
+        if len(g.actions) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.actions):
+                if i > 0:
+                    out = out + ","
+                let j = do irActionJSON(g.actions[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.procs) > 0:
+            out = out + ",\"procs\":["
+            let mut i = 0
+            loop i < len(g.procs):
+                if i > 0:
+                    out = out + ","
+                let j = do irProcJSON(g.procs[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"jobs\":"
+        if len(g.jobs) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.jobs):
+                if i > 0:
+                    out = out + ","
+                let j = do irJobJSON(g.jobs[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.daemons) > 0:
+            out = out + ",\"daemons\":["
+            let mut i = 0
+            loop i < len(g.daemons):
+                if i > 0:
+                    out = out + ","
+                let j = do irDaemonJSON(g.daemons[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.components) > 0:
+            out = out + ",\"components\":["
+            let mut i = 0
+            loop i < len(g.components):
+                if i > 0:
+                    out = out + ","
+                let j = do irComponentJSON(g.components[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.services) > 0:
+            out = out + ",\"services\":["
+            let mut i = 0
+            loop i < len(g.services):
+                if i > 0:
+                    out = out + ","
+                let j = do irServiceJSON(g.services[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.files) > 0:
+            out = out + ",\"files\":["
+            let mut i = 0
+            loop i < len(g.files):
+                if i > 0:
+                    out = out + ","
+                let j = do irFileJSON(g.files[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.webhooks) > 0:
+            out = out + ",\"webhooks\":["
+            let mut i = 0
+            loop i < len(g.webhooks):
+                if i > 0:
+                    out = out + ","
+                let j = do irWebhookJSON(g.webhooks[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.triggers) > 0:
+            out = out + ",\"triggers\":["
+            let mut i = 0
+            loop i < len(g.triggers):
+                if i > 0:
+                    out = out + ","
+                let j = do irTriggerJSON(g.triggers[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        if g.theme.kind == "obj" && len(g.theme.keys) > 0:
+            let tj = do jvalJSON(g.theme)
+            out = out + ",\"theme\":" + tj
+        if g.themeDark.kind == "obj" && len(g.themeDark.keys) > 0:
+            let tj = do jvalJSON(g.themeDark)
+            out = out + ",\"themeDark\":" + tj
+        if g.themes.kind == "obj" && len(g.themes.keys) > 0:
+            let tj = do jvalJSON(g.themes)
+            out = out + ",\"themes\":" + tj
+        if g.css != "":
+            let cq = do jsonQuote(g.css)
+            out = out + ",\"css\":" + cq
+        if g.assets.kind == "obj" && len(g.assets.keys) > 0:
+            let aj = do jvalJSON(g.assets)
+            out = out + ",\"assets\":" + aj
+        if len(g.routes) > 0:
+            out = out + ",\"routes\":["
+            let mut i = 0
+            loop i < len(g.routes):
+                if i > 0:
+                    out = out + ","
+                let j = do irRouteJSON(g.routes[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"pages\":"
+        if len(g.pages) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.pages):
+                if i > 0:
+                    out = out + ","
+                let j = do irPageJSON(g.pages[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"bindings\":"
+        if len(g.bindings) == 0:
+            out = out + "null"
+        else:
+            out = out + "["
+            let mut i = 0
+            loop i < len(g.bindings):
+                if i > 0:
+                    out = out + ","
+                let j = do irBindingJSON(g.bindings[i])
+                out = out + j
+                i = i + 1
+            out = out + "]"
+        out = out + ",\"view\":"
+        if len(g.view) == 0:
+            out = out + "null"
+        else:
+            let vj = do irNodesJSON(g.view)
+            out = out + vj
+        let dj = do jvalJSON(g.depGraph)
+        return out + ",\"depGraph\":" + dj + "}"
+
+    # ── live driver ─────────────────────────────────────────────────────────
+    proc irGraphRoundTrip(src: text) -> text:
+        let v = do jsonParse(src)
+        let g = do irGraphFromJVal(v)
+        let j = do irGraphJSON(g)
+        return j
+
+    state irGraphBack: text = ""
+
+    action runIRGraphRoundTrip(src: text):
+        let j = do irGraphRoundTrip(src)
+        irGraphBack = j
+
+    private view IRGraphHome at "/ir_graph":
+        box:
+            text "{irGraphBack}"

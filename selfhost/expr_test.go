@@ -116,21 +116,34 @@ func postExprJSON(t *testing.T, ts *httptest.Server, action string, args ...any)
 // kind 14, `{k: v, ...}`) — the third variable-length-child shape, this one
 // with TWO parallel children lists (`mapKeys`/`mapVals`) rather than one,
 // since each entry is a key/value PAIR.
+//
+// Round 6 adds "struct" (ast.StructLit{Type, Fields} / ExprNode kind
+// "struct", `Name{f: v, ...}` — `name` is the type, `fieldNames`/`fieldVals`
+// the parallel field list; on the .fct side the fields ride in the same
+// `pairs: [Pair]` slot a map literal uses, each key a `ref` node naming the
+// field) and "astate" (ast.ActState{Op, Action} / ExprNode kind "astate",
+// `pending(a)`/`failed(a)`/`dirty(s)`/`touched(s)` — `op` and `name`). The
+// round's other additions (`%`, `<<`/`>>`, membership `in`, the missing
+// builtin names and two-argument `min`/`max`) are all just new operator/
+// name STRINGS on the existing "bin"/"call" kinds, so no new shape was
+// needed for them.
 type treeShape struct {
-	kind        string  // "lit" | "ref" | "bin" | "un" | "get" | "index" | "call" | "list" | "entity" | "map"
+	kind        string  // "lit" | "ref" | "bin" | "un" | "get" | "index" | "call" | "list" | "entity" | "map" | "struct" | "astate"
 	litKind     string  // kind == "lit": "int" | "bool" | "text" | "float"
 	intVal      int     // kind == "lit" && litKind == "int"
 	boolVal     bool    // kind == "lit" && litKind == "bool"
 	textVal     string  // kind == "lit" && litKind == "text"
 	floatVal    float64 // kind == "lit" && litKind == "float"
-	name        string  // kind == "ref" | "call" | "entity" (entity's builtin/entity name)
-	op          string  // kind == "bin" | "un"
+	name        string  // kind == "ref" | "call" | "entity" | "struct" (type name) | "astate" (action/cell name)
+	op          string  // kind == "bin" | "un" | "astate" (pending/failed/dirty/touched)
 	field       string  // kind == "get" | "entity" (entity: "" means no field)
 	left, right *treeShape
 	args        []*treeShape // kind == "call"
 	elems       []*treeShape // kind == "list"
 	mapKeys     []*treeShape // kind == "map"
 	mapVals     []*treeShape // kind == "map" (parallel to mapKeys)
+	fieldNames  []string     // kind == "struct"
+	fieldVals   []*treeShape // kind == "struct" (parallel to fieldNames)
 }
 
 func shapeFromGoExpr(t *testing.T, e ast.Expr) *treeShape {
@@ -205,8 +218,18 @@ func shapeFromGoExpr(t *testing.T, e ast.Expr) *treeShape {
 			vals = append(vals, shapeFromGoExpr(t, v))
 		}
 		return &treeShape{kind: "map", mapKeys: keys, mapVals: vals}
+	case ast.StructLit:
+		var names []string
+		var vals []*treeShape
+		for _, f := range x.Fields {
+			names = append(names, f.Name)
+			vals = append(vals, shapeFromGoExpr(t, f.Expr))
+		}
+		return &treeShape{kind: "struct", name: x.Type, fieldNames: names, fieldVals: vals}
+	case ast.ActState:
+		return &treeShape{kind: "astate", op: x.Op, name: x.Action}
 	default:
-		t.Fatalf("shapeFromGoExpr: unexpected ast.Expr node %T (this subset only covers Lit(int/bool/text/float)/Ref/Bin/Un/Get/Index/Call/ListLit/EntityGet/MapLit)", e)
+		t.Fatalf("shapeFromGoExpr: unexpected ast.Expr node %T (this port covers Lit(int/bool/text/float)/Ref/Bin/Un/Get/Index/Call/ListLit/EntityGet/MapLit/StructLit/ActState)", e)
 		return nil
 	}
 }
@@ -312,6 +335,21 @@ func shapeFromSerialized(t *testing.T, flat []string, pos int) (*treeShape, int)
 		return &treeShape{kind: "entity", name: text, field: field, left: children[0]}, pos
 	case "map":
 		return &treeShape{kind: "map", mapKeys: pairKeys, mapVals: pairVals}, pos
+	case "struct":
+		// A struct literal's fields ride in the same `pairs` slot a map
+		// literal uses (expr_tokens.fct's kind == "struct" doc): each key
+		// is a `ref` node whose name is the field name, never an
+		// arbitrary key expression.
+		var names []string
+		for i, k := range pairKeys {
+			if k.kind != "ref" {
+				t.Fatalf("shapeFromSerialized: struct literal %s field %d key is %s, want a ref naming the field", text, i, shapeString(k))
+			}
+			names = append(names, k.name)
+		}
+		return &treeShape{kind: "struct", name: text, fieldNames: names, fieldVals: pairVals}, pos
+	case "astate":
+		return &treeShape{kind: "astate", op: text, name: field}, pos
 	default:
 		t.Fatalf("shapeFromSerialized: unknown node kind %q", kind)
 		return nil, pos
@@ -425,6 +463,18 @@ func shapesEqual(a, b *treeShape) bool {
 			}
 		}
 		return true
+	case "struct":
+		if a.name != b.name || len(a.fieldNames) != len(b.fieldNames) || len(a.fieldVals) != len(b.fieldVals) {
+			return false
+		}
+		for i := range a.fieldNames {
+			if a.fieldNames[i] != b.fieldNames[i] || !shapesEqual(a.fieldVals[i], b.fieldVals[i]) {
+				return false
+			}
+		}
+		return true
+	case "astate":
+		return a.op == b.op && a.name == b.name
 	}
 	return false
 }
@@ -488,6 +538,17 @@ func shapeString(s *treeShape) string {
 			out += shapeString(s.mapKeys[i]) + ": " + shapeString(s.mapVals[i])
 		}
 		return out + "}"
+	case "struct":
+		out := s.name + "{"
+		for i := range s.fieldNames {
+			if i > 0 {
+				out += ", "
+			}
+			out += s.fieldNames[i] + ": " + shapeString(s.fieldVals[i])
+		}
+		return out + "}"
+	case "astate":
+		return s.op + "(" + s.name + ")"
 	}
 	return "?"
 }
@@ -1086,18 +1147,19 @@ func TestExprArenaMatchesGoParserRound4(t *testing.T) {
 //     See TestEntityLookupDisambiguation, below, for the shape-level proof
 //     (cross-checked against the real Go parser) that this is now a genuine,
 //     correct ast.EntityGet, not a guess.
-//   - "min(a, b)" / "max(x)": deliberately excluded from BOTH isCallNameTok
-//     AND isEntityNameTok's entity-lookup candidacy (ROUND 4 SCOPE NOTE,
-//     finding 2, and ROUND 5 SCOPE NOTE) because the real grammar's own
-//     disambiguation for these two names (call vs. aggregate, decided by
-//     whether the argument list has a top-level comma) is itself out of
-//     scope — including them here (as a call OR an entity lookup) would risk
-//     a WRONG tree shape, not just an incomplete one, so both keep degrading
-//     the same honest "not consumed" way, regardless of arity.
-//   - "count(x)" / "sum(Coll.field)" / "pending(action)": the OTHER reserved
-//     aggregate/action-state names (isEntityNameTok) — still unconsumed,
-//     confirming these did NOT accidentally start being treated as entity
-//     lookups just because they aren't builtin call names either.
+//   - "min(a, b)" / "max(x)": UPDATED in round 6 — `min`/`max` are now in
+//     isCallNameTok (they are in the real isBuiltinCall list), and
+//     isCallStartAt applies the real grammar's own disambiguation
+//     (argListHasComma / hasTopLevelCommaAt): a top-level comma means the
+//     two-argument scalar Call, so "min(a, b)" is now fully consumed. "max(x)"
+//     has no comma, so it can only be the aggregate form, which the real
+//     parser rejects ("max needs a field") — so it stays unconsumed here,
+//     the same honest degrade as before, now for the exact reason Go errors.
+//   - "count(x)" / "sum(Coll.field)": aggregates, fully consumed since the
+//     aggregate grammar landed.
+//   - "pending(action)": UPDATED in round 6 — the action-state reads
+//     (pending/failed/dirty/touched) now build a real "astate" node
+//     (isActStateStartAt/actStateNodes, STAGE 2h), so this is consumed too.
 //   - "len" alone (no trailing `(`) and "len + x" both confirm the other
 //     direction: a builtin name NOT immediately followed by `(` is still
 //     just a bare Ref and IS fully consumed — isCallStartAt's lookahead
@@ -1108,15 +1170,15 @@ func TestCallDisambiguationAndOutOfScopeNames(t *testing.T) {
 		src  string
 		want bool
 	}{
-		{"foo(x)", true},     // round 5: non-builtin, non-reserved name + `(` is now a real EntityGet
-		{"min(a, b)", false}, // min/max deliberately excluded (aggregate ambiguity) — unchanged
-		{"max(x)", false},    // real Go: "max needs a field: max(x.field)" — numericAgg with no field/sel is a hard error, so this port refuses to start the agg here too (isAggStartAt)
-		{"count(x)", true},   // real Go: valid whole-collection Agg{Op:"count",Coll:"x"} — count/exists never need a field, so this IS in scope, not "still unconsumed" (an earlier round's comment here was stale)
+		{"foo(x)", true},          // round 5: non-builtin, non-reserved name + `(` is now a real EntityGet
+		{"min(a, b)", true},       // round 6: a top-level comma means the two-argument scalar builtin Call, exactly as argListHasComma decides
+		{"max(x)", false},         // real Go: "max needs a field: max(x.field)" — numericAgg with no field/sel is a hard error, so this port refuses to start the agg here too (isAggStartAt)
+		{"count(x)", true},        // real Go: valid whole-collection Agg{Op:"count",Coll:"x"} — count/exists never need a field, so this IS in scope, not "still unconsumed" (an earlier round's comment here was stale)
 		{"sum(Coll.field)", true}, // real Go: valid Agg{Op:"sum",Coll:"Coll",Field:"field"} — the field IS present, so numericAgg's field requirement is satisfied
-		{"pending(action)", false}, // reserved action-state name: still genuinely out of scope — no ActState grammar exists anywhere in this port yet (unlike aggregates, which now do)
-		{"len", true},              // builtin name, no `(`: just a bare Ref, fully consumed
-		{"len + x", true},          // ditto, mid-expression
-		{"len(x)", true},           // builtin name + `(`: a real call, fully consumed
+		{"pending(action)", true}, // round 6: a real ActState node now (isActStateStartAt/actStateNodes, STAGE 2h)
+		{"len", true},             // builtin name, no `(`: just a bare Ref, fully consumed
+		{"len + x", true},         // ditto, mid-expression
+		{"len(x)", true},          // builtin name + `(`: a real call, fully consumed
 	}
 	for _, c := range cases {
 		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
@@ -1381,12 +1443,13 @@ func TestFloatTrailingDotConsumedAll(t *testing.T) {
 // TestEntityLookupDisambiguation is this round's headline new-grammar-
 // boundary check, mirroring TestIndexVsListLitDisambiguation's own role for
 // round 4: a plain call-shaped name that is a builtin (`len(x)`), a reserved
-// aggregate/action-state name (`count(x)`, `pending(a)` — still out of scope,
-// still unconsumed), or neither (a real entity lookup, `Post(id)`) must never
-// be confused, cross-checked against the real Go parser's own ast.Expr where
-// that's meaningful (the reserved-name cases produce a DIFFERENT real AST —
-// ast.Agg/ast.ActState — so those are checked via consumedAll only, mirroring
-// TestCallDisambiguationAndOutOfScopeNames's own established split).
+// aggregate/action-state name (`count(x)`, `pending(a)`), or neither (a real
+// entity lookup, `Post(id)`) must never be confused, cross-checked against
+// the real Go parser's own ast.Expr where that's meaningful (the aggregate
+// cases produce ast.Agg, which this file's treeShape does not model, so
+// those are checked via consumedAll only, mirroring
+// TestCallDisambiguationAndOutOfScopeNames's own established split; the
+// action-state cases ARE shape-checked, in exprCasesRound6).
 func TestEntityLookupDisambiguation(t *testing.T) {
 	ts := loadExprApp(t)
 	shapeCases := []string{
@@ -1419,29 +1482,31 @@ func TestEntityLookupDisambiguation(t *testing.T) {
 	// reservedCases checks that count/sum/exists/avg/min/max/pending/
 	// failed/dirty/touched immediately followed by `(` are NEVER
 	// misparsed as an entity lookup (isEntityNameTok) — but "never an
-	// entity lookup" does not mean "never a valid expression at all": once
-	// this port's aggregate grammar (isAggStartAt/aggEnd/aggNodes) can
-	// actually build a valid Agg node, `want` is `true`, matching what the
-	// real Go parser.ParseExpr accepts with no error; it's `false` only
-	// where the real parser itself errors (numericAgg missing a field —
-	// see TestCallDisambiguationAndOutOfScopeNames's own `max(x)` case) or
-	// where this port has no grammar for the shape yet at all (action-state
-	// reads: pending/failed/dirty/touched have no ActState port anywhere
-	// in this file, unlike aggregates).
+	// entity lookup" does not mean "never a valid expression at all": the
+	// aggregate grammar (isAggStartAt/aggEnd/aggNodes), the two-argument
+	// min/max Call (isCallStartAt's comma gate) and, since round 6, the
+	// action-state reads (isActStateStartAt/actStateNodes) each build a
+	// real node, so `want` is `true` wherever the real Go parser.ParseExpr
+	// accepts the input with no error; it's `false` only where the real
+	// parser itself errors (numericAgg missing a field — see
+	// TestCallDisambiguationAndOutOfScopeNames's own `max(x)` case, or an
+	// action-state read whose argument is not one bare IDENT).
 	reservedCases := []struct {
 		src  string
 		want bool
 	}{
-		{"count(x)", true},          // real Go: valid Agg{Op:"count",Coll:"x"} — count never needs a field
-		{"sum(Coll.field)", true},   // real Go: valid Agg{Op:"sum",Coll:"Coll",Field:"field"} — field present
-		{"exists(x)", true},         // real Go: valid Agg{Op:"exists",Coll:"x"} — exists never needs a field
-		{"avg(Coll.field)", true},   // real Go: valid Agg{Op:"avg",Coll:"Coll",Field:"field"} — field present
-		{"min(a, b)", false},        // min/max deliberately excluded from this port's call grammar (aggregate ambiguity) — unchanged
-		{"max(x)", false},           // real Go: "max needs a field: max(x.field)" — a genuine parse error, not just out of scope
-		{"pending(action)", false},  // no ActState grammar in this port at all — genuinely still out of scope
-		{"failed(action)", false},   // ditto
-		{"dirty(x)", false},         // ditto
-		{"touched(x)", false},       // ditto
+		{"count(x)", true},        // real Go: valid Agg{Op:"count",Coll:"x"} — count never needs a field
+		{"sum(Coll.field)", true}, // real Go: valid Agg{Op:"sum",Coll:"Coll",Field:"field"} — field present
+		{"exists(x)", true},       // real Go: valid Agg{Op:"exists",Coll:"x"} — exists never needs a field
+		{"avg(Coll.field)", true}, // real Go: valid Agg{Op:"avg",Coll:"Coll",Field:"field"} — field present
+		{"min(a, b)", true},       // round 6: a top-level comma means the two-argument scalar builtin Call, exactly as argListHasComma decides
+		{"max(x)", false},         // real Go: "max needs a field: max(x.field)" — a genuine parse error, not just out of scope
+		{"pending(action)", true}, // round 6: a real ActState node now (isActStateStartAt/actStateNodes, STAGE 2h)
+		{"failed(action)", true},  // ditto
+		{"dirty(x)", true},        // ditto
+		{"touched(x)", true},      // ditto
+		{"pending(a + b)", false}, // real Go: "pending needs an action name" — the argument must be one bare IDENT, so this port refuses to start the read (isActStateStartAt) and leaves `(...)` unconsumed
+		{"pending()", false},      // real Go: same error — no name at all
 	}
 	for _, c := range reservedCases {
 		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
@@ -1490,5 +1555,216 @@ func TestMapLitDisambiguation(t *testing.T) {
 				t.Errorf("%q: parseExprConsumedAll = false, want true", src)
 			}
 		})
+	}
+}
+
+// ============================================================
+// Round 6: the last of expr.go's grammar — `%` at the `*`/`/` level, the
+// shift level (`<<`/`>>`, binPrec 7, between comparison and `+`/`-`), the
+// general membership `in` operator (binPrec 6, alongside the comparisons,
+// and distinct from an aggregate's own `in`), the builtin names
+// isCallNameTok was missing against the real isBuiltinCall (`replace`,
+// `slug`, `floatBits`, `floatFromBits`), two-argument `min(a, b)`/`max(a, b)`
+// as Calls (argListHasComma's own rule), struct literals (`Name{f: v, ...}`,
+// ast.StructLit), and the action-state reads `pending`/`failed`/`dirty`/
+// `touched` (ast.ActState) — verified the exact same way rounds 1-5 were.
+//
+// The precedence interactions that matter most here (each one is a
+// different pair of levels meeting in one expression):
+//
+//   - "a + b << 1"          shift (7) is LOOSER than `+` (8): `(a + b) << 1`
+//   - "x << 1 == y"         shift (7) is TIGHTER than comparison (6): `(x << 1) == y`
+//   - "a % b * c"           `%` sits at the `*` level, left-associative
+//   - "a + b % c"           `%` (9) binds tighter than `+` (8)
+//   - "x in xs && y"        `in` (6) binds tighter than `&&` (2)
+//   - "a + 1 in xs"         `+` (8) binds tighter than `in` (6): `(a + 1) in xs`
+//   - "x in xs == true"     `in` and `==` share level 6, left-associative
+//   - "sum(l.qty << 1 in Line where l.k in ks)"  an aggregate's reduced
+//     value is parsed at precArith (7), so the shift binds INTO it while
+//     the aggregate's own `in` is left for parseAgg — and the `where`
+//     clause is a full expression, so the membership `in` inside it is
+//     the binPrec-6 operator
+var exprCasesRound6 = []string{
+	// `%`, individually and against neighbours
+	"a % b",
+	"10 % 3",
+	"a % b % c",
+	"a % b * c",
+	"a * b % c",
+	"a + b % c",
+	"-a % b",
+	"a % b == 0",
+	// shifts, individually and against neighbours
+	"a << 1",
+	"a >> 2",
+	"a << b << c",
+	"a << b >> c",
+	"a + b << 1",
+	"a << 1 + b",
+	"x << 1 == y",
+	"a << b & c",
+	"1 << 4 | 1 << 2",
+	"~a >> 1",
+	"a * 2 >> 1 + b",
+	// membership `in`, individually and against neighbours
+	"x in xs",
+	"1 in [1, 2, 3]",
+	"x in xs && y in ys",
+	"!(x in xs)",
+	"a + 1 in xs",
+	"x in xs == true",
+	"x in xs || y",
+	"a.field in b.list",
+	"x in xs[0]",
+	"[x in xs, y in ys]",
+	"{x in xs: 1}",
+	"len(x in xs)",
+	// builtin names that were missing from the allowlist
+	"replace(s, a, b)",
+	"slug(title)",
+	"floatBits(f)",
+	"floatFromBits(n)",
+	"slug(replace(s, a, b))",
+	// two-argument min/max are Calls (a top-level comma); the one-argument
+	// aggregate form is checked via consumedAll elsewhere (treeShape has no
+	// agg kind)
+	"min(a, b)",
+	"max(a, b)",
+	"min(a, b) + max(c, d)",
+	"min(len(x), 10)",
+	"max(a, min(b, c))",
+	"min([a, b][0], c)",
+	// struct literals
+	"Node{kind: \"bin\"}",
+	"Node{kind: \"bin\", left: a, right: b}",
+	"Pair{key: k, value: v}",
+	"Node{kind: \"bin\", children: [a, b]}",
+	"Node{inner: Node{kind: \"ref\"}}",
+	"Node{kind: \"bin\"}.kind",
+	"Node{items: [1, 2]}.items[0]",
+	"Node{a: 1 + 2, b: x in xs, c: {1: 2}}",
+	"[Node{a: 1}, Node{a: 2}]",
+	"Node{a: 1}.a + Node{a: 2}.a",
+	"-Node{a: 1}.a",
+	// action-state reads
+	"pending(save)",
+	"failed(save)",
+	"dirty(draft)",
+	"touched(draft)",
+	"pending(save) && !failed(save)",
+	"!pending(save)",
+	"pending(save) || dirty(draft)",
+	"[pending(a), touched(b)]",
+	"failed(save) == \"\"",
+}
+
+// TestExprArenaMatchesGoParserRound6 is TestExprArenaMatchesGoParser's exact
+// twin, run over exprCasesRound6 — same real-Go-parser cross-check, same
+// shape comparison, same consumedAll assertion, kept separate per this
+// file's convention of never editing an already-verified case list.
+func TestExprArenaMatchesGoParserRound6(t *testing.T) {
+	ts := loadExprApp(t)
+	for _, src := range exprCasesRound6 {
+		t.Run(src, func(t *testing.T) {
+			wantExpr, err := parser.ParseExpr(src)
+			if err != nil {
+				t.Fatalf("real Go parser.ParseExpr(%q): %v", src, err)
+			}
+			want := shapeFromGoExpr(t, wantExpr)
+
+			d := postExprJSON(t, ts, "runParseExpr", src)
+			got := treeShapeFromResult(t, d)
+
+			if !shapesEqual(got, want) {
+				t.Errorf("%q:\n  got  %s\n  want %s (real Go parser.ParseExpr)", src, shapeString(got), shapeString(want))
+			}
+
+			if consumedOK, _ := d["consumedAllResult"].(bool); !consumedOK {
+				t.Errorf("%q: parseExprConsumedAll = false, want true (a fully valid expression)", src)
+			}
+		})
+	}
+}
+
+// TestTokenizeRound6ShiftOps checks the longest-match tokenization the shift
+// operators need directly: `<<`/`>>` must be ONE token, `<`/`>` next to `=`
+// must still be `<=`/`>=`, and a lone `<`/`>` must stay single. `%` needs no
+// tokenizer change (any single operator character already tokenizes as its
+// own "op" token) but is listed to pin that.
+func TestTokenizeRound6ShiftOps(t *testing.T) {
+	ts := loadExprApp(t)
+	cases := []struct {
+		src  string
+		want []string
+	}{
+		{"a<<b", []string{"a", "<<", "b"}},
+		{"a>>b", []string{"a", ">>", "b"}},
+		{"a << 1", []string{"a", "<<", "1"}},
+		{"a<b", []string{"a", "<", "b"}},
+		{"a<=b", []string{"a", "<=", "b"}},
+		{"a<<=b", []string{"a", "<<", "=", "b"}}, // longest match at the first `<`: `<<`, then a lone `=` (exactly expr.go's tokenize)
+		{"a>>>b", []string{"a", ">>", ">", "b"}},
+		{"a%b", []string{"a", "%", "b"}},
+		{"x in xs", []string{"x", "in", "xs"}},
+		{"Node{kind: 1}", []string{"Node", "{", "kind", ":", "1", "}"}},
+		{"pending(save)", []string{"pending", "(", "save", ")"}},
+	}
+	for _, c := range cases {
+		d := postExprJSON(t, ts, "runTokenTexts", c.src)
+		raw, ok := d["tokenTextsResult"].([]any)
+		if !ok {
+			t.Fatalf("%q: tokenTextsResult = %#v, want a list", c.src, d["tokenTextsResult"])
+		}
+		got := make([]string, len(raw))
+		for i, v := range raw {
+			got[i] = v.(string)
+		}
+		if len(got) != len(c.want) {
+			t.Fatalf("%q: got %d tokens %v, want %d tokens %v", c.src, len(got), got, len(c.want), c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%q: token %d = %q, want %q (full: got %v, want %v)", c.src, i, got[i], c.want[i], got, c.want)
+			}
+		}
+	}
+}
+
+// TestRound6HonestDegrades pins, via consumedAll only, the round-6 inputs
+// the real Go parser REJECTS (so they can never be a shapesEqual case):
+// this port refuses to start the construct and leaves the offending tokens
+// unconsumed — the same "never a wrong tree, never a crash" convention
+// every earlier round's malformed-input case follows. Each case is first
+// confirmed against parser.ParseExpr, so a future grammar change that
+// starts accepting one of them shows up here as a stale pin, not a silent
+// divergence.
+func TestRound6HonestDegrades(t *testing.T) {
+	ts := loadExprApp(t)
+	cases := []struct {
+		src  string
+		want bool
+	}{
+		{"Node{}", false},         // "literal has no fields": not started as a struct literal, `{}` left over after ref Node
+		{"Node{1: 2}", false},     // "expected a field name": a map-style key is not a field name
+		{"node{a: 1}", false},     // lower-case name + `{`: still the syntax error it always was
+		{"max(x)", false},         // "max needs a field": no comma, so never a Call; the aggregate refuses it
+		{"min(x)", false},         // ditto
+		{"pending(a + b)", false}, // "pending needs an action name": one bare IDENT only
+		{"pending(a, b)", false},  // "missing `)` in pending(...)"
+		{"dirty()", false},        // "dirty needs a state cell"
+		{"Node{a: 1}", true},      // and the well-formed neighbours DO consume
+		{"pending(save)", true},
+		{"min(a, b)", true},
+		{"min(x.f)", true}, // one argument WITH a field: the aggregate, accepted
+	}
+	for _, c := range cases {
+		if _, err := parser.ParseExpr(c.src); (err == nil) != c.want {
+			t.Fatalf("real Go parser.ParseExpr(%q): err=%v, but this pin expects consumedAll=%v — the real grammar moved; update the pin", c.src, err, c.want)
+		}
+		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
+		got, _ := d["consumedAllResult"].(bool)
+		if got != c.want {
+			t.Errorf("parseExprConsumedAll(%q) = %v, want %v", c.src, got, c.want)
+		}
 	}
 }

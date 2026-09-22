@@ -23,6 +23,9 @@ func (e *BuildError) Error() string {
 
 // env is the name environment used to validate references and compute deps.
 type env struct {
+	wireTypes     map[string]bool                   // wire `type`/`message` names (SCHEMA_IDL_SCOPE Tier C) — an action may return one
+	emittedTypes  map[string]int                    // wire type -> line of an `emit` of it, checked against the streams that carry it
+	wireFields    map[string]map[string]bool        // wire type -> field set, for a `Dto{...}` literal's field check
 	states        map[string]string                 // name -> placement
 	entities      map[string]bool                   // entity names
 	entityFields  map[string]map[string]bool        // entity -> field set (incl id)
@@ -179,7 +182,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, structs: map[string]map[string]structField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}, files: map[string]*ast.File{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, structs: map[string]map[string]structField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}, files: map[string]*ast.File{}, emittedTypes: map[string]int{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -301,6 +304,7 @@ func Build(app *ast.App) (*IR, error) {
 		wireSeen[ms.Name] = ms.Line
 		wireNames[ms.Name] = true
 	}
+	e.wireTypes = wireNames
 	resolveWireField := func(declName string, f ast.RecordField, seen map[string]bool) (WireField, error) {
 		if seen[f.Name] {
 			return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q has duplicate field %q", declName, f.Name)}
@@ -360,15 +364,18 @@ func Build(app *ast.App) (*IR, error) {
 		}
 		return wf, nil
 	}
+	e.wireFields = map[string]map[string]bool{}
 	for _, ty := range app.Types {
 		seen := map[string]bool{}
 		var fields []WireField
+		e.wireFields[ty.Name] = map[string]bool{}
 		for _, f := range ty.Fields {
 			wf, err := resolveWireField(ty.Name, f, seen)
 			if err != nil {
 				return nil, err
 			}
 			fields = append(fields, wf)
+			e.wireFields[ty.Name][f.Name] = true
 		}
 		out.Types = append(out.Types, WireType{Name: ty.Name, Query: ty.Query, Fields: fields})
 	}
@@ -1089,6 +1096,99 @@ func Build(app *ast.App) (*IR, error) {
 		out.Webhooks = append(out.Webhooks, Webhook{Path: wh.Path, Action: wh.Action, Secret: wh.Secret})
 	}
 
+	// 4d′. Declared HTTP endpoints (`api METHOD "/path" -> action`): the typed
+	// contract. Each binds a server-placed action; every `{name}` in the path
+	// must be one of its parameters (the rest arrive as query or body fields);
+	// method+path is unique; the auth mode is read off the action's gate.
+	apiSeen := map[string]int{}
+	for _, ap := range app.APIs {
+		act, ok := byActionName[ap.Action]
+		if !ok {
+			return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q targets unknown action %q", ap.Method, ap.Path, ap.Action)}
+		}
+		if act.Placement != Server {
+			// An endpoint's action runs on the authority by definition. An
+			// action the calculus placed in the browser only because nothing it
+			// touches is authoritative simply moves; one that reads or writes
+			// @client state cannot, since the authority cannot see that state.
+			for _, n := range append(append([]string{}, act.Reads...), act.Writes...) {
+				if e.states[n] == Client {
+					return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q targets action %q, which reads or writes client-only state %q; an endpoint runs on the authority, which cannot see ephemeral client state", ap.Method, ap.Path, ap.Action, n)}
+				}
+			}
+			act.Placement = Server
+			act.Reason = fmt.Sprintf("serves api %s %s — an endpoint runs on the authority", ap.Method, ap.Path)
+		}
+		key := ap.Method + " " + ap.Path
+		if prev, ok := apiSeen[key]; ok {
+			return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q redeclared (first at line %d)", ap.Method, ap.Path, prev)}
+		}
+		apiSeen[key] = ap.Line
+		paramSet := map[string]bool{}
+		for _, p := range act.Params {
+			paramSet[p.Name] = true
+		}
+		var pathParams []string
+		for _, seg := range strings.Split(ap.Path, "/") {
+			if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
+				name := seg[1 : len(seg)-1]
+				if !paramSet[name] {
+					return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: path parameter {%s} is not a parameter of action %q", ap.Method, ap.Path, name, ap.Action)}
+				}
+				pathParams = append(pathParams, name)
+			} else if strings.ContainsAny(seg, "{}") {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: a path parameter is a whole segment, {name}", ap.Method, ap.Path)}
+			}
+		}
+		status := ap.Status
+		if status == 0 {
+			status = 200
+		}
+		if status == 204 && act.Ret != "" {
+			return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q answers 204 (no content) but action %q returns a value", ap.Method, ap.Path, ap.Action)}
+		}
+		auth := "none"
+		if len(act.Requires) > 0 {
+			auth = "session"
+		}
+		out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Params: pathParams, Action: ap.Action, Status: status, Rate: ap.Rate, Since: ap.Since, Auth: auth, Ret: act.Ret, RetList: act.RetList})
+	}
+
+	// 4d″. Streams: `stream "/path" [requires policy]: TypeA, TypeB`. Every
+	// event is a wire type; every `emit` in an action names a type some stream
+	// carries, or it could never reach anyone.
+	streamSeen := map[string]int{}
+	carried := map[string]bool{}
+	for _, st := range app.Streams {
+		if prev, ok := streamSeen[st.Path]; ok {
+			return nil, &BuildError{st.Line, fmt.Sprintf("stream path %q redeclared (first at line %d)", st.Path, prev)}
+		}
+		streamSeen[st.Path] = st.Line
+		for _, ev := range st.Events {
+			if !e.wireTypes[ev] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("stream %q carries %q, which is not a declared wire type", st.Path, ev)}
+			}
+			carried[ev] = true
+		}
+		auth := "none"
+		if st.Requires != "" {
+			params, ok := e.policyParams[st.Requires]
+			if !ok {
+				return nil, &BuildError{st.Line, fmt.Sprintf("stream %q requires unknown policy %q", st.Path, st.Requires)}
+			}
+			if len(params) != 0 {
+				return nil, &BuildError{st.Line, fmt.Sprintf("stream %q requires policy %q, which takes arguments; a stream gate is a plain permission", st.Path, st.Requires)}
+			}
+			auth = "session"
+		}
+		out.Streams = append(out.Streams, Stream{Path: st.Path, Events: st.Events, Requires: st.Requires, Auth: auth})
+	}
+	for typ, line := range e.emittedTypes {
+		if !carried[typ] {
+			return nil, &BuildError{line, fmt.Sprintf("emit %s{…}: no stream carries %q — declare one: stream \"/path\": %s", typ, typ, typ)}
+		}
+	}
+
 	// 4e. Triggers: `on <action> -> <reaction>`. When the source action completes,
 	// the runtime runs the reaction — a zero-arg, server-placed action, like a job's
 	// target. The reaction must exist and be authoritative; an edge whose source is
@@ -1744,6 +1844,20 @@ func lowerASCII(s string) string {
 
 func (e *env) action(a *ast.Action) (Action, error) {
 	act := Action{Name: a.Name}
+	if a.Ret != "" {
+		// A reply value's type: a primitive, an entity (the reply is a row),
+		// or a wire type (a DTO). A proc-only type (struct, float) has no wire
+		// form and is refused the way a float action parameter is.
+		if a.Ret == "float" || e.structs[a.Ret] != nil {
+			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q returns %s, a proc-only type with no wire form — return int/text/bool/money/date, an entity row, or a wire `type`", a.Name, a.Ret)}
+		}
+		if !isPrimitive(a.Ret) && !e.entities[a.Ret] && !e.wireTypes[a.Ret] && e.records[a.Ret] == nil {
+			if _, isEnum := e.enums[a.Ret]; !isEnum {
+				return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q returns unknown type %q", a.Name, a.Ret)}
+			}
+		}
+		act.Ret, act.RetList = a.Ret, a.RetList
+	}
 	// Record-typed locals (a `let v = call …` whose op returns a record) live for the
 	// span of this action build, so a later `v.field` resolves against the record.
 	e.locRecords = map[string]recBind{}
@@ -1825,6 +1939,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	callsService := false       // calls an external service (an effect)
 	callsProc := false          // calls a proc (`do`) — unconditionally server-executed
 	establishesID := false      // sets the session identity (`establish`)
+	emits := false              // puts an event on a stream (`emit`) — only the authority holds subscribers
 
 	// readExprIn validates an expression against a named scope and records what it
 	// reads: the state cells (for placement soundness) and whether it reached an
@@ -1903,7 +2018,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 						"state the rule instead of the value"); err != nil {
 					return nil, err
 				}
-				body = append(body, Stmt{Op: "check", Value: e.low(st.Cond), Msg: st.Msg})
+				body = append(body, Stmt{Op: "check", Value: e.low(st.Cond), Msg: st.Msg, Status: st.Status})
 			case ast.Assign:
 				p, ok := e.states[st.Target]
 				if !ok {
@@ -2176,6 +2291,45 @@ func (e *env) action(a *ast.Action) (Action, error) {
 					return nil, err
 				}
 				body = append(body, Stmt{Op: "exprstmt", Value: e.low(st.Call)})
+			case ast.Emit:
+				// `emit Dto{…} [to expr]`: the value must be a literal of a wire type
+				// some stream carries (checked once streams are built, in the
+				// stream pass); here it is an ordinary action expression.
+				lit, ok := st.Value.(ast.StructLit)
+				if !ok || !e.wireTypes[lit.Type] {
+					return nil, &BuildError{st.Line, "emit takes a wire type literal: emit EventType{field: value, …}"}
+				}
+				if err := readExpr(st.Value, st.Line); err != nil {
+					return nil, err
+				}
+				out := Stmt{Op: "emit", Field: lit.Type, Value: e.low(st.Value)}
+				if st.To != nil {
+					if err := readExpr(st.To, st.Line); err != nil {
+						return nil, err
+					}
+					out.Key = e.low(st.To)
+				}
+				emits = true
+				e.emittedTypes[lit.Type] = st.Line
+				body = append(body, out)
+			case ast.Return:
+				// `return expr`: the reply value. Its expression is an ordinary
+				// action expression (rows, aggregates, parameters, locals, the
+				// clock), so it goes through the same read bookkeeping.
+				if st.Value == nil {
+					if a.Ret != "" {
+						return nil, &BuildError{st.Line, fmt.Sprintf("action %q returns %s, so `return` needs a value", a.Name, a.Ret)}
+					}
+					body = append(body, Stmt{Op: "return"})
+					continue
+				}
+				if a.Ret == "" {
+					return nil, &BuildError{st.Line, fmt.Sprintf("action %q declares no return type (`action %s(...) -> Type:`), so `return` cannot carry a value", a.Name, a.Name)}
+				}
+				if err := readExpr(st.Value, st.Line); err != nil {
+					return nil, err
+				}
+				body = append(body, Stmt{Op: "return", Value: e.low(st.Value)})
 			case ast.Let:
 				// `let name = expr`: an action-local bound once, visible for the rest
 				// of this block. The value is an ordinary action expression — it may
@@ -2273,6 +2427,11 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				collect(st.Cond)
 			case ast.Let:
 				collect(st.Value)
+			case ast.Return:
+				collect(st.Value)
+			case ast.Emit:
+				collect(st.Value)
+				collect(st.To)
 			case ast.IfStmt:
 				collect(st.Cond)
 			case ast.ForStmt:
@@ -2375,6 +2534,15 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	case establishesID:
 		act.Placement = Server
 		act.Reason = "establishes the session identity — only the authority may set who you are"
+	case a.Ret != "":
+		// A reply value is computed once, by the authority, and read back from
+		// the reply — the browser's own runner returns nothing, so a returning
+		// action has exactly one place it can run.
+		act.Placement = Server
+		act.Reason = "returns a value — the authority computes the reply"
+	case emits:
+		act.Placement = Server
+		act.Reason = "emits a stream event — only the authority holds the subscribers"
 	}
 	if act.Placement == Client {
 		for _, w := range sortedKeys(writes) {
@@ -2656,6 +2824,34 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			// (see isPrimitive), so every value ever bound to a bytesType local was
 			// created by bytes(...) or copied from another bytesType local.
 			out = append(out, Stmt{Op: "indexset", Target: st.Target, Key: e.low(st.Index), Value: e.low(st.Value), Bytes: types[st.Target] == bytesType})
+		case ast.FieldAssign:
+			// `s.field = expr` — gated exactly like an index write (ast.IndexAssign
+			// above): the local must be a declared `let mut`, its type a struct
+			// that has the field, and the value's type — when both are provable —
+			// the field's. The write itself is in place (runtime "fieldset"),
+			// which cloneCompositeValue makes safe for the same reason it makes
+			// an index write safe: no two locals ever share a struct's map.
+			if !locals[st.Target] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not declared in proc %q — use `let %s = …` first", st.Target, p.Name, st.Target)}
+			}
+			if !mutable[st.Target] {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to assign its fields", st.Target, st.Target)}
+			}
+			fields, isStruct := e.structs[types[st.Target]]
+			if !isStruct {
+				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not a struct (its type is %s) — a field write (`%s.%s = …`) needs a struct local", st.Target, types[st.Target], st.Target, st.Field)}
+			}
+			sf, hasField := fields[st.Field]
+			if !hasField {
+				return nil, &BuildError{st.Line, fmt.Sprintf("struct %q has no field %q", types[st.Target], st.Field)}
+			}
+			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line, actionSigs); err != nil {
+				return nil, err
+			}
+			if vt := inferProcType(st.Value, types); vt != "" && !sf.list && vt != sf.typ && !(sf.typ == "float" && vt == "int") {
+				return nil, &BuildError{st.Line, fmt.Sprintf("cannot assign %s to field %q of struct %q, whose type is %s", vt, st.Field, types[st.Target], sf.typ)}
+			}
+			out = append(out, Stmt{Op: "fieldset", Target: st.Target, Field: st.Field, Value: e.low(st.Value)})
 		case ast.Do:
 			sig, ok := e.procSigs[st.Proc]
 			if !ok {
@@ -2671,6 +2867,31 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				}
 				ds.Args = append(ds.Args, e.low(arg))
 			}
+			if st.Reassign {
+				// `name = do …`: the same gate a plain reassignment has, then the
+				// result lands in the EXISTING local (Stmt.Target, which the
+				// runtime writes through frame.set, so a local declared outside a
+				// loop and reassigned inside it is the one updated).
+				if !locals[st.Bind] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("%q is not declared in proc %q — use `let %s = …` first", st.Bind, p.Name, st.Bind)}
+				}
+				if !mutable[st.Bind] {
+					return nil, &BuildError{st.Line, fmt.Sprintf("%q is not mutable — declare it `let mut %s = …` to reassign it", st.Bind, st.Bind)}
+				}
+				if sig.ret == "" {
+					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type to assign its result", st.Proc)}
+				}
+				if sig.retList {
+					types[st.Bind] = arrayType
+				} else {
+					types[st.Bind] = sig.ret
+				}
+				ds.Target = st.Bind
+				ds.Ret = sig.ret
+				ds.RetList = sig.retList
+				out = append(out, ds)
+				continue
+			}
 			if st.Bind != "" {
 				if locals[st.Bind] {
 					return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
@@ -2679,6 +2900,9 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type to bind it", st.Proc)}
 				}
 				locals[st.Bind] = true
+				if st.Mut {
+					mutable[st.Bind] = true
+				}
 				// Same arrayType tagging as a parameter (see e.proc's doc): a
 				// list-returning proc's result must be tagged arrayType, not its
 				// element type, or a later `st.Bind[i]`/`len(st.Bind)` inside THIS
@@ -5299,7 +5523,10 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 	if err := checkNoBitwise(ex, line); err != nil {
 		return err
 	}
-	if err := checkNoIndex(ex, line); err != nil {
+	if err := e.checkWireLits(ex, line); err != nil {
+		return err
+	}
+	if err := checkNoIndex(ex, e.wireTypes, line); err != nil {
 		return err
 	}
 	if err := checkNoFloat(ex, line); err != nil {
@@ -5425,42 +5652,119 @@ func checkNoBitwise(ex ast.Expr, line int) error {
 // there is no schema representation, wire encoding, or facet.js mirror for
 // one yet, and — like a map — it is a genuinely new proc-local value kind,
 // not a general field type any other part of the language already knows.
-func checkNoIndex(ex ast.Expr, line int) error {
+// checkWireLits validates every wire-type literal in ex — `Dto{f: v, …}` where
+// Dto is a declared wire `type` — against the type's declared fields: each
+// field named must exist and be set once. A wire type is a plain JSON shape
+// with a schema, so its literal is legal in any expression position (an
+// action's `return`, a derive, a view), unlike a proc-local `struct` literal,
+// which checkNoIndex still refuses outside a proc. Field VALUE types are not
+// checked here (the wire schema's own types are for codegen; the runtime
+// encodes whatever the expression yields), which is the same stance the
+// generic `/api/<entity>` JSON already takes.
+func (e *env) checkWireLits(ex ast.Expr, line int) error {
+	var walk func(ex ast.Expr) error
+	walk = func(ex ast.Expr) error {
+		switch t := ex.(type) {
+		case ast.StructLit:
+			if fields, ok := e.wireFields[t.Type]; ok {
+				set := map[string]bool{}
+				for _, fi := range t.Fields {
+					if !fields[fi.Name] {
+						return &BuildError{line, fmt.Sprintf("type %q has no field %q", t.Type, fi.Name)}
+					}
+					if set[fi.Name] {
+						return &BuildError{line, fmt.Sprintf("field %q set twice in a %s{...} literal", fi.Name, t.Type)}
+					}
+					set[fi.Name] = true
+					if err := walk(fi.Expr); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		case ast.Bin:
+			if err := walk(t.L); err != nil {
+				return err
+			}
+			return walk(t.R)
+		case ast.Un:
+			return walk(t.X)
+		case ast.Get:
+			return walk(t.Obj)
+		case ast.EntityGet:
+			return walk(t.Key)
+		case ast.Call:
+			for _, a := range t.Args {
+				if err := walk(a); err != nil {
+					return err
+				}
+			}
+		case ast.ListLit:
+			for _, el := range t.Elems {
+				if err := walk(el); err != nil {
+					return err
+				}
+			}
+		case ast.Agg:
+			for _, sub := range []ast.Expr{t.Where, t.Sel, t.Limit} {
+				if sub != nil {
+					if err := walk(sub); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+	return walk(ex)
+}
+
+func checkNoIndex(ex ast.Expr, wire map[string]bool, line int) error {
 	switch t := ex.(type) {
 	case ast.Index:
 		return &BuildError{line, "array/map indexing (`x[i]`) is only available inside a proc — arrays and maps are proc-local values, not readable from an action, view, policy, or derive yet"}
 	case ast.MapLit:
 		return &BuildError{line, "a map literal (`{...}`) is only available inside a proc — maps are proc-local values, not readable from an action, view, policy, or derive yet"}
 	case ast.StructLit:
+		if wire[t.Type] {
+			// A wire `type` literal — a DTO — is a plain JSON object anywhere
+			// (see checkWireLits); only its field values still need this walk.
+			for _, fi := range t.Fields {
+				if err := checkNoIndex(fi.Expr, wire, line); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		return &BuildError{line, fmt.Sprintf("a %s{...} struct literal is only available inside a proc — structs are proc-local values, not readable from an action, view, policy, or derive yet", t.Type)}
 	case ast.Bin:
-		if err := checkNoIndex(t.L, line); err != nil {
+		if err := checkNoIndex(t.L, wire, line); err != nil {
 			return err
 		}
-		return checkNoIndex(t.R, line)
+		return checkNoIndex(t.R, wire, line)
 	case ast.Un:
-		return checkNoIndex(t.X, line)
+		return checkNoIndex(t.X, wire, line)
 	case ast.Get:
-		return checkNoIndex(t.Obj, line)
+		return checkNoIndex(t.Obj, wire, line)
 	case ast.EntityGet:
-		return checkNoIndex(t.Key, line)
+		return checkNoIndex(t.Key, wire, line)
 	case ast.Call:
 		for _, a := range t.Args {
-			if err := checkNoIndex(a, line); err != nil {
+			if err := checkNoIndex(a, wire, line); err != nil {
 				return err
 			}
 		}
 	case ast.ListLit:
 		for _, el := range t.Elems {
-			if err := checkNoIndex(el, line); err != nil {
+			if err := checkNoIndex(el, wire, line); err != nil {
 				return err
 			}
 		}
 	case ast.Agg:
-		if err := checkNoIndex(t.Where, line); err != nil {
+		if err := checkNoIndex(t.Where, wire, line); err != nil {
 			return err
 		}
-		return checkNoIndex(t.Sel, line)
+		return checkNoIndex(t.Sel, wire, line)
 	}
 	return nil
 }
@@ -5933,6 +6237,16 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 		}
 		if t.Op == "exists" && t.Var == "" {
 			return &BuildError{line, fmt.Sprintf("exists needs a filtered form: exists(x in %s where <cond>)", t.Coll)}
+		}
+		if t.Op == "list" {
+			if t.Order != "" && t.Order != "id" && !e.entityFields[t.Coll][t.Order] {
+				return &BuildError{line, fmt.Sprintf("entity %q has no field %q to order list(...) by", t.Coll, t.Order)}
+			}
+			if t.Limit != nil {
+				if err := e.checkBuiltins(t.Limit, line); err != nil {
+					return err
+				}
+			}
 		}
 		if t.Where != nil {
 			if err := e.checkBuiltins(t.Where, line); err != nil {
@@ -6505,6 +6819,13 @@ func freeNames(ex ast.Expr) map[string]bool {
 					}
 				}
 			}
+			// A list's limit is evaluated once, outside the row, so its names
+			// resolve in the enclosing scope like any other.
+			if t.Limit != nil {
+				for n := range freeNames(t.Limit) {
+					out[n] = true
+				}
+			}
 		case ast.Call:
 			for _, a := range t.Args {
 				walk(a)
@@ -6613,9 +6934,12 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 	case ast.ActState:
 		return &Expr{Kind: "astate", Op: t.Op, Name: t.Action}
 	case ast.Agg:
-		a := &Expr{Kind: "agg", Op: t.Op, Name: t.Coll, Field: t.Field, Var: t.Var}
+		a := &Expr{Kind: "agg", Op: t.Op, Name: t.Coll, Field: t.Field, Var: t.Var, Order: t.Order, Desc: t.Desc}
 		if t.Where != nil {
 			a.Where = lower(t.Where, inline, enums)
+		}
+		if t.Limit != nil {
+			a.Limit = lower(t.Limit, inline, enums)
 		}
 		if t.Sel != nil {
 			// The reduced value, when it is more than one of the row's columns.
@@ -6650,6 +6974,8 @@ func cloneExpr(e *Expr) *Expr {
 	c.Obj = cloneExpr(e.Obj)
 	c.Key = cloneExpr(e.Key)
 	c.Where = cloneExpr(e.Where)
+	c.Sel = cloneExpr(e.Sel)
+	c.Limit = cloneExpr(e.Limit)
 	if e.Args != nil {
 		c.Args = make([]*Expr, len(e.Args))
 		for i, a := range e.Args {

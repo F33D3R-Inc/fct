@@ -9,8 +9,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"facet/internal/ir"
 )
@@ -53,6 +55,160 @@ type structVal struct {
 type frame struct {
 	vars   map[string]any
 	parent *frame
+	// builders backs the `x = x + e` fast path (appendText): one
+	// strings.Builder per text local that is being grown by repeated
+	// self-concatenation, so a parser or emitter written in fct that builds
+	// its output a piece at a time runs in linear time instead of copying
+	// the whole accumulated string on every statement. Lazily allocated.
+	builders map[string]*strings.Builder
+}
+
+// appendText is the `x = x + e` fast path: append add to the text local
+// name in place, through a strings.Builder kept beside the variable, and
+// return the new value. strings.Builder.String() shares the builder's buffer
+// without copying, so the variable's value is always the builder's current
+// contents at zero cost; a value produced earlier keeps its own length and
+// never sees later appends. The builder is trusted only while the variable
+// still holds exactly the string it last produced (same backing pointer, same
+// length) — any other assignment to the variable in between makes the next
+// append start a fresh builder from the variable's real value, so the
+// optimization can never observe a stale buffer.
+func (f *frame) appendText(name, cur, add string) string {
+	fr := f
+	for ; fr != nil; fr = fr.parent {
+		if _, ok := fr.vars[name]; ok {
+			break
+		}
+	}
+	if fr == nil {
+		fr = f
+	}
+	if fr.builders == nil {
+		fr.builders = map[string]*strings.Builder{}
+	}
+	b := fr.builders[name]
+	if b == nil || b.Len() != len(cur) || (len(cur) > 0 && unsafe.StringData(b.String()) != unsafe.StringData(cur)) {
+		b = &strings.Builder{}
+		b.Grow(2*len(cur) + len(add) + 64)
+		b.WriteString(cur)
+		fr.builders[name] = b
+	}
+	b.WriteString(add)
+	v := b.String()
+	fr.vars[name] = v
+	return v
+}
+
+// ── rune-indexed text without allocation ─────────────────────────────────────
+//
+// len/take/slice/charAt index text by rune, so a multi-byte character is never
+// cut in half. The obvious implementation — `[]rune(s)` — allocates and decodes
+// the WHOLE string on every call, which makes a character-by-character scan of
+// an n-character string O(n²) in time and, worse, O(n²) in allocation: a
+// self-hosted parser reading a 400 KB document through charAt allocated
+// terabytes. Instead, textIndex decides once per distinct string whether it
+// is pure ASCII (rune index == byte index, every operation O(1) on the string
+// itself) and, when it is not, builds the table of each rune's byte offset
+// once — after which every index is still O(1). The answer is remembered in a
+// small cache keyed by the string's own backing pointer and length, so a loop
+// over one string pays the scan once; strings under 128 bytes are simply
+// scanned, which is cheaper than the cache.
+
+type textIndexEntry struct {
+	s     string
+	ascii bool
+	offs  []int32 // byte offset of each rune, plus len(s) as a final sentinel; nil when ascii
+}
+
+var (
+	textIndexMu    sync.Mutex
+	textIndexCache [32]textIndexEntry
+	textIndexNext  int
+)
+
+func scanASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+func runeOffsets(s string) []int32 {
+	offs := make([]int32, 0, len(s)/2+1)
+	for i := range s {
+		offs = append(offs, int32(i))
+	}
+	return append(offs, int32(len(s)))
+}
+
+// textIndex answers (ascii, offsets): offsets is nil for ASCII text.
+func textIndex(s string) (bool, []int32) {
+	if len(s) < 128 {
+		if scanASCII(s) {
+			return true, nil
+		}
+		return false, runeOffsets(s)
+	}
+	p := unsafe.StringData(s)
+	textIndexMu.Lock()
+	for i := range textIndexCache {
+		e := &textIndexCache[i]
+		if len(e.s) == len(s) && unsafe.StringData(e.s) == p {
+			textIndexMu.Unlock()
+			return e.ascii, e.offs
+		}
+	}
+	textIndexMu.Unlock()
+	ascii := scanASCII(s)
+	var offs []int32
+	if !ascii {
+		offs = runeOffsets(s)
+	}
+	textIndexMu.Lock()
+	textIndexCache[textIndexNext] = textIndexEntry{s: s, ascii: ascii, offs: offs}
+	textIndexNext = (textIndexNext + 1) % len(textIndexCache)
+	textIndexMu.Unlock()
+	return ascii, offs
+}
+
+// runeLen is len(s) in runes.
+func runeLen(s string) int {
+	ascii, offs := textIndex(s)
+	if ascii {
+		return len(s)
+	}
+	return len(offs) - 1
+}
+
+// runeSlice is s[start:end] in runes, both bounds clamped into [0, runeLen]
+// and end clamped up to start, exactly slice()'s documented behaviour.
+func runeSlice(s string, start, end int) string {
+	ascii, offs := textIndex(s)
+	n := len(s)
+	if !ascii {
+		n = len(offs) - 1
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start > n {
+		start = n
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end > n {
+		end = n
+	}
+	if end < start {
+		end = start
+	}
+	if ascii {
+		return s[start:end]
+	}
+	return s[offs[start]:offs[end]]
 }
 
 // get resolves a name by walking the frame chain from the innermost scope
@@ -531,6 +687,36 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 			return len(rows) > 0
 		case "count":
 			return len(rows)
+		case "list":
+			// The rows themselves — ordered, capped, and shaped by Sel per row
+			// when there is one — as a fresh list. This is a reply value, not a
+			// projection: a bare `list(x in Entity)` carries the rows as stored,
+			// so a field an actor may not read belongs in a Dto{...} Sel, never
+			// in a bare row list (the generic /api/<entity> read gates fields;
+			// this does not).
+			rows = sortRows(rows, e.Order, e.Desc)
+			if e.Limit != nil {
+				if lim := toInt(eval(e.Limit, scope)); lim >= 0 && len(rows) > lim {
+					rows = rows[:lim]
+				}
+			}
+			if e.Sel == nil {
+				return append([]any{}, rows...)
+			}
+			out := make([]any, 0, len(rows))
+			prev, had := scope[e.Var]
+			for _, r := range rows {
+				if m, ok := r.(record); ok {
+					scope[e.Var] = m
+					out = append(out, eval(e.Sel, scope))
+				}
+			}
+			if had {
+				scope[e.Var] = prev
+			} else {
+				delete(scope, e.Var)
+			}
+			return out
 		}
 		// sum/avg/min/max reduce a numeric value over the (filtered) rows: a
 		// bare column, or an expression evaluated once per row.
@@ -648,6 +834,18 @@ func reduceAgg(op string, rows []any, value func(row any) (int, bool)) int {
 // collection, split out so eval's collection cases stay legible.
 func evalRest(e *ir.Expr, scope map[string]any) any {
 	switch e.Kind {
+	case "struct":
+		// A wire-type literal (`Dto{f: v, …}`, see build.go's checkWireLits):
+		// a plain record — the same shape a row has — so it JSON-encodes as an
+		// object and `.field` reads work on it. (A proc-local struct literal
+		// never reaches eval(); evalInFrame builds those as structVal.)
+		out := record{}
+		for i, f := range e.Fields {
+			if i < len(e.Args) {
+				out[f] = eval(e.Args[i], scope)
+			}
+		}
+		return out
 	case "astate":
 		// Action status and form-field status are client-only runtime state; the
 		// server has none at render time, so first paint shows "not pending" / "no
@@ -1126,7 +1324,7 @@ func callBuiltin(name string, argVals []any) any {
 		case map[any]any:
 			return len(v)
 		default:
-			return utf8.RuneCountInString(toStr(v))
+			return runeLen(toStr(v))
 		}
 	case "byteLen":
 		// byteLen(s) -> int: s's real UTF-8 byte length, as opposed to len's
@@ -1234,15 +1432,11 @@ func callBuiltin(name string, argVals []any) any {
 	case "commas":
 		return commas(toInt(arg(0)))
 	case "take":
-		r := []rune(toStr(arg(0)))
 		n := toInt(arg(1))
 		if n < 0 {
 			n = 0
 		}
-		if n > len(r) {
-			n = len(r)
-		}
-		return string(r[:n])
+		return runeSlice(toStr(arg(0)), 0, n)
 	case "split":
 		// split(s, sep) -> [text], matching Go's strings.Split exactly,
 		// including its edge cases (empty sep splits after every UTF-8
@@ -1270,36 +1464,18 @@ func callBuiltin(name string, argVals []any) any {
 		// [0, len(r)], and a start left past end after clamping yields "" —
 		// the exact same "clamp, never error" convention take already
 		// established for an n longer than the string.
-		r := []rune(toStr(arg(0)))
-		start, end := toInt(arg(1)), toInt(arg(2))
-		if start < 0 {
-			start = 0
-		}
-		if start > len(r) {
-			start = len(r)
-		}
-		if end < 0 {
-			end = 0
-		}
-		if end > len(r) {
-			end = len(r)
-		}
-		if end < start {
-			end = start
-		}
-		return string(r[start:end])
+		return runeSlice(toStr(arg(0)), toInt(arg(1)), toInt(arg(2)))
 	case "charAt":
 		// charAt(s, i) -> text, a length-1 string (this language has no
 		// separate character/rune type) — defined as exactly slice(s, i,
 		// i+1), so it inherits the same clamp-not-error behavior: an
 		// out-of-range i (negative or >= len) yields "" rather than a runtime
 		// error.
-		r := []rune(toStr(arg(0)))
 		i := toInt(arg(1))
-		if i < 0 || i >= len(r) {
+		if i < 0 {
 			return ""
 		}
-		return string(r[i])
+		return runeSlice(toStr(arg(0)), i, i+1)
 	case "year":
 		return int(time.Unix(int64(toInt(arg(0))), 0).UTC().Year())
 	case "month":

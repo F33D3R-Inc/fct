@@ -8,6 +8,7 @@ import (
 	goast "go/ast"
 	goparser "go/parser"
 	gotoken "go/token"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -253,6 +254,16 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 		var wh *ast.Webhook
 		if wh, err = parseWebhook(c.Line.Text, c.Line.No); err == nil {
 			app.Webhooks = append(app.Webhooks, wh)
+		}
+	case strings.HasPrefix(c.Line.Text, "api "):
+		var ap *ast.API
+		if ap, err = parseAPI(c.Line.Text, c.Line.No); err == nil {
+			app.APIs = append(app.APIs, ap)
+		}
+	case strings.HasPrefix(c.Line.Text, "stream "):
+		var st *ast.Stream
+		if st, err = parseStream(c.Line.Text, c.Line.No); err == nil {
+			app.Streams = append(app.Streams, st)
 		}
 	case strings.HasPrefix(c.Line.Text, "on "):
 		var tr *ast.Trigger
@@ -1471,11 +1482,24 @@ func parseAction(n *source.Node) (*ast.Action, error) {
 		optimistic = true
 		head = strings.TrimSpace(strings.TrimSuffix(head, "@optimistic"))
 	}
+	// `-> Type` declares a return value, the same trailing clause a proc header
+	// carries (parseProc).
+	var ret string
+	var retList bool
+	if arrow := strings.Index(head, "->"); arrow >= 0 {
+		rt := strings.TrimSpace(head[arrow+2:])
+		head = strings.TrimSpace(head[:arrow])
+		core, list, optional := splitType(rt)
+		if optional || !isTypeName(core) {
+			return nil, &Error{n.Line.No, fmt.Sprintf("invalid return type %q", rt)}
+		}
+		ret, retList = core, list
+	}
 	name, params, err := parseSignature(head, n.Line.No, false, false)
 	if err != nil {
 		return nil, err
 	}
-	a := &ast.Action{Name: name, Params: params, Optimistic: optimistic, Line: n.Line.No}
+	a := &ast.Action{Name: name, Params: params, Optimistic: optimistic, Ret: ret, RetList: retList, Line: n.Line.No}
 	// `requires` is a header-level clause of the action — a policy gate that
 	// runs before the body — so it is pulled out here, in source order, and
 	// everything else is the body. A `requires` written inside a nested block
@@ -1582,6 +1606,37 @@ func parseActionBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				return nil, err
 			}
 			body = append(body, d)
+		case strings.HasPrefix(t, "emit "):
+			// `emit Dto{…} [to <expr>]` — a typed stream event (ast.Emit).
+			rest := strings.TrimSpace(t[len("emit "):])
+			var to ast.Expr
+			if i := indexOutside(rest, " to "); i >= 0 {
+				toExpr, err := parseExpr(strings.TrimSpace(rest[i+len(" to "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				to = toExpr
+				rest = strings.TrimSpace(rest[:i])
+			}
+			val, err := parseExpr(rest, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, ast.Emit{Value: val, To: to, Line: c.Line.No})
+		case t == "return" || strings.HasPrefix(t, "return "):
+			// `return expr` — the action's reply value (ast.Action.Ret); a bare
+			// `return` ends a no-return action early. Execution stops here,
+			// however deep in a `for`/`if` it sits.
+			rest := strings.TrimSpace(strings.TrimPrefix(t, "return"))
+			var val ast.Expr
+			if rest != "" {
+				v, err := parseExpr(rest, c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				val = v
+			}
+			body = append(body, ast.Return{Value: val, Line: c.Line.No})
 		case strings.HasPrefix(t, "for "):
 			// `for item in Entity [where cond] [by field desc|asc] [limit n]:` — the
 			// exact header a view's `for` has (parseRange), over a block of action
@@ -1838,6 +1893,109 @@ func parseFile(n *source.Node) (*ast.File, error) {
 		return nil, &Error{n.Line.No, fmt.Sprintf("file %q type must be text or bytes, got %q", name, typ)}
 	}
 	return &ast.File{Name: name, Type: typ, Path: path, Line: n.Line.No}, nil
+}
+
+var checkStatusRe = regexp.MustCompile(`\s+status\s+(\d{3})$`)
+
+// parseAPI parses a one-line typed HTTP endpoint (see ast.API):
+//
+//	api GET "/api/v2/works/{id}" -> getWork [status N] [rate read|write|auth] [since "YYYY-MM-DD"]
+func parseAPI(line string, no int) (*ast.API, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "api"))
+	sp := strings.IndexByte(rest, ' ')
+	if sp < 0 {
+		return nil, &Error{no, `api needs a method, a path and an action: api GET "/path/{id}" -> actionName`}
+	}
+	method := rest[:sp]
+	switch method {
+	case "GET", "POST", "PUT", "PATCH", "DELETE":
+	default:
+		return nil, &Error{no, fmt.Sprintf("api method %q must be GET, POST, PUT, PATCH or DELETE", method)}
+	}
+	rest = strings.TrimSpace(rest[sp:])
+	arrow := strings.Index(rest, "->")
+	if arrow < 0 {
+		return nil, &Error{no, `api needs a target action: api GET "/path" -> actionName`}
+	}
+	path, err := unquote(strings.TrimSpace(rest[:arrow]), no)
+	if err != nil || path == "" {
+		return nil, &Error{no, `api needs a quoted path: api GET "/path" -> actionName`}
+	}
+	if !strings.HasPrefix(path, "/") {
+		return nil, &Error{no, fmt.Sprintf("api path %q must start with /", path)}
+	}
+	tail := strings.Fields(strings.TrimSpace(rest[arrow+2:]))
+	if len(tail) == 0 || !isIdent(tail[0]) {
+		return nil, &Error{no, "api target must be an action name"}
+	}
+	ap := &ast.API{Method: method, Path: path, Action: tail[0], Line: no}
+	for i := 1; i < len(tail); i++ {
+		if i+1 >= len(tail) {
+			return nil, &Error{no, fmt.Sprintf("api clause %q needs a value", tail[i])}
+		}
+		val := tail[i+1]
+		switch tail[i] {
+		case "status":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 200 || n > 299 {
+				return nil, &Error{no, fmt.Sprintf("api status %q must be a 2xx success code", val)}
+			}
+			ap.Status = n
+		case "rate":
+			if val != "read" && val != "write" && val != "auth" {
+				return nil, &Error{no, fmt.Sprintf("api rate class %q must be read, write or auth", val)}
+			}
+			ap.Rate = val
+		case "since":
+			d, err := unquote(val, no)
+			if err != nil || d == "" {
+				return nil, &Error{no, `api since needs a quoted date: since "2026-09-13"`}
+			}
+			ap.Since = d
+		default:
+			return nil, &Error{no, fmt.Sprintf("unknown api clause %q (expected status, rate or since)", tail[i])}
+		}
+		i++
+	}
+	return ap, nil
+}
+
+// parseStream parses `stream "<path>" [requires <policy>]: TypeA, TypeB`
+// (see ast.Stream).
+func parseStream(line string, no int) (*ast.Stream, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "stream"))
+	colon := indexOutside(rest, ":")
+	if colon < 0 {
+		return nil, &Error{no, `stream needs its events: stream "/path": TypeA, TypeB`}
+	}
+	head, events := strings.TrimSpace(rest[:colon]), strings.TrimSpace(rest[colon+1:])
+	requires := ""
+	if i := strings.Index(head, " requires "); i >= 0 {
+		requires = strings.TrimSpace(head[i+len(" requires "):])
+		head = strings.TrimSpace(head[:i])
+		if !isIdent(requires) {
+			return nil, &Error{no, fmt.Sprintf("stream requires %q must be a policy name", requires)}
+		}
+	}
+	path, err := unquote(head, no)
+	if err != nil || path == "" {
+		return nil, &Error{no, `stream needs a quoted path: stream "/path": TypeA, TypeB`}
+	}
+	if !strings.HasPrefix(path, "/") {
+		return nil, &Error{no, fmt.Sprintf("stream path %q must start with /", path)}
+	}
+	st := &ast.Stream{Path: path, Requires: requires, Line: no}
+	for _, ev := range strings.Split(events, ",") {
+		ev = strings.TrimSpace(ev)
+		if !isIdent(ev) || !isUpper(ev) {
+			return nil, &Error{no, fmt.Sprintf("stream event %q must be a wire type name", ev)}
+		}
+		st.Events = append(st.Events, ev)
+	}
+	if len(st.Events) == 0 {
+		return nil, &Error{no, "stream declares no events"}
+	}
+	return st, nil
 }
 
 // parseWebhook parses a one-line inbound endpoint:
@@ -2254,14 +2412,14 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 			}
 			rhs := strings.TrimSpace(rest[eq+1:])
 			if strings.HasPrefix(rhs, "do ") {
-				if mut {
-					return nil, &Error{c.Line.No, "`let mut` can't bind a `do` call result yet — bind it plainly, then use it to compute a `let mut` local if you need to mutate it"}
-				}
+				// `let name = do …` binds the result; `let mut name = do …` binds
+				// it reassignable (ast.Do.Mut).
 				d, err := parseDo(strings.TrimSpace(rhs[len("do "):]), c.Line.No)
 				if err != nil {
 					return nil, err
 				}
 				d.Bind = lname
+				d.Mut = mut
 				body = append(body, d)
 				continue
 			}
@@ -2341,9 +2499,36 @@ func parseProcBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				return nil, &Error{c.Line.No, fmt.Sprintf("unknown statement %q in %s — expected let/return/do/act/read/write/spawn/join/loop/if/break/continue, or a reassignment (`name = expr`)", firstWord(t), ctx)}
 			}
 			target := strings.TrimSpace(t[:eq])
-			val, err := parseExpr(strings.TrimSpace(t[eq+1:]), c.Line.No)
+			rhsText := strings.TrimSpace(t[eq+1:])
+			// `name = do Proc(args)` — a `let mut` local taking a proc call's
+			// result (ast.Do.Reassign). The right-hand side is a statement shape,
+			// not an expression, so it is dispatched before parseExpr sees it.
+			if strings.HasPrefix(rhsText, "do ") {
+				if !isIdent(target) {
+					return nil, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q", target)}
+				}
+				d, err := parseDo(strings.TrimSpace(rhsText[len("do "):]), c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				d.Bind = target
+				d.Reassign = true
+				body = append(body, d)
+				continue
+			}
+			val, err := parseExpr(rhsText, c.Line.No)
 			if err != nil {
 				return nil, err
+			}
+			// `s.field = expr` — one field of a struct local written in place
+			// (ast.FieldAssign): a dotted target of exactly one level.
+			if dot := strings.IndexByte(target, '.'); dot > 0 && !strings.Contains(target, "[") {
+				obj, field := strings.TrimSpace(target[:dot]), strings.TrimSpace(target[dot+1:])
+				if !isIdent(obj) || !isIdent(field) {
+					return nil, &Error{c.Line.No, fmt.Sprintf("invalid assignment target %q — a field write is `local.field = expr`, one level deep", target)}
+				}
+				body = append(body, ast.FieldAssign{Target: obj, Field: field, Value: val, Line: c.Line.No})
+				continue
 			}
 			// `xs[i] = expr` — an indexed array mutation, told apart from a plain
 			// reassignment by the target ending in `]`. Parsed as its own statement
@@ -2409,6 +2594,17 @@ func parseCall(s string, line int) (ast.ServiceCall, error) {
 // trailing quoted string; everything before it is the condition.
 func parseCheck(s string, line int) (ast.Check, error) {
 	s = strings.TrimSpace(s)
+	// `check <cond> "<msg>" status <code>` — the HTTP status a declared api
+	// route answers with when this check fails (ast.Check.Status).
+	status := 0
+	if m := checkStatusRe.FindStringSubmatch(s); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		if n < 400 || n > 599 {
+			return ast.Check{}, &Error{line, fmt.Sprintf("check status %d is not a client or server error code (400-599)", n)}
+		}
+		status = n
+		s = strings.TrimSpace(s[:len(s)-len(m[0])])
+	}
 	if !strings.HasSuffix(s, `"`) {
 		return ast.Check{}, &Error{line, `check needs a message: check <cond> "why it failed"`}
 	}
@@ -2435,7 +2631,7 @@ func parseCheck(s string, line int) (ast.Check, error) {
 	if err != nil {
 		return ast.Check{}, err
 	}
-	return ast.Check{Cond: cond, Msg: msg, Line: line}, nil
+	return ast.Check{Cond: cond, Msg: msg, Status: status, Line: line}, nil
 }
 
 // parseRequire parses one `requires` clause: a bare policy name (`admin`) or a

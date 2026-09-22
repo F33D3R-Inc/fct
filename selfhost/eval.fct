@@ -1,0 +1,879 @@
+import "expr.fct"
+
+app EvalSelfHost:
+    # Honest, partial self-hosting port of runtime/eval.go — the expression
+    # EVALUATOR (eval/evalRest, applyBin, truthy, negate, toInt, toFloat,
+    # toStr, equal, evalCall/callBuiltin) plus runtime/format.go's
+    # money/compact/commas/ago formatting — into `.fct` `proc`s, evaluated
+    # directly over expr.fct's `ExprNode` tree (the lowered IR has the same
+    # shape: lit/ref/bin/un/call/list/index; lowering is a separate port).
+    #
+    # ============================================================
+    # THE VALUE MODEL
+    # ============================================================
+    # The Go evaluator is dynamically typed over `any` (int, float64, string,
+    # bool, []any, nil, plus records/maps/structs). A proc here is statically
+    # typed, so the dynamic value is one tagged struct, `Val`, whose `kind`
+    # says which payload field is live — exactly the shape fabric_core.fct's
+    # own `Value` and aggregate.fct's `FieldValue` already use for the same
+    # reason. The `none` kind is Go's nil (an unbound ref, an unknown
+    # builtin, an out-of-scope node): it stringifies to "", counts as 0,
+    # and is falsy — precisely toStr/toInt/truthy's nil cases.
+    #
+    # Every coercion is a REAL port of its Go twin, not an approximation:
+    #   valToStr   = toStr   (ints via itoa, integral floats spelled as
+    #                          ints, bools "true"/"false", lists joined by
+    #                          ",", nil "")
+    #   valToInt   = toInt   (float truncates, bool 1/0, text via
+    #                          parseNumericText — delegated to this
+    #                          language's own toInt(text), which IS that
+    #                          function)
+    #   valToFloat = toFloat (same delegation to toFloat(text))
+    #   valTruthy  = truthy  (bool itself, int/float != 0, text != "",
+    #                          list non-empty, nil false)
+    #   valEqual   = equal   (text on either side compares spellings; a
+    #                          bool on the left compares against truthy;
+    #                          a float on either side compares as floats;
+    #                          otherwise as ints)
+    #   applyBin   = applyBin (`+` concatenates when EITHER side is text;
+    #                          `/` and `%` are integer with x/0 == 0;
+    #                          `<`-family compares spellings when either
+    #                          side is text, else floats, else ints; `in`
+    #                          over a list uses equal; bitwise ops on ints)
+    #   `&&`/`||`  short-circuit at the evalNode call site, exactly where
+    #                          eval/evalRest does it (never inside applyBin)
+    #
+    # Most builtins are ONE call: the same `abs`/`min`/`money`/`slug`/...
+    # exist in this language and are implemented by the very callBuiltin
+    # being ported, so `upper(valToStr(a0))` is not a re-implementation, it
+    # is the real thing reached through its own front door — this port's
+    # contribution is the ARGUMENT COERCION (Go's `toStr(arg(0))` /
+    # `toInt(arg(1))` / the isFloatVal dispatch / the missing-arg nil) and
+    # the RESULT KIND, which is where a dynamic evaluator's semantics live.
+    #
+    # ============================================================
+    # OUT OF SCOPE (returns none, never crashes — this file's degrade rule)
+    # ============================================================
+    #   - `now()`/`rand(n)`: impure (clock/PRNG); cannot be cross-checked
+    #     deterministically and are not "evaluation" in any interesting
+    #     sense. `ago(ts)` IS ported — it reads the clock only through the
+    #     real builtin, the same clock the Go original reads.
+    #   - entity lookups (`Post(id).field`), aggregates (`count(p in Post
+    #     where ...)`), `record`/struct field reads (`x.field`), map
+    #     literals: these need entity rows / the materializer / the proc
+    #     frame — a storage-and-session layer, not an evaluator, and a Val
+    #     model with records would need a map-typed payload this language's
+    #     struct fields cannot carry.
+    #   - `astate` (`pending`/`failed` action-state reads): session-only.
+    #   - the IO/channel builtins callProcBuiltin routes (readFile, httpGet,
+    #     listen, ...): capability-gated side effects, not pure evaluation.
+    #   - `print`, `bytes`/`textToBytes`/`bytesToText`/`byteLen`,
+    #     `floatBits`/`floatFromBits`, `append`, `toFloat`: not on this
+    #     port's brief; the first group needs a bytes kind in Val.
+    #   - an index out of bounds: Go's evalInFrame returns an ERROR (the one
+    #     proc expression that can fail at runtime); a proc has no error
+    #     channel, so it degrades to none here.
+    # ============================================================
+
+    struct Val:
+        kind: text
+        i: int
+        t: text
+        b: bool
+        f: float
+        items: [Val]
+
+    proc noneVal() -> Val:
+        return Val{kind: "none", i: 0, t: "", b: false, f: 0.0, items: []}
+
+    proc intVal(n: int) -> Val:
+        return Val{kind: "int", i: n, t: "", b: false, f: 0.0, items: []}
+
+    proc textVal(s: text) -> Val:
+        return Val{kind: "text", i: 0, t: s, b: false, f: 0.0, items: []}
+
+    proc boolVal(v: bool) -> Val:
+        return Val{kind: "bool", i: 0, t: "", b: v, f: 0.0, items: []}
+
+    proc floatVal(x: float) -> Val:
+        return Val{kind: "float", i: 0, t: "", b: false, f: x, items: []}
+
+    proc listVal(elems: [Val]) -> Val:
+        return Val{kind: "list", i: 0, t: "", b: false, f: 0.0, items: elems}
+
+    # ============================================================
+    # COERCIONS — toStr / toInt / toFloat / truthy / equal / negate.
+    # ============================================================
+    # valToStr: runtime/eval.go's toStr. `"" + n` on an int is applyBin's
+    # own string branch, i.e. itoa; `"" + f` on a float is toStr(float64)
+    # itself (integral values spell as ints, others via FormatFloat 'g'),
+    # so both spellings are the real ones, not re-derived.
+    proc valToStr(v: Val) -> text:
+        if v.kind == "text":
+            return v.t
+        if v.kind == "int":
+            return "" + v.i
+        if v.kind == "float":
+            return "" + v.f
+        if v.kind == "bool":
+            if v.b:
+                return "true"
+            return "false"
+        if v.kind == "list":
+            let mut out = ""
+            let mut k = 0
+            loop k < len(v.items):
+                if k > 0:
+                    out = out + ","
+                let s = do valToStr(v.items[k])
+                out = out + s
+                k = k + 1
+            return out
+        return ""
+
+    # valToInt: toInt. A float truncates toward zero (Go's int(t)); text goes
+    # through parseNumericText — which is exactly what this language's own
+    # toInt(text) runs; a list or nil is 0.
+    proc valToInt(v: Val) -> int:
+        if v.kind == "int":
+            return v.i
+        if v.kind == "float":
+            return toInt(v.f)
+        if v.kind == "bool":
+            if v.b:
+                return 1
+            return 0
+        if v.kind == "text":
+            return toInt(v.t)
+        return 0
+
+    proc valToFloat(v: Val) -> float:
+        if v.kind == "float":
+            return v.f
+        if v.kind == "int":
+            return toFloat(v.i)
+        if v.kind == "bool":
+            if v.b:
+                return 1.0
+            return 0.0
+        if v.kind == "text":
+            return toFloat(v.t)
+        return 0.0
+
+    proc valTruthy(v: Val) -> bool:
+        if v.kind == "bool":
+            return v.b
+        if v.kind == "int":
+            return v.i != 0
+        if v.kind == "float":
+            return v.f != 0.0
+        if v.kind == "text":
+            return v.t != ""
+        if v.kind == "list":
+            return len(v.items) > 0
+        return false
+
+    proc isFloatVal(v: Val) -> bool:
+        return v.kind == "float"
+
+    # valEqual: equal, clause for clause and in the same order — the order
+    # matters (`true == "1"` takes the text clause, not the bool one).
+    proc valEqual(a: Val, b: Val) -> bool:
+        if a.kind == "text":
+            let bs = do valToStr(b)
+            return a.t == bs
+        if b.kind == "text":
+            let as = do valToStr(a)
+            return as == b.t
+        if a.kind == "bool":
+            let bt = do valTruthy(b)
+            return a.b == bt
+        let af = do isFloatVal(a)
+        let bf = do isFloatVal(b)
+        if af || bf:
+            let x = do valToFloat(a)
+            let y = do valToFloat(b)
+            return x == y
+        let xi = do valToInt(a)
+        let yi = do valToInt(b)
+        return xi == yi
+
+    proc valNegate(v: Val) -> Val:
+        if v.kind == "float":
+            let r = do floatVal(0.0 - v.f)
+            return r
+        let n = do valToInt(v)
+        let r2 = do intVal(0 - n)
+        return r2
+
+    # ============================================================
+    # applyBin — every non-short-circuit binary operator.
+    # ============================================================
+    proc eitherText(l: Val, r: Val) -> bool:
+        if l.kind == "text":
+            return true
+        return r.kind == "text"
+
+    proc eitherFloat(l: Val, r: Val) -> bool:
+        if l.kind == "float":
+            return true
+        return r.kind == "float"
+
+    # compareVals: the `<`/`<=`/`>`/`>=` family. textOperands first (either
+    # side text → both spelled and compared lexicographically), then float,
+    # then int — applyBin's own order.
+    proc compareVals(op: text, l: Val, r: Val) -> bool:
+        let anyText = do eitherText(l, r)
+        if anyText:
+            let ls = do valToStr(l)
+            let rs = do valToStr(r)
+            if op == "<":
+                return ls < rs
+            if op == "<=":
+                return ls <= rs
+            if op == ">":
+                return ls > rs
+            return ls >= rs
+        let anyFloat = do eitherFloat(l, r)
+        if anyFloat:
+            let lf = do valToFloat(l)
+            let rf = do valToFloat(r)
+            if op == "<":
+                return lf < rf
+            if op == "<=":
+                return lf <= rf
+            if op == ">":
+                return lf > rf
+            return lf >= rf
+        let li = do valToInt(l)
+        let ri = do valToInt(r)
+        if op == "<":
+            return li < ri
+        if op == "<=":
+            return li <= ri
+        if op == ">":
+            return li > ri
+        return li >= ri
+
+    proc inList(l: Val, r: Val) -> bool:
+        if r.kind != "list":
+            return false
+        let mut k = 0
+        loop k < len(r.items):
+            let eq = do valEqual(l, r.items[k])
+            if eq:
+                return true
+            k = k + 1
+        return false
+
+    proc applyBin(op: text, l: Val, r: Val) -> Val:
+        if op == "&&":
+            let lt = do valTruthy(l)
+            let rt = do valTruthy(r)
+            let both = do boolVal(lt && rt)
+            return both
+        if op == "||":
+            let lt2 = do valTruthy(l)
+            let rt2 = do valTruthy(r)
+            let either = do boolVal(lt2 || rt2)
+            return either
+        if op == "+":
+            if l.kind == "text":
+                let rs = do valToStr(r)
+                let cat = do textVal(l.t + rs)
+                return cat
+            if r.kind == "text":
+                let ls = do valToStr(l)
+                let cat2 = do textVal(ls + r.t)
+                return cat2
+            let anyFloat = do eitherFloat(l, r)
+            if anyFloat:
+                let lf = do valToFloat(l)
+                let rf = do valToFloat(r)
+                let sumF = do floatVal(lf + rf)
+                return sumF
+            let li = do valToInt(l)
+            let ri = do valToInt(r)
+            let sumI = do intVal(li + ri)
+            return sumI
+        if op == "-":
+            let anyFloat2 = do eitherFloat(l, r)
+            if anyFloat2:
+                let lf2 = do valToFloat(l)
+                let rf2 = do valToFloat(r)
+                let difF = do floatVal(lf2 - rf2)
+                return difF
+            let li2 = do valToInt(l)
+            let ri2 = do valToInt(r)
+            let difI = do intVal(li2 - ri2)
+            return difI
+        if op == "*":
+            let anyFloat3 = do eitherFloat(l, r)
+            if anyFloat3:
+                let lf3 = do valToFloat(l)
+                let rf3 = do valToFloat(r)
+                let prodF = do floatVal(lf3 * rf3)
+                return prodF
+            let li3 = do valToInt(l)
+            let ri3 = do valToInt(r)
+            let prodI = do intVal(li3 * ri3)
+            return prodI
+        if op == "/":
+            let anyFloat4 = do eitherFloat(l, r)
+            if anyFloat4:
+                let lf4 = do valToFloat(l)
+                let rf4 = do valToFloat(r)
+                let quoF = do floatVal(lf4 / rf4)
+                return quoF
+            let li4 = do valToInt(l)
+            let ri4 = do valToInt(r)
+            if ri4 == 0:
+                let zero = do intVal(0)
+                return zero
+            let quoI = do intVal(li4 / ri4)
+            return quoI
+        if op == "%":
+            let li5 = do valToInt(l)
+            let ri5 = do valToInt(r)
+            if ri5 == 0:
+                let zero2 = do intVal(0)
+                return zero2
+            let remI = do intVal(li5 % ri5)
+            return remI
+        if op == "==":
+            let eq = do valEqual(l, r)
+            let eqV = do boolVal(eq)
+            return eqV
+        if op == "!=":
+            let eq2 = do valEqual(l, r)
+            let neV = do boolVal(!eq2)
+            return neV
+        if op == "<" || op == "<=" || op == ">" || op == ">=":
+            let cmp = do compareVals(op, l, r)
+            let cmpV = do boolVal(cmp)
+            return cmpV
+        if op == "in":
+            let has = do inList(l, r)
+            let hasV = do boolVal(has)
+            return hasV
+        if op == "&":
+            let a6 = do valToInt(l)
+            let b6 = do valToInt(r)
+            let andV = do intVal(a6 & b6)
+            return andV
+        if op == "|":
+            let a7 = do valToInt(l)
+            let b7 = do valToInt(r)
+            let orV = do intVal(a7 | b7)
+            return orV
+        if op == "^":
+            let a8 = do valToInt(l)
+            let b8 = do valToInt(r)
+            let xorV = do intVal(a8 ^ b8)
+            return xorV
+        if op == "<<":
+            let a9 = do valToInt(l)
+            let b9 = do valToInt(r)
+            if b9 < 0:
+                let z9 = do intVal(0)
+                return z9
+            let shlV = do intVal(a9 << b9)
+            return shlV
+        if op == ">>":
+            let a10 = do valToInt(l)
+            let b10 = do valToInt(r)
+            if b10 < 0:
+                let z10 = do intVal(0)
+                return z10
+            let shrV = do intVal(a10 >> b10)
+            return shrV
+        let none = do noneVal()
+        return none
+
+    # ============================================================
+    # BUILTINS — callBuiltin's pure subset. `argAt` is Go's `arg(i)`
+    # closure: a missing argument is nil (none), never a crash.
+    # ============================================================
+    proc argAt(args: [Val], k: int) -> Val:
+        if k < len(args):
+            return args[k]
+        let none = do noneVal()
+        return none
+
+    proc callBuiltin(name: text, args: [Val]) -> Val:
+        let a0 = do argAt(args, 0)
+        let a1 = do argAt(args, 1)
+        let a2 = do argAt(args, 2)
+        if name == "abs":
+            if a0.kind == "float":
+                let rf = do floatVal(abs(a0.f))
+                return rf
+            let n = do valToInt(a0)
+            let ri = do intVal(abs(n))
+            return ri
+        if name == "min":
+            let anyFloat = do eitherFloat(a0, a1)
+            if anyFloat:
+                let x = do valToFloat(a0)
+                let y = do valToFloat(a1)
+                let mf = do floatVal(min(x, y))
+                return mf
+            let xi = do valToInt(a0)
+            let yi = do valToInt(a1)
+            let mi = do intVal(min(xi, yi))
+            return mi
+        if name == "max":
+            let anyFloat2 = do eitherFloat(a0, a1)
+            if anyFloat2:
+                let x2 = do valToFloat(a0)
+                let y2 = do valToFloat(a1)
+                let mf2 = do floatVal(max(x2, y2))
+                return mf2
+            let xi2 = do valToInt(a0)
+            let yi2 = do valToInt(a1)
+            let mi2 = do intVal(max(xi2, yi2))
+            return mi2
+        if name == "floor":
+            if a0.kind == "float":
+                let fl = do intVal(floor(a0.f))
+                return fl
+            let n2 = do valToInt(a0)
+            let fl2 = do intVal(n2)
+            return fl2
+        if name == "round":
+            if a0.kind == "float":
+                let rd = do intVal(round(a0.f))
+                return rd
+            let n3 = do valToInt(a0)
+            let rd2 = do intVal(n3)
+            return rd2
+        if name == "toInt":
+            let n4 = do valToInt(a0)
+            let ti = do intVal(n4)
+            return ti
+        if name == "toMoney":
+            let s0 = do valToStr(a0)
+            let cents = toMoney(s0)
+            let tm = do intVal(cents)
+            return tm
+        if name == "money":
+            let n5 = do valToInt(a0)
+            let mo = do textVal(money(n5))
+            return mo
+        if name == "len":
+            if a0.kind == "list":
+                let ln = do intVal(len(a0.items))
+                return ln
+            let s1 = do valToStr(a0)
+            let ln2 = do intVal(len(s1))
+            return ln2
+        if name == "upper":
+            let s2 = do valToStr(a0)
+            let up = do textVal(upper(s2))
+            return up
+        if name == "lower":
+            let s3 = do valToStr(a0)
+            let lo = do textVal(lower(s3))
+            return lo
+        if name == "trim":
+            let s4 = do valToStr(a0)
+            let tr = do textVal(trim(s4))
+            return tr
+        if name == "contains":
+            let s5 = do valToStr(a0)
+            let s6 = do valToStr(a1)
+            let ct = do boolVal(contains(s5, s6))
+            return ct
+        if name == "replace":
+            let s7 = do valToStr(a0)
+            let s8 = do valToStr(a1)
+            let s9 = do valToStr(a2)
+            let rp = do textVal(replace(s7, s8, s9))
+            return rp
+        if name == "slug":
+            let s10 = do valToStr(a0)
+            let sl = do textVal(slug(s10))
+            return sl
+        if name == "ago":
+            let n6 = do valToInt(a0)
+            let ag = do textVal(ago(n6))
+            return ag
+        if name == "compact":
+            let n7 = do valToInt(a0)
+            let cp = do textVal(compact(n7))
+            return cp
+        if name == "commas":
+            let n8 = do valToInt(a0)
+            let cm = do textVal(commas(n8))
+            return cm
+        if name == "take":
+            let s11 = do valToStr(a0)
+            let n9 = do valToInt(a1)
+            let tk = do textVal(take(s11, n9))
+            return tk
+        if name == "split":
+            let s12 = do valToStr(a0)
+            let s13 = do valToStr(a1)
+            let parts = split(s12, s13)
+            let mut elems = []
+            let mut k = 0
+            loop k < len(parts):
+                let part = do textVal(parts[k])
+                elems = append(elems, part)
+                k = k + 1
+            let sp = do listVal(elems)
+            return sp
+        if name == "slice":
+            let s14 = do valToStr(a0)
+            let n10 = do valToInt(a1)
+            let n11 = do valToInt(a2)
+            let sc = do textVal(slice(s14, n10, n11))
+            return sc
+        if name == "charAt":
+            let s15 = do valToStr(a0)
+            let n12 = do valToInt(a1)
+            let ch = do textVal(charAt(s15, n12))
+            return ch
+        if name == "year":
+            let n13 = do valToInt(a0)
+            let yr = do intVal(year(n13))
+            return yr
+        if name == "month":
+            let n14 = do valToInt(a0)
+            let mn = do intVal(month(n14))
+            return mn
+        if name == "day":
+            let n15 = do valToInt(a0)
+            let dy = do intVal(day(n15))
+            return dy
+        let none = do noneVal()
+        return none
+
+    # ============================================================
+    # LITERAL DECODING — expr_tokens.fct keeps a string literal's RAW token
+    # (quotes and escapes intact; see its header), so the evaluator is the
+    # consumer that decodes it: the escapes strconv.Unquote knows that a
+    # source expression realistically carries (\" \\ \n \t \r); any other
+    # escaped character is kept as itself.
+    # ============================================================
+    proc unquoteText(raw: text) -> text:
+        let n = len(raw)
+        if n < 2:
+            return raw
+        if charAt(raw, 0) != "\"":
+            return raw
+        let mut stop = n
+        if charAt(raw, n - 1) == "\"":
+            stop = n - 1
+        let mut out = ""
+        let mut k = 1
+        loop k < stop:
+            let c = charAt(raw, k)
+            if c == "\\":
+                if k + 1 < stop:
+                    let e = charAt(raw, k + 1)
+                    if e == "n":
+                        out = out + "\n"
+                    else:
+                        if e == "t":
+                            out = out + "\t"
+                        else:
+                            if e == "r":
+                                out = out + "\r"
+                            else:
+                                out = out + e
+                    k = k + 2
+                else:
+                    k = k + 1
+            else:
+                out = out + c
+                k = k + 1
+        return out
+
+    # ============================================================
+    # THE EVALUATOR — eval/evalRest over an ExprNode, scope as two
+    # parallel lists (a ref not in scope is nil in Go: `scope[e.Name]` on a
+    # missing key — so none here, never an error).
+    # ============================================================
+    proc lookupRef(name: text, names: [text], vals: [Val]) -> Val:
+        let mut k = 0
+        loop k < len(names):
+            if names[k] == name:
+                if k < len(vals):
+                    return vals[k]
+            k = k + 1
+        let none = do noneVal()
+        return none
+
+    proc evalArgs(nodes: [ExprNode], names: [text], vals: [Val]) -> [Val]:
+        let mut out = []
+        let mut k = 0
+        loop k < len(nodes):
+            let v = do evalNode(nodes[k], names, vals)
+            out = append(out, v)
+            k = k + 1
+        return out
+
+    proc evalNode(n: ExprNode, names: [text], vals: [Val]) -> Val:
+        if n.kind == "int":
+            let iv = do intVal(toInt(n.text))
+            return iv
+        if n.kind == "float":
+            let fv = do floatVal(toFloat(n.text))
+            return fv
+        if n.kind == "bool":
+            let bv = do boolVal(n.text == "true")
+            return bv
+        if n.kind == "text":
+            let decoded = do unquoteText(n.text)
+            let tv = do textVal(decoded)
+            return tv
+        if n.kind == "ref":
+            let rv = do lookupRef(n.text, names, vals)
+            return rv
+        if n.kind == "list":
+            let elems = do evalArgs(n.children, names, vals)
+            let lv = do listVal(elems)
+            return lv
+        if n.kind == "un":
+            if len(n.children) < 1:
+                let none0 = do noneVal()
+                return none0
+            let x = do evalNode(n.children[0], names, vals)
+            if n.text == "!":
+                let tx = do valTruthy(x)
+                let notV = do boolVal(!tx)
+                return notV
+            if n.text == "-":
+                let neg = do valNegate(x)
+                return neg
+            if n.text == "~":
+                let xi = do valToInt(x)
+                let inv = do intVal(~xi)
+                return inv
+            let none1 = do noneVal()
+            return none1
+        if n.kind == "bin":
+            if len(n.children) < 2:
+                let none2 = do noneVal()
+                return none2
+            if n.text == "&&" || n.text == "||":
+                let l = do evalNode(n.children[0], names, vals)
+                let lt = do valTruthy(l)
+                if n.text == "&&" && !lt:
+                    let f = do boolVal(false)
+                    return f
+                if n.text == "||" && lt:
+                    let t = do boolVal(true)
+                    return t
+                let r = do evalNode(n.children[1], names, vals)
+                let rt = do valTruthy(r)
+                let rv2 = do boolVal(rt)
+                return rv2
+            let l2 = do evalNode(n.children[0], names, vals)
+            let r2 = do evalNode(n.children[1], names, vals)
+            let res = do applyBin(n.text, l2, r2)
+            return res
+        if n.kind == "index":
+            if len(n.children) < 2:
+                let none3 = do noneVal()
+                return none3
+            let obj = do evalNode(n.children[0], names, vals)
+            let idxV = do evalNode(n.children[1], names, vals)
+            if obj.kind == "list":
+                let idx = do valToInt(idxV)
+                if idx >= 0 && idx < len(obj.items):
+                    return obj.items[idx]
+            let none4 = do noneVal()
+            return none4
+        if n.kind == "call":
+            let args = do evalArgs(n.children, names, vals)
+            let cv = do callBuiltin(n.text, args)
+            return cv
+        # get / entityGet / map / agg — out of scope (see header).
+        let none5 = do noneVal()
+        return none5
+
+    # ============================================================
+    # TEXT-LEVEL DRIVERS — a scope arrives as typed spellings (kind +
+    # text), since neither an action nor state can carry a Val.
+    # ============================================================
+    # scopeVal: kind + spelling → Val. "list" is a comma-separated list of
+    # INT spellings (the one list shape a `state xs: [int]` cell seeds in
+    # the cross-check; a text list would need an escape scheme this driver
+    # does not pretend to have).
+    proc scopeVal(kind: text, spelling: text) -> Val:
+        if kind == "int":
+            let iv = do intVal(toInt(spelling))
+            return iv
+        if kind == "text":
+            let tv = do textVal(spelling)
+            return tv
+        if kind == "bool":
+            let bv = do boolVal(spelling == "true")
+            return bv
+        if kind == "float":
+            let fv = do floatVal(toFloat(spelling))
+            return fv
+        if kind == "list":
+            let mut elems = []
+            if spelling != "":
+                let parts = split(spelling, ",")
+                let mut k = 0
+                loop k < len(parts):
+                    let el = do intVal(toInt(parts[k]))
+                    elems = append(elems, el)
+                    k = k + 1
+            let lv = do listVal(elems)
+            return lv
+        let none = do noneVal()
+        return none
+
+    proc buildScope(kinds: [text], texts: [text]) -> [Val]:
+        let mut out = []
+        let mut k = 0
+        loop k < len(kinds):
+            let mut spelling = ""
+            if k < len(texts):
+                spelling = texts[k]
+            let v = do scopeVal(kinds[k], spelling)
+            out = append(out, v)
+            k = k + 1
+        return out
+
+    proc evalSrcVal(src: text, names: [text], kinds: [text], texts: [text]) -> Val:
+        let tree = do parseExprTree(src)
+        let vals = do buildScope(kinds, texts)
+        let v = do evalNode(tree, names, vals)
+        return v
+
+    proc evalSrc(src: text, names: [text], kinds: [text], texts: [text]) -> text:
+        let v = do evalSrcVal(src, names, kinds, texts)
+        let s = do valToStr(v)
+        return s
+
+    proc evalSrcKind(src: text, names: [text], kinds: [text], texts: [text]) -> text:
+        let v = do evalSrcVal(src, names, kinds, texts)
+        return v.kind
+
+    # A scope spec for the HTTP driver: one `name<TAB>kind<TAB>spelling`
+    # row per line (an action parameter is a scalar, so three parallel
+    # lists ride in as one text and are split back here). A row without
+    # two tabs is skipped — degrade, don't crash.
+    proc specRows(spec: text) -> [text]:
+        let mut out = []
+        let rows = split(spec, "\n")
+        let mut k = 0
+        loop k < len(rows):
+            let cols = split(rows[k], "\t")
+            if len(cols) >= 3:
+                out = append(out, rows[k])
+            k = k + 1
+        return out
+
+    proc specColumn(spec: text, col: int) -> [text]:
+        let rows = do specRows(spec)
+        let mut out = []
+        let mut k = 0
+        loop k < len(rows):
+            let cols = split(rows[k], "\t")
+            out = append(out, cols[col])
+            k = k + 1
+        return out
+
+    proc evalSpec(src: text, spec: text) -> text:
+        let names = do specColumn(spec, 0)
+        let kinds = do specColumn(spec, 1)
+        let texts = do specColumn(spec, 2)
+        let s = do evalSrc(src, names, kinds, texts)
+        return s
+
+    proc evalSpecKind(src: text, spec: text) -> text:
+        let names = do specColumn(spec, 0)
+        let kinds = do specColumn(spec, 1)
+        let texts = do specColumn(spec, 2)
+        let k = do evalSrcKind(src, names, kinds, texts)
+        return k
+
+    # ============================================================
+    # NODE-LEVEL DRIVER — one operator or builtin applied to scope refs,
+    # bypassing the source parser. Needed because expr_tree.fct's grammar
+    # subset (checked live, 2026-09-21) does not yet accept `%`, `in`, the
+    # `<<`/`>>` two-character tokens, or `min`/`max`/`replace`/`slug` as
+    # plain calls, while the Go evaluator being ported — and this port of
+    # it — handles every one of them. The tree is built with
+    # expr_tokens.fct's own constructors, so what gets evaluated is the
+    # very same ExprNode shape the parser would produce once its grammar
+    # catches up; nothing here is a second evaluator.
+    # ============================================================
+    proc isPureBuiltinName(name: text) -> bool:
+        return name in ["abs", "min", "max", "floor", "round", "money", "len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", "replace", "slug", "year", "month", "day", "ago", "compact", "commas", "toMoney", "toInt"]
+
+    proc refLeaves(argNames: [text]) -> [ExprNode]:
+        let mut out = []
+        let mut k = 0
+        loop k < len(argNames):
+            let leaf = do refNode(argNames[k])
+            out = append(out, leaf)
+            k = k + 1
+        return out
+
+    # nodeForOp: a builtin name → call node; otherwise arity decides
+    # unary (1 arg) vs binary (2 args); anything else is the honest
+    # degrade filler (emptyNode, an int 0).
+    proc nodeForOp(op: text, args: [ExprNode]) -> ExprNode:
+        let isBuiltin = do isPureBuiltinName(op)
+        if isBuiltin:
+            let c = do callNode(op, args)
+            return c
+        if len(args) == 1:
+            let u = do unNode(op, args[0])
+            return u
+        if len(args) == 2:
+            let b = do binNode(op, args[0], args[1])
+            return b
+        let filler = do emptyNode()
+        return filler
+
+    proc evalOpRefsVal(op: text, argsCsv: text, spec: text) -> Val:
+        let mut argNames = []
+        if argsCsv != "":
+            argNames = split(argsCsv, ",")
+        let leaves = do refLeaves(argNames)
+        let tree = do nodeForOp(op, leaves)
+        let names = do specColumn(spec, 0)
+        let kinds = do specColumn(spec, 1)
+        let texts = do specColumn(spec, 2)
+        let vals = do buildScope(kinds, texts)
+        let v = do evalNode(tree, names, vals)
+        return v
+
+    proc evalOpRefs(op: text, argsCsv: text, spec: text) -> text:
+        let v = do evalOpRefsVal(op, argsCsv, spec)
+        let s = do valToStr(v)
+        return s
+
+    proc evalOpRefsKind(op: text, argsCsv: text, spec: text) -> text:
+        let v = do evalOpRefsVal(op, argsCsv, spec)
+        return v.kind
+
+    state evalResult: text = ""
+    state evalKind: text = ""
+
+    action runEvalSrc(src: text, spec: text):
+        let r = do evalSpec(src, spec)
+        let k = do evalSpecKind(src, spec)
+        evalResult = r
+        evalKind = k
+
+    # runEvalNode: `op` applied to the comma-separated scope names in
+    # `argsCsv` (see the NODE-LEVEL DRIVER note above).
+    action runEvalNode(op: text, argsCsv: text, spec: text):
+        let r = do evalOpRefs(op, argsCsv, spec)
+        let k = do evalOpRefsKind(op, argsCsv, spec)
+        evalResult = r
+        evalKind = k
+
+    private view EvalHome at "/eval":
+        box:
+            text "{evalKind} {evalResult}"

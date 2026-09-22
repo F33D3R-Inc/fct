@@ -8,14 +8,15 @@ app ActionStmtSelfHost:
     # stmt.fct's `Stmt`/`parseProcBodySrc` ports `parseProcBody` (pure
     # computation: let/assign/if/loop/do/return/break/continue) — a real
     # action body instead has `check`/`requires`/`add`/`set`/`remove`/
-    # `clear`/`call`/`do`/`let`(=bound call-or-do)/`establish`, a bare
-    # builtin call, and a plain `target = expr` assignment (parseAction,
-    # internal/parser/parser.go:1467-1636, read fresh for this file — an
-    # action has NO `if`/`loop`/`return`/`break`/`continue` at all: its
-    # switch has no such cases). Reusing stmt.fct's parser here would
-    # silently misparse or wrongly reject every real action statement,
-    # exactly as previously flagged; this file is the real, separate,
-    # additional port that gap calls for.
+    # `clear`/`call`/`do`/`let`/`establish`, a bare builtin call, a plain
+    # `target = expr` assignment, and — since the real grammar grew control
+    # flow (parser.go's parseActionBody) — `for <range>:` over an entity's
+    # rows, `if`/`else`, `let name = expr` and `let id = add …`. An action
+    # still has NO `loop`/`return`/`break`/`continue`/`let mut`: those stay
+    # proc-only, and `for` takes a view's Range header rather than a proc's
+    # `loop <cond>`. Reusing stmt.fct's parser here would therefore still
+    # misparse or wrongly reject real action statements; this file is the
+    # real, separate port, kept in step with parseActionBody.
     #
     # ============================================================
     # WHY THIS FILE CAN NOW `import "parser_proc.fct"` DIRECTLY (fixing the
@@ -55,10 +56,10 @@ app ActionStmtSelfHost:
     # list, `emptyNode()` for an absent expression, `false` for an absent
     # flag — never a magic number, never an arena index).
     #
-    #   kind: one of "check" | "requires" | "add" | "set" | "setWhere" |
-    #         "remove" | "removeWhere" | "clear" | "call" | "letCall" |
-    #         "do" | "letDo" | "establish" | "assign" | "exprStmt" |
-    #         "unsupported".
+    #   kind: one of "check" | "requires" | "add" | "letAdd" | "set" |
+    #         "setWhere" | "remove" | "removeWhere" | "clear" | "call" |
+    #         "letCall" | "do" | "letDo" | "let" | "establish" | "assign" |
+    #         "exprStmt" | "for" | "if" | "unsupported".
     #   lineIdx: this statement's own source line index (its caller's
     #         `texts`/`parents` arrays) — always present.
     #   valid: this statement's own accept/reject verdict — parseAction's
@@ -106,10 +107,25 @@ app ActionStmtSelfHost:
     #   hasRole: bool       — establish's optional `role` clause presence.
     #   role: ExprNode      — establish's optional role expression
     #                          (emptyNode() when hasRole is false).
-    #   target: text        — plain assign's target name.
+    #   target: text        — plain assign's target name / let's local name.
     #   exprCall: ExprNode  — exprStmt's bare builtin call, as one real
     #                          "call"-kind ExprNode (its own args already
     #                          nested inside via expr.fct's callNode).
+    #   orderField: text    — for's `by field` ("" = insertion order).
+    #   orderDesc: bool     — for's `desc` (false for `asc`/absent).
+    #   limit: ExprNode     — for's `limit n` expression (emptyNode() when
+    #                          hasLimit is false).
+    #   hasLimit: bool      — for's `limit` clause presence.
+    #   body: [ActionStmt]  — for's body / if's `then` branch: the SAME
+    #                          recursive statement list this struct is one
+    #                          element of (stmt.fct's own `Stmt.body` shape).
+    #   elseBody: [ActionStmt] — if's `else` branch ([] = no else).
+    #
+    # Since the real parser grew control flow in an action body (parser.go's
+    # parseActionBody — `for <range>:`, `if <cond>:`/`else:`, `let name =
+    # expr`, `let id = add …`), this port carries the same: "for"/"if" nest
+    # through body/elseBody, "let" is a plain expression bind (target +
+    # value), and "letAdd" is an add whose new row's id lands in bindName.
     # ============================================================
     struct ActionStmt:
         kind: text
@@ -135,6 +151,12 @@ app ActionStmtSelfHost:
         role: ExprNode
         target: text
         exprCall: ExprNode
+        orderField: text
+        orderDesc: bool
+        limit: ExprNode
+        hasLimit: bool
+        body: [ActionStmt]
+        elseBody: [ActionStmt]
         valid: bool
 
     # actUnsupported: the one honest-degrade constructor every malformed
@@ -142,7 +164,7 @@ app ActionStmtSelfHost:
     # valid=false, matching stmt.fct's own "unsupported" Stmt kind.
     proc actUnsupported(lineIdx: int) -> ActionStmt:
         let noExpr = do emptyNode()
-        return ActionStmt{kind: "unsupported", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: false}
+        return ActionStmt{kind: "unsupported", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: false}
 
     # ============================================================
     # STAGE 1: this file's own local raw-text scanning helpers — the ones
@@ -498,12 +520,14 @@ app ActionStmtSelfHost:
     # expr` block) in, ONE (or for `requires`, one-per-comma-separated-
     # policy — see actRequiresStmts below) real `ActionStmt` out.
     #
-    # Prefix-dispatch order is real parseAction's own switch order exactly
-    # (check, requires, add, set, remove, clear, call, do, let, establish,
-    # isBareCallStmt, default) — confirmed by reading parseAction fresh, not
-    # assumed. An action has no `if`/`loop`/`return`/`break`/`continue`
-    # case at all (unlike a proc body), so none is ported here — a real gap
-    # this file does NOT need to close, since it does not exist.
+    # Prefix-dispatch order is real parseActionBody's own switch order
+    # exactly (check, add, set, remove, clear, call, do, for, if, else, let,
+    # establish, isBareCallStmt, default) — confirmed by reading it fresh,
+    # not assumed. `if` needs to see its SIBLING (`else:` is the next line
+    # of the same block, not a child), so like `requires` it is dispatched
+    # from the block loop (actionBlockStmts) rather than here; `for` owns
+    # only its own children and is handled below. An action still has no
+    # `loop`/`return`/`break`/`continue` — those remain proc-only.
     # ============================================================
     proc singleActionStmt(texts: [text], parents: [int], lineIdx: int) -> ActionStmt:
         let t = trim(texts[lineIdx])
@@ -519,7 +543,7 @@ app ActionStmtSelfHost:
             let condSrc = do checkConditionText(rest)
             let condNode = do parseExprTree(condSrc)
             let msgRaw = do checkMessageRaw(rest)
-            return ActionStmt{kind: "check", lineIdx: lineIdx, cond: condNode, msg: msgRaw, policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true}
+            return ActionStmt{kind: "check", lineIdx: lineIdx, cond: condNode, msg: msgRaw, policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
         # `requires` needs to hand back POSSIBLY MULTIPLE ActionStmt entries
         # from one line (`requires owns(id), admin`) — that shape doesn't
@@ -551,7 +575,7 @@ app ActionStmtSelfHost:
             if !ok:
                 let u = do actUnsupported(lineIdx)
                 return u
-            return ActionStmt{kind: "clear", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true}
+            return ActionStmt{kind: "clear", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
         let isCall = do hasPrefixText(t, "call ")
         if isCall:
@@ -565,10 +589,27 @@ app ActionStmtSelfHost:
             let s = do actDoStmt(trim(rest), lineIdx, "")
             return s
 
+        let isFor = do hasPrefixText(t, "for ")
+        if isFor:
+            let s = do actForStmt(texts, parents, lineIdx)
+            return s
+
+        # A bare `else` reaching here had no `if` sibling to attach to
+        # (actionBlockStmts consumes the one that does) — real parseActionBody
+        # refuses it ("`else` with no matching `if`").
+        if t == "else:" || t == "else":
+            let u = do actUnsupported(lineIdx)
+            return u
+
         let isLet = do hasPrefixText(t, "let ")
         if isLet:
             let restRaw = do trimPrefixText(t, "let ")
             let rest = trim(restRaw)
+            # `let mut` is proc-only: an action local is bound once.
+            let isMut = do hasPrefixText(rest, "mut ")
+            if isMut:
+                let u = do actUnsupported(lineIdx)
+                return u
             let eq = do firstEqIndex(rest)
             if eq < 0:
                 let u = do actUnsupported(lineIdx)
@@ -591,8 +632,17 @@ app ActionStmtSelfHost:
                 let doRest = trim(doRestRaw)
                 let s = do actDoStmt(doRest, lineIdx, bindName)
                 return s
-            let u = do actUnsupported(lineIdx)
-            return u
+            # `let id = add Entity { … }`: the add's record text after `add `
+            # goes through the exact same record parsing a bare `add` does,
+            # with the new row's id bound to `bindName`.
+            let rhsIsAdd = do hasPrefixText(rhs, "add ")
+            if rhsIsAdd:
+                let addRestRaw = do trimPrefixText(rhs, "add ")
+                let s = do actAddText(trim(addRestRaw), texts, parents, lineIdx, bindName)
+                return s
+            # Any other right-hand side is a plain expression bind.
+            let val = do parseExprTree(rhs)
+            return ActionStmt{kind: "let", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: val, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: bindName, exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
         let isEstablish = do hasPrefixText(t, "establish ")
         if isEstablish:
@@ -603,7 +653,7 @@ app ActionStmtSelfHost:
         if isBareCall:
             let callNode = do parseExprTree(t)
             let ok = callNode.kind == "call"
-            return ActionStmt{kind: "exprStmt", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: callNode, valid: ok}
+            return ActionStmt{kind: "exprStmt", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: callNode, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: ok}
 
         # Default: `target = expr` — real parseAction's own DEFAULT case
         # uses the NAIVE first-`=` scan (`strings.IndexByte`), not the
@@ -620,7 +670,7 @@ app ActionStmtSelfHost:
             let u = do actUnsupported(lineIdx)
             return u
         let val = do parseExprTree(trim(slice(t, eq2 + 1, len(t))))
-        return ActionStmt{kind: "assign", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: val, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: target, exprCall: noExpr, valid: true}
+        return ActionStmt{kind: "assign", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: val, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: target, exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
     # actCallStmt: `Service.op(args)` (the shared shape of both bare `call
     # Service.op(args)` and bound `let name = call Service.op(args)`).
@@ -651,7 +701,7 @@ app ActionStmtSelfHost:
         let mut kind = "call"
         if bindName != "":
             kind = "letCall"
-        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: svc, opName: op, callArgs: args, procName: "", bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true}
+        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: svc, opName: op, callArgs: args, procName: "", bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
     # actDoStmt: `ProcName(args)` (the shared shape of both bare `do
     # ProcName(args)` and bound `let name = do ProcName(args)`).
@@ -674,7 +724,7 @@ app ActionStmtSelfHost:
         let mut kind = "do"
         if bindName != "":
             kind = "letDo"
-        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: args, procName: name, bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true}
+        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: args, procName: name, bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
     # actEstablishStmt: `establish actor <expr> [role <expr>]`. The
     # `" role "` search is a PLAIN substring index (real Go's own
@@ -705,7 +755,7 @@ app ActionStmtSelfHost:
         if hasRole:
             let r = do parseExprTree(roleSrc)
             roleNode = r
-        return ActionStmt{kind: "establish", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: actorNode, hasRole: hasRole, role: roleNode, target: "", exprCall: noExpr, valid: true}
+        return ActionStmt{kind: "establish", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: actorNode, hasRole: hasRole, role: roleNode, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
     # actAddStmt: `add Entity { f: expr, ... }`, including the multi-line
     # record-literal continuation (actCloseAddRecord, above). Field names
@@ -713,10 +763,17 @@ app ActionStmtSelfHost:
     # Go's own parseAdd never calls isIdent on a field's own name, unlike
     # almost every other name in this grammar.
     proc actAddStmt(texts: [text], parents: [int], lineIdx: int) -> ActionStmt:
-        let noExpr = do emptyNode()
         let t = trim(texts[lineIdx])
         let rest0Raw = do trimPrefixText(t, "add ")
-        let rest0 = trim(rest0Raw)
+        let s = do actAddText(trim(rest0Raw), texts, parents, lineIdx, "")
+        return s
+
+    # actAddText: real parser.go's `parseAddText` — the record text after the
+    # `add ` keyword, against the line it came from (whose children hold a
+    # multi-line record's continuation). Shared by the bare `add` statement
+    # and the bound `let id = add …` form; `bindName` is "" for the former.
+    proc actAddText(rest0: text, texts: [text], parents: [int], lineIdx: int, bindName: text) -> ActionStmt:
+        let noExpr = do emptyNode()
         let rest = do actCloseAddRecord(rest0, lineIdx, parents, texts)
         let open = do indexOf(rest, "{")
         let close = do lastCharIndex(rest, "}")
@@ -750,7 +807,10 @@ app ActionStmtSelfHost:
         if !ok:
             let u = do actUnsupported(lineIdx)
             return u
-        return ActionStmt{kind: "add", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: fieldNames, fieldValues: fieldValues, serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true}
+        let mut kind = "add"
+        if bindName != "":
+            kind = "letAdd"
+        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: fieldNames, fieldValues: fieldValues, serviceName: "", opName: "", callArgs: [], procName: "", bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
     # actSetStmt: the two real forms — `set Entity(key).field = expr`
     # (by-id) and `set item in Entity where cond:` (filtered, its own
@@ -812,7 +872,7 @@ app ActionStmtSelfHost:
                         fieldValues = append(fieldValues, fval)
                 i = i + 1
             let overallValid = len(fieldNames) > 0
-            return ActionStmt{kind: "setWhere", lineIdx: lineIdx, cond: whereNode, msg: "", policyName: "", policyArgs: [], entity: hf[2], key: noExpr, field: "", value: noExpr, itemVar: hf[0], fieldNames: fieldNames, fieldValues: fieldValues, serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: overallValid}
+            return ActionStmt{kind: "setWhere", lineIdx: lineIdx, cond: whereNode, msg: "", policyName: "", policyArgs: [], entity: hf[2], key: noExpr, field: "", value: noExpr, itemVar: hf[0], fieldNames: fieldNames, fieldValues: fieldValues, serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: overallValid}
         let eq = do actIndexAssign(rest)
         if eq < 0:
             let u = do actUnsupported(lineIdx)
@@ -827,7 +887,181 @@ app ActionStmtSelfHost:
         if !fieldOk:
             let u = do actUnsupported(lineIdx)
             return u
-        return ActionStmt{kind: "set", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: lhsNode.text, key: lhsNode.children[0], field: lhsNode.field, value: valNode, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true}
+        return ActionStmt{kind: "set", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: lhsNode.text, key: lhsNode.children[0], field: lhsNode.field, value: valNode, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+
+    # actForClausePos: splitForClauses' own keyword scan — the first
+    # top-level identifier token equal to kw, or -1. Top level means: not
+    # inside a "..." literal (a bare toggle, as naive as Go's own), and at
+    # paren/brace depth zero — square brackets are deliberately NOT counted,
+    # because Go's scan does not count them either.
+    private proc actForClausePos(rest: text, kw: text) -> int:
+        let n = len(rest)
+        let mut inStr = false
+        let mut depth = 0
+        let mut i = 0
+        let mut found = -1
+        loop i < n && found == -1:
+            let c = charAt(rest, i)
+            if c == "\"":
+                inStr = !inStr
+                i = i + 1
+            else:
+                if inStr:
+                    i = i + 1
+                else:
+                    if c == "(" || c == "{":
+                        depth = depth + 1
+                        i = i + 1
+                    else:
+                        if c == ")" || c == "}":
+                            depth = depth - 1
+                            i = i + 1
+                        else:
+                            let st = do isIdentStartChar(c)
+                            if depth == 0 && st:
+                                let mut j = i
+                                let mut run = true
+                                loop j < n && run:
+                                    let ic = do isIdentChar(charAt(rest, j))
+                                    if ic:
+                                        j = j + 1
+                                    else:
+                                        run = false
+                                if slice(rest, i, j) == kw:
+                                    found = i
+                                i = j
+                            else:
+                                i = i + 1
+        return found
+
+    # actForClauseEnd: where a clause starting at `start` ends — the nearest
+    # of the other three keyword positions that lies after it, else n.
+    private proc actForClauseEnd(start: int, p1: int, p2: int, p3: int, n: int) -> int:
+        let mut e = n
+        if p1 > start && p1 < e:
+            e = p1
+        if p2 > start && p2 < e:
+            e = p2
+        if p3 > start && p3 < e:
+            e = p3
+        return e
+
+    # actForStmt: real parser.go's `for <range>:` action statement — the
+    # header is `parseRange`'s own grammar (`item in Coll [where cond] [by
+    # field desc|asc] [limit n] [more action]`, exactly what a view's `for`
+    # takes), the body is this same file's block grammar over the line's
+    # children. Ported faithfully: the three leading words are peeled off
+    # the way parseRange peels them (var, `in`, coll), the clause tail is
+    # scanned for its keywords at the TOP level only (parser.go's own
+    # `splitForClauses` skips strings and parens, so a `where` nested inside
+    # an aggregate's `(… where …)` never splits the header — actIndexOutside
+    # is that same scan), and the clauses must come in where→by→limit→more
+    # order. `more` is a view's paging control with no meaning in an action,
+    # so — as real parseActionBody refuses it — it degrades to unsupported
+    # here; so does a header without its trailing `:` or a `for` with no
+    # body.
+    proc actForStmt(texts: [text], parents: [int], lineIdx: int) -> ActionStmt:
+        let noExpr = do emptyNode()
+        let t = trim(texts[lineIdx])
+        let endsColon = do hasSuffixText(t, ":")
+        if !endsColon:
+            let u = do actUnsupported(lineIdx)
+            return u
+        let headRaw = do trimPrefixText(t, "for ")
+        let headNoColon = do trimSuffixText(trim(headRaw), ":")
+        let head = trim(headNoColon)
+        let fields = do actFieldsSplit(head)
+        if len(fields) < 3:
+            let u = do actUnsupported(lineIdx)
+            return u
+        if fields[1] != "in":
+            let u = do actUnsupported(lineIdx)
+            return u
+        let v0 = do isIdentToken(fields[0])
+        let v2 = do isIdentToken(fields[2])
+        if !v0 || !v2:
+            let u = do actUnsupported(lineIdx)
+            return u
+        # remainder after `<var> in <Coll>` — parseRange's own three trims
+        let r1 = trim(slice(head, len(fields[0]), len(head)))
+        let r1b = do trimPrefixText(r1, "in")
+        let r2 = trim(r1b)
+        let r2b = do trimPrefixText(r2, fields[2])
+        let r3 = trim(r2b)
+        # parser.go's own splitForClauses: each clause keyword is the FIRST
+        # top-level identifier token spelling it, a clause's content runs
+        # from just after its keyword to the nearest LATER keyword (so the
+        # clauses may come in any order, exactly as Go accepts them), an
+        # empty clause is refused ("`where` needs a value"), and text no
+        # clause claims is ignored — all faithfully mirrored, quirks
+        # included.
+        let tn = len(r3)
+        let wi = do actForClausePos(r3, "where")
+        let bi = do actForClausePos(r3, "by")
+        let li = do actForClausePos(r3, "limit")
+        let mi = do actForClausePos(r3, "more")
+        let mut whereS = ""
+        let mut clauseOk = true
+        if wi >= 0:
+            let wEnd = do actForClauseEnd(wi, bi, li, mi, tn)
+            whereS = trim(slice(r3, wi + 5, wEnd))
+            if whereS == "":
+                clauseOk = false
+        let mut byS = ""
+        if bi >= 0:
+            let bEnd = do actForClauseEnd(bi, wi, li, mi, tn)
+            byS = trim(slice(r3, bi + 2, bEnd))
+            if byS == "":
+                clauseOk = false
+        let mut limitS = ""
+        if li >= 0:
+            let lEnd = do actForClauseEnd(li, wi, bi, mi, tn)
+            limitS = trim(slice(r3, li + 5, lEnd))
+            if limitS == "":
+                clauseOk = false
+        if !clauseOk:
+            let u = do actUnsupported(lineIdx)
+            return u
+        # `more` is a view's paging control; real parseActionBody refuses it
+        # in an action's own `for` whether or not it carries a value.
+        if mi >= 0:
+            let u = do actUnsupported(lineIdx)
+            return u
+        let mut whereNode = noExpr
+        if whereS != "":
+            let wn = do parseExprTree(whereS)
+            whereNode = wn
+        let mut orderField = ""
+        let mut orderDesc = false
+        if byS != "":
+            let bp = do actFieldsSplit(byS)
+            let bn = len(bp)
+            if bn < 1 || bn > 2:
+                let u = do actUnsupported(lineIdx)
+                return u
+            let fOk = do isIdentToken(bp[0])
+            if !fOk:
+                let u = do actUnsupported(lineIdx)
+                return u
+            orderField = bp[0]
+            if bn == 2:
+                if bp[1] == "desc":
+                    orderDesc = true
+                else:
+                    if bp[1] != "asc":
+                        let u = do actUnsupported(lineIdx)
+                        return u
+        let mut limitNode = noExpr
+        let mut hasLimit = false
+        if limitS != "":
+            let ln = do parseExprTree(limitS)
+            limitNode = ln
+            hasLimit = true
+        let bodyStmts = do actionBlockStmts(texts, parents, lineIdx)
+        if len(bodyStmts) == 0:
+            let u = do actUnsupported(lineIdx)
+            return u
+        return ActionStmt{kind: "for", lineIdx: lineIdx, cond: whereNode, msg: "", policyName: "", policyArgs: [], entity: fields[2], key: noExpr, field: "", value: noExpr, itemVar: fields[0], fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: orderField, orderDesc: orderDesc, limit: limitNode, hasLimit: hasLimit, body: bodyStmts, elseBody: [], valid: true}
 
     # actRemoveStmt: `remove Entity(key)` (by-id) or `remove item in Entity
     # where cond` (filtered — a single line, NOT a block, unlike `set`'s
@@ -864,7 +1098,7 @@ app ActionStmtSelfHost:
                 return u
             let condSrc = trim(slice(rest, wi + 7, len(rest)))
             let condNode = do parseExprTree(condSrc)
-            return ActionStmt{kind: "removeWhere", lineIdx: lineIdx, cond: condNode, msg: "", policyName: "", policyArgs: [], entity: hf[2], key: noExpr, field: "", value: noExpr, itemVar: hf[0], fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true}
+            return ActionStmt{kind: "removeWhere", lineIdx: lineIdx, cond: condNode, msg: "", policyName: "", policyArgs: [], entity: hf[2], key: noExpr, field: "", value: noExpr, itemVar: hf[0], fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
         let open = do firstParenIndex(rest)
         let close = do lastCharIndex(rest, ")")
         if open < 0 || close < open:
@@ -872,7 +1106,7 @@ app ActionStmtSelfHost:
             return u
         let ent = trim(slice(rest, 0, open))
         let keyNode = do parseExprTree(trim(slice(rest, open + 1, close)))
-        return ActionStmt{kind: "remove", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: keyNode, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true}
+        return ActionStmt{kind: "remove", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: keyNode, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
 
     # actRequiresStmts: `requires <policy>` or `requires <policy>(args),
     # <policy2>, ...` — ONE line can produce SEVERAL real ast.Require
@@ -893,7 +1127,7 @@ app ActionStmtSelfHost:
             if open < 0:
                 let nameOk = do isIdentToken(p)
                 if nameOk:
-                    out = append(out, ActionStmt{kind: "requires", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: p, policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true})
+                    out = append(out, ActionStmt{kind: "requires", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: p, policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true})
                 else:
                     let u1 = do actUnsupported(lineIdx)
                     out = append(out, u1)
@@ -915,7 +1149,7 @@ app ActionStmtSelfHost:
                             let av = do parseExprTree(trim(argPieces[j]))
                             args = append(args, av)
                             j = j + 1
-                    out = append(out, ActionStmt{kind: "requires", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: name, policyArgs: args, entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, valid: true})
+                    out = append(out, ActionStmt{kind: "requires", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: name, policyArgs: args, entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true})
             i = i + 1
         return out
 
@@ -940,6 +1174,7 @@ app ActionStmtSelfHost:
             let lineIdx = kids[i]
             let t = trim(texts[lineIdx])
             let isRequires = do hasPrefixText(t, "requires ")
+            let isIf = do hasPrefixText(t, "if ")
             if isRequires:
                 let rs = do actRequiresStmts(t, lineIdx)
                 let rn = len(rs)
@@ -947,10 +1182,47 @@ app ActionStmtSelfHost:
                 loop j < rn:
                     out = append(out, rs[j])
                     j = j + 1
+                i = i + 1
             else:
-                let s = do singleActionStmt(texts, parents, lineIdx)
-                out = append(out, s)
-            i = i + 1
+                if isIf:
+                    # `if <cond>:` with an optional sibling `else:` — exactly
+                    # stmt.fct's stmtBlockStmts shape for a proc body, over this
+                    # file's own block grammar. A header without its `:`, an
+                    # empty condition, or an empty branch degrades to
+                    # unsupported, as real parseActionBody refuses each.
+                    let noExpr = do emptyNode()
+                    let endsColon = do hasSuffixText(t, ":")
+                    let condRaw = do trimPrefixText(t, "if ")
+                    let condTrim = trim(condRaw)
+                    let condNoColon = do trimSuffixText(condTrim, ":")
+                    let condText = trim(condNoColon)
+                    let thenStmts = do actionBlockStmts(texts, parents, lineIdx)
+                    let mut elseStmts = []
+                    let mut consumedElse = false
+                    let mut elseEmpty = false
+                    if i + 1 < m:
+                        let nextLineIdx = kids[i + 1]
+                        let nt = trim(texts[nextLineIdx])
+                        if nt == "else:" || nt == "else":
+                            let es = do actionBlockStmts(texts, parents, nextLineIdx)
+                            elseStmts = es
+                            consumedElse = true
+                            if len(es) == 0:
+                                elseEmpty = true
+                    if !endsColon || condText == "" || len(thenStmts) == 0 || elseEmpty:
+                        let u = do actUnsupported(lineIdx)
+                        out = append(out, u)
+                    else:
+                        let cond = do parseExprTree(condText)
+                        out = append(out, ActionStmt{kind: "if", lineIdx: lineIdx, cond: cond, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: thenStmts, elseBody: elseStmts, valid: true})
+                    if consumedElse:
+                        i = i + 2
+                    else:
+                        i = i + 1
+                else:
+                    let s = do singleActionStmt(texts, parents, lineIdx)
+                    out = append(out, s)
+                    i = i + 1
         return out
 
     # parseActionBodySrc: the end-to-end driver this task asks for — raw,
@@ -1083,6 +1355,26 @@ app ActionStmtSelfHost:
             return "do(" + s.procName + ")"
         if s.kind == "letDo":
             return "letDo(" + s.bindName + "=" + s.procName + ")"
+        if s.kind == "let":
+            return "let(" + s.target + ")"
+        if s.kind == "letAdd":
+            return "letAdd(" + s.bindName + "=" + s.entity + ")"
+        if s.kind == "for":
+            let inner = do describeActionStmts(s.body)
+            let mut clauses = ""
+            if s.orderField != "":
+                clauses = clauses + " by " + s.orderField
+                if s.orderDesc:
+                    clauses = clauses + " desc"
+            if s.hasLimit:
+                clauses = clauses + " limit"
+            return "for(" + s.itemVar + " in " + s.entity + clauses + "){" + inner + "}"
+        if s.kind == "if":
+            let thenD = do describeActionStmts(s.body)
+            if len(s.elseBody) == 0:
+                return "if{" + thenD + "}"
+            let elseD = do describeActionStmts(s.elseBody)
+            return "if{" + thenD + "}else{" + elseD + "}"
         if s.kind == "establish":
             return "establish"
         if s.kind == "assign":

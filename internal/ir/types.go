@@ -242,6 +242,16 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			return vtype{core: "int"}
 		case "exists":
 			return vtype{core: "bool"}
+		case "list":
+			// The rows (or Sel's value per row), as a list.
+			if t.Sel != nil {
+				inner := sc.with(t.Var)
+				inner.varTypes[t.Var] = vtype{core: t.Coll}
+				vt := e.exprType(t.Sel, inner)
+				vt.list = true
+				return vt
+			}
+			return vtype{core: t.Coll, list: true}
 		default: // sum | avg | min | max reduce one numeric value per row
 			if t.Sel != nil {
 				// The reduced value is an expression over the row, so the

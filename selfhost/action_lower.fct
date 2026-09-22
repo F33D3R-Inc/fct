@@ -1,0 +1,1168 @@
+import "action_stmt.fct"
+import "lower.fct"
+import "ir_decl.fct"
+
+app ActionLowerSelfHost:
+    # Self-hosting port of internal/ir/build.go's `(e *env) action(a
+    # *ast.Action) (Action, error)` — the ACTION lowering: every statement
+    # kind of an action body lowered to ir_stmt.fct's IRStmt constructors,
+    # the flags the body accumulates (writes, reads, entWrite, impure,
+    # usesPrint, callsService, callsProc, establishesID), the placement
+    # switch and its soundness gates, spelled into ir_decl.fct's IRAction
+    # so `irActionJSON` prints exactly what encoding/json prints for the
+    # real compiler's ir.Action.
+    #
+    # INPUT: the action's name, parameter names/types, `@optimistic` flag,
+    # and its BODY SOURCE (the dedented lines under the `action …:` header),
+    # parsed by action_stmt.fct's `parseActionBodySrc` (the port of
+    # parseAction's body grammar) — `requires` lines split out with
+    # `actionRequiresOnly`/`actionBodyOnly`, exactly as parseAction routes
+    # them into ast.Action.Requires vs Body. Every expression is lowered by
+    # lower.fct's `lowerNode` (the port of lower()).
+    #
+    # ============================================================
+    # THE ENVIRONMENT (ALowEnv) — what `*env` becomes
+    # ============================================================
+    # A proc has no map-typed parameter, so each table action() reads off
+    # `*env` is a parallel list, bundled in one struct:
+    #
+    #   stateNames / statePlacements   e.states: name -> "server"|"client"
+    #                                  (a @private cell is "server", as the
+    #                                  real builder records it)
+    #   entityNames                    e.entities
+    #   entityFields                   e.entityFields flattened to
+    #                                  "Entity.field" (declared fields plus
+    #                                  a @softdelete's injected `archived`;
+    #                                  `id` is NOT in it, as in Go — `for …
+    #                                  by id` is special-cased there too)
+    #   entityDerives                  e.entityDerives as "Entity.derive"
+    #   enumNames                      e.enums' key set
+    #   policyNames / policyParamCounts e.policyParams (every policy, with
+    #                                  its arity) — e.policySet is the same
+    #                                  key set
+    #   inlineNames / inlineExprs      e.inline: zero-arg policy and derive
+    #                                  names -> their ALREADY-LOWERED IR,
+    #                                  the same table lower() substitutes
+    #   serviceNames / serviceOps / serviceArgCounts / serviceRets /
+    #   serviceRetLists                e.services + e.serviceRets, one
+    #                                  entry PER OPERATION (serviceNames[i]
+    #                                  is the service op i belongs to)
+    #   procNames / procParamCounts / procRets / procRetLists
+    #                                  e.procSigs
+    #   structNames                    e.structs' key set (a `do` cannot
+    #                                  bind a struct-returning proc)
+    #
+    # ============================================================
+    # THE ERROR CHANNEL
+    # ============================================================
+    # Go returns `(Action{}, error)`; a proc has one return value. Where
+    # the real action() returns a BuildError, this port returns an
+    # IRAction whose `placement` is "" (never a real placement — the real
+    # compiler only ever assigns "server"/"client") and whose `reason`
+    # carries the diagnostic text, spelled as build.go spells it (Go's %q
+    # restated as a quoted name; BuildError's `line N: ` prefix is the
+    # caller's business and is not reproduced). Every other field of that
+    # IRAction is empty. The statement walk stops at the first error, as
+    # the Go closure returns at its first `err`.
+    #
+    # ============================================================
+    # WHAT IS PORTED
+    # ============================================================
+    # Statement kinds (block's type switch, in its order): check, assign,
+    # add (with `let id = add` bind), set by id, set … where (filtered,
+    # with its field block), remove by id, remove … where, clear, call
+    # (with `let x = call` bind, ret/retList), do (with bind, ret/retList,
+    # the float/struct/nothing-returned refusals), establish (actor +
+    # optional role), exprstmt (a bare builtin call), let, if/else, for
+    # (where/by/desc/limit, nested body). bindLocal's three scope rules
+    # ("already in scope", "would shadow the state cell", "would shadow
+    # the entity") and its clone-per-nested-block scoping. readExprIn's
+    # bookkeeping (impure/print flags, state reads via depsIR over the
+    # LOWERED expression, so an inlined derive's own state reads count).
+    # `requires` with a row-level policy and args (arity, purity, the
+    # "which is a derive, not a policy" / "unknown policy" refusals). The
+    # float-parameter refusal. The placement switch with every Reason
+    # string verbatim, the post-switch "writes authoritative state" upgrade
+    # over the SORTED write set, the two soundness gates (client read /
+    # client write by a server-placed action) and the requires gate.
+    # Writes/Reads are sorted (sortedKeys).
+    #
+    # ============================================================
+    # WHAT IS LEFT OUT, AND WHY
+    # ============================================================
+    # - @e2e sealed fields (e2eWrite, the seal-dataflow re-walk, `Seal`):
+    #   the environment carries no e2e field set, so an action over an
+    #   @e2e entity is out of scope; `seal` is always empty here.
+    # - The full `e.check` rule set on each expression (builtin arity,
+    #   proc-only operators/index/float/io/concurrency, dropped-brace text
+    #   literals, `Enum.member` validation, record-field access on a
+    #   `let`-bound record): check.fct ports those, but it cannot be
+    #   imported alongside action_stmt.fct (both declare a public
+    #   `indexOfFrom`), so this file ports only the piece placement
+    #   depends on — free-name resolution ("unknown reference") and the
+    #   now/rand/print purity rules of checkPure — and trusts the rest.
+    # - `checkLiteral` on a check's message (the interpolation-brace
+    #   diagnostic) and `checkNoPrivate` on establish's actor/role.
+    # - e.locRecords (record-typed `let` binds) — bookkeeping for a check
+    #   this file does not port.
+    # - A statement the self-hosted grammar cannot parse (kind
+    #   "unsupported") degrades to an error reason of its own, not a Go
+    #   message — the real parser would have refused it earlier.
+    # - Go's soundness loops iterate a map in random order; here the
+    #   offending name reported is the FIRST in sorted order.
+    # - `@optimistic` is parsed (ast.Action.Optimistic) but the real
+    #   action() never copies it into ir.Action, so neither does this port
+    #   (see lowerActionSrc's closing note).
+    struct ALowEnv:
+        stateNames: [text]
+        statePlacements: [text]
+        entityNames: [text]
+        entityFields: [text]
+        entityDerives: [text]
+        enumNames: [text]
+        policyNames: [text]
+        policyParamCounts: [int]
+        inlineNames: [text]
+        inlineExprs: [IRExpr]
+        serviceNames: [text]
+        serviceOps: [text]
+        serviceArgCounts: [int]
+        serviceRets: [text]
+        serviceRetLists: [bool]
+        procNames: [text]
+        procParamCounts: [int]
+        procRets: [text]
+        procRetLists: [bool]
+        structNames: [text]
+
+    # ALowAcc: the frame action()'s closures share — the lowered body of
+    # the block in hand, the first error, the flag set the placement
+    # switch reads, and the names in scope (`loc`). A proc cannot mutate
+    # its caller's variables, so every step returns a fresh ALowAcc.
+    struct ALowAcc:
+        body: [IRStmt]
+        err: text
+        writes: [text]
+        reads: [text]
+        entWrite: bool
+        impure: bool
+        usesPrint: bool
+        callsService: bool
+        callsProc: bool
+        establishesID: bool
+        locals: [text]
+
+    private proc alowAccNew(locals: [text]) -> ALowAcc:
+        return ALowAcc{body: [], err: "", writes: [], reads: [], entWrite: false, impure: false, usesPrint: false, callsService: false, callsProc: false, establishesID: false, locals: locals}
+
+    # alowAccWith: the same flags, a different body and scope.
+    private proc alowAccWith(a: ALowAcc, body: [IRStmt], locals: [text]) -> ALowAcc:
+        return ALowAcc{body: body, err: a.err, writes: a.writes, reads: a.reads, entWrite: a.entWrite, impure: a.impure, usesPrint: a.usesPrint, callsService: a.callsService, callsProc: a.callsProc, establishesID: a.establishesID, locals: locals}
+
+    private proc alowFail(a: ALowAcc, msg: text) -> ALowAcc:
+        return ALowAcc{body: a.body, err: msg, writes: a.writes, reads: a.reads, entWrite: a.entWrite, impure: a.impure, usesPrint: a.usesPrint, callsService: a.callsService, callsProc: a.callsProc, establishesID: a.establishesID, locals: a.locals}
+
+    private proc alowEmit(a: ALowAcc, st: IRStmt) -> ALowAcc:
+        let body = append(a.body, st)
+        let out = do alowAccWith(a, body, a.locals)
+        return out
+
+    # alowFlags: one flag flipped on (the accumulating `x = true` writes).
+    private proc alowFlags(a: ALowAcc, entWrite: bool, impure: bool, usesPrint: bool, callsService: bool, callsProc: bool, establishesID: bool) -> ALowAcc:
+        return ALowAcc{body: a.body, err: a.err, writes: a.writes, reads: a.reads, entWrite: a.entWrite || entWrite, impure: a.impure || impure, usesPrint: a.usesPrint || usesPrint, callsService: a.callsService || callsService, callsProc: a.callsProc || callsProc, establishesID: a.establishesID || establishesID, locals: a.locals}
+
+    private proc alowWithWrites(a: ALowAcc, writes: [text]) -> ALowAcc:
+        return ALowAcc{body: a.body, err: a.err, writes: writes, reads: a.reads, entWrite: a.entWrite, impure: a.impure, usesPrint: a.usesPrint, callsService: a.callsService, callsProc: a.callsProc, establishesID: a.establishesID, locals: a.locals}
+
+    private proc alowWithReads(a: ALowAcc, reads: [text]) -> ALowAcc:
+        return ALowAcc{body: a.body, err: a.err, writes: a.writes, reads: reads, entWrite: a.entWrite, impure: a.impure, usesPrint: a.usesPrint, callsService: a.callsService, callsProc: a.callsProc, establishesID: a.establishesID, locals: a.locals}
+
+    # ── name-set helpers (Go's map[string]bool) ─────────────────────────
+    private proc alowAddName(names: [text], name: text) -> [text]:
+        if name in names:
+            return names
+        return append(names, name)
+
+    private proc alowMergeNames(a: [text], b: [text]) -> [text]:
+        let n = len(b)
+        let mut out = a
+        let mut i = 0
+        loop i < n:
+            let merged = do alowAddName(out, b[i])
+            out = merged
+            i = i + 1
+        return out
+
+    # alowSortText: sortedKeys — an insertion sort over text (`>` compares
+    # text lexicographically, as Go's sort.Strings does).
+    proc alowSortText(names: [text]) -> [text]:
+        let mut xs = names
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0:
+                if xs[j - 1] > xs[j]:
+                    let tmp = xs[j - 1]
+                    xs[j - 1] = xs[j]
+                    xs[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            i = i + 1
+        return xs
+
+    private proc alowStatePlacement(name: text, env: ALowEnv) -> text:
+        let at = do lowerFindName(env.stateNames, name)
+        if at < 0:
+            return ""
+        return env.statePlacements[at]
+
+    # alowWritesOnlyClientState: writesOnlyClientState — at least one
+    # write, and every one lands in a @client cell.
+    private proc alowWritesOnlyClientState(writes: [text], env: ALowEnv) -> bool:
+        let n = len(writes)
+        if n == 0:
+            return false
+        let mut i = 0
+        loop i < n:
+            let p = do alowStatePlacement(writes[i], env)
+            if p != "client":
+                return false
+            i = i + 1
+        return true
+
+    # ── expression facts (the slice of check/checkPure placement needs) ──
+    private proc alowIsBuiltinRef(n: text) -> bool:
+        return n == "actor" || n == "role" || n == "verified" || n == "tenant" || n == "tenantRole" || n == "session"
+
+    # alowHasCall: procCapabilities' walk restricted to "does any call node
+    # name one of these" — hasImpure is [now, rand], hasPrint is [print].
+    private proc alowHasCall(n: ExprNode, names: [text]) -> bool:
+        if n.kind == "call":
+            if n.text in names:
+                return true
+        let mut i = 0
+        loop i < len(n.children):
+            let viaChild = do alowHasCall(n.children[i], names)
+            if viaChild:
+                return true
+            i = i + 1
+        let mut j = 0
+        loop j < len(n.pairs):
+            let viaKey = do alowHasCall(n.pairs[j].key, names)
+            if viaKey:
+                return true
+            let viaVal = do alowHasCall(n.pairs[j].value, names)
+            if viaVal:
+                return true
+            j = j + 1
+        let mut k = 0
+        loop k < len(n.whereClause):
+            let viaWhere = do alowHasCall(n.whereClause[k], names)
+            if viaWhere:
+                return true
+            k = k + 1
+        let mut m = 0
+        loop m < len(n.sel):
+            let viaSel = do alowHasCall(n.sel[m], names)
+            if viaSel:
+                return true
+            m = m + 1
+        return false
+
+    private proc alowDropName(names: [text], name: text) -> [text]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(names):
+            if names[i] != name:
+                out = append(out, names[i])
+            i = i + 1
+        return out
+
+    # alowFreeNames: build.go's freeNames — a ref's name, an entity
+    # lookup's entity, an aggregate's collection plus its filter's and
+    # reduced value's names minus the item variable, a struct literal's
+    # field VALUES only (its keys are field names, not references), a map
+    # literal's keys and values, and every other node's children.
+    private proc alowFreeNames(n: ExprNode) -> [text]:
+        if n.kind == "ref":
+            return [n.text]
+        if n.kind == "astate":
+            return []
+        let mut out = []
+        if n.kind == "entityGet":
+            out = append(out, n.text)
+        if n.kind == "agg":
+            out = append(out, n.coll)
+            let mut k = 0
+            loop k < len(n.whereClause):
+                let whereNames = do alowFreeNames(n.whereClause[k])
+                let whereKept = do alowDropName(whereNames, n.itemVar)
+                let mergedWhere = do alowMergeNames(out, whereKept)
+                out = mergedWhere
+                k = k + 1
+            let mut m = 0
+            loop m < len(n.sel):
+                let selNames = do alowFreeNames(n.sel[m])
+                let selKept = do alowDropName(selNames, n.itemVar)
+                let mergedSel = do alowMergeNames(out, selKept)
+                out = mergedSel
+                m = m + 1
+            return out
+        let mut i = 0
+        loop i < len(n.children):
+            let childNames = do alowFreeNames(n.children[i])
+            let mergedChild = do alowMergeNames(out, childNames)
+            out = mergedChild
+            i = i + 1
+        let mut j = 0
+        loop j < len(n.pairs):
+            if n.kind != "struct":
+                let keyNames = do alowFreeNames(n.pairs[j].key)
+                let mergedKey = do alowMergeNames(out, keyNames)
+                out = mergedKey
+            let valNames = do alowFreeNames(n.pairs[j].value)
+            let mergedVal = do alowMergeNames(out, valNames)
+            out = mergedVal
+            j = j + 1
+        return out
+
+    # alowResolves: (e *env) resolves — locals/builtin, state, entity,
+    # enum, inline, in that order.
+    private proc alowResolves(name: text, locals: [text], env: ALowEnv) -> bool:
+        if name in locals:
+            return true
+        let builtin = do alowIsBuiltinRef(name)
+        if builtin:
+            return true
+        if name in env.stateNames:
+            return true
+        if name in env.entityNames:
+            return true
+        if name in env.enumNames:
+            return true
+        return name in env.inlineNames
+
+    # alowCheckDiag: the "unknown reference" half of e.check ("" = ok).
+    private proc alowCheckDiag(n: ExprNode, locals: [text], env: ALowEnv) -> text:
+        let names = do alowFreeNames(n)
+        let mut i = 0
+        loop i < len(names):
+            let ok = do alowResolves(names[i], locals, env)
+            if !ok:
+                return "unknown reference \"" + names[i] + "\""
+            i = i + 1
+        return ""
+
+    # alowCheckPureDiag: checkPure — check, then no now/rand, no print.
+    private proc alowCheckPureDiag(n: ExprNode, locals: [text], env: ALowEnv, ctx: text) -> text:
+        let d = do alowCheckDiag(n, locals, env)
+        if d != "":
+            return d
+        let impure = do alowHasCall(n, ["now", "rand"])
+        if impure:
+            return ctx + " cannot use an effectful builtin (now/rand); it must be pure so it can run on any client. Compute it in an action instead"
+        let prints = do alowHasCall(n, ["print"])
+        if prints:
+            return ctx + " cannot call print(...); it is a server-only debugging aid with no client implementation. Call it from an action body or a proc instead"
+        return ""
+
+    # alowStateDeps: e.depsIR over the LOWERED expression, filtered to
+    # state names (the only deps action() keeps: `if _, isState :=
+    # e.states[n]`). Walks exactly the kinds depsIR walks — ref, get,
+    # eget, astate (dirty/touched name the cell itself), agg (its filter),
+    # call/list args, bin, un — and, like Go, not index/map/struct.
+    private proc alowStateDeps(e: IRExpr, env: ALowEnv) -> [text]:
+        if e.kind == "ref":
+            if e.name in env.stateNames:
+                return [e.name]
+            return []
+        if e.kind == "get":
+            if len(e.obj) > 0:
+                let viaObj = do alowStateDeps(e.obj[0], env)
+                return viaObj
+            return []
+        if e.kind == "eget":
+            if len(e.key) > 0:
+                let viaKey = do alowStateDeps(e.key[0], env)
+                return viaKey
+            return []
+        if e.kind == "astate":
+            if e.op == "dirty" || e.op == "touched":
+                if e.name in env.stateNames:
+                    return [e.name]
+            return []
+        if e.kind == "agg":
+            if len(e.where) > 0:
+                let viaWhere = do alowStateDeps(e.where[0], env)
+                return viaWhere
+            return []
+        if e.kind == "call" || e.kind == "list":
+            let mut out = []
+            let mut i = 0
+            loop i < len(e.args):
+                let viaArg = do alowStateDeps(e.args[i], env)
+                let merged = do alowMergeNames(out, viaArg)
+                out = merged
+                i = i + 1
+            return out
+        if e.kind == "bin":
+            let mut out = []
+            if len(e.l) > 0:
+                let viaL = do alowStateDeps(e.l[0], env)
+                out = viaL
+            if len(e.r) > 0:
+                let viaR = do alowStateDeps(e.r[0], env)
+                let merged = do alowMergeNames(out, viaR)
+                out = merged
+            return out
+        if e.kind == "un":
+            if len(e.x) > 0:
+                let viaX = do alowStateDeps(e.x[0], env)
+                return viaX
+            return []
+        return []
+
+    private proc alowLow(n: ExprNode, env: ALowEnv) -> IRExpr:
+        let e = do lowerNode(n, env.inlineNames, env.inlineExprs, env.enumNames)
+        return e
+
+    # alowReadDeps: record the state cells a lowered expression reads.
+    private proc alowReadDeps(a: ALowAcc, e: IRExpr, env: ALowEnv) -> ALowAcc:
+        let deps = do alowStateDeps(e, env)
+        let reads = do alowMergeNames(a.reads, deps)
+        let out = do alowWithReads(a, reads)
+        return out
+
+    # alowReadExpr: readExprIn — check the expression in `locals`, flip
+    # impure/usesPrint, record its state reads.
+    private proc alowReadExpr(a: ALowAcc, n: ExprNode, locals: [text], env: ALowEnv) -> ALowAcc:
+        let d = do alowCheckDiag(n, locals, env)
+        if d != "":
+            let failed = do alowFail(a, d)
+            return failed
+        let impure = do alowHasCall(n, ["now", "rand"])
+        let prints = do alowHasCall(n, ["print"])
+        let flagged = do alowFlags(a, false, impure, prints, false, false, false)
+        let low = do alowLow(n, env)
+        let out = do alowReadDeps(flagged, low, env)
+        return out
+
+    # alowBindLocal: bindLocal — fresh, not a state cell, not an entity;
+    # then in scope for the rest of this block.
+    private proc alowBindLocal(a: ALowAcc, name: text, what: text, env: ALowEnv) -> ALowAcc:
+        if name in a.locals:
+            let f1 = do alowFail(a, "\"" + name + "\" is already in scope — pick another name for " + what)
+            return f1
+        if name in env.stateNames:
+            let f2 = do alowFail(a, what + " \"" + name + "\" would shadow the state cell of the same name — pick another name")
+            return f2
+        if name in env.entityNames:
+            let f3 = do alowFail(a, what + " \"" + name + "\" would shadow the entity of the same name — pick another name")
+            return f3
+        let locals = append(a.locals, name)
+        let out = do alowAccWith(a, a.body, locals)
+        return out
+
+    private proc alowEntityHasField(entity: text, field: text, env: ALowEnv) -> bool:
+        return (entity + "." + field) in env.entityFields
+
+    private proc alowEntityHasDerive(entity: text, field: text, env: ALowEnv) -> bool:
+        return (entity + "." + field) in env.entityDerives
+
+    private proc alowDeriveDiag(entity: text, field: text, inAdd: bool) -> text:
+        let base = "entity \"" + entity + "\"'s \"" + field + "\" is a derive, not a stored field — it is computed from the row's own other fields on every read and cannot be set"
+        if inAdd:
+            return base + " in `add`"
+        return base
+
+    # alowServiceOpIndex: the op's row in the per-op service tables, -1 when
+    # the service has no such op; alowServiceKnown says whether the service
+    # itself is declared at all.
+    private proc alowServiceKnown(service: text, env: ALowEnv) -> bool:
+        return service in env.serviceNames
+
+    private proc alowServiceOpIndex(service: text, op: text, env: ALowEnv) -> int:
+        let n = len(env.serviceNames)
+        let mut i = 0
+        loop i < n:
+            if env.serviceNames[i] == service && env.serviceOps[i] == op:
+                return i
+            i = i + 1
+        return -1
+
+    # ── the statement kinds ─────────────────────────────────────────────
+    private proc alowCheck(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let d = do alowCheckPureDiag(s.cond, a.locals, env, "a check")
+        if d != "":
+            let failed = do alowFail(a, d)
+            return failed
+        let cond = do alowLow(s.cond, env)
+        let msg = do lowerUnquote(s.msg)
+        let st = do irCheck(cond, msg)
+        let out = do alowEmit(a, st)
+        return out
+
+    private proc alowAssign(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let known = s.target in env.stateNames
+        if !known:
+            let failed = do alowFail(a, "assignment to unknown state \"" + s.target + "\"")
+            return failed
+        let read = do alowReadExpr(a, s.value, a.locals, env)
+        if read.err != "":
+            return read
+        let writes = do alowAddName(read.writes, s.target)
+        let wrote = do alowWithWrites(read, writes)
+        let value = do alowLow(s.value, env)
+        let st = do irAssign(s.target, value)
+        let out = do alowEmit(wrote, st)
+        return out
+
+    private proc alowAdd(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let known = s.entity in env.entityNames
+        if !known:
+            let failed = do alowFail(a, "add to unknown entity \"" + s.entity + "\"")
+            return failed
+        let flagged = do alowFlags(a, true, false, false, false, false, false)
+        let mut acc = flagged
+        let mut exprs = []
+        let n = len(s.fieldNames)
+        let mut i = 0
+        loop i < n:
+            let isDerive = do alowEntityHasDerive(s.entity, s.fieldNames[i], env)
+            if isDerive:
+                let dd = do alowDeriveDiag(s.entity, s.fieldNames[i], true)
+                let failedD = do alowFail(acc, dd)
+                return failedD
+            let read = do alowReadExpr(acc, s.fieldValues[i], acc.locals, env)
+            if read.err != "":
+                return read
+            acc = read
+            let low = do alowLow(s.fieldValues[i], env)
+            exprs = append(exprs, low)
+            i = i + 1
+        if s.bindName != "":
+            let bound = do alowBindLocal(acc, s.bindName, "the new row's id", env)
+            if bound.err != "":
+                return bound
+            acc = bound
+        let st = do irAdd(s.entity, s.fieldNames, exprs, s.bindName)
+        let out = do alowEmit(acc, st)
+        return out
+
+    private proc alowSetWhere(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let wl = do alowAddName(a.locals, s.itemVar)
+        let d = do alowCheckPureDiag(s.cond, wl, env, "a `set … where` filter")
+        if d != "":
+            let failed = do alowFail(a, d)
+            return failed
+        let lw = do alowLow(s.cond, env)
+        let readW = do alowReadDeps(a, lw, env)
+        let mut acc = readW
+        let mut exprs = []
+        let n = len(s.fieldNames)
+        let mut i = 0
+        loop i < n:
+            let isDerive = do alowEntityHasDerive(s.entity, s.fieldNames[i], env)
+            if isDerive:
+                let dd = do alowDeriveDiag(s.entity, s.fieldNames[i], false)
+                let failedD = do alowFail(acc, dd)
+                return failedD
+            let hasField = do alowEntityHasField(s.entity, s.fieldNames[i], env)
+            if !hasField:
+                let failedF = do alowFail(acc, "entity \"" + s.entity + "\" has no field \"" + s.fieldNames[i] + "\" to set")
+                return failedF
+            let read = do alowReadExpr(acc, s.fieldValues[i], wl, env)
+            if read.err != "":
+                return read
+            acc = read
+            let low = do alowLow(s.fieldValues[i], env)
+            exprs = append(exprs, low)
+            i = i + 1
+        let st = do irSetWhere(s.entity, s.itemVar, lw, s.fieldNames, exprs)
+        let out = do alowEmit(acc, st)
+        return out
+
+    private proc alowSet(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let known = s.entity in env.entityNames
+        if !known:
+            let failed = do alowFail(a, "set on unknown entity \"" + s.entity + "\"")
+            return failed
+        let flagged = do alowFlags(a, true, false, false, false, false, false)
+        if s.kind == "setWhere":
+            let viaWhere = do alowSetWhere(flagged, s, env)
+            return viaWhere
+        let isDerive = do alowEntityHasDerive(s.entity, s.field, env)
+        if isDerive:
+            let dd = do alowDeriveDiag(s.entity, s.field, false)
+            let failedD = do alowFail(flagged, dd)
+            return failedD
+        let readK = do alowReadExpr(flagged, s.key, flagged.locals, env)
+        if readK.err != "":
+            return readK
+        let readV = do alowReadExpr(readK, s.value, readK.locals, env)
+        if readV.err != "":
+            return readV
+        let key = do alowLow(s.key, env)
+        let value = do alowLow(s.value, env)
+        let st = do irSet(s.entity, key, s.field, value)
+        let out = do alowEmit(readV, st)
+        return out
+
+    private proc alowRemove(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let known = s.entity in env.entityNames
+        if !known:
+            let failed = do alowFail(a, "remove on unknown entity \"" + s.entity + "\"")
+            return failed
+        let flagged = do alowFlags(a, true, false, false, false, false, false)
+        if s.kind == "removeWhere":
+            let wl = do alowAddName(flagged.locals, s.itemVar)
+            let d = do alowCheckPureDiag(s.cond, wl, env, "a `remove … where` filter")
+            if d != "":
+                let failedW = do alowFail(flagged, d)
+                return failedW
+            let lw = do alowLow(s.cond, env)
+            let readW = do alowReadDeps(flagged, lw, env)
+            let stW = do irRemoveWhere(s.entity, s.itemVar, lw)
+            let outW = do alowEmit(readW, stW)
+            return outW
+        let readK = do alowReadExpr(flagged, s.key, flagged.locals, env)
+        if readK.err != "":
+            return readK
+        let key = do alowLow(s.key, env)
+        let st = do irRemove(s.entity, key)
+        let out = do alowEmit(readK, st)
+        return out
+
+    private proc alowClear(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let known = s.entity in env.entityNames
+        if !known:
+            let failed = do alowFail(a, "clear on unknown entity \"" + s.entity + "\"")
+            return failed
+        let flagged = do alowFlags(a, true, false, false, false, false, false)
+        let st = do irClear(s.entity)
+        let out = do alowEmit(flagged, st)
+        return out
+
+    private proc alowArgs(a: ALowAcc, args: [ExprNode], env: ALowEnv) -> ALowAcc:
+        let mut acc = a
+        let mut i = 0
+        loop i < len(args):
+            let read = do alowReadExpr(acc, args[i], acc.locals, env)
+            if read.err != "":
+                return read
+            acc = read
+            i = i + 1
+        return acc
+
+    private proc alowLowList(args: [ExprNode], env: ALowEnv) -> [IRExpr]:
+        let out = do lowerNodeList(args, env.inlineNames, env.inlineExprs, env.enumNames)
+        return out
+
+    private proc alowCall(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let svcKnown = do alowServiceKnown(s.serviceName, env)
+        if !svcKnown:
+            let f1 = do alowFail(a, "call to unknown service \"" + s.serviceName + "\"")
+            return f1
+        let at = do alowServiceOpIndex(s.serviceName, s.opName, env)
+        if at < 0:
+            let f2 = do alowFail(a, "service \"" + s.serviceName + "\" has no operation \"" + s.opName + "\"")
+            return f2
+        let argc = env.serviceArgCounts[at]
+        if len(s.callArgs) != argc:
+            let f3 = do alowFail(a, s.serviceName + "." + s.opName + " expects " + argc + " argument(s), got " + len(s.callArgs))
+            return f3
+        let flagged = do alowFlags(a, false, false, false, true, false, false)
+        let readArgs = do alowArgs(flagged, s.callArgs, env)
+        if readArgs.err != "":
+            return readArgs
+        let mut acc = readArgs
+        let mut ret = ""
+        let mut retList = false
+        if s.bindName != "":
+            if env.serviceRets[at] == "":
+                let f4 = do alowFail(acc, s.serviceName + "." + s.opName + " returns nothing — declare a return type (`" + s.opName + "(…) -> Type`) to bind it")
+                return f4
+            let bound = do alowBindLocal(acc, s.bindName, "the bound result", env)
+            if bound.err != "":
+                return bound
+            acc = bound
+            ret = env.serviceRets[at]
+            retList = env.serviceRetLists[at]
+        let args = do alowLowList(s.callArgs, env)
+        let st = do irCallStmt(s.serviceName, s.opName, args, s.bindName, ret, retList)
+        let out = do alowEmit(acc, st)
+        return out
+
+    private proc alowDo(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let at = do lowerFindName(env.procNames, s.procName)
+        if at < 0:
+            let f1 = do alowFail(a, "do calls unknown proc \"" + s.procName + "\"")
+            return f1
+        let argc = env.procParamCounts[at]
+        if len(s.callArgs) != argc:
+            let f2 = do alowFail(a, "proc \"" + s.procName + "\" expects " + argc + " argument(s), got " + len(s.callArgs))
+            return f2
+        let flagged = do alowFlags(a, false, false, false, false, true, false)
+        let readArgs = do alowArgs(flagged, s.callArgs, env)
+        if readArgs.err != "":
+            return readArgs
+        let mut acc = readArgs
+        let mut ret = ""
+        let mut retList = false
+        if s.bindName != "":
+            let sigRet = env.procRets[at]
+            if sigRet == "":
+                let f3 = do alowFail(acc, "proc \"" + s.procName + "\" returns nothing — declare a return type (`proc " + s.procName + "(...) -> Type`) to bind it")
+                return f3
+            if sigRet == "float":
+                let f4 = do alowFail(acc, "proc \"" + s.procName + "\" returns float, which is only usable inside another proc — an action cannot bind it (no client-side representation exists for a float; see LANGUAGE.md's `proc` section). Convert it inside the proc first (e.g. `return round(x)`) and give \"" + s.procName + "\" an int/text/bool/money/date return type instead")
+                return f4
+            if sigRet in env.structNames:
+                let f5 = do alowFail(acc, "proc \"" + s.procName + "\" returns " + sigRet + ", a struct type usable only inside another proc — an action cannot bind it (structs are proc-local values, with no schema/wire representation yet; see LANGUAGE.md's `proc` section). Read its fields inside the proc and give \"" + s.procName + "\" a scalar/list return type instead")
+                return f5
+            let bound = do alowBindLocal(acc, s.bindName, "the bound result", env)
+            if bound.err != "":
+                return bound
+            acc = bound
+            ret = sigRet
+            retList = env.procRetLists[at]
+        let args = do alowLowList(s.callArgs, env)
+        let st = do irDo(s.procName, args, s.bindName, ret, retList)
+        let out = do alowEmit(acc, st)
+        return out
+
+    private proc alowEstablish(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let flagged = do alowFlags(a, false, false, false, false, false, true)
+        let readA = do alowReadExpr(flagged, s.actor, flagged.locals, env)
+        if readA.err != "":
+            return readA
+        let actor = do alowLow(s.actor, env)
+        let mut acc = readA
+        let mut role = []
+        if s.hasRole:
+            let readR = do alowReadExpr(acc, s.role, acc.locals, env)
+            if readR.err != "":
+                return readR
+            acc = readR
+            let r = do alowLow(s.role, env)
+            role = [r]
+        let st = do irEstablish(actor, role)
+        let out = do alowEmit(acc, st)
+        return out
+
+    private proc alowExprStmt(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let read = do alowReadExpr(a, s.exprCall, a.locals, env)
+        if read.err != "":
+            return read
+        let call = do alowLow(s.exprCall, env)
+        let st = do irExprStmt(call)
+        let out = do alowEmit(read, st)
+        return out
+
+    private proc alowLet(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let read = do alowReadExpr(a, s.value, a.locals, env)
+        if read.err != "":
+            return read
+        let bound = do alowBindLocal(read, s.target, "the local", env)
+        if bound.err != "":
+            return bound
+        let value = do alowLow(s.value, env)
+        let st = do irLet(s.target, value)
+        let out = do alowEmit(bound, st)
+        return out
+
+    private proc alowIf(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let read = do alowReadExpr(a, s.cond, a.locals, env)
+        if read.err != "":
+            return read
+        let outerBody = read.body
+        let outerLocals = read.locals
+        let thenIn = do alowAccWith(read, [], outerLocals)
+        let thenOut = do alowBlock(s.body, thenIn, env)
+        if thenOut.err != "":
+            return thenOut
+        let mut els = []
+        let mut acc = thenOut
+        if len(s.elseBody) > 0:
+            let elseIn = do alowAccWith(thenOut, [], outerLocals)
+            let elseOut = do alowBlock(s.elseBody, elseIn, env)
+            if elseOut.err != "":
+                return elseOut
+            els = elseOut.body
+            acc = elseOut
+        let cond = do alowLow(s.cond, env)
+        let st = do irIf(cond, thenOut.body, els)
+        let body = append(outerBody, st)
+        let out = do alowAccWith(acc, body, outerLocals)
+        return out
+
+    private proc alowFor(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        let known = s.entity in env.entityNames
+        if !known:
+            let f1 = do alowFail(a, "`for` in an action walks an entity's rows; \"" + s.entity + "\" is not an entity")
+            return f1
+        let outerBody = a.body
+        let outerLocals = a.locals
+        let scoped = do alowAccWith(a, a.body, outerLocals)
+        let bound = do alowBindLocal(scoped, s.itemVar, "the loop variable", env)
+        if bound.err != "":
+            return bound
+        let wl = bound.locals
+        let mut acc = bound
+        let mut where = []
+        let hasWhere = s.cond.kind != "int" || s.cond.text != "0"
+        if hasWhere:
+            let d = do alowCheckPureDiag(s.cond, wl, env, "a `for … where` filter")
+            if d != "":
+                let f2 = do alowFail(acc, d)
+                return f2
+            let lw = do alowLow(s.cond, env)
+            where = [lw]
+            let readW = do alowReadDeps(acc, lw, env)
+            acc = readW
+        if s.orderField != "":
+            let hasField = do alowEntityHasField(s.entity, s.orderField, env)
+            if !hasField && s.orderField != "id":
+                let f3 = do alowFail(acc, "entity \"" + s.entity + "\" has no field \"" + s.orderField + "\" to order by")
+                return f3
+        let mut limit = []
+        if s.hasLimit:
+            let readL = do alowReadExpr(acc, s.limit, outerLocals, env)
+            if readL.err != "":
+                return readL
+            acc = readL
+            let ll = do alowLow(s.limit, env)
+            limit = [ll]
+        let bodyIn = do alowAccWith(acc, [], wl)
+        let bodyOut = do alowBlock(s.body, bodyIn, env)
+        if bodyOut.err != "":
+            return bodyOut
+        let st = do irFor(s.entity, s.itemVar, where, s.orderField, s.orderDesc, limit, bodyOut.body)
+        let body = append(outerBody, st)
+        let out = do alowAccWith(bodyOut, body, outerLocals)
+        return out
+
+    # alowStmt: block's type switch, one statement.
+    private proc alowStmt(a: ALowAcc, s: ActionStmt, env: ALowEnv) -> ALowAcc:
+        if !s.valid:
+            let fu = do alowFail(a, "unsupported statement (outside the self-hosted action grammar)")
+            return fu
+        if s.kind == "check":
+            let r = do alowCheck(a, s, env)
+            return r
+        if s.kind == "assign":
+            let r = do alowAssign(a, s, env)
+            return r
+        if s.kind == "add" || s.kind == "letAdd":
+            let r = do alowAdd(a, s, env)
+            return r
+        if s.kind == "set" || s.kind == "setWhere":
+            let r = do alowSet(a, s, env)
+            return r
+        if s.kind == "remove" || s.kind == "removeWhere":
+            let r = do alowRemove(a, s, env)
+            return r
+        if s.kind == "clear":
+            let r = do alowClear(a, s, env)
+            return r
+        if s.kind == "call" || s.kind == "letCall":
+            let r = do alowCall(a, s, env)
+            return r
+        if s.kind == "do" || s.kind == "letDo":
+            let r = do alowDo(a, s, env)
+            return r
+        if s.kind == "establish":
+            let r = do alowEstablish(a, s, env)
+            return r
+        if s.kind == "exprStmt":
+            let r = do alowExprStmt(a, s, env)
+            return r
+        if s.kind == "let":
+            let r = do alowLet(a, s, env)
+            return r
+        if s.kind == "if":
+            let r = do alowIf(a, s, env)
+            return r
+        if s.kind == "for":
+            let r = do alowFor(a, s, env)
+            return r
+        let f = do alowFail(a, "unsupported statement kind \"" + s.kind + "\"")
+        return f
+
+    # alowBlock: block — one statement list against the scope in
+    # `a.locals`; a `let`/bind widens the scope for the statements after
+    # it in this block only (the caller restores its own scope).
+    proc alowBlock(stmts: [ActionStmt], a: ALowAcc, env: ALowEnv) -> ALowAcc:
+        let mut acc = a
+        let n = len(stmts)
+        let mut i = 0
+        loop i < n:
+            let next = do alowStmt(acc, stmts[i], env)
+            if next.err != "":
+                return next
+            acc = next
+            i = i + 1
+        return acc
+
+    # ── the action ──────────────────────────────────────────────────────
+    private proc alowFailedAction(msg: text) -> IRAction:
+        return IRAction{name: "", params: [], requires: [], optimistic: false, ret: "", retList: false, placement: "", reason: msg, writes: [], reads: [], seal: [], body: []}
+
+    # lowerActionSrc: action(), end to end. `paramTypes[i]` is the declared
+    # type of `paramNames[i]`; `bodySrc` is the action's dedented body
+    # (including its `requires` lines).
+    proc lowerActionSrc(name: text, paramNames: [text], paramTypes: [text], optimistic: bool, bodySrc: text, env: ALowEnv) -> IRAction:
+        let mut params = []
+        let mut loc = ["actor", "role", "verified", "tenant", "tenantRole", "session"]
+        let pn = len(paramNames)
+        let mut i = 0
+        loop i < pn:
+            if paramTypes[i] == "float":
+                let fp = do alowFailedAction("action \"" + name + "\" parameter \"" + paramNames[i] + "\": float is only supported inside a proc body — not yet on an action parameter, which arrives from an HTTP request and may be re-evaluated by the client")
+                return fp
+            params = append(params, IRParam{name: paramNames[i], type: paramTypes[i], optional: false, list: false})
+            loc = append(loc, paramNames[i])
+            i = i + 1
+        let stmts = do parseActionBodySrc(bodySrc)
+        let reqStmts = do actionRequiresOnly(stmts)
+        let bodyStmts = do actionBodyOnly(stmts)
+        # requires: a known policy, the right arity, pure arguments.
+        let mut reqs = []
+        let rn = len(reqStmts)
+        let mut r = 0
+        loop r < rn:
+            let rs = reqStmts[r]
+            if !rs.valid:
+                let fu = do alowFailedAction("unsupported requires clause (outside the self-hosted action grammar)")
+                return fu
+            let pat = do lowerFindName(env.policyNames, rs.policyName)
+            if pat < 0:
+                let isInline = rs.policyName in env.inlineNames
+                if isInline:
+                    let fd = do alowFailedAction("requires \"" + rs.policyName + "\", which is a derive, not a policy")
+                    return fd
+                let fp = do alowFailedAction("requires unknown policy \"" + rs.policyName + "\"")
+                return fp
+            let want = env.policyParamCounts[pat]
+            if len(rs.policyArgs) != want:
+                let fa = do alowFailedAction("policy \"" + rs.policyName + "\" takes " + want + " argument(s), got " + len(rs.policyArgs))
+                return fa
+            let mut args = []
+            let an = len(rs.policyArgs)
+            let mut j = 0
+            loop j < an:
+                let d = do alowCheckPureDiag(rs.policyArgs[j], loc, env, "a requires argument")
+                if d != "":
+                    let fc = do alowFailedAction(d)
+                    return fc
+                let low = do alowLow(rs.policyArgs[j], env)
+                args = append(args, low)
+                j = j + 1
+            reqs = append(reqs, IRRequire{name: rs.policyName, args: args})
+            r = r + 1
+        # the body
+        let acc0 = do alowAccNew(loc)
+        let acc = do alowBlock(bodyStmts, acc0, env)
+        if acc.err != "":
+            let fb = do alowFailedAction(acc.err)
+            return fb
+        let writes = do alowSortText(acc.writes)
+        let reads = do alowSortText(acc.reads)
+        # placement: server iff it writes any authoritative cell OR is
+        # impure — with the @client-only exception (see build.go).
+        let onlyClient = do alowWritesOnlyClientState(writes, env)
+        let mut placement = "client"
+        let mut reason = "only touches @client state, so it runs in the browser with no round-trip"
+        let mut decided = false
+        if acc.entWrite:
+            placement = "server"
+            reason = "writes durable entity data — the authority owns the database"
+            decided = true
+        if !decided && acc.usesPrint:
+            placement = "server"
+            reason = "calls print(...) — a server-only debugging aid with no client implementation; the authority is the only process with log output to write it to"
+            decided = true
+        if !decided && acc.impure && !onlyClient:
+            placement = "server"
+            reason = "uses an effectful builtin (now/rand) — the authority owns nondeterminism, so every client sees one agreed result"
+            decided = true
+        if !decided && acc.callsService:
+            placement = "server"
+            reason = "calls an external service — egress routes through the authority, never the client"
+            decided = true
+        if !decided && acc.callsProc:
+            placement = "server"
+            reason = "calls a `proc`, which is unconditionally server-executed — no client mirror of proc code exists"
+            decided = true
+        if !decided && acc.establishesID:
+            placement = "server"
+            reason = "establishes the session identity — only the authority may set who you are"
+            decided = true
+        if placement == "client":
+            let wn = len(writes)
+            let mut w = 0
+            loop w < wn:
+                let p = do alowStatePlacement(writes[w], env)
+                if p == "server":
+                    placement = "server"
+                    reason = "writes authoritative state \"" + writes[w] + "\" — only the authority may change it"
+                    break
+                w = w + 1
+        if placement == "server":
+            let rdn = len(reads)
+            let mut k = 0
+            loop k < rdn:
+                let p = do alowStatePlacement(reads[k], env)
+                if p == "client":
+                    let fr = do alowFailedAction("action \"" + name + "\" runs on the server (it writes authoritative state or uses an effectful builtin) but reads client-only state \"" + reads[k] + "\"; the authority cannot see ephemeral client state")
+                    return fr
+                k = k + 1
+            let wrn = len(writes)
+            let mut m = 0
+            loop m < wrn:
+                let p = do alowStatePlacement(writes[m], env)
+                if p == "client":
+                    let fw = do alowFailedAction("action \"" + name + "\" runs on the server but writes client-only state \"" + writes[m] + "\"; the authority cannot reach ephemeral client state")
+                    return fw
+                m = m + 1
+        if len(reqs) > 0 && placement != "server":
+            let fg = do alowFailedAction("action \"" + name + "\" has `requires` but is client-placed; only authoritative (server) actions can be gated")
+            return fg
+        # `optimistic` is accepted (it is ast.Action's flag) but NOT copied
+        # into the result: the real action() starts from `Action{Name:
+        # a.Name}` and nothing in build.go ever sets ir.Action.Optimistic,
+        # so `@optimistic` is dropped on the floor there — mirrored here so
+        # the JSON stays byte for byte the compiler's.
+        let dropped = optimistic && false
+        return IRAction{name: name, params: params, requires: reqs, optimistic: dropped, ret: "", retList: false, placement: placement, reason: reason, writes: writes, reads: reads, seal: [], body: acc.body}
+
+    proc lowerActionJSON(name: text, paramNames: [text], paramTypes: [text], optimistic: bool, bodySrc: text, env: ALowEnv) -> text:
+        let a = do lowerActionSrc(name, paramNames, paramTypes, optimistic, bodySrc, env)
+        let j = do irActionJSON(a)
+        return j
+
+    # ── text-list environment (the HTTP driver's wire shape) ────────────
+    # An action cannot take a list parameter, so every table arrives as
+    # one newline-separated text, each line colon-separated:
+    #   paramLines      name:type
+    #   stateLines      name:placement
+    #   entityLines     Entity
+    #   fieldLines      Entity.field
+    #   deriveLines     Entity.derive
+    #   enumLines       Enum
+    #   policyLines     name:paramCount
+    #   inlineNameLines name            (index-parallel to inlineJSONLines)
+    #   inlineJSONLines the real compiler's lowered ir.Expr JSON, one per
+    #                   line (json.Marshal never emits a newline)
+    #   serviceLines    Service.op:argCount:ret:retList
+    #   procLines       name:paramCount:ret:retList
+    #   structLines     Struct
+    private proc alowField(line: text, i: int) -> text:
+        let parts = split(line, ":")
+        if i < len(parts):
+            return parts[i]
+        return ""
+
+    proc alowEnvFromLines(stateLines: text, entityLines: text, fieldLines: text, deriveLines: text, enumLines: text, policyLines: text, inlineNameLines: text, inlineJSONLines: text, serviceLines: text, procLines: text, structLines: text) -> ALowEnv:
+        let states = do lowerSplitLines(stateLines)
+        let mut stateNames = []
+        let mut statePlacements = []
+        let mut i = 0
+        loop i < len(states):
+            let n = do alowField(states[i], 0)
+            let p = do alowField(states[i], 1)
+            stateNames = append(stateNames, n)
+            statePlacements = append(statePlacements, p)
+            i = i + 1
+        let entityNames = do lowerSplitLines(entityLines)
+        let entityFields = do lowerSplitLines(fieldLines)
+        let entityDerives = do lowerSplitLines(deriveLines)
+        let enumNames = do lowerSplitLines(enumLines)
+        let policies = do lowerSplitLines(policyLines)
+        let mut policyNames = []
+        let mut policyParamCounts = []
+        let mut j = 0
+        loop j < len(policies):
+            let n = do alowField(policies[j], 0)
+            let c = do alowField(policies[j], 1)
+            policyNames = append(policyNames, n)
+            policyParamCounts = append(policyParamCounts, toInt(c))
+            j = j + 1
+        let inlineNames = do lowerSplitLines(inlineNameLines)
+        let inlineJSON = do lowerSplitLines(inlineJSONLines)
+        let mut inlineExprs = []
+        let mut k = 0
+        loop k < len(inlineJSON):
+            let e = do irExprFromJSON(inlineJSON[k])
+            inlineExprs = append(inlineExprs, e)
+            k = k + 1
+        let services = do lowerSplitLines(serviceLines)
+        let mut serviceNames = []
+        let mut serviceOps = []
+        let mut serviceArgCounts = []
+        let mut serviceRets = []
+        let mut serviceRetLists = []
+        let mut s = 0
+        loop s < len(services):
+            let svcOp = do alowField(services[s], 0)
+            let dot = split(svcOp, ".")
+            let argc = do alowField(services[s], 1)
+            let ret = do alowField(services[s], 2)
+            let rl = do alowField(services[s], 3)
+            serviceNames = append(serviceNames, dot[0])
+            serviceOps = append(serviceOps, dot[1])
+            serviceArgCounts = append(serviceArgCounts, toInt(argc))
+            serviceRets = append(serviceRets, ret)
+            serviceRetLists = append(serviceRetLists, rl == "true")
+            s = s + 1
+        let procs = do lowerSplitLines(procLines)
+        let mut procNames = []
+        let mut procParamCounts = []
+        let mut procRets = []
+        let mut procRetLists = []
+        let mut q = 0
+        loop q < len(procs):
+            let n = do alowField(procs[q], 0)
+            let c = do alowField(procs[q], 1)
+            let ret = do alowField(procs[q], 2)
+            let rl = do alowField(procs[q], 3)
+            procNames = append(procNames, n)
+            procParamCounts = append(procParamCounts, toInt(c))
+            procRets = append(procRets, ret)
+            procRetLists = append(procRetLists, rl == "true")
+            q = q + 1
+        let structNames = do lowerSplitLines(structLines)
+        return ALowEnv{stateNames: stateNames, statePlacements: statePlacements, entityNames: entityNames, entityFields: entityFields, entityDerives: entityDerives, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: inlineNames, inlineExprs: inlineExprs, serviceNames: serviceNames, serviceOps: serviceOps, serviceArgCounts: serviceArgCounts, serviceRets: serviceRets, serviceRetLists: serviceRetLists, procNames: procNames, procParamCounts: procParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames}
+
+    proc lowerActionLinesJSON(name: text, paramLines: text, optimistic: bool, bodySrc: text, stateLines: text, entityLines: text, fieldLines: text, deriveLines: text, enumLines: text, policyLines: text, inlineNameLines: text, inlineJSONLines: text, serviceLines: text, procLines: text, structLines: text) -> text:
+        let params = do lowerSplitLines(paramLines)
+        let mut paramNames = []
+        let mut paramTypes = []
+        let mut i = 0
+        loop i < len(params):
+            let n = do alowField(params[i], 0)
+            let t = do alowField(params[i], 1)
+            paramNames = append(paramNames, n)
+            paramTypes = append(paramTypes, t)
+            i = i + 1
+        let env = do alowEnvFromLines(stateLines, entityLines, fieldLines, deriveLines, enumLines, policyLines, inlineNameLines, inlineJSONLines, serviceLines, procLines, structLines)
+        let j = do lowerActionJSON(name, paramNames, paramTypes, optimistic, bodySrc, env)
+        return j
+
+    state actionLowerResult: text = ""
+
+    # runLowerAction: POST {"args": [name, paramLines, optimistic, bodySrc,
+    # stateLines, entityLines, fieldLines, deriveLines, enumLines,
+    # policyLines, inlineNameLines, inlineJSONLines, serviceLines,
+    # procLines, structLines]} -> actionLowerResult is the action's IR JSON
+    # (or, for a compile error, an action with placement "" and the
+    # diagnostic in `reason`).
+    action runLowerAction(name: text, paramLines: text, optimistic: bool, bodySrc: text, stateLines: text, entityLines: text, fieldLines: text, deriveLines: text, enumLines: text, policyLines: text, inlineNameLines: text, inlineJSONLines: text, serviceLines: text, procLines: text, structLines: text):
+        let j = do lowerActionLinesJSON(name, paramLines, optimistic, bodySrc, stateLines, entityLines, fieldLines, deriveLines, enumLines, policyLines, inlineNameLines, inlineJSONLines, serviceLines, procLines, structLines)
+        actionLowerResult = j
+
+    private view ActionLowerHome at "/action_lower":
+        box:
+            text "{actionLowerResult}"

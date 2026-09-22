@@ -1,0 +1,234 @@
+app IRExprSelfHost:
+    # Self-hosting port of internal/ir/ir.go's `Expr` — the serializable IR
+    # form every compiled expression takes (the same JSON the runtime and
+    # assets/facet.js both interpret). One struct, `kind`-discriminated
+    # exactly as the Go struct is, with every field the Go struct has:
+    #
+    #   kind:   lit | ref | get | eget | agg | call | bin | un | list | index |
+    #           map | struct | astate
+    #   hasVal/val/vtype: a literal's value. Go's Val is `any` (int/text/bool/
+    #           float) — here the value is carried as its SOURCE SPELLING in
+    #           `val` and `vtype` says which JSON scalar it is (int/money/date/
+    #           float → a bare number, bool → true/false, text → a JSON
+    #           string). hasVal mirrors Go's `omitempty` on an interface: a
+    #           non-literal has no `val` key at all.
+    #   name:   ref / eget's entity / agg's collection / call's builtin /
+    #           struct's type name / astate's action
+    #   field:  get / eget / agg's bare reduced field
+    #   obj:    get / index — the addressed object (0 or 1 element)
+    #   key:    eget / index — the key/index expression (0 or 1 element)
+    #   op:     bin / un / agg (count|sum|exists|avg|min|max) / astate
+    #   args:   call's arguments / list's elements / map's values / struct's
+    #           field values
+    #   keys:   map's keys, parallel to args
+    #   fields: struct's field names, parallel to args
+    #   l, r:   bin's operands (0 or 1 element each)
+    #   x:      un's operand
+    #   itemVar: agg's item variable (Go's `Var`)
+    #   where:  agg's filter (0 or 1 element)
+    #   sel:    agg's reduced expression (0 or 1 element)
+    #   order/desc/limit: list(...)'s `by field [desc]` and `limit n`
+    #
+    # A nil-able single child is a 0-or-1-element list — the convention
+    # expr_tokens.fct's ExprNode already uses for `whereClause`/`sel`, since a
+    # struct field cannot be optional and a struct cannot name its own type
+    # directly as a scalar field.
+    #
+    # `irExprJSON` spells a value as the exact key ORDER Go's encoding/json
+    # gives ir.Expr (kind, val, vtype, name, field, obj, key, op, args, keys,
+    # fields, l, r, x, var, where, sel) with `omitempty` semantics, so a Go
+    # test can unmarshal it straight into ir.Expr and compare with what the
+    # real compiler produced.
+    struct IRExpr:
+        kind: text
+        hasVal: bool
+        val: text
+        vtype: text
+        name: text
+        field: text
+        obj: [IRExpr]
+        key: [IRExpr]
+        op: text
+        args: [IRExpr]
+        keys: [IRExpr]
+        fields: [text]
+        l: [IRExpr]
+        r: [IRExpr]
+        x: [IRExpr]
+        itemVar: text
+        where: [IRExpr]
+        sel: [IRExpr]
+        order: text
+        desc: bool
+        limit: [IRExpr]
+
+    # emptyIR: the "absent" sentinel (kind ""), never emitted.
+    proc emptyIR() -> IRExpr:
+        return IRExpr{kind: "", hasVal: false, val: "", vtype: "", name: "", field: "", obj: [], key: [], op: "", args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irLit(val: text, vtype: text) -> IRExpr:
+        return IRExpr{kind: "lit", hasVal: true, val: val, vtype: vtype, name: "", field: "", obj: [], key: [], op: "", args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irRef(name: text) -> IRExpr:
+        return IRExpr{kind: "ref", hasVal: false, val: "", vtype: "", name: name, field: "", obj: [], key: [], op: "", args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irBin(op: text, l: IRExpr, r: IRExpr) -> IRExpr:
+        return IRExpr{kind: "bin", hasVal: false, val: "", vtype: "", name: "", field: "", obj: [], key: [], op: op, args: [], keys: [], fields: [], l: [l], r: [r], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irUn(op: text, x: IRExpr) -> IRExpr:
+        return IRExpr{kind: "un", hasVal: false, val: "", vtype: "", name: "", field: "", obj: [], key: [], op: op, args: [], keys: [], fields: [], l: [], r: [], x: [x], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irGet(obj: IRExpr, field: text) -> IRExpr:
+        return IRExpr{kind: "get", hasVal: false, val: "", vtype: "", name: "", field: field, obj: [obj], key: [], op: "", args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irEGet(entity: text, key: IRExpr, field: text) -> IRExpr:
+        return IRExpr{kind: "eget", hasVal: false, val: "", vtype: "", name: entity, field: field, obj: [], key: [key], op: "", args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irIndex(obj: IRExpr, key: IRExpr) -> IRExpr:
+        return IRExpr{kind: "index", hasVal: false, val: "", vtype: "", name: "", field: "", obj: [obj], key: [key], op: "", args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irCall(name: text, args: [IRExpr]) -> IRExpr:
+        return IRExpr{kind: "call", hasVal: false, val: "", vtype: "", name: name, field: "", obj: [], key: [], op: "", args: args, keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irList(elems: [IRExpr]) -> IRExpr:
+        return IRExpr{kind: "list", hasVal: false, val: "", vtype: "", name: "", field: "", obj: [], key: [], op: "", args: elems, keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irMap(keys: [IRExpr], vals: [IRExpr]) -> IRExpr:
+        return IRExpr{kind: "map", hasVal: false, val: "", vtype: "", name: "", field: "", obj: [], key: [], op: "", args: vals, keys: keys, fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irStruct(typeName: text, fields: [text], vals: [IRExpr]) -> IRExpr:
+        return IRExpr{kind: "struct", hasVal: false, val: "", vtype: "", name: typeName, field: "", obj: [], key: [], op: "", args: vals, keys: [], fields: fields, l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    proc irAState(op: text, action: text) -> IRExpr:
+        return IRExpr{kind: "astate", hasVal: false, val: "", vtype: "", name: action, field: "", obj: [], key: [], op: op, args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: "", where: [], sel: [], order: "", desc: false, limit: []}
+
+    # irAgg: `where`/`sel` are 0-or-1-element lists (empty = absent).
+    proc irAgg(op: text, coll: text, field: text, itemVar: text, where: [IRExpr], sel: [IRExpr]) -> IRExpr:
+        return IRExpr{kind: "agg", hasVal: false, val: "", vtype: "", name: coll, field: field, obj: [], key: [], op: op, args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: itemVar, where: where, sel: sel, order: "", desc: false, limit: []}
+
+    # ── JSON ────────────────────────────────────────────────────────────────
+    # jsonQuote: a JSON string literal for s, spelled as encoding/json spells
+    # it: `"`, `\` and the three common control characters escaped, and —
+    # because Go's encoder is HTML-safe by default — `<`, `>` and `&` written
+    # as \u003c, \u003e and \u0026 (an operator like `>=` therefore reads
+    # "\u003e=" in the real compiler's IR, and here). Other control characters
+    # do not occur in .fct source (the tokenizer never produces them).
+    proc jsonQuote(s: text) -> text:
+        let a = replace(s, "\\", "\\\\")
+        let b = replace(a, "\"", "\\\"")
+        let c = replace(b, "\n", "\\n")
+        let d = replace(c, "\t", "\\t")
+        let e = replace(d, "\r", "\\r")
+        let f = replace(e, "<", "\\u003c")
+        let g = replace(f, ">", "\\u003e")
+        let h = replace(g, "&", "\\u0026")
+        return "\"" + h + "\""
+
+    proc irListJSON(xs: [IRExpr]) -> text:
+        let n = len(xs)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let j = do irExprJSON(xs[i])
+            out = out + j
+            i = i + 1
+        return out + "]"
+
+    proc textListJSON(xs: [text]) -> text:
+        let n = len(xs)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let q = do jsonQuote(xs[i])
+            out = out + q
+            i = i + 1
+        return out + "]"
+
+    # irExprJSON: exactly encoding/json over ir.Expr — key order is the
+    # struct's field order, and a zero value (empty text, empty list, nil
+    # child) is omitted, as `omitempty` omits it.
+    proc irExprJSON(e: IRExpr) -> text:
+        let kq = do jsonQuote(e.kind)
+        let mut out = "{\"kind\":" + kq
+        if e.hasVal:
+            if e.vtype == "text":
+                let vq = do jsonQuote(e.val)
+                out = out + ",\"val\":" + vq
+            else:
+                out = out + ",\"val\":" + e.val
+        if e.vtype != "":
+            let tq = do jsonQuote(e.vtype)
+            out = out + ",\"vtype\":" + tq
+        if e.name != "":
+            let nq = do jsonQuote(e.name)
+            out = out + ",\"name\":" + nq
+        if e.field != "":
+            let fq = do jsonQuote(e.field)
+            out = out + ",\"field\":" + fq
+        if len(e.obj) > 0:
+            let oj = do irExprJSON(e.obj[0])
+            out = out + ",\"obj\":" + oj
+        if len(e.key) > 0:
+            let kj = do irExprJSON(e.key[0])
+            out = out + ",\"key\":" + kj
+        if e.op != "":
+            let oq = do jsonQuote(e.op)
+            out = out + ",\"op\":" + oq
+        if len(e.args) > 0:
+            let aj = do irListJSON(e.args)
+            out = out + ",\"args\":" + aj
+        if len(e.keys) > 0:
+            let ksj = do irListJSON(e.keys)
+            out = out + ",\"keys\":" + ksj
+        if len(e.fields) > 0:
+            let fj = do textListJSON(e.fields)
+            out = out + ",\"fields\":" + fj
+        if len(e.l) > 0:
+            let lj = do irExprJSON(e.l[0])
+            out = out + ",\"l\":" + lj
+        if len(e.r) > 0:
+            let rj = do irExprJSON(e.r[0])
+            out = out + ",\"r\":" + rj
+        if len(e.x) > 0:
+            let xj = do irExprJSON(e.x[0])
+            out = out + ",\"x\":" + xj
+        if e.itemVar != "":
+            let vq2 = do jsonQuote(e.itemVar)
+            out = out + ",\"var\":" + vq2
+        if len(e.where) > 0:
+            let wj = do irExprJSON(e.where[0])
+            out = out + ",\"where\":" + wj
+        if len(e.sel) > 0:
+            let sj = do irExprJSON(e.sel[0])
+            out = out + ",\"sel\":" + sj
+        if e.order != "":
+            let orq = do jsonQuote(e.order)
+            out = out + ",\"order\":" + orq
+        if e.desc:
+            out = out + ",\"desc\":true"
+        if len(e.limit) > 0:
+            let lj = do irExprJSON(e.limit[0])
+            out = out + ",\"limit\":" + lj
+        return out + "}"
+
+    # ── live driver ─────────────────────────────────────────────────────────
+    state irDemo: text = ""
+
+    proc irDemoJSON() -> text:
+        let one = do irLit("1", "int")
+        let n = do irRef("n")
+        let s = do irBin("+", n, one)
+        let j = do irExprJSON(s)
+        return j
+
+    action runIRDemo():
+        let j = do irDemoJSON()
+        irDemo = j
+
+    private view IRExprHome at "/ir_expr":
+        box:
+            text "{irDemo}"

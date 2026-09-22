@@ -54,6 +54,9 @@ type testStep struct {
 	Args  []any      `json:"args"`
 	As    *testActor `json:"as"`
 	Fails string     `json:"fails"`
+	// Returns asserts the action's reply value (`return expr`); compared like
+	// `equals`, so a list or object compares by canonical JSON.
+	Returns any `json:"returns"`
 	// assert an expression
 	Expect string `json:"expect"`
 	Equals any    `json:"equals"`
@@ -118,7 +121,16 @@ func runCase(graph *ir.IR, tc testCase) error {
 				a, r = identityOf(step.As, a, r)
 				v = step.As.Verified
 			}
-			_, err := srv.Run(a, r, v, step.Run, step.Args)
+			var err error
+			if step.Returns != nil {
+				var got any
+				got, err = srv.RunValue(a, r, v, step.Run, step.Args)
+				if err == nil && !valuesEqual(got, step.Returns) {
+					return fmt.Errorf("%s: expected %q to return %s, got %s", where, step.Run, jsonOf(step.Returns), jsonOf(got))
+				}
+			} else {
+				_, err = srv.Run(a, r, v, step.Run, step.Args)
+			}
 			if step.Fails != "" {
 				if err == nil {
 					return fmt.Errorf("%s: expected %q to fail with %q, but it succeeded", where, step.Run, step.Fails)

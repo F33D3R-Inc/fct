@@ -1,0 +1,802 @@
+import "expr.fct"
+
+app CheckSelfHost:
+    # Partial, honest self-hosting port of internal/ir/build.go's expression
+    # checker — `(e *env) check(ex, locals, line)` and everything it calls
+    # (`checkBuiltins` with `pureBuiltinArity`, `checkNoBitwise`,
+    # `checkNoIndex`, `checkNoFloat`, `checkNoIO`, `checkNoConcurrency`,
+    # `checkDaemonOnlyBuiltins`, `freeNames`, `resolves`, `isBuiltinRef`,
+    # `withActor`, `viewScope`, and braces.go's `checkLiteralExpr`/
+    # `litInterp`/`concatForm`) plus `checkPure` (`hasImpure`/`hasPrint`) —
+    # over the real `ExprNode` tree expr.fct's `parseExprTree` builds.
+    #
+    # The Go original returns an `error` (nil = accepted); a proc has one
+    # return type and no error channel, so every checker here returns a
+    # `text` diagnostic, "" meaning "the real compiler would accept this
+    # expression in this scope" — exactly semantics.fct's/action_stmt.fct's
+    # convention. The wording of every non-empty diagnostic is copied from
+    # build.go/braces.go verbatim (Go's `%q` restated as a quoted name), so
+    # a test can pin the two to each other by substring.
+    #
+    # ============================================================
+    # WHAT THE `env` TABLES BECOME
+    # ============================================================
+    # Go's `check` reads six name tables off `*env` (`e.states`,
+    # `e.entities`, `e.entityFields`, `e.enums`, `e.inline`, `e.actionSet`)
+    # plus the caller's `locals` set. A proc cannot take a map-typed
+    # parameter (semantics.fct's header spells out why), so each table is a
+    # plain `[text]` list looked up by a linear scan (`nameIn`, STAGE 1):
+    #
+    #   locals        the scope's own bindings, ALREADY widened the way
+    #                 build.go widens it before calling check — `withActor`
+    #                 (an action/derive/policy scope) or `viewScope` (a
+    #                 render scope, which also binds `route`). Both are
+    #                 ported below so a caller can do that widening in fct.
+    #   stateNames    every `state` cell's name (`e.states`' key set).
+    #   entityNames   every `entity`'s name (`e.entities`).
+    #   entityFields  every declared entity field as "Entity.field" —
+    #                 `e.entityFields` flattened to one list, the only way
+    #                 a map-of-sets crosses a proc boundary here. An entity
+    #                 with no "Entity." entry at all is "an entity whose
+    #                 fields the builder did not record" (Go's `fields ==
+    #                 nil`), so `Entity(k).anything` passes for it exactly
+    #                 as it does in Go.
+    #   enumNames     every `enum`'s name (`e.enums`' key set).
+    #   inlineNames   every policy/derive name (`e.inline`'s key set).
+    #
+    # ============================================================
+    # THE ONE STRUCTURAL RESTATEMENT: preorder flatten + per-node rules
+    # ============================================================
+    # build.go writes checkNoBitwise/checkNoIndex/checkNoFloat/checkNoIO/
+    # checkNoConcurrency/checkDaemonOnlyBuiltins as six separate recursive
+    # tree walks that differ ONLY in which node they refuse; each visits the
+    # tree in preorder (a node's own rule first, then its children left to
+    # right) and stops at the first hit. This port computes that preorder
+    # once (`allNodes`, STAGE 2) and runs each rule as a loop over the flat
+    # list (`firstNodeDiag`/`nodeDiag`) in the same order check() runs
+    # them, so the FIRST diagnostic reported for an expression that breaks
+    # several rules is the same one build.go reports. `checkBuiltins`'
+    # aggregate/call/entity-lookup rules are also per-node and take the
+    # same shape. `freeNames` is the one walk that is NOT per-node (an
+    # aggregate hides its own item variable from its filter's and reduced
+    # value's names), so it stays a real recursion (STAGE 4), as does
+    # the literal-brace scan, which re-parses each `{…}` it finds.
+    #
+    # ============================================================
+    # WHAT IS OUT OF SCOPE, AND WHY
+    # ============================================================
+    # - `pending(a)`/`failed(a)`/`dirty(s)`/`touched(s)` (ast.ActState):
+    #   expr_tree.fct's grammar has no ActState node (those four names are
+    #   reserved out of entity-lookup position and never built into a
+    #   node), so exprCheck can never see one. The rule itself IS ported —
+    #   `actStateCheck` (STAGE 3), build.go's ActState arm verbatim, taking
+    #   the op/target pair the parser would have produced — and has its own
+    #   driver action so it is still cross-checked against the real
+    #   compiler.
+    # - `Enum.member` validation ("enum %q has no member %q") and the
+    #   record-field check on a `let`-bound record: both need per-enum
+    #   member lists / per-record field tables, which the prescribed
+    #   `enumNames: [text]` does not carry. An unknown enum member is
+    #   therefore ACCEPTED here where build.go refuses it.
+    # - An entity `derive` counts as a field for `Entity(k).field` in Go
+    #   (`e.entityDerives`); this port knows only `entityFields`, so list a
+    #   derive there if a caller needs it accepted.
+    # - `asset from "..."` (ast.Asset), struct literals (ast.StructLit),
+    #   `<<`/`>>`/`%`, the general `in` membership operator, and the two-
+    #   argument `min(a, b)`/`max(a, b)` call form: none of these is in
+    #   expr_tree.fct's grammar, so no node for them ever reaches this
+    #   file. `min`/`max`/`append`'s arities are still in pureBuiltinArity
+    #   for completeness.
+    # - `unknown builtin %q` is ported but unreachable: both parsers only
+    #   build a call node for a name in their builtin allowlist. That
+    #   allowlist (expr_tree.fct's isCallNameTok) also lags the Go
+    #   parser's isBuiltinCall by four names — `replace`, `slug`,
+    #   `floatBits`, `floatFromBits` — which it parses as an entity lookup
+    #   instead, so a call to one of them reaches this file as an
+    #   unconsumable token stream ("cannot parse …"), never as a call node.
+    # - A `src` the self-hosted parser cannot consume entirely (or an
+    #   empty one) yields this file's OWN diagnostic, "cannot parse …", not
+    #   a build.go message — the Go parser would have refused it earlier,
+    #   with a parser error this file does not port.
+    # - `line` numbers: BuildError's line prefix is the caller's business;
+    #   the diagnostic text here is the message only.
+
+    # ============================================================
+    # STAGE 1: scope — nameIn, isBuiltinRef, withActor, viewScope, resolves.
+    # ============================================================
+    proc nameIn(name: text, names: [text]) -> bool:
+        return name in names
+
+    # isBuiltinRef: build.go's runtime-provided identity values — the one
+    # set of names that resolves in EVERY scope regardless of `locals`.
+    proc isBuiltinRef(n: text) -> bool:
+        return n == "actor" || n == "role" || n == "verified" || n == "tenant" || n == "tenantRole" || n == "session"
+
+    # withActor: build.go's withActor — the session's own bindings plus the
+    # caller's locals (an action's parameters, a policy's parameters, an
+    # aggregate/for item variable, ...). Order is irrelevant (a set).
+    proc withActor(locals: [text]) -> [text]:
+        let base = ["actor", "role", "verified", "tenant", "tenantRole", "session"]
+        let merged = do appendAllText(base, locals)
+        return merged
+
+    # viewScope: withActor plus `route`, the one name only a RENDER binds —
+    # see build.go's viewScope doc for why it is not in isBuiltinRef.
+    proc viewScope(locals: [text]) -> [text]:
+        let base = do withActor(locals)
+        return append(base, "route")
+
+    # resolves: build.go's (e *env) resolves, one table at a time in its
+    # exact order (locals/builtin, state, entity, enum, inline).
+    proc resolves(name: text, locals: [text], stateNames: [text], entityNames: [text], enumNames: [text], inlineNames: [text]) -> bool:
+        let isLocal = do nameIn(name, locals)
+        if isLocal:
+            return true
+        let isBuiltin = do isBuiltinRef(name)
+        if isBuiltin:
+            return true
+        let isState = do nameIn(name, stateNames)
+        if isState:
+            return true
+        let isEntity = do nameIn(name, entityNames)
+        if isEntity:
+            return true
+        let isEnum = do nameIn(name, enumNames)
+        if isEnum:
+            return true
+        let isInline = do nameIn(name, inlineNames)
+        return isInline
+
+    # entityHasField / entityFieldsRecorded: `e.entityFields[ent][field]`
+    # and `e.entityFields[ent] != nil` over the flattened "Entity.field"
+    # list (see this file's header).
+    proc entityHasField(entityName: text, fieldName: text, entityFields: [text]) -> bool:
+        return (entityName + "." + fieldName) in entityFields
+
+    proc entityFieldsRecorded(entityName: text, entityFields: [text]) -> bool:
+        let prefix = entityName + "."
+        let pn = len(prefix)
+        let n = len(entityFields)
+        let mut i = 0
+        loop i < n:
+            let entry = entityFields[i]
+            if len(entry) >= pn:
+                if slice(entry, 0, pn) == prefix:
+                    return true
+            i = i + 1
+        return false
+
+    # ============================================================
+    # STAGE 2: the preorder flatten every per-node rule below loops over.
+    # A node, then its `children` (left to right), then each map `pairs`
+    # entry as key-then-value, then `whereClause`, then `sel` — the order
+    # the Go walkers visit a node's parts in.
+    # ============================================================
+    proc appendAllNodes(base: [ExprNode], extra: [ExprNode]) -> [ExprNode]:
+        let mut out = base
+        let mut i = 0
+        loop i < len(extra):
+            out = append(out, extra[i])
+            i = i + 1
+        return out
+
+    proc allNodes(n: ExprNode) -> [ExprNode]:
+        let mut out = [n]
+        let mut i = 0
+        loop i < len(n.children):
+            let sub = do allNodes(n.children[i])
+            let merged = do appendAllNodes(out, sub)
+            out = merged
+            i = i + 1
+        let mut j = 0
+        loop j < len(n.pairs):
+            let keySub = do allNodes(n.pairs[j].key)
+            let mergedKey = do appendAllNodes(out, keySub)
+            out = mergedKey
+            let valSub = do allNodes(n.pairs[j].value)
+            let mergedVal = do appendAllNodes(out, valSub)
+            out = mergedVal
+            j = j + 1
+        let mut k = 0
+        loop k < len(n.whereClause):
+            let whereSub = do allNodes(n.whereClause[k])
+            let mergedWhere = do appendAllNodes(out, whereSub)
+            out = mergedWhere
+            k = k + 1
+        let mut m = 0
+        loop m < len(n.sel):
+            let selSub = do allNodes(n.sel[m])
+            let mergedSel = do appendAllNodes(out, selSub)
+            out = mergedSel
+            m = m + 1
+        return out
+
+    # ============================================================
+    # STAGE 3: checkBuiltins — aggregates, action-state reads, builtin
+    # calls (arity), entity-lookup fields. build.go's pureBuiltinArity is
+    # restated with -1 as its "not a pure builtin" second return.
+    # ============================================================
+    proc pureBuiltinArity(name: text) -> int:
+        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits"]:
+            return 1
+        if name == "print":
+            return 1
+        if name == "append":
+            return 2
+        if name in ["min", "max", "contains", "take", "split", "charAt"]:
+            return 2
+        if name in ["slice", "replace"]:
+            return 3
+        return -1
+
+    # isFieldAgg: sum/avg/min/max reduce a field; count/exists range over rows.
+    proc isFieldAgg(op: text) -> bool:
+        return op == "sum" || op == "avg" || op == "min" || op == "max"
+
+    # callArityDiag: checkBuiltins' ast.Call arm, one message per builtin
+    # family, verbatim.
+    proc callArityDiag(n: ExprNode) -> text:
+        let name = n.text
+        let argc = len(n.children)
+        if name == "now":
+            if argc != 0:
+                return "now() takes no arguments"
+            return ""
+        if name == "rand":
+            if argc != 1:
+                return "rand(n) takes exactly one argument (an exclusive upper bound)"
+            return ""
+        if name == "readFile" || name == "httpGet" || name == "listen" || name == "accept" || name == "closeConn":
+            if argc != 1:
+                return name + "(...) takes exactly one argument"
+            return ""
+        if name == "writeFile" || name == "httpPost" || name == "readBytes" || name == "writeBytes":
+            if argc != 2:
+                return name + "(...) takes exactly two arguments"
+            return ""
+        if name == "channel":
+            if argc != 0:
+                return "channel() takes no arguments"
+            return ""
+        if name == "recv":
+            if argc != 1:
+                return "recv(ch) takes exactly one argument (the channel)"
+            return ""
+        if name == "send":
+            if argc != 2:
+                return "send(ch, value) takes exactly two arguments"
+            return ""
+        let arity = do pureBuiltinArity(name)
+        if arity < 0:
+            return "unknown builtin \"" + name + "\""
+        if argc != arity:
+            return name + " takes " + arity + " argument(s), got " + argc
+        return ""
+
+    # aggDiag: checkBuiltins' ast.Agg arm — the collection must be an
+    # entity; a field aggregate with no general reduced value needs a
+    # field the entity has; `exists` needs the filtered (item-variable)
+    # form.
+    proc aggDiag(n: ExprNode, entityNames: [text], entityFields: [text]) -> text:
+        let op = n.text
+        let coll = n.coll
+        let isEntity = do nameIn(coll, entityNames)
+        if !isEntity:
+            return op + "(...) needs an entity collection; \"" + coll + "\" is not an entity"
+        let fieldAgg = do isFieldAgg(op)
+        if fieldAgg && len(n.sel) == 0:
+            let hasField = do entityHasField(coll, n.field, entityFields)
+            if !hasField:
+                if n.field == "":
+                    return op + " needs a field of " + coll + " to reduce, or an expression over each row: " + op + "(x.field in " + coll + " where …)"
+                return "entity \"" + coll + "\" has no field \"" + n.field + "\" to " + op
+        if op == "exists" && n.itemVar == "":
+            return "exists needs a filtered form: exists(x in " + coll + " where <cond>)"
+        return ""
+
+    # entityGetDiag: checkBuiltins' ast.EntityGet arm — `Entity(k).field`
+    # names a field the entity has (or `id`), checked only for an entity
+    # whose fields were recorded.
+    proc entityGetDiag(n: ExprNode, entityFields: [text]) -> text:
+        let entityName = n.text
+        let fieldName = n.field
+        if fieldName == "" || fieldName == "id":
+            return ""
+        let recorded = do entityFieldsRecorded(entityName, entityFields)
+        if !recorded:
+            return ""
+        let hasField = do entityHasField(entityName, fieldName, entityFields)
+        if hasField:
+            return ""
+        return "entity \"" + entityName + "\" has no field \"" + fieldName + "\" (in `" + entityName + "(…)." + fieldName + "`)"
+
+    # actStateCheck: checkBuiltins' ast.ActState arm, verbatim, over the
+    # (op, target) pair the parser would carry — see this file's header on
+    # why exprCheck itself can never reach it.
+    proc actStateCheck(op: text, target: text, actionNames: [text], stateNames: [text]) -> text:
+        if op == "pending" || op == "failed":
+            let knownAction = do nameIn(target, actionNames)
+            if !knownAction:
+                return op + "(" + target + ") names an unknown action \"" + target + "\""
+            return ""
+        let knownState = do nameIn(target, stateNames)
+        if !knownState:
+            return op + "(" + target + ") names an unknown state cell \"" + target + "\""
+        return ""
+
+    proc builtinDiag(n: ExprNode, entityNames: [text], entityFields: [text]) -> text:
+        if n.kind == "agg":
+            let d = do aggDiag(n, entityNames, entityFields)
+            return d
+        if n.kind == "call":
+            let d2 = do callArityDiag(n)
+            return d2
+        if n.kind == "entityGet":
+            let d3 = do entityGetDiag(n, entityFields)
+            return d3
+        return ""
+
+    proc checkBuiltins(nodes: [ExprNode], entityNames: [text], entityFields: [text]) -> text:
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let d = do builtinDiag(nodes[i], entityNames, entityFields)
+            if d != "":
+                return d
+            i = i + 1
+        return ""
+
+    # ============================================================
+    # STAGE 3b: the six "only inside a proc" barriers, as one per-node
+    # dispatcher keyed by rule name, each message verbatim from build.go.
+    # `rule` is one of "bitwise" | "index" | "float" | "io" |
+    # "concurrency" | "daemon" (checkDaemonOnlyBuiltins with isDaemon
+    # false, the only way check() ever calls it).
+    # ============================================================
+    proc ioCapability(name: text) -> text:
+        if name == "readFile" || name == "writeFile":
+            return "io.file"
+        if name == "httpGet" || name == "httpPost":
+            return "io.net"
+        return ""
+
+    proc nodeDiag(n: ExprNode, rule: text) -> text:
+        if rule == "bitwise":
+            if n.kind == "bin":
+                if n.text in ["&", "|", "^", "<<", ">>"]:
+                    return "\"" + n.text + "\" is only available inside a proc — a proc always runs on the server, but this expression may run on the client too, and the client has no bitwise operators"
+            if n.kind == "un" && n.text == "~":
+                return "`~` is only available inside a proc — a proc always runs on the server, but this expression may run on the client too, and the client has no bitwise operators"
+            return ""
+        if rule == "index":
+            if n.kind == "index":
+                return "array/map indexing (`x[i]`) is only available inside a proc — arrays and maps are proc-local values, not readable from an action, view, policy, or derive yet"
+            if n.kind == "map":
+                return "a map literal (`{...}`) is only available inside a proc — maps are proc-local values, not readable from an action, view, policy, or derive yet"
+            return ""
+        if rule == "float":
+            if n.kind == "float":
+                return "a float literal is only available inside a proc — a proc always runs on the server, but this expression may run on the client too, and the client has no float representation (see LANGUAGE.md's `proc` section)"
+            if n.kind == "call" && (n.text == "toFloat" || n.text == "floatFromBits"):
+                return n.text + "(...) is only available inside a proc — it produces a float, which is only available inside a proc (see LANGUAGE.md's `proc` section)"
+            return ""
+        if rule == "io":
+            if n.kind == "call":
+                let capName = do ioCapability(n.text)
+                if capName != "":
+                    return n.text + "(...) is only available inside a proc that declares `uses " + capName + "` — it is a real I/O effect, and only a proc is unconditionally server-executed with no client mirror to disagree with it"
+            return ""
+        if rule == "concurrency":
+            if n.kind == "call" && (n.text == "channel" || n.text == "send" || n.text == "recv"):
+                return n.text + "(...) is only available inside a proc body — it is real, blocking concurrency machinery, and only a proc is unconditionally server-executed with no client mirror to disagree with it"
+            return ""
+        if rule == "daemon":
+            if n.kind == "call" && (n.text == "listen" || n.text == "accept" || n.text == "readBytes" || n.text == "writeBytes" || n.text == "closeConn"):
+                return n.text + "(...) is only available inside a daemon body — it can block indefinitely, and only a daemon runs detached from every request's lock (see `daemon Name uses io.net.listen:`)"
+            return ""
+        return ""
+
+    proc firstNodeDiag(nodes: [ExprNode], rule: text) -> text:
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let d = do nodeDiag(nodes[i], rule)
+            if d != "":
+                return d
+            i = i + 1
+        return ""
+
+    # ============================================================
+    # STAGE 4: freeNames — build.go's walk, as a recursion because an
+    # aggregate binds its own item variable for its filter and reduced
+    # value: every name in those two sub-trees is free EXCEPT that one.
+    # Duplicates are harmless (Go returns a set; every consumer here only
+    # asks "does each name resolve").
+    # ============================================================
+    proc dropName(names: [text], name: text) -> [text]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(names):
+            if names[i] != name:
+                out = append(out, names[i])
+            i = i + 1
+        return out
+
+    proc freeNames(n: ExprNode) -> [text]:
+        if n.kind == "ref":
+            return [n.text]
+        let mut out = []
+        if n.kind == "entityGet":
+            out = append(out, n.text)
+        if n.kind == "agg":
+            out = append(out, n.coll)
+            let mut k = 0
+            loop k < len(n.whereClause):
+                let whereNames = do freeNames(n.whereClause[k])
+                let whereKept = do dropName(whereNames, n.itemVar)
+                let mergedWhere = do appendAllText(out, whereKept)
+                out = mergedWhere
+                k = k + 1
+            let mut m = 0
+            loop m < len(n.sel):
+                let selNames = do freeNames(n.sel[m])
+                let selKept = do dropName(selNames, n.itemVar)
+                let mergedSel = do appendAllText(out, selKept)
+                out = mergedSel
+                m = m + 1
+            return out
+        let mut i = 0
+        loop i < len(n.children):
+            let childNames = do freeNames(n.children[i])
+            let mergedChild = do appendAllText(out, childNames)
+            out = mergedChild
+            i = i + 1
+        let mut j = 0
+        loop j < len(n.pairs):
+            let keyNames = do freeNames(n.pairs[j].key)
+            let mergedKey = do appendAllText(out, keyNames)
+            out = mergedKey
+            let valNames = do freeNames(n.pairs[j].value)
+            let mergedVal = do appendAllText(out, valNames)
+            out = mergedVal
+            j = j + 1
+        return out
+
+    proc unknownReferenceDiag(names: [text], locals: [text], stateNames: [text], entityNames: [text], enumNames: [text], inlineNames: [text]) -> text:
+        let n = len(names)
+        let mut i = 0
+        loop i < n:
+            let ok = do resolves(names[i], locals, stateNames, entityNames, enumNames, inlineNames)
+            if !ok:
+                return "unknown reference \"" + names[i] + "\""
+            i = i + 1
+        return ""
+
+    # ============================================================
+    # STAGE 5: braces.go — checkLiteralExpr/litInterp/concatForm. A text
+    # literal's `{…}` is a dropped interpolation iff its inside parses as
+    # an expression AND every free name in it resolves in this scope; the
+    # diagnostic quotes the string, the snippet, and the concatenation to
+    # write instead. The tree keeps a string literal's RAW token text
+    # (expr_tokens.fct's header), so unquoteLit is the strconv.Unquote the
+    # Go parser already applied.
+    # ============================================================
+    proc unquoteLit(raw: text) -> text:
+        let n = len(raw)
+        if n < 2:
+            return raw
+        let mut stop = n
+        if charAt(raw, n - 1) == "\"":
+            stop = n - 1
+        let mut out = ""
+        let mut i = 1
+        loop i < stop:
+            let c = charAt(raw, i)
+            if c == "\\" && i + 1 < stop:
+                let d = charAt(raw, i + 1)
+                if d == "n":
+                    out = out + "\n"
+                else:
+                    if d == "t":
+                        out = out + "\t"
+                    else:
+                        out = out + d
+                i = i + 2
+            else:
+                out = out + c
+                i = i + 1
+        return out
+
+    # quoteText: strconv.Quote for the characters a diagnostic will meet.
+    proc quoteText(s: text) -> text:
+        let n = len(s)
+        let mut out = "\""
+        let mut i = 0
+        loop i < n:
+            let c = charAt(s, i)
+            if c == "\"":
+                out = out + "\\\""
+            else:
+                if c == "\\":
+                    out = out + "\\\\"
+                else:
+                    if c == "\n":
+                        out = out + "\\n"
+                    else:
+                        if c == "\t":
+                            out = out + "\\t"
+                        else:
+                            out = out + c
+            i = i + 1
+        return out + "\""
+
+    proc indexOfFrom(s: text, ch: text, from: int) -> int:
+        let n = len(s)
+        let mut i = from
+        loop i < n:
+            if charAt(s, i) == ch:
+                return i
+            i = i + 1
+        return -1
+
+    # innerParses: braces.go's `parser.ParseExpr(inner) == nil` — here,
+    # "at least one token, and one top-level expression consumes them all".
+    proc innerParses(inner: text) -> bool:
+        let kinds = do tokenKinds(inner)
+        if len(kinds) == 0:
+            return false
+        let consumed = do parseExprConsumedAll(inner)
+        return consumed
+
+    proc allResolve(names: [text], locals: [text], stateNames: [text], entityNames: [text], enumNames: [text], inlineNames: [text]) -> bool:
+        let d = do unknownReferenceDiag(names, locals, stateNames, entityNames, enumNames, inlineNames)
+        return d == ""
+
+    # litInterp: the offending `{…}` snippet, braces included, or "".
+    proc litInterp(s: text, locals: [text], stateNames: [text], entityNames: [text], enumNames: [text], inlineNames: [text]) -> text:
+        let n = len(s)
+        let mut i = 0
+        loop i < n:
+            if charAt(s, i) == "{":
+                let end = do indexOfFrom(s, "}", i)
+                if end < 0:
+                    return ""
+                let inner = slice(s, i + 1, end)
+                i = end
+                let parses = do innerParses(inner)
+                if parses:
+                    let tree = do parseExprTree(inner)
+                    let names = do freeNames(tree)
+                    if len(names) > 0:
+                        let ok = do allResolve(names, locals, stateNames, entityNames, enumNames, inlineNames)
+                        if ok:
+                            return "{" + inner + "}"
+            i = i + 1
+        return ""
+
+    proc joinWithPlus(parts: [text]) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < len(parts):
+            if i > 0:
+                out = out + " + "
+            out = out + parts[i]
+            i = i + 1
+        return out
+
+    # concatForm: `"/p/{p.id}"` -> `"/p/" + p.id`, `"{p.name}"` -> `p.name`.
+    proc concatForm(s: text) -> text:
+        let n = len(s)
+        let mut parts = []
+        let mut lit = ""
+        let mut i = 0
+        loop i < n:
+            let c = charAt(s, i)
+            let mut handled = false
+            if c == "{":
+                let end = do indexOfFrom(s, "}", i)
+                if end >= 0:
+                    let inner = slice(s, i + 1, end)
+                    let parses = do innerParses(inner)
+                    if parses:
+                        if lit != "":
+                            let q = do quoteText(lit)
+                            parts = append(parts, q)
+                            lit = ""
+                        parts = append(parts, trim(inner))
+                        i = end
+                        handled = true
+            if !handled:
+                lit = lit + c
+            i = i + 1
+        if lit != "":
+            let qTail = do quoteText(lit)
+            parts = append(parts, qTail)
+        if len(parts) == 0:
+            return "\"\""
+        let joined = do joinWithPlus(parts)
+        return joined
+
+    proc textLits(nodes: [ExprNode]) -> [text]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(nodes):
+            if nodes[i].kind == "text":
+                let s = do unquoteLit(nodes[i].text)
+                out = append(out, s)
+            i = i + 1
+        return out
+
+    proc braceDiag(s: text, snip: text) -> text:
+        let q = do quoteText(s)
+        let fix = do concatForm(s)
+        return "a text literal does not interpolate, so " + q + " renders `" + snip + "` as literal text — write the value as an expression: " + fix + ". `{…}` interpolates in node text, labels, placeholders, `class`, `meta` and link/image destinations, and nowhere else; braces around a name the scope does not define are literal everywhere"
+
+    proc checkLiteralExpr(nodes: [ExprNode], locals: [text], stateNames: [text], entityNames: [text], enumNames: [text], inlineNames: [text]) -> text:
+        let lits = do textLits(nodes)
+        let mut i = 0
+        loop i < len(lits):
+            let snip = do litInterp(lits[i], locals, stateNames, entityNames, enumNames, inlineNames)
+            if snip != "":
+                let d = do braceDiag(lits[i], snip)
+                return d
+            i = i + 1
+        return ""
+
+    # ============================================================
+    # STAGE 6: check / checkPure — build.go's exact rule order.
+    # ============================================================
+    proc exprCheckTree(tree: ExprNode, locals: [text], stateNames: [text], entityNames: [text], entityFields: [text], enumNames: [text], inlineNames: [text]) -> text:
+        let nodes = do allNodes(tree)
+        let d1 = do checkBuiltins(nodes, entityNames, entityFields)
+        if d1 != "":
+            return d1
+        let d2 = do firstNodeDiag(nodes, "bitwise")
+        if d2 != "":
+            return d2
+        let d3 = do firstNodeDiag(nodes, "index")
+        if d3 != "":
+            return d3
+        let d4 = do firstNodeDiag(nodes, "float")
+        if d4 != "":
+            return d4
+        let d5 = do firstNodeDiag(nodes, "io")
+        if d5 != "":
+            return d5
+        let d6 = do firstNodeDiag(nodes, "concurrency")
+        if d6 != "":
+            return d6
+        let d7 = do firstNodeDiag(nodes, "daemon")
+        if d7 != "":
+            return d7
+        let names = do freeNames(tree)
+        let d8 = do unknownReferenceDiag(names, locals, stateNames, entityNames, enumNames, inlineNames)
+        if d8 != "":
+            return d8
+        let d9 = do checkLiteralExpr(nodes, locals, stateNames, entityNames, enumNames, inlineNames)
+        return d9
+
+    # exprCheck: parse `src` with expr.fct's parser, then check() it in the
+    # given scope. `locals` is the ALREADY-widened scope (see header).
+    proc exprCheck(src: text, locals: [text], stateNames: [text], entityNames: [text], entityFields: [text], enumNames: [text], inlineNames: [text]) -> text:
+        let kinds = do tokenKinds(src)
+        if len(kinds) == 0:
+            return "cannot parse \"" + src + "\": empty expression (outside the self-hosted expression grammar)"
+        let consumed = do parseExprConsumedAll(src)
+        if !consumed:
+            return "cannot parse \"" + src + "\": trailing input after a complete expression (outside the self-hosted expression grammar)"
+        let tree = do parseExprTree(src)
+        let d = do exprCheckTree(tree, locals, stateNames, entityNames, entityFields, enumNames, inlineNames)
+        return d
+
+    proc hasCallNamed(nodes: [ExprNode], names: [text]) -> bool:
+        let mut i = 0
+        loop i < len(nodes):
+            if nodes[i].kind == "call":
+                if nodes[i].text in names:
+                    return true
+            i = i + 1
+        return false
+
+    proc hasImpure(nodes: [ExprNode]) -> bool:
+        let r = do hasCallNamed(nodes, ["now", "rand"])
+        return r
+
+    proc hasPrint(nodes: [ExprNode]) -> bool:
+        let r = do hasCallNamed(nodes, ["print"])
+        return r
+
+    # exprCheckPure: check plus the side-effect guarantee — no now()/rand(),
+    # no print(...) — with `ctx` naming the position ("a derive", "a check",
+    # "a view", ...) exactly as build.go's callers pass it.
+    proc exprCheckPure(src: text, locals: [text], stateNames: [text], entityNames: [text], entityFields: [text], enumNames: [text], inlineNames: [text], ctx: text) -> text:
+        let d = do exprCheck(src, locals, stateNames, entityNames, entityFields, enumNames, inlineNames)
+        if d != "":
+            return d
+        let tree = do parseExprTree(src)
+        let nodes = do allNodes(tree)
+        let impure = do hasImpure(nodes)
+        if impure:
+            return ctx + " cannot use an effectful builtin (now/rand); it must be pure so it can run on any client. Compute it in an action instead"
+        let prints = do hasPrint(nodes)
+        if prints:
+            return ctx + " cannot call print(...); it is a server-only debugging aid with no client implementation. Call it from an action body or a proc instead"
+        return ""
+
+    # ============================================================
+    # STAGE 7: the live, HTTP-exercisable driver. An action cannot take a
+    # list parameter ("parameter cannot be a list"), so every scope table
+    # arrives as one comma-separated `text` and is split here. `position`
+    # picks the build.go call site being imitated:
+    #   "derive"  checkPure(withActor(locals), "a derive")
+    #   "check"   checkPure(withActor(locals), "a check")   (an action's
+    #             `check cond "msg"`; locals = the action's parameters)
+    #   "view"    checkPure(viewScope(locals), "a view")    (a view's
+    #             `text "{…}"`; locals = the enclosing `for` variables)
+    #   anything else: plain check(withActor(locals)) — an action-body
+    #             value expression (build.go's readExprIn).
+    # ============================================================
+    proc splitNames(csv: text) -> [text]:
+        if csv == "":
+            return []
+        let parts = split(csv, ",")
+        let mut out = []
+        let mut i = 0
+        loop i < len(parts):
+            let t = trim(parts[i])
+            if t != "":
+                out = append(out, t)
+            i = i + 1
+        return out
+
+    proc exprCheckDriver(src: text, position: text, localsCsv: text, statesCsv: text, entitiesCsv: text, entityFieldsCsv: text, enumsCsv: text, inlinesCsv: text) -> text:
+        let locals = do splitNames(localsCsv)
+        let stateNames = do splitNames(statesCsv)
+        let entityNames = do splitNames(entitiesCsv)
+        let entityFields = do splitNames(entityFieldsCsv)
+        let enumNames = do splitNames(enumsCsv)
+        let inlineNames = do splitNames(inlinesCsv)
+        if position == "view":
+            let vscope = do viewScope(locals)
+            let dv = do exprCheckPure(src, vscope, stateNames, entityNames, entityFields, enumNames, inlineNames, "a view")
+            return dv
+        let ascope = do withActor(locals)
+        if position == "derive":
+            let dd = do exprCheckPure(src, ascope, stateNames, entityNames, entityFields, enumNames, inlineNames, "a derive")
+            return dd
+        if position == "check":
+            let dc = do exprCheckPure(src, ascope, stateNames, entityNames, entityFields, enumNames, inlineNames, "a check")
+            return dc
+        let da = do exprCheck(src, ascope, stateNames, entityNames, entityFields, enumNames, inlineNames)
+        return da
+
+    proc actStateDriver(op: text, target: text, actionsCsv: text, statesCsv: text) -> text:
+        let actionNames = do splitNames(actionsCsv)
+        let stateNames = do splitNames(statesCsv)
+        let d = do actStateCheck(op, target, actionNames, stateNames)
+        return d
+
+    # The runtime ships a state cell in an action's response deltas only when
+    # the assignment CHANGED it (runtime/server.go's "assign" case is
+    # sameValue-gated), and "" — the accepted answer — is also each cell's
+    # initial value, so an accepted expression after an accepted expression
+    # would ship nothing. Each action therefore first parks the cell on a
+    # sentinel no checker can ever produce, then writes the real answer: the
+    # second write always differs from the sentinel, so the answer is always
+    # in the deltas, "" included.
+    state checkResult: text = ""
+    state actStateResult: text = ""
+
+    action runExprCheck(src: text, position: text, locals: text, states: text, entities: text, entityFields: text, enums: text, inlines: text):
+        let r = do exprCheckDriver(src, position, locals, states, entities, entityFields, enums, inlines)
+        checkResult = "<unset>"
+        checkResult = r
+
+    action runActStateCheck(op: text, target: text, actions: text, states: text):
+        let r = do actStateDriver(op, target, actions, states)
+        actStateResult = "<unset>"
+        actStateResult = r
+
+    private view CheckHome at "/check":
+        box:
+            text "{checkResult} {actStateResult}"

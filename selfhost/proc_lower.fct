@@ -1,0 +1,977 @@
+import "stmt.fct"
+import "lower.fct"
+import "ir_decl.fct"
+import "parser_proc.fct"
+
+app ProcLowerSelfHost:
+    # Self-hosting port of internal/ir/build.go's `proc()` + `procBlock()`
+    # — the lowering of one `proc` declaration (header + body) into
+    # ir_decl.fct's IRProc (the port of ir.Proc), statement by statement,
+    # with the scope rules the Go builder enforces. The INPUT is the proc's
+    # header line (parsed by parser_proc.fct's header helpers) and its raw
+    # body text (parsed by stmt.fct's parseProcBodySrc into [Stmt]); the
+    # OUTPUT is an IRProc whose `irProcJSON` spelling equals
+    # `json.Marshal(ir.Proc)` byte for byte, which proc_lower_test.go pins
+    # against the real compiler.
+    #
+    # Go's environment maps become parallel lists, since a proc has no map
+    # parameter:
+    #   e.procSigs  -> procNames / procRets / procRetLists (index-parallel;
+    #                  a proc with no return type has ret ""). The
+    #                  signature's PARAM COUNT is not carried, so the
+    #                  "expects N argument(s), got M" arity check is the
+    #                  one `do`/`spawn` rule left out here.
+    #   e.files     -> fileNames / fileTypes ("text"|"bytes") / filePaths
+    #   e.enums     -> enumNames (only its key set matters to lower())
+    #   locals / mutable / types -> names / muts / types, threaded through
+    #                  plBlock by value, which is exactly Go's clone-on-
+    #                  entry: a nested block's additions never leak back.
+    #   pendingSpawns -> pendNames / pendProcs, fresh per block, checked
+    #                  empty at every point Go calls checkSpawnsJoined.
+    #
+    # DIAGNOSTIC CHANNEL: a proc has no error return, so every compile
+    # error the Go builder would raise degrades to an IRProc whose `name`
+    # is "" (never a valid proc name), and `lowerProcDiag(...)` returns the
+    # Go message text ("" on success). The two are computed by one
+    # internal `plLowerProc` returning a PLResult{proc, diag} pair; the
+    # public `lowerProcSrc`/`lowerProcJSON`/`lowerProcDiag` are its views.
+    # Messages are spelled exactly as build.go's fmt.Sprintf calls spell
+    # them (with %q rendered as a plain double-quoted identifier), so a Go
+    # test can assert the real compiler's message is a substring.
+    #
+    # Statement kinds ported (stmt.fct kind -> IR op), with their rules:
+    #   let / letMut     -> let       already-declared check; type inferred
+    #   assign           -> assign    "is not declared" / "is not mutable"
+    #   indexAssign      -> indexset  same two, "not an array or map", map
+    #                                 key int/text, `bytes` flag from type
+    #   do / letDo       -> do        unknown proc; bind: in-scope, returns
+    #                                 nothing; ret/retList; array tagging
+    #   spawn            -> spawn     unknown proc; handle in-scope; task
+    #                                 type; pending
+    #   join / letJoin   -> join      undeclared / not a handle / already
+    #                                 joined; bind rules as `do`
+    #   exprStmt         -> exprstmt  the call checked like any expression
+    #   read / letRead   -> fileread  undeclared file; no args; io.file cap
+    #   write / letWrite -> filewrite undeclared file; one arg; io.file
+    #                                 cap; content type vs file type
+    #   loop             -> loop      spawns joined; nested block depth+1
+    #   if               -> if        spawns joined; then/else blocks
+    #   break / continue -> break/continue  spawns joined; outside a loop;
+    #                                 must be last of its block
+    #   return           -> return    spawns joined; must be last; value
+    #                                 vs declared return type
+    #   (anything else)  -> "unsupported statement in proc"
+    # Plus proc-level: duplicate parameter, empty body, return
+    # completeness (stmtsReturnComplete), and the end-of-block spawn check.
+    #
+    # checkProcExpr is ported as far as it gates what lowers here: unknown
+    # reference (freeNames), daemon-only builtins, index-on-non-array,
+    # task-handle-as-value, and the capability gate (checkProcCapabilities
+    # / requireProcCapability). Left out: checkBuiltins (the self-hosted
+    # parser only produces known builtins), the bitwise/numeric/map-key
+    # operand type checks, struct-field checks and the `{expr}` literal
+    # check — none of them change the IR of a proc that compiles.
+
+    struct PLEnv:
+        procName: text
+        procRet: text
+        uses: [text]
+        texts: [text]
+        procNames: [text]
+        procRets: [text]
+        procRetLists: [bool]
+        fileNames: [text]
+        fileTypes: [text]
+        filePaths: [text]
+        enumNames: [text]
+
+    struct PLBlock:
+        stmts: [IRStmt]
+        diag: text
+
+    struct PLResult:
+        proc: IRProc
+        diag: text
+
+    # ── small helpers ──────────────────────────────────────────────────
+    proc plQuote(s: text) -> text:
+        return "\"" + s + "\""
+
+    proc plAppendAll(a: [text], b: [text]) -> [text]:
+        let n = len(b)
+        let mut out = a
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc plRemoveAt(xs: [text], at: int) -> [text]:
+        let n = len(xs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if i != at:
+                out = append(out, xs[i])
+            i = i + 1
+        return out
+
+    proc plTextAt(xs: [text], i: int) -> text:
+        if i < 0 || i >= len(xs):
+            return ""
+        return xs[i]
+
+    proc plBoolAt(xs: [bool], i: int) -> bool:
+        if i < 0 || i >= len(xs):
+            return false
+        return xs[i]
+
+    # plMinText: sort.Strings(names)[0] — the smallest name.
+    proc plMinText(xs: [text]) -> text:
+        let n = len(xs)
+        if n == 0:
+            return ""
+        let mut m = xs[0]
+        let mut i = 1
+        loop i < n:
+            if xs[i] < m:
+                m = xs[i]
+            i = i + 1
+        return m
+
+    # plBodyTexts: stmt.fct's (private) bodyTexts restated — the same
+    # trimmed, blank/comment-free line list its Stmt.lineIdx indexes.
+    proc plBodyTexts(src: text) -> [text]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let t = trim(rawLines[i])
+            let blank = len(t) == 0 || slice(t, 0, 1) == "#"
+            if !blank:
+                out = append(out, t)
+            i = i + 1
+        return out
+
+    proc plEmptyProc() -> IRProc:
+        return IRProc{name: "", params: [], ret: "", retList: false, body: []}
+
+    # ── IRStmt constructors for the proc-only ops ──────────────────────
+    proc plIndexSet(target: text, key: IRExpr, value: IRExpr, bytesFlag: bool) -> IRStmt:
+        return IRStmt{op: "indexset", target: target, entity: "", field: "", key: [key], value: [value], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: bytesFlag, file: "", path: ""}
+
+    proc plReturn(value: [IRExpr]) -> IRStmt:
+        return IRStmt{op: "return", target: "", entity: "", field: "", key: [], value: value, fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc plLoop(cond: IRExpr, body: [IRStmt]) -> IRStmt:
+        return IRStmt{op: "loop", target: "", entity: "", field: "", key: [], value: [cond], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: body, elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc plSpawn(handle: text, procName: text, args: [IRExpr]) -> IRStmt:
+        return IRStmt{op: "spawn", target: handle, entity: "", field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: procName, args: args, itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc plJoin(handle: text, bind: text, ret: text, retList: bool) -> IRStmt:
+        return IRStmt{op: "join", target: handle, entity: "", field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: bind, ret: ret, retList: retList, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc plFileRead(file: text, path: text, bytesFlag: bool, bind: text) -> IRStmt:
+        return IRStmt{op: "fileread", target: "", entity: "", field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: bind, ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: bytesFlag, file: file, path: path}
+
+    proc plFileWrite(file: text, path: text, bytesFlag: bool, value: IRExpr, bind: text) -> IRStmt:
+        return IRStmt{op: "filewrite", target: "", entity: "", field: "", key: [], value: [value], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: bind, ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: bytesFlag, file: file, path: path}
+
+    # ── expression walks (the checkProcExpr subset) ────────────────────
+    # plSubNodes: every direct child expression of a node — children,
+    # map pairs, an aggregate's where/sel — the union of what Go's
+    # per-check walkers descend into.
+    proc plSubNodes(e: ExprNode) -> [ExprNode]:
+        let mut out = e.children
+        let np = len(e.pairs)
+        let mut i = 0
+        loop i < np:
+            out = append(out, e.pairs[i].key)
+            out = append(out, e.pairs[i].value)
+            i = i + 1
+        let nw = len(e.whereClause)
+        let mut j = 0
+        loop j < nw:
+            out = append(out, e.whereClause[j])
+            j = j + 1
+        let ns = len(e.sel)
+        let mut k = 0
+        loop k < ns:
+            out = append(out, e.sel[k])
+            k = k + 1
+        return out
+
+    proc plFreeNamesList(ns: [ExprNode]) -> [text]:
+        let n = len(ns)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let sub = do plFreeNames(ns[i])
+            let merged = do plAppendAll(out, sub)
+            out = merged
+            i = i + 1
+        return out
+
+    # plFreeNames: freeNames() — every referenced name, an entity lookup's
+    # entity and an aggregate's collection included, the aggregate's own
+    # item variable excluded from its where/sel.
+    proc plFreeNames(e: ExprNode) -> [text]:
+        if e.kind == "ref":
+            return [e.text]
+        if e.kind == "entityGet":
+            let sub = do plFreeNamesList(e.children)
+            let out = do plAppendAll([e.text], sub)
+            return out
+        if e.kind == "agg":
+            let w = do plFreeNamesList(e.whereClause)
+            let s = do plFreeNamesList(e.sel)
+            let both = do plAppendAll(w, s)
+            let mut out = [e.coll]
+            let n = len(both)
+            let mut i = 0
+            loop i < n:
+                if both[i] != e.itemVar:
+                    out = append(out, both[i])
+                i = i + 1
+            return out
+        if e.kind == "map":
+            let np = len(e.pairs)
+            let mut out = []
+            let mut i = 0
+            loop i < np:
+                let k = do plFreeNames(e.pairs[i].key)
+                let v = do plFreeNames(e.pairs[i].value)
+                let m1 = do plAppendAll(out, k)
+                let m2 = do plAppendAll(m1, v)
+                out = m2
+                i = i + 1
+            return out
+        let out = do plFreeNamesList(e.children)
+        return out
+
+    # plBuiltinCap: builtinCapability().
+    proc plBuiltinCap(name: text) -> text:
+        if name == "readFile" || name == "writeFile":
+            return "io.file"
+        if name == "httpGet" || name == "httpPost":
+            return "io.net"
+        if name == "listen" || name == "accept" || name == "readBytes" || name == "writeBytes" || name == "closeConn":
+            return "io.net.listen"
+        return ""
+
+    # plCapBuiltin: procCapabilities()'s `caps[cap] = t.Name` for one cap —
+    # the LAST builtin in walk order that needs it, "" when none does.
+    proc plCapBuiltin(e: ExprNode, cap: text) -> text:
+        let mut found = ""
+        if e.kind == "call":
+            let c = do plBuiltinCap(e.text)
+            if c == cap:
+                found = e.text
+        let subs = do plSubNodes(e)
+        let n = len(subs)
+        let mut i = 0
+        loop i < n:
+            let f = do plCapBuiltin(subs[i], cap)
+            if f != "":
+                found = f
+            i = i + 1
+        return found
+
+    # plRequireCap: requireProcCapability().
+    proc plRequireCap(env: PLEnv, cap: text, what: text) -> text:
+        let at = do lowerFindName(env.uses, cap)
+        if at >= 0:
+            return ""
+        let pq = do plQuote(env.procName)
+        let cq = do plQuote(cap)
+        return "proc " + pq + " calls " + what + ", which requires capability " + cq + " — declare it on the proc header (e.g. `proc " + env.procName + "(...) -> ... uses " + cap + ":`)"
+
+    # plCheckCaps: checkProcCapabilities() — the capability names sorted
+    # ("io.file" < "io.net" < "io.net.listen"), each required in turn.
+    proc plCheckCaps(env: PLEnv, e: ExprNode) -> text:
+        let caps = ["io.file", "io.net", "io.net.listen"]
+        let mut i = 0
+        loop i < 3:
+            let b = do plCapBuiltin(e, caps[i])
+            if b != "":
+                let d = do plRequireCap(env, caps[i], b + "(...)")
+                if d != "":
+                    return d
+            i = i + 1
+        return ""
+
+    # plDaemonOnly: checkDaemonOnlyBuiltins() with isDaemon false.
+    proc plDaemonOnly(e: ExprNode) -> text:
+        if e.kind == "call":
+            let c = do plBuiltinCap(e.text)
+            if c == "io.net.listen":
+                return e.text + "(...) is only available inside a daemon body — it can block indefinitely, and only a daemon runs detached from every request's lock (see `daemon Name uses io.net.listen:`)"
+        let subs = do plSubNodes(e)
+        let n = len(subs)
+        let mut i = 0
+        loop i < n:
+            let d = do plDaemonOnly(subs[i])
+            if d != "":
+                return d
+            i = i + 1
+        return ""
+
+    # plIndexTypes: checkIndexTypes() — an index read on a local whose
+    # type is known and is not array/bytes/map.
+    proc plIndexTypes(e: ExprNode, names: [text], types: [text]) -> text:
+        if e.kind == "index":
+            let obj = e.children[0]
+            if obj.kind == "ref":
+                let at = do lowerFindName(names, obj.text)
+                if at >= 0:
+                    let ty = types[at]
+                    if ty != "" && ty != "array" && ty != "bytes" && ty != "map":
+                        let q = do plQuote(obj.text)
+                        return q + " is not an array or map (its type is " + ty + ") — index access (`" + obj.text + "[...]`) needs an array, map, or byte-buffer local"
+        let subs = do plSubNodes(e)
+        let n = len(subs)
+        let mut i = 0
+        loop i < n:
+            let d = do plIndexTypes(subs[i], names, types)
+            if d != "":
+                return d
+            i = i + 1
+        return ""
+
+    # plTaskUse: checkNoTaskUse() — a spawned handle used as a value.
+    proc plTaskUse(e: ExprNode, names: [text], types: [text]) -> text:
+        if e.kind == "ref":
+            let at = do lowerFindName(names, e.text)
+            if at >= 0:
+                if types[at] == "task":
+                    let q = do plQuote(e.text)
+                    return q + " is a spawned task handle — it can only be consumed by `join " + e.text + "`, not used as a value"
+        let subs = do plSubNodes(e)
+        let n = len(subs)
+        let mut i = 0
+        loop i < n:
+            let d = do plTaskUse(subs[i], names, types)
+            if d != "":
+                return d
+            i = i + 1
+        return ""
+
+    # plInferType: inferProcType() — the shallow static type of a proc
+    # expression ("" = unknown), over the parser's node kinds.
+    proc plInferType(e: ExprNode, names: [text], types: [text]) -> text:
+        if e.kind == "int" || e.kind == "float" || e.kind == "bool" || e.kind == "text":
+            return e.kind
+        if e.kind == "list":
+            return "array"
+        if e.kind == "map":
+            return "map"
+        if e.kind == "ref":
+            let at = do lowerFindName(names, e.text)
+            if at < 0:
+                return ""
+            return types[at]
+        if e.kind == "call":
+            let r = do plInferCallType(e, names, types)
+            return r
+        if e.kind == "un":
+            if e.text == "!":
+                return "bool"
+            if e.text == "-" || e.text == "~":
+                let r = do plInferType(e.children[0], names, types)
+                return r
+            return ""
+        if e.kind == "bin":
+            let r = do plInferBinType(e, names, types)
+            return r
+        return ""
+
+    proc plInferCallType(e: ExprNode, names: [text], types: [text]) -> text:
+        let name = e.text
+        if name == "append" || name == "split":
+            return "array"
+        if name == "bytes" || name == "textToBytes" || name == "readBytes":
+            return "bytes"
+        if name == "bytesToText" || name == "readFile" || name == "httpGet" || name == "httpPost" || name == "recv":
+            return "text"
+        if name == "byteLen" || name == "listen" || name == "accept" || name == "channel" || name == "floatBits" || name == "toInt" || name == "floor" || name == "round":
+            return "int"
+        if name == "writeBytes" || name == "closeConn" || name == "send" || name == "writeFile":
+            return "bool"
+        if name == "toFloat" || name == "floatFromBits":
+            return "float"
+        if name == "print":
+            if len(e.children) == 1:
+                let r = do plInferType(e.children[0], names, types)
+                return r
+            return ""
+        if name == "abs":
+            if len(e.children) == 1:
+                let at = do plInferType(e.children[0], names, types)
+                if at == "int" || at == "float":
+                    return at
+            return ""
+        if name == "min" || name == "max":
+            if len(e.children) == 2:
+                let at = do plInferType(e.children[0], names, types)
+                let bt = do plInferType(e.children[1], names, types)
+                if at == bt && (at == "int" || at == "float"):
+                    return at
+            return ""
+        return ""
+
+    proc plInferBinType(e: ExprNode, names: [text], types: [text]) -> text:
+        let op = e.text
+        if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "&&" || op == "||" || op == "in":
+            return "bool"
+        if op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>":
+            return "int"
+        let lt = do plInferType(e.children[0], names, types)
+        let rt = do plInferType(e.children[1], names, types)
+        if op == "+":
+            if lt == "text" || rt == "text":
+                return "text"
+            if lt == "int" && rt == "int":
+                return "int"
+            if lt == "float" && rt == "float":
+                return "float"
+            return ""
+        if op == "-" || op == "*" || op == "/":
+            if lt == "int" && rt == "int":
+                return "int"
+            if lt == "float" && rt == "float":
+                return "float"
+            return ""
+        if op == "%":
+            if lt == "int" && rt == "int":
+                return "int"
+            return ""
+        return ""
+
+    # plCheckExpr: checkProcExpr()'s gating subset, in Go's order.
+    proc plCheckExpr(env: PLEnv, e: ExprNode, names: [text], types: [text]) -> text:
+        let free = do plFreeNames(e)
+        let nf = len(free)
+        let mut i = 0
+        loop i < nf:
+            let at = do lowerFindName(names, free[i])
+            if at < 0:
+                let q = do plQuote(free[i])
+                return "unknown reference " + q + " — a proc sees only its own parameters and `let` locals (no state or entities in this milestone)"
+            i = i + 1
+        let d1 = do plDaemonOnly(e)
+        if d1 != "":
+            return d1
+        let d2 = do plIndexTypes(e, names, types)
+        if d2 != "":
+            return d2
+        let d3 = do plTaskUse(e, names, types)
+        if d3 != "":
+            return d3
+        let d4 = do plCheckCaps(env, e)
+        return d4
+
+    proc plCheckArgs(env: PLEnv, args: [ExprNode], names: [text], types: [text]) -> text:
+        let n = len(args)
+        let mut i = 0
+        loop i < n:
+            let d = do plCheckExpr(env, args[i], names, types)
+            if d != "":
+                return d
+            i = i + 1
+        return ""
+
+    # plLower: e.low() — lower() with no inline table (a proc never sees a
+    # derive/policy name: freeNames would have refused it first).
+    proc plLower(env: PLEnv, e: ExprNode) -> IRExpr:
+        let noNames = []
+        let noExprs = []
+        let r = do lowerNode(e, noNames, noExprs, env.enumNames)
+        return r
+
+    proc plLowerList(env: PLEnv, es: [ExprNode]) -> [IRExpr]:
+        let noNames = []
+        let noExprs = []
+        let r = do lowerNodeList(es, noNames, noExprs, env.enumNames)
+        return r
+
+    # plSpawnsJoined: checkSpawnsJoined().
+    proc plSpawnsJoined(env: PLEnv, pendNames: [text], what: text) -> text:
+        if len(pendNames) == 0:
+            return ""
+        let h = do plMinText(pendNames)
+        let pq = do plQuote(env.procName)
+        let hq = do plQuote(h)
+        return "proc " + pq + " has a spawned task handle " + hq + " still unjoined when " + what + " — join it with `join " + h + "` first; every spawn must be joined in the same block before it can end"
+
+    # plReturnComplete: stmtsReturnComplete().
+    proc plReturnComplete(body: [IRStmt]) -> bool:
+        let n = len(body)
+        if n == 0:
+            return false
+        let last = body[n - 1]
+        if last.op == "return":
+            return true
+        if last.op == "if":
+            if len(last.elseBody) == 0:
+                return false
+            let a = do plReturnComplete(last.body)
+            if !a:
+                return false
+            let b = do plReturnComplete(last.elseBody)
+            return b
+        return false
+
+    # ── procBlock ──────────────────────────────────────────────────────
+    proc plBlock(env: PLEnv, stmts: [Stmt], names0: [text], muts0: [bool], types0: [text], loopDepth: int) -> PLBlock:
+        let mut names = names0
+        let mut muts = muts0
+        let mut types = types0
+        let mut pendNames = []
+        let mut pendProcs = []
+        let mut out = []
+        let pq = do plQuote(env.procName)
+        let n = len(stmts)
+        let mut i = 0
+        loop i < n:
+            let s = stmts[i]
+            let last = i == n - 1
+            let lineText = env.texts[s.lineIdx]
+            if s.kind == "let" || s.kind == "letMut":
+                let name = do letOrAssignName(lineText)
+                let at = do lowerFindName(names, name)
+                if at >= 0:
+                    let q = do plQuote(name)
+                    return PLBlock{stmts: [], diag: q + " is already declared in proc " + pq}
+                let d = do plCheckExpr(env, s.expr, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let ty = do plInferType(s.expr, names, types)
+                names = append(names, name)
+                muts = append(muts, s.kind == "letMut")
+                types = append(types, ty)
+                let v = do plLower(env, s.expr)
+                let st = do irLet(name, v)
+                out = append(out, st)
+            if s.kind == "assign":
+                let target = do letOrAssignName(lineText)
+                let at = do lowerFindName(names, target)
+                let q = do plQuote(target)
+                if at < 0:
+                    return PLBlock{stmts: [], diag: q + " is not declared in proc " + pq + " — use `let " + target + " = …` first"}
+                if !muts[at]:
+                    return PLBlock{stmts: [], diag: q + " is not mutable — declare it `let mut " + target + " = …` to reassign it"}
+                let d = do plCheckExpr(env, s.expr, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let v = do plLower(env, s.expr)
+                let st = do irAssign(target, v)
+                out = append(out, st)
+            if s.kind == "indexAssign":
+                let target = do indexAssignTargetName(lineText)
+                let at = do lowerFindName(names, target)
+                let q = do plQuote(target)
+                if at < 0:
+                    return PLBlock{stmts: [], diag: q + " is not declared in proc " + pq + " — use `let " + target + " = …` first"}
+                if !muts[at]:
+                    return PLBlock{stmts: [], diag: q + " is not mutable — declare it `let mut " + target + " = …` to index-assign into it"}
+                let ty = types[at]
+                if ty != "" && ty != "array" && ty != "bytes" && ty != "map":
+                    return PLBlock{stmts: [], diag: q + " is not an array or map (its type is " + ty + ") — index assignment (`" + target + "[...] = …`) needs an array, map, or byte-buffer local"}
+                let d1 = do plCheckExpr(env, s.index, names, types)
+                if d1 != "":
+                    return PLBlock{stmts: [], diag: d1}
+                let d2 = do plCheckExpr(env, s.expr, names, types)
+                if d2 != "":
+                    return PLBlock{stmts: [], diag: d2}
+                if ty == "map":
+                    let kt = do plInferType(s.index, names, types)
+                    let keyOk = kt == "" || kt == "int" || kt == "text"
+                    if !keyOk:
+                        return PLBlock{stmts: [], diag: "map key must be int or text, got " + kt}
+                let k = do plLower(env, s.index)
+                let v = do plLower(env, s.expr)
+                let st = do plIndexSet(target, k, v, ty == "bytes")
+                out = append(out, st)
+            if s.kind == "do" || s.kind == "letDo":
+                let mut procName = ""
+                let mut bind = ""
+                if s.kind == "do":
+                    let pn = do bareDoProcName(lineText)
+                    procName = pn
+                else:
+                    let pn = do letDoProcName(lineText)
+                    let bn = do letDoBoundName(lineText)
+                    procName = pn
+                    bind = bn
+                let sigAt = do lowerFindName(env.procNames, procName)
+                let cq = do plQuote(procName)
+                if sigAt < 0:
+                    return PLBlock{stmts: [], diag: "do calls unknown proc " + cq}
+                let d = do plCheckArgs(env, s.args, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let args = do plLowerList(env, s.args)
+                let sigRet = do plTextAt(env.procRets, sigAt)
+                let sigRetList = do plBoolAt(env.procRetLists, sigAt)
+                let mut ret = ""
+                let mut retList = false
+                if bind != "":
+                    let bat = do lowerFindName(names, bind)
+                    if bat >= 0:
+                        let bq = do plQuote(bind)
+                        return PLBlock{stmts: [], diag: bq + " is already in scope — pick another name for the bound result"}
+                    if sigRet == "":
+                        return PLBlock{stmts: [], diag: "proc " + cq + " returns nothing — declare a return type to bind it"}
+                    names = append(names, bind)
+                    muts = append(muts, false)
+                    if sigRetList:
+                        types = append(types, "array")
+                    else:
+                        types = append(types, sigRet)
+                    ret = sigRet
+                    retList = sigRetList
+                let st = do irDo(procName, args, bind, ret, retList)
+                out = append(out, st)
+            if s.kind == "spawn":
+                let pn = do spawnProcName(lineText)
+                let handle = do spawnHandleName(lineText)
+                let sigAt = do lowerFindName(env.procNames, pn)
+                if sigAt < 0:
+                    let cq = do plQuote(pn)
+                    return PLBlock{stmts: [], diag: "spawn calls unknown proc " + cq}
+                let d = do plCheckArgs(env, s.args, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let args = do plLowerList(env, s.args)
+                let hat = do lowerFindName(names, handle)
+                if hat >= 0:
+                    let hq = do plQuote(handle)
+                    return PLBlock{stmts: [], diag: hq + " is already in scope — pick another name for the spawned task handle"}
+                names = append(names, handle)
+                muts = append(muts, false)
+                types = append(types, "task")
+                pendNames = append(pendNames, handle)
+                pendProcs = append(pendProcs, pn)
+                let st = do plSpawn(handle, pn, args)
+                out = append(out, st)
+            if s.kind == "join" || s.kind == "letJoin":
+                let mut handle = ""
+                let mut bind = ""
+                if s.kind == "join":
+                    let h = do joinHandleName(lineText)
+                    handle = h
+                else:
+                    let h = do letJoinHandleName(lineText)
+                    let b = do letJoinBoundName(lineText)
+                    handle = h
+                    bind = b
+                let hq = do plQuote(handle)
+                let hat = do lowerFindName(names, handle)
+                if hat < 0:
+                    return PLBlock{stmts: [], diag: "join of undeclared local " + hq + " — expected a handle from `let " + handle + " = spawn ProcName(args)`"}
+                if types[hat] != "task":
+                    return PLBlock{stmts: [], diag: hq + " is not a spawned task handle — join needs a `let h = spawn ProcName(args)` result"}
+                let pat = do lowerFindName(pendNames, handle)
+                if pat < 0:
+                    return PLBlock{stmts: [], diag: hq + " was already joined — a task handle can only be joined once, and only in the same block it was spawned in"}
+                let taskProc = pendProcs[pat]
+                let pn2 = do plRemoveAt(pendNames, pat)
+                let pp2 = do plRemoveAt(pendProcs, pat)
+                pendNames = pn2
+                pendProcs = pp2
+                let sigAt = do lowerFindName(env.procNames, taskProc)
+                let sigRet = do plTextAt(env.procRets, sigAt)
+                let sigRetList = do plBoolAt(env.procRetLists, sigAt)
+                let mut ret = ""
+                let mut retList = false
+                if bind != "":
+                    let bat = do lowerFindName(names, bind)
+                    if bat >= 0:
+                        let bq = do plQuote(bind)
+                        return PLBlock{stmts: [], diag: bq + " is already in scope — pick another name for the joined result"}
+                    if sigRet == "":
+                        let tq = do plQuote(taskProc)
+                        return PLBlock{stmts: [], diag: "spawned proc " + tq + " returns nothing — declare a return type to bind its joined result"}
+                    names = append(names, bind)
+                    muts = append(muts, false)
+                    if sigRetList:
+                        types = append(types, "array")
+                    else:
+                        types = append(types, sigRet)
+                    ret = sigRet
+                    retList = sigRetList
+                let st = do plJoin(handle, bind, ret, retList)
+                out = append(out, st)
+            if s.kind == "exprStmt":
+                let d = do plCheckExpr(env, s.expr, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let v = do plLower(env, s.expr)
+                let st = do irExprStmt(v)
+                out = append(out, st)
+            if s.kind == "read" || s.kind == "letRead" || s.kind == "write" || s.kind == "letWrite":
+                let isRead = s.kind == "read" || s.kind == "letRead"
+                let mut op = "write"
+                if isRead:
+                    op = "read"
+                let mut fileName = ""
+                let mut bind = ""
+                if s.kind == "read" || s.kind == "write":
+                    let fnm = do bareFileOpName(lineText, op + " ")
+                    fileName = fnm
+                else:
+                    let fnm = do letFileOpFileName(lineText, op + " ")
+                    let b = do letFileOpBoundName(lineText)
+                    fileName = fnm
+                    bind = b
+                let fq = do plQuote(fileName)
+                let fat = do lowerFindName(env.fileNames, fileName)
+                if fat < 0:
+                    return PLBlock{stmts: [], diag: op + " " + fileName + "(...) — " + fq + " is not a declared file (add `file " + fileName + ": text at \"...\"` or `bytes`)"}
+                let fileType = do plTextAt(env.fileTypes, fat)
+                let filePath = do plTextAt(env.filePaths, fat)
+                let isBytes = fileType == "bytes"
+                if isRead:
+                    if len(s.args) != 0:
+                        return PLBlock{stmts: [], diag: "read " + fileName + "() takes no arguments"}
+                    let cd = do plRequireCap(env, "io.file", "read " + fileName + "(...)")
+                    if cd != "":
+                        return PLBlock{stmts: [], diag: cd}
+                    if bind != "":
+                        let bat = do lowerFindName(names, bind)
+                        if bat >= 0:
+                            let bq = do plQuote(bind)
+                            return PLBlock{stmts: [], diag: bq + " is already in scope — pick another name for the bound result"}
+                        names = append(names, bind)
+                        muts = append(muts, false)
+                        if isBytes:
+                            types = append(types, "bytes")
+                        else:
+                            types = append(types, "text")
+                    let st = do plFileRead(fileName, filePath, isBytes, bind)
+                    out = append(out, st)
+                else:
+                    if len(s.args) != 1:
+                        return PLBlock{stmts: [], diag: "write " + fileName + "(...) takes exactly one argument (the content to write)"}
+                    let cd = do plRequireCap(env, "io.file", "write " + fileName + "(...)")
+                    if cd != "":
+                        return PLBlock{stmts: [], diag: cd}
+                    let d = do plCheckExpr(env, s.args[0], names, types)
+                    if d != "":
+                        return PLBlock{stmts: [], diag: d}
+                    let mut wantType = "text"
+                    if isBytes:
+                        wantType = "bytes"
+                    let argType = do plInferType(s.args[0], names, types)
+                    if argType != "" && argType != wantType:
+                        if isBytes:
+                            return PLBlock{stmts: [], diag: "write " + fileName + "(...) needs a byte buffer — file " + fq + " is declared `bytes`, got " + argType}
+                        return PLBlock{stmts: [], diag: "write " + fileName + "(...) needs text — file " + fq + " is declared `text`, got " + argType}
+                    if bind != "":
+                        let bat = do lowerFindName(names, bind)
+                        if bat >= 0:
+                            let bq = do plQuote(bind)
+                            return PLBlock{stmts: [], diag: bq + " is already in scope — pick another name for the bound result"}
+                        names = append(names, bind)
+                        muts = append(muts, false)
+                        types = append(types, "bool")
+                    let v = do plLower(env, s.args[0])
+                    let st = do plFileWrite(fileName, filePath, isBytes, v, bind)
+                    out = append(out, st)
+            if s.kind == "loop":
+                let sj = do plSpawnsJoined(env, pendNames, "starting a loop")
+                if sj != "":
+                    return PLBlock{stmts: [], diag: sj}
+                let d = do plCheckExpr(env, s.expr, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let kids = do plBlock(env, s.body, names, muts, types, loopDepth + 1)
+                if kids.diag != "":
+                    return PLBlock{stmts: [], diag: kids.diag}
+                let cond = do plLower(env, s.expr)
+                let st = do plLoop(cond, kids.stmts)
+                out = append(out, st)
+            if s.kind == "if":
+                let sj = do plSpawnsJoined(env, pendNames, "branching (if)")
+                if sj != "":
+                    return PLBlock{stmts: [], diag: sj}
+                let d = do plCheckExpr(env, s.expr, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let then = do plBlock(env, s.body, names, muts, types, loopDepth)
+                if then.diag != "":
+                    return PLBlock{stmts: [], diag: then.diag}
+                let mut els = []
+                if len(s.elseBody) > 0:
+                    let eb = do plBlock(env, s.elseBody, names, muts, types, loopDepth)
+                    if eb.diag != "":
+                        return PLBlock{stmts: [], diag: eb.diag}
+                    els = eb.stmts
+                let cond = do plLower(env, s.expr)
+                let st = do irIf(cond, then.stmts, els)
+                out = append(out, st)
+            if s.kind == "break" || s.kind == "continue":
+                let mut what = "breaking"
+                if s.kind == "continue":
+                    what = "continuing"
+                let sj = do plSpawnsJoined(env, pendNames, what)
+                if sj != "":
+                    return PLBlock{stmts: [], diag: sj}
+                if loopDepth == 0:
+                    return PLBlock{stmts: [], diag: s.kind + " outside a loop in proc " + pq}
+                if !last:
+                    return PLBlock{stmts: [], diag: s.kind + " must be the last statement of its block"}
+                let st = do irStmt(s.kind)
+                out = append(out, st)
+            if s.kind == "return":
+                let sj = do plSpawnsJoined(env, pendNames, "returning")
+                if sj != "":
+                    return PLBlock{stmts: [], diag: sj}
+                if !last:
+                    return PLBlock{stmts: [], diag: "return must be the last statement of its block"}
+                let bare = trim(lineText) == "return"
+                if env.procRet == "":
+                    if !bare:
+                        return PLBlock{stmts: [], diag: "proc " + pq + " declares no return type, so `return` cannot carry a value"}
+                    let st = do plReturn([])
+                    out = append(out, st)
+                else:
+                    if bare:
+                        return PLBlock{stmts: [], diag: "proc " + pq + " returns " + env.procRet + ", so `return` needs a value"}
+                    let d = do plCheckExpr(env, s.expr, names, types)
+                    if d != "":
+                        return PLBlock{stmts: [], diag: d}
+                    let v = do plLower(env, s.expr)
+                    let st = do plReturn([v])
+                    out = append(out, st)
+            if s.kind == "unsupported":
+                return PLBlock{stmts: [], diag: "unsupported statement in proc " + pq}
+            i = i + 1
+        let endDiag = do plSpawnsJoined(env, pendNames, "the block ends")
+        if endDiag != "":
+            return PLBlock{stmts: [], diag: endDiag}
+        return PLBlock{stmts: out, diag: ""}
+
+    # ── proc ───────────────────────────────────────────────────────────
+    proc plLowerProc(headerLine: text, bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text]) -> PLResult:
+        let name = do parseProcHeaderName(headerLine)
+        let pNames = do parseProcHeaderParamNames(headerLine)
+        let pTypes = do parseProcHeaderParamTypes(headerLine)
+        let pLists = do parseProcHeaderParamLists(headerLine)
+        let pOpts = do parseProcHeaderParamOptionals(headerLine)
+        let hasRet = do parseProcHeaderHasRet(headerLine)
+        let retCore0 = do parseProcHeaderRetCore(headerLine)
+        let retList0 = do parseProcHeaderRetIsList(headerLine)
+        let uses = do parseProcHeaderUses(headerLine)
+        let mut ret = ""
+        let mut retList = false
+        if hasRet:
+            ret = retCore0
+            retList = retList0
+        let empty = do plEmptyProc()
+        let pq = do plQuote(name)
+        let np = len(pNames)
+        let mut names = []
+        let mut muts = []
+        let mut types = []
+        let mut params = []
+        let mut i = 0
+        loop i < np:
+            let dup = do lowerFindName(names, pNames[i])
+            if dup >= 0:
+                let dq = do plQuote(pNames[i])
+                return PLResult{proc: empty, diag: "proc " + pq + " has duplicate parameter " + dq}
+            names = append(names, pNames[i])
+            muts = append(muts, false)
+            if pLists[i]:
+                types = append(types, "array")
+            else:
+                types = append(types, pTypes[i])
+            params = append(params, IRParam{name: pNames[i], type: pTypes[i], optional: pOpts[i], list: pLists[i]})
+            i = i + 1
+        let texts = do plBodyTexts(bodySrc)
+        let stmts = do parseProcBodySrc(bodySrc)
+        let env = PLEnv{procName: name, procRet: ret, uses: uses, texts: texts, procNames: procNames, procRets: procRets, procRetLists: procRetLists, fileNames: fileNames, fileTypes: fileTypes, filePaths: filePaths, enumNames: enumNames}
+        let blk = do plBlock(env, stmts, names, muts, types, 0)
+        if blk.diag != "":
+            return PLResult{proc: empty, diag: blk.diag}
+        if len(blk.stmts) == 0:
+            return PLResult{proc: empty, diag: "proc " + pq + " has no body"}
+        if ret != "":
+            let complete = do plReturnComplete(blk.stmts)
+            if !complete:
+                return PLResult{proc: empty, diag: "proc " + pq + " declares a return type " + ret + ", so its body must end with `return <expr>` on every path — an `if` used as the last statement needs an `else`, and both branches must themselves end that way"}
+        return PLResult{proc: IRProc{name: name, params: params, ret: ret, retList: retList, body: blk.stmts}, diag: ""}
+
+    # lowerProcSrc: the IRProc (name "" on a compile error).
+    proc lowerProcSrc(headerLine: text, bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text]) -> IRProc:
+        let r = do plLowerProc(headerLine, bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames)
+        return r.proc
+
+    # lowerProcDiag: "" on success, else the Go builder's message.
+    proc lowerProcDiag(headerLine: text, bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text]) -> text:
+        let r = do plLowerProc(headerLine, bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames)
+        return r.diag
+
+    # lowerProcJSON: json.Marshal(ir.Proc)'s spelling of the lowered proc
+    # ("" on a compile error, since an unnamed proc is never emitted).
+    proc lowerProcJSON(headerLine: text, bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text]) -> text:
+        let r = do plLowerProc(headerLine, bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames)
+        if r.diag != "":
+            return ""
+        let j = do irProcJSON(r.proc)
+        return j
+
+    # ── HTTP driver ────────────────────────────────────────────────────
+    # Newline-separated text lists (lower.fct's lowerSplitLines: "" is
+    # the empty list); procRetListLines is "true"/"false" per line.
+    proc plBoolLines(s: text) -> [bool]:
+        let parts = do lowerSplitLines(s)
+        let n = len(parts)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, parts[i] == "true")
+            i = i + 1
+        return out
+
+    proc lowerProcLinesJSON(headerLine: text, bodySrc: text, procNameLines: text, procRetLines: text, procRetListLines: text, fileNameLines: text, fileTypeLines: text, filePathLines: text, enumLines: text) -> text:
+        let procNames = do lowerSplitLines(procNameLines)
+        let procRets = do lowerSplitLines(procRetLines)
+        let procRetLists = do plBoolLines(procRetListLines)
+        let fileNames = do lowerSplitLines(fileNameLines)
+        let fileTypes = do lowerSplitLines(fileTypeLines)
+        let filePaths = do lowerSplitLines(filePathLines)
+        let enums = do lowerSplitLines(enumLines)
+        let j = do lowerProcJSON(headerLine, bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enums)
+        return j
+
+    proc lowerProcLinesDiag(headerLine: text, bodySrc: text, procNameLines: text, procRetLines: text, procRetListLines: text, fileNameLines: text, fileTypeLines: text, filePathLines: text, enumLines: text) -> text:
+        let procNames = do lowerSplitLines(procNameLines)
+        let procRets = do lowerSplitLines(procRetLines)
+        let procRetLists = do plBoolLines(procRetListLines)
+        let fileNames = do lowerSplitLines(fileNameLines)
+        let fileTypes = do lowerSplitLines(fileTypeLines)
+        let filePaths = do lowerSplitLines(filePathLines)
+        let enums = do lowerSplitLines(enumLines)
+        let d = do lowerProcDiag(headerLine, bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enums)
+        return d
+
+    state procLowerResult: text = ""
+    state procLowerDiag: text = ""
+
+    # runLowerProc: POST {"args": [headerLine, bodySrc, "p1\np2",
+    # "int\n", "false\ntrue", "Config", "text", "config.txt", "Status"]}
+    # -> procLowerResult is the IR JSON ("" on error), procLowerDiag the
+    # message ("" on success).
+    action runLowerProc(headerLine: text, bodySrc: text, procNameLines: text, procRetLines: text, procRetListLines: text, fileNameLines: text, fileTypeLines: text, filePathLines: text, enumLines: text):
+        let j = do lowerProcLinesJSON(headerLine, bodySrc, procNameLines, procRetLines, procRetListLines, fileNameLines, fileTypeLines, filePathLines, enumLines)
+        let d = do lowerProcLinesDiag(headerLine, bodySrc, procNameLines, procRetLines, procRetListLines, fileNameLines, fileTypeLines, filePathLines, enumLines)
+        procLowerResult = j
+        procLowerDiag = d
+
+    private view ProcLowerHome at "/proc_lower":
+        box:
+            text "{procLowerDiag} {procLowerResult}"

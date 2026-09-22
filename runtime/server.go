@@ -68,10 +68,14 @@ type Server struct {
 	nextID   map[string]int           // per-entity id counter
 	sessions map[string]*sessionState // sid -> session (per-session scalar state + identity + expiry)
 
-	limiter *rateLimiter  // per-IP request throttle on state-changing endpoints
-	lockout *lockout      // per-username brute-force login lockout
-	audit   *auditLog     // append-only record of every server action
-	oidc    *oidcProvider // optional OIDC SSO (nil unless configured)
+	limiter     *rateLimiter // per-IP request throttle on state-changing endpoints
+	rateMu      sync.Mutex
+	rateClasses map[string]*rateLimiter // per-class limiters for declared api routes (runtime/apidecl.go)
+	streamMu    sync.Mutex
+	streamSubs  map[string]map[*streamSub]bool // stream path -> live subscribers (runtime/streams.go)
+	lockout     *lockout                       // per-username brute-force login lockout
+	audit       *auditLog                      // append-only record of every server action
+	oidc        *oidcProvider                  // optional OIDC SSO (nil unless configured)
 
 	obs      *obs         // structured logs + metrics + tracing
 	cluster  *cluster     // cross-instance pub/sub + shared sessions (nil unless FACET_CLUSTER)
@@ -132,8 +136,17 @@ type Server struct {
 // -in identity (actor/role/verified), and a sliding expiry. Client state never
 // lives here — the authority cannot see it.
 type sessionState struct {
-	state    map[string]any
-	actor    string // signed-in username, else "guest"
+	state map[string]any
+	actor string // signed-in username, else "guest"
+	// visitor is the stable key the language exposes as `session`: minted once,
+	// when the session is created, and carried unchanged through every
+	// rotateSession. The cookie identifier is the credential and rotates on
+	// each privilege change (login, logout); this key is what an app may pin
+	// pre-login state to — a guest's cart — and still find after the sign-in
+	// that rotated the cookie. It is never accepted from the client and never
+	// equals a live cookie value, so a page that renders it reveals nothing
+	// that could be replayed.
+	visitor  string
 	role     string // actor role: admin | member | guest
 	verified bool   // the account's email/contact is verified
 	expires  time.Time
@@ -501,12 +514,26 @@ func (s *Server) Handler() http.Handler {
 	for i := range s.ir.Webhooks {
 		mux.HandleFunc(s.ir.Webhooks[i].Path, s.webhookHandler(s.ir.Webhooks[i]))
 	}
+	// Declared event streams (runtime/streams.go), one SSE route each.
+	for i := range s.ir.Streams {
+		mux.HandleFunc(s.ir.Streams[i].Path, s.streamHandler(s.ir.Streams[i]))
+	}
 	// The app's view router, last and least specific: it receives every path no
 	// built-in above claimed. shadowedRoutes reports the ones it will never see.
 	mux.HandleFunc("/", s.handlePage)
-	// Wrap the whole mux in the observability middleware: every request becomes a
-	// span, a structured access log line, and a metrics sample.
-	return s.obs.observe(mux)
+	// Declared `api` endpoints are matched first, by method and path pattern
+	// (runtime/apidecl.go): they are the app's own contract, so they take
+	// precedence over the generic /api/ projection and the view router alike.
+	apis := s.compileAPIs()
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.serveDeclaredAPI(w, r, apis) {
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	// Wrap the whole thing in the observability middleware: every request
+	// becomes a span, a structured access log line, and a metrics sample.
+	return s.obs.observe(root)
 }
 
 // RouteShadow is one of an app's routes together with the built-in endpoint that
@@ -1388,7 +1415,7 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sid := s.session(w, r)
-	deltas, status, msg := s.runAction(sid, act, req.Args)
+	deltas, value, status, msg := s.runActionValue(sid, act, req.Args)
 	if status != http.StatusOK {
 		http.Error(w, msg, status)
 		return
@@ -1397,7 +1424,11 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		s.persistSession(sid) // the action changed per-session state; share it
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"deltas": deltas})
+	reply := map[string]any{"deltas": deltas}
+	if act.Ret != "" {
+		reply["value"] = value
+	}
+	json.NewEncoder(w).Encode(reply)
 }
 
 // maxTriggerDepth bounds reaction chains as a defense in depth: the compiler
@@ -1412,15 +1443,22 @@ const maxTriggerDepth = 64
 // outside the action lock (it re-enters runAction for each reaction), so the lock
 // is never held re-entrantly.
 func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]any, int, string) {
+	deltas, _, status, msg := s.runActionValue(sid, act, args)
+	return deltas, status, msg
+}
+
+// runActionValue is runAction plus the action's reply value (`return expr`,
+// nil when the action declares none) — what the JSON projections answer with.
+func (s *Server) runActionValue(sid string, act *ir.Action, args []any) (map[string]any, any, int, string) {
 	return s.runActionDepth(sid, act, args, 0)
 }
 
-func (s *Server) runActionDepth(sid string, act *ir.Action, args []any, depth int) (map[string]any, int, string) {
-	deltas, status, msg := s.runActionLocked(sid, act, args)
+func (s *Server) runActionDepth(sid string, act *ir.Action, args []any, depth int) (map[string]any, any, int, string) {
+	deltas, value, status, msg := s.runActionLocked(sid, act, args)
 	if status == http.StatusOK {
 		s.fireTriggers(act.Name, depth)
 	}
-	return deltas, status, msg
+	return deltas, value, status, msg
 }
 
 // fireTriggers runs the reactions registered for a just-completed action, each as
@@ -1463,7 +1501,7 @@ func (s *Server) ensureSession(sid string) *sessionState {
 	return ses
 }
 
-func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[string]any, int, string) {
+func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[string]any, any, int, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1474,7 +1512,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		if i < len(args) {
 			var ok bool
 			if v, ok = coerceParam(args[i], p.Type); !ok {
-				return nil, http.StatusBadRequest, fmt.Sprintf(
+				return nil, nil, http.StatusBadRequest, fmt.Sprintf(
 					"%s: parameter %q expects %s, got %v", act.Name, p.Name, p.Type, args[i])
 			}
 		} else {
@@ -1490,7 +1528,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		if !s.policyPasses(req, scope) {
 			s.recordAudit(actor, act.Name, false, "denied: "+req.Name)
 			s.obs.metrics.observeAction(act.Name, "denied")
-			return nil, http.StatusForbidden, "forbidden: " + req.Name
+			return nil, nil, http.StatusForbidden, "forbidden: " + req.Name
 		}
 	}
 
@@ -1517,7 +1555,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		// policy that fails before the first write has nothing to undo, and the
 		// rollback of an empty log is a no-op.)
 		ar.undo.rollback(s, ses, sess)
-		return nil, status, msg
+		return nil, nil, status, msg
 	}
 	deltas, entChanged, ops, undo := ar.deltas, ar.entChanged, ar.ops, ar.undo
 
@@ -1537,7 +1575,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		s.obs.metrics.observeAction(act.Name, "error")
 		s.obs.log.Error("action rolled back: the store refused the write",
 			slog.String("action", act.Name), slog_err(err))
-		return nil, http.StatusInternalServerError, "the write could not be stored and was rolled back"
+		return nil, nil, http.StatusInternalServerError, "the write could not be stored and was rolled back"
 	}
 
 	// Shared (entity) changes fan out to every live client over SSE — including
@@ -1552,7 +1590,8 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 	}
 	s.recordAudit(actor, act.Name, true, "")
 	s.obs.metrics.observeAction(act.Name, "ok")
-	return deltas, http.StatusOK, ""
+	s.fanoutEvents(ar.emits)
+	return deltas, ar.retVal, http.StatusOK, ""
 }
 
 // actionRun is the frame one action body executes in: the scope every
@@ -1572,6 +1611,12 @@ type actionRun struct {
 	entChanged map[string]bool
 	ops        []durOp // durable writes, replayed in one transaction at the end
 	undo       *undoLog
+	// retVal/returned carry `return expr`: the reply value, and the fact that
+	// the body has ended early — every enclosing block checks `returned`
+	// after a nested block runs and stops too.
+	retVal   any
+	returned bool
+	emits    []emitted // `emit` statements, delivered after the commit
 }
 
 // execActionBlock runs one statement list of an action body — the body itself,
@@ -1605,6 +1650,9 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 			if !truthy(eval(st.Value, ar.scope)) {
 				s.recordAudit(ar.actor, ar.act.Name, false, "check failed: "+st.Msg)
 				s.obs.metrics.observeAction(ar.act.Name, "invalid")
+				if st.Status != 0 {
+					return st.Status, st.Msg
+				}
 				return http.StatusUnprocessableEntity, st.Msg
 			}
 		case "assign":
@@ -1893,6 +1941,18 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 			// allows in an action body (readExpr's e.check funnel), so there is
 			// nothing left to fail on here.
 			eval(st.Value, ar.scope)
+		case "return":
+			if st.Value != nil {
+				ar.retVal = eval(st.Value, ar.scope)
+			}
+			ar.returned = true
+			return http.StatusOK, ""
+		case "emit":
+			ev := emitted{typ: st.Field, payload: eval(st.Value, ar.scope)}
+			if st.Key != nil {
+				ev.to, ev.targeted = toStr(eval(st.Key, ar.scope)), true
+			}
+			ar.emits = append(ar.emits, ev)
 		case "let":
 			// `let name = expr`: bound into the action's flat scope for the rest
 			// of this block, and dropped when the block ends. The compiler proved
@@ -1910,6 +1970,9 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 			}
 			if status, msg := s.execActionBlock(branch, ar); status != http.StatusOK {
 				return status, msg
+			}
+			if ar.returned {
+				return http.StatusOK, ""
 			}
 		case "for":
 			// `for item in Entity [where …] [by …] [limit …]:` — the rows are
@@ -1954,7 +2017,7 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 			for _, m := range picked {
 				ar.scope[st.Var] = m
 				status, msg := s.execActionBlock(st.Body, ar)
-				if status != http.StatusOK {
+				if status != http.StatusOK || ar.returned {
 					if had {
 						ar.scope[st.Var] = prev
 					} else {
@@ -2080,6 +2143,26 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			// across iterations instead of resetting. cloneCompositeValue for the
 			// same reason as "let": the local is taking on a freshly-computed
 			// value.
+			//
+			// `x = x + e` on a text local is the one shape that grows a string a
+			// piece at a time — an emitter or a parser written in fct does it
+			// once per output character — and evaluating the whole `x + e`
+			// copies everything x already holds each time, which is quadratic.
+			// frame.appendText appends e in place instead; `+` with a text left
+			// operand is exactly concatenation with toStr of the right side
+			// (applyBin's textOperands rule), so the value is identical.
+			if v := st.Value; v != nil && v.Kind == "bin" && v.Op == "+" && v.L != nil && v.L.Kind == "ref" && v.L.Name == st.Target {
+				if cur, ok := fr.get(st.Target); ok {
+					if cs, isText := cur.(string); isText {
+						rv, err := s.evalInFrame(v.R, fr)
+						if err != nil {
+							return ctlSignal{}, err
+						}
+						fr.appendText(st.Target, cs, toStr(rv))
+						continue
+					}
+				}
+			}
 			v, err := s.evalInFrame(st.Value, fr)
 			if err != nil {
 				return ctlSignal{}, err
@@ -2165,7 +2248,26 @@ func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
 			}
 			if st.Bind != "" {
 				fr.vars[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
+			} else if st.Target != "" {
+				// `name = do …`: a reassignment of an existing `let mut` local, so
+				// it goes through frame.set to reach the frame that declared it.
+				fr.set(st.Target, s.coerceRet(res, st.Ret, st.RetList))
 			}
+		case "fieldset":
+			// `s.field = expr` — one field of a struct local written in place.
+			// internal/ir/build.go proved Target is a `let mut` struct local with
+			// this field; the map behind a structVal is never shared between two
+			// locals (cloneCompositeValue), so the write is invisible elsewhere.
+			tv, _ := fr.get(st.Target)
+			sv, ok := tv.(structVal)
+			if !ok {
+				return ctlSignal{}, fmt.Errorf("%q is not a struct", st.Target)
+			}
+			val, err := s.evalInFrame(st.Value, fr)
+			if err != nil {
+				return ctlSignal{}, err
+			}
+			sv.Fields[st.Field] = cloneCompositeValue(val)
 		case "actcall":
 			// `act ActionName(args)` (daemon-only — internal/ir/build.go's
 			// procBlock never emits this for a real proc's body): invoke a
@@ -2555,14 +2657,20 @@ func (s *Server) scope(sid string) map[string]any {
 	if ses != nil {
 		actor, role, verified = ses.actor, ses.role, ses.verified
 	}
-	// `session` is the raw session id itself: unlike `actor` (which stays "guest"
-	// until login), it is stable for a caller from the moment their browser first
-	// arrives (see Server.session), so it is what a pre-login, anonymous visitor
-	// can key state to — an anonymous cart, kept by browser rather than by
-	// account. apiScope can pass sid == "" for a cookieless machine caller; that
-	// is a legitimate value here too (an identity that resolves to "no session"),
-	// not an error.
-	scope := map[string]any{"actor": actor, "role": role, "verified": verified, "session": sid}
+	// `session` is the session's stable visitor key (sessionState.visitor):
+	// unlike `actor` (which stays "guest" until login), it is set from the
+	// moment a browser first arrives (see Server.session) and — unlike the
+	// cookie identifier, which rotateSession replaces on login and logout — it
+	// never changes for the life of the session. That is what lets a pre-login
+	// visitor key state to it (an anonymous cart) and still own that state once
+	// signed in. apiScope can pass a sid that names no session (a cookieless
+	// machine caller); that resolves to "" — "no session" — which is a
+	// legitimate value here, not an error.
+	visitor := ""
+	if ses != nil {
+		visitor = ses.visitor
+	}
+	scope := map[string]any{"actor": actor, "role": role, "verified": verified, "session": visitor}
 	// Phase 6: the session's active tenant and the actor's role within it, exposed
 	// to the graph like `actor`/`role` so policies can scope rows by `tenant`.
 	tid := activeTenant(ses)
@@ -2721,6 +2829,9 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case "_audit":
 		s.handleAudit(w, r)
 		return
+	case "_contract":
+		s.handleContract(w, r)
+		return
 	case "_export":
 		s.handleGDPRExport(w, r)
 		return
@@ -2833,7 +2944,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sid := s.session(w, r)
-		deltas, status, msg := s.runAction(sid, act, req.Args)
+		deltas, value, status, msg := s.runActionValue(sid, act, req.Args)
 		if status != http.StatusOK {
 			http.Error(w, msg, status)
 			return
@@ -2842,7 +2953,11 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			s.persistSession(sid)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "deltas": deltas})
+		reply := map[string]any{"ok": true, "deltas": deltas}
+		if act.Ret != "" {
+			reply["value"] = value
+		}
+		json.NewEncoder(w).Encode(reply)
 
 	default:
 		http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
@@ -3881,7 +3996,7 @@ func persistedFromSession(ses *sessionState) *persistedSession {
 		state[k] = v
 	}
 	return &persistedSession{
-		Actor: ses.actor, Role: ses.role, Verified: ses.verified,
+		Actor: ses.actor, Role: ses.role, Verified: ses.verified, Visitor: ses.visitor,
 		PendingMFA: ses.pendingMFA, State: state, Expires: ses.expires,
 	}
 }
@@ -3892,8 +4007,14 @@ func sessionFromPersisted(ps *persistedSession) *sessionState {
 	if state == nil {
 		state = map[string]any{}
 	}
+	visitor := ps.Visitor
+	if visitor == "" {
+		// A row written before the visitor key existed: mint one now, so the
+		// rehydrated session has a `session` value like every other.
+		visitor = newSessionID()
+	}
 	return &sessionState{
-		state: state, actor: ps.Actor, role: ps.Role, verified: ps.Verified,
+		state: state, actor: ps.Actor, role: ps.Role, verified: ps.Verified, visitor: visitor,
 		pendingMFA: ps.PendingMFA, expires: ps.Expires,
 	}
 }
@@ -3921,7 +4042,7 @@ func (s *Server) newSession(actor, role string) *sessionState {
 			store[st.Name] = eval(st.Init, map[string]any{})
 		}
 	}
-	return &sessionState{state: store, actor: actor, role: role, expires: time.Now().Add(sessionTTL)}
+	return &sessionState{state: store, actor: actor, role: role, visitor: newSessionID(), expires: time.Now().Add(sessionTTL)}
 }
 
 // ── value helpers ────────────────────────────────────────────────────────────

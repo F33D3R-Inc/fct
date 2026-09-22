@@ -1,0 +1,263 @@
+import "ir_expr.fct"
+
+app IRStmtSelfHost:
+    # Self-hosting port of internal/ir/ir.go's `Stmt` — the serializable IR
+    # form of one statement in an action, proc or daemon body, `op`-
+    # discriminated exactly as the Go struct is, with every field the Go
+    # struct has. Sibling of ir_expr.fct's IRExpr (which its expression-
+    # valued fields hold), and the shape internal/ir/build.go's `action()`
+    # and `procBlock` produce — so a self-hosted port of either lowering
+    # builds these and is compared to the real compiler through
+    # `irStmtJSON`, which spells a value in the exact key ORDER encoding/json
+    # gives ir.Stmt (op, target, entity, field, key, value, fields, service,
+    # args, var, where, order, desc, limit, bind, ret, retList, role, msg,
+    # body, else, bytes, file, path) with `omitempty` semantics.
+    #
+    #   op:          check | assign | add | set | remove | clear | call | do |
+    #                establish | exprstmt | let | if | for | loop | return |
+    #                break | continue | indexset | spawn | join | actcall |
+    #                fileread | filewrite
+    #   target:      assign/let/indexset/spawn/join's local or cell
+    #   entity:      add/set/remove/clear/for
+    #   field:       set's field; call's operation name
+    #   key:         set/remove by id; indexset's index (0 or 1 element)
+    #   value:       assign/set/let/return/check's condition/loop's
+    #                condition/if's condition/exprstmt's call/establish's
+    #                actor/filewrite's content (0 or 1 element)
+    #   fieldNames/fieldExprs: add's and a filtered set's `name: expr` pairs,
+    #                index-parallel (Go's []FieldInit)
+    #   service:     call's service; do/spawn's proc; actcall's action
+    #   args:        call/do/spawn/actcall arguments
+    #   itemVar:     filtered set/remove and for's item variable (Go's `Var`)
+    #   where:       filtered set/remove and for's predicate (0 or 1)
+    #   order/desc/limit: for's `by`/`desc`/`limit`
+    #   bind:        call/do/join/fileread/filewrite's bound local; add's
+    #                bound id
+    #   ret/retList: call/do/join's result type
+    #   role:        establish's optional role (0 or 1)
+    #   msg:         check's message
+    #   status:      check's `status N` (0 = the default 422)
+    #   body/elseBody: loop/for's body, if's then/else
+    #   bytesFlag:   indexset/fileread/filewrite's byte-buffer flag (Go's
+    #                `Bytes`; renamed here because `bytes` is a builtin)
+    #   file/path:   fileread/filewrite's declared resource and its path
+    #
+    # A nil-able single child is a 0-or-1-element list, exactly as in
+    # ir_expr.fct.
+    struct IRStmt:
+        op: text
+        target: text
+        entity: text
+        field: text
+        key: [IRExpr]
+        value: [IRExpr]
+        fieldNames: [text]
+        fieldExprs: [IRExpr]
+        service: text
+        args: [IRExpr]
+        itemVar: text
+        where: [IRExpr]
+        order: text
+        desc: bool
+        limit: [IRExpr]
+        bind: text
+        ret: text
+        retList: bool
+        role: [IRExpr]
+        msg: text
+        status: int
+        body: [IRStmt]
+        elseBody: [IRStmt]
+        bytesFlag: bool
+        file: text
+        path: text
+
+    # Constructors: one per statement op the action lowering builds, each a
+    # full literal (a struct field cannot be assigned after construction, and
+    # `let mut` cannot bind a `do` result, so there is no "start absent and
+    # fill in" shape — every constructor spells all 25 fields).
+    proc irStmt(op: text) -> IRStmt:
+        return IRStmt{op: op, target: "", entity: "", field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irCheck(cond: IRExpr, msg: text) -> IRStmt:
+        return IRStmt{op: "check", target: "", entity: "", field: "", key: [], value: [cond], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: msg, status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irAssign(target: text, value: IRExpr) -> IRStmt:
+        return IRStmt{op: "assign", target: target, entity: "", field: "", key: [], value: [value], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irLet(target: text, value: IRExpr) -> IRStmt:
+        return IRStmt{op: "let", target: target, entity: "", field: "", key: [], value: [value], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irAdd(entity: text, fieldNames: [text], fieldExprs: [IRExpr], bind: text) -> IRStmt:
+        return IRStmt{op: "add", target: "", entity: entity, field: "", key: [], value: [], fieldNames: fieldNames, fieldExprs: fieldExprs, service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: bind, ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irSet(entity: text, key: IRExpr, field: text, value: IRExpr) -> IRStmt:
+        return IRStmt{op: "set", target: "", entity: entity, field: field, key: [key], value: [value], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irSetWhere(entity: text, itemVar: text, where: IRExpr, fieldNames: [text], fieldExprs: [IRExpr]) -> IRStmt:
+        return IRStmt{op: "set", target: "", entity: entity, field: "", key: [], value: [], fieldNames: fieldNames, fieldExprs: fieldExprs, service: "", args: [], itemVar: itemVar, where: [where], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irRemove(entity: text, key: IRExpr) -> IRStmt:
+        return IRStmt{op: "remove", target: "", entity: entity, field: "", key: [key], value: [], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irRemoveWhere(entity: text, itemVar: text, where: IRExpr) -> IRStmt:
+        return IRStmt{op: "remove", target: "", entity: entity, field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: itemVar, where: [where], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irClear(entity: text) -> IRStmt:
+        return IRStmt{op: "clear", target: "", entity: entity, field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irCallStmt(service: text, op: text, args: [IRExpr], bind: text, ret: text, retList: bool) -> IRStmt:
+        return IRStmt{op: "call", target: "", entity: "", field: op, key: [], value: [], fieldNames: [], fieldExprs: [], service: service, args: args, itemVar: "", where: [], order: "", desc: false, limit: [], bind: bind, ret: ret, retList: retList, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irDo(procName: text, args: [IRExpr], bind: text, ret: text, retList: bool) -> IRStmt:
+        return IRStmt{op: "do", target: "", entity: "", field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: procName, args: args, itemVar: "", where: [], order: "", desc: false, limit: [], bind: bind, ret: ret, retList: retList, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irEstablish(actor: IRExpr, role: [IRExpr]) -> IRStmt:
+        return IRStmt{op: "establish", target: "", entity: "", field: "", key: [], value: [actor], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: role, msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irExprStmt(call: IRExpr) -> IRStmt:
+        return IRStmt{op: "exprstmt", target: "", entity: "", field: "", key: [], value: [call], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    proc irIf(cond: IRExpr, then: [IRStmt], els: [IRStmt]) -> IRStmt:
+        return IRStmt{op: "if", target: "", entity: "", field: "", key: [], value: [cond], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: then, elseBody: els, bytesFlag: false, file: "", path: ""}
+
+    proc irFor(entity: text, itemVar: text, where: [IRExpr], order: text, desc: bool, limit: [IRExpr], body: [IRStmt]) -> IRStmt:
+        return IRStmt{op: "for", target: "", entity: entity, field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: "", args: [], itemVar: itemVar, where: where, order: order, desc: desc, limit: limit, bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: body, elseBody: [], bytesFlag: false, file: "", path: ""}
+
+    # ── JSON ────────────────────────────────────────────────────────────────
+    proc irFieldInitsJSON(names: [text], exprs: [IRExpr]) -> text:
+        let n = len(names)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let nq = do jsonQuote(names[i])
+            let ej = do irExprJSON(exprs[i])
+            out = out + "{\"name\":" + nq + ",\"expr\":" + ej + "}"
+            i = i + 1
+        return out + "]"
+
+    proc irStmtListJSON(xs: [IRStmt]) -> text:
+        let n = len(xs)
+        let mut out = "["
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let j = do irStmtJSON(xs[i])
+            out = out + j
+            i = i + 1
+        return out + "]"
+
+    # irStmtJSON: exactly encoding/json over ir.Stmt — struct field order,
+    # zero values omitted.
+    proc irStmtJSON(s: IRStmt) -> text:
+        let oq = do jsonQuote(s.op)
+        let mut out = "{\"op\":" + oq
+        if s.target != "":
+            let q = do jsonQuote(s.target)
+            out = out + ",\"target\":" + q
+        if s.entity != "":
+            let q = do jsonQuote(s.entity)
+            out = out + ",\"entity\":" + q
+        if s.field != "":
+            let q = do jsonQuote(s.field)
+            out = out + ",\"field\":" + q
+        if len(s.key) > 0:
+            let j = do irExprJSON(s.key[0])
+            out = out + ",\"key\":" + j
+        if len(s.value) > 0:
+            let j = do irExprJSON(s.value[0])
+            out = out + ",\"value\":" + j
+        if len(s.fieldNames) > 0:
+            let j = do irFieldInitsJSON(s.fieldNames, s.fieldExprs)
+            out = out + ",\"fields\":" + j
+        if s.service != "":
+            let q = do jsonQuote(s.service)
+            out = out + ",\"service\":" + q
+        if len(s.args) > 0:
+            let j = do irListJSON(s.args)
+            out = out + ",\"args\":" + j
+        if s.itemVar != "":
+            let q = do jsonQuote(s.itemVar)
+            out = out + ",\"var\":" + q
+        if len(s.where) > 0:
+            let j = do irExprJSON(s.where[0])
+            out = out + ",\"where\":" + j
+        if s.order != "":
+            let q = do jsonQuote(s.order)
+            out = out + ",\"order\":" + q
+        if s.desc:
+            out = out + ",\"desc\":true"
+        if len(s.limit) > 0:
+            let j = do irExprJSON(s.limit[0])
+            out = out + ",\"limit\":" + j
+        if s.bind != "":
+            let q = do jsonQuote(s.bind)
+            out = out + ",\"bind\":" + q
+        if s.ret != "":
+            let q = do jsonQuote(s.ret)
+            out = out + ",\"ret\":" + q
+        if s.retList:
+            out = out + ",\"retList\":true"
+        if len(s.role) > 0:
+            let j = do irExprJSON(s.role[0])
+            out = out + ",\"role\":" + j
+        if s.msg != "":
+            let q = do jsonQuote(s.msg)
+            out = out + ",\"msg\":" + q
+        if s.status != 0:
+            out = out + ",\"status\":" + s.status
+        if len(s.body) > 0:
+            let j = do irStmtListJSON(s.body)
+            out = out + ",\"body\":" + j
+        if len(s.elseBody) > 0:
+            let j = do irStmtListJSON(s.elseBody)
+            out = out + ",\"else\":" + j
+        if s.bytesFlag:
+            out = out + ",\"bytes\":true"
+        if s.file != "":
+            let q = do jsonQuote(s.file)
+            out = out + ",\"file\":" + q
+        if s.path != "":
+            let q = do jsonQuote(s.path)
+            out = out + ",\"path\":" + q
+        return out + "}"
+
+    # ── live driver ─────────────────────────────────────────────────────────
+    # The demo is a whole-cart checkout's shape: a `for` over CartLine whose
+    # body checks, sets, adds with a bound id, and branches.
+    proc irStmtDemoJSON() -> text:
+        let l = do irRef("l")
+        let qty = do irGet(l, "qty")
+        let product = do irGet(l, "product")
+        let stockOf = do irEGet("Product", product, "stock")
+        let cond = do irBin(">=", stockOf, qty)
+        let chk = do irCheck(cond, "sold out")
+        let dec = do irBin("-", stockOf, qty)
+        let setStock = do irSet("Product", product, "stock", dec)
+        let actor = do irRef("actor")
+        let addOrder = do irAdd("Order", ["buyer", "qty"], [actor, qty], "oid")
+        let oid = do irRef("oid")
+        let assignLast = do irAssign("lastOrder", oid)
+        let zero = do irLit("0", "int")
+        let assignZero = do irAssign("lastOrder", zero)
+        let big = do irLit("10", "int")
+        let ifCond = do irBin(">", qty, big)
+        let branch = do irIf(ifCond, [assignLast], [assignZero])
+        let owner = do irGet(l, "owner")
+        let where = do irBin("==", owner, actor)
+        let loop = do irFor("CartLine", "l", [where], "id", false, [], [chk, setStock, addOrder, branch])
+        let j = do irStmtJSON(loop)
+        return j
+
+    state irStmtDemo: text = ""
+
+    action runIRStmtDemo():
+        let j = do irStmtDemoJSON()
+        irStmtDemo = j
+
+    private view IRStmtHome at "/ir_stmt":
+        box:
+            text "{irStmtDemo}"

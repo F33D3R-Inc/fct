@@ -85,6 +85,8 @@ type App struct {
 	Services   []*Service
 	Files      []*File
 	Webhooks   []*Webhook
+	APIs       []*API
+	Streams    []*Stream
 	Triggers   []*Trigger
 	Theme      []ThemeVar   // base design tokens (the light palette)
 	DarkTheme  []ThemeVar   // `theme dark:` — token overrides applied under prefers-color-scheme: dark
@@ -115,6 +117,59 @@ type Webhook struct {
 	Action string
 	Secret string
 	Line   int
+}
+
+// API is one declared HTTP endpoint of the app's typed contract:
+//
+//	api GET "/api/v2/works/{id}" -> getWork rate read since "2026-09-13"
+//	api POST "/api/v2/works" -> createWork status 201 rate write
+//
+// The route binds to an action: `{name}` path segments, then query fields
+// (GET/DELETE) or the JSON body's fields (POST/PUT/PATCH), fill the action's
+// parameters by name; the action's `requires` gate is the route's auth; its
+// reply value (`-> Type` + `return`) is the response body; a failed `check`
+// answers with its own status. Status is the success code (200 by default,
+// 201 for a create, 204 for a reply with no body). Rate names the limiter
+// class the route is metered under (read | write | auth). Since is the date
+// the route entered the contract, published as x-since. Together with the
+// wire `type`s the reply values are shaped from, these declarations ARE the
+// contract: the runtime serves them and publishes them as OpenAPI at
+// GET /api/_contract, and the mobile SDKs are generated from the same graph.
+type API struct {
+	Method string
+	Path   string
+	Action string
+	Status int
+	Rate   string
+	Since  string
+	Line   int
+}
+
+// Stream is one named event stream of the contract — a server-sent-events
+// route carrying typed events:
+//
+//	stream "/api/v2/events" requires member: Notify, WorkEngagement
+//
+// Events are wire `type` names; an action puts one on the wire with `emit
+// Notify{…}` (every subscriber) or `emit Notify{…} to handle` (the
+// subscribers signed in as that actor). Requires names a zero-argument policy
+// a subscriber must pass to connect; without it the stream is open.
+type Stream struct {
+	Path     string
+	Events   []string
+	Requires string
+	Line     int
+}
+
+// Emit puts one typed event on every stream that carries its type: `emit
+// Dto{…}` (broadcast) or `emit Dto{…} to <expr>` (only subscribers whose
+// actor is the text the expression yields). Emitted after the action
+// commits, so a rolled-back action emits nothing. Action-only; it forces
+// server placement, since only the authority holds the subscribers.
+type Emit struct {
+	Value Expr
+	To    Expr
+	Line  int
 }
 
 // Socket is one typed slot declared by a wireframe: `socket feed: data`. Accept
@@ -550,6 +605,13 @@ type Action struct {
 	Params     []Param
 	Requires   []Require
 	Optimistic bool // @optimistic — the client predicts the result before the round-trip
+	// Ret/RetList declare a return value: `action name(params) -> Type:` whose
+	// body ends in `return expr`. The value rides back to the caller as the
+	// reply's `value` (the `/event` and `/api/<action>` JSON), which is what a
+	// typed HTTP endpoint answers with. Ret is a primitive, an entity name (a
+	// row), or a wire `type` name (a DTO); RetList makes it a list of those.
+	Ret     string
+	RetList bool
 	// Body holds every statement in source order, including `check` validations —
 	// so a check may run after a `let` bind and validate the bound result, or
 	// inside a `for` and guard the row in hand. A failed check (or any other
@@ -702,7 +764,12 @@ type Establish struct {
 type Check struct {
 	Cond Expr
 	Msg  string
-	Line int
+	// Status is the HTTP status a declared `api` route answers with when this
+	// check fails — `check exists(...) "not found" status 404`. 0 means the
+	// default (422 Unprocessable Entity), which is also what every other
+	// projection reports for a failed check.
+	Status int
+	Line   int
 }
 
 func (Check) stmt() {}
@@ -971,7 +1038,26 @@ type Do struct {
 	Proc string
 	Args []Expr
 	Bind string // "" = fire-and-forget (result discarded)
-	Line int
+	// Mut marks `let mut name = do Proc(args)` (proc-only): the bound local is
+	// reassignable, exactly as a `let mut name = expr` local is.
+	Mut bool
+	// Reassign marks `name = do Proc(args)` (proc-only): Bind names an
+	// EXISTING `let mut` local that takes the call's result, the way a plain
+	// `name = expr` reassigns it — no new declaration.
+	Reassign bool
+	Line     int
+}
+
+// FieldAssign writes one field of a proc-local struct value in place:
+// `s.field = expr`. Proc-only, and gated like IndexAssign: Target must be a
+// `let mut` local whose declared type is a struct that has Field. Without it a
+// struct could only ever be rebuilt whole with a full literal to change one
+// field, which every self-host port ended up doing by hand.
+type FieldAssign struct {
+	Target string
+	Field  string
+	Value  Expr
+	Line   int
 }
 
 // ExprStmt is a bare builtin call used as its own statement, purely for its
@@ -1050,8 +1136,10 @@ func (Set) stmt()         {}
 func (Remove) stmt()      {}
 func (Clear) stmt()       {}
 func (ForStmt) stmt()     {}
+func (Emit) stmt()        {}
 func (Let) stmt()         {}
 func (IndexAssign) stmt() {}
+func (FieldAssign) stmt() {}
 func (Return) stmt()      {}
 func (Do) stmt()          {}
 func (Loop) stmt()        {}
@@ -1772,6 +1860,17 @@ type Agg struct {
 	// through the compiler), and anything else lands here and is evaluated once
 	// per row with Var bound to it.
 	Sel Expr
+
+	// Order/Desc/Limit are `list(...)`'s own clauses — `list(Dto{…} in Post
+	// where p.published by created desc limit 20)`: the rows a reply carries,
+	// each shaped by Sel (or the row itself when Sel is nil), in `by` order,
+	// at most `limit` of them. `list` is the aggregate that yields the rows
+	// rather than a number over them: it is how an action builds the list a
+	// typed HTTP endpoint answers with, out of the same filtered-collection
+	// grammar every other aggregate already uses. No other op carries them.
+	Order string
+	Desc  bool
+	Limit Expr
 }
 
 // Call is an effectful builtin invocation — `now()` (server clock, unix seconds)
