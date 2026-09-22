@@ -1669,9 +1669,8 @@ func litValue(e *ir.Expr) any {
 		// strconv.ParseFloat, and internal/ir/build.go's lower() copies it
 		// through unchanged — so this is a plain type assertion, not a
 		// conversion: there is no "numeric text" fallback the way toInt has
-		// one, because a float literal can only ever reach here already typed
-		// (checkNoFloat bars a float literal everywhere but a proc body,
-		// where every literal is compiler-generated, never boundary input).
+		// one, because a float literal is compiler-generated (never
+		// boundary input) wherever it reaches here.
 		f, _ := e.Val.(float64)
 		return f
 	case "bool":

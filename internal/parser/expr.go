@@ -19,14 +19,11 @@ func ParseExpr(src string) (ast.Expr, error) { return parseExpr(src, 1) }
 // Precedence-climbing; produces an ast.Expr every executor interprets
 // identically.
 //
-// A float literal (`3.14`) parses everywhere, same as a bitwise operator (see
-// below) — but internal/ir/build.go's checkNoFloat rejects one outside a
-// `proc` body at compile time, for the same reason checkNoBitwise does: a
-// float has no representation in assets/facet.js today (no float-typed state,
-// no wire encoding), so an action/view expression — which facet.js may
-// re-evaluate on the client — must never see one. See LANGUAGE.md's `proc`
-// section for the full float design (no automatic int/float promotion;
-// `toFloat`/`toInt` convert explicitly).
+// A float literal (`3.14`) parses everywhere and is real everywhere — a
+// first-class scalar on the same footing as int/text/bool/money/date, with
+// its own client-side representation (assets/facet.js) and wire encoding.
+// See LANGUAGE.md's `proc` section for the full float design (no automatic
+// int/float promotion; `toFloat`/`toInt` convert explicitly).
 //
 // The bitwise operators parse everywhere (there is no syntactic distinction
 // between a proc expression and an action/view one at this layer), but
@@ -725,8 +722,7 @@ func (p *exprParser) parseAtom() (ast.Expr, error) {
 			// A float literal (`3.14`, `0.5`) — the tokenizer only ever produces
 			// this shape for `<digits>.<digits>` (see tokenize), so ParseFloat
 			// cannot fail here. `float` is a real scalar type, distinct from
-			// `int`, usable only inside a proc body (see internal/ir/build.go's
-			// checkNoFloat) — no automatic int/float promotion anywhere in this
+			// `int` — no automatic int/float promotion anywhere in this
 			// language (internal/ir/build.go's checkNumericTypes), matching
 			// this language's one-widening-only-into-text philosophy
 			// (internal/ir/types.go).

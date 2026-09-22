@@ -322,6 +322,7 @@ func TestDeclaredAPIMessageBody(t *testing.T) {
 // public URL as the parameter's value — and that the published contract
 // describes the route as multipart/form-data with a binary-format field.
 func TestDeclaredAPIMultipartUpload(t *testing.T) {
+	t.Setenv("FACET_UPLOAD_DIR", t.TempDir())
 	src := `app W:
     entity Work:
         id: int
@@ -460,5 +461,80 @@ func TestDeclaredAPIDateTime(t *testing.T) {
 	createdSchema := props["created"].(map[string]any)
 	if createdSchema["type"] != "string" || createdSchema["format"] != "date-time" {
 		t.Fatalf("created schema = %v, want {type: string, format: date-time}", createdSchema)
+	}
+}
+
+// TestDeclaredAPIPublicWriteMintsDistinctSessions is the root-cause regression
+// for a real bug found while wiring the f33d3r contract: a declared `api`
+// route with no `requires` gate (a public signup/login-shaped write) resolved
+// its caller with the read-only sidForRequest, which never mints — so every
+// anonymous caller reached runActionLocked with sid == "", and
+// ensureSession("") stores the FIRST such caller's session under the literal
+// "" map key and every later anonymous caller then reuses that exact same
+// session (and its `establish`ed identity). Two independent signups here must
+// land on two distinct actors, never collide on one shared guest.
+func TestDeclaredAPIPublicWriteMintsDistinctSessions(t *testing.T) {
+	src := `app W:
+    type SessionDTO:
+        actor: text
+    entity Account:
+        id: int
+        handle: text
+    action signup(handle: text) -> SessionDTO:
+        let id = add Account { handle: handle }
+        establish actor handle
+        return SessionDTO{actor: actor}
+    api POST "/api/v2/accounts" -> signup status 201
+    view Home at "/":
+        text "x"
+`
+	g, err := compile.String(src)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(handle string) (int, map[string]any, []*http.Cookie) {
+		resp, err := http.Post(ts.URL+"/api/v2/accounts", "application/json",
+			strings.NewReader(`{"handle":"`+handle+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body map[string]any
+		json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, body, resp.Cookies()
+	}
+
+	codeA, bodyA, cookiesA := post("alice")
+	codeB, bodyB, cookiesB := post("bob")
+	if codeA != 201 || codeB != 201 {
+		t.Fatalf("signup status = %d, %d, want 201, 201", codeA, codeB)
+	}
+	if bodyA["actor"] != "alice" || bodyB["actor"] != "bob" {
+		t.Fatalf("established actors = %v, %v, want alice, bob (no collision)", bodyA["actor"], bodyB["actor"])
+	}
+	var sidA, sidB string
+	for _, c := range cookiesA {
+		if c.Name == "fa_sid" {
+			sidA = c.Value
+		}
+	}
+	for _, c := range cookiesB {
+		if c.Name == "fa_sid" {
+			sidB = c.Value
+		}
+	}
+	if sidA == "" || sidB == "" {
+		t.Fatalf("expected each anonymous write to mint its own session cookie, got %q, %q", sidA, sidB)
+	}
+	if sidA == sidB {
+		t.Fatal("two independent anonymous signups minted the SAME session — the collision bug is back")
 	}
 }

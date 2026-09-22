@@ -8,15 +8,15 @@ import (
 // TestFloatLiteralAndArithmeticCompiles proves the basic float shape
 // compiles: a float parameter, a float `let`, float arithmetic
 // (`+`/`-`/`*`/`/`) between two floats, a float comparison, and a float
-// return type — the minimum bar this milestone sets (LANGUAGE.md's `proc`
-// section): float is real inside a proc body (parameters, `let`/`let mut`
-// locals, return types), nowhere else.
+// return type inside a proc body (parameters, `let`/`let mut` locals, return
+// types) — float is real everywhere in the language now (see isPrimitive's
+// doc and TestFloatAcceptedEverywhere below), but a proc's own arithmetic is
+// still where it is exercised most, so this stays the baseline case.
 //
-// An action can pass only int/text/bool/money/date arguments to a `do` call
-// (checkNoFloat, called from check(), bars a float literal or a toFloat()
-// call in action source — see TestFloatDeclarationErrors) — so roundIt takes
-// plain ints and converts them to float itself, entirely inside the proc
-// layer, which is the pattern every other test in this file uses too.
+// roundIt takes plain ints and converts them to float itself, entirely
+// inside the proc layer, which is the pattern every other test in this file
+// uses too — not because an action couldn't pass a float argument to `do`
+// directly (it can), but to keep this file's baseline cases minimal.
 func TestFloatLiteralAndArithmeticCompiles(t *testing.T) {
 	src := `app A:
     proc scaleAndCompare(x: float, y: float) -> float:

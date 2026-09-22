@@ -2254,10 +2254,10 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				// print(...) on its own line, the action-body counterpart to procBlock's
 				// identical ast.ExprStmt case. Not print-specific machinery: readExpr's
 				// e.check funnel already refuses any builtin that doesn't belong in an
-				// action body (readFile/writeFile/httpGet/httpPost/channel/bitwise/float
-				// all stay proc-only via checkNoIO/checkNoConcurrency/checkNoBitwise/
-				// checkNoFloat), so print is simply the one builtin this shape is
-				// actually useful for today.
+				// action body (readFile/writeFile/httpGet/httpPost/channel/bitwise all
+				// stay proc-only via checkNoIO/checkNoConcurrency/checkNoBitwise; float
+				// itself is real everywhere now — see isPrimitive's doc), so print is
+				// simply the one builtin this shape is actually useful for today.
 				if err := readExpr(st.Call, st.Line); err != nil {
 					return nil, err
 				}
@@ -3450,9 +3450,7 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return "float"
 		case "floatFromBits":
 			// floatFromBits(b) -> float, the IEEE-754 bit-cast inverse of
-			// floatBits(f) -> int — see checkNoFloat's doc for why this call
-			// itself (not just a float literal or toFloat()) must be barred
-			// outside a proc: it is a second way to produce a float value.
+			// floatBits(f) -> int.
 			return "float"
 		case "floatBits":
 			// floatBits(f) -> int, the raw IEEE-754 bit pattern of f
@@ -5737,16 +5735,15 @@ func checkNoIndex(ex ast.Expr, wire map[string]bool, line int) error {
 	return nil
 }
 
-
 // ioBuiltins is the set of capability-gated I/O builtins (see builtinCapability)
-// — proc-only, the same way bitwise operators and float are, and for the same
-// underlying reason (checkNoBitwise/checkNoFloat's docs): each has exactly one
+// — proc-only, the same way bitwise operators are, and for the same
+// underlying reason (checkNoBitwise's doc): each has exactly one
 // interpreter, runtime/io.go, which only ever runs on the server inside a
 // proc's own frame (runtime/eval.go's evalInFrame), so an action/view/policy/
 // derive expression — which may be placed on or re-evaluated by the client —
 // must never be able to write one into source at all. checkNoIO is the
-// syntactic barrier that guarantees that, exactly mirroring checkNoBitwise/
-// checkNoFloat's shape and its single call site inside check().
+// syntactic barrier that guarantees that, exactly mirroring checkNoBitwise's
+// shape and its single call site inside check().
 var ioBuiltins = map[string]bool{"readFile": true, "writeFile": true, "httpGet": true, "httpPost": true}
 
 // checkNoIO rejects a call to readFile/writeFile/httpGet/httpPost anywhere

@@ -1793,10 +1793,8 @@ func (SlotRef) node()   {}
 type Expr interface{ expr() }
 
 // Lit is an int, text, bool, or float literal. A float literal (Kind
-// "float") is real only inside a proc body — internal/ir/build.go's
-// checkNoFloat rejects one everywhere else, the same way checkNoBitwise
-// rejects a bitwise operator outside a proc — see LANGUAGE.md's `proc`
-// section.
+// "float") is a real scalar everywhere in the language — see LANGUAGE.md's
+// `proc` section for the full float design.
 type Lit struct {
 	Kind string
 	Val  any

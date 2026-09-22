@@ -170,9 +170,9 @@ func TestIOCapabilityMustBeDeclared(t *testing.T) {
 
 // TestIOBuiltinsRejectedOutsideProc proves readFile/writeFile/httpGet/httpPost
 // are proc-only — barred from an action body entirely, the same way bitwise
-// operators and float are (checkNoBitwise/checkNoFloat's own precedent) —
-// since only a proc is unconditionally server-executed with no client mirror
-// to disagree with a real I/O effect.
+// operators are (checkNoBitwise's own precedent) — since only a proc is
+// unconditionally server-executed with no client mirror to disagree with a
+// real I/O effect.
 func TestIOBuiltinsRejectedOutsideProc(t *testing.T) {
 	src := `app A:
     state result: text = ""

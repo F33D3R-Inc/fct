@@ -282,6 +282,20 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 		apiError(w, http.StatusUnauthorized, "sign in to call this endpoint")
 		return true
 	}
+	// A route with no `requires` gate (Auth != "session") is reachable by a
+	// caller with no session yet — a public signup/login-shaped write. Unlike a
+	// GET, which must stay read-only (sidForRequest never mints; see its own
+	// doc), a write here needs a REAL, distinct session before the action runs:
+	// runActionLocked's ensureSession(sid) treats sid as a session's storage
+	// key, and leaving it "" for every anonymous caller would collapse them
+	// all onto the one session literally keyed by "" — the same shared,
+	// racing identity for every concurrent unauthenticated write. `session`
+	// mints one and signs it into the response the exact way the generic
+	// `/api/<action>` POST path already does, so this matches that existing,
+	// already-correct behavior instead of adding a second rule.
+	if sid == "" && r.Method != http.MethodGet {
+		sid = s.session(w, r)
+	}
 	_, value, status, msg := s.runActionValue(sid, a.act, args)
 	if status != http.StatusOK {
 		apiError(w, status, msg)
