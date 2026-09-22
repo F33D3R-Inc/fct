@@ -490,6 +490,7 @@
       case "replace": return toStr(a(0)).replaceAll(toStr(a(1)), toStr(a(2)));
       case "slug": return toStr(a(0)).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
       case "ago": return ago(toInt(a(0)), Math.floor(Date.now() / 1000));
+      case "iso": return isoJS(toInt(a(0)));
       case "compact": return compact(toInt(a(0)));
       case "commas": return commas(toInt(a(0)));
       case "take": { const r = Array.from(toStr(a(0))); let n = toInt(a(1)); if (n < 0) n = 0; return r.slice(0, n).join(""); }
@@ -510,6 +511,17 @@
     let s = mon[t.getUTCMonth()] + " " + t.getUTCDate();
     if (t.getUTCFullYear() !== n.getUTCFullYear()) s += ", " + t.getUTCFullYear();
     return s;
+  }
+  // isoJS mirrors runtime/format.go's iso() exactly: an RFC 3339 UTC instant,
+  // always seconds precision (no fractional seconds), always "Z" — the same
+  // fixed-width shape Date#toISOString would give with its milliseconds
+  // truncated off, so a first paint from the server and a client re-render
+  // of the same second produce byte-identical text.
+  function isoJS(ts) {
+    const d = new Date(ts * 1000);
+    const p2 = (n) => (n < 10 ? "0" : "") + n;
+    return d.getUTCFullYear() + "-" + p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) +
+      "T" + p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes()) + ":" + p2(d.getUTCSeconds()) + "Z";
   }
   function compact(n) {
     const neg = n < 0; if (neg) n = -n;
@@ -551,6 +563,15 @@
     const t = typeof v === "string" ? v.trim() : toStr(v);
     if (!FA_NUMERIC.test(t)) return 0;
     return Math.round(Number(t) * 100);
+  }
+  // toFloatJS mirrors eval.go's toFloat: the same FA_NUMERIC shape, no
+  // truncation — the actual decimal value, for a `float`-typed control or
+  // state cell (see coerce/controlValue below).
+  function toFloatJS(v) {
+    if (typeof v === "number") return v;
+    const t = typeof v === "string" ? v.trim() : toStr(v);
+    if (!FA_NUMERIC.test(t)) return 0;
+    return Number(t);
   }
   function truthy(v) { if (Array.isArray(v)) return v.length > 0; return !(v === false || v === 0 || v === "" || v == null); }
   // Mirrors eval.go's toInt exactly, including the accepted spelling of a number
@@ -1681,6 +1702,7 @@
 
   function coerce(v, type) {
     if (type === "int" || type === "money" || type === "date") return toInt(v);
+    if (type === "float") return toFloatJS(v);
     if (type === "bool") return truthy(v);
     if (type === "text") return toStr(v);
     return v; // enum (already text) or entity-typed (a record) — pass through
@@ -1779,7 +1801,9 @@
     const type = t.getAttribute("type");
     if (type === "checkbox") return !!t.checked;
     if (type === "radio") return t.getAttribute("value");
-    return (stateType[name] === "int" || stateType[name] === "money" || stateType[name] === "date") ? toInt(t.value) : t.value;
+    if (stateType[name] === "int" || stateType[name] === "money" || stateType[name] === "date") return toInt(t.value);
+    if (stateType[name] === "float") return toFloatJS(t.value);
+    return t.value;
   }
 
   // syncControl writes a cell's value back into every element bound to it.

@@ -15,7 +15,7 @@ import (
 
 // The dev server is `facet dev`: it runs the app and watches its source file, so
 // a save recompiles, hot-swaps the running graph, and live-reloads the browser —
-// no restart, no manual refresh. If FACET_DATABASE_URL is set it uses Postgres;
+// no restart, no manual refresh. If FACET_DATABASE_URL is set it uses FacetQL;
 // otherwise it spins up the in-memory backend so a new project runs with zero
 // setup. A compile error is shown as an overlay in the browser and logged, and
 // the last good build keeps serving until the source is valid again.

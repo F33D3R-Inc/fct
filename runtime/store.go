@@ -59,8 +59,8 @@ func numericField(f ir.Field) bool {
 // relations are foreign keys, so reads can be pushed down (Query) and stay
 // sub-linear as a table grows past what fits in memory. The backend is FacetQL,
 // the stack's native database (AGENT_LOG §2); you point at it with
-// FACET_DATABASE_URL (facetql://…). Postgres support was excised once FacetQL
-// reached parity — see AGENT_LOG.md, "Changelog — 2026-09-06 (evening)".
+// FACET_DATABASE_URL (facetql://…). FacetQL is the only backend; the SQL store
+// that preceded it was removed once FacetQL reached parity.
 type Store interface {
 	// Init brings the schema up to date (the same additive migration Migrate
 	// applies) and returns every existing row (entity name -> rows) to seed the
@@ -242,8 +242,14 @@ func normalize(v any, f ir.Field) any {
 	case nil:
 		return zeroFor(f)
 	case int64:
+		if f.Type == "float" {
+			return float64(t)
+		}
 		return int(t)
 	case float64:
+		if f.Type == "float" {
+			return t
+		}
 		return int(t)
 	case []byte:
 		return decryptIf(f, string(t))
@@ -267,6 +273,8 @@ func zeroFor(f ir.Field) any {
 	switch {
 	case f.IsRelation() || f.Type == "int":
 		return 0
+	case f.Type == "float":
+		return 0.0
 	case f.Type == "bool":
 		return false
 	default:

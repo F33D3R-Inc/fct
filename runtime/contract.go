@@ -54,6 +54,8 @@ func buildContract(g *ir.IR) map[string]any {
 		var params []map[string]any
 		body := map[string]any{}
 		var required []string
+		var bodyWireParams []ir.Param // POST/PUT/PATCH params that bind from the JSON body, in order
+		hasBytesBody := false         // a `bytes` param uploads a file: the body is multipart, not JSON
 		for _, p := range act.Params {
 			schema := wireSchema(p.Type, false, g, usedEntities)
 			switch {
@@ -62,11 +64,25 @@ func buildContract(g *ir.IR) map[string]any {
 			case a.Method == http.MethodGet || a.Method == http.MethodDelete:
 				params = append(params, map[string]any{"name": p.Name, "in": "query", "required": !p.Optional, "schema": schema})
 			default:
+				if p.Type == "bytes" {
+					hasBytesBody = true
+				}
+				bodyWireParams = append(bodyWireParams, p)
 				body[p.Name] = schema
 				if !p.Optional {
 					required = append(required, p.Name)
 				}
 			}
+		}
+		// A body of exactly one parameter typed as a declared wire `type` or
+		// `message` is the whole-body convention (`api POST "/events" ->
+		// postEvent`, `postEvent(msg: ClientMessage)`): the JSON body IS the
+		// DTO/tagged union, not `{"msg": {...}}` — see runtime/apidecl.go's
+		// matching bind-the-whole-body case. Every other body shape keeps the
+		// per-field object it already had.
+		wholeBodyWireType := ""
+		if len(bodyWireParams) == 1 && isWireTypeOrMessage(bodyWireParams[0].Type, g) {
+			wholeBodyWireType = bodyWireParams[0].Type
 		}
 		op := map[string]any{
 			"operationId": a.Action,
@@ -82,12 +98,18 @@ func buildContract(g *ir.IR) map[string]any {
 		if len(params) > 0 {
 			op["parameters"] = params
 		}
-		if len(body) > 0 {
+		if wholeBodyWireType != "" {
+			op["requestBody"] = map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": wireSchema(wholeBodyWireType, false, g, usedEntities)}}}
+		} else if len(body) > 0 {
 			bodySchema := map[string]any{"type": "object", "properties": body}
 			if len(required) > 0 {
 				bodySchema["required"] = required
 			}
-			op["requestBody"] = map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": bodySchema}}}
+			contentType := "application/json"
+			if hasBytesBody {
+				contentType = "multipart/form-data"
+			}
+			op["requestBody"] = map[string]any{"required": true, "content": map[string]any{contentType: map[string]any{"schema": bodySchema}}}
 		}
 		responses := map[string]any{}
 		okResp := map[string]any{"description": http.StatusText(a.Status)}
@@ -140,6 +162,35 @@ func buildContract(g *ir.IR) map[string]any {
 		}
 		schemas[t.Name] = sch
 	}
+	// A `message` is a tagged union: internally tagged on "type" with the
+	// variant's own (snake_case) name as the discriminant value — see
+	// ast.Message's doc. Each variant gets its own named schema (its fields
+	// plus a `type` const), and the message's own name is the oneOf across
+	// them, with an OpenAPI discriminator so a client can dispatch on the
+	// same field the wire actually carries.
+	for _, m := range g.Messages {
+		var variantRefs []map[string]any
+		mapping := map[string]any{}
+		for _, v := range m.Variants {
+			vSchemaName := m.Name + "_" + v.Name
+			props := map[string]any{"type": map[string]any{"type": "string", "enum": []string{v.Name}}}
+			req := []string{"type"}
+			for _, f := range v.Fields {
+				props[f.Name] = wireSchema(f.Type, f.List, g, usedEntities)
+				if !f.Optional {
+					req = append(req, f.Name)
+				}
+			}
+			schemas[vSchemaName] = map[string]any{"type": "object", "properties": props, "required": req}
+			ref := "#/components/schemas/" + vSchemaName
+			variantRefs = append(variantRefs, map[string]any{"$ref": ref})
+			mapping[v.Name] = ref
+		}
+		schemas[m.Name] = map[string]any{
+			"oneOf":         variantRefs,
+			"discriminator": map[string]any{"propertyName": "type", "mapping": mapping},
+		}
+	}
 	for name := range usedEntities {
 		for _, e := range g.Entities {
 			if e.Name != name {
@@ -187,18 +238,42 @@ func buildContract(g *ir.IR) map[string]any {
 	return doc
 }
 
+// isWireTypeOrMessage reports whether name is a declared wire `type` or
+// `message` — the shapes whose own schema IS a request body, not a field
+// wrapped inside one (see buildContract's wholeBodyWireType).
+func isWireTypeOrMessage(name string, g *ir.IR) bool {
+	for _, t := range g.Types {
+		if t.Name == name {
+			return true
+		}
+	}
+	for _, m := range g.Messages {
+		if m.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // wireSchema is the OpenAPI schema of one fct type name.
 func wireSchema(typ string, list bool, g *ir.IR, usedEntities map[string]bool) map[string]any {
 	var sch map[string]any
 	switch typ {
 	case "int", "money", "date":
 		sch = map[string]any{"type": "integer"}
-	case "number":
+	case "float", "number":
 		sch = map[string]any{"type": "number"}
 	case "bool":
 		sch = map[string]any{"type": "boolean"}
 	case "text":
 		sch = map[string]any{"type": "string"}
+	case "datetime":
+		sch = map[string]any{"type": "string", "format": "date-time"}
+	case "bytes":
+		// An action parameter bound from an uploaded file's multipart form
+		// field (see internal/ir/build.go's `bytes`-parameter validation) —
+		// OpenAPI's own convention for a file upload field.
+		sch = map[string]any{"type": "string", "format": "binary"}
 	case "json":
 		sch = map[string]any{"type": "object"}
 	default:

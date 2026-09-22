@@ -99,7 +99,7 @@ func goScalar(core string, enums map[string]bool, isRef bool) string {
 		return core
 	}
 	switch core {
-	case "text", "date":
+	case "text", "date", "datetime":
 		return "string"
 	case "bool":
 		return "bool"
@@ -107,7 +107,7 @@ func goScalar(core string, enums map[string]bool, isRef bool) string {
 		return "int64"
 	case "json":
 		return "json.RawMessage"
-	case "number":
+	case "number", "float":
 		return "float64"
 	}
 	if enums[core] {

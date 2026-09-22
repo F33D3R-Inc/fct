@@ -111,7 +111,7 @@ func TestActionReturnGates(t *testing.T) {
 	cases := []struct{ name, src, want string }{
 		{"value without a return type", "    action f():\n        return 1\n", "declares no return type"},
 		{"bare return with a return type", "    action f() -> int:\n        return\n", "needs a value"},
-		{"proc-only return type", "    action f() -> float:\n        return 1\n", "proc-only type"},
+		{"proc-only return type", "    struct S:\n        x: int\n    action f() -> S:\n        return 1\n", "proc-only type"},
 		{"unknown return type", "    action f() -> Nope:\n        return 1\n", "unknown type"},
 	}
 	for _, c := range cases {

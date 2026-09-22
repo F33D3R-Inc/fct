@@ -63,6 +63,88 @@ func (s *Server) compileAPIs() []compiledAPI {
 	return out
 }
 
+// wholeBodyParam names the single non-path parameter of a's action when its
+// type is a declared wire `type` or `message` and there is exactly one such
+// parameter — the same rule runtime/contract.go's wholeBodyWireType uses for
+// the OpenAPI requestBody, kept in one place logically even though the two
+// call sites can't share code (one walks a compiledAPI, the other an ir.API).
+func wholeBodyParam(a *compiledAPI, g *ir.IR) (string, bool) {
+	inPath := map[string]bool{}
+	for _, name := range a.decl.Params {
+		inPath[name] = true
+	}
+	var bodyParams []ir.Param
+	for _, p := range a.act.Params {
+		if !inPath[p.Name] {
+			bodyParams = append(bodyParams, p)
+		}
+	}
+	if len(bodyParams) != 1 || !isWireTypeOrMessage(bodyParams[0].Type, g) {
+		return "", false
+	}
+	return bodyParams[0].Name, true
+}
+
+// bytesParams is the non-path parameters of a's action typed `bytes` — each
+// one an uploaded file's multipart form field — or nil if there are none.
+func bytesParams(a *compiledAPI) []ir.Param {
+	inPath := map[string]bool{}
+	for _, name := range a.decl.Params {
+		inPath[name] = true
+	}
+	var out []ir.Param
+	for _, p := range a.act.Params {
+		if !inPath[p.Name] && p.Type == "bytes" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// bindMultipartBody parses a multipart/form-data request into bound: each
+// `bytes`-typed parameter is read as a file field (named after the
+// parameter), stored through the same upload mechanism POST /upload uses
+// (runtime/upload.go's storeUpload), and bound to the stored file's public
+// URL — the "path/id" a `bytes` parameter's value actually is at runtime,
+// exactly as an ordinary JSON body parameter is bound to its decoded value.
+// Every other, non-`bytes` parameter is read as an ordinary form value field.
+func (s *Server) bindMultipartBody(w http.ResponseWriter, r *http.Request, a *compiledAPI, bound map[string]any) error {
+	cap := singleUploadCap()
+	r.Body = http.MaxBytesReader(w, r.Body, cap)
+	if err := r.ParseMultipartForm(cap); err != nil {
+		return fmt.Errorf("request body must be multipart/form-data")
+	}
+	inPath := map[string]bool{}
+	for _, name := range a.decl.Params {
+		inPath[name] = true
+	}
+	for _, p := range a.act.Params {
+		if inPath[p.Name] {
+			continue
+		}
+		if p.Type == "bytes" {
+			file, hdr, err := r.FormFile(p.Name)
+			if err != nil {
+				continue // an absent optional file; the caller's "missing parameter" check handles a required one
+			}
+			name, err := s.storeUpload(file, hdr.Filename)
+			file.Close()
+			if err != nil {
+				return err
+			}
+			bound[p.Name] = mediaPathPrefix + name
+			continue
+		}
+		if _, ok := bound[p.Name]; ok {
+			continue
+		}
+		if v := r.FormValue(p.Name); v != "" {
+			bound[p.Name] = v
+		}
+	}
+	return nil
+}
+
 func literalCount(segs []string) int {
 	n := 0
 	for _, s := range segs {
@@ -141,14 +223,37 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 		}
 	}
 	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
-		var body map[string]any
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil && err.Error() != "EOF" {
-			apiError(w, http.StatusBadRequest, "request body must be a JSON object")
-			return true
-		}
-		for k, v := range body {
-			if _, ok := bound[k]; !ok {
-				bound[k] = v
+		if bytesParams(a) != nil {
+			// A `bytes`-typed body parameter uploads a file: the request is
+			// multipart/form-data, not JSON (internal/ir/build.go refuses a
+			// `bytes` parameter on a GET/DELETE route, so POST/PUT/PATCH is
+			// the only case this reaches).
+			if err := s.bindMultipartBody(w, r, a, bound); err != nil {
+				apiError(w, http.StatusBadRequest, err.Error())
+				return true
+			}
+		} else {
+			var body map[string]any
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil && err.Error() != "EOF" {
+				apiError(w, http.StatusBadRequest, "request body must be a JSON object")
+				return true
+			}
+			// A route whose only body-bound parameter is typed as a declared
+			// wire `type` or `message` takes the whole decoded body as that
+			// one parameter's value (the message IS the body — see
+			// runtime/contract.go's matching wholeBodyWireType, the golden
+			// shape a tagged-union mutation endpoint like `POST /events`
+			// wants: one object with its own `type`/discriminant field, not
+			// `{"paramName": {...}}`). Every other route keeps binding the
+			// body's own top-level fields to same-named parameters, unchanged.
+			if name, ok := wholeBodyParam(a, s.ir); ok {
+				bound[name] = body
+			} else {
+				for k, v := range body {
+					if _, ok := bound[k]; !ok {
+						bound[k] = v
+					}
+				}
 			}
 		}
 	}

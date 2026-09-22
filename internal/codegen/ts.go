@@ -87,11 +87,11 @@ func tsFieldType(f ir.WireField, enums map[string]bool) string {
 
 func tsScalar(core string, enums map[string]bool) string {
 	switch core {
-	case "text", "date":
+	case "text", "date", "datetime":
 		return "string"
 	case "bool":
 		return "boolean"
-	case "int", "money", "number":
+	case "int", "money", "number", "float":
 		return "number"
 	case "json":
 		return "unknown"

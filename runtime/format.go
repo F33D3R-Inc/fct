@@ -16,6 +16,16 @@ import (
 // nothing else may set it.
 var clock = time.Now
 
+// iso renders a unix timestamp as an RFC 3339 UTC instant ("2026-09-21T21:40:00Z")
+// — the wire form a `datetime`-typed field/parameter carries (runtime/
+// contract.go's wireSchema emits `format: date-time` for it), the same way
+// `money(n)` renders a `money` int as its own decimal text. `now()` is the
+// int this formats: `iso(now())` is how an action populates a `datetime`
+// field with the current instant.
+func iso(ts int) string {
+	return time.Unix(int64(ts), 0).UTC().Format(time.RFC3339)
+}
+
 // ago renders a unix timestamp relative to now the way a timeline does: "now"
 // under a minute, then "5m", "20h", then a date — "Jun 3" inside the current
 // year, "Jun 3, 2025" outside it. Days are not counted ("3d") because past a day

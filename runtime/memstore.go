@@ -322,7 +322,7 @@ func (s *memStore) Aggregate(query Query, spec AggSpec) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return reduceAgg(spec.Func, rows, fieldValue(spec.Field)), nil
+	return toInt(reduceAgg(spec.Func, rows, fieldValue(spec.Field))), nil
 }
 
 func (s *memStore) AggregateBy(query Query, spec AggSpec, groupBy string, values []any) (map[string]int, error) {
@@ -349,7 +349,7 @@ func (s *memStore) AggregateBy(query Query, spec AggSpec, groupBy string, values
 		grouped[key] = append(grouped[key], r)
 	}
 	for key, rs := range grouped {
-		out[key] = reduceAgg(spec.Func, rs, fieldValue(spec.Field))
+		out[key] = toInt(reduceAgg(spec.Func, rs, fieldValue(spec.Field)))
 	}
 	return out, nil
 }

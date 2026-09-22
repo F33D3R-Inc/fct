@@ -458,8 +458,8 @@ func appFct(p project) string {
 #   facet routes app.fct    every route this app serves
 #   facet inspect app.fct   what it compiles to, and where each piece runs
 #
-# For a real database, point at Postgres or FacetQL and use ` + "`facet run`" + `:
-#   export FACET_DATABASE_URL=postgres://user:pw@localhost:5432/db
+# For durable rows, point at a running FacetQL and use ` + "`facet run`" + `:
+#   export FACET_DATABASE_URL=facetql://<token>@localhost:8080
 #   export FACET_SECRET=$(facet config --gen-secret)
 app ` + p.App + `:
     # Built-in identity: signup/login/logout, the ` + "`actor`" + ` and ` + "`role`" + ` references,
@@ -1041,7 +1041,7 @@ func scaffoldDeploy(app string) error {
 		return err
 	}
 	fmt.Printf("\nfacet: deploy assets ready for %s.\n", app)
-	fmt.Println("one command (app + Postgres):")
+	fmt.Println("one command (app + FacetQL):")
 	fmt.Println("  cp .env.example .env   # set FACET_SECRET (facet config --gen-secret)")
 	fmt.Println("  docker compose up --build")
 	return nil
@@ -1214,7 +1214,17 @@ services:
     # Set this to the FacetQL image you run.
     image: ghcr.io/f33d3r-inc/facetql:latest
     environment:
-      FACETQL_ADMIN_TOKEN: "${FACETQL_ADMIN_TOKEN:?set FACETQL_ADMIN_TOKEN in deploy/.env}"
+      # Two identities: the admin token (migrate only) and the app token
+      # (serve). FacetQL reads them as token:owner[:admin], comma-separated.
+      FACETQL_TOKENS: "${FACETQL_ADMIN_TOKEN:?set FACETQL_ADMIN_TOKEN in deploy/.env}:admin:admin,${FACETQL_APP_TOKEN:?set FACETQL_APP_TOKEN in deploy/.env}:app"
+      # Rows are encrypted at rest under this key; FacetQL refuses to start
+      # in production without one.
+      FACETQL_MASTER_KEY: "${FACETQL_MASTER_KEY:?set FACETQL_MASTER_KEY in deploy/.env — openssl rand -hex 32}"
+      FACETQL_ENV: production
+      # Plaintext HTTP is acknowledged only because this port is reachable
+      # solely on the compose network; FacetQL is not published to the host.
+      FACETQL_ALLOW_PLAINTEXT: "1"
+      FACETQL_DATA_DIR: /data
     volumes:
       - facetql-data:/data
     restart: unless-stopped
@@ -1338,16 +1348,21 @@ func prodEnvExample(d deployment) string {
 # every session and makes @secret columns unreadable, so set it once and keep it.
 FACET_SECRET=
 
-# Where the rows live. FacetQL is the stack's own datastore; Postgres also works
-# (postgres://user:pw@host:5432/db). Without this the app connects to
-# facetql://localhost:8080, which does not exist inside a container.
+# Where the rows live: the FacetQL instance. Without this the app connects to
+# facetql://localhost:8080, which does not exist inside a container. The compose
+# file derives it from the tokens below; set it here for the systemd path.
 FACET_DATABASE_URL=facetql://localhost:8080
 
 # Two FacetQL identities, on purpose: the admin token declares indexes and
 # cascade rules (` + d.Binary + ` migrate), the app token only reads and writes rows.
 # Serving with the admin token is credential excess and doctor reports it.
+# Mint each with:  openssl rand -hex 32
 FACETQL_ADMIN_TOKEN=
 FACETQL_APP_TOKEN=
+
+# FacetQL encrypts rows at rest under this key and refuses to start in
+# production without it. Mint with:  openssl rand -hex 32
+FACETQL_MASTER_KEY=
 
 # This process serves plain HTTP; terminate TLS in front of it and leave this at
 # 1 so the session cookie is never sent over a plaintext hop.
@@ -1388,49 +1403,49 @@ facet-uploads
 .env
 `
 
-const dockerCompose = `# One-command stack: the app plus its Postgres.
+const dockerCompose = `# One-command stack: the app plus its FacetQL.
 #   cp .env.example .env          # then set FACET_SECRET (facet config --gen-secret)
 #   docker compose up --build
 services:
-  db:
-    image: postgres:16-alpine
+  facetql:
+    # The FacetQL engine image — set it to the one your organization publishes.
+    image: ghcr.io/f33d3r-inc/facetql:latest
     environment:
-      POSTGRES_USER: facet
-      POSTGRES_PASSWORD: facet
-      POSTGRES_DB: facet
+      # Development posture: plaintext HTTP inside the compose network and a
+      # dev master key are fine here. Production is facet deploy --production.
+      FACETQL_ENV: development
+      FACETQL_ALLOW_PLAINTEXT: "1"
+      # token:owner[:admin] — the app connects with this token (below).
+      FACETQL_TOKENS: "facet-dev-token:facet:admin"
+      FACETQL_DATA_DIR: /data
     volumes:
-      - facet-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U facet"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
+      - facetql-data:/data
 
   app:
     build: .
     depends_on:
-      db:
-        condition: service_healthy
+      - facetql
     environment:
-      FACET_DATABASE_URL: postgres://facet:facet@db:5432/facet?sslmode=disable
+      FACET_DATABASE_URL: facetql://facet-dev-token@facetql:8080
       # Quoted: the value contains a colon, which would otherwise end the scalar.
       FACET_SECRET: "${FACET_SECRET:?set FACET_SECRET in .env — mint one with facet config --gen-secret}"
       FACET_SECURE_COOKIES: "0"
     ports:
       - "7373:7373"
+    restart: on-failure
 
 volumes:
-  facet-data:
+  facetql-data:
 `
 
 const envExample = `# Copy to .env (git-ignored). Real environment variables always override these.
 # Mint a strong secret:  facet config --gen-secret
 FACET_SECRET=
 
-# Where the data lives. Unset, the dev tools use an in-memory store; ` + "`facet run`" + `
-# needs a real one. FacetQL is the stack's own datastore; Postgres also works:
-#   FACET_DATABASE_URL=facetql://localhost:8080
-FACET_DATABASE_URL=postgres://facet:facet@localhost:5432/facet?sslmode=disable
+# Where the rows live. Unset, the dev tools use an in-memory store; ` + "`facet run`" + `
+# needs a running FacetQL: facetql://[token@]host:port. The token is whatever
+# FACETQL_TOKENS names on the engine (token:owner[:admin]).
+FACET_DATABASE_URL=facetql://facet-dev-token@localhost:8080
 
 # Set to 1 behind TLS in production so session cookies are HTTPS-only:
 FACET_SECURE_COOKIES=0

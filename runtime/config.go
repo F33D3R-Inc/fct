@@ -85,9 +85,9 @@ func ResolveConfig() Config {
 func (c Config) Warnings() []string {
 	var w []string
 	if c.DatabaseURL == "" {
-		w = append(w, "FACET_DATABASE_URL is not set — `facet run` needs Postgres (only the dev tools work without it).")
-	} else if !strings.HasPrefix(c.DatabaseURL, "postgres") {
-		w = append(w, "FACET_DATABASE_URL is not a postgres:// URL.")
+		w = append(w, "FACET_DATABASE_URL is not set — `facet run` connects to facetql://localhost:8080, which does not exist inside a container (the dev tools work without it).")
+	} else if !strings.HasPrefix(c.DatabaseURL, "facetql://") {
+		w = append(w, "FACET_DATABASE_URL is not a facetql:// URL — FacetQL is the only datastore; use facetql://[token@]host:port.")
 	}
 	if c.Secret == "" {
 		w = append(w, "FACET_SECRET is not set — cookies, MFA secrets and encrypted columns ride an ephemeral key that does not survive a restart. Set one with `facet config --gen-secret`.")
@@ -155,7 +155,8 @@ func redact(s string) string {
 	return s[:3] + "…" + "(set)"
 }
 
-// redactURL hides the password in a Postgres URL while showing host/db.
+// redactURL hides the credential in a datastore URL (the token in
+// facetql://token@host:port) while showing the host.
 func redactURL(u string) string {
 	if u == "" {
 		return ""

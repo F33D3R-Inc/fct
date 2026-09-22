@@ -1659,6 +1659,90 @@ func parseActionBody(children []*source.Node, ctx string) ([]ast.Stmt, error) {
 				return nil, &Error{c.Line.No, "for has no body"}
 			}
 			body = append(body, ast.ForStmt{Range: rg, Body: kids, Line: c.Line.No})
+		case strings.HasPrefix(t, "match "):
+			// `match <expr>: case "value": ... [else: ...]` in an action body —
+			// dispatch over a message parameter's variant discriminant (or any
+			// other value). Desugared straight into a nested ast.IfStmt chain
+			// right here, at parse time: every case becomes `if <expr> ==
+			// "value": ... else: <next case, or the else body>`, comparing by
+			// the same stringified equality the view-level `match`/`case`
+			// already compiles down to (case.go's caseValue: a case value is
+			// always the constant's decimal text). That means zero new IR or
+			// runtime code — internal/ir/build.go's existing ast.IfStmt case
+			// and both runtimes' existing "if" op already do the rest, exactly
+			// as they do for a hand-written if/else if/else chain.
+			//
+			// An action match requires an explicit `else`, unlike the view
+			// form: a message's variants are not an enum the compiler can
+			// prove exhaustive coverage against (see ast.Message's doc), so
+			// unconditional exhaustiveness would mean a variant added
+			// elsewhere silently breaks every existing dispatch — the
+			// required default arm is the safer, and simpler, contract.
+			matchExprS := strings.TrimSuffix(strings.TrimSpace(t[len("match "):]), ":")
+			if matchExprS == "" {
+				return nil, &Error{c.Line.No, "match needs a value: match <expr>:"}
+			}
+			if !strings.HasSuffix(strings.TrimSpace(t), ":") {
+				return nil, &Error{c.Line.No, "a `match` in an action takes a block: end the line with `:` and indent its cases under it"}
+			}
+			matchExpr, err := parseExpr(matchExprS, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			type matchArm struct {
+				val  string
+				body []ast.Stmt
+			}
+			var arms []matchArm
+			var elseBody []ast.Stmt
+			haveElse := false
+			seenVals := map[string]bool{}
+			for _, cc := range c.Children {
+				ct := strings.TrimSpace(cc.Line.Text)
+				switch {
+				case strings.HasPrefix(ct, "case "):
+					val, err := caseValue(strings.TrimSuffix(strings.TrimSpace(ct[len("case "):]), ":"), cc.Line.No)
+					if err != nil {
+						return nil, err
+					}
+					if seenVals[val] {
+						return nil, &Error{cc.Line.No, fmt.Sprintf("duplicate match case %q", val)}
+					}
+					seenVals[val] = true
+					armBody, err := parseActionBody(cc.Children, "a match case body")
+					if err != nil {
+						return nil, err
+					}
+					if len(armBody) == 0 {
+						return nil, &Error{cc.Line.No, "match case has no body"}
+					}
+					arms = append(arms, matchArm{val, armBody})
+				case ct == "else:" || ct == "else":
+					body2, err := parseActionBody(cc.Children, "a match else body")
+					if err != nil {
+						return nil, err
+					}
+					if len(body2) == 0 {
+						return nil, &Error{cc.Line.No, "match else has no body"}
+					}
+					elseBody = body2
+					haveElse = true
+				default:
+					return nil, &Error{cc.Line.No, `match children must be cases: case "value": (or else:)`}
+				}
+			}
+			if len(arms) == 0 {
+				return nil, &Error{c.Line.No, "match needs at least one `case`"}
+			}
+			if !haveElse {
+				return nil, &Error{c.Line.No, "match in an action must be exhaustive: add an `else` branch (an action's match has no enum-exhaustiveness proof, so the default arm is required)"}
+			}
+			chain := elseBody
+			for i := len(arms) - 1; i >= 0; i-- {
+				eq := ast.Bin{Op: "==", L: matchExpr, R: ast.Lit{Kind: "text", Val: arms[i].val}}
+				chain = []ast.Stmt{ast.IfStmt{Cond: eq, Then: arms[i].body, Else: chain, Line: c.Line.No}}
+			}
+			body = append(body, chain[0])
 		case strings.HasPrefix(t, "if "):
 			condS := strings.TrimSuffix(strings.TrimSpace(t[len("if "):]), ":")
 			if condS == "" {
@@ -4868,7 +4952,7 @@ func firstWord(s string) string {
 // float check. See LANGUAGE.md's `proc` section for the full design.
 func isType(s string) bool {
 	switch s {
-	case "int", "text", "bool", "money", "date", "float":
+	case "int", "text", "bool", "money", "date", "float", "bytes", "datetime":
 		return true
 	}
 	return false

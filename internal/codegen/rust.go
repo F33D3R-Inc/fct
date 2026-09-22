@@ -166,10 +166,12 @@ func rustScalar(core string, enums map[string]bool, isRef bool) string {
 		return core // another generated struct/enum, referenced by name
 	}
 	switch core {
-	case "text":
+	case "text", "datetime":
 		return "String"
 	case "bool":
 		return "bool"
+	case "float":
+		return "f64"
 	case "int", "money":
 		// The wire schema has no bit-width concept (JSON numbers don't have
 		// one); a real cutover narrows a specific field further (e.g.

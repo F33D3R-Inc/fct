@@ -4201,6 +4201,21 @@ func coerceParam(v any, typ string) (any, bool) {
 				return nil, false
 			}
 		}
+	case "float":
+		switch t := v.(type) {
+		case nil:
+			return zero(typ), true
+		case string:
+			return floatArg(t)
+		case []byte:
+			return floatArg(string(t))
+		case bool, map[string]any, []any:
+			return nil, false
+		default:
+			if _, isNum := numeric(v); !isNum {
+				return nil, false
+			}
+		}
 	case "bool", "text":
 		switch v.(type) {
 		case map[string]any, []any:
@@ -4209,6 +4224,20 @@ func coerceParam(v any, typ string) (any, bool) {
 	}
 
 	return coerce(v, typ), true
+}
+
+// floatArg interprets a float parameter that arrived as text: blank is the
+// zero, anything that is not a decimal number is a refusal.
+func floatArg(s string) (any, bool) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0.0, true
+	}
+	f, err := strconv.ParseFloat(t, 64)
+	if err != nil {
+		return nil, false
+	}
+	return f, true
 }
 
 // numericArg interprets a numeric parameter that arrived as text. Blank is an
@@ -4243,7 +4272,12 @@ func coerce(v any, typ string) any {
 		return toFloat(v)
 	case "bool":
 		return truthy(v)
-	case "text":
+	case "text", "datetime":
+		// `datetime` is stored and passed exactly like `text`: an RFC 3339
+		// string the author already formatted (`iso(now())`), never coerced
+		// from a raw number the way int/money/date are — a mis-typed int
+		// here just decimal-stringifies (an author error, not caught here,
+		// the same way an unformatted int caught nothing on any other type).
 		return toStr(v)
 	default:
 		// an enum (already text) or an entity-typed value (a row record) — pass it

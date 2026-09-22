@@ -1,5 +1,5 @@
 # One-command demo stack for the Facet toolchain: builds the image and serves the
-# bundled Chirp example against a Postgres container.
+# bundled Chirp example against a FacetQL container — the stack's own datastore.
 #
 #   docker compose up --build
 #   open http://localhost:7373
@@ -7,34 +7,34 @@
 # Point the `app` service's volume at your own .fct to run a different app, and
 # set FACET_SECRET in the environment (or a .env file) for a real deployment.
 services:
-  db:
-    image: postgres:16-alpine
+  facetql:
+    # Built from the sibling engine checkout (facetql/Dockerfile).
+    build: ../facetql
     environment:
-      POSTGRES_USER: facet
-      POSTGRES_PASSWORD: facet
-      POSTGRES_DB: facet
+      # Development posture: plaintext HTTP inside the compose network and a
+      # dev master key are acceptable here, and nowhere else.
+      FACETQL_ENV: development
+      FACETQL_ALLOW_PLAINTEXT: "1"
+      # token:owner[:admin] — the app connects with this token (below).
+      FACETQL_TOKENS: "facet-dev-token:facet:admin"
+      FACETQL_DATA_DIR: /data
     volumes:
-      - facet-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U facet"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
+      - facetql-data:/data
 
   app:
     build: .
     command: ["run", "/app/app.fct", "0.0.0.0:7373"]
     depends_on:
-      db:
-        condition: service_healthy
+      - facetql
     environment:
-      FACET_DATABASE_URL: postgres://facet:facet@db:5432/facet?sslmode=disable
+      FACET_DATABASE_URL: facetql://facet-dev-token@facetql:8080
       FACET_SECRET: ${FACET_SECRET:-dev-secret-change-me-0000000000000000000000000000}
       FACET_SECURE_COOKIES: "0"
     volumes:
       - ./examples/chirp.fct:/app/app.fct:ro
     ports:
       - "7373:7373"
+    restart: on-failure
 
 volumes:
-  facet-data:
+  facetql-data:

@@ -731,7 +731,7 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 				delete(scope, e.Var)
 			}
 		}()
-		return reduceAgg(e.Op, rows, func(r any) (int, bool) {
+		return reduceAgg(e.Op, rows, func(r any) (any, bool) {
 			m, ok := r.(record)
 			if !ok {
 				return 0, false
@@ -742,7 +742,7 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 			// still, so a nested aggregate or lookup inside it has no address
 			// of its own and must be computed for the row that is bound rather
 			// than read back from the one the first row wrote.
-			return toInt(evalPerRow(e.Sel, scope)), true
+			return numValue(evalPerRow(e.Sel, scope)), true
 		})
 	}
 }
@@ -753,14 +753,24 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 // A row that is not a record contributes nothing and is not counted, which is
 // what keeps `avg`'s divisor honest when a collection holds something that is
 // not a row at all.
-func fieldValue(field string) func(row any) (int, bool) {
-	return func(r any) (int, bool) {
+func fieldValue(field string) func(row any) (any, bool) {
+	return func(r any) (any, bool) {
 		m, ok := r.(record)
 		if !ok {
 			return 0, false
 		}
-		return toInt(m[field]), true
+		return numValue(m[field]), true
 	}
+}
+
+// numValue keeps a float64 as the float it is and folds everything else to
+// int, so a reduction over a float column stays float and one over an int
+// column stays int.
+func numValue(v any) any {
+	if isFloatVal(v) {
+		return v
+	}
+	return toInt(v)
 }
 
 // reduceAgg folds rows to the value `sum`/`avg`/`min`/`max` reduces them to.
@@ -794,26 +804,66 @@ func fieldValue(field string) func(row any) (int, bool) {
 // reduce a stored column, hands in the first and never has to know about the
 // second. Returning false means the row contributes nothing AND is not counted,
 // so it stays out of `avg`'s divisor.
-func reduceAgg(op string, rows []any, value func(row any) (int, bool)) int {
+func reduceAgg(op string, rows []any, value func(row any) (any, bool)) any {
+	// Int arithmetic unless a float value appears, after which the fold is
+	// float — the same int-or-float dispatch applyBin makes per operation.
 	total, n := 0, 0
 	var lo, hi int
+	ftotal, flo, fhi := 0.0, 0.0, 0.0
+	isFloat := false
 	for _, r := range rows {
 		v, ok := value(r)
 		if !ok {
 			continue
 		}
-		if n == 0 {
-			lo, hi = v, v
-		} else {
-			if v < lo {
-				lo = v
+		if !isFloat && isFloatVal(v) {
+			isFloat = true
+			ftotal, flo, fhi = float64(total), float64(lo), float64(hi)
+		}
+		if isFloat {
+			f := toFloat(v)
+			if n == 0 {
+				flo, fhi = f, f
+			} else {
+				if f < flo {
+					flo = f
+				}
+				if f > fhi {
+					fhi = f
+				}
 			}
-			if v > hi {
-				hi = v
+			ftotal += f
+			n++
+			continue
+		}
+		i := toInt(v)
+		if n == 0 {
+			lo, hi = i, i
+		} else {
+			if i < lo {
+				lo = i
+			}
+			if i > hi {
+				hi = i
 			}
 		}
-		total += v
+		total += i
 		n++
+	}
+	if isFloat {
+		switch op {
+		case "avg":
+			if n == 0 {
+				return 0.0
+			}
+			return ftotal / float64(n)
+		case "min":
+			return flo
+		case "max":
+			return fhi
+		default:
+			return ftotal
+		}
 	}
 	switch op {
 	case "avg":
@@ -1427,6 +1477,8 @@ func callBuiltin(name string, argVals []any) any {
 		return slug(toStr(arg(0)))
 	case "ago":
 		return ago(toInt(arg(0)), int(clock().Unix()))
+	case "iso":
+		return iso(toInt(arg(0)))
 	case "compact":
 		return compact(toInt(arg(0)))
 	case "commas":

@@ -52,25 +52,36 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-
-	if err := os.MkdirAll(s.uploadDir, 0o755); err != nil {
-		http.Error(w, "cannot store upload", http.StatusInternalServerError)
-		return
-	}
-	name := randomName() + safeExt(hdr.Filename)
-	dst, err := os.Create(filepath.Join(s.uploadDir, name))
+	name, err := s.storeUpload(file, hdr.Filename)
 	if err != nil {
-		http.Error(w, "cannot store upload", http.StatusInternalServerError)
-		return
-	}
-	defer dst.Close()
-	if _, err := io.Copy(dst, file); err != nil {
-		http.Error(w, "write failed", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	// The client stores the durable reference and previews through the grant
 	// beside it; a signature is never what lands in a row (see writeUploaded).
 	writeUploaded(w, name)
+}
+
+// storeUpload writes an uploaded file's content to the upload directory under
+// a random, collision-free name (keeping the original extension) and returns
+// that stored name — the one piece handleUpload and a `bytes`-typed `api`
+// route parameter (runtime/apidecl.go's bindMultipartBody) both need, so
+// there is exactly one place that mints a stored upload's name and writes its
+// bytes to disk.
+func (s *Server) storeUpload(file io.Reader, filename string) (string, error) {
+	if err := os.MkdirAll(s.uploadDir, 0o755); err != nil {
+		return "", fmt.Errorf("cannot store upload")
+	}
+	name := randomName() + safeExt(filename)
+	dst, err := os.Create(filepath.Join(s.uploadDir, name))
+	if err != nil {
+		return "", fmt.Errorf("cannot store upload")
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, file); err != nil {
+		return "", fmt.Errorf("write failed")
+	}
+	return name, nil
 }
 
 // handleUploads serves a stored upload by name, read-only. It refuses any name

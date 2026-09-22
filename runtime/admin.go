@@ -345,6 +345,12 @@ func adminInput(f ir.Field, cur any) string {
 			v = itoa(toInt(cur))
 		}
 		return fmt.Sprintf(`<input type="number" name="%s" value="%s">`, html.EscapeString(f.Name), html.EscapeString(v))
+	case f.Type == "float":
+		v := ""
+		if cur != nil {
+			v = toStr(cur)
+		}
+		return fmt.Sprintf(`<input type="number" step="any" name="%s" value="%s">`, html.EscapeString(f.Name), html.EscapeString(v))
 	default:
 		return fmt.Sprintf(`<input type="text" name="%s" value="%s">`, html.EscapeString(f.Name), html.EscapeString(toStr(cur)))
 	}

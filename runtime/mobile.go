@@ -79,6 +79,8 @@ func swiftType(f ir.Field) string {
 	switch {
 	case f.IsRelation() || f.Type == "int" || f.Type == "money" || f.Type == "date":
 		return "Int"
+	case f.Type == "float":
+		return "Double"
 	case f.Type == "bool":
 		return "Bool"
 	default:
@@ -147,6 +149,8 @@ func swiftParams(ps []ir.Param) string {
 		switch p.Type {
 		case "int", "money", "date":
 			t = "Int"
+		case "float":
+			t = "Double"
 		case "bool":
 			t = "Bool"
 		}
@@ -169,6 +173,8 @@ func kotlinType(f ir.Field) string {
 	switch {
 	case f.IsRelation() || f.Type == "int" || f.Type == "money" || f.Type == "date":
 		return "Long"
+	case f.Type == "float":
+		return "Double"
 	case f.Type == "bool":
 		return "Boolean"
 	default:
@@ -220,7 +226,7 @@ func kotlinClient(graph *ir.IR, ents []ir.Entity, acts []ir.Action) string {
 
 func tsType(f ir.Field) string {
 	switch {
-	case f.IsRelation() || f.Type == "int" || f.Type == "money" || f.Type == "date":
+	case f.IsRelation() || f.Type == "int" || f.Type == "money" || f.Type == "date" || f.Type == "float":
 		return "number"
 	case f.Type == "bool":
 		return "boolean"
@@ -272,7 +278,7 @@ func tsClient(graph *ir.IR, ents []ir.Entity, acts []ir.Action) string {
 
 func tsParamType(p ir.Param) string {
 	switch p.Type {
-	case "int", "money", "date":
+	case "int", "money", "date", "float":
 		return "number"
 	case "bool":
 		return "boolean"

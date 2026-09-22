@@ -222,9 +222,6 @@ func Build(app *ast.App) (*IR, error) {
 			if _, dup := fields[f.Name]; dup {
 				return nil, &BuildError{f.Line, fmt.Sprintf("record %q has duplicate field %q", rc.Name, f.Name)}
 			}
-			if f.Type == "float" {
-				return nil, &BuildError{f.Line, fmt.Sprintf("record field %q: float is only supported inside a proc body (a parameter, a `let`/`let mut` local, or a return type) — not yet in a record, which a service reply may carry across the wire", f.Name)}
-			}
 			// A record is flat: its field is a primitive or an enum, never another
 			// record or an entity — so `v.field` is always a single-level, typed read.
 			if !isPrimitive(f.Type) {
@@ -315,8 +312,6 @@ func Build(app *ast.App) (*IR, error) {
 			wf.Default = *f.Default
 		}
 		switch {
-		case f.Type == "float":
-			return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q field %q: float is only supported inside a proc body — not yet on a wire type/message, which has no float encoding", declName, f.Name)}
 		case f.Type == "json", f.Type == "number", isPrimitive(f.Type):
 			// inline scalar
 		case wireNames[f.Type]:
@@ -523,10 +518,6 @@ func Build(app *ast.App) (*IR, error) {
 				}
 				continue
 			}
-			if f.Type == "float" {
-				return nil, &BuildError{0, fmt.Sprintf(
-					"field %q: float is only supported inside a proc body (a parameter, a `let`/`let mut` local, or a return type) — not yet on an entity, which has no database column type for it", f.Name)}
-			}
 			if !e.entities[f.Type] {
 				return nil, &BuildError{0, fmt.Sprintf(
 					"field %q has unknown type %q (use int, text, bool, or an entity name)", f.Name, f.Type)}
@@ -565,9 +556,6 @@ func Build(app *ast.App) (*IR, error) {
 		core := s.Type
 		if s.List {
 			core = s.Elem
-		}
-		if core == "float" {
-			return nil, &BuildError{s.Line, fmt.Sprintf("state %q: float is only supported inside a proc body (a parameter, a `let`/`let mut` local, or a return type) — not yet on state, which has no client-side (assets/facet.js) representation for it", s.Name)}
 		}
 		if !isPrimitive(core) {
 			if _, isEnum := e.enums[core]; !isEnum {
@@ -765,9 +753,6 @@ func Build(app *ast.App) (*IR, error) {
 				return nil, &BuildError{cm.Line, fmt.Sprintf("component %q has duplicate parameter %q", cm.Name, p.Name)}
 			}
 			pseen[p.Name] = true
-			if p.Type == "float" {
-				return nil, &BuildError{cm.Line, fmt.Sprintf("component %q parameter %q: float is only supported inside a proc body — not yet on a component parameter, which assets/facet.js may also have to render", cm.Name, p.Name)}
-			}
 			// A cell parameter names a state cell, so its declared type is the cell's
 			// type and must be one the language has.
 			if p.Ref == ast.RefCell && !isPrimitive(p.Type) {
@@ -859,9 +844,6 @@ func Build(app *ast.App) (*IR, error) {
 			// A declared return type must resolve: a primitive, an enum, or a record
 			// (the structured-reply case). A bare capitalized name the parser accepted
 			// is only valid here if it names a real record/enum.
-			if op.Ret == "float" {
-				return nil, &BuildError{op.Line, fmt.Sprintf("%s.%s: float is only supported inside a proc body — a service op cannot return one, since its JSON reply crosses the wire and a `let`-bound service result is usable from an action, which floats are not", sv.Name, op.Name)}
-			}
 			if op.Ret != "" && !isPrimitive(op.Ret) {
 				_, isEnum := e.enums[op.Ret]
 				_, isRec := e.records[op.Ret]
@@ -921,11 +903,7 @@ func Build(app *ast.App) (*IR, error) {
 		if _, dup := e.services[p.Name]; dup {
 			return nil, &BuildError{p.Line, fmt.Sprintf("proc %q collides with a service name", p.Name)}
 		}
-		// A proc's return type may additionally be "float" — the one type
-		// position in the language where float is real (see isPrimitive's doc
-		// and LANGUAGE.md's `proc` section): a proc is unconditionally
-		// server-executed, so it has no client mirror to disagree with.
-		if p.Ret != "" && p.Ret != "float" && !isPrimitive(p.Ret) {
+		if p.Ret != "" && !isPrimitive(p.Ret) {
 			_, isEnum := e.enums[p.Ret]
 			_, isRec := e.records[p.Ret]
 			_, isStruct := e.structs[p.Ret]
@@ -1138,6 +1116,21 @@ func Build(app *ast.App) (*IR, error) {
 				pathParams = append(pathParams, name)
 			} else if strings.ContainsAny(seg, "{}") {
 				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: a path parameter is a whole segment, {name}", ap.Method, ap.Path)}
+			}
+		}
+		// A `bytes`-typed parameter (see isPrimitive's doc: legal on an action
+		// parameter only) is bound from an uploaded file's multipart form
+		// field (runtime/apidecl.go's bindMultipartBody) — meaningless on a
+		// GET/DELETE route, which carries no request body at all.
+		if ap.Method == "GET" || ap.Method == "DELETE" {
+			inPathParam := map[string]bool{}
+			for _, name := range pathParams {
+				inPathParam[name] = true
+			}
+			for _, p := range act.Params {
+				if p.Type == "bytes" && !inPathParam[p.Name] {
+					return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: action %q has a `bytes` parameter %q, which uploads a file — GET and DELETE carry no request body to upload it in", ap.Method, ap.Path, ap.Action, p.Name)}
+				}
 			}
 		}
 		status := ap.Status
@@ -1846,10 +1839,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	act := Action{Name: a.Name}
 	if a.Ret != "" {
 		// A reply value's type: a primitive, an entity (the reply is a row),
-		// or a wire type (a DTO). A proc-only type (struct, float) has no wire
-		// form and is refused the way a float action parameter is.
-		if a.Ret == "float" || e.structs[a.Ret] != nil {
-			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q returns %s, a proc-only type with no wire form — return int/text/bool/money/date, an entity row, or a wire `type`", a.Name, a.Ret)}
+		// or a wire type (a DTO). A struct is proc-local and has no wire form.
+		if e.structs[a.Ret] != nil {
+			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q returns %s, a proc-only type with no wire form — return a primitive, an entity row, or a wire `type`", a.Name, a.Ret)}
 		}
 		if !isPrimitive(a.Ret) && !e.entities[a.Ret] && !e.wireTypes[a.Ret] && e.records[a.Ret] == nil {
 			if _, isEnum := e.enums[a.Ret]; !isEnum {
@@ -1866,25 +1858,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	paramSet := map[string]bool{}   // this action's parameter names
 	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true, "session": true}
 	for _, p := range a.Params {
-		// An action's parameter arrives over HTTP (a form post, a JSON body, a
-		// route parameter) and its value is then a plain reference usable
-		// anywhere in the body — checkNoFloat (called from check(), below)
-		// only catches a float LITERAL or a toFloat() call by its syntactic
-		// shape, not a reference to a parameter that merely happens to be
-		// float-typed, so that path has to be closed here instead, at the
-		// one place an action's own parameter list is built. (Every other
-		// scalar type is unvalidated here today — a pre-existing gap outside
-		// this feature's scope — but float specifically needs its own gate:
-		// unlike a bogus/unknown type name, which coerce/coerceParam already
-		// handle by leaving the value untouched, "float" is a type this
-		// runtime DOES know how to coerce (coerce's own "float" case), so
-		// without this check a float-typed action parameter would silently
-		// work at the boundary and only misbehave later, e.g. `text "{x}"`
-		// truncating it via toStr's float64 case.)
-		if p.Type == "float" {
-			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q parameter %q: float is only supported inside a proc body — not yet on an action parameter, which arrives from an HTTP request and may be re-evaluated by the client", a.Name, p.Name)}
-		}
-		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type})
+		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type, Optional: p.Optional, List: p.List})
 		loc[p.Name] = true
 		paramSet[p.Name] = true
 	}
@@ -2237,9 +2211,6 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				if st.Bind != "" {
 					if sig.ret == "" {
 						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type (`proc %s(...) -> Type`) to bind it", st.Proc, st.Proc)}
-					}
-					if sig.ret == "float" {
-						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns float, which is only usable inside another proc — an action cannot bind it (no client-side representation exists for a float; see LANGUAGE.md's `proc` section). Convert it inside the proc first (e.g. `return round(x)`) and give %q an int/text/bool/money/date return type instead", st.Proc, st.Proc)}
 					}
 					if e.structs[sig.ret] != nil {
 						return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns %s, a struct type usable only inside another proc — an action cannot bind it (structs are proc-local values, with no schema/wire representation yet; see LANGUAGE.md's `proc` section). Read its fields inside the proc and give %q a scalar/list return type instead", st.Proc, sig.ret, st.Proc)}
@@ -5529,9 +5500,6 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 	if err := checkNoIndex(ex, e.wireTypes, line); err != nil {
 		return err
 	}
-	if err := checkNoFloat(ex, line); err != nil {
-		return err
-	}
 	if err := checkNoIO(ex, line); err != nil {
 		return err
 	}
@@ -5769,92 +5737,6 @@ func checkNoIndex(ex ast.Expr, wire map[string]bool, line int) error {
 	return nil
 }
 
-// checkNoFloat rejects a float literal (`3.14`) or a `toFloat(...)`/
-// `floatFromBits(...)` call — both float-producing — anywhere outside a proc
-// body, the same way checkNoBitwise rejects a bitwise
-// operator there and for the same underlying reason: a float value has
-// exactly one interpreter today, runtime/eval.go's applyBin/evalInFrame/
-// callBuiltin, which only ever runs on the server — assets/facet.js has no
-// float-typed state, no wire encoding for one, and would either silently
-// truncate it (toStr's existing float64 case, kept for an unrelated reason —
-// see its doc) or diverge outright. An action or view expression may be
-// placed on, or re-evaluated by, the client, so a float reaching one there
-// would be exactly the kind of server/browser disagreement checkNoBitwise
-// already exists to rule out for bitwise operators.
-//
-// This is a syntactic barrier (like checkNoBitwise/checkNoIndex), not a
-// value-flow one: it stops a float from ever being *written* into
-// action/view/policy/derive source, which combined with the proc-return
-// check in action() (an action's `do` cannot bind a float-returning proc's
-// result — see its own doc) means a float value can never reach eval()'s flat
-// scope map at all. checkProcExpr (proc bodies) never calls check(), so a
-// proc may use float literals and toFloat() freely.
-func checkNoFloat(ex ast.Expr, line int) error {
-	switch t := ex.(type) {
-	case ast.Lit:
-		if t.Kind == "float" {
-			return &BuildError{line, "a float literal is only available inside a proc — a proc always runs on the server, but this expression may run on the client too, and the client has no float representation (see LANGUAGE.md's `proc` section)"}
-		}
-	case ast.Call:
-		if t.Name == "toFloat" || t.Name == "floatFromBits" {
-			return &BuildError{line, fmt.Sprintf("%s(...) is only available inside a proc — it produces a float, which is only available inside a proc (see LANGUAGE.md's `proc` section)", t.Name)}
-		}
-		for _, a := range t.Args {
-			if err := checkNoFloat(a, line); err != nil {
-				return err
-			}
-		}
-	case ast.Bin:
-		if err := checkNoFloat(t.L, line); err != nil {
-			return err
-		}
-		return checkNoFloat(t.R, line)
-	case ast.Un:
-		return checkNoFloat(t.X, line)
-	case ast.Get:
-		return checkNoFloat(t.Obj, line)
-	case ast.EntityGet:
-		return checkNoFloat(t.Key, line)
-	case ast.ListLit:
-		for _, el := range t.Elems {
-			if err := checkNoFloat(el, line); err != nil {
-				return err
-			}
-		}
-	case ast.MapLit:
-		// Reachable only via checkNoIndex's own error for the map literal
-		// itself; walked anyway so a float nested inside one that somehow got
-		// this far is still caught, the same defensive-depth stance
-		// checkNoBitwise takes for the same node kind.
-		for i, k := range t.Keys {
-			if err := checkNoFloat(k, line); err != nil {
-				return err
-			}
-			if err := checkNoFloat(t.Vals[i], line); err != nil {
-				return err
-			}
-		}
-	case ast.StructLit:
-		// Reachable only via checkNoIndex's own error for the struct literal
-		// itself; walked anyway for the same defensive-depth reason as MapLit.
-		for _, fi := range t.Fields {
-			if err := checkNoFloat(fi.Expr, line); err != nil {
-				return err
-			}
-		}
-	case ast.Index:
-		if err := checkNoFloat(t.Obj, line); err != nil {
-			return err
-		}
-		return checkNoFloat(t.Idx, line)
-	case ast.Agg:
-		if err := checkNoFloat(t.Where, line); err != nil {
-			return err
-		}
-		return checkNoFloat(t.Sel, line)
-	}
-	return nil
-}
 
 // ioBuiltins is the set of capability-gated I/O builtins (see builtinCapability)
 // — proc-only, the same way bitwise operators and float are, and for the same
@@ -6580,7 +6462,7 @@ func requireProcCapability(p *ast.Proc, cap, what string, line int) error {
 func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
-		"ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney", "slug",
+		"ago", "compact", "commas", "iso", "bytes", "toFloat", "toInt", "toMoney", "slug",
 		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits":
 		return 1, true
 	case "print":
@@ -6618,7 +6500,7 @@ func pureBuiltinArity(name string) (int, bool) {
 // caller keeps rejecting it unchanged.
 func isPrimitive(t string) bool {
 	switch t {
-	case "int", "text", "bool", "money", "date":
+	case "int", "text", "bool", "money", "date", "float", "datetime":
 		return true
 	}
 	return false

@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -48,22 +47,11 @@ func apiCall(t *testing.T, c *http.Client, url, body string) (map[string]any, in
 	return out, res.StatusCode
 }
 
-// requirePostgres skips a server integration test unless FACET_DATABASE_URL
-// points at a Postgres database (the only backend). Run them with, e.g.:
-//
-//	FACET_DATABASE_URL=postgres://user:pw@localhost:5432/facet_test go test ./runtime
-func requirePostgres(t *testing.T) {
-	t.Helper()
-	if url := os.Getenv("FACET_DATABASE_URL"); !strings.HasPrefix(url, "postgres") {
-		t.Skip("set FACET_DATABASE_URL=postgres://… to run server integration tests")
-	}
-}
-
 // The JSON API is a second projection of the same graph: the schema describes
 // the invocable server actions, POST runs one (policies enforced exactly as on
 // the web channel), and GET lists an entity's durable rows.
 func TestAPIProjection(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
 	// GET /api/<Entity> is closed unless the app publishes the entity — the
 	// framework default is to refuse rather than serve every row to every
 	// caller (runtime/apiread.go). These projection tests read entity lists,
@@ -139,9 +127,9 @@ app ApiApp:
 	}
 }
 
-// resetEntities clears the given entities in both the database and the in-memory
-// working set (and resets their id counters), giving an integration test a clean,
-// deterministic slate regardless of what an earlier run left behind. Children are
+// resetEntities clears the given entities in both the datastore and the in-memory
+// working set (and resets their id counters). Every test boots its own empty
+// engine, so this is about a deterministic slate within one test, not between runs. Children are
 // listed before parents so cascade ordering is irrelevant.
 func resetEntities(srv *Server, names ...string) {
 	srv.mu.Lock()
@@ -166,12 +154,12 @@ func getJSON(t *testing.T, url string) map[string]any {
 	return out
 }
 
-// Removing a parent cascades to its children — in the database (ON DELETE
-// CASCADE on the relation foreign key) and in the live working set the API reads
-// through query pushdown. A multi-statement action also persists every statement
+// Removing a parent cascades to its children — in the datastore (the relation
+// is declared to FacetQL as a cascading reference) and in the live working set
+// the API reads through query pushdown. A multi-statement action also persists every statement
 // atomically.
 func TestCascadeAndTransaction(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
 	t.Setenv(apiReadEnv, "*") // see TestAPIProjection: entity lists are published, not default-open
 	g, err := compile.String(`
 app Rel:
@@ -229,10 +217,10 @@ app Rel:
 	}
 }
 
-// The entity list endpoint pushes `by`/`limit`/`after` down to indexed SQL and
-// paginates with an opaque keyset cursor.
+// The entity list endpoint pushes `by`/`limit`/`after` down to the engine's
+// indexed query and paginates with an opaque keyset cursor.
 func TestQueryPushdownPagination(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
 	t.Setenv(apiReadEnv, "*") // see TestAPIProjection: entity lists are published, not default-open
 	g, err := compile.String(`
 app Feed:
@@ -285,7 +273,7 @@ app Feed:
 // Migrate is idempotent: after New has reconciled the schema, a dry-run plan is
 // empty.
 func TestMigrateIdempotent(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
 	g, err := compile.String(`
 app Mig:
     entity Widget:
@@ -313,7 +301,8 @@ app Mig:
 // An `on start` job runs its server action once when the server starts, with no
 // client involved — its effect is visible immediately over the API.
 func TestOnStartJob(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
+	t.Setenv(apiReadEnv, "*") // see TestAPIProjection: entity lists are published, not default-open
 	g, err := compile.String(`
 app JobApp:
     entity Thing:
@@ -355,7 +344,7 @@ app JobApp:
 // Row-level authorization: a parameterized policy gates a mutation on the
 // specific row's owner, so a user may edit only their own post.
 func TestRowLevelAuthorization(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
 	t.Setenv(apiReadEnv, "*") // see TestAPIProjection: entity lists are published, not default-open
 	g, err := compile.String(`
 app Own:
@@ -408,7 +397,7 @@ app Own:
 
 // The account lifecycle: verification and password reset, end to end.
 func TestAccountLifecycle(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
 	g := mustAuthApp(t)
 	srv, err := New(g)
 	if err != nil {
@@ -452,7 +441,7 @@ func TestAccountLifecycle(t *testing.T) {
 
 // MFA: enroll TOTP, then a later login demands the second factor.
 func TestMFAFlow(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
 	g := mustAuthApp(t)
 	srv, err := New(g)
 	if err != nil {
@@ -494,7 +483,7 @@ func TestMFAFlow(t *testing.T) {
 // RBAC: the first user is admin and can promote another; the audit log is
 // admin-only.
 func TestRBACAndAudit(t *testing.T) {
-	requirePostgres(t)
+	requireFacetQL(t)
 	g := mustAuthApp(t)
 	srv, err := New(g)
 	if err != nil {

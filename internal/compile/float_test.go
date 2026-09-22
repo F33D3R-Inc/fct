@@ -271,8 +271,32 @@ func TestFloatDeclarationErrors(t *testing.T) {
 `,
 			"map key must be int or text",
 		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := String(c.src)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want error containing %q, got %v", c.want, err)
+			}
+		})
+	}
+}
+
+// TestFloatAcceptedEverywhere proves float is a real first-class scalar
+// throughout the language now, not gated to a proc body: a bare float
+// literal or toFloat() in an action/check, a float-typed entity field,
+// state cell, component parameter, action parameter, and record field, and
+// an action binding a float-returning proc's result via `let` — every shape
+// this test used to require the compiler to reject. There is no longer a
+// proc-only carve-out for float: the wire (contract, entity storage, the
+// client runtime) all have a real float representation now. (The type-
+// mismatch rules in TestFloatDeclarationErrors above are unrelated to this
+// gate and are untouched: `int + float` is still refused, just not because
+// float is out of bounds outside a proc.)
+func TestFloatAcceptedEverywhere(t *testing.T) {
+	cases := []struct{ name, src string }{
 		{
-			"a float literal outside a proc is rejected",
+			"a float literal outside a proc",
 			`app A:
     state result: int = 0
     action run():
@@ -282,10 +306,9 @@ func TestFloatDeclarationErrors(t *testing.T) {
         box:
             text "{result}"
 `,
-			"only available inside a proc",
 		},
 		{
-			"toFloat outside a proc is rejected",
+			"toFloat outside a proc",
 			`app A:
     state result: int = 0
     action run():
@@ -295,10 +318,9 @@ func TestFloatDeclarationErrors(t *testing.T) {
         box:
             text "{result}"
 `,
-			"only available inside a proc",
 		},
 		{
-			"an action cannot bind a float-returning proc's result",
+			"an action binds a float-returning proc's result",
 			`app A:
     proc pi() -> float:
         return 3.14
@@ -310,10 +332,9 @@ func TestFloatDeclarationErrors(t *testing.T) {
         box:
             text "{result}"
 `,
-			"only usable inside another proc",
 		},
 		{
-			"an entity field cannot be float-typed",
+			"an entity field is float-typed",
 			`app A:
     entity Item:
         weight: float
@@ -324,10 +345,9 @@ func TestFloatDeclarationErrors(t *testing.T) {
         box:
             text "{result}"
 `,
-			"only supported inside a proc body",
 		},
 		{
-			"a state cell cannot be float-typed",
+			"a state cell is float-typed",
 			`app A:
     state weight: float = 0.0
     action run():
@@ -336,10 +356,9 @@ func TestFloatDeclarationErrors(t *testing.T) {
         box:
             text "{weight}"
 `,
-			"only supported inside a proc body",
 		},
 		{
-			"a component parameter cannot be float-typed",
+			"a component parameter is float-typed",
 			`app A:
     component Badge(weight: float):
         text "{weight}"
@@ -351,10 +370,9 @@ func TestFloatDeclarationErrors(t *testing.T) {
             use Badge(1.5)
             text "{result}"
 `,
-			"only supported inside a proc body",
 		},
 		{
-			"an action parameter cannot be float-typed",
+			"an action parameter is float-typed",
 			`app A:
     state result: int = 0
     action run(x: float):
@@ -363,10 +381,9 @@ func TestFloatDeclarationErrors(t *testing.T) {
         box:
             text "{result}"
 `,
-			"only supported inside a proc body",
 		},
 		{
-			"a record field cannot be float-typed",
+			"a record field is float-typed",
 			`app A:
     record Stats:
         weight: float
@@ -377,14 +394,12 @@ func TestFloatDeclarationErrors(t *testing.T) {
         box:
             text "{result}"
 `,
-			"only supported inside a proc body",
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := String(c.src)
-			if err == nil || !strings.Contains(err.Error(), c.want) {
-				t.Fatalf("want error containing %q, got %v", c.want, err)
+			if _, err := String(c.src); err != nil {
+				t.Fatalf("compile: %v, want float accepted here", err)
 			}
 		})
 	}

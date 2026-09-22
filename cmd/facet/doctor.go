@@ -228,26 +228,34 @@ func checkCompiles(entry string) (*ir.IR, check) {
 		entry, len(graph.Entities), len(graph.Actions), len(graph.Pages)), ""}
 }
 
-// checkDatastore actually opens the datastore and reconciles this app's schema
-// as a dry run — the real connection, with nothing written. An unreachable
-// store is a warning, not a failure: `facet dev` runs on an in-memory store on
-// purpose, and that is the common case on a laptop.
+// checkDatastore probes the datastore in two steps. First, liveness: one
+// authenticated GET / against the FacetQL endpoint FACET_DATABASE_URL names
+// (or the default the store falls back to), so an engine that is down or
+// refusing the token is reported even when there is no app to compile here.
+// Then, with a graph, it reconciles the app's schema as a dry run — the real
+// connection, with nothing written. An unreachable store is a warning, not a
+// failure, unless FACET_DATABASE_URL was set explicitly: `facet dev` runs on an
+// in-memory store on purpose, and that is the common case on a laptop.
 func checkDatastore(graph *ir.IR) check {
 	url := os.Getenv("FACET_DATABASE_URL")
 	where := runtime.StoreDescription("")
-	if graph == nil {
-		return check{statusWarn, "datastore", where + " — not probed (the app did not compile)", ""}
-	}
-	plan, err := runtime.Migrate(graph, false)
-	if err != nil {
-		state, fix := statusWarn, "start the datastore, or set FACET_DATABASE_URL — `facet dev` works without one (in-memory)"
+	if err := probeFacetQL(url); err != nil {
+		state, fix := statusWarn, "start FacetQL, or set FACET_DATABASE_URL — `facet dev` works without one (in-memory)"
 		if url != "" {
 			// An explicitly configured store that cannot be reached is a real
 			// misconfiguration, not a laptop default.
 			state = statusFail
-			fix = "check FACET_DATABASE_URL and that the datastore is running"
+			fix = "check FACET_DATABASE_URL and that FacetQL is running"
 		}
 		return check{state, "datastore", where + " unreachable: " + err.Error(), fix}
+	}
+	if graph == nil {
+		return check{statusOK, "datastore", where + " reachable — schema not checked (no app compiled here)", ""}
+	}
+	plan, err := runtime.Migrate(graph, false)
+	if err != nil {
+		return check{statusFail, "datastore", where + " reachable, but the schema could not be read: " + err.Error(),
+			"check the token in FACET_DATABASE_URL (facetql://<token>@host:port)"}
 	}
 	if len(plan) > 0 {
 		return check{statusWarn, "datastore",
@@ -255,6 +263,40 @@ func checkDatastore(graph *ir.IR) check {
 			"facet migrate <file.fct>   (--plan to see the statements first)"}
 	}
 	return check{statusOK, "datastore", where + " reachable, schema up to date", ""}
+}
+
+// probeFacetQL is the liveness probe: GET / on the engine named by raw (or the
+// store's default when raw is empty), with the token as x-api-key exactly as
+// the store sends it. FacetQL answers GET / to any caller, so a non-2xx here
+// means a proxy or the wrong process is on that port, not a bad token.
+func probeFacetQL(raw string) error {
+	if raw == "" {
+		raw = "facetql://localhost:8080"
+	}
+	if !strings.HasPrefix(raw, "facetql://") {
+		return fmt.Errorf("FACET_DATABASE_URL %q is not a FacetQL (facetql://…) URL", raw)
+	}
+	base, token, err := facetQLEndpoint(raw)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodGet, base+"/", nil)
+	if err != nil {
+		return err
+	}
+	if token != "" {
+		req.Header.Set("x-api-key", token)
+	}
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("%s answered %d to GET /", base, resp.StatusCode)
+	}
+	return nil
 }
 
 // checkConfig reports the runtime configuration exactly as `facet config`
@@ -273,9 +315,6 @@ func checkConfig(production bool) []check {
 	}
 	out := make([]check, 0, len(warnings))
 	for _, w := range warnings {
-		if staleStoreWarning(w, cfg.DatabaseURL) {
-			continue
-		}
 		// Config.Warnings writes "<problem> — <what to do>." — split on the first
 		// sentence so the fix lands in the fix column.
 		detail, fix := w, ""
@@ -288,18 +327,6 @@ func checkConfig(production bool) []check {
 		return []check{{statusOK, "config", "complete and production-safe", ""}}
 	}
 	return out
-}
-
-// staleStoreWarning drops the one configuration warning that two parts of the
-// runtime disagree about: Config.Warnings still says FACET_DATABASE_URL must be
-// a postgres:// URL, while the store layer (openStore / StoreDescription) makes
-// FacetQL the stack's native and default backend. Reporting a facetql:// URL as
-// a misconfiguration would refuse to boot the datastore the project is built on.
-//
-// Nothing is judged here that the runtime does not already judge — this only
-// declines to repeat a line the runtime's own store layer contradicts.
-func staleStoreWarning(warning, url string) bool {
-	return strings.HasPrefix(url, "facetql://") && strings.Contains(warning, "not a postgres:// URL")
 }
 
 // ── production readiness ─────────────────────────────────────────────────────
@@ -453,7 +480,7 @@ func checkSecrets(graph *ir.IR) []check {
 func checkStoreIdentity() (check, bool) {
 	raw := os.Getenv("FACET_DATABASE_URL")
 	if !strings.HasPrefix(raw, "facetql://") {
-		return check{}, false // Postgres privilege is the database's own to answer
+		return check{}, false // no FacetQL endpoint to ask
 	}
 	base, token, err := facetQLEndpoint(raw)
 	if err != nil {

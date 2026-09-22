@@ -1566,8 +1566,10 @@ func storeAnswers(e *ir.Expr, ent ir.Entity) bool {
 		if e.Sel != nil || e.Field == "" {
 			return false
 		}
+		// A float column reduces in-process: the store's aggregate contract
+		// is int-valued.
 		f, ok := fieldOf(ent, e.Field)
-		return ok && numericField(f)
+		return ok && numericField(f) && f.Type != "float"
 	}
 	return false
 }

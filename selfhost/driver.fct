@@ -1,0 +1,619 @@
+# driver.fct — the missing root piece the earlier selfhost ports never
+# built: a single end-to-end compiler over a WHOLE .fct app's source text,
+# chaining program.fct's parseProgramSrc (source -> Program), the
+# per-declaration lowerers (action_lower.fct/proc_lower.fct/lower.fct), and
+# ir_graph.fct's native IRGraph + irGraphJSON into one `compileSrc(src) ->
+# text` that answers with the same JSON shape encoding/json.Marshal(*ir.IR)
+# produces for the declarations this file covers.
+#
+# SCOPE, STATED HONESTLY: this driver assembles the DECLARATION half of a
+# compiled app — enums, records, structs, states (with correct per-type
+# zero defaults), top-level derives (with real dependency sets), policies,
+# entities (fields, including enum/relation resolution, @unique/@softdelete
+# index and archived-field injection, entity-level read/derive), actions
+# (via action_lower.fct's real placement inference), procs (via
+# proc_lower.fct), services, jobs, webhooks, and triggers — plus the
+# fixed `auth` entity/actions table when `auth` is declared. It does NOT
+# assemble views/pages/bindings/routes/depGraph, nor
+# types/messages/daemons/components/files/api/stream/theme/css/assets: the
+# view-compilation stage (segs -> binding ids, `for`/`if` -> dynamic
+# regions, dependency graphs) is real-compiler logic that lives entirely in
+# internal/ir/build.go's viewCtx and internal/codegen, with THOUSANDS of
+# lines and no self-hosted port anywhere in this directory — confirmed by
+# grep, not assumed. driver_test.go compares only the keys this file
+# actually emits against the same keys of the real compiler's own IR JSON,
+# so "passing" here means "the declaration-level IR matches exactly," not
+# "the whole app round-trips."
+#
+# A second, real gap surfaced while wiring this: the self-hosted parser's
+# `parseExprTree` (expr.fct, used for entity `read:`/`derive` bodies and
+# state defaults) never runs `qualifyRowRefs` the way internal/parser/
+# parser.go's real parseEntity does — a bare field name inside an entity's
+# `read:`/`derive` expression is NOT rewritten to `Get{Ref{"$row"}, name}`
+# here the way the real compiler rewrites it before Build ever sees the
+# expression. Any example whose entity read/derive references a bare field
+# name (not `actor`) will disagree with the real compiler on exactly that
+# expression's `ref` vs `get` shape. Reported, not silently patched over —
+# fixing it means porting qualifyRowRefs itself, which is out of this
+# slice's scope.
+import "program.fct"
+import "action_lower.fct"
+import "proc_lower.fct"
+import "ir_graph.fct"
+
+app DriverSelfHost:
+    # ── literal ExprNode builders for synthesized defaults ──────────────
+    # State with no `= default` clause: real parser.go's defaultFor (int
+    # -> 0, bool -> false, else -> ""), or an empty list for a `[T]` state
+    # (ast.ListLit{}). program.fct's own buildStateDecl always leaves
+    # `default` as expr_tokens.fct's emptyNode() (a filler int-0 node) when
+    # hasDefault is false, regardless of the state's real type — wrong for
+    # a bool/text/list cell, so this driver recomputes the correct default
+    # itself rather than trusting that filler.
+    private proc driverIntLit(text0: text) -> ExprNode:
+        return ExprNode{kind: "int", text: text0, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    private proc driverBoolLit(text0: text) -> ExprNode:
+        return ExprNode{kind: "bool", text: text0, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    private proc driverTextLit(quoted: text) -> ExprNode:
+        return ExprNode{kind: "text", text: quoted, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    private proc driverEmptyListLit() -> ExprNode:
+        return ExprNode{kind: "list", text: "", field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+
+    proc driverStateDefaultNode(sd: StateDecl) -> ExprNode:
+        if sd.hasDefault:
+            return sd.default
+        if sd.isList:
+            let el = do driverEmptyListLit()
+            return el
+        if sd.typeCore == "int":
+            let il = do driverIntLit("0")
+            return il
+        if sd.typeCore == "bool":
+            let bl = do driverBoolLit("false")
+            return bl
+        let tl = do driverTextLit("\"\"")
+        return tl
+
+    private proc driverAddName(names: [text], name: text) -> [text]:
+        if name in names:
+            return names
+        return append(names, name)
+
+    # ── dependency walk for a top-level derive's lowered expression ─────
+    # Mirrors internal/ir/build.go's (*env).depsIR exactly: only
+    # ref/get/eget/astate/agg/call/list/bin/un are walked (agg only
+    # descends into `where`, never `sel` — a real, deliberate Go asymmetry,
+    # reproduced here rather than "fixed").
+    private proc driverDepsWalk(e: IRExpr, stateNames: [text], entityNames: [text], acc: [text]) -> [text]:
+        if e.kind == "ref":
+            if e.name in stateNames:
+                let t1 = do driverAddName(acc, e.name)
+                return t1
+            if e.name in entityNames:
+                let t2 = do driverAddName(acc, e.name)
+                return t2
+            return acc
+        if e.kind == "get":
+            if len(e.obj) > 0:
+                let t3 = do driverDepsWalk(e.obj[0], stateNames, entityNames, acc)
+                return t3
+            return acc
+        if e.kind == "eget":
+            let mut acc2 = acc
+            if e.name in entityNames:
+                let t4 = do driverAddName(acc2, e.name)
+                acc2 = t4
+            if len(e.key) > 0:
+                let t5 = do driverDepsWalk(e.key[0], stateNames, entityNames, acc2)
+                acc2 = t5
+            return acc2
+        if e.kind == "astate":
+            if e.op == "dirty" || e.op == "touched":
+                let t6 = do driverAddName(acc, e.name)
+                return t6
+            let t7 = do driverAddName(acc, "@act:" + e.name)
+            return t7
+        if e.kind == "agg":
+            let mut acc3 = acc
+            if e.name in entityNames:
+                let t8 = do driverAddName(acc3, e.name)
+                acc3 = t8
+            if len(e.where) > 0:
+                let t9 = do driverDepsWalk(e.where[0], stateNames, entityNames, acc3)
+                acc3 = t9
+            return acc3
+        if e.kind == "call" || e.kind == "list":
+            let mut acc4 = acc
+            let n = len(e.args)
+            let mut i = 0
+            loop i < n:
+                let t10 = do driverDepsWalk(e.args[i], stateNames, entityNames, acc4)
+                acc4 = t10
+                i = i + 1
+            return acc4
+        if e.kind == "bin":
+            let mut acc5 = acc
+            if len(e.l) > 0:
+                let t11 = do driverDepsWalk(e.l[0], stateNames, entityNames, acc5)
+                acc5 = t11
+            if len(e.r) > 0:
+                let t12 = do driverDepsWalk(e.r[0], stateNames, entityNames, acc5)
+                acc5 = t12
+            return acc5
+        if e.kind == "un":
+            if len(e.x) > 0:
+                let __t136 = do driverDepsWalk(e.x[0], stateNames, entityNames, acc)
+                return __t136
+            return acc
+        return acc
+
+    proc driverDepsOf(e: IRExpr, stateNames: [text], entityNames: [text]) -> [text]:
+        let raw = do driverDepsWalk(e, stateNames, entityNames, [])
+        let sorted = do alowSortText(raw)
+        return sorted
+
+    # ── entity field lowering (enum text-tag, relation Ref+index, @unique
+    #    index, @requires read policy) ────────────────────────────────────
+    proc driverEntityFieldIR(f: EntityFieldDecl, enumNames: [text], entityNames: [text]) -> IRField:
+        let mut ftype = f.typeCore
+        let mut ref = ""
+        let mut enumName = ""
+        let mut idx = false
+        if f.typeCore in enumNames:
+            ftype = "text"
+            enumName = f.typeCore
+        if f.typeCore in entityNames:
+            ref = f.typeCore
+            idx = true
+        if f.unique:
+            idx = true
+        let mut onDel = ""
+        if f.onDeleteRestrict:
+            onDel = "restrict"
+        if f.onDeleteSetNull:
+            onDel = "setNull"
+        let mut readPolicy = ""
+        if f.hasRequiresPolicy:
+            readPolicy = f.requiresPolicy
+        return IRField{name: f.name, type: ftype, ref: ref, enumName: enumName, index: idx, secret: f.secret, e2e: f.e2e, readPolicy: readPolicy, optional: f.isOptional, unique: f.unique, required: f.required, hasMin: f.hasMin, min: f.minValue, hasMax: f.hasMax, max: f.maxValue, matches: f.matchesPattern, onDelete: onDel}
+
+    proc driverArchivedField() -> IRField:
+        return IRField{name: "archived", type: "bool", ref: "", enumName: "", index: true, secret: false, e2e: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
+
+    proc driverEntityIR(ed: EntityDecl, enumNames: [text], entityNames: [text], inlineNames: [text], inlineExprs: [IRExpr]) -> IREntity:
+        let mut fields = []
+        let fn = len(ed.fields)
+        let mut fi = 0
+        loop fi < fn:
+            let irf = do driverEntityFieldIR(ed.fields[fi], enumNames, entityNames)
+            fields = append(fields, irf)
+            fi = fi + 1
+        if ed.softDelete:
+            let af = do driverArchivedField()
+            fields = append(fields, af)
+        let mut derives = []
+        let dn = len(ed.derives)
+        let mut di = 0
+        loop di < dn:
+            let dd = ed.derives[di]
+            let lowered = do lowerNode(dd.expr, inlineNames, inlineExprs, enumNames)
+            derives = append(derives, IRDerive{name: dd.name, type: dd.typeCore, expr: [lowered], deps: []})
+            di = di + 1
+        let mut readList = []
+        if ed.hasRead:
+            let rl = do lowerNode(ed.readExpr, inlineNames, inlineExprs, enumNames)
+            readList = [rl]
+        return IREntity{name: ed.name, softDelete: ed.softDelete, ephemeral: ed.ephemeral, fields: fields, read: readList, derives: derives}
+
+    # ── state lowering (placement + private flag + correct zero default) ─
+    proc driverStateIR(sd: StateDecl, enumNames: [text], inlineNames: [text], inlineExprs: [IRExpr]) -> IRState:
+        let mut placement = "server"
+        let mut private = false
+        if sd.placement == "client":
+            placement = "client"
+        if sd.placement == "private":
+            private = true
+        let defNode = do driverStateDefaultNode(sd)
+        let lowered = do lowerNode(defNode, inlineNames, inlineExprs, enumNames)
+        let mut styp = sd.typeCore
+        let mut selem = ""
+        if sd.isList:
+            styp = "[" + sd.typeCore + "]"
+            selem = sd.typeCore
+        return IRState{name: sd.name, type: styp, elem: selem, list: sd.isList, optional: sd.isOptional, placement: placement, private: private, init: [lowered]}
+
+    # ── the fixed `auth` table (mirrors internal/ir/build.go's
+    #    reservedUserEntity + authActions() verbatim) ─────────────────────
+    proc driverAuthPlainField(name0: text, type0: text, secret0: bool) -> IRField:
+        return IRField{name: name0, type: type0, ref: "", enumName: "", index: false, secret: secret0, e2e: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
+
+    proc driverAuthEntity() -> IREntity:
+        let mut fields = []
+        let f_id = do driverAuthPlainField("id", "int", false)
+        fields = append(fields, f_id)
+        let f_username = do driverAuthPlainField("username", "text", false)
+        fields = append(fields, f_username)
+        let f_password = do driverAuthPlainField("password", "text", false)
+        fields = append(fields, f_password)
+        let f_role = do driverAuthPlainField("role", "text", false)
+        fields = append(fields, f_role)
+        let f_email = do driverAuthPlainField("email", "text", false)
+        fields = append(fields, f_email)
+        let f_verified = do driverAuthPlainField("verified", "bool", false)
+        fields = append(fields, f_verified)
+        let f_verifyToken = do driverAuthPlainField("verifyToken", "text", false)
+        fields = append(fields, f_verifyToken)
+        let f_resetToken = do driverAuthPlainField("resetToken", "text", false)
+        fields = append(fields, f_resetToken)
+        let f_resetExpires = do driverAuthPlainField("resetExpires", "int", false)
+        fields = append(fields, f_resetExpires)
+        let f_mfaSecret = do driverAuthPlainField("mfaSecret", "text", true)
+        fields = append(fields, f_mfaSecret)
+        let f_mfaEnabled = do driverAuthPlainField("mfaEnabled", "bool", false)
+        fields = append(fields, f_mfaEnabled)
+        return IREntity{name: "FacetUser", softDelete: false, ephemeral: false, fields: fields, read: [], derives: []}
+
+    private proc driverAuthActionNoParams(name: text) -> IRAction:
+        return IRAction{name: name, params: [], requires: [], optimistic: false, ret: "", retList: false, placement: "server", reason: "", writes: [], reads: [], seal: [], body: []}
+
+    private proc driverAuthActionParams(name: text, paramNames: [text]) -> IRAction:
+        let mut ps = []
+        let n = len(paramNames)
+        let mut i = 0
+        loop i < n:
+            ps = append(ps, IRParam{name: paramNames[i], type: "text", optional: false, list: false})
+            i = i + 1
+        return IRAction{name: name, params: ps, requires: [], optimistic: false, ret: "", retList: false, placement: "server", reason: "", writes: [], reads: [], seal: [], body: []}
+
+    proc driverAuthActions() -> [IRAction]:
+        let mut acts = []
+        let a1 = do driverAuthActionParams("signup", ["username", "password"])
+        acts = append(acts, a1)
+        let a2 = do driverAuthActionParams("login", ["username", "password"])
+        acts = append(acts, a2)
+        let a3 = do driverAuthActionNoParams("logout")
+        acts = append(acts, a3)
+        let a4 = do driverAuthActionParams("setRole", ["username", "role"])
+        acts = append(acts, a4)
+        let a5 = do driverAuthActionParams("requestReset", ["username"])
+        acts = append(acts, a5)
+        let a6 = do driverAuthActionParams("resetPassword", ["username", "token", "password"])
+        acts = append(acts, a6)
+        let a7 = do driverAuthActionParams("verifyEmail", ["token"])
+        acts = append(acts, a7)
+        let a8 = do driverAuthActionNoParams("enableMFA")
+        acts = append(acts, a8)
+        let a9 = do driverAuthActionParams("confirmMFA", ["code"])
+        acts = append(acts, a9)
+        let a10 = do driverAuthActionParams("loginMFA", ["username", "code"])
+        acts = append(acts, a10)
+        return acts
+
+    # ── the end-to-end driver ────────────────────────────────────────────
+    proc compileGraph(src: text) -> IRGraph:
+        let prog = do parseProgramSrc(src)
+
+        # Pass 0: enums (name set needed by entity field + state resolution).
+        let mut enums = []
+        let mut enumNames = []
+        let en = len(prog.enums)
+        let mut ei = 0
+        loop ei < en:
+            let ed = prog.enums[ei]
+            let mut values = []
+            let mut wireNames = []
+            let vn = len(ed.values)
+            let mut vi = 0
+            loop vi < vn:
+                values = append(values, ed.values[vi].name)
+                wireNames = append(wireNames, ed.values[vi].wireName)
+                vi = vi + 1
+            enums = append(enums, IREnum{name: ed.name, values: values, wireNames: wireNames})
+            enumNames = append(enumNames, ed.name)
+            ei = ei + 1
+
+        # Records (flat value objects).
+        let mut records = []
+        let rn = len(prog.records)
+        let mut ri = 0
+        loop ri < rn:
+            let rd = prog.records[ri]
+            let mut rfields = []
+            let rfn = len(rd.fields)
+            let mut rfi = 0
+            loop rfi < rfn:
+                let rf = rd.fields[rfi]
+                rfields = append(rfields, IRRecordField{name: rf.name, type: rf.typeCore, list: rf.isList, optional: rf.isOptional})
+                rfi = rfi + 1
+            records = append(records, IRRecord{name: rd.name, fields: rfields})
+            ri = ri + 1
+
+        # Structs (proc-local composite types) — same wire shape as Record.
+        let mut structs = []
+        let sn2 = len(prog.structs)
+        let mut si2 = 0
+        loop si2 < sn2:
+            let sd2 = prog.structs[si2]
+            let mut sfields = []
+            let sfn = len(sd2.fields)
+            let mut sfi = 0
+            loop sfi < sfn:
+                let sf = sd2.fields[sfi]
+                sfields = append(sfields, IRRecordField{name: sf.name, type: sf.typeCore, list: sf.isList, optional: false})
+                sfi = sfi + 1
+            structs = append(structs, IRRecord{name: sd2.name, fields: sfields})
+            si2 = si2 + 1
+
+        # Entity name set (needed for relation-field resolution).
+        let mut entityNames = []
+        let en2 = len(prog.entities)
+        let mut eni = 0
+        loop eni < en2:
+            entityNames = append(entityNames, prog.entities[eni].name)
+            eni = eni + 1
+
+        # Policies (zero-arg ones become part of the inline table) + the
+        # inline table's other half, top-level derives.
+        let mut policies = []
+        let mut policyNames = []
+        let mut policyParamCounts = []
+        let mut inlineNames = []
+        let mut inlineExprs = []
+        let pn = len(prog.policies)
+        let mut pi = 0
+        loop pi < pn:
+            let pd = prog.policies[pi]
+            let lowered = do lowerNode(pd.predicate, inlineNames, inlineExprs, enumNames)
+            let mut pparams = []
+            let ppn = len(pd.paramNames)
+            let mut ppi = 0
+            loop ppi < ppn:
+                pparams = append(pparams, IRParam{name: pd.paramNames[ppi], type: pd.paramTypes[ppi], optional: pd.paramOptionals[ppi], list: false})
+                ppi = ppi + 1
+            policies = append(policies, IRPolicy{name: pd.name, params: pparams, expr: [lowered]})
+            policyNames = append(policyNames, pd.name)
+            policyParamCounts = append(policyParamCounts, ppn)
+            if ppn == 0:
+                inlineNames = append(inlineNames, pd.name)
+                inlineExprs = append(inlineExprs, lowered)
+            pi = pi + 1
+
+        # Top-level derives — each lowered against the inline table
+        # (policies + every earlier derive) as it stood before this one was
+        # added, then folded into the table itself (see driverBuildDerives).
+        let builtDerives = do driverBuildDerives(prog.derives, enumNames, entityNames, prog.states, inlineNames, inlineExprs)
+
+        # Entities.
+        let mut entities = []
+        let mut eni3 = 0
+        loop eni3 < en2:
+            let irEnt = do driverEntityIR(prog.entities[eni3], enumNames, entityNames, builtDerives.inlineNames, builtDerives.inlineExprs)
+            entities = append(entities, irEnt)
+            eni3 = eni3 + 1
+        if prog.hasAuth:
+            let authEnt = do driverAuthEntity()
+            entities = append(entities, authEnt)
+
+        # States.
+        let mut states = []
+        let stn = len(prog.states)
+        let mut sti = 0
+        loop sti < stn:
+            let irSt = do driverStateIR(prog.states[sti], enumNames, builtDerives.inlineNames, builtDerives.inlineExprs)
+            states = append(states, irSt)
+            sti = sti + 1
+        let mut stateNames = []
+        let mut stj = 0
+        loop stj < stn:
+            stateNames = append(stateNames, prog.states[stj].name)
+            stj = stj + 1
+
+        # Services.
+        let mut services = []
+        let svn = len(prog.services)
+        let mut svi = 0
+        loop svi < svn:
+            let sv = prog.services[svi]
+            let mut ops = []
+            let opn = len(sv.ops)
+            let mut opi = 0
+            loop opi < opn:
+                let op = sv.ops[opi]
+                ops = append(ops, IRServiceOp{name: op.name, params: op.paramNames, ret: op.retCore, retList: op.retIsList})
+                opi = opi + 1
+            services = append(services, IRService{name: sv.name, url: sv.url, ops: ops})
+            svi = svi + 1
+
+        # Procs (name/paramCount/ret/retList env, then real lowering).
+        let mut procNames = []
+        let mut procRets = []
+        let mut procRetLists = []
+        let pcn = len(prog.procs)
+        let mut pci = 0
+        loop pci < pcn:
+            procNames = append(procNames, prog.procs[pci].name)
+            let mut rc = ""
+            if prog.procs[pci].hasRet:
+                rc = prog.procs[pci].retCore
+            procRets = append(procRets, rc)
+            procRetLists = append(procRetLists, prog.procs[pci].retIsList)
+            pci = pci + 1
+        let mut procs = []
+        let mut pci2 = 0
+        loop pci2 < pcn:
+            let pd2 = prog.procs[pci2]
+            let irp = do lowerProcSrc(pd2.headerLine, pd2.bodySrc, procNames, procRets, procRetLists, [], [], [], enumNames)
+            procs = append(procs, irp)
+            pci2 = pci2 + 1
+
+        # Entity field env for action lowering: "Entity.field" / "Entity.derive".
+        let mut entityFieldKeys = []
+        let mut entityDeriveKeys = []
+        let mut efi = 0
+        loop efi < en2:
+            let ent = prog.entities[efi]
+            let fkn = len(ent.fields)
+            let mut fki = 0
+            loop fki < fkn:
+                entityFieldKeys = append(entityFieldKeys, ent.name + "." + ent.fields[fki].name)
+                fki = fki + 1
+            let dkn = len(ent.derives)
+            let mut dki = 0
+            loop dki < dkn:
+                entityDeriveKeys = append(entityDeriveKeys, ent.name + "." + ent.derives[dki].name)
+                dki = dki + 1
+            efi = efi + 1
+
+        let mut structNames = []
+        let mut stni = 0
+        loop stni < sn2:
+            structNames = append(structNames, prog.structs[stni].name)
+            stni = stni + 1
+
+        # ALowEnv for action lowering — state placements, entity/field/
+        # derive sets, enums, policies, the same inline table, services,
+        # procs, structs. Mirrors action_lower_test.go's alowEnvArgs, built
+        # here directly from the Program instead of round-tripped through
+        # a compiled Go graph.
+        let mut statePlacements = []
+        let mut stk = 0
+        loop stk < stn:
+            statePlacements = append(statePlacements, prog.states[stk].placement)
+            stk = stk + 1
+        # ALowEnv.statePlacements expects "server"/"client" only (never
+        # "infer"/"private" — see alowStatePlacement's callers); recompute
+        # from the same rule driverStateIR uses.
+        let mut alowPlacements = []
+        let mut stk2 = 0
+        loop stk2 < stn:
+            let mut p = "server"
+            if prog.states[stk2].placement == "client":
+                p = "client"
+            alowPlacements = append(alowPlacements, p)
+            stk2 = stk2 + 1
+
+        let mut serviceEnvNames = []
+        let mut serviceEnvOps = []
+        let mut serviceEnvArgCounts = []
+        let mut serviceEnvRets = []
+        let mut serviceEnvRetLists = []
+        let mut svi2 = 0
+        loop svi2 < svn:
+            let sv2 = prog.services[svi2]
+            let opn2 = len(sv2.ops)
+            let mut opi2 = 0
+            loop opi2 < opn2:
+                let op2 = sv2.ops[opi2]
+                serviceEnvNames = append(serviceEnvNames, sv2.name)
+                serviceEnvOps = append(serviceEnvOps, op2.name)
+                serviceEnvArgCounts = append(serviceEnvArgCounts, len(op2.paramNames))
+                serviceEnvRets = append(serviceEnvRets, op2.retCore)
+                serviceEnvRetLists = append(serviceEnvRetLists, op2.retIsList)
+                opi2 = opi2 + 1
+            svi2 = svi2 + 1
+
+        let mut procEnvParamCounts = []
+        let mut pci3 = 0
+        loop pci3 < pcn:
+            procEnvParamCounts = append(procEnvParamCounts, len(prog.procs[pci3].paramNames))
+            pci3 = pci3 + 1
+
+        let env = ALowEnv{stateNames: stateNames, statePlacements: alowPlacements, entityNames: entityNames, entityFields: entityFieldKeys, entityDerives: entityDeriveKeys, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: builtDerives.inlineNames, inlineExprs: builtDerives.inlineExprs, serviceNames: serviceEnvNames, serviceOps: serviceEnvOps, serviceArgCounts: serviceEnvArgCounts, serviceRets: serviceEnvRets, serviceRetLists: serviceEnvRetLists, procNames: procNames, procParamCounts: procEnvParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames}
+
+        # Actions.
+        let mut actions = []
+        let an = len(prog.actions)
+        let mut ai = 0
+        loop ai < an:
+            let ad = prog.actions[ai]
+            let ira = do lowerActionSrc(ad.name, ad.paramNames, ad.paramTypes, ad.optimistic, ad.bodySrc, env)
+            actions = append(actions, ira)
+            ai = ai + 1
+        if prog.hasAuth:
+            let authActs = do driverAuthActions()
+            let aan = len(authActs)
+            let mut aai = 0
+            loop aai < aan:
+                actions = append(actions, authActs[aai])
+                aai = aai + 1
+
+        # Jobs.
+        let mut jobs = []
+        let jn = len(prog.jobs)
+        let mut ji = 0
+        loop ji < jn:
+            let jd = prog.jobs[ji]
+            jobs = append(jobs, IRJob{name: jd.name, action: jd.action, every: jd.everySeconds, onStart: jd.onStart})
+            ji = ji + 1
+
+        # Webhooks.
+        let mut webhooks = []
+        let whn = len(prog.webhooks)
+        let mut whi = 0
+        loop whi < whn:
+            let wh = prog.webhooks[whi]
+            webhooks = append(webhooks, IRWebhook{path: wh.path, action: wh.action, secret: wh.secret})
+            whi = whi + 1
+
+        # Triggers.
+        let mut triggers = []
+        let trn = len(prog.triggers)
+        let mut tri = 0
+        loop tri < trn:
+            let tr = prog.triggers[tri]
+            triggers = append(triggers, IRTrigger{on: tr.onAction, action: tr.reactionAction})
+            tri = tri + 1
+
+        let noneVal = do jNone()
+        return IRGraph{app: prog.name, auth: prog.hasAuth, entities: entities, records: records, structs: structs, enums: enums, types: [], messages: [], states: states, derives: builtDerives.derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: [], components: [], services: services, files: [], webhooks: webhooks, triggers: triggers, theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
+
+    # driverBuildDerives: the real single-pass shape of Go's step 3b — each
+    # derive lowered against the inline table as it stood BEFORE this
+    # derive was added (so it can read an earlier derive, never a later
+    # one), then added to the table for the next one, with its own real
+    # dependency set (over states + entities, per driverDepsOf).
+    struct DriverDerivesResult:
+        derives: [IRDerive]
+        inlineNames: [text]
+        inlineExprs: [IRExpr]
+
+    proc driverBuildDerives(decls: [DeriveDeclFull], enumNames: [text], entityNames: [text], stateDecls: [StateDecl], inlineNames0: [text], inlineExprs0: [IRExpr]) -> DriverDerivesResult:
+        let mut names = inlineNames0
+        let mut exprs = inlineExprs0
+        let mut out = []
+        let mut stateNames = []
+        let sn = len(stateDecls)
+        let mut si = 0
+        loop si < sn:
+            stateNames = append(stateNames, stateDecls[si].name)
+            si = si + 1
+        let n = len(decls)
+        let mut i = 0
+        loop i < n:
+            let dd = decls[i]
+            let lowered = do lowerNode(dd.expr, names, exprs, enumNames)
+            let deps = do driverDepsOf(lowered, stateNames, entityNames)
+            out = append(out, IRDerive{name: dd.name, type: dd.typeCore, expr: [lowered], deps: deps})
+            names = append(names, dd.name)
+            exprs = append(exprs, lowered)
+            i = i + 1
+        return DriverDerivesResult{derives: out, inlineNames: names, inlineExprs: exprs}
+
+    # ── the live driver: whole-source in, IR JSON out ───────────────────
+    proc compileSrc(src: text) -> text:
+        let g = do compileGraph(src)
+        let j = do irGraphJSON(g)
+        return j
+
+    state compiledOut: text = ""
+
+    action runCompileSrc(src: text):
+        let out = do compileSrc(src)
+        compiledOut = out
+
+    private view DriverHome at "/driver":
+        box:
+            text "{compiledOut}"

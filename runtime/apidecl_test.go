@@ -1,12 +1,15 @@
 package runtime
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"facet/internal/compile"
 )
@@ -220,5 +223,242 @@ func TestDeclaredAPIGates(t *testing.T) {
 				t.Fatalf("want %q, got %v", c.want, err)
 			}
 		})
+	}
+}
+
+// TestDeclaredAPIMessageBody proves a `message` (tagged union) action
+// parameter binds the whole POST body — not `{"paramName": {...}}` — and
+// that the action can `match` on its discriminant to dispatch per variant,
+// exactly the shape a mutation lane like `POST /events` needs (one JSON
+// object with its own `type` field, closed set of variants). Also checks the
+// published contract references the message's own oneOf schema as the
+// requestBody, with a named schema per variant.
+func TestDeclaredAPIMessageBody(t *testing.T) {
+	src := `app W:
+    message ClientEvent:
+        | ping()
+        | rename(id: int, title: text)
+    state lastKind: text = ""
+    state lastTitle: text = ""
+    action postEvent(ev: ClientEvent) -> text:
+        match ev.type:
+            case "ping":
+                lastKind = "ping"
+            case "rename":
+                lastKind = "rename"
+                lastTitle = ev.title
+            else:
+                lastKind = "unknown"
+        return lastKind
+    api POST "/api/v2/events" -> postEvent
+    view Home at "/":
+        text "{lastKind}"
+`
+	g, err := compile.String(src)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	postEvent := func(body string) (int, string) {
+		t.Helper()
+		resp, err := http.Post(ts.URL+"/api/v2/events", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var s string
+		json.Unmarshal(raw, &s)
+		return resp.StatusCode, s
+	}
+	if code, v := postEvent(`{"type":"rename","id":1,"title":"New name"}`); code != 200 || v != "rename" {
+		t.Fatalf("rename event = %d %q", code, v)
+	}
+	if code, v := postEvent(`{"type":"ping"}`); code != 200 || v != "ping" {
+		t.Fatalf("ping event = %d %q", code, v)
+	}
+	if code, v := postEvent(`{"type":"nope"}`); code != 200 || v != "unknown" {
+		t.Fatalf("unknown event = %d %q", code, v)
+	}
+
+	resp, err := http.Get(ts.URL + "/api/_contract")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	json.NewDecoder(resp.Body).Decode(&doc)
+	resp.Body.Close()
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	msg, ok := schemas["ClientEvent"].(map[string]any)
+	if !ok {
+		t.Fatalf("contract has no ClientEvent schema: %v", schemas)
+	}
+	if _, ok := msg["oneOf"]; !ok {
+		t.Fatalf("ClientEvent schema is not a oneOf: %v", msg)
+	}
+	if _, ok := schemas["ClientEvent_ping"]; !ok {
+		t.Fatalf("contract has no ClientEvent_ping variant schema: %v", schemas)
+	}
+	if _, ok := schemas["ClientEvent_rename"]; !ok {
+		t.Fatalf("contract has no ClientEvent_rename variant schema: %v", schemas)
+	}
+	paths := doc["paths"].(map[string]any)
+	op := paths["/api/v2/events"].(map[string]any)["post"].(map[string]any)
+	reqSchema := op["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+	if ref, _ := reqSchema["$ref"].(string); ref != "#/components/schemas/ClientEvent" {
+		t.Fatalf("requestBody schema = %v, want a $ref to ClientEvent (the whole body IS the message)", reqSchema)
+	}
+}
+
+// TestDeclaredAPIMultipartUpload proves a `bytes`-typed action parameter on
+// an `api POST` route accepts multipart/form-data, stores the uploaded file
+// through the same mechanism POST /upload uses, and binds the resulting
+// public URL as the parameter's value — and that the published contract
+// describes the route as multipart/form-data with a binary-format field.
+func TestDeclaredAPIMultipartUpload(t *testing.T) {
+	src := `app W:
+    entity Work:
+        id: int
+        posterUrl: text
+    action addWork(title: text) -> Work:
+        add Work { posterUrl: "" }
+    action setPoster(id: int, poster: bytes) -> Work:
+        set Work(id).posterUrl = poster
+        return Work(id)
+    api POST "/api/v2/works" -> addWork status 201
+    api POST "/api/v2/works/{id}/poster" -> setPoster
+    view Home at "/":
+        text "x"
+`
+	g, err := compile.String(src)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	addResp, err := http.Post(ts.URL+"/api/v2/works", "application/json", bytes.NewReader([]byte(`{"title":"Hello"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addResp.Body.Close()
+	if addResp.StatusCode != 201 {
+		t.Fatalf("addWork = %d", addResp.StatusCode)
+	}
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, _ := mw.CreateFormFile("poster", "cover.png")
+	part.Write([]byte("fake-png-bytes"))
+	mw.Close()
+
+	resp, err := http.Post(ts.URL+"/api/v2/works/1/poster", mw.FormDataContentType(), &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("setPoster = %d: %s", resp.StatusCode, raw)
+	}
+	var work map[string]any
+	json.Unmarshal(raw, &work)
+	url, _ := work["posterUrl"].(string)
+	if url == "" || url[:9] != "/uploads/" {
+		t.Fatalf("posterUrl = %q, want a stored /uploads/... reference: %s", url, raw)
+	}
+
+	resp2, err := http.Get(ts.URL + "/api/_contract")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	json.NewDecoder(resp2.Body).Decode(&doc)
+	resp2.Body.Close()
+	paths := doc["paths"].(map[string]any)
+	op := paths["/api/v2/works/{id}/poster"].(map[string]any)["post"].(map[string]any)
+	content := op["requestBody"].(map[string]any)["content"].(map[string]any)
+	mp, ok := content["multipart/form-data"].(map[string]any)
+	if !ok {
+		t.Fatalf("requestBody content lacks multipart/form-data: %v", content)
+	}
+	props := mp["schema"].(map[string]any)["properties"].(map[string]any)
+	posterSchema := props["poster"].(map[string]any)
+	if posterSchema["format"] != "binary" {
+		t.Fatalf("poster field schema = %v, want format binary", posterSchema)
+	}
+}
+
+// TestDeclaredAPIDateTime proves a `datetime`-typed wire type field is a
+// real RFC 3339 string end to end: `iso(now())` populates it, it round-trips
+// through JSON as a string (never an int the way `date`/`money` do), and the
+// published contract describes it as `{"type":"string","format":"date-time"}`
+// — the golden contract's own shape for a timestamp field.
+func TestDeclaredAPIDateTime(t *testing.T) {
+	src := `app W:
+    type WorkDTO:
+        id: int
+        created: datetime
+    entity Work:
+        id: int
+        createdAt: int
+    action addWork() -> WorkDTO:
+        let id = add Work { createdAt: now() }
+        return WorkDTO{id: id, created: iso(Work(id).createdAt)}
+    api POST "/api/v2/works" -> addWork status 201
+    view Home at "/":
+        text "x"
+`
+	g, err := compile.String(src)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/api/v2/works", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var work map[string]any
+	json.NewDecoder(resp.Body).Decode(&work)
+	created, ok := work["created"].(string)
+	if !ok {
+		t.Fatalf("created = %#v, want a JSON string", work["created"])
+	}
+	if _, err := time.Parse(time.RFC3339, created); err != nil {
+		t.Fatalf("created %q does not parse as RFC 3339: %v", created, err)
+	}
+
+	resp2, err := http.Get(ts.URL + "/api/_contract")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	json.NewDecoder(resp2.Body).Decode(&doc)
+	resp2.Body.Close()
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	dto := schemas["WorkDTO"].(map[string]any)
+	props := dto["properties"].(map[string]any)
+	createdSchema := props["created"].(map[string]any)
+	if createdSchema["type"] != "string" || createdSchema["format"] != "date-time" {
+		t.Fatalf("created schema = %v, want {type: string, format: date-time}", createdSchema)
 	}
 }
