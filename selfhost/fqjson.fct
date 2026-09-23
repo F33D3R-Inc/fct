@@ -1,0 +1,775 @@
+import "index_text.fct"
+import "aes_gcm.fct"
+
+app FqJsonSelfHost:
+    # fqjson.fct — the `serde_json::Value` facetql's storage layer reads a
+    # node's `data` through: parsed exactly as `serde_json::from_str`
+    # accepts and rejects it, and written back exactly as `Value`'s
+    # `to_string` writes it. An ordered index keys a composite `data` value
+    # by that string (index.rs's encode_value_body), so the port has to
+    # reproduce it byte for byte — object keys sorted (serde_json's `Map` is
+    # a BTreeMap, a repeated key keeping its last value), no whitespace,
+    # serde_json's string escapes, integers as written and floats as zmij
+    # formats them.
+    #
+    # Parsing follows serde_json's grammar and number rules: a leading zero
+    # followed by a digit, a trailing comma, a raw control character in a
+    # string, an unknown escape or a lone surrogate, trailing characters and
+    # nesting 128 deep are all errors; an integer is kept exactly when it
+    # fits u64 (or, negative, i64 — `-0` is the float -0.0), anything else
+    # is an f64 read the way serde_json reads it without float_roundtrip
+    # (digits past u64 dropped, then scaled by powers of ten — not always
+    # the nearest f64, and the index has to see the same one), and one
+    # that overflows is "number out of range".
+    struct FqJ:
+        kind: text
+        b: bool
+        s: text
+        f: float
+        items: [FqJ]
+        keys: [text]
+
+    struct FqJR:
+        ok: bool
+        err: text
+        v: FqJ
+        pos: int
+
+    proc fjNull() -> FqJ:
+        return FqJ{kind: "null", b: false, s: "", f: 0.0, items: [], keys: []}
+
+    proc fjFail(msg: text, pos: int) -> FqJR:
+        let n = do fjNull()
+        return FqJR{ok: false, err: msg, v: n, pos: pos}
+
+    proc fjWs(bs: [int], p0: int) -> int:
+        let n = len(bs)
+        let mut p = p0
+        loop p < n && (bs[p] == 32 || bs[p] == 9 || bs[p] == 10 || bs[p] == 13):
+            p = p + 1
+        return p
+
+    proc fjIsDigit(c: int) -> bool:
+        return c >= 48 && c <= 57
+
+    # fjDigitsLE: whether decimal digit text a ≤ b, both without leading
+    # zeros.
+    proc fjDigitsLE(a: text, b: text) -> bool:
+        if len(a) != len(b):
+            return len(a) < len(b)
+        return a <= b
+
+    proc fjIsInf(f: float) -> bool:
+        let bits = floatBits(f)
+        return ((bits >> 52) & 2047) == 2047
+
+    # u64 arithmetic in the runtime's int64: the same bits, compared and
+    # converted as unsigned.
+    proc fjU64Gt(a: int, b: int) -> bool:
+        let m = 1 << 63
+        return (a ^ m) > (b ^ m)
+
+    proc fjU64Float(a: int) -> float:
+        if a >= 0:
+            return toFloat(a)
+        let half = ((a >> 1) & 9223372036854775807) | (a & 1)
+        return toFloat(half) * 2.0
+
+    # fjMulOverflows: serde_json's overflow!(a * 10 + d, u64::MAX).
+    proc fjMulOverflows(a: int, d: int) -> bool:
+        let lim = 1844674407370955161
+        return !fjU64Gt(lim, a) && (fjU64Gt(a, lim) || d > 5)
+
+    struct FjF:
+        ok: bool
+        err: text
+        f: float
+        pos: int
+
+    # fjFromParts: f64_from_parts without float_roundtrip — the
+    # significand as f64, scaled by a power of ten one multiply or divide
+    # at a time (not correctly rounded, and exactly as facetql reads it).
+    proc fjFromParts(positive: bool, sig: int, exp0: int, pos: int) -> FjF:
+        let mut f = do fjU64Float(sig)
+        let mut exponent = exp0
+        loop true:
+            let mut ae = exponent
+            if ae < 0:
+                ae = 0 - ae
+            if ae <= 308:
+                let pow = toFloat("1e" + ae)
+                if exponent >= 0:
+                    f = f * pow
+                    let inf = do fjIsInf(f)
+                    if inf:
+                        return FjF{ok: false, err: "number out of range", f: 0.0, pos: pos}
+                else:
+                    f = f / pow
+                break
+            if f == 0.0:
+                break
+            if exponent >= 0:
+                return FjF{ok: false, err: "number out of range", f: 0.0, pos: pos}
+            f = f / toFloat("1e308")
+            exponent = exponent + 308
+        if !positive:
+            f = 0.0 - f
+            if f == 0.0:
+                f = floatFromBits(1 << 63)
+        return FjF{ok: true, err: "", f: f, pos: pos}
+
+    proc fjSatI32(v: int) -> int:
+        if v > 2147483647:
+            return 2147483647
+        if v < -2147483648:
+            return -2147483648
+        return v
+
+    # fjExponent: parse_exponent, at the `e`.
+    proc fjExponent(bs: [int], p0: int, positive: bool, sig: int, start: int) -> FjF:
+        let n = len(bs)
+        let mut p = p0 + 1
+        let mut posExp = true
+        if p < n && (bs[p] == 43 || bs[p] == 45):
+            posExp = bs[p] == 43
+            p = p + 1
+        if p >= n || !fjIsDigit(bs[p]):
+            return FjF{ok: false, err: "invalid number", f: 0.0, pos: p}
+        let mut exp = bs[p] - 48
+        p = p + 1
+        loop p < n && fjIsDigit(bs[p]):
+            let d = bs[p] - 48
+            p = p + 1
+            if exp >= 214748364 && (exp > 214748364 || d > 7):
+                if sig != 0 && posExp:
+                    return FjF{ok: false, err: "number out of range", f: 0.0, pos: p}
+                loop p < n && fjIsDigit(bs[p]):
+                    p = p + 1
+                let mut z = 0.0
+                if !positive:
+                    z = floatFromBits(1 << 63)
+                return FjF{ok: true, err: "", f: z, pos: p}
+            exp = exp * 10 + d
+        let mut fin = start + exp
+        if !posExp:
+            fin = start - exp
+        let sat = do fjSatI32(fin)
+        let r = do fjFromParts(positive, sig, sat, p)
+        return r
+
+    # fjDecimal: parse_decimal, at the `.`.
+    proc fjDecimal(bs: [int], p0: int, positive: bool, sig0: int, before: int) -> FjF:
+        let n = len(bs)
+        let mut p = p0 + 1
+        let mut sig = sig0
+        let mut after = 0
+        loop p < n && fjIsDigit(bs[p]):
+            let d = bs[p] - 48
+            let over = do fjMulOverflows(sig, d)
+            if over:
+                loop p < n && fjIsDigit(bs[p]):
+                    p = p + 1
+                if p < n && (bs[p] == 101 || bs[p] == 69):
+                    let e0 = do fjExponent(bs, p, positive, sig, before + after)
+                    return e0
+                let r0 = do fjFromParts(positive, sig, before + after, p)
+                return r0
+            sig = sig * 10 + d
+            after = after - 1
+            p = p + 1
+        if after == 0:
+            return FjF{ok: false, err: "invalid number", f: 0.0, pos: p}
+        if p < n && (bs[p] == 101 || bs[p] == 69):
+            let e1 = do fjExponent(bs, p, positive, sig, before + after)
+            return e1
+        let r1 = do fjFromParts(positive, sig, before + after, p)
+        return r1
+
+    # fjNumber: parse_integer and parse_number — an integer is u64 (i64
+    # when negative) unless it overflows, has a fraction or an exponent, or
+    # is -0.
+    proc fjNumber(bs: [int], p0: int) -> FqJR:
+        let n = len(bs)
+        let mut p = p0
+        let mut positive = true
+        if p < n && bs[p] == 45:
+            positive = false
+            p = p + 1
+        if p >= n || !fjIsDigit(bs[p]):
+            let e0 = do fjFail("invalid number", p)
+            return e0
+        let intStart = p
+        let mut sig = 0
+        let mut long = false
+        let mut longExp = 0
+        if bs[p] == 48:
+            p = p + 1
+            if p < n && fjIsDigit(bs[p]):
+                let e1 = do fjFail("invalid number", p)
+                return e1
+        else:
+            loop p < n && fjIsDigit(bs[p]):
+                let d = bs[p] - 48
+                if long:
+                    longExp = longExp + 1
+                else:
+                    let over = do fjMulOverflows(sig, d)
+                    if over:
+                        long = true
+                        longExp = 1
+                    else:
+                        sig = sig * 10 + d
+                p = p + 1
+        let digits = bytesToText(btRangeJ(bs, intStart, p))
+        let mut fr = FjF{ok: true, err: "", f: 0.0, pos: p}
+        if p < n && bs[p] == 46:
+            let d1 = do fjDecimal(bs, p, positive, sig, longExp)
+            fr = d1
+        else:
+            if p < n && (bs[p] == 101 || bs[p] == 69):
+                let x1 = do fjExponent(bs, p, positive, sig, longExp)
+                fr = x1
+            else:
+                if long:
+                    let l1 = do fjFromParts(positive, sig, longExp, p)
+                    fr = l1
+                else:
+                    if positive:
+                        return FqJR{ok: true, err: "", v: FqJ{kind: "int", b: false, s: digits, f: fjU64Float(sig), items: [], keys: []}, pos: p}
+                    let neg = 0 - sig
+                    if neg < 0:
+                        return FqJR{ok: true, err: "", v: FqJ{kind: "int", b: false, s: "-" + digits, f: toFloat(neg), items: [], keys: []}, pos: p}
+                    let nf = 0.0 - fjU64Float(sig)
+                    let mut negf = nf
+                    if sig == 0:
+                        negf = floatFromBits(1 << 63)
+                    return FqJR{ok: true, err: "", v: FqJ{kind: "float", b: false, s: "", f: negf, items: [], keys: []}, pos: p}
+        if !fr.ok:
+            let e2 = do fjFail(fr.err, fr.pos)
+            return e2
+        return FqJR{ok: true, err: "", v: FqJ{kind: "float", b: false, s: "", f: fr.f, items: [], keys: []}, pos: fr.pos}
+
+    proc btRangeJ(bs: [int], from: int, to: int) -> [int]:
+        let mut out = bytes(to - from)
+        let mut i = from
+        loop i < to:
+            out[i - from] = bs[i]
+            i = i + 1
+        return out
+
+    proc fjHex4(bs: [int], p: int) -> int:
+        let n = len(bs)
+        if p + 4 > n:
+            return -1
+        let mut v = 0
+        let mut i = 0
+        loop i < 4:
+            let c = bs[p + i]
+            let mut d = -1
+            if c >= 48 && c <= 57:
+                d = c - 48
+            if c >= 97 && c <= 102:
+                d = c - 87
+            if c >= 65 && c <= 70:
+                d = c - 55
+            if d < 0:
+                return -1
+            v = v * 16 + d
+            i = i + 1
+        return v
+
+    proc fjUtf8(out: [int], cp: int) -> [int]:
+        let mut o = out
+        if cp < 128:
+            o = append(o, cp)
+            return o
+        if cp < 2048:
+            o = append(o, 192 | (cp >> 6))
+            o = append(o, 128 | (cp & 63))
+            return o
+        if cp < 65536:
+            o = append(o, 224 | (cp >> 12))
+            o = append(o, 128 | ((cp >> 6) & 63))
+            o = append(o, 128 | (cp & 63))
+            return o
+        o = append(o, 240 | (cp >> 18))
+        o = append(o, 128 | ((cp >> 12) & 63))
+        o = append(o, 128 | ((cp >> 6) & 63))
+        o = append(o, 128 | (cp & 63))
+        return o
+
+    # fjString: a string starting at the opening quote at p0.
+    proc fjString(bs: [int], p0: int) -> FqJR:
+        let n = len(bs)
+        let mut out = []
+        let mut p = p0 + 1
+        loop p < n:
+            let c = bs[p]
+            if c == 34:
+                return FqJR{ok: true, err: "", v: FqJ{kind: "str", b: false, s: bytesToText(out), f: 0.0, items: [], keys: []}, pos: p + 1}
+            if c < 32:
+                let e0 = do fjFail("control character (\\u0000-\\u001F) found while parsing a string", p)
+                return e0
+            if c != 92:
+                out = append(out, c)
+                p = p + 1
+            else:
+                if p + 1 >= n:
+                    let e1 = do fjFail("EOF while parsing a string", p)
+                    return e1
+                let e = bs[p + 1]
+                p = p + 2
+                if e == 34 || e == 92 || e == 47:
+                    out = append(out, e)
+                else:
+                    if e == 98:
+                        out = append(out, 8)
+                    else:
+                        if e == 102:
+                            out = append(out, 12)
+                        else:
+                            if e == 110:
+                                out = append(out, 10)
+                            else:
+                                if e == 114:
+                                    out = append(out, 13)
+                                else:
+                                    if e == 116:
+                                        out = append(out, 9)
+                                    else:
+                                        if e != 117:
+                                            let e2 = do fjFail("invalid escape", p)
+                                            return e2
+                                        let mut cp = do fjHex4(bs, p)
+                                        if cp < 0:
+                                            let e3 = do fjFail("invalid escape", p)
+                                            return e3
+                                        p = p + 4
+                                        if cp >= 56320 && cp <= 57343:
+                                            let e4 = do fjFail("lone leading surrogate in hex escape", p)
+                                            return e4
+                                        if cp >= 55296 && cp <= 56319:
+                                            if p + 6 > n || bs[p] != 92 || bs[p + 1] != 117:
+                                                let e5 = do fjFail("unexpected end of hex escape", p)
+                                                return e5
+                                            let lo = do fjHex4(bs, p + 2)
+                                            if lo < 56320 || lo > 57343:
+                                                let e6 = do fjFail("lone leading surrogate in hex escape", p)
+                                                return e6
+                                            cp = 65536 + ((cp - 55296) << 10) + (lo - 56320)
+                                            p = p + 6
+                                        let o2 = do fjUtf8(out, cp)
+                                        out = o2
+        let e7 = do fjFail("EOF while parsing a string", p)
+        return e7
+
+    proc fjValue(bs: [int], p0: int, depth: int) -> FqJR:
+        let n = len(bs)
+        let p = do fjWs(bs, p0)
+        if p >= n:
+            let e0 = do fjFail("EOF while parsing a value", p)
+            return e0
+        let c = bs[p]
+        if c == 110 || c == 116 || c == 102:
+            let mut word = "null"
+            if c == 116:
+                word = "true"
+            if c == 102:
+                word = "false"
+            let wl = len(word)
+            if p + wl > n || bytesToText(btRangeJ(bs, p, p + wl)) != word:
+                let e1 = do fjFail("expected ident", p)
+                return e1
+            let mut v = do fjNull()
+            if c != 110:
+                v = FqJ{kind: "bool", b: c == 116, s: "", f: 0.0, items: [], keys: []}
+            return FqJR{ok: true, err: "", v: v, pos: p + wl}
+        if c == 34:
+            let s = do fjString(bs, p)
+            return s
+        if c == 45 || fjIsDigit(c):
+            let num = do fjNumber(bs, p)
+            return num
+        if c == 91 || c == 123:
+            if depth + 1 >= 128:
+                let e2 = do fjFail("recursion limit exceeded", p)
+                return e2
+            let isObj = c == 123
+            let mut close = 93
+            if isObj:
+                close = 125
+            let mut items = []
+            let mut keys = []
+            let mut q = do fjWs(bs, p + 1)
+            if q < n && bs[q] == close:
+                let mut kind0 = "arr"
+                if isObj:
+                    kind0 = "obj"
+                return FqJR{ok: true, err: "", v: FqJ{kind: kind0, b: false, s: "", f: 0.0, items: [], keys: []}, pos: q + 1}
+            loop true:
+                if isObj:
+                    q = do fjWs(bs, q)
+                    if q >= n || bs[q] != 34:
+                        let e3 = do fjFail("key must be a string", q)
+                        return e3
+                    let k = do fjString(bs, q)
+                    if !k.ok:
+                        return k
+                    q = do fjWs(bs, k.pos)
+                    if q >= n || bs[q] != 58:
+                        let e4 = do fjFail("expected `:`", q)
+                        return e4
+                    let v = do fjValue(bs, q + 1, depth + 1)
+                    if !v.ok:
+                        return v
+                    let at = do fjKeyAt(keys, k.v.s)
+                    if at >= 0:
+                        items[at] = v.v
+                    else:
+                        keys = append(keys, k.v.s)
+                        items = append(items, v.v)
+                    q = v.pos
+                else:
+                    let v2 = do fjValue(bs, q, depth + 1)
+                    if !v2.ok:
+                        return v2
+                    items = append(items, v2.v)
+                    q = v2.pos
+                q = do fjWs(bs, q)
+                if q >= n:
+                    let e5 = do fjFail("EOF while parsing a list or object", q)
+                    return e5
+                if bs[q] == close:
+                    if isObj:
+                        let sorted = do fjSortMembers(keys, items)
+                        return FqJR{ok: true, err: "", v: sorted, pos: q + 1}
+                    return FqJR{ok: true, err: "", v: FqJ{kind: "arr", b: false, s: "", f: 0.0, items: items, keys: []}, pos: q + 1}
+                if bs[q] != 44:
+                    let e6 = do fjFail("expected `,` or end of list or object", q)
+                    return e6
+                q = do fjWs(bs, q + 1)
+                if q < n && bs[q] == close:
+                    let e7 = do fjFail("trailing comma", q)
+                    return e7
+        let e8 = do fjFail("expected value", p)
+        return e8
+
+    proc fjKeyAt(keys: [text], k: text) -> int:
+        let n = len(keys)
+        let mut i = 0
+        loop i < n:
+            if keys[i] == k:
+                return i
+            i = i + 1
+        return -1
+
+    # fjSortMembers: the BTreeMap's order — keys by their bytes.
+    proc fjSortMembers(keys0: [text], items0: [FqJ]) -> FqJ:
+        let mut keys = keys0
+        let mut items = items0
+        let n = len(keys)
+        let mut i = 1
+        loop i < n:
+            let k = keys[i]
+            let v = items[i]
+            let mut j = i - 1
+            loop j >= 0 && keys[j] > k:
+                keys[j + 1] = keys[j]
+                items[j + 1] = items[j]
+                j = j - 1
+            keys[j + 1] = k
+            items[j + 1] = v
+            i = i + 1
+        return FqJ{kind: "obj", b: false, s: "", f: 0.0, items: items, keys: keys}
+
+    # fjParse: serde_json::from_str::<Value>.
+    proc fjParse(s: text) -> FqJR:
+        let bs = textToBytes(s)
+        let r = do fjValue(bs, 0, 0)
+        if !r.ok:
+            return r
+        let p = do fjWs(bs, r.pos)
+        if p != len(bs):
+            let e = do fjFail("trailing characters", p)
+            return e
+        return r
+
+    # fjGet: Value::get(field) — a member of an object, absent otherwise.
+    proc fjGet(v: FqJ, field: text) -> FqJR:
+        if v.kind == "obj":
+            let at = do fjKeyAt(v.keys, field)
+            if at >= 0:
+                return FqJR{ok: true, err: "", v: v.items[at], pos: 0}
+        let e = do fjFail("absent", 0)
+        return e
+
+    # ── serialization ──────────────────────────────────────────────────
+    proc fjHexDigit(d: int) -> text:
+        return charAt("0123456789abcdef", d)
+
+    proc fjQuote(s: text) -> text:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let c = bs[i]
+            if c == 34 || c == 92:
+                out = append(out, 92)
+                out = append(out, c)
+            else:
+                if c < 32:
+                    out = append(out, 92)
+                    if c == 8:
+                        out = append(out, 98)
+                    else:
+                        if c == 9:
+                            out = append(out, 116)
+                        else:
+                            if c == 10:
+                                out = append(out, 110)
+                            else:
+                                if c == 12:
+                                    out = append(out, 102)
+                                else:
+                                    if c == 13:
+                                        out = append(out, 114)
+                                    else:
+                                        let hx = textToBytes("u00" + fjHexDigit(c >> 4) + fjHexDigit(c & 15))
+                                        let mut h = 0
+                                        loop h < 5:
+                                            out = append(out, hx[h])
+                                            h = h + 1
+                else:
+                    out = append(out, c)
+            i = i + 1
+        return "\"" + bytesToText(out) + "\""
+
+    struct FjDigits:
+        neg: bool
+        digits: text
+        exp: int
+
+    # fjStripZeros: digit text and exponent with leading and trailing
+    # zeros removed (value = digits × 10^exp).
+    proc fjStripZeros(neg: bool, d0: text, exp0: int) -> FjDigits:
+        let mut d = d0
+        let mut exp = exp0
+        let mut a = 0
+        let n = len(d)
+        loop a < n - 1 && charAt(d, a) == "0":
+            a = a + 1
+        d = slice(d, a, n)
+        loop len(d) > 1 && charAt(d, len(d) - 1) == "0":
+            d = slice(d, 0, len(d) - 1)
+            exp = exp + 1
+        return FjDigits{neg: neg, digits: d, exp: exp}
+
+    # fjPow10: 10^k for 0 ≤ k ≤ 18.
+    proc fjPow10(k: int) -> int:
+        let mut v = 1
+        let mut i = 0
+        loop i < k:
+            v = v * 10
+            i = i + 1
+        return v
+
+    # fjShortest: the shortest decimal digits that read back as f, and
+    # their exponent — what zmij computes. The runtime renders a float with
+    # a fraction (or beyond 2^63) by its shortest round-trip form already,
+    # and one below 2^53 that is whole as its exact integer, whose digits
+    # are the shortest; a whole float from 2^53 to 2^63 is rendered exactly
+    # too, so its shortest form is searched for here: the fewest
+    # significant digits within half a unit in the last place (the bound
+    # itself included when the mantissa is even, as round-to-even reads it
+    # back), nearest the value.
+    proc fjShortest(f: float) -> FjDigits:
+        let bits = floatBits(f)
+        let neg = ((bits >> 63) & 1) == 1
+        let mut a = f
+        if neg:
+            a = 0.0 - f
+        if a == 0.0:
+            return FjDigits{neg: neg, digits: "0", exp: 0}
+        let two53 = 9007199254740992.0
+        let two63 = 9223372036854775808.0
+        if a >= two53 && a < two63:
+            let x = toInt(a)
+            let biased = (bits >> 52) & 2047
+            let ulp = 1 << (biased - 1075)
+            let half = ulp / 2
+            let even = (bits & 1) == 0
+            let mut k = 18
+            loop k >= 0:
+                let p = do fjPow10(k)
+                let c = ((x + p / 2) / p) * p
+                let mut dist = c - x
+                if dist < 0:
+                    dist = 0 - dist
+                if dist < half || (dist == half && even):
+                    let r = do fjStripZeros(neg, "" + (c / p), k)
+                    return r
+                k = k - 1
+            let r0 = do fjStripZeros(neg, "" + x, 0)
+            return r0
+        let t = "" + a
+        let mut mant = t
+        let mut exp = 0
+        let ep = do fjIndexOf(t, "e")
+        if ep >= 0:
+            mant = slice(t, 0, ep)
+            let es = slice(t, ep + 1, len(t))
+            if charAt(es, 0) == "+":
+                exp = toInt(slice(es, 1, len(es)))
+            else:
+                exp = toInt(es)
+        let dot = do fjIndexOf(mant, ".")
+        if dot >= 0:
+            exp = exp - (len(mant) - dot - 1)
+            mant = slice(mant, 0, dot) + slice(mant, dot + 1, len(mant))
+        let r2 = do fjStripZeros(neg, mant, exp)
+        return r2
+
+    proc fjIndexOf(s: text, c: text) -> int:
+        let n = len(s)
+        let mut i = 0
+        loop i < n:
+            if charAt(s, i) == c:
+                return i
+            i = i + 1
+        return -1
+
+    proc fjZeros(n: int) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            out = out + "0"
+            i = i + 1
+        return out
+
+    # fjFloatText: how serde_json writes an f64 (zmij): the shortest
+    # digits, fixed notation for decimal exponents -5..=15 (a whole value
+    # ending `.0`), otherwise `d.ddde±X`.
+    proc fjFloatText(f: float) -> text:
+        let sd = do fjShortest(f)
+        let mut sign = ""
+        if sd.neg:
+            sign = "-"
+        if sd.digits == "0":
+            return sign + "0.0"
+        let d = sd.digits
+        let length = len(d)
+        let k = sd.exp
+        let kk = length + k
+        if k >= 0 && kk <= 16:
+            return sign + d + fjZeros(k) + ".0"
+        if kk > 0 && kk <= 16:
+            return sign + slice(d, 0, kk) + "." + slice(d, kk, length)
+        if kk > -5 && kk <= 0:
+            return sign + "0." + fjZeros(0 - kk) + d
+        let mut e = "e" + (kk - 1)
+        if kk - 1 >= 0:
+            e = "e+" + (kk - 1)
+        if length == 1:
+            return sign + d + e
+        return sign + slice(d, 0, 1) + "." + slice(d, 1, length) + e
+
+    # fjText: Value's Display — serde_json::to_string.
+    proc fjText(v: FqJ) -> text:
+        if v.kind == "null":
+            return "null"
+        if v.kind == "bool":
+            if v.b:
+                return "true"
+            return "false"
+        if v.kind == "int":
+            return v.s
+        if v.kind == "float":
+            let ft = do fjFloatText(v.f)
+            return ft
+        if v.kind == "str":
+            let q = do fjQuote(v.s)
+            return q
+        let n = len(v.items)
+        let mut out = "["
+        if v.kind == "obj":
+            out = "{"
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            if v.kind == "obj":
+                let kq = do fjQuote(v.keys[i])
+                out = out + kq + ":"
+            let it = do fjText(v.items[i])
+            out = out + it
+            i = i + 1
+        if v.kind == "obj":
+            return out + "}"
+        return out + "]"
+
+    # fjDataValue: the value as index_text.fct's DataValue — what
+    # encode_order_value ranks and encodes (a number by its f64, an array
+    # or object by its serialized text).
+    proc fjDataValue(r: FqJR) -> DataValue:
+        if !r.ok:
+            let a = do absentDataValue()
+            return a
+        let v = r.v
+        if v.kind == "null":
+            let n = do nullDataValue()
+            return n
+        if v.kind == "bool":
+            let b = do boolDataValue(v.b)
+            return b
+        if v.kind == "int" || v.kind == "float":
+            let f = do numDataValue(v.f)
+            return f
+        if v.kind == "str":
+            let s = do textDataValue(v.s)
+            return s
+        let t = do fjText(v)
+        return DataValue{kind: "composite", boolVal: false, textVal: t, numVal: 0.0}
+
+    # encodeDataValueForKey: encode_order_value for every DataValue —
+    # index_text.fct's encoder, plus the composite arm (rank 0x50 and the
+    # value's serde_json text, escaped and terminated like every body).
+    proc encodeDataValueForKey(v: DataValue) -> [int]:
+        if v.kind == "composite":
+            let raw = textToBytes(v.textVal)
+            let body = do concatBytes([80], raw)
+            let out = do appendEscaped([], body)
+            return out
+        let out2 = do encodeOrderValue(v)
+        return out2
+
+    # ── test harness ───────────────────────────────────────────────────
+    state jsonOut: text = ""
+
+    # fjCanonText: each line's document as serde_json writes it back, or
+    # `error` where serde_json refuses it; ` | ` then encode_order_value's
+    # bytes in hex.
+    proc fjCanonText(docs: text) -> text:
+        let lines = split(docs, "\n")
+        let n = len(lines)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let r = do fjParse(lines[i])
+            if !r.ok:
+                out = out + "error\n"
+            else:
+                let t = do fjText(r.v)
+                let dv = do fjDataValue(r)
+                let enc = do encodeDataValueForKey(dv)
+                let hx = do cryptoEncodeHex(enc)
+                out = out + t + " | " + hx + "\n"
+            i = i + 1
+        return out
+
+    action runJson(docs: text):
+        let r = do fjCanonText(docs)
+        jsonOut = r
+
+    view JsonHome at "/json":
+        text "{jsonOut}"

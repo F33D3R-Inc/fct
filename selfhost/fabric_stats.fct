@@ -1,4 +1,5 @@
 import "fabric_telemetry.fct"
+import "fabric_json.fct"
 
 app FabricStatsSelfHost:
     # Self-hosting port of fabric/crates/fabric-facetql/src/sample.rs (606L)
@@ -60,59 +61,15 @@ app FabricStatsSelfHost:
     # `clampFloat` directly rather than re-deriving any of them.
     #
     # ============================================================
-    # THE TWO `now()`-FAMILY CALLS — THE ONE DELIBERATE APPROXIMATION IN THIS
-    # FILE, NAMED PRECISELY (same category as fabric_routing.fct's packed-int
-    # RoutingKey: a documented, honest simplification, not a silently
-    # dropped feature)
+    # CLOCKS
     # ============================================================
-    # `StatsSample::take` stamps every sample with TWO real clock reads:
-    #
-    #   taken_at_ms: now_ms()       -- SystemTime::now(), wall clock, for
-    #                                  LABELLING an observation (epoch ms).
-    #   taken_at:    Instant::now() -- a MONOTONIC clock, for MEASURING
-    #                                  elapsed time between two samples; per
-    #                                  the real module's own docs, chosen
-    #                                  specifically because it "cannot jump
-    #                                  when NTP steps the clock."
-    #
-    # This language's only clock builtin is `now()` (`facet lang`'s own
-    # list), which reads `time.Now().Unix()` — a WALL-CLOCK read, in whole
-    # SECONDS, with none of `Instant`'s monotonicity guarantee. Both fields
-    # below are stamped from this one builtin, which is the documented,
-    # honest simplification this task asked for. Two real, named
-    # consequences follow, and both are accepted rather than hidden:
-    #
-    #   1. RESOLUTION: two samples taken less than one second apart alias to
-    #      the same `takenAt` value here, where real nanosecond-resolution
-    #      `Instant`s would not. This lands in exactly the branch the real
-    #      code already has for it: `statsSampleDifference` treats
-    #      `seconds <= 0.0` (a zero-length interval) as "no interval to
-    #      report" and returns `has: false` — the real
-    #      `a_zero_length_interval_is_not_a_rate` test's own case — so a
-    #      too-fast poll here degrades to "report nothing this round," never
-    #      to a fabricated infinite rate.
-    #   2. MONOTONICITY: if the wall clock is stepped BACKWARD between two
-    #      polls (the exact failure mode real `Instant` is immune to and the
-    #      real module's docs call out by name), `takenAt` can go backward
-    #      too. This is not separately guarded against because it does not
-    #      need to be: `next.takenAt - current.takenAt` then computes a
-    #      negative `seconds`, which the SAME `seconds <= 0.0` check above
-    #      already catches — a clock step is silently treated as "no
-    #      interval," never as a fabricated negative-time spike. (Real
-    #      `Instant::saturating_duration_since` clamps this to exactly zero
-    #      for the same reason, so the two implementations agree on the
-    #      outcome even though they reach it by different arithmetic.)
-    #
-    # `takenAtMs` (the label field) is `takenAt * 1000` — this multiplies a
-    # whole-second reading up into millisecond units to keep the FIELD's
-    # declared unit meaningful for a caller that compares it against a real
-    # millisecond timestamp, but it does NOT recover sub-second precision:
-    # it is honestly a second-granularity number wearing a millisecond
-    # label, never a claim of true millisecond resolution. The real
-    # `now_ms()`'s own "clock set before 1970 reads as 0" guard is not
-    # separately restated: this runtime's `now()` reads `time.Now().Unix()`
-    # on a real host clock, which cannot produce a pre-1970 value the way an
-    # arbitrary `SystemTime` subtraction hypothetically could.
+    # StatsSample::take reads two clocks: now_ms() (epoch milliseconds, a
+    # label) and Instant::now() (monotonic, for elapsed time). The clock-free
+    # statsSampleTakeAt takes both readings from the caller, and
+    # `difference` measures elapsed time exactly as Duration::as_secs_f64
+    # over the monotonic nanosecond readings (saturating at zero).
+    # statsSampleTake reads monoMs() (millisecond resolution) for elapsed
+    # time and now() for the label.
 
     # ============================================================
     # wire.rs — the stats-DTO subtree, transcribed field-for-field.
@@ -218,9 +175,551 @@ app FabricStatsSelfHost:
     # `takenAt`/`takenAtMs` restate `Instant`/epoch-ms — see this file's
     # header for the exact, named approximation both carry.
     # ============================================================
+    # ============================================================
+    # wire.rs EngineStats: its serde schema for fabric_json.fct's sjDecode
+    # (serde_json::from_slice::<EngineStats> exactly, error text and
+    # position included), the decoded tree read into the structs, and the
+    # JSON text FacetQL sends. Generated from wire.rs's field table.
+    # ============================================================
+
+    proc statsSchema() -> [SjType]:
+        let mut ts = []
+        ts = append(ts, sjOptionType("opt_u64", "u64"))
+        ts = append(ts, sjOptionType("opt_f64", "f64"))
+        ts = append(ts, sjOptionType("opt_string", "string"))
+        ts = append(ts, sjVecType("vec_KindCount", "KindCount"))
+        ts = append(ts, sjVecType("vec_CellStats", "CellStats"))
+        ts = append(ts, sjStructType("KindCount", "struct KindCount", ["kind", "count"], ["string", "u64"], [false, false]))
+        ts = append(ts, sjStructType("StorageStats", "struct StorageStats", ["page_size", "segments", "pages", "obsolete_bytes"], ["u32", "u64", "u64", "u64"], [false, false, false, false]))
+        ts = append(ts, sjStructType("LatencyStats", "struct LatencyStats", ["count", "p50_us", "p99_us", "max_us"], ["u64", "opt_u64", "opt_u64", "opt_u64"], [true, true, true, true]))
+        ts = append(ts, sjStructType("WindowStats", "struct WindowStats", ["duration_ms", "age_ms", "cpu_utilization", "read_latency", "write_latency"], ["u64", "u64", "opt_f64", "LatencyStats", "LatencyStats"], [true, true, true, true, true]))
+        ts = append(ts, sjStructType("RequestStats", "struct RequestStats", ["total", "read", "write", "excluded", "unclassified", "in_flight", "max_concurrent", "write_queue_depth", "write_queue_contended_total"], ["u64", "u64", "u64", "u64", "u64", "u64", "u64", "u64", "u64"], [true, true, true, true, true, true, true, true, true]))
+        ts = append(ts, sjStructType("ProcessStats", "struct ProcessStats", ["cpu_seconds_total", "cpu_cores", "resident_bytes", "memory_limit_bytes", "memory_limit_source", "memory_utilization"], ["opt_f64", "opt_u64", "opt_u64", "opt_u64", "opt_string", "opt_f64"], [true, true, true, true, true, true]))
+        ts = append(ts, sjStructType("RuntimeStats", "struct RuntimeStats", ["uptime_seconds", "requests", "window", "process"], ["u64", "RequestStats", "WindowStats", "ProcessStats"], [true, true, true, true]))
+        ts = append(ts, sjStructType("CellStats", "struct CellStats", ["x", "y", "z", "q", "reads", "writes", "bytes_read", "bytes_written"], ["u8", "u8", "u8", "u8", "u64", "u64", "u64", "u64"], [true, true, true, true, true, true, true, true]))
+        ts = append(ts, sjStructType("CellAttribution", "struct CellAttribution", ["capacity", "tracked", "overflow_reads", "overflow_writes", "unattributed_writes", "cells"], ["u64", "u64", "u64", "u64", "u64", "vec_CellStats"], [true, true, true, true, true, true]))
+        ts = append(ts, sjStructType("EngineStats", "struct EngineStats", ["node_count", "edge_count", "user_count", "history_entries", "kinds", "reads_total", "writes_total", "storage", "version", "runtime", "cells"], ["u64", "u64", "u64", "u64", "vec_KindCount", "u64", "u64", "StorageStats", "opt_string", "RuntimeStats", "CellAttribution"], [false, false, false, false, false, false, false, false, true, true, true]))
+        return ts
+
+    proc statsReadKindCount(v: SjV) -> KindCount:
+        let mut out = do statsZeroKindCount()
+        out.kind = v.items[0].s
+        out.count = v.items[1].u
+        return out
+
+    proc statsReadStorageStats(v: SjV) -> StorageStats:
+        let mut out = do statsZeroStorageStats()
+        out.pageSize = v.items[0].u
+        out.segments = v.items[1].u
+        out.pages = v.items[2].u
+        out.obsoleteBytes = v.items[3].u
+        return out
+
+    proc statsReadLatencyStats(v: SjV) -> LatencyStats:
+        let mut out = do statsZeroLatencyStats()
+        out.count = v.items[0].u
+        out.hasP50Us = v.items[1].kind != "absent"
+        if out.hasP50Us:
+            out.p50Us = v.items[1].u
+        out.hasP99Us = v.items[2].kind != "absent"
+        if out.hasP99Us:
+            out.p99Us = v.items[2].u
+        out.hasMaxUs = v.items[3].kind != "absent"
+        if out.hasMaxUs:
+            out.maxUs = v.items[3].u
+        return out
+
+    proc statsReadWindowStats(v: SjV) -> WindowStats:
+        let mut out = do statsZeroWindowStats()
+        out.durationMs = v.items[0].u
+        out.ageMs = v.items[1].u
+        out.hasCpuUtilization = v.items[2].kind != "absent"
+        if out.hasCpuUtilization:
+            out.cpuUtilization = v.items[2].f
+        let mut rReadLatency = do statsDefaultLatencyStats()
+        if v.items[3].kind != "absent":
+            rReadLatency = do statsReadLatencyStats(v.items[3])
+        out.readLatency = rReadLatency
+        let mut rWriteLatency = do statsDefaultLatencyStats()
+        if v.items[4].kind != "absent":
+            rWriteLatency = do statsReadLatencyStats(v.items[4])
+        out.writeLatency = rWriteLatency
+        return out
+
+    proc statsReadRequestStats(v: SjV) -> RequestStats:
+        let mut out = do statsZeroRequestStats()
+        out.total = v.items[0].u
+        out.read = v.items[1].u
+        out.write = v.items[2].u
+        out.excluded = v.items[3].u
+        out.unclassified = v.items[4].u
+        out.inFlight = v.items[5].u
+        out.maxConcurrent = v.items[6].u
+        out.writeQueueDepth = v.items[7].u
+        out.writeQueueContendedTotal = v.items[8].u
+        return out
+
+    proc statsReadProcessStats(v: SjV) -> ProcessStats:
+        let mut out = do statsZeroProcessStats()
+        out.hasCpuSecondsTotal = v.items[0].kind != "absent"
+        if out.hasCpuSecondsTotal:
+            out.cpuSecondsTotal = v.items[0].f
+        out.hasCpuCores = v.items[1].kind != "absent"
+        if out.hasCpuCores:
+            out.cpuCores = v.items[1].u
+        out.hasResidentBytes = v.items[2].kind != "absent"
+        if out.hasResidentBytes:
+            out.residentBytes = v.items[2].u
+        out.hasMemoryLimitBytes = v.items[3].kind != "absent"
+        if out.hasMemoryLimitBytes:
+            out.memoryLimitBytes = v.items[3].u
+        out.hasMemoryLimitSource = v.items[4].kind != "absent"
+        if out.hasMemoryLimitSource:
+            out.memoryLimitSource = v.items[4].s
+        out.hasMemoryUtilization = v.items[5].kind != "absent"
+        if out.hasMemoryUtilization:
+            out.memoryUtilization = v.items[5].f
+        return out
+
+    proc statsReadRuntimeStats(v: SjV) -> RuntimeStats:
+        let mut out = do statsZeroRuntimeStats()
+        out.uptimeSeconds = v.items[0].u
+        let mut rRequests = do statsDefaultRequestStats()
+        if v.items[1].kind != "absent":
+            rRequests = do statsReadRequestStats(v.items[1])
+        out.requests = rRequests
+        let mut rWindow = do statsDefaultWindowStats()
+        if v.items[2].kind != "absent":
+            rWindow = do statsReadWindowStats(v.items[2])
+        out.window = rWindow
+        let mut rProcess = do statsDefaultProcessStats()
+        if v.items[3].kind != "absent":
+            rProcess = do statsReadProcessStats(v.items[3])
+        out.process = rProcess
+        return out
+
+    proc statsReadCellStats(v: SjV) -> CellStats:
+        let mut out = do statsZeroCellStats()
+        out.x = v.items[0].u
+        out.y = v.items[1].u
+        out.z = v.items[2].u
+        out.q = v.items[3].u
+        out.reads = v.items[4].u
+        out.writes = v.items[5].u
+        out.bytesRead = v.items[6].u
+        out.bytesWritten = v.items[7].u
+        return out
+
+    proc statsReadCellAttribution(v: SjV) -> CellAttribution:
+        let mut out = do statsZeroCellAttribution()
+        out.capacity = v.items[0].u
+        out.tracked = v.items[1].u
+        out.overflowReads = v.items[2].u
+        out.overflowWrites = v.items[3].u
+        out.unattributedWrites = v.items[4].u
+        let mut xsCells = []
+        let mut kCells = 0
+        loop kCells < len(v.items[5].items):
+            let eCells = do statsReadCellStats(v.items[5].items[kCells])
+            xsCells = append(xsCells, eCells)
+            kCells = kCells + 1
+        out.cells = xsCells
+        return out
+
+    proc statsReadEngineStats(v: SjV) -> EngineStats:
+        let mut out = do statsZeroEngineStats()
+        out.nodeCount = v.items[0].u
+        out.edgeCount = v.items[1].u
+        out.userCount = v.items[2].u
+        out.historyEntries = v.items[3].u
+        let mut xsKinds = []
+        let mut kKinds = 0
+        loop kKinds < len(v.items[4].items):
+            let eKinds = do statsReadKindCount(v.items[4].items[kKinds])
+            xsKinds = append(xsKinds, eKinds)
+            kKinds = kKinds + 1
+        out.kinds = xsKinds
+        out.readsTotal = v.items[5].u
+        out.writesTotal = v.items[6].u
+        let rStorage = do statsReadStorageStats(v.items[7])
+        out.storage = rStorage
+        out.hasVersion = v.items[8].kind != "absent"
+        if out.hasVersion:
+            out.version = v.items[8].s
+        let mut rRuntime = do statsDefaultRuntimeStats()
+        if v.items[9].kind != "absent":
+            rRuntime = do statsReadRuntimeStats(v.items[9])
+        out.runtime = rRuntime
+        let mut rCells = do statsDefaultCellAttribution()
+        if v.items[10].kind != "absent":
+            rCells = do statsReadCellAttribution(v.items[10])
+        out.cells = rCells
+        return out
+
+    struct StatsDecodeResult:
+        ok: bool
+        err: text
+        stats: EngineStats
+
+    # serde_json::from_slice::<EngineStats>; `err` is the error's Display.
+    proc statsDecodeEngineStats(body: text) -> StatsDecodeResult:
+        let schema = do statsSchema()
+        let r = do sjDecode(schema, body, "EngineStats")
+        if !r.ok:
+            let z = do statsZeroEngineStats()
+            return StatsDecodeResult{ok: false, err: r.err, stats: z}
+        let s = do statsReadEngineStats(r.v)
+        return StatsDecodeResult{ok: true, err: "", stats: s}
+
+    proc statsDefaultLatencyStats() -> LatencyStats:
+        return LatencyStats{count: 0, hasP50Us: false, p50Us: 0, hasP99Us: false, p99Us: 0, hasMaxUs: false, maxUs: 0}
+
+    proc statsDefaultWindowStats() -> WindowStats:
+        let dReadLatency = do statsDefaultLatencyStats()
+        let dWriteLatency = do statsDefaultLatencyStats()
+        return WindowStats{durationMs: 0, ageMs: 0, hasCpuUtilization: false, cpuUtilization: 0.0, readLatency: dReadLatency, writeLatency: dWriteLatency}
+
+    proc statsDefaultRequestStats() -> RequestStats:
+        return RequestStats{total: 0, read: 0, write: 0, excluded: 0, unclassified: 0, inFlight: 0, maxConcurrent: 0, writeQueueDepth: 0, writeQueueContendedTotal: 0}
+
+    proc statsDefaultProcessStats() -> ProcessStats:
+        return ProcessStats{hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasResidentBytes: false, residentBytes: 0, hasMemoryLimitBytes: false, memoryLimitBytes: 0, hasMemoryLimitSource: false, memoryLimitSource: "", hasMemoryUtilization: false, memoryUtilization: 0.0}
+
+    proc statsDefaultRuntimeStats() -> RuntimeStats:
+        let dRequests = do statsDefaultRequestStats()
+        let dWindow = do statsDefaultWindowStats()
+        let dProcess = do statsDefaultProcessStats()
+        return RuntimeStats{uptimeSeconds: 0, requests: dRequests, window: dWindow, process: dProcess}
+
+    proc statsDefaultCellStats() -> CellStats:
+        return CellStats{x: 0, y: 0, z: 0, q: 0, reads: 0, writes: 0, bytesRead: 0, bytesWritten: 0}
+
+    proc statsDefaultCellAttribution() -> CellAttribution:
+        return CellAttribution{capacity: 0, tracked: 0, overflowReads: 0, overflowWrites: 0, unattributedWrites: 0, cells: []}
+
+    proc statsZeroKindCount() -> KindCount:
+        return KindCount{kind: "", count: 0}
+
+    proc statsZeroStorageStats() -> StorageStats:
+        return StorageStats{pageSize: 0, segments: 0, pages: 0, obsoleteBytes: 0}
+
+    proc statsZeroLatencyStats() -> LatencyStats:
+        return LatencyStats{count: 0, hasP50Us: false, p50Us: 0, hasP99Us: false, p99Us: 0, hasMaxUs: false, maxUs: 0}
+
+    proc statsZeroWindowStats() -> WindowStats:
+        let zReadLatency = do statsZeroLatencyStats()
+        let zWriteLatency = do statsZeroLatencyStats()
+        return WindowStats{durationMs: 0, ageMs: 0, hasCpuUtilization: false, cpuUtilization: 0.0, readLatency: zReadLatency, writeLatency: zWriteLatency}
+
+    proc statsZeroRequestStats() -> RequestStats:
+        return RequestStats{total: 0, read: 0, write: 0, excluded: 0, unclassified: 0, inFlight: 0, maxConcurrent: 0, writeQueueDepth: 0, writeQueueContendedTotal: 0}
+
+    proc statsZeroProcessStats() -> ProcessStats:
+        return ProcessStats{hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasResidentBytes: false, residentBytes: 0, hasMemoryLimitBytes: false, memoryLimitBytes: 0, hasMemoryLimitSource: false, memoryLimitSource: "", hasMemoryUtilization: false, memoryUtilization: 0.0}
+
+    proc statsZeroRuntimeStats() -> RuntimeStats:
+        let zRequests = do statsZeroRequestStats()
+        let zWindow = do statsZeroWindowStats()
+        let zProcess = do statsZeroProcessStats()
+        return RuntimeStats{uptimeSeconds: 0, requests: zRequests, window: zWindow, process: zProcess}
+
+    proc statsZeroCellStats() -> CellStats:
+        return CellStats{x: 0, y: 0, z: 0, q: 0, reads: 0, writes: 0, bytesRead: 0, bytesWritten: 0}
+
+    proc statsZeroCellAttribution() -> CellAttribution:
+        return CellAttribution{capacity: 0, tracked: 0, overflowReads: 0, overflowWrites: 0, unattributedWrites: 0, cells: []}
+
+    proc statsZeroEngineStats() -> EngineStats:
+        let zStorage = do statsZeroStorageStats()
+        let zRuntime = do statsZeroRuntimeStats()
+        let zCells = do statsZeroCellAttribution()
+        return EngineStats{nodeCount: 0, edgeCount: 0, userCount: 0, historyEntries: 0, kinds: [], readsTotal: 0, writesTotal: 0, storage: zStorage, hasVersion: false, version: "", runtime: zRuntime, cells: zCells}
+
+    # KindCount: deserialize_struct, then visit_seq or visit_map as derived.
+
+    proc statsJsonKindCount(v: KindCount) -> text:
+        let jKind = do sjQuote(v.kind)
+        let jCount = do sjU64Text(v.count)
+        return "{" + "\"kind\":" + jKind + "," + "\"count\":" + jCount + "}"
+
+    # StorageStats as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonStorageStats(v: StorageStats) -> text:
+        let jPageSize = do sjU64Text(v.pageSize)
+        let jSegments = do sjU64Text(v.segments)
+        let jPages = do sjU64Text(v.pages)
+        let jObsoleteBytes = do sjU64Text(v.obsoleteBytes)
+        return "{" + "\"page_size\":" + jPageSize + "," + "\"segments\":" + jSegments + "," + "\"pages\":" + jPages + "," + "\"obsolete_bytes\":" + jObsoleteBytes + "}"
+
+    # LatencyStats as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonLatencyStats(v: LatencyStats) -> text:
+        let jCount = do sjU64Text(v.count)
+        let mut jP50Us = "null"
+        if v.hasP50Us:
+            jP50Us = do sjU64Text(v.p50Us)
+        let mut jP99Us = "null"
+        if v.hasP99Us:
+            jP99Us = do sjU64Text(v.p99Us)
+        let mut jMaxUs = "null"
+        if v.hasMaxUs:
+            jMaxUs = do sjU64Text(v.maxUs)
+        return "{" + "\"count\":" + jCount + "," + "\"p50_us\":" + jP50Us + "," + "\"p99_us\":" + jP99Us + "," + "\"max_us\":" + jMaxUs + "}"
+
+    # WindowStats as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonWindowStats(v: WindowStats) -> text:
+        let jDurationMs = do sjU64Text(v.durationMs)
+        let jAgeMs = do sjU64Text(v.ageMs)
+        let mut jCpuUtilization = "null"
+        if v.hasCpuUtilization:
+            jCpuUtilization = do sjF64Text(v.cpuUtilization)
+        let jReadLatency = do statsJsonLatencyStats(v.readLatency)
+        let jWriteLatency = do statsJsonLatencyStats(v.writeLatency)
+        return "{" + "\"duration_ms\":" + jDurationMs + "," + "\"age_ms\":" + jAgeMs + "," + "\"cpu_utilization\":" + jCpuUtilization + "," + "\"read_latency\":" + jReadLatency + "," + "\"write_latency\":" + jWriteLatency + "}"
+
+    # RequestStats as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonRequestStats(v: RequestStats) -> text:
+        let jTotal = do sjU64Text(v.total)
+        let jRead = do sjU64Text(v.read)
+        let jWrite = do sjU64Text(v.write)
+        let jExcluded = do sjU64Text(v.excluded)
+        let jUnclassified = do sjU64Text(v.unclassified)
+        let jInFlight = do sjU64Text(v.inFlight)
+        let jMaxConcurrent = do sjU64Text(v.maxConcurrent)
+        let jWriteQueueDepth = do sjU64Text(v.writeQueueDepth)
+        let jWriteQueueContendedTotal = do sjU64Text(v.writeQueueContendedTotal)
+        return "{" + "\"total\":" + jTotal + "," + "\"read\":" + jRead + "," + "\"write\":" + jWrite + "," + "\"excluded\":" + jExcluded + "," + "\"unclassified\":" + jUnclassified + "," + "\"in_flight\":" + jInFlight + "," + "\"max_concurrent\":" + jMaxConcurrent + "," + "\"write_queue_depth\":" + jWriteQueueDepth + "," + "\"write_queue_contended_total\":" + jWriteQueueContendedTotal + "}"
+
+    # ProcessStats as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonProcessStats(v: ProcessStats) -> text:
+        let mut jCpuSecondsTotal = "null"
+        if v.hasCpuSecondsTotal:
+            jCpuSecondsTotal = do sjF64Text(v.cpuSecondsTotal)
+        let mut jCpuCores = "null"
+        if v.hasCpuCores:
+            jCpuCores = do sjU64Text(v.cpuCores)
+        let mut jResidentBytes = "null"
+        if v.hasResidentBytes:
+            jResidentBytes = do sjU64Text(v.residentBytes)
+        let mut jMemoryLimitBytes = "null"
+        if v.hasMemoryLimitBytes:
+            jMemoryLimitBytes = do sjU64Text(v.memoryLimitBytes)
+        let mut jMemoryLimitSource = "null"
+        if v.hasMemoryLimitSource:
+            jMemoryLimitSource = do sjQuote(v.memoryLimitSource)
+        let mut jMemoryUtilization = "null"
+        if v.hasMemoryUtilization:
+            jMemoryUtilization = do sjF64Text(v.memoryUtilization)
+        return "{" + "\"cpu_seconds_total\":" + jCpuSecondsTotal + "," + "\"cpu_cores\":" + jCpuCores + "," + "\"resident_bytes\":" + jResidentBytes + "," + "\"memory_limit_bytes\":" + jMemoryLimitBytes + "," + "\"memory_limit_source\":" + jMemoryLimitSource + "," + "\"memory_utilization\":" + jMemoryUtilization + "}"
+
+    # RuntimeStats as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonRuntimeStats(v: RuntimeStats) -> text:
+        let jUptimeSeconds = do sjU64Text(v.uptimeSeconds)
+        let jRequests = do statsJsonRequestStats(v.requests)
+        let jWindow = do statsJsonWindowStats(v.window)
+        let jProcess = do statsJsonProcessStats(v.process)
+        return "{" + "\"uptime_seconds\":" + jUptimeSeconds + "," + "\"requests\":" + jRequests + "," + "\"window\":" + jWindow + "," + "\"process\":" + jProcess + "}"
+
+    # CellStats as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonCellStats(v: CellStats) -> text:
+        let jX = do sjU64Text(v.x)
+        let jY = do sjU64Text(v.y)
+        let jZ = do sjU64Text(v.z)
+        let jQ = do sjU64Text(v.q)
+        let jReads = do sjU64Text(v.reads)
+        let jWrites = do sjU64Text(v.writes)
+        let jBytesRead = do sjU64Text(v.bytesRead)
+        let jBytesWritten = do sjU64Text(v.bytesWritten)
+        return "{" + "\"x\":" + jX + "," + "\"y\":" + jY + "," + "\"z\":" + jZ + "," + "\"q\":" + jQ + "," + "\"reads\":" + jReads + "," + "\"writes\":" + jWrites + "," + "\"bytes_read\":" + jBytesRead + "," + "\"bytes_written\":" + jBytesWritten + "}"
+
+    # CellAttribution as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonCellAttribution(v: CellAttribution) -> text:
+        let jCapacity = do sjU64Text(v.capacity)
+        let jTracked = do sjU64Text(v.tracked)
+        let jOverflowReads = do sjU64Text(v.overflowReads)
+        let jOverflowWrites = do sjU64Text(v.overflowWrites)
+        let jUnattributedWrites = do sjU64Text(v.unattributedWrites)
+        let jCells = do statsJsonVecCellStats(v.cells)
+        return "{" + "\"capacity\":" + jCapacity + "," + "\"tracked\":" + jTracked + "," + "\"overflow_reads\":" + jOverflowReads + "," + "\"overflow_writes\":" + jOverflowWrites + "," + "\"unattributed_writes\":" + jUnattributedWrites + "," + "\"cells\":" + jCells + "}"
+
+    # EngineStats as JSON text, fields in wire.rs order (None as null).
+
+    proc statsJsonEngineStats(v: EngineStats) -> text:
+        let jNodeCount = do sjU64Text(v.nodeCount)
+        let jEdgeCount = do sjU64Text(v.edgeCount)
+        let jUserCount = do sjU64Text(v.userCount)
+        let jHistoryEntries = do sjU64Text(v.historyEntries)
+        let jKinds = do statsJsonVecKindCount(v.kinds)
+        let jReadsTotal = do sjU64Text(v.readsTotal)
+        let jWritesTotal = do sjU64Text(v.writesTotal)
+        let jStorage = do statsJsonStorageStats(v.storage)
+        let mut jVersion = "null"
+        if v.hasVersion:
+            jVersion = do sjQuote(v.version)
+        let jRuntime = do statsJsonRuntimeStats(v.runtime)
+        let jCells = do statsJsonCellAttribution(v.cells)
+        return "{" + "\"node_count\":" + jNodeCount + "," + "\"edge_count\":" + jEdgeCount + "," + "\"user_count\":" + jUserCount + "," + "\"history_entries\":" + jHistoryEntries + "," + "\"kinds\":" + jKinds + "," + "\"reads_total\":" + jReadsTotal + "," + "\"writes_total\":" + jWritesTotal + "," + "\"storage\":" + jStorage + "," + "\"version\":" + jVersion + "," + "\"runtime\":" + jRuntime + "," + "\"cells\":" + jCells + "}"
+
+    proc statsJsonVecKindCount(xs: [KindCount]) -> text:
+        let mut out = []
+        let mut i = 0
+        loop i < len(xs):
+            let s = do statsJsonKindCount(xs[i])
+            out = append(out, s)
+            i = i + 1
+        return "[" + join(out, ",") + "]"
+
+    proc statsJsonVecCellStats(xs: [CellStats]) -> text:
+        let mut out = []
+        let mut i = 0
+        loop i < len(xs):
+            let s = do statsJsonCellStats(xs[i])
+            out = append(out, s)
+            i = i + 1
+        return "[" + join(out, ",") + "]"
+
+    proc statsDigestKindCount(v: KindCount) -> text:
+        let gKind = do sjQuote(v.kind)
+        let gCount = do sjU64Text(v.count)
+        return "(" + gKind + "," + gCount + ")"
+
+    proc statsDigestStorageStats(v: StorageStats) -> text:
+        let gPageSize = do sjU64Text(v.pageSize)
+        let gSegments = do sjU64Text(v.segments)
+        let gPages = do sjU64Text(v.pages)
+        let gObsoleteBytes = do sjU64Text(v.obsoleteBytes)
+        return "(" + gPageSize + "," + gSegments + "," + gPages + "," + gObsoleteBytes + ")"
+
+    proc statsDigestLatencyStats(v: LatencyStats) -> text:
+        let gCount = do sjU64Text(v.count)
+        let mut gP50Us = "-"
+        if v.hasP50Us:
+            gP50Us = do sjU64Text(v.p50Us)
+        let mut gP99Us = "-"
+        if v.hasP99Us:
+            gP99Us = do sjU64Text(v.p99Us)
+        let mut gMaxUs = "-"
+        if v.hasMaxUs:
+            gMaxUs = do sjU64Text(v.maxUs)
+        return "(" + gCount + "," + gP50Us + "," + gP99Us + "," + gMaxUs + ")"
+
+    proc statsDigestWindowStats(v: WindowStats) -> text:
+        let gDurationMs = do sjU64Text(v.durationMs)
+        let gAgeMs = do sjU64Text(v.ageMs)
+        let mut gCpuUtilization = "-"
+        if v.hasCpuUtilization:
+            gCpuUtilization = "" + floatBits(v.cpuUtilization)
+        let gReadLatency = do statsDigestLatencyStats(v.readLatency)
+        let gWriteLatency = do statsDigestLatencyStats(v.writeLatency)
+        return "(" + gDurationMs + "," + gAgeMs + "," + gCpuUtilization + "," + gReadLatency + "," + gWriteLatency + ")"
+
+    proc statsDigestRequestStats(v: RequestStats) -> text:
+        let gTotal = do sjU64Text(v.total)
+        let gRead = do sjU64Text(v.read)
+        let gWrite = do sjU64Text(v.write)
+        let gExcluded = do sjU64Text(v.excluded)
+        let gUnclassified = do sjU64Text(v.unclassified)
+        let gInFlight = do sjU64Text(v.inFlight)
+        let gMaxConcurrent = do sjU64Text(v.maxConcurrent)
+        let gWriteQueueDepth = do sjU64Text(v.writeQueueDepth)
+        let gWriteQueueContendedTotal = do sjU64Text(v.writeQueueContendedTotal)
+        return "(" + gTotal + "," + gRead + "," + gWrite + "," + gExcluded + "," + gUnclassified + "," + gInFlight + "," + gMaxConcurrent + "," + gWriteQueueDepth + "," + gWriteQueueContendedTotal + ")"
+
+    proc statsDigestProcessStats(v: ProcessStats) -> text:
+        let mut gCpuSecondsTotal = "-"
+        if v.hasCpuSecondsTotal:
+            gCpuSecondsTotal = "" + floatBits(v.cpuSecondsTotal)
+        let mut gCpuCores = "-"
+        if v.hasCpuCores:
+            gCpuCores = do sjU64Text(v.cpuCores)
+        let mut gResidentBytes = "-"
+        if v.hasResidentBytes:
+            gResidentBytes = do sjU64Text(v.residentBytes)
+        let mut gMemoryLimitBytes = "-"
+        if v.hasMemoryLimitBytes:
+            gMemoryLimitBytes = do sjU64Text(v.memoryLimitBytes)
+        let mut gMemoryLimitSource = "-"
+        if v.hasMemoryLimitSource:
+            gMemoryLimitSource = do sjQuote(v.memoryLimitSource)
+        let mut gMemoryUtilization = "-"
+        if v.hasMemoryUtilization:
+            gMemoryUtilization = "" + floatBits(v.memoryUtilization)
+        return "(" + gCpuSecondsTotal + "," + gCpuCores + "," + gResidentBytes + "," + gMemoryLimitBytes + "," + gMemoryLimitSource + "," + gMemoryUtilization + ")"
+
+    proc statsDigestRuntimeStats(v: RuntimeStats) -> text:
+        let gUptimeSeconds = do sjU64Text(v.uptimeSeconds)
+        let gRequests = do statsDigestRequestStats(v.requests)
+        let gWindow = do statsDigestWindowStats(v.window)
+        let gProcess = do statsDigestProcessStats(v.process)
+        return "(" + gUptimeSeconds + "," + gRequests + "," + gWindow + "," + gProcess + ")"
+
+    proc statsDigestCellStats(v: CellStats) -> text:
+        let gX = do sjU64Text(v.x)
+        let gY = do sjU64Text(v.y)
+        let gZ = do sjU64Text(v.z)
+        let gQ = do sjU64Text(v.q)
+        let gReads = do sjU64Text(v.reads)
+        let gWrites = do sjU64Text(v.writes)
+        let gBytesRead = do sjU64Text(v.bytesRead)
+        let gBytesWritten = do sjU64Text(v.bytesWritten)
+        return "(" + gX + "," + gY + "," + gZ + "," + gQ + "," + gReads + "," + gWrites + "," + gBytesRead + "," + gBytesWritten + ")"
+
+    proc statsDigestCellAttribution(v: CellAttribution) -> text:
+        let gCapacity = do sjU64Text(v.capacity)
+        let gTracked = do sjU64Text(v.tracked)
+        let gOverflowReads = do sjU64Text(v.overflowReads)
+        let gOverflowWrites = do sjU64Text(v.overflowWrites)
+        let gUnattributedWrites = do sjU64Text(v.unattributedWrites)
+        let gCells = do statsDigestVecCellStats(v.cells)
+        return "(" + gCapacity + "," + gTracked + "," + gOverflowReads + "," + gOverflowWrites + "," + gUnattributedWrites + "," + gCells + ")"
+
+    proc statsDigestEngineStats(v: EngineStats) -> text:
+        let gNodeCount = do sjU64Text(v.nodeCount)
+        let gEdgeCount = do sjU64Text(v.edgeCount)
+        let gUserCount = do sjU64Text(v.userCount)
+        let gHistoryEntries = do sjU64Text(v.historyEntries)
+        let gKinds = do statsDigestVecKindCount(v.kinds)
+        let gReadsTotal = do sjU64Text(v.readsTotal)
+        let gWritesTotal = do sjU64Text(v.writesTotal)
+        let gStorage = do statsDigestStorageStats(v.storage)
+        let mut gVersion = "-"
+        if v.hasVersion:
+            gVersion = do sjQuote(v.version)
+        let gRuntime = do statsDigestRuntimeStats(v.runtime)
+        let gCells = do statsDigestCellAttribution(v.cells)
+        return "(" + gNodeCount + "," + gEdgeCount + "," + gUserCount + "," + gHistoryEntries + "," + gKinds + "," + gReadsTotal + "," + gWritesTotal + "," + gStorage + "," + gVersion + "," + gRuntime + "," + gCells + ")"
+
+    proc statsDigestVecKindCount(xs: [KindCount]) -> text:
+        let mut out = []
+        let mut i = 0
+        loop i < len(xs):
+            let s = do statsDigestKindCount(xs[i])
+            out = append(out, s)
+            i = i + 1
+        return "[" + join(out, ";") + "]"
+
+    proc statsDigestVecCellStats(xs: [CellStats]) -> text:
+        let mut out = []
+        let mut i = 0
+        loop i < len(xs):
+            let s = do statsDigestCellStats(xs[i])
+            out = append(out, s)
+            i = i + 1
+        return "[" + join(out, ";") + "]"
+
+
+    # `taken_at` (an Instant) is `takenAtNanos`, a monotonic nanosecond
+    # reading; `takenAt` is the same reading in whole seconds.
     struct StatsSample:
         takenAtMs: int
         takenAt: int
+        takenAtNanos: int
         readsTotal: int
         writesTotal: int
         nodeCount: int
@@ -244,13 +743,20 @@ app FabricStatsSelfHost:
     # statsSampleTake: `StatsSample::take` — every field a straight
     # projection off the wire response, except the two clock stamps (see
     # this file's header).
-    proc statsSampleTake(stats: EngineStats) -> StatsSample:
-        let takenAt = now()
-        let takenAtMs = takenAt * 1000
-        return StatsSample{takenAtMs: takenAtMs, takenAt: takenAt, readsTotal: stats.readsTotal, writesTotal: stats.writesTotal, nodeCount: stats.nodeCount, edgeCount: stats.edgeCount, hasCpuSecondsTotal: stats.runtime.process.hasCpuSecondsTotal, cpuSecondsTotal: stats.runtime.process.cpuSecondsTotal, hasCpuCores: stats.runtime.process.hasCpuCores, cpuCores: stats.runtime.process.cpuCores, hasMemoryUtilization: stats.runtime.process.hasMemoryUtilization, memoryUtilization: stats.runtime.process.memoryUtilization, hasReadLatencyP99Us: stats.runtime.window.readLatency.hasP99Us, readLatencyP99Us: stats.runtime.window.readLatency.p99Us, hasWriteLatencyP99Us: stats.runtime.window.writeLatency.hasP99Us, writeLatencyP99Us: stats.runtime.window.writeLatency.p99Us, inFlight: stats.runtime.requests.inFlight, maxConcurrent: stats.runtime.requests.maxConcurrent, cells: stats.cells.cells, overflowReads: stats.cells.overflowReads, overflowWrites: stats.cells.overflowWrites}
+    # StatsSample::take with the two clock readings passed in: `takenAtMs`
+    # epoch milliseconds (labelling), `takenAtNanos` a monotonic reading
+    # (measuring); statsSampleTake below stamps them from now() and
+    # monoMs().
+    proc statsSampleTakeAt(stats: EngineStats, takenAtMs: int, takenAtNanos: int) -> StatsSample:
+        return StatsSample{takenAtMs: takenAtMs, takenAt: takenAtNanos / 1000000000, takenAtNanos: takenAtNanos, readsTotal: stats.readsTotal, writesTotal: stats.writesTotal, nodeCount: stats.nodeCount, edgeCount: stats.edgeCount, hasCpuSecondsTotal: stats.runtime.process.hasCpuSecondsTotal, cpuSecondsTotal: stats.runtime.process.cpuSecondsTotal, hasCpuCores: stats.runtime.process.hasCpuCores, cpuCores: stats.runtime.process.cpuCores, hasMemoryUtilization: stats.runtime.process.hasMemoryUtilization, memoryUtilization: stats.runtime.process.memoryUtilization, hasReadLatencyP99Us: stats.runtime.window.readLatency.hasP99Us, readLatencyP99Us: stats.runtime.window.readLatency.p99Us, hasWriteLatencyP99Us: stats.runtime.window.writeLatency.hasP99Us, writeLatencyP99Us: stats.runtime.window.writeLatency.p99Us, inFlight: stats.runtime.requests.inFlight, maxConcurrent: stats.runtime.requests.maxConcurrent, cells: stats.cells.cells, overflowReads: stats.cells.overflowReads, overflowWrites: stats.cells.overflowWrites}
 
-    # statsSaturatingSub: `u64::saturating_sub`, the same `max(a - b, 0)`
-    # restatement fabric.fct's own `failoverSaturatingSub` already uses.
+    # StatsSample::take: the label from the wall clock (now(), whole
+    # seconds, in ms), elapsed time from the monotonic millisecond clock.
+    proc statsSampleTake(stats: EngineStats) -> StatsSample:
+        let mono = monoMs()
+        let s = do statsSampleTakeAt(stats, now() * 1000, mono * 1000000)
+        return s
+
     proc statsSaturatingSub(a: int, b: int) -> int:
         return max(a - b, 0)
 
@@ -374,9 +880,7 @@ app FabricStatsSelfHost:
     # statsSampleDifference: `StatsSample::difference` verbatim — `has:
     # false` covers both real "no interval" cases the real doc comment
     # names: a counter gone backwards (a restart) and a non-positive elapsed
-    # time (a same-instant pair, OR — the one case only this port's clock
-    # approximation can hit — a stepped-backward wall clock; see this file's
-    # header). `readLatencyUs`/`writeLatencyUs`/`memoryUtilization` fall back
+    # time (a same-instant pair). `readLatencyUs`/`writeLatencyUs`/`memoryUtilization` fall back
     # to 0.0 on an absent optional, the same "absent reads as low pressure"
     # convention `statsCpuUtilization` already uses.
     proc statsSampleDifference(current: StatsSample, next: StatsSample) -> WorkloadMetricsOption:
@@ -384,8 +888,8 @@ app FabricStatsSelfHost:
         let none = WorkloadMetricsOption{has: false, metrics: zero}
         if next.readsTotal < current.readsTotal || next.writesTotal < current.writesTotal:
             return none
-        let elapsed = next.takenAt - current.takenAt
-        let seconds = toFloat(elapsed)
+        let elapsed = max(next.takenAtNanos - current.takenAtNanos, 0)
+        let seconds = toFloat(elapsed / 1000000000) + toFloat(elapsed % 1000000000) / 1000000000.0
         if seconds <= 0.0:
             return none
         let readsPerSecond = toFloat(next.readsTotal - current.readsTotal) / seconds
@@ -424,222 +928,17 @@ app FabricStatsSelfHost:
     # TEST FIXTURES restated as plain constructors — sample.rs's own
     # `#[cfg(test)]` helpers `sample()`/`cell()`, verbatim.
     # ============================================================
+    # sample.rs's test fixture `sample(taken_at, reads, writes)`, taken_at in
+    # whole seconds.
     proc statsSampleFixture(takenAt: int, reads: int, writes: int) -> StatsSample:
-        return StatsSample{takenAtMs: 0, takenAt: takenAt, readsTotal: reads, writesTotal: writes, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
+        return StatsSample{takenAtMs: 0, takenAt: takenAt, takenAtNanos: takenAt * 1000000000, readsTotal: reads, writesTotal: writes, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
+
+    # The same fixture at a monotonic nanosecond reading.
+    proc statsSampleFixtureAt(takenAtNanos: int, reads: int, writes: int) -> StatsSample:
+        let mut s = do statsSampleFixture(0, reads, writes)
+        s.takenAtNanos = takenAtNanos
+        s.takenAt = takenAtNanos / 1000000000
+        return s
 
     proc statsCellFixture(x: int, reads: int, writes: int, bytesRead: int, bytesWritten: int) -> CellStats:
         return CellStats{x: x, y: 0, z: 0, q: 0, reads: reads, writes: writes, bytesRead: bytesRead, bytesWritten: bytesWritten}
-
-    private proc statsCellWorkloadIndexOfX(cells: [CellWorkloadMetrics], x: int) -> int:
-        let n = len(cells)
-        let mut i = 0
-        let mut found = -1
-        loop i < n:
-            if found == -1:
-                if cells[i].x == x:
-                    found = i
-            i = i + 1
-        return found
-
-    # ============================================================
-    # DEMO / BUILD-CHECK FIXTURES — one per real `#[test]` in sample.rs,
-    # hand-traced against that test's own literal expectation, restated in
-    # this directory's established demo-proc convention (see
-    # fabric_telemetry.fct/fabric_table.fct).
-    # ============================================================
-
-    # two_samples_a_second_apart_are_a_rate
-    proc demoTwoSamplesASecondApartAreARate() -> bool:
-        let start = 1000
-        let first = do statsSampleFixture(start, 100, 10)
-        let second = do statsSampleFixture(start + 2, 300, 30)
-        let result = do statsSampleDifference(first, second)
-        let readsOk = result.metrics.readsPerSecond == 100.0
-        let writesOk = result.metrics.writesPerSecond == 10.0
-        let opsOk = result.metrics.operationsPerSecond == 110.0
-        let ratios = do statsRatios(result.metrics)
-        let readRatioOk = abs(ratios.read - (100.0 / 110.0)) < 0.000000000001
-        let writeRatioOk = abs(ratios.write - (10.0 / 110.0)) < 0.000000000001
-        return result.has && readsOk && writesOk && opsOk && readRatioOk && writeRatioOk
-
-    # nothing_facetql_does_not_measure_is_invented
-    proc demoNothingFacetqlDoesNotMeasureIsInvented() -> bool:
-        let start = 2000
-        let before = do statsSampleFixture(start, 0, 0)
-        let after = do statsSampleFixture(start + 1, 10, 0)
-        let result = do statsSampleDifference(before, after)
-        let cpuOk = result.metrics.cpuUtilization == 0.0
-        let memOk = result.metrics.memoryUtilization == 0.0
-        let queueOk = result.metrics.queueDepth == 0
-        let latencyOk = result.metrics.readLatencyUs == 0.0
-        let breakdownEmpty = len(result.metrics.cellBreakdown) == 0
-        let notPartial = !result.metrics.cellBreakdownPartial
-        let isHot = do workloadMetricsIsHot(result.metrics)
-        return result.has && cpuOk && memOk && queueOk && latencyOk && breakdownEmpty && notPartial && !isHot
-
-    # a_restart_drops_the_interval_instead_of_reporting_a_spike
-    proc demoARestartDropsTheInterval() -> bool:
-        let start = 3000
-        let before = do statsSampleFixture(start, 5000000, 1000)
-        let afterRestart = do statsSampleFixture(start + 1, 3, 0)
-        let result = do statsSampleDifference(before, afterRestart)
-        return !result.has
-
-    # a_zero_length_interval_is_not_a_rate
-    proc demoAZeroLengthIntervalIsNotARate() -> bool:
-        let start = 4000
-        let a = do statsSampleFixture(start, 0, 0)
-        let b = do statsSampleFixture(start, 10, 10)
-        let result = do statsSampleDifference(a, b)
-        return !result.has
-
-    # an_idle_interval_is_zero_traffic_not_all_reads
-    proc demoAnIdleIntervalIsZeroTrafficNotAllReads() -> bool:
-        let start = 5000
-        let before = do statsSampleFixture(start, 7, 7)
-        let after = do statsSampleFixture(start + 1, 7, 7)
-        let result = do statsSampleDifference(before, after)
-        let ratios = do statsRatios(result.metrics)
-        return result.has && result.metrics.operationsPerSecond == 0.0 && ratios.read == 0.0 && ratios.write == 0.0
-
-    # cpu_utilization_comes_from_the_monotonic_counter
-    proc demoCpuUtilizationComesFromTheMonotonicCounter() -> bool:
-        let start = 6000
-        let before = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: true, cpuSecondsTotal: 1.0, hasCpuCores: true, cpuCores: 2, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
-        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: true, cpuSecondsTotal: 2.0, hasCpuCores: true, cpuCores: 2, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
-        let result = do statsSampleDifference(before, after)
-        return result.has && abs(result.metrics.cpuUtilization - 0.5) < 0.000000001
-
-    # an_unclosed_window_and_a_measured_idle_window_agree_on_absence
-    proc demoAnUnclosedWindowAndAMeasuredIdleWindowAgreeOnAbsence() -> bool:
-        let start = 7000
-        let neverClosedBefore = do statsSampleFixture(start, 0, 0)
-        let neverClosedAfter = do statsSampleFixture(start + 1, 0, 0)
-        let neverClosed = do statsSampleDifference(neverClosedBefore, neverClosedAfter)
-        let neverClosedOk = neverClosed.has && neverClosed.metrics.cpuUtilization == 0.0
-        let idleBefore = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: true, cpuSecondsTotal: 5.0, hasCpuCores: true, cpuCores: 4, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
-        let idleAfter = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: true, cpuSecondsTotal: 5.0, hasCpuCores: true, cpuCores: 4, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [], overflowReads: 0, overflowWrites: 0}
-        let idle = do statsSampleDifference(idleBefore, idleAfter)
-        let idleOk = idle.has && idle.metrics.cpuUtilization == 0.0
-        return neverClosedOk && idleOk
-
-    # a_saturated_engine_reports_maximum_queue_pressure
-    proc demoASaturatedEngineReportsMaximumQueuePressure() -> bool:
-        let start = 8000
-        let before = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 512, cells: [], overflowReads: 0, overflowWrites: 0}
-        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 512, maxConcurrent: 512, cells: [], overflowReads: 0, overflowWrites: 0}
-        let result = do statsSampleDifference(before, after)
-        let queueOk = result.metrics.queueDepth == 10000
-        let hot = do workloadMetricsIsQueueHot(result.metrics)
-        return result.has && queueOk && hot
-
-    # a_quiet_engine_reports_low_queue_pressure
-    proc demoAQuietEngineReportsLowQueuePressure() -> bool:
-        let start = 9000
-        let before = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 5, maxConcurrent: 512, cells: [], overflowReads: 0, overflowWrites: 0}
-        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 5, maxConcurrent: 512, cells: [], overflowReads: 0, overflowWrites: 0}
-        let result = do statsSampleDifference(before, after)
-        let low = result.metrics.queueDepth < 200
-        let hot = do workloadMetricsIsQueueHot(result.metrics)
-        return result.has && low && !hot
-
-    # per_cell_traffic_is_differenced_into_rates
-    proc demoPerCellTrafficIsDifferencedIntoRates() -> bool:
-        let start = 10000
-        let cellA1 = do statsCellFixture(1, 100, 10, 1000, 100)
-        let cellA2 = do statsCellFixture(2, 50, 5, 500, 50)
-        let before = StatsSample{takenAtMs: 0, takenAt: start, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [cellA1, cellA2], overflowReads: 0, overflowWrites: 0}
-        let cellB1 = do statsCellFixture(1, 300, 10, 3000, 100)
-        let cellB2 = do statsCellFixture(2, 50, 25, 500, 250)
-        let cellB3 = do statsCellFixture(3, 40, 0, 400, 0)
-        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [cellB1, cellB2, cellB3], overflowReads: 0, overflowWrites: 0}
-        let result = do statsSampleDifference(before, after)
-        let breakdown = result.metrics.cellBreakdown
-        let lenOk = len(breakdown) == 3
-        let idx1 = do statsCellWorkloadIndexOfX(breakdown, 1)
-        let idx3 = do statsCellWorkloadIndexOfX(breakdown, 3)
-        let cell1 = breakdown[idx1]
-        let cell3 = breakdown[idx3]
-        let cell1Ok = cell1.readsPerSecond == 200.0 && cell1.writesPerSecond == 0.0 && cell1.bytesReadPerSecond == 2000.0
-        let cell3Ok = cell3.readsPerSecond == 40.0
-        let busiestFirst = breakdown[0].x == 1
-        let notPartial = !result.metrics.cellBreakdownPartial
-        return result.has && lenOk && cell1Ok && cell3Ok && busiestFirst && notPartial
-
-    # overflow_marks_the_breakdown_as_partial
-    proc demoOverflowMarksTheBreakdownAsPartial() -> bool:
-        let start = 11000
-        let before = do statsSampleFixture(start, 0, 0)
-        let cell1 = do statsCellFixture(1, 10, 0, 100, 0)
-        let after = StatsSample{takenAtMs: 0, takenAt: start + 1, readsTotal: 0, writesTotal: 0, nodeCount: 0, edgeCount: 0, hasCpuSecondsTotal: false, cpuSecondsTotal: 0.0, hasCpuCores: false, cpuCores: 0, hasMemoryUtilization: false, memoryUtilization: 0.0, hasReadLatencyP99Us: false, readLatencyP99Us: 0, hasWriteLatencyP99Us: false, writeLatencyP99Us: 0, inFlight: 0, maxConcurrent: 0, cells: [cell1], overflowReads: 3, overflowWrites: 0}
-        let result = do statsSampleDifference(before, after)
-        return result.has && result.metrics.cellBreakdownPartial
-
-    # statsSampleTake, exercised against the exact JSON values wire.rs's own
-    # `a_current_stats_response_decodes_every_added_field` test decodes —
-    # this port has no JSON layer, so this demo instead confirms the same
-    # values survive the wire-DTO -> StatsSample projection, plus the clock
-    # fields' documented approximation (takenAt > 0, takenAtMs == takenAt *
-    # 1000).
-    proc demoStatsSampleTakeProjectsWireFields() -> bool:
-        let latencyRead = LatencyStats{count: 10, hasP50Us: true, p50Us: 100, hasP99Us: true, p99Us: 900, hasMaxUs: true, maxUs: 950}
-        let latencyWrite = LatencyStats{count: 0, hasP50Us: false, p50Us: 0, hasP99Us: false, p99Us: 0, hasMaxUs: false, maxUs: 0}
-        let window = WindowStats{durationMs: 1000, ageMs: 5, hasCpuUtilization: true, cpuUtilization: 0.42, readLatency: latencyRead, writeLatency: latencyWrite}
-        let requests = RequestStats{total: 50, read: 30, write: 20, excluded: 1, unclassified: 0, inFlight: 400, maxConcurrent: 512, writeQueueDepth: 3, writeQueueContendedTotal: 9}
-        let process = ProcessStats{hasCpuSecondsTotal: true, cpuSecondsTotal: 12.5, hasCpuCores: true, cpuCores: 8, hasResidentBytes: true, residentBytes: 1048576, hasMemoryLimitBytes: true, memoryLimitBytes: 4194304, hasMemoryLimitSource: true, memoryLimitSource: "cgroup", hasMemoryUtilization: true, memoryUtilization: 0.25}
-        let runtime = RuntimeStats{uptimeSeconds: 120, requests: requests, window: window, process: process}
-        let cellA = CellStats{x: 1, y: 2, z: 3, q: 4, reads: 100, writes: 10, bytesRead: 1000, bytesWritten: 100}
-        let cellB = CellStats{x: 0, y: 0, z: 0, q: 0, reads: 5, writes: 1, bytesRead: 50, bytesWritten: 5}
-        let cellAttribution = CellAttribution{capacity: 256, tracked: 2, overflowReads: 0, overflowWrites: 0, unattributedWrites: 1, cells: [cellA, cellB]}
-        let kindCount = KindCount{kind: "Post", count: 3}
-        let storage = StorageStats{pageSize: 4096, segments: 1, pages: 9, obsoleteBytes: 0}
-        let stats = EngineStats{nodeCount: 3, edgeCount: 1, userCount: 2, historyEntries: 4, kinds: [kindCount], readsTotal: 10, writesTotal: 5, storage: storage, hasVersion: true, version: "1.2.3", runtime: runtime, cells: cellAttribution}
-        let sample = do statsSampleTake(stats)
-        let projOk = sample.readsTotal == 10 && sample.writesTotal == 5 && sample.nodeCount == 3 && sample.edgeCount == 1
-        let cpuOk = sample.hasCpuSecondsTotal && sample.cpuSecondsTotal == 12.5 && sample.hasCpuCores && sample.cpuCores == 8
-        let memOk = sample.hasMemoryUtilization && sample.memoryUtilization == 0.25
-        let latencyOk = sample.hasReadLatencyP99Us && sample.readLatencyP99Us == 900 && !sample.hasWriteLatencyP99Us
-        let requestsOk = sample.inFlight == 400 && sample.maxConcurrent == 512
-        let cellsOk = len(sample.cells) == 2 && sample.cells[0].x == 1
-        let overflowOk = sample.overflowReads == 0 && sample.overflowWrites == 0
-        let clockOk = sample.takenAt > 0 && sample.takenAtMs == sample.takenAt * 1000
-        return projOk && cpuOk && memOk && latencyOk && requestsOk && cellsOk && overflowOk && clockOk
-
-    state demoTwoSamplesASecondApartAreARate: bool = false
-    state demoNothingFacetqlDoesNotMeasureIsInvented: bool = false
-    state demoARestartDropsTheInterval: bool = false
-    state demoAZeroLengthIntervalIsNotARate: bool = false
-    state demoAnIdleIntervalIsZeroTrafficNotAllReads: bool = false
-    state demoCpuUtilizationComesFromTheMonotonicCounter: bool = false
-    state demoAnUnclosedWindowAndAMeasuredIdleWindowAgreeOnAbsence: bool = false
-    state demoASaturatedEngineReportsMaximumQueuePressure: bool = false
-    state demoAQuietEngineReportsLowQueuePressure: bool = false
-    state demoPerCellTrafficIsDifferencedIntoRates: bool = false
-    state demoOverflowMarksTheBreakdownAsPartial: bool = false
-    state demoStatsSampleTakeProjectsWireFields: bool = false
-
-    action runDemoStats():
-        let r1 = do demoTwoSamplesASecondApartAreARate()
-        let r2 = do demoNothingFacetqlDoesNotMeasureIsInvented()
-        let r3 = do demoARestartDropsTheInterval()
-        let r4 = do demoAZeroLengthIntervalIsNotARate()
-        let r5 = do demoAnIdleIntervalIsZeroTrafficNotAllReads()
-        let r6 = do demoCpuUtilizationComesFromTheMonotonicCounter()
-        let r7 = do demoAnUnclosedWindowAndAMeasuredIdleWindowAgreeOnAbsence()
-        let r8 = do demoASaturatedEngineReportsMaximumQueuePressure()
-        let r9 = do demoAQuietEngineReportsLowQueuePressure()
-        let r10 = do demoPerCellTrafficIsDifferencedIntoRates()
-        let r11 = do demoOverflowMarksTheBreakdownAsPartial()
-        let r12 = do demoStatsSampleTakeProjectsWireFields()
-        demoTwoSamplesASecondApartAreARate = r1
-        demoNothingFacetqlDoesNotMeasureIsInvented = r2
-        demoARestartDropsTheInterval = r3
-        demoAZeroLengthIntervalIsNotARate = r4
-        demoAnIdleIntervalIsZeroTrafficNotAllReads = r5
-        demoCpuUtilizationComesFromTheMonotonicCounter = r6
-        demoAnUnclosedWindowAndAMeasuredIdleWindowAgreeOnAbsence = r7
-        demoASaturatedEngineReportsMaximumQueuePressure = r8
-        demoAQuietEngineReportsLowQueuePressure = r9
-        demoPerCellTrafficIsDifferencedIntoRates = r10
-        demoOverflowMarksTheBreakdownAsPartial = r11
-        demoStatsSampleTakeProjectsWireFields = r12

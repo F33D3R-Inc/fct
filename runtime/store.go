@@ -150,6 +150,12 @@ type Store interface {
 	LoadSession(sid string) (*persistedSession, bool, error)
 	SaveSession(sid string, ps *persistedSession) error
 	DeleteSession(sid string) error
+	// DeleteVisitorSessions removes every session carrying a `session` key (the
+	// stable visitor key an app revokes by), whichever instance created it.
+	DeleteVisitorSessions(visitor string) error
+	// RestateSessions gives every stored session signed in as actor the role
+	// (`restate actor … role …`), leaving the sessions themselves alive.
+	RestateSessions(actor, role string) error
 	PurgeExpiredSessions() error
 
 	// Durable job queue: enqueue persists a unit of work; ClaimJob atomically

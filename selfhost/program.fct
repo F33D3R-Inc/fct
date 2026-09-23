@@ -1,4 +1,5 @@
 import "parser_decl2.fct"
+import "parser_decl3.fct"
 import "nodes.fct"
 import "action_stmt.fct"
 
@@ -169,6 +170,19 @@ app ProgramSelfHost:
             i = i + 1
         return out
 
+    # progKeptLineNos: the 1-based source line of each progKeptRawLines entry.
+    proc progKeptLineNos(src: text) -> [int]:
+        let rawLines = split(src, "\n")
+        let n = len(rawLines)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let skip = do progIsBlankOrComment(rawLines[i])
+            if !skip:
+                out = append(out, i + 1)
+            i = i + 1
+        return out
+
     proc progIndentsOf(rawLines: [text]) -> [int]:
         let n = len(rawLines)
         let mut out = []
@@ -317,6 +331,11 @@ app ProgramSelfHost:
         headerValid: bool
         exprSrc: text
         expr: ExprNode
+        # line/cont: the declaration's own text and any continuation lines
+        # (a definition whose brackets span lines), for the driver's full
+        # parseDerive (parameters, joinOpenBrackets).
+        line: text
+        cont: text
 
     struct StateDecl:
         name: text
@@ -359,6 +378,7 @@ app ProgramSelfHost:
         hasSecret: bool
         secret: text
         valid: bool
+        line: int
 
     struct JobDecl:
         name: text
@@ -383,6 +403,12 @@ app ProgramSelfHost:
         url: text
         headerValid: bool
         ops: [ServiceOpDecl]
+        # urlEnv / headerNames / headerEnvs: the header's `env VAR` and
+        # `header "Name" env VAR` clauses; err: parseService's refusal.
+        urlEnv: text
+        headerNames: [text]
+        headerEnvs: [text]
+        err: text
 
     # ActionDecl: closes program.fct's own previously-named gap ("`action`:
     # ... `action` blocks are therefore left out of `Program`'s own fields
@@ -421,6 +447,16 @@ app ProgramSelfHost:
         # inference needs a fresh ALowAcc walk over the statements, not the
         # bare parse tree this struct's own `body` field already holds).
         bodySrc: text
+        # renameFrom/renameTo: see ProcDecl's (manglePrivate's per-file
+        # rewrite of `do` targets).
+        renameFrom: [text]
+        renameTo: [text]
+        # paramLists/ret/retList: parseSignature(allowList=true)'s list
+        # parameters and the `-> Type` reply (parser.go parseAction).
+        paramLists: [bool]
+        ret: text
+        retList: bool
+        retErr: text
 
     # ComponentEntry/ViewEntry: header genuinely parsed (ComponentDecl reused
     # verbatim from parser_decl2.fct; the view header restated locally per
@@ -430,12 +466,74 @@ app ProgramSelfHost:
     struct ComponentEntry:
         header: ComponentDecl
         body: [UiNode]
+        # headerLine/bodySrc: the raw text, for view_parse.fct's full grammar.
+        headerLine: text
+        bodySrc: text
+
+    # LayoutEntry: `layout Name:` and its raw body (parser.go parseLayout).
+    # Layered-facet parts (parser.go parsePlayground/parseWireframe/
+    # parseUIData): a playground's `mount`s, a wireframe's `socket`s and
+    # `frame:`, a ui/data facet's `content:`.
+    struct ProgMount:
+        wireframe: text
+        path: text
+        requires: text
+        err: text
+
+    struct ProgSocket:
+        name: text
+        accept: text
+        err: text
+
+    # RawDecl: a declaration kept as its raw text for the driver's own
+    # parsers — `type`, `message`, `api`, `contract`, `stream`, `file`,
+    # `css from` (kw is the leading keyword).
+    struct RawDecl:
+        kw: text
+        header: text
+        bodySrc: text
+        line: int
+        # bodyLineNos: the source line of each (kept) line of bodySrc.
+        bodyLineNos: [int]
+
+    struct LayoutEntry:
+        headerLine: text
+        bodySrc: text
 
     struct ViewEntry:
         name: text
         path: text
         headerValid: bool
         body: [UiNode]
+        # header/bodySrc: the declaration's own raw text, kept so the full
+        # view grammar (view_parse.fct's vpParseView) can re-read it.
+        header: text
+        bodySrc: text
+        # private: declared `private view` (a file-local name, mangled per
+        # module by the driver exactly as internal/compile's manglePrivate).
+        private: bool
+
+    # DaemonDecl: parser.go's parseDaemon — `daemon Name [every <dur>]
+    # [uses cap, …]:` plus its proc-shaped body (kept raw for
+    # proc_lower.fct's plLowerDaemon). `err` carries the header's first
+    # refusal ("" when well-formed).
+    struct DaemonDecl:
+        name: text
+        every: int
+        uses: [text]
+        bodySrc: text
+        err: text
+        renameFrom: [text]
+        renameTo: [text]
+
+    # ProgThemeBlock: one `theme:` / `theme dark:` / `theme <name>:` block
+    # (parser.go parseTheme/parseNamedTheme) — kind is "base", "dark" or
+    # "named"; the entries are parser_decl3.fct's ThemeVar.
+    struct ProgThemeBlock:
+        kind: text
+        name: text
+        vars: [ThemeVar]
+        valid: bool
 
     struct Program:
         name: text
@@ -455,6 +553,26 @@ app ProgramSelfHost:
         components: [ComponentEntry]
         triggers: [TriggerDecl]
         views: [ViewEntry]
+        themes: [ProgThemeBlock]
+        css: text
+        daemons: [DaemonDecl]
+        # privateProcs: the names of this file's `private proc`s (see
+        # ViewEntry.private); parseErrors: the refusals parseDecl makes that
+        # no per-declaration struct carries (first one wins).
+        privateProcs: [text]
+        parseErrors: [text]
+        layouts: [LayoutEntry]
+        # kind: "app" | "playground" | "wireframe" | "ui" | "data"; into:
+        # a ui/data facet's socket.
+        rawDecls: [RawDecl]
+        kind: text
+        into: text
+        mounts: [ProgMount]
+        sockets: [ProgSocket]
+        hasFrame: bool
+        frameSrc: text
+        hasContent: bool
+        contentSrc: text
         unknownKeywords: [text]
 
     # ============================================================
@@ -477,7 +595,7 @@ app ProgramSelfHost:
         if exprSrc != "":
             let parsed = do parseExprTree(exprSrc)
             ex = parsed
-        return DeriveDeclFull{name: name, typeCore: core, headerValid: hv, exprSrc: exprSrc, expr: ex}
+        return DeriveDeclFull{name: name, typeCore: core, headerValid: hv, exprSrc: exprSrc, expr: ex, line: lineText, cont: ""}
 
     proc buildStateDecl(lineText: text) -> StateDecl:
         let name = do stateNameOf(lineText)
@@ -517,6 +635,37 @@ app ProgramSelfHost:
                 ok = false
             i = i + 1
         return ok
+
+    # qualifyRowRefs: internal/parser/parser.go's qualifyRowRefs — every
+    # bare ref naming one of the entity's own fields becomes
+    # `get($row, name)`, recursing through get/entityGet key/agg where+sel/
+    # call/list/bin/un exactly as the Go switch does (index/map/struct and
+    # literals fall into its default arm and are returned untouched).
+    proc qualifyRowRefsList(xs: [ExprNode], fields: [text]) -> [ExprNode]:
+        let mut out = []
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            let q = do qualifyRowRefs(xs[i], fields)
+            out = append(out, q)
+            i = i + 1
+        return out
+
+    proc qualifyRowRefs(ex: ExprNode, fields: [text]) -> ExprNode:
+        if ex.kind == "ref":
+            if ex.text in fields:
+                let row = do refNode("$row")
+                let g = do getNode(row, ex.text)
+                return g
+            return ex
+        if ex.kind == "get" || ex.kind == "entityGet" || ex.kind == "call" || ex.kind == "list" || ex.kind == "bin" || ex.kind == "un":
+            let kids = do qualifyRowRefsList(ex.children, fields)
+            return ExprNode{kind: ex.kind, text: ex.text, field: ex.field, itemVar: ex.itemVar, coll: ex.coll, children: kids, pairs: ex.pairs, whereClause: ex.whereClause, sel: ex.sel, order: ex.order, desc: ex.desc, limit: ex.limit, orderBy: ex.orderBy, varFromArg: ex.varFromArg}
+        if ex.kind == "agg":
+            let w = do qualifyRowRefsList(ex.whereClause, fields)
+            let sl = do qualifyRowRefsList(ex.sel, fields)
+            return ExprNode{kind: ex.kind, text: ex.text, field: ex.field, itemVar: ex.itemVar, coll: ex.coll, children: ex.children, pairs: ex.pairs, whereClause: w, sel: sl, order: ex.order, desc: ex.desc, limit: ex.limit, orderBy: ex.orderBy, varFromArg: ex.varFromArg}
+        return ex
 
     # buildEntityDecl: real parseEntity (parser.go lines 509-714), read
     # fresh again for this task — a `derive name: …` child line is an
@@ -563,6 +712,26 @@ app ProgramSelfHost:
                     let fd = do buildEntityFieldDecl(lt)
                     fields = append(fields, fd)
             i = i + 1
+        # parser.go qualifies `read:` and every entity derive against the
+        # full field set once the field loop is done.
+        let mut fieldNames = []
+        let nf = len(fields)
+        let mut fi = 0
+        loop fi < nf:
+            fieldNames = append(fieldNames, fields[fi].name)
+            fi = fi + 1
+        if hasRead:
+            let qr = do qualifyRowRefs(readExpr, fieldNames)
+            readExpr = qr
+        let mut qderives = []
+        let nd = len(derives)
+        let mut di = 0
+        loop di < nd:
+            let d0 = derives[di]
+            let qd = do qualifyRowRefs(d0.expr, fieldNames)
+            qderives = append(qderives, DeriveDeclFull{name: d0.name, typeCore: d0.typeCore, headerValid: d0.headerValid, exprSrc: d0.exprSrc, expr: qd, line: d0.line, cont: d0.cont})
+            di = di + 1
+        derives = qderives
         let fieldsOk = do entityFieldsAllValid(fields)
         let mut valid = false
         if headerValid:
@@ -577,7 +746,7 @@ app ProgramSelfHost:
         let secret = do parseWebhookSecret(header)
         let valid = do parseWebhookValid(header)
         let hasSecret = secret != ""
-        return WebhookDecl{path: path, action: action, hasSecret: hasSecret, secret: secret, valid: valid}
+        return WebhookDecl{path: path, action: action, hasSecret: hasSecret, secret: secret, valid: valid, line: 0}
 
     proc buildJobDecl(header: text) -> JobDecl:
         let name = do parseJobName(header)
@@ -610,7 +779,112 @@ app ProgramSelfHost:
             let op = do buildServiceOpDecl(bodyLines[i])
             ops = append(ops, op)
             i = i + 1
-        return ServiceDecl{name: name, url: url, headerValid: hv, ops: ops}
+        let sh = do progServiceHead(header)
+        return ServiceDecl{name: name, url: url, headerValid: hv, ops: ops, urlEnv: sh.urlEnv, headerNames: sh.headerNames, headerEnvs: sh.headerEnvs, err: sh.err}
+
+    # progServiceHead: parseService's header — `service Name at "url"`
+    # followed by `env VAR` and any number of `header "Name" env VAR`.
+    struct ProgServiceHead:
+        err: text
+        urlEnv: text
+        headerNames: [text]
+        headerEnvs: [text]
+
+    proc progQuotedEnd(s: text) -> int:
+        let n = len(s)
+        if n == 0 || charAt(s, 0) != "\"":
+            return -1
+        let mut i = 1
+        loop i < n:
+            let c = charAt(s, i)
+            if c == "\\":
+                i = i + 2
+                continue
+            if c == "\"":
+                return i
+            i = i + 1
+        return -1
+
+    proc progWords(s: text) -> [text]:
+        let parts = split(trim(s), " ")
+        let mut out = []
+        let n = len(parts)
+        let mut i = 0
+        loop i < n:
+            if trim(parts[i]) != "":
+                out = append(out, trim(parts[i]))
+            i = i + 1
+        return out
+
+    proc progServiceHead(header: text) -> ProgServiceHead:
+        let none = ProgServiceHead{err: "", urlEnv: "", headerNames: [], headerEnvs: []}
+        let base = "service needs a base URL: service Name at \"http://host:port\""
+        let h0 = do trimPrefixText(trim(header), "service")
+        let rest0 = trim(h0)
+        let rest = do trimSuffixText(rest0, ":")
+        let i = do indexOf(rest, " at ")
+        if i < 0:
+            return ProgServiceHead{err: base, urlEnv: "", headerNames: [], headerEnvs: []}
+        let name = trim(slice(rest, 0, i))
+        let tail = trim(slice(rest, i + 4, len(rest)))
+        let e = do progQuotedEnd(tail)
+        if e < 0:
+            return ProgServiceHead{err: base, urlEnv: "", headerNames: [], headerEnvs: []}
+        let u = do goUnquote(slice(tail, 0, e + 1))
+        if !u.ok || u.value == "":
+            return ProgServiceHead{err: base, urlEnv: "", headerNames: [], headerEnvs: []}
+        let mut urlEnv = ""
+        let mut names = []
+        let mut envs = []
+        let mut clauses = trim(slice(tail, e + 1, len(tail)))
+        loop clauses != "":
+            let isEnv = do hasPrefixText(clauses, "env ")
+            let isHeader = do hasPrefixText(clauses, "header ")
+            if isEnv:
+                let afterEnv = trim(slice(clauses, 4, len(clauses)))
+                let f = do progWords(afterEnv)
+                let mut ok = len(f) > 0
+                if ok:
+                    let fi = do isIdentToken(f[0])
+                    ok = fi
+                if !ok:
+                    return ProgServiceHead{err: "service `env` names the env var that overrides its URL: env THEMIS_URL", urlEnv: "", headerNames: [], headerEnvs: []}
+                urlEnv = f[0]
+                let rem = do trimPrefixText(afterEnv, f[0])
+                clauses = trim(rem)
+            else:
+                if isHeader:
+                    let h = trim(slice(clauses, 7, len(clauses)))
+                    let he = do progQuotedEnd(h)
+                    if he < 0:
+                        return ProgServiceHead{err: "service header is header \"Name\" env VAR", urlEnv: "", headerNames: [], headerEnvs: []}
+                    let hn = do goUnquote(slice(h, 0, he + 1))
+                    let after = slice(h, he + 1, len(h))
+                    let f2 = do progWords(after)
+                    let mut ok2 = len(f2) >= 2 && hn.value != ""
+                    if ok2:
+                        let fi2 = do isIdentToken(f2[1])
+                        ok2 = f2[0] == "env" && fi2
+                    if !ok2:
+                        return ProgServiceHead{err: "service header is header \"Name\" env VAR — its value comes from the environment, never the source", urlEnv: "", headerNames: [], headerEnvs: []}
+                    names = append(names, hn.value)
+                    envs = append(envs, f2[1])
+                    let a1 = do trimPrefixText(trim(after), "env")
+                    let a2 = do trimPrefixText(trim(a1), f2[1])
+                    clauses = trim(a2)
+                else:
+                    let cq = do goQuote(clauses)
+                    return ProgServiceHead{err: "unknown service clause " + cq + " (expected env VAR or header \"Name\" env VAR)", urlEnv: "", headerNames: [], headerEnvs: []}
+        let ni = do isIdentToken(name)
+        if !ni:
+            let nq = do goQuote(name)
+            return ProgServiceHead{err: "invalid service name " + nq, urlEnv: "", headerNames: [], headerEnvs: []}
+        let hp = do hasPrefixText(u.value, "http://")
+        let hps = do hasPrefixText(u.value, "https://")
+        if !hp && !hps:
+            let nq2 = do goQuote(name)
+            return ProgServiceHead{err: "service " + nq2 + " url must start with http:// or https://", urlEnv: "", headerNames: [], headerEnvs: []}
+        return ProgServiceHead{err: "", urlEnv: urlEnv, headerNames: names, headerEnvs: envs}
 
     # buildActionDecl: real parseAction's header (action_stmt.fct's own
     # `actionHeadOf`/`actionIsOptimistic`/`actionHeadStripOptimistic`, then
@@ -629,16 +903,31 @@ app ProgramSelfHost:
         let paramTypes = do headerParamTypes(head)
         let paramOptionals = do headerParamOptionals(head)
         let headerValid = do actionHeaderValid(head)
+        let paramLists = do headerParamLists(head)
+        let hasRet = do headerRetSectionExists(head)
+        let mut ret = ""
+        let mut retList = false
+        let mut retErr = ""
+        if hasRet:
+            let rc = do headerRetCore(head)
+            let rl = do headerRetIsList(head)
+            let ropt = do headerRetIsOptional(head)
+            let rtn = do isTypeNameToken(rc)
+            if ropt || !rtn:
+                let raw = do headerRetTypeRaw(head)
+                retErr = "invalid return type \"" + raw + "\""
+            ret = rc
+            retList = rl
         let allStmts = do parseActionBodySrc(bodySrc)
         let body = do actionBodyOnly(allStmts)
         let requiresList = do actionRequiresOnly(allStmts)
         let bodyValid = len(body) > 0
-        return ActionDecl{name: name, paramNames: paramNames, paramTypes: paramTypes, paramOptionals: paramOptionals, optimistic: optimistic, headerValid: headerValid, requires: requiresList, body: body, bodyValid: bodyValid, bodySrc: bodySrc}
+        return ActionDecl{name: name, paramNames: paramNames, paramTypes: paramTypes, paramOptionals: paramOptionals, optimistic: optimistic, headerValid: headerValid, requires: requiresList, body: body, bodyValid: bodyValid, bodySrc: bodySrc, renameFrom: [], renameTo: [], paramLists: paramLists, ret: ret, retList: retList, retErr: retErr}
 
     proc buildComponentEntry(header: text, bodySrc: text) -> ComponentEntry:
         let cd = do buildComponentDecl(header)
         let body = do nodeTreeSrc(bodySrc)
-        return ComponentEntry{header: cd, body: body}
+        return ComponentEntry{header: cd, body: body, headerLine: header, bodySrc: bodySrc}
 
     # progViewHeadOf/progViewAtIndex: the trivial header-only restatement of
     # nodes.fct's own `viewHeadOf`/`viewAtMarkerIndex` (the body itself is
@@ -652,6 +941,188 @@ app ProgramSelfHost:
     proc progViewAtIndex(head: text) -> int:
         let r = do indexOf(head, " at ")
         return r
+
+    # progDurationSecs: parseDuration — `30s`/`5m`/`2h`, -1 when invalid.
+    proc progDurationSecs(s: text) -> int:
+        if len(s) < 2:
+            return -1
+        let unit = charAt(s, len(s) - 1)
+        let num = slice(s, 0, len(s) - 1)
+        let digits = split(num, "")
+        let nd = len(digits)
+        if nd == 0:
+            return -1
+        let mut i = 0
+        loop i < nd:
+            let c = digits[i]
+            if c < "0" || c > "9":
+                return -1
+            i = i + 1
+        let n = toInt(num)
+        if n <= 0:
+            return -1
+        if unit == "s":
+            return n
+        if unit == "m":
+            return n * 60
+        if unit == "h":
+            return n * 3600
+        return -1
+
+    proc buildDaemonDecl(header: text, bodySrc: text) -> DaemonDecl:
+        let h0 = do trimPrefixText(trim(header), "daemon")
+        let h1 = do trimSuffixText(trim(h0), ":")
+        let mut head = trim(h1)
+        let mut uses = []
+        let ui = do indexOf(head, " uses ")
+        if ui >= 0:
+            let usesPart = trim(slice(head, ui + 6, len(head)))
+            head = trim(slice(head, 0, ui))
+            if usesPart == "":
+                return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "uses needs at least one capability (e.g. `uses io.file`)", renameFrom: [], renameTo: []}
+            let parts = split(usesPart, ",")
+            let np = len(parts)
+            let mut pi = 0
+            loop pi < np:
+                let c = trim(parts[pi])
+                let ok = do isCapabilityNameToken(c)
+                if !ok:
+                    return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "invalid capability \"" + c + "\" in uses clause (expected a dotted name like io.file)", renameFrom: [], renameTo: []}
+                uses = append(uses, c)
+                pi = pi + 1
+        let mut every = 0
+        let ei = do indexOf(head, " every ")
+        if ei >= 0:
+            let durS = trim(slice(head, ei + 7, len(head)))
+            head = trim(slice(head, 0, ei))
+            let secs = do progDurationSecs(durS)
+            if secs < 0:
+                return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "invalid duration \"" + durS + "\" (use 30s, 5m, 2h)", renameFrom: [], renameTo: []}
+            every = secs
+        let name = trim(head)
+        let idOk = do isIdentToken(name)
+        if !idOk:
+            return DaemonDecl{name: name, every: 0, uses: [], bodySrc: bodySrc, err: "invalid daemon name \"" + name + "\"", renameFrom: [], renameTo: []}
+        return DaemonDecl{name: name, every: every, uses: uses, bodySrc: bodySrc, err: "", renameFrom: [], renameTo: []}
+
+    # buildProgThemeBlock: parser.go's three theme dispatch arms. Entries are
+    # the block's direct children; a value's escapes are decoded the way
+    # unquote's strconv.Unquote does for the characters a CSS value holds.
+    proc buildProgThemeBlock(header: text, bodyLines: [text]) -> ProgThemeBlock:
+        let isDark = do themeHeaderIsDark(header)
+        let isBase = do themeHeaderIsBase(header)
+        let mut kind = "named"
+        let mut name = ""
+        if isDark:
+            kind = "dark"
+        else:
+            if isBase:
+                kind = "base"
+            else:
+                let nm = do namedThemeName(header)
+                name = nm
+        let mut lines = []
+        let n = len(bodyLines)
+        let mut i = 0
+        loop i < n:
+            lines = append(lines, trim(bodyLines[i]))
+            i = i + 1
+        let d = do buildThemeDecl(lines)
+        let mut valid = d.valid
+        if kind == "named":
+            let nv = do isThemeKeyToken(name)
+            valid = valid && nv
+        return ProgThemeBlock{kind: kind, name: name, vars: d.vars, valid: valid}
+
+    # progThemeEntryDiag: parseTheme's per-entry refusal — `name "value"`
+    # split at the first space, a theme key, a strconv.Unquote-able value.
+    proc progThemeEntryDiag(t: text) -> text:
+        let mut sp = -1
+        let tn = len(t)
+        let mut si = 0
+        loop si < tn && sp < 0:
+            if charAt(t, si) == " ":
+                sp = si
+            si = si + 1
+        if sp < 0:
+            return "theme entry must be `name \"value\"`"
+        let name = slice(t, 0, sp)
+        let ok = do isThemeKeyToken(name)
+        if !ok:
+            let nq = do goQuote(name)
+            return "invalid theme name " + nq
+        let raw = trim(slice(t, sp + 1, len(t)))
+        let q = do themeValueIsQuoted(raw)
+        let rq = do goQuote(raw)
+        if !q:
+            return "expected a quoted string, got " + rq
+        let u = do goUnquote(raw)
+        if !u.ok:
+            return "invalid string " + rq
+        return ""
+
+    # progCSSBlock: parseCSS — every nested line of a `css:` block, trimmed,
+    # in source order, joined with newlines.
+    proc progCSSBlock(bodyLines: [text]) -> text:
+        let mut out = ""
+        let n = len(bodyLines)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + "\n"
+            out = out + trim(bodyLines[i])
+            i = i + 1
+        return out
+
+    # buildProgMount: parseMount — `mount W [at "/path"] [requires p]`.
+    proc buildProgMount(t: text) -> ProgMount:
+        let r0 = do trimPrefixText(t, "mount ")
+        let mut rest = trim(r0)
+        let mut guard = ""
+        let ri = do indexOf(rest, " requires ")
+        if ri >= 0:
+            let g0 = trim(slice(rest, ri + 10, len(rest)))
+            let g1 = do trimSuffixText(g0, ":")
+            guard = g1
+            rest = trim(slice(rest, 0, ri))
+            let gok = do isIdentToken(guard)
+            if !gok:
+                return ProgMount{wireframe: "", path: "", requires: "", err: "invalid guard policy \"" + guard + "\" after `requires`"}
+        let mut path = "/"
+        let ai = do indexOf(rest, " at ")
+        if ai >= 0:
+            let q = trim(slice(rest, ai + 4, len(rest)))
+            let qn = len(q)
+            if qn < 2 || charAt(q, 0) != "\"" || charAt(q, qn - 1) != "\"" || qn == 2:
+                return ProgMount{wireframe: "", path: "", requires: "", err: "mount route must be a quoted path: `mount W at \"/path\"`"}
+            path = slice(q, 1, qn - 1)
+            rest = trim(slice(rest, 0, ai))
+        let w0 = do trimSuffixText(trim(rest), ":")
+        let w = trim(w0)
+        let wok = do isIdentToken(w)
+        if !wok:
+            return ProgMount{wireframe: "", path: "", requires: "", err: "invalid wireframe name \"" + w + "\" after `mount`"}
+        return ProgMount{wireframe: w, path: path, requires: guard, err: ""}
+
+    # buildProgSocket: parseSocket — `socket <name>: <ui|data>`.
+    proc buildProgSocket(t: text) -> ProgSocket:
+        let r0 = do trimPrefixText(t, "socket ")
+        let rest = trim(r0)
+        let colon = do indexOf(rest, ":")
+        if colon < 0:
+            return ProgSocket{name: "", accept: "", err: "socket needs a kind: `socket <name>: <ui|data>`"}
+        let sname = trim(slice(rest, 0, colon))
+        let accept = trim(slice(rest, colon + 1, len(rest)))
+        let ok = do isIdentToken(sname)
+        if !ok:
+            return ProgSocket{name: "", accept: "", err: "invalid socket name \"" + sname + "\""}
+        if accept != "ui" && accept != "data":
+            return ProgSocket{name: "", accept: "", err: "socket \"" + sname + "\" must accept `ui` or `data`, got \"" + accept + "\""}
+        return ProgSocket{name: sname, accept: accept, err: ""}
+
+    proc nodeFirstWordOf(s: text) -> text:
+        let parts = split(s, " ")
+        return parts[0]
 
     proc buildViewEntry(header: text, bodySrc: text) -> ViewEntry:
         let head = do progViewHeadOf(header)
@@ -673,7 +1144,7 @@ app ProgramSelfHost:
             let idOk = do isIdentToken(name)
             headerValid = idOk
         let body = do nodeTreeSrc(bodySrc)
-        return ViewEntry{name: name, path: path, headerValid: headerValid, body: body}
+        return ViewEntry{name: name, path: path, headerValid: headerValid, body: body, header: header, bodySrc: bodySrc, private: false}
 
     # ============================================================
     # STAGE 5: the dispatch keyword set this file actually wires, restated
@@ -714,6 +1185,10 @@ app ProgramSelfHost:
             return true
         if kw == "view":
             return true
+        if kw == "type" || kw == "message" || kw == "api" || kw == "contract" || kw == "stream" || kw == "file" || kw == "cssfrom":
+            return true
+        if kw == "theme" || kw == "css" || kw == "daemon" || kw == "layout" || kw == "mount" || kw == "socket" || kw == "frame" || kw == "content":
+            return true
         return false
 
     # ============================================================
@@ -722,6 +1197,7 @@ app ProgramSelfHost:
     # ============================================================
     proc parseProgramSrc(src: text) -> Program:
         let rawLines = do progKeptRawLines(src)
+        let lineNos = do progKeptLineNos(src)
         let n = len(rawLines)
         let indents = do progIndentsOf(rawLines)
         let parents = do progParentsOf(indents)
@@ -754,10 +1230,42 @@ app ProgramSelfHost:
         let mut triggers = []
         let mut views = []
         let mut unknownKeywords = []
+        let mut themes = []
+        let mut css = ""
+        let mut daemons = []
+        let mut privateProcs = []
+        let mut parseErrors = []
+        let mut layouts = []
+        let mut rawDecls = []
+        let mut kind = "app"
+        let mut into = ""
+        let mut mounts = []
+        let mut sockets = []
+        let mut hasFrame = false
+        let mut frameSrc = ""
+        let mut hasContent = false
+        let mut contentSrc = ""
 
         if appHeaderIndex >= 0:
             let nm = do progFacetName(rawLines[appHeaderIndex])
             name = nm
+            let hdr = trim(rawLines[appHeaderIndex])
+            let fkw = do nodeFirstWordOf(hdr)
+            kind = fkw
+            if fkw == "ui" || fkw == "data":
+                let hparts = split(trim(nm), " ")
+                let mut hf = []
+                let nhp = len(hparts)
+                let mut hpi = 0
+                loop hpi < nhp:
+                    if trim(hparts[hpi]) != "":
+                        hf = append(hf, trim(hparts[hpi]))
+                    hpi = hpi + 1
+                if len(hf) == 3 && hf[1] == "in":
+                    name = hf[0]
+                    into = hf[2]
+                else:
+                    parseErrors = append(parseErrors, fkw + " facet header must read `" + fkw + " Name in <socket>:`")
 
             let mut topIdx = []
             let mut j = 0
@@ -774,7 +1282,17 @@ app ProgramSelfHost:
                 let mut bodyEnd = n
                 if k + 1 < topN:
                     bodyEnd = topIdx[k + 1]
-                let header = trim(rawLines[headerIndex])
+                let header0 = trim(rawLines[headerIndex])
+                let mut header = header0
+                let isPrivate = do hasPrefixText(header0, "private ")
+                if isPrivate:
+                    let stripped = do trimPrefixText(header0, "private ")
+                    header = stripped
+                    let pp = do hasPrefixText(stripped, "proc ")
+                    let pv = do hasPrefixText(stripped, "view ")
+                    if !pp && !pv:
+                        let fw = do nodeFirstWordOf(stripped)
+                        parseErrors = append(parseErrors, "`private` is only supported on proc and view declarations, not \"" + fw + "\"")
                 let bodyLines = do progRangeOf(rawLines, bodyStart, bodyEnd)
                 let bodySrc = do progJoinLines(bodyLines)
 
@@ -784,6 +1302,19 @@ app ProgramSelfHost:
                     let isStruct = do hasPrefixText(header, "struct ")
                     if isStruct:
                         kw = "struct"
+                    let isDaemon = do hasPrefixText(header, "daemon ")
+                    if isDaemon:
+                        kw = "daemon"
+                    let isMount = do hasPrefixText(header, "mount ")
+                    if isMount:
+                        kw = "mount"
+                    let isSocket = do hasPrefixText(header, "socket ")
+                    if isSocket:
+                        kw = "socket"
+                    if header == "frame:" || header == "frame":
+                        kw = "frame"
+                    if header == "content:" || header == "content":
+                        kw = "content"
 
                 if kw == "auth":
                     hasAuth = true
@@ -806,7 +1337,8 @@ app ProgramSelfHost:
                     let st = do buildStateDecl(header)
                     states = append(states, st)
                 if kw == "derive":
-                    let dv = do buildDeriveDeclFull(header)
+                    let dv0 = do buildDeriveDeclFull(header)
+                    let dv = DeriveDeclFull{name: dv0.name, typeCore: dv0.typeCore, headerValid: dv0.headerValid, exprSrc: dv0.exprSrc, expr: dv0.expr, line: header, cont: bodySrc}
                     derives = append(derives, dv)
                 if kw == "policy":
                     let pd = do buildPolicyDeclFull(header, bodyLines)
@@ -814,18 +1346,22 @@ app ProgramSelfHost:
                 if kw == "proc":
                     let pcd = do parseProcDecl(header, bodySrc)
                     procs = append(procs, pcd)
+                    if isPrivate:
+                        privateProcs = append(privateProcs, pcd.name)
                 if kw == "action":
                     let ad = do buildActionDecl(header, bodySrc)
                     actions = append(actions, ad)
                 if kw == "webhook":
                     let wh = do buildWebhookDecl(header)
-                    webhooks = append(webhooks, wh)
+                    webhooks = append(webhooks, WebhookDecl{path: wh.path, action: wh.action, hasSecret: wh.hasSecret, secret: wh.secret, valid: wh.valid, line: lineNos[headerIndex]})
                 if kw == "job":
                     let jb = do buildJobDecl(header)
                     jobs = append(jobs, jb)
                 if kw == "service":
                     let sv = do buildServiceDecl(header, bodyLines)
                     services = append(services, sv)
+                    if sv.err != "":
+                        parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": " + sv.err)
                 if kw == "component":
                     let ce = do buildComponentEntry(header, bodySrc)
                     components = append(components, ce)
@@ -834,7 +1370,87 @@ app ProgramSelfHost:
                     triggers = append(triggers, tr)
                 if kw == "view":
                     let ve = do buildViewEntry(header, bodySrc)
-                    views = append(views, ve)
+                    views = append(views, ViewEntry{name: ve.name, path: ve.path, headerValid: ve.headerValid, body: ve.body, header: ve.header, bodySrc: ve.bodySrc, private: isPrivate})
+                let isApi = do hasPrefixText(header, "api ")
+                let isContract = do hasPrefixText(header, "contract ")
+                let isStream = do hasPrefixText(header, "stream ")
+                let isFile = do hasPrefixText(header, "file ")
+                let isCssFrom = do hasPrefixText(header, "css from ")
+                if kw == "type" || kw == "message" || isApi || isContract || isStream || isFile || isCssFrom:
+                    let mut rk = kw
+                    if isApi:
+                        rk = "api"
+                    if isContract:
+                        rk = "contract"
+                    if isStream:
+                        rk = "stream"
+                    if isFile:
+                        rk = "file"
+                    if isCssFrom:
+                        rk = "cssfrom"
+                    let mut bodyNos = []
+                    let mut bni = bodyStart
+                    loop bni < bodyEnd:
+                        bodyNos = append(bodyNos, lineNos[bni])
+                        bni = bni + 1
+                    rawDecls = append(rawDecls, RawDecl{kw: rk, header: header, bodySrc: bodySrc, line: lineNos[headerIndex], bodyLineNos: bodyNos})
+                    kw = rk
+                if kw == "mount":
+                    let mt = do buildProgMount(header)
+                    mounts = append(mounts, mt)
+                if kw == "socket":
+                    let sk = do buildProgSocket(header)
+                    sockets = append(sockets, sk)
+                if kw == "frame":
+                    if hasFrame:
+                        parseErrors = append(parseErrors, "a wireframe has one `frame`")
+                    hasFrame = true
+                    frameSrc = bodySrc
+                if kw == "content":
+                    if hasContent:
+                        parseErrors = append(parseErrors, kind + " facet \"" + name + "\" has one `content` block")
+                    hasContent = true
+                    contentSrc = bodySrc
+                if kw == "layout":
+                    layouts = append(layouts, LayoutEntry{headerLine: header, bodySrc: bodySrc})
+                if kw == "daemon":
+                    let dm = do buildDaemonDecl(header, bodySrc)
+                    daemons = append(daemons, dm)
+                if kw == "theme":
+                    let tb = do buildProgThemeBlock(header, bodyLines)
+                    themes = append(themes, tb)
+                    # parseTheme's diagnostics, first failing entry first.
+                    let ntl = len(bodyLines)
+                    if ntl == 0:
+                        parseErrors = append(parseErrors, "line " + lineNos[headerIndex] + ": theme block is empty")
+                    let mut tli = 0
+                    loop tli < ntl:
+                        let td = do progThemeEntryDiag(trim(bodyLines[tli]))
+                        if td != "":
+                            parseErrors = append(parseErrors, "line " + lineNos[bodyStart + tli] + ": " + td)
+                            break
+                        tli = tli + 1
+                if kw == "css":
+                    # checkCSSComments: a `#`-anchored rule inside the block
+                    # would be dropped as a comment — refuse it instead.
+                    let cssFrom = lineNos[headerIndex]
+                    let mut cssTo = cssFrom
+                    if bodyEnd > bodyStart:
+                        cssTo = lineNos[bodyEnd - 1]
+                    let srcLines = split(src, "\n")
+                    let mut cl = cssFrom
+                    loop cl < cssTo:
+                        let ct = trim(srcLines[cl])
+                        let isC = do hasPrefixText(ct, "#")
+                        if isC && contains(ct, "{"):
+                            parseErrors = append(parseErrors, "line " + (cl + 1) + ": this looks like a CSS rule, but `#` starts a comment in this language, so the line is discarded and the rule never reaches the page: " + ct + "\n      Anchor the selector on something other than an id — `[data-fa-mount]` is the app root and is worth the same as a class — or drop the anchor entirely.")
+                            break
+                        cl = cl + 1
+                    let block = do progCSSBlock(bodyLines)
+                    if css == "":
+                        css = block
+                    else:
+                        css = css + "\n" + block
 
                 let known = do progKnownKeyword(kw)
                 if !known:
@@ -842,7 +1458,7 @@ app ProgramSelfHost:
 
                 k = k + 1
 
-        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, unknownKeywords: unknownKeywords}
+        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: privateProcs, parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: kind, into: into, mounts: mounts, sockets: sockets, hasFrame: hasFrame, frameSrc: frameSrc, hasContent: hasContent, contentSrc: contentSrc, unknownKeywords: unknownKeywords}
 
     # ============================================================
     # STAGE 7: the live, HTTP-exercisable driver — proof `parseProgramSrc`

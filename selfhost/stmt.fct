@@ -585,6 +585,10 @@ app StmtSelfHost:
             let after = do stmtTrimPrefix(t, "loop ")
             let afterTrim = trim(after)
             let condText = do stmtTrimSuffix(afterTrim, ":")
+            if trim(condText) == "":
+                # parseProcBody: "loop needs a condition: loop <cond>:"
+                let noCond = do emptyNode()
+                return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noCond, args: [], body: [], elseBody: [], index: noCond}
             let ck = do tokenKinds(condText)
             let ct = do tokenTexts(condText)
             let cond = do orNodes(ck, ct, 0)
@@ -611,6 +615,20 @@ app StmtSelfHost:
             let args = do doArgsNodes(rest)
             let noExpr = do emptyNode()
             return Stmt{kind: "do", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+        # `act ActionName(args)` — parser.go's parseAct: fire-and-forget only,
+        # a `(` is required, the args are a call's own arg list. Valid to
+        # parse in any proc-shaped body; proc_lower.fct's plBlock is what
+        # restricts it to a daemon body, exactly as build.go's procBlock does.
+        let isAct = do stmtHasPrefix(t, "act ")
+        if isAct:
+            let rest0 = do stmtTrimPrefix(t, "act ")
+            let rest = trim(rest0)
+            let noExpr = do emptyNode()
+            let openAt = do firstParenIndex(rest)
+            if openAt < 0:
+                return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+            let args = do doArgsNodes(rest)
+            return Stmt{kind: "act", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
         # `write Name(content)` — bare, fire-and-forget (result discarded);
         # a bound `let ok = write Name(content)` is handled below, in the
         # `let ` case, exactly like `do`'s two forms. `Name(content)` is
@@ -658,19 +676,16 @@ app StmtSelfHost:
             let rhs = trim(rhs0)
             let isRhsDo = do stmtHasPrefix(rhs, "do ")
             if isRhsDo:
-                if isMut:
-                    # `let mut name = do ...` is real-grammar-illegal (a `do`
-                    # result can never bind mut — LANGUAGE.md's `proc`
-                    # section) — degrades to Unsupported rather than
-                    # silently producing a wrong LetDo, this port's
-                    # established honest-degrade convention.
-                    let noExpr = do emptyNode()
-                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+                # `let mut name = do ...` binds a reassignable local
+                # (ast.Do.Mut), `let name = do ...` a plain one.
                 let callRest0 = do stmtTrimPrefix(rhs, "do ")
                 let callRest = trim(callRest0)
                 let args = do doArgsNodes(callRest)
                 let noExpr = do emptyNode()
-                return Stmt{kind: "letDo", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+                let mut doKind = "letDo"
+                if isMut:
+                    doKind = "letMutDo"
+                return Stmt{kind: doKind, lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
             # `let h = spawn ProcName(args)` — real grammar forbids `let mut`
             # here too (LANGUAGE.md: "a handle ... is not an ordinary value",
             # never reassigned), same honest-degrade-to-Unsupported handling
@@ -752,6 +767,17 @@ app StmtSelfHost:
         if eq2 >= 0:
             let target = trim(slice(t, 0, eq2))
             let rhs2 = trim(slice(t, eq2 + 1, len(t)))
+            # `name = do Proc(args)` — an existing `let mut` local takes the
+            # call's result (ast.Do.Reassign).
+            let isRhsDo2 = do stmtHasPrefix(rhs2, "do ")
+            if isRhsDo2:
+                let noExprD = do emptyNode()
+                let tid = do stmtIsIdent(target)
+                if !tid:
+                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExprD, args: [], body: [], elseBody: [], index: noExprD}
+                let callRestD0 = do stmtTrimPrefix(rhs2, "do ")
+                let argsD = do doArgsNodes(trim(callRestD0))
+                return Stmt{kind: "assignDo", lineIdx: lineIdx, expr: noExprD, args: argsD, body: [], elseBody: [], index: noExprD}
             let rk2 = do tokenKinds(rhs2)
             let rt2 = do tokenTexts(rhs2)
             let e2 = do orNodes(rk2, rt2, 0)
@@ -760,6 +786,15 @@ app StmtSelfHost:
             # (mirrors parseProcBody's own `strings.HasSuffix(target, "]")`
             # check exactly). One real AST shape (ast.IndexAssign) covers
             # both an array and a map target, so one kind does here too.
+            # `s.field = expr` — one field of a struct local, one level deep.
+            let dot = do stmtIndexOfText(target, ".")
+            if dot > 0 && !contains(target, "["):
+                let noExprF = do emptyNode()
+                let fo = do stmtIsIdent(trim(slice(target, 0, dot)))
+                let ff = do stmtIsIdent(trim(slice(target, dot + 1, len(target))))
+                if !fo || !ff:
+                    return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExprF, args: [], body: [], elseBody: [], index: noExprF}
+                return Stmt{kind: "fieldAssign", lineIdx: lineIdx, expr: e2, args: [], body: [], elseBody: [], index: noExprF}
             let isIndexed = do stmtHasSuffix(target, "]")
             if isIndexed:
                 let lb = do firstBracketIndex(target)
@@ -940,13 +975,50 @@ app StmtSelfHost:
         return trim(slice(rest, 0, openParen))
 
     proc letDoBoundName(lineText: text) -> text:
+        let n = do letOrAssignName(lineText)
+        return n
+
+    # assignDoParts: `name = do Proc(args)` — the local and the proc.
+    proc assignDoTarget(lineText: text) -> text:
         let t = trim(lineText)
-        let rest0 = do stmtTrimPrefix(t, "let ")
-        let rest = trim(rest0)
-        let eq = do firstEqIndex(rest)
-        if eq < 0:
-            return ""
-        return trim(slice(rest, 0, eq))
+        let eq = do firstEqIndex(t)
+        return trim(slice(t, 0, eq))
+
+    proc assignDoProcName(lineText: text) -> text:
+        let t = trim(lineText)
+        let eq = do firstEqIndex(t)
+        let rhs = trim(slice(t, eq + 1, len(t)))
+        let afterDo0 = do stmtTrimPrefix(rhs, "do ")
+        let afterDo = trim(afterDo0)
+        let openParen = do firstParenIndex(afterDo)
+        if openParen < 0:
+            return afterDo
+        return trim(slice(afterDo, 0, openParen))
+
+    # fieldAssignParts: `local.field = expr` — "local" / "field".
+    proc fieldAssignLocal(lineText: text) -> text:
+        let t = trim(lineText)
+        let eq = do firstEqIndex(t)
+        let target = trim(slice(t, 0, eq))
+        let dot = do stmtIndexOfText(target, ".")
+        return trim(slice(target, 0, dot))
+
+    proc fieldAssignField(lineText: text) -> text:
+        let t = trim(lineText)
+        let eq = do firstEqIndex(t)
+        let target = trim(slice(t, 0, eq))
+        let dot = do stmtIndexOfText(target, ".")
+        return trim(slice(target, dot + 1, len(target)))
+
+    proc stmtIndexOfText(s: text, sub: text) -> int:
+        let n = len(s)
+        let m = len(sub)
+        let mut i = 0
+        loop i + m <= n:
+            if slice(s, i, i + m) == sub:
+                return i
+            i = i + 1
+        return -1
 
     proc letDoProcName(lineText: text) -> text:
         let t = trim(lineText)

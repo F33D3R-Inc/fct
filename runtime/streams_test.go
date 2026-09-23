@@ -146,7 +146,7 @@ func TestStreamsDeliverEmittedEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, ch := range map[string]<-chan string{"ada": ada, "bob": bob, "public": pub} {
-		if f := next(t, ch); f != "event: Ping\ndata: {\"n\":7}" {
+		if f := next(t, ch); f != "id: 1\nevent: Ping\ndata: {\"n\":7}" {
 			t.Fatalf("%s got %q", name, f)
 		}
 	}
@@ -156,8 +156,8 @@ func TestStreamsDeliverEmittedEvents(t *testing.T) {
 	}
 	f := next(t, bob)
 	var payload map[string]any
-	json.Unmarshal([]byte(strings.TrimPrefix(strings.Split(f, "\n")[1], "data: ")), &payload)
-	if !strings.HasPrefix(f, "event: Notify") || payload["text"] != "hi bob" {
+	json.Unmarshal([]byte(strings.TrimPrefix(strings.Split(f, "\n")[2], "data: ")), &payload)
+	if !strings.HasPrefix(f, "id: 2\nevent: Notify") || payload["text"] != "hi bob" {
 		t.Fatalf("targeted event: %q", f)
 	}
 	none(t, ada) // not for ada
@@ -175,7 +175,7 @@ func TestStreamsDeliverEmittedEvents(t *testing.T) {
 	json.NewDecoder(r2.Body).Decode(&doc)
 	r2.Body.Close()
 	events, _ := doc["x-stream-events"].([]any)
-	if len(events) != 3 {
+	if len(events) != 5 { // Notify and Ping on one stream, Ping on the other, and each stream's hello
 		t.Fatalf("x-stream-events = %v", events)
 	}
 	if paths := doc["paths"].(map[string]any); paths["/api/v2/events"] == nil {
@@ -188,7 +188,7 @@ func TestStreamGates(t *testing.T) {
 	cases := []struct{ name, decl, want string }{
 		{"event is not a wire type", "    stream \"/s\": Nope\n", "not a declared wire type"},
 		{"emit with no stream", "    action p():\n        emit Ping{n: 1}\n", "no stream carries"},
-		{"emit of a non-literal", "    stream \"/s\": Ping\n    action p():\n        emit 1\n", "wire type literal"},
+		{"emit of a non-literal", "    stream \"/s\": Ping\n    action p():\n        emit 1\n", "wire type value"},
 		{"stream requires a parameterized policy", "    stream \"/s\" requires owns: Ping\n", "takes arguments"},
 		{"stream redeclared", "    stream \"/s\": Ping\n    stream \"/s\": Ping\n", "redeclared"},
 	}

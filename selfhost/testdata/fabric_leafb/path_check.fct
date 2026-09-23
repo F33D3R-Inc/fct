@@ -1,0 +1,57 @@
+import "../../fabric_stats.fct"
+import "../../fabric_protocol.fct"
+
+app FabricPathCheck:
+    # fabric_json.fct's failure classification (SjDecoded.category / .path)
+    # against serde_path_to_error + serde_json::Error::classify over the
+    # real types (fabric_leaf_b_test.go's TestFabricLeafBPathToError).
+    # Each batch item is `<type>:<hex body>`; each result line is `ok` or
+    # `<category>|<path>|<error Display>`.
+
+    proc lbHexVal(c: int) -> int:
+        if c >= 48 && c <= 57:
+            return c - 48
+        return c - 87
+
+    proc lbUnhex(h: text) -> [int]:
+        let hb = textToBytes(h)
+        let mut out = []
+        let mut i = 0
+        loop i + 1 < len(hb):
+            let a = do lbHexVal(hb[i])
+            let b = do lbHexVal(hb[i + 1])
+            out = append(out, a * 16 + b)
+            i = i + 2
+        return out
+
+    proc lbCase(item: text) -> text:
+        let parts = split(item, ":")
+        let bs = do lbUnhex(parts[1])
+        let mut types = []
+        let mut name = "value"
+        if parts[0] == "stats":
+            types = do statsSchema()
+            name = "EngineStats"
+        if parts[0] == "message":
+            types = do protoSchema()
+            name = "FabricMessage"
+        let r = do sjDecodeBytes(types, bs, name)
+        if r.ok:
+            return "ok"
+        return r.category + "|" + r.path + "|" + r.err
+
+    proc lbBatch(list: text) -> text:
+        let items = split(list, ",")
+        let mut out = []
+        let mut i = 0
+        loop i < len(items):
+            let r = do lbCase(items[i])
+            out = append(out, r)
+            i = i + 1
+        return join(out, "\n")
+
+    state pathResult: text = ""
+
+    action runPathCases(tag: text, list: text):
+        let r = do lbBatch(list)
+        pathResult = tag + "|" + r

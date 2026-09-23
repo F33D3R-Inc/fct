@@ -1,0 +1,85 @@
+# Outbound TCP from an ordinary proc (`uses io.net`): connect, write, read to
+# EOF, and the failure modes a client reports as values — a refused dial and
+# a read deadline — through connError. Driven by runtime/netconnect_test.go
+# against real Go listeners.
+app NetConnect:
+    state result: text = ""
+
+    proc readAll(c: int) -> [int] uses io.net:
+        let mut got = []
+        let mut more = true
+        loop more:
+            let chunk = readBytes(c, 7)
+            let n = len(chunk)
+            if n == 0:
+                more = false
+            let mut i = 0
+            loop i < n:
+                got = append(got, chunk[i])
+                i = i + 1
+        return got
+
+    proc roundTrip(host: text, port: int, msg: text) -> text uses io.net:
+        let c = connect(host, port)
+        let wrote = writeBytes(c, textToBytes(msg))
+        let got = do readAll(c)
+        let err = connError(c)
+        let closed = closeConn(c)
+        return bytesToText(got) + "|" + wrote + "|" + err + "|" + closed
+
+    proc stall(host: text, port: int, ms: int) -> text uses io.net:
+        let c = connect(host, port)
+        let set = setTimeoutMs(c, ms)
+        let chunk = readBytes(c, 16)
+        let err = connError(c)
+        let closed = closeConn(c)
+        return "" + len(chunk) + "|" + set + "|" + err
+
+    proc refused(host: text, port: int) -> text uses io.net:
+        let c = connect(host, port)
+        let wrote = writeBytes(c, textToBytes("x"))
+        let chunk = readBytes(c, 16)
+        let err = connError(c)
+        let closed = closeConn(c)
+        return "" + wrote + "|" + len(chunk) + "|" + err
+
+    # drain: poll a connection whose peer answers late and then closes —
+    # an empty poll is "not yet", not a failure, until connOpen says the
+    # stream is over.
+    proc drain(host: text, port: int) -> text uses io.net:
+        let c = connect(host, port)
+        let wrote = writeBytes(c, textToBytes("go"))
+        let first = pollBytes(c, 64, 0)
+        let firstErr = connError(c)
+        let mut got = []
+        let mut polls = 0
+        loop connOpen(c) && polls < 400:
+            let chunk = pollBytes(c, 64, 25)
+            let mut i = 0
+            loop i < len(chunk):
+                got = append(got, chunk[i])
+                i = i + 1
+            polls = polls + 1
+        let endErr = connError(c)
+        let closed = closeConn(c)
+        return "" + len(first) + "|" + firstErr + "|" + bytesToText(got) + "|" + (polls < 400) + "|" + endErr
+
+    action echo(host: text, port: int, msg: text):
+        let r = do roundTrip(host, port, msg)
+        result = r
+
+    action wait(host: text, port: int, ms: int):
+        let r = do stall(host, port, ms)
+        result = r
+
+    action poll(host: text, port: int):
+        let r = do drain(host, port)
+        result = r
+
+    action dialDead(host: text, port: int):
+        let r = do refused(host, port)
+        result = r
+
+    view Home at "/":
+        box:
+            text "{result}"

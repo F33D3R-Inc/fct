@@ -59,7 +59,14 @@ func (s *Server) visibleRows(entity string, rows any, scope map[string]any) any 
 		return rows // no gated fields on this entity: nothing to decide, no copy
 	}
 	if scope == nil {
-		scope = map[string]any{} // never nil: a policy with an aggregate writes its item var into the scope
+		// No actor to authorize, so every gate fails outright — not by evaluating
+		// the policy against an empty scope, where a negative rule such as
+		// `actor != "guest"` would pass for nobody at all.
+		drop := map[string]bool{}
+		for _, gf := range s.gated[entity] {
+			drop[gf.name] = true
+		}
+		return stripFields(rows, drop)
 	}
 	return stripFields(rows, s.gateForActor(entity, scope))
 }
@@ -1550,10 +1557,9 @@ func (s *Server) aggQuery(e *ir.Expr, scope map[string]any) (Query, string, bool
 //
 // `count`/`exists` reduce rows and need nothing from the schema. The other four
 // reduce a column, so the column has to exist and has to be one the language's
-// reducer folds — integer arithmetic, meaning `int` or `money`. A `min` over a
-// text column is not refused here so much as left where it already is: the
-// interpreter reduces it with toInt, which is not what any database would do,
-// so pushing it down would make the answer depend on which path served it.
+// reducer folds — integer arithmetic, meaning `int` or `money`. A `min`/`max`
+// over a text column orders text (VType "text", reduceText) — a store's
+// reduction is integer-valued, so the mirror answers it.
 //
 // Sel is the general reduced expression — `sum(l.qty * l.unitPrice in ...)`.
 // That is a value computed per row, not a stored column, so there is nothing for

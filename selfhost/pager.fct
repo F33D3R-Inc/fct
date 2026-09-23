@@ -1,0 +1,436 @@
+import "page.fct"
+import "aes_gcm.fct"
+
+app PagerSelfHost:
+    # pager.fct — self-hosted port of facetql/src/storage/pager.rs: page
+    # I/O over one paged file with a bounded, least-recently-used buffer
+    # cache, every page stored encrypted at rest.
+    #
+    # On disk a page is crypto.rs's `nonce || ciphertext || tag` of its
+    # page.fct body — exactly PAGE_SIZE (16384) bytes, page n at byte
+    # n * 16384 — so a file written here is one the Rust pager reads and
+    # the reverse. A read checks the GCM tag first and then every
+    # page.rs decode check; a miss reads one page with readFileAt; a dirty
+    # page reaches the disk on eviction or flush (writeFileAt), and flush
+    # ends with syncFile.
+    #
+    # pager.rs keeps its cache behind a Mutex so readers can fault pages
+    # in through `&self`; a proc has no shared mutable state, so the pager
+    # here is a value every call takes and returns. Two things a proc
+    # cannot do are parameters, as in wal.fct: the master key, and the
+    # nonces — a pager draws the n-th page nonce from `nonceBase` (four
+    # bytes) and its own counter (eight), and a caller must never reuse a
+    # base under one key.
+    struct FqPgEntry:
+        id: int
+        body: [int]
+        dirty: bool
+        tick: int
+
+    struct FqPager:
+        path: text
+        pageCount: int
+        capacity: int
+        entries: [FqPgEntry]
+        tick: int
+        key: [int]
+        nonceBase: int
+        nonceCounter: int
+
+    struct FqPagerR:
+        ok: bool
+        err: text
+        pager: FqPager
+
+    struct FqPageRead:
+        ok: bool
+        err: text
+        pager: FqPager
+        body: [int]
+
+    struct FqPageId:
+        pager: FqPager
+        id: int
+
+    proc pgrWith(p: FqPager, pageCount: int, entries: [FqPgEntry], tick: int, nonceCounter: int) -> FqPager:
+        return FqPager{path: p.path, pageCount: pageCount, capacity: p.capacity, entries: entries, tick: tick, key: p.key, nonceBase: p.nonceBase, nonceCounter: nonceCounter}
+
+    # pgrOpen: Pager::open — create the file when absent; a trailing
+    # partial page (a torn extension) rounds the page count down.
+    proc pgrOpen(path: text, capacity: int, key: [int], nonceBase: int) -> FqPager uses io.file:
+        let mut size = fileSize(path)
+        if size < 0:
+            let created = writeFileAt(path, 0, [])
+            size = 0
+        let mut cap = capacity
+        if cap <= 0:
+            cap = 256
+        return FqPager{path: path, pageCount: size / 16384, capacity: cap, entries: [], tick: 0, key: key, nonceBase: nonceBase, nonceCounter: 0}
+
+    proc pgrPageCount(p: FqPager) -> int:
+        return p.pageCount
+
+    proc pgrSetPageCount(p: FqPager, pages: int) -> FqPager:
+        let r = do pgrWith(p, pages, p.entries, p.tick, p.nonceCounter)
+        return r
+
+    # pgrAllocate: reserve the next page id (nothing is on disk until a
+    # write reaches it).
+    proc pgrAllocate(p: FqPager) -> FqPageId:
+        let id = p.pageCount
+        let q = do pgrWith(p, p.pageCount + 1, p.entries, p.tick, p.nonceCounter)
+        return FqPageId{pager: q, id: id}
+
+    proc pgrFind(p: FqPager, id: int) -> int:
+        let n = len(p.entries)
+        let mut i = 0
+        loop i < n:
+            if p.entries[i].id == id:
+                return i
+            i = i + 1
+        return -1
+
+    # pgrNonce: the n-th nonce — nonceBase big-endian in the first four
+    # bytes, the counter big-endian in the last eight; a negative base
+    # draws 12 fresh random bytes instead (a real server, as crypto.rs).
+    proc pgrNonce(base: int, n: int) -> [int]:
+        if base < 0:
+            let r = randomBytes(12)
+            return r
+        let mut out = bytes(12)
+        let mut b = base
+        let mut i = 3
+        loop i >= 0:
+            out[i] = b % 256
+            b = b / 256
+            i = i - 1
+        let mut c = n
+        let mut j = 11
+        loop j >= 4:
+            out[j] = c % 256
+            c = c / 256
+            j = j - 1
+        return out
+
+    # pgrWriteOut: write_to_disk — seal the entry's encoded body and write
+    # it at its page offset; the entry is then clean.
+    proc pgrWriteOut(p: FqPager, at: int) -> FqPagerR uses io.file:
+        let e = p.entries[at]
+        let body = do pgEncode(e.body)
+        let nonce = do pgrNonce(p.nonceBase, p.nonceCounter)
+        let blob = do cryptoEncrypt(p.key, nonce, body)
+        if len(blob) != 16384:
+            return FqPagerR{ok: false, err: "encrypted page is " + len(blob) + " bytes, expected 16384 — the page body size and the cipher envelope no longer agree", pager: p}
+        let w = writeFileAt(p.path, e.id * 16384, blob)
+        let mut entries = p.entries
+        entries[at] = FqPgEntry{id: e.id, body: e.body, dirty: false, tick: e.tick}
+        let q = do pgrWith(p, p.pageCount, entries, p.tick, p.nonceCounter + 1)
+        return FqPagerR{ok: true, err: "", pager: q}
+
+    # pgrAdmit: admit — install the page (replacing a resident copy), then
+    # evict least-recently-used pages, writing dirty ones out, until the
+    # cache is within capacity; the page just admitted is never the victim.
+    proc pgrAdmit(p0: FqPager, id: int, body: [int], dirty: bool) -> FqPagerR uses io.file:
+        let tick = p0.tick + 1
+        let at = do pgrFind(p0, id)
+        let mut entries = p0.entries
+        let entry = FqPgEntry{id: id, body: body, dirty: dirty, tick: tick}
+        if at >= 0:
+            entries[at] = entry
+        else:
+            entries = append(entries, entry)
+        let mut p = do pgrWith(p0, p0.pageCount, entries, tick, p0.nonceCounter)
+        loop len(p.entries) > p.capacity:
+            let n = len(p.entries)
+            let mut victim = 0
+            let mut i = 1
+            loop i < n:
+                if p.entries[i].tick < p.entries[victim].tick:
+                    victim = i
+                i = i + 1
+            if p.entries[victim].id == id:
+                break
+            if p.entries[victim].dirty:
+                let w = do pgrWriteOut(p, victim)
+                if !w.ok:
+                    return w
+                p = w.pager
+            let mut kept = []
+            let mut k = 0
+            loop k < n:
+                if k != victim:
+                    kept = append(kept, p.entries[k])
+                k = k + 1
+            let q = do pgrWith(p, p.pageCount, kept, p.tick, p.nonceCounter)
+            p = q
+        return FqPagerR{ok: true, err: "", pager: p}
+
+    proc pgrReadErr(p: FqPager, msg: text) -> FqPageRead:
+        return FqPageRead{ok: false, err: msg, pager: p, body: []}
+
+    # pgrRead: read — from the cache when resident (its use recorded),
+    # else from disk: bounds, decrypt, decode, then admitted clean.
+    proc pgrRead(p: FqPager, id: int) -> FqPageRead uses io.file:
+        let at = do pgrFind(p, id)
+        if at >= 0:
+            let tick = p.tick + 1
+            let e = p.entries[at]
+            let mut entries = p.entries
+            entries[at] = FqPgEntry{id: e.id, body: e.body, dirty: e.dirty, tick: tick}
+            let q = do pgrWith(p, p.pageCount, entries, tick, p.nonceCounter)
+            return FqPageRead{ok: true, err: "", pager: q, body: e.body}
+        if id < 0 || id >= p.pageCount:
+            let e0 = do pgrReadErr(p, "page " + id + " is past the end of " + p.path + " (" + p.pageCount + " pages)")
+            return e0
+        let blob = readFileAt(p.path, id * 16384, 16384)
+        let dec = do cryptoDecrypt(p.key, blob)
+        if !dec.ok:
+            let e1 = do pgrReadErr(p, "failed to decrypt page " + id + " of " + p.path + ": " + dec.err + " — wrong FACETQL_MASTER_KEY, or the page is damaged")
+            return e1
+        let pg = do pgDecode(dec.plaintext)
+        if !pg.ok:
+            let e2 = do pgrReadErr(p, "page " + id + " of " + p.path + ": " + pg.err)
+            return e2
+        let ad = do pgrAdmit(p, id, pg.body, false)
+        if !ad.ok:
+            let e3 = do pgrReadErr(p, ad.err)
+            return e3
+        return FqPageRead{ok: true, err: "", pager: ad.pager, body: pg.body}
+
+    # pgrWrite: write — install `body` as page `id`, dirty; the file grows
+    # to cover an id past its end.
+    proc pgrWrite(p0: FqPager, id: int, body: [int]) -> FqPagerR uses io.file:
+        let mut count = p0.pageCount
+        if id >= count:
+            count = id + 1
+        let p = do pgrWith(p0, count, p0.entries, p0.tick, p0.nonceCounter)
+        let r = do pgrAdmit(p, id, body, true)
+        return r
+
+    # pgrFlush: flush — every dirty page out, then fsync the file.
+    proc pgrFlush(p0: FqPager) -> FqPagerR uses io.file:
+        let mut p = p0
+        let n = len(p0.entries)
+        let mut i = 0
+        loop i < n:
+            if p.entries[i].dirty:
+                let w = do pgrWriteOut(p, i)
+                if !w.ok:
+                    return w
+                p = w.pager
+            i = i + 1
+        let s = syncFile(p.path)
+        return FqPagerR{ok: true, err: "", pager: p}
+
+    proc pgrResident(p: FqPager) -> [int]:
+        let mut out = []
+        let n = len(p.entries)
+        let mut i = 0
+        loop i < n:
+            out = append(out, p.entries[i].id)
+            i = i + 1
+        return out
+
+    # ── test harness: scripted page and pager sessions ─────────────────
+    # An action takes scalars only, so pages, keys and cells travel as hex.
+    state pagerOut: text = ""
+
+    proc pgrHex(s: text) -> [int]:
+        let h = do cryptoDecodeHex(s)
+        return h.bytes
+
+    proc pgrWords(line: text) -> [text]:
+        let parts = split(trim(line), " ")
+        let mut out = []
+        let n = len(parts)
+        let mut i = 0
+        loop i < n:
+            if parts[i] != "":
+                out = append(out, parts[i])
+            i = i + 1
+        return out
+
+    # pgCellsText: every cell's hex, comma-separated.
+    proc pgCellsText(b: [int]) -> text:
+        let n = do pgSlotCount(b)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let c = do pgCell(b, i)
+            let h = do cryptoEncodeHex(c)
+            out = out + h
+            i = i + 1
+        return out
+
+    # pgScriptText: run page ops (`new K`, `push HEX`, `insert I HEX`,
+    # `replace I HEX`, `remove I`, `compact`, `extra V`), one result per
+    # op, then the page's counters, its cells and its encoded body.
+    proc pgScriptText(script: text) -> text:
+        let lines = split(script, "\n")
+        let mut b = do pgNew(4)
+        let mut out = ""
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let w = do pgrWords(lines[i])
+            if len(w) > 0:
+                let op = w[0]
+                if op == "new":
+                    let nb = do pgNew(toInt(w[1]))
+                    b = nb
+                    out = out + "new;"
+                if op == "push":
+                    let d = do pgrHex(w[1])
+                    let r = do pgPushCell(b, d)
+                    b = r.body
+                    if r.ok:
+                        out = out + "push " + r.index + ";"
+                    else:
+                        out = out + "push full;"
+                if op == "insert":
+                    let d2 = do pgrHex(w[2])
+                    let r2 = do pgInsertCell(b, toInt(w[1]), d2)
+                    b = r2.body
+                    out = out + "insert " + r2.ok + ";"
+                if op == "replace":
+                    let d3 = do pgrHex(w[2])
+                    let r3 = do pgReplaceCell(b, toInt(w[1]), d3)
+                    b = r3.body
+                    out = out + "replace " + r3.ok + ";"
+                if op == "remove":
+                    let r4 = do pgRemoveCell(b, toInt(w[1]))
+                    b = r4
+                    out = out + "remove;"
+                if op == "compact":
+                    let r5 = do pgCompact(b)
+                    b = r5
+                    out = out + "compact;"
+                if op == "extra":
+                    let r6 = do pgSetExtra(b, toInt(w[1]))
+                    b = r6
+                    out = out + "extra;"
+            i = i + 1
+        let enc = do pgEncode(b)
+        let fs = do pgFreeSpace(enc)
+        let rs = do pgReclaimableSpace(enc)
+        let sc = do pgSlotCount(enc)
+        let kind = do pgKind(enc)
+        let extra = do pgExtra(enc)
+        let cells = do pgCellsText(enc)
+        let hex = do cryptoEncodeHex(enc)
+        return out + "\nkind=" + kind + " extra=" + extra + " count=" + sc + " free=" + fs + " reclaim=" + rs + "\ncells=" + cells + "\nbody=" + hex
+
+    # pgDecodeText: decode a body (unencrypted) and list it, or its error.
+    proc pgDecodeText(bodyHex: text) -> text:
+        let bs = do pgrHex(bodyHex)
+        let d = do pgDecode(bs)
+        if !d.ok:
+            return "error: " + d.err
+        let sc = do pgSlotCount(d.body)
+        let kind = do pgKind(d.body)
+        let cells = do pgCellsText(d.body)
+        return "kind=" + kind + " count=" + sc + " cells=" + cells
+
+    # pgOpenText: a stored page (nonce || ct || tag) decrypted and decoded.
+    proc pgOpenText(keyHex: text, blobHex: text) -> text:
+        let key = do pgrHex(keyHex)
+        let blob = do pgrHex(blobHex)
+        let dec = do cryptoDecrypt(key, blob)
+        if !dec.ok:
+            return "error: " + dec.err
+        let hex = do cryptoEncodeHex(dec.plaintext)
+        let t = do pgDecodeText(hex)
+        return t
+
+    # pgSealText: an encoded body sealed as the pager stores it.
+    proc pgSealText(keyHex: text, nonceHex: text, bodyHex: text) -> text:
+        let key = do pgrHex(keyHex)
+        let nonce = do pgrHex(nonceHex)
+        let body = do pgrHex(bodyHex)
+        let blob = do cryptoEncrypt(key, nonce, body)
+        let h = do cryptoEncodeHex(blob)
+        return h
+
+    # pgrScriptText: a pager session over `path` — `alloc`, `write ID HEX`
+    # (a heap page holding that one cell), `read ID`, `flush`, `setcount
+    # N` — reporting each read's cells (or its error), the resident set
+    # after every op, and the final page count.
+    proc pgrScriptText(path: text, keyHex: text, nonceBase: int, capacity: int, script: text) -> text uses io.file:
+        let key = do pgrHex(keyHex)
+        let mut p = do pgrOpen(path, capacity, key, nonceBase)
+        let mut out = "open " + p.pageCount + ";"
+        let lines = split(script, "\n")
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let w = do pgrWords(lines[i])
+            if len(w) > 0:
+                let op = w[0]
+                if op == "alloc":
+                    let a = do pgrAllocate(p)
+                    p = a.pager
+                    out = out + "alloc " + a.id + ";"
+                if op == "write":
+                    let pg0 = do pgNew(4)
+                    let d = do pgrHex(w[2])
+                    let pushed = do pgPushCell(pg0, d)
+                    let wr = do pgrWrite(p, toInt(w[1]), pushed.body)
+                    if !wr.ok:
+                        return out + "error: " + wr.err
+                    p = wr.pager
+                    out = out + "write " + w[1] + ";"
+                if op == "read":
+                    let rd = do pgrRead(p, toInt(w[1]))
+                    if rd.ok:
+                        p = rd.pager
+                        let cells = do pgCellsText(rd.body)
+                        out = out + "read " + w[1] + "=" + cells + ";"
+                    else:
+                        out = out + "read " + w[1] + " error: " + rd.err + ";"
+                if op == "flush":
+                    let fl = do pgrFlush(p)
+                    if !fl.ok:
+                        return out + "error: " + fl.err
+                    p = fl.pager
+                    out = out + "flush;"
+                if op == "setcount":
+                    let sp = do pgrSetPageCount(p, toInt(w[1]))
+                    p = sp
+                    out = out + "setcount;"
+                let res = do pgrResident(p)
+                let mut rtext = ""
+                let nr = len(res)
+                let mut k = 0
+                loop k < nr:
+                    if k > 0:
+                        rtext = rtext + ","
+                    rtext = rtext + res[k]
+                    k = k + 1
+                out = out + "[" + rtext + "] "
+            i = i + 1
+        return out + "pages=" + p.pageCount
+
+    action runPageScript(script: text):
+        let r = do pgScriptText(script)
+        pagerOut = r
+
+    action runPageDecode(bodyHex: text):
+        let r = do pgDecodeText(bodyHex)
+        pagerOut = r
+
+    action runPageOpen(keyHex: text, blobHex: text):
+        let r = do pgOpenText(keyHex, blobHex)
+        pagerOut = r
+
+    action runPageSeal(keyHex: text, nonceHex: text, bodyHex: text):
+        let r = do pgSealText(keyHex, nonceHex, bodyHex)
+        pagerOut = r
+
+    action runPager(path: text, keyHex: text, nonceBase: int, capacity: int, script: text):
+        let r = do pgrScriptText(path, keyHex, nonceBase, capacity, script)
+        pagerOut = r
+
+    view PagerHome at "/pager":
+        text "{pagerOut}"

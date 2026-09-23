@@ -183,3 +183,48 @@ func TestBitwisePrecedence(t *testing.T) {
 		})
 	}
 }
+
+// A lower-case name in call position that is not a builtin is a call — of a
+// parameterized derive, which only the builder can resolve — and a list whose
+// value reads its row only through such a call takes its item variable from the
+// filter: the leftmost member access on a name no nested aggregate binds.
+func TestProjectionCallAndItemVariable(t *testing.T) {
+	ex, err := ParseExpr("card(w, me)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := ex.(ast.Call); !ok || c.Name != "card" || len(c.Args) != 2 {
+		t.Fatalf("card(w, me) should parse as a two-argument call, got %#v", ex)
+	}
+	for src, want := range map[string]string{
+		"list(card(a, me) in Account where a.handle != \"\")":                                           "a",
+		"list(card(a, me) in Account where exists(b in Block where b.owner == me && b.target == a.id))": "a",
+		"list(card(Account(v.account), me) in View where v.id > 0)":                                     "v",
+	} {
+		ex, err := ParseExpr(src)
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		if ag, ok := ex.(ast.Agg); !ok || ag.Var != want {
+			t.Errorf("%s: item variable = %#v, want %q", src, ex, want)
+		}
+	}
+}
+
+func TestExponentFloatLiterals(t *testing.T) {
+	for src, want := range map[string]float64{"1e22": 1e22, "2.5E-3": 2.5e-3, "7e+2": 700, "0e0": 0} {
+		ex, err := ParseExpr(src)
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		lit, ok := ex.(ast.Lit)
+		if !ok || lit.Kind != "float" || lit.Val != want {
+			t.Fatalf("%s parsed as %#v, want float %v", src, ex, want)
+		}
+	}
+	// An `e` with no digit after it is not an exponent: `2e` is still an
+	// int followed by an identifier, exactly as before.
+	if toks := tokenize("2e"); len(toks) < 2 || toks[0].text != "2" {
+		t.Fatalf("2e tokenized as %v", toks)
+	}
+}

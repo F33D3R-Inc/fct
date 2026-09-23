@@ -290,12 +290,12 @@ func redactRow(e ir.Entity, m record) record {
 		out[k] = v
 	}
 	if e.Name == reservedUserEntity {
-		for _, k := range []string{"password", "verifyToken", "resetToken", "mfaSecret"} {
+		for _, k := range []string{"verifyToken", "resetToken"} {
 			delete(out, k)
 		}
 	}
 	for _, f := range e.Fields {
-		if f.Secret {
+		if f.Secret || f.Password {
 			delete(out, f.Name)
 		}
 	}

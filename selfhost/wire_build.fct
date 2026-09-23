@@ -1,0 +1,1757 @@
+import "view_build.fct"
+
+app WireBuildSelfHost:
+    # wire_build.fct — self-hosted port of the declared-contract half of the
+    # compiler: parser.go's parseType / parseMessage (`type Name [query]
+    # [as "schema"]:` and `message Name:` with `| variant(fields)`),
+    # parseAPI (`api METHOD "/path" -> action [status N] [rate r]
+    # [since "d"] [auth s bearer p]`), parseContractDecl and parseStream
+    # (inline `: TypeA, TypeB` or a block of `name: Type [since "d"]
+    # ["summary"]` events), with Build's resolution of each: wire fields
+    # (resolveWireField, defaults checked against their type), api routes
+    # bound to their actions (path parameters, auth mode, a client-placed
+    # target promoted to the authority), the contract route and the
+    # streams.
+    struct WField:
+        name: text
+        type: text
+        list: bool
+        optional: bool
+        hasDefault: bool
+        default: text
+        description: text
+        aliases: [text]
+        enum: [text]
+        into: text
+        nullable: bool
+
+    struct WType:
+        err: text
+        name: text
+        schema: text
+        query: bool
+        fields: [WField]
+
+    struct WVariant:
+        name: text
+        fields: [WField]
+        wire: text
+        action: text
+        since: text
+        summary: text
+        bodyParam: text
+        bodyType: text
+
+    struct WMessage:
+        err: text
+        name: text
+        tag: text
+        variants: [WVariant]
+
+    struct WFieldR:
+        err: text
+        field: WField
+        skip: bool
+
+    proc wIsWireTypeName(s: text) -> bool:
+        if s == "json" || s == "number":
+            return true
+        let t = do vpIsTypeName(s)
+        return t
+
+    # wSplitDefault: splitWireDefault — `type = <literal>`.
+    proc wField(spec0: text, what: text) -> WFieldR:
+        let blank = WField{name: "", type: "", list: false, optional: false, hasDefault: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false}
+        let spec = trim(spec0)
+        if spec == "":
+            return WFieldR{err: "", field: blank, skip: true}
+        let colon = do vpIndexOf(spec, ":")
+        if colon < 0:
+            return WFieldR{err: what + " field \"" + spec + "\" must be `name: type`", field: blank, skip: false}
+        let fn = trim(slice(spec, 0, colon))
+        let mut ft = trim(slice(spec, colon + 1, len(spec)))
+        let ok = do vpIsIdent(fn)
+        if !ok:
+            return WFieldR{err: "invalid " + what + " field name \"" + fn + "\"", field: blank, skip: false}
+        let mut hasDef = false
+        let mut def = ""
+        let di = do vpIndexOf(ft, " = ")
+        if di >= 0:
+            let lit = trim(slice(ft, di + 3, len(ft)))
+            ft = trim(slice(ft, 0, di))
+            let mut valid = lit == "true" || lit == "false" || lit == "[]" || lit == "{}"
+            if !valid && lit != "":
+                let q = charAt(lit, 0) == "\"" && len(lit) >= 2 && charAt(lit, len(lit) - 1) == "\""
+                let isI = do vpIsInt(lit)
+                valid = q || isI
+            if !valid:
+                return WFieldR{err: "default \"" + lit + "\" must be a quoted string, an integer, true/false, [], or {}", field: blank, skip: false}
+            hasDef = true
+            def = lit
+        # splitNullable: a trailing ` or null` — present, maybe null
+        let mut nullable = false
+        let nulled = do vpHasSuffix(trim(ft), " or null")
+        if nulled:
+            let tf = trim(ft)
+            ft = trim(slice(tf, 0, len(tf) - 8))
+            nullable = true
+        let mut core = ft
+        let mut optional = false
+        let mut list = false
+        let q2 = do vpHasSuffix(core, "?")
+        if q2:
+            optional = true
+            core = trim(slice(core, 0, len(core) - 1))
+        let lb = do vpHasPrefix(core, "[")
+        let rb = do vpHasSuffix(core, "]")
+        if lb && rb:
+            list = true
+            core = trim(slice(core, 1, len(core) - 1))
+        let tn = do wIsWireTypeName(core)
+        if !tn:
+            return WFieldR{err: "unknown type \"" + core + "\" in field \"" + fn + "\" (use a primitive, `json`, `number`, an enum, another type/message, or a list of those)", field: blank, skip: false}
+        if optional && hasDef:
+            return WFieldR{err: "field \"" + fn + "\" cannot be both optional (?) and have a default (=) — pick one", field: blank, skip: false}
+        if nullable && (optional || hasDef):
+            return WFieldR{err: "field \"" + fn + "\": `or null` is a present-but-maybe-null field; it is neither optional (?) nor defaulted", field: blank, skip: false}
+        return WFieldR{err: "", field: WField{name: fn, type: core, list: list, optional: optional, hasDefault: hasDef, default: def, description: "", aliases: [], enum: [], into: "", nullable: nullable}, skip: false}
+
+    proc wTypeErr(msg: text) -> WType:
+        return WType{err: msg, name: "", schema: "", query: false, fields: []}
+
+    proc wParseType(header: text, bodySrc: text) -> WType:
+        let h0 = do vpTrimPrefix(trim(header), "type")
+        let head = do vpTrimSuffix(trim(h0), ":")
+        let mut name = head
+        let mut inline = ""
+        let colon = do vpIndexOutside(head, ":")
+        if colon >= 0:
+            name = trim(slice(head, 0, colon))
+            inline = trim(slice(head, colon + 1, len(head)))
+        let mut schema = ""
+        let ai = do vpIndexOf(name, " as ")
+        if ai >= 0:
+            let sq = trim(slice(name, ai + 4, len(name)))
+            let uq = do vpUnquoteOk(sq)
+            if !uq:
+                let e0 = do wTypeErr("type schema name must be quoted: type Name as \"schemaName\":")
+                return e0
+            let sn = do vpUnquote(sq)
+            if sn == "":
+                let e1 = do wTypeErr("type schema name must be quoted: type Name as \"schemaName\":")
+                return e1
+            schema = sn
+            name = trim(slice(name, 0, ai))
+        let mut query = false
+        let isQ = do vpHasSuffix(name, " query")
+        if isQ:
+            query = true
+            name = trim(slice(name, 0, len(name) - 6))
+        let ni = do vpIsIdent(name)
+        let nu = do vpIsUpper(name)
+        if !ni || !nu:
+            let e2 = do wTypeErr("type name \"" + name + "\" must be capitalized")
+            return e2
+        let mut fields = []
+        if inline != "":
+            let parts = split(inline, ",")
+            let np = len(parts)
+            let mut i = 0
+            loop i < np:
+                let f = do wField(parts[i], "type")
+                if f.err != "":
+                    let e3 = do wTypeErr(f.err)
+                    return e3
+                if !f.skip:
+                    fields = append(fields, f.field)
+                i = i + 1
+        let lines = do vpLinesOf(bodySrc)
+        let nl = len(lines)
+        let mut j = 0
+        loop j < nl:
+            let f2 = do wField(lines[j].text, "type")
+            if f2.err != "":
+                let e4 = do wTypeErr(f2.err)
+                return e4
+            if !f2.skip:
+                fields = append(fields, f2.field)
+            j = j + 1
+        if len(fields) == 0:
+            let e5 = do wTypeErr("type \"" + name + "\" has no fields")
+            return e5
+        return WType{err: "", name: name, schema: schema, query: query, fields: fields}
+
+    proc vpIndexOutside(s: text, sep: text) -> int:
+        let cs = split(s, "")
+        let ss = split(sep, "")
+        let n = len(cs)
+        let mut depth = 0
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if c == "\"":
+                let e = do vpEndOfQuoted(cs, i)
+                if e < 0:
+                    return -1
+                i = e + 1
+                continue
+            if c == "(" || c == "[" || c == "{":
+                depth = depth + 1
+                i = i + 1
+                continue
+            if c == ")" || c == "]" || c == "}":
+                depth = depth - 1
+                i = i + 1
+                continue
+            if depth == 0:
+                let hit = do vpMatchAt(cs, i, ss)
+                if hit:
+                    return i
+            i = i + 1
+        return -1
+
+    proc wMsgErr(msg: text) -> WMessage:
+        return WMessage{err: msg, name: "", tag: "", variants: []}
+
+    # wSplitOutside: splitOutside — split on sep wherever it sits outside
+    # quotes and brackets.
+    proc wSplitOutside(s0: text, sep: text) -> [text]:
+        let mut out = []
+        let mut s = s0
+        loop true:
+            let i = do vpIndexOutside(s, sep)
+            if i < 0:
+                return append(out, s)
+            out = append(out, slice(s, 0, i))
+            s = slice(s, i + len(sep), len(s))
+        return out
+
+    # wSplitDefault: splitWireDefault — `type = <literal>`.
+    struct WDef:
+        err: text
+        rest: text
+        has: bool
+        lit: text
+
+    proc wSplitDefault(ft: text) -> WDef:
+        let idx = do vpIndexOf(ft, " = ")
+        if idx < 0:
+            return WDef{err: "", rest: ft, has: false, lit: ""}
+        let rest = trim(slice(ft, 0, idx))
+        let lit = trim(slice(ft, idx + 3, len(ft)))
+        let mut valid = lit == "true" || lit == "false" || lit == "[]" || lit == "{}"
+        if !valid && lit != "":
+            let q = charAt(lit, 0) == "\"" && len(lit) >= 2 && charAt(lit, len(lit) - 1) == "\""
+            let isI = do vpIsInt(lit)
+            valid = q || isI
+        if !valid:
+            let lq = do goQuote(lit)
+            return WDef{err: "default " + lq + " must be a quoted string, an integer, true/false, [], or {}", rest: "", has: false, lit: ""}
+        return WDef{err: "", rest: rest, has: true, lit: lit}
+
+    # wVariantField: parseVariantField — `name: type [= default]
+    # ["description"] [also a, b] [one of "x", "y"]`, or a pattern field
+    # `prefix_<field>: T "…" into param`.
+    proc wVariantField(spec: text, vname: text) -> WFieldR:
+        let blank = WField{name: "", type: "", list: false, optional: false, hasDefault: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false}
+        let vq = do goQuote(vname)
+        let colon = do vpIndexOf(spec, ":")
+        if colon < 0:
+            let sq = do goQuote(spec)
+            return WFieldR{err: "field " + sq + " in variant " + vq + " must be `name: type`", field: blank, skip: false}
+        let fn = trim(slice(spec, 0, colon))
+        let mut ft = trim(slice(spec, colon + 1, len(spec)))
+        let fq = do goQuote(fn)
+        let hasPat = do vpHasSuffix(fn, "<field>")
+        let mut pattern = false
+        if hasPat:
+            let pi = do vpIsIdent(slice(fn, 0, len(fn) - 7))
+            pattern = pi
+        let fid = do vpIsIdent(fn)
+        if !fid && !pattern:
+            return WFieldR{err: "invalid field name " + fq + " in variant " + vq, field: blank, skip: false}
+        let mut into = ""
+        let ii = do vpIndexOutside(ft, " into ")
+        if ii >= 0:
+            into = trim(slice(ft, ii + 6, len(ft)))
+            ft = trim(slice(ft, 0, ii))
+            let iid = do vpIsIdent(into)
+            if !pattern || !iid:
+                return WFieldR{err: "field " + fq + ": `into param` belongs to a pattern field, prefix_<field>", field: blank, skip: false}
+        if pattern && into == "":
+            return WFieldR{err: "pattern field " + fq + " gathers its keys into an action parameter: " + fn + ": text? \"…\" into param", field: blank, skip: false}
+        let mut enum = []
+        let oi = do vpIndexOutside(ft, " one of ")
+        if oi >= 0:
+            let parts = do wSplitOutside(slice(ft, oi + 8, len(ft)), ",")
+            let np = len(parts)
+            let mut k = 0
+            loop k < np:
+                let u = do goUnquote(trim(parts[k]))
+                if !u.ok:
+                    return WFieldR{err: "field " + fq + ": one of takes quoted values", field: blank, skip: false}
+                enum = append(enum, u.value)
+                k = k + 1
+            ft = trim(slice(ft, 0, oi))
+        let mut aliases = []
+        let ai = do vpIndexOutside(ft, " also ")
+        if ai >= 0:
+            let aparts = split(slice(ft, ai + 6, len(ft)), ",")
+            let na = len(aparts)
+            let mut k2 = 0
+            loop k2 < na:
+                let al = trim(aparts[k2])
+                let alid = do vpIsIdent(al)
+                if !alid:
+                    return WFieldR{err: "field " + fq + ": also names the other field names it is accepted under", field: blank, skip: false}
+                aliases = append(aliases, al)
+                k2 = k2 + 1
+            ft = trim(slice(ft, 0, ai))
+        let mut desc = ""
+        let endsQ = do vpHasSuffix(ft, "\"")
+        if endsQ:
+            let q = do vpIndexOf(ft, "\"")
+            if q > 0:
+                let beforeEq = do vpHasSuffix(trim(slice(ft, 0, q)), "=")
+                if !beforeEq:
+                    let du = do goUnquote(slice(ft, q, len(ft)))
+                    if !du.ok:
+                        return WFieldR{err: "field " + fq + ": the description must be one quoted string", field: blank, skip: false}
+                    desc = du.value
+                    ft = trim(slice(ft, 0, q))
+        let sd = do wSplitDefault(ft)
+        if sd.err != "":
+            return WFieldR{err: sd.err, field: blank, skip: false}
+        let mut core = sd.rest
+        let mut optional = false
+        let mut list = false
+        let q2 = do vpHasSuffix(core, "?")
+        if q2:
+            optional = true
+            core = trim(slice(core, 0, len(core) - 1))
+        let lb = do vpHasPrefix(core, "[")
+        let rb = do vpHasSuffix(core, "]")
+        if lb && rb:
+            list = true
+            core = trim(slice(core, 1, len(core) - 1))
+        let tn = do wIsWireTypeName(core)
+        if !tn:
+            let cq = do goQuote(core)
+            return WFieldR{err: "unknown type " + cq + " in variant " + vq + " field " + fq, field: blank, skip: false}
+        if optional && sd.has:
+            return WFieldR{err: "field " + fq + " in variant " + vq + " cannot be both optional (?) and have a default (=) — pick one", field: blank, skip: false}
+        return WFieldR{err: "", field: WField{name: fn, type: core, list: list, optional: optional, hasDefault: sd.has, default: sd.lit, description: desc, aliases: aliases, enum: enum, into: into, nullable: false}, skip: false}
+
+    struct WVariantR:
+        err: text
+        v: WVariant
+
+    proc wVariantErr(msg: text) -> WVariantR:
+        return WVariantR{err: msg, v: WVariant{name: "", fields: [], wire: "", action: "", since: "", summary: "", bodyParam: "", bodyType: ""}}
+
+    # wVariantHead: parseVariantHead — `name [as "wire"] [(field: type, …)]
+    # [-> action] [body param: WireType] [since "date"] ["summary"]`.
+    proc wVariantHead(line: text) -> WVariantR:
+        let cs = split(line, "")
+        let n = len(cs)
+        let mut nameEnd = n
+        let mut i = 0
+        loop i < n && nameEnd == n:
+            if cs[i] == " " || cs[i] == "(":
+                nameEnd = i
+            i = i + 1
+        let vname = slice(line, 0, nameEnd)
+        let mut rest = trim(slice(line, nameEnd, n))
+        let vq = do goQuote(vname)
+        let vid = do vpIsIdent(vname)
+        let vup = do vpIsUpper(vname)
+        if !vid || vup:
+            let e0 = do wVariantErr("message variant " + vq + " must be a lowercase identifier (it is the wire discriminant, written as-is)")
+            return e0
+        let mut wire = ""
+        let isAs = do vpHasPrefix(rest, "as ")
+        if isAs:
+            rest = trim(slice(rest, 3, len(rest)))
+            let rcs = split(rest, "")
+            let mut e = -1
+            if len(rcs) > 0 && rcs[0] == "\"":
+                let ee = do vpEndOfQuoted(rcs, 0)
+                e = ee
+            if e < 0:
+                let e1 = do wVariantErr("variant " + vq + ": as needs a quoted wire name: " + vname + " as \"wire.name\"")
+                return e1
+            let u = do goUnquote(slice(rest, 0, e + 1))
+            if !u.ok || u.value == "":
+                let e2 = do wVariantErr("variant " + vq + ": as needs a quoted wire name")
+                return e2
+            wire = u.value
+            rest = trim(slice(rest, e + 1, len(rest)))
+        let mut inner = ""
+        let mut hasParens = false
+        let op = do vpHasPrefix(rest, "(")
+        if op:
+            let close = do vpLastIndexOf(rest, ")")
+            if close < 0:
+                let e3 = do wVariantErr("message variant " + vq + " is missing `)`")
+                return e3
+            inner = trim(slice(rest, 1, close))
+            rest = trim(slice(rest, close + 1, len(rest)))
+            hasParens = true
+        let mut action = ""
+        let arrow = do vpHasPrefix(rest, "->")
+        if arrow:
+            rest = trim(slice(rest, 2, len(rest)))
+            let mut a = rest
+            let sp = do vpIndexOf(rest, " ")
+            if sp >= 0:
+                a = slice(rest, 0, sp)
+                rest = trim(slice(rest, sp, len(rest)))
+            else:
+                rest = ""
+            let aid = do vpIsIdent(a)
+            if !aid:
+                let e4 = do wVariantErr("variant " + vq + ": -> names the action it runs")
+                return e4
+            action = a
+        let mut bodyParam = ""
+        let mut bodyType = ""
+        let isBody = do vpHasPrefix(rest, "body ")
+        if isBody:
+            rest = trim(slice(rest, 5, len(rest)))
+            let bc = do vpIndexOf(rest, ":")
+            if bc < 0:
+                let e5 = do wVariantErr("variant " + vq + ": body is `body param: WireType`")
+                return e5
+            let p = trim(slice(rest, 0, bc))
+            rest = trim(slice(rest, bc + 1, len(rest)))
+            let mut t = rest
+            let sp2 = do vpIndexOf(rest, " ")
+            if sp2 >= 0:
+                t = slice(rest, 0, sp2)
+                rest = trim(slice(rest, sp2, len(rest)))
+            else:
+                rest = ""
+            let pid = do vpIsIdent(p)
+            let tid = do vpIsIdent(t)
+            let tup = do vpIsUpper(t)
+            if !pid || !tid || !tup:
+                let e6 = do wVariantErr("variant " + vq + ": body is `body param: WireType`")
+                return e6
+            bodyParam = p
+            bodyType = t
+        let mut since = ""
+        let isSince = do vpHasPrefix(rest, "since ")
+        if isSince:
+            rest = trim(slice(rest, 6, len(rest)))
+            let scs = split(rest, "")
+            let mut se = -1
+            if len(scs) > 0 && scs[0] == "\"":
+                let see = do vpEndOfQuoted(scs, 0)
+                se = see
+            if se < 0:
+                let e7 = do wVariantErr("variant " + vq + ": since needs a quoted date")
+                return e7
+            let su = do goUnquote(slice(rest, 0, se + 1))
+            since = su.value
+            rest = trim(slice(rest, se + 1, len(rest)))
+        let mut summary = ""
+        if rest != "":
+            let mu = do goUnquote(rest)
+            if !mu.ok:
+                let e8 = do wVariantErr("variant " + vq + ": the summary must be one quoted string, got " + rest)
+                return e8
+            summary = mu.value
+        let mut fields = []
+        if hasParens && inner != "":
+            let specs = do wSplitOutside(inner, ",")
+            let ns = len(specs)
+            let mut k = 0
+            loop k < ns:
+                let sp3 = trim(specs[k])
+                if sp3 != "":
+                    let f = do wVariantField(sp3, vname)
+                    if f.err != "":
+                        let e9 = do wVariantErr(f.err)
+                        return e9
+                    fields = append(fields, f.field)
+                k = k + 1
+        return WVariantR{err: "", v: WVariant{name: vname, fields: fields, wire: wire, action: action, since: since, summary: summary, bodyParam: bodyParam, bodyType: bodyType}}
+
+    # wParseMessage: parseMessage — `message Name [tag "field"]:` then one
+    # `| variant …` line per arm, its fields inline or as an indented block.
+    proc wParseMessage(header: text, bodySrc: text, declLine: int, bodyLineNos: [int]) -> WMessage:
+        let at0 = "line " + declLine + ": "
+        let h0 = do vpTrimPrefix(trim(header), "message")
+        let head0 = do vpTrimSuffix(trim(h0), ":")
+        let head = trim(head0)
+        let mut name = head
+        let mut tag = ""
+        let ti = do vpIndexOf(head, " tag ")
+        if ti >= 0:
+            let tu = do goUnquote(trim(slice(head, ti + 5, len(head))))
+            let tid = do vpIsIdent(tu.value)
+            if !tu.ok || !tid:
+                let et = do wMsgErr(at0 + "message tag must be a quoted field name: message Name tag \"event_type\":")
+                return et
+            name = trim(slice(head, 0, ti))
+            tag = tu.value
+        let ni = do vpIsIdent(name)
+        let nu = do vpIsUpper(name)
+        if !ni || !nu:
+            let nq = do goQuote(name)
+            let e0 = do wMsgErr(at0 + "message name " + nq + " must be capitalized")
+            return e0
+        let lines = do vpLinesOf(bodySrc)
+        let mut variants = []
+        let mut seen = []
+        let n = len(lines)
+        let mut pre = 0
+        let mut i = 0
+        loop i < n:
+            let mut vl = declLine
+            if pre < len(bodyLineNos):
+                vl = bodyLineNos[pre]
+            let atV = "line " + vl + ": "
+            pre = pre + 1
+            let line0 = trim(lines[i].text)
+            let bar = do vpHasPrefix(line0, "|")
+            if !bar:
+                let lq = do goQuote(line0)
+                let e1 = do wMsgErr(atV + "message variant " + lq + " must start with `|`")
+                return e1
+            let mut line = trim(slice(line0, 1, len(line0)))
+            let block = len(lines[i].kids) > 0
+            if block:
+                let colonEnd = do vpHasSuffix(line, ":")
+                if !colonEnd:
+                    let e2 = do wMsgErr(atV + "a message variant with indented fields ends its line with `:`")
+                    return e2
+                line = trim(slice(line, 0, len(line) - 1))
+            let vh = do wVariantHead(line)
+            if vh.err != "":
+                let e3 = do wMsgErr(atV + vh.err)
+                return e3
+            let v = vh.v
+            let mut key = v.name
+            if v.wire != "":
+                key = v.wire
+            if (v.name in seen) || (key in seen):
+                let mq = do goQuote(name)
+                let kq = do goQuote(key)
+                let e4 = do wMsgErr(atV + "message " + mq + " has two variants named " + kq)
+                return e4
+            seen = append(seen, v.name)
+            seen = append(seen, key)
+            let mut fields = v.fields
+            let nk = len(lines[i].kids)
+            let mut k = 0
+            loop k < nk:
+                let mut fl = declLine
+                if pre < len(bodyLineNos):
+                    fl = bodyLineNos[pre]
+                pre = pre + 1
+                let f = do wVariantField(trim(lines[i].kids[k].text), v.name)
+                if f.err != "":
+                    let e5 = do wMsgErr("line " + fl + ": " + f.err)
+                    return e5
+                fields = append(fields, f.field)
+                k = k + 1
+            variants = append(variants, WVariant{name: v.name, fields: fields, wire: v.wire, action: v.action, since: v.since, summary: v.summary, bodyParam: v.bodyParam, bodyType: v.bodyType})
+            i = i + 1
+        if len(variants) == 0:
+            let mq2 = do goQuote(name)
+            let e6 = do wMsgErr(at0 + "message " + mq2 + " has no variants")
+            return e6
+        return WMessage{err: "", name: name, tag: tag, variants: variants}
+
+    # ── Build: resolveWireField + the type/message tables ────────────────
+    struct WBuilt:
+        err: text
+        types: [IRWireType]
+        messages: [IRWireMessage]
+        names: [text]
+
+    proc wBuiltErr(msg: text) -> WBuilt:
+        return WBuilt{err: msg, types: [], messages: [], names: []}
+
+    struct WResolved:
+        err: text
+        field: IRWireField
+
+    proc wResolve(decl: text, f: WField, names: [text], enumNames: [text]) -> WResolved:
+        let blank = IRWireField{name: "", type: "", list: false, optional: false, ref: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false}
+        let mut ref = false
+        let prim = do vbIsPrimitive(f.type)
+        if f.type == "json" || f.type == "number" || prim:
+            ref = false
+        else:
+            if f.type in names:
+                ref = true
+            else:
+                if !(f.type in enumNames):
+                    return WResolved{err: "\"" + decl + "\" field \"" + f.name + "\" has unknown type \"" + f.type + "\" (not a primitive, `json`, an enum, or a declared type/message)", field: blank}
+        let d = f.default
+        if f.hasDefault && d != "":
+            if f.list:
+                if d != "[]":
+                    return WResolved{err: "\"" + decl + "\" field \"" + f.name + "\": a list field's only supported default is [], not " + d, field: blank}
+            else:
+                let isBool = d == "true" || d == "false"
+                let isStr = len(d) >= 2 && charAt(d, 0) == "\""
+                let isObj = d == "{}"
+                let isInt = !isBool && !isStr && !isObj
+                if f.type == "bool" && !isBool:
+                    return WResolved{err: "\"" + decl + "\" field \"" + f.name + "\": default " + d + " doesn't match its bool type", field: blank}
+                if (f.type == "int" || f.type == "money" || f.type == "number") && !isInt:
+                    return WResolved{err: "\"" + decl + "\" field \"" + f.name + "\": default " + d + " doesn't match its numeric type", field: blank}
+                if (f.type == "text" || f.type == "date") && !isStr:
+                    return WResolved{err: "\"" + decl + "\" field \"" + f.name + "\": default " + d + " doesn't match its text type", field: blank}
+                if f.type == "json" && !isObj:
+                    return WResolved{err: "\"" + decl + "\" field \"" + f.name + "\": a json field's only supported default is {}, not " + d, field: blank}
+                let known = f.type == "bool" || f.type == "int" || f.type == "money" || f.type == "number" || f.type == "text" || f.type == "date" || f.type == "json"
+                if !known:
+                    return WResolved{err: "\"" + decl + "\" field \"" + f.name + "\": a default is only supported on bool/int/money/number/text/date/json, or a list ([]), not \"" + f.type + "\"", field: blank}
+        return WResolved{err: "", field: IRWireField{name: f.name, type: f.type, list: f.list, optional: f.optional, ref: ref, default: d, description: f.description, aliases: f.aliases, enum: f.enum, into: f.into, nullable: f.nullable}}
+
+    proc wResolveFields(decl: text, fs: [WField], names: [text], enumNames: [text]) -> WBuiltFields:
+        let mut out = []
+        let mut seen = []
+        let n = len(fs)
+        let mut i = 0
+        loop i < n:
+            if fs[i].name in seen:
+                return WBuiltFields{err: "\"" + decl + "\" has duplicate field \"" + fs[i].name + "\"", fields: []}
+            seen = append(seen, fs[i].name)
+            let r = do wResolve(decl, fs[i], names, enumNames)
+            if r.err != "":
+                return WBuiltFields{err: r.err, fields: []}
+            out = append(out, r.field)
+            i = i + 1
+        return WBuiltFields{err: "", fields: out}
+
+    struct WBuiltFields:
+        err: text
+        fields: [IRWireField]
+
+    proc wBuild(types: [WType], messages: [WMessage], enumNames: [text]) -> WBuilt:
+        let mut names = []
+        let nt = len(types)
+        let mut i = 0
+        loop i < nt:
+            let t = types[i]
+            if t.err != "":
+                let e0 = do wBuiltErr(t.err)
+                return e0
+            if t.name in names:
+                let e1 = do wBuiltErr("type \"" + t.name + "\" redeclared")
+                return e1
+            names = append(names, t.name)
+            i = i + 1
+        let mut schemaNames = []
+        let mut schemaOwners = []
+        let mut j = 0
+        loop j < nt:
+            let t2 = types[j]
+            let mut sn = t2.schema
+            if sn == "":
+                sn = t2.name
+            let at = do vbFind(schemaNames, sn)
+            if at >= 0:
+                let e2 = do wBuiltErr("type \"" + t2.name + "\" publishes schema \"" + sn + "\", which type \"" + schemaOwners[at] + "\" already publishes")
+                return e2
+            schemaNames = append(schemaNames, sn)
+            schemaOwners = append(schemaOwners, t2.name)
+            j = j + 1
+        let mut k = 0
+        loop k < nt:
+            let t3 = types[k]
+            if t3.schema != "" && (t3.schema in names) && t3.schema != t3.name:
+                let e3 = do wBuiltErr("type \"" + t3.name + "\" publishes schema \"" + t3.schema + "\", the name of another declared type")
+                return e3
+            k = k + 1
+        let nm = len(messages)
+        let mut m = 0
+        loop m < nm:
+            let ms = messages[m]
+            if ms.err != "":
+                let e4 = do wBuiltErr(ms.err)
+                return e4
+            if ms.name in names:
+                let e5 = do wBuiltErr("message \"" + ms.name + "\" redeclared (possibly as a type)")
+                return e5
+            names = append(names, ms.name)
+            m = m + 1
+        let mut irTypes = []
+        let mut p = 0
+        loop p < nt:
+            let t4 = types[p]
+            let rf = do wResolveFields(t4.name, t4.fields, names, enumNames)
+            if rf.err != "":
+                let e6 = do wBuiltErr(rf.err)
+                return e6
+            irTypes = append(irTypes, IRWireType{name: t4.name, schema: t4.schema, query: t4.query, fields: rf.fields})
+            p = p + 1
+        let mut irMsgs = []
+        let mut q = 0
+        loop q < nm:
+            let ms2 = messages[q]
+            let mut vars = []
+            let nv = len(ms2.variants)
+            let mut v = 0
+            loop v < nv:
+                let va = ms2.variants[v]
+                let rf2 = do wResolveFields(ms2.name + "." + va.name, va.fields, names, enumNames)
+                if rf2.err != "":
+                    let e7 = do wBuiltErr(rf2.err)
+                    return e7
+                if va.bodyType != "" && !(va.bodyType in names):
+                    let e8 = do wBuiltErr(ms2.name + "." + va.name + ": body type \"" + va.bodyType + "\" is not a declared wire type")
+                    return e8
+                vars = append(vars, IRWireVariant{name: va.name, fields: rf2.fields, wire: va.wire, action: va.action, since: va.since, summary: va.summary, bodyParam: va.bodyParam, bodyType: va.bodyType})
+                v = v + 1
+            irMsgs = append(irMsgs, IRWireMessage{name: ms2.name, tag: ms2.tag, variants: vars})
+            q = q + 1
+        return WBuilt{err: "", types: irTypes, messages: irMsgs, names: names}
+
+    # ── api / contract / stream declarations ───────────────────────────
+    struct WAPI:
+        err: text
+        method: text
+        path: text
+        action: text
+        status: int
+        rate: text
+        since: text
+        authScheme: text
+        bearer: text
+
+    proc wApiErr(msg: text) -> WAPI:
+        return WAPI{err: msg, method: "", path: "", action: "", status: 0, rate: "", since: "", authScheme: "", bearer: ""}
+
+    proc wUnquoteDate(v: text) -> text:
+        let ok = do vpUnquoteOk(v)
+        if !ok:
+            return ""
+        let d = do vpUnquote(v)
+        return d
+
+    # wParseAPI: parseAPI.
+    proc wParseAPI(line: text) -> WAPI:
+        let r0 = do vpTrimPrefix(trim(line), "api")
+        let mut rest = trim(r0)
+        let sp = do vpIndexOf(rest, " ")
+        if sp < 0:
+            let e0 = do wApiErr("api needs a method, a path and an action: api GET \"/path/{id}\" -> actionName")
+            return e0
+        let method = slice(rest, 0, sp)
+        if method != "GET" && method != "POST" && method != "PUT" && method != "PATCH" && method != "DELETE":
+            let e1 = do wApiErr("api method \"" + method + "\" must be GET, POST, PUT, PATCH or DELETE")
+            return e1
+        rest = trim(slice(rest, sp, len(rest)))
+        let arrow = do vpIndexOf(rest, "->")
+        if arrow < 0:
+            let e2 = do wApiErr("api needs a target action: api GET \"/path\" -> actionName")
+            return e2
+        let pq = trim(slice(rest, 0, arrow))
+        let path = do wUnquoteDate(pq)
+        if path == "":
+            let e3 = do wApiErr("api needs a quoted path: api GET \"/path\" -> actionName")
+            return e3
+        let slash = do vpHasPrefix(path, "/")
+        if !slash:
+            let e4 = do wApiErr("api path \"" + path + "\" must start with /")
+            return e4
+        let tail = do vpFields(trim(slice(rest, arrow + 2, len(rest))))
+        let mut t0ok = false
+        if len(tail) > 0:
+            let io = do vpIsIdent(tail[0])
+            t0ok = io
+        if !t0ok:
+            let e5 = do wApiErr("api target must be an action name")
+            return e5
+        let mut status = 0
+        let mut rate = ""
+        let mut since = ""
+        let mut scheme = ""
+        let mut bearer = ""
+        let nt = len(tail)
+        let mut i = 1
+        loop i < nt:
+            if i + 1 >= nt:
+                let e6 = do wApiErr("api clause \"" + tail[i] + "\" needs a value")
+                return e6
+            let val = tail[i + 1]
+            let key = tail[i]
+            if key == "status":
+                let isI = do vpIsInt(val)
+                let n = toInt(val)
+                if !isI || n < 200 || n > 299:
+                    let e7 = do wApiErr("api status \"" + val + "\" must be a 2xx success code")
+                    return e7
+                status = n
+            else:
+                if key == "rate":
+                    if val != "read" && val != "write" && val != "auth":
+                        let e8 = do wApiErr("api rate class \"" + val + "\" must be read, write or auth")
+                        return e8
+                    rate = val
+                else:
+                    if key == "since":
+                        let d = do wUnquoteDate(val)
+                        if d == "":
+                            let e9 = do wApiErr("api since needs a quoted date: since \"2026-09-13\"")
+                            return e9
+                        since = d
+                    else:
+                        if key == "auth":
+                            let vi = do vpIsIdent(val)
+                            let mut ok = vi && i + 3 < nt
+                            if ok:
+                                let bi = do vpIsIdent(tail[i + 3])
+                                ok = tail[i + 2] == "bearer" && bi
+                            if !ok:
+                                let e10 = do wApiErr("api auth clause is `auth <scheme> bearer <param>`: the route's credential scheme and the action parameter the bearer token binds to")
+                                return e10
+                            scheme = val
+                            bearer = tail[i + 3]
+                            i = i + 2
+                        else:
+                            let e11 = do wApiErr("unknown api clause \"" + key + "\" (expected status, rate, since or auth)")
+                            return e11
+            i = i + 2
+        return WAPI{err: "", method: method, path: path, action: tail[0], status: status, rate: rate, since: since, authScheme: scheme, bearer: bearer}
+
+    struct WContract:
+        err: text
+        path: text
+        rate: text
+        since: text
+
+    proc wParseContract(line: text) -> WContract:
+        let r0 = do vpTrimPrefix(trim(line), "contract")
+        let rest = trim(r0)
+        let cs = split(rest, "")
+        let mut e = -1
+        if len(cs) > 0 && cs[0] == "\"":
+            let ee = do vpEndOfQuoted(cs, 0)
+            e = ee
+        if e < 0:
+            return WContract{err: "contract needs a quoted path: contract \"/api/v2/contract\"", path: "", rate: "", since: ""}
+        let pq = slice(rest, 0, e + 1)
+        let path = do vpUnquote(pq)
+        let slash = do vpHasPrefix(path, "/")
+        let endSlash = do vpHasSuffix(path, "/")
+        if !slash || contains(path, "{") || contains(path, "}") || endSlash:
+            return WContract{err: "contract path must be a literal path starting with /: contract \"/api/v2/contract\"", path: "", rate: "", since: ""}
+        let tail = do vpFields(slice(rest, e + 1, len(rest)))
+        let mut rate = ""
+        let mut since = ""
+        let nt = len(tail)
+        let mut i = 0
+        loop i < nt:
+            if i + 1 >= nt:
+                return WContract{err: "contract clause \"" + tail[i] + "\" needs a value", path: "", rate: "", since: ""}
+            let val = tail[i + 1]
+            if tail[i] == "rate":
+                if val != "read" && val != "write" && val != "auth":
+                    return WContract{err: "contract rate class \"" + val + "\" must be read, write or auth", path: "", rate: "", since: ""}
+                rate = val
+            else:
+                if tail[i] == "since":
+                    let d = do wUnquoteDate(val)
+                    if d == "":
+                        return WContract{err: "contract since needs a quoted date: since \"2026-09-13\"", path: "", rate: "", since: ""}
+                    since = d
+                else:
+                    return WContract{err: "unknown contract clause \"" + tail[i] + "\" (expected rate or since)", path: "", rate: "", since: ""}
+            i = i + 2
+        return WContract{err: "", path: path, rate: rate, since: since}
+
+    struct WStream:
+        err: text
+        path: text
+        requires: text
+        rate: text
+        since: text
+        events: [IRStreamEvent]
+        connects: [IRStreamHook]
+        disconnect: text
+
+    proc wStreamErr(msg: text) -> WStream:
+        return WStream{err: msg, path: "", requires: "", rate: "", since: "", events: [], connects: [], disconnect: ""}
+
+    proc wParseStream(header: text, bodySrc: text) -> WStream:
+        let r0 = do vpTrimPrefix(trim(header), "stream")
+        let rest = trim(r0)
+        let colon = do vpIndexOutside(rest, ":")
+        if colon < 0:
+            let e0 = do wStreamErr("stream needs its events: stream \"/path\": TypeA, TypeB")
+            return e0
+        let head = trim(slice(rest, 0, colon))
+        let evs = trim(slice(rest, colon + 1, len(rest)))
+        let cs = split(head, "")
+        let mut pe = -1
+        if len(cs) > 0 && cs[0] == "\"":
+            let ee = do vpEndOfQuoted(cs, 0)
+            pe = ee
+        if pe < 0:
+            let e1 = do wStreamErr("stream needs a quoted path: stream \"/path\": TypeA, TypeB")
+            return e1
+        let path = do vpUnquote(slice(head, 0, pe + 1))
+        if path == "":
+            let e2 = do wStreamErr("stream needs a quoted path: stream \"/path\": TypeA, TypeB")
+            return e2
+        let slash = do vpHasPrefix(path, "/")
+        if !slash:
+            let e3 = do wStreamErr("stream path \"" + path + "\" must start with /")
+            return e3
+        let clauses = do vpFields(slice(head, pe + 1, len(head)))
+        let mut guard = ""
+        let mut rate = ""
+        let mut since = ""
+        let nc = len(clauses)
+        let mut i = 0
+        loop i < nc:
+            if i + 1 >= nc:
+                let e4 = do wStreamErr("stream clause \"" + clauses[i] + "\" needs a value")
+                return e4
+            let val = clauses[i + 1]
+            if clauses[i] == "requires":
+                let ri = do vpIsIdent(val)
+                if !ri:
+                    let e5 = do wStreamErr("stream requires \"" + val + "\" must be a policy name")
+                    return e5
+                guard = val
+            else:
+                if clauses[i] == "rate":
+                    if val != "read" && val != "write" && val != "auth":
+                        let e6 = do wStreamErr("stream rate class \"" + val + "\" must be read, write or auth")
+                        return e6
+                    rate = val
+                else:
+                    if clauses[i] == "since":
+                        let d = do wUnquoteDate(val)
+                        if d == "":
+                            let e7 = do wStreamErr("stream since needs a quoted date: since \"2026-09-13\"")
+                            return e7
+                        since = d
+                    else:
+                        let e8 = do wStreamErr("unknown stream clause \"" + clauses[i] + "\" (expected requires, rate or since)")
+                        return e8
+            i = i + 2
+        let lines = do vpLinesOf(bodySrc)
+        let mut events = []
+        if evs != "":
+            if len(lines) > 0:
+                let e9 = do wStreamErr("a stream lists its events either after the colon or as an indented block, not both")
+                return e9
+            let parts = split(evs, ",")
+            let np = len(parts)
+            let mut k = 0
+            loop k < np:
+                let ev = trim(parts[k])
+                let ei = do vpIsIdent(ev)
+                let eu = do vpIsUpper(ev)
+                if !ei || !eu:
+                    let e10 = do wStreamErr("stream event \"" + ev + "\" must be a wire type name")
+                    return e10
+                events = append(events, IRStreamEvent{name: ev, type: ev, since: "", summary: ""})
+                k = k + 1
+        let nl = len(lines)
+        let mut connects = []
+        let mut disconnect = ""
+        let mut j = 0
+        loop j < nl:
+            let t = trim(lines[j].text)
+            let isCon = do vpHasPrefix(t, "connect ")
+            let isDis = do vpHasPrefix(t, "disconnect ")
+            if isCon || isDis:
+                # `connect -> action [as event]` / `disconnect -> action`.
+                let mut word = "connect"
+                if isDis:
+                    word = "disconnect"
+                let hr = trim(slice(t, len(word), len(t)))
+                let arrow = do vpHasPrefix(hr, "->")
+                if !arrow:
+                    let eh1 = do wStreamErr("stream " + word + " hook is `" + word + " -> action`")
+                    return eh1
+                let f = do vpFields(trim(slice(hr, 2, len(hr))))
+                let mut fi0 = false
+                if len(f) > 0:
+                    let fid = do vpIsIdent(f[0])
+                    fi0 = fid
+                if !fi0:
+                    let eh2 = do wStreamErr("stream " + word + " hook needs an action: " + word + " -> action")
+                    return eh2
+                let mut asOk = false
+                if len(f) == 3:
+                    let f2i = do vpIsIdent(f[2])
+                    asOk = f[1] == "as" && f2i
+                if word == "connect" && len(f) == 1:
+                    connects = append(connects, IRStreamHook{action: f[0], event: ""})
+                else:
+                    if word == "connect" && asOk:
+                        connects = append(connects, IRStreamHook{action: f[0], event: f[2]})
+                    else:
+                        if word == "disconnect" && len(f) == 1:
+                            disconnect = f[0]
+                        else:
+                            let eh3 = do wStreamErr("stream hooks are `connect -> action [as event]` and `disconnect -> action`")
+                            return eh3
+                j = j + 1
+                continue
+            let c2 = do vpIndexOf(t, ":")
+            if c2 < 0:
+                let e11 = do wStreamErr("a stream event is name: Type [since \"<date>\"] [\"summary\"]")
+                return e11
+            let name = trim(slice(t, 0, c2))
+            let ni = do vpIsIdent(name)
+            let nu = do vpIsUpper(name)
+            if !ni || nu:
+                let e12 = do wStreamErr("stream event name \"" + name + "\" must be a lowercase identifier (it is the SSE event name, written as-is)")
+                return e12
+            let mut r2 = trim(slice(t, c2 + 1, len(t)))
+            let mut typ = r2
+            let sp = do vpIndexOf(r2, " ")
+            if sp >= 0:
+                typ = slice(r2, 0, sp)
+                r2 = trim(slice(r2, sp, len(r2)))
+            else:
+                r2 = ""
+            let ti = do vpIsIdent(typ)
+            let tu = do vpIsUpper(typ)
+            if !ti || !tu:
+                let e13 = do wStreamErr("stream event \"" + name + "\": payload \"" + typ + "\" must be a wire type name")
+                return e13
+            let mut esince = ""
+            let hs = do vpHasPrefix(r2, "since ")
+            if hs:
+                r2 = trim(slice(r2, 6, len(r2)))
+                let rc = split(r2, "")
+                let mut qe = -1
+                if len(rc) > 0 && rc[0] == "\"":
+                    let qq = do vpEndOfQuoted(rc, 0)
+                    qe = qq
+                if qe < 0:
+                    let e14 = do wStreamErr("stream event since needs a quoted date: since \"2026-09-13\"")
+                    return e14
+                let d2 = do vpUnquote(slice(r2, 0, qe + 1))
+                if d2 == "":
+                    let e15 = do wStreamErr("stream event since needs a quoted date: since \"2026-09-13\"")
+                    return e15
+                esince = d2
+                r2 = trim(slice(r2, qe + 1, len(r2)))
+            let mut summary = ""
+            if r2 != "":
+                let uq = do vpUnquoteOk(r2)
+                if !uq:
+                    let e16 = do wStreamErr("stream event \"" + name + "\": the summary must be one quoted string, got " + r2)
+                    return e16
+                let sm = do vpUnquote(r2)
+                summary = sm
+            events = append(events, IRStreamEvent{name: name, type: typ, since: esince, summary: summary})
+            j = j + 1
+        if len(events) == 0:
+            let e17 = do wStreamErr("stream declares no events")
+            return e17
+        return WStream{err: "", path: path, requires: guard, rate: rate, since: since, events: events, connects: connects, disconnect: disconnect}
+
+    # ── Build 4d′/4d‴/4d″ ───────────────────────────────────────────────
+    struct WRoutes:
+        err: text
+        actions: [IRAction]
+        apis: [IRAPI]
+        contract: [IRContract]
+        streams: [IRStream]
+
+    proc wRoutesErr(msg: text) -> WRoutes:
+        return WRoutes{err: msg, actions: [], apis: [], contract: [], streams: []}
+
+    proc wFindAction(actions: [IRAction], name: text) -> int:
+        let n = len(actions)
+        let mut i = 0
+        loop i < n:
+            if actions[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc wSplitSlash(p: text) -> [text]:
+        let r = split(p, "/")
+        return r
+
+    # wEmits: every emit an action body holds, at any depth, as
+    # "event\ttype" pairs (the event "" when unnamed).
+    proc wEmits(body: [IRStmt], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(body)
+        let mut i = 0
+        loop i < n:
+            let s = body[i]
+            if s.op == "emit":
+                out = append(out, s.target + "\t" + s.field + "\t" + len(s.args))
+            let a = do wEmits(s.body, out)
+            let b = do wEmits(s.elseBody, a)
+            out = b
+            i = i + 1
+        return out
+
+    proc wFindMessage(ms: [IRWireMessage], name: text) -> int:
+        let n = len(ms)
+        let mut i = 0
+        loop i < n:
+            if ms[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc wVariantWireName(v: IRWireVariant) -> text:
+        if v.wire != "":
+            return v.wire
+        return v.name
+
+    struct WDispatch:
+        err: text
+        actions: [IRAction]
+
+    # wDispatchRoute: dispatchRoute — a body-carrying, literal route whose
+    # every variant names the action it runs and carries that action's
+    # required parameters; each variant's action moves to the authority.
+    proc wDispatchRoute(ap: WAPI, msg: IRWireMessage, actions0: [IRAction], apiKeys: [text], line: int) -> WDispatch:
+        let mut actions = actions0
+        let pq = do goQuote(ap.path)
+        let head = "api " + ap.method + " " + pq
+        if ap.method == "GET" || ap.method == "DELETE":
+            return WDispatch{err: "line " + line + ": " + head + " -> " + msg.name + ": a dispatching route decodes its body, so it is a POST, PUT or PATCH", actions: actions0}
+        if contains(ap.path, "{") || contains(ap.path, "}"):
+            return WDispatch{err: "line " + line + ": " + head + " -> " + msg.name + ": a dispatching route's path is literal — the variant carries everything", actions: actions0}
+        if ap.bearer != "":
+            return WDispatch{err: "line " + line + ": " + head + " -> " + msg.name + ": each variant's action carries its own auth", actions: actions0}
+        if (ap.method + " " + ap.path) in apiKeys:
+            return WDispatch{err: "line " + line + ": " + head + " redeclared", actions: actions0}
+        let nv = len(msg.variants)
+        let mut vi = 0
+        loop vi < nv:
+            let v = msg.variants[vi]
+            let wn = do wVariantWireName(v)
+            let wq = do goQuote(wn)
+            if v.action == "":
+                return WDispatch{err: "line " + line + ": " + head + " -> " + msg.name + ": variant " + wq + " names no action (| " + v.name + " -> action)", actions: actions0}
+            let ai = do wFindAction(actions, v.action)
+            let aq = do goQuote(v.action)
+            if ai < 0:
+                return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + " runs unknown action " + aq, actions: actions0}
+            let act = actions[ai]
+            let mut bound = []
+            if v.bodyParam != "":
+                let mut ok = false
+                let np = len(act.params)
+                let mut pi = 0
+                loop pi < np:
+                    if act.params[pi].name == v.bodyParam && act.params[pi].type == v.bodyType && !act.params[pi].list:
+                        ok = true
+                    pi = pi + 1
+                if !ok:
+                    return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + ": body " + v.bodyParam + ": " + v.bodyType + " must be a " + v.bodyType + " parameter of action " + aq, actions: actions0}
+                bound = append(bound, v.bodyParam)
+            let nf = len(v.fields)
+            let mut fi = 0
+            loop fi < nf:
+                let f = v.fields[fi]
+                let fq = do goQuote(f.name)
+                let mut pname = f.name
+                if f.into != "":
+                    pname = f.into
+                let mut at = -1
+                let np2 = len(act.params)
+                let mut pj = 0
+                loop pj < np2:
+                    if act.params[pj].name == pname:
+                        at = pj
+                    pj = pj + 1
+                if f.into != "":
+                    if at < 0 || act.params[at].type != "json" || !act.params[at].optional:
+                        let iq = do goQuote(f.into)
+                        return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + ": pattern field " + fq + " gathers into " + iq + ", which must be an optional json parameter of action " + aq, actions: actions0}
+                    bound = append(bound, pname)
+                else:
+                    if at < 0:
+                        return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + " field " + fq + " is not a parameter of action " + aq, actions: actions0}
+                    if act.params[at].list != f.list:
+                        return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + " field " + fq + " and action " + aq + "'s parameter disagree on being a list", actions: actions0}
+                    bound = append(bound, f.name)
+                fi = fi + 1
+            let np3 = len(act.params)
+            let mut pk = 0
+            loop pk < np3:
+                if !(act.params[pk].name in bound) && !act.params[pk].optional:
+                    let rq = do goQuote(act.params[pk].name)
+                    return WDispatch{err: "line " + line + ": " + msg.name + " variant " + wq + " does not carry action " + aq + "'s required parameter " + rq, actions: actions0}
+                pk = pk + 1
+            if act.placement != "server":
+                actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves " + ap.method + " " + ap.path + " (" + wn + ") — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body}
+            vi = vi + 1
+        return WDispatch{err: "", actions: actions}
+
+    proc wBuildRoutes(actions0: [IRAction], raws: [RawDecl], clientStates: [text], policyNames: [text], policyCounts: [int], wireNames: [text], messages: [IRWireMessage]) -> WRoutes:
+        let mut actions = actions0
+        let mut apis = []
+        let mut apiKeys = []
+        let mut apiLines = []
+        let mut contract = []
+        let mut streams = []
+        let nr = len(raws)
+        let mut ri = 0
+        loop ri < nr:
+            let rd = raws[ri]
+            if rd.kw == "api":
+                let ap = do wParseAPI(rd.header)
+                if ap.err != "":
+                    let e0 = do wRoutesErr(ap.err)
+                    return e0
+                let mi = do wFindMessage(messages, ap.action)
+                if mi >= 0:
+                    # `api POST "/events" -> Mutation`: a dispatching route.
+                    let dr = do wDispatchRoute(ap, messages[mi], actions, apiKeys, rd.line)
+                    if dr.err != "":
+                        let ed = do wRoutesErr(dr.err)
+                        return ed
+                    actions = dr.actions
+                    apiKeys = append(apiKeys, ap.method + " " + ap.path)
+                    apiLines = append(apiLines, rd.line)
+                    apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: [], action: "", status: 200, rate: ap.rate, since: ap.since, auth: "none", ret: "", retList: false, bearer: "", dispatch: messages[mi].name})
+                    ri = ri + 1
+                    continue
+                let ai = do wFindAction(actions, ap.action)
+                if ai < 0:
+                    let e1 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" targets unknown action \"" + ap.action + "\"")
+                    return e1
+                let act = actions[ai]
+                if act.placement != "server":
+                    let touched = do wConcat(act.reads, act.writes)
+                    let nt = len(touched)
+                    let mut ti = 0
+                    loop ti < nt:
+                        if touched[ti] in clientStates:
+                            let e2 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" targets action \"" + ap.action + "\", which reads or writes client-only state \"" + touched[ti] + "\"; an endpoint runs on the authority, which cannot see ephemeral client state")
+                            return e2
+                        ti = ti + 1
+                    actions[ai] = IRAction{name: act.name, params: act.params, requires: act.requires, optimistic: act.optimistic, ret: act.ret, retList: act.retList, placement: "server", reason: "serves api " + ap.method + " " + ap.path + " — an endpoint runs on the authority", writes: act.writes, reads: act.reads, seal: act.seal, body: act.body}
+                let key = ap.method + " " + ap.path
+                if key in apiKeys:
+                    let e3 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" redeclared")
+                    return e3
+                apiKeys = append(apiKeys, key)
+                apiLines = append(apiLines, rd.line)
+                let segs = do wSplitSlash(ap.path)
+                let mut pathParams = []
+                let ns = len(segs)
+                let mut si = 0
+                loop si < ns:
+                    let sg = segs[si]
+                    let op = do vpHasPrefix(sg, "{")
+                    let cl = do vpHasSuffix(sg, "}")
+                    if op && cl:
+                        let pn = slice(sg, 1, len(sg) - 1)
+                        let mut found = -1
+                        let np = len(act.params)
+                        let mut pi = 0
+                        loop pi < np:
+                            if act.params[pi].name == pn:
+                                found = pi
+                            pi = pi + 1
+                        if found < 0:
+                            let e4 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": path parameter {" + pn + "} is not a parameter of action \"" + ap.action + "\"")
+                            return e4
+                        if act.params[found].list:
+                            let e5 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": path parameter {" + pn + "} is a list — a path segment carries one value; take the list from the query or body instead")
+                            return e5
+                        pathParams = append(pathParams, pn)
+                    else:
+                        if contains(sg, "{") || contains(sg, "}"):
+                            let e6 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": a path parameter is a whole segment, {name}")
+                            return e6
+                    si = si + 1
+                if ap.method == "GET" || ap.method == "DELETE":
+                    let np2 = len(act.params)
+                    let mut bj = 0
+                    loop bj < np2:
+                        if act.params[bj].type == "bytes" && !(act.params[bj].name in pathParams):
+                            let e7 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": action \"" + ap.action + "\" has a `bytes` parameter \"" + act.params[bj].name + "\", which uploads a file — GET and DELETE carry no request body to upload it in")
+                            return e7
+                        bj = bj + 1
+                let mut status = ap.status
+                if status == 0:
+                    status = 200
+                if status == 204 && act.ret != "":
+                    let e8 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" answers 204 (no content) but action \"" + ap.action + "\" returns a value")
+                    return e8
+                let mut auth = "none"
+                if len(act.requires) > 0:
+                    auth = "session"
+                if ap.bearer != "":
+                    if len(act.requires) > 0:
+                        let e9 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" authenticates with " + ap.authScheme + " bearer tokens, so action \"" + ap.action + "\" cannot also require a session policy")
+                        return e9
+                    let mut bok = false
+                    let np3 = len(act.params)
+                    let mut bk = 0
+                    loop bk < np3:
+                        if act.params[bk].name == ap.bearer && act.params[bk].type == "text" && !act.params[bk].list:
+                            bok = true
+                        bk = bk + 1
+                    if !bok:
+                        let e10 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": bearer parameter \"" + ap.bearer + "\" must be a text parameter of action \"" + ap.action + "\"")
+                        return e10
+                    if ap.bearer in pathParams:
+                        let e11 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": {" + ap.bearer + "} is a path parameter, not the bearer credential")
+                        return e11
+                    if ap.authScheme == "none" || ap.authScheme == "session":
+                        let e12 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": auth scheme \"" + ap.authScheme + "\" is reserved; name the credential (e.g. dev_token)")
+                        return e12
+                    auth = ap.authScheme
+                apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: pathParams, action: ap.action, status: status, rate: ap.rate, since: ap.since, auth: auth, ret: act.ret, retList: act.retList, bearer: ap.bearer, dispatch: ""})
+            ri = ri + 1
+        # the contract route
+        let mut rc = 0
+        loop rc < nr:
+            if raws[rc].kw == "contract":
+                if len(contract) > 0:
+                    let e13 = do wRoutesErr("contract redeclared")
+                    return e13
+                let cd = do wParseContract(raws[rc].header)
+                if cd.err != "":
+                    let e14 = do wRoutesErr(cd.err)
+                    return e14
+                let subs = ["", "/version", "/history", "/diff"]
+                let mut sb = 0
+                loop sb < 4:
+                    if ("GET " + cd.path + subs[sb]) in apiKeys:
+                        let e15 = do wRoutesErr("api GET \"" + cd.path + subs[sb] + "\" is served by the contract declaration")
+                        return e15
+                    sb = sb + 1
+                contract = [IRContract{path: cd.path, rate: cd.rate, since: cd.since}]
+            rc = rc + 1
+        # streams
+        let mut streamPaths = []
+        let mut streamParamPaths = []
+        let mut streamParamCounts = []
+        let mut streamEvents = []
+        let mut carried = []
+        let mut carriedNamed = []
+        let mut rs = 0
+        loop rs < nr:
+            if raws[rs].kw == "stream":
+                let st = do wParseStream(raws[rs].header, raws[rs].bodySrc)
+                if st.err != "":
+                    let e16 = do wRoutesErr(st.err)
+                    return e16
+                if st.path in streamPaths:
+                    let e17 = do wRoutesErr("stream path \"" + st.path + "\" redeclared")
+                    return e17
+                streamPaths = append(streamPaths, st.path)
+                let mut evSeen = []
+                let ne = len(st.events)
+                let mut ei = 0
+                loop ei < ne:
+                    let ev = st.events[ei]
+                    if !(ev.type in wireNames):
+                        let e18 = do wRoutesErr("stream \"" + st.path + "\" carries \"" + ev.type + "\", which is not a declared wire type")
+                        return e18
+                    if ev.name in evSeen:
+                        let e19 = do wRoutesErr("stream \"" + st.path + "\" declares event \"" + ev.name + "\" twice")
+                        return e19
+                    if ev.name == "hello":
+                        let e20 = do wRoutesErr("stream \"" + st.path + "\": `hello` is the connect frame the runtime sends itself")
+                        return e20
+                    evSeen = append(evSeen, ev.name)
+                    carried = append(carried, ev.type)
+                    carriedNamed = append(carriedNamed, ev.name + "\t" + ev.type)
+                    ei = ei + 1
+                let mut auth = "none"
+                if st.requires != "":
+                    let pat = do vbFind(policyNames, st.requires)
+                    if pat < 0:
+                        let e21 = do wRoutesErr("stream \"" + st.path + "\" requires unknown policy \"" + st.requires + "\"")
+                        return e21
+                    if policyCounts[pat] != 0:
+                        let e22 = do wRoutesErr("stream \"" + st.path + "\" requires policy \"" + st.requires + "\", which takes arguments; a stream gate is a plain permission")
+                        return e22
+                    auth = "session"
+                # the path's {params}: one stream instance per value tuple
+                let ssegs = do wSplitSlash(st.path)
+                let mut sparams = []
+                let nss = len(ssegs)
+                let mut ssi = 0
+                loop ssi < nss:
+                    let sg2 = ssegs[ssi]
+                    let so = do vpHasPrefix(sg2, "{")
+                    let sc = do vpHasSuffix(sg2, "}")
+                    if so && sc:
+                        sparams = append(sparams, slice(sg2, 1, len(sg2) - 1))
+                    else:
+                        if contains(sg2, "{") || contains(sg2, "}"):
+                            let e26 = do wRoutesErr("stream \"" + st.path + "\": a path parameter is a whole segment, {name}")
+                            return e26
+                    ssi = ssi + 1
+                streamParamPaths = append(streamParamPaths, st.path)
+                streamParamCounts = append(streamParamCounts, len(sparams))
+                streamEvents = append(streamEvents, st.events)
+                # connect/disconnect hooks run as the subscriber, on the authority
+                let nh = len(st.connects)
+                let mut hk = 0
+                loop hk <= nh:
+                    let mut kind = "connect"
+                    let mut hname = ""
+                    let mut hevent = ""
+                    if hk < nh:
+                        hname = st.connects[hk].action
+                        hevent = st.connects[hk].event
+                    else:
+                        kind = "disconnect"
+                        hname = st.disconnect
+                    if hname != "":
+                        let hi = do wFindAction(actions, hname)
+                        if hi < 0:
+                            let e27 = do wRoutesErr("stream \"" + st.path + "\" " + kind + " -> " + hname + ": no such action")
+                            return e27
+                        let ha = actions[hi]
+                        if len(ha.params) != len(sparams):
+                            let joined = do wJoin(sparams, ", ")
+                            let e28 = do wRoutesErr("stream \"" + st.path + "\" " + kind + " -> " + hname + ": the action takes the path's parameters (" + joined + "), no more and no fewer")
+                            return e28
+                        let nhp = len(ha.params)
+                        let mut hp = 0
+                        loop hp < nhp:
+                            if !(ha.params[hp].name in sparams):
+                                let e29 = do wRoutesErr("stream \"" + st.path + "\" " + kind + " -> " + hname + ": parameter \"" + ha.params[hp].name + "\" is not one of the path's {params}")
+                                return e29
+                            hp = hp + 1
+                        actions[hi] = IRAction{name: ha.name, params: ha.params, requires: ha.requires, optimistic: ha.optimistic, ret: ha.ret, retList: ha.retList, placement: "server", reason: "runs on " + kind + " of stream " + st.path + " — the authority holds the connection", writes: ha.writes, reads: ha.reads, seal: ha.seal, body: ha.body}
+                        if hevent != "":
+                            let mut evType = ""
+                            let ne2 = len(st.events)
+                            let mut ek = 0
+                            loop ek < ne2:
+                                if st.events[ek].name == hevent:
+                                    evType = st.events[ek].type
+                                ek = ek + 1
+                            if evType == "":
+                                let e30 = do wRoutesErr("stream \"" + st.path + "\" connect -> " + hname + " as " + hevent + ": the stream carries no event \"" + hevent + "\"")
+                                return e30
+                            if ha.ret != evType || ha.retList:
+                                let e31 = do wRoutesErr("stream \"" + st.path + "\" connect -> " + hname + " as " + hevent + ": the action must return " + evType + ", the event's payload")
+                                return e31
+                    hk = hk + 1
+                streams = append(streams, IRStream{path: st.path, events: st.events, requires: st.requires, auth: auth, rate: st.rate, since: st.since, params: sparams, connects: st.connects, disconnect: st.disconnect})
+            rs = rs + 1
+        let nsp = len(streamParamPaths)
+        let mut gs = 0
+        loop gs < nsp:
+            if ("GET " + streamParamPaths[gs]) in apiKeys:
+                let e32 = do wRoutesErr("api GET \"" + streamParamPaths[gs] + "\" is also declared as a stream — a route is one or the other")
+                return e32
+            gs = gs + 1
+        # every emit reaches some stream
+        let na = len(actions)
+        let mut ak = 0
+        loop ak < na:
+            let ems = do wEmits(actions[ak].body, [])
+            let nm = len(ems)
+            # an emit into a parameterized stream names its instance (`on id`),
+            # one into a plain stream names none
+            let mut ck = 0
+            loop ck < nm:
+                let cparts = split(ems[ck], "\t")
+                let con = toInt(cparts[2])
+                let mut sk = 0
+                loop sk < nsp:
+                    let sevs = streamEvents[sk]
+                    let nse = len(sevs)
+                    let mut sj = 0
+                    loop sj < nse:
+                        if sevs[sj].type == cparts[1] && (cparts[0] == "" || sevs[sj].name == cparts[0]):
+                            let npc = streamParamCounts[sk]
+                            if npc != con:
+                                if npc == 0:
+                                    let e33 = do wRoutesErr("emit " + cparts[1] + "{…} on …: stream \"" + streamParamPaths[sk] + "\" has no path parameters to name")
+                                    return e33
+                                let e34 = do wRoutesErr("emit " + cparts[1] + "{…}: stream \"" + streamParamPaths[sk] + "\" is one per " + npc + " path value(s) — name the instance: emit … " + cparts[1] + "{…} on <value>")
+                                return e34
+                        sj = sj + 1
+                    sk = sk + 1
+                ck = ck + 1
+            let mut mk = 0
+            loop mk < nm:
+                let parts = split(ems[mk], "\t")
+                let evn = parts[0]
+                let typ = parts[1]
+                if evn != "":
+                    if !((evn + "\t" + typ) in carriedNamed):
+                        let e23 = do wRoutesErr("emit " + evn + " " + typ + "{…}: no stream carries an event \"" + evn + "\" with a " + typ + " payload")
+                        return e23
+                if !(typ in carried):
+                    let e24 = do wRoutesErr("emit " + typ + "{…}: no stream carries \"" + typ + "\" — declare one: stream \"/path\": " + typ)
+                    return e24
+                if evn == "":
+                    # an unnamed emit of a type one stream carries under
+                    # several names could mean any of them
+                    let mut sk2 = 0
+                    loop sk2 < nsp:
+                        let sevs2 = streamEvents[sk2]
+                        let mut names = []
+                        let nse2 = len(sevs2)
+                        let mut sj2 = 0
+                        loop sj2 < nse2:
+                            if sevs2[sj2].type == typ:
+                                names = append(names, sevs2[sj2].name)
+                            sj2 = sj2 + 1
+                        if len(names) > 1:
+                            let joined = do wJoin(names, " and ")
+                            let e25 = do wRoutesErr("emit " + typ + "{…}: stream \"" + streamParamPaths[sk2] + "\" carries " + typ + " as " + joined + " — name the event: emit " + names[0] + " " + typ + "{…}")
+                            return e25
+                        sk2 = sk2 + 1
+                mk = mk + 1
+            ak = ak + 1
+        return WRoutes{err: "", actions: actions, apis: apis, contract: contract, streams: streams}
+
+    proc wJoin(xs: [text], sep: text) -> text:
+        let mut out = ""
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + sep
+            out = out + xs[i]
+            i = i + 1
+        return out
+
+    proc wConcat(a: [text], b: [text]) -> [text]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    # ── derives: parseDerive (parameters, joinOpenBrackets) + deriveOrder ─
+    struct WDerive:
+        err: text
+        name: text
+        params: [VParam]
+        type: text
+        expr: ExprNode
+
+    proc wDeriveErr(msg: text) -> WDerive:
+        let e = do emptyNode()
+        return WDerive{err: msg, name: "", params: [], type: "", expr: e}
+
+    # wBraceDepth: parser.go braceDepth — naive quote toggling.
+    proc wBraceDepth(s: text, start: int) -> int:
+        let cs = split(s, "")
+        let n = len(cs)
+        let mut depth = start
+        let mut inStr = false
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if c == "\"":
+                inStr = !inStr
+            else:
+                if !inStr:
+                    if c == "(" || c == "{" || c == "[":
+                        depth = depth + 1
+                    if c == ")" || c == "}" || c == "]":
+                        depth = depth - 1
+            i = i + 1
+        return depth
+
+    proc wParseDerive(line: text, cont: text) -> WDerive:
+        let r0 = do vpTrimPrefix(trim(line), "derive")
+        let rest = trim(r0)
+        let mut colon = do vpIndexOf(rest, ":")
+        if colon < 0:
+            let e0 = do wDeriveErr("derive needs a type: `derive name: int = expr`")
+            return e0
+        let mut params = []
+        let mut name = trim(slice(rest, 0, colon))
+        let open = do vpIndexOf(name, "(")
+        if open >= 0:
+            let cs = split(rest, "")
+            let close = do vpMatchParen(cs, open)
+            if close < 0:
+                let e1 = do wDeriveErr("missing `)` in derive signature")
+                return e1
+            let after = do vpIndexOf(slice(rest, close, len(rest)), ":")
+            if after < 0:
+                let e2 = do wDeriveErr("derive needs a type: `derive name(p: int): int = expr`")
+                return e2
+            colon = close + after
+            let sig = do vpSignature(trim(slice(rest, 0, close + 1)))
+            if sig.err != "":
+                let e3 = do wDeriveErr(sig.err)
+                return e3
+            let np = len(sig.params)
+            let mut pi = 0
+            loop pi < np:
+                if sig.params[pi].ref != "" || sig.params[pi].list:
+                    let e3b = do wDeriveErr("invalid parameter \"" + sig.params[pi].name + "\"")
+                    return e3b
+                pi = pi + 1
+            name = sig.name
+            params = sig.params
+            if len(params) == 0:
+                let e4 = do wDeriveErr("derive \"" + name + "\" takes no parameters, so it is declared without parentheses: `derive " + name + ": T = expr`")
+                return e4
+        let ni = do vpIsIdent(name)
+        if !ni:
+            let e5 = do wDeriveErr("invalid derive name \"" + name + "\"")
+            return e5
+        let after2 = trim(slice(rest, colon + 1, len(rest)))
+        let eq = do vpIndexOf(after2, "=")
+        if eq < 0:
+            let e6 = do wDeriveErr("derive needs a definition: `derive name: int = expr`")
+            return e6
+        let typ = trim(slice(after2, 0, eq))
+        let mut core = typ
+        let q = do vpHasSuffix(core, "?")
+        if q:
+            core = trim(slice(core, 0, len(core) - 1))
+        let lb = do vpHasPrefix(core, "[")
+        let rb = do vpHasSuffix(core, "]")
+        if lb && rb:
+            core = trim(slice(core, 1, len(core) - 1))
+        let tn = do vpIsTypeName(core)
+        if !tn:
+            let e7 = do wDeriveErr("unknown type \"" + typ + "\" (use int, text, bool, money, date, an enum, or [T])")
+            return e7
+        let mut def = trim(slice(after2, eq + 1, len(after2)))
+        let mut depth = do wBraceDepth(def, 0)
+        if depth > 0:
+            let lines = split(cont, "\n")
+            let nl = len(lines)
+            let mut li = 0
+            let mut closed = false
+            loop li < nl:
+                let lt = trim(lines[li])
+                if lt != "":
+                    let isC = do vpHasPrefix(lt, "#")
+                    if !isC:
+                        def = def + " " + lt
+                        let d2 = do wBraceDepth(lt, depth)
+                        depth = d2
+                        if depth <= 0:
+                            closed = true
+                            break
+                li = li + 1
+            if !closed:
+                let e8 = do wDeriveErr("derive \"" + name + "\"'s definition is missing its closing bracket (indent the continuation lines, and the closing bracket, under `derive`)")
+                return e8
+        let perr = do epParseError(def)
+        if perr != "":
+            let e9 = do wDeriveErr(perr)
+            return e9
+        let ex = do parseExprTree(def)
+        return WDerive{err: "", name: name, params: params, type: typ, expr: ex}
+
+    # wCalledNames: calledNames — every call's name, anywhere.
+    proc wCalledNames(ex: ExprNode, acc: [text]) -> [text]:
+        let mut out = acc
+        if ex.kind == "call" && !(ex.text in out):
+            out = append(out, ex.text)
+        if ex.kind == "call" || ex.kind == "get" || ex.kind == "entityGet" || ex.kind == "bin" || ex.kind == "un" || ex.kind == "list":
+            let n = len(ex.children)
+            let mut i = 0
+            loop i < n:
+                let a = do wCalledNames(ex.children[i], out)
+                out = a
+                i = i + 1
+        if ex.kind == "agg":
+            let a1 = do wCalledNamesList(ex.whereClause, out)
+            let a2 = do wCalledNamesList(ex.sel, a1)
+            let a3 = do wCalledNamesList(ex.limit, a2)
+            out = a3
+        if ex.kind == "struct":
+            let np = len(ex.pairs)
+            let mut j = 0
+            loop j < np:
+                let b = do wCalledNames(ex.pairs[j].value, out)
+                out = b
+                j = j + 1
+        return out
+
+    proc wCalledNamesList(xs: [ExprNode], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            let a = do wCalledNames(xs[i], out)
+            out = a
+            i = i + 1
+        return out
+
+    struct WOrder:
+        err: text
+        order: [int]
+        state: [int]
+
+    # wDeriveOrder: deriveOrder — each derive after the derives it reads
+    # or calls (by sorted name), a cycle refused.
+    proc wVisitDerive(ds: [WDerive], names: [text], i: int, path: [text], st0: WOrder) -> WOrder:
+        if st0.state[i] == 2:
+            return st0
+        if st0.state[i] == 1:
+            let mut chain = ""
+            let np = len(path)
+            let mut k = 0
+            loop k < np:
+                chain = chain + path[k] + " -> "
+                k = k + 1
+            return WOrder{err: "derive \"" + ds[i].name + "\" is defined in terms of itself (" + chain + ds[i].name + ")", order: [], state: []}
+        let mut state = st0.state
+        state[i] = 1
+        let mut cur = WOrder{err: "", order: st0.order, state: state}
+        let fr = do freeNames(ds[i].expr)
+        let reads = do wCalledNames(ds[i].expr, fr)
+        let mut filtered = []
+        let nr = len(reads)
+        let mut r = 0
+        loop r < nr:
+            let isParam = do vbParamNamed(ds[i].params, reads[r])
+            if !isParam:
+                filtered = append(filtered, reads[r])
+            r = r + 1
+        let sorted = do vbSortText(filtered)
+        let ns = len(sorted)
+        let mut j = 0
+        loop j < ns:
+            let at = do vbFind(names, sorted[j])
+            if at >= 0:
+                let v = do wVisitDerive(ds, names, at, append(path, ds[i].name), cur)
+                if v.err != "":
+                    return v
+                cur = v
+            j = j + 1
+        let mut state2 = cur.state
+        state2[i] = 2
+        return WOrder{err: "", order: append(cur.order, i), state: state2}
+
+    proc wDeriveOrder(ds: [WDerive]) -> WOrder:
+        let mut names = []
+        let mut state = []
+        let n = len(ds)
+        let mut i = 0
+        loop i < n:
+            names = append(names, ds[i].name)
+            state = append(state, 0)
+            i = i + 1
+        let mut cur = WOrder{err: "", order: [], state: state}
+        let mut j = 0
+        loop j < n:
+            let v = do wVisitDerive(ds, names, j, [], cur)
+            if v.err != "":
+                return v
+            cur = v
+            j = j + 1
+        return cur

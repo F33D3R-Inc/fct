@@ -1,0 +1,643 @@
+import "fabric_stats.fct"
+import "fabric_json.fct"
+
+app FabricFacetqlWireSelfHost:
+    # Self-hosting port of fabric/crates/fabric-facetql/src/wire.rs — the
+    # FacetQL wire contract as Fabric's client speaks it — as JSON encoders
+    # and decoders that write and read exactly what serde_json does for the
+    # real Rust types:
+    #
+    #   * Serialize: fields in declaration order, `skip_serializing_if`
+    #     honored field by field (QueryRequest's Options and `desc`),
+    #     TxOperation internally tagged under "type" with snake_case
+    #     variant names, SetIf's `#[serde(flatten)] expect` emitted in
+    #     place as its single key, `serde_json::Value`/`Map` members in the
+    #     Map's (BTreeMap's) key order, u64 and f64 as serde_json writes
+    #     them.
+    #   * Deserialize: fabric_json.fct's serde_json-exact reader over a
+    #     schema table of the real derived types (fqlSchema) — unknown keys
+    #     skipped, duplicate and missing fields refused, the array form of
+    #     a struct, `#[serde(default)]`, Option (null or missing is None),
+    #     the u8/u32/u64/f64 number classes (a u64 past i64 kept in an
+    #     int's bits) — and a refusal's text is serde_json::Error's Display,
+    #     " at line L column C" included.
+    #
+    # serde_json::Value is fabric_json's SjV. The `GET /stats` DTO subtree
+    # (EngineStats and everything under it) is fabric_stats.fct's structs,
+    # reused, not redeclared; this file adds their decoder.
+    #
+    # FacetQL's 4-axis coordinate is FqlCoordinate here — never fabric's
+    # grid Coordinate (fabric_core.fct), exactly as wire.rs's module docs
+    # insist.
+
+    # ── the JSON value helpers (serde_json::Value as fabric_json's SjV) ──
+    proc fqlJStr(s: text) -> SjV:
+        return SjV{kind: "str", b: false, s: s, num: "", u: 0, f: 0.0, items: [], keys: []}
+
+    # fqlJInt: an unsigned integer (a u64 held in an int's bits).
+    proc fqlJInt(n: int) -> SjV:
+        let v = do sjNumV("u64", n, sjU64Float(n))
+        return v
+
+    proc fqlJFloat(f: float) -> SjV:
+        let v = do sjF64V(f)
+        return v
+
+    proc fqlJBool(b: bool) -> SjV:
+        return SjV{kind: "bool", b: b, s: "", num: "", u: 0, f: 0.0, items: [], keys: []}
+
+    proc fqlJArr(items: [SjV]) -> SjV:
+        return SjV{kind: "arr", b: false, s: "", num: "", u: 0, f: 0.0, items: items, keys: []}
+
+    # fqlJObj: a serde_json::Map — members in key order, a repeated key
+    # keeping its last value.
+    proc fqlJObj(keys: [text], vals: [SjV]) -> SjV:
+        let mut ks = []
+        let mut vs = []
+        let n = len(keys)
+        let mut i = 0
+        loop i < n:
+            let mut at = -1
+            let mut j = 0
+            loop j < len(ks) && at < 0:
+                if ks[j] == keys[i]:
+                    at = j
+                j = j + 1
+            if at >= 0:
+                vs[at] = vals[i]
+            else:
+                ks = append(ks, keys[i])
+                vs = append(vs, vals[i])
+            i = i + 1
+        let o = do sjObject(ks, vs)
+        return o
+
+    proc fqlJOptStr(has: bool, s: text) -> SjV:
+        if has:
+            let v = do fqlJStr(s)
+            return v
+        let n = do sjNull()
+        return n
+
+    proc fqlJOptInt(has: bool, n: int) -> SjV:
+        if has:
+            let v = do fqlJInt(n)
+            return v
+        let z = do sjNull()
+        return z
+
+    proc fqlJOptFloat(has: bool, f: float) -> SjV:
+        if has:
+            let v = do fqlJFloat(f)
+            return v
+        let z = do sjNull()
+        return z
+
+    # fqlMember: `"key":<json>` for a hand-ordered struct encoding.
+    proc fqlMember(key: text, json: text) -> text:
+        return sjQuote(key) + ":" + json
+
+    proc fqlBoolText(b: bool) -> text:
+        if b:
+            return "true"
+        return "false"
+
+    # ── wire types ─────────────────────────────────────────────────────
+    struct FqlCoordinate:
+        x: int
+        y: int
+        z: int
+        q: int
+
+    # Visibility is its variant name, "Private" or "Public".
+    struct FqlNode:
+        address: text
+        coordinate: FqlCoordinate
+        value: int
+        kind: text
+        data: text
+        owner: text
+        hasClaimedBy: bool
+        claimedBy: text
+        visibility: text
+
+    struct FqlQueryPage:
+        nodes: [FqlNode]
+        next: text
+
+    proc fqlQueryPageHasMore(page: FqlQueryPage) -> bool:
+        return page.next != ""
+
+    struct FqlQueryRequest:
+        hasKind: bool
+        kind: text
+        hasOwner: bool
+        owner: text
+        hasWhere: bool
+        whereValue: SjV
+        hasItemVar: bool
+        itemVar: text
+        hasOrder: bool
+        order: text
+        desc: bool
+        hasAfter: bool
+        after: text
+        hasLimit: bool
+        limit: int
+
+    # fqlQueryRequestDefault: QueryRequest::default().
+    proc fqlQueryRequestDefault() -> FqlQueryRequest:
+        let n = do sjNull()
+        return FqlQueryRequest{hasKind: false, kind: "", hasOwner: false, owner: "", hasWhere: false, whereValue: n, hasItemVar: false, itemVar: "", hasOrder: false, order: "", desc: false, hasAfter: false, after: "", hasLimit: false, limit: 0}
+
+    struct FqlCreateNodeRequest:
+        address: text
+        kind: text
+        x: int
+        y: int
+        z: int
+        q: int
+        data: text
+        public: bool
+        ifAbsent: bool
+
+    # Expect: kind is its serde key — "expect_le" (AtMost), "expect_eq"
+    # (Equals) or "expect_absent" (Absent).
+    struct FqlExpect:
+        kind: text
+        atMost: float
+        equals: SjV
+        absent: bool
+
+    proc fqlExpectAtMost(f: float) -> FqlExpect:
+        let n = do sjNull()
+        return FqlExpect{kind: "expect_le", atMost: f, equals: n, absent: false}
+
+    proc fqlExpectEquals(v: SjV) -> FqlExpect:
+        return FqlExpect{kind: "expect_eq", atMost: 0.0, equals: v, absent: false}
+
+    proc fqlExpectAbsent(b: bool) -> FqlExpect:
+        let n = do sjNull()
+        return FqlExpect{kind: "expect_absent", atMost: 0.0, equals: n, absent: b}
+
+    # fqlExpectVersion: Expect::version — compare-and-swap on a counter.
+    proc fqlExpectVersion(version: int) -> FqlExpect:
+        let v = do fqlJInt(version)
+        let e = do fqlExpectEquals(v)
+        return e
+
+    # TxOperation: `op` is its serde tag. Each variant reads only its own
+    # fields; `set` is a serde_json::Map (an SjV object).
+    struct FqlTxOp:
+        op: text
+        address: text
+        kind: text
+        x: int
+        y: int
+        z: int
+        q: int
+        data: text
+        public: bool
+        from: text
+        to: text
+        hasWhere: bool
+        whereValue: SjV
+        field: text
+        expect: FqlExpect
+        set: SjV
+
+    proc fqlTxBlank(op: text) -> FqlTxOp:
+        let n = do sjNull()
+        let e = do fqlExpectAbsent(false)
+        let o = do sjObject([], [])
+        return FqlTxOp{op: op, address: "", kind: "", x: 0, y: 0, z: 0, q: 0, data: "", public: false, from: "", to: "", hasWhere: false, whereValue: n, field: "", expect: e, set: o}
+
+    proc fqlTxInsertNode(address: text, kind: text, x: int, y: int, z: int, q: int, data: text, public: bool) -> FqlTxOp:
+        let b = do fqlTxBlank("insert_node")
+        return FqlTxOp{op: b.op, address: address, kind: kind, x: x, y: y, z: z, q: q, data: data, public: public, from: "", to: "", hasWhere: false, whereValue: b.whereValue, field: "", expect: b.expect, set: b.set}
+
+    proc fqlTxDeleteNode(address: text) -> FqlTxOp:
+        let b = do fqlTxBlank("delete_node")
+        return FqlTxOp{op: b.op, address: address, kind: "", x: 0, y: 0, z: 0, q: 0, data: "", public: false, from: "", to: "", hasWhere: false, whereValue: b.whereValue, field: "", expect: b.expect, set: b.set}
+
+    proc fqlTxEdge(op: text, from: text, to: text, kind: text) -> FqlTxOp:
+        let b = do fqlTxBlank(op)
+        return FqlTxOp{op: op, address: "", kind: kind, x: 0, y: 0, z: 0, q: 0, data: "", public: false, from: from, to: to, hasWhere: false, whereValue: b.whereValue, field: "", expect: b.expect, set: b.set}
+
+    proc fqlTxClearKind(kind: text) -> FqlTxOp:
+        let b = do fqlTxBlank("clear_kind")
+        return FqlTxOp{op: b.op, address: "", kind: kind, x: 0, y: 0, z: 0, q: 0, data: "", public: false, from: "", to: "", hasWhere: false, whereValue: b.whereValue, field: "", expect: b.expect, set: b.set}
+
+    proc fqlTxDeleteWhere(kind: text, hasWhere: bool, whereValue: SjV) -> FqlTxOp:
+        let b = do fqlTxBlank("delete_where")
+        return FqlTxOp{op: b.op, address: "", kind: kind, x: 0, y: 0, z: 0, q: 0, data: "", public: false, from: "", to: "", hasWhere: hasWhere, whereValue: whereValue, field: "", expect: b.expect, set: b.set}
+
+    proc fqlTxSetIf(address: text, field: text, expect: FqlExpect, set: SjV) -> FqlTxOp:
+        let b = do fqlTxBlank("set_if")
+        return FqlTxOp{op: b.op, address: address, kind: "", x: 0, y: 0, z: 0, q: 0, data: "", public: false, from: "", to: "", hasWhere: false, whereValue: b.whereValue, field: field, expect: expect, set: set}
+
+    # ── Serialize ──────────────────────────────────────────────────────
+    proc fqlEncodeCoordinate(c: FqlCoordinate) -> text:
+        return "{\"x\":" + c.x + ",\"y\":" + c.y + ",\"z\":" + c.z + ",\"q\":" + c.q + "}"
+
+    proc fqlEncodeNode(n: FqlNode) -> text:
+        let mut claimed = "null"
+        if n.hasClaimedBy:
+            claimed = sjQuote(n.claimedBy)
+        return "{" + fqlMember("address", sjQuote(n.address)) + "," + fqlMember("coordinate", fqlEncodeCoordinate(n.coordinate)) + "," + fqlMember("value", sjU64Text(n.value)) + "," + fqlMember("kind", sjQuote(n.kind)) + "," + fqlMember("data", sjQuote(n.data)) + "," + fqlMember("owner", sjQuote(n.owner)) + "," + fqlMember("claimed_by", claimed) + "," + fqlMember("visibility", sjQuote(n.visibility)) + "}"
+
+    proc fqlEncodeQueryRequest(r: FqlQueryRequest) -> text:
+        let mut parts = []
+        if r.hasKind:
+            parts = append(parts, fqlMember("kind", sjQuote(r.kind)))
+        if r.hasOwner:
+            parts = append(parts, fqlMember("owner", sjQuote(r.owner)))
+        if r.hasWhere:
+            parts = append(parts, fqlMember("where", sjValueText(r.whereValue)))
+        if r.hasItemVar:
+            parts = append(parts, fqlMember("item_var", sjQuote(r.itemVar)))
+        if r.hasOrder:
+            parts = append(parts, fqlMember("order", sjQuote(r.order)))
+        if r.desc:
+            parts = append(parts, fqlMember("desc", "true"))
+        if r.hasAfter:
+            parts = append(parts, fqlMember("after", sjQuote(r.after)))
+        if r.hasLimit:
+            parts = append(parts, fqlMember("limit", sjU64Text(r.limit)))
+        return "{" + join(parts, ",") + "}"
+
+    proc fqlEncodeCreateNodeRequest(r: FqlCreateNodeRequest) -> text:
+        return "{" + fqlMember("address", sjQuote(r.address)) + "," + fqlMember("kind", sjQuote(r.kind)) + "," + fqlMember("x", "" + r.x) + "," + fqlMember("y", "" + r.y) + "," + fqlMember("z", "" + r.z) + "," + fqlMember("q", "" + r.q) + "," + fqlMember("data", sjQuote(r.data)) + "," + fqlMember("public", fqlBoolText(r.public)) + "," + fqlMember("if_absent", fqlBoolText(r.ifAbsent)) + "}"
+
+    proc fqlEncodeExpect(e: FqlExpect) -> text:
+        if e.kind == "expect_le":
+            return fqlMember("expect_le", sjF64Text(e.atMost))
+        if e.kind == "expect_eq":
+            return fqlMember("expect_eq", sjValueText(e.equals))
+        return fqlMember("expect_absent", fqlBoolText(e.absent))
+
+    proc fqlEncodeTxOp(o: FqlTxOp) -> text:
+        let head = fqlMember("type", sjQuote(o.op))
+        if o.op == "insert_node":
+            return "{" + head + "," + fqlMember("address", sjQuote(o.address)) + "," + fqlMember("kind", sjQuote(o.kind)) + "," + fqlMember("x", "" + o.x) + "," + fqlMember("y", "" + o.y) + "," + fqlMember("z", "" + o.z) + "," + fqlMember("q", "" + o.q) + "," + fqlMember("data", sjQuote(o.data)) + "," + fqlMember("public", fqlBoolText(o.public)) + "}"
+        if o.op == "delete_node":
+            return "{" + head + "," + fqlMember("address", sjQuote(o.address)) + "}"
+        if o.op == "insert_edge" || o.op == "delete_edge":
+            return "{" + head + "," + fqlMember("from", sjQuote(o.from)) + "," + fqlMember("to", sjQuote(o.to)) + "," + fqlMember("kind", sjQuote(o.kind)) + "}"
+        if o.op == "clear_kind":
+            return "{" + head + "," + fqlMember("kind", sjQuote(o.kind)) + "}"
+        if o.op == "delete_where":
+            let mut w = ""
+            if o.hasWhere:
+                w = "," + fqlMember("where", sjValueText(o.whereValue))
+            return "{" + head + "," + fqlMember("kind", sjQuote(o.kind)) + w + "}"
+        return "{" + head + "," + fqlMember("address", sjQuote(o.address)) + "," + fqlMember("field", sjQuote(o.field)) + "," + fqlEncodeExpect(o.expect) + "," + fqlMember("set", sjValueText(o.set)) + "}"
+
+    proc fqlEncodeTransaction(ops: [FqlTxOp]) -> text:
+        let mut parts = []
+        let n = len(ops)
+        let mut i = 0
+        loop i < n:
+            parts = append(parts, fqlEncodeTxOp(ops[i]))
+            i = i + 1
+        return "{\"operations\":[" + join(parts, ",") + "]}"
+
+    # ── Deserialize: the schema of every type this client reads ────────
+    proc fqlSchema() -> [SjType]:
+        let u8x4 = ["u8", "u8", "u8", "u8"]
+        let coordinate = sjStructType("Coordinate", "struct Coordinate", ["x", "y", "z", "q"], u8x4, [false, false, false, false])
+        let visibility = sjEnumType("Visibility", "enum Visibility", ["Private", "Public"], ["", ""], ["unit", "unit"])
+        let optString = sjOptionType("Option<String>", "string")
+        let optU64 = sjOptionType("Option<u64>", "u64")
+        let optF64 = sjOptionType("Option<f64>", "f64")
+        let node = sjStructType("Node", "struct Node", ["address", "coordinate", "value", "kind", "data", "owner", "claimed_by", "visibility"], ["string", "Coordinate", "u64", "string", "string", "string", "Option<String>", "Visibility"], [false, false, false, false, false, false, false, false])
+        let nodes = sjVecType("Vec<Node>", "Node")
+        let page = sjStructType("QueryPage", "struct QueryPage", ["nodes", "next"], ["Vec<Node>", "string"], [false, false])
+        let kindCount = sjStructType("KindCount", "struct KindCount", ["kind", "count"], ["string", "u64"], [false, false])
+        let kinds = sjVecType("Vec<KindCount>", "KindCount")
+        let storage = sjStructType("StorageStats", "struct StorageStats", ["page_size", "segments", "pages", "obsolete_bytes"], ["u32", "u64", "u64", "u64"], [false, false, false, false])
+        let latency = sjStructType("LatencyStats", "struct LatencyStats", ["count", "p50_us", "p99_us", "max_us"], ["u64", "Option<u64>", "Option<u64>", "Option<u64>"], [true, true, true, true])
+        let window = sjStructType("WindowStats", "struct WindowStats", ["duration_ms", "age_ms", "cpu_utilization", "read_latency", "write_latency"], ["u64", "u64", "Option<f64>", "LatencyStats", "LatencyStats"], [true, true, true, true, true])
+        let requests = sjStructType("RequestStats", "struct RequestStats", ["total", "read", "write", "excluded", "unclassified", "in_flight", "max_concurrent", "write_queue_depth", "write_queue_contended_total"], ["u64", "u64", "u64", "u64", "u64", "u64", "u64", "u64", "u64"], [true, true, true, true, true, true, true, true, true])
+        let process = sjStructType("ProcessStats", "struct ProcessStats", ["cpu_seconds_total", "cpu_cores", "resident_bytes", "memory_limit_bytes", "memory_limit_source", "memory_utilization"], ["Option<f64>", "Option<u64>", "Option<u64>", "Option<u64>", "Option<String>", "Option<f64>"], [true, true, true, true, true, true])
+        let runtime = sjStructType("RuntimeStats", "struct RuntimeStats", ["uptime_seconds", "requests", "window", "process"], ["u64", "RequestStats", "WindowStats", "ProcessStats"], [true, true, true, true])
+        let cell = sjStructType("CellStats", "struct CellStats", ["x", "y", "z", "q", "reads", "writes", "bytes_read", "bytes_written"], ["u8", "u8", "u8", "u8", "u64", "u64", "u64", "u64"], [true, true, true, true, true, true, true, true])
+        let cellVec = sjVecType("Vec<CellStats>", "CellStats")
+        let cells = sjStructType("CellAttribution", "struct CellAttribution", ["capacity", "tracked", "overflow_reads", "overflow_writes", "unattributed_writes", "cells"], ["u64", "u64", "u64", "u64", "u64", "Vec<CellStats>"], [true, true, true, true, true, true])
+        let stats = sjStructType("EngineStats", "struct EngineStats", ["node_count", "edge_count", "user_count", "history_entries", "kinds", "reads_total", "writes_total", "storage", "version", "runtime", "cells"], ["u64", "u64", "u64", "u64", "Vec<KindCount>", "u64", "u64", "StorageStats", "Option<String>", "RuntimeStats", "CellAttribution"], [false, false, false, false, false, false, false, false, true, true, true])
+        let count = sjStructType("CountReply", "struct CountReply", ["count"], ["u64"], [false])
+        return [coordinate, visibility, optString, optU64, optF64, node, nodes, page, kindCount, kinds, storage, latency, window, requests, process, runtime, cell, cellVec, cells, stats, count]
+
+    # Field readers over a decoded SjV object (fields in declaration order,
+    # "absent" where a defaulted or None field was not given) — and, for a
+    # parsed Value, over its members.
+    proc fqlHas(obj: SjV, key: text) -> bool:
+        if obj.kind != "obj":
+            return false
+        let mut i = 0
+        loop i < len(obj.keys):
+            if obj.keys[i] == key:
+                return obj.items[i].kind != "absent"
+            i = i + 1
+        return false
+
+    proc fqlAt(obj: SjV, key: text) -> SjV:
+        if obj.kind == "obj":
+            let mut i = 0
+            loop i < len(obj.keys):
+                if obj.keys[i] == key:
+                    return obj.items[i]
+                i = i + 1
+        let n = do sjNull()
+        return n
+
+    # fqlU: an unsigned integer field (its u64 bits); 0 when absent.
+    proc fqlU(obj: SjV, key: text) -> int:
+        let v = do fqlAt(obj, key)
+        if v.kind != "num" || v.num == "f64":
+            return 0
+        return v.u
+
+    # fqlF: a float field, or a Value number read as f64 (as_f64).
+    proc fqlF(obj: SjV, key: text) -> float:
+        let v = do fqlAt(obj, key)
+        let f = do fqlNumF64(v)
+        return f
+
+    proc fqlNumF64(v: SjV) -> float:
+        if v.kind != "num":
+            return 0.0
+        if v.num == "u64":
+            return sjU64Float(v.u)
+        if v.num == "i64":
+            return toFloat(v.u)
+        return v.f
+
+    proc fqlS(obj: SjV, key: text) -> text:
+        let v = do fqlAt(obj, key)
+        return v.s
+
+    proc fqlB(obj: SjV, key: text) -> bool:
+        let v = do fqlAt(obj, key)
+        return v.kind == "bool" && v.b
+
+    # fqlSome: whether an Option field holds a value.
+    proc fqlSome(obj: SjV, key: text) -> bool:
+        let v = do fqlAt(obj, key)
+        return v.kind != "absent" && v.kind != "null"
+
+    struct FqlNodeR:
+        ok: bool
+        err: text
+        v: FqlNode
+
+    proc fqlNodeBlank() -> FqlNode:
+        return FqlNode{address: "", coordinate: FqlCoordinate{x: 0, y: 0, z: 0, q: 0}, value: 0, kind: "", data: "", owner: "", hasClaimedBy: false, claimedBy: "", visibility: "Private"}
+
+    proc fqlNodeOf(v: SjV) -> FqlNode:
+        let c = do fqlAt(v, "coordinate")
+        let vis = do fqlAt(v, "visibility")
+        return FqlNode{address: fqlS(v, "address"), coordinate: FqlCoordinate{x: fqlU(c, "x"), y: fqlU(c, "y"), z: fqlU(c, "z"), q: fqlU(c, "q")}, value: fqlU(v, "value"), kind: fqlS(v, "kind"), data: fqlS(v, "data"), owner: fqlS(v, "owner"), hasClaimedBy: fqlSome(v, "claimed_by"), claimedBy: fqlS(v, "claimed_by"), visibility: vis.s}
+
+    proc fqlNodesOf(v: SjV) -> [FqlNode]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(v.items):
+            out = append(out, fqlNodeOf(v.items[i]))
+            i = i + 1
+        return out
+
+    # fqlDecodeNode: serde_json::from_str::<Node>.
+    proc fqlDecodeNode(src: text) -> FqlNodeR:
+        let d = do sjDecode(fqlSchema(), src, "Node")
+        if !d.ok:
+            let blank = do fqlNodeBlank()
+            return FqlNodeR{ok: false, err: d.err, v: blank}
+        return FqlNodeR{ok: true, err: "", v: fqlNodeOf(d.v)}
+
+    struct FqlNodesR:
+        ok: bool
+        err: text
+        v: [FqlNode]
+
+    # fqlDecodeNodes: serde_json::from_str::<Vec<Node>>.
+    proc fqlDecodeNodes(src: text) -> FqlNodesR:
+        let d = do sjDecode(fqlSchema(), src, "Vec<Node>")
+        if !d.ok:
+            return FqlNodesR{ok: false, err: d.err, v: []}
+        return FqlNodesR{ok: true, err: "", v: fqlNodesOf(d.v)}
+
+    struct FqlQueryPageR:
+        ok: bool
+        err: text
+        v: FqlQueryPage
+
+    # fqlDecodeQueryPage: serde_json::from_str::<QueryPage>.
+    proc fqlDecodeQueryPage(src: text) -> FqlQueryPageR:
+        let d = do sjDecode(fqlSchema(), src, "QueryPage")
+        if !d.ok:
+            return FqlQueryPageR{ok: false, err: d.err, v: FqlQueryPage{nodes: [], next: ""}}
+        return FqlQueryPageR{ok: true, err: "", v: FqlQueryPage{nodes: fqlNodesOf(fqlAt(d.v, "nodes")), next: fqlS(d.v, "next")}}
+
+    struct FqlCountR:
+        ok: bool
+        err: text
+        v: int
+
+    # fqlDecodeCount: the `{"count": u64}` reply of POST /nodes/count.
+    proc fqlDecodeCount(src: text) -> FqlCountR:
+        let d = do sjDecode(fqlSchema(), src, "CountReply")
+        if !d.ok:
+            return FqlCountR{ok: false, err: d.err, v: 0}
+        return FqlCountR{ok: true, err: "", v: fqlU(d.v, "count")}
+
+    struct FqlStatsR:
+        ok: bool
+        err: text
+        v: EngineStats
+
+    proc fqlLatencyOf(v: SjV) -> LatencyStats:
+        return LatencyStats{count: fqlU(v, "count"), hasP50Us: fqlSome(v, "p50_us"), p50Us: fqlU(v, "p50_us"), hasP99Us: fqlSome(v, "p99_us"), p99Us: fqlU(v, "p99_us"), hasMaxUs: fqlSome(v, "max_us"), maxUs: fqlU(v, "max_us")}
+
+    # fqlStatsOf: an absent (defaulted) sub-struct reads as its Default,
+    # which is every field 0 / None / empty.
+    proc fqlStatsOf(v: SjV) -> EngineStats:
+        let mut kinds = []
+        let kv = do fqlAt(v, "kinds")
+        let mut i = 0
+        loop i < len(kv.items):
+            kinds = append(kinds, KindCount{kind: fqlS(kv.items[i], "kind"), count: fqlU(kv.items[i], "count")})
+            i = i + 1
+        let st = do fqlAt(v, "storage")
+        let rt = do fqlAt(v, "runtime")
+        let rq = do fqlAt(rt, "requests")
+        let w = do fqlAt(rt, "window")
+        let p = do fqlAt(rt, "process")
+        let ca = do fqlAt(v, "cells")
+        let cv = do fqlAt(ca, "cells")
+        let mut cells = []
+        let mut j = 0
+        loop j < len(cv.items):
+            let c = cv.items[j]
+            cells = append(cells, CellStats{x: fqlU(c, "x"), y: fqlU(c, "y"), z: fqlU(c, "z"), q: fqlU(c, "q"), reads: fqlU(c, "reads"), writes: fqlU(c, "writes"), bytesRead: fqlU(c, "bytes_read"), bytesWritten: fqlU(c, "bytes_written")})
+            j = j + 1
+        let requests = RequestStats{total: fqlU(rq, "total"), read: fqlU(rq, "read"), write: fqlU(rq, "write"), excluded: fqlU(rq, "excluded"), unclassified: fqlU(rq, "unclassified"), inFlight: fqlU(rq, "in_flight"), maxConcurrent: fqlU(rq, "max_concurrent"), writeQueueDepth: fqlU(rq, "write_queue_depth"), writeQueueContendedTotal: fqlU(rq, "write_queue_contended_total")}
+        let window = WindowStats{durationMs: fqlU(w, "duration_ms"), ageMs: fqlU(w, "age_ms"), hasCpuUtilization: fqlSome(w, "cpu_utilization"), cpuUtilization: fqlF(w, "cpu_utilization"), readLatency: fqlLatencyOf(fqlAt(w, "read_latency")), writeLatency: fqlLatencyOf(fqlAt(w, "write_latency"))}
+        let process = ProcessStats{hasCpuSecondsTotal: fqlSome(p, "cpu_seconds_total"), cpuSecondsTotal: fqlF(p, "cpu_seconds_total"), hasCpuCores: fqlSome(p, "cpu_cores"), cpuCores: fqlU(p, "cpu_cores"), hasResidentBytes: fqlSome(p, "resident_bytes"), residentBytes: fqlU(p, "resident_bytes"), hasMemoryLimitBytes: fqlSome(p, "memory_limit_bytes"), memoryLimitBytes: fqlU(p, "memory_limit_bytes"), hasMemoryLimitSource: fqlSome(p, "memory_limit_source"), memoryLimitSource: fqlS(p, "memory_limit_source"), hasMemoryUtilization: fqlSome(p, "memory_utilization"), memoryUtilization: fqlF(p, "memory_utilization")}
+        return EngineStats{nodeCount: fqlU(v, "node_count"), edgeCount: fqlU(v, "edge_count"), userCount: fqlU(v, "user_count"), historyEntries: fqlU(v, "history_entries"), kinds: kinds, readsTotal: fqlU(v, "reads_total"), writesTotal: fqlU(v, "writes_total"), storage: StorageStats{pageSize: fqlU(st, "page_size"), segments: fqlU(st, "segments"), pages: fqlU(st, "pages"), obsoleteBytes: fqlU(st, "obsolete_bytes")}, hasVersion: fqlSome(v, "version"), version: fqlS(v, "version"), runtime: RuntimeStats{uptimeSeconds: fqlU(rt, "uptime_seconds"), requests: requests, window: window, process: process}, cells: CellAttribution{capacity: fqlU(ca, "capacity"), tracked: fqlU(ca, "tracked"), overflowReads: fqlU(ca, "overflow_reads"), overflowWrites: fqlU(ca, "overflow_writes"), unattributedWrites: fqlU(ca, "unattributed_writes"), cells: cells}}
+
+    # fqlDecodeStats: serde_json::from_str::<EngineStats>.
+    proc fqlDecodeStats(src: text) -> FqlStatsR:
+        let d = do sjDecode(fqlSchema(), src, "EngineStats")
+        if !d.ok:
+            return FqlStatsR{ok: false, err: d.err, v: fqlStatsOf(sjNull())}
+        return FqlStatsR{ok: true, err: "", v: fqlStatsOf(d.v)}
+
+    # fqlParseValue: serde_json::from_str::<serde_json::Value>.
+    proc fqlParseValue(src: text) -> SjDecoded:
+        let d = do sjDecode([], src, "value")
+        return d
+
+    # ── canonical renderings (for the both-way checks) ────────────────
+    # fqlStatsValue: every EngineStats field as one serde_json::Value — the
+    # same object fabric_check builds from the real struct with json!,
+    # Options as null.
+    proc fqlLatencyValue(l: LatencyStats) -> SjV:
+        let o = do fqlJObj(["count", "p50_us", "p99_us", "max_us"], [fqlJInt(l.count), fqlJOptInt(l.hasP50Us, l.p50Us), fqlJOptInt(l.hasP99Us, l.p99Us), fqlJOptInt(l.hasMaxUs, l.maxUs)])
+        return o
+
+    proc fqlStatsValue(s: EngineStats) -> SjV:
+        let mut kinds = []
+        let nk = len(s.kinds)
+        let mut i = 0
+        loop i < nk:
+            kinds = append(kinds, fqlJObj(["kind", "count"], [fqlJStr(s.kinds[i].kind), fqlJInt(s.kinds[i].count)]))
+            i = i + 1
+        let mut cells = []
+        let nc = len(s.cells.cells)
+        let mut j = 0
+        loop j < nc:
+            let c = s.cells.cells[j]
+            cells = append(cells, fqlJObj(["x", "y", "z", "q", "reads", "writes", "bytes_read", "bytes_written"], [fqlJInt(c.x), fqlJInt(c.y), fqlJInt(c.z), fqlJInt(c.q), fqlJInt(c.reads), fqlJInt(c.writes), fqlJInt(c.bytesRead), fqlJInt(c.bytesWritten)]))
+            j = j + 1
+        let st = s.storage
+        let storage = do fqlJObj(["page_size", "segments", "pages", "obsolete_bytes"], [fqlJInt(st.pageSize), fqlJInt(st.segments), fqlJInt(st.pages), fqlJInt(st.obsoleteBytes)])
+        let rq = s.runtime.requests
+        let requests = do fqlJObj(["total", "read", "write", "excluded", "unclassified", "in_flight", "max_concurrent", "write_queue_depth", "write_queue_contended_total"], [fqlJInt(rq.total), fqlJInt(rq.read), fqlJInt(rq.write), fqlJInt(rq.excluded), fqlJInt(rq.unclassified), fqlJInt(rq.inFlight), fqlJInt(rq.maxConcurrent), fqlJInt(rq.writeQueueDepth), fqlJInt(rq.writeQueueContendedTotal)])
+        let w = s.runtime.window
+        let window = do fqlJObj(["duration_ms", "age_ms", "cpu_utilization", "read_latency", "write_latency"], [fqlJInt(w.durationMs), fqlJInt(w.ageMs), fqlJOptFloat(w.hasCpuUtilization, w.cpuUtilization), fqlLatencyValue(w.readLatency), fqlLatencyValue(w.writeLatency)])
+        let p = s.runtime.process
+        let process = do fqlJObj(["cpu_seconds_total", "cpu_cores", "resident_bytes", "memory_limit_bytes", "memory_limit_source", "memory_utilization"], [fqlJOptFloat(p.hasCpuSecondsTotal, p.cpuSecondsTotal), fqlJOptInt(p.hasCpuCores, p.cpuCores), fqlJOptInt(p.hasResidentBytes, p.residentBytes), fqlJOptInt(p.hasMemoryLimitBytes, p.memoryLimitBytes), fqlJOptStr(p.hasMemoryLimitSource, p.memoryLimitSource), fqlJOptFloat(p.hasMemoryUtilization, p.memoryUtilization)])
+        let runtime = do fqlJObj(["uptime_seconds", "requests", "window", "process"], [fqlJInt(s.runtime.uptimeSeconds), requests, window, process])
+        let ca = s.cells
+        let cellsV = do fqlJObj(["capacity", "tracked", "overflow_reads", "overflow_writes", "unattributed_writes", "cells"], [fqlJInt(ca.capacity), fqlJInt(ca.tracked), fqlJInt(ca.overflowReads), fqlJInt(ca.overflowWrites), fqlJInt(ca.unattributedWrites), fqlJArr(cells)])
+        let o = do fqlJObj(["node_count", "edge_count", "user_count", "history_entries", "kinds", "reads_total", "writes_total", "storage", "version", "runtime", "cells"], [fqlJInt(s.nodeCount), fqlJInt(s.edgeCount), fqlJInt(s.userCount), fqlJInt(s.historyEntries), fqlJArr(kinds), fqlJInt(s.readsTotal), fqlJInt(s.writesTotal), storage, fqlJOptStr(s.hasVersion, s.version), runtime, cellsV])
+        return o
+
+    # ── specs: a JSON description of a Serialize-only value, read the same
+    # way fabric_check reads it, so both sides build the same value ──────
+    proc fqlSpecQueryRequest(spec: SjV) -> FqlQueryRequest:
+        let w = do fqlAt(spec, "where")
+        let lim = do fqlAt(spec, "limit")
+        return FqlQueryRequest{hasKind: fqlAt(spec, "kind").kind == "str", kind: fqlS(spec, "kind"), hasOwner: fqlAt(spec, "owner").kind == "str", owner: fqlS(spec, "owner"), hasWhere: w.kind != "null", whereValue: w, hasItemVar: fqlAt(spec, "item_var").kind == "str", itemVar: fqlS(spec, "item_var"), hasOrder: fqlAt(spec, "order").kind == "str", order: fqlS(spec, "order"), desc: fqlB(spec, "desc"), hasAfter: fqlAt(spec, "after").kind == "str", after: fqlS(spec, "after"), hasLimit: lim.kind == "num" && lim.num == "u64", limit: fqlU(spec, "limit")}
+
+    proc fqlSpecCreateNode(spec: SjV) -> FqlCreateNodeRequest:
+        return FqlCreateNodeRequest{address: fqlAt(spec, "address").s, kind: fqlAt(spec, "kind").s, x: fqlU(spec, "x"), y: fqlU(spec, "y"), z: fqlU(spec, "z"), q: fqlU(spec, "q"), data: fqlAt(spec, "data").s, public: fqlAt(spec, "public").b, ifAbsent: fqlAt(spec, "if_absent").b}
+
+    # fqlSpecTxOp: one op from `{"op": <tag>, ...fields}`; a set_if's
+    # expectation is `"expect": {"le": f}` / `{"eq": v}` / `{"absent": b}`.
+    proc fqlSpecTxOp(spec: SjV) -> FqlTxOp:
+        let op = fqlAt(spec, "op").s
+        let s = do fqlAt(spec, "address")
+        if op == "insert_node":
+            let o = do fqlTxInsertNode(s.s, fqlAt(spec, "kind").s, fqlU(spec, "x"), fqlU(spec, "y"), fqlU(spec, "z"), fqlU(spec, "q"), fqlAt(spec, "data").s, fqlAt(spec, "public").b)
+            return o
+        if op == "delete_node":
+            let o = do fqlTxDeleteNode(s.s)
+            return o
+        if op == "insert_edge" || op == "delete_edge":
+            let o = do fqlTxEdge(op, fqlAt(spec, "from").s, fqlAt(spec, "to").s, fqlAt(spec, "kind").s)
+            return o
+        if op == "clear_kind":
+            let o = do fqlTxClearKind(fqlAt(spec, "kind").s)
+            return o
+        if op == "delete_where":
+            let w = do fqlAt(spec, "where")
+            let o = do fqlTxDeleteWhere(fqlAt(spec, "kind").s, w.kind != "null", w)
+            return o
+        let ex = do fqlAt(spec, "expect")
+        let mut e = do fqlExpectAbsent(fqlAt(ex, "absent").b)
+        if fqlHas(ex, "le"):
+            e = fqlExpectAtMost(fqlF(ex, "le"))
+        if fqlHas(ex, "eq"):
+            e = fqlExpectEquals(fqlAt(ex, "eq"))
+        let set = do fqlAt(spec, "set")
+        let o = do fqlTxSetIf(s.s, fqlAt(spec, "field").s, e, set)
+        return o
+
+    # ── test drivers ──────────────────────────────────────────────────
+    state fqlWireOut: text = ""
+
+    # fqlWireRun: one `mode` over one input line, in fabric_check's own
+    # output form: an encoding for the encode modes, the canonical
+    # rendering (or `ERR <message>`) for the decode modes.
+    proc fqlWireLine(mode: text, line: text) -> text:
+        if mode == "decode-node":
+            let r = do fqlDecodeNode(line)
+            if !r.ok:
+                return "ERR " + r.err
+            let t = do fqlEncodeNode(r.v)
+            return t
+        if mode == "decode-page":
+            let r = do fqlDecodeQueryPage(line)
+            if !r.ok:
+                return "ERR " + r.err
+            let mut parts = []
+            let n = len(r.v.nodes)
+            let mut i = 0
+            loop i < n:
+                parts = append(parts, fqlEncodeNode(r.v.nodes[i]))
+                i = i + 1
+            return "[" + join(parts, ",") + "]|" + r.v.next + "|" + fqlBoolText(fqlQueryPageHasMore(r.v))
+        if mode == "decode-stats":
+            let r = do fqlDecodeStats(line)
+            if !r.ok:
+                return "ERR " + r.err
+            let t = do sjValueText(fqlStatsValue(r.v))
+            return t
+        let pr = do fqlParseValue(line)
+        if !pr.ok:
+            return "ERR " + pr.err
+        let v = pr.v
+        if mode == "encode-query":
+            let q = do fqlSpecQueryRequest(v)
+            let t = do fqlEncodeQueryRequest(q)
+            return t
+        if mode == "encode-create":
+            let c = do fqlSpecCreateNode(v)
+            let t = do fqlEncodeCreateNodeRequest(c)
+            return t
+        if mode == "encode-tx":
+            let mut ops = []
+            let n = len(v.items)
+            let mut i = 0
+            loop i < n:
+                ops = append(ops, fqlSpecTxOp(v.items[i]))
+                i = i + 1
+            let t = do fqlEncodeTransaction(ops)
+            return t
+        return "ERR unknown mode " + mode
+
+    proc fqlWireLines(mode: text, lines: text) -> text:
+        let ls = split(lines, "\n")
+        let mut out = []
+        let n = len(ls)
+        let mut i = 0
+        loop i < n:
+            out = append(out, fqlWireLine(mode, ls[i]))
+            i = i + 1
+        return join(out, "\n")
+
+    action fqlWireRun(mode: text, lines: text):
+        let r = do fqlWireLines(mode, lines)
+        fqlWireOut = r

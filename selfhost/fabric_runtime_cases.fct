@@ -1,0 +1,1520 @@
+import "fabric_runtime.fct"
+import "fabric_simulator.fct"
+
+app FabricRuntimeCases:
+    # Conformance fixtures for the fabric-runtime port. Each case replays one
+    # of the Rust crate's own #[test]s input for input and returns a digest of
+    # every value the test asserts on (plus the surrounding state: placement
+    # and routing generations, the migration, the cell's replica set, the
+    # placement map and both routing answers). fabric_runtime_test.go holds
+    # the digests the real crate prints for the same steps.
+
+    # ------------------------------------------------------------ digests
+
+    proc caseRoute(r: TableResolveResult) -> text:
+        if r.ok:
+            return r.route.node + "@" + r.route.servedBy
+        return "E:" + r.err.kind
+
+    proc caseSnap(f: PlacementFabric, t: ActionTarget) -> text:
+        let mig = do placementFabricMigration(f, t)
+        let mut m = "-"
+        if mig.has:
+            let label = do migrationPhaseLabel(mig.val.phase)
+            let cut = do migrationHasCutOverOf(mig.val)
+            let fenced = do migrationIsWriteFencedOf(mig.val)
+            let pending = do migrationPendingWritesOf(mig.val)
+            let readOwner = do migrationReadOwner(mig.val)
+            let writeOwner = do migrationWriteOwner(mig.val)
+            let mut w = "-"
+            if writeOwner.has:
+                w = writeOwner.node
+            let mut cutText = "0"
+            if cut:
+                cutText = "1"
+            let mut fencedText = "0"
+            if fenced:
+                fencedText = "1"
+            m = label + "/" + cutText + "/" + fencedText + "/" + pending + "/" + readOwner + "/" + w
+        let cellSet = do placementFabricReplicaSet(f, t)
+        let mut s = "-"
+        if cellSet.has:
+            let mut parts = ""
+            let n = len(cellSet.val.replicas)
+            let mut i = 0
+            loop i < n:
+                let r = cellSet.val.replicas[i]
+                let state = do replStateLabel(r.state)
+                let mut role = "S"
+                if r.isPrimary:
+                    role = "P"
+                if i > 0:
+                    parts = parts + ","
+                parts = parts + r.node + ":" + state + ":" + role
+                i = i + 1
+            s = parts
+        let located = do topologyRegistryLocate(f.topology, t.shardId, t.coordinate)
+        let mut owner = "-"
+        if located.found:
+            owner = located.placement.dbmsId
+        let primary = ReadPreference{kind: "Primary", region: ""}
+        let read = do placementFabricResolveRead(f, t, primary)
+        let write = do placementFabricResolveWrite(f, t)
+        let readText = do caseRoute(read)
+        let writeText = do caseRoute(write)
+        let routingGen = do tableGeneration(f.routing)
+        return "g=" + f.generation + ";rg=" + routingGen + ";m=" + m + ";s=" + s + ";o=" + owner + ";r=" + readText + ";w=" + writeText
+
+    proc caseUnit(ok: bool, fault: ExecutionFault) -> text:
+        if ok:
+            return "ok"
+        let shown = do executionFaultDisplay(fault)
+        return "fault(" + shown + ")"
+
+    proc caseProgress(r: MechPollResult) -> text:
+        if !r.ok:
+            let shown = do executionFaultDisplay(r.fault)
+            return "fault(" + shown + ")"
+        if r.progress.kind == "Complete":
+            return "complete"
+        return "running(" + toInt(round(r.progress.fraction * 1000.0)) + ")"
+
+    proc caseRollback(r: MechAbortResult) -> text:
+        if !r.ok:
+            let shown = do executionFaultDisplay(r.fault)
+            return "fault(" + shown + ")"
+        if r.outcome.kind == "Restored":
+            return "restored"
+        return "irreversible(" + r.outcome.reason + ")"
+
+    proc caseJoinIds(ids: [DbmsId]) -> text:
+        let mut out = ""
+        let n = len(ids)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            out = out + ids[i].value
+            i = i + 1
+        return out
+
+    proc casePlan(p: PlacementPlan) -> text:
+        let adds = do caseJoinIds(p.adds)
+        let removes = do caseJoinIds(p.removes)
+        let mut phases = ""
+        let n = len(p.phases)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                phases = phases + ","
+            phases = phases + p.phases[i]
+            i = i + 1
+        let authority = do placementPlanChangesAuthority(p)
+        let mut auth = "0"
+        if authority:
+            auth = "1"
+        return "adds=" + adds + ";removes=" + removes + ";phases=" + phases + ";bytes=" + p.estimatedBytes + ";auth=" + auth
+
+    proc casePlanResult(r: PlacementPlanNewResult) -> text:
+        if r.ok:
+            let d = do casePlan(r.value)
+            return d
+        let shown = do planErrorDisplay(r.err)
+        return "err(" + shown + ")"
+
+    proc caseBool(b: bool) -> text:
+        if b:
+            return "1"
+        return "0"
+
+    # ---------------------------------------------------- mechanism.rs tests
+
+    proc caseTarget() -> ActionTarget:
+        return ActionTarget{shardId: 7, coordinate: Coordinate{x: 3, y: 4}}
+
+    # fabric(cells): the cells on db-a; db-a/db-b/db-c registered and
+    # healthy at 1000; the first cell's size is 4096 bytes.
+    proc caseFabric(cells: [Coordinate]) -> PlacementFabric:
+        let mut topology = do topologyRegistryNew()
+        let n = len(cells)
+        let mut i = 0
+        loop i < n:
+            let placed = do topologyRegistryPlace(topology, "db-a", 7, cells[i], "us-east")
+            topology = placed
+            i = i + 1
+        let mut registry = do nodeRegistryNew()
+        let ids = ["db-a", "db-b", "db-c"]
+        let regions = ["us-east", "us-west", "us-west"]
+        let mut j = 0
+        loop j < 3:
+            let registration = do nodeRegistrationNew(DbmsId{value: ids[j]}, "0.13.0", regions[j])
+            let registered = do nodeRegistryRegister(registry, registration, 1000)
+            let beat = do nodeRegistryHeartbeat(registered.registry, NodeHeartbeat{nodeId: DbmsId{value: ids[j]}, timestampMs: 1000, healthy: true})
+            registry = beat.registry
+            j = j + 1
+        let fresh = do placementFabricNew()
+        let adopted = do placementFabricAdoptTopology(fresh, topology)
+        let observed = do placementFabricObserveNodes(adopted, registry, 1000, 30000)
+        let sized = do placementFabricRecordSize(observed, ActionTarget{shardId: 7, coordinate: cells[0]}, 4096)
+        return sized
+
+    proc caseRequest(action: OptimizationAction) -> PlanRequest:
+        let target = do caseTarget()
+        let source = do placementNew("db-a", 7, target.coordinate, "us-east")
+        let hasDestination = action.kind == "Replicate" || action.kind == "Move"
+        let request = do planRequestNew(target, action, source, hasDestination, DbmsId{value: action.target}, [DbmsId{value: "db-a"}], 1000)
+        return request
+
+    proc caseMoveToB() -> PlanRequest:
+        let action = do optimizationActionMove("db-b")
+        let r = do caseRequest(action)
+        return r
+
+    proc caseRecordTransfer(m: PlacementMechanism, node: text, atoms: int, bytes: int, atMs: int) -> PlacementMechanism:
+        let target = do caseTarget()
+        let recorded = do placementFabricRecordTransfer(m.fabric, target, node, atoms, bytes, atMs)
+        let out = do placementMechanismWithFabric(m, recorded)
+        return out
+
+    struct CaseDrive:
+        mechanism: PlacementMechanism
+        plan: PlacementPlan
+        out: [text]
+
+    # driveToCutover: prepare, transfer (the copy lands and a verification
+    # is demanded), begin cutover.
+    proc caseDriveToCutover(out0: [text]) -> CaseDrive:
+        let target = do caseTarget()
+        let fabric = do caseFabric([target.coordinate])
+        let m0 = do placementMechanismNew(fabric)
+        let request = do caseMoveToB()
+        let planned = do mechanismPlan(m0, request)
+        let plan = planned.value
+        let mut out = out0
+        let b1 = do mechanismBeginPhase(m0, plan, "prepare", 1000)
+        let u1 = do caseUnit(b1.ok, b1.fault)
+        out = append(out, u1)
+        let p1 = do mechanismPollPhase(b1.mechanism, plan, "prepare", 1000)
+        let d1 = do caseProgress(p1)
+        out = append(out, d1)
+        let b2 = do mechanismBeginPhase(p1.mechanism, plan, "transfer", 2000)
+        let u2 = do caseUnit(b2.ok, b2.fault)
+        out = append(out, u2)
+        let transferred = do placementFabricRecordTransfer(b2.mechanism.fabric, target, "db-b", 1, 4096, 3000)
+        let demanded = do placementFabricDemandVerification(transferred, target, "db-b")
+        let m2 = do placementMechanismWithFabric(b2.mechanism, demanded)
+        let p2 = do mechanismPollPhase(m2, plan, "transfer", 3000)
+        let d2 = do caseProgress(p2)
+        out = append(out, d2)
+        let b3 = do mechanismBeginPhase(p2.mechanism, plan, "cutover", 4000)
+        let u3 = do caseUnit(b3.ok, b3.fault)
+        out = append(out, u3)
+        let s3 = do caseSnap(b3.mechanism.fabric, target)
+        out = append(out, s3)
+        return CaseDrive{mechanism: b3.mechanism, plan: plan, out: out}
+
+    proc caseMechCutoverVerification() -> [text]:
+        let target = do caseTarget()
+        let first = do caseDriveToCutover([])
+        let mut out = first.out
+        let plan = first.plan
+        let p1 = do mechanismPollPhase(first.mechanism, plan, "cutover", 4000)
+        let d1 = do caseProgress(p1)
+        out = append(out, d1)
+        let s1 = do caseSnap(p1.mechanism.fabric, target)
+        out = append(out, s1)
+        let verified = do copyVerdictVerified(3, 4500)
+        let withVerdict = do placementFabricRecordVerification(p1.mechanism.fabric, target, "db-b", verified)
+        let m1 = do placementMechanismWithFabric(p1.mechanism, withVerdict)
+        let p2 = do mechanismPollPhase(m1, plan, "cutover", 5000)
+        let d2 = do caseProgress(p2)
+        out = append(out, d2)
+        let s2 = do caseSnap(p2.mechanism.fabric, target)
+        out = append(out, s2)
+        let second = do caseDriveToCutover(out)
+        out = second.out
+        let failedVerdict = do copyVerdictFailed("'Post:1' differs in `data`", 4500)
+        let withFailed = do placementFabricRecordVerification(second.mechanism.fabric, target, "db-b", failedVerdict)
+        let m2 = do placementMechanismWithFabric(second.mechanism, withFailed)
+        let p3 = do mechanismPollPhase(m2, second.plan, "cutover", 5000)
+        let d3 = do caseProgress(p3)
+        out = append(out, d3)
+        let s3 = do caseSnap(p3.mechanism.fabric, target)
+        out = append(out, s3)
+        let aborted = do mechanismAbort(p3.mechanism, second.plan, ["prepare", "transfer"], 6000)
+        let d4 = do caseRollback(aborted)
+        out = append(out, d4)
+        let s4 = do caseSnap(aborted.mechanism.fabric, target)
+        out = append(out, s4)
+        return out
+
+    proc caseMechRoutingLearns() -> [text]:
+        let target = do caseTarget()
+        let fabric = do caseFabric([target.coordinate])
+        let m0 = do placementMechanismNew(fabric)
+        let request = do caseMoveToB()
+        let planned = do mechanismPlan(m0, request)
+        let plan = planned.value
+        let mut out = []
+        let pd = do casePlan(plan)
+        out = append(out, pd)
+        let b1 = do mechanismBeginPhase(m0, plan, "prepare", 1000)
+        let u1 = do caseUnit(b1.ok, b1.fault)
+        out = append(out, u1)
+        let s1 = do caseSnap(b1.mechanism.fabric, target)
+        out = append(out, s1)
+        let p1 = do mechanismPollPhase(b1.mechanism, plan, "prepare", 1000)
+        let d1 = do caseProgress(p1)
+        out = append(out, d1)
+        let b2 = do mechanismBeginPhase(p1.mechanism, plan, "transfer", 2000)
+        let u2 = do caseUnit(b2.ok, b2.fault)
+        out = append(out, u2)
+        let s2 = do caseSnap(b2.mechanism.fabric, target)
+        out = append(out, s2)
+        let p2 = do mechanismPollPhase(b2.mechanism, plan, "transfer", 2000)
+        let d2 = do caseProgress(p2)
+        out = append(out, d2)
+        let written = do placementFabricAcceptWrite(p2.mechanism.fabric, target, 0)
+        if written.ok:
+            if written.route == "source":
+                out = append(out, "write=Ok(Source)")
+            else:
+                out = append(out, "write=Ok(Destination)")
+        else:
+            let shownW = do fabricErrorDisplay(written.err)
+            out = append(out, "write=Err(\"" + shownW + "\")")
+        let m2 = do placementMechanismWithFabric(p2.mechanism, written.fabric)
+        let m3 = do caseRecordTransfer(m2, "db-b", 1, 4096, 3000)
+        let p3 = do mechanismPollPhase(m3, plan, "transfer", 3000)
+        let d3 = do caseProgress(p3)
+        out = append(out, d3)
+        let s3 = do caseSnap(p3.mechanism.fabric, target)
+        out = append(out, s3)
+        let b4 = do mechanismBeginPhase(p3.mechanism, plan, "cutover", 4000)
+        let u4 = do caseUnit(b4.ok, b4.fault)
+        out = append(out, u4)
+        let s4 = do caseSnap(b4.mechanism.fabric, target)
+        out = append(out, s4)
+        let p4 = do mechanismPollPhase(b4.mechanism, plan, "cutover", 4000)
+        let d4 = do caseProgress(p4)
+        out = append(out, d4)
+        let applied = do placementFabricRecordApplied(p4.mechanism.fabric, target, 0, 4500)
+        if applied.ok:
+            out = append(out, "applied=Ok(())")
+        else:
+            let shownA = do fabricErrorDisplay(applied.err)
+            out = append(out, "applied=Err(\"" + shownA + "\")")
+        let m5 = do placementMechanismWithFabric(p4.mechanism, applied.fabric)
+        let p5 = do mechanismPollPhase(m5, plan, "cutover", 5000)
+        let d5 = do caseProgress(p5)
+        out = append(out, d5)
+        let s5 = do caseSnap(p5.mechanism.fabric, target)
+        out = append(out, s5)
+        let b6 = do mechanismBeginPhase(p5.mechanism, plan, "cleanup", 6000)
+        let u6 = do caseUnit(b6.ok, b6.fault)
+        out = append(out, u6)
+        let p6 = do mechanismPollPhase(b6.mechanism, plan, "cleanup", 6000)
+        let d6 = do caseProgress(p6)
+        out = append(out, d6)
+        let s6 = do caseSnap(p6.mechanism.fabric, target)
+        out = append(out, s6)
+        return out
+
+    proc caseMechSibling() -> [text]:
+        let target = do caseTarget()
+        let sibling = Coordinate{x: 5, y: 5}
+        let st = ActionTarget{shardId: 7, coordinate: sibling}
+        let fabric = do caseFabric([target.coordinate, sibling])
+        let mut m = do placementMechanismNew(fabric)
+        let request = do caseMoveToB()
+        let planned = do mechanismPlan(m, request)
+        let plan = planned.value
+        let mut out = []
+        let pd = do casePlan(plan)
+        out = append(out, pd)
+        let s0 = do caseSnap(m.fabric, st)
+        out = append(out, s0)
+        let phases = ["prepare", "transfer", "cutover", "cleanup"]
+        let times = [1000, 2000, 3000, 4000]
+        let mut i = 0
+        loop i < 4:
+            let began = do mechanismBeginPhase(m, plan, phases[i], times[i])
+            let u = do caseUnit(began.ok, began.fault)
+            out = append(out, u)
+            let sb = do caseSnap(began.mechanism.fabric, st)
+            out = append(out, sb)
+            m = began.mechanism
+            if phases[i] == "transfer":
+                let recorded = do caseRecordTransfer(m, "db-b", 1, 4096, times[i])
+                m = recorded
+            let polled = do mechanismPollPhase(m, plan, phases[i], times[i])
+            let d = do caseProgress(polled)
+            out = append(out, d)
+            m = polled.mechanism
+            let st1 = do caseSnap(m.fabric, target)
+            out = append(out, st1)
+            let st2 = do caseSnap(m.fabric, st)
+            out = append(out, st2)
+            i = i + 1
+        let entry = do tableShardLookup(m.fabric.routing, 7)
+        let shardwide = do caseBool(entry.entry.hasReplicas)
+        let sibSetLookup = do tableShardEntryReplicaSetAt(entry.entry, sibling)
+        let sibMigLookup = do tableShardEntryMigrationAt(entry.entry, sibling)
+        let sibSet = do caseBool(sibSetLookup.has)
+        let sibMig = do caseBool(sibMigLookup.has)
+        let siblingSet = do placementFabricReplicaSet(m.fabric, st)
+        let siblingHas = do caseBool(siblingSet.has)
+        out = append(out, "shardwide=" + shardwide + ";sibset=" + sibSet + ";sibmig=" + sibMig + ";sibling_has_set=" + siblingHas)
+        return out
+
+    proc caseMechRollbackBefore() -> [text]:
+        let target = do caseTarget()
+        let fabric = do caseFabric([target.coordinate])
+        let m0 = do placementMechanismNew(fabric)
+        let request = do caseMoveToB()
+        let planned = do mechanismPlan(m0, request)
+        let plan = planned.value
+        let mut out = []
+        let b1 = do mechanismBeginPhase(m0, plan, "prepare", 1000)
+        let u1 = do caseUnit(b1.ok, b1.fault)
+        out = append(out, u1)
+        let p1 = do mechanismPollPhase(b1.mechanism, plan, "prepare", 1000)
+        let d1 = do caseProgress(p1)
+        out = append(out, d1)
+        let b2 = do mechanismBeginPhase(p1.mechanism, plan, "transfer", 2000)
+        let u2 = do caseUnit(b2.ok, b2.fault)
+        out = append(out, u2)
+        let s2 = do caseSnap(b2.mechanism.fabric, target)
+        out = append(out, s2)
+        let a1 = do mechanismAbort(b2.mechanism, plan, ["prepare"], 3000)
+        let r1 = do caseRollback(a1)
+        out = append(out, r1)
+        let s3 = do caseSnap(a1.mechanism.fabric, target)
+        out = append(out, s3)
+        let a2 = do mechanismAbort(a1.mechanism, plan, ["prepare"], 3500)
+        let r2 = do caseRollback(a2)
+        out = append(out, r2)
+        return out
+
+    proc caseMechRollbackAfter() -> [text]:
+        let target = do caseTarget()
+        let fabric = do caseFabric([target.coordinate])
+        let m0 = do placementMechanismNew(fabric)
+        let request = do caseMoveToB()
+        let planned = do mechanismPlan(m0, request)
+        let plan = planned.value
+        let mut out = []
+        let b1 = do mechanismBeginPhase(m0, plan, "prepare", 1000)
+        let u1 = do caseUnit(b1.ok, b1.fault)
+        out = append(out, u1)
+        let p1 = do mechanismPollPhase(b1.mechanism, plan, "prepare", 1000)
+        let d1 = do caseProgress(p1)
+        out = append(out, d1)
+        let b2 = do mechanismBeginPhase(p1.mechanism, plan, "transfer", 2000)
+        let u2 = do caseUnit(b2.ok, b2.fault)
+        out = append(out, u2)
+        let m2 = do caseRecordTransfer(b2.mechanism, "db-b", 1, 4096, 2000)
+        let p2 = do mechanismPollPhase(m2, plan, "transfer", 2000)
+        let d2 = do caseProgress(p2)
+        out = append(out, d2)
+        let b3 = do mechanismBeginPhase(p2.mechanism, plan, "cutover", 3000)
+        let u3 = do caseUnit(b3.ok, b3.fault)
+        out = append(out, u3)
+        let p3 = do mechanismPollPhase(b3.mechanism, plan, "cutover", 3000)
+        let d3 = do caseProgress(p3)
+        out = append(out, d3)
+        let s3 = do caseSnap(p3.mechanism.fabric, target)
+        out = append(out, s3)
+        let a1 = do mechanismAbort(p3.mechanism, plan, ["prepare", "transfer", "cutover"], 4000)
+        let r1 = do caseRollback(a1)
+        out = append(out, r1)
+        let s4 = do caseSnap(a1.mechanism.fabric, target)
+        out = append(out, s4)
+        return out
+
+    proc caseMechReplicate() -> [text]:
+        let target = do caseTarget()
+        let fabric = do caseFabric([target.coordinate])
+        let mut m = do placementMechanismNew(fabric)
+        let action = do optimizationActionReplicate("db-b")
+        let request = do caseRequest(action)
+        let planned = do mechanismPlan(m, request)
+        let plan = planned.value
+        let mut out = []
+        let pd = do casePlan(plan)
+        out = append(out, pd)
+        let phases = ["prepare", "transfer"]
+        let times = [1000, 2000]
+        let mut i = 0
+        loop i < 2:
+            let began = do mechanismBeginPhase(m, plan, phases[i], times[i])
+            let u = do caseUnit(began.ok, began.fault)
+            out = append(out, u)
+            m = began.mechanism
+            if phases[i] == "transfer":
+                let early = do mechanismPollPhase(m, plan, phases[i], times[i])
+                let de = do caseProgress(early)
+                out = append(out, de)
+                m = early.mechanism
+                let recorded = do caseRecordTransfer(m, "db-b", 1, 4096, times[i])
+                m = recorded
+            let polled = do mechanismPollPhase(m, plan, phases[i], times[i])
+            let d = do caseProgress(polled)
+            out = append(out, d)
+            m = polled.mechanism
+            let s = do caseSnap(m.fabric, target)
+            out = append(out, s)
+            i = i + 1
+        let entry = do tableShardLookup(m.fabric.routing, 7)
+        let cellSet = do tableShardEntryReplicaSetAt(entry.entry, target.coordinate)
+        let mut fresh = 99
+        if cellSet.has:
+            let targets = do replGroupReadTargets(cellSet.group, false)
+            fresh = len(targets)
+        let shardwide = do caseBool(entry.entry.hasReplicas)
+        out = append(out, "fresh=" + fresh + ";shardwide=" + shardwide)
+        return out
+
+    proc caseMechPlans() -> [text]:
+        let target = do caseTarget()
+        let fabric = do caseFabric([target.coordinate])
+        let m = do placementMechanismNew(fabric)
+        let isolate = do optimizationActionIsolate()
+        let split = do optimizationActionSplit()
+        let noAction = do optimizationActionNoAction()
+        let moveA = do optimizationActionMove("db-a")
+        let colocate = do optimizationActionColocate(Coordinate{x: 1, y: 1})
+        let actions = [isolate, split, noAction, moveA, colocate]
+        let mut out = []
+        let mut i = 0
+        loop i < 5:
+            let supports = do mechanismSupports(m, actions[i])
+            let sd = do caseBool(supports)
+            out = append(out, "supports=" + sd)
+            let request = do caseRequest(actions[i])
+            let planned = do mechanismPlan(m, request)
+            let pd = do casePlanResult(planned)
+            out = append(out, pd)
+            i = i + 1
+        let base = do caseRequest(colocate)
+        let named = PlanRequest{target: base.target, action: base.action, source: base.source, hasDestination: true, destination: DbmsId{value: "db-c"}, replicas: base.replicas, requestedAtMs: base.requestedAtMs}
+        let planned2 = do mechanismPlan(m, named)
+        let pd2 = do casePlanResult(planned2)
+        out = append(out, pd2)
+        return out
+
+    # ------------------------------------------------ registry.rs / lib.rs
+
+    proc caseRegistration(id: text) -> NodeRegistration:
+        let r = do nodeRegistrationNew(DbmsId{value: id}, "0.13.0", "us-east")
+        return r
+
+    proc caseBeat(id: text, atMs: int, healthy: bool) -> NodeHeartbeat:
+        return NodeHeartbeat{nodeId: DbmsId{value: id}, timestampMs: atMs, healthy: healthy}
+
+    proc caseNode(n: RegisteredNode, nowMs: int, deadlineMs: int) -> text:
+        let mut last = "-"
+        if n.hasLastHeartbeat:
+            last = "" + n.lastHeartbeatMs
+        let reported = do caseBool(n.reportedHealthy)
+        let health = do registeredNodeHealth(n, nowMs, deadlineMs)
+        let silence = do registeredNodeSilenceMs(n, nowMs)
+        let mut silenceText = "-"
+        if silence.has:
+            silenceText = "" + silence.val
+        let serviceable = do nodeHealthIsServiceable(health)
+        let serviceableText = do caseBool(serviceable)
+        return n.id + ":" + n.protocol + ":" + n.softwareVersion + ":" + n.region + ":" + n.registeredAtMs + ":" + last + ":" + reported + ":" + n.heartbeats + ":" + health + ":" + silenceText + ":" + serviceableText
+
+    proc caseRegistry() -> [text]:
+        let mut out = []
+        let empty = do nodeRegistryNew()
+        let regA = do caseRegistration("db-a")
+        let r1 = do nodeRegistryRegister(empty, regA, 1000)
+        let created = do caseBool(r1.created)
+        out = append(out, "reg=" + created)
+        out = append(out, "len=" + len(r1.registry.nodes))
+        let deadline = do defaultHeartbeatDeadlineMs()
+        let g1 = do nodeRegistryGet(r1.registry, "db-a")
+        let d1 = do caseNode(g1.val, 1000, deadline)
+        out = append(out, d1)
+        let r2 = do nodeRegistryRegister(empty, regA, 0)
+        let b2 = do nodeRegistryHeartbeat(r2.registry, NodeHeartbeat{nodeId: DbmsId{value: "db-a"}, timestampMs: 10000, healthy: true})
+        let g2 = do nodeRegistryGet(b2.registry, "db-a")
+        let nows = [10000, 40000, 40001]
+        let mut i = 0
+        loop i < 3:
+            let d = do caseNode(g2.val, nows[i], 30000)
+            out = append(out, d)
+            i = i + 1
+        let b3 = do nodeRegistryHeartbeat(r2.registry, NodeHeartbeat{nodeId: DbmsId{value: "db-a"}, timestampMs: 10000, healthy: false})
+        let g3 = do nodeRegistryGet(b3.registry, "db-a")
+        let d3 = do caseNode(g3.val, 10000, 30000)
+        out = append(out, d3)
+        let degraded = do nodeHealthIsServiceable("degraded")
+        let degradedText = do caseBool(degraded)
+        out = append(out, "degradedServiceable=" + degradedText)
+        let ghost = do nodeRegistryHeartbeat(empty, NodeHeartbeat{nodeId: DbmsId{value: "ghost"}, timestampMs: 1, healthy: true})
+        let isEmpty = do nodeRegistryIsEmpty(ghost.registry)
+        let emptyText = do caseBool(isEmpty)
+        out = append(out, "ghost=" + ghost.err + ";empty=" + emptyText)
+        let b4 = do nodeRegistryHeartbeat(r2.registry, NodeHeartbeat{nodeId: DbmsId{value: "db-a"}, timestampMs: 20000, healthy: true})
+        let b5 = do nodeRegistryHeartbeat(b4.registry, NodeHeartbeat{nodeId: DbmsId{value: "db-a"}, timestampMs: 5000, healthy: true})
+        let g5 = do nodeRegistryGet(b5.registry, "db-a")
+        let d5 = do caseNode(g5.val, 20000, 30000)
+        out = append(out, d5)
+        let b6 = do nodeRegistryHeartbeat(r2.registry, NodeHeartbeat{nodeId: DbmsId{value: "db-a"}, timestampMs: 10000, healthy: true})
+        let r6 = do nodeRegistryRegister(b6.registry, regA, 12000)
+        let rereg = do caseBool(r6.created)
+        out = append(out, "rereg=" + rereg)
+        let g6 = do nodeRegistryGet(r6.registry, "db-a")
+        let d6 = do caseNode(g6.val, 12000, 30000)
+        out = append(out, d6)
+        let mut reg = empty
+        let ids = ["db-c", "db-a", "db-b"]
+        let mut j = 0
+        loop j < 3:
+            let registration = do caseRegistration(ids[j])
+            let registered = do nodeRegistryRegister(reg, registration, 0)
+            reg = registered.registry
+            j = j + 1
+        let hA = do nodeRegistryHeartbeat(reg, NodeHeartbeat{nodeId: DbmsId{value: "db-a"}, timestampMs: 10000, healthy: true})
+        let hB = do nodeRegistryHeartbeat(hA.registry, NodeHeartbeat{nodeId: DbmsId{value: "db-b"}, timestampMs: 10000, healthy: false})
+        let unhealthy = do nodeRegistryUnhealthy(hB.registry, 10000, 30000)
+        let mut names = ""
+        let n = len(unhealthy)
+        let mut k = 0
+        loop k < n:
+            if k > 0:
+                names = names + ","
+            names = names + unhealthy[k].id
+            k = k + 1
+        out = append(out, "unhealthy=" + names)
+        let mut order = ""
+        let m = len(hB.registry.nodes)
+        let mut o = 0
+        loop o < m:
+            if o > 0:
+                order = order + ","
+            order = order + hB.registry.nodes[o].id
+            o = o + 1
+        out = append(out, "order=" + order)
+        return out
+
+    proc caseResponse(r: FabricResponse) -> text:
+        if r.kind == "Registered":
+            return "Registered(" + r.registeredNodeId + ")"
+        if r.kind == "Rejected":
+            return "Rejected(" + r.rejectedReason + ")"
+        return r.kind
+
+    proc caseMessage(kind: text) -> FabricMessage:
+        let empty = do protoEmptyFabricMessage()
+        return FabricMessage{kind: kind, registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: empty.telemetry, workload: empty.workload}
+
+    proc caseRegisterMessage(id: text, region: text) -> FabricMessage:
+        let base = do caseMessage("RegisterNode")
+        let registration = do nodeRegistrationNew(DbmsId{value: id}, "0.13.0", region)
+        return FabricMessage{kind: base.kind, registerNode: registration, heartbeat: base.heartbeat, topology: base.topology, telemetry: base.telemetry, workload: base.workload}
+
+    proc caseHeartbeatMessage(id: text, atMs: int, healthy: bool) -> FabricMessage:
+        let base = do caseMessage("Heartbeat")
+        return FabricMessage{kind: base.kind, registerNode: base.registerNode, heartbeat: NodeHeartbeat{nodeId: DbmsId{value: id}, timestampMs: atMs, healthy: healthy}, topology: base.topology, telemetry: base.telemetry, workload: base.workload}
+
+    proc caseSample(coordinate: Coordinate, ops: float, readRatio: float, writeRatio: float) -> TelemetrySample:
+        return TelemetrySample{coordinate: coordinate, operationsPerSecond: ops, readRatio: readRatio, writeRatio: writeRatio, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, queueDepth: 0, cellBreakdown: [], cellBreakdownPartial: false}
+
+    proc caseTelemetryMessage(atMs: int, node: text, shardId: int, domain: text, samples: [TelemetrySample]) -> FabricMessage:
+        let base = do caseMessage("Telemetry")
+        let batch = TelemetryBatch{timestampMs: atMs, nodeId: DbmsId{value: node}, shard: ProtocolShard{id: shardId, workloadDomain: domain}, samples: samples}
+        return FabricMessage{kind: base.kind, registerNode: base.registerNode, heartbeat: base.heartbeat, topology: base.topology, telemetry: batch, workload: base.workload}
+
+    proc caseAvailability(rt: FabricRuntime, id: text) -> text:
+        let fabric = do fabricRuntimePlacement(rt)
+        let entry = do tableNodeLookup(fabric.routing, id)
+        if !entry.found:
+            return "-"
+        return entry.entry.availability
+
+    proc caseLib() -> [text]:
+        let mut out = []
+        let fresh = do fabricRuntimeNew()
+        let regA = do caseRegisterMessage("db-a", "us-east")
+        let h1 = do fabricRuntimeHandle(fresh, regA)
+        let d1 = do caseResponse(h1.response)
+        out = append(out, d1)
+        out = append(out, "nodes=" + len(h1.runtime.nodes.nodes))
+        let hb = do caseHeartbeatMessage("db-a", 12000, true)
+        let h2 = do fabricRuntimeHandle(h1.runtime, hb)
+        let d2 = do caseResponse(h2.response)
+        out = append(out, d2)
+        out = append(out, "clock=" + h2.runtime.clockMs)
+        let g2 = do nodeRegistryGet(h2.runtime.nodes, "db-a")
+        let n2 = do caseNode(g2.val, h2.runtime.clockMs, 30000)
+        out = append(out, n2)
+        let ghostBeat = do caseHeartbeatMessage("ghost", 12000, true)
+        let h3 = do fabricRuntimeHandle(fresh, ghostBeat)
+        let d3 = do caseResponse(h3.response)
+        out = append(out, d3)
+        out = append(out, "nodes=" + len(h3.runtime.nodes.nodes) + ";clock=" + h3.runtime.clockMs)
+        let regB = do caseRegisterMessage("db-b", "us-east")
+        let s1 = do fabricRuntimeHandle(fresh, regA)
+        let s2 = do fabricRuntimeHandle(s1.runtime, regB)
+        let beatA = do caseHeartbeatMessage("db-a", 10000, true)
+        let beatB = do caseHeartbeatMessage("db-b", 10000, true)
+        let lateB = do caseHeartbeatMessage("db-b", 100000, true)
+        let s3 = do fabricRuntimeHandle(s2.runtime, beatA)
+        let s4 = do fabricRuntimeHandle(s3.runtime, beatB)
+        let s5 = do fabricRuntimeHandle(s4.runtime, lateB)
+        let now = s5.runtime.clockMs
+        let deadline = do defaultHeartbeatDeadlineMs()
+        let stale = do nodeRegistryUnhealthy(s5.runtime.nodes, now, deadline)
+        let mut staleText = ""
+        let ns = len(stale)
+        let mut i = 0
+        loop i < ns:
+            if i > 0:
+                staleText = staleText + ","
+            staleText = staleText + stale[i].id
+            i = i + 1
+        let availA = do caseAvailability(s5.runtime, "db-a")
+        let availB = do caseAvailability(s5.runtime, "db-b")
+        out = append(out, "clock=" + now + ";stale=" + staleText + ";a=" + availA + ";b=" + availB)
+        let shortDeadline = do fabricRuntimeWithHeartbeatDeadlineMs(fresh, 5000)
+        let t1 = do fabricRuntimeHandle(shortDeadline, regA)
+        let t2 = do fabricRuntimeHandle(t1.runtime, beatA)
+        let before = do caseAvailability(t2.runtime, "db-a")
+        out = append(out, "before=" + before)
+        let t3 = do fabricRuntimeTickClock(t2.runtime, 20000)
+        let after = do caseAvailability(t3, "db-a")
+        out = append(out, "clock=" + t3.clockMs + ";after=" + after)
+        let t4 = do fabricRuntimeTickClock(t3, 1000)
+        out = append(out, "clock=" + t4.clockMs)
+        let mut windowed = fresh
+        let limit = do recentObservations()
+        let one = do caseSample(Coordinate{x: 0, y: 0}, 1.0, 1.0, 0.0)
+        let mut tick = 0
+        loop tick < limit * 2:
+            let message = do caseTelemetryMessage(1000 + tick, "db-a", 1, "us-east", [one])
+            let handled = do fabricRuntimeHandle(windowed, message)
+            windowed = handled.runtime
+            tick = tick + 1
+        let windowLen = len(windowed.observations)
+        let analyzerLen = do workloadAnalyzerLen(windowed.analyzer)
+        let stateLen = do fabricStateLen(windowed.state)
+        out = append(out, "window=" + windowLen + ";first=" + windowed.observations[0].timestampMs + ";last=" + windowed.observations[windowLen - 1].timestampMs + ";analyzer=" + analyzerLen + ";state=" + stateLen)
+        let defaults = do controllerPolicyDefault()
+        let policy = ControllerPolicy{maxDecisionAgeMs: defaults.maxDecisionAgeMs, minConfidence: defaults.minConfidence, minReplicas: defaults.minReplicas, maxNodeUtilization: defaults.maxNodeUtilization, maxConcurrentActions: defaults.maxConcurrentActions, maxActionsPerNode: defaults.maxActionsPerNode, phaseTimeoutMs: 1234, measurementSettleMs: defaults.measurementSettleMs, measurementDeadlineMs: defaults.measurementDeadlineMs, outcomeNoiseFloor: defaults.outcomeNoiseFloor}
+        let withPolicy = do fabricRuntimeWithPolicy(policy)
+        let mechs = do fabricControllerMechanisms(withPolicy.controller)
+        let mut mechText = ""
+        let nm = len(mechs)
+        let mut k = 0
+        loop k < nm:
+            if k > 0:
+                mechText = mechText + ","
+            mechText = mechText + mechs[k]
+            k = k + 1
+        out = append(out, "timeout=" + withPolicy.controller.policy.phaseTimeoutMs + ";mechs=" + mechText)
+        let hot = do caseSample(Coordinate{x: 0, y: 0}, 10.0, 0.9, 0.1)
+        let telemetry = do caseTelemetryMessage(7000, "db-a", 1, "us-east", [hot])
+        let h8 = do fabricRuntimeHandle(fresh, telemetry)
+        let d8 = do caseResponse(h8.response)
+        out = append(out, d8)
+        let profile = do fabricRuntimeProfile(h8.runtime, 1, Coordinate{x: 0, y: 0})
+        let analyzer8 = do workloadAnalyzerLen(h8.runtime.analyzer)
+        let p = profile.val
+        out = append(out, "clock=" + h8.runtime.clockMs + ";analyzer=" + analyzer8 + ";ops=" + toInt(round(p.operationsPerSecond * 1000.0)) + ";r=" + toInt(round(p.readRatio * 1000.0)) + ";w=" + toInt(round(p.writeRatio * 1000.0)) + ";pressure=" + toInt(round(p.pressureScore * 1000000.0)))
+        return out
+
+    proc caseActionText(a: OptimizationAction) -> text:
+        let label = do controllerPlanActionLabel(a)
+        if a.kind == "Replicate" || a.kind == "Move":
+            return label + ":" + a.target
+        if a.kind == "Colocate":
+            return label + ":" + a.coordinate.x + "," + a.coordinate.y
+        return label
+
+    proc caseStateText(rt: FabricRuntime, id: ActionId, known: bool, execState: text) -> text:
+        if !known:
+            return "-"
+        if execState == "running":
+            let record = do fabricControllerRecord(rt.controller, id)
+            return "running:" + record.val.runningPhase
+        return execState
+
+    proc caseHeartbeatAll(rt: FabricRuntime, atMs: int) -> FabricRuntime:
+        let ids = ["db-a", "db-b", "db-c"]
+        let mut current = rt
+        let mut i = 0
+        loop i < 3:
+            let message = do caseHeartbeatMessage(ids[i], atMs, true)
+            let handled = do fabricRuntimeHandle(current, message)
+            current = handled.runtime
+            i = i + 1
+        return current
+
+    proc caseRuntimeLoop() -> [text]:
+        let mut out = []
+        let target = do caseTarget()
+        let mut rt = do fabricRuntimeNew()
+        let ids = ["db-a", "db-b", "db-c"]
+        let regions = ["us-east", "us-west", "us-west"]
+        let mut i = 0
+        loop i < 3:
+            let registration = do caseRegisterMessage(ids[i], regions[i])
+            let handled = do fabricRuntimeHandle(rt, registration)
+            rt = handled.runtime
+            i = i + 1
+        let beaten = do caseHeartbeatAll(rt, 1000)
+        rt = beaten
+        let empty = do topologyRegistryNew()
+        let topology = do topologyRegistryPlace(empty, "db-a", 7, target.coordinate, "us-east")
+        let adopted = do fabricRuntimeAdoptTopology(rt, topology)
+        rt = adopted
+        let placement0 = do fabricRuntimePlacement(rt)
+        let s0 = do caseSnap(placement0, target)
+        out = append(out, s0)
+        let hot = TelemetrySample{coordinate: target.coordinate, operationsPerSecond: 12000.0, readRatio: 0.5, writeRatio: 0.5, readLatencyUs: 40000.0, writeLatencyUs: 60000.0, cpuUtilization: 0.99, memoryUtilization: 0.95, queueDepth: 30000, cellBreakdown: [], cellBreakdownPartial: false}
+        let telemetry = do caseTelemetryMessage(2000, "db-a", 7, "social", [hot])
+        let observed = do fabricRuntimeHandle(rt, telemetry)
+        rt = observed.runtime
+        let profile = do fabricRuntimeProfile(rt, 7, target.coordinate)
+        let baseline = profile.val
+        let decision = do fabricRuntimeOptimize(rt, baseline)
+        let actionText = do caseActionText(decision.action)
+        out = append(out, "decision=" + actionText + ";gain=" + toInt(round(decision.expectedGain * 1000000.0)) + ";cost=" + toInt(round(decision.estimatedCost * 1000000.0)) + ";conf=" + toInt(round(decision.confidence * 1000000.0)))
+        let view = do fabricRuntimeFleetView(rt)
+        let statuses = do fleetViewNodesSortedById(view)
+        let mut fleetText = ""
+        let nf = len(statuses)
+        let mut f = 0
+        loop f < nf:
+            let st = statuses[f]
+            if f > 0:
+                fleetText = fleetText + ","
+            fleetText = fleetText + st.id.value + ":" + st.condition + ":" + st.hostedPlacements + ":" + toInt(round(st.cpuUtilization * 1000.0)) + ":" + toInt(round(st.memoryUtilization * 1000.0))
+            f = f + 1
+        out = append(out, "fleet=" + fleetText + ";gen=" + view.generation)
+        let envelope = do decisionEnvelopeNew(decision, 2000, view.generation)
+        let submitted = do fabricRuntimeSubmit(rt, envelope, baseline)
+        rt = submitted.runtime
+        if !submitted.ok:
+            let shown = do validationErrorDisplay(submitted.err)
+            out = append(out, "submit=err(" + shown + ")")
+            return out
+        let id = submitted.id
+        let record = do fabricControllerRecord(rt.controller, id)
+        let destination = record.val.plan.adds[0].value
+        out = append(out, "submit=" + id.value + ";dest=" + destination)
+        let sizedFabric = do fabricRuntimePlacement(rt)
+        let sized = do placementFabricRecordSize(sizedFabric, target, 8192)
+        rt = do fabricRuntimeWithPlacement(rt, sized)
+        let mut state = "admitted"
+        let mut wrote = false
+        let mut step = 0
+        loop step < 14:
+            let at = 3000 + step * 1000
+            let alive = do caseHeartbeatAll(rt, at)
+            rt = alive
+            if state == "running:transfer":
+                let copied = min(step * 4096, 8192)
+                let mut atoms = 0
+                if copied >= 8192:
+                    atoms = 1
+                let current = do fabricRuntimePlacement(rt)
+                let recorded = do placementFabricRecordTransfer(current, target, destination, atoms, copied, at)
+                rt = do fabricRuntimeWithPlacement(rt, recorded)
+                if !wrote:
+                    let current2 = do fabricRuntimePlacement(rt)
+                    let written = do placementFabricAcceptWrite(current2, target, 0)
+                    if written.ok:
+                        if written.route == "source":
+                            out = append(out, "write=Ok(Source)")
+                        else:
+                            out = append(out, "write=Ok(Destination)")
+                    else:
+                        let shownW = do fabricErrorDisplay(written.err)
+                        out = append(out, "write=Err(\"" + shownW + "\")")
+                    rt = do fabricRuntimeWithPlacement(rt, written.fabric)
+                    wrote = true
+            if state == "running:cutover":
+                let current3 = do fabricRuntimePlacement(rt)
+                let applied = do placementFabricRecordApplied(current3, target, 0, at)
+                if applied.ok:
+                    out = append(out, "applied=Ok(())")
+                else:
+                    let shownA = do fabricErrorDisplay(applied.err)
+                    out = append(out, "applied=Err(\"" + shownA + "\")")
+                rt = do fabricRuntimeWithPlacement(rt, applied.fabric)
+            let advanced = do fabricRuntimeAdvance(rt, id)
+            rt = advanced.runtime
+            let label = do caseStateText(rt, id, advanced.known, advanced.execState)
+            state = label
+            out = append(out, "" + at + ":" + label)
+            let placement = do fabricRuntimePlacement(rt)
+            let snapped = do caseSnap(placement, target)
+            out = append(out, snapped)
+            let located = do topologyRegistryLocate(rt.topology, 7, target.coordinate)
+            let mut owner = "-"
+            if located.found:
+                owner = located.placement.dbmsId
+            out = append(out, "rtowner=" + owner)
+            if state == "awaiting-measurement":
+                step = 14
+            step = step + 1
+        let settled = do caseHeartbeatAll(rt, 60000)
+        rt = settled
+        let b = baseline
+        let after = WorkloadProfile{shardId: b.shardId, coordinate: b.coordinate, operationsPerSecond: 3000.0, readRatio: b.readRatio, writeRatio: b.writeRatio, readLatencyUs: 5000.0, writeLatencyUs: 8000.0, cpuUtilization: 0.40, memoryUtilization: 0.50, storageBytesPerSecond: b.storageBytesPerSecond, networkInBytesPerSecond: b.networkInBytesPerSecond, networkOutBytesPerSecond: b.networkOutBytesPerSecond, queueDepth: 100, cellBreakdown: b.cellBreakdown, cellBreakdownPartial: b.cellBreakdownPartial, pressureScore: b.pressureScore, pressure: b.pressure}
+        let measured = do fabricRuntimeMeasure(rt, id, after)
+        rt = measured.runtime
+        if measured.ok:
+            out = append(out, "measured=" + measured.outcome.verdict + ";realized=" + toInt(round(measured.outcome.realizedGain * 1000000.0)) + ";ratio=" + toInt(round(measured.outcome.gainRatio * 1000000.0)))
+        else:
+            let shownM = do measurementErrorDisplay(measured.err)
+            out = append(out, "measure=err(" + shownM + ")")
+        let reports = do fabricControllerReports(rt.controller)
+        let mut mech = ""
+        if len(reports) > 0:
+            mech = reports[0].mechanism
+        out = append(out, "reports=" + len(reports) + ";mech=" + mech)
+        return out
+
+    # ------------------------------------------- tests/control_loop.rs
+
+    proc clSpec(classes: [text], shardsPerNode: int, cellsPerShard: int) -> ClusterSpec:
+        let d = do clusterSpecDefault()
+        return ClusterSpec{seed: 7, tickMs: d.tickMs, startMs: d.startMs, regions: d.regions, nodesPerRegion: d.nodesPerRegion, shardsPerNode: shardsPerNode, cellsPerShard: cellsPerShard, placementCapacity: d.placementCapacity, nodeCapacityOps: d.nodeCapacityOps, classes: classes, transferBytesPerMs: d.transferBytesPerMs, diurnalPeriodMs: d.diurnalPeriodMs}
+
+    proc clMixedDuress(node: text, shard: ObservationShard, coordinate: Coordinate, atMs: int, readRatio: float) -> FabricMessage:
+        let sample = TelemetrySample{coordinate: coordinate, operationsPerSecond: 12000.0, readRatio: readRatio, writeRatio: 1.0 - readRatio, readLatencyUs: 40000.0, writeLatencyUs: 60000.0, cpuUtilization: 0.99, memoryUtilization: 0.95, queueDepth: 30000, cellBreakdown: [], cellBreakdownPartial: false}
+        let m = do caseTelemetryMessage(atMs, node, shard.id, shard.workloadDomain, [sample])
+        return m
+
+    proc clFeed(rt: FabricRuntime, messages: [FabricMessage]) -> FabricRuntime:
+        let mut current = rt
+        let n = len(messages)
+        let mut i = 0
+        loop i < n:
+            let handled = do fabricRuntimeHandle(current, messages[i])
+            current = handled.runtime
+            i = i + 1
+        return current
+
+    proc clProfile(p: WorkloadProfile) -> text:
+        return "ops=" + toInt(round(p.operationsPerSecond * 1000.0)) + ";r=" + toInt(round(p.readRatio * 1000000.0)) + ";w=" + toInt(round(p.writeRatio * 1000000.0)) + ";cpu=" + toInt(round(p.cpuUtilization * 1000000.0)) + ";mem=" + toInt(round(p.memoryUtilization * 1000000.0)) + ";q=" + p.queueDepth + ";p=" + toInt(round(p.pressureScore * 1000000.0))
+
+    proc clDecision(d: OptimizationDecision) -> text:
+        let action = do caseActionText(d.action)
+        let execute = do optimizationDecisionShouldExecute(d)
+        let exec = do caseBool(execute)
+        return "decision=" + action + ";gain=" + toInt(round(d.expectedGain * 1000000.0)) + ";cost=" + toInt(round(d.estimatedCost * 1000000.0)) + ";conf=" + toInt(round(d.confidence * 1000000.0)) + ";exec=" + exec
+
+    proc clOutcome(o: ExecutionOutcome) -> text:
+        return "verdict=" + o.verdict + ";expected=" + toInt(round(o.expectedGain * 1000000.0)) + ";realized=" + toInt(round(o.realizedGain * 1000000.0)) + ";ratio=" + toInt(round(o.gainRatio * 1000000.0)) + ";latency=" + toInt(round(o.latencyDeltaUs * 1000.0)) + ";throughput=" + toInt(round(o.throughputDelta * 1000.0))
+
+    proc clOwner(rt: FabricRuntime, t: ActionTarget) -> text:
+        let located = do topologyRegistryLocate(rt.topology, t.shardId, t.coordinate)
+        if located.found:
+            return located.placement.dbmsId
+        return "-"
+
+    proc clHasCutOver(rt: FabricRuntime, t: ActionTarget) -> bool:
+        let fabric = do fabricRuntimePlacement(rt)
+        let mig = do placementFabricMigration(fabric, t)
+        if !mig.has:
+            return false
+        let cut = do migrationHasCutOverOf(mig.val)
+        return cut
+
+    # ClLoop: the runtime, the simulation and the digest lines, threaded
+    # through the helpers together.
+    struct ClLoop:
+        rt: FabricRuntime
+        sim: Simulation
+        out: [text]
+        state: text
+
+    proc clStart(spec: ClusterSpec, target: ActionTarget) -> ClLoop:
+        let fresh = do simulationNew(spec)
+        let rt0 = do fabricRuntimeNew()
+        let topology = do simulationTopology(fresh)
+        let rt1 = do fabricRuntimeAdoptTopology(rt0, topology)
+        let hot = do faultHotShard(target, 3.0, 900000)
+        let injected = do simulationInject(fresh, hot)
+        let ran = do simulationRun(injected, 5)
+        let mut rt = rt1
+        let n = len(ran.ticks)
+        let mut i = 0
+        loop i < n:
+            let fed = do clFeed(rt, ran.ticks[i].messages)
+            rt = fed
+            i = i + 1
+        return ClLoop{rt: rt, sim: ran.simulation, out: [], state: "admitted"}
+
+    proc clShard(sim: Simulation, shardId: int) -> ObservationShard:
+        let world = do simulationState(sim)
+        let shard = do clusterStateShard(world, shardId)
+        return shard.val
+
+    proc clCellOwner(sim: Simulation, t: ActionTarget) -> text:
+        let world = do simulationState(sim)
+        let cell = do clusterStateCell(world, t)
+        return cell.val.owner
+
+    proc clStep(l: ClLoop) -> ClLoop:
+        let stepped = do simulationStep(l.sim)
+        let fed = do clFeed(l.rt, stepped.tick.messages)
+        return ClLoop{rt: fed, sim: stepped.simulation, out: l.out, state: l.state}
+
+    proc clSettleAndMeasure(l: ClLoop, id: ActionId, shard: ObservationShard, coordinate: Coordinate) -> ClLoop:
+        let mut current = l
+        let mut hasAfter = false
+        let zero = do workloadProfileZero()
+        let mut after = zero
+        let mut i = 0
+        loop i < 45:
+            let stepped = do clStep(current)
+            current = stepped
+            let profile = do fabricRuntimeProfile(current.rt, shard.id, coordinate)
+            hasAfter = profile.has
+            if profile.has:
+                after = profile.val
+            i = i + 1
+        let mut out = current.out
+        let shown = do clProfile(after)
+        out = append(out, "after:" + shown)
+        let measured = do fabricRuntimeMeasure(current.rt, id, after)
+        if measured.ok:
+            let o = do clOutcome(measured.outcome)
+            out = append(out, o)
+        else:
+            let shownM = do measurementErrorDisplay(measured.err)
+            out = append(out, "measure=err(" + shownM + ")")
+        let reports = do fabricControllerReports(measured.runtime.controller)
+        let mut mech = ""
+        if len(reports) > 0:
+            mech = reports[0].mechanism
+        out = append(out, "reports=" + len(reports) + ";mech=" + mech)
+        return ClLoop{rt: measured.runtime, sim: current.sim, out: out, state: current.state}
+
+    # execute: the test file's helper — step the fleet, report the copy,
+    # advance, snapshot the watched cells, mirror authority into the fleet.
+    proc clExecute(l0: ClLoop, id: ActionId, target: ActionTarget, destination: text, watch: [ActionTarget]) -> ClLoop:
+        let world = do simulationState(l0.sim)
+        let cell = do clusterStateCell(world, target)
+        let bytes = cell.val.bytes
+        let rate = do clusterStateTransferBytesPerMs(world)
+        let mut out = l0.out
+        out = append(out, "bytes=" + bytes + ";rate=" + rate)
+        let sized = do fabricRuntimePlacement(l0.rt)
+        let withSize = do placementFabricRecordSize(sized, target, bytes)
+        let rt0 = do fabricRuntimeWithPlacement(l0.rt, withSize)
+        let mut l = ClLoop{rt: rt0, sim: l0.sim, out: out, state: "admitted"}
+        let mut hasBegan = false
+        let mut began = 0
+        let mut mirrored = false
+        let mut i = 0
+        loop i < 40:
+            let stepped = do clStep(l)
+            l = stepped
+            let atMs = do simulationNowMs(l.sim)
+            let mut rt = l.rt
+            if l.state == "running:transfer":
+                if !hasBegan:
+                    hasBegan = true
+                    began = atMs
+                let copied = min(max(atMs - began, 0) * rate, bytes)
+                let mut atoms = 0
+                if copied >= bytes:
+                    atoms = 1
+                let current = do fabricRuntimePlacement(rt)
+                let recorded = do placementFabricRecordTransfer(current, target, destination, atoms, copied, atMs)
+                rt = do fabricRuntimeWithPlacement(rt, recorded)
+            let advanced = do fabricRuntimeAdvance(rt, id)
+            rt = advanced.runtime
+            let label = do caseStateText(rt, id, advanced.known, advanced.execState)
+            let mut lines = l.out
+            lines = append(lines, "" + atMs + ":" + label)
+            let placement = do fabricRuntimePlacement(rt)
+            let nw = len(watch)
+            let mut w = 0
+            loop w < nw:
+                let snapped = do caseSnap(placement, watch[w])
+                lines = append(lines, snapped)
+                w = w + 1
+            let mut sim = l.sim
+            let cutOver = do clHasCutOver(rt, target)
+            if cutOver && !mirrored:
+                let world2 = do simulationState(sim)
+                let owned = do clusterStateSetOwner(world2, target, destination)
+                sim = do simulationWithState(sim, owned.world)
+                mirrored = true
+                lines = append(lines, "mirrored")
+            if label == "awaiting-measurement":
+                if !mirrored:
+                    let world3 = do simulationState(sim)
+                    let promoted = do clusterStatePromote(world3, target, destination)
+                    sim = do simulationWithState(sim, promoted)
+                    lines = append(lines, "promoted")
+                i = 40
+            l = ClLoop{rt: rt, sim: sim, out: lines, state: label}
+            i = i + 1
+        return l
+
+    proc clIsolate() -> [text]:
+        let spec = do clSpec(["WriteHeavy"], 2, 1)
+        let probe = do simulationNew(spec)
+        let targets = do simulationTargets(probe)
+        let target = targets[0]
+        let mut l = do clStart(spec, target)
+        let shard = do clShard(l.sim, target.shardId)
+        let source = do clCellOwner(l.sim, target)
+        let shownTarget = do actionTargetDisplay(target)
+        let mut out = []
+        out = append(out, "target=" + shownTarget + ";source=" + source + ";clock=" + l.rt.clockMs)
+        let now0 = do simulationNowMs(l.sim)
+        let duress = do clMixedDuress(source, shard, target.coordinate, now0, 0.10)
+        let handled = do fabricRuntimeHandle(l.rt, duress)
+        let mut rt = handled.runtime
+        let profile = do fabricRuntimeProfile(rt, shard.id, target.coordinate)
+        let baseline = profile.val
+        let shownBaseline = do clProfile(baseline)
+        out = append(out, "baseline:" + shownBaseline)
+        let decision = do fabricRuntimeOptimize(rt, baseline)
+        let shownDecision = do clDecision(decision)
+        out = append(out, shownDecision)
+        let view = do fabricRuntimeFleetView(rt)
+        let envelope = do decisionEnvelopeNew(decision, now0, view.generation)
+        let submitted = do fabricRuntimeSubmit(rt, envelope, baseline)
+        rt = submitted.runtime
+        if !submitted.ok:
+            let shownErr = do validationErrorDisplay(submitted.err)
+            out = append(out, "submit=err(" + shownErr + ")")
+            return out
+        let id = submitted.id
+        let record = do fabricControllerRecord(rt.controller, id)
+        let destination = record.val.plan.adds[0].value
+        out = append(out, "id=" + id.value + ";dest=" + destination)
+        let p0 = do fabricRuntimePlacement(rt)
+        let s0 = do caseSnap(p0, target)
+        out = append(out, s0)
+        let world = do simulationState(l.sim)
+        let cell = do clusterStateCell(world, target)
+        let bytes = cell.val.bytes
+        let rate = do clusterStateTransferBytesPerMs(world)
+        let sizedFabric = do placementFabricRecordSize(p0, target, bytes)
+        rt = do fabricRuntimeWithPlacement(rt, sizedFabric)
+        out = append(out, "bytes=" + bytes + ";rate=" + rate)
+        l = ClLoop{rt: rt, sim: l.sim, out: out, state: "admitted"}
+        let mut hasBegan = false
+        let mut began = 0
+        let mut writes = 0
+        let mut applied = false
+        let mut mirrored = false
+        let mut i = 0
+        loop i < 30:
+            let stepped = do clStep(l)
+            l = stepped
+            let atMs = do simulationNowMs(l.sim)
+            let mut rtStep = l.rt
+            let mut lines = l.out
+            if l.state == "running:transfer":
+                if !hasBegan:
+                    hasBegan = true
+                    began = atMs
+                let copied = min(max(atMs - began, 0) * rate, bytes)
+                let mut atoms = 0
+                if copied >= bytes:
+                    atoms = 1
+                let current = do fabricRuntimePlacement(rtStep)
+                let recorded = do placementFabricRecordTransfer(current, target, destination, atoms, copied, atMs)
+                rtStep = do fabricRuntimeWithPlacement(rtStep, recorded)
+                if writes == 0:
+                    let current2 = do fabricRuntimePlacement(rtStep)
+                    let written = do placementFabricAcceptWrite(current2, target, 0)
+                    if written.ok:
+                        if written.route == "source":
+                            lines = append(lines, "write=Ok(Source)")
+                        else:
+                            lines = append(lines, "write=Ok(Destination)")
+                    else:
+                        let shownW = do fabricErrorDisplay(written.err)
+                        lines = append(lines, "write=Err(\"" + shownW + "\")")
+                    rtStep = do fabricRuntimeWithPlacement(rtStep, written.fabric)
+                    writes = writes + 1
+            if l.state == "running:cutover" && !applied:
+                let fencedFabric = do fabricRuntimePlacement(rtStep)
+                let fencedSnap = do caseSnap(fencedFabric, target)
+                lines = append(lines, "fenced:" + fencedSnap)
+                let appliedResult = do placementFabricRecordApplied(fencedFabric, target, 0, atMs)
+                if appliedResult.ok:
+                    lines = append(lines, "applied=Ok(())")
+                else:
+                    let shownA = do fabricErrorDisplay(appliedResult.err)
+                    lines = append(lines, "applied=Err(\"" + shownA + "\")")
+                rtStep = do fabricRuntimeWithPlacement(rtStep, appliedResult.fabric)
+                applied = true
+            let advanced = do fabricRuntimeAdvance(rtStep, id)
+            rtStep = advanced.runtime
+            let label = do caseStateText(rtStep, id, advanced.known, advanced.execState)
+            lines = append(lines, "" + atMs + ":" + label)
+            let placement = do fabricRuntimePlacement(rtStep)
+            let snapped = do caseSnap(placement, target)
+            lines = append(lines, snapped)
+            let mut sim = l.sim
+            let cutOver = do clHasCutOver(rtStep, target)
+            if cutOver && !mirrored:
+                let world2 = do simulationState(sim)
+                let owned = do clusterStateSetOwner(world2, target, destination)
+                sim = do simulationWithState(sim, owned.world)
+                mirrored = true
+                lines = append(lines, "mirrored")
+            l = ClLoop{rt: rtStep, sim: sim, out: lines, state: label}
+            if label == "awaiting-measurement":
+                i = 30
+            i = i + 1
+        let finalFabric = do fabricRuntimePlacement(l.rt)
+        let finalMig = do placementFabricMigration(finalFabric, target)
+        let rtOwner = do clOwner(l.rt, target)
+        let mut lines2 = l.out
+        lines2 = append(lines2, "history=" + len(finalMig.val.history) + ";rtowner=" + rtOwner)
+        let cool = do faultHotShard(target, 1.0, 0)
+        let cooled = do simulationInject(l.sim, cool)
+        let measured = do clSettleAndMeasure(ClLoop{rt: l.rt, sim: cooled, out: lines2, state: l.state}, id, shard, target.coordinate)
+        return measured.out
+
+    proc clMoveOneCell() -> [text]:
+        let spec = do clSpec(["Mixed"], 1, 2)
+        let probe = do simulationNew(spec)
+        let targets = do simulationTargets(probe)
+        let target = targets[0]
+        let mut sibling = target
+        let nt = len(targets)
+        let mut k = nt - 1
+        loop k >= 0:
+            let c = targets[k]
+            if c.shardId == target.shardId && !(c.coordinate.x == target.coordinate.x && c.coordinate.y == target.coordinate.y):
+                sibling = c
+            k = k - 1
+        let l0 = do clStart(spec, target)
+        let shard = do clShard(l0.sim, target.shardId)
+        let source = do clCellOwner(l0.sim, target)
+        let siblingOwner = do clCellOwner(l0.sim, sibling)
+        let shownTarget = do actionTargetDisplay(target)
+        let shownSibling = do actionTargetDisplay(sibling)
+        let mut out = []
+        out = append(out, "target=" + shownTarget + ";sibling=" + shownSibling + ";source=" + source + ";sibowner=" + siblingOwner)
+        let now0 = do simulationNowMs(l0.sim)
+        let duress = do clMixedDuress(source, shard, target.coordinate, now0, 0.55)
+        let handled = do fabricRuntimeHandle(l0.rt, duress)
+        let mut rt = handled.runtime
+        let profile = do fabricRuntimeProfile(rt, shard.id, target.coordinate)
+        let baseline = profile.val
+        let shownBaseline = do clProfile(baseline)
+        out = append(out, "baseline:" + shownBaseline)
+        let decision = do fabricRuntimeOptimize(rt, baseline)
+        let shownDecision = do clDecision(decision)
+        out = append(out, shownDecision)
+        let mut destination = "-"
+        if decision.action.kind == "Move":
+            destination = decision.action.target
+        let view = do fabricRuntimeFleetView(rt)
+        let known = do fleetViewGet(view, DbmsId{value: destination})
+        let knownText = do caseBool(known.found)
+        out = append(out, "known=" + knownText)
+        let envelope = do decisionEnvelopeNew(decision, now0, view.generation)
+        let submitted = do fabricRuntimeSubmit(rt, envelope, baseline)
+        rt = submitted.runtime
+        if !submitted.ok:
+            let shownErr = do validationErrorDisplay(submitted.err)
+            out = append(out, "submit=err(" + shownErr + ")")
+            return out
+        let id = submitted.id
+        let record = do fabricControllerRecord(rt.controller, id)
+        let adds = do caseJoinIds(record.val.plan.adds)
+        out = append(out, "id=" + id.value + ";adds=" + adds)
+        let p0 = do fabricRuntimePlacement(rt)
+        let s0 = do caseSnap(p0, sibling)
+        out = append(out, s0)
+        let executed = do clExecute(ClLoop{rt: rt, sim: l0.sim, out: out, state: "admitted"}, id, target, destination, [target, sibling])
+        let mut lines = executed.out
+        lines = append(lines, "final=" + executed.state)
+        let fabric = do fabricRuntimePlacement(executed.rt)
+        let sibSet = do placementFabricReplicaSet(fabric, sibling)
+        let sibMig = do placementFabricMigration(fabric, sibling)
+        let entry = do tableShardLookup(fabric.routing, target.shardId)
+        let scoped = do tableShardEntryScopedCells(entry.entry)
+        let mut scopedText = ""
+        let ns = len(scoped)
+        let mut s = 0
+        loop s < ns:
+            if s > 0:
+                scopedText = scopedText + ";"
+            scopedText = scopedText + scoped[s].x + "," + scoped[s].y
+            s = s + 1
+        let a = do caseBool(sibSet.has)
+        let b = do caseBool(sibMig.has)
+        let c2 = do caseBool(entry.entry.hasReplicas)
+        let d = do caseBool(entry.entry.hasMigration)
+        lines = append(lines, "sibset=" + a + ";sibmig=" + b + ";shardset=" + c2 + ";shardmig=" + d + ";scoped=" + scopedText)
+        let ownerT = do clOwner(executed.rt, target)
+        let ownerS = do clOwner(executed.rt, sibling)
+        lines = append(lines, "rtowner=" + ownerT + ";sibrtowner=" + ownerS)
+        let cool = do faultHotShard(target, 1.0, 0)
+        let cooled = do simulationInject(executed.sim, cool)
+        let measured = do clSettleAndMeasure(ClLoop{rt: executed.rt, sim: cooled, out: lines, state: executed.state}, id, shard, target.coordinate)
+        return measured.out
+
+    proc clReplicate() -> [text]:
+        let spec = do clSpec(["ReadHeavy"], 2, 1)
+        let probe = do simulationNew(spec)
+        let targets = do simulationTargets(probe)
+        let target = targets[0]
+        let l0 = do clStart(spec, target)
+        let shard = do clShard(l0.sim, target.shardId)
+        let source = do clCellOwner(l0.sim, target)
+        let shownTarget = do actionTargetDisplay(target)
+        let mut out = []
+        out = append(out, "target=" + shownTarget + ";source=" + source)
+        let now0 = do simulationNowMs(l0.sim)
+        let duress = do clMixedDuress(source, shard, target.coordinate, now0, 0.90)
+        let handled = do fabricRuntimeHandle(l0.rt, duress)
+        let mut rt = handled.runtime
+        let profile = do fabricRuntimeProfile(rt, shard.id, target.coordinate)
+        let baseline = profile.val
+        let shownBaseline = do clProfile(baseline)
+        out = append(out, "baseline:" + shownBaseline)
+        let decision = do fabricRuntimeOptimize(rt, baseline)
+        let shownDecision = do clDecision(decision)
+        out = append(out, shownDecision)
+        let mut destination = "-"
+        if decision.action.kind == "Replicate":
+            destination = decision.action.target
+        let view = do fabricRuntimeFleetView(rt)
+        let status = do fleetViewGet(view, DbmsId{value: destination})
+        if status.found:
+            let full = do nodeStatusIsFull(status.status)
+            let fullText = do caseBool(full)
+            out = append(out, "status=" + status.status.condition + ":" + fullText + ":" + status.status.hostedPlacements)
+        let envelope = do decisionEnvelopeNew(decision, now0, view.generation)
+        let submitted = do fabricRuntimeSubmit(rt, envelope, baseline)
+        rt = submitted.runtime
+        if !submitted.ok:
+            let shownErr = do validationErrorDisplay(submitted.err)
+            out = append(out, "submit=err(" + shownErr + ")")
+            return out
+        let id = submitted.id
+        let executed = do clExecute(ClLoop{rt: rt, sim: l0.sim, out: out, state: "admitted"}, id, target, destination, [target])
+        let mut lines = executed.out
+        lines = append(lines, "final=" + executed.state)
+        let fabric = do fabricRuntimePlacement(executed.rt)
+        let cellSet = do placementFabricReplicaSet(fabric, target)
+        let reads = do replGroupReadTargets(cellSet.val, false)
+        let ownerT = do clOwner(executed.rt, target)
+        lines = append(lines, "reads=" + len(reads) + ";rtowner=" + ownerT)
+        let measured = do clSettleAndMeasure(ClLoop{rt: executed.rt, sim: executed.sim, out: lines, state: executed.state}, id, shard, target.coordinate)
+        return measured.out
+
+    # Paths the crate's own tests leave untraced: a Workload message, a
+    # Topology report, the tick-driven advanceActions and an operator abort.
+    proc caseRuntimeMisc() -> [text]:
+        let mut out = []
+        let mut rt = do fabricRuntimeNew()
+        let ids = ["db-a", "db-b", "db-c"]
+        let regions = ["us-east", "us-west", "us-west"]
+        let mut i = 0
+        loop i < 3:
+            let registration = do caseRegisterMessage(ids[i], regions[i])
+            let handled = do fabricRuntimeHandle(rt, registration)
+            rt = handled.runtime
+            i = i + 1
+        rt = do caseHeartbeatAll(rt, 1000)
+        let base = do caseMessage("Workload")
+        let workload = FabricMessage{kind: base.kind, registerNode: base.registerNode, heartbeat: base.heartbeat, topology: base.topology, telemetry: base.telemetry, workload: WorkloadObservation{nodeId: "db-a", coordinate: Coordinate{x: 1, y: 2}, timestampMs: 1500, operationsPerSecond: 800.0, readRatio: 0.25, writeRatio: 0.75}}
+        let h1 = do fabricRuntimeHandle(rt, workload)
+        rt = h1.runtime
+        let r1 = do caseResponse(h1.response)
+        out = append(out, r1)
+        let profile = do fabricRuntimeProfile(rt, 0, Coordinate{x: 1, y: 2})
+        let stateLen = do fabricStateLen(rt.state)
+        let analyzerLen = do workloadAnalyzerLen(rt.analyzer)
+        out = append(out, "clock=" + rt.clockMs + ";state=" + stateLen + ";analyzer=" + analyzerLen + ";ops=" + toInt(round(profile.val.operationsPerSecond * 1000.0)) + ";r=" + toInt(round(profile.val.readRatio * 1000.0)) + ";w=" + toInt(round(profile.val.writeRatio * 1000.0)))
+        let tbase = do caseMessage("Topology")
+        let report = TopologyReport{nodeId: DbmsId{value: "db-a"}, timestampMs: 1600, placements: [ProtocolPlacement{coordinate: Coordinate{x: 3, y: 4}, dbmsId: DbmsId{value: "db-a"}, region: "us-east"}, ProtocolPlacement{coordinate: Coordinate{x: 0, y: 1}, dbmsId: DbmsId{value: "db-c"}, region: "us-west"}]}
+        let topologyMessage = FabricMessage{kind: tbase.kind, registerNode: tbase.registerNode, heartbeat: tbase.heartbeat, topology: report, telemetry: tbase.telemetry, workload: tbase.workload}
+        let h2 = do fabricRuntimeHandle(rt, topologyMessage)
+        rt = h2.runtime
+        let r2 = do caseResponse(h2.response)
+        out = append(out, r2)
+        let placements = do topologyRegistryPlacements(rt.topology)
+        let mut placedList = []
+        let np = len(placements)
+        let mut pi = 0
+        loop pi < np:
+            let p = placements[pi]
+            let entry = "" + p.shardId + ":" + p.coordinate.x + "," + p.coordinate.y + ":" + p.dbmsId
+            let mut sorted = []
+            let mut placed = false
+            let ns = len(placedList)
+            let mut si = 0
+            loop si < ns:
+                if !placed && entry < placedList[si]:
+                    sorted = append(sorted, entry)
+                    placed = true
+                sorted = append(sorted, placedList[si])
+                si = si + 1
+            if !placed:
+                sorted = append(sorted, entry)
+            placedList = sorted
+            pi = pi + 1
+        let mut placedText = ""
+        let mut pj = 0
+        loop pj < len(placedList):
+            if pj > 0:
+                placedText = placedText + ","
+            placedText = placedText + placedList[pj]
+            pj = pj + 1
+        let fabric0 = do fabricRuntimePlacement(rt)
+        out = append(out, "clock=" + rt.clockMs + ";placed=" + placedText + ";gen=" + fabric0.generation)
+        let t1 = ActionTarget{shardId: 51, coordinate: Coordinate{x: 3, y: 4}}
+        let t2 = ActionTarget{shardId: 12, coordinate: Coordinate{x: 0, y: 1}}
+        let targets = [t1, t2]
+        let dests = ["db-b", "db-a"]
+        let sources = ["db-a", "db-c"]
+        let mut actionIds = []
+        let mut k = 0
+        loop k < 2:
+            let t = targets[k]
+            let move = do optimizationActionMove(dests[k])
+            let decision = OptimizationDecision{shardId: t.shardId, coordinate: t.coordinate, action: move, expectedGain: 0.9, estimatedCost: 0.1, confidence: 0.95}
+            let metrics = do workloadMetricsDefault()
+            let baseline = do workloadProfileFromMetrics(t.shardId, t.coordinate, metrics)
+            let view = do fabricRuntimeFleetView(rt)
+            let envelope = do decisionEnvelopeNew(decision, 1600, view.generation)
+            let submitted = do fabricRuntimeSubmit(rt, envelope, baseline)
+            rt = submitted.runtime
+            if submitted.ok:
+                out = append(out, "submit=" + submitted.id.value + ":" + sources[k])
+                actionIds = append(actionIds, submitted.id)
+            else:
+                let shownErr = do validationErrorDisplay(submitted.err)
+                out = append(out, "submit=err(" + shownErr + ")")
+            k = k + 1
+        let mut step = 0
+        loop step < 3:
+            let at = 2000 + step * 1000
+            rt = do caseHeartbeatAll(rt, at)
+            let ticked = do fabricRuntimeAdvanceActions(rt)
+            rt = ticked.runtime
+            let mut line = ""
+            let nt = len(ticked.ids)
+            let mut ti = 0
+            loop ti < nt:
+                let label = do caseStateText(rt, ticked.ids[ti], true, ticked.states[ti])
+                if ti > 0:
+                    line = line + ","
+                line = line + ticked.ids[ti].value + ":" + label
+                ti = ti + 1
+            out = append(out, "tick" + step + "=" + line)
+            let placement = do fabricRuntimePlacement(rt)
+            let s1 = do caseSnap(placement, t1)
+            let s2 = do caseSnap(placement, t2)
+            out = append(out, s1)
+            out = append(out, s2)
+            step = step + 1
+        if len(actionIds) == 0:
+            return out
+        let aborted = do fabricRuntimeAbort(rt, actionIds[0])
+        rt = aborted.runtime
+        let abortLabel = do caseStateText(rt, actionIds[0], aborted.known, aborted.execState)
+        out = append(out, "abort=" + abortLabel)
+        let placement2 = do fabricRuntimePlacement(rt)
+        let s3 = do caseSnap(placement2, t1)
+        out = append(out, s3)
+        let again = do fabricRuntimeAbort(rt, actionIds[0])
+        rt = again.runtime
+        let againLabel = do caseStateText(rt, actionIds[0], again.known, again.execState)
+        out = append(out, "abortAgain=" + againLabel)
+        let unknown = do fabricRuntimeAbort(rt, ActionId{value: 99})
+        let unknownLabel = do caseStateText(rt, ActionId{value: 99}, unknown.known, unknown.execState)
+        out = append(out, "abortUnknown=" + unknownLabel)
+        let reports = do fabricControllerReports(rt.controller)
+        let mut reportText = ""
+        let nr = len(reports)
+        let mut ri = 0
+        loop ri < nr:
+            if ri > 0:
+                reportText = reportText + ";"
+            let mut failure = ""
+            if reports[ri].hasFailure:
+                failure = reports[ri].failure
+            reportText = reportText + reports[ri].actionId.value + ":" + reports[ri].verdict + ":" + failure
+            ri = ri + 1
+        out = append(out, "reports=" + reportText)
+        return out
+
+    proc caseJoin(parts: [text]) -> text:
+        let mut out = ""
+        let n = len(parts)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + "|"
+            out = out + parts[i]
+            i = i + 1
+        return out
+
+    proc runtimeCase(name: text) -> text:
+        let mut parts = []
+        if name == "mechCutoverVerification":
+            let r1 = do caseMechCutoverVerification()
+            parts = r1
+        if name == "mechRoutingLearns":
+            let r2 = do caseMechRoutingLearns()
+            parts = r2
+        if name == "mechSibling":
+            let r3 = do caseMechSibling()
+            parts = r3
+        if name == "mechRollbackBefore":
+            let r4 = do caseMechRollbackBefore()
+            parts = r4
+        if name == "mechRollbackAfter":
+            let r5 = do caseMechRollbackAfter()
+            parts = r5
+        if name == "mechReplicate":
+            let r6 = do caseMechReplicate()
+            parts = r6
+        if name == "mechPlans":
+            let r7 = do caseMechPlans()
+            parts = r7
+        if name == "registry":
+            let r8 = do caseRegistry()
+            parts = r8
+        if name == "lib":
+            let r9 = do caseLib()
+            parts = r9
+        if name == "runtimeLoop":
+            let r10 = do caseRuntimeLoop()
+            parts = r10
+        if name == "controlLoopIsolate":
+            let r11 = do clIsolate()
+            parts = r11
+        if name == "controlLoopMoveOneCell":
+            let r12 = do clMoveOneCell()
+            parts = r12
+        if name == "controlLoopReplicate":
+            let r13 = do clReplicate()
+            parts = r13
+        if name == "runtimeMisc":
+            let r14 = do caseRuntimeMisc()
+            parts = r14
+        let joined = do caseJoin(parts)
+        return joined
+
+    state runtimeCaseOut: text = ""
+
+    action runRuntimeCase(name: text):
+        let out = do runtimeCase(name)
+        runtimeCaseOut = out

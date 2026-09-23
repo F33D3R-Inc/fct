@@ -1,0 +1,251 @@
+import "fabric_daemon_status.fct"
+import "http_client.fct"
+
+app FabricDaemonAdminSelfHost:
+    # Port of fabric/crates/fabric-daemon/src/admin.rs: the operator port's
+    # routes as pure request -> response procs, exactly as the crate's axum
+    # router answers them (fabric_daemon_test.go drives the real router with
+    # the same requests):
+    #
+    #   GET /healthz                 unauthenticated "ok\n"
+    #   GET /status /fleet /placements /routing /actions /actions/history
+    #                                the snapshot, or a part of it, as JSON
+    #   POST /actions/{id}/transfer  a mover's transfer report -> the loop
+    #   POST /actions/{id}/abort     an abort -> the loop
+    #   anything else                404 "fabricd: no such admin route\n"
+    #
+    # with axum's own behaviour around them: a GET route answers HEAD with
+    # no body; a known path under another method is 405 with `allow`; the
+    # `{id}` segment is percent-decoded and parsed as a u64 before anything
+    # else runs (400 "Invalid URL: Cannot parse `x` to a `u64`"), so even an
+    # unauthenticated request with a bad id is refused for its id. Every
+    # other route checks `x-api-key` first, compared in time that does not
+    # depend on the matching prefix.
+    #
+    # A write is a question for the control loop: the route answers
+    # `ask` with the DaemonControlAsk, and daemonAdminAnswer turns the
+    # loop's reply (ok / err / the loop stopped / it stopped before
+    # answering) into the response. Names are prefixed `dad` / `daemon` /
+    # `Daemon`.
+
+    struct DaemonAdminRequest:
+        method: text
+        target: text
+        headers: [HttpHeader]
+        body: text
+
+    struct DaemonAdminResponse:
+        status: int
+        contentType: text
+        allow: text
+        body: text
+
+    # What the operator port asks the control loop: kind "Transfer" or
+    # "Abort".
+    struct DaemonControlAsk:
+        kind: text
+        id: int
+        atomsCopied: int
+        bytesCopied: int
+        hasResident: bool
+        residentBytes: int
+
+    struct DaemonAdminOutcome:
+        ask: bool
+        request: DaemonControlAsk
+        response: DaemonAdminResponse
+
+    proc dadText(status: int, body: text) -> DaemonAdminResponse:
+        return DaemonAdminResponse{status: status, contentType: "text/plain; charset=utf-8", allow: "-", body: body}
+
+    proc dadJson(body: text) -> DaemonAdminResponse:
+        return DaemonAdminResponse{status: 200, contentType: "application/json", allow: "-", body: body}
+
+    proc dadNoAsk() -> DaemonControlAsk:
+        return DaemonControlAsk{kind: "", id: 0, atomsCopied: 0, bytesCopied: 0, hasResident: false, residentBytes: 0}
+
+    proc dadAnswered(r: DaemonAdminResponse) -> DaemonAdminOutcome:
+        return DaemonAdminOutcome{ask: false, request: dadNoAsk(), response: r}
+
+    # `authorized`: equal bytes and equal length, every byte compared
+    # whatever matched before it (the length difference folded in as a u8).
+    proc daemonAuthorized(presented: text, expected: text) -> bool:
+        let a = textToBytes(presented)
+        let b = textToBytes(expected)
+        let mut difference = (len(a) ^ len(b)) & 255
+        let n = max(len(a), len(b))
+        let mut i = 0
+        loop i < n:
+            let mut left = 0
+            if i < len(a):
+                left = a[i]
+            let mut right = 0
+            if i < len(b):
+                right = b[i]
+            difference = difference | (left ^ right)
+            i = i + 1
+        return difference == 0
+
+    # HeaderMap::get("x-api-key").to_str(): the first such header, "" when
+    # absent or not visible ASCII.
+    proc dadApiKey(headers: [HttpHeader]) -> text:
+        let n = len(headers)
+        let mut k = 0
+        loop k < n:
+            if lower(headers[k].name) == "x-api-key":
+                let bs = textToBytes(headers[k].value)
+                let mut i = 0
+                loop i < len(bs):
+                    if (bs[i] < 32 && bs[i] != 9) || bs[i] > 126:
+                        return ""
+                    i = i + 1
+                return headers[k].value
+            k = k + 1
+        return ""
+
+    proc dadUnauthorized() -> DaemonAdminResponse:
+        return dadText(401, "fabricd: the operator surface requires x-api-key\n")
+
+    proc dadHexValue(c: int) -> int:
+        if c >= 48 && c <= 57:
+            return c - 48
+        if c >= 97 && c <= 102:
+            return c - 87
+        if c >= 65 && c <= 70:
+            return c - 55
+        return -1
+
+    # percent_decode_str: `%` and two hex digits is that byte; anything else
+    # (including a `%` not followed by two hex digits) is itself.
+    proc dadPercentDecode(s: text) -> text:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            if bs[i] == 37 && i + 2 < n:
+                let hi = do dadHexValue(bs[i + 1])
+                let lo = do dadHexValue(bs[i + 2])
+                if hi >= 0 && lo >= 0:
+                    out = append(out, hi * 16 + lo)
+                    i = i + 3
+                else:
+                    out = append(out, bs[i])
+                    i = i + 1
+            else:
+                out = append(out, bs[i])
+                i = i + 1
+        return bytesToText(out)
+
+    struct DadId:
+        ok: bool
+        id: int
+
+    # `str::parse::<u64>`: an optional `+`, then one or more digits, no
+    # overflow.
+    proc dadParseU64(s: text) -> DadId:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut i = 0
+        if n > 0 && bs[0] == 43:
+            i = 1
+        if i >= n:
+            return DadId{ok: false, id: 0}
+        let mut v = 0
+        loop i < n:
+            let c = bs[i]
+            if c < 48 || c > 57:
+                return DadId{ok: false, id: 0}
+            let over = do sjMulOverflows(v, c - 48)
+            if over:
+                return DadId{ok: false, id: 0}
+            v = v * 10 + (c - 48)
+            i = i + 1
+        return DadId{ok: true, id: v}
+
+    # TransferReport: deny_unknown_fields; atoms_copied (usize, default),
+    # bytes_copied (u64), resident_bytes (Option<u64>, default).
+    proc daemonTransferReportTypes() -> [SjType]:
+        return [sjOptionType("Option<u64>", "u64"), sjStructTypeDeny("TransferReport", "struct TransferReport", ["atoms_copied", "bytes_copied", "resident_bytes"], ["usize", "u64", "Option<u64>"], [true, false, true])]
+
+    proc dadIsGetRoute(path: text) -> bool:
+        return path == "/status" || path == "/fleet" || path == "/placements" || path == "/routing" || path == "/actions" || path == "/actions/history"
+
+    # The routes' bodies for one snapshot.
+    proc dadGetBody(path: text, s: DaemonStatus) -> text:
+        if path == "/status":
+            return daemonStatusJson(s)
+        if path == "/fleet":
+            return daemonBackendsJson(s.backends)
+        if path == "/placements":
+            return daemonPlacementsJson(s.placements)
+        if path == "/routing":
+            return daemonRoutingJson(s)
+        if path == "/actions":
+            return daemonActionsJson(s.inFlight)
+        return daemonHistoryJson(s.history)
+
+    proc dadWithoutBody(r: DaemonAdminResponse, method: text) -> DaemonAdminResponse:
+        if method == "HEAD":
+            return DaemonAdminResponse{status: r.status, contentType: r.contentType, allow: r.allow, body: ""}
+        return r
+
+    proc dadMethodNotAllowed(allow: text) -> DaemonAdminResponse:
+        return DaemonAdminResponse{status: 405, contentType: "-", allow: allow, body: ""}
+
+    # One request to the operator port, against the published snapshot.
+    proc daemonAdminRoute(req: DaemonAdminRequest, status: DaemonStatus, token: text) -> DaemonAdminOutcome:
+        let q = split(req.target, "?")
+        let path = q[0]
+        let isGet = req.method == "GET" || req.method == "HEAD"
+        if path == "/healthz":
+            if !isGet:
+                return dadAnswered(dadMethodNotAllowed("GET,HEAD"))
+            return dadAnswered(dadWithoutBody(dadText(200, "ok\n"), req.method))
+        let getRoute = do dadIsGetRoute(path)
+        if getRoute:
+            if !isGet:
+                return dadAnswered(dadMethodNotAllowed("GET,HEAD"))
+            let authorized = do daemonAuthorized(dadApiKey(req.headers), token)
+            if !authorized:
+                return dadAnswered(dadWithoutBody(dadUnauthorized(), req.method))
+            return dadAnswered(dadWithoutBody(dadJson(dadGetBody(path, status)), req.method))
+        let segments = split(path, "/")
+        let actionRoute = len(segments) == 4 && segments[0] == "" && segments[1] == "actions" && (segments[3] == "transfer" || segments[3] == "abort")
+        if !actionRoute:
+            return dadAnswered(dadText(404, "fabricd: no such admin route\n"))
+        if req.method != "POST":
+            return dadAnswered(dadMethodNotAllowed("POST"))
+        let raw = do dadPercentDecode(segments[2])
+        let id = do dadParseU64(raw)
+        if !id.ok:
+            return dadAnswered(dadText(400, "Invalid URL: Cannot parse `" + raw + "` to a `u64`"))
+        let authorized2 = do daemonAuthorized(dadApiKey(req.headers), token)
+        if !authorized2:
+            return dadAnswered(dadUnauthorized())
+        if segments[3] == "abort":
+            return DaemonAdminOutcome{ask: true, request: DaemonControlAsk{kind: "Abort", id: id.id, atomsCopied: 0, bytesCopied: 0, hasResident: false, residentBytes: 0}, response: dadText(0, "")}
+        let parsed = do sjDecode(daemonTransferReportTypes(), req.body, "TransferReport")
+        if !parsed.ok:
+            return dadAnswered(dadText(400, "fabricd: " + parsed.err + "\n"))
+        let v = parsed.v
+        let mut atoms = 0
+        if v.items[0].kind == "num":
+            atoms = v.items[0].u
+        if sjU64Gt(atoms, 1):
+            atoms = 1
+        let resident = v.items[2]
+        return DaemonAdminOutcome{ask: true, request: DaemonControlAsk{kind: "Transfer", id: id.id, atomsCopied: atoms, bytesCopied: v.items[1].u, hasResident: resident.kind == "num", residentBytes: resident.u}, response: dadText(0, "")}
+
+    # `ask`'s response for the loop's reply: kind "ok" (200, the message),
+    # "err" (409, a refusal is the control plane declining, not a bad
+    # request), "stopped" (the loop is gone) or "dropped" (it stopped before
+    # answering).
+    proc daemonAdminAnswer(kind: text, message: text) -> DaemonAdminResponse:
+        if kind == "ok":
+            return dadText(200, message + "\n")
+        if kind == "err":
+            return dadText(409, "fabricd: " + message + "\n")
+        if kind == "stopped":
+            return dadText(503, "fabricd: the control loop has stopped\n")
+        return dadText(503, "fabricd: the control loop stopped before answering\n")

@@ -1,0 +1,157 @@
+import "fabric_facetql_mover.fct"
+import "fabric_daemon_status.fct"
+
+app FabricDaemonMoverSelfHost:
+    # Port of fabric/crates/fabric-daemon/src/mover.rs's MoverSupervisor:
+    # exactly one copy per in-flight relocation, started the first time the
+    # control loop sees that action reach a copying phase and never a second
+    # time, with every copy that could not even be started kept — by action
+    # id, with its reason — for the status page.
+    #
+    # The supervisor is bookkeeping over values; starting a copy is the
+    # caller's to do with the DaemonCopyStart it is handed (the copy itself
+    # is fabric_facetql_mover.fct's CellMover). `stop` names the copies whose
+    # task must end. Names are prefixed `dmv` / `daemon` / `Daemon`.
+
+    struct DaemonMoverRunning:
+        id: int
+        destination: text
+
+    struct DaemonMovers:
+        running: [DaemonMoverRunning]
+        refusals: [DaemonRefusedCopy]
+
+    proc daemonMoversNew() -> DaemonMovers:
+        return DaemonMovers{running: [], refusals: []}
+
+    proc dmvRunningIndex(m: DaemonMovers, id: int) -> int:
+        let n = len(m.running)
+        let mut k = 0
+        loop k < n:
+            if m.running[k].id == id:
+                return k
+            k = k + 1
+        return -1
+
+    proc daemonMoversIsRunning(m: DaemonMovers, id: int) -> bool:
+        let k = do dmvRunningIndex(m, id)
+        return k >= 0
+
+    # BTreeMap order: by action id (ids are u64 and small here).
+    proc dmvInsertRunning(xs: [DaemonMoverRunning], r: DaemonMoverRunning) -> [DaemonMoverRunning]:
+        let mut out = []
+        let mut placed = false
+        let n = len(xs)
+        let mut k = 0
+        loop k < n:
+            if !placed && r.id < xs[k].id:
+                out = append(out, r)
+                placed = true
+            out = append(out, xs[k])
+            k = k + 1
+        if !placed:
+            out = append(out, r)
+        return out
+
+    proc dmvWithRefusal(xs: [DaemonRefusedCopy], r: DaemonRefusedCopy) -> [DaemonRefusedCopy]:
+        let mut out = []
+        let mut placed = false
+        let n = len(xs)
+        let mut k = 0
+        loop k < n:
+            if xs[k].id == r.id:
+                out = append(out, r)
+                placed = true
+            else:
+                if !placed && r.id < xs[k].id:
+                    out = append(out, r)
+                    placed = true
+                out = append(out, xs[k])
+            k = k + 1
+        if !placed:
+            out = append(out, r)
+        return out
+
+    proc dmvWithoutRefusal(xs: [DaemonRefusedCopy], id: int) -> [DaemonRefusedCopy]:
+        let mut out = []
+        let n = len(xs)
+        let mut k = 0
+        loop k < n:
+            if xs[k].id != id:
+                out = append(out, xs[k])
+            k = k + 1
+        return out
+
+    # ensure: the copy for `id` is running (a new one is recorded; one
+    # already running is left alone), and any refusal for it is forgotten.
+    # `started` says whether the caller must now start the copy.
+    struct DaemonMoversEnsured:
+        movers: DaemonMovers
+        started: bool
+
+    proc daemonMoversEnsure(m: DaemonMovers, id: int, destination: text) -> DaemonMoversEnsured:
+        let running = do daemonMoversIsRunning(m, id)
+        if running:
+            return DaemonMoversEnsured{movers: m, started: false}
+        let next = DaemonMovers{running: dmvInsertRunning(m.running, DaemonMoverRunning{id: id, destination: destination}), refusals: dmvWithoutRefusal(m.refusals, id)}
+        return DaemonMoversEnsured{movers: next, started: true}
+
+    # refuse: record that no copy could be started for `id` — unless one is
+    # running.
+    proc daemonMoversRefuse(m: DaemonMovers, id: int, reason: text) -> DaemonMovers:
+        let running = do daemonMoversIsRunning(m, id)
+        if running:
+            return m
+        return DaemonMovers{running: m.running, refusals: dmvWithRefusal(m.refusals, DaemonRefusedCopy{id: id, reason: reason})}
+
+    # stop: forget the copy for `id` (its task is the caller's to end).
+    proc daemonMoversStop(m: DaemonMovers, id: int) -> DaemonMovers:
+        let mut running = []
+        let n = len(m.running)
+        let mut k = 0
+        loop k < n:
+            if m.running[k].id != id:
+                running = append(running, m.running[k])
+            k = k + 1
+        return DaemonMovers{running: running, refusals: m.refusals}
+
+    proc daemonMoversStopAll(m: DaemonMovers) -> DaemonMovers:
+        return DaemonMovers{running: [], refusals: m.refusals}
+
+    proc dmvContains(ids: [int], id: int) -> bool:
+        let n = len(ids)
+        let mut k = 0
+        loop k < n:
+            if ids[k] == id:
+                return true
+            k = k + 1
+        return false
+
+    # retain: drop the bookkeeping — copies and refusals — of every action
+    # not in `live`.
+    proc daemonMoversRetain(m: DaemonMovers, live: [int]) -> DaemonMovers:
+        let mut running = []
+        let n = len(m.running)
+        let mut k = 0
+        loop k < n:
+            if dmvContains(live, m.running[k].id):
+                running = append(running, m.running[k])
+            k = k + 1
+        let mut refusals = []
+        let r = len(m.refusals)
+        let mut j = 0
+        loop j < r:
+            if dmvContains(live, m.refusals[j].id):
+                refusals = append(refusals, m.refusals[j])
+            j = j + 1
+        return DaemonMovers{running: running, refusals: refusals}
+
+    # For the status page: what is being copied, and what was refused.
+    proc daemonMoversStatus(m: DaemonMovers) -> DaemonMoverStatus:
+        let mut copying = []
+        let n = len(m.running)
+        let mut k = 0
+        loop k < n:
+            copying = append(copying, DaemonCopyingStatus{id: m.running[k].id, destination: m.running[k].destination})
+            k = k + 1
+        return DaemonMoverStatus{copying: copying, refused: m.refusals}

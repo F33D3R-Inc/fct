@@ -1,0 +1,1128 @@
+import "fqheap.fct"
+
+app FqIndexSelfHost:
+    # fqindex.fct — self-hosted port of facetql/src/storage/index.rs's
+    # `Indexes` (the engine's durable access paths, each a paged B+tree
+    # through fqbtree.fct) and of engine.rs's apply step over them:
+    # `apply_operation` with `assert_data_keys` / `retract_data_keys` /
+    # `assert_text_keys` / `retract_text_keys` / `backfill_index` /
+    # `backfill_text_index`, and `load`'s replay of the definition logs.
+    #
+    #   primary   address → RecordLocation of the node's current record
+    #   kind      component(kind) · address → ()
+    #   owner     component(owner) · address → ()
+    #   edge_out  component(from) · component(kind) · to → edge location
+    #   edge_in   component(to) · component(kind) · from → edge location
+    #   history   component(address) · version u64 BE → archived location
+    #   data.N    encode_order_value(data[field]) · address → ()
+    #   text.N    gram · address → ()
+    #
+    # The key encoders are index_text.fct's; a `data` value is read with
+    # fqjson.fct, so a composite value keys by serde_json's own text. The
+    # heap is fqheap.fct's, so an applied operation leaves the heap, the
+    # catalog and every tree as facetql's apply leaves them.
+    #
+    # The definition logs (facetql.indexes, facetql.text_indexes,
+    # facetql.references) are binary.fct record logs of `Put(def)` (variant
+    # 0) / `Drop(name)` (variant 1), replayed last-write-wins and opened in
+    # name order.
+    struct FqDataIx:
+        def: IndexDef
+        tree: FqBTree
+
+    struct FqTextIx:
+        def: TextIndexDef
+        tree: FqBTree
+
+    struct FqIndexes:
+        dir: text
+        key: [int]
+        nonceBase: int
+        opens: int
+        primary: FqBTree
+        kind: FqBTree
+        owner: FqBTree
+        edgeOut: FqBTree
+        edgeIn: FqBTree
+        history: FqBTree
+        data: [FqDataIx]
+        text: [FqTextIx]
+
+    struct FqIxR:
+        ok: bool
+        err: text
+        ix: FqIndexes
+
+    proc ixPath(dir: text, name: text) -> text:
+        return dir + "facetql.idx." + name
+
+    # ixTreeNonce: each tree file's pager gets its own nonce prefix.
+    proc ixTreeNonce(ix: FqIndexes) -> int:
+        return (ix.nonceBase * 4096 + ix.opens) % 4294967296
+
+    proc ixOpenTree(ix: FqIndexes, name: text) -> FqBtR uses io.file:
+        let nb = do ixTreeNonce(ix)
+        let r = do btOpen(ixPath(ix.dir, name), ix.key, nb, 64)
+        return r
+
+    proc ixWith(ix: FqIndexes, which: text, t: FqBTree) -> FqIndexes:
+        let mut p = ix.primary
+        let mut k = ix.kind
+        let mut o = ix.owner
+        let mut eo = ix.edgeOut
+        let mut ei = ix.edgeIn
+        let mut h = ix.history
+        if which == "primary":
+            p = t
+        if which == "kind":
+            k = t
+        if which == "owner":
+            o = t
+        if which == "edge_out":
+            eo = t
+        if which == "edge_in":
+            ei = t
+        if which == "history":
+            h = t
+        return FqIndexes{dir: ix.dir, key: ix.key, nonceBase: ix.nonceBase, opens: ix.opens, primary: p, kind: k, owner: o, edgeOut: eo, edgeIn: ei, history: h, data: ix.data, text: ix.text}
+
+    proc ixTree(ix: FqIndexes, which: text) -> FqBTree:
+        if which == "primary":
+            return ix.primary
+        if which == "kind":
+            return ix.kind
+        if which == "owner":
+            return ix.owner
+        if which == "edge_out":
+            return ix.edgeOut
+        if which == "edge_in":
+            return ix.edgeIn
+        return ix.history
+
+    proc ixSets(ix: FqIndexes, opens: int, data: [FqDataIx], text: [FqTextIx]) -> FqIndexes:
+        return FqIndexes{dir: ix.dir, key: ix.key, nonceBase: ix.nonceBase, opens: opens, primary: ix.primary, kind: ix.kind, owner: ix.owner, edgeOut: ix.edgeOut, edgeIn: ix.edgeIn, history: ix.history, data: data, text: text}
+
+    # ixOpen: Indexes::open — the six built-in trees.
+    proc ixOpen(dir: text, key: [int], nonceBase: int) -> FqIxR uses io.file:
+        let names = ["primary", "kind", "owner", "edge_out", "edge_in", "history"]
+        let o0 = do pgrOpen(dir + "facetql.idx.primary", 64, key, 0)
+        let blank = FqBTree{pager: o0, generation: 0, root: 2, entries: 0, free: [], dirty: []}
+        let mut ix = FqIndexes{dir: dir, key: key, nonceBase: nonceBase, opens: 0, primary: blank, kind: blank, owner: blank, edgeOut: blank, edgeIn: blank, history: blank, data: [], text: []}
+        let mut i = 0
+        loop i < 6:
+            let r = do ixOpenTree(ix, names[i])
+            if !r.ok:
+                return FqIxR{ok: false, err: r.err, ix: ix}
+            let w = do ixWith(ix, names[i], r.tree)
+            ix = do ixSets(w, w.opens + 1, w.data, w.text)
+            i = i + 1
+        return FqIxR{ok: true, err: "", ix: ix}
+
+    proc ixSameDef(a: IndexDef, b: IndexDef) -> bool:
+        return a.name == b.name && a.kind == b.kind && a.field == b.field && a.unique == b.unique
+
+    # ixOpenData: open_data — idempotent by name; a changed definition
+    # under the same name reopens its tree.
+    proc ixOpenData(ix: FqIndexes, def: IndexDef) -> FqIxR uses io.file:
+        let mut rest = []
+        let mut kept = false
+        let mut keptIx = FqDataIx{def: def, tree: ix.primary}
+        let n = len(ix.data)
+        let mut i = 0
+        loop i < n:
+            if ix.data[i].def.name == def.name:
+                let same = do ixSameDef(ix.data[i].def, def)
+                if same:
+                    kept = true
+                    keptIx = ix.data[i]
+            else:
+                rest = append(rest, ix.data[i])
+            i = i + 1
+        let mut opens = ix.opens
+        if !kept:
+            let r = do ixOpenTree(ix, "data." + def.name)
+            if !r.ok:
+                return FqIxR{ok: false, err: r.err, ix: ix}
+            keptIx = FqDataIx{def: def, tree: r.tree}
+            opens = opens + 1
+        rest = append(rest, keptIx)
+        let out = do ixSets(ix, opens, rest, ix.text)
+        return FqIxR{ok: true, err: "", ix: out}
+
+    proc ixDropData(ix: FqIndexes, name: text) -> FqIxR uses io.file:
+        let mut rest = []
+        let n = len(ix.data)
+        let mut i = 0
+        loop i < n:
+            if ix.data[i].def.name != name:
+                rest = append(rest, ix.data[i])
+            i = i + 1
+        let rm = removeFile(ixPath(ix.dir, "data." + name))
+        let out = do ixSets(ix, ix.opens, rest, ix.text)
+        return FqIxR{ok: true, err: "", ix: out}
+
+    proc ixOpenText(ix: FqIndexes, def: TextIndexDef) -> FqIxR uses io.file:
+        let mut rest = []
+        let mut kept = false
+        let mut keptIx = FqTextIx{def: def, tree: ix.primary}
+        let n = len(ix.text)
+        let mut i = 0
+        loop i < n:
+            if ix.text[i].def.name == def.name:
+                let d = ix.text[i].def
+                if d.kind == def.kind && d.field == def.field:
+                    kept = true
+                    keptIx = ix.text[i]
+            else:
+                rest = append(rest, ix.text[i])
+            i = i + 1
+        let mut opens = ix.opens
+        if !kept:
+            let r = do ixOpenTree(ix, "text." + def.name)
+            if !r.ok:
+                return FqIxR{ok: false, err: r.err, ix: ix}
+            keptIx = FqTextIx{def: def, tree: r.tree}
+            opens = opens + 1
+        rest = append(rest, keptIx)
+        let out = do ixSets(ix, opens, ix.data, rest)
+        return FqIxR{ok: true, err: "", ix: out}
+
+    proc ixDropText(ix: FqIndexes, name: text) -> FqIxR uses io.file:
+        let mut rest = []
+        let n = len(ix.text)
+        let mut i = 0
+        loop i < n:
+            if ix.text[i].def.name != name:
+                rest = append(rest, ix.text[i])
+            i = i + 1
+        let rm = removeFile(ixPath(ix.dir, "text." + name))
+        let out = do ixSets(ix, ix.opens, ix.data, rest)
+        return FqIxR{ok: true, err: "", ix: out}
+
+    # ixCommit: commit — every tree's pages flushed and its next meta
+    # generation written.
+    proc ixCommit(ix0: FqIndexes) -> FqIxR uses io.file:
+        let names = ["primary", "kind", "owner", "edge_out", "edge_in", "history"]
+        let mut ix = ix0
+        let mut i = 0
+        loop i < 6:
+            let t = do ixTree(ix, names[i])
+            let c = do btCommit(t)
+            if !c.ok:
+                return FqIxR{ok: false, err: c.err, ix: ix}
+            ix = do ixWith(ix, names[i], c.tree)
+            i = i + 1
+        let mut data = ix.data
+        let nd = len(data)
+        let mut j = 0
+        loop j < nd:
+            let c2 = do btCommit(data[j].tree)
+            if !c2.ok:
+                return FqIxR{ok: false, err: c2.err, ix: ix}
+            data[j] = FqDataIx{def: data[j].def, tree: c2.tree}
+            j = j + 1
+        let mut text = ix.text
+        let nt = len(text)
+        let mut k = 0
+        loop k < nt:
+            let c3 = do btCommit(text[k].tree)
+            if !c3.ok:
+                return FqIxR{ok: false, err: c3.err, ix: ix}
+            text[k] = FqTextIx{def: text[k].def, tree: c3.tree}
+            k = k + 1
+        let out = do ixSets(ix, ix.opens, data, text)
+        return FqIxR{ok: true, err: "", ix: out}
+
+    # ── the store: heap + indexes + the definition logs ────────────────
+    struct FqStore:
+        heap: FqHeap
+        ix: FqIndexes
+        references: [ReferenceDef]
+        nonceBase: int
+        seq: int
+        meta: FqCounts
+
+    # FqCounts: what the engine counts rather than stores — reads_total,
+    # writes_total, the user log's record count, the change scan's horizon
+    # (wal::scan_horizon: `horizonMax` stands for u64::MAX) and the cell
+    # table (metrics.rs's CellTable: 256 open-addressed slots, 8 probes,
+    # keyed by the packed coordinate).
+    struct FqCounts:
+        reads: int
+        writes: int
+        userLog: int
+        horizon: int
+        horizonMax: bool
+        cellKeys: [int]
+        cellReads: [int]
+        cellWrites: [int]
+        cellBytesRead: [int]
+        cellBytesWritten: [int]
+        overflowReads: int
+        overflowWrites: int
+        unattributed: int
+
+    proc metaNew() -> FqCounts:
+        let mut zeros = []
+        let mut i = 0
+        loop i < 256:
+            zeros = append(zeros, 0)
+            i = i + 1
+        return FqCounts{reads: 0, writes: 0, userLog: 0, horizon: 0, horizonMax: false, cellKeys: zeros, cellReads: zeros, cellWrites: zeros, cellBytesRead: zeros, cellBytesWritten: zeros, overflowReads: 0, overflowWrites: 0, unattributed: 0}
+
+    proc stWithMeta(st: FqStore, m: FqCounts) -> FqStore:
+        return FqStore{heap: st.heap, ix: st.ix, references: st.references, nonceBase: st.nonceBase, seq: st.seq, meta: m}
+
+    # metaSlot: CellTable::slot — the slot a packed key lives in (claimed
+    # when free), -1 when 8 probes find neither it nor a free slot.
+    proc metaSlot(m: FqCounts, key: int) -> int:
+        let h = ((key * -7046029254386353131) >> 32) & 4294967295
+        let mut index = h % 256
+        let mut p = 0
+        loop p < 8:
+            let cur = m.cellKeys[index]
+            if cur == key || cur == 0:
+                return index
+            index = (index + 1) % 256
+            p = p + 1
+        return -1
+
+    proc metaCellKey(c: Coordinate) -> int:
+        return (1 << 32) | (c.x << 24) | (c.y << 16) | (c.z << 8) | c.q
+
+    # metaRecord: record_read / record_write.
+    proc metaRecord(m: FqCounts, c: Coordinate, nbytes: int, write: bool) -> FqCounts:
+        let key = do metaCellKey(c)
+        let at = do metaSlot(m, key)
+        if at < 0:
+            if write:
+                return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites + 1, unattributed: m.unattributed}
+            return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads + 1, overflowWrites: m.overflowWrites, unattributed: m.unattributed}
+        let mut keys = m.cellKeys
+        keys[at] = key
+        let mut r = m.cellReads
+        let mut w = m.cellWrites
+        let mut br = m.cellBytesRead
+        let mut bw = m.cellBytesWritten
+        if write:
+            w[at] = w[at] + 1
+            bw[at] = bw[at] + nbytes
+        else:
+            r[at] = r[at] + 1
+            br[at] = br[at] + nbytes
+        return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: keys, cellReads: r, cellWrites: w, cellBytesRead: br, cellBytesWritten: bw, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed}
+
+    proc metaCount(m: FqCounts, reads: int, writes: int, userLog: int, unattributed: int) -> FqCounts:
+        return FqCounts{reads: m.reads + reads, writes: m.writes + writes, userLog: m.userLog + userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed + unattributed}
+
+    # metaNoteHorizon: wal::note_scan_horizon — a fetch_max; `toMax` is
+    # u64::MAX.
+    proc metaNoteHorizon(m: FqCounts, position: int, toMax: bool) -> FqCounts:
+        let mut h = m.horizon
+        let mut hm = m.horizonMax || toMax
+        if position > h:
+            h = position
+        return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: h, horizonMax: hm, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed}
+
+    proc metaSetUserLog(m: FqCounts, n: int) -> FqCounts:
+        return FqCounts{reads: m.reads, writes: m.writes, userLog: n, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed}
+
+    struct FqStoreR:
+        ok: bool
+        err: text
+        store: FqStore
+
+    proc stErr(st: FqStore, msg: text) -> FqStoreR:
+        return FqStoreR{ok: false, err: msg, store: st}
+
+    proc stWith(st: FqStore, h: FqHeap, ix: FqIndexes) -> FqStore:
+        return FqStore{heap: h, ix: ix, references: st.references, nonceBase: st.nonceBase, seq: st.seq, meta: st.meta}
+
+    # stNonce: the next nonce for a sealed record this store appends.
+    proc stNonce(st: FqStore) -> [int]:
+        let n = do fqwNonce(st.nonceBase, st.seq)
+        return n
+
+    proc stBump(st: FqStore) -> FqStore:
+        return FqStore{heap: st.heap, ix: st.ix, references: st.references, nonceBase: st.nonceBase, seq: st.seq + 1, meta: st.meta}
+
+    # stLog: append one definition-log record (Put = variant 0 + the def,
+    # Drop = variant 1 + the name).
+    proc stLog(st: FqStore, file: text, record: [int]) -> FqStoreR uses io.file:
+        let nonce = do stNonce(st)
+        let a = do bnAppendRecord(st.ix.dir + file, record, st.ix.key, nonce)
+        let b = do stBump(st)
+        if !a.ok:
+            let e = do stErr(b, a.err)
+            return e
+        return FqStoreR{ok: true, err: "", store: b}
+
+    proc stDropRecord(name: text) -> [int]:
+        let t = do fqwPutUint([], 1, 4)
+        let r = do fqwPutString(t, name)
+        return r
+
+    # stLoad: StorageEngine::load's storage half — the catalog and heap,
+    # the six trees, then every declared data and text index (the
+    # definition logs replayed, last write wins, opened in name order) and
+    # the reference registry.
+    proc stLoad(dir: text, key: [int], nonceBase: int) -> FqStoreR uses io.file:
+        let o = do hpOpen(dir, key, nonceBase)
+        let ir = do ixOpen(dir, key, nonceBase + 1)
+        let st0 = FqStore{heap: o.heap, ix: ir.ix, references: [], nonceBase: nonceBase + 2, seq: 0, meta: metaNew()}
+        if !o.ok:
+            let e0 = do stErr(st0, o.err)
+            return e0
+        if !ir.ok:
+            let e1 = do stErr(st0, ir.err)
+            return e1
+        let mut ix = ir.ix
+        let dl = do bnReadAll(dir + "facetql.indexes", key)
+        if dl.err != "":
+            let e2 = do stErr(st0, dl.err)
+            return e2
+        let mut defs = []
+        let nd = len(dl.records)
+        let mut i = 0
+        loop i < nd:
+            let c = FqwCur{buf: dl.records[i].record, pos: 0, err: ""}
+            let tag = do fqwGetUint(c, 4)
+            if tag.v == 0:
+                let g = do fqwGetIndexDef(tag.cur)
+                if g.cur.err != "":
+                    let e3 = do stErr(st0, "failed to decode an index definition: " + g.cur.err)
+                    return e3
+                let rest = do ixDefsWithout(defs, g.def.name)
+                defs = append(rest, g.def)
+            else:
+                let s = do fqwGetString(tag.cur)
+                let rest2 = do ixDefsWithout(defs, s.v)
+                defs = rest2
+            i = i + 1
+        let sorted = do ixSortDefs(defs)
+        let ns = len(sorted)
+        let mut j = 0
+        loop j < ns:
+            let r = do ixOpenData(ix, sorted[j])
+            if !r.ok:
+                let e4 = do stErr(st0, r.err)
+                return e4
+            ix = r.ix
+            j = j + 1
+        let tl = do bnReadAll(dir + "facetql.text_indexes", key)
+        if tl.err != "":
+            let e5 = do stErr(st0, tl.err)
+            return e5
+        let mut tdefs = []
+        let nt = len(tl.records)
+        let mut k = 0
+        loop k < nt:
+            let c2 = FqwCur{buf: tl.records[k].record, pos: 0, err: ""}
+            let tag2 = do fqwGetUint(c2, 4)
+            if tag2.v == 0:
+                let gt = do fqwGetTextIndexDef(tag2.cur)
+                let rest3 = do ixTextDefsWithout(tdefs, gt.def.name)
+                tdefs = append(rest3, gt.def)
+            else:
+                let s2 = do fqwGetString(tag2.cur)
+                let rest4 = do ixTextDefsWithout(tdefs, s2.v)
+                tdefs = rest4
+            k = k + 1
+        let tsorted = do ixSortTextDefs(tdefs)
+        let nts = len(tsorted)
+        let mut m = 0
+        loop m < nts:
+            let r2 = do ixOpenText(ix, tsorted[m])
+            if !r2.ok:
+                let e6 = do stErr(st0, r2.err)
+                return e6
+            ix = r2.ix
+            m = m + 1
+        let rl = do bnReadAll(dir + "facetql.references", key)
+        if rl.err != "":
+            let e7 = do stErr(st0, rl.err)
+            return e7
+        let mut refs = []
+        let nr = len(rl.records)
+        let mut q = 0
+        loop q < nr:
+            let c3 = FqwCur{buf: rl.records[q].record, pos: 0, err: ""}
+            let tag3 = do fqwGetUint(c3, 4)
+            if tag3.v == 0:
+                let gr = do fqwGetReferenceDef(tag3.cur)
+                let rest5 = do ixRefsWithout(refs, gr.def.name)
+                refs = append(rest5, gr.def)
+            else:
+                let s3 = do fqwGetString(tag3.cur)
+                let rest6 = do ixRefsWithout(refs, s3.v)
+                refs = rest6
+            q = q + 1
+        return FqStoreR{ok: true, err: "", store: FqStore{heap: o.heap, ix: ix, references: refs, nonceBase: nonceBase + 2, seq: 0, meta: metaNew()}}
+
+    proc ixDefsWithout(defs: [IndexDef], name: text) -> [IndexDef]:
+        let mut out = []
+        let n = len(defs)
+        let mut i = 0
+        loop i < n:
+            if defs[i].name != name:
+                out = append(out, defs[i])
+            i = i + 1
+        return out
+
+    proc ixTextDefsWithout(defs: [TextIndexDef], name: text) -> [TextIndexDef]:
+        let mut out = []
+        let n = len(defs)
+        let mut i = 0
+        loop i < n:
+            if defs[i].name != name:
+                out = append(out, defs[i])
+            i = i + 1
+        return out
+
+    # References keep their log order — the registry is keyed by name and
+    # a re-put replaces in place, as References::put does.
+    proc ixRefsWithout(refs: [ReferenceDef], name: text) -> [ReferenceDef]:
+        let mut out = []
+        let n = len(refs)
+        let mut i = 0
+        loop i < n:
+            if refs[i].name != name:
+                out = append(out, refs[i])
+            i = i + 1
+        return out
+
+    proc ixSortDefs(defs0: [IndexDef]) -> [IndexDef]:
+        let mut defs = defs0
+        let n = len(defs)
+        let mut i = 1
+        loop i < n:
+            let d = defs[i]
+            let mut j = i - 1
+            loop j >= 0 && defs[j].name > d.name:
+                defs[j + 1] = defs[j]
+                j = j - 1
+            defs[j + 1] = d
+            i = i + 1
+        return defs
+
+    proc ixSortTextDefs(defs0: [TextIndexDef]) -> [TextIndexDef]:
+        let mut defs = defs0
+        let n = len(defs)
+        let mut i = 1
+        loop i < n:
+            let d = defs[i]
+            let mut j = i - 1
+            loop j >= 0 && defs[j].name > d.name:
+                defs[j + 1] = defs[j]
+                j = j - 1
+            defs[j + 1] = d
+            i = i + 1
+        return defs
+
+    # ── tree edits over the store ──────────────────────────────────────
+    proc stPut(st: FqStore, which: text, key: [int], value: [int]) -> FqStoreR uses io.file:
+        let t = do ixTree(st.ix, which)
+        let r = do btPut(t, key, value)
+        let ix = do ixWith(st.ix, which, r.tree)
+        let st2 = do stWith(st, st.heap, ix)
+        if !r.ok:
+            let e = do stErr(st2, r.err)
+            return e
+        return FqStoreR{ok: true, err: "", store: st2}
+
+    proc stRemove(st: FqStore, which: text, key: [int]) -> FqStoreR uses io.file:
+        let t = do ixTree(st.ix, which)
+        let r = do btRemove(t, key)
+        let ix = do ixWith(st.ix, which, r.tree)
+        let st2 = do stWith(st, st.heap, ix)
+        if !r.ok:
+            let e = do stErr(st2, r.err)
+            return e
+        return FqStoreR{ok: true, err: "", store: st2}
+
+    struct FqStGet:
+        ok: bool
+        err: text
+        store: FqStore
+        found: bool
+        value: [int]
+
+    proc stGet(st: FqStore, which: text, key: [int]) -> FqStGet uses io.file:
+        let t = do ixTree(st.ix, which)
+        let r = do btGet(t, key)
+        let ix = do ixWith(st.ix, which, r.tree)
+        let st2 = do stWith(st, st.heap, ix)
+        return FqStGet{ok: r.ok, err: r.err, store: st2, found: r.entry.found, value: r.entry.value}
+
+    # stMarkPrevious: a location read out of an index, marked obsolete.
+    proc stMarkPrevious(st: FqStore, raw: [int]) -> FqStoreR:
+        let l = do hpLocDecode(raw)
+        if !l.ok:
+            let e = do stErr(st, l.err)
+            return e
+        let h = do hpMarkObsolete(st.heap, l.loc)
+        let st2 = do stWith(st, h, st.ix)
+        return FqStoreR{ok: true, err: "", store: st2}
+
+    struct FqStNode:
+        ok: bool
+        err: text
+        store: FqStore
+        found: bool
+        loc: FqLocation
+        node: Node
+
+    # stNodeAt: node_location + node_at — the node the primary index names,
+    # its read recorded against its cell (node_at's record_read).
+    proc stNodeAt(st: FqStore, address: text) -> FqStNode uses io.file:
+        let r = do stPeekNode(st, address)
+        if r.found:
+            let m = do metaRecord(r.store.meta, r.node.coordinate, byteLen(r.node.data), false)
+            return FqStNode{ok: true, err: "", store: stWithMeta(r.store, m), found: true, loc: r.loc, node: r.node}
+        return r
+
+    # stPeekNode: the same lookup, counted nowhere (a test harness looking).
+    proc stPeekNode(st: FqStore, address: text) -> FqStNode uses io.file:
+        let blankNode = operationBlank("insert").node
+        let noLoc = FqLocation{segment: 0, page: 0, slot: 0, length: 0}
+        let g = do stGet(st, "primary", textToBytes(address))
+        if !g.ok:
+            return FqStNode{ok: false, err: g.err, store: g.store, found: false, loc: noLoc, node: blankNode}
+        if !g.found:
+            return FqStNode{ok: true, err: "", store: g.store, found: false, loc: noLoc, node: blankNode}
+        let l = do hpLocDecode(g.value)
+        if !l.ok:
+            return FqStNode{ok: false, err: l.err, store: g.store, found: false, loc: noLoc, node: blankNode}
+        let r = do hpRead(g.store.heap, l.loc)
+        let st2 = do stWith(g.store, r.heap, g.store.ix)
+        if !r.ok:
+            return FqStNode{ok: false, err: r.err, store: st2, found: false, loc: noLoc, node: blankNode}
+        if r.record.kind != "node":
+            return FqStNode{ok: false, err: "expected a node record at " + hpLocText(l.loc) + ", found " + r.record.kind + " — the index and the heap disagree", store: st2, found: false, loc: noLoc, node: blankNode}
+        return FqStNode{ok: true, err: "", store: st2, found: true, loc: l.loc, node: r.record.node}
+
+    # ── data / text index maintenance ──────────────────────────────────
+    proc stDataKey(parsed: FqJR, field: text, address: text) -> [int]:
+        let mut v = parsed
+        if parsed.ok:
+            let g = do fjGet(parsed.v, field)
+            v = g
+        let dv = do fjDataValue(v)
+        let enc = do encodeDataValueForKey(dv)
+        let k = do concatBytes(enc, textToBytes(address))
+        return k
+
+    # stDataKeys: assert_data_keys (put) or retract_data_keys (remove) —
+    # one key per ordered index over the node's kind.
+    proc stDataKeys(st0: FqStore, node: Node, put: bool) -> FqStoreR uses io.file:
+        let mut st = st0
+        let parsed = do fjParse(node.data)
+        let mut data = st.ix.data
+        let n = len(data)
+        let mut i = 0
+        loop i < n:
+            if data[i].def.kind == node.kind:
+                let k = do stDataKey(parsed, data[i].def.field, node.address)
+                if put:
+                    let r = do btPut(data[i].tree, k, [])
+                    data[i] = FqDataIx{def: data[i].def, tree: r.tree}
+                    if !r.ok:
+                        let st1 = do stWith(st, st.heap, ixSets(st.ix, st.ix.opens, data, st.ix.text))
+                        let e = do stErr(st1, r.err)
+                        return e
+                else:
+                    let r2 = do btRemove(data[i].tree, k)
+                    data[i] = FqDataIx{def: data[i].def, tree: r2.tree}
+                    if !r2.ok:
+                        let st2 = do stWith(st, st.heap, ixSets(st.ix, st.ix.opens, data, st.ix.text))
+                        let e2 = do stErr(st2, r2.err)
+                        return e2
+            i = i + 1
+        let ix = do ixSets(st.ix, st.ix.opens, data, st.ix.text)
+        st = do stWith(st, st.heap, ix)
+        return FqStoreR{ok: true, err: "", store: st}
+
+    # stTextKeys: assert_text_keys / retract_text_keys — one posting per
+    # distinct gram of the field's string value (absent, or not a string,
+    # posts nothing).
+    proc stTextKeys(st0: FqStore, node: Node, put: bool) -> FqStoreR uses io.file:
+        let mut st = st0
+        let parsed = do fjParse(node.data)
+        let mut text = st.ix.text
+        let n = len(text)
+        let mut i = 0
+        loop i < n:
+            if text[i].def.kind == node.kind && parsed.ok:
+                let g = do fjGet(parsed.v, text[i].def.field)
+                if g.ok && g.v.kind == "str":
+                    let gs = do grams(g.v.s)
+                    let ng = len(gs)
+                    let mut t = text[i].tree
+                    let mut j = 0
+                    loop j < ng:
+                        let k = do textIndexKey(gs[j], node.address)
+                        if put:
+                            let r = do btPut(t, k, [])
+                            t = r.tree
+                            if !r.ok:
+                                text[i] = FqTextIx{def: text[i].def, tree: t}
+                                let st1 = do stWith(st, st.heap, ixSets(st.ix, st.ix.opens, st.ix.data, text))
+                                let e = do stErr(st1, r.err)
+                                return e
+                        else:
+                            let r2 = do btRemove(t, k)
+                            t = r2.tree
+                            if !r2.ok:
+                                text[i] = FqTextIx{def: text[i].def, tree: t}
+                                let st2 = do stWith(st, st.heap, ixSets(st.ix, st.ix.opens, st.ix.data, text))
+                                let e2 = do stErr(st2, r2.err)
+                                return e2
+                        j = j + 1
+                    text[i] = FqTextIx{def: text[i].def, tree: t}
+            i = i + 1
+        let ix = do ixSets(st.ix, st.ix.opens, st.ix.data, text)
+        st = do stWith(st, st.heap, ix)
+        return FqStoreR{ok: true, err: "", store: st}
+
+    # stKindNodes: scan_candidates(Some(kind)) — every live node of the
+    # kind, in the kind index's order.
+    struct FqKindNodes:
+        ok: bool
+        err: text
+        store: FqStore
+        nodes: [Node]
+
+    proc stKindNodes(st0: FqStore, kind: text) -> FqKindNodes uses io.file:
+        let prefix = do indexKindPrefix(kind)
+        let sc = do btScan(st0.ix.kind, prefix, false, [], false, 0)
+        let mut st = do stWith(st0, st0.heap, ixWith(st0.ix, "kind", sc.tree))
+        if !sc.ok:
+            return FqKindNodes{ok: false, err: sc.err, store: st, nodes: []}
+        let mut nodes = []
+        let n = len(sc.keys)
+        let pl = len(prefix)
+        let mut i = 0
+        loop i < n:
+            let kb = do fqwHexBytes(sc.keys[i])
+            let addr = bytesToText(btRange(kb, pl, len(kb)))
+            let r = do stNodeAt(st, addr)
+            st = r.store
+            if !r.ok:
+                return FqKindNodes{ok: false, err: r.err, store: st, nodes: []}
+            if r.found:
+                nodes = append(nodes, r.node)
+            i = i + 1
+        return FqKindNodes{ok: true, err: "", store: st, nodes: nodes}
+
+    proc stDataIxAt(ix: FqIndexes, name: text) -> int:
+        let n = len(ix.data)
+        let mut i = 0
+        loop i < n:
+            if ix.data[i].def.name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc stTextIxAt(ix: FqIndexes, name: text) -> int:
+        let n = len(ix.text)
+        let mut i = 0
+        loop i < n:
+            if ix.text[i].def.name == name:
+                return i
+            i = i + 1
+        return -1
+
+    # stBackfill: backfill_index / backfill_text_index — every existing
+    # node of the index's kind keyed into the new tree.
+    proc stBackfill(st0: FqStore, name: text, isText: bool) -> FqStoreR uses io.file:
+        let mut kind = ""
+        if isText:
+            let at = do stTextIxAt(st0.ix, name)
+            if at < 0:
+                return FqStoreR{ok: true, err: "", store: st0}
+            kind = st0.ix.text[at].def.kind
+        else:
+            let at2 = do stDataIxAt(st0.ix, name)
+            if at2 < 0:
+                return FqStoreR{ok: true, err: "", store: st0}
+            kind = st0.ix.data[at2].def.kind
+        let kn = do stKindNodes(st0, kind)
+        if !kn.ok:
+            let e = do stErr(kn.store, kn.err)
+            return e
+        let mut st = kn.store
+        let n = len(kn.nodes)
+        let mut i = 0
+        loop i < n:
+            let nd = kn.nodes[i]
+            if isText:
+                let at3 = do stTextIxAt(st.ix, name)
+                let only = do ixSets(st.ix, st.ix.opens, st.ix.data, [st.ix.text[at3]])
+                let r = do stTextKeys(stWith(st, st.heap, only), nd, true)
+                let mut text = st.ix.text
+                text[at3] = r.store.ix.text[0]
+                st = do stWith(r.store, r.store.heap, ixSets(st.ix, st.ix.opens, st.ix.data, text))
+                if !r.ok:
+                    let e2 = do stErr(st, r.err)
+                    return e2
+            else:
+                let at4 = do stDataIxAt(st.ix, name)
+                let parsed = do fjParse(nd.data)
+                let k = do stDataKey(parsed, st.ix.data[at4].def.field, nd.address)
+                let r2 = do btPut(st.ix.data[at4].tree, k, [])
+                let mut data = st.ix.data
+                data[at4] = FqDataIx{def: data[at4].def, tree: r2.tree}
+                st = do stWith(st, st.heap, ixSets(st.ix, st.ix.opens, data, st.ix.text))
+                if !r2.ok:
+                    let e3 = do stErr(st, r2.err)
+                    return e3
+            i = i + 1
+        return FqStoreR{ok: true, err: "", store: st}
+
+    # ── apply_operation ────────────────────────────────────────────────
+    proc stAppend(st: FqStore, rec: FqHeapRecord) -> FqAppended uses io.file:
+        let a = do hpAppend(st.heap, rec)
+        return a
+
+    proc stApply(st0: FqStore, op: Operation) -> FqStoreR uses io.file:
+        let mut st = st0
+        if op.tag == "archive":
+            let rec = do hpHistoryRecord(op.entry)
+            let a = do stAppend(st, rec)
+            st = do stWith(st, a.heap, st.ix)
+            if !a.ok:
+                let e0 = do stErr(st, a.err)
+                return e0
+            let key = do indexHistoryKey(op.entry.address, op.entry.version)
+            let g = do stGet(st, "history", key)
+            st = g.store
+            if !g.ok:
+                let e1 = do stErr(st, g.err)
+                return e1
+            if g.found:
+                let m = do stMarkPrevious(st, g.value)
+                if !m.ok:
+                    return m
+                st = m.store
+            let p = do stPut(st, "history", key, hpLocEncode(a.loc))
+            return p
+        if op.tag == "insert":
+            let node = op.node
+            let prev = do stNodeAt(st, node.address)
+            st = prev.store
+            if !prev.ok:
+                let e2 = do stErr(st, prev.err)
+                return e2
+            let nr = do hpNodeRecord(node)
+            let a2 = do stAppend(st, nr)
+            st = do stWith(st, a2.heap, st.ix)
+            if !a2.ok:
+                let e3 = do stErr(st, a2.err)
+                return e3
+            let p1 = do stPut(st, "primary", textToBytes(node.address), hpLocEncode(a2.loc))
+            if !p1.ok:
+                return p1
+            st = p1.store
+            if prev.found:
+                if prev.node.kind != node.kind:
+                    let r1 = do stRemove(st, "kind", indexKindKey(prev.node.kind, node.address))
+                    if !r1.ok:
+                        return r1
+                    st = r1.store
+                if prev.node.owner != node.owner:
+                    let r2 = do stRemove(st, "owner", indexOwnerKey(prev.node.owner, node.address))
+                    if !r2.ok:
+                        return r2
+                    st = r2.store
+            let p2 = do stPut(st, "kind", indexKindKey(node.kind, node.address), [])
+            if !p2.ok:
+                return p2
+            let p3 = do stPut(p2.store, "owner", indexOwnerKey(node.owner, node.address), [])
+            if !p3.ok:
+                return p3
+            st = p3.store
+            if prev.found:
+                let rd = do stDataKeys(st, prev.node, false)
+                if !rd.ok:
+                    return rd
+                let rt = do stTextKeys(rd.store, prev.node, false)
+                if !rt.ok:
+                    return rt
+                st = rt.store
+            let ad = do stDataKeys(st, node, true)
+            if !ad.ok:
+                return ad
+            let at = do stTextKeys(ad.store, node, true)
+            if !at.ok:
+                return at
+            st = at.store
+            if prev.found:
+                let h = do hpMarkObsolete(st.heap, prev.loc)
+                st = do stWith(st, h, st.ix)
+            let mw = do metaRecord(metaCount(st.meta, 0, 1, 0, 0), node.coordinate, byteLen(node.data), true)
+            st = do stWithMeta(st, mw)
+            return FqStoreR{ok: true, err: "", store: st}
+        if op.tag == "delete":
+            let cur = do stNodeAt(st, op.name)
+            st = cur.store
+            if !cur.ok:
+                let e4 = do stErr(st, cur.err)
+                return e4
+            if cur.found:
+                let node2 = cur.node
+                let d1 = do stRemove(st, "primary", textToBytes(op.name))
+                if !d1.ok:
+                    return d1
+                let d2 = do stRemove(d1.store, "kind", indexKindKey(node2.kind, op.name))
+                if !d2.ok:
+                    return d2
+                let d3 = do stRemove(d2.store, "owner", indexOwnerKey(node2.owner, op.name))
+                if !d3.ok:
+                    return d3
+                let d4 = do stDataKeys(d3.store, node2, false)
+                if !d4.ok:
+                    return d4
+                let d5 = do stTextKeys(d4.store, node2, false)
+                if !d5.ok:
+                    return d5
+                st = d5.store
+                let h2 = do hpMarkObsolete(st.heap, cur.loc)
+                st = do stWith(st, h2, st.ix)
+                let md = do metaRecord(metaCount(st.meta, 0, 1, 0, 0), node2.coordinate, byteLen(node2.data), true)
+                st = do stWithMeta(st, md)
+            else:
+                st = do stWithMeta(st, metaCount(st.meta, 0, 1, 0, 1))
+            return FqStoreR{ok: true, err: "", store: st}
+        if op.tag == "insert_edge" || op.tag == "delete_edge":
+            let mut from = op.edge.from
+            let mut to = op.edge.to
+            let mut kind = op.edge.kind
+            if op.tag == "delete_edge":
+                from = op.edgeId.from
+                to = op.edgeId.to
+                kind = op.edgeId.kind
+            let outKey = do indexEdgeOutKey(from, kind, to)
+            let inKey = do indexEdgeInKey(to, kind, from)
+            let g2 = do stGet(st, "edge_out", outKey)
+            st = g2.store
+            if !g2.ok:
+                let e5 = do stErr(st, g2.err)
+                return e5
+            if g2.found:
+                let m2 = do stMarkPrevious(st, g2.value)
+                if !m2.ok:
+                    return m2
+                st = m2.store
+            st = do stWithMeta(st, metaCount(st.meta, 0, 1, 0, 1))
+            if op.tag == "delete_edge":
+                let x1 = do stRemove(st, "edge_out", outKey)
+                if !x1.ok:
+                    return x1
+                let x2 = do stRemove(x1.store, "edge_in", inKey)
+                return x2
+            let er = do hpEdgeRecord(op.edge)
+            let a3 = do stAppend(st, er)
+            st = do stWith(st, a3.heap, st.ix)
+            if !a3.ok:
+                let e6 = do stErr(st, a3.err)
+                return e6
+            let loc = do hpLocEncode(a3.loc)
+            let y1 = do stPut(st, "edge_out", outKey, loc)
+            if !y1.ok:
+                return y1
+            let y2 = do stPut(y1.store, "edge_in", inKey, loc)
+            return y2
+        if op.tag == "insert_user" || op.tag == "revoke_user":
+            let mut uop = BnUserOp{op: "put", user: op.user, revoked: ""}
+            if op.tag == "revoke_user":
+                uop = BnUserOp{op: "revoke", user: op.user, revoked: op.name}
+            let ub = do bnUserOpEncode(uop)
+            let ul = do stLog(st, "facetql.users", ub)
+            if !ul.ok:
+                return ul
+            return FqStoreR{ok: true, err: "", store: stWithMeta(ul.store, metaCount(ul.store.meta, 0, 0, 1, 0))}
+        if op.tag == "create_index":
+            let t0 = do fqwPutUint([], 0, 4)
+            let rec2 = do fqwPutIndexDef(t0, op.indexDef)
+            let l1 = do stLog(st, "facetql.indexes", rec2)
+            if !l1.ok:
+                return l1
+            st = l1.store
+            let od = do ixOpenData(st.ix, op.indexDef)
+            st = do stWith(st, st.heap, od.ix)
+            if !od.ok:
+                let e7 = do stErr(st, od.err)
+                return e7
+            let bf = do stBackfill(st, op.indexDef.name, false)
+            return bf
+        if op.tag == "drop_index":
+            let rec3 = do stDropRecord(op.name)
+            let l2 = do stLog(st, "facetql.indexes", rec3)
+            if !l2.ok:
+                return l2
+            st = l2.store
+            let dd = do ixDropData(st.ix, op.name)
+            st = do stWith(st, st.heap, dd.ix)
+            return FqStoreR{ok: true, err: "", store: st}
+        if op.tag == "create_reference":
+            let t1 = do fqwPutUint([], 0, 4)
+            let rec4 = do fqwPutReferenceDef(t1, op.reference)
+            let l3 = do stLog(st, "facetql.references", rec4)
+            if !l3.ok:
+                return l3
+            st = l3.store
+            let rest = do ixRefsWithout(st.references, op.reference.name)
+            let refs = append(rest, op.reference)
+            return FqStoreR{ok: true, err: "", store: FqStore{heap: st.heap, ix: st.ix, references: refs, nonceBase: st.nonceBase, seq: st.seq, meta: st.meta}}
+        if op.tag == "drop_reference":
+            let rec5 = do stDropRecord(op.name)
+            let l4 = do stLog(st, "facetql.references", rec5)
+            if !l4.ok:
+                return l4
+            st = l4.store
+            let refs2 = do ixRefsWithout(st.references, op.name)
+            return FqStoreR{ok: true, err: "", store: FqStore{heap: st.heap, ix: st.ix, references: refs2, nonceBase: st.nonceBase, seq: st.seq, meta: st.meta}}
+        if op.tag == "create_text_index":
+            let t2 = do fqwPutUint([], 0, 4)
+            let rec6 = do fqwPutTextIndexDef(t2, op.textIndexDef)
+            let l5 = do stLog(st, "facetql.text_indexes", rec6)
+            if !l5.ok:
+                return l5
+            st = l5.store
+            let ot = do ixOpenText(st.ix, op.textIndexDef)
+            st = do stWith(st, st.heap, ot.ix)
+            if !ot.ok:
+                let e8 = do stErr(st, ot.err)
+                return e8
+            let bt = do stBackfill(st, op.textIndexDef.name, true)
+            return bt
+        if op.tag == "drop_text_index":
+            let rec7 = do stDropRecord(op.name)
+            let l6 = do stLog(st, "facetql.text_indexes", rec7)
+            if !l6.ok:
+                return l6
+            st = l6.store
+            let dt = do ixDropText(st.ix, op.name)
+            st = do stWith(st, st.heap, dt.ix)
+            return FqStoreR{ok: true, err: "", store: st}
+        let e9 = do stErr(st, "unknown operation " + op.tag)
+        return e9
+
+    # stFlush: the storage half of a checkpoint — the heap's pages and
+    # catalog, then every tree committed.
+    proc stFlush(st: FqStore) -> FqStoreR uses io.file:
+        let nonce = do stNonce(st)
+        let s = do hpSync(st.heap, nonce, st.nonceBase * 1000 + st.seq)
+        let st1 = do stBump(stWith(st, s.heap, st.ix))
+        if !s.ok:
+            let e = do stErr(st1, s.err)
+            return e
+        let c = do ixCommit(st1.ix)
+        let st2 = do stWith(st1, st1.heap, c.ix)
+        if !c.ok:
+            let e2 = do stErr(st2, c.err)
+            return e2
+        return FqStoreR{ok: true, err: "", store: st2}
+
+    # ── test harness ───────────────────────────────────────────────────
+    state indexOut: text = ""
+
+    proc ixScriptNode(address: text, kind: text, owner: text, data: text) -> Node:
+        let c = do coordinateNew(1, 2, 3, 250)
+        return Node{address: address, coordinate: c, value: 7, kind: kind, data: data, owner: owner, hasClaimedBy: false, claimedBy: "", visibility: "private"}
+
+    # ixScriptText: the storage engine's public writes lowered as
+    # StorageEngine lowers them (no references declared) and applied:
+    #   put ADDR KIND OWNER DATA   insert (an existing node archived first)
+    #   del ADDR                   delete (archived first, when it exists)
+    #   edge FROM TO KIND          insert_edge (owner alice)
+    #   unedge FROM TO KIND        delete_edge
+    #   index NAME KIND FIELD      create_index
+    #   text NAME KIND FIELD       create_text_index
+    #   drop NAME                  drop_index / drop_text_index
+    #   checkpoint                 the heap synced, every tree committed
+    #   as VERSION UNIX            the next archive's version and time
+    # Ops are `;`-separated; DATA is the rest of its op. A version is the
+    # WAL's operation-id counter and the time the clock's, both the write
+    # path's (the next slice) — so the script states the ones facetql
+    # used, and each put/del that archives reports them back.
+    proc ixScriptText(dir: text, keyHex: text, nonceBase: int, script: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let ld = do stLoad(dir, key, nonceBase)
+        if !ld.ok:
+            return "error: " + ld.err
+        let mut st = ld.store
+        let mut out = ""
+        let mut asVersion = 0
+        let mut asTime = 0
+        let ops = split(script, ";")
+        let n = len(ops)
+        let mut i = 0
+        loop i < n:
+            let line = trim(ops[i])
+            let w = split(line, " ")
+            if line != "":
+                let verb = w[0]
+                let mut lowered = []
+                let mut archived = false
+                if verb == "put":
+                    let dataStart = len(w[0]) + len(w[1]) + len(w[2]) + len(w[3]) + 4
+                    let data = slice(line, dataStart, len(line))
+                    let prev = do stPeekNode(st, w[1])
+                    st = prev.store
+                    if prev.found:
+                        lowered = append(lowered, opArchive(HistoryEntry{address: w[1], archivedAtUnix: asTime, node: prev.node, version: asVersion}))
+                        archived = true
+                    lowered = append(lowered, opInsert(ixScriptNode(w[1], w[2], w[3], data)))
+                if verb == "del":
+                    let cur = do stPeekNode(st, w[1])
+                    st = cur.store
+                    if cur.found:
+                        lowered = append(lowered, opArchive(HistoryEntry{address: w[1], archivedAtUnix: asTime, node: cur.node, version: asVersion}))
+                        archived = true
+                    lowered = append(lowered, opDelete(w[1]))
+                if verb == "edge":
+                    lowered = append(lowered, opInsertEdge(edgeNew(w[1], w[2], w[3], "alice")))
+                if verb == "unedge":
+                    lowered = append(lowered, opDeleteEdge(edgeIdNew(w[1], w[2], w[3])))
+                if verb == "index":
+                    lowered = append(lowered, opCreateIndex(indexDefNew(w[1], w[2], w[3], false)))
+                if verb == "text":
+                    lowered = append(lowered, opCreateTextIndex(textIndexDefNew(w[1], w[2], w[3])))
+                if verb == "drop":
+                    let tat = do stTextIxAt(st.ix, w[1])
+                    if tat >= 0:
+                        lowered = append(lowered, opDropTextIndex(w[1]))
+                    else:
+                        lowered = append(lowered, opDropIndex(w[1]))
+                let nl = len(lowered)
+                let mut j = 0
+                loop j < nl:
+                    let r = do stApply(st, lowered[j])
+                    st = r.store
+                    if !r.ok:
+                        return out + "error: " + r.err
+                    j = j + 1
+                if verb == "checkpoint":
+                    let f = do stFlush(st)
+                    st = f.store
+                    if !f.ok:
+                        return out + "error: " + f.err
+                if verb == "as":
+                    asVersion = toInt(w[1])
+                    asTime = toInt(w[2])
+                else:
+                    if archived:
+                        out = out + "ok v=" + asVersion + " t=" + asTime + ";"
+                    else:
+                        out = out + "ok;"
+            i = i + 1
+        let ct = do ctText(st.heap.catalog)
+        return out + "|" + ct
+
+    action runIndex(dir: text, keyHex: text, nonceBase: int, script: text):
+        let r = do ixScriptText(dir, keyHex, nonceBase, script)
+        indexOut = r
+
+    view IndexHome at "/index":
+        text "{indexOut}"

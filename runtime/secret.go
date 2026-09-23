@@ -18,10 +18,13 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // keyring holds the derived keys, initialized once from FACET_SECRET.
@@ -144,6 +147,70 @@ func randomToken(n int) string {
 		panic("facet: rng failure: " + err.Error())
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// ── password hashing (@password fields) ─────────────────────────────────────
+
+// errPasswordTooLong is bcrypt's input limit, surfaced as a refusal of the write
+// rather than a silent truncation of what the user typed.
+var errPasswordTooLong = errors.New("must be at most 72 bytes")
+
+// hashPassword is the one-way, salted hash a @password field stores in place of
+// what was written (and what the built-in `auth` user table stores). An empty
+// value stays empty: no credential, which passwordMatches never accepts.
+func hashPassword(plain string) (string, error) {
+	if plain == "" {
+		return "", nil
+	}
+	if len(plain) > 72 {
+		return "", errPasswordTooLong
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(h), nil
+}
+
+// passwordMatches reports whether candidate is the value hash was made from.
+// An empty hash (no credential) matches nothing.
+func passwordMatches(hash, candidate string) bool {
+	return hash != "" && bcrypt.CompareHashAndPassword([]byte(hash), []byte(candidate)) == nil
+}
+
+// tokenAlphabet is what secureText draws from: lowercase letters and digits,
+// easy to read back and type (a backup code), safe in a URL (a reset token).
+const tokenAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+// maxSecureText bounds randomToken(n), so a computed length cannot ask the
+// CSPRNG for an unbounded allocation.
+const maxSecureText = 1024
+
+// secureText is n characters drawn uniformly from tokenAlphabet by the OS
+// CSPRNG — the `randomToken(n)` builtin. Bytes at or above the largest multiple
+// of the alphabet's size are rejected rather than reduced, so no character is
+// likelier than another (each carries log2(36) ≈ 5.17 bits).
+func secureText(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n > maxSecureText {
+		n = maxSecureText
+	}
+	limit := byte(256 - 256%len(tokenAlphabet))
+	out := make([]byte, 0, n)
+	buf := make([]byte, n)
+	for len(out) < n {
+		if _, err := rand.Read(buf); err != nil {
+			panic("facet: rng failure: " + err.Error())
+		}
+		for _, b := range buf {
+			if b < limit && len(out) < n {
+				out = append(out, tokenAlphabet[int(b)%len(tokenAlphabet)])
+			}
+		}
+	}
+	return string(out)
 }
 
 // ── CSRF tokens ──────────────────────────────────────────────────────────────

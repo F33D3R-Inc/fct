@@ -1,0 +1,882 @@
+import "fabric_facetql_placement.fct"
+import "fabric.fct"
+import "fabric_runtime_placement.fct"
+
+app FabricFacetqlMoverSelfHost:
+    # Self-hosting port of fabric/crates/fabric-facetql/src/mover.rs — the
+    # thing that copies one cell's nodes from one FacetQL instance to
+    # another, on this directory's client (fabric_facetql_client.fct) and
+    # its streaming HTTP reader (http_client.fct's HttpStream):
+    #
+    #   * enumeration by the keyset cursor (`POST /nodes/query`, ordered by
+    #     address), never an offset — one pass per declared kind of the
+    #     cell, or one unfiltered pass for a catch-all cell;
+    #   * writes as batched, all-or-nothing `insert_node` upserts (250 ops or
+    #     2 MiB of data per batch, whichever binds first), progress counted
+    #     only after a batch committed;
+    #   * catch-up from `GET /events`, subscribed before the first page:
+    #     every in-scope address a frame names goes into a dirty set, and
+    #     catch-up re-reads the dirty addresses with multiget and applies the
+    #     source's current truth (present -> upsert, absent -> delete if the
+    #     destination has it);
+    #   * a field-by-field comparison of both instances before any verdict,
+    #     and a refusal to copy a cell with edges in it;
+    #   * the feed ending or failing is fatal (FeedBroken), never a quiet
+    #     continuation.
+    #
+    # The one structural difference, named: the Rust drains the SSE stream
+    # on a spawned task that runs alongside the copy. Here the feed is a
+    # value the mover pumps (HttpStream over pollBytes) at every point the
+    # Rust consults the feed's state — before each page of the snapshot, at
+    # catch-up, and around the verification's comparison — so every frame
+    # that has arrived by then is admitted before the decision it could
+    # change. Between pumps, frames wait in the socket, where the Rust's
+    # would wait in its task's buffer. Both are equally exposed to FacetQL's
+    # own bounded broadcast if the consumer falls far behind.
+    #
+    # Keyspace (the declared namespace -> RoutingKey map) is fabric.fct's
+    # port of frontdoor/keyspace.rs; a RoutingKey is its packed int.
+    # CopyVerdict is fabric_runtime_placement.fct's.
+
+    proc moverMaxPages() -> int:
+        return 10000
+
+    struct MoverConfig:
+        batchOps: int
+        batchBytes: int
+        pageLimit: int
+
+    proc moverConfigDefault() -> MoverConfig:
+        return MoverConfig{batchOps: 250, batchBytes: 2 * 1024 * 1024, pageLimit: 500}
+
+    # MoverError: kind "" (none), "Wire" (node + error), "FeedBroken"
+    # (reason), "Runaway" (pages) or "NotIdentical" (reason).
+    struct MoverError:
+        kind: text
+        node: text
+        error: FqlError
+        reason: text
+        pages: int
+
+    proc moverErrNone() -> MoverError:
+        let e = do fqlErrNone()
+        return MoverError{kind: "", node: "", error: e, reason: "", pages: 0}
+
+    proc moverErrWire(node: text, error: FqlError) -> MoverError:
+        return MoverError{kind: "Wire", node: node, error: error, reason: "", pages: 0}
+
+    proc moverErrOf(kind: text, reason: text, pages: int) -> MoverError:
+        let e = do fqlErrNone()
+        return MoverError{kind: kind, node: "", error: e, reason: reason, pages: pages}
+
+    proc moverErrorDisplay(e: MoverError) -> text:
+        if e.kind == "Wire":
+            return "'" + e.node + "': " + fqlErrorDisplay(e.error)
+        if e.kind == "FeedBroken":
+            return "the source's change feed is no longer complete (" + e.reason + "), so writes landing during the copy can no longer be seen"
+        if e.kind == "Runaway":
+            return "the source's cursor did not terminate within " + e.pages + " pages"
+        return e.reason
+
+    # ── the scope ─────────────────────────────────────────────────────
+    struct CellScope:
+        kinds: [text]
+        prefixes: [text]
+        catchAll: bool
+        excludedKinds: [text]
+        excludedPrefixes: [text]
+
+    proc cellScopeWholeNamespace() -> CellScope:
+        return CellScope{kinds: [], prefixes: [], catchAll: true, excludedKinds: [], excludedPrefixes: []}
+
+    # cellScopeForKey: what `key` holds according to the keyspace — the
+    # union of the rules naming it, and, when it is the fallback,
+    # everything no other rule claims.
+    proc cellScopeForKey(ks: Keyspace, key: int) -> CellScope:
+        let mut kinds = []
+        let mut prefixes = []
+        let mut exKinds = []
+        let mut exPrefixes = []
+        let n = len(ks.rules)
+        let mut i = 0
+        loop i < n:
+            let r = ks.rules[i]
+            if r.key == key:
+                kinds = append(kinds, r.kind)
+                prefixes = append(prefixes, r.prefix)
+            else:
+                exKinds = append(exKinds, r.kind)
+                exPrefixes = append(exPrefixes, r.prefix)
+            i = i + 1
+        return CellScope{kinds: kinds, prefixes: prefixes, catchAll: ks.hasFallback && ks.fallbackKey == key, excludedKinds: exKinds, excludedPrefixes: exPrefixes}
+
+    proc cellScopeKinds(s: CellScope) -> [text]:
+        if s.catchAll:
+            return []
+        return s.kinds
+
+    proc moverAnyEqual(xs: [text], x: text) -> bool:
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if xs[i] == x:
+                return true
+            i = i + 1
+        return false
+
+    proc moverAnyPrefix(prefixes: [text], address: text) -> bool:
+        let n = len(prefixes)
+        let mut i = 0
+        loop i < n:
+            if textStartsWith(address, prefixes[i]):
+                return true
+            i = i + 1
+        return false
+
+    # cellScopeContains: whether a node belongs to the cell — either half
+    # of a rule identifies it.
+    proc cellScopeContains(s: CellScope, kind: text, address: text) -> bool:
+        if s.catchAll:
+            return !moverAnyEqual(s.excludedKinds, kind) && !moverAnyPrefix(s.excludedPrefixes, address)
+        return moverAnyEqual(s.kinds, kind) || moverAnyPrefix(s.prefixes, address)
+
+    # cellScopeMayContainAddress: whether an address alone could name a
+    # node of the cell (node_updated/node_deleted carry no kind).
+    proc cellScopeMayContainAddress(s: CellScope, address: text) -> bool:
+        if s.catchAll:
+            return !moverAnyPrefix(s.excludedPrefixes, address)
+        return moverAnyPrefix(s.prefixes, address)
+
+    # ── the change feed ───────────────────────────────────────────────
+    # moverChangedAddresses: the addresses one SSE frame's `data:` lines
+    # name as changed; any other event contributes nothing.
+    proc moverChangedAddresses(frame: text) -> [text]:
+        let mut out = []
+        let lines = split(frame, "\n")
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let mut line = lines[i]
+            if len(line) > 0 && charAt(line, len(line) - 1) == "\r":
+                line = slice(line, 0, len(line) - 1)
+            if textStartsWith(line, "data:"):
+                let pr = do fqlParseValue(trim(slice(line, 5, len(line))))
+                if pr.ok:
+                    let ev = do fqlAt(pr.v, "event")
+                    if ev.kind == "str":
+                        if ev.s == "node_created" || ev.s == "node_updated" || ev.s == "node_deleted" || ev.s == "node_claimed":
+                            let a = do fqlAt(pr.v, "address")
+                            if a.kind == "str":
+                                out = append(out, a.s)
+                        if ev.s == "transaction_committed":
+                            let arr = do fqlAt(pr.v, "addresses")
+                            if arr.kind == "arr":
+                                let mut j = 0
+                                loop j < len(arr.items):
+                                    if arr.items[j].kind == "str":
+                                        out = append(out, arr.items[j].s)
+                                    j = j + 1
+            i = i + 1
+        return out
+
+    # moverFrameEnd: the index just past the blank line ending the first
+    # frame (`\n\n` or `\r\n\r\n`, whichever comes first), or -1.
+    proc moverFrameEnd(buf: [int]) -> int:
+        let n = len(buf)
+        let mut lf = -1
+        let mut crlf = -1
+        let mut i = 0
+        loop i + 1 < n && lf < 0:
+            if buf[i] == 10 && buf[i + 1] == 10:
+                lf = i + 2
+            i = i + 1
+        let mut j = 0
+        loop j + 3 < n && crlf < 0:
+            if buf[j] == 13 && buf[j + 1] == 10 && buf[j + 2] == 13 && buf[j + 3] == 10:
+                crlf = j + 4
+            j = j + 1
+        if lf < 0:
+            return crlf
+        if crlf < 0:
+            return lf
+        return min(lf, crlf)
+
+    # A sorted, duplicate-free set of addresses (the BTreeSet).
+    proc moverSetInsert(set: [text], x: text) -> [text]:
+        let n = len(set)
+        let mut lo = 0
+        let mut hi = n
+        loop lo < hi:
+            let mid = (lo + hi) / 2
+            if set[mid] < x:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < n && set[lo] == x:
+            return set
+        let mut out = []
+        let mut i = 0
+        loop i < lo:
+            out = append(out, set[i])
+            i = i + 1
+        out = append(out, x)
+        loop i < n:
+            out = append(out, set[i])
+            i = i + 1
+        return out
+
+    struct ChangeFeed:
+        stream: HttpStream
+        buf: [int]
+        dirty: [text]
+        observed: int
+        applied: int
+        broken: bool
+        brokenReason: text
+        node: text
+        scope: CellScope
+
+    proc changeFeedWith(f: ChangeFeed, dirty: [text], observed: int, applied: int) -> ChangeFeed:
+        return ChangeFeed{stream: f.stream, buf: f.buf, dirty: dirty, observed: observed, applied: applied, broken: f.broken, brokenReason: f.brokenReason, node: f.node, scope: f.scope}
+
+    # changeFeedHealth: "" while Live, else the Broken reason.
+    proc changeFeedHealth(f: ChangeFeed) -> text:
+        if f.broken:
+            return f.brokenReason
+        return ""
+
+    # changeFeedAdmit: split complete frames off buf and admit every
+    # in-scope address they name — one event is one write in `observed`.
+    proc changeFeedAdmit(f: ChangeFeed, bytes: [int]) -> ChangeFeed:
+        let mut buf = f.buf + bytes
+        let mut dirty = f.dirty
+        let mut observed = f.observed
+        let mut end = moverFrameEnd(buf)
+        loop end >= 0:
+            let frame = bytesToText(httpBytesRange(buf, 0, end))
+            buf = httpBytesRange(buf, end, len(buf))
+            let named = do moverChangedAddresses(frame)
+            let mut i = 0
+            loop i < len(named):
+                if cellScopeMayContainAddress(f.scope, named[i]):
+                    dirty = moverSetInsert(dirty, named[i])
+                    observed = observed + 1
+                i = i + 1
+            end = moverFrameEnd(buf)
+        return ChangeFeed{stream: f.stream, buf: buf, dirty: dirty, observed: observed, applied: f.applied, broken: f.broken, brokenReason: f.brokenReason, node: f.node, scope: f.scope}
+
+    # changeFeedPump: take in every frame that has arrived; the stream
+    # ending, cleanly or not, breaks the feed for good.
+    proc changeFeedPump(f: ChangeFeed) -> ChangeFeed uses io.net:
+        if f.broken:
+            return f
+        let s = do httpStreamPump(f.stream, 0)
+        let withStream = ChangeFeed{stream: httpStreamWithData(s, []), buf: f.buf, dirty: f.dirty, observed: f.observed, applied: f.applied, broken: false, brokenReason: "", node: f.node, scope: f.scope}
+        let admitted = do changeFeedAdmit(withStream, s.data)
+        if !s.ended:
+            return admitted
+        let mut reason = "the stream from '" + f.node + "' ended"
+        if s.endErr != "":
+            reason = "the stream from '" + f.node + "' failed: " + s.endErr
+        return ChangeFeed{stream: admitted.stream, buf: admitted.buf, dirty: admitted.dirty, observed: admitted.observed, applied: admitted.applied, broken: true, brokenReason: reason, node: f.node, scope: f.scope}
+
+    proc changeFeedClose(f: ChangeFeed) -> bool uses io.net:
+        let c = do httpStreamClose(f.stream)
+        return c
+
+    # ── the mover ─────────────────────────────────────────────────────
+    struct CellMover:
+        source: FqlClient
+        destination: FqlClient
+        scope: CellScope
+        config: MoverConfig
+        rowsCopied: int
+        bytesCopied: int
+        hasResident: bool
+        residentBytes: int
+        snapshotComplete: bool
+
+    proc cellMoverNew(source: FqlClient, destination: FqlClient, scope: CellScope, config: MoverConfig) -> CellMover:
+        return CellMover{source: source, destination: destination, scope: scope, config: config, rowsCopied: 0, bytesCopied: 0, hasResident: false, residentBytes: 0, snapshotComplete: false}
+
+    proc cellMoverSourceId(m: CellMover) -> text:
+        return m.source.endpoint.dbmsId
+
+    proc cellMoverDestinationId(m: CellMover) -> text:
+        return m.destination.endpoint.dbmsId
+
+    proc moverWithCounts(m: CellMover, rows: int, bytes: int) -> CellMover:
+        return CellMover{source: m.source, destination: m.destination, scope: m.scope, config: m.config, rowsCopied: rows, bytesCopied: bytes, hasResident: m.hasResident, residentBytes: m.residentBytes, snapshotComplete: m.snapshotComplete}
+
+    struct SubscribeResult:
+        ok: bool
+        err: MoverError
+        feed: ChangeFeed
+
+    # moverSubscribe: open the source's `GET /events` — call before the
+    # snapshot. A refusal maps like open_events: 401/403 Unauthorized,
+    # any other non-2xx Status.
+    proc moverSubscribe(m: CellMover) -> SubscribeResult uses io.net:
+        let opened = do fqlOpenEvents(m.source)
+        let s = opened.stream
+        let feed = ChangeFeed{stream: s, buf: [], dirty: [], observed: 0, applied: 0, broken: false, brokenReason: "", node: cellMoverSourceId(m), scope: m.scope}
+        if !opened.ok:
+            return SubscribeResult{ok: false, err: moverErrWire(cellMoverSourceId(m), opened.err), feed: feed}
+        let none = do moverErrNone()
+        let admitted = do changeFeedAdmit(ChangeFeed{stream: httpStreamWithData(s, []), buf: [], dirty: [], observed: 0, applied: 0, broken: false, brokenReason: "", node: feed.node, scope: m.scope}, s.data)
+        return SubscribeResult{ok: true, err: none, feed: admitted}
+
+    # moverInsertOp: the upsert that reproduces a node elsewhere.
+    proc moverInsertOp(n: FqlNode) -> FqlTxOp:
+        let op = do fqlTxInsertNode(n.address, n.kind, n.coordinate.x, n.coordinate.y, n.coordinate.z, n.coordinate.q, n.data, n.visibility == "Public")
+        return op
+
+    # moverFirstDifference: the first field two nodes disagree on, or "".
+    proc moverFirstDifference(a: FqlNode, b: FqlNode) -> text:
+        if a.address != b.address:
+            return "address"
+        if a.kind != b.kind:
+            return "kind"
+        if a.data != b.data:
+            return "data"
+        if a.coordinate.x != b.coordinate.x || a.coordinate.y != b.coordinate.y || a.coordinate.z != b.coordinate.z || a.coordinate.q != b.coordinate.q:
+            return "coordinate"
+        if a.value != b.value:
+            return "value"
+        if a.owner != b.owner:
+            return "owner"
+        if a.hasClaimedBy != b.hasClaimedBy || (a.hasClaimedBy && a.claimedBy != b.claimedBy):
+            return "claimed_by"
+        if a.visibility != b.visibility:
+            return "visibility"
+        return ""
+
+    proc moverIdentityHint(field: text) -> text:
+        if field == "owner":
+            return ". `insert_node` stamps the writing identity as the owner and has no `owner` field, so a cell can only be moved by a credential whose owner already owns its nodes"
+        if field == "claimed_by":
+            return ". A claim (POST /node/:address/claim) has no representation in `insert_node`, so it cannot be carried across instances"
+        return ""
+
+    proc moverRefuseEdges(m: CellMover) -> MoverError uses io.net:
+        let none = do moverErrNone()
+        let stats = do fqlStats(m.source)
+        if !stats.ok:
+            if stats.err.kind == "Unauthorized":
+                return moverErrOf("NotIdentical", "'" + cellMoverSourceId(m) + "' will not report GET /stats to this credential, so the mover cannot check whether the cell has edges — and an edge cannot be copied (FacetQL enumerates edges only per node, and an edge out of the cell cannot be written on the destination). Give the mover an admin credential, or move a cell whose edge set is known to be empty", 0)
+            return moverErrWire(cellMoverSourceId(m), stats.err)
+        if stats.v.edgeCount > 0:
+            return moverErrOf("NotIdentical", "'" + cellMoverSourceId(m) + "' holds " + stats.v.edgeCount + " edge(s). FacetQL exposes edges only per node (GET /node/:address/edges/out) and refuses an edge whose far endpoint is not readable on the instance it is written to, so an edge leaving this cell cannot be reconstructed on the destination. Copying the nodes alone would produce a destination that looks complete and is not", 0)
+        return none
+
+    proc moverPageRequest(hasKind: bool, kind: text, limit: int, hasAfter: bool, after: text) -> FqlQueryRequest:
+        let d = do fqlQueryRequestDefault()
+        return FqlQueryRequest{hasKind: hasKind, kind: kind, hasOwner: false, owner: "", hasWhere: false, whereValue: d.whereValue, hasItemVar: false, itemVar: "", hasOrder: false, order: "", desc: false, hasAfter: hasAfter, after: after, hasLimit: true, limit: limit}
+
+    struct MoverCommit:
+        mover: CellMover
+        err: MoverError
+        progress: [text]
+
+    # moverWriteAll: rows in batches — flushed at batchOps ops or batchBytes
+    # of data — each counted only once it committed.
+    proc moverWriteAll(m0: CellMover, rows: [FqlNode]) -> MoverCommit uses io.net:
+        let none = do moverErrNone()
+        let mut m = m0
+        let mut progress = []
+        let mut batch = []
+        let mut bytes = 0
+        let n = len(rows)
+        let mut i = 0
+        loop i < n:
+            batch = append(batch, moverInsertOp(rows[i]))
+            bytes = bytes + byteLen(rows[i].data)
+            let last = i == n - 1
+            if len(batch) >= m.config.batchOps || bytes >= m.config.batchBytes || (last && len(batch) > 0):
+                let r = do fqlTransaction(m.destination, batch)
+                if !r.ok:
+                    return MoverCommit{mover: m, err: moverErrWire(cellMoverDestinationId(m), r.err), progress: progress}
+                m = moverWithCounts(m, m.rowsCopied + len(batch), m.bytesCopied + bytes)
+                progress = append(progress, "" + m.rowsCopied + "," + m.bytesCopied)
+                batch = []
+                bytes = 0
+            i = i + 1
+        return MoverCommit{mover: m, err: none, progress: progress}
+
+    struct SnapshotResult:
+        mover: CellMover
+        feed: ChangeFeed
+        err: MoverError
+        progress: [text]
+
+    # moverSnapshot: walk the source cursor and write every node of the
+    # cell to the destination; the feed is pumped (and must be live)
+    # before every page.
+    proc moverSnapshot(m0: CellMover, f0: ChangeFeed) -> SnapshotResult uses io.net:
+        let refused = do moverRefuseEdges(m0)
+        if refused.kind != "":
+            return SnapshotResult{mover: m0, feed: f0, err: refused, progress: []}
+        let mut m = m0
+        let mut f = f0
+        let mut progress = []
+        let kinds = do cellScopeKinds(m.scope)
+        let mut passes = len(kinds)
+        if m.scope.catchAll:
+            passes = 1
+        let mut resident = 0
+        let mut p = 0
+        loop p < passes:
+            let hasKind = !m.scope.catchAll
+            let mut kind = ""
+            if hasKind:
+                kind = kinds[p]
+            let mut hasAfter = false
+            let mut after = ""
+            let mut pages = 0
+            let mut last = false
+            loop !last:
+                f = changeFeedPump(f)
+                if f.broken:
+                    return SnapshotResult{mover: m, feed: f, err: moverErrOf("FeedBroken", f.brokenReason, 0), progress: progress}
+                pages = pages + 1
+                if pages > moverMaxPages():
+                    return SnapshotResult{mover: m, feed: f, err: moverErrOf("Runaway", "", moverMaxPages()), progress: progress}
+                let page = do fqlQuery(m.source, moverPageRequest(hasKind, kind, m.config.pageLimit, hasAfter, after))
+                if !page.ok:
+                    return SnapshotResult{mover: m, feed: f, err: moverErrWire(cellMoverSourceId(m), page.err), progress: progress}
+                last = !fqlQueryPageHasMore(page.v)
+                hasAfter = true
+                after = page.v.next
+                let mut rows = []
+                let mut i = 0
+                loop i < len(page.v.nodes):
+                    let node = page.v.nodes[i]
+                    if cellScopeContains(m.scope, node.kind, node.address):
+                        rows = append(rows, node)
+                        resident = resident + byteLen(node.data)
+                    i = i + 1
+                let w = do moverWriteAll(m, rows)
+                m = w.mover
+                progress = progress + w.progress
+                if w.err.kind != "":
+                    return SnapshotResult{mover: m, feed: f, err: w.err, progress: progress}
+            p = p + 1
+        let done = CellMover{source: m.source, destination: m.destination, scope: m.scope, config: m.config, rowsCopied: m.rowsCopied, bytesCopied: m.bytesCopied, hasResident: true, residentBytes: resident, snapshotComplete: true}
+        let none = do moverErrNone()
+        return SnapshotResult{mover: done, feed: f, err: none, progress: progress}
+
+    # moverReconcile: bring `addresses` on the destination to whatever the
+    # source now says.
+    proc moverReconcile(m: CellMover, addresses: [text]) -> MoverError uses io.net:
+        let none = do moverErrNone()
+        let present = do fqlMultiget(m.source, addresses)
+        if !present.ok:
+            return moverErrWire(cellMoverSourceId(m), present.err)
+        let mut ops = []
+        let n = len(addresses)
+        let mut i = 0
+        loop i < n:
+            let mut at = -1
+            let mut j = 0
+            loop j < len(present.v) && at < 0:
+                let node = present.v[j]
+                if node.address == addresses[i] && cellScopeContains(m.scope, node.kind, node.address):
+                    at = j
+                j = j + 1
+            if at >= 0:
+                ops = append(ops, moverInsertOp(present.v[at]))
+            else:
+                let there = do fqlGetNode(m.destination, addresses[i])
+                if !there.ok:
+                    return moverErrWire(cellMoverDestinationId(m), there.err)
+                if there.found:
+                    ops = append(ops, fqlTxDeleteNode(addresses[i]))
+            i = i + 1
+        let mut k = 0
+        loop k < len(ops):
+            let mut batch = []
+            let mut b = 0
+            loop b < m.config.batchOps && k + b < len(ops):
+                batch = append(batch, ops[k + b])
+                b = b + 1
+            let r = do fqlTransaction(m.destination, batch)
+            if !r.ok:
+                return moverErrWire(cellMoverDestinationId(m), r.err)
+            k = k + b
+        return none
+
+    struct CatchUpResult:
+        feed: ChangeFeed
+        reconciled: int
+        err: MoverError
+
+    # moverCatchUp: reconcile every dirty address once. A failure puts the
+    # addresses back and does not advance `applied`.
+    proc moverCatchUp(m: CellMover, f0: ChangeFeed) -> CatchUpResult uses io.net:
+        let f = do changeFeedPump(f0)
+        if f.broken:
+            return CatchUpResult{feed: f, reconciled: 0, err: moverErrOf("FeedBroken", f.brokenReason, 0)}
+        let addresses = f.dirty
+        let observed = f.observed
+        let taken = do changeFeedWith(f, [], f.observed, f.applied)
+        let none = do moverErrNone()
+        if len(addresses) == 0:
+            return CatchUpResult{feed: changeFeedWith(taken, [], taken.observed, max(taken.applied, observed)), reconciled: 0, err: none}
+        let mut k = 0
+        loop k < len(addresses):
+            let mut chunk = []
+            let mut c = 0
+            loop c < fqlMultigetLimit() && k + c < len(addresses):
+                chunk = append(chunk, addresses[k + c])
+                c = c + 1
+            let e = do moverReconcile(m, chunk)
+            if e.kind != "":
+                let mut restored = taken.dirty
+                let mut r = 0
+                loop r < len(addresses):
+                    restored = moverSetInsert(restored, addresses[r])
+                    r = r + 1
+                return CatchUpResult{feed: changeFeedWith(taken, restored, taken.observed, taken.applied), reconciled: 0, err: e}
+            k = k + c
+        return CatchUpResult{feed: changeFeedWith(taken, taken.dirty, taken.observed, max(taken.applied, observed)), reconciled: len(addresses), err: none}
+
+    struct NodesByAddressR:
+        err: MoverError
+        nodes: [FqlNode]
+
+    proc moverSortByAddress(xs: [FqlNode]) -> [FqlNode]:
+        let n = len(xs)
+        if n <= 1:
+            return xs
+        let mut left = []
+        let mut right = []
+        let mut i = 0
+        loop i < n:
+            if i < n / 2:
+                left = append(left, xs[i])
+            else:
+                right = append(right, xs[i])
+            i = i + 1
+        let l = do moverSortByAddress(left)
+        let r = do moverSortByAddress(right)
+        let mut out = []
+        let mut a = 0
+        let mut b = 0
+        loop a < len(l) || b < len(r):
+            if b >= len(r) || (a < len(l) && l[a].address <= r[b].address):
+                out = append(out, l[a])
+                a = a + 1
+            else:
+                out = append(out, r[b])
+                b = b + 1
+        return out
+
+    # moverEnumerate: every node of the cell on one instance, by address (a
+    # later duplicate replacing an earlier one, as BTreeMap::insert does).
+    proc moverEnumerate(m: CellMover, client: FqlClient, isSource: bool) -> NodesByAddressR uses io.net:
+        let kinds = do cellScopeKinds(m.scope)
+        let mut passes = len(kinds)
+        if m.scope.catchAll:
+            passes = 1
+        let mut all = []
+        let mut p = 0
+        loop p < passes:
+            let hasKind = !m.scope.catchAll
+            let mut kind = ""
+            if hasKind:
+                kind = kinds[p]
+            let mut hasAfter = false
+            let mut after = ""
+            let mut pages = 0
+            let mut last = false
+            loop !last:
+                pages = pages + 1
+                if pages > moverMaxPages():
+                    return NodesByAddressR{err: moverErrOf("Runaway", "", moverMaxPages()), nodes: []}
+                let page = do fqlQuery(client, moverPageRequest(hasKind, kind, m.config.pageLimit, hasAfter, after))
+                if !page.ok:
+                    let mut who = cellMoverDestinationId(m)
+                    if isSource:
+                        who = cellMoverSourceId(m)
+                    return NodesByAddressR{err: moverErrWire(who, page.err), nodes: []}
+                last = !fqlQueryPageHasMore(page.v)
+                hasAfter = true
+                after = page.v.next
+                let mut i = 0
+                loop i < len(page.v.nodes):
+                    if cellScopeContains(m.scope, page.v.nodes[i].kind, page.v.nodes[i].address):
+                        all = append(all, page.v.nodes[i])
+                    i = i + 1
+            p = p + 1
+        let sorted = do moverSortByAddress(all)
+        let mut out = []
+        let mut j = 0
+        loop j < len(sorted):
+            if len(out) > 0 && out[len(out) - 1].address == sorted[j].address:
+                out[len(out) - 1] = sorted[j]
+            else:
+                out = append(out, sorted[j])
+            j = j + 1
+        let none = do moverErrNone()
+        return NodesByAddressR{err: none, nodes: out}
+
+    struct CompareResult:
+        err: MoverError
+        rows: int
+
+    # moverCompare: both instances in full, every field of every node.
+    proc moverCompare(m: CellMover) -> CompareResult uses io.net:
+        let src = do moverEnumerate(m, m.source, true)
+        if src.err.kind != "":
+            return CompareResult{err: src.err, rows: 0}
+        let dst = do moverEnumerate(m, m.destination, false)
+        if dst.err.kind != "":
+            return CompareResult{err: dst.err, rows: 0}
+        if len(src.nodes) != len(dst.nodes):
+            return CompareResult{err: moverErrOf("NotIdentical", "'" + cellMoverSourceId(m) + "' holds " + len(src.nodes) + " node(s) in this cell and '" + cellMoverDestinationId(m) + "' holds " + len(dst.nodes), 0), rows: 0}
+        let mut d = 0
+        let mut i = 0
+        loop i < len(src.nodes):
+            let expected = src.nodes[i]
+            loop d < len(dst.nodes) && dst.nodes[d].address < expected.address:
+                d = d + 1
+            if d >= len(dst.nodes) || dst.nodes[d].address != expected.address:
+                return CompareResult{err: moverErrOf("NotIdentical", "'" + cellMoverDestinationId(m) + "' is missing '" + expected.address + "'", 0), rows: 0}
+            let field = do moverFirstDifference(expected, dst.nodes[d])
+            if field != "":
+                return CompareResult{err: moverErrOf("NotIdentical", "'" + expected.address + "' differs in `" + field + "` between '" + cellMoverSourceId(m) + "' and '" + cellMoverDestinationId(m) + "'" + moverIdentityHint(field), 0), rows: 0}
+            i = i + 1
+        let none = do moverErrNone()
+        return CompareResult{err: none, rows: len(src.nodes)}
+
+    struct VerifyResult:
+        feed: ChangeFeed
+        verdict: CopyVerdict
+
+    proc moverFeedBrokenVerdict(reason: text, atMs: int) -> CopyVerdict:
+        let v = do copyVerdictFailed(moverErrorDisplay(moverErrOf("FeedBroken", reason, 0)), atMs)
+        return v
+
+    # moverVerify: Verified only when the snapshot is complete, nothing is
+    # waiting to be reconciled before or after the full comparison, and the
+    # feed stayed whole throughout.
+    proc moverVerify(m: CellMover, f0: ChangeFeed, atMs: int) -> VerifyResult uses io.net:
+        let f = do changeFeedPump(f0)
+        if f.broken:
+            return VerifyResult{feed: f, verdict: moverFeedBrokenVerdict(f.brokenReason, atMs)}
+        if !m.snapshotComplete || len(f.dirty) > 0:
+            return VerifyResult{feed: f, verdict: copyVerdictPending()}
+        let cmp = do moverCompare(m)
+        let after = do changeFeedPump(f)
+        if cmp.err.kind == "":
+            if len(after.dirty) > 0:
+                return VerifyResult{feed: after, verdict: copyVerdictPending()}
+            if after.broken:
+                return VerifyResult{feed: after, verdict: moverFeedBrokenVerdict(after.brokenReason, atMs)}
+            return VerifyResult{feed: after, verdict: copyVerdictVerified(cmp.rows, atMs)}
+        if cmp.err.kind == "NotIdentical":
+            return VerifyResult{feed: after, verdict: copyVerdictFailed(cmp.err.reason, atMs)}
+        if cmp.err.kind == "Wire":
+            return VerifyResult{feed: after, verdict: copyVerdictPending()}
+        return VerifyResult{feed: after, verdict: copyVerdictFailed(moverErrorDisplay(cmp.err), atMs)}
+
+    struct MoverReport:
+        rowsCopied: int
+        bytesCopied: int
+        hasResidentBytes: bool
+        residentBytes: int
+        snapshotComplete: bool
+        observedWrites: int
+        appliedWrites: int
+        verdict: CopyVerdict
+
+    proc moverReport(m: CellMover, f: ChangeFeed, verdict: CopyVerdict) -> MoverReport:
+        return MoverReport{rowsCopied: m.rowsCopied, bytesCopied: m.bytesCopied, hasResidentBytes: m.hasResident, residentBytes: m.residentBytes, snapshotComplete: m.snapshotComplete, observedWrites: f.observed, appliedWrites: f.applied, verdict: verdict}
+
+    # ── mover.rs's #[test]s, input for input ──────────────────────────
+    proc moverTestKey(shard: int) -> int:
+        let k = do routingKeyPack(shard, 0, 0)
+        return k
+
+    proc moverTestNode(address: text, kind: text, data: text) -> FqlNode:
+        return FqlNode{address: address, coordinate: FqlCoordinate{x: 0, y: 0, z: 0, q: 0}, value: 0, kind: kind, data: data, owner: "app", hasClaimedBy: false, claimedBy: "", visibility: "Private"}
+
+    proc moverTestKeyspace(rules: [RoutingRule]) -> Keyspace:
+        let mut ks = keyspaceNew()
+        let mut i = 0
+        loop i < len(rules):
+            let r = do keyspaceWithRule(ks, rules[i])
+            ks = r.keyspace
+            i = i + 1
+        return ks
+
+    proc demoADeclaredCellHoldsItsOwnKindsAndNothingElse() -> bool:
+        let post = do keyspaceRuleNew("Post", "Post:", moverTestKey(1))
+        let session = do keyspaceRuleNew("Session", "Session:", moverTestKey(2))
+        let ks = do moverTestKeyspace([post.rule, session.rule])
+        let s = do cellScopeForKey(ks, moverTestKey(1))
+        let kinds = do cellScopeKinds(s)
+        return len(kinds) == 1 && kinds[0] == "Post" && cellScopeContains(s, "Post", "Post:1") && !cellScopeContains(s, "Session", "Session:1") && cellScopeMayContainAddress(s, "Post:1") && !cellScopeMayContainAddress(s, "Session:1")
+
+    proc demoAFallbackCellHoldsEverythingNoOtherRuleClaims() -> bool:
+        let single = do cellScopeForKey(keyspaceSingle(moverTestKey(1)), moverTestKey(1))
+        let a = single.catchAll && len(cellScopeKinds(single)) == 0 && cellScopeContains(single, "anything", "at:all")
+        let session = do keyspaceRuleNew("Session", "Session:", moverTestKey(2))
+        let split = do keyspaceWithFallback(moverTestKeyspace([session.rule]), moverTestKey(1))
+        let s = do cellScopeForKey(split, moverTestKey(1))
+        return a && s.catchAll && cellScopeContains(s, "Post", "Post:1") && !cellScopeContains(s, "Session", "Session:1") && !cellScopeMayContainAddress(s, "Session:9")
+
+    proc demoEveryWriteShapedEventYieldsTheAddressesItNames() -> bool:
+        let a = do moverChangedAddresses("data: {\"event\":\"node_created\",\"address\":\"Post:1\",\"kind\":\"Post\"}\n\n")
+        let b = do moverChangedAddresses("data: {\"event\":\"node_updated\",\"address\":\"Post:2\"}\n\n")
+        let c = do moverChangedAddresses("data: {\"event\":\"node_deleted\",\"address\":\"Post:3\"}\n\n")
+        let d = do moverChangedAddresses("data: {\"event\":\"transaction_committed\",\"addresses\":[\"a\",\"b\"]}\n\n")
+        return join(a, ",") == "Post:1" && join(b, ",") == "Post:2" && join(c, ",") == "Post:3" && join(d, ",") == "a,b"
+
+    proc demoAnEventThatIsNotANodeWriteContributesNothing() -> bool:
+        let a = do moverChangedAddresses("data: {\"event\":\"edge_created\",\"from\":\"a\",\"to\":\"b\"}\n\n")
+        let b = do moverChangedAddresses("data: {\"event\":\"user_created\",\"owner\":\"bob\"}\n\n")
+        let c = do moverChangedAddresses("data: not json\n\n")
+        let d = do moverChangedAddresses(": keep-alive\n\n")
+        return len(a) == 0 && len(b) == 0 && len(c) == 0 && len(d) == 0
+
+    proc demoAnInsertOpCarriesEveryFieldInsertNodeHas() -> bool:
+        let base = do moverTestNode("Post:1", "Post", "{\"n\":1}")
+        let n = FqlNode{address: base.address, coordinate: FqlCoordinate{x: 1, y: 2, z: 3, q: 4}, value: base.value, kind: base.kind, data: base.data, owner: base.owner, hasClaimedBy: false, claimedBy: "", visibility: "Public"}
+        let enc = do fqlEncodeTxOp(moverInsertOp(n))
+        let got = do fqlParseValue(enc)
+        let want = do fqlParseValue("{\"type\":\"insert_node\",\"address\":\"Post:1\",\"kind\":\"Post\",\"x\":1,\"y\":2,\"z\":3,\"q\":4,\"data\":\"{\\\"n\\\":1}\",\"public\":true}")
+        return sjValueText(got.v) == sjValueText(want.v)
+
+    proc demoTheCheckCatchesTheFieldsInsertNodeCannotCarry() -> bool:
+        let src = do moverTestNode("Post:1", "Post", "{}")
+        let reowned = FqlNode{address: src.address, coordinate: src.coordinate, value: src.value, kind: src.kind, data: src.data, owner: "fabric", hasClaimedBy: false, claimedBy: "", visibility: src.visibility}
+        let claimed = FqlNode{address: src.address, coordinate: src.coordinate, value: src.value, kind: src.kind, data: src.data, owner: src.owner, hasClaimedBy: true, claimedBy: "worker-1", visibility: src.visibility}
+        let edited = FqlNode{address: src.address, coordinate: src.coordinate, value: src.value, kind: src.kind, data: "{\"n\":2}", owner: src.owner, hasClaimedBy: false, claimedBy: "", visibility: src.visibility}
+        return moverFirstDifference(src, reowned) == "owner" && contains(moverIdentityHint("owner"), "`owner` field") && moverFirstDifference(src, claimed) == "claimed_by" && moverFirstDifference(src, edited) == "data" && moverFirstDifference(src, src) == ""
+
+    proc demoSseFramesAreSplitOnTheBlankLineInEitherEncoding() -> bool:
+        return moverFrameEnd(textToBytes("data: x\n\ndata: y\n\n")) == 9 && moverFrameEnd(textToBytes("data: x\r\n\r\n")) == 11 && moverFrameEnd(textToBytes("data: incomplete\n")) == -1
+
+    state moverOut: text = ""
+
+    action moverRunDemos:
+        let a = do demoADeclaredCellHoldsItsOwnKindsAndNothingElse()
+        let b = do demoAFallbackCellHoldsEverythingNoOtherRuleClaims()
+        let c = do demoEveryWriteShapedEventYieldsTheAddressesItNames()
+        let d = do demoAnEventThatIsNotANodeWriteContributesNothing()
+        let e = do demoAnInsertOpCarriesEveryFieldInsertNodeHas()
+        let f = do demoTheCheckCatchesTheFieldsInsertNodeCannotCarry()
+        let g = do demoSseFramesAreSplitOnTheBlankLineInEitherEncoding()
+        moverOut = "" + a + "," + b + "," + c + "," + d + "," + e + "," + f + "," + g
+
+    # ── live flows, against two real FacetQL instances ────────────────
+    proc moverLiveClient(id: text, base: text, token: text) -> FqlClient:
+        let ep = do fqlEndpointNew(id, base, token)
+        let c = do fqlClientNew(ep.v)
+        return c
+
+    proc moverLiveCreate(c: FqlClient, address: text, kind: text, data: text) -> bool uses io.net:
+        let r = do fqlCreateNode(c, FqlCreateNodeRequest{address: address, kind: kind, x: 1, y: 2, z: 3, q: 4, data: data, public: false, ifAbsent: false})
+        return r.ok
+
+    proc moverVerdictLine(v: CopyVerdict) -> text:
+        if v.kind == "failed":
+            return "failed " + v.reason
+        if v.kind == "verified":
+            return "verified " + v.rows
+        return v.kind
+
+    # moverLiveCopy: seed a source, subscribe, snapshot, write to the source
+    # while the copy is live, catch up, verify; then tamper with the copy,
+    # and finally refuse a source that has an edge.
+    proc moverLiveCopy(src: text, dst: text, token: text) -> text uses io.net:
+        let s = do moverLiveClient("src", src, token)
+        let d = do moverLiveClient("dst", dst, token)
+        let mut seeded = 0
+        let mut i = 0
+        loop i < 30:
+            if moverLiveCreate(s, "Post:" + i, "Post", "{\"n\":" + i + "}"):
+                seeded = seeded + 1
+            i = i + 1
+        let mut j = 0
+        loop j < 5:
+            if moverLiveCreate(s, "Session:" + j, "Session", "{}"):
+                seeded = seeded + 1
+            j = j + 1
+        let post = do keyspaceRuleNew("Post", "Post:", moverTestKey(1))
+        let session = do keyspaceRuleNew("Session", "Session:", moverTestKey(2))
+        let ks = do moverTestKeyspace([post.rule, session.rule])
+        let scope = do cellScopeForKey(ks, moverTestKey(1))
+        let m0 = do cellMoverNew(s, d, scope, MoverConfig{batchOps: 7, batchBytes: 2 * 1024 * 1024, pageLimit: 10})
+        let sub = do moverSubscribe(m0)
+        let snap = do moverSnapshot(m0, sub.feed)
+        let early = do moverVerify(snap.mover, snap.feed, 1000)
+        let w1 = do moverLiveCreate(s, "Post:3", "Post", "{\"n\":\"updated\"}")
+        let w2 = do fqlTransaction(s, [fqlTxDeleteNode("Post:4")])
+        let w3 = do moverLiveCreate(s, "Post:99", "Post", "{\"n\":99}")
+        let w4 = do moverLiveCreate(s, "Session:0", "Session", "{\"out\":\"of scope\"}")
+        let mut feed = early.feed
+        let mut reconciled = 0
+        let mut tries = 0
+        loop feed.observed < 3 && tries < 200:
+            let cu = do moverCatchUp(snap.mover, feed)
+            feed = cu.feed
+            reconciled = reconciled + cu.reconciled
+            if feed.observed < 3:
+                let slept = sleepMs(10)
+            tries = tries + 1
+        let cu2 = do moverCatchUp(snap.mover, feed)
+        feed = cu2.feed
+        reconciled = reconciled + cu2.reconciled
+        let verified = do moverVerify(snap.mover, feed, 2000)
+        let report = do moverReport(snap.mover, verified.feed, verified.verdict)
+        let tamper = do moverLiveCreate(d, "Post:5", "Post", "{\"n\":\"tampered\"}")
+        let tampered = do moverVerify(snap.mover, verified.feed, 3000)
+        let closed = do changeFeedClose(tampered.feed)
+        let edge = do fqlTransaction(s, [fqlTxEdge("insert_edge", "Post:1", "Post:2", "rel")])
+        let m1 = do cellMoverNew(s, d, scope, moverConfigDefault())
+        let sub2 = do moverSubscribe(m1)
+        let refused = do moverSnapshot(m1, sub2.feed)
+        let closed2 = do changeFeedClose(refused.feed)
+        let mut out = ["seeded=" + seeded, "subscribe=" + sub.ok, "snapshotErr=" + snap.err.kind, "rowsCopied=" + snap.mover.rowsCopied]
+        out = append(out, "progress=" + join(snap.progress, ";"))
+        out = append(out, "resident=" + snap.mover.hasResident + " " + snap.mover.residentBytes)
+        out = append(out, "writes=" + w1 + "," + w2.ok + "," + w3 + "," + w4)
+        out = append(out, "observed=" + feed.observed + " applied=" + feed.applied + " reconciled=" + reconciled)
+        out = append(out, "verified=" + moverVerdictLine(verified.verdict))
+        out = append(out, "report=" + report.rowsCopied + " " + report.snapshotComplete + " " + report.observedWrites + " " + report.appliedWrites)
+        out = append(out, "tampered=" + tamper + " " + moverVerdictLine(tampered.verdict))
+        out = append(out, "edge=" + edge.ok + " " + refused.err.kind + " " + moverErrorDisplay(refused.err))
+        return join(out, "\n")
+
+    # moverLiveFeed: a source whose /events refuses, and one whose stream
+    # ends — both fatal, both said.
+    proc moverLiveFeed(src: text, token: text) -> text uses io.net:
+        let s = do moverLiveClient("src", src, token)
+        let d = do moverLiveClient("dst", src, token)
+        let m = do cellMoverNew(s, d, cellScopeWholeNamespace(), moverConfigDefault())
+        let sub = do moverSubscribe(m)
+        if !sub.ok:
+            return "subscribe=" + moverErrorDisplay(sub.err)
+        let mut feed = sub.feed
+        let mut tries = 0
+        loop !feed.broken && tries < 200:
+            feed = changeFeedPump(feed)
+            if !feed.broken:
+                let slept = sleepMs(10)
+            tries = tries + 1
+        let cu = do moverCatchUp(m, feed)
+        let v = do moverVerify(m, cu.feed, 7)
+        return "dirty=" + join(feed.dirty, ",") + "\nobserved=" + feed.observed + "\ncatchUp=" + moverErrorDisplay(cu.err) + "\nverify=" + moverVerdictLine(v.verdict)
+
+    proc moverLiveFlow(flow: text, src: text, dst: text, token: text) -> text uses io.net:
+        if flow == "copy":
+            let r = do moverLiveCopy(src, dst, token)
+            return r
+        let r = do moverLiveFeed(src, token)
+        return r
+
+    action moverRunLive(flow: text, src: text, dst: text, token: text):
+        let r = do moverLiveFlow(flow, src, dst, token)
+        moverOut = r

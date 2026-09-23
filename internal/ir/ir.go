@@ -27,11 +27,13 @@ type IR struct {
 	Procs      []Proc                       `json:"procs,omitempty"` // general-purpose, unconditionally server-executed code (self-hosting + product logic)
 	Jobs       []Job                        `json:"jobs"`
 	Daemons    []Daemon                     `json:"daemons,omitempty"`    // detached, process-lifetime background tasks (see Daemon's doc)
+	Shareds    []Shared                     `json:"shareds,omitempty"`    // process-local cells procs and daemons share (see Shared's doc)
 	Components []Component                  `json:"components,omitempty"` // reusable view fragments
 	Services   []Service                    `json:"services,omitempty"`   // external services (brains) actions may call
 	Files      []File                       `json:"files,omitempty"`      // declared file resources a proc may read/write (io.file)
 	Webhooks   []Webhook                    `json:"webhooks,omitempty"`   // inbound endpoints external systems POST to
 	APIs       []API                        `json:"apis,omitempty"`       // declared typed HTTP endpoints (the app's contract; see API)
+	Contract   *ContractRoute               `json:"contract,omitempty"`   // `contract "/path"`: serve the published contract (see ContractRoute)
 	Streams    []Stream                     `json:"streams,omitempty"`    // named event streams (see Stream)
 	Triggers   []Trigger                    `json:"triggers,omitempty"`   // event reactions: an action's success runs another action
 	Theme      map[string]string            `json:"theme,omitempty"`      // CSS custom properties (--fa-<name>)
@@ -142,6 +144,9 @@ type Struct struct {
 // meaning.
 type WireType struct {
 	Name string `json:"name"`
+	// Schema is the name the contract publishes this type's schema under
+	// (`type Name as "schema":`); "" means Name. See SchemaName.
+	Schema string `json:"schema,omitempty"`
 	// Query marks this type as bound from a URL query string, never a JSON
 	// body — see ast.Type.Query's doc comment for what that changes (and
 	// deliberately does not change) in each codegen target.
@@ -149,18 +154,55 @@ type WireType struct {
 	Fields []WireField `json:"fields"`
 }
 
+// SchemaName is the type's contract schema name: its `as "…"` alias, else Name.
+func (t WireType) SchemaName() string {
+	if t.Schema != "" {
+		return t.Schema
+	}
+	return t.Name
+}
+
 // WireMessage is a `message Name:` tagged union: a closed set of variants,
 // each carrying its own fields, discriminated on the wire by the variant's
 // own (already snake_case) name.
 type WireMessage struct {
 	Name     string               `json:"name"`
+	Tag      string               `json:"tag,omitempty"` // the discriminant's field name ("" = "type"); see TagName
 	Variants []WireMessageVariant `json:"variants"`
+}
+
+// TagName is the discriminant's field name on the wire.
+func (m WireMessage) TagName() string {
+	if m.Tag != "" {
+		return m.Tag
+	}
+	return "type"
 }
 
 // WireMessageVariant is one arm of a WireMessage.
 type WireMessageVariant struct {
 	Name   string      `json:"name"`
 	Fields []WireField `json:"fields"`
+	// Wire is the discriminant value when it differs from Name (`as "…"`).
+	Wire string `json:"wire,omitempty"`
+	// Action is what a dispatching route (`api POST "/events" -> Message`)
+	// runs for this variant, its fields bound to the action's parameters by
+	// name; Since/Summary document it in the contract's x-mutation-events.
+	Action  string `json:"action,omitempty"`
+	Since   string `json:"since,omitempty"`
+	Summary string `json:"summary,omitempty"`
+	// BodyParam/BodyType: the whole body, decoded as the wire type BodyType,
+	// binds the action's parameter BodyParam (`body envelope: WorkEnvelope`).
+	BodyParam string `json:"bodyParam,omitempty"`
+	BodyType  string `json:"bodyType,omitempty"`
+}
+
+// WireName is the variant's discriminant value on the wire.
+func (v WireMessageVariant) WireName() string {
+	if v.Wire != "" {
+		return v.Wire
+	}
+	return v.Name
 }
 
 // WireField is one typed field of a WireType or WireMessageVariant. Ref marks
@@ -178,6 +220,15 @@ type WireField struct {
 	// Default is the raw literal text of a `= value` clause (`"item"`, `1`,
 	// `true`) — never set alongside Optional. Empty string means no default.
 	Default string `json:"default,omitempty"`
+	// A message variant field's contract documentation.
+	Description string   `json:"description,omitempty"`
+	Aliases     []string `json:"aliases,omitempty"` // other names a caller may send it under
+	Enum        []string `json:"enum,omitempty"`    // its closed set of values
+	// Nullable: `T or null` — required, but an empty value is null.
+	Nullable bool `json:"nullable,omitempty"`
+	// Into: a pattern field's (`then_<field>`) action parameter, which
+	// receives every body key with the prefix as one json object.
+	Into string `json:"into,omitempty"`
 }
 
 // Component is a reusable view fragment: parameters plus a node tree whose
@@ -225,8 +276,9 @@ type Field struct {
 	Ref        string `json:"ref,omitempty"`        // relation target entity, else ""
 	Enum       string `json:"enum,omitempty"`       // enum type name when Type is text-backed enum
 	Index      bool   `json:"index,omitempty"`      // build a database index for this column
-	Secret     bool   `json:"secret,omitempty"`     // encrypt this column at rest (AES-GCM)
+	Secret     bool   `json:"secret,omitempty"`     // encrypt this column at rest (AES-GCM); never served in a row projection unless @requires(policy) admits the reader
 	E2E        bool   `json:"e2e,omitempty"`        // end-to-end sealed: stored/served as client-sealed ciphertext; the authority never holds plaintext and never renders it
+	Password   bool   `json:"password,omitempty"`   // @password: every write stores a bcrypt hash of the value; the column is never served, only checked by verifyPassword
 	ReadPolicy string `json:"readPolicy,omitempty"` // @requires(policy): served only to admitted actors, never over SSE
 	Optional   bool   `json:"optional,omitempty"`   // column is nullable
 	// Declarative constraints — the authority validates them on every add/set.
@@ -332,11 +384,16 @@ type State struct {
 // here for introspection (`facet build`) and tooling, while every use site
 // already carries the inlined expression. Deps are the base state/entity names
 // it transitively reads, for dependency tracking.
+//
+// Params is set for a parameterized derive (a projection): Expr then reads its
+// parameters as plain refs, and every call site already carries Expr with the
+// call's arguments substituted for them.
 type Derive struct {
-	Name string   `json:"name"`
-	Type string   `json:"type"`
-	Expr *Expr    `json:"expr"`
-	Deps []string `json:"deps"`
+	Name   string   `json:"name"`
+	Params []Param  `json:"params,omitempty"`
+	Type   string   `json:"type"`
+	Expr   *Expr    `json:"expr"`
+	Deps   []string `json:"deps"`
 }
 
 // Policy is a named predicate; enforced on the server, also shipped so the UI
@@ -397,16 +454,59 @@ type API struct {
 	Auth    string   `json:"auth"`
 	Ret     string   `json:"ret,omitempty"`
 	RetList bool     `json:"retList,omitempty"`
+	// Bearer names the action parameter the `Authorization: Bearer` value
+	// binds to on a route that authenticates with an app-issued credential
+	// (`auth <scheme> bearer <param>`); Auth is then that scheme.
+	Bearer string `json:"bearer,omitempty"`
+	// Dispatch names the message a dispatching route decodes its body as
+	// (`api POST "/events" -> Mutation`): the variant its tag selects runs its
+	// own action. Action is then "".
+	Dispatch string `json:"dispatch,omitempty"`
+}
+
+// ContractRoute is `contract "/path"`: the runtime serves the app's own
+// published contract under Path (Path, Path/version, Path/history,
+// Path/diff) and records each distinct version it serves.
+type ContractRoute struct {
+	Path  string `json:"path"`
+	Rate  string `json:"rate,omitempty"`
+	Since string `json:"since,omitempty"`
 }
 
 // Stream is one declared event stream (ast.Stream): Events are the wire type
 // names it carries; Auth is "session" when it requires a policy (Requires
 // names it), "none" otherwise.
 type Stream struct {
-	Path     string   `json:"path"`
-	Events   []string `json:"events"`
-	Requires string   `json:"requires,omitempty"`
-	Auth     string   `json:"auth"`
+	Path     string        `json:"path"`
+	Events   []StreamEvent `json:"events"`
+	Requires string        `json:"requires,omitempty"`
+	Auth     string        `json:"auth"`
+	Rate     string        `json:"rate,omitempty"`  // rate class a connect is metered against ("" = unmetered)
+	Since    string        `json:"since,omitempty"` // contract x-since of the stream route
+	// Params are the path's {params}: one stream instance per value tuple
+	// (`emit … on id` addresses one). Connect/Disconnect are actions run as
+	// the subscriber with those values when a connection opens/closes; a
+	// Connect with ConnectEvent sends its reply to that connection as that event.
+	Params     []string     `json:"params,omitempty"`
+	Connects   []StreamHook `json:"connects,omitempty"`
+	Disconnect string       `json:"disconnect,omitempty"`
+}
+
+// StreamHook is one `connect -> Action [as Event]`: run as the subscriber when
+// a connection opens; its reply, when Event is set, is sent to it first.
+type StreamHook struct {
+	Action string `json:"action"`
+	Event  string `json:"event,omitempty"`
+}
+
+// StreamEvent is one event a stream carries: Name is the SSE `event:` field,
+// Type the payload's wire type (several events may share one), and Since /
+// Summary its contract documentation.
+type StreamEvent struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Since   string `json:"since,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 // Require is one resolved permission check on an action: the policy name plus the
@@ -440,7 +540,7 @@ type Job struct {
 // doc for the full design rationale (why it is not simply a Job with the join
 // requirement dropped). Body is proc-shaped IR (Stmt's ordinary "let"/"loop"/
 // "if"/"spawn"/"join"/etc. ops) plus the "actcall" op (see Stmt's doc),
-// runtime/server.go's execProcBlock interprets both. Every, if nonzero, is
+// runtime/proccompile.go interprets both. Every, if nonzero, is
 // this instance's own tick interval (no fleet-wide coordination, unlike Job's
 // Every); Every == 0 means Body runs once, for the process's life, and is
 // expected to loop internally. runtime/daemon.go is what actually schedules
@@ -452,12 +552,33 @@ type Daemon struct {
 	Body  []Stmt `json:"body"`
 }
 
+// Shared is one `shared name: Type` cell (see ast.Shared's doc): process-
+// local, in-memory, read and assigned only from proc-shaped bodies. A proc
+// body's read of it lowers to a call of the runtime intrinsic "$shared.get"
+// and an assignment to "$shared.set" (internal/ir/build.go's
+// lowerSharedRefs); runtime/shared.go holds the values.
+type Shared struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	List bool   `json:"list,omitempty"`
+}
+
 // Service is an external service the runtime may call: a base URL and its typed
 // operations. A `call` statement posts to URL + "/" + op with the named arguments.
 type Service struct {
-	Name string      `json:"name"`
-	URL  string      `json:"url"`
-	Ops  []ServiceOp `json:"ops"`
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	// URLEnv: an env var that, when set, replaces URL; Headers: request
+	// headers valued from env vars (`header "X-Internal-Key" env KEY`).
+	URLEnv  string          `json:"urlEnv,omitempty"`
+	Headers []ServiceHeader `json:"headers,omitempty"`
+	Ops     []ServiceOp     `json:"ops"`
+}
+
+// ServiceHeader is a request header a service call carries, valued from Env.
+type ServiceHeader struct {
+	Name string `json:"name"`
+	Env  string `json:"env"`
 }
 
 // ServiceOp is one operation: its name, parameter names (the JSON keys a call
@@ -514,20 +635,20 @@ type Trigger struct {
 // through, unlike a service).
 // assign is shared: in an action it writes a state cell (into session state +
 // wire deltas); in a proc it reassigns a `let mut` local in the proc's own
-// frame. The two never alias, because runActionLocked and runProcLocked/
-// execProcBlock interpret the two bodies separately.
+// frame. The two never alias, because runActionLocked and runProcLocked
+// (runtime/proccompile.go) interpret the two bodies separately.
 //
 // indexset is a proc-only array element mutation, `xs[i] = expr`: Target names
 // the array local (gated the same way a plain reassignment is — see Assign,
 // above — since it mutates the value Target is bound to), Key is the index
 // expression (reusing the same field a `set`/`remove` entity key already
 // carries), and Value is the new element. It is bounds-checked only at
-// runtime (runtime/server.go's execProcBlock) — see ast.Index's doc for why.
+// runtime (runtime/proccompile.go) — see ast.Index's doc for why.
 //
 // loop/if are the one place a Stmt nests (Milestone 2): Value holds the
 // condition both share, Body is loop's repeated body / if's `then` branch, and
 // Else is if's optional `else` branch (nil = none — loop never sets it). A
-// runtime interpreter (runtime/server.go execProcBlock) walks Body/Else
+// runtime interpreter (runtime/proccompile.go) walks Body/Else
 // recursively; break/continue carry no payload beyond Op itself.
 //
 // spawn/join (Milestone 5: structured concurrency) are proc-only, like
@@ -538,21 +659,21 @@ type Trigger struct {
 // join blocks on the handle named by Target, and — like do/call — binds its
 // result into Bind (coerced per Ret/RetList) when Bind is non-empty.
 // internal/ir/build.go's procBlock (checkSpawnsJoined) proves every spawn is
-// joined before its own enclosing statement block ends; runtime/server.go's
-// execProcBlock is the interpreter for both.
+// joined before its own enclosing statement block ends;
+// runtime/proccompile.go is the interpreter for both.
 //
 // actcall is daemon-only (Milestone: detached background tasks): it invokes
 // the action named by Service (reusing the same field "do"/"spawn" use for a
 // proc name) with Args, fire-and-forget — no Target, no Bind, since an action
 // has no scalar return, only the deltas its own body applies. Emitted only
 // when internal/ir/build.go's procBlock lowers a daemon body (never a real
-// proc's), and interpreted by runtime/server.go's execProcBlock via
+// proc's), and interpreted by runtime/proccompile.go via
 // s.runAction under the synthetic system actor — the same call a Job or
 // trigger fires through, which is what holds the store lock for only this one
 // call, not the daemon's own lifetime.
 type Stmt struct {
 	Op      string      `json:"op"`
-	Target  string      `json:"target,omitempty"`  // assign (action: a state cell; proc: a `let mut` local); let: the local's name; do: the `let mut` local a `name = do …` reassigns; fieldset: the struct local
+	Target  string      `json:"target,omitempty"`  // check: its error code (`code "…"`); assign (action: a state cell; proc: a `let mut` local); let: the local's name; do: the `let mut` local a `name = do …` reassigns; fieldset: the struct local
 	Entity  string      `json:"entity,omitempty"`  // add/set/remove/clear
 	Field   string      `json:"field,omitempty"`   // set; for a call, the operation name
 	Key     *Expr       `json:"key,omitempty"`     // set/remove
@@ -570,7 +691,7 @@ type Stmt struct {
 	RetList bool        `json:"retList,omitempty"` // call/do (request→response): result is a list of Ret
 	Role    *Expr       `json:"role,omitempty"`    // establish: optional new session role (Value holds the new actor)
 	Msg     string      `json:"msg,omitempty"`     // check: the message returned when the condition (Value) is false
-	Status  int         `json:"status,omitempty"`  // check: the HTTP status a declared api answers with on failure (0 = 422)
+	Status  int         `json:"status,omitempty"`  // check: the HTTP status a declared api answers with on failure (0 = 422); return: the reply's own 2xx (0 = the route's)
 	Body    []Stmt      `json:"body,omitempty"`    // loop/for: the repeated body; if: the `then` branch
 	Else    []Stmt      `json:"else,omitempty"`    // if: the `else` branch (nil = none)
 	Bytes   bool        `json:"bytes,omitempty"`   // indexset: Target is a byte-buffer local (internal/ir/build.go's bytesType) — range-check Value to 0-255 rather than accepting any int; fileread/filewrite: the file resource is `bytes`-typed rather than `text`
@@ -889,6 +1010,18 @@ type Expr struct {
 	Order  string   `json:"order,omitempty"` // agg (list): sort field
 	Desc   bool     `json:"desc,omitempty"`  // agg (list): descending
 	Limit  *Expr    `json:"limit,omitempty"` // agg (list): max rows
+	// OrderBy is a list's computed sort key (`by <expr>`), evaluated per row
+	// with Var bound — deliberately not one of Kids(): it is read fresh per
+	// row (a nested aggregate in it has no render address of its own).
+	OrderBy *Expr `json:"orderBy,omitempty"`
+	// Omit names the optional (`?`) fields of a wire-type literal (Kind
+	// "struct"): each is left out of the value when it evaluates to nothing —
+	// null, "", or an empty list — the way the contract marks it not
+	// required, instead of crossing as "" or [].
+	Omit []string `json:"omit,omitempty"`
+	// Nulls names a wire-type literal's `T or null` fields: each is present,
+	// and null when it evaluates to nothing or "" (or is not set at all).
+	Nulls []string `json:"nulls,omitempty"`
 }
 
 // Kids is every sub-expression hanging off this one, in the order both renderers

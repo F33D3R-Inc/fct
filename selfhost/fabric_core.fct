@@ -1,104 +1,23 @@
+import "fabric_json.fct"
+
 app FabricCoreSelfHost:
-    # Self-hosting port of fabric/crates/fabric-core/src/ IN FULL — the
-    # native FacetQL data model every other fabric-* crate is built on top
-    # of: atom.rs (33L), coordinate.rs (24L), value.rs (68L), record.rs
-    # (46L), grid.rs (66L), storage.rs (76L), engine.rs (93L), shard.rs
-    # (93L), topology.rs (47L), workload.rs (23L) — 609 real Rust lines,
-    # zero crypto, zero network I/O, no test modules (`cargo test -p
-    # fabric-core` — confirmed by reading every file: no `#[cfg(test)]`
-    # module anywhere in this crate), verified by hand-tracing this port
-    # against each Rust file read in full, line for line.
+    # Port of fabric/crates/fabric-core/src in full: coordinate.rs, atom.rs,
+    # value.rs, record.rs, grid.rs, storage.rs, engine.rs, shard.rs,
+    # topology.rs, workload.rs, plus each derived type's serde shape
+    # (coordinateJson ... workloadJson). The crate has no #[test]s;
+    # fabric_leaf_a_test.go checks every public function and serde shape
+    # against digests printed by the real crate.
     #
-    # WHY THIS CRATE, chosen over the other untouched candidates surveyed
-    # first (fabric-telemetry, fabric-workload, fabric-ml, fabric-optimizer,
-    # fabric-simulator, fabric-controller, fabric-cli, and fabric-replication's
-    # remaining replica.rs/placement.rs/set.rs): fabric-core is the one
-    # crate every other fabric-* crate actually depends on for its own real
-    # types (`fabric_core::Coordinate` is imported directly by
-    # fabric-routing's key.rs, confirmed by reading its Cargo.toml and its
-    # `use` line) — porting it is foundational rather than one more
-    # independent leaf, it is small enough to port completely rather than
-    # partially (unlike fabric-controller's 3757L or fabric-simulator's
-    # 2269L), and unlike fabric-replication's remaining files it is a
-    # genuinely different concern (the native storage ENGINE, not more
-    # replication-set policy), so porting it adds real new coverage rather
-    # than extending what fabric.fct/fabric_routing.fct already cover.
-    #
-    # ============================================================
-    # RELATIONSHIP TO fabric_routing.fct's OWN `Coordinate` — read in full
-    # before writing this file. fabric_routing.fct already restates a
-    # `Coordinate{x,y}` with `coordinateIsValid`/`coordinateIndex` (its own
-    # header explains why: fabric-routing's real key.rs imports
-    # `fabric_core::Coordinate` directly — the SAME real Rust type this file
-    # ports). This file restates its own copy again rather than
-    # `import`-ing fabric_routing.fct, for the same reason core_types.fct's
-    # own header gives for its own restatement of an overlapping shape
-    # ("the same way every other file in this directory restates its own
-    # copy of whatever it needs") — this directory's established convention
-    # is per-file self-containment, not cross-file struct reuse, and this
-    # task's own instructions treat fabric_routing.fct as read-only
-    # reference, not as an import target. The two restatements are
-    # byte-for-byte the same real logic (verified against the identical
-    # Rust source, fabric-core/src/coordinate.rs), just declared twice, the
-    # same way fabric_routing.fct's own Coordinate is already a second
-    # declaration of the first one implied by fabric.fct's unrelated packed-
-    # int representation.
-    #
-    # ============================================================
-    # REPRESENTATION CHOICES
-    # ============================================================
-    # Value (value.rs) — a 7-variant Rust enum (Null/Bool/Integer/Unsigned/
-    # Float/Text/Bytes), several variants carrying DIFFERENT payload types.
-    # Ported with this directory's established text-tagged-struct
-    # convention (predicate.fct's `Field`, fabric_routing.fct's
-    # `RoutingError`/`ReadPreference`): `kind` names the live variant, every
-    # payload field is always present but only the one `kind` names is
-    # meaningful. `Integer(i64)` and `Unsigned(u64)` both collapse onto this
-    # language's single `int` type (LANGUAGE.md: `int` is the only
-    # non-float integer type, no fixed-width variants) — kept as two
-    # separate fields (`intVal`/`uintVal`) rather than merged into one, so
-    # `kind` alone still tells a caller which Rust variant produced the
-    # value, exactly as `as_integer`/`as_unsigned` staying separate methods
-    # does in the real source. `Bytes(Vec<u8>)` is `[int]`, one array slot
-    # per byte (0..255 each, unchecked the same way core_types.fct's own
-    # u8 fields go unchecked — a genuine, honestly-noted width gap, not a
-    # silent one).
-    #
-    # `as_bool`/`as_integer`/`as_unsigned`/`as_float`/`as_text`/`as_bytes`
-    # (each `Option<T>`) are ported with this directory's other established
-    # Option convention (core_types.fct's `hasClaimedBy`/`claimedBy`): a
-    # small `has`/`val` result struct per return type, one per accessor.
-    #
-    # Atom::new/ShardStorage/TopologyRegistry/FacetEngine::write all mirror
-    # patterns fabric_routing.fct already established (Result-shaped
-    # structs for fallible operations, array-searched-linearly-by-key
-    # instead of a HashMap, "mutating" procs returning a new value instead
-    # of taking `&mut self` since a `proc` has none) — see each one's own
-    # comment below for the specific precedent it follows.
-    #
-    # ONE GENUINE BEHAVIOR GAP, flagged honestly rather than silently
-    # ported around: `Atom::new` calls `assert!(coordinate.is_valid(), ...)`
-    # in the real Rust — an invalid coordinate PANICS (aborts the whole
-    # process), it does not return an error. This language's `proc`s have
-    # no abort/panic primitive at all (LANGUAGE.md's `check`/`requires`
-    # guard clauses exist only for `action`s, a different declaration kind
-    # this crate has no use for). `atomNew` below restates the exact same
-    # condition as a checked `AtomNewResult{ok, atom}` instead — the same
-    # Result-struct convention `fabric_routing.fct`'s `routingKeyNew`
-    # already uses for its own (non-panicking, `Result`-returning) coordinate
-    # check. This is a real semantic difference from the Rust source (a
-    # caller here gets `ok: false` back and keeps running, rather than the
-    # process crashing outright) — every real call site in grid.rs only
-    # ever calls `Atom::new` with a coordinate it just built from its own
-    # `0..GRID_WIDTH`/`0..GRID_HEIGHT` loop, so `ok` is always true in
-    # practice, and this port does not invent a scenario where it isn't.
-    #
-    # DEFERRED, not ported: `Shard`'s `serde` (de)serialization attributes
-    # and `#[derive(Debug, ...)]` machinery have no meaning outside Rust's
-    # own trait system and are not "logic" to port — every derived trait
-    # this file's own procs actually need (equality, a stand-in for Hash,
-    # Clone's real field-by-field behavior) is ported as an explicit named
-    # proc below (`shardEquals`, `shardClone`) instead.
+    # Representation: Value is a text-tagged struct (`kind` names the
+    # variant; Integer and Unsigned keep separate fields, a u64 held in the
+    # int's 64 bits); Option<T> results are has/val structs; storage and
+    # topology maps are arrays searched by key; "mutating" procs return the
+    # new value. Atom::new panics on an off-grid coordinate — atomNew
+    # returns `ok: false` instead, since a proc has no panic. ShardStorage's
+    # get_mut and FacetEngine's shard_mut hand out `&mut` and have no
+    # counterpart; their callers update by value. u8/u64 widths are not
+    # enforced on these structs (the wire decoders in fabric_protocol.fct
+    # enforce them where input arrives).
 
     # ============================================================
     # coordinate.rs — Coordinate. `is_valid`: x<12 && y<13. `index`: row-
@@ -596,6 +515,71 @@ app FabricCoreSelfHost:
 
     proc workloadNew(id: int, class: text) -> Workload:
         return Workload{id: id, class: class}
+
+    # ============================================================
+    # SERDE SHAPES — serde_json::to_string of each derived type
+    # ============================================================
+    # Field names verbatim, unit enum variants as bare strings, the DbmsId
+    # newtype as its bare string, Value externally tagged (`"Null"` /
+    # `{"Integer":-5}` ...), Shard without its #[serde(skip)] grid/storage.
+    # u64 fields are written unsigned (sjU64Text), f64 fields as serde_json
+    # writes them (sjF64Text).
+    proc coordinateJson(c: Coordinate) -> text:
+        return "{\"x\":" + c.x + ",\"y\":" + c.y + "}"
+
+    proc atomJson(a: Atom) -> text:
+        return "{\"id\":" + sjQuote(a.id) + ",\"coordinate\":" + coordinateJson(a.coordinate) + "}"
+
+    proc valueJson(v: Value) -> text:
+        if v.kind == "bool":
+            return "{\"Bool\":" + sjBoolText(v.boolVal) + "}"
+        if v.kind == "integer":
+            return "{\"Integer\":" + v.intVal + "}"
+        if v.kind == "unsigned":
+            return "{\"Unsigned\":" + sjU64Text(v.uintVal) + "}"
+        if v.kind == "float":
+            return "{\"Float\":" + sjF64Text(v.floatVal) + "}"
+        if v.kind == "text":
+            return "{\"Text\":" + sjQuote(v.textVal) + "}"
+        if v.kind == "bytes":
+            return "{\"Bytes\":[" + join(v.bytesVal, ",") + "]}"
+        return "\"Null\""
+
+    proc atomRecordJson(r: AtomRecord) -> text:
+        return "{\"atom\":" + atomJson(r.atom) + ",\"value\":" + valueJson(r.value) + "}"
+
+    proc gridJson(g: Grid) -> text:
+        let mut parts = []
+        let mut i = 0
+        loop i < len(g.atoms):
+            parts = append(parts, atomJson(g.atoms[i]))
+            i = i + 1
+        return "{\"atoms\":[" + join(parts, ",") + "]}"
+
+    proc shardJson(s: Shard) -> text:
+        return "{\"id\":" + sjU64Text(s.id) + ",\"workload_domain\":" + sjQuote(s.workloadDomain) + "}"
+
+    proc dbmsIdJson(id: DbmsId) -> text:
+        return sjQuote(id.value)
+
+    proc dbmsNodeJson(node: DbmsNode) -> text:
+        let mut parts = []
+        let mut i = 0
+        loop i < len(node.shards):
+            parts = append(parts, shardJson(node.shards[i]))
+            i = i + 1
+        return "{\"id\":" + dbmsIdJson(node.id) + ",\"region\":" + sjQuote(node.region) + ",\"shards\":[" + join(parts, ",") + "]}"
+
+    proc topologyJson(t: Topology) -> text:
+        let mut parts = []
+        let mut i = 0
+        loop i < len(t.nodes):
+            parts = append(parts, dbmsNodeJson(t.nodes[i]))
+            i = i + 1
+        return "{\"nodes\":[" + join(parts, ",") + "]}"
+
+    proc workloadJson(w: Workload) -> text:
+        return "{\"id\":" + sjU64Text(w.id) + ",\"class\":" + sjQuote(w.class) + "}"
 
     # ============================================================
     # DEMO / HAND-TRACE FIXTURES — no `cargo test` exists for this crate

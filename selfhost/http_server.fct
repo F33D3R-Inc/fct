@@ -1,0 +1,389 @@
+import "http_client.fct"
+
+app HttpServerSelfHost:
+    # http_server.fct — an HTTP/1.1 server written in fct over the runtime's
+    # raw inbound TCP primitives (listen/accept/readBytes/writeBytes), the
+    # server half of http_client.fct. It reads requests off an accepted
+    # connection and writes responses to it; what to answer is the caller's.
+    #
+    # The shape a server takes (see fabric_frontdoor.fct's FrontDoor daemon):
+    #
+    #   proc serveConn(c: int) uses io.net.listen:
+    #       let mut pending = []
+    #       let mut open = true
+    #       loop open:
+    #           let req = do httpServerReadRequest(c, pending, maxBody)
+    #           if req.state != 1:
+    #               # 0: the client closed; -1: malformed (400); -2: too large (413)
+    #               ... httpServerRefuse(c, 400/413, why) for -1/-2, then stop
+    #           pending = req.rest
+    #           let keep = do httpServerKeepAlive(req)
+    #           let wrote = do httpServerWriteResponse(c, req.method, answer(req), keep)
+    #           open = wrote && keep
+    #       let closed = closeConn(c)
+    #
+    #   daemon Server uses io.net.listen:
+    #       let l = listen(port)
+    #       loop true:
+    #           let c = accept(l)
+    #           detach serveConn(c)          # every connection concurrently
+    #
+    # A response that does not end (SSE) is written with
+    # httpServerStartStream, then httpServerWriteChunk per piece, then
+    # httpServerEndStream — or, to tell the client the stream broke rather
+    # than ended, a plain closeConn without the end.
+    #
+    # What it does the way hyper does: a request body is framed by
+    # Transfer-Encoding: chunked or Content-Length (a body over the caller's
+    # limit is refused before the rest of it is read); a pipelined next
+    # request's bytes are kept (`rest`); HTTP/1.1 connections persist unless
+    # either side says close, 1.0 ones only on request; every response
+    # carries the canonical reason phrase and a `date`; a whole response is
+    # framed by content-length, a streamed one chunked; a connection refused
+    # mid-request is drained before it is closed, so the refusal is read
+    # rather than lost to a reset. Bodies are UTF-8 text.
+
+    # HttpServerResponse: one whole response. reason "" writes the status's
+    # canonical reason phrase (httpServerReason).
+    struct HttpServerResponse:
+        status: int
+        reason: text
+        headers: [HttpHeader]
+        body: text
+
+    # httpServerPlain: axum's `(StatusCode, String).into_response()`.
+    proc httpServerPlain(status: int, body: text) -> HttpServerResponse:
+        return HttpServerResponse{status: status, reason: "", headers: [HttpHeader{name: "content-type", value: "text/plain; charset=utf-8"}], body: body}
+
+    struct HttpServerRequest:
+        # 1: a request; 0: the client closed cleanly between requests;
+        # -1: malformed (err); -2: the body exceeds the limit
+        state: int
+        err: text
+        method: text
+        target: text
+        path: text
+        hasQuery: bool
+        query: text
+        version: text
+        headers: [HttpHeader]
+        body: text
+        # bytes already read past this request (a pipelined next one)
+        rest: [int]
+
+    proc httpServerRequestFailed(state: int, err: text) -> HttpServerRequest:
+        return HttpServerRequest{state: state, err: err, method: "", target: "", path: "", hasQuery: false, query: "", version: "", headers: [], body: "", rest: []}
+
+    struct HttpServerChunked:
+        # 0: need more bytes, 1: complete, -1: malformed, -2: over the limit
+        state: int
+        bytes: [int]
+        # index just past the chunked body (its trailer section included)
+        end: int
+
+    # httpServerDechunk: a chunked request body starting at `from`, refused as soon
+    # as its decoded length passes `max`.
+    proc httpServerDechunk(bs: [int], from: int, max: int) -> HttpServerChunked:
+        let mut out = []
+        let mut p = from
+        loop true:
+            let lineEnd = do httpFindCrlf(bs, p)
+            if lineEnd < 0:
+                return HttpServerChunked{state: 0, bytes: [], end: 0}
+            let mut size = 0
+            let mut digits = 0
+            let mut inExt = false
+            let mut i = p
+            loop i < lineEnd:
+                let c = bs[i]
+                if c == 59:
+                    inExt = true
+                if !inExt && c != 32 && c != 9:
+                    let h = do httpHexValue(c)
+                    if h < 0 || digits >= 15:
+                        return HttpServerChunked{state: -1, bytes: [], end: 0}
+                    size = size * 16 + h
+                    digits = digits + 1
+                i = i + 1
+            if digits == 0:
+                return HttpServerChunked{state: -1, bytes: [], end: 0}
+            if len(out) + size > max:
+                return HttpServerChunked{state: -2, bytes: [], end: 0}
+            let dataStart = lineEnd + 2
+            if size == 0:
+                let mut t = dataStart
+                loop true:
+                    let te = do httpFindCrlf(bs, t)
+                    if te < 0:
+                        return HttpServerChunked{state: 0, bytes: [], end: 0}
+                    if te == t:
+                        return HttpServerChunked{state: 1, bytes: out, end: te + 2}
+                    t = te + 2
+            if dataStart + size + 2 > len(bs):
+                return HttpServerChunked{state: 0, bytes: [], end: 0}
+            out = out + httpBytesRange(bs, dataStart, dataStart + size)
+            if bs[dataStart + size] != 13 || bs[dataStart + size + 1] != 10:
+                return HttpServerChunked{state: -1, bytes: [], end: 0}
+            p = dataStart + size + 2
+        return HttpServerChunked{state: -1, bytes: [], end: 0}
+
+    # httpServerIndexOf: the first byte offset of sub in s, or -1.
+    proc httpServerIndexOf(s: text, sub: text) -> int:
+        let bs = textToBytes(s)
+        let ss = textToBytes(sub)
+        let n = len(bs)
+        let m = len(ss)
+        let mut i = 0
+        loop i + m <= n:
+            let mut j = 0
+            loop j < m && bs[i + j] == ss[j]:
+                j = j + 1
+            if j == m:
+                return len(bytesToText(httpBytesRange(bs, 0, i)))
+            i = i + 1
+        return -1
+
+    proc httpServerStartsWith(s: text, prefix: text) -> bool:
+        if len(prefix) > len(s):
+            return false
+        return slice(s, 0, len(prefix)) == prefix
+
+    # httpServerParseHead: the request line and headers of bs[0..end).
+    proc httpServerParseHead(bs: [int], end: int) -> HttpServerRequest:
+        let head = bytesToText(httpBytesRange(bs, 0, end - 4))
+        let lines = split(head, "\r\n")
+        let parts = split(lines[0], " ")
+        if len(parts) != 3 || !httpServerStartsWith(parts[2], "HTTP/1."):
+            let f = do httpServerRequestFailed(-1, "invalid request line")
+            return f
+        let target = parts[1]
+        let mut path = target
+        let mut query = ""
+        let q = do httpServerIndexOf(target, "?")
+        let hasQuery = q >= 0
+        if hasQuery:
+            path = slice(target, 0, q)
+            query = slice(target, q + 1, len(target))
+        let mut headers = []
+        let n = len(lines)
+        let mut i = 1
+        loop i < n:
+            let line = lines[i]
+            let colon = do httpServerIndexOf(line, ":")
+            if colon <= 0:
+                let f = do httpServerRequestFailed(-1, "invalid header line")
+                return f
+            headers = append(headers, HttpHeader{name: lower(trim(slice(line, 0, colon))), value: trim(slice(line, colon + 1, len(line)))})
+            i = i + 1
+        return HttpServerRequest{state: 1, err: "", method: parts[0], target: target, path: path, hasQuery: hasQuery, query: query, version: parts[2], headers: headers, body: "", rest: []}
+
+    # httpServerReadRequest: the next request on connection c: its head, then its
+    # body framed by Transfer-Encoding: chunked or Content-Length — a body
+    # over maxBody is refused (state -2) without reading the rest of it.
+    # httpServerTooLarge: state -2 still carries the request head, so a
+    # caller can answer the way its framework orders its checks (routing,
+    # auth, content type) before the body limit, as axum's extractors do.
+    proc httpServerTooLarge(req: HttpServerRequest) -> HttpServerRequest:
+        return HttpServerRequest{state: -2, err: "", method: req.method, target: req.target, path: req.path, hasQuery: req.hasQuery, query: req.query, version: req.version, headers: req.headers, body: "", rest: []}
+
+    proc httpServerReadRequest(c: int, pending: [int], maxBody: int) -> HttpServerRequest uses io.net.listen:
+        let mut buf = pending
+        let mut scan = 0
+        let mut end = do httpFindHeadEnd(buf, 0)
+        loop end < 0:
+            if len(buf) > 65536:
+                let f = do httpServerRequestFailed(-1, "request head too large")
+                return f
+            let chunk = readBytes(c, 65536)
+            if len(chunk) == 0:
+                if len(buf) == 0:
+                    let f = do httpServerRequestFailed(0, "")
+                    return f
+                let f = do httpServerRequestFailed(-1, "connection closed mid-request")
+                return f
+            scan = len(buf) - 3
+            if scan < 0:
+                scan = 0
+            buf = buf + chunk
+            end = do httpFindHeadEnd(buf, scan)
+        let req = do httpServerParseHead(buf, end)
+        if req.state != 1:
+            return req
+        let te = lower(httpHeaderValue(req.headers, "transfer-encoding"))
+        if contains(te, "chunked"):
+            loop true:
+                let d = do httpServerDechunk(buf, end, maxBody)
+                if d.state == 1:
+                    return HttpServerRequest{state: 1, err: "", method: req.method, target: req.target, path: req.path, hasQuery: req.hasQuery, query: req.query, version: req.version, headers: req.headers, body: bytesToText(d.bytes), rest: httpBytesRange(buf, d.end, len(buf))}
+                if d.state == -1:
+                    let f = do httpServerRequestFailed(-1, "invalid chunked body")
+                    return f
+                if d.state == -2:
+                    let f = do httpServerTooLarge(req)
+                    return f
+                let chunk = readBytes(c, 65536)
+                if len(chunk) == 0:
+                    let f = do httpServerRequestFailed(-1, "connection closed mid-body")
+                    return f
+                buf = buf + chunk
+        let cl = do httpContentLength(req.headers)
+        if cl == -2:
+            let f = do httpServerRequestFailed(-1, "invalid content-length")
+            return f
+        let mut want = cl
+        if want < 0:
+            want = 0
+        if want > maxBody:
+            let f = do httpServerTooLarge(req)
+            return f
+        loop len(buf) - end < want:
+            let chunk = readBytes(c, 65536)
+            if len(chunk) == 0:
+                let f = do httpServerRequestFailed(-1, "connection closed mid-body")
+                return f
+            buf = buf + chunk
+        return HttpServerRequest{state: 1, err: "", method: req.method, target: req.target, path: req.path, hasQuery: req.hasQuery, query: req.query, version: req.version, headers: req.headers, body: bytesToText(httpBytesRange(buf, end, end + want)), rest: httpBytesRange(buf, end + want, len(buf))}
+
+    # httpServerReason: the canonical reason phrase hyper writes for a status.
+    proc httpServerReason(status: int) -> text:
+        let codes = [200, 201, 202, 204, 206, 301, 302, 304, 307, 308, 400, 401, 403, 404, 405, 406, 408, 409, 410, 411, 412, 413, 414, 415, 416, 421, 422, 425, 426, 428, 429, 431, 500, 501, 502, 503, 504, 505]
+        let names = ["OK", "Created", "Accepted", "No Content", "Partial Content", "Moved Permanently", "Found", "Not Modified", "Temporary Redirect", "Permanent Redirect", "Bad Request", "Unauthorized", "Forbidden", "Not Found", "Method Not Allowed", "Not Acceptable", "Request Timeout", "Conflict", "Gone", "Length Required", "Precondition Failed", "Payload Too Large", "URI Too Long", "Unsupported Media Type", "Range Not Satisfiable", "Misdirected Request", "Unprocessable Entity", "Too Early", "Upgrade Required", "Precondition Required", "Too Many Requests", "Request Header Fields Too Large", "Internal Server Error", "Not Implemented", "Bad Gateway", "Service Unavailable", "Gateway Timeout", "HTTP Version Not Supported"]
+        let mut i = 0
+        loop i < len(codes):
+            if codes[i] == status:
+                return names[i]
+            i = i + 1
+        return ""
+
+    proc httpServerPad2(n: int) -> text:
+        if n < 10:
+            return "0" + n
+        return "" + n
+
+    # httpServerDate: IMF-fixdate for a Unix time — the `date` header hyper puts
+    # on every response it writes.
+    proc httpServerDate(unix: int) -> text:
+        let days = unix / 86400
+        let secs = unix % 86400
+        let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        let z = days + 719468
+        let era = z / 146097
+        let doe = z - era * 146097
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        let mp = (5 * doy + 2) / 153
+        let d = doy - (153 * mp + 2) / 5 + 1
+        let mut m = mp + 3
+        if mp >= 10:
+            m = mp - 9
+        let mut y = yoe + era * 400
+        if m <= 2:
+            y = y + 1
+        let hh = do httpServerPad2(secs / 3600)
+        let mm = do httpServerPad2((secs % 3600) / 60)
+        let ss = do httpServerPad2(secs % 60)
+        let dd = do httpServerPad2(d)
+        return weekdays[(days + 4) % 7] + ", " + dd + " " + months[m - 1] + " " + y + " " + hh + ":" + mm + ":" + ss + " GMT"
+
+    # httpServerHead: the status line and headers (not the blank line that
+    # ends them), with a `date` unless the headers carry one.
+    proc httpServerHead(status: int, reason0: text, headers: [HttpHeader]) -> text:
+        let mut reason = reason0
+        if reason == "":
+            reason = do httpServerReason(status)
+        let mut head = "HTTP/1.1 " + status + " " + reason + "\r\n"
+        let n = len(headers)
+        let mut i = 0
+        loop i < n:
+            head = head + headers[i].name + ": " + headers[i].value + "\r\n"
+            i = i + 1
+        let hasDate = do httpHasHeader(headers, "date")
+        if !hasDate:
+            let date = do httpServerDate(now())
+            head = head + "date: " + date + "\r\n"
+        return head
+
+    # httpServerWriteResponse: a whole response, framed by content-length; HEAD
+    # gets the head alone. Answers whether the write went through.
+    proc httpServerWriteResponse(c: int, method: text, r: HttpServerResponse, keepAlive: bool) -> bool uses io.net.listen:
+        let body = textToBytes(r.body)
+        let mut head = do httpServerHead(r.status, r.reason, r.headers)
+        head = head + "content-length: " + len(body) + "\r\n"
+        if !keepAlive:
+            head = head + "connection: close\r\n"
+        head = head + "\r\n"
+        if method == "HEAD":
+            let ok = writeBytes(c, textToBytes(head))
+            return ok
+        let ok = writeBytes(c, textToBytes(head) + body)
+        return ok
+
+    # httpServerLingerClose: close a connection whose request was refused before its
+    # body was read (a 413, a malformed request). Closing with the client's
+    # bytes still unread makes the kernel answer with a reset, which can
+    # destroy the response before the client reads it — so, as hyper and Go's
+    # net/http do, the rest of what the client sends is read and discarded
+    # first, bounded in both bytes and time.
+    proc httpServerLingerClose(c: int) -> bool uses io.net.listen:
+        let set = setTimeoutMs(c, 1000)
+        let mut drained = 0
+        let mut more = true
+        loop more:
+            let chunk = readBytes(c, 65536)
+            drained = drained + len(chunk)
+            if len(chunk) == 0 || drained > 67108864:
+                more = false
+        let closed = closeConn(c)
+        return closed
+
+    # httpServerKeepAlive: HTTP/1.1 persists unless either side says close; 1.0
+    # only when the client asks.
+    proc httpServerKeepAlive(req: HttpServerRequest) -> bool:
+        let conn = lower(httpHeaderValue(req.headers, "connection"))
+        if req.version == "HTTP/1.0":
+            return contains(conn, "keep-alive")
+        return !contains(conn, "close")
+
+    # ── streaming responses ───────────────────────────────────────────
+    proc httpServerHex(n: int) -> text:
+        if n == 0:
+            return "0"
+        let mut out = ""
+        let mut v = n
+        loop v > 0:
+            out = charAt("0123456789abcdef", v % 16) + out
+            v = v / 16
+        return out
+
+    # httpServerStartStream: the head of a response whose body is written
+    # as it is produced, chunked.
+    proc httpServerStartStream(c: int, status: int, headers: [HttpHeader]) -> bool uses io.net.listen:
+        let head = do httpServerHead(status, "", headers)
+        let ok = writeBytes(c, textToBytes(head + "transfer-encoding: chunked\r\n\r\n"))
+        return ok
+
+    # httpServerWriteChunk: one piece of a streamed body, as one chunk (an
+    # empty piece writes nothing: a zero-size chunk would end the body).
+    proc httpServerWriteChunk(c: int, data: [int]) -> bool uses io.net.listen:
+        if len(data) == 0:
+            return true
+        let size = do httpServerHex(len(data))
+        let ok = writeBytes(c, textToBytes(size + "\r\n") + data + textToBytes("\r\n"))
+        return ok
+
+    # httpServerEndStream: the end of a streamed body (the zero chunk). A
+    # stream that broke is instead cut with closeConn and no end, which a
+    # client reads as the truncation it is.
+    proc httpServerEndStream(c: int) -> bool uses io.net.listen:
+        let ok = writeBytes(c, textToBytes("0\r\n\r\n"))
+        return ok
+
+    # httpServerRefuse: answer a request that could not be read (a
+    # malformed one, 400; one over the body limit, 413), then drain and
+    # close the connection — it cannot carry another request.
+    proc httpServerRefuse(c: int, status: int, body: text) -> bool uses io.net.listen:
+        let r = do httpServerPlain(status, body)
+        let wrote = do httpServerWriteResponse(c, "GET", r, false)
+        let closed = do httpServerLingerClose(c)
+        return wrote

@@ -1,0 +1,2030 @@
+import "fqengine.fct"
+
+app FqQuerySelfHost:
+    # fqquery.fct — self-hosted port of the paged store's query side:
+    # facetql/src/core/predicate.rs (a `where` expression — the IR's own
+    # JSON expression shape — evaluated against one node's `data`, and the
+    # literals a planner can lift out of it), core/aggregate.rs (the
+    # count/sum/avg/min/max fold), index.rs's compare_order_values, and
+    # engine.rs's query_where / count_where / aggregate_where / count_by /
+    # aggregate_by with every access path they choose between: an ordered
+    # index's equality run or string prefix, a text index's posting lists,
+    # the kind/owner/primary walk (keyset-paged by a base64url cursor), an
+    # ordered index walk for `order`, and the materialize-and-sort
+    # fallback — each read through fqengine.fct's store.
+    #
+    # A predicate and every JSON value are fqjson.fct values (FqJ), so
+    # equality, ordering and the text they print in errors are serde_json's.
+
+    # ── predicate.rs ───────────────────────────────────────────────────
+    struct PredR:
+        ok: bool
+        err: text
+        v: FqJ
+
+    proc prOk(v: FqJ) -> PredR:
+        return PredR{ok: true, err: "", v: v}
+
+    proc prErr(msg: text) -> PredR:
+        let n = do fjNull()
+        return PredR{ok: false, err: msg, v: n}
+
+    proc pjMember(e: FqJ, name: text) -> FqJR:
+        let g = do fjGet(e, name)
+        if g.ok && g.v.kind == "null":
+            let n = do fjFail("null", 0)
+            return n
+        return g
+
+    # pjText: an optional string member (serde's Option<String>); has false
+    # when absent or null.
+    struct PjText:
+        has: bool
+        s: text
+
+    proc pjText(e: FqJ, name: text) -> PjText:
+        let g = do pjMember(e, name)
+        if g.ok && g.v.kind == "str":
+            return PjText{has: true, s: g.v.s}
+        return PjText{has: false, s: ""}
+
+    proc pjKind(e: FqJ) -> text:
+        let t = do pjText(e, "kind")
+        return t.s
+
+    proc prDebugOptStr(t: PjText) -> text:
+        if !t.has:
+            return "None"
+        let q = do ckQuote(t.s)
+        return "Some(" + q + ")"
+
+    # fjDebug: serde_json::Value's Debug formatting.
+    proc fjDebug(v: FqJ) -> text:
+        if v.kind == "null":
+            return "Null"
+        if v.kind == "bool":
+            if v.b:
+                return "Bool(true)"
+            return "Bool(false)"
+        if v.kind == "int" || v.kind == "float":
+            let t = do fjText(v)
+            return "Number(" + t + ")"
+        if v.kind == "str":
+            let q = do ckQuote(v.s)
+            return "String(" + q + ")"
+        let n = len(v.items)
+        if v.kind == "arr":
+            let mut out = "Array ["
+            let mut i = 0
+            loop i < n:
+                if i > 0:
+                    out = out + ", "
+                let d = do fjDebug(v.items[i])
+                out = out + d
+                i = i + 1
+            return out + "]"
+        let mut o = "Object {"
+        let mut j = 0
+        loop j < n:
+            if j > 0:
+                o = o + ", "
+            let k = do ckQuote(v.keys[j])
+            let d2 = do fjDebug(v.items[j])
+            o = o + k + ": " + d2
+            j = j + 1
+        return o + "}"
+
+    proc fjAsF64(v: FqJ) -> PredR:
+        if v.kind == "int" || v.kind == "float":
+            return PredR{ok: true, err: "", v: v}
+        let e = do prErr("")
+        return e
+
+    proc fjNum(v: FqJ) -> float:
+        return v.f
+
+    # prNumber: number_value — a finite f64 as a float Number, else null.
+    proc prNumber(f: float) -> FqJ:
+        let inf = do fjIsInf(f)
+        if inf || f != f:
+            let n = do fjNull()
+            return n
+        return FqJ{kind: "float", b: false, s: "", f: f, items: [], keys: []}
+
+    proc prBool(b: bool) -> FqJ:
+        return FqJ{kind: "bool", b: b, s: "", f: 0.0, items: [], keys: []}
+
+    proc prTruthy(v: FqJ) -> bool:
+        if v.kind == "bool":
+            return v.b
+        return v.kind != "null"
+
+    # prValuesEqual: values_equal — numbers by their f64, else Value's ==.
+    proc prValuesEqual(l: FqJ, r: FqJ) -> bool:
+        let ln = l.kind == "int" || l.kind == "float"
+        let rn = r.kind == "int" || r.kind == "float"
+        if ln && rn:
+            return l.f == r.f
+        let eq = do enJsonEqual(l, r)
+        return eq
+
+    # prLitValue: lit_value.
+    proc prLitValue(e: FqJ) -> FqJ:
+        let vr = do pjMember(e, "val")
+        let mut val = do fjNull()
+        if vr.ok:
+            val = vr.v
+        let vt = do pjText(e, "vtype")
+        if vt.has && vt.s == "int":
+            if val.kind == "int":
+                return val
+            if val.kind == "float":
+                let t = do prTrunc(val.f)
+                let nv = do prNumber(t)
+                return nv
+            let n0 = do fjNull()
+            return n0
+        if vt.has && vt.s == "bool":
+            let b = val.kind == "bool" && val.b
+            let bv = do prBool(b)
+            return bv
+        if vt.has && vt.s == "text":
+            if val.kind == "str":
+                return val
+            let t2 = do fjText(val)
+            return FqJ{kind: "str", b: false, s: t2, f: 0.0, items: [], keys: []}
+        return val
+
+    # prTrunc: f64::trunc.
+    proc prTrunc(f: float) -> float:
+        let bits = floatBits(f)
+        let exp = ((bits >> 52) & 2047) - 1023
+        if exp >= 52:
+            return f
+        if exp < 0:
+            if ((bits >> 63) & 1) == 1:
+                return floatFromBits(1 << 63)
+            return 0.0
+        let mask = (1 << (52 - exp)) - 1
+        return floatFromBits(bits & (~mask))
+
+    proc prMaxDepth() -> int:
+        return 64
+
+    proc prDepthErr() -> PredR:
+        let e = do prErr("predicate nests deeper than 64 levels; simplify it or split the query")
+        return e
+
+    # prEval: eval_at.
+    proc prEval(e: FqJ, itemVar: text, data: FqJ, depth: int) -> PredR:
+        if depth >= 64:
+            let d = do prDepthErr()
+            return d
+        let kind = do pjKind(e)
+        if kind == "lit":
+            let lv = do prLitValue(e)
+            let o0 = do prOk(lv)
+            return o0
+        if kind == "get":
+            let obj = do pjMember(e, "obj")
+            if !obj.ok:
+                let e0 = do prErr("get expression missing obj")
+                return e0
+            let on = do pjText(obj.v, "name")
+            let ok = do pjKind(obj.v)
+            let fld = do pjText(e, "field")
+            if !(ok == "ref" && on.has && on.s == itemVar):
+                let fd = do prDebugOptStr(fld)
+                let e1 = do prErr("cannot evaluate field access " + fd + ": not a reference to " + itemVar)
+                return e1
+            if !fld.has:
+                let e2 = do prErr("get expression missing field")
+                return e2
+            let g = do fjGet(data, fld.s)
+            if g.ok:
+                let o1 = do prOk(g.v)
+                return o1
+            let n = do fjNull()
+            let o2 = do prOk(n)
+            return o2
+        if kind == "un":
+            let x = do pjMember(e, "x")
+            if !x.ok:
+                let e3 = do prErr("un expression missing x")
+                return e3
+            let v = do prEval(x.v, itemVar, data, depth + 1)
+            if !v.ok:
+                return v
+            let op = do pjText(e, "op")
+            if op.has && op.s == "!":
+                let t = do prTruthy(v.v)
+                let bv = do prBool(!t)
+                let o3 = do prOk(bv)
+                return o3
+            if op.has && op.s == "-":
+                if v.v.kind != "int" && v.v.kind != "float":
+                    let e4 = do prErr("cannot negate a non-numeric value")
+                    return e4
+                let nv = do prNumber(0.0 - v.v.f)
+                let o4 = do prOk(nv)
+                return o4
+            let od = do prDebugOptStr(op)
+            let e5 = do prErr("cannot evaluate unary operator " + od)
+            return e5
+        if kind == "bin":
+            let l = do pjMember(e, "l")
+            if !l.ok:
+                let e6 = do prErr("bin expression missing l")
+                return e6
+            let r = do pjMember(e, "r")
+            if !r.ok:
+                let e7 = do prErr("bin expression missing r")
+                return e7
+            let op2 = do pjText(e, "op")
+            if !op2.has:
+                let e8 = do prErr("bin expression missing op")
+                return e8
+            if op2.s == "&&" || op2.s == "||":
+                let lv = do prEval(l.v, itemVar, data, depth + 1)
+                if !lv.ok:
+                    return lv
+                let lt = do prTruthy(lv.v)
+                if op2.s == "&&" && !lt:
+                    let f = do prBool(false)
+                    let o5 = do prOk(f)
+                    return o5
+                if op2.s == "||" && lt:
+                    let tr = do prBool(true)
+                    let o6 = do prOk(tr)
+                    return o6
+                let rv = do prEval(r.v, itemVar, data, depth + 1)
+                if !rv.ok:
+                    return rv
+                let rt = do prTruthy(rv.v)
+                let bb = do prBool(rt)
+                let o7 = do prOk(bb)
+                return o7
+            let lv2 = do prEval(l.v, itemVar, data, depth + 1)
+            if !lv2.ok:
+                return lv2
+            let rv2 = do prEval(r.v, itemVar, data, depth + 1)
+            if !rv2.ok:
+                return rv2
+            let res = do prBinOp(op2.s, lv2.v, rv2.v)
+            return res
+        let kq = do ckQuote(kind)
+        let e9 = do prErr("cannot evaluate " + kq + " expression")
+        return e9
+
+    proc prNumericPairErr(op: text, l: FqJ, r: FqJ) -> PredR:
+        let oq = do ckQuote(op)
+        let ld = do fjDebug(l)
+        let rd = do fjDebug(r)
+        let e = do prErr("operator " + oq + " requires numeric operands, got " + ld + " and " + rd)
+        return e
+
+    proc prIsNum(v: FqJ) -> bool:
+        return v.kind == "int" || v.kind == "float"
+
+    proc prHasPrefix(s: text, p: text) -> bool:
+        let a = textToBytes(s)
+        let b = textToBytes(p)
+        if len(b) > len(a):
+            return false
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            if a[i] != b[i]:
+                return false
+            i = i + 1
+        return true
+
+    proc prHasSuffix(s: text, p: text) -> bool:
+        let a = textToBytes(s)
+        let b = textToBytes(p)
+        if len(b) > len(a):
+            return false
+        let off = len(a) - len(b)
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            if a[off + i] != b[i]:
+                return false
+            i = i + 1
+        return true
+
+    # prBinOp: eval_bin_op.
+    proc prBinOp(op: text, l: FqJ, r: FqJ) -> PredR:
+        if op == "==" || op == "!=":
+            let eq = do prValuesEqual(l, r)
+            let b = do prBool((op == "==") == eq)
+            let o = do prOk(b)
+            return o
+        if op == "starts_with" || op == "ends_with" || op == "contains":
+            if l.kind != "str" || r.kind != "str":
+                let f = do prBool(false)
+                let o1 = do prOk(f)
+                return o1
+            let mut found = false
+            if op == "starts_with":
+                found = do prHasPrefix(l.s, r.s)
+            if op == "ends_with":
+                found = do prHasSuffix(l.s, r.s)
+            if op == "contains":
+                found = contains(l.s, r.s)
+            let fb = do prBool(found)
+            let o2 = do prOk(fb)
+            return o2
+        if op == "in" || op == "not in":
+            if r.kind != "arr":
+                let oq = do ckQuote(op)
+                let rd = do fjDebug(r)
+                let e0 = do prErr("operator " + oq + " needs an array on the right, got " + rd)
+                return e0
+            if len(r.items) > 1000:
+                let e1 = do prErr("`" + op + "` set holds " + len(r.items) + " values; the maximum is 1000.                      A set is compared against once per candidate row, so its                      size multiplies the scan.")
+                return e1
+            let mut hit = false
+            let n = len(r.items)
+            let mut i = 0
+            loop i < n && !hit:
+                hit = do prValuesEqual(l, r.items[i])
+                i = i + 1
+            let ib = do prBool((op == "in") == hit)
+            let o3 = do prOk(ib)
+            return o3
+        if op == "<" || op == "<=" || op == ">" || op == ">=":
+            let ln = do prIsNum(l)
+            let rn = do prIsNum(r)
+            if !ln || !rn:
+                let pe = do prNumericPairErr(op, l, r)
+                return pe
+            let mut res = false
+            if op == "<":
+                res = l.f < r.f
+            if op == "<=":
+                res = l.f <= r.f
+            if op == ">":
+                res = l.f > r.f
+            if op == ">=":
+                res = l.f >= r.f
+            let cb = do prBool(res)
+            let o4 = do prOk(cb)
+            return o4
+        if op == "+":
+            if l.kind == "str" && r.kind == "str":
+                let total = byteLen(l.s) + byteLen(r.s)
+                if total > 65536:
+                    let e2 = do prErr("string concatenation inside a predicate would produce " + total + " bytes; the maximum is 65536. A predicate decides whether one record matches — it is not a place to build a value.")
+                    return e2
+                let o5 = do prOk(FqJ{kind: "str", b: false, s: l.s + r.s, f: 0.0, items: [], keys: []})
+                return o5
+            let ln2 = do prIsNum(l)
+            let rn2 = do prIsNum(r)
+            if !ln2 || !rn2:
+                let pe2 = do prNumericPairErr(op, l, r)
+                return pe2
+            let sv = do prNumber(l.f + r.f)
+            let o6 = do prOk(sv)
+            return o6
+        if op == "-" || op == "*" || op == "/" || op == "%":
+            let ln3 = do prIsNum(l)
+            let rn3 = do prIsNum(r)
+            if !ln3 || !rn3:
+                let pe3 = do prNumericPairErr(op, l, r)
+                return pe3
+            let mut v = 0.0
+            if op == "-":
+                v = l.f - r.f
+            if op == "*":
+                v = l.f * r.f
+            if op == "/":
+                if r.f == 0.0:
+                    let e3 = do prErr("division by zero")
+                    return e3
+                v = l.f / r.f
+            if op == "%":
+                if r.f == 0.0:
+                    let e4 = do prErr("modulo by zero")
+                    return e4
+                v = do prFmod(l.f, r.f)
+            let nv = do prNumber(v)
+            let o7 = do prOk(nv)
+            return o7
+        let oq2 = do ckQuote(op)
+        let e5 = do prErr("cannot evaluate operator " + oq2)
+        return e5
+
+    # prFmod: Rust's f64 `%` (fmod: the result has the dividend's sign).
+    proc prFmod(a: float, b: float) -> float:
+        let q = a / b
+        let t = do prTrunc(q)
+        let r = a - t * b
+        return r
+
+    # prValidate: validate — depth and node budget.
+    struct PrBudget:
+        err: text
+        budget: int
+
+    proc prValidateAt(e: FqJ, depth: int, budget: int) -> PrBudget:
+        if depth >= 64:
+            return PrBudget{err: "predicate nests deeper than 64 levels; simplify it or split the query", budget: budget}
+        if budget == 0:
+            return PrBudget{err: "predicate has more than 256 expression nodes. Every node is evaluated once per candidate row, so the work a single request can ask for is the node count times the row count; simplify the filter or narrow the query.", budget: 0}
+        let mut b = budget - 1
+        let names = ["obj", "key", "l", "r", "x", "where"]
+        let mut i = 0
+        loop i < 6:
+            let c = do pjMember(e, names[i])
+            if c.ok:
+                let r = do prValidateAt(c.v, depth + 1, b)
+                if r.err != "":
+                    return r
+                b = r.budget
+            i = i + 1
+        let a = do pjMember(e, "args")
+        if a.ok && a.v.kind == "arr":
+            let n = len(a.v.items)
+            let mut j = 0
+            loop j < n:
+                let r2 = do prValidateAt(a.v.items[j], depth + 1, b)
+                if r2.err != "":
+                    return r2
+                b = r2.budget
+                j = j + 1
+        return PrBudget{err: "", budget: b}
+
+    proc prValidate(e: FqJ) -> text:
+        let r = do prValidateAt(e, 0, 256)
+        return r.err
+
+    # ── planning: literals a predicate pins ─────────────────────────────
+    proc prIsFieldAccess(e: FqJ, itemVar: text, field: text) -> bool:
+        let k = do pjKind(e)
+        if k != "get":
+            return false
+        let f = do pjText(e, "field")
+        if !f.has || f.s != field:
+            return false
+        let o = do pjMember(e, "obj")
+        if !o.ok:
+            return false
+        let ok = do pjKind(o.v)
+        let on = do pjText(o.v, "name")
+        return ok == "ref" && on.has && on.s == itemVar
+
+    struct PrLit:
+        ok: bool
+        v: FqJ
+
+    proc prNoLit() -> PrLit:
+        let n = do fjNull()
+        return PrLit{ok: false, v: n}
+
+    # prEqualityLiteral: equality_literal — a conjunct `item.field ==
+    # literal` (either side), its non-null value.
+    proc prEqualityLiteral(e: FqJ, itemVar: text, field: text, depth: int) -> PrLit:
+        let none = do prNoLit()
+        if depth >= 64:
+            return none
+        let k = do pjKind(e)
+        if k != "bin":
+            return none
+        let l = do pjMember(e, "l")
+        let r = do pjMember(e, "r")
+        if !l.ok || !r.ok:
+            return none
+        let op = do pjText(e, "op")
+        if op.has && op.s == "&&":
+            let a = do prEqualityLiteral(l.v, itemVar, field, depth + 1)
+            if a.ok:
+                return a
+            let b = do prEqualityLiteral(r.v, itemVar, field, depth + 1)
+            return b
+        if op.has && op.s == "==":
+            let m1 = do prMatchEquality(l.v, r.v, itemVar, field)
+            if m1.ok:
+                return m1
+            let m2 = do prMatchEquality(r.v, l.v, itemVar, field)
+            return m2
+        return none
+
+    proc prMatchEquality(access: FqJ, literal: FqJ, itemVar: text, field: text) -> PrLit:
+        let none = do prNoLit()
+        let ak = do pjKind(access)
+        let lk = do pjKind(literal)
+        if ak != "get" || lk != "lit":
+            return none
+        let fa = do prIsFieldAccess(access, itemVar, field)
+        if !fa:
+            return none
+        let v = do prLitValue(literal)
+        if v.kind == "null":
+            return none
+        return PrLit{ok: true, v: v}
+
+    # prPrefixLiteral: prefix_literal — a conjunct `item.field starts_with
+    # "…"` (non-empty).
+    proc prPrefixLiteral(e: FqJ, itemVar: text, field: text, depth: int) -> PjText:
+        let none = PjText{has: false, s: ""}
+        if depth >= 64:
+            return none
+        let k = do pjKind(e)
+        if k != "bin":
+            return none
+        let l = do pjMember(e, "l")
+        let r = do pjMember(e, "r")
+        if !l.ok || !r.ok:
+            return none
+        let op = do pjText(e, "op")
+        if op.has && op.s == "&&":
+            let a = do prPrefixLiteral(l.v, itemVar, field, depth + 1)
+            if a.has:
+                return a
+            let b = do prPrefixLiteral(r.v, itemVar, field, depth + 1)
+            return b
+        if op.has && op.s == "starts_with":
+            let rk = do pjKind(r.v)
+            let fa = do prIsFieldAccess(l.v, itemVar, field)
+            if rk != "lit" || !fa:
+                return none
+            let v = do prLitValue(r.v)
+            if v.kind == "str" && v.s != "":
+                return PjText{has: true, s: v.s}
+        return none
+
+    # prSubstringLiterals: substring_literals — every contains/starts_with/
+    # ends_with literal on the field among the conjuncts.
+    proc prSubstringLiterals(e: FqJ, itemVar: text, field: text, depth: int, acc: [text]) -> [text]:
+        if depth >= 64:
+            return acc
+        let k = do pjKind(e)
+        if k != "bin":
+            return acc
+        let l = do pjMember(e, "l")
+        let r = do pjMember(e, "r")
+        if !l.ok || !r.ok:
+            return acc
+        let op = do pjText(e, "op")
+        if op.has && op.s == "&&":
+            let a = do prSubstringLiterals(l.v, itemVar, field, depth + 1, acc)
+            let b = do prSubstringLiterals(r.v, itemVar, field, depth + 1, a)
+            return b
+        if op.has && (op.s == "contains" || op.s == "starts_with" || op.s == "ends_with"):
+            let rk = do pjKind(r.v)
+            let fa = do prIsFieldAccess(l.v, itemVar, field)
+            if rk != "lit" || !fa:
+                return acc
+            let v = do prLitValue(r.v)
+            if v.kind == "str" && v.s != "":
+                return append(acc, v.s)
+        return acc
+
+    # ── index.rs: compare_order_values ─────────────────────────────────
+    proc qvRank(present: bool, v: FqJ) -> int:
+        if !present:
+            return 240
+        if v.kind == "null":
+            return 16
+        if v.kind == "bool":
+            return 32
+        if v.kind == "int" || v.kind == "float":
+            return 48
+        if v.kind == "str":
+            return 64
+        return 80
+
+    proc qvCmpBytes(a: [int], b: [int]) -> int:
+        let na = len(a)
+        let nb = len(b)
+        let mut i = 0
+        loop i < na && i < nb:
+            if a[i] < b[i]:
+                return -1
+            if a[i] > b[i]:
+                return 1
+            i = i + 1
+        if na < nb:
+            return -1
+        if na > nb:
+            return 1
+        return 0
+
+    # qvCompare: compare_order_values over (present, value) — -1, 0, 1.
+    proc qvCompare(ap: bool, a: FqJ, bp: bool, b: FqJ) -> int:
+        let ra = do qvRank(ap, a)
+        let rb = do qvRank(bp, b)
+        if ra < rb:
+            return -1
+        if ra > rb:
+            return 1
+        if !ap || !bp:
+            return 0
+        if a.kind == "bool" && b.kind == "bool":
+            if a.b == b.b:
+                return 0
+            if !a.b:
+                return -1
+            return 1
+        if ra == 48:
+            if a.f < b.f:
+                return -1
+            if a.f > b.f:
+                return 1
+            return 0
+        if a.kind == "str" && b.kind == "str":
+            let c = do qvCmpBytes(textToBytes(a.s), textToBytes(b.s))
+            return c
+        if ra == 80:
+            let at = do fjText(a)
+            let bt = do fjText(b)
+            let c2 = do qvCmpBytes(textToBytes(at), textToBytes(bt))
+            return c2
+        return 0
+
+    proc qvEncode(present: bool, v: FqJ) -> [int]:
+        let mut r = FqJR{ok: present, err: "", v: v, pos: 0}
+        let dv = do fjDataValue(r)
+        let e = do encodeDataValueForKey(dv)
+        return e
+
+    # ── aggregate.rs: the Accumulator ──────────────────────────────────
+    struct QAcc:
+        func: text
+        rows: int
+        contributed: int
+        hi: int
+        lo: int
+        floatSum: float
+        allInt: bool
+        hasExtreme: bool
+        extreme: FqJ
+
+    proc qaNew(func: text) -> QAcc:
+        let n = do fjNull()
+        return QAcc{func: func, rows: 0, contributed: 0, hi: 0, lo: 0, floatSum: 0.0, allInt: true, hasExtreme: false, extreme: n}
+
+    struct QAccR:
+        ok: bool
+        err: text
+        acc: QAcc
+
+    # qaAdd128: (hi, lo) + an i64, two's complement 128-bit.
+    struct Q128:
+        hi: int
+        lo: int
+
+    proc qaAdd128(hi: int, lo: int, v: int) -> Q128:
+        let nlo = lo + v
+        let mut carry = 0
+        let wrapped = do fjU64Gt(lo, nlo)
+        if wrapped:
+            carry = 1
+        let mut ext = 0
+        if v < 0:
+            ext = -1
+        return Q128{hi: hi + carry + ext, lo: nlo}
+
+    # qa128Float: an i128 as f64, rounded to nearest: the top 64 bits with
+    # every lower bit folded into a sticky bit, converted, then scaled.
+    proc qa128Float(hi: int, lo: int) -> float:
+        let neg = hi < 0
+        let mut h = hi
+        let mut l = lo
+        if neg:
+            h = ~hi
+            l = ~lo
+            let nl = l + 1
+            if nl == 0:
+                h = h + 1
+            l = nl
+        if h == 0:
+            let f0 = do fjU64Float(l)
+            if neg:
+                return 0.0 - f0
+            return f0
+        let mut bh = 0
+        let mut hh = h
+        loop hh > 0:
+            hh = hh >> 1
+            bh = bh + 1
+        let low = (l >> bh) & ((1 << (64 - bh)) - 1)
+        let mut t = (h << (64 - bh)) | low
+        if (l & ((1 << bh) - 1)) != 0:
+            t = t | 1
+        let f = do fjU64Float(t)
+        let mut scale = 1.0
+        let mut k = 0
+        loop k < bh:
+            scale = scale * 2.0
+            k = k + 1
+        let r = f * scale
+        if neg:
+            return 0.0 - r
+        return r
+
+    proc qaDescribe(v: FqJ) -> text:
+        if v.kind == "null":
+            return "null"
+        if v.kind == "bool":
+            return "a boolean"
+        if v.kind == "int" || v.kind == "float":
+            return "a number"
+        if v.kind == "str":
+            if byteLen(v.s) <= 32:
+                let q = do ckQuote(v.s)
+                return "the text " + q
+            return "text"
+        if v.kind == "arr":
+            return "a list"
+        return "an object"
+
+    proc qaFuncName(func: text) -> text:
+        return func
+
+    # qaFold: Accumulator::fold.
+    proc qaFold(a: QAcc, field: text, present: bool, v: FqJ) -> QAccR:
+        let rows = a.rows + 1
+        let mut acc = QAcc{func: a.func, rows: rows, contributed: a.contributed, hi: a.hi, lo: a.lo, floatSum: a.floatSum, allInt: a.allInt, hasExtreme: a.hasExtreme, extreme: a.extreme}
+        if a.func == "count":
+            return QAccR{ok: true, err: "", acc: acc}
+        if !present || v.kind == "null":
+            return QAccR{ok: true, err: "", acc: acc}
+        if a.func == "sum" || a.func == "avg":
+            if v.kind != "int" && v.kind != "float":
+                let fq = do ckQuote(field)
+                let d = do qaDescribe(v)
+                return QAccR{ok: false, err: a.func + " over " + fq + " found " + d + " in a row that matched; an aggregate over a field that is not always a number has no answer, so this is refused rather than reported as a total over the rows that happened to be numeric", acc: acc}
+            let isI64 = v.kind == "int" && (charAt(v.s, 0) == "-" || fjDigitsLE(v.s, "9223372036854775807"))
+            if acc.allInt && isI64:
+                let s = do qaAdd128(acc.hi, acc.lo, toInt(v.s))
+                acc = QAcc{func: acc.func, rows: acc.rows, contributed: acc.contributed, hi: s.hi, lo: s.lo, floatSum: acc.floatSum, allInt: true, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+            else:
+                let mut fs = acc.floatSum
+                if acc.allInt:
+                    fs = do qa128Float(acc.hi, acc.lo)
+                fs = fs + v.f
+                acc = QAcc{func: acc.func, rows: acc.rows, contributed: acc.contributed, hi: acc.hi, lo: acc.lo, floatSum: fs, allInt: false, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+        else:
+            let mut better = !acc.hasExtreme
+            if acc.hasExtreme:
+                let c = do qvCompare(true, v, true, acc.extreme)
+                if a.func == "min":
+                    better = c < 0
+                else:
+                    better = c > 0
+            if better:
+                acc = QAcc{func: acc.func, rows: acc.rows, contributed: acc.contributed, hi: acc.hi, lo: acc.lo, floatSum: acc.floatSum, allInt: acc.allInt, hasExtreme: true, extreme: v}
+        acc = QAcc{func: acc.func, rows: acc.rows, contributed: acc.contributed + 1, hi: acc.hi, lo: acc.lo, floatSum: acc.floatSum, allInt: acc.allInt, hasExtreme: acc.hasExtreme, extreme: acc.extreme}
+        return QAccR{ok: true, err: "", acc: acc}
+
+    proc qaFoldRows(a: QAcc, by: int) -> QAcc:
+        return QAcc{func: a.func, rows: a.rows + by, contributed: a.contributed, hi: a.hi, lo: a.lo, floatSum: a.floatSum, allInt: a.allInt, hasExtreme: a.hasExtreme, extreme: a.extreme}
+
+    proc qaIntValue(n: int) -> FqJ:
+        return FqJ{kind: "int", b: false, s: "" + n, f: toFloat(n), items: [], keys: []}
+
+    # qaFinish: Accumulator::finish.
+    proc qaFinish(a: QAcc) -> FqJ:
+        if a.func == "count":
+            let c = do qaIntValue(a.rows)
+            return c
+        if a.func == "sum":
+            if a.allInt:
+                let fits = (a.hi == 0 && a.lo >= 0) || (a.hi == -1 && a.lo < 0)
+                if fits:
+                    let iv = do qaIntValue(a.lo)
+                    return iv
+                let f = do qa128Float(a.hi, a.lo)
+                let nf = do prNumber(f)
+                return nf
+            let nf2 = do prNumber(a.floatSum)
+            return nf2
+        if a.func == "avg":
+            if a.contributed == 0:
+                let n = do fjNull()
+                return n
+            let mut total = a.floatSum
+            if a.allInt:
+                total = do qa128Float(a.hi, a.lo)
+            let av = do prNumber(total / toFloat(a.contributed))
+            return av
+        if a.hasExtreme:
+            return a.extreme
+        let n2 = do fjNull()
+        return n2
+
+    # ── the query engine ───────────────────────────────────────────────
+    struct QSpec:
+        hasKind: bool
+        kind: text
+        hasOwner: bool
+        owner: text
+        hasRequester: bool
+        requester: text
+        hasPredicate: bool
+        predicate: FqJ
+        itemVar: text
+
+    proc qDataOf(node: Node) -> FqJ:
+        let p = do fjParse(node.data)
+        if p.ok:
+            return p.v
+        let n = do fjNull()
+        return n
+
+    struct QMatch:
+        ok: bool
+        err: text
+        v: bool
+
+    # qMatches: query_where's `matches` — kind, owner, readability, then
+    # the predicate over the node's data (unparsable data is null).
+    proc qMatches(q: QSpec, node: Node) -> QMatch:
+        if q.hasKind && node.kind != q.kind:
+            return QMatch{ok: true, err: "", v: false}
+        if q.hasOwner && node.owner != q.owner:
+            return QMatch{ok: true, err: "", v: false}
+        if q.hasRequester:
+            let cr = do nodeCanRead(node, q.requester)
+            if !cr:
+                return QMatch{ok: true, err: "", v: false}
+        if !q.hasPredicate:
+            return QMatch{ok: true, err: "", v: true}
+        let data = do qDataOf(node)
+        let r = do prEval(q.predicate, q.itemVar, data, 0)
+        if !r.ok:
+            return QMatch{ok: false, err: "predicate evaluation failed: " + r.err, v: false}
+        return QMatch{ok: true, err: "", v: r.v.kind == "bool" && r.v.b}
+
+    # the cursor: {"o": order value?, "a": address} as serde_json writes it,
+    # base64url without padding.
+    struct QCursor:
+        has: bool
+        hasO: bool
+        o: FqJ
+        a: text
+
+    proc qNoCursor() -> QCursor:
+        let n = do fjNull()
+        return QCursor{has: false, hasO: false, o: n, a: ""}
+
+    proc qB64Alphabet() -> text:
+        return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+    proc qB64Encode(bs: [int]) -> text:
+        let al = do qB64Alphabet()
+        let n = len(bs)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let b0 = bs[i]
+            let mut b1 = 0
+            let mut b2 = 0
+            let rem = n - i
+            if rem > 1:
+                b1 = bs[i + 1]
+            if rem > 2:
+                b2 = bs[i + 2]
+            let v = (b0 << 16) | (b1 << 8) | b2
+            out = out + charAt(al, (v >> 18) & 63) + charAt(al, (v >> 12) & 63)
+            if rem > 1:
+                out = out + charAt(al, (v >> 6) & 63)
+            if rem > 2:
+                out = out + charAt(al, v & 63)
+            i = i + 3
+        return out
+
+    struct QBytes:
+        ok: bool
+        bytes: [int]
+
+    proc qB64Val(c: int) -> int:
+        if c >= 65 && c <= 90:
+            return c - 65
+        if c >= 97 && c <= 122:
+            return c - 97 + 26
+        if c >= 48 && c <= 57:
+            return c - 48 + 52
+        if c == 45:
+            return 62
+        if c == 95:
+            return 63
+        return -1
+
+    proc qB64Decode(s: text) -> QBytes:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let mut clen = n - i
+            if clen > 4:
+                clen = 4
+            if clen < 2:
+                return QBytes{ok: false, bytes: []}
+            let mut v = 0
+            let mut j = 0
+            loop j < clen:
+                let d = do qB64Val(bs[i + j])
+                if d < 0:
+                    return QBytes{ok: false, bytes: []}
+                v = v | (d << (18 - 6 * j))
+                j = j + 1
+            out = append(out, (v >> 16) & 255)
+            if clen > 2:
+                out = append(out, (v >> 8) & 255)
+            if clen > 3:
+                out = append(out, v & 255)
+            i = i + 4
+        return QBytes{ok: true, bytes: out}
+
+    proc qOrderKey(node: Node, field: text) -> FqJR:
+        let p = do fjParse(node.data)
+        if !p.ok:
+            return p
+        let g = do fjGet(p.v, field)
+        return g
+
+    proc qCursorFrom(node: Node, hasOrder: bool, field: text) -> text:
+        let q = do fjQuote(node.address)
+        if hasOrder:
+            let ok = do qOrderKey(node, field)
+            if ok.ok:
+                let ot = do fjText(ok.v)
+                let j = "{\"o\":" + ot + ",\"a\":" + q + "}"
+                let e = do qB64Encode(textToBytes(j))
+                return e
+        let j2 = "{\"a\":" + q + "}"
+        let e2 = do qB64Encode(textToBytes(j2))
+        return e2
+
+    struct QCursorR:
+        ok: bool
+        err: text
+        cursor: QCursor
+
+    proc qCursorDecode(s: text) -> QCursorR:
+        let none = do qNoCursor()
+        if byteLen(s) > 4096:
+            return QCursorR{ok: false, err: "invalid cursor: " + byteLen(s) + " bytes, over the 4096-byte maximum — this is not a cursor this server issued", cursor: none}
+        let d = do qB64Decode(s)
+        if !d.ok:
+            return QCursorR{ok: false, err: "invalid cursor: not valid base64url", cursor: none}
+        let p = do fjParse(bytesToText(d.bytes))
+        if !p.ok || p.v.kind != "obj":
+            return QCursorR{ok: false, err: "invalid cursor: malformed payload", cursor: none}
+        let a = do fjGet(p.v, "a")
+        if !a.ok || a.v.kind != "str":
+            return QCursorR{ok: false, err: "invalid cursor: malformed payload", cursor: none}
+        let o = do fjGet(p.v, "o")
+        let hasO = o.ok && o.v.kind != "null"
+        let mut ov = do fjNull()
+        if hasO:
+            ov = o.v
+        return QCursorR{ok: true, err: "", cursor: QCursor{has: true, hasO: hasO, o: ov, a: a.v.s}}
+
+    proc qCmpNodeCursor(node: Node, hasOrder: bool, field: text, c: QCursor) -> int:
+        if hasOrder:
+            let ok = do qOrderKey(node, field)
+            let base = do qvCompare(ok.ok, ok.v, c.hasO, c.o)
+            if base != 0:
+                return base
+        let r = do qvCmpBytes(textToBytes(node.address), textToBytes(c.a))
+        return r
+
+    struct QPage:
+        ok: bool
+        err: text
+        eng: FqEngine
+        nodes: [Node]
+        next: text
+        examined: int
+
+    proc qPageErr(e: FqEngine, msg: text, examined: int) -> QPage:
+        return QPage{ok: false, err: msg, eng: e, nodes: [], next: "", examined: examined}
+
+    # qKeysScan: for_each_range over a tree with an optional exclusive
+    # start and direction — its (key, value) hex pairs.
+    proc qTreeScan(e: FqEngine, which: text, dataAt: int, prefix: [int], hasStart: bool, start: [int], desc: bool) -> FqEngRange uses io.file:
+        if dataAt >= 0:
+            let sc = do btScan(e.st.ix.data[dataAt].tree, prefix, hasStart, start, desc, 0)
+            let mut data = e.st.ix.data
+            data[dataAt] = FqDataIx{def: data[dataAt].def, tree: sc.tree}
+            let e2 = do enWith(e, stWith(e.st, e.st.heap, ixSets(e.st.ix, e.st.ix.opens, data, e.st.ix.text)))
+            return FqEngRange{ok: sc.ok, err: sc.err, eng: e2, keys: sc.keys, values: sc.values}
+        let t = do ixTree(e.st.ix, which)
+        let sc2 = do btScan(t, prefix, hasStart, start, desc, 0)
+        let e3 = do enWith(e, stWith(e.st, e.st.heap, ixWith(e.st.ix, which, sc2.tree)))
+        return FqEngRange{ok: sc2.ok, err: sc2.err, eng: e3, keys: sc2.keys, values: sc2.values}
+
+    # qCandidates: scan_candidates with a start and direction — each entry
+    # an address (kind/owner) or a node location (primary).
+    struct QCand:
+        ok: bool
+        err: text
+        eng: FqEngine
+        addrs: [text]
+        locs: [text]
+
+    proc qCandidates(e: FqEngine, q: QSpec, hasAfter: bool, after: text, desc: bool) -> QCand uses io.file:
+        if !q.hasKind && !q.hasOwner:
+            let sc = do qTreeScan(e, "primary", -1, [], hasAfter, textToBytes(after), desc)
+            if !sc.ok:
+                return QCand{ok: false, err: sc.err, eng: sc.eng, addrs: [], locs: []}
+            let mut addrs = []
+            let n = len(sc.keys)
+            let mut i = 0
+            loop i < n:
+                let kb = do fqwHexBytes(sc.keys[i])
+                addrs = append(addrs, bytesToText(kb))
+                i = i + 1
+            return QCand{ok: true, err: "", eng: sc.eng, addrs: addrs, locs: sc.values}
+        let mut which = "owner"
+        let mut prefix = do indexOwnerPrefix(q.owner)
+        if q.hasKind:
+            which = "kind"
+            prefix = do indexKindPrefix(q.kind)
+        let start = do concatBytes(prefix, textToBytes(after))
+        let sc2 = do qTreeScan(e, which, -1, prefix, hasAfter, start, desc)
+        if !sc2.ok:
+            return QCand{ok: false, err: sc2.err, eng: sc2.eng, addrs: [], locs: []}
+        let pl = len(prefix)
+        let mut out = []
+        let m = len(sc2.keys)
+        let mut j = 0
+        loop j < m:
+            let kb2 = do fqwHexBytes(sc2.keys[j])
+            out = append(out, bytesToText(btRange(kb2, pl, len(kb2))))
+            j = j + 1
+        return QCand{ok: true, err: "", eng: sc2.eng, addrs: out, locs: []}
+
+    # qNodeOf: the node a candidate names — through its location (primary
+    # walk) or its address (read_node); found false when it is gone.
+    proc qNodeOf(e: FqEngine, c: QCand, i: int) -> FqEngNode uses io.file:
+        if len(c.locs) > 0:
+            let r = do enRecordAt(e, c.locs[i], "node")
+            if !r.ok:
+                return FqEngNode{ok: false, err: r.err, eng: r.eng, found: false, node: r.record.node}
+            return FqEngNode{ok: true, err: "", eng: r.eng, found: true, node: r.record.node}
+        let rn = do enReadNode(e, c.addrs[i])
+        return rn
+
+    # qPaged: the shared visitor of every streaming access path — matches,
+    # skip `toSkip`, take up to `limit`, note whether more remained.
+    proc qPaged(e0: FqEngine, q: QSpec, c: QCand, toSkip: int, limit: int, hasOrder: bool, orderField: text, examined0: int) -> QPage uses io.file:
+        let mut e = e0
+        let mut nodes = []
+        let mut skipped = 0
+        let mut more = false
+        let mut examined = examined0
+        let n = len(c.addrs)
+        let mut i = 0
+        loop i < n && !more:
+            let r = do qNodeOf(e, c, i)
+            e = r.eng
+            if !r.ok:
+                let pe = do qPageErr(e, r.err, examined)
+                return pe
+            if r.found:
+                examined = examined + 1
+                let m = do qMatches(q, r.node)
+                if !m.ok:
+                    let pe2 = do qPageErr(e, m.err, examined)
+                    return pe2
+                if m.v:
+                    if skipped < toSkip:
+                        skipped = skipped + 1
+                    else:
+                        if len(nodes) == limit:
+                            more = true
+                        else:
+                            nodes = append(nodes, r.node)
+            i = i + 1
+        let mut next = ""
+        if more && len(nodes) > 0:
+            next = do qCursorFrom(nodes[len(nodes) - 1], hasOrder, orderField)
+        return QPage{ok: true, err: "", eng: e, nodes: nodes, next: next, examined: examined}
+
+    # qDataKeyAddrs: a data index's entries as addresses.
+    proc qDataAddrs(sc: FqEngRange) -> [text]:
+        let mut out = []
+        let n = len(sc.keys)
+        let mut i = 0
+        loop i < n:
+            let a = do enKeyAddress(sc.keys[i])
+            if a != "":
+                out = append(out, a)
+            i = i + 1
+        return out
+
+    # qEqualitySelection: equality_selection — the first ordered index over
+    # the kind (in name order, as data_all lists them) the predicate pins.
+    struct QSel:
+        ok: bool
+        at: int
+        v: FqJ
+
+    proc qEqualitySelection(e: FqEngine, q: QSpec) -> QSel:
+        let n0 = do fjNull()
+        if !q.hasKind || !q.hasPredicate:
+            return QSel{ok: false, at: -1, v: n0}
+        let order = do qDataOrder(e)
+        let n = len(order)
+        let mut i = 0
+        loop i < n:
+            let def = e.st.ix.data[order[i]].def
+            if def.kind == q.kind:
+                let l = do prEqualityLiteral(q.predicate, q.itemVar, def.field, 0)
+                if l.ok:
+                    return QSel{ok: true, at: order[i], v: l.v}
+            i = i + 1
+        return QSel{ok: false, at: -1, v: n0}
+
+    # qDataOrder: the data indexes' positions in name order (data_all).
+    proc qDataOrder(e: FqEngine) -> [int]:
+        let n = len(e.st.ix.data)
+        let mut idx = []
+        let mut i = 0
+        loop i < n:
+            idx = append(idx, i)
+            i = i + 1
+        let mut j = 1
+        loop j < n:
+            let v = idx[j]
+            let mut k = j - 1
+            loop k >= 0 && e.st.ix.data[idx[k]].def.name > e.st.ix.data[v].def.name:
+                idx[k + 1] = idx[k]
+                k = k - 1
+            idx[k + 1] = v
+            j = j + 1
+        return idx
+
+    proc qTextOrder(e: FqEngine) -> [int]:
+        let n = len(e.st.ix.text)
+        let mut idx = []
+        let mut i = 0
+        loop i < n:
+            idx = append(idx, i)
+            i = i + 1
+        let mut j = 1
+        loop j < n:
+            let v = idx[j]
+            let mut k = j - 1
+            loop k >= 0 && e.st.ix.text[idx[k]].def.name > e.st.ix.text[v].def.name:
+                idx[k + 1] = idx[k]
+                k = k - 1
+            idx[k + 1] = v
+            j = j + 1
+        return idx
+
+    # qTextCandidates: text_candidate_plan + text_candidates.
+    struct QText:
+        ok: bool
+        err: text
+        eng: FqEngine
+        found: bool
+        addrs: [text]
+
+    proc qGramLess(a: Gram, b: Gram) -> bool:
+        let c = do compareGrams(a, b)
+        return c < 0
+
+    proc qTextPlan(e0: FqEngine, q: QSpec) -> QText uses io.file:
+        let mut e = e0
+        if !q.hasKind || !q.hasPredicate:
+            return QText{ok: true, err: "", eng: e, found: false, addrs: []}
+        let order = do qTextOrder(e)
+        let no = len(order)
+        let mut oi = 0
+        loop oi < no:
+            let at = order[oi]
+            let def = e.st.ix.text[at].def
+            if def.kind == q.kind:
+                let lits = do prSubstringLiterals(q.predicate, q.itemVar, def.field, 0, [])
+                if len(lits) > 0:
+                    let mut gs = []
+                    let nl = len(lits)
+                    let mut li = 0
+                    loop li < nl:
+                        let g = do grams(lits[li])
+                        let ng = len(g)
+                        let mut gi = 0
+                        loop gi < ng:
+                            let has = do gramsContains(gs, g[gi])
+                            if !has:
+                                gs = append(gs, g[gi])
+                            gi = gi + 1
+                        li = li + 1
+                    let sorted = do sortGramsAscending(gs)
+                    if len(sorted) > 0:
+                        let tc = do qTextCandidates(e, at, sorted)
+                        e = tc.eng
+                        if !tc.ok:
+                            return tc
+                        if tc.found:
+                            return tc
+            oi = oi + 1
+        return QText{ok: true, err: "", eng: e, found: false, addrs: []}
+
+    proc qTextScan(e: FqEngine, at: int, prefix: [int]) -> FqEngRange uses io.file:
+        let sc = do btScan(e.st.ix.text[at].tree, prefix, false, [], false, 0)
+        let mut text = e.st.ix.text
+        text[at] = FqTextIx{def: text[at].def, tree: sc.tree}
+        let e2 = do enWith(e, stWith(e.st, e.st.heap, ixSets(e.st.ix, e.st.ix.opens, e.st.ix.data, text)))
+        return FqEngRange{ok: sc.ok, err: sc.err, eng: e2, keys: sc.keys, values: sc.values}
+
+    proc qSortedInsert(xs: [text], x: text) -> [text]:
+        if x in xs:
+            return xs
+        let mut out = []
+        let mut placed = false
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if !placed:
+                let c = do qvCmpBytes(textToBytes(x), textToBytes(xs[i]))
+                if c < 0:
+                    out = append(out, x)
+                    placed = true
+            out = append(out, xs[i])
+            i = i + 1
+        if !placed:
+            out = append(out, x)
+        return out
+
+    proc qTextCandidates(e0: FqEngine, at: int, gs: [Gram]) -> QText uses io.file:
+        let mut e = e0
+        let cap = do enMaxScanRows()
+        let mut hasBest = false
+        let mut best = []
+        let mut bestLen = cap
+        let mut budget = cap
+        let ng = len(gs)
+        let mut i = 0
+        loop i < ng && i < 4:
+            let mut limit = bestLen
+            if budget < limit:
+                limit = budget
+            if limit == 0:
+                break
+            let g = gs[i]
+            let sc = do qTextScan(e, at, [g.b0, g.b1, g.b2])
+            e = sc.eng
+            if !sc.ok:
+                return QText{ok: false, err: sc.err, eng: e, found: false, addrs: []}
+            let mut list = []
+            let mut nread = 0
+            let mut over = false
+            let nk = len(sc.keys)
+            let mut k = 0
+            loop k < nk && !over:
+                if nread >= limit:
+                    over = true
+                else:
+                    nread = nread + 1
+                    let kb = do fqwHexBytes(sc.keys[k])
+                    if len(kb) > 3:
+                        list = do qSortedInsert(list, bytesToText(btRange(kb, 3, len(kb))))
+                k = k + 1
+            budget = budget - nread
+            if !over:
+                bestLen = len(list)
+                best = list
+                hasBest = true
+                if bestLen <= 1024:
+                    break
+            i = i + 1
+        if !hasBest:
+            return QText{ok: true, err: "", eng: e, found: false, addrs: []}
+        let mut cands = best
+        let mut budget2 = cap
+        let mut j = 0
+        loop j < ng && j < 16:
+            if len(cands) <= 64 || budget2 < len(cands):
+                break
+            budget2 = budget2 - len(cands)
+            let mut kept = []
+            let nc = len(cands)
+            let mut c = 0
+            loop c < nc:
+                let key = do textIndexKey(gs[j], cands[c])
+                let gt = do btGet(e.st.ix.text[at].tree, key)
+                let mut text = e.st.ix.text
+                text[at] = FqTextIx{def: text[at].def, tree: gt.tree}
+                e = do enWith(e, stWith(e.st, e.st.heap, ixSets(e.st.ix, e.st.ix.opens, e.st.ix.data, text)))
+                if !gt.ok:
+                    return QText{ok: false, err: gt.err, eng: e, found: false, addrs: []}
+                if gt.entry.found:
+                    kept = append(kept, cands[c])
+                c = c + 1
+            cands = kept
+            j = j + 1
+        return QText{ok: true, err: "", eng: e, found: true, addrs: cands}
+
+    # qByText: query_by_text — the candidate addresses (sorted), after the
+    # cursor, in either direction.
+    proc qByText(e: FqEngine, q: QSpec, addrs: [text], cursor: QCursor, desc: bool, limit: int, offset: int, examined: int) -> QPage uses io.file:
+        let mut toSkip = offset
+        if cursor.has:
+            toSkip = 0
+        let mut sel = []
+        let n = len(addrs)
+        let mut i = 0
+        loop i < n:
+            let keep = !cursor.has
+            let mut k2 = keep
+            if cursor.has:
+                let c = do qvCmpBytes(textToBytes(addrs[i]), textToBytes(cursor.a))
+                if desc:
+                    k2 = c < 0
+                else:
+                    k2 = c > 0
+            if k2:
+                sel = append(sel, addrs[i])
+            i = i + 1
+        if desc:
+            let mut rev = []
+            let mut j = len(sel) - 1
+            loop j >= 0:
+                rev = append(rev, sel[j])
+                j = j - 1
+            sel = rev
+        let cand = QCand{ok: true, err: "", eng: e, addrs: sel, locs: []}
+        let p = do qPaged(e, q, cand, toSkip, limit, false, "", examined)
+        return p
+
+    # qSorted: query_sorted — every match materialized, sorted by the
+    # order field then address, paged by cursor or offset.
+    proc qSorted(e0: FqEngine, q: QSpec, hasOrder: bool, orderField: text, cursor: QCursor, desc: bool, limit: int, offset: int, textFound: bool, textAddrs: [text], examined0: int) -> QPage uses io.file:
+        let mut e = e0
+        let mut examined = examined0
+        let cap = do enMaxScanRows()
+        let sel = do qEqualitySelection(e, q)
+        let mut cand = QCand{ok: true, err: "", eng: e, addrs: [], locs: []}
+        if sel.ok:
+            let prefix = do qvEncode(true, sel.v)
+            let sc = do qTreeScan(e, "", sel.at, prefix, false, [], false)
+            e = sc.eng
+            if !sc.ok:
+                let pe = do qPageErr(e, sc.err, examined)
+                return pe
+            let ad = do qDataAddrs(sc)
+            cand = QCand{ok: true, err: "", eng: e, addrs: ad, locs: []}
+        else:
+            if textFound:
+                cand = QCand{ok: true, err: "", eng: e, addrs: textAddrs, locs: []}
+            else:
+                let cs = do qCandidates(e, q, false, "", false)
+                e = cs.eng
+                if !cs.ok:
+                    let pe2 = do qPageErr(e, cs.err, examined)
+                    return pe2
+                cand = cs
+        let mut matched = []
+        let n = len(cand.addrs)
+        let mut i = 0
+        loop i < n:
+            let r = do qNodeOf(e, cand, i)
+            e = r.eng
+            if !r.ok:
+                let pe3 = do qPageErr(e, r.err, examined)
+                return pe3
+            if r.found:
+                examined = examined + 1
+                let m = do qMatches(q, r.node)
+                if !m.ok:
+                    let pe4 = do qPageErr(e, m.err, examined)
+                    return pe4
+                if m.v:
+                    if len(matched) >= cap:
+                        let lim = do enScanLimitExceeded("ordering by an unindexed field")
+                        let pe5 = do qPageErr(e, lim, examined)
+                        return pe5
+                    matched = append(matched, r.node)
+            i = i + 1
+        let sorted = do qSortNodes(matched, hasOrder, orderField)
+        let mut ordered = sorted
+        if desc:
+            let mut rev = []
+            let mut j = len(sorted) - 1
+            loop j >= 0:
+                rev = append(rev, sorted[j])
+                j = j - 1
+            ordered = rev
+        let total = len(ordered)
+        let mut start = offset
+        if start > total:
+            start = total
+        if cursor.has:
+            start = total
+            let mut k = 0
+            loop k < total:
+                let c = do qCmpNodeCursor(ordered[k], hasOrder, orderField, cursor)
+                if (desc && c < 0) || (!desc && c > 0):
+                    start = k
+                    break
+                k = k + 1
+        let mut page = []
+        let mut p = start
+        loop p < total && len(page) < limit:
+            page = append(page, ordered[p])
+            p = p + 1
+        let mut next = ""
+        if len(page) > 0 && start + len(page) < total:
+            next = do qCursorFrom(page[len(page) - 1], hasOrder, orderField)
+        return QPage{ok: true, err: "", eng: e, nodes: page, next: next, examined: examined}
+
+    proc qNodeCmp(a: Node, b: Node, hasOrder: bool, field: text) -> int:
+        if hasOrder:
+            let ka = do qOrderKey(a, field)
+            let kb = do qOrderKey(b, field)
+            let c = do qvCompare(ka.ok, ka.v, kb.ok, kb.v)
+            if c != 0:
+                return c
+        let r = do qvCmpBytes(textToBytes(a.address), textToBytes(b.address))
+        return r
+
+    # qSortNodes: a stable merge sort (sort_by's order).
+    proc qSortNodes(xs: [Node], hasOrder: bool, field: text) -> [Node]:
+        let n = len(xs)
+        if n <= 1:
+            return xs
+        let mid = n / 2
+        let mut left = []
+        let mut right = []
+        let mut i = 0
+        loop i < n:
+            if i < mid:
+                left = append(left, xs[i])
+            else:
+                right = append(right, xs[i])
+            i = i + 1
+        let l = do qSortNodes(left, hasOrder, field)
+        let r = do qSortNodes(right, hasOrder, field)
+        let mut out = []
+        let mut a = 0
+        let mut b = 0
+        loop a < len(l) || b < len(r):
+            if b >= len(r):
+                out = append(out, l[a])
+                a = a + 1
+            else:
+                if a >= len(l):
+                    out = append(out, r[b])
+                    b = b + 1
+                else:
+                    let c = do qNodeCmp(r[b], l[a], hasOrder, field)
+                    if c < 0:
+                        out = append(out, r[b])
+                        b = b + 1
+                    else:
+                        out = append(out, l[a])
+                        a = a + 1
+        return out
+
+    # qQueryWhere: query_where.
+    proc qQueryWhere(e0: FqEngine, q: QSpec, hasOrder0: bool, order0: text, desc: bool, hasAfter: bool, after: text, limit: int, offset: int) -> QPage uses io.file:
+        let mut e = do enCountRead(e0)
+        let cursorGiven = hasAfter && after != ""
+        let mo = do enMaxQueryOffset()
+        if !cursorGiven && offset > mo:
+            let pe = do qPageErr(e, "offset " + offset + " is above the maximum of " + mo + ". Deep offset paging re-reads and discards every row before the page, so its cost grows with the page number; use the keyset cursor (`after`, from a previous page's `next`) on POST /nodes/query, which costs the same at any depth. Raise FACETQL_MAX_QUERY_OFFSET to override.", 0)
+            return pe
+        let hasOrder = hasOrder0 && order0 != "id"
+        let orderField = order0
+        let mut cursor = do qNoCursor()
+        if cursorGiven:
+            let cd = do qCursorDecode(after)
+            if !cd.ok:
+                let pe2 = do qPageErr(e, cd.err, 0)
+                return pe2
+            cursor = cd.cursor
+        let mut toSkip = offset
+        if cursor.has:
+            toSkip = 0
+        # equality_prefix_plan
+        let sel = do qEqualitySelection(e, q)
+        if sel.ok && (!hasOrder || orderField == e.st.ix.data[sel.at].def.field):
+            let prefix = do qvEncode(true, sel.v)
+            let p1 = do qByKeyPrefix(e, q, sel.at, prefix, cursor, desc, limit, toSkip)
+            return p1
+        # string_prefix_plan
+        if q.hasKind && q.hasPredicate && hasOrder:
+            let oi = do enDataFind(e, q.kind, orderField)
+            if oi >= 0:
+                let pl = do prPrefixLiteral(q.predicate, q.itemVar, e.st.ix.data[oi].def.field, 0)
+                if pl.has:
+                    let sp = do encodeStringPrefix(pl.s)
+                    let p2 = do qByKeyPrefix(e, q, oi, sp, cursor, desc, limit, toSkip)
+                    return p2
+        if !hasOrder:
+            let tp = do qTextPlan(e, q)
+            e = tp.eng
+            if !tp.ok:
+                let pe3 = do qPageErr(e, tp.err, 0)
+                return pe3
+            if tp.found:
+                let p3 = do qByText(e, q, tp.addrs, cursor, desc, limit, offset, 0)
+                return p3
+            let cs = do qCandidates(e, q, cursor.has, cursor.a, desc)
+            if !cs.ok:
+                let pe4 = do qPageErr(cs.eng, cs.err, 0)
+                return pe4
+            let p4 = do qPaged(cs.eng, q, cs, toSkip, limit, false, "", 0)
+            return p4
+        if q.hasKind:
+            let di = do enDataFind(e, q.kind, orderField)
+            if di >= 0:
+                let mut start = []
+                if cursor.has:
+                    start = do qDataKey(cursor.hasO, cursor.o, cursor.a)
+                let sc = do qTreeScan(e, "", di, [], cursor.has, start, desc)
+                if !sc.ok:
+                    let pe5 = do qPageErr(sc.eng, sc.err, 0)
+                    return pe5
+                let ad = do qDataAddrs(sc)
+                let cand = QCand{ok: true, err: "", eng: sc.eng, addrs: ad, locs: []}
+                let p5 = do qPaged(sc.eng, q, cand, toSkip, limit, true, orderField, 0)
+                return p5
+        let mut textFound = false
+        let mut textAddrs = []
+        let eqs = do qEqualitySelection(e, q)
+        if !eqs.ok:
+            let tp2 = do qTextPlan(e, q)
+            e = tp2.eng
+            if !tp2.ok:
+                let pe6 = do qPageErr(e, tp2.err, 0)
+                return pe6
+            textFound = tp2.found
+            textAddrs = tp2.addrs
+        let p6 = do qSorted(e, q, hasOrder, orderField, cursor, desc, limit, offset, textFound, textAddrs, 0)
+        return p6
+
+    proc qDataKey(hasV: bool, v: FqJ, address: text) -> [int]:
+        let enc = do qvEncode(hasV, v)
+        let k = do concatBytes(enc, textToBytes(address))
+        return k
+
+    # qByKeyPrefix: query_by_key_prefix over data index `at`.
+    proc qByKeyPrefix(e: FqEngine, q: QSpec, at: int, prefix: [int], cursor: QCursor, desc: bool, limit: int, toSkip: int) -> QPage uses io.file:
+        let mut start = []
+        if cursor.has:
+            start = do qDataKey(cursor.hasO, cursor.o, cursor.a)
+        let sc = do qTreeScan(e, "", at, prefix, cursor.has, start, desc)
+        if !sc.ok:
+            let pe = do qPageErr(sc.eng, sc.err, 0)
+            return pe
+        let ad = do qDataAddrs(sc)
+        let cand = QCand{ok: true, err: "", eng: sc.eng, addrs: ad, locs: []}
+        let field = e.st.ix.data[at].def.field
+        let p = do qPaged(sc.eng, q, cand, toSkip, limit, true, field, 0)
+        return p
+
+    # ── fold_where / fold_by ───────────────────────────────────────────
+    struct QFold:
+        ok: bool
+        err: text
+        eng: FqEngine
+        acc: QAcc
+
+    proc qFoldVisit(q: QSpec, a: QAcc, field: text, node: Node) -> QAccR:
+        if q.hasKind && node.kind != q.kind:
+            return QAccR{ok: true, err: "", acc: a}
+        if q.hasOwner && node.owner != q.owner:
+            return QAccR{ok: true, err: "", acc: a}
+        if q.hasRequester:
+            let cr = do nodeCanRead(node, q.requester)
+            if !cr:
+                return QAccR{ok: true, err: "", acc: a}
+        let needs = a.func != "count"
+        let n0 = do fjNull()
+        if !q.hasPredicate && !needs:
+            let f0 = do qaFold(a, field, false, n0)
+            return f0
+        let data = do qDataOf(node)
+        if q.hasPredicate:
+            let v = do prEval(q.predicate, q.itemVar, data, 0)
+            if !v.ok:
+                return QAccR{ok: false, err: "predicate evaluation failed: " + v.err, acc: a}
+            if !(v.v.kind == "bool" && v.v.b):
+                return QAccR{ok: true, err: "", acc: a}
+        if needs:
+            let g = do fjGet(data, field)
+            let f1 = do qaFold(a, field, g.ok, g.v)
+            return f1
+        let f2 = do qaFold(a, field, false, n0)
+        return f2
+
+    proc qFoldWhere(e0: FqEngine, q: QSpec, func: text, field: text) -> QFold uses io.file:
+        let mut e = do enCountRead(e0)
+        let mut acc = do qaNew(func)
+        let needs = func != "count"
+        if !q.hasPredicate && !q.hasRequester && !needs && (q.hasKind != q.hasOwner):
+            let mut which = "owner"
+            let mut prefix = do indexOwnerPrefix(q.owner)
+            if q.hasKind:
+                which = "kind"
+                prefix = do indexKindPrefix(q.kind)
+            let sc = do qTreeScan(e, which, -1, prefix, false, [], false)
+            if !sc.ok:
+                return QFold{ok: false, err: sc.err, eng: sc.eng, acc: acc}
+            acc = do qaFoldRows(acc, len(sc.keys))
+            return QFold{ok: true, err: "", eng: sc.eng, acc: acc}
+        let sel = do qEqualitySelection(e, q)
+        let mut cand = QCand{ok: true, err: "", eng: e, addrs: [], locs: []}
+        if sel.ok:
+            let prefix2 = do qvEncode(true, sel.v)
+            let sc2 = do qTreeScan(e, "", sel.at, prefix2, false, [], false)
+            e = sc2.eng
+            if !sc2.ok:
+                return QFold{ok: false, err: sc2.err, eng: e, acc: acc}
+            let ad = do qDataAddrs(sc2)
+            cand = QCand{ok: true, err: "", eng: e, addrs: ad, locs: []}
+        else:
+            let tp = do qTextPlan(e, q)
+            e = tp.eng
+            if !tp.ok:
+                return QFold{ok: false, err: tp.err, eng: e, acc: acc}
+            if tp.found:
+                cand = QCand{ok: true, err: "", eng: e, addrs: tp.addrs, locs: []}
+            else:
+                let cs = do qCandidates(e, q, false, "", false)
+                e = cs.eng
+                if !cs.ok:
+                    return QFold{ok: false, err: cs.err, eng: e, acc: acc}
+                cand = cs
+        let n = len(cand.addrs)
+        let mut i = 0
+        loop i < n:
+            let r = do qNodeOf(e, cand, i)
+            e = r.eng
+            if !r.ok:
+                return QFold{ok: false, err: r.err, eng: e, acc: acc}
+            if r.found:
+                let v = do qFoldVisit(q, acc, field, r.node)
+                if !v.ok:
+                    return QFold{ok: false, err: v.err, eng: e, acc: acc}
+                acc = v.acc
+            i = i + 1
+        return QFold{ok: true, err: "", eng: e, acc: acc}
+
+    # groups: parallel lists of (encoded value, present, value, acc).
+    struct QGroups:
+        ok: bool
+        err: text
+        eng: FqEngine
+        keys: [text]
+        present: [bool]
+        values: [FqJ]
+        accs: [QAcc]
+
+    struct QGroupAt:
+        ok: bool
+        err: text
+        g: QGroups
+        at: int
+
+    proc qGroupEntry(g: QGroups, func: text, present: bool, v: FqJ) -> QGroupAt:
+        let enc = do qvEncode(present, v)
+        let kh = do cryptoEncodeHex(enc)
+        let at = do fqwIndexOfText(g.keys, kh)
+        if at >= 0:
+            return QGroupAt{ok: true, err: "", g: g, at: at}
+        let cap = do enMaxScanRows()
+        if len(g.keys) >= cap:
+            let m = do enScanLimitExceeded("grouping by a field with this many distinct values")
+            return QGroupAt{ok: false, err: m, g: g, at: -1}
+        let a = do qaNew(func)
+        let g2 = QGroups{ok: g.ok, err: g.err, eng: g.eng, keys: append(g.keys, kh), present: append(g.present, present), values: append(g.values, v), accs: append(g.accs, a)}
+        return QGroupAt{ok: true, err: "", g: g2, at: len(g.keys)}
+
+    proc qGroupsSetAcc(g: QGroups, at: int, a: QAcc) -> QGroups:
+        let mut accs = g.accs
+        accs[at] = a
+        return QGroups{ok: g.ok, err: g.err, eng: g.eng, keys: g.keys, present: g.present, values: g.values, accs: accs}
+
+    # qGroupsFinish: the wanted values each get a group (empty ones too),
+    # then every group in compare_order_values order.
+    proc qGroupsFinish(g0: QGroups, func: text, hasValues: bool, wanted: [FqJ]) -> QGroups:
+        let mut g = g0
+        if hasValues:
+            let n = len(wanted)
+            let mut i = 0
+            loop i < n:
+                let ge = do qGroupEntry(g, func, true, wanted[i])
+                g = ge.g
+                i = i + 1
+        let n2 = len(g.keys)
+        let mut idx = []
+        let mut j = 0
+        loop j < n2:
+            idx = append(idx, j)
+            j = j + 1
+        let sorted = do qSortGroupIdx(g, idx)
+        let mut keys = []
+        let mut present = []
+        let mut values = []
+        let mut accs = []
+        let mut k = 0
+        loop k < n2:
+            keys = append(keys, g.keys[sorted[k]])
+            present = append(present, g.present[sorted[k]])
+            values = append(values, g.values[sorted[k]])
+            accs = append(accs, g.accs[sorted[k]])
+            k = k + 1
+        return QGroups{ok: true, err: "", eng: g.eng, keys: keys, present: present, values: values, accs: accs}
+
+    proc qSortGroupIdx(g: QGroups, xs: [int]) -> [int]:
+        let n = len(xs)
+        if n <= 1:
+            return xs
+        let mid = n / 2
+        let mut left = []
+        let mut right = []
+        let mut i = 0
+        loop i < n:
+            if i < mid:
+                left = append(left, xs[i])
+            else:
+                right = append(right, xs[i])
+            i = i + 1
+        let l = do qSortGroupIdx(g, left)
+        let r = do qSortGroupIdx(g, right)
+        let mut out = []
+        let mut a = 0
+        let mut b = 0
+        loop a < len(l) || b < len(r):
+            if b >= len(r):
+                out = append(out, l[a])
+                a = a + 1
+            else:
+                if a >= len(l):
+                    out = append(out, r[b])
+                    b = b + 1
+                else:
+                    let c = do qvCompare(g.present[r[b]], g.values[r[b]], g.present[l[a]], g.values[l[a]])
+                    if c < 0:
+                        out = append(out, r[b])
+                        b = b + 1
+                    else:
+                        out = append(out, l[a])
+                        a = a + 1
+        return out
+
+    proc qFoldBy(e0: FqEngine, q: QSpec, groupBy: text, hasValues: bool, wanted: [FqJ], func: text, field: text) -> QGroups uses io.file:
+        let mut e = do enCountRead(e0)
+        let mut g = QGroups{ok: true, err: "", eng: e, keys: [], present: [], values: [], accs: []}
+        let needs = func != "count"
+        let cap = do enMaxScanRows()
+        let simple = !q.hasPredicate && !q.hasRequester && !q.hasOwner && !needs && q.hasKind
+        let mut gi = -1
+        if simple:
+            gi = do enDataFind(e, q.kind, groupBy)
+        if hasValues:
+            if len(wanted) > 1000:
+                return QGroups{ok: false, err: "grouping was given " + len(wanted) + " values; the maximum is 1000. Ask for the values a page actually renders, or omit `values` to group the whole kind.", eng: e, keys: [], present: [], values: [], accs: []}
+            if gi >= 0:
+                let mut answered = []
+                let nw = len(wanted)
+                let mut i = 0
+                loop i < nw:
+                    let prefix = do qvEncode(true, wanted[i])
+                    let ph = do cryptoEncodeHex(prefix)
+                    if !(ph in answered):
+                        answered = append(answered, ph)
+                        let sc = do qTreeScan(e, "", gi, prefix, false, [], false)
+                        e = sc.eng
+                        if !sc.ok:
+                            return QGroups{ok: false, err: sc.err, eng: e, keys: [], present: [], values: [], accs: []}
+                        g = QGroups{ok: true, err: "", eng: e, keys: g.keys, present: g.present, values: g.values, accs: g.accs}
+                        let ge = do qGroupEntry(g, func, true, wanted[i])
+                        if !ge.ok:
+                            return QGroups{ok: false, err: ge.err, eng: e, keys: [], present: [], values: [], accs: []}
+                        let fr = do qaFoldRows(ge.g.accs[ge.at], len(sc.keys))
+                        g = do qGroupsSetAcc(ge.g, ge.at, fr)
+                    i = i + 1
+                let fin = do qGroupsFinish(g, func, hasValues, wanted)
+                return QGroups{ok: true, err: "", eng: e, keys: fin.keys, present: fin.present, values: fin.values, accs: fin.accs}
+        if gi >= 0:
+            let sc2 = do qTreeScan(e, "", gi, [], false, [], false)
+            e = sc2.eng
+            if !sc2.ok:
+                return QGroups{ok: false, err: sc2.err, eng: e, keys: [], present: [], values: [], accs: []}
+            let mut runKeys = []
+            let mut runReps = []
+            let mut runCounts = []
+            let nk = len(sc2.keys)
+            let mut k = 0
+            loop k < nk:
+                let kb = do fqwHexBytes(sc2.keys[k])
+                let ad = do addressFromDataKey(kb)
+                if ad.found:
+                    let enc = btRange(kb, 0, len(kb) - len(ad.address))
+                    let eh = do cryptoEncodeHex(enc)
+                    let last = len(runKeys) - 1
+                    if last >= 0 && runKeys[last] == eh:
+                        runCounts[last] = runCounts[last] + 1
+                    else:
+                        if len(runKeys) >= cap:
+                            let m = do enScanLimitExceeded("grouping by a field with this many distinct values")
+                            return QGroups{ok: false, err: m, eng: e, keys: [], present: [], values: [], accs: []}
+                        runKeys = append(runKeys, eh)
+                        runReps = append(runReps, bytesToText(ad.address))
+                        runCounts = append(runCounts, 1)
+                k = k + 1
+            let nr = len(runKeys)
+            let mut r = 0
+            loop r < nr:
+                let rn = do enReadNode(e, runReps[r])
+                e = rn.eng
+                if !rn.ok:
+                    return QGroups{ok: false, err: rn.err, eng: e, keys: [], present: [], values: [], accs: []}
+                let mut present = false
+                let mut val = do fjNull()
+                if rn.found:
+                    let p = do fjParse(rn.node.data)
+                    if p.ok:
+                        let gv = do fjGet(p.v, groupBy)
+                        present = gv.ok
+                        val = gv.v
+                let ge2 = do qGroupEntry(g, func, present, val)
+                if !ge2.ok:
+                    return QGroups{ok: false, err: ge2.err, eng: e, keys: [], present: [], values: [], accs: []}
+                let fr2 = do qaFoldRows(ge2.g.accs[ge2.at], runCounts[r])
+                g = do qGroupsSetAcc(ge2.g, ge2.at, fr2)
+                r = r + 1
+            let fin2 = do qGroupsFinish(g, func, hasValues, wanted)
+            return QGroups{ok: true, err: "", eng: e, keys: fin2.keys, present: fin2.present, values: fin2.values, accs: fin2.accs}
+        let cs = do qCandidates(e, q, false, "", false)
+        e = cs.eng
+        if !cs.ok:
+            return QGroups{ok: false, err: cs.err, eng: e, keys: [], present: [], values: [], accs: []}
+        let n = len(cs.addrs)
+        let mut i2 = 0
+        loop i2 < n:
+            let nr2 = do qNodeOf(e, cs, i2)
+            e = nr2.eng
+            if !nr2.ok:
+                return QGroups{ok: false, err: nr2.err, eng: e, keys: [], present: [], values: [], accs: []}
+            if nr2.found:
+                let node = nr2.node
+                let data = do qDataOf(node)
+                let mut ok = true
+                if q.hasKind && node.kind != q.kind:
+                    ok = false
+                if q.hasOwner && node.owner != q.owner:
+                    ok = false
+                if ok && q.hasRequester:
+                    ok = do nodeCanRead(node, q.requester)
+                if ok && q.hasPredicate:
+                    let pv = do prEval(q.predicate, q.itemVar, data, 0)
+                    if !pv.ok:
+                        return QGroups{ok: false, err: "predicate evaluation failed: " + pv.err, eng: e, keys: [], present: [], values: [], accs: []}
+                    ok = pv.v.kind == "bool" && pv.v.b
+                if ok:
+                    let gv2 = do fjGet(data, groupBy)
+                    let mut wantedOk = true
+                    if hasValues:
+                        wantedOk = false
+                        let nw2 = len(wanted)
+                        let mut w = 0
+                        loop w < nw2:
+                            let c = do qvCompare(true, wanted[w], gv2.ok, gv2.v)
+                            if c == 0:
+                                wantedOk = true
+                            w = w + 1
+                    if wantedOk:
+                        let ge3 = do qGroupEntry(g, func, gv2.ok, gv2.v)
+                        if !ge3.ok:
+                            return QGroups{ok: false, err: ge3.err, eng: e, keys: [], present: [], values: [], accs: []}
+                        let mut fp = false
+                        let mut fv = do fjNull()
+                        if needs:
+                            let fg = do fjGet(data, field)
+                            fp = fg.ok
+                            fv = fg.v
+                        let fo = do qaFold(ge3.g.accs[ge3.at], field, fp, fv)
+                        if !fo.ok:
+                            return QGroups{ok: false, err: fo.err, eng: e, keys: [], present: [], values: [], accs: []}
+                        g = do qGroupsSetAcc(ge3.g, ge3.at, fo.acc)
+            i2 = i2 + 1
+        let fin3 = do qGroupsFinish(g, func, hasValues, wanted)
+        return QGroups{ok: true, err: "", eng: e, keys: fin3.keys, present: fin3.present, values: fin3.values, accs: fin3.accs}
+
+    # ── harness ────────────────────────────────────────────────────────
+    state queryOut: text = ""
+
+    # A request line: `op|kind|owner|requester|where-json|itemVar|order|
+    # desc|after|limit|offset|groupBy|values-json|func|field`, `-` for
+    # none; op is where, count, aggregate, countBy or aggregateBy. `after`
+    # may be `@prev` for the previous where's next cursor.
+    proc qOpt(s: text) -> bool:
+        return s != "-"
+
+    proc qSpecOf(f: [text]) -> QSpec:
+        let hk = do qOpt(f[1])
+        let ho = do qOpt(f[2])
+        let hr = do qOpt(f[3])
+        let hp = do qOpt(f[4])
+        let mut pred = do fjNull()
+        if hp:
+            let p = do fjParse(f[4])
+            pred = p.v
+        return QSpec{hasKind: hk, kind: f[1], hasOwner: ho, owner: f[2], hasRequester: hr, requester: f[3], hasPredicate: hp, predicate: pred, itemVar: f[5]}
+
+    proc qGroupsText(g: QGroups, withResult: bool) -> text:
+        let mut out = "["
+        let n = len(g.keys)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let mut v = "none"
+            if g.present[i]:
+                v = do fjText(g.values[i])
+            if withResult:
+                let r = do qaFinish(g.accs[i])
+                let rt = do fjText(r)
+                out = out + v + "=" + rt
+            else:
+                out = out + v + "=" + g.accs[i].rows
+            i = i + 1
+        return out + "]"
+
+    proc qQueryText(dir: text, keyHex: text, nonceBase: int, script: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let ld = do enLoad(dir, key, nonceBase, 256, 67108864)
+        if !ld.ok:
+            return "error: " + ld.err
+        let mut e = ld.eng
+        let mut out = ""
+        let mut prevNext = ""
+        let lines = split(script, "\n")
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let line = lines[i]
+            if trim(line) != "":
+                let f = split(line, "\t")
+                let q = do qSpecOf(f)
+                let op = f[0]
+                let mut res = ""
+                if q.hasPredicate:
+                    let pv = do prValidate(q.predicate)
+                    if pv != "":
+                        res = "error: " + pv
+                if res == "" && op == "where":
+                    let ho = do qOpt(f[6])
+                    let mut after = f[8]
+                    if after == "@prev":
+                        after = prevNext
+                    let ha = do qOpt(after)
+                    let pg = do qQueryWhere(e, q, ho, f[6], f[7] == "desc", ha, after, toInt(f[9]), toInt(f[10]))
+                    e = pg.eng
+                    if !pg.ok:
+                        res = "error: " + pg.err
+                    else:
+                        let nt = do enNodesText(pg.nodes)
+                        res = nt + " next=" + pg.next + " examined=" + pg.examined
+                        prevNext = pg.next
+                if res == "" && (op == "count" || op == "aggregate"):
+                    let mut func = "count"
+                    if op == "aggregate":
+                        func = f[13]
+                    let fw = do qFoldWhere(e, q, func, f[14])
+                    e = fw.eng
+                    if !fw.ok:
+                        res = "error: " + fw.err
+                    else:
+                        if op == "count":
+                            res = "" + fw.acc.rows
+                        else:
+                            let fin = do qaFinish(fw.acc)
+                            res = do fjText(fin)
+                if res == "" && (op == "countBy" || op == "aggregateBy"):
+                    let hv = do qOpt(f[12])
+                    let mut wanted = []
+                    if hv:
+                        let wp = do fjParse(f[12])
+                        wanted = wp.v.items
+                    let mut func2 = "count"
+                    if op == "aggregateBy":
+                        func2 = f[13]
+                    let fb = do qFoldBy(e, q, f[11], hv, wanted, func2, f[14])
+                    e = fb.eng
+                    if !fb.ok:
+                        res = "error: " + fb.err
+                    else:
+                        res = do qGroupsText(fb, op == "aggregateBy")
+                out = out + res + "\n"
+            i = i + 1
+        return out
+
+    action runQuery(dir: text, keyHex: text, nonceBase: int, script: text):
+        let r = do qQueryText(dir, keyHex, nonceBase, script)
+        queryOut = r
+
+    view QueryHome at "/query":
+        text "{queryOut}"

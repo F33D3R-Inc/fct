@@ -48,7 +48,7 @@ func GenerateTS(s Schema) (string, error) {
 		fmt.Fprintf(&b, "export type %s = %s;\n\n", m.Name, strings.Join(names, " | "))
 		for _, v := range m.Variants {
 			fmt.Fprintf(&b, "export interface %s {\n", m.Name+snakeToUpperCamel(v.Name))
-			fmt.Fprintf(&b, "  type: %q;\n", v.Name)
+			fmt.Fprintf(&b, "  %s: %q;\n", m.TagName(), v.WireName())
 			for _, f := range v.Fields {
 				writeTSField(&b, f, enums)
 			}

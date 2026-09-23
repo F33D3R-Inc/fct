@@ -1,0 +1,49 @@
+import "../../fabric_json.fct"
+
+app FabricSerdeCheck:
+    # fabric_json.fct's serde_json::Value decode (sjDecode "value") against serde_json::from_slice::<Value> + to_string:
+    # each case's input arrives hex-encoded (raw bytes, invalid UTF-8
+    # included) and yields "ok:<to_string>" or "err:<Display>", compared in
+    # fabric_leaf_b_test.go with serde_rust.tsv printed by the real crate.
+
+    proc lbHexVal(c: int) -> int:
+        if c >= 48 && c <= 57:
+            return c - 48
+        return c - 87
+
+    proc lbUnhex(h: text) -> [int]:
+        let hb = textToBytes(h)
+        let mut out = []
+        let mut i = 0
+        loop i + 1 < len(hb):
+            let a = do lbHexVal(hb[i])
+            let b = do lbHexVal(hb[i + 1])
+            out = append(out, a * 16 + b)
+            i = i + 2
+        return out
+
+    proc lbCase(hexInput: text) -> text:
+        let bs = do lbUnhex(hexInput)
+        let r = do sjDecodeBytes([], bs, "value")
+        if r.ok:
+            let t = do sjValueText(r.v)
+            return "ok:" + t
+        return "err:" + r.err
+
+    proc lbBatch(hexList: text) -> text:
+        let items = split(hexList, ",")
+        let mut out = []
+        let mut i = 0
+        loop i < len(items):
+            let r = do lbCase(items[i])
+            out = append(out, r)
+            i = i + 1
+        return join(out, "\n")
+
+    state serdeResult: text = ""
+
+    # A batch of comma-separated hex inputs; one result line per input.
+    # `tag` makes every reply distinct so it always shows up as a delta.
+    action runSerdeCases(tag: text, hexList: text):
+        let r = do lbBatch(hexList)
+        serdeResult = tag + "|" + r

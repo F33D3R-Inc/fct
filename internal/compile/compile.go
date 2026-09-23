@@ -87,6 +87,9 @@ func File(path string) (*ir.IR, error) {
 	} else {
 		// Plain apps: flat-merge every module's declarations into the entry graph.
 		root = facets[0]
+		if err := checkRouteCollisions(facets); err != nil {
+			return nil, err
+		}
 		for _, m := range facets[1:] {
 			mergeInto(root, m)
 		}
@@ -120,6 +123,7 @@ func collectModules(abs string, visited map[string]bool, stack []string, res *re
 	// file's declarations ever reach mergeInto/checkDuplicates below — see
 	// private.go for why this has to happen per-file, this early.
 	manglePrivate(app, abs)
+	app.Source = filepath.Base(abs)
 	dir := filepath.Dir(abs)
 	// `css from "styles.css"` is the external-file counterpart of an inline
 	// `css:` block: a sibling stylesheet on disk, referenced by the same quoted
@@ -170,6 +174,50 @@ func collectModules(abs string, visited map[string]bool, stack []string, res *re
 	return list, nil
 }
 
+// checkRouteCollisions refuses two modules declaring the same HTTP route —
+// an `api` method+path, a `stream` path, a `webhook` path — or a second
+// `contract`, naming both files, before the flat merge loses which file
+// each declaration came from.
+func checkRouteCollisions(mods []*ast.App) error {
+	type origin struct {
+		file string
+		line int
+	}
+	seen := map[string]origin{}
+	claim := func(key string, m *ast.App, line int) error {
+		if prev, ok := seen[key]; ok && prev.file != m.Source {
+			return fmt.Errorf("%s:%d: %s is already declared in %s:%d", m.Source, line, key, prev.file, prev.line)
+		}
+		if _, ok := seen[key]; !ok {
+			seen[key] = origin{m.Source, line}
+		}
+		return nil
+	}
+	for _, m := range mods {
+		for _, a := range m.APIs {
+			if err := claim("api "+a.Method+" "+a.Path, m, a.Line); err != nil {
+				return err
+			}
+		}
+		for _, st := range m.Streams {
+			if err := claim("stream "+st.Path, m, st.Line); err != nil {
+				return err
+			}
+		}
+		for _, wh := range m.Webhooks {
+			if err := claim("webhook "+wh.Path, m, wh.Line); err != nil {
+				return err
+			}
+		}
+		if m.Contract != nil {
+			if err := claim("contract", m, m.Contract.Line); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // mergeInto folds an imported module's declarations into dst, after dst's own
 // (so the root file's first view stays the "/" page). Names are kept as written;
 // checkDuplicates validates uniqueness across the merged graph.
@@ -188,12 +236,24 @@ func mergeInto(dst, src *ast.App) {
 	dst.Procs = append(dst.Procs, src.Procs...)
 	dst.Jobs = append(dst.Jobs, src.Jobs...)
 	dst.Daemons = append(dst.Daemons, src.Daemons...)
+	dst.Shareds = append(dst.Shareds, src.Shareds...)
 	dst.Components = append(dst.Components, src.Components...)
 	dst.Layouts = append(dst.Layouts, src.Layouts...)
 	dst.Views = append(dst.Views, src.Views...)
 	dst.Services = append(dst.Services, src.Services...)
 	dst.Files = append(dst.Files, src.Files...)
 	dst.Theme = append(dst.Theme, src.Theme...)
+	// The HTTP surface a module declares next to its domain — its `api`
+	// routes, `stream`s, inbound `webhook`s, `on` triggers and a `contract`
+	// route — joins the app's like its actions do; checkRouteCollisions has
+	// already refused two modules claiming one route.
+	dst.APIs = append(dst.APIs, src.APIs...)
+	dst.Streams = append(dst.Streams, src.Streams...)
+	dst.Webhooks = append(dst.Webhooks, src.Webhooks...)
+	dst.Triggers = append(dst.Triggers, src.Triggers...)
+	if dst.Contract == nil {
+		dst.Contract = src.Contract
+	}
 
 	// A facet's stylesheet ships with the facet, exactly like its theme
 	// variables directly above. Without this an imported atom could declare a
@@ -242,7 +302,7 @@ func checkDuplicates(app *ast.App) error {
 	}
 	var (
 		entities, records, structs, enums, states, derives []string
-		policies, actions, procs, jobs, daemons            []string
+		policies, actions, procs, jobs, daemons, shareds   []string
 		components, layouts, views                         []string
 	)
 	for _, e := range app.Entities {
@@ -278,6 +338,9 @@ func checkDuplicates(app *ast.App) error {
 	for _, d := range app.Daemons {
 		daemons = append(daemons, d.Name)
 	}
+	for _, sh := range app.Shareds {
+		shareds = append(shareds, sh.Name)
+	}
 	for _, c := range app.Components {
 		components = append(components, c.Name)
 	}
@@ -294,7 +357,7 @@ func checkDuplicates(app *ast.App) error {
 		{"entity", entities}, {"record", records}, {"struct", structs},
 		{"enum", enums}, {"state", states}, {"derive", derives},
 		{"policy", policies}, {"action", actions}, {"proc", procs}, {"job", jobs},
-		{"daemon", daemons}, {"component", components}, {"layout", layouts}, {"view", views},
+		{"daemon", daemons}, {"shared cell", shareds}, {"component", components}, {"layout", layouts}, {"view", views},
 	} {
 		if err := dup(check.kind, check.names); err != nil {
 			return err

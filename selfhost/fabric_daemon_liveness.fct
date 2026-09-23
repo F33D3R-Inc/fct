@@ -1,0 +1,123 @@
+import "fabric_runtime.fct"
+import "http_client.fct"
+
+app FabricDaemonLivenessSelfHost:
+    # Port of fabric/crates/fabric-daemon/src/liveness.rs: whether an
+    # instance is actually there, asked with FacetQL's one unauthenticated
+    # route (`GET /`), and how the answer becomes — or pointedly does not
+    # become — a heartbeat.
+    #
+    # Three answers, not two: Serving (a 2xx) files a healthy heartbeat;
+    # Answering (any other status) files an unhealthy one, still routable;
+    # Unreachable files NOTHING, so the inventory's silence clock keeps
+    # running and the daemon's own clock tick carries it past the budget.
+    #
+    # The sweep probes every target concurrently (the Rust join_all): each
+    # probe is `spawn`ed and the next target's sweep runs while it is in
+    # flight, so a fleet behind one wedged instance still takes one timeout,
+    # not N. The probe's timeout bounds each read and write of the exchange
+    # (http_client.fct's per-operation deadline); the dial itself is bounded
+    # by the runtime's connect deadline.
+    #
+    # Names are prefixed `dl` / `daemon` / `Daemon`.
+
+    struct DaemonProbeTarget:
+        id: text
+        url: text
+
+    # Probe: kind "Serving" | "Answering" (with the status) | "Unreachable"
+    # (with the reason, never the URL).
+    struct DaemonProbe:
+        kind: text
+        status: int
+        error: text
+
+    proc daemonProbeServing(status: int) -> DaemonProbe:
+        return DaemonProbe{kind: "Serving", status: status, error: ""}
+
+    proc daemonProbeAnswering(status: int) -> DaemonProbe:
+        return DaemonProbe{kind: "Answering", status: status, error: ""}
+
+    proc daemonProbeUnreachable(error: text) -> DaemonProbe:
+        return DaemonProbe{kind: "Unreachable", status: 0, error: error}
+
+    # Probe::reached: evidence the instance is there at all.
+    proc daemonProbeReached(p: DaemonProbe) -> bool:
+        return p.kind != "Unreachable"
+
+    # Probe::healthy: the instance reported itself well.
+    proc daemonProbeHealthy(p: DaemonProbe) -> bool:
+        return p.kind == "Serving"
+
+    proc daemonProbeDescribe(p: DaemonProbe) -> text:
+        if p.kind == "Serving":
+            return "serving (" + p.status + ")"
+        if p.kind == "Answering":
+            return "answering " + p.status
+        return "unreachable: " + p.error
+
+    # transport_reason: a failed exchange's reason without the URL, in the
+    # four classes reqwest's error kinds give it (timeout first, as there).
+    # http_client.fct names a deadline "... timed out after Nms", a failed
+    # dial "connect host:port: ...", and an unparsable URL "builder error:
+    # ..."; anything else went wrong sending or reading the exchange.
+    proc daemonTransportReason(err: text) -> text:
+        if contains(err, "timed out") || contains(err, "i/o timeout"):
+            return "timed out"
+        if slice(err, 0, 8) == "connect ":
+            return "connection refused or unresolvable"
+        if slice(err, 0, 14) == "builder error:":
+            return "the probe failed"
+        return "the request could not be sent"
+
+    # What one `GET {url}/` exchange says about the instance.
+    proc daemonProbeOfResponse(r: HttpResponse) -> DaemonProbe:
+        if !r.ok:
+            let reason = do daemonTransportReason(r.err)
+            return daemonProbeUnreachable(reason)
+        if r.status >= 200 && r.status < 300:
+            return daemonProbeServing(r.status)
+        return daemonProbeAnswering(r.status)
+
+    proc daemonProbeOnce(target: DaemonProbeTarget, timeoutMs: int) -> DaemonProbe uses io.net:
+        let req = HttpRequest{method: "GET", url: target.url + "/", headers: [], body: "", timeoutMs: timeoutMs}
+        let r = do httpExchange(req)
+        let p = do daemonProbeOfResponse(r)
+        return p
+
+    # LivenessProber::sweep from target `i` on: this target's probe runs
+    # while the rest of the sweep does.
+    proc daemonSweepFrom(targets: [DaemonProbeTarget], i: int, timeoutMs: int) -> [DaemonProbe] uses io.net:
+        if i >= len(targets):
+            return []
+        let h = spawn daemonProbeOnce(targets[i], timeoutMs)
+        let rest = do daemonSweepFrom(targets, i + 1, timeoutMs)
+        let mine = join h
+        let mut out = [mine]
+        let n = len(rest)
+        let mut k = 0
+        loop k < n:
+            out = append(out, rest[k])
+            k = k + 1
+        return out
+
+    # Every instance once, answers in target order.
+    proc daemonSweep(targets: [DaemonProbeTarget], timeoutMs: int) -> [DaemonProbe] uses io.net:
+        let out = do daemonSweepFrom(targets, 0, timeoutMs)
+        return out
+
+    struct DaemonHeartbeatOption:
+        has: bool
+        message: FabricMessage
+
+    # control.rs `probe`: a reached instance files a heartbeat stamped with
+    # the sweep's time, healthy exactly when it was serving; an unreachable
+    # one files none.
+    proc daemonProbeHeartbeat(id: text, p: DaemonProbe, nowMs: int) -> DaemonHeartbeatOption:
+        let m = do protoEmptyFabricMessage()
+        let reached = do daemonProbeReached(p)
+        if !reached:
+            return DaemonHeartbeatOption{has: false, message: m}
+        let healthy = do daemonProbeHealthy(p)
+        let beat = NodeHeartbeat{nodeId: DbmsId{value: id}, timestampMs: nowMs, healthy: healthy}
+        return DaemonHeartbeatOption{has: true, message: FabricMessage{kind: "Heartbeat", registerNode: m.registerNode, heartbeat: beat, topology: m.topology, telemetry: m.telemetry, workload: m.workload}}

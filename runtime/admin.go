@@ -235,13 +235,21 @@ func (s *Server) adminSave(w http.ResponseWriter, r *http.Request, sid string) {
 			row[f.Name] = r.FormValue(f.Name) != ""
 			continue
 		}
-		// Leave an unspecified password untouched on edit (the field is blank in the
-		// form so a hash is not echoed); a non-empty value overwrites it.
-		if f.Name == "password" && !isNew && r.FormValue(f.Name) == "" {
+		// Leave an unspecified password or secret untouched on edit (the field is
+		// blank in the form so it is not echoed); a non-empty value overwrites it,
+		// hashed by storedValue like any other write of a @password field.
+		if (f.Password || f.Secret) && !isNew && r.FormValue(f.Name) == "" {
 			continue
 		}
+		v, msg := s.storedValue(entity, f.Name, coerce(r.FormValue(f.Name), f.Type))
+		if msg != "" {
+			undo.rollback(s, nil, nil)
+			s.mu.Unlock()
+			http.Error(w, msg, http.StatusUnprocessableEntity)
+			return
+		}
 		undo.field(row, f.Name)
-		row[f.Name] = coerce(r.FormValue(f.Name), f.Type)
+		row[f.Name] = v
 	}
 	if err := s.commit([]durOp{{kind: "save", entity: entity, row: row}}); err != nil {
 		undo.rollback(s, nil, nil)
@@ -337,7 +345,9 @@ func adminInput(f ir.Field, cur any) string {
 	case f.Enum != "":
 		// rendered as a free text field; the closed set is documented in the label.
 		return fmt.Sprintf(`<input type="text" name="%s" value="%s">`, html.EscapeString(f.Name), html.EscapeString(toStr(cur)))
-	case f.Name == "password":
+	case f.Password || f.Secret:
+		// Never echoed: a hash has no use in a form, and a secret is not the
+		// console's to display. Left blank on an edit, the stored value stays.
 		return fmt.Sprintf(`<input type="password" name="%s" placeholder="(unchanged)">`, html.EscapeString(f.Name))
 	case f.IsRelation() || f.Type == "int" || f.Type == "money" || f.Type == "date":
 		v := ""
@@ -358,13 +368,13 @@ func adminInput(f ir.Field, cur any) string {
 
 // displayCell renders a cell for the list table, masking credential-shaped fields.
 func displayCell(e ir.Entity, col string, v any) string {
-	if col == "password" {
-		if toStr(v) == "" {
-			return ""
-		}
-		return "••••••"
-	}
 	for _, f := range e.Fields {
+		if f.Name == col && f.Password {
+			if toStr(v) == "" {
+				return ""
+			}
+			return "••••••"
+		}
 		if f.Name == col && f.Secret {
 			return "••••••"
 		}

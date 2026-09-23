@@ -1,0 +1,519 @@
+import "http_client.fct"
+import "fabric_facetql_wire.fct"
+
+app FabricFacetqlClientSelfHost:
+    # Self-hosting port of fabric/crates/fabric-facetql/src/{error.rs,
+    # endpoint.rs, client.rs}: an authenticated HTTP/JSON client for one
+    # FacetQL instance, over http_client.fct (HTTP/1.1 written in fct on the
+    # runtime's outbound TCP primitive) and fabric_facetql_wire.fct (the
+    # serde-exact wire types).
+    #
+    # Same contract as the Rust client, call for call: the token travels in
+    # the `x-api-key` header on every request and nowhere else; a JSON body
+    # is sent with `content-type: application/json`; `GET /nodes` puts its
+    # filters in a form-encoded query; `GET /node/:address` percent-encodes
+    # the address with NON_ALPHANUMERIC while `POST /node/:address/claim`
+    # passes it raw through URL parsing (both exactly as client.rs builds
+    # them); the status maps onto the error variant that says what the
+    # caller must do (401/403 Unauthorized, 404 NotFound, 409 Conflict, 412
+    # PreconditionFailed, other non-2xx Status); `query_all` follows the
+    # keyset cursor with limit 500 for at most 10,000 pages.
+    #
+    # `open_events` hands back the live `GET /events` response as
+    # http_client.fct's HttpStream, which the caller pumps as frames arrive.
+    # A Transport error's text after "{context} on {base_url}: " is the fct
+    # runtime's transport error, not reqwest's; and from_env reads a
+    # non-UTF-8 variable's bytes where std::env::var refuses it as unset.
+
+    # ── error.rs ───────────────────────────────────────────────────────
+    # kind is the variant name. Configuration/Transport carry `message`;
+    # Unauthorized/Status carry `status` and `body`; PreconditionFailed/
+    # Conflict/NotFound carry `body`; Decode carries `context` and `message`.
+    struct FqlError:
+        kind: text
+        status: int
+        body: text
+        context: text
+        message: text
+
+    proc fqlErrNone() -> FqlError:
+        return FqlError{kind: "", status: 0, body: "", context: "", message: ""}
+
+    proc fqlErrConfiguration(message: text) -> FqlError:
+        return FqlError{kind: "Configuration", status: 0, body: "", context: "", message: message}
+
+    proc fqlErrTransport(message: text) -> FqlError:
+        return FqlError{kind: "Transport", status: 0, body: "", context: "", message: message}
+
+    proc fqlErrUnauthorized(status: int, body: text) -> FqlError:
+        return FqlError{kind: "Unauthorized", status: status, body: body, context: "", message: ""}
+
+    proc fqlErrPreconditionFailed(body: text) -> FqlError:
+        return FqlError{kind: "PreconditionFailed", status: 0, body: body, context: "", message: ""}
+
+    proc fqlErrConflict(body: text) -> FqlError:
+        return FqlError{kind: "Conflict", status: 0, body: body, context: "", message: ""}
+
+    proc fqlErrNotFound(body: text) -> FqlError:
+        return FqlError{kind: "NotFound", status: 0, body: body, context: "", message: ""}
+
+    proc fqlErrStatus(status: int, body: text) -> FqlError:
+        return FqlError{kind: "Status", status: status, body: body, context: "", message: ""}
+
+    proc fqlErrDecode(context: text, message: text) -> FqlError:
+        return FqlError{kind: "Decode", status: 0, body: "", context: context, message: message}
+
+    # fqlErrorImpliesUnhealthy: FacetqlError::implies_unhealthy.
+    proc fqlErrorImpliesUnhealthy(e: FqlError) -> bool:
+        if e.kind == "PreconditionFailed" || e.kind == "Conflict" || e.kind == "NotFound":
+            return false
+        return true
+
+    # fqlErrorDisplay: FacetqlError's Display.
+    proc fqlErrorDisplay(e: FqlError) -> text:
+        if e.kind == "Configuration":
+            return "facetql endpoint misconfigured: " + e.message
+        if e.kind == "Transport":
+            return "facetql unreachable: " + e.message
+        if e.kind == "Unauthorized":
+            return "facetql refused the token (" + e.status + "): " + e.body
+        if e.kind == "PreconditionFailed":
+            return "facetql compare-and-set refused (412): " + e.body
+        if e.kind == "Conflict":
+            return "facetql conflict (409): " + e.body
+        if e.kind == "NotFound":
+            return "facetql not found (404): " + e.body
+        if e.kind == "Status":
+            return "facetql returned " + e.status + ": " + e.body
+        return "facetql response for " + e.context + " did not decode: " + e.message
+
+    # ── endpoint.rs ────────────────────────────────────────────────────
+    struct FqlEndpoint:
+        dbmsId: text
+        baseUrl: text
+        token: text
+
+    struct FqlEndpointR:
+        ok: bool
+        err: FqlError
+        v: FqlEndpoint
+
+    proc fqlTrimTrailingSlashes(s: text) -> text:
+        let mut end = len(s)
+        loop end > 0 && charAt(s, end - 1) == "/":
+            end = end - 1
+        return slice(s, 0, end)
+
+    proc fqlStartsWith(s: text, prefix: text) -> bool:
+        return slice(s, 0, len(prefix)) == prefix
+
+    # fqlEndpointNew: FacetqlEndpoint::new — the base URL trimmed (and its
+    # trailing slashes dropped), an empty token or a non-http(s) URL
+    # refused as Configuration.
+    proc fqlEndpointNew(dbmsId: text, baseUrl: text, token: text) -> FqlEndpointR:
+        let base = do fqlTrimTrailingSlashes(trim(baseUrl))
+        let blank = FqlEndpoint{dbmsId: dbmsId, baseUrl: base, token: ""}
+        if token == "":
+            return FqlEndpointR{ok: false, err: fqlErrConfiguration("no API token for FacetQL instance '" + dbmsId + "'"), v: blank}
+        if !(fqlStartsWith(base, "http://") || fqlStartsWith(base, "https://")):
+            return FqlEndpointR{ok: false, err: fqlErrConfiguration("FacetQL instance '" + dbmsId + "' has a base URL that is not http(s): " + base), v: blank}
+        let none = do fqlErrNone()
+        return FqlEndpointR{ok: true, err: none, v: FqlEndpoint{dbmsId: dbmsId, baseUrl: base, token: token}}
+
+    # fqlEndpointFromEnv: FacetqlEndpoint::from_env — the token read from
+    # the named variable and never echoed: an unset variable is reported by
+    # name (a set-but-empty one reaches `new`'s "no API token").
+    proc fqlEndpointFromEnv(dbmsId: text, baseUrl: text, tokenVar: text) -> FqlEndpointR uses io.env:
+        if !envSet(tokenVar):
+            let blank = FqlEndpoint{dbmsId: dbmsId, baseUrl: baseUrl, token: ""}
+            return FqlEndpointR{ok: false, err: fqlErrConfiguration("environment variable " + tokenVar + " is not set: no API token for FacetQL instance '" + dbmsId + "'"), v: blank}
+        let r = do fqlEndpointNew(dbmsId, baseUrl, envVar(tokenVar))
+        return r
+
+    proc fqlEndpointUrl(e: FqlEndpoint, path: text) -> text:
+        return e.baseUrl + path
+
+    # fqlRustDebugStr: a str as Rust's `{:?}` writes it — quoted, with
+    # char::escape_debug's escapes (\t \r \n \\ \" \0 and \u{..} for other
+    # control characters).
+    proc fqlRustDebugStr(s: text) -> text:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let c = bs[i]
+            if c == 34 || c == 92:
+                out = append(out, 92)
+                out = append(out, c)
+            else:
+                if c == 9 || c == 10 || c == 13 || c == 0:
+                    out = append(out, 92)
+                    if c == 9:
+                        out = append(out, 116)
+                    if c == 10:
+                        out = append(out, 110)
+                    if c == 13:
+                        out = append(out, 114)
+                    if c == 0:
+                        out = append(out, 48)
+                else:
+                    if c < 32 || c == 127:
+                        let hx = textToBytes("\\u{" + fqlLowerHex(c) + "}")
+                        let mut h = 0
+                        loop h < len(hx):
+                            out = append(out, hx[h])
+                            h = h + 1
+                    else:
+                        out = append(out, c)
+            i = i + 1
+        return "\"" + bytesToText(out) + "\""
+
+    proc fqlLowerHex(n: int) -> text:
+        if n < 16:
+            return charAt("0123456789abcdef", n)
+        return charAt("0123456789abcdef", n >> 4) + charAt("0123456789abcdef", n & 15)
+
+    # fqlEndpointDebug: the hand-written Debug — the token redacted.
+    proc fqlEndpointDebug(e: FqlEndpoint) -> text:
+        return "FacetqlEndpoint { dbms_id: DbmsId(" + fqlRustDebugStr(e.dbmsId) + "), base_url: " + fqlRustDebugStr(e.baseUrl) + ", token: \"<redacted>\" }"
+
+    # ── client.rs ──────────────────────────────────────────────────────
+    # timeoutMs: the per-operation deadline (with_http's caller-supplied
+    # timeouts); 0 keeps the runtime's default bound.
+    struct FqlClient:
+        endpoint: FqlEndpoint
+        timeoutMs: int
+
+    proc fqlClientNew(endpoint: FqlEndpoint) -> FqlClient:
+        return FqlClient{endpoint: endpoint, timeoutMs: 0}
+
+    proc fqlClientWithTimeout(endpoint: FqlEndpoint, timeoutMs: int) -> FqlClient:
+        return FqlClient{endpoint: endpoint, timeoutMs: timeoutMs}
+
+    proc fqlClientDebug(c: FqlClient) -> text:
+        return "FacetqlClient { endpoint: " + fqlEndpointDebug(c.endpoint) + ", timeout_ms: " + c.timeoutMs + " }"
+
+    proc fqlPageLimit() -> int:
+        return 500
+
+    proc fqlMaxPages() -> int:
+        return 10000
+
+    proc fqlMultigetLimit() -> int:
+        return 1000
+
+    struct FqlSendR:
+        ok: bool
+        err: FqlError
+        body: text
+
+    # fqlRequestHeaders: what every request carries — the token header, and
+    # reqwest's own default `accept: */*` — plus the JSON content type when
+    # there is a body.
+    proc fqlRequestHeaders(c: FqlClient, json: bool) -> [HttpHeader]:
+        let mut hs = [HttpHeader{name: "x-api-key", value: c.endpoint.token}]
+        if json:
+            hs = append(hs, HttpHeader{name: "content-type", value: "application/json"})
+        hs = append(hs, HttpHeader{name: "accept", value: "*/*"})
+        return hs
+
+    # fqlSend: `send` — the request, then the status mapped onto the
+    # variant that says what the caller must do.
+    proc fqlSend(c: FqlClient, method: text, url: text, json: bool, body: text, context: text) -> FqlSendR uses io.net:
+        let hs = do fqlRequestHeaders(c, json)
+        let r = do httpExchange(HttpRequest{method: method, url: url, headers: hs, body: body, timeoutMs: c.timeoutMs})
+        let none = do fqlErrNone()
+        if !r.ok:
+            return FqlSendR{ok: false, err: fqlErrTransport(context + " on " + c.endpoint.baseUrl + ": " + r.err), body: ""}
+        if r.status >= 200 && r.status < 300:
+            return FqlSendR{ok: true, err: none, body: r.body}
+        if r.status == 401 || r.status == 403:
+            return FqlSendR{ok: false, err: fqlErrUnauthorized(r.status, r.body), body: ""}
+        if r.status == 404:
+            return FqlSendR{ok: false, err: fqlErrNotFound(r.body), body: ""}
+        if r.status == 409:
+            return FqlSendR{ok: false, err: fqlErrConflict(r.body), body: ""}
+        if r.status == 412:
+            return FqlSendR{ok: false, err: fqlErrPreconditionFailed(r.body), body: ""}
+        return FqlSendR{ok: false, err: fqlErrStatus(r.status, r.body), body: ""}
+
+    proc fqlPostJson(c: FqlClient, path: text, payload: text, context: text) -> FqlSendR uses io.net:
+        let r = do fqlSend(c, "POST", fqlEndpointUrl(c.endpoint, path), true, payload, context)
+        return r
+
+    struct FqlStatsResult:
+        ok: bool
+        err: FqlError
+        v: EngineStats
+
+    # fqlStats: `GET /stats`.
+    proc fqlStats(c: FqlClient) -> FqlStatsResult uses io.net:
+        let blank = do fqlStatsOf(sjNull())
+        let s = do fqlSend(c, "GET", fqlEndpointUrl(c.endpoint, "/stats"), false, "", "GET /stats")
+        if !s.ok:
+            return FqlStatsResult{ok: false, err: s.err, v: blank}
+        let d = do fqlDecodeStats(s.body)
+        if !d.ok:
+            return FqlStatsResult{ok: false, err: fqlErrDecode("GET /stats", d.err), v: blank}
+        return FqlStatsResult{ok: true, err: s.err, v: d.v}
+
+    struct FqlNodesResult:
+        ok: bool
+        err: FqlError
+        v: [FqlNode]
+
+    proc fqlNodesFromBody(s: FqlSendR, context: text) -> FqlNodesResult:
+        if !s.ok:
+            return FqlNodesResult{ok: false, err: s.err, v: []}
+        let d = do fqlDecodeNodes(s.body)
+        if !d.ok:
+            return FqlNodesResult{ok: false, err: fqlErrDecode(context, d.err), v: []}
+        return FqlNodesResult{ok: true, err: s.err, v: d.v}
+
+    # fqlListNodes: `GET /nodes?kind=&owner=&limit=&offset=`.
+    proc fqlListNodes(c: FqlClient, hasKind: bool, kind: text, hasOwner: bool, owner: text, hasLimit: bool, limit: int, hasOffset: bool, offset: int) -> FqlNodesResult uses io.net:
+        let mut pairs = []
+        if hasKind:
+            pairs = append(pairs, HttpHeader{name: "kind", value: kind})
+        if hasOwner:
+            pairs = append(pairs, HttpHeader{name: "owner", value: owner})
+        if hasLimit:
+            pairs = append(pairs, HttpHeader{name: "limit", value: "" + limit})
+        if hasOffset:
+            pairs = append(pairs, HttpHeader{name: "offset", value: "" + offset})
+        let mut url = fqlEndpointUrl(c.endpoint, "/nodes")
+        let q = do httpQueryString(pairs)
+        if q != "":
+            url = url + "?" + q
+        let s = do fqlSend(c, "GET", url, false, "", "GET /nodes")
+        let r = do fqlNodesFromBody(s, "GET /nodes")
+        return r
+
+    struct FqlPageResult:
+        ok: bool
+        err: FqlError
+        v: FqlQueryPage
+
+    # fqlQuery: `POST /nodes/query` — one page and its cursor.
+    proc fqlQuery(c: FqlClient, request: FqlQueryRequest) -> FqlPageResult uses io.net:
+        let blank = FqlQueryPage{nodes: [], next: ""}
+        let s = do fqlPostJson(c, "/nodes/query", fqlEncodeQueryRequest(request), "POST /nodes/query")
+        if !s.ok:
+            return FqlPageResult{ok: false, err: s.err, v: blank}
+        let d = do fqlDecodeQueryPage(s.body)
+        if !d.ok:
+            return FqlPageResult{ok: false, err: fqlErrDecode("POST /nodes/query", d.err), v: blank}
+        return FqlPageResult{ok: true, err: s.err, v: d.v}
+
+    # fqlQueryAll: every node matching, following the cursor to the end —
+    # the caller's `after`/`limit` overridden.
+    proc fqlQueryAll(c: FqlClient, request: FqlQueryRequest) -> FqlNodesResult uses io.net:
+        let r0 = request
+        let mut req = FqlQueryRequest{hasKind: r0.hasKind, kind: r0.kind, hasOwner: r0.hasOwner, owner: r0.owner, hasWhere: r0.hasWhere, whereValue: r0.whereValue, hasItemVar: r0.hasItemVar, itemVar: r0.itemVar, hasOrder: r0.hasOrder, order: r0.order, desc: r0.desc, hasAfter: false, after: "", hasLimit: true, limit: fqlPageLimit()}
+        let mut nodes = []
+        let mut pages = 0
+        loop pages < fqlMaxPages():
+            let page = do fqlQuery(c, req)
+            if !page.ok:
+                return FqlNodesResult{ok: false, err: page.err, v: []}
+            nodes = nodes + page.v.nodes
+            if !fqlQueryPageHasMore(page.v):
+                return FqlNodesResult{ok: true, err: page.err, v: nodes}
+            req = FqlQueryRequest{hasKind: req.hasKind, kind: req.kind, hasOwner: req.hasOwner, owner: req.owner, hasWhere: req.hasWhere, whereValue: req.whereValue, hasItemVar: req.hasItemVar, itemVar: req.itemVar, hasOrder: req.hasOrder, order: req.order, desc: req.desc, hasAfter: true, after: page.v.next, hasLimit: true, limit: req.limit}
+            pages = pages + 1
+        return FqlNodesResult{ok: false, err: fqlErrDecode("POST /nodes/query", "cursor did not terminate within " + fqlMaxPages() + " pages"), v: []}
+
+    struct FqlNodeResult:
+        ok: bool
+        err: FqlError
+        found: bool
+        v: FqlNode
+
+    # fqlGetNode: `GET /node/:address` — None (found false) on 404.
+    proc fqlGetNode(c: FqlClient, address: text) -> FqlNodeResult uses io.net:
+        let blank = do fqlNodeBlank()
+        let path = "/node/" + httpPercentEncode(address)
+        let s = do fqlSend(c, "GET", fqlEndpointUrl(c.endpoint, path), false, "", "GET /node/:address")
+        if !s.ok:
+            if s.err.kind == "NotFound":
+                let none = do fqlErrNone()
+                return FqlNodeResult{ok: true, err: none, found: false, v: blank}
+            return FqlNodeResult{ok: false, err: s.err, found: false, v: blank}
+        let d = do fqlDecodeNode(s.body)
+        if !d.ok:
+            return FqlNodeResult{ok: false, err: fqlErrDecode("GET /node/:address", d.err), found: false, v: blank}
+        return FqlNodeResult{ok: true, err: s.err, found: true, v: d.v}
+
+    # fqlMultiget: `POST /nodes/multiget` — absent addresses simply missing.
+    proc fqlMultiget(c: FqlClient, addresses: [text]) -> FqlNodesResult uses io.net:
+        let mut items = []
+        let n = len(addresses)
+        let mut i = 0
+        loop i < n:
+            items = append(items, fqlJStr(addresses[i]))
+            i = i + 1
+        let body = do sjValueText(fqlJObj(["addresses"], [fqlJArr(items)]))
+        let s = do fqlPostJson(c, "/nodes/multiget", body, "POST /nodes/multiget")
+        let r = do fqlNodesFromBody(s, "POST /nodes/multiget")
+        return r
+
+    struct FqlCountResult:
+        ok: bool
+        err: FqlError
+        v: int
+
+    # fqlCount: `POST /nodes/count` — kind/owner/where of the request only.
+    proc fqlCount(c: FqlClient, request: FqlQueryRequest) -> FqlCountResult uses io.net:
+        let mut parts = []
+        if request.hasKind:
+            parts = append(parts, fqlMember("kind", sjQuote(request.kind)))
+        if request.hasOwner:
+            parts = append(parts, fqlMember("owner", sjQuote(request.owner)))
+        if request.hasWhere:
+            parts = append(parts, fqlMember("where", sjValueText(request.whereValue)))
+        let s = do fqlPostJson(c, "/nodes/count", "{" + join(parts, ",") + "}", "POST /nodes/count")
+        if !s.ok:
+            return FqlCountResult{ok: false, err: s.err, v: 0}
+        let d = do fqlDecodeCount(s.body)
+        if !d.ok:
+            return FqlCountResult{ok: false, err: fqlErrDecode("POST /nodes/count", d.err), v: 0}
+        return FqlCountResult{ok: true, err: s.err, v: d.v}
+
+    struct FqlUnitResult:
+        ok: bool
+        err: FqlError
+
+    # fqlCreateNode: `POST /node` — with if_absent, 409 is Conflict.
+    proc fqlCreateNode(c: FqlClient, request: FqlCreateNodeRequest) -> FqlUnitResult uses io.net:
+        let s = do fqlPostJson(c, "/node", fqlEncodeCreateNodeRequest(request), "POST /node")
+        return FqlUnitResult{ok: s.ok, err: s.err}
+
+    # fqlTransaction: `POST /transaction` — all-or-nothing; a refused
+    # set_if is PreconditionFailed and nothing was applied.
+    proc fqlTransaction(c: FqlClient, operations: [FqlTxOp]) -> FqlUnitResult uses io.net:
+        let s = do fqlPostJson(c, "/transaction", fqlEncodeTransaction(operations), "POST /transaction")
+        return FqlUnitResult{ok: s.ok, err: s.err}
+
+    struct FqlClaimResult:
+        ok: bool
+        err: FqlError
+        won: bool
+
+    # fqlClaim: `POST /node/:address/claim` — won, lost (409), or failed.
+    struct FqlEventsResult:
+        ok: bool
+        err: FqlError
+        stream: HttpStream
+
+    # fqlOpenEvents: `GET /events` (SSE), opened but not read — the stream
+    # is the caller's to pump (httpStreamPump) and close. No deadline: a
+    # subscription is the one request meant never to finish, so reads are
+    # the caller's pollBytes waits. A refusal maps 401/403 to Unauthorized
+    # and any other non-2xx (404 included) to Status, as open_events does.
+    proc fqlOpenEvents(c: FqlClient) -> FqlEventsResult uses io.net:
+        let s = do httpOpenStream(HttpRequest{method: "GET", url: fqlEndpointUrl(c.endpoint, "/events"), headers: [HttpHeader{name: "x-api-key", value: c.endpoint.token}, HttpHeader{name: "accept", value: "text/event-stream"}], body: "", timeoutMs: 0})
+        if !s.ok:
+            return FqlEventsResult{ok: false, err: fqlErrTransport("GET /events on " + c.endpoint.baseUrl + ": " + s.err), stream: s}
+        if s.status < 200 || s.status > 299:
+            let body = bytesToText(s.data)
+            let closed = do httpStreamClose(s)
+            if s.status == 401 || s.status == 403:
+                return FqlEventsResult{ok: false, err: fqlErrUnauthorized(s.status, body), stream: s}
+            return FqlEventsResult{ok: false, err: fqlErrStatus(s.status, body), stream: s}
+        let none = do fqlErrNone()
+        return FqlEventsResult{ok: true, err: none, stream: s}
+
+    proc fqlClaim(c: FqlClient, address: text) -> FqlClaimResult uses io.net:
+        let s = do fqlSend(c, "POST", fqlEndpointUrl(c.endpoint, "/node/" + address + "/claim"), false, "", "POST /node/:address/claim")
+        let none = do fqlErrNone()
+        if s.ok:
+            return FqlClaimResult{ok: true, err: none, won: true}
+        if s.err.kind == "Conflict":
+            return FqlClaimResult{ok: true, err: none, won: false}
+        return FqlClaimResult{ok: false, err: s.err, won: false}
+
+    # ── renderings shared by the tests ────────────────────────────────
+    # fqlErrLine: `ERR <variant> <implies_unhealthy> <Display>`.
+    proc fqlErrLine(e: FqlError) -> text:
+        return "ERR " + e.kind + " " + fqlBoolText(fqlErrorImpliesUnhealthy(e)) + " " + fqlErrorDisplay(e)
+
+    proc fqlNodesJson(nodes: [FqlNode]) -> text:
+        let mut parts = []
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            parts = append(parts, fqlEncodeNode(nodes[i]))
+            i = i + 1
+        return "[" + join(parts, ",") + "]"
+
+    # ── unit-test drivers (client.rs/endpoint.rs/error.rs #[test]s) ────
+    state fqlClientOut: text = ""
+
+    # fqlEndpointLine: new(dbms, url, token) as `OK <Debug>|<base_url>`
+    # or `ERR <variant> <Display>`.
+    proc fqlEndpointLine(dbms: text, url: text, token: text) -> text:
+        let r = do fqlEndpointNew(dbms, url, token)
+        if !r.ok:
+            return "ERR " + r.err.kind + " " + fqlErrorDisplay(r.err)
+        return "OK " + fqlEndpointDebug(r.v) + "|" + r.v.baseUrl
+
+    # endpoint.rs's a_trailing_slash_does_not_double_up.
+    proc demoATrailingSlashDoesNotDoubleUp() -> bool:
+        let r = do fqlEndpointNew("db-a", "http://127.0.0.1:8892/", "s3cret")
+        return fqlEndpointUrl(r.v, "/stats") == "http://127.0.0.1:8892/stats"
+
+    action fqlTrailingSlashRun:
+        let r = do demoATrailingSlashDoesNotDoubleUp()
+        fqlClientOut = "" + r
+
+    # fqlEndpointEnvLine: from_env(dbms, url, var), rendered like
+    # fqlEndpointLine.
+    proc fqlEndpointEnvLine(dbms: text, url: text, tokenVar: text) -> text uses io.env:
+        let r = do fqlEndpointFromEnv(dbms, url, tokenVar)
+        if !r.ok:
+            return "ERR " + r.err.kind + " " + fqlErrorDisplay(r.err)
+        return "OK " + fqlEndpointDebug(r.v) + "|" + r.v.baseUrl
+
+    action fqlEndpointEnvRun(dbms: text, url: text, tokenVar: text):
+        let r = do fqlEndpointEnvLine(dbms, url, tokenVar)
+        fqlClientOut = r
+
+    action fqlEndpointRun(dbms: text, url: text, token: text):
+        let r = do fqlEndpointLine(dbms, url, token)
+        fqlClientOut = r
+
+    # fqlErrorLineFor: one constructed error rendered like fqlErrLine.
+    proc fqlErrorLineFor(kind: text, status: int, a: text, b: text) -> text:
+        let mut e = fqlErrConfiguration(a)
+        if kind == "Transport":
+            e = fqlErrTransport(a)
+        if kind == "Unauthorized":
+            e = fqlErrUnauthorized(status, a)
+        if kind == "PreconditionFailed":
+            e = fqlErrPreconditionFailed(a)
+        if kind == "Conflict":
+            e = fqlErrConflict(a)
+        if kind == "NotFound":
+            e = fqlErrNotFound(a)
+        if kind == "Status":
+            e = fqlErrStatus(status, a)
+        if kind == "Decode":
+            e = fqlErrDecode(a, b)
+        let l = do fqlErrLine(e)
+        return l
+
+    action fqlErrorRun(kind: text, status: int, a: text, b: text):
+        let r = do fqlErrorLineFor(kind, status, a, b)
+        fqlClientOut = r
+
+    # fqlClientDebugLine: a client's Debug, to prove the token stays out.
+    proc fqlClientDebugLine(dbms: text, url: text, token: text) -> text:
+        let r = do fqlEndpointNew(dbms, url, token)
+        let c = do fqlClientNew(r.v)
+        let d = do fqlClientDebug(c)
+        return d
+
+    action fqlClientDebugRun(dbms: text, url: text, token: text):
+        let r = do fqlClientDebugLine(dbms, url, token)
+        fqlClientOut = r

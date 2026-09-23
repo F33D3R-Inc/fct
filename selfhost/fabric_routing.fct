@@ -135,8 +135,9 @@ app FabricRoutingSelfHost:
     # inverse, Coordinate only owns the forward direction).
     # ============================================================
     proc coordinateAt(index: int) -> Coordinate:
-        let x = index % 12
-        let y = index / 12
+        # `(index % 12) as u8, (index / 12) as u8`: the casts truncate.
+        let x = (index % 12) & 255
+        let y = (index / 12) & 255
         return Coordinate{x: x, y: y}
 
     # ============================================================
@@ -221,7 +222,7 @@ app FabricRoutingSelfHost:
     # the exact order the real `fmt` match declares them.
     proc routingErrorMessage(e: RoutingError) -> text:
         if e.kind == "UnknownShard":
-            return "shard " + e.shardId + " is not in the routing table"
+            return "shard " + sjU64Text(e.shardId) + " is not in the routing table"
         if e.kind == "InvalidCoordinate":
             return "coordinate (" + e.x + "," + e.y + ") is outside the 12x13 grid"
         if e.kind == "InvalidAddress":
@@ -232,13 +233,13 @@ app FabricRoutingSelfHost:
             return "node '" + e.node + "' holds a placement but is not in the routing table"
         if e.kind == "NoLiveOwner":
             let names = do joinTextArray(e.considered, ", ")
-            return "shard " + e.shardId + " has no live owner (considered: " + names + ")"
+            return "shard " + sjU64Text(e.shardId) + " has no live owner (considered: " + names + ")"
         if e.kind == "NoWritableReplica":
-            return "shard " + e.shardId + " has no in-sync primary to accept writes"
+            return "shard " + sjU64Text(e.shardId) + " has no in-sync primary to accept writes"
         if e.kind == "NoReadableReplica":
-            return "shard " + e.shardId + " has no copy fresh enough for this read"
+            return "shard " + sjU64Text(e.shardId) + " has no copy fresh enough for this read"
         if e.kind == "WriteFenced":
-            return "shard " + e.shardId + " is fenced for cutover from '" + e.source + "' to '" + e.destination + "'; retry"
+            return "shard " + sjU64Text(e.shardId) + " is fenced for cutover from '" + e.source + "' to '" + e.destination + "'; retry"
         return ""
 
     # ============================================================
@@ -266,56 +267,37 @@ app FabricRoutingSelfHost:
     proc isDigitChar(c: text) -> bool:
         return c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
-    # isUnsignedIntText: the syntactic gate this port uses in place of
-    # `u8`/`u64::from_str`'s error return — an optional leading `+`
-    # (confirmed against real `rustc`: `"+7".parse::<u8>()` is `Ok(7)`,
-    # `"-7".parse::<u8>()` is `Err(InvalidDigit)` — unsigned integer parsing
-    # accepts a leading `+` but never a `-`) then one or more digits.
-    # Decoding the digits themselves is left to the real `toInt` builtin
-    # (confirmed to already handle a leading `+` and leading zeros
-    # correctly — `toInt("+7")` and `toInt("07")` both return `7`), exactly
-    # the same division of labour `isIntLiteralToken` already uses
-    # elsewhere in this codebase (parser_proc.fct) for `strconv.Atoi`.
-    # Magnitude overflow beyond what an `int` here can hold (Rust's real
-    # `u64::MAX` has 20 digits; this host's `int` is a 64-bit signed value)
-    # is a genuine, narrow, honestly-noted gap: neither key.rs's own tests
-    # nor any realistic shard id ever approaches that boundary, so this
-    # port does not special-case it, the same way fabric.fct's own header
-    # already flags (rather than silently papers over) the language's
-    # missing lexicographic text comparison.
-    # ============================================================
-    proc isUnsignedIntText(s: text) -> bool:
-        let n = len(s)
-        if n == 0:
-            return false
-        let mut start = 0
-        if charAt(s, 0) == "+":
-            start = 1
-        if start >= n:
-            return false
-        let mut ok = true
-        let mut i = start
+    # routingParseUnsigned: `u64::from_str` (isU64 true) / `u8::from_str`:
+    # an optional leading `+`, then one or more ASCII digits, refused on
+    # overflow. A u64 above i64::MAX is held in the int's 64 bits (see
+    # fabric_json's sjU64Text).
+    struct RoutingUnsigned:
+        ok: bool
+        n: int
+
+    proc routingParseUnsigned(s: text, isU64: bool) -> RoutingUnsigned:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut i = 0
+        if n > 0 && bs[0] == 43:
+            i = 1
+        if i >= n:
+            return RoutingUnsigned{ok: false, n: 0}
+        let mut v = 0
         loop i < n:
-            let d = do isDigitChar(charAt(s, i))
-            if !d:
-                ok = false
+            let c = bs[i]
+            if c < 48 || c > 57:
+                return RoutingUnsigned{ok: false, n: 0}
+            let d = c - 48
+            if isU64:
+                if sjMulOverflows(v, d):
+                    return RoutingUnsigned{ok: false, n: 0}
+            else:
+                if v * 10 + d > 255:
+                    return RoutingUnsigned{ok: false, n: 0}
+            v = v * 10 + d
             i = i + 1
-        return ok
-
-    # isU8Text: `isUnsignedIntText` plus the `u8` range check (`<= 255`) —
-    # `"256"` parses its digits fine but is rejected exactly like
-    # `"256".parse::<u8>()` returning `Err(PosOverflow)` (confirmed against
-    # real `rustc`).
-    proc isU8Text(s: text) -> bool:
-        let syntaxOk = do isUnsignedIntText(s)
-        if !syntaxOk:
-            return false
-        let v = toInt(s)
-        return v <= 255
-
-    proc isU64Text(s: text) -> bool:
-        let syntaxOk = do isUnsignedIntText(s)
-        return syntaxOk
+        return RoutingUnsigned{ok: true, n: v}
 
     # ============================================================
     # key.rs — RoutingKey.
@@ -349,7 +331,7 @@ app FabricRoutingSelfHost:
 
     # routingKeyDisplay: `impl Display` — "{shard}/{x},{y}".
     proc routingKeyDisplay(k: RoutingKey) -> text:
-        return k.shardId + "/" + k.coordinate.x + "," + k.coordinate.y
+        return sjU64Text(k.shardId) + "/" + k.coordinate.x + "," + k.coordinate.y
 
     # routingKeyParse: `impl FromStr` — "<shard>/<x>,<y>", e.g. "42/7,3".
     # Restates each guard in the real function's own order: missing '/',
@@ -371,24 +353,21 @@ app FabricRoutingSelfHost:
             return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
         let xRaw = slice(cell, 0, commaIdx)
         let yRaw = slice(cell, commaIdx + 1, len(cell))
-        let shardTrim = trim(shardRaw)
-        let xTrim = trim(xRaw)
-        let yTrim = trim(yRaw)
-        let shardOk = do isU64Text(shardTrim)
-        if !shardOk:
+        let shard = routingParseUnsigned(trim(shardRaw), true)
+        if !shard.ok:
             let e = do routingErrorInvalidAddress(address, "shard id is not a number")
             return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
-        let xOk = do isU8Text(xTrim)
-        if !xOk:
+        let xv = routingParseUnsigned(trim(xRaw), false)
+        if !xv.ok:
             let e = do routingErrorInvalidAddress(address, "x is not a number")
             return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
-        let yOk = do isU8Text(yTrim)
-        if !yOk:
+        let yv = routingParseUnsigned(trim(yRaw), false)
+        if !yv.ok:
             let e = do routingErrorInvalidAddress(address, "y is not a number")
             return RoutingKeyResult{ok: false, key: RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, err: e}
-        let shardId = toInt(shardTrim)
-        let x = toInt(xTrim)
-        let y = toInt(yTrim)
+        let shardId = shard.n
+        let x = xv.n
+        let y = yv.n
         let built = do routingKeyNew(shardId, Coordinate{x: x, y: y})
         return built
 
@@ -676,6 +655,61 @@ app FabricRoutingSelfHost:
     # particular order.
     proc topologyRegistryPlacements(reg: TopologyRegistry) -> [Placement]:
         return reg.placements
+
+    # ============================================================
+    # SERDE SHAPES — serde_json::to_string of each derived type
+    # ============================================================
+    proc routingKeyJson(k: RoutingKey) -> text:
+        return "{\"shard_id\":" + sjU64Text(k.shardId) + ",\"coordinate\":" + coordinateJson(k.coordinate) + "}"
+
+    proc routingErrorJson(e: RoutingError) -> text:
+        if e.kind == "InvalidCoordinate":
+            return "{\"InvalidCoordinate\":{\"x\":" + e.x + ",\"y\":" + e.y + "}}"
+        if e.kind == "InvalidAddress":
+            return "{\"InvalidAddress\":{\"address\":" + sjQuote(e.address) + ",\"reason\":" + sjQuote(e.reason) + "}}"
+        if e.kind == "InvalidRange":
+            return "{\"InvalidRange\":{\"start\":" + coordinateJson(e.start) + ",\"end\":" + coordinateJson(e.end) + "}}"
+        if e.kind == "UnknownNode":
+            return "{\"UnknownNode\":{\"node\":" + sjQuote(e.node) + "}}"
+        if e.kind == "NoLiveOwner":
+            let mut names = []
+            let mut i = 0
+            loop i < len(e.considered):
+                names = append(names, sjQuote(e.considered[i]))
+                i = i + 1
+            return "{\"NoLiveOwner\":{\"shard_id\":" + sjU64Text(e.shardId) + ",\"considered\":[" + join(names, ",") + "]}}"
+        if e.kind == "WriteFenced":
+            return "{\"WriteFenced\":{\"shard_id\":" + sjU64Text(e.shardId) + ",\"source\":" + sjQuote(e.source) + ",\"destination\":" + sjQuote(e.destination) + "}}"
+        return "{\"" + e.kind + "\":{\"shard_id\":" + sjU64Text(e.shardId) + "}}"
+
+    proc coordinateRangeJson(r: CoordinateRange) -> text:
+        return "{\"start\":" + coordinateJson(r.start) + ",\"end\":" + coordinateJson(r.end) + "}"
+
+    proc readPreferenceJson(p: ReadPreference) -> text:
+        if p.kind == "PreferRegion":
+            return "{\"PreferRegion\":{\"region\":" + sjQuote(p.region) + "}}"
+        return "\"" + p.kind + "\""
+
+    proc routeIntentJson(intent: RouteIntent) -> text:
+        if intent.isWrite:
+            return "\"Write\""
+        return "{\"Read\":" + readPreferenceJson(intent.readPref) + "}"
+
+    proc routeJson(r: Route) -> text:
+        let mut coord = "null"
+        if r.hasCoordinate:
+            coord = coordinateJson(r.coordinate)
+        return "{\"shard_id\":" + sjU64Text(r.shardId) + ",\"coordinate\":" + coord + ",\"node\":" + sjQuote(r.node) + ",\"region\":" + sjQuote(r.region) + ",\"served_by\":\"" + r.servedBy + "\",\"kind\":\"" + r.kind + "\",\"generation\":" + sjU64Text(r.generation) + "}"
+
+    proc routeSegmentJson(seg: RouteSegment) -> text:
+        return "{\"range\":" + coordinateRangeJson(seg.range) + ",\"route\":" + routeJson(seg.route) + "}"
+
+    proc routeRequestJson(req: RouteRequest) -> text:
+        return "{\"key\":" + routingKeyJson(req.key) + ",\"intent\":" + routeIntentJson(req.intent) + "}"
+
+    # fabric-topology's Placement.
+    proc placementJson(p: Placement) -> text:
+        return "{\"dbms_id\":" + sjQuote(p.dbmsId) + ",\"shard_id\":" + sjU64Text(p.shardId) + ",\"coordinate\":" + coordinateJson(p.coordinate) + ",\"region\":" + sjQuote(p.region) + "}"
 
     # ============================================================
     # DEMO / BUILD-CHECK FIXTURES — hand-verified against ground truth.

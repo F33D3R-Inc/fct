@@ -1,5 +1,6 @@
 import "core_types.fct"
 import "index_text.fct"
+import "fqjson.fct"
 import "reference.fct"
 
 app TransactionSelfHost:
@@ -96,8 +97,8 @@ app TransactionSelfHost:
     #     its message verbatim)              -> checkDataKeys
     #   `check_text_keys` + `indexed_text`   -> checkTextKeys
     #   `serde_json::from_str(data).ok()`
-    #     + `Value::get(field)`              -> jsonParseObject /
-    #                                           jsonObjectGet (simplification 5)
+    #     + `Value::get(field)`              -> fqjson.fct's fjParse /
+    #                                           jsonObjectGet (note 5)
     #
     # ============================================================
     # DELIBERATE SIMPLIFICATIONS (each named, none hidden)
@@ -132,24 +133,10 @@ app TransactionSelfHost:
     #      `opTag`, and the three control variants Begin/Commit/Abort are
     #      the tags "begin"/"commit"/"abort" — which is exactly what
     #      `stage`'s control-record guard has to recognise.
-    #   5. This language has no JSON decoder, so `check_data_keys`/
-    #      `check_text_keys` bring a minimal one: `jsonParseObject` reads a
-    #      top-level JSON object into (key, value) members with every
-    #      scalar decoded (strings unescaped, incl. \uXXXX and surrogate
-    #      pairs; numbers via toFloat; true/false/null) and every nested
-    #      array/object kept as a "composite" `DataValue` holding its
-    #      source text with the whitespace outside strings removed — the
-    #      shape `Value::to_string()` would serialise it back to, up to
-    #      escape normalisation and number reformatting inside the
-    #      composite (the only residual divergence, and only in the
-    #      byte-length a composite value contributes). Anything that is
-    #      not one well-formed top-level object decodes to "every field
-    #      absent", which is what `serde_json::from_str(..).ok()` +
-    #      `Value::get` give for the same inputs. Duplicate keys: last one
-    #      wins, as in serde_json's map. Number syntax is not validated
-    #      as strictly as serde ("01" is accepted); a number only ever
-    #      contributes its fixed 8-byte encoding, so this cannot change a
-    #      length check's answer.
+    #   5. `serde_json::from_str(data).ok()` and `Value::get` are
+    #      fqjson.fct's fjParse / fjGet — serde_json's own grammar, number
+    #      reading and serialization — so a composite value is keyed and
+    #      measured by exactly the text facetql serializes it to.
     #   6. `Transaction::commit`'s `apply` closure is the engine's
     #      `apply_committed`, which writes heap + indexes. Its one
     #      observable contract here — it either succeeds or returns a
@@ -275,392 +262,19 @@ app TransactionSelfHost:
     # `jsonScan` values: `pos` is the rune index just past what was
     # consumed; `ok` false means the document is malformed (and the whole
     # decode is then "None", as serde's would be).
-    struct JsonScan:
-        ok: bool
-        pos: int
-        value: DataValue
-
-    struct JsonMember:
-        key: text
-        value: DataValue
-
-    struct JsonObject:
-        ok: bool
-        members: [JsonMember]
-
-    private proc quoteChar() -> text:
-        return bytesToText([34])
-
-    private proc backslashChar() -> text:
-        return bytesToText([92])
-
-    private proc jsonIsWs(c: text) -> bool:
-        return c == " " || c == "\t" || c == "\n" || c == "\r"
-
-    private proc jsonSkipWs(s: text, n: int, pos: int) -> int:
-        let mut p = pos
-        let mut going = true
-        loop going:
-            if p < n:
-                let c = charAt(s, p)
-                let ws = do jsonIsWs(c)
-                if ws:
-                    p = p + 1
-                else:
-                    going = false
-            else:
-                going = false
-        return p
-
-    private proc hexDigitValue(c: text) -> int:
-        if c == "0":
-            return 0
-        if c == "1":
-            return 1
-        if c == "2":
-            return 2
-        if c == "3":
-            return 3
-        if c == "4":
-            return 4
-        if c == "5":
-            return 5
-        if c == "6":
-            return 6
-        if c == "7":
-            return 7
-        if c == "8":
-            return 8
-        if c == "9":
-            return 9
-        if c == "a" || c == "A":
-            return 10
-        if c == "b" || c == "B":
-            return 11
-        if c == "c" || c == "C":
-            return 12
-        if c == "d" || c == "D":
-            return 13
-        if c == "e" || c == "E":
-            return 14
-        if c == "f" || c == "F":
-            return 15
-        return -1
-
-    # Four hex digits at `pos`, or -1.
-    private proc jsonHex4(s: text, n: int, pos: int) -> int:
-        if pos + 4 > n:
-            return -1
-        let mut v = 0
-        let mut i = 0
-        loop i < 4:
-            let c = charAt(s, pos + i)
-            let d = do hexDigitValue(c)
-            if d < 0:
-                return -1
-            v = v * 16 + d
-            i = i + 1
-        return v
-
-    # A code point as its UTF-8 bytes.
-    private proc utf8Encode(cp: int) -> [int]:
-        if cp < 128:
-            return [cp]
-        if cp < 2048:
-            return [192 + cp / 64, 128 + cp % 64]
-        if cp < 65536:
-            return [224 + cp / 4096, 128 + (cp / 64) % 64, 128 + cp % 64]
-        return [240 + cp / 262144, 128 + (cp / 4096) % 64, 128 + (cp / 64) % 64, 128 + cp % 64]
-
-    # A JSON string starting at the opening quote; the value is the
-    # unescaped text.
-    private proc jsonScanString(s: text, n: int, pos: int) -> JsonScan:
-        let absent = do absentDataValue()
-        let q = do quoteChar()
-        let bs = do backslashChar()
-        let mut p = pos + 1
-        let mut acc = ""
-        let mut going = true
-        let mut closed = false
-        let mut bad = false
-        loop going:
-            if p >= n:
-                going = false
-            else:
-                let c = charAt(s, p)
-                if c == q:
-                    closed = true
-                    going = false
-                    p = p + 1
-                else:
-                    if c == bs:
-                        if p + 1 >= n:
-                            bad = true
-                            going = false
-                        else:
-                            let e = charAt(s, p + 1)
-                            if e == "u":
-                                let cp = do jsonHex4(s, n, p + 2)
-                                if cp < 0:
-                                    bad = true
-                                    going = false
-                                else:
-                                    let mut code = cp
-                                    let mut used = 6
-                                    if cp >= 55296 && cp < 56320:
-                                        # a high surrogate: pair it with a
-                                        # following \uDC00..\uDFFF
-                                        if p + 11 < n + 0:
-                                            let bs2 = charAt(s, p + 6)
-                                            let u2 = charAt(s, p + 7)
-                                            if bs2 == bs && u2 == "u":
-                                                let lo = do jsonHex4(s, n, p + 8)
-                                                if lo >= 56320 && lo < 57344:
-                                                    code = 65536 + (cp - 55296) * 1024 + (lo - 56320)
-                                                    used = 12
-                                    let encoded = do utf8Encode(code)
-                                    let piece = bytesToText(encoded)
-                                    acc = acc + piece
-                                    p = p + used
-                            else:
-                                let mut piece = ""
-                                let mut known = true
-                                if e == q:
-                                    piece = q
-                                if e == bs:
-                                    piece = bs
-                                if e == "/":
-                                    piece = "/"
-                                if e == "n":
-                                    piece = "\n"
-                                if e == "t":
-                                    piece = "\t"
-                                if e == "r":
-                                    piece = "\r"
-                                if e == "b":
-                                    piece = bytesToText([8])
-                                if e == "f":
-                                    piece = bytesToText([12])
-                                if piece == "":
-                                    known = false
-                                if known:
-                                    acc = acc + piece
-                                    p = p + 2
-                                else:
-                                    bad = true
-                                    going = false
-                    else:
-                        acc = acc + c
-                        p = p + 1
-        if bad || !closed:
-            return JsonScan{ok: false, pos: p, value: absent}
-        let v = do textDataValue(acc)
-        return JsonScan{ok: true, pos: p, value: v}
-
-    private proc jsonIsNumberChar(c: text) -> bool:
-        return c in ["-", "+", ".", "e", "E", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
-
-    private proc jsonScanNumber(s: text, n: int, pos: int) -> JsonScan:
-        let absent = do absentDataValue()
-        let mut p = pos
-        let mut going = true
-        let mut digits = 0
-        loop going:
-            if p < n:
-                let c = charAt(s, p)
-                let numeric = do jsonIsNumberChar(c)
-                if numeric:
-                    if c in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]:
-                        digits = digits + 1
-                    p = p + 1
-                else:
-                    going = false
-            else:
-                going = false
-        if digits == 0:
-            return JsonScan{ok: false, pos: p, value: absent}
-        let raw = slice(s, pos, p)
-        let f = toFloat(raw)
-        let v = do numDataValue(f)
-        return JsonScan{ok: true, pos: p, value: v}
-
-    # A nested array/object: consumed as a balanced run, string-aware,
-    # and kept as a "composite" DataValue holding its compact source
-    # text (whitespace outside strings dropped).
-    private proc jsonScanComposite(s: text, n: int, pos: int) -> JsonScan:
-        let absent = do absentDataValue()
-        let q = do quoteChar()
-        let bs = do backslashChar()
-        let mut p = pos
-        let mut depth = 0
-        let mut inString = false
-        let mut acc = ""
-        let mut going = true
-        let mut closed = false
-        loop going:
-            if p >= n:
-                going = false
-            else:
-                let c = charAt(s, p)
-                if inString:
-                    acc = acc + c
-                    if c == bs:
-                        if p + 1 < n:
-                            let e = charAt(s, p + 1)
-                            acc = acc + e
-                        p = p + 2
-                    else:
-                        if c == q:
-                            inString = false
-                        p = p + 1
-                else:
-                    let ws = do jsonIsWs(c)
-                    if !ws:
-                        acc = acc + c
-                    if c == q:
-                        inString = true
-                    if c == "{" || c == "[":
-                        depth = depth + 1
-                    if c == "}" || c == "]":
-                        depth = depth - 1
-                        if depth == 0:
-                            closed = true
-                            going = false
-                    p = p + 1
-        if !closed:
-            return JsonScan{ok: false, pos: p, value: absent}
-        let v = DataValue{kind: "composite", boolVal: false, textVal: acc, numVal: 0.0}
-        return JsonScan{ok: true, pos: p, value: v}
-
-    private proc jsonScanValue(s: text, n: int, pos: int) -> JsonScan:
-        let absent = do absentDataValue()
-        if pos >= n:
-            return JsonScan{ok: false, pos: pos, value: absent}
-        let c = charAt(s, pos)
-        let q = do quoteChar()
-        if c == q:
-            let r = do jsonScanString(s, n, pos)
-            return r
-        if c == "{" || c == "[":
-            let r2 = do jsonScanComposite(s, n, pos)
-            return r2
-        if slice(s, pos, pos + 4) == "true":
-            let vt = do boolDataValue(true)
-            return JsonScan{ok: true, pos: pos + 4, value: vt}
-        if slice(s, pos, pos + 5) == "false":
-            let vf = do boolDataValue(false)
-            return JsonScan{ok: true, pos: pos + 5, value: vf}
-        if slice(s, pos, pos + 4) == "null":
-            let vn = do nullDataValue()
-            return JsonScan{ok: true, pos: pos + 4, value: vn}
-        let numeric = do jsonIsNumberChar(c)
-        if numeric:
-            let r3 = do jsonScanNumber(s, n, pos)
-            return r3
-        return JsonScan{ok: false, pos: pos, value: absent}
-
-    # `serde_json::from_str(data).ok()` restricted to what `Value::get`
-    # can then serve: a top-level object, fully validated (a malformed
-    # tail after a good member still makes the whole decode fail, as it
-    # does for serde).
-    proc jsonParseObject(s: text) -> JsonObject:
-        let n = len(s)
-        let q = do quoteChar()
-        let mut members = []
-        let p0 = do jsonSkipWs(s, n, 0)
-        if p0 >= n || charAt(s, p0) != "{":
-            return JsonObject{ok: false, members: []}
-        let mut p = p0 + 1
-        let afterOpen = do jsonSkipWs(s, n, p)
-        if afterOpen < n && charAt(s, afterOpen) == "}":
-            let tail = do jsonSkipWs(s, n, afterOpen + 1)
-            if tail != n:
-                return JsonObject{ok: false, members: []}
-            return JsonObject{ok: true, members: []}
-        let mut going = true
-        let mut bad = false
-        let mut closed = false
-        loop going:
-            let pk = do jsonSkipWs(s, n, p)
-            if pk >= n || charAt(s, pk) != q:
-                bad = true
-                going = false
-            else:
-                let keyScan = do jsonScanString(s, n, pk)
-                if !keyScan.ok:
-                    bad = true
-                    going = false
-                else:
-                    let pc = do jsonSkipWs(s, n, keyScan.pos)
-                    if pc >= n || charAt(s, pc) != ":":
-                        bad = true
-                        going = false
-                    else:
-                        let pv = do jsonSkipWs(s, n, pc + 1)
-                        let valScan = do jsonScanValue(s, n, pv)
-                        if !valScan.ok:
-                            bad = true
-                            going = false
-                        else:
-                            let keyVal = keyScan.value
-                            let member = JsonMember{key: keyVal.textVal, value: valScan.value}
-                            members = append(members, member)
-                            let pn = do jsonSkipWs(s, n, valScan.pos)
-                            if pn >= n:
-                                bad = true
-                                going = false
-                            else:
-                                let sep = charAt(s, pn)
-                                if sep == ",":
-                                    p = pn + 1
-                                else:
-                                    if sep == "}":
-                                        closed = true
-                                        going = false
-                                        p = pn + 1
-                                    else:
-                                        bad = true
-                                        going = false
-        if bad || !closed:
-            return JsonObject{ok: false, members: []}
-        let tail2 = do jsonSkipWs(s, n, p)
-        if tail2 != n:
-            return JsonObject{ok: false, members: []}
-        return JsonObject{ok: true, members: members}
-
-    # `decoded.as_ref().and_then(|d| d.get(field))` — absent when the
-    # decode failed or the key is missing; the last duplicate wins.
-    proc jsonObjectGet(obj: JsonObject, field: text) -> DataValue:
-        let absent = do absentDataValue()
-        if !obj.ok:
-            return absent
-        let members = obj.members
-        let n = len(members)
-        let mut found = absent
-        let mut i = 0
-        loop i < n:
-            if members[i].key == field:
-                found = members[i].value
-            i = i + 1
-        return found
-
-    # ============================================================
-    # PART THREE — `check_data_keys` / `check_text_keys`, the two loops.
-    # ============================================================
-    # `encode_order_value` for every DataValue index_text.fct's encoder
-    # knows, plus the composite arm it never needed: rank 0x50 and the
-    # serialised bytes, escaped and terminated like every other body.
-    proc encodeDataValueForKey(v: DataValue) -> [int]:
-        if v.kind == "composite":
-            let raw = textToBytes(v.textVal)
-            let body = do concatBytes([80], raw)
-            let out = do appendEscaped([], body)
-            return out
-        let out2 = do encodeOrderValue(v)
-        return out2
+    # jsonObjectGet: `decoded.as_ref().and_then(|d| d.get(field))` as the
+    # DataValue encode_order_value reads — absent when the document did
+    # not parse or has no such member.
+    proc jsonObjectGet(decoded: FqJR, field: text) -> DataValue:
+        if !decoded.ok:
+            let a = do absentDataValue()
+            return a
+        let g = do fjGet(decoded.v, field)
+        let dv = do fjDataValue(g)
+        return dv
 
     proc checkDataKeys(defs: [IndexDef], address: text, data: text) -> CheckResult:
-        let decoded = do jsonParseObject(data)
+        let decoded = do fjParse(data)
         let maxValLen = do indexMaxIndexValueLen()
         let addrBytes = textToBytes(address)
         let n = len(defs)
@@ -687,7 +301,7 @@ app TransactionSelfHost:
         let n = len(defs)
         if n == 0:
             return CheckResult{ok: true, err: ""}
-        let decoded = do jsonParseObject(data)
+        let decoded = do fjParse(data)
         let maxTextLen = do textIndexMaxTextValueLen()
         let gramLen = do textIndexGramLen()
         let maxKeyLen = do indexMaxKeyLen()
@@ -1666,33 +1280,33 @@ app TransactionSelfHost:
         return r.err
 
     proc jsonFieldKind(data: text, field: text) -> text:
-        let obj = do jsonParseObject(data)
+        let obj = do fjParse(data)
         let v = do jsonObjectGet(obj, field)
         return v.kind
 
     proc jsonFieldText(data: text, field: text) -> text:
-        let obj = do jsonParseObject(data)
+        let obj = do fjParse(data)
         let v = do jsonObjectGet(obj, field)
         return v.textVal
 
     # The number's IEEE-754 bit pattern (state has no float type; the
     # Go test compares it against math.Float64bits).
     proc jsonFieldNumBits(data: text, field: text) -> int:
-        let obj = do jsonParseObject(data)
+        let obj = do fjParse(data)
         let v = do jsonObjectGet(obj, field)
         return floatBits(v.numVal)
 
     proc jsonFieldBool(data: text, field: text) -> bool:
-        let obj = do jsonParseObject(data)
+        let obj = do fjParse(data)
         let v = do jsonObjectGet(obj, field)
         return v.boolVal
 
     proc jsonDocumentOk(data: text) -> bool:
-        let obj = do jsonParseObject(data)
-        return obj.ok
+        let obj = do fjParse(data)
+        return obj.ok && obj.v.kind == "obj"
 
     proc jsonFieldEncodedLen(data: text, field: text) -> int:
-        let obj = do jsonParseObject(data)
+        let obj = do fjParse(data)
         let v = do jsonObjectGet(obj, field)
         let encoded = do encodeDataValueForKey(v)
         return len(encoded)

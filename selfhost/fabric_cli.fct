@@ -1,0 +1,551 @@
+import "fabric_runtime.fct"
+import "fabric_cli_render.fct"
+
+app FabricCli:
+    # Port of fabric/crates/fabric-cli/src/{args.rs, session.rs, main.rs}:
+    # the `fabric` operator CLI. render.rs is fabric_cli_render.fct. Run it as
+    # a command:
+    #
+    #   facet exec selfhost/fabric_cli.fct status --input session.json
+    #
+    # `main` is the whole of main.rs: parse the arguments, replay the session
+    # through the real runtime, render, and exit with main.rs's codes.
+
+    proc cliExitOk() -> int:
+        return 0
+
+    proc cliExitError() -> int:
+        return 1
+
+    proc cliExitUsage() -> int:
+        return 2
+
+    proc cliExitInvalid() -> int:
+        return 3
+
+    proc cliVersion() -> text:
+        return "0.1.0"
+
+    # ------------------------------------------------------------- args.rs
+
+    # Subcommand::parse — the eight names, else "".
+    proc cliSubcommandParse(name: text) -> text:
+        if name == "status" || name == "topology" || name == "workload" || name == "metrics" || name == "placement" || name == "predict" || name == "validate" || name == "nodes":
+            return name
+        return ""
+
+    struct RunOpts:
+        hasInput: bool
+        input: text
+        json: bool
+        help: bool
+        hasNow: bool
+        now: int
+        hasDeadline: bool
+        deadline: int
+
+    proc runOptsDefault() -> RunOpts:
+        return RunOpts{hasInput: false, input: "", json: false, help: false, hasNow: false, now: 0, hasDeadline: false, deadline: 0}
+
+    # ParseError: kind UnknownCommand | UnknownFlag | MissingValue |
+    # UnexpectedArgument (arg) | InvalidValue (arg = flag, value).
+    struct CliParseError:
+        kind: text
+        arg: text
+        value: text
+
+    proc cliParseErrorDisplay(e: CliParseError) -> text:
+        if e.kind == "UnknownCommand":
+            return "unknown command '" + e.arg + "'"
+        if e.kind == "UnknownFlag":
+            return "unknown flag '" + e.arg + "'"
+        if e.kind == "MissingValue":
+            return "flag '" + e.arg + "' expects a value"
+        if e.kind == "UnexpectedArgument":
+            return "unexpected argument '" + e.arg + "'"
+        return "flag '" + e.arg + "' expects a number, got '" + e.value + "'"
+
+    # Command: kind "help" | "version" | "run" (subcommand, opts); ok false
+    # carries the ParseError.
+    struct CliCommand:
+        ok: bool
+        kind: text
+        subcommand: text
+        opts: RunOpts
+        err: CliParseError
+
+    private proc cliFail(kind: text, arg: text, value: text) -> CliCommand:
+        let opts = do runOptsDefault()
+        return CliCommand{ok: false, kind: "", subcommand: "", opts: opts, err: CliParseError{kind: kind, arg: arg, value: value}}
+
+    private proc cliNoError() -> CliParseError:
+        return CliParseError{kind: "", arg: "", value: ""}
+
+    proc cliHasPrefix(s: text, prefix: text) -> bool:
+        if len(s) < len(prefix):
+            return false
+        return slice(s, 0, len(prefix)) == prefix
+
+    struct CliNumber:
+        ok: bool
+        n: int
+
+    # parseNumber: `str::parse::<u64>` — an optional '+', then one or more
+    # ASCII digits, and no overflow.
+    proc cliParseU64(value: text) -> CliNumber:
+        let bs = textToBytes(value)
+        let n = len(bs)
+        let mut i = 0
+        if n > 0 && bs[0] == 43:
+            i = 1
+        if i >= n:
+            return CliNumber{ok: false, n: 0}
+        let mut acc = 0
+        loop i < n:
+            let c = bs[i]
+            if c < 48 || c > 57:
+                return CliNumber{ok: false, n: 0}
+            let digit = c - 48
+            if acc > (9223372036854775807 - digit) / 10:
+                return CliNumber{ok: false, n: 0}
+            acc = acc * 10 + digit
+            i = i + 1
+        return CliNumber{ok: true, n: acc}
+
+    private proc withOpts(help: bool, json: bool, hasInput: bool, input: text, hasNow: bool, now: int, hasDeadline: bool, deadline: int) -> RunOpts:
+        return RunOpts{hasInput: hasInput, input: input, json: json, help: help, hasNow: hasNow, now: now, hasDeadline: hasDeadline, deadline: deadline}
+
+    # parse: args.rs `parse`, argument for argument.
+    proc cliParse(args: [text]) -> CliCommand:
+        let defaults = do runOptsDefault()
+        let none = do cliNoError()
+        let n = len(args)
+        if n == 0:
+            return CliCommand{ok: true, kind: "help", subcommand: "", opts: defaults, err: none}
+        let first = args[0]
+        if first == "-h" || first == "--help" || first == "help":
+            return CliCommand{ok: true, kind: "help", subcommand: "", opts: defaults, err: none}
+        if first == "-V" || first == "--version" || first == "version":
+            return CliCommand{ok: true, kind: "version", subcommand: "", opts: defaults, err: none}
+        let subcommand = do cliSubcommandParse(first)
+        if subcommand == "":
+            let e0 = do cliFail("UnknownCommand", first, "")
+            return e0
+        let mut help = false
+        let mut json = false
+        let mut hasInput = false
+        let mut input = ""
+        let mut hasNow = false
+        let mut now = 0
+        let mut hasDeadline = false
+        let mut deadline = 0
+        let mut i = 1
+        loop i < n:
+            let arg = args[i]
+            if arg == "-h" || arg == "--help":
+                help = true
+            else:
+                if arg == "--json":
+                    json = true
+                else:
+                    if arg == "-i" || arg == "--input":
+                        if i + 1 >= n:
+                            let e1 = do cliFail("MissingValue", arg, "")
+                            return e1
+                        hasInput = true
+                        input = args[i + 1]
+                        i = i + 1
+                    else:
+                        if cliHasPrefix(arg, "--input="):
+                            hasInput = true
+                            input = slice(arg, 8, len(arg))
+                        else:
+                            if arg == "--now" || arg == "--deadline" || cliHasPrefix(arg, "--now=") || cliHasPrefix(arg, "--deadline="):
+                                let mut flagValue = ""
+                                if arg == "--now" || arg == "--deadline":
+                                    if i + 1 >= n:
+                                        let e2 = do cliFail("MissingValue", arg, "")
+                                        return e2
+                                    flagValue = args[i + 1]
+                                    i = i + 1
+                                else:
+                                    if cliHasPrefix(arg, "--now="):
+                                        flagValue = slice(arg, 6, len(arg))
+                                    else:
+                                        flagValue = slice(arg, 11, len(arg))
+                                let parsed = do cliParseU64(flagValue)
+                                if !parsed.ok:
+                                    let e3 = do cliFail("InvalidValue", arg, flagValue)
+                                    return e3
+                                if arg == "--now" || cliHasPrefix(arg, "--now="):
+                                    hasNow = true
+                                    now = parsed.n
+                                else:
+                                    hasDeadline = true
+                                    deadline = parsed.n
+                            else:
+                                if cliHasPrefix(arg, "-"):
+                                    let e4 = do cliFail("UnknownFlag", arg, "")
+                                    return e4
+                                let e5 = do cliFail("UnexpectedArgument", arg, "")
+                                return e5
+            i = i + 1
+        let opts = do withOpts(help, json, hasInput, input, hasNow, now, hasDeadline, deadline)
+        return CliCommand{ok: true, kind: "run", subcommand: subcommand, opts: opts, err: none}
+
+    # ----------------------------------------------------------- session.rs
+
+    struct CliSession:
+        ok: bool
+        err: text
+        runtime: FabricRuntime
+
+    # replaySession: every decoded message through FabricRuntime::handle, in
+    # order; the acknowledgements are discarded, the state is what renders.
+    proc cliReplaySession(label: text, content: text) -> CliSession:
+        let runtime = do fabricRuntimeNew()
+        let decoded = do protocolDecodeMessages(content)
+        if !decoded.ok:
+            return CliSession{ok: false, err: "invalid session '" + label + "': " + decoded.error, runtime: runtime}
+        let mut current = runtime
+        let n = len(decoded.messages)
+        let mut i = 0
+        loop i < n:
+            let handled = do fabricRuntimeHandle(current, decoded.messages[i])
+            current = handled.runtime
+            i = i + 1
+        return CliSession{ok: true, err: "", runtime: current}
+
+    # load: no path is an empty runtime; "-" is standard input; otherwise the
+    # file, whose absence is session.rs's Io error.
+    proc cliLoadSession(opts: RunOpts) -> CliSession uses io.file, io.console:
+        if !opts.hasInput:
+            let empty = do fabricRuntimeNew()
+            return CliSession{ok: true, err: "", runtime: empty}
+        if opts.input == "-":
+            let piped = readStdin()
+            let fromStdin = do cliReplaySession("<stdin>", piped)
+            return fromStdin
+        let present = fileExists(opts.input)
+        if !present:
+            let missing = do fabricRuntimeNew()
+            return CliSession{ok: false, err: "could not read session '" + opts.input + "': No such file or directory (os error 2)", runtime: missing}
+        let content = readFile(opts.input)
+        let fromFile = do cliReplaySession(opts.input, content)
+        return fromFile
+
+    # -------------------------------------------------------------- main.rs
+
+    proc cliTopHelp() -> text:
+        return "fabric -- Facet Fabric operator CLI\n\nUSAGE:\n    fabric <command> [--input <file>] [--json]\n\nCOMMANDS:\n    status      Runtime summary (grid geometry, protocol version, counts)\n    topology    Physical placements known to the topology registry\n    workload    Workload profiles derived from ingested telemetry\n    metrics     Latest raw workload metrics per location\n    placement   Optimizer placement/optimization decisions\n    predict     ML hotspot probability and anomaly score per profile\n    validate    Check that ingested coordinates fall within the grid\n    nodes       Fleet inventory: registered nodes and their liveness\n\nOPTIONS:\n    -i, --input <file>   JSON array of FabricMessage values to replay ('-' = stdin)\n        --json           Emit JSON instead of human-readable text\n        --now <ms>       nodes: judge liveness at this epoch-millisecond instant\n                         (default: the newest timestamp the runtime ingested)\n        --deadline <ms>  nodes: silence budget before a node is unreachable\n                         (default: 30000)\n    -h, --help           Show help\n    -V, --version        Show version\n\nNOTES:\n    Fabric has no live daemon yet, so this tool runs the real analysis pipeline\n    over a captured/authored protocol-message session. With no --input the\n    runtime is empty and each command reports the empty state."
+
+    proc cliSubcommandHelp(sub: text) -> text:
+        let mut purpose = ""
+        if sub == "status":
+            purpose = "Print a runtime summary: protocol version, grid geometry, and counts of placements, profiles, observations and hot coordinates."
+        if sub == "topology":
+            purpose = "List physical placements (coordinate, shard, region, DBMS) held by the topology registry."
+        if sub == "workload":
+            purpose = "Summarize workload profiles: ops/sec, read/write ratio, pressure level and whether the location is hot."
+        if sub == "metrics":
+            purpose = "Show the latest raw metrics per observed location (ops/sec, CPU, memory, queue depth)."
+        if sub == "placement":
+            purpose = "Run the optimizer over each workload profile and print the resulting placement decision."
+        if sub == "predict":
+            purpose = "Score each workload profile with the optimizer's ML predictor: hotspot probability and anomaly score."
+        if sub == "validate":
+            purpose = "Check every ingested coordinate against the grid bounds; exit 3 if any fall outside."
+        if sub == "nodes":
+            purpose = "List every node that registered with the runtime, with its region, heartbeat count and liveness verdict. A node that never reported in, or that missed its heartbeat deadline, is unreachable -- silence is never read as health."
+        return "fabric " + sub + " -- " + purpose + "\n\nUSAGE:\n    fabric " + sub + " [--input <file>] [--json]\n"
+
+    proc cliStatusSummary(rt: FabricRuntime) -> StatusSummary:
+        let placements = do topologyRegistryLen(rt.topology)
+        let profiles = do workloadAnalyzerLen(rt.analyzer)
+        let observations = do fabricStateLen(rt.state)
+        let hot = do workloadAnalyzerHotCoordinates(rt.analyzer)
+        let version = do protocolVersionV1()
+        return StatusSummary{placements: placements, profiles: profiles, observations: observations, hotCoordinates: len(hot), gridWidth: 12, gridHeight: 13, gridAtoms: 156, protocolMajor: version.major, protocolMinor: version.minor}
+
+    # topology: placements sorted by (coordinate index, shard id).
+    proc cliTopology(rt: FabricRuntime) -> [Placement]:
+        let placements = do topologyRegistryPlacements(rt.topology)
+        let mut out = []
+        let n = len(placements)
+        let mut i = 0
+        loop i < n:
+            let p = placements[i]
+            let key = do coordinateIndex(p.coordinate)
+            let mut sorted = []
+            let mut placed = false
+            let m = len(out)
+            let mut j = 0
+            loop j < m:
+                let other = do coordinateIndex(out[j].coordinate)
+                if !placed && (key < other || (key == other && p.shardId < out[j].shardId)):
+                    sorted = append(sorted, p)
+                    placed = true
+                sorted = append(sorted, out[j])
+                j = j + 1
+            if !placed:
+                sorted = append(sorted, p)
+            out = sorted
+            i = i + 1
+        return out
+
+    # workload: profiles, stably sorted by coordinate index.
+    proc cliWorkload(rt: FabricRuntime) -> [WorkloadProfile]:
+        let profiles = do workloadAnalyzerProfiles(rt.analyzer)
+        let mut out = []
+        let n = len(profiles)
+        let mut i = 0
+        loop i < n:
+            let p = profiles[i]
+            let key = do coordinateIndex(p.coordinate)
+            let mut sorted = []
+            let mut placed = false
+            let m = len(out)
+            let mut j = 0
+            loop j < m:
+                let other = do coordinateIndex(out[j].coordinate)
+                if !placed && key < other:
+                    sorted = append(sorted, p)
+                    placed = true
+                sorted = append(sorted, out[j])
+                j = j + 1
+            if !placed:
+                sorted = append(sorted, p)
+            out = sorted
+            i = i + 1
+        return out
+
+    # metrics: latest observations sorted by (coordinate index, shard id).
+    proc cliMetrics(rt: FabricRuntime) -> [Observation]:
+        let observations = do fabricStateObservations(rt.state)
+        let mut out = []
+        let n = len(observations)
+        let mut i = 0
+        loop i < n:
+            let o = observations[i]
+            let key = do coordinateIndex(o.coordinate)
+            let mut sorted = []
+            let mut placed = false
+            let m = len(out)
+            let mut j = 0
+            loop j < m:
+                let other = do coordinateIndex(out[j].coordinate)
+                if !placed && (key < other || (key == other && o.shard.id < out[j].shard.id)):
+                    sorted = append(sorted, o)
+                    placed = true
+                sorted = append(sorted, out[j])
+                j = j + 1
+            if !placed:
+                sorted = append(sorted, o)
+            out = sorted
+            i = i + 1
+        return out
+
+    # placement: the optimizer's decision for every profile, stably sorted by
+    # coordinate index.
+    proc cliPlacement(rt: FabricRuntime) -> [OptimizationDecision]:
+        let profiles = do workloadAnalyzerProfiles(rt.analyzer)
+        let mut out = []
+        let n = len(profiles)
+        let mut i = 0
+        loop i < n:
+            let d = do fabricRuntimeOptimize(rt, profiles[i])
+            let key = do coordinateIndex(d.coordinate)
+            let mut sorted = []
+            let mut placed = false
+            let m = len(out)
+            let mut j = 0
+            loop j < m:
+                let other = do coordinateIndex(out[j].coordinate)
+                if !placed && key < other:
+                    sorted = append(sorted, d)
+                    placed = true
+                sorted = append(sorted, out[j])
+                j = j + 1
+            if !placed:
+                sorted = append(sorted, d)
+            out = sorted
+            i = i + 1
+        return out
+
+    # predictions: the optimizer's own predictor over every profile.
+    proc cliPredictions(rt: FabricRuntime) -> [PredictionRow]:
+        let predictor = do workloadOptimizerPredictor(rt.optimizer)
+        let profiles = do workloadAnalyzerProfiles(rt.analyzer)
+        let mut out = []
+        let n = len(profiles)
+        let mut i = 0
+        loop i < n:
+            let hotspot = do workloadPredictorPredictHotspot(predictor, profiles[i])
+            let anomaly = do workloadPredictorDetectAnomaly(predictor, profiles[i])
+            let likely = do hotspotPredictionIsLikelyHot(hotspot)
+            let anomalous = do anomalyScoreIsAnomalous(anomaly)
+            let row = PredictionRow{coordinate: profiles[i].coordinate, hotspotProbability: hotspot.probability, likelyHot: likely, anomalyScore: anomaly.score, anomalous: anomalous}
+            let key = do coordinateIndex(row.coordinate)
+            let mut sorted = []
+            let mut placed = false
+            let m = len(out)
+            let mut j = 0
+            loop j < m:
+                let other = do coordinateIndex(out[j].coordinate)
+                if !placed && key < other:
+                    sorted = append(sorted, row)
+                    placed = true
+                sorted = append(sorted, out[j])
+                j = j + 1
+            if !placed:
+                sorted = append(sorted, row)
+            out = sorted
+            i = i + 1
+        return out
+
+    # nodes: the inventory in DbmsId order, judged at nowMs.
+    proc cliNodes(rt: FabricRuntime, nowMs: int, deadlineMs: int) -> [NodeRow]:
+        let mut out = []
+        let n = len(rt.nodes.nodes)
+        let mut i = 0
+        loop i < n:
+            let node = rt.nodes.nodes[i]
+            let silence = do registeredNodeSilenceMs(node, nowMs)
+            let health = do registeredNodeHealth(node, nowMs, deadlineMs)
+            out = append(out, NodeRow{dbmsId: node.id, region: node.region, softwareVersion: node.softwareVersion, registeredAtMs: node.registeredAtMs, hasLastHeartbeatMs: node.hasLastHeartbeat, lastHeartbeatMs: node.lastHeartbeatMs, hasSilenceMs: silence.has, silenceMs: silence.val, heartbeats: node.heartbeats, health: health})
+            i = i + 1
+        return out
+
+    # validation: every distinct ingested coordinate (placements first, then
+    # observations) that falls outside the grid, sorted by index.
+    proc cliValidation(rt: FabricRuntime) -> [ValidationIssue]:
+        let placements = do topologyRegistryPlacements(rt.topology)
+        let observations = do fabricStateObservations(rt.state)
+        let mut seen = []
+        let mut i = 0
+        loop i < len(placements):
+            seen = append(seen, placements[i].coordinate)
+            i = i + 1
+        let mut j = 0
+        loop j < len(observations):
+            seen = append(seen, observations[j].coordinate)
+            j = j + 1
+        let mut invalid = []
+        let mut k = 0
+        loop k < len(seen):
+            let c = seen[k]
+            let mut duplicate = false
+            let mut d = 0
+            loop d < k:
+                if seen[d].x == c.x && seen[d].y == c.y:
+                    duplicate = true
+                d = d + 1
+            let valid = do coordinateIsValid(c)
+            if !duplicate && !valid:
+                let key = do coordinateIndex(c)
+                let mut sorted = []
+                let mut placed = false
+                let mut s = 0
+                loop s < len(invalid):
+                    let other = do coordinateIndex(invalid[s])
+                    if !placed && key < other:
+                        sorted = append(sorted, c)
+                        placed = true
+                    sorted = append(sorted, invalid[s])
+                    s = s + 1
+                if !placed:
+                    sorted = append(sorted, c)
+                invalid = sorted
+            k = k + 1
+        let mut issues = []
+        let mut v = 0
+        loop v < len(invalid):
+            let c2 = invalid[v]
+            issues = append(issues, ValidationIssue{coordinate: c2, reason: "coordinate (" + c2.x + "," + c2.y + ") is outside the 12x13 grid"})
+            v = v + 1
+        return issues
+
+    # CliOutput: what main writes and the code it exits with.
+    struct CliOutput:
+        stdout: text
+        stderr: text
+        code: int
+
+    # cliRun: main.rs `run` against an already-loaded session.
+    proc cliRun(subcommand: text, opts: RunOpts, rt: FabricRuntime) -> CliOutput:
+        let mut output = ""
+        if subcommand == "status":
+            let summary = do cliStatusSummary(rt)
+            let r1 = do renderStatus(summary, opts.json)
+            output = r1
+        if subcommand == "topology":
+            let rows = do cliTopology(rt)
+            let r2 = do renderTopology(rows, opts.json)
+            output = r2
+        if subcommand == "workload":
+            let rows3 = do cliWorkload(rt)
+            let r3 = do renderWorkload(rows3, opts.json)
+            output = r3
+        if subcommand == "metrics":
+            let rows4 = do cliMetrics(rt)
+            let r4 = do renderMetrics(rows4, opts.json)
+            output = r4
+        if subcommand == "placement":
+            let rows5 = do cliPlacement(rt)
+            let r5 = do renderPlacement(rows5, opts.json)
+            output = r5
+        if subcommand == "predict":
+            let rows6 = do cliPredictions(rt)
+            let r6 = do renderPredict(rows6, opts.json)
+            output = r6
+        if subcommand == "nodes":
+            let mut now = rt.clockMs
+            if opts.hasNow:
+                now = opts.now
+            let mut deadline = do defaultHeartbeatDeadlineMs()
+            if opts.hasDeadline:
+                deadline = opts.deadline
+            let rows7 = do cliNodes(rt, now, deadline)
+            let r7 = do renderNodes(rows7, now, deadline, opts.json)
+            output = r7
+        if subcommand == "validate":
+            let issues = do cliValidation(rt)
+            let r8 = do renderValidation(issues, opts.json)
+            let mut code = do cliExitOk()
+            if len(issues) > 0:
+                code = do cliExitInvalid()
+            return CliOutput{stdout: r8 + "\n", stderr: "", code: code}
+        let ok = do cliExitOk()
+        return CliOutput{stdout: output + "\n", stderr: "", code: ok}
+
+    # cliMain: main.rs `main` as a value — used by `main` below and by tests.
+    proc cliMain(args: [text]) -> CliOutput uses io.file, io.console:
+        let command = do cliParse(args)
+        if !command.ok:
+            let shown = do cliParseErrorDisplay(command.err)
+            let usage = do cliExitUsage()
+            return CliOutput{stdout: "", stderr: "error: " + shown + "\ntry 'fabric --help'\n", code: usage}
+        let ok = do cliExitOk()
+        if command.kind == "help":
+            let help = do cliTopHelp()
+            return CliOutput{stdout: help + "\n", stderr: "", code: ok}
+        if command.kind == "version":
+            let version = do cliVersion()
+            return CliOutput{stdout: "fabric " + version + "\n", stderr: "", code: ok}
+        if command.opts.help:
+            let subHelp = do cliSubcommandHelp(command.subcommand)
+            return CliOutput{stdout: subHelp, stderr: "", code: ok}
+        let session = do cliLoadSession(command.opts)
+        if !session.ok:
+            let failed = do cliExitError()
+            return CliOutput{stdout: "", stderr: "error: " + session.err + "\n", code: failed}
+        let out = do cliRun(command.subcommand, command.opts, session.runtime)
+        return out
+
+    proc main(args: [text]) -> int uses io.file, io.console:
+        let out = do cliMain(args)
+        if len(out.stdout) > 0:
+            writeStdout(out.stdout)
+        if len(out.stderr) > 0:
+            writeStderr(out.stderr)
+        return out.code

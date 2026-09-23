@@ -76,7 +76,7 @@ func (s *Server) RunValue(actor, role string, verified bool, action string, args
 	if act == nil {
 		return nil, fmt.Errorf("unknown action %q", action)
 	}
-	_, value, status, msg := s.runActionValue(toolSID, act, args)
+	_, value, _, status, msg := s.runActionValue(toolSID, act, args)
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("%s", msg)
 	}
@@ -135,6 +135,10 @@ func (s *Server) AddRow(entity string, fields map[string]any) (int, error) {
 	row := record{}
 	for k, v := range fields {
 		row[k] = v
+	}
+	// A seeded @password is hashed like any other write of one.
+	if msg := s.storeRow(entity, row); msg != "" {
+		return 0, fmt.Errorf("%s: %s", entity, msg)
 	}
 	undo := newUndoLog(nil)
 	undo.entity(s, entity) // before the id counter moves, so a refused write returns it too

@@ -1,0 +1,2177 @@
+import "fqhttp.fct"
+
+app FqServerSelfHost:
+    # fqserver.fct — the FacetQL server, in fct: facetql's main.rs
+    # (`facetql start`), api/routes.rs, auth.rs, api/limits.rs, metrics.rs
+    # and database.rs's event feed, over the engine in fqengine.fct /
+    # fqquery.fct / fqtx.fct and the HTTP layer in fqhttp.fct.
+    #
+    #   facet exec selfhost/fqserver.fct      (FACET_DATA_DIR must hold the
+    #                                          data directory)
+    #
+    # configured exactly as `facetql start` is: FACETQL_DATA_DIR,
+    # FACETQL_PORT, FACETQL_TOKENS, FACETQL_MASTER_KEY, FACETQL_ENV,
+    # FACETQL_ALLOWED_ORIGINS, FACETQL_ALLOW_PLAINTEXT, FACETQL_RATE_*,
+    # FACETQL_MAX_BODY_BYTES, FACETQL_MAX_SUBSCRIBERS,
+    # FACETQL_CHECKPOINT_INTERVAL, FACETQL_WAL_ROTATE_BYTES, with the
+    # ENOCHIAN_* spellings still honoured (config.rs's legacy aliases).
+    #
+    # The shape. The Rust server shares one StorageEngine behind locks
+    # between request tasks; a proc has no locks, so here the engine is a
+    # value owned by exactly one task — the engine loop (svLoop) — and every
+    # request reaches it as a message:
+    #   * the daemon (FacetQL) loads the database (Database::new), detaches
+    #     the engine loop and a keep-alive ticker, then accepts connections,
+    #     each on its own detached handler (svServeConn);
+    #   * a handler reads requests off its connection (fqhttp.fct's
+    #     hReadRequest, keep-alive and pipelining included), sends each to
+    #     the loop with its own reply channel, and writes the answer back;
+    #   * the loop runs the router as axum layers it — CORS, route match,
+    #     auth, rate limit, metrics, handler — so everything with state (the
+    #     engine, the event feed, live subscribers, rate buckets, metrics)
+    #     has one owner and requests are serialised as the engine's writes
+    #     are anyway;
+    #   * GET /events is answered by the loop itself: it writes the stream's
+    #     head and replayed backlog to the connection, keeps the connection
+    #     as a subscriber, and writes every admitted event to it as it is
+    #     published (and a keep-alive comment on the ticker's beat).
+    #
+    # What differs from the Rust server, and why:
+    #   * a subscriber's writes carry a deadline (a stalled client would
+    #     otherwise stall the loop); one that fails or times out is dropped,
+    #     where tokio's broadcast channel would report it lagged;
+    #   * the keep-alive comment goes to every subscriber on one 15 s beat
+    #     rather than 15 s after each stream's last frame;
+    #   * the request timeout and the in-flight cap are satisfied by
+    #     construction (one request at a time), so `in_flight` reads 1 and
+    #     no 408/503 is ever produced by them;
+    #   * process statistics (CPU, resident memory, limits) are not
+    #     measurable from fct: those fields are null, as Rust reports them
+    #     on a platform that cannot measure them;
+    #   * latency is measured on a millisecond clock (monoMs), so each
+    #     sample is a whole number of milliseconds in microseconds;
+    #   * a refusal to start (bad posture, unreadable database) is printed
+    #     as Rust prints it, but the process exit status stays 0 — a
+    #     daemon has no way to set one;
+    #   * there is no SIGTERM drain/checkpoint (fct has no signals), which
+    #     costs only replay time: every acknowledged write is in the WAL;
+    #   * TLS: the runtime has no TLS primitive, so FACETQL_TLS_IDENTITY is
+    #     refused rather than silently served in plaintext.
+
+    # ── configuration ──────────────────────────────────────────────────
+    struct SvRate:
+        on: bool
+        burst: float
+        refill: float
+
+    struct SvConfig:
+        ok: bool
+        dataDir: text
+        port: int
+        keyHex: text
+        dev: bool
+        corsAny: bool
+        origins: [text]
+        maxBody: int
+        rates: [SvRate]
+        tokHashes: [text]
+        tokOwners: [text]
+        tokAdmins: [bool]
+        interval: int
+        rotateBytes: int
+        maxSubscribers: int
+        maxConcurrent: int
+        timeoutSecs: int
+
+    # svEnv: a variable, or its deprecated ENOCHIAN_* alias when only that
+    # is set (apply_legacy_env_aliases).
+    proc svEnvName(name: text) -> text uses io.env:
+        let current = ["FACETQL_TOKENS", "FACETQL_MASTER_KEY", "FACETQL_DATA_DIR", "FACETQL_PORT", "FACETQL_TLS_IDENTITY", "FACETQL_TLS_IDENTITY_PASSWORD"]
+        let at = do fqwIndexOfText(current, name)
+        if at < 0 || envSet(name):
+            return name
+        let legacy = "ENOCHIAN_" + slice(name, 8, len(name))
+        if envSet(legacy):
+            return legacy
+        return name
+
+    proc svEnvSet(name: text) -> bool uses io.env:
+        let n = do svEnvName(name)
+        return envSet(n)
+
+    proc svEnv(name: text) -> text uses io.env:
+        let n = do svEnvName(name)
+        return envVar(n)
+
+    proc svAliasWarnings() -> bool uses io.console, io.env:
+        let current = ["FACETQL_TOKENS", "FACETQL_MASTER_KEY", "FACETQL_DATA_DIR", "FACETQL_PORT", "FACETQL_TLS_IDENTITY", "FACETQL_TLS_IDENTITY_PASSWORD"]
+        let mut i = 0
+        loop i < len(current):
+            let n = do svEnvName(current[i])
+            if n != current[i]:
+                let w = writeStderr("warning: " + n + " is deprecated and will be removed in a future release — set " + current[i] + " instead. Using its value for now.\n")
+            i = i + 1
+        return true
+
+    # svEnvUsize: env_usize — a positive integer, else None (0).
+    proc svEnvUsize(name: text) -> int uses io.env:
+        let raw = trim(envVar(name))
+        let u = do hParseUint(raw)
+        if !u.ok || u.v <= 0:
+            return 0
+        return u.v
+
+    # svParseF64: Rust's f64::from_str for what a rate is written as.
+    struct SvF64:
+        ok: bool
+        f: float
+
+    proc svParseF64(s: text) -> SvF64:
+        if s == "":
+            return SvF64{ok: false, f: 0.0}
+        let mut t = s
+        if charAt(t, 0) == "+":
+            t = slice(t, 1, len(t))
+        if len(t) > 0 && charAt(t, 0) == ".":
+            t = "0" + t
+        if len(t) > 0 && charAt(t, len(t) - 1) == ".":
+            t = t + "0"
+        let p = do fjParse(t)
+        if !p.ok || (p.v.kind != "int" && p.v.kind != "float") || contains(t, " "):
+            return SvF64{ok: false, f: 0.0}
+        return SvF64{ok: true, f: p.v.f}
+
+    proc svClassNames() -> [text]:
+        return ["Read", "Write", "Bulk", "Admin", "Subscribe"]
+
+    proc svClassEnv(class: int) -> text:
+        let names = ["FACETQL_RATE_READ", "FACETQL_RATE_WRITE", "FACETQL_RATE_BULK", "FACETQL_RATE_ADMIN", "FACETQL_RATE_SUBSCRIBE"]
+        return names[class]
+
+    # parse_rate_from: unset is the class default, `off` is no limit,
+    # `burst[:refill]` with both positive, anything else the default.
+    proc svParseRate(class: int) -> SvRate uses io.env:
+        let bursts = [600.0, 300.0, 120.0, 60.0, 30.0]
+        let refills = [300.0, 150.0, 60.0, 30.0, 5.0]
+        let dflt = SvRate{on: true, burst: bursts[class], refill: refills[class]}
+        let name = do svClassEnv(class)
+        if !envSet(name):
+            return dflt
+        let raw = trim(envVar(name))
+        if lower(raw) == "off":
+            return SvRate{on: false, burst: 0.0, refill: 0.0}
+        let colon = do hIndexOf(raw, ":")
+        let mut b = raw
+        let mut r = ""
+        let mut hasR = false
+        if colon >= 0:
+            b = trim(slice(raw, 0, colon))
+            r = trim(slice(raw, colon + 1, len(raw)))
+            hasR = true
+        let bp = do svParseF64(b)
+        if !bp.ok || bp.f <= 0.0:
+            return dflt
+        if !hasR:
+            return SvRate{on: true, burst: bp.f, refill: bp.f}
+        let rp = do svParseF64(r)
+        if !rp.ok || rp.f <= 0.0:
+            return dflt
+        return SvRate{on: true, burst: bp.f, refill: rp.f}
+
+    # parse_token_entries: `token:owner[:admin]`, comma-separated; later
+    # entries win (they are collected into a map).
+    struct SvTokens:
+        hashes: [text]
+        owners: [text]
+        admins: [bool]
+
+    proc svParseTokens(raw: text) -> SvTokens:
+        let mut hashes = []
+        let mut owners = []
+        let mut admins = []
+        let entries = split(raw, ",")
+        let mut i = 0
+        loop i < len(entries):
+            let e = entries[i]
+            let c1 = do hIndexOf(e, ":")
+            if c1 >= 0:
+                let token = trim(slice(e, 0, c1))
+                let rest = slice(e, c1 + 1, len(e))
+                let c2 = do hIndexOf(rest, ":")
+                let mut owner = trim(rest)
+                let mut admin = false
+                if c2 >= 0:
+                    owner = trim(slice(rest, 0, c2))
+                    admin = trim(slice(rest, c2 + 1, len(rest))) == "admin"
+                if token != "" && owner != "":
+                    hashes = append(hashes, sha256Hex(token))
+                    owners = append(owners, owner)
+                    admins = append(admins, admin)
+            i = i + 1
+        return SvTokens{hashes: hashes, owners: owners, admins: admins}
+
+    proc svDevToken() -> text:
+        return "dev-local-key-change-me"
+
+    proc svConfig() -> SvConfig uses io.console, io.env:
+        let w = do svAliasWarnings()
+        let mut dir = svEnv("FACETQL_DATA_DIR")
+        if dir == "":
+            dir = envVar("HOME") + "/.facetql"
+        if charAt(dir, len(dir) - 1) != "/":
+            dir = dir + "/"
+        let mut port = 8080
+        if svEnvSet("FACETQL_PORT"):
+            let pu = do hParseUint(trim(svEnv("FACETQL_PORT")))
+            if !pu.ok || pu.v > 65535:
+                let e0 = writeStderr("error: invalid value '" + svEnv("FACETQL_PORT") + "' for '--port <PORT>': invalid digit found in string\n")
+                return SvConfig{ok: false, dataDir: dir, port: 0, keyHex: "", dev: false, corsAny: false, origins: [], maxBody: 0, rates: [], tokHashes: [], tokOwners: [], tokAdmins: [], interval: 0, rotateBytes: 0, maxSubscribers: 0, maxConcurrent: 0, timeoutSecs: 0}
+            port = pu.v
+        let envName = lower(trim(envVar("FACETQL_ENV")))
+        let dev = envName == "development" || envName == "dev" || envName == "test"
+        let originsRaw = trim(envVar("FACETQL_ALLOWED_ORIGINS"))
+        let corsAny = dev || originsRaw == "*"
+        let mut origins = []
+        let parts = split(originsRaw, ",")
+        let mut i = 0
+        loop i < len(parts):
+            let o = trim(parts[i])
+            if o != "":
+                origins = append(origins, o)
+            i = i + 1
+        let mut maxBody = do svEnvUsize("FACETQL_MAX_BODY_BYTES")
+        if maxBody == 0:
+            maxBody = 4194304
+        let mut rates = []
+        let mut c = 0
+        loop c < 5:
+            let r = do svParseRate(c)
+            rates = append(rates, r)
+            c = c + 1
+        let mut toks = SvTokens{hashes: [], owners: [], admins: []}
+        if svEnvSet("FACETQL_TOKENS"):
+            toks = do svParseTokens(svEnv("FACETQL_TOKENS"))
+        else:
+            toks = SvTokens{hashes: [sha256Hex(svDevToken())], owners: ["dev"], admins: [true]}
+        let mut interval = 256
+        let iv = do hParseUint(envVar("FACETQL_CHECKPOINT_INTERVAL"))
+        if iv.ok && iv.v > 0:
+            interval = iv.v
+        let mut rotate = 67108864
+        let rv = do hParseUint(envVar("FACETQL_WAL_ROTATE_BYTES"))
+        if rv.ok && rv.v > 0:
+            rotate = rv.v
+        let mut maxSubs = do svEnvUsize("FACETQL_MAX_SUBSCRIBERS")
+        if maxSubs == 0:
+            maxSubs = 256
+        let mut maxConc = do svEnvUsize("FACETQL_MAX_CONCURRENT_REQUESTS")
+        if maxConc == 0:
+            maxConc = 512
+        let mut tsecs = do svEnvUsize("FACETQL_REQUEST_TIMEOUT_SECS")
+        if tsecs == 0:
+            tsecs = 30
+        return SvConfig{ok: true, dataDir: dir, port: port, keyHex: svEnv("FACETQL_MASTER_KEY"), dev: dev, corsAny: corsAny, origins: origins, maxBody: maxBody, rates: rates, tokHashes: toks.hashes, tokOwners: toks.owners, tokAdmins: toks.admins, interval: interval, rotateBytes: rotate, maxSubscribers: maxSubs, maxConcurrent: maxConc, timeoutSecs: tsecs}
+
+    # ── the deployment posture (main.rs's enforce_deployment_posture) ──
+    struct SvKey:
+        ok: bool
+        why: text
+        key: [int]
+
+    # decode_hex, then the AES-256 length.
+    proc svDecodeKey(raw: text) -> SvKey:
+        let s = trim(raw)
+        if len(s) % 2 != 0:
+            return SvKey{ok: false, why: "hex string has an odd number of characters", key: []}
+        let bs = textToBytes(s)
+        let mut out = []
+        let mut i = 0
+        loop i < len(bs):
+            let hi = do httpHexValue(bs[i])
+            let lo = do httpHexValue(bs[i + 1])
+            if hi < 0 || lo < 0:
+                return SvKey{ok: false, why: "invalid hex at position " + i + ": invalid digit found in string", key: []}
+            out = append(out, hi * 16 + lo)
+            i = i + 2
+        return SvKey{ok: true, why: "", key: out}
+
+    proc svFindings(cfg: SvConfig) -> [text] uses io.env:
+        let mut findings = []
+        if !svEnvSet("FACETQL_TOKENS"):
+            findings = append(findings, "FACETQL_TOKENS is not set, so the only credential this server would accept is the built-in development admin token — a value published in this source file")
+        else:
+            if len(cfg.tokHashes) == 0:
+                findings = append(findings, "FACETQL_TOKENS is set but no entry in it parsed as `token:owner[:admin]`, which leaves the credential store empty and falls back to the built-in development admin token")
+            else:
+                let dev = sha256Hex(svDevToken())
+                if dev in cfg.tokHashes:
+                    findings = append(findings, "FACETQL_TOKENS hands out the built-in development admin token, whose value is published in this source file")
+        if !svEnvSet("FACETQL_MASTER_KEY"):
+            findings = append(findings, "FACETQL_MASTER_KEY is not set, so every record, write-ahead log frame and history entry would be encrypted under the all-zero development key — which is to say, not encrypted")
+        else:
+            let k = do svDecodeKey(cfg.keyHex)
+            if !k.ok:
+                findings = append(findings, "FACETQL_MASTER_KEY is not a usable AES-256 key: " + k.why)
+            else:
+                if len(k.key) != 32:
+                    findings = append(findings, "FACETQL_MASTER_KEY is not a usable AES-256 key: it decodes to " + len(k.key) + " bytes, not the 32 AES-256 requires")
+                else:
+                    let mut zero = true
+                    let mut i = 0
+                    loop i < 32:
+                        if k.key[i] != 0:
+                            zero = false
+                        i = i + 1
+                    if zero:
+                        findings = append(findings, "FACETQL_MASTER_KEY is set to the all-zero development key, which is a published constant and protects nothing")
+        if !envSet("FACETQL_ALLOW_PLAINTEXT"):
+            findings = append(findings, "no TLS identity is configured, so every request — including the x-api-key bearer token in its header — would cross the network in the clear")
+        return findings
+
+    # svPosture: true when the server may start.
+    proc svPosture(cfg: SvConfig) -> bool uses io.console, io.env:
+        let findings = do svFindings(cfg)
+        if len(findings) == 0:
+            return true
+        if cfg.dev:
+            let mut out = "\nFacetQL is running in DEVELOPMENT posture (FACETQL_ENV=development). Not safe for real data:\n"
+            let mut i = 0
+            loop i < len(findings):
+                out = out + "  - " + findings[i] + "\n"
+                i = i + 1
+            let w = writeStderr(out + "\n")
+            return true
+        let mut msg = "\nFacetQL refused to start — the configuration is not one it will serve with.\n\n  Posture: production (the default; FACETQL_ENV is not set to `development`)\n\n  What is wrong:\n"
+        let mut j = 0
+        loop j < len(findings):
+            msg = msg + "    - " + findings[j] + "\n"
+            j = j + 1
+        msg = msg + "\n  Next steps — set what applies, then start again:\n    1. Real bootstrap credentials, at least one of them an admin:\n         export FACETQL_TOKENS=\"$(openssl rand -hex 32):root:admin\"\n       Then create every further identity through POST /admin/users.\n    2. A real at-rest key — 64 hex characters, kept with the data it\n       encrypts, because losing it loses the database:\n         export FACETQL_MASTER_KEY=\"$(openssl rand -hex 32)\"\n    3. TLS. Either serve it here:\n         --tls-identity <file.p12> --tls-identity-password <password>\n       or, if TLS is terminated by a proxy in front of this process,\n       say so explicitly:\n         export FACETQL_ALLOW_PLAINTEXT=1\n\n  If this really is a development machine and none of the above is\n  meant to be real:\n         export FACETQL_ENV=development\n\n"
+        let w2 = writeStderr(msg)
+        return false
+
+    # ── state the loop owns ────────────────────────────────────────────
+    # The event feed (database.rs's EventFeed): the retained ring and the
+    # earliest position a resume may name.
+    struct SvFeed:
+        seqs: [int]
+        payloads: [text]
+        everyone: [bool]
+        owners: [text]
+        earliest: int
+
+    struct SvSubs:
+        conns: [int]
+        owners: [text]
+        admins: [bool]
+
+    struct SvBuckets:
+        keys: [text]
+        tokens: [float]
+        updated: [int]
+
+    struct SvMetrics:
+        started: int
+        total: int
+        read: int
+        write: int
+        excluded: int
+        unclassified: int
+        readHist: [int]
+        writeHist: [int]
+        winOpened: int
+        winClosed: int
+        readOpen: [int]
+        writeOpen: [int]
+        lastDuration: int
+        lastRead: text
+        lastWrite: text
+
+    struct SvState:
+        cfg: SvConfig
+        eng: FqEngine
+        feed: SvFeed
+        subs: SvSubs
+        buckets: SvBuckets
+        met: SvMetrics
+
+    proc svWithEng(st: SvState, e: FqEngine) -> SvState:
+        return SvState{cfg: st.cfg, eng: e, feed: st.feed, subs: st.subs, buckets: st.buckets, met: st.met}
+
+    # ── a request, as the loop sees it ─────────────────────────────────
+    struct SvReq:
+        conn: int
+        method: text
+        path: text
+        query: text
+        hasQuery: bool
+        headers: [HttpHeader]
+        body: text
+        tooLarge: bool
+
+    struct SvIdent:
+        owner: text
+        admin: bool
+
+    struct SvOut:
+        st: SvState
+        resp: HttpServerResponse
+        sse: bool
+
+    proc svOut(st: SvState, r: HttpServerResponse) -> SvOut:
+        return SvOut{st: st, resp: r, sse: false}
+
+    # svWire: the request's fields between a handler and the loop, each
+    # length-prefixed.
+    proc svPack(fields: [text]) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < len(fields):
+            out = out + len(fields[i]) + ":" + fields[i]
+            i = i + 1
+        return out
+
+    proc svUnpack(s: text) -> [text]:
+        let mut out = []
+        let n = len(s)
+        let mut p = 0
+        loop p < n:
+            let mut q = p
+            loop charAt(s, q) != ":":
+                q = q + 1
+            let k = toInt(slice(s, p, q))
+            out = append(out, slice(s, q + 1, q + 1 + k))
+            p = q + 1 + k
+        return out
+
+    proc svBoolText(b: bool) -> text:
+        if b:
+            return "1"
+        return "0"
+
+    proc svReqPack(reply: int, c: int, r: HttpServerRequest, tooLarge: bool) -> text:
+        let mut f = ["" + reply, "" + c, r.method, r.path, r.query, svBoolText(r.hasQuery), svBoolText(tooLarge), r.body]
+        let mut i = 0
+        loop i < len(r.headers):
+            f = append(f, r.headers[i].name)
+            f = append(f, r.headers[i].value)
+            i = i + 1
+        let p = do svPack(f)
+        return "Q" + p
+
+    proc svReqUnpack(f: [text]) -> SvReq:
+        let mut hs = []
+        let mut i = 8
+        loop i + 1 < len(f):
+            hs = append(hs, HttpHeader{name: f[i], value: f[i + 1]})
+            i = i + 2
+        return SvReq{conn: toInt(f[1]), method: f[2], path: f[3], query: f[4], hasQuery: f[5] == "1", headers: hs, body: f[7], tooLarge: f[6] == "1"}
+
+    proc svRespPack(r: HttpServerResponse, sse: bool) -> text:
+        let mut f = ["" + r.status, svBoolText(sse), r.body]
+        let mut i = 0
+        loop i < len(r.headers):
+            f = append(f, r.headers[i].name)
+            f = append(f, r.headers[i].value)
+            i = i + 1
+        let p = do svPack(f)
+        return p
+
+    struct SvReply:
+        sse: bool
+        resp: HttpServerResponse
+
+    proc svRespUnpack(s: text) -> SvReply:
+        let f = do svUnpack(s)
+        let mut hs = []
+        let mut i = 3
+        loop i + 1 < len(f):
+            hs = append(hs, HttpHeader{name: f[i], value: f[i + 1]})
+            i = i + 2
+        return SvReply{sse: f[1] == "1", resp: HttpServerResponse{status: toInt(f[0]), reason: "", headers: hs, body: f[2]}}
+
+    # ── routing (create_router) ────────────────────────────────────────
+    # svRoute: the route pattern the path matches ("" for none), its
+    # parameter, and the methods it answers (axum's `allow`, in the order
+    # the routes were registered; a GET route answers HEAD too).
+    struct SvRoute:
+        pattern: text
+        param: text
+        allow: [text]
+        paramOk: bool
+
+    proc svNoRoute() -> SvRoute:
+        return SvRoute{pattern: "", param: "", allow: [], paramOk: true}
+
+    proc svMatch(path: text) -> SvRoute:
+        if path == "/":
+            return SvRoute{pattern: "/", param: "", allow: ["GET", "HEAD"], paramOk: true}
+        if charAt(path, 0) != "/":
+            let n0 = do svNoRoute()
+            return n0
+        let segs = split(slice(path, 1, len(path)), "/")
+        let n = len(segs)
+        let mut k = 0
+        loop k < n:
+            if segs[k] == "":
+                let n1 = do svNoRoute()
+                return n1
+            k = k + 1
+        let s0 = segs[0]
+        if n == 1:
+            if s0 == "node":
+                return SvRoute{pattern: "/node", param: "", allow: ["POST"], paramOk: true}
+            if s0 == "nodes":
+                return SvRoute{pattern: "/nodes", param: "", allow: ["GET", "HEAD"], paramOk: true}
+            if s0 == "edge":
+                return SvRoute{pattern: "/edge", param: "", allow: ["POST", "DELETE"], paramOk: true}
+            if s0 == "transaction":
+                return SvRoute{pattern: "/transaction", param: "", allow: ["POST"], paramOk: true}
+            if s0 == "events":
+                return SvRoute{pattern: "/events", param: "", allow: ["GET", "HEAD"], paramOk: true}
+            if s0 == "changes":
+                return SvRoute{pattern: "/changes", param: "", allow: ["GET", "HEAD"], paramOk: true}
+            if s0 == "publish":
+                return SvRoute{pattern: "/publish", param: "", allow: ["POST"], paramOk: true}
+            if s0 == "stats":
+                return SvRoute{pattern: "/stats", param: "", allow: ["GET", "HEAD"], paramOk: true}
+        if n == 2:
+            if s0 == "node":
+                let d = do hPercentDecode(segs[1], false)
+                return SvRoute{pattern: "/node/:address", param: d.text, allow: ["GET", "HEAD", "PUT", "DELETE"], paramOk: d.ok}
+            if s0 == "nodes":
+                let names = ["multiget", "query", "count", "count_by", "aggregate", "aggregate_by"]
+                if segs[1] in names:
+                    return SvRoute{pattern: "/nodes/" + segs[1], param: "", allow: ["POST"], paramOk: true}
+            if s0 == "admin":
+                if segs[1] == "users" || segs[1] == "indexes" || segs[1] == "references":
+                    return SvRoute{pattern: "/admin/" + segs[1], param: "", allow: ["POST", "GET", "HEAD"], paramOk: true}
+        if n == 3:
+            if s0 == "node":
+                let tails = ["history", "owned", "claim"]
+                if segs[2] in tails:
+                    let d2 = do hPercentDecode(segs[1], false)
+                    let mut al = ["GET", "HEAD"]
+                    if segs[2] == "claim":
+                        al = ["POST"]
+                    return SvRoute{pattern: "/node/:address/" + segs[2], param: d2.text, allow: al, paramOk: d2.ok}
+            if s0 == "sequence" && segs[2] == "next":
+                let d3 = do hPercentDecode(segs[1], false)
+                return SvRoute{pattern: "/sequence/:name/next", param: d3.text, allow: ["POST"], paramOk: d3.ok}
+            if s0 == "admin":
+                if segs[1] == "users":
+                    let d4 = do hPercentDecode(segs[2], false)
+                    return SvRoute{pattern: "/admin/users/:owner", param: d4.text, allow: ["DELETE"], paramOk: d4.ok}
+                if segs[1] == "indexes" || segs[1] == "references":
+                    let d5 = do hPercentDecode(segs[2], false)
+                    return SvRoute{pattern: "/admin/" + segs[1] + "/:name", param: d5.text, allow: ["DELETE"], paramOk: d5.ok}
+        if n == 4 && s0 == "node" && segs[2] == "edges" && (segs[3] == "out" || segs[3] == "in"):
+            let d6 = do hPercentDecode(segs[1], false)
+            return SvRoute{pattern: "/node/:address/edges/" + segs[3], param: d6.text, allow: ["GET", "HEAD"], paramOk: d6.ok}
+        let n2 = do svNoRoute()
+        return n2
+
+    # EndpointClass::of — over the raw path, as limits.rs classifies it:
+    # 0 Read, 1 Write, 2 Bulk, 3 Admin, 4 Subscribe.
+    proc svClassOf(method: text, path: text) -> int:
+        let raw = split(path, "/")
+        let mut segs = []
+        let mut i = 0
+        loop i < len(raw):
+            if raw[i] != "":
+                segs = append(segs, raw[i])
+            i = i + 1
+        let n = len(segs)
+        if n == 0:
+            return 0
+        let s0 = segs[0]
+        if s0 == "admin" || (n == 1 && s0 == "stats"):
+            return 3
+        if n == 1 && s0 == "events":
+            return 4
+        if n == 2 && s0 == "nodes" && segs[1] in ["multiget", "query", "count", "count_by", "aggregate", "aggregate_by"]:
+            return 2
+        if n == 1 && (s0 == "transaction" || s0 == "changes"):
+            return 2
+        if n == 1 && (s0 == "publish" || s0 == "edge" || s0 == "node"):
+            return 1
+        if n == 3 && s0 == "node" && segs[2] == "claim":
+            return 1
+        if n == 3 && s0 == "sequence" && segs[2] == "next":
+            return 1
+        if n == 1 && s0 == "nodes":
+            return 0
+        if n == 3 && s0 == "node" && (segs[2] == "history" || segs[2] == "owned"):
+            return 0
+        if n == 4 && s0 == "node" && segs[2] == "edges":
+            return 0
+        if n == 2 && s0 == "node":
+            if method == "GET":
+                return 0
+            return 1
+        return 3
+
+    # metrics.rs's classify, over the matched route: 0 read, 1 write,
+    # 2 excluded, 3 unclassified.
+    proc svMetricClass(method: text, pattern: text) -> int:
+        if pattern == "/node":
+            if method == "POST":
+                return 1
+            return 3
+        if pattern == "/node/:address":
+            if method == "GET":
+                return 0
+            if method == "PUT" || method == "DELETE":
+                return 1
+            return 3
+        let reads = ["/node/:address/history", "/node/:address/owned", "/node/:address/edges/out", "/node/:address/edges/in", "/nodes", "/nodes/multiget", "/nodes/query", "/nodes/count", "/nodes/count_by", "/nodes/aggregate", "/nodes/aggregate_by"]
+        if pattern in reads:
+            return 0
+        if pattern in ["/node/:address/claim", "/sequence/:name/next", "/edge", "/transaction"]:
+            return 1
+        if pattern in ["/publish", "/stats", "/", "/events", "/changes"] || hHasPrefixT(pattern, "/admin/"):
+            return 2
+        return 3
+
+    # ── CORS (cors_layer) ──────────────────────────────────────────────
+    proc svCors(cfg: SvConfig, req: SvReq, r: HttpServerResponse) -> HttpServerResponse:
+        let mut out = do hWithHeader(r, "vary", "origin, access-control-request-method, access-control-request-headers")
+        if cfg.corsAny:
+            out = do hWithHeader(out, "access-control-allow-origin", "*")
+            return out
+        let origin = do httpHeaderValue(req.headers, "origin")
+        if httpHasHeader(req.headers, "origin") && origin in cfg.origins:
+            out = do hWithHeader(out, "access-control-allow-origin", origin)
+        return out
+
+    proc svPreflight(cfg: SvConfig, req: SvReq) -> HttpServerResponse:
+        let mut out = do hEmpty(200)
+        let origin = do httpHeaderValue(req.headers, "origin")
+        if cfg.corsAny:
+            out = do hWithHeader(out, "access-control-allow-origin", "*")
+        else:
+            if httpHasHeader(req.headers, "origin") && origin in cfg.origins:
+                out = do hWithHeader(out, "access-control-allow-origin", origin)
+        out = do hWithHeader(out, "vary", "origin, access-control-request-method, access-control-request-headers")
+        out = do hWithHeader(out, "access-control-allow-methods", "GET,POST,PUT,DELETE")
+        if cfg.corsAny:
+            out = do hWithHeader(out, "access-control-allow-headers", "*")
+        else:
+            out = do hWithHeader(out, "access-control-allow-headers", "content-type,x-api-key")
+        return out
+
+    # ── auth (auth_middleware) ─────────────────────────────────────────
+    struct SvAuth:
+        ok: bool
+        resp: HttpServerResponse
+        id: SvIdent
+
+    proc svAuth(st: SvState, req: SvReq) -> SvAuth:
+        let none = SvIdent{owner: "", admin: false}
+        let hasHeader = do httpHasHeader(req.headers, "x-api-key")
+        let mut provided = do httpHeaderValue(req.headers, "x-api-key")
+        let mut has = hasHeader
+        if !hasHeader && req.hasQuery:
+            let pairs = split(req.query, "&")
+            let mut i = 0
+            loop i < len(pairs) && !has:
+                let eq = do hIndexOf(pairs[i], "=")
+                if eq >= 0 && slice(pairs[i], 0, eq) == "key":
+                    provided = slice(pairs[i], eq + 1, len(pairs[i]))
+                    has = true
+                i = i + 1
+        if !has:
+            let r = do hText(401, "missing x-api-key header (or ?key= for SSE)")
+            return SvAuth{ok: false, resp: r, id: none}
+        let hash = sha256Hex(provided)
+        let cfg = st.cfg
+        let mut k = len(cfg.tokHashes) - 1
+        loop k >= 0:
+            if cfg.tokHashes[k] == hash:
+                return SvAuth{ok: true, resp: hEmpty(200), id: SvIdent{owner: cfg.tokOwners[k], admin: cfg.tokAdmins[k]}}
+            k = k - 1
+        let u = do enFindUserByHash(st.eng, hash)
+        if u.found:
+            return SvAuth{ok: true, resp: hEmpty(200), id: SvIdent{owner: u.user.owner, admin: roleIsAdmin(u.user.role)}}
+        let r2 = do hText(401, "invalid x-api-key")
+        return SvAuth{ok: false, resp: r2, id: none}
+
+    # ── rate limiting (limits.rs's token buckets) ──────────────────────
+    struct SvLimited:
+        ok: bool
+        st: SvState
+        resp: HttpServerResponse
+
+    # Rust's `{}` of an f64 (no exponent, shortest digits).
+    proc svF64Display(f: float) -> text:
+        let t = do sjF64Text(f)
+        if hHasSuffixT(t, ".0"):
+            return slice(t, 0, len(t) - 2)
+        return t
+
+    proc svCeil(f: float) -> int:
+        let t = toInt(f)
+        if toFloat(t) < f:
+            return t + 1
+        return t
+
+    proc svBucketFull(b: SvBuckets, i: int, rate: SvRate, now: int) -> bool:
+        let elapsed = toFloat(now - b.updated[i]) / 1000.0
+        return b.tokens[i] + elapsed * rate.refill >= rate.burst
+
+    proc svRateLimit(st: SvState, req: SvReq, id: SvIdent) -> SvLimited:
+        let class = do svClassOf(req.method, req.path)
+        let rate = st.cfg.rates[class]
+        if !rate.on:
+            return SvLimited{ok: true, st: st, resp: hEmpty(200)}
+        let now = monoMs()
+        let key = id.owner + "\n" + class
+        let mut b = st.buckets
+        let mut at = do fqwIndexOfText(b.keys, key)
+        let mut retry = -1
+        let mut allowed = false
+        if at < 0 && len(b.keys) >= 10000:
+            let mut keys = []
+            let mut tokens = []
+            let mut updated = []
+            let mut i = 0
+            loop i < len(b.keys):
+                let parts = split(b.keys[i], "\n")
+                let r = st.cfg.rates[toInt(parts[len(parts) - 1])]
+                if r.on && !svBucketFull(b, i, r, now):
+                    keys = append(keys, b.keys[i])
+                    tokens = append(tokens, b.tokens[i])
+                    updated = append(updated, b.updated[i])
+                i = i + 1
+            b = SvBuckets{keys: keys, tokens: tokens, updated: updated}
+            if len(b.keys) >= 10000:
+                let st1 = SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: st.subs, buckets: b, met: st.met}
+                let r1 = do svTooMany(class, rate, -1)
+                return SvLimited{ok: false, st: st1, resp: r1}
+        if at < 0:
+            b = SvBuckets{keys: append(b.keys, key), tokens: append(b.tokens, rate.burst), updated: append(b.updated, now)}
+            at = len(b.keys) - 1
+        let elapsed = toFloat(now - b.updated[at]) / 1000.0
+        let mut tokens = b.tokens[at] + elapsed * rate.refill
+        if tokens > rate.burst:
+            tokens = rate.burst
+        let mut upd = b.updated
+        upd[at] = now
+        if tokens >= 1.0:
+            tokens = tokens - 1.0
+            allowed = true
+        else:
+            retry = do svCeil((1.0 - tokens) / rate.refill)
+        let mut toks = b.tokens
+        toks[at] = tokens
+        b = SvBuckets{keys: b.keys, tokens: toks, updated: upd}
+        let st2 = SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: st.subs, buckets: b, met: st.met}
+        if allowed:
+            return SvLimited{ok: true, st: st2, resp: hEmpty(200)}
+        let r2 = do svTooMany(class, rate, retry)
+        return SvLimited{ok: false, st: st2, resp: r2}
+
+    proc svTooMany(class: int, rate: SvRate, retry: int) -> HttpServerResponse:
+        let names = do svClassNames()
+        let env = do svClassEnv(class)
+        let mut r = do hText(429, "rate limit exceeded for " + names[class] + " requests by this identity (" + svF64Display(rate.burst) + " burst, " + svF64Display(rate.refill) + "/s). Retry after the interval in the Retry-After header, or raise " + env + " on the server.")
+        if retry >= 0:
+            r = do hWithHeader(r, "retry-after", "" + retry)
+        return r
+
+    # ── metrics (metrics.rs) ───────────────────────────────────────────
+    proc svZeros(n: int) -> [int]:
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            out = append(out, 0)
+            i = i + 1
+        return out
+
+    proc svMetricsNew() -> SvMetrics:
+        let z = do svZeros(512)
+        let t = monoMs()
+        let empty = "{\"count\":0,\"p50_us\":null,\"p99_us\":null,\"max_us\":null}"
+        return SvMetrics{started: t, total: 0, read: 0, write: 0, excluded: 0, unclassified: 0, readHist: z, writeHist: z, winOpened: t, winClosed: -1, readOpen: z, writeOpen: z, lastDuration: 0, lastRead: empty, lastWrite: empty}
+
+    # bucket_index / bucket_upper_us: a log-linear histogram, eight
+    # sub-buckets per octave.
+    proc svBucketIndex(us: int) -> int:
+        if us < 8:
+            return us
+        let mut msb = 0
+        let mut v = us
+        loop v > 1:
+            v = v / 2
+            msb = msb + 1
+        let sub = (us >> (msb - 3)) & 7
+        let idx = (msb - 3 + 1) * 8 + sub
+        if idx > 511:
+            return 511
+        return idx
+
+    proc svBucketUpper(index: int) -> int:
+        if index < 8:
+            return index
+        let octave = index / 8
+        let sub = index % 8
+        let msb = octave + 3 - 1
+        let width = 1 << (msb - 3)
+        let base = (8 + sub) << (msb - 3)
+        return base + width - 1
+
+    proc svLatencyJson(delta: [int]) -> text:
+        let mut count = 0
+        let mut i = 0
+        loop i < 512:
+            count = count + delta[i]
+            i = i + 1
+        if count == 0:
+            return "{\"count\":0,\"p50_us\":null,\"p99_us\":null,\"max_us\":null}"
+        let p50 = do svQuantile(delta, count, 50)
+        let p99 = do svQuantile(delta, count, 99)
+        let mut last = 511
+        loop last >= 0 && delta[last] == 0:
+            last = last - 1
+        return "{\"count\":" + count + ",\"p50_us\":" + p50 + ",\"p99_us\":" + p99 + ",\"max_us\":" + svBucketUpper(last) + "}"
+
+    # the rank ceil(count × q), at least 1, walked to its bucket.
+    proc svQuantile(delta: [int], count: int, pct: int) -> text:
+        let mut rank = (count * pct + 99) / 100
+        if rank < 1:
+            rank = 1
+        let mut seen = 0
+        let mut i = 0
+        loop i < 512:
+            seen = seen + delta[i]
+            if seen >= rank:
+                return "" + svBucketUpper(i)
+            i = i + 1
+        return "null"
+
+    proc svRecord(m: SvMetrics, class: int, us: int) -> SvMetrics:
+        let idx = do svBucketIndex(us)
+        let mut rh = m.readHist
+        let mut wh = m.writeHist
+        if class == 0:
+            rh[idx] = rh[idx] + 1
+        if class == 1:
+            wh[idx] = wh[idx] + 1
+        return SvMetrics{started: m.started, total: m.total, read: m.read, write: m.write, excluded: m.excluded, unclassified: m.unclassified, readHist: rh, writeHist: wh, winOpened: m.winOpened, winClosed: m.winClosed, readOpen: m.readOpen, writeOpen: m.writeOpen, lastDuration: m.lastDuration, lastRead: m.lastRead, lastWrite: m.lastWrite}
+
+    proc svCount(m: SvMetrics, class: int) -> SvMetrics:
+        let mut r = m.read
+        let mut w = m.write
+        let mut x = m.excluded
+        let mut u = m.unclassified
+        if class == 0:
+            r = r + 1
+        if class == 1:
+            w = w + 1
+        if class == 2:
+            x = x + 1
+        if class == 3:
+            u = u + 1
+        return SvMetrics{started: m.started, total: m.total + 1, read: r, write: w, excluded: x, unclassified: u, readHist: m.readHist, writeHist: m.writeHist, winOpened: m.winOpened, winClosed: m.winClosed, readOpen: m.readOpen, writeOpen: m.writeOpen, lastDuration: m.lastDuration, lastRead: m.lastRead, lastWrite: m.lastWrite}
+
+    struct SvRuntime:
+        met: SvMetrics
+        json: text
+
+    # snapshot(): the counters, the window (closed and reopened once it
+    # has run a second), and the process section.
+    proc svRuntime(m0: SvMetrics, maxConcurrent: int) -> SvRuntime:
+        let now = monoMs()
+        let mut m = m0
+        let elapsed = now - m.winOpened
+        if elapsed >= 1000:
+            let mut rd = svZeros(512)
+            let mut wd = svZeros(512)
+            let mut i = 0
+            loop i < 512:
+                rd[i] = m.readHist[i] - m.readOpen[i]
+                wd[i] = m.writeHist[i] - m.writeOpen[i]
+                i = i + 1
+            let lr = do svLatencyJson(rd)
+            let lw = do svLatencyJson(wd)
+            m = SvMetrics{started: m.started, total: m.total, read: m.read, write: m.write, excluded: m.excluded, unclassified: m.unclassified, readHist: m.readHist, writeHist: m.writeHist, winOpened: now, winClosed: now, readOpen: m.readHist, writeOpen: m.writeHist, lastDuration: elapsed, lastRead: lr, lastWrite: lw}
+        let mut age = 0
+        if m.winClosed >= 0:
+            age = now - m.winClosed
+        let requests = "{\"total\":" + m.total + ",\"read\":" + m.read + ",\"write\":" + m.write + ",\"excluded\":" + m.excluded + ",\"unclassified\":" + m.unclassified + ",\"in_flight\":1,\"max_concurrent\":" + maxConcurrent + ",\"write_queue_depth\":0,\"write_queue_contended_total\":0}"
+        let window = "{\"duration_ms\":" + m.lastDuration + ",\"age_ms\":" + age + ",\"cpu_utilization\":null,\"read_latency\":" + m.lastRead + ",\"write_latency\":" + m.lastWrite + "}"
+        let process = "{\"cpu_seconds_total\":null,\"cpu_cores\":null,\"resident_bytes\":null,\"memory_limit_bytes\":null,\"memory_limit_source\":null,\"memory_utilization\":null}"
+        let json = "{\"uptime_seconds\":" + ((now - m.started) / 1000) + ",\"requests\":" + requests + ",\"window\":" + window + ",\"process\":" + process + "}"
+        return SvRuntime{met: m, json: json}
+
+    # ── the event feed and its subscribers ─────────────────────────────
+    # svJsonObject: serde_json::json!'s object — a BTreeMap, so keys sort.
+    proc svJsonObject(keys0: [text], vals0: [text]) -> text:
+        let mut keys = keys0
+        let mut vals = vals0
+        let n = len(keys)
+        let mut i = 1
+        loop i < n:
+            let k = keys[i]
+            let v = vals[i]
+            let mut j = i - 1
+            loop j >= 0 && qvCmpBytesE(textToBytes(keys[j]), textToBytes(k)) > 0:
+                keys[j + 1] = keys[j]
+                vals[j + 1] = vals[j]
+                j = j - 1
+            keys[j + 1] = k
+            vals[j + 1] = v
+            i = i + 1
+        let mut out = "{"
+        let mut m = 0
+        loop m < n:
+            if m > 0:
+                out = out + ","
+            out = out + fjQuote(keys[m]) + ":" + vals[m]
+            m = m + 1
+        return out + "}"
+
+    # svFrame: the SSE frame axum writes for Event::default().id(seq)
+    # .data(payload) — "" when the payload holds a carriage return, which
+    # axum refuses by panicking the stream.
+    proc svFrame(seq: int, payload: text) -> text:
+        if contains(payload, "\r"):
+            return ""
+        let lines = split(payload, "\n")
+        let mut out = "id: " + seq + "\n"
+        let mut i = 0
+        loop i < len(lines):
+            out = out + "data: " + lines[i] + "\n"
+            i = i + 1
+        return out + "\n"
+
+    proc svAdmits(everyone: bool, only: text, owner: text, admin: bool) -> bool:
+        return everyone || admin || only == owner
+
+    # svEmit: emit_with — the next operation id as the event's sequence,
+    # the ring trimmed to 1024, then every admitted live subscriber written
+    # to (one whose write fails is dropped and closed).
+    proc svEmit(st: SvState, everyone: bool, only: text, payload0: text, isJson: bool, keys: [text], vals: [text]) -> SvState uses io.net.listen:
+        let n = do enNextOperationId(st.eng)
+        let seq = n.v
+        let mut payload = payload0
+        if isJson:
+            payload = do svJsonObject(append(keys, "seq"), append(vals, "" + seq))
+        let mut f = st.feed
+        let mut seqs = f.seqs
+        let mut payloads = f.payloads
+        let mut evs = f.everyone
+        let mut owners = f.owners
+        let mut earliest = f.earliest
+        if len(seqs) >= 1024:
+            earliest = seqs[0]
+            seqs = slice(seqs, 1, len(seqs))
+            payloads = slice(payloads, 1, len(payloads))
+            evs = slice(evs, 1, len(evs))
+            owners = slice(owners, 1, len(owners))
+        f = SvFeed{seqs: append(seqs, seq), payloads: append(payloads, payload), everyone: append(evs, everyone), owners: append(owners, only), earliest: earliest}
+        let frame = do svFrame(seq, payload)
+        let subs = st.subs
+        let mut conns = []
+        let mut sowners = []
+        let mut admins = []
+        let mut i = 0
+        loop i < len(subs.conns):
+            let mut keep = true
+            if svAdmits(everyone, only, subs.owners[i], subs.admins[i]):
+                if frame == "":
+                    keep = false
+                else:
+                    keep = do hWriteChunk(subs.conns[i], textToBytes(frame))
+            if keep:
+                conns = append(conns, subs.conns[i])
+                sowners = append(sowners, subs.owners[i])
+                admins = append(admins, subs.admins[i])
+            else:
+                let c = closeConn(subs.conns[i])
+            i = i + 1
+        return SvState{cfg: st.cfg, eng: n.eng, feed: f, subs: SvSubs{conns: conns, owners: sowners, admins: admins}, buckets: st.buckets, met: st.met}
+
+    proc svPublishJson(st: SvState, everyone: bool, only: text, keys: [text], vals: [text]) -> SvState uses io.net.listen:
+        let r = do svEmit(st, everyone, only, "", true, keys, vals)
+        return r
+
+    # svKeepAlive: KeepAlive's empty comment to every live subscriber.
+    proc svKeepAlive(st: SvState) -> SvState uses io.net.listen:
+        let subs = st.subs
+        let mut conns = []
+        let mut owners = []
+        let mut admins = []
+        let mut i = 0
+        loop i < len(subs.conns):
+            let ok = do hWriteChunk(subs.conns[i], textToBytes(":\n\n"))
+            if ok:
+                conns = append(conns, subs.conns[i])
+                owners = append(owners, subs.owners[i])
+                admins = append(admins, subs.admins[i])
+            else:
+                let c = closeConn(subs.conns[i])
+            i = i + 1
+        return SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: SvSubs{conns: conns, owners: owners, admins: admins}, buckets: st.buckets, met: st.met}
+
+    proc svQ(s: text) -> text:
+        let q = do fjQuote(s)
+        return q
+
+    # ── shared handler pieces ──────────────────────────────────────────
+    # storage_failure: an InvalidInput (a read over the row bound, a deep
+    # offset) is the caller's to fix, a 400; anything else a 500.
+    proc svStorageFailure(err: text) -> HttpServerResponse:
+        if contains(err, " would materialize more than ") || hHasPrefixT(err, "offset "):
+            let r = do hText(400, err)
+            return r
+        let r2 = do hText(500, "storage error: " + err)
+        return r2
+
+    proc svAdminOnly() -> HttpServerResponse:
+        let r = do hText(403, "admin only")
+        return r
+
+    proc svReadable(n: Node, id: SvIdent) -> bool:
+        return id.admin || nodeCanRead(n, id.owner)
+
+    # reject_unbounded_predicate
+    proc svRejectPredicate(has: bool, pred: FqJ) -> text:
+        if !has:
+            return ""
+        let v = do prValidate(pred)
+        return v
+
+    struct SvRefusal:
+        refused: bool
+        resp: HttpServerResponse
+        eng: FqEngine
+
+    # authorize_edge: `from` must be writable (a readable node the caller
+    # may not write is a 403; one it may not read is "not found"), `to`
+    # readable; an absent endpoint is left to the engine.
+    proc svAuthorizeEdge(e0: FqEngine, id: SvIdent, from: text, to: text) -> SvRefusal uses io.file:
+        if id.admin:
+            return SvRefusal{refused: false, resp: hEmpty(200), eng: e0}
+        let f = do enGet(e0, from)
+        if !f.ok:
+            let r0 = do svStorageFailure(f.err)
+            return SvRefusal{refused: true, resp: r0, eng: f.eng}
+        if f.found:
+            if !nodeCanRead(f.node, id.owner):
+                let r1 = do hText(400, "edge 'from' address not found: " + from)
+                return SvRefusal{refused: true, resp: r1, eng: f.eng}
+            if !nodeCanWrite(f.node, id.owner):
+                let r2 = do hText(403, "not authorized to create an edge from " + from + ": an edge out of a node is a write to that node")
+                return SvRefusal{refused: true, resp: r2, eng: f.eng}
+        let t = do enGet(f.eng, to)
+        if !t.ok:
+            let r3 = do svStorageFailure(t.err)
+            return SvRefusal{refused: true, resp: r3, eng: t.eng}
+        if t.found && !nodeCanRead(t.node, id.owner):
+            let r4 = do hText(400, "edge 'to' address not found: " + to)
+            return SvRefusal{refused: true, resp: r4, eng: t.eng}
+        return SvRefusal{refused: false, resp: hEmpty(200), eng: t.eng}
+
+    struct SvPublic:
+        ok: bool
+        err: text
+        eng: FqEngine
+        v: bool
+
+    # public_endpoints: both ends exist and are public.
+    proc svPublicEndpoints(e0: FqEngine, from: text, to: text) -> SvPublic uses io.file:
+        let ends = [from, to]
+        let mut e = e0
+        let mut i = 0
+        loop i < 2:
+            let g = do enGet(e, ends[i])
+            e = g.eng
+            if !g.ok:
+                return SvPublic{ok: false, err: g.err, eng: e, v: false}
+            if !(g.found && g.node.visibility == "public"):
+                return SvPublic{ok: true, err: "", eng: e, v: false}
+            i = i + 1
+        return SvPublic{ok: true, err: "", eng: e, v: true}
+
+    proc svSpecFor(v: SjV, id: SvIdent) -> QSpec:
+        let hk = do hHas(v, 0)
+        let ho = do hHas(v, 1)
+        let hp = do hHas(v, 2)
+        let mut pred = do fjNull()
+        if hp:
+            pred = do hExprFq(v.items[2])
+        let iv = do hStrOr(v, 3, "item")
+        return QSpec{hasKind: hk, kind: hStr(v, 0), hasOwner: ho, owner: hStr(v, 1), hasRequester: !id.admin, requester: id.owner, hasPredicate: hp, predicate: pred, itemVar: iv}
+
+    proc svValues(v: SjV) -> [FqJ]:
+        let mut out = []
+        let mut i = 0
+        loop i < len(v.items):
+            let f = do hFq(v.items[i])
+            out = append(out, f)
+            i = i + 1
+        return out
+
+    # AggFunc::parse + AggSpec::new: "" when the pair is usable.
+    proc svAggSpecError(func: text, hasField: bool, field: text) -> text:
+        if !(func in ["count", "sum", "avg", "min", "max"]):
+            let q = do ckQuote(func)
+            return "unknown aggregate " + q + "; expected one of count, sum, avg, min, max"
+        if func != "count" && (!hasField || field == ""):
+            return func + " needs a field to aggregate; pass `field`"
+        if func == "count" && hasField && field != "":
+            let q2 = do ckQuote(field)
+            return "count aggregates rows, not the field " + q2 + "; omit `field`, or use a predicate to select the rows to count"
+        return ""
+
+    proc svGroupsJson(g: QGroups, withResult: bool) -> text:
+        let mut rows = []
+        let mut i = 0
+        loop i < len(g.keys):
+            let mut v = "null"
+            if g.present[i]:
+                v = do fjText(g.values[i])
+            if withResult:
+                let fin = do qaFinish(g.accs[i])
+                let rt = do fjText(fin)
+                rows = append(rows, "{\"value\":" + v + ",\"result\":" + rt + "}")
+            else:
+                rows = append(rows, "{\"value\":" + v + ",\"count\":" + g.accs[i].rows + "}")
+            i = i + 1
+        return "[" + join(rows, ",") + "]"
+
+    proc svNodeFrom(address: text, kind: text, v: SjV, xAt: int, owner: text) -> Node:
+        let c = do coordinateNew(hInt(v, xAt), hInt(v, xAt + 1), hInt(v, xAt + 2), hInt(v, xAt + 3))
+        let n = do nodeNew(c, address, kind, owner)
+        return n
+
+    # ── the handlers (routes.rs) ───────────────────────────────────────
+    proc svCreateNode(st: SvState, req: SvReq, id: SvIdent, types: [SjType]) -> SvOut uses io.file, io.net.listen:
+        let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+        let b = do hJsonBody(hr, req.tooLarge, types, "CreateNodeRequest")
+        if !b.ok:
+            let o = do svOut(st, b.resp)
+            return o
+        let v = b.v
+        let address = do hStr(v, 0)
+        let kind = do hStr(v, 1)
+        let base = do svNodeFrom(address, kind, v, 2, id.owner)
+        let mut vis = "private"
+        if hBool(v, 7):
+            vis = "public"
+        let node = Node{address: base.address, coordinate: base.coordinate, value: base.value, kind: base.kind, data: hStr(v, 6), owner: base.owner, hasClaimedBy: false, claimedBy: "", visibility: vis}
+        let mut tos = []
+        let mut kinds = []
+        if hHas(v, 8):
+            let es = v.items[8].items
+            let mut i = 0
+            loop i < len(es):
+                tos = append(tos, es[i].items[0].s)
+                kinds = append(kinds, es[i].items[1].s)
+                i = i + 1
+        let g = do enGet(st.eng, address)
+        let st1 = do svWithEng(st, g.eng)
+        if !g.ok:
+            let o1 = do svOut(st1, svStorageFailure(g.err))
+            return o1
+        if hBool(v, 9) && g.found:
+            let o2 = do svOut(st1, hText(409, "node already exists: " + address))
+            return o2
+        let ins = do txInsertWithEdges(st1.eng, node, tos, kinds, id.admin)
+        let st2 = do svWithEng(st1, ins.eng)
+        if !ins.ok:
+            if hHasPrefixT(ins.err, "not authorized"):
+                let o3 = do svOut(st2, hText(403, ins.err))
+                return o3
+            let o4 = do svOut(st2, hJson(400, "{\"error\":" + svQ(ins.err) + ",\"edges_created_before_failure\":[]}"))
+            return o4
+        let st3 = do svPublishJson(st2, vis == "public", id.owner, ["event", "address", "kind"], ["\"node_created\"", svQ(address), svQ(kind)])
+        let mut edges = []
+        let mut j = 0
+        loop j < len(tos):
+            edges = append(edges, edgeNew(address, tos[j], kinds[j], id.owner))
+            j = j + 1
+        let o5 = do svOut(st3, hJson(201, "{\"address\":" + svQ(address) + ",\"edges_created\":" + jEdges(edges) + "}"))
+        return o5
+
+    proc svGetNode(st: SvState, address: text, id: SvIdent, what: text) -> SvOut uses io.file:
+        let g = do enGet(st.eng, address)
+        let st1 = do svWithEng(st, g.eng)
+        if !g.ok:
+            let o0 = do svOut(st1, svStorageFailure(g.err))
+            return o0
+        if !g.found:
+            let o1 = do svOut(st1, hText(404, "node not found"))
+            return o1
+        if !svReadable(g.node, id):
+            let mut msg = "not authorized to read this node"
+            if what == "history":
+                msg = "not authorized to read this node's history"
+            if what == "out" || what == "in":
+                msg = "not authorized to read this node's edges"
+            let o2 = do svOut(st1, hText(403, msg))
+            return o2
+        if what == "history":
+            let h = do enHistoryFor(st1.eng, address)
+            let st2 = do svWithEng(st1, h.eng)
+            if !h.ok:
+                let o3 = do svOut(st2, svStorageFailure(h.err))
+                return o3
+            let o4 = do svOut(st2, hJson(200, jHistory(h.entries)))
+            return o4
+        if what == "out" || what == "in":
+            let es = do enEdges(st1.eng, address, what == "out")
+            let st3 = do svWithEng(st1, es.eng)
+            if !es.ok:
+                let o5 = do svOut(st3, svStorageFailure(es.err))
+                return o5
+            let o6 = do svOut(st3, hJson(200, jEdges(es.edges)))
+            return o6
+        if what == "owned":
+            let ow = do enNodesByOwner(st1.eng, g.node.owner, !id.admin, id.owner)
+            let st4 = do svWithEng(st1, ow.eng)
+            if !ow.ok:
+                let o7 = do svOut(st4, svStorageFailure(ow.err))
+                return o7
+            let o8 = do svOut(st4, hJson(200, jNodes(ow.nodes)))
+            return o8
+        let o9 = do svOut(st1, hJson(200, jNode(g.node)))
+        return o9
+
+    proc svUpdateNode(st: SvState, req: SvReq, address: text, id: SvIdent, types: [SjType]) -> SvOut uses io.file, io.net.listen:
+        let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+        let b = do hJsonBody(hr, req.tooLarge, types, "UpdateNodeRequest")
+        if !b.ok:
+            let o = do svOut(st, b.resp)
+            return o
+        let g = do enGet(st.eng, address)
+        let st1 = do svWithEng(st, g.eng)
+        if !g.ok:
+            let o0 = do svOut(st1, svStorageFailure(g.err))
+            return o0
+        if !g.found:
+            let o1 = do svOut(st1, hText(404, "node not found"))
+            return o1
+        if !id.admin && !nodeCanWrite(g.node, id.owner):
+            let o2 = do svOut(st1, hText(403, "not authorized to modify this node"))
+            return o2
+        let n = g.node
+        let mut vis = n.visibility
+        if hHas(b.v, 1):
+            vis = "private"
+            if hBool(b.v, 1):
+                vis = "public"
+        let updated = Node{address: n.address, coordinate: n.coordinate, value: n.value, kind: n.kind, data: hStr(b.v, 0), owner: n.owner, hasClaimedBy: n.hasClaimedBy, claimedBy: n.claimedBy, visibility: vis}
+        let ins = do enInsert(st1.eng, updated)
+        let st2 = do svWithEng(st1, ins.eng)
+        if !ins.ok:
+            let o3 = do svOut(st2, hText(500, ins.err))
+            return o3
+        let st3 = do svPublishJson(st2, vis == "public", n.owner, ["event", "address", "kind"], ["\"node_updated\"", svQ(address), svQ(n.kind)])
+        let o4 = do svOut(st3, hText(200, "Node updated"))
+        return o4
+
+    proc svDeleteNode(st: SvState, address: text, id: SvIdent) -> SvOut uses io.file, io.net.listen:
+        let g = do enGet(st.eng, address)
+        let st1 = do svWithEng(st, g.eng)
+        if !g.ok:
+            let o0 = do svOut(st1, svStorageFailure(g.err))
+            return o0
+        if !g.found:
+            let o1 = do svOut(st1, hText(404, "node not found"))
+            return o1
+        if !id.admin && !nodeCanWrite(g.node, id.owner):
+            let o2 = do svOut(st1, hText(403, "not authorized to delete this node"))
+            return o2
+        let d = do enDeleteK(st1.eng, address)
+        let st2 = do svWithEng(st1, d.eng)
+        if !d.ok:
+            let mut status = 500
+            if d.kind == "precondition":
+                status = 409
+            if d.kind == "invalid":
+                status = 400
+            let o3 = do svOut(st2, hText(status, d.err))
+            return o3
+        let st3 = do svPublishJson(st2, g.node.visibility == "public", g.node.owner, ["event", "address", "kind"], ["\"node_deleted\"", svQ(address), svQ(g.node.kind)])
+        let o4 = do svOut(st3, hText(204, ""))
+        return o4
+
+    proc svClaimNode(st: SvState, address: text, id: SvIdent) -> SvOut uses io.file, io.net.listen:
+        let g = do enGet(st.eng, address)
+        let st1 = do svWithEng(st, g.eng)
+        if !g.ok:
+            let o0 = do svOut(st1, svStorageFailure(g.err))
+            return o0
+        let mut everyone = false
+        let mut only = id.owner
+        let mut kind = "null"
+        if g.found:
+            if !id.admin && !nodeCanWrite(g.node, id.owner):
+                if nodeCanRead(g.node, id.owner):
+                    let o1 = do svOut(st1, hText(403, "not authorized to claim this node"))
+                    return o1
+                let o2 = do svOut(st1, hText(404, "node not found"))
+                return o2
+            everyone = g.node.visibility == "public"
+            only = g.node.owner
+            kind = do svQ(g.node.kind)
+        let c = do txClaim(st1.eng, address, id.owner)
+        let st2 = do svWithEng(st1, c.eng)
+        if !c.ok:
+            if c.err == "node not found":
+                let o3 = do svOut(st2, hText(404, "node not found"))
+                return o3
+            if hHasPrefixT(c.err, "already claimed by "):
+                let o4 = do svOut(st2, hText(409, c.err))
+                return o4
+            let o5 = do svOut(st2, hText(500, c.err))
+            return o5
+        let st3 = do svPublishJson(st2, everyone, only, ["event", "address", "kind", "worker"], ["\"node_claimed\"", svQ(address), kind, svQ(id.owner)])
+        let o6 = do svOut(st3, hText(200, "claimed"))
+        return o6
+
+    proc svQueryNodes(st: SvState, req: SvReq, id: SvIdent) -> SvOut uses io.file:
+        let q = do hQueryDecode(req.query, ["kind", "owner", "limit", "offset"], ["text", "text", "uint", "uint"])
+        if !q.ok:
+            let o = do svOut(st, hText(400, "Failed to deserialize query string: " + q.err))
+            return o
+        let mut limit = 50
+        if q.has[2]:
+            limit = q.ints[2]
+        if limit > 500:
+            limit = 500
+        let mut offset = 0
+        if q.has[3]:
+            offset = q.ints[3]
+        let r = do enQuery(st.eng, q.has[0], q.texts[0], q.has[1], q.texts[1], !id.admin, id.owner, limit, offset)
+        let st1 = do svWithEng(st, r.eng)
+        if !r.ok:
+            let o1 = do svOut(st1, svStorageFailure(r.err))
+            return o1
+        let o2 = do svOut(st1, hJson(200, jNodes(r.nodes)))
+        return o2
+
+    proc svSequenceNext(st: SvState, req: SvReq, name: text, id: SvIdent, types: [SjType]) -> SvOut uses io.file:
+        let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+        let b = do hJsonBody(hr, req.tooLarge, types, "SequenceRequest")
+        if !b.ok:
+            let o = do svOut(st, b.resp)
+            return o
+        let mut count = 1
+        if hHas(b.v, 0):
+            count = do hInt(b.v, 0)
+        let s = do txSequenceNext(st.eng, name, count, id.owner, id.admin)
+        let st1 = do svWithEng(st, s.eng)
+        if !s.ok:
+            if hHasPrefixT(s.err, "not authorized"):
+                let o1 = do svOut(st1, hText(403, s.err))
+                return o1
+            let o2 = do svOut(st1, hText(400, s.err))
+            return o2
+        let o3 = do svOut(st1, hJson(200, "{\"first\":" + s.start + ",\"count\":" + count + "}"))
+        return o3
+
+    # svBulk: the POST /nodes/* family.
+    proc svBulk(st: SvState, req: SvReq, which: text, id: SvIdent, types: [SjType]) -> SvOut uses io.file:
+        let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+        let names = ["multiget", "query", "count", "count_by", "aggregate", "aggregate_by"]
+        let structs = ["MultiGetRequest", "QueryWhereRequest", "CountRequest", "CountByRequest", "AggregateRequest", "AggregateByRequest"]
+        let at = do fqwIndexOfText(names, which)
+        let b = do hJsonBody(hr, req.tooLarge, types, structs[at])
+        if !b.ok:
+            let o = do svOut(st, b.resp)
+            return o
+        let v = b.v
+        if which == "multiget":
+            let mut addrs = []
+            let mut i = 0
+            loop i < len(v.items[0].items):
+                addrs = append(addrs, v.items[0].items[i].s)
+                i = i + 1
+            let m = do enMultiGet(st.eng, addrs, !id.admin, id.owner)
+            let st1 = do svWithEng(st, m.eng)
+            if !m.ok:
+                let o1 = do svOut(st1, hText(400, m.err))
+                return o1
+            let o2 = do svOut(st1, hJson(200, jNodes(m.nodes)))
+            return o2
+        let q = do svSpecFor(v, id)
+        let refusal = do svRejectPredicate(q.hasPredicate, q.predicate)
+        if refusal != "":
+            let o3 = do svOut(st, hText(400, refusal))
+            return o3
+        if which == "query":
+            let mut limit = 50
+            if hHas(v, 7):
+                limit = do hInt(v, 7)
+            if limit > 500:
+                limit = 500
+            let mut offset = 0
+            if hHas(v, 8):
+                offset = do hInt(v, 8)
+            let pg = do qQueryWhere(st.eng, q, hHas(v, 4), hStr(v, 4), hBool(v, 5), hHas(v, 6), hStr(v, 6), limit, offset)
+            let st2 = do svWithEng(st, pg.eng)
+            if !pg.ok:
+                let o4 = do svOut(st2, hText(400, pg.err))
+                return o4
+            let o5 = do svOut(st2, hJson(200, "{\"nodes\":" + jNodes(pg.nodes) + ",\"next\":" + svQ(pg.next) + ",\"examined\":" + pg.examined + "}"))
+            return o5
+        if which == "count":
+            let fw = do qFoldWhere(st.eng, q, "count", "")
+            let st3 = do svWithEng(st, fw.eng)
+            if !fw.ok:
+                let o6 = do svOut(st3, hText(400, fw.err))
+                return o6
+            let o7 = do svOut(st3, hJson(200, "{\"count\":" + fw.acc.rows + "}"))
+            return o7
+        let grouped = which == "count_by" || which == "aggregate_by"
+        let mut groupBy = ""
+        let mut hasValues = false
+        let mut wanted = []
+        if grouped:
+            groupBy = do hStr(v, 4)
+            if groupBy == "":
+                let o8 = do svOut(st, hText(400, "group_by must name a field"))
+                return o8
+            hasValues = do hHas(v, 5)
+            if hasValues:
+                wanted = do svValues(v.items[5])
+        let mut func = "count"
+        let mut field = ""
+        if which == "aggregate" || which == "aggregate_by":
+            let mut fi = 4
+            if which == "aggregate_by":
+                fi = 6
+            func = do hStr(v, fi)
+            let hf = do hHas(v, fi + 1)
+            field = do hStr(v, fi + 1)
+            let se = do svAggSpecError(func, hf, field)
+            if se != "":
+                let o9 = do svOut(st, hText(400, se))
+                return o9
+        if !grouped:
+            let fa = do qFoldWhere(st.eng, q, func, field)
+            let st4 = do svWithEng(st, fa.eng)
+            if !fa.ok:
+                let o10 = do svOut(st4, hText(400, fa.err))
+                return o10
+            let fin = do qaFinish(fa.acc)
+            let o11 = do svOut(st4, hJson(200, "{\"result\":" + fjText(fin) + "}"))
+            return o11
+        let gb = do qFoldBy(st.eng, q, groupBy, hasValues, wanted, func, field)
+        let st5 = do svWithEng(st, gb.eng)
+        if !gb.ok:
+            let o12 = do svOut(st5, hText(400, gb.err))
+            return o12
+        if which == "count_by":
+            let o13 = do svOut(st5, hJson(200, "{\"counts\":" + svGroupsJson(gb, false) + "}"))
+            return o13
+        let o14 = do svOut(st5, hJson(200, "{\"groups\":" + svGroupsJson(gb, true) + "}"))
+        return o14
+
+    proc svCreateEdge(st: SvState, req: SvReq, id: SvIdent, types: [SjType]) -> SvOut uses io.file, io.net.listen:
+        let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+        let b = do hJsonBody(hr, req.tooLarge, types, "CreateEdgeRequest")
+        if !b.ok:
+            let o = do svOut(st, b.resp)
+            return o
+        let from = do hStr(b.v, 0)
+        let to = do hStr(b.v, 1)
+        let kind = do hStr(b.v, 2)
+        let az = do svAuthorizeEdge(st.eng, id, from, to)
+        let st1 = do svWithEng(st, az.eng)
+        if az.refused:
+            let o1 = do svOut(st1, az.resp)
+            return o1
+        let pe = do svPublicEndpoints(st1.eng, from, to)
+        let st2 = do svWithEng(st1, pe.eng)
+        if !pe.ok:
+            let o2 = do svOut(st2, svStorageFailure(pe.err))
+            return o2
+        let ins = do enInsertEdge(st2.eng, edgeNew(from, to, kind, id.owner))
+        let st3 = do svWithEng(st2, ins.eng)
+        if !ins.ok:
+            let o3 = do svOut(st3, hText(400, ins.err))
+            return o3
+        let st4 = do svPublishJson(st3, pe.v, id.owner, ["event", "from", "to", "kind"], ["\"edge_created\"", svQ(from), svQ(to), svQ(kind)])
+        let o4 = do svOut(st4, hText(201, "Edge created"))
+        return o4
+
+    proc svDeleteEdge(st: SvState, req: SvReq, id: SvIdent, types: [SjType]) -> SvOut uses io.file, io.net.listen:
+        let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+        let b = do hJsonBody(hr, req.tooLarge, types, "DeleteEdgeRequest")
+        if !b.ok:
+            let o = do svOut(st, b.resp)
+            return o
+        let from = do hStr(b.v, 0)
+        let to = do hStr(b.v, 1)
+        let kind = do hStr(b.v, 2)
+        let ex = do enFindEdge(st.eng, from, to, kind)
+        let st1 = do svWithEng(st, ex.eng)
+        if !ex.ok:
+            let o1 = do svOut(st1, svStorageFailure(ex.err))
+            return o1
+        if !ex.found:
+            let o2 = do svOut(st1, hText(404, "edge not found"))
+            return o2
+        if !id.admin && !edgeCanWrite(ex.edge, id.owner):
+            let o3 = do svOut(st1, hText(403, "not authorized to delete this edge"))
+            return o3
+        let pe = do svPublicEndpoints(st1.eng, from, to)
+        let st2 = do svWithEng(st1, pe.eng)
+        if !pe.ok:
+            let o4 = do svOut(st2, svStorageFailure(pe.err))
+            return o4
+        let d = do enDeleteEdge(st2.eng, from, to, kind)
+        let st3 = do svWithEng(st2, d.eng)
+        if !d.ok:
+            let o5 = do svOut(st3, hText(500, d.err))
+            return o5
+        let st4 = do svPublishJson(st3, pe.v, ex.edge.owner, ["event", "from", "to", "kind"], ["\"edge_deleted\"", svQ(from), svQ(to), svQ(kind)])
+        let o6 = do svOut(st4, hText(204, ""))
+        return o6
+
+    proc svTransaction(st: SvState, req: SvReq, id: SvIdent, types: [SjType]) -> SvOut uses io.file, io.net.listen:
+        let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+        let b = do hJsonBody(hr, req.tooLarge, types, "TransactionRequest")
+        if !b.ok:
+            let o = do svOut(st, b.resp)
+            return o
+        let dec = do hTxOps(req.body, types)
+        if !dec.ok:
+            let o0 = do svOut(st, dec.resp)
+            return o0
+        let n0 = do fjNull()
+        let blankNode = do nodeNew(coordinateNew(0, 0, 0, 0), "", "", "")
+        let e0 = do edgeNew("", "", "", "")
+        let mut e = st.eng
+        let mut ops = []
+        let mut touched = []
+        let mut i = 0
+        loop i < len(dec.ops):
+            let tag = dec.tags[i]
+            let v = dec.ops[i]
+            if tag == "insert_node":
+                let address = do hStr(v, 0)
+                if !id.admin && (hHas(v, 8) || hHas(v, 9)):
+                    let o1 = do svOut(svWithEng(st, e), hText(403, "not authorized to set owner or claimed_by on " + address + ": those fields are admin-only, because they create a node owned by or leased to somebody other than the writer. Omit them and the node is owned by you."))
+                    return o1
+                let owner = do hStrOr(v, 8, id.owner)
+                let base = do svNodeFrom(address, hStr(v, 1), v, 2, owner)
+                let mut vis = "private"
+                if hBool(v, 7):
+                    vis = "public"
+                let node = Node{address: base.address, coordinate: base.coordinate, value: base.value, kind: base.kind, data: hStr(v, 6), owner: base.owner, hasClaimedBy: hHas(v, 9), claimedBy: hStr(v, 9), visibility: vis}
+                touched = append(touched, address)
+                ops = append(ops, TxOp{tag: "insert", node: node, address: "", edge: e0, owner: "", isAdmin: false, kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0})
+            if tag == "insert_edge":
+                let az = do svAuthorizeEdge(e, id, hStr(v, 0), hStr(v, 1))
+                e = az.eng
+                if az.refused:
+                    let o2 = do svOut(svWithEng(st, e), az.resp)
+                    return o2
+                ops = append(ops, TxOp{tag: "insertEdge", node: blankNode, address: "", edge: edgeNew(hStr(v, 0), hStr(v, 1), hStr(v, 2), id.owner), owner: "", isAdmin: false, kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0})
+            if tag == "delete_edge":
+                let from = do hStr(v, 0)
+                let to = do hStr(v, 1)
+                let kind = do hStr(v, 2)
+                if !id.admin:
+                    let fe = do enFindEdge(e, from, to, kind)
+                    e = fe.eng
+                    if !fe.ok:
+                        let o3 = do svOut(svWithEng(st, e), svStorageFailure(fe.err))
+                        return o3
+                    if fe.found && !edgeCanWrite(fe.edge, id.owner):
+                        let o4 = do svOut(svWithEng(st, e), hText(403, "not authorized to delete edge " + from + " -" + kind + "-> " + to))
+                        return o4
+                    if !fe.found:
+                        let o5 = do svOut(svWithEng(st, e), hText(404, "delete target not found: edge " + from + " -" + kind + "-> " + to))
+                        return o5
+                ops = append(ops, TxOp{tag: "deleteEdge", node: blankNode, address: "", edge: edgeNew(from, to, kind, ""), owner: id.owner, isAdmin: id.admin, kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0})
+            if tag == "delete_node":
+                let address2 = do hStr(v, 0)
+                if !id.admin:
+                    let g = do enGet(e, address2)
+                    e = g.eng
+                    if !g.ok:
+                        let o6 = do svOut(svWithEng(st, e), svStorageFailure(g.err))
+                        return o6
+                    if g.found && !nodeCanWrite(g.node, id.owner):
+                        let o7 = do svOut(svWithEng(st, e), hText(403, "not authorized to delete " + address2))
+                        return o7
+                    if !g.found:
+                        let o8 = do svOut(svWithEng(st, e), hText(404, "delete target not found: " + address2))
+                        return o8
+                touched = append(touched, address2)
+                ops = append(ops, TxOp{tag: "delete", node: blankNode, address: address2, edge: e0, owner: "", isAdmin: false, kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0})
+            if tag == "clear_kind" || tag == "delete_where":
+                let kind2 = do hStr(v, 0)
+                let mut hasWhere = false
+                let mut where = n0
+                if tag == "delete_where" && hHas(v, 1):
+                    hasWhere = true
+                    where = do hExprFq(v.items[1])
+                    let refusal = do svRejectPredicate(true, where)
+                    if refusal != "":
+                        let o9 = do svOut(svWithEng(st, e), hText(400, refusal))
+                        return o9
+                let tg = do txDeleteWhereTargets(e, kind2, hasWhere, where, id.owner, id.admin)
+                e = tg.eng
+                if !tg.ok:
+                    let o10 = do svOut(svWithEng(st, e), hText(400, tg.err))
+                    return o10
+                touched = touched + tg.addrs
+                let mut t2 = "clear"
+                if tag == "delete_where":
+                    t2 = "deleteWhere"
+                ops = append(ops, TxOp{tag: t2, node: blankNode, address: "", edge: e0, owner: id.owner, isAdmin: id.admin, kind: kind2, hasWhere: hasWhere, where: where, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0})
+            if tag == "set_if":
+                let mut stated = 0
+                let mut expect = ""
+                let mut ef = 0.0
+                let mut ev = n0
+                if hHas(v, 2):
+                    stated = stated + 1
+                    expect = "atmost"
+                    ef = v.items[2].f
+                    if v.items[2].num != "f64":
+                        let fq = do hFq(v.items[2])
+                        ef = fq.f
+                if hHas(v, 3):
+                    stated = stated + 1
+                    expect = "equals"
+                    ev = do hFq(v.items[3])
+                if hBool(v, 4):
+                    stated = stated + 1
+                    expect = "absent"
+                if stated != 1:
+                    let o11 = do svOut(svWithEng(st, e), hText(400, "set_if requires exactly one of expect_le, expect_eq, expect_absent"))
+                    return o11
+                let mut setMap = FqJ{kind: "obj", b: false, s: "", f: 0.0, items: [], keys: []}
+                if hHas(v, 5):
+                    setMap = do hFq(v.items[5])
+                touched = append(touched, hStr(v, 0))
+                ops = append(ops, TxOp{tag: "setIf", node: blankNode, address: hStr(v, 0), edge: e0, owner: id.owner, isAdmin: id.admin, kind: "", hasWhere: false, where: n0, field: hStr(v, 1), expect: expect, expectF: ef, expectV: ev, set: setMap})
+            i = i + 1
+        let x = do txExecuteK(e, ops)
+        let st1 = do svWithEng(st, x.eng)
+        if !x.ok:
+            let mut status = 500
+            if x.kind == "precondition":
+                status = 412
+            if x.kind == "invalid":
+                status = 400
+            let o12 = do svOut(st1, hText(status, x.err))
+            return o12
+        let mut qs = []
+        let mut k = 0
+        loop k < len(touched):
+            qs = append(qs, svQ(touched[k]))
+            k = k + 1
+        let st2 = do svPublishJson(st1, false, id.owner, ["event", "addresses"], ["\"transaction_committed\"", "[" + join(qs, ",") + "]"])
+        let o13 = do svOut(st2, hText(200, "transaction committed"))
+        return o13
+
+    proc svPublish(st: SvState, req: SvReq, id: SvIdent, types: [SjType]) -> SvOut uses io.net.listen:
+        let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+        let b = do hJsonBody(hr, req.tooLarge, types, "PublishRequest")
+        if !b.ok:
+            let o = do svOut(st, b.resp)
+            return o
+        let payload = do hStr(b.v, 0)
+        let size = byteLen(payload)
+        if size > 65536:
+            let o1 = do svOut(st, hText(413, "event payload is " + size + " bytes; the maximum is 65536. `/publish` is a notification channel, not a transport — publish an address and let subscribers read the node."))
+            return o1
+        let st1 = do svEmit(st, id.admin, id.owner, payload, false, [], [])
+        let o2 = do svOut(st1, hText(200, "published"))
+        return o2
+
+    proc svSubscribe(st: SvState, req: SvReq, id: SvIdent) -> SvOut uses io.net.listen:
+        if len(st.subs.conns) >= st.cfg.maxSubscribers:
+            let o = do svOut(st, hText(503, "too many live subscribers; retry shortly"))
+            return o
+        let q = do hQueryDecode(req.query, ["after"], ["uint"])
+        if !q.ok:
+            let o0 = do svOut(st, hText(400, "Failed to deserialize query string: " + q.err))
+            return o0
+        let f = st.feed
+        if q.has[0] && q.ints[0] < f.earliest:
+            let o1 = do svOut(st, hText(410, "cannot resume the event feed from " + q.ints[0] + ": the oldest position still available is " + f.earliest + " (" + len(f.seqs) + " of at most 1024 events retained, in memory only — nothing published before this process started is retained at all). The events between those two positions are gone from the feed and this server will not pretend otherwise by starting from the live edge. Reconcile from a full read instead."))
+            return o1
+        let mut head = [HttpHeader{name: "content-type", value: "text/event-stream"}, HttpHeader{name: "cache-control", value: "no-cache"}]
+        let cors = do svCors(st.cfg, req, hEmpty(200))
+        head = head + cors.headers
+        let c = req.conn
+        let timed = setTimeoutMs(c, 10000)
+        let mut ok = do httpServerStartStream(c, 200, head)
+        if q.has[0]:
+            let mut i = 0
+            loop i < len(f.seqs) && ok:
+                if f.seqs[i] > q.ints[0] && svAdmits(f.everyone[i], f.owners[i], id.owner, id.admin):
+                    let frame = do svFrame(f.seqs[i], f.payloads[i])
+                    if frame == "":
+                        ok = false
+                    else:
+                        ok = do hWriteChunk(c, textToBytes(frame))
+                i = i + 1
+        if !ok:
+            let closed = closeConn(c)
+            return SvOut{st: st, resp: hEmpty(200), sse: true}
+        let subs = st.subs
+        let st1 = SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: SvSubs{conns: append(subs.conns, c), owners: append(subs.owners, id.owner), admins: append(subs.admins, id.admin)}, buckets: st.buckets, met: st.met}
+        return SvOut{st: st1, resp: hEmpty(200), sse: true}
+
+    proc svChanges(st: SvState, req: SvReq, id: SvIdent) -> SvOut uses io.file:
+        let q = do hQueryDecode(req.query, ["after", "limit"], ["uint", "uint"])
+        if !q.ok:
+            let o = do svOut(st, hText(400, "Failed to deserialize query string: " + q.err))
+            return o
+        let mut after = 0
+        if q.has[0]:
+            after = q.ints[0]
+        let mut limit = 500
+        if q.has[1]:
+            limit = q.ints[1]
+        if limit < 1:
+            limit = 1
+        if limit > 2000:
+            limit = 2000
+        let c = do enChanges(st.eng, after, limit, id.owner, id.admin)
+        let st1 = do svWithEng(st, c.eng)
+        if c.status == 200:
+            let o1 = do svOut(st1, hJson(200, c.body))
+            return o1
+        let o2 = do svOut(st1, hText(c.status, c.body))
+        return o2
+
+    proc svStats(st: SvState, id: SvIdent) -> SvOut uses io.file:
+        if !id.admin:
+            let o = do svOut(st, svAdminOnly())
+            return o
+        let rt = do svRuntime(st.met, st.cfg.maxConcurrent)
+        let s = do enStatsJson(st.eng, rt.json)
+        let st1 = SvState{cfg: st.cfg, eng: s.eng, feed: st.feed, subs: st.subs, buckets: st.buckets, met: rt.met}
+        if !s.ok:
+            let o1 = do svOut(st1, svStorageFailure(s.err))
+            return o1
+        let o2 = do svOut(st1, hJson(200, s.text))
+        return o2
+
+    proc svRoleWire(role: text) -> text:
+        if role == "admin":
+            return "Admin"
+        return "User"
+
+    proc svUsers(st: SvState, req: SvReq, route: SvRoute, id: SvIdent, types: [SjType]) -> SvOut uses io.file, io.net.listen:
+        if req.method == "POST":
+            let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+            let b = do hJsonBody(hr, req.tooLarge, types, "CreateUserRequest")
+            if !b.ok:
+                let o = do svOut(st, b.resp)
+                return o
+            if !id.admin:
+                let o0 = do svOut(st, svAdminOnly())
+                return o0
+            let owner = do hStr(b.v, 0)
+            let mut role = "user"
+            if hHas(b.v, 1):
+                let r = do hStr(b.v, 1)
+                if r == "admin":
+                    role = "admin"
+                else:
+                    if r != "user":
+                        let o1 = do svOut(st, hText(400, "unknown role " + ckQuote(r) + " — use \"admin\" or \"user\""))
+                        return o1
+            let token = do cryptoEncodeHex(randomBytes(32))
+            let ins = do enInsertUser(st.eng, UserRecord{tokenHash: sha256Hex(token), owner: owner, role: role})
+            let st1 = do svWithEng(st, ins.eng)
+            if !ins.ok:
+                let o2 = do svOut(st1, hText(500, ins.err))
+                return o2
+            let st2 = do svPublishJson(st1, false, id.owner, ["event", "owner", "created_by"], ["\"user_created\"", svQ(owner), svQ(id.owner)])
+            let o3 = do svOut(st2, hJson(201, "{\"owner\":" + svQ(owner) + ",\"role\":\"" + svRoleWire(role) + "\",\"token\":\"" + token + "\"}"))
+            return o3
+        if !id.admin:
+            let o4 = do svOut(st, svAdminOnly())
+            return o4
+        if req.method == "DELETE":
+            let owner2 = route.param
+            let mut hashes = []
+            let mut i = 0
+            loop i < len(st.eng.users):
+                if st.eng.users[i].owner == owner2:
+                    hashes = append(hashes, st.eng.users[i].tokenHash)
+                i = i + 1
+            if len(hashes) == 0:
+                let o5 = do svOut(st, hText(404, "no persistent user with that owner"))
+                return o5
+            let mut e = st.eng
+            let mut j = 0
+            loop j < len(hashes):
+                let rv = do enRevokeUser(e, hashes[j])
+                e = rv.eng
+                if !rv.ok:
+                    let o6 = do svOut(svWithEng(st, e), hText(500, rv.err))
+                    return o6
+                j = j + 1
+            let st3 = do svPublishJson(svWithEng(st, e), false, id.owner, ["event", "owner"], ["\"user_revoked\"", svQ(owner2)])
+            let o7 = do svOut(st3, hText(204, ""))
+            return o7
+        let mut rows = []
+        let mut k = 0
+        loop k < len(st.eng.users):
+            rows = append(rows, "{\"owner\":" + svQ(st.eng.users[k].owner) + ",\"role\":\"" + svRoleWire(st.eng.users[k].role) + "\"}")
+            k = k + 1
+        let o8 = do svOut(st, hJson(200, "[" + join(rows, ",") + "]"))
+        return o8
+
+    proc svIndexes(st: SvState, req: SvReq, route: SvRoute, id: SvIdent, types: [SjType]) -> SvOut uses io.file:
+        if req.method == "POST":
+            let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+            let b = do hJsonBody(hr, req.tooLarge, types, "CreateIndexRequest")
+            if !b.ok:
+                let o = do svOut(st, b.resp)
+                return o
+            if !id.admin:
+                let o0 = do svOut(st, svAdminOnly())
+                return o0
+            let name = do hStr(b.v, 0)
+            let kind = do hStr(b.v, 1)
+            let field = do hStr(b.v, 2)
+            let unique = do hBool(b.v, 3)
+            let mode = do hStrOr(b.v, 4, "ordered")
+            if lower(mode) == "text":
+                if unique:
+                    let o1 = do svOut(st, hText(400, "a text index cannot be unique: it stores windows of a value, not the value, so it has nothing to hold unique. Declare an ordered unique index over the same field if that is what you want."))
+                    return o1
+                let t = do enCreateTextIndex(st.eng, textIndexDefNew(name, kind, field))
+                let st1 = do svWithEng(st, t.eng)
+                if !t.ok:
+                    let mut s1 = 400
+                    if contains(t.err, "already"):
+                        s1 = 409
+                    let o2 = do svOut(st1, hText(s1, t.err))
+                    return o2
+                let o3 = do svOut(st1, hJson(201, jIndexInfo(name, kind, field, false, "text")))
+                return o3
+            if lower(mode) != "ordered":
+                let o4 = do svOut(st, hText(400, "unknown index mode " + ckQuote(mode) + "; expected \"ordered\" or \"text\""))
+                return o4
+            let c = do enCreateIndex(st.eng, indexDefNew(name, kind, field, unique))
+            let st2 = do svWithEng(st, c.eng)
+            if !c.ok:
+                let mut s2 = 400
+                if contains(c.err, "already"):
+                    s2 = 409
+                let o5 = do svOut(st2, hText(s2, c.err))
+                return o5
+            let o6 = do svOut(st2, hJson(201, jIndexInfo(name, kind, field, unique, "ordered")))
+            return o6
+        if !id.admin:
+            let o7 = do svOut(st, svAdminOnly())
+            return o7
+        if req.method == "DELETE":
+            let d = do enDropIndex(st.eng, route.param)
+            let st3 = do svWithEng(st, d.eng)
+            if !d.ok:
+                let o8 = do svOut(st3, hText(404, d.err))
+                return o8
+            let o9 = do svOut(st3, hText(204, ""))
+            return o9
+        let o10 = do svOut(st, hJson(200, enListAllIndexes(st.eng)))
+        return o10
+
+    proc svReferences(st: SvState, req: SvReq, route: SvRoute, id: SvIdent, types: [SjType]) -> SvOut uses io.file:
+        if req.method == "POST":
+            let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
+            let b = do hJsonBody(hr, req.tooLarge, types, "CreateReferenceRequest")
+            if !b.ok:
+                let o = do svOut(st, b.resp)
+                return o
+            if !id.admin:
+                let o0 = do svOut(st, svAdminOnly())
+                return o0
+            let v = b.v
+            let def = do referenceDefNew(hStr(v, 0), hStr(v, 1), hStr(v, 2), hStr(v, 3), hHas(v, 4), hStr(v, 4), v.items[5].s)
+            let c = do enCreateReference(st.eng, def)
+            let st1 = do svWithEng(st, c.eng)
+            if !c.ok:
+                let mut s1 = 400
+                if contains(c.err, "already exists"):
+                    s1 = 409
+                let o1 = do svOut(st1, hText(s1, c.err))
+                return o1
+            let o2 = do svOut(st1, hJson(201, jReference(def)))
+            return o2
+        if !id.admin:
+            let o3 = do svOut(st, svAdminOnly())
+            return o3
+        if req.method == "DELETE":
+            let d = do enDropReference(st.eng, route.param)
+            let st2 = do svWithEng(st, d.eng)
+            if !d.ok:
+                let o4 = do svOut(st2, hText(404, d.err))
+                return o4
+            let o5 = do svOut(st2, hText(204, ""))
+            return o5
+        let o6 = do svOut(st, hJson(200, enListReferences(st.eng)))
+        return o6
+
+    # svDispatch: the matched route's handler (method already allowed).
+    proc svDispatch(st: SvState, req: SvReq, route: SvRoute, id: SvIdent, types: [SjType]) -> SvOut uses io.file, io.net.listen:
+        let p = route.pattern
+        let m = req.method
+        if !route.paramOk:
+            let o = do svOut(st, hText(400, "Invalid URL: Invalid UTF-8 in path parameter"))
+            return o
+        if p == "/node":
+            let r0 = do svCreateNode(st, req, id, types)
+            return r0
+        if p == "/node/:address":
+            if m == "PUT":
+                let r1 = do svUpdateNode(st, req, route.param, id, types)
+                return r1
+            if m == "DELETE":
+                let r2 = do svDeleteNode(st, route.param, id)
+                return r2
+            let r3 = do svGetNode(st, route.param, id, "")
+            return r3
+        if p == "/node/:address/history":
+            let r4 = do svGetNode(st, route.param, id, "history")
+            return r4
+        if p == "/node/:address/owned":
+            let r5 = do svGetNode(st, route.param, id, "owned")
+            return r5
+        if p == "/node/:address/edges/out":
+            let r6 = do svGetNode(st, route.param, id, "out")
+            return r6
+        if p == "/node/:address/edges/in":
+            let r7 = do svGetNode(st, route.param, id, "in")
+            return r7
+        if p == "/node/:address/claim":
+            let r8 = do svClaimNode(st, route.param, id)
+            return r8
+        if p == "/nodes":
+            let r9 = do svQueryNodes(st, req, id)
+            return r9
+        if p == "/sequence/:name/next":
+            let r10 = do svSequenceNext(st, req, route.param, id, types)
+            return r10
+        if hHasPrefixT(p, "/nodes/"):
+            let r11 = do svBulk(st, req, slice(p, 7, len(p)), id, types)
+            return r11
+        if p == "/edge":
+            if m == "DELETE":
+                let r12 = do svDeleteEdge(st, req, id, types)
+                return r12
+            let r13 = do svCreateEdge(st, req, id, types)
+            return r13
+        if p == "/transaction":
+            let r14 = do svTransaction(st, req, id, types)
+            return r14
+        if p == "/events":
+            let r15 = do svSubscribe(st, req, id)
+            return r15
+        if p == "/changes":
+            let r16 = do svChanges(st, req, id)
+            return r16
+        if p == "/publish":
+            let r17 = do svPublish(st, req, id, types)
+            return r17
+        if p == "/stats":
+            let r18 = do svStats(st, id)
+            return r18
+        if hHasPrefixT(p, "/admin/users"):
+            let r19 = do svUsers(st, req, route, id, types)
+            return r19
+        if hHasPrefixT(p, "/admin/indexes"):
+            let r20 = do svIndexes(st, req, route, id, types)
+            return r20
+        let r21 = do svReferences(st, req, route, id, types)
+        return r21
+
+    # svHandle: one request through the router's layers, outermost first —
+    # CORS (a preflight answered here), the route match (404 / 405, whose
+    # `allow` rides on whatever answers), auth and the rate limit (route
+    # layers, so a wrong method is still authenticated first), metrics for
+    # the request routes, then the handler; HEAD is GET without a body.
+    proc svHandle(st0: SvState, req0: SvReq, types: [SjType]) -> SvOut uses io.file, io.net.listen:
+        let mut req = req0
+        let route = do svMatch(req.path)
+        let mut allowed = req.method in route.allow
+        let mut allowHeader = ""
+        if route.pattern != "" && !allowed:
+            allowHeader = join(route.allow, ",")
+        if req.method == "OPTIONS":
+            let mut pf = do svPreflight(st0.cfg, req)
+            if allowHeader != "":
+                pf = do hWithHeader(pf, "allow", allowHeader)
+            let o0 = do svOut(st0, pf)
+            return o0
+        if route.pattern == "":
+            let o1 = do svOut(st0, svCors(st0.cfg, req, hEmpty(404)))
+            return o1
+        if route.pattern == "/":
+            let mut home = do hText(200, "FacetQL Online")
+            if !allowed:
+                home = do hWithHeader(hEmpty(405), "allow", allowHeader)
+            let o2 = do svOut(st0, svCors(st0.cfg, req, home))
+            return o2
+        let au = do svAuth(st0, req)
+        if !au.ok:
+            let mut r0 = do svCors(st0.cfg, req, au.resp)
+            if allowHeader != "":
+                r0 = do hWithHeader(r0, "allow", allowHeader)
+            let o3 = do svOut(st0, r0)
+            return o3
+        if !allowed:
+            let r1 = do hWithHeader(svCors(st0.cfg, req, hEmpty(405)), "allow", allowHeader)
+            let o4 = do svOut(st0, r1)
+            return o4
+        let lim = do svRateLimit(st0, req, au.id)
+        let mut st = lim.st
+        if !lim.ok:
+            let o5 = do svOut(st, svCors(st.cfg, req, lim.resp))
+            return o5
+        let observed = route.pattern != "/events"
+        let mclass = do svMetricClass(req.method, route.pattern)
+        if observed:
+            st = SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: st.subs, buckets: st.buckets, met: svCount(st.met, mclass)}
+        if req.method == "HEAD":
+            req = SvReq{conn: req.conn, method: "GET", path: req.path, query: req.query, hasQuery: req.hasQuery, headers: req.headers, body: req.body, tooLarge: req.tooLarge}
+        let t0 = monoMs()
+        let out = do svDispatch(st, req, route, au.id, types)
+        let mut st2 = out.st
+        if observed && (mclass == 0 || mclass == 1):
+            let us = (monoMs() - t0) * 1000
+            st2 = SvState{cfg: st2.cfg, eng: st2.eng, feed: st2.feed, subs: st2.subs, buckets: st2.buckets, met: svRecord(st2.met, mclass, us)}
+        if out.sse:
+            return SvOut{st: st2, resp: out.resp, sse: true}
+        let o6 = do svOut(st2, svCors(st2.cfg, req, out.resp))
+        return o6
+
+    # ── the tasks ──────────────────────────────────────────────────────
+    # svLoop: the engine's one owner. Messages: "Q…" a request (answered
+    # on the reply channel it names), "T" a keep-alive beat.
+    proc svLoop(ch: int, st0: SvState) uses io.file, io.net.listen:
+        let types = do hTypes()
+        let mut st = st0
+        loop true:
+            let msg = recv(ch)
+            let k = slice(msg, 0, 1)
+            if k == "T":
+                st = do svKeepAlive(st)
+            if k == "Q":
+                let f = do svUnpack(slice(msg, 1, len(msg)))
+                let req = do svReqUnpack(f)
+                let out = do svHandle(st, req, types)
+                st = out.st
+                let sent = send(toInt(f[0]), svRespPack(out.resp, out.sse))
+
+    proc svTicker(ch: int):
+        loop true:
+            let s = sleepMs(15000)
+            let sent = send(ch, "T")
+
+    # svServeConn: one connection, request after request — each handed to
+    # the loop and its answer written back. A body over the limit is not
+    # read: the answer goes out and the connection is drained and closed.
+    # A connection that became an event stream belongs to the loop.
+    proc svServeConn(c: int, ch: int, maxBody: int) uses io.net.listen:
+        let reply = channel()
+        let mut pending = []
+        let mut open = true
+        loop open:
+            let rd = do hReadRequest(c, pending, maxBody)
+            if rd.state == 0:
+                open = false
+            if rd.state < 0:
+                let refused = do hRefuseMalformed(c)
+                return
+            if rd.state == 1:
+                pending = rd.req.rest
+                let keep = do httpServerKeepAlive(rd.req)
+                let sent = send(ch, svReqPack(reply, c, rd.req, rd.tooLarge))
+                let answer = recv(reply)
+                let r = do svRespUnpack(answer)
+                if r.sse:
+                    return
+                let wrote = do hWriteResponse(c, rd.req.method, r.resp, keep && !rd.tooLarge)
+                if rd.tooLarge:
+                    let lingered = do httpServerLingerClose(c)
+                    return
+                open = wrote && keep
+        let closed = closeConn(c)
+
+    # svOpen: Database::new — the engine loaded and recovered, the user log
+    # compacted, the event feed started at the next operation id.
+    struct SvOpened:
+        ok: bool
+        st: SvState
+
+    # svKeyFor: crypto.rs's cipher() — the configured key, or the all-zero
+    # development key when none is set; an unusable one stops the start.
+    proc svKeyFor(cfg: SvConfig) -> SvKey uses io.console, io.env:
+        let mut keyHex = cfg.keyHex
+        let set = do svEnvSet("FACETQL_MASTER_KEY")
+        if !set:
+            let w0 = writeStderr("warning: FACETQL_MASTER_KEY not set — using an all-zero dev key. Data encrypted with this key is NOT secure. Generate a real key with `openssl rand -hex 32` and set FACETQL_MASTER_KEY to it before running with real data.\n")
+            keyHex = "0000000000000000000000000000000000000000000000000000000000000000"
+        let k = do svDecodeKey(keyHex)
+        if !k.ok:
+            let w1 = writeStderr("FACETQL_MASTER_KEY is not valid hex: " + k.why + "\n")
+            return k
+        if len(k.key) != 32:
+            let w2 = writeStderr("FACETQL_MASTER_KEY must decode to exactly 32 bytes (64 hex characters) for AES-256 — got " + len(k.key) + " bytes. Generate one with `openssl rand -hex 32`.\n")
+            return SvKey{ok: false, why: "length", key: []}
+        return k
+
+    proc svOpen(cfg: SvConfig, key: [int]) -> SvOpened uses io.file, io.console:
+        let blank = do svMetricsNew()
+        let noFeed = SvFeed{seqs: [], payloads: [], everyone: [], owners: [], earliest: 0}
+        let noSubs = SvSubs{conns: [], owners: [], admins: []}
+        let noBuckets = SvBuckets{keys: [], tokens: [], updated: []}
+        let ld = do enLoad(cfg.dataDir, key, -1000000000, cfg.interval, cfg.rotateBytes)
+        if !ld.ok:
+            let w3 = writeStderr("\nFacetQL could not open its database in " + cfg.dataDir + ": " + ld.err + "\n")
+            return SvOpened{ok: false, st: SvState{cfg: cfg, eng: ld.eng, feed: noFeed, subs: noSubs, buckets: noBuckets, met: blank}}
+        let cu = do enCompactUserLog(ld.eng)
+        if !cu.ok:
+            let w4 = writeStderr("warning: could not compact the user log: " + cu.err + ". The existing log is intact and correct; it will simply stay longer than it needs to be.\n")
+        let first = do enNextOperationId(cu.eng)
+        let feed = SvFeed{seqs: [], payloads: [], everyone: [], owners: [], earliest: first.v}
+        return SvOpened{ok: true, st: SvState{cfg: cfg, eng: first.eng, feed: feed, subs: noSubs, buckets: noBuckets, met: blank}}
+
+    daemon FacetQL uses io.file, io.net.listen, io.console, io.env:
+        let cfg = do svConfig()
+        if cfg.ok:
+            let tls = do svEnvSet("FACETQL_TLS_IDENTITY")
+            if tls:
+                let t = writeStderr("FacetQL (fct): --tls-identity is not supported — the fct runtime has no TLS primitive. Terminate TLS at a reverse proxy in front of this server and set FACETQL_ALLOW_PLAINTEXT=1.\n")
+            else:
+                let may = do svPosture(cfg)
+                let tokensSet = do svEnvSet("FACETQL_TOKENS")
+                if may:
+                    if !tokensSet:
+                        let w = writeStderr("warning: FACETQL_TOKENS not set — using a single dev token ('dev-local-key-change-me' -> owner 'dev', role Admin) so there's a way to bootstrap the first real admin via POST /admin/users. Do not run production traffic against this.\n")
+                    let key = do svKeyFor(cfg)
+                    if key.ok:
+                        let opened = do svOpen(cfg, key.key)
+                        if opened.ok:
+                            let mut shown = cfg.dataDir
+                            if len(shown) > 1:
+                                shown = slice(shown, 0, len(shown) - 1)
+                            let b1 = writeStdout("Data directory: " + shown + "\n")
+                            let b2 = writeStdout("Auth: every route except GET / requires header 'x-api-key', resolved to an owner identity via FACETQL_TOKENS (token:owner[:admin], comma-separated) or the persistent users created through POST /admin/users. Run `facetql routes` for the per-endpoint authorization matrix this build enforces.\n")
+                            let b3 = writeStdout("Guards: body <= " + cfg.maxBody + " bytes, " + cfg.timeoutSecs + " s per request, <= " + cfg.maxConcurrent + " in-flight requests, per-identity rate limits by endpoint class (FACETQL_RATE_READ/WRITE/BULK/ADMIN/SUBSCRIBE).\n")
+                            let l = listen(cfg.port)
+                            let b4 = writeStdout("FacetQL Server Running on port " + cfg.port + " (HTTP — no TLS; either pass --tls-identity/--tls-identity-password for native HTTPS, or terminate TLS at a reverse proxy in front of this, before running with real traffic)\n")
+                            let ch = channel()
+                            detach svLoop(ch, opened.st)
+                            detach svTicker(ch)
+                            loop true:
+                                let c = accept(l)
+                                detach svServeConn(c, ch, cfg.maxBody)

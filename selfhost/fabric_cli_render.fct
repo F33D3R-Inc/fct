@@ -2,137 +2,22 @@ import "fabric_core.fct"
 import "fabric_optimizer.fct"
 import "fabric_telemetry.fct"
 import "fabric_routing.fct"
+import "fabric_json.fct"
+import "fabric_fmt.fct"
 
 app FabricCliRenderSelfHost:
-    # Self-hosting port of fabric/crates/fabric-cli/src/render.rs (452L) —
-    # read in full before writing this file. Its own header states plainly
-    # what it is: "Pure output formatting for each command... deterministic
-    # and free of I/O", built entirely on already-ported types
-    # (`fabric_core::Coordinate`, `fabric_optimizer::{OptimizationAction,
-    # OptimizationDecision}`, `fabric_telemetry::Observation`,
-    # `fabric_topology::Placement` (ported in this directory's
-    # fabric_routing.fct — see that file's own header on why its
-    # `Placement`/`TopologyRegistry` live there under the fabric-topology
-    # crate name), `fabric_workload::{PressureLevel, WorkloadProfile}`
-    # (ported in fabric_telemetry.fct — see that file's header on why both
-    # crates share one file)). This is the one file in fabric-cli that is
-    # real portable logic; args.rs/main.rs/session.rs are real process I/O
-    # (argv parsing, stdin/file reads, process exit codes) and stay
-    # correctly out of scope, per this task's own brief.
+    # Port of fabric/crates/fabric-cli/src/render.rs: the four row/summary
+    # types, pressure_label, action_label, and every render_* function in
+    # both modes — the human table (Rust's format! width/precision
+    # directives, reproduced exactly: `{:<N}`/`{:>N}` pad by characters,
+    # `{:.N}` is the exact decimal value of the f64 rounded half-to-even,
+    # see fabric_fmt.fct's fmtFixed) and `--json` (serde_json::to_string_pretty of the
+    # underlying derived types, via fabric_json's encoders and sjPretty).
+    # args.rs/main.rs/session.rs are process I/O and are not ported here.
     #
-    # `cargo test -p fabric-cli` was run for real (no `--lib`: this crate
-    # has no library target, only a `[[bin]]`, so its `#[cfg(test)]`
-    # modules compile into the binary's own unit-test harness instead —
-    # confirmed by reading Cargo.toml first, not guessed): 28 passed, 0
-    # failed, of which 8 are `render::tests::*`
-    # (pressure_labels, action_labels, empty_renderers_are_explicit,
-    # topology_human_and_json, predict_empty_and_populated,
-    # nodes_empty_and_populated, validation_valid_and_invalid,
-    # status_json_roundtrips). Every one of those tests' HUMAN-output
-    # assertions is restated below as a demo proc using this language's own
-    # `contains` builtin, the same substring-assertion style the real tests
-    # themselves use (`.contains("(1,2)")`, not a byte-exact full-string
-    # comparison) — genuine re-verification against the same fixtures, not
-    # independently invented ones. `status_json_roundtrips` is JSON-only
-    # (see below) and has no human counterpart to restate.
-    #
-    # ============================================================
-    # WHAT IS DELIBERATELY EXCLUDED, AND WHY — THE `json: bool` BRANCHES
-    # ============================================================
-    # Every one of the eight real `render_*` functions in render.rs starts
-    # with `if json { return serde_json::to_string_pretty(x)... }`. NONE of
-    # that is ported here. This is not a narrowing of scope invented for
-    # convenience — it is the exact boundary this task's own brief draws
-    # ("Explicitly EXCLUDE the `json: bool` / `serde_json::to_string_pretty`
-    # branches"), for the same root reason this directory's other files
-    # already hit and documented honestly: `facet lang` has no generic
-    # serializer that walks an arbitrary struct/array/Option shape and
-    # produces JSON text the way `#[derive(Serialize)]` does for free in
-    # Rust. fabric_protocol.fct's own header describes solving a JSON
-    # problem for real, but for a CLOSED, SMALL set of message shapes it
-    # owns outright (`FabricMessage`/`FabricResponse`), hand-writing a
-    # dedicated encoder/decoder pair for those specific fields — not a
-    # general `to_string_pretty::<T>()` that works for any `T`, which
-    # `serde_json` provides here via one derive on eight unrelated struct
-    # shapes (`StatusSummary`, `[Placement]`, `[WorkloadProfile]`,
-    # `[Observation]`, `[OptimizationDecision]`, `[PredictionRow]`,
-    # `[NodeRow]`, `[ValidationIssue]`) at once. Writing eight more
-    # bespoke hand-rolled encoders here, one per shape, the way
-    # fabric_protocol.fct did for its own two, is real work this task's own
-    # brief says not to take on this round — it would also not be "the same
-    # logic" as `serde_json::to_string_pretty`, which real callers may rely
-    # on for exact key ordering/escaping/pretty-printing this port would
-    # have to reinvent byte-for-byte to be a faithful port rather than a
-    # look-alike. So the honest choice, matching this directory's own
-    # established convention for a documented absence (LANGUAGE.md's own
-    # "if it's not in that list, it doesn't exist yet — that's a real gap,
-    # not something you're missing"), is: port the human branch in full,
-    # and drop the `json: bool` parameter from every render function's
-    # signature entirely, rather than keep a parameter that can only ever
-    # be `false` here. A future dedicated JSON-encoding pass, if ever
-    # undertaken for this directory, is the right place to close this gap
-    # for all eight shapes at once — not something to fake per-function
-    # here with a placeholder that silently never produces JSON.
-    #
-    # ============================================================
-    # A SECOND REAL GAP THIS PORT HAD TO CLOSE FOR REAL: FIXED-WIDTH TABLE
-    # FORMATTING
-    # ============================================================
-    # Every populated `render_*` human branch in the real source builds its
-    # rows with Rust's `format!` alignment/precision directives —
-    # `{:<7}`/`{:<21}` (left-justify, pad with spaces to a minimum width),
-    # `{:>10.1}`/`{:>4.2}` (right-justify to a minimum width, AND round to a
-    # fixed number of decimal places). `facet lang`'s builtin list
-    # (confirmed against `facet lang` and LANGUAGE.md's own "Built-in
-    # functions" section, not assumed) has no padding function and no
-    # fixed-decimal float formatter at all — `+` concatenation on a float
-    # calls this runtime's own `toStr`, which (per fabric_protocol.fct's own
-    # header, confirmed by reading runtime/eval.go) uses Go's
-    # `strconv.FormatFloat(t, 'g', -1, 64)`, i.e. SHORTEST round-trip
-    # notation (`0.9`, not `0.90`) — a genuinely different, unpadded,
-    # variable-precision text, not a drop-in stand-in for `{:.2}`. This is
-    # real logic `render.rs` depends on for every populated table it prints,
-    # so it is ported for real below (`textPadLeft`/`textPadRight`/
-    # `floatFixed`/`pow10`), not skipped and not faked with an
-    # approximation that merely looks similar on a few lucky inputs:
-    #   - `textPadRight`/`textPadLeft` restate `{:<N}`/`{:>N}` exactly —
-    #     pad with spaces to a MINIMUM width, never truncate a string
-    #     already at or past that width (matching Rust's own format! width
-    #     semantics, confirmed against the Rust documentation for
-    #     `std::fmt`, not assumed).
-    #   - `floatFixed(v, decimals)` restates `{:.N}` — scale by 10^N via the
-    #     real numeric operators this language does have (`*`, `toFloat`,
-    #     `round`, `/`, `%`, all confirmed present in LANGUAGE.md's numeric
-    #     section), then reassemble sign/int-part/zero-padded-fraction as
-    #     text.
-    # ONE NAMED, HONEST DIVERGENCE: `round(x)` here is round-half-away-from-
-    # zero (LANGUAGE.md's own documented behavior for this language's
-    # `round` builtin, matching Go's `math.Round`, explicitly NOT round-
-    # half-to-even), whereas Rust's `{:.N}` float formatting rounds based on
-    # the float's exact binary value via a correctly-rounded decimal
-    # conversion algorithm. The two can disagree only on a value that is an
-    # EXACT tie at the requested decimal place in its true binary
-    # representation — vanishingly rare for the real quantities this file
-    # formats (probabilities, ratios, percentages, gain/cost/confidence
-    # scores) and never hit by any of the real Rust tests' own fixture
-    # values (0.91, 0.42, 75.0, 400.0, none of which sit on such a tie), so
-    # this port does not special-case it, the same way fabric_routing.fct's
-    # own header already flags (rather than silently papers over) a
-    # narrower divergence of the same "real but negligible for every actual
-    # caller" shape.
-    #
-    # ============================================================
-    # STRUCT NAMES — verified directly against render.rs's own four struct
-    # definitions (lines 15-60), not assumed: `StatusSummary`,
-    # `PredictionRow`, `NodeRow`, `ValidationIssue`. All four are restated
-    # here with every real field (including ones the human branch itself
-    # never reads, e.g. `NodeRow.registered_at_ms`/`last_heartbeat_ms`,
-    # both JSON-only in the real source) — a struct is the real, whole
-    # shape render.rs declares, not narrowed down to only what one branch
-    # happens to use. `Option<u64>` fields (`last_heartbeat_ms`,
-    # `silence_ms`) use this directory's established has*/value convention
-    # (`fabric_routing.fct`'s `Route.hasCoordinate`/`coordinate`).
-    # ============================================================
+    # `Option<u64>` fields use the has*/value convention; PressureLevel is
+    # the lower-case tag fabric_telemetry.fct carries.
+
     struct StatusSummary:
         placements: int
         profiles: int
@@ -167,122 +52,28 @@ app FabricCliRenderSelfHost:
         coordinate: Coordinate
         reason: text
 
-    # ============================================================
-    # FORMATTING HELPERS — see this file's header for why these are real,
-    # necessary ports rather than a gap. `pow10` only ever needs to cover
-    # this file's own decimal widths (0, 1, 2) but is written generally
-    # rather than hard-coded to those three, since the general shape is no
-    # more code and stays correct if a future render function needs a
-    # different precision.
-    # ============================================================
-    proc pow10(n: int) -> int:
-        let mut result = 1
-        let mut i = 0
-        loop i < n:
-            result = result * 10
-            i = i + 1
-        return result
-
-    # textPadLeftChar: the general padding primitive both public helpers
-    # below specialize — pads `s` with `padChar` on the LEFT until it
-    # reaches `width`, never truncating a string already that long or
-    # longer (matching `{:>N}`'s own "minimum width" semantics).
-    proc textPadLeftChar(s: text, width: int, padChar: text) -> text:
-        let mut result = s
-        loop len(result) < width:
-            result = padChar + result
-        return result
-
-    # textPadLeft: `{:>N}` restated — right-justify with spaces.
-    proc textPadLeft(s: text, width: int) -> text:
-        let padded = do textPadLeftChar(s, width, " ")
-        return padded
-
-    # textPadRight: `{:<N}` restated — left-justify with spaces (pad on the
-    # right instead).
-    proc textPadRight(s: text, width: int) -> text:
-        let mut result = s
-        loop len(result) < width:
-            result = result + " "
-        return result
-
-    # floatFixed: `{:.N}` restated — see this file's header for the one
-    # named rounding-mode divergence. Handles negative values (real
-    # OptimizationDecision.score() can be negative) the same way Rust's own
-    # `{:.N}` does: the sign is decided by the ORIGINAL value, so a value
-    # that rounds to exactly zero from below still prints a leading `-`
-    # (confirmed against real `rustc` behavior for `format!("{:.2}",
-    # -0.001)` == "-0.00" — not special-cased away here, restated exactly).
-    proc floatFixed(v: float, decimals: int) -> text:
-        let neg = v < 0.0
-        let av = abs(v)
-        let scale = do pow10(decimals)
-        let scaleFloat = toFloat(scale)
-        let scaledFloat = av * scaleFloat
-        let scaled = round(scaledFloat)
-        let intPart = scaled / scale
-        let fracPart = scaled % scale
-        let fracRaw = "" + fracPart
-        let fracText = do textPadLeftChar(fracRaw, decimals, "0")
-        let mut result = "" + intPart
-        if decimals > 0:
-            result = result + "." + fracText
-        if neg:
-            result = "-" + result
-        return result
-
-    # coordText: `render.rs`'s own private `coord(c: Coordinate) -> String`
-    # helper, restated verbatim — "({},{})".
+    # render.rs `coord`: "(x,y)".
     proc coordText(c: Coordinate) -> text:
         return "(" + c.x + "," + c.y + ")"
 
-    # yesNo: every render function's own inline `if x { "yes" } else { "no" }`
-    # ternary, factored into one shared proc since this language has no
-    # ternary expression (confirmed against LANGUAGE.md: only `if`/`else`
-    # statements, no `cond ? a : b`).
     proc yesNo(b: bool) -> text:
         if b:
             return "yes"
         return "no"
 
     # ============================================================
-    # pressure_label — `PressureLevel` itself is not a separate type on
-    # this side: fabric_telemetry.fct's own header already made the choice
-    # to represent the real Rust enum's four variants directly as the
-    # lowercase text tag ("normal"/"elevated"/"high"/"critical") that
-    # `WorkloadProfile.pressure` carries — the SAME four strings
-    # `pressure_label` itself returns. So this restates the real function's
-    # exhaustive four-arm match (in the same order: Normal, Elevated, High,
-    # Critical) as an explicit total function over that representation,
-    # including a trailing fallback for the fact that `text` here is not a
-    # closed enum the way the real Rust `match` is exhaustively checked
-    # over at compile time — not a shortcut, since every value this file
-    # ever produces or consumes is already one of the four (`pressureLevelFromScore`
-    # in fabric_telemetry.fct is the only producer, and it is a closed
-    # four-arm function itself).
+    # labels
     # ============================================================
     proc pressureLabel(level: text) -> text:
-        if level == "normal":
-            return "normal"
-        if level == "elevated":
-            return "elevated"
-        if level == "high":
-            return "high"
         if level == "critical":
             return "critical"
-        return level
+        if level == "high":
+            return "high"
+        if level == "elevated":
+            return "elevated"
+        return "normal"
 
-    # ============================================================
-    # action_label — six-arm match over `OptimizationAction.kind`, in the
-    # same order decision.rs's own enum declares the variants (matching
-    # fabric_optimizer.fct's own established order for this type).
-    # `target.0` (a `DbmsId`'s inner `String`) is already plain
-    # `action.target: text` on this side — see fabric_optimizer.fct's own
-    # header on why `DbmsId` here is never a wrapper struct.
-    # ============================================================
     proc actionLabel(action: OptimizationAction) -> text:
-        if action.kind == "NoAction":
-            return "no-action"
         if action.kind == "Replicate":
             return "replicate -> " + action.target
         if action.kind == "Move":
@@ -292,17 +83,36 @@ app FabricCliRenderSelfHost:
         if action.kind == "Isolate":
             return "isolate"
         if action.kind == "Colocate":
-            let c = do coordText(action.coordinate)
-            return "colocate -> " + c
-        return ""
+            return "colocate -> " + coordText(action.coordinate)
+        return "no-action"
 
     # ============================================================
-    # render_status — human branch only (see this file's header for the
-    # `json: bool` exclusion). Column layout has no `{:<N}`/`{:.N}`
-    # directives at all in the real source (unlike every other render
-    # function below), so no padding helper is needed here.
+    # serde shapes of the render-only types
     # ============================================================
-    proc renderStatus(summary: StatusSummary) -> text:
+    proc statusSummaryJson(s: StatusSummary) -> text:
+        return "{\"placements\":" + s.placements + ",\"profiles\":" + s.profiles + ",\"observations\":" + s.observations + ",\"hot_coordinates\":" + s.hotCoordinates + ",\"grid_width\":" + s.gridWidth + ",\"grid_height\":" + s.gridHeight + ",\"grid_atoms\":" + s.gridAtoms + ",\"protocol_major\":" + s.protocolMajor + ",\"protocol_minor\":" + s.protocolMinor + "}"
+
+    proc predictionRowJson(r: PredictionRow) -> text:
+        return "{\"coordinate\":" + coordinateJson(r.coordinate) + ",\"hotspot_probability\":" + sjF64Text(r.hotspotProbability) + ",\"likely_hot\":" + sjBoolText(r.likelyHot) + ",\"anomaly_score\":" + sjF64Text(r.anomalyScore) + ",\"anomalous\":" + sjBoolText(r.anomalous) + "}"
+
+    proc nodeRowJson(r: NodeRow) -> text:
+        let mut last = "null"
+        if r.hasLastHeartbeatMs:
+            last = sjU64Text(r.lastHeartbeatMs)
+        let mut silence = "null"
+        if r.hasSilenceMs:
+            silence = sjU64Text(r.silenceMs)
+        return "{\"dbms_id\":" + sjQuote(r.dbmsId) + ",\"region\":" + sjQuote(r.region) + ",\"software_version\":" + sjQuote(r.softwareVersion) + ",\"registered_at_ms\":" + sjU64Text(r.registeredAtMs) + ",\"last_heartbeat_ms\":" + last + ",\"silence_ms\":" + silence + ",\"heartbeats\":" + sjU64Text(r.heartbeats) + ",\"health\":" + sjQuote(r.health) + "}"
+
+    proc validationIssueJson(i: ValidationIssue) -> text:
+        return "{\"coordinate\":" + coordinateJson(i.coordinate) + ",\"reason\":" + sjQuote(i.reason) + "}"
+
+    # ============================================================
+    # render_*
+    # ============================================================
+    proc renderStatus(summary: StatusSummary, json: bool) -> text:
+        if json:
+            return sjPretty(statusSummaryJson(summary))
         let mut out = "Facet Fabric runtime status\n"
         out = out + "  protocol version   " + summary.protocolMajor + "." + summary.protocolMinor + "\n"
         out = out + "  grid geometry      " + summary.gridWidth + "x" + summary.gridHeight + " (" + summary.gridAtoms + " atoms)\n"
@@ -312,11 +122,15 @@ app FabricCliRenderSelfHost:
         out = out + "  hot coordinates    " + summary.hotCoordinates + "\n"
         return out
 
-    # ============================================================
-    # render_topology — human branch only.
-    # ============================================================
-    proc renderTopology(placements: [Placement]) -> text:
+    proc renderTopology(placements: [Placement], json: bool) -> text:
         let n = len(placements)
+        if json:
+            let mut parts = []
+            let mut j = 0
+            loop j < n:
+                parts = append(parts, placementJson(placements[j]))
+                j = j + 1
+            return sjPretty("[" + join(parts, ",") + "]")
         if n == 0:
             return "No placements. Topology registry is empty."
         let mut out = "Topology: " + n + " placement(s)\n"
@@ -324,21 +138,19 @@ app FabricCliRenderSelfHost:
         let mut i = 0
         loop i < n:
             let p = placements[i]
-            let coordStr = do coordText(p.coordinate)
-            let coordPadded = do textPadRight(coordStr, 7)
-            let shardRaw = "" + p.shardId
-            let shardPadded = do textPadRight(shardRaw, 5)
-            let regionPadded = do textPadRight(p.region, 16)
-            let row = "  " + coordPadded + "  " + shardPadded + "  " + regionPadded + "  " + p.dbmsId + "\n"
-            out = out + row
+            out = out + "  " + fmtPadRight(coordText(p.coordinate), 7) + "  " + fmtPadRight(sjU64Text(p.shardId), 5) + "  " + fmtPadRight(p.region, 16) + "  " + p.dbmsId + "\n"
             i = i + 1
         return out
 
-    # ============================================================
-    # render_workload — human branch only.
-    # ============================================================
-    proc renderWorkload(profiles: [WorkloadProfile]) -> text:
+    proc renderWorkload(profiles: [WorkloadProfile], json: bool) -> text:
         let n = len(profiles)
+        if json:
+            let mut parts = []
+            let mut j = 0
+            loop j < n:
+                parts = append(parts, workloadProfileJson(profiles[j]))
+                j = j + 1
+            return sjPretty("[" + join(parts, ",") + "]")
         if n == 0:
             return "No workload profiles. No telemetry has been ingested."
         let mut out = "Workload: " + n + " profile(s)\n"
@@ -346,30 +158,20 @@ app FabricCliRenderSelfHost:
         let mut i = 0
         loop i < n:
             let p = profiles[i]
-            let isHot = do workloadProfileIsHot(p)
-            let hotText = do yesNo(isHot)
-            let label = do pressureLabel(p.pressure)
-            let coordStr = do coordText(p.coordinate)
-            let coordPadded = do textPadRight(coordStr, 7)
-            let opsStr = do floatFixed(p.operationsPerSecond, 1)
-            let opsPadded = do textPadLeft(opsStr, 10)
-            let readPct = p.readRatio * 100.0
-            let readStr = do floatFixed(readPct, 0)
-            let readPadded = do textPadLeft(readStr, 5)
-            let writePct = p.writeRatio * 100.0
-            let writeStr = do floatFixed(writePct, 0)
-            let writePadded = do textPadLeft(writeStr, 6)
-            let labelPadded = do textPadRight(label, 9)
-            let row = "  " + coordPadded + "  " + opsPadded + "  " + readPadded + "  " + writePadded + "  " + labelPadded + "  " + hotText + "\n"
-            out = out + row
+            let hot = workloadProfileIsHot(p)
+            out = out + "  " + fmtPadRight(coordText(p.coordinate), 7) + "  " + fmtPadLeft(fmtFixed(p.operationsPerSecond, 1), 10) + "  " + fmtPadLeft(fmtFixed(p.readRatio * 100.0, 0), 5) + "  " + fmtPadLeft(fmtFixed(p.writeRatio * 100.0, 0), 6) + "  " + fmtPadRight(pressureLabel(p.pressure), 9) + "  " + yesNo(hot) + "\n"
             i = i + 1
         return out
 
-    # ============================================================
-    # render_metrics — human branch only.
-    # ============================================================
-    proc renderMetrics(observations: [Observation]) -> text:
+    proc renderMetrics(observations: [Observation], json: bool) -> text:
         let n = len(observations)
+        if json:
+            let mut parts = []
+            let mut j = 0
+            loop j < n:
+                parts = append(parts, observationJson(observations[j]))
+                j = j + 1
+            return sjPretty("[" + join(parts, ",") + "]")
         if n == 0:
             return "No metrics. No observations recorded."
         let mut out = "Metrics: " + n + " observation(s)\n"
@@ -378,31 +180,19 @@ app FabricCliRenderSelfHost:
         loop i < n:
             let o = observations[i]
             let m = o.metrics
-            let total = do workloadMetricsTotalOperations(m)
-            let coordStr = do coordText(o.coordinate)
-            let coordPadded = do textPadRight(coordStr, 7)
-            let shardRaw = "" + o.shard.id
-            let shardPadded = do textPadRight(shardRaw, 5)
-            let totalStr = do floatFixed(total, 1)
-            let totalPadded = do textPadLeft(totalStr, 10)
-            let cpuPct = m.cpuUtilization * 100.0
-            let cpuStr = do floatFixed(cpuPct, 0)
-            let cpuPadded = do textPadLeft(cpuStr, 4)
-            let memPct = m.memoryUtilization * 100.0
-            let memStr = do floatFixed(memPct, 0)
-            let memPadded = do textPadLeft(memStr, 4)
-            let queueRaw = "" + m.queueDepth
-            let queuePadded = do textPadLeft(queueRaw, 6)
-            let row = "  " + coordPadded + "  " + shardPadded + "  " + totalPadded + "  " + cpuPadded + "%  " + memPadded + "%  " + queuePadded + "\n"
-            out = out + row
+            out = out + "  " + fmtPadRight(coordText(o.coordinate), 7) + "  " + fmtPadRight(sjU64Text(o.shard.id), 5) + "  " + fmtPadLeft(fmtFixed(workloadMetricsTotalOperations(m), 1), 10) + "  " + fmtPadLeft(fmtFixed(m.cpuUtilization * 100.0, 0), 4) + "%  " + fmtPadLeft(fmtFixed(m.memoryUtilization * 100.0, 0), 4) + "%  " + fmtPadLeft(sjU64Text(m.queueDepth), 6) + "\n"
             i = i + 1
         return out
 
-    # ============================================================
-    # render_placement — human branch only.
-    # ============================================================
-    proc renderPlacement(decisions: [OptimizationDecision]) -> text:
+    proc renderPlacement(decisions: [OptimizationDecision], json: bool) -> text:
         let n = len(decisions)
+        if json:
+            let mut parts = []
+            let mut j = 0
+            loop j < n:
+                parts = append(parts, optimizationDecisionJson(decisions[j]))
+                j = j + 1
+            return sjPretty("[" + join(parts, ",") + "]")
         if n == 0:
             return "No placement decisions. No workload profiles to optimize."
         let mut out = "Placement: " + n + " decision(s)\n"
@@ -410,31 +200,20 @@ app FabricCliRenderSelfHost:
         let mut i = 0
         loop i < n:
             let d = decisions[i]
-            let score = do optimizationDecisionScore(d)
-            let exec = do optimizationDecisionShouldExecute(d)
-            let execText = do yesNo(exec)
-            let actionText = do actionLabel(d.action)
-            let coordStr = do coordText(d.coordinate)
-            let coordPadded = do textPadRight(coordStr, 7)
-            let actionPadded = do textPadRight(actionText, 21)
-            let gainStr = do floatFixed(d.expectedGain, 2)
-            let gainPadded = do textPadLeft(gainStr, 4)
-            let costStr = do floatFixed(d.estimatedCost, 2)
-            let costPadded = do textPadLeft(costStr, 4)
-            let scoreStr = do floatFixed(score, 2)
-            let scorePadded = do textPadLeft(scoreStr, 5)
-            let confStr = do floatFixed(d.confidence, 2)
-            let confPadded = do textPadLeft(confStr, 4)
-            let row = "  " + coordPadded + "  " + actionPadded + "  " + gainPadded + "   " + costPadded + "   " + scorePadded + "   " + confPadded + "   " + execText + "\n"
-            out = out + row
+            let exec = optimizationDecisionShouldExecute(d)
+            out = out + "  " + fmtPadRight(coordText(d.coordinate), 7) + "  " + fmtPadRight(actionLabel(d.action), 21) + "  " + fmtPadLeft(fmtFixed(d.expectedGain, 2), 4) + "   " + fmtPadLeft(fmtFixed(d.estimatedCost, 2), 4) + "   " + fmtPadLeft(fmtFixed(optimizationDecisionScore(d), 2), 5) + "   " + fmtPadLeft(fmtFixed(d.confidence, 2), 4) + "   " + yesNo(exec) + "\n"
             i = i + 1
         return out
 
-    # ============================================================
-    # render_predict — human branch only.
-    # ============================================================
-    proc renderPredict(rows: [PredictionRow]) -> text:
+    proc renderPredict(rows: [PredictionRow], json: bool) -> text:
         let n = len(rows)
+        if json:
+            let mut parts = []
+            let mut j = 0
+            loop j < n:
+                parts = append(parts, predictionRowJson(rows[j]))
+                j = j + 1
+            return sjPretty("[" + join(parts, ",") + "]")
         if n == 0:
             return "No predictions. No workload profiles to score."
         let mut out = "Predict: " + n + " profile(s)\n"
@@ -442,267 +221,47 @@ app FabricCliRenderSelfHost:
         let mut i = 0
         loop i < n:
             let r = rows[i]
-            let coordStr = do coordText(r.coordinate)
-            let coordPadded = do textPadRight(coordStr, 7)
-            let hotspotStr = do floatFixed(r.hotspotProbability, 2)
-            let hotspotPadded = do textPadLeft(hotspotStr, 7)
-            let likelyText = do yesNo(r.likelyHot)
-            let likelyPadded = do textPadRight(likelyText, 10)
-            let anomalyStr = do floatFixed(r.anomalyScore, 2)
-            let anomalyPadded = do textPadLeft(anomalyStr, 7)
-            let anomalousText = do yesNo(r.anomalous)
-            let row = "  " + coordPadded + "  " + hotspotPadded + "  " + likelyPadded + "  " + anomalyPadded + "  " + anomalousText + "\n"
-            out = out + row
+            out = out + "  " + fmtPadRight(coordText(r.coordinate), 7) + "  " + fmtPadLeft(fmtFixed(r.hotspotProbability, 2), 7) + "  " + fmtPadRight(yesNo(r.likelyHot), 10) + "  " + fmtPadLeft(fmtFixed(r.anomalyScore, 2), 7) + "  " + yesNo(r.anomalous) + "\n"
             i = i + 1
         return out
 
-    # ============================================================
-    # render_nodes — human branch only. `silence_ms: Option<u64>` prints
-    # "{ms}ms" when present, "never" when a node has never reported in
-    # (restated exactly, not shown as "0ms" — the real source's own comment
-    # on its test makes this an explicit, deliberate distinction, not an
-    # incidental one).
-    # ============================================================
-    proc renderNodes(rows: [NodeRow], nowMs: int, deadlineMs: int) -> text:
+    proc renderNodes(rows: [NodeRow], nowMs: int, deadlineMs: int, json: bool) -> text:
         let n = len(rows)
+        if json:
+            let mut parts = []
+            let mut j = 0
+            loop j < n:
+                parts = append(parts, nodeRowJson(rows[j]))
+                j = j + 1
+            return sjPretty("[" + join(parts, ",") + "]")
         if n == 0:
             return "No nodes. Nothing has registered with the runtime."
-        let mut out = "Nodes: " + n + " registered (as of t=" + nowMs + "ms, deadline " + deadlineMs + "ms)\n"
+        let mut out = "Nodes: " + n + " registered (as of t=" + sjU64Text(nowMs) + "ms, deadline " + sjU64Text(deadlineMs) + "ms)\n"
         out = out + "  DBMS              REGION            VERSION   BEATS  SILENT       HEALTH\n"
         let mut i = 0
         loop i < n:
             let row = rows[i]
-            let mut silentText = "never"
+            let mut silent = "never"
             if row.hasSilenceMs:
-                silentText = "" + row.silenceMs + "ms"
-            let dbmsPadded = do textPadRight(row.dbmsId, 16)
-            let regionPadded = do textPadRight(row.region, 16)
-            let versionPadded = do textPadRight(row.softwareVersion, 8)
-            let beatsRaw = "" + row.heartbeats
-            let beatsPadded = do textPadLeft(beatsRaw, 5)
-            let silentPadded = do textPadRight(silentText, 11)
-            let line = "  " + dbmsPadded + "  " + regionPadded + "  " + versionPadded + "  " + beatsPadded + "  " + silentPadded + "  " + row.health + "\n"
-            out = out + line
+                silent = sjU64Text(row.silenceMs) + "ms"
+            out = out + "  " + fmtPadRight(row.dbmsId, 16) + "  " + fmtPadRight(row.region, 16) + "  " + fmtPadRight(row.softwareVersion, 8) + "  " + fmtPadLeft(sjU64Text(row.heartbeats), 5) + "  " + fmtPadRight(silent, 11) + "  " + row.health + "\n"
             i = i + 1
         return out
 
-    # ============================================================
-    # render_validation — human branch only.
-    # ============================================================
-    proc renderValidation(issues: [ValidationIssue]) -> text:
+    proc renderValidation(issues: [ValidationIssue], json: bool) -> text:
         let n = len(issues)
+        if json:
+            let mut parts = []
+            let mut j = 0
+            loop j < n:
+                parts = append(parts, validationIssueJson(issues[j]))
+                j = j + 1
+            return sjPretty("[" + join(parts, ",") + "]")
         if n == 0:
             return "Valid. Every ingested coordinate is within the grid."
         let mut out = "Invalid: " + n + " out-of-grid coordinate(s)\n"
         let mut i = 0
         loop i < n:
-            let issue = issues[i]
-            out = out + "  " + issue.reason + "\n"
+            out = out + "  " + issues[i].reason + "\n"
             i = i + 1
         return out
-
-    # ============================================================
-    # DEMO / BUILD-CHECK FIXTURES — restating the real, passing `cargo test
-    # -p fabric-cli` fixtures for every `render::tests::*` test that has a
-    # human-output assertion (see this file's header for the full run:
-    # 28 passed, 8 in `render::tests`). Plus three additional hand-traced
-    # demos (status/metrics/placement) for the three render functions the
-    # real test module never exercises with a populated human table beyond
-    # the shared `empty_renderers_are_explicit` check — traced directly
-    # against each function's own body above, not against a Rust test that
-    # doesn't exist for these cases.
-    # ============================================================
-
-    # `pressure_labels`: PressureLevel::Normal -> "normal",
-    # PressureLevel::Critical -> "critical".
-    proc demoPressureLabels() -> bool:
-        let a = do pressureLabel("normal")
-        let b = do pressureLabel("critical")
-        return a == "normal" && b == "critical"
-
-    # `action_labels`: NoAction -> "no-action", Isolate -> "isolate",
-    # Move{node-b} -> "move -> node-b", Colocate{(3,4)} -> "colocate -> (3,4)".
-    proc demoActionLabels() -> bool:
-        let noAction = do optimizationActionNoAction()
-        let noActionLabel = do actionLabel(noAction)
-        let isolate = do optimizationActionIsolate()
-        let isolateLabel = do actionLabel(isolate)
-        let moveAction = do optimizationActionMove("node-b")
-        let moveLabel = do actionLabel(moveAction)
-        let colocateTarget = Coordinate{x: 3, y: 4}
-        let colocateAction = do optimizationActionColocate(colocateTarget)
-        let colocateLabel = do actionLabel(colocateAction)
-        return noActionLabel == "no-action" && isolateLabel == "isolate" && moveLabel == "move -> node-b" && colocateLabel == "colocate -> (3,4)"
-
-    # `empty_renderers_are_explicit`: topology/workload/metrics/placement
-    # each say something explicit, never an empty string, when given no
-    # rows.
-    proc demoEmptyRenderersAreExplicit() -> bool:
-        let emptyPlacements = []
-        let topo = do renderTopology(emptyPlacements)
-        let topoOk = contains(topo, "empty")
-        let emptyProfiles = []
-        let wl = do renderWorkload(emptyProfiles)
-        let wlOk = contains(wl, "No workload")
-        let emptyObservations = []
-        let mt = do renderMetrics(emptyObservations)
-        let mtOk = contains(mt, "No metrics")
-        let emptyDecisions = []
-        let pl = do renderPlacement(emptyDecisions)
-        let plOk = contains(pl, "No placement")
-        return topoOk && wlOk && mtOk && plOk
-
-    # `topology_human_and_json`: one placement (node-a, shard 7, (1,2),
-    # us-east) — the human branch must mention the coordinate, the region
-    # and the node id.
-    proc demoTopologyHuman() -> bool:
-        let target = Coordinate{x: 1, y: 2}
-        let placement = do placementNew("node-a", 7, target, "us-east")
-        let placements = [placement]
-        let human = do renderTopology(placements)
-        let hasCoord = contains(human, "(1,2)")
-        let hasRegion = contains(human, "us-east")
-        let hasDbms = contains(human, "node-a")
-        return hasCoord && hasRegion && hasDbms
-
-    # `predict_empty_and_populated`: empty says "No predictions"; one row
-    # (2,3)/0.91/likely/0.42/not-anomalous shows the coordinate, the
-    # probability and a "yes".
-    proc demoPredictEmptyAndPopulated() -> bool:
-        let emptyRows = []
-        let empty = do renderPredict(emptyRows)
-        let emptyOk = contains(empty, "No predictions")
-        let predictCoord = Coordinate{x: 2, y: 3}
-        let row = PredictionRow{coordinate: predictCoord, hotspotProbability: 0.91, likelyHot: true, anomalyScore: 0.42, anomalous: false}
-        let rows = [row]
-        let human = do renderPredict(rows)
-        let hasCoord = contains(human, "(2,3)")
-        let hasProb = contains(human, "0.91")
-        let hasYes = contains(human, "yes")
-        return emptyOk && hasCoord && hasProb && hasYes
-
-    # `validation_valid_and_invalid`: empty says "Valid"; one issue at
-    # (20,20) says "Invalid" and names the coordinate in its reason text.
-    proc demoValidationValidAndInvalid() -> bool:
-        let emptyIssues = []
-        let empty = do renderValidation(emptyIssues)
-        let emptyOk = contains(empty, "Valid")
-        let badCoord = Coordinate{x: 20, y: 20}
-        let issue = ValidationIssue{coordinate: badCoord, reason: "coordinate (20,20) is outside the 12x13 grid"}
-        let issues = [issue]
-        let human = do renderValidation(issues)
-        let hasInvalid = contains(human, "Invalid")
-        let hasCoord = contains(human, "(20,20)")
-        return emptyOk && hasInvalid && hasCoord
-
-    # `nodes_empty_and_populated`: empty says "No nodes"; db-a (healthy,
-    # silence 1000ms) and db-b (unreachable, never reported in) both show
-    # up, and a never-reported node says "never" rather than "0ms".
-    proc demoNodesEmptyAndPopulated() -> bool:
-        let emptyRows = []
-        let empty = do renderNodes(emptyRows, 0, 30000)
-        let emptyOk = contains(empty, "No nodes")
-        let rowA = NodeRow{dbmsId: "db-a", region: "us-east", softwareVersion: "0.13.0", registeredAtMs: 0, hasLastHeartbeatMs: true, lastHeartbeatMs: 9000, hasSilenceMs: true, silenceMs: 1000, heartbeats: 3, health: "healthy"}
-        let rowB = NodeRow{dbmsId: "db-b", region: "eu-west", softwareVersion: "unknown", registeredAtMs: 0, hasLastHeartbeatMs: false, lastHeartbeatMs: 0, hasSilenceMs: false, silenceMs: 0, heartbeats: 0, health: "unreachable"}
-        let rows = [rowA, rowB]
-        let human = do renderNodes(rows, 10000, 30000)
-        let hasA = contains(human, "db-a")
-        let hasHealthy = contains(human, "healthy")
-        let hasNever = contains(human, "never")
-        let hasUnreachable = contains(human, "unreachable")
-        return emptyOk && hasA && hasHealthy && hasNever && hasUnreachable
-
-    # Additional hand-trace (no direct Rust test exercises a populated
-    # render_status table beyond JSON): protocol 1.0, grid 12x13 (156
-    # atoms).
-    proc demoStatusHuman() -> bool:
-        let summary = StatusSummary{placements: 2, profiles: 3, observations: 4, hotCoordinates: 1, gridWidth: 12, gridHeight: 13, gridAtoms: 156, protocolMajor: 1, protocolMinor: 0}
-        let human = do renderStatus(summary)
-        let hasHeader = contains(human, "Facet Fabric runtime status")
-        let hasProtocol = contains(human, "1.0")
-        let hasGrid = contains(human, "12x13")
-        let hasAtoms = contains(human, "156 atoms")
-        return hasHeader && hasProtocol && hasGrid && hasAtoms
-
-    # Additional hand-trace for render_metrics: reads=300, writes=100 ->
-    # total_operations()=400.0, at coordinate (3,4).
-    proc demoMetricsHuman() -> bool:
-        let shard = ObservationShard{id: 9, workloadDomain: "orders"}
-        let metrics = WorkloadMetrics{operationsPerSecond: 0.0, readsPerSecond: 300.0, writesPerSecond: 100.0, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.90, memoryUtilization: 0.50, storageBytesPerSecond: 0, networkInBytesPerSecond: 0, networkOutBytesPerSecond: 0, queueDepth: 5000, cellBreakdown: [], cellBreakdownPartial: false}
-        let metricsCoord = Coordinate{x: 3, y: 4}
-        let obs = do observationNew(1000, shard, metricsCoord, metrics)
-        let observations = [obs]
-        let human = do renderMetrics(observations)
-        let hasCoord = contains(human, "(3,4)")
-        let hasTotal = contains(human, "400.0")
-        return hasCoord && hasTotal
-
-    # Additional hand-trace for render_placement: a Replicate decision with
-    # score 1.20-0.35=0.85>0 and confidence 0.99>=0.80 should_execute -> yes.
-    proc demoPlacementHuman() -> bool:
-        let replicateAction = do optimizationActionReplicate("db-c")
-        let placementCoord = Coordinate{x: 5, y: 6}
-        let decision = OptimizationDecision{shardId: 1, coordinate: placementCoord, action: replicateAction, expectedGain: 1.20, estimatedCost: 0.35, confidence: 0.99}
-        let decisions = [decision]
-        let human = do renderPlacement(decisions)
-        let hasCoord = contains(human, "(5,6)")
-        let hasAction = contains(human, "replicate -> db-c")
-        let hasYes = contains(human, "yes")
-        return hasCoord && hasAction && hasYes
-
-    # Additional hand-trace for render_workload: reads 300/writes 100 ->
-    # ops 400.0, read 75%, write 25%, pressure "elevated" (0.64, per
-    # fabric_telemetry.fct's own demoWorkloadPressureScoreAndProfile trace)
-    # which is NOT hot (only high/critical count) -> "no".
-    proc demoWorkloadHuman() -> bool:
-        let workloadCoord = Coordinate{x: 3, y: 4}
-        let profile = WorkloadProfile{shardId: 1, coordinate: workloadCoord, operationsPerSecond: 400.0, readRatio: 0.75, writeRatio: 0.25, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, storageBytesPerSecond: 0, networkInBytesPerSecond: 0, networkOutBytesPerSecond: 0, queueDepth: 0, cellBreakdown: [], cellBreakdownPartial: false, pressureScore: 0.64, pressure: "elevated"}
-        let profiles = [profile]
-        let human = do renderWorkload(profiles)
-        let hasCoord = contains(human, "(3,4)")
-        let hasOps = contains(human, "400.0")
-        let hasPressure = contains(human, "elevated")
-        let hasNo = contains(human, "no")
-        return hasCoord && hasOps && hasPressure && hasNo
-
-    state demoPressureLabelsResult: bool = false
-    state demoActionLabelsResult: bool = false
-    state demoEmptyRenderersAreExplicitResult: bool = false
-    state demoTopologyHumanResult: bool = false
-    state demoPredictEmptyAndPopulatedResult: bool = false
-    state demoValidationValidAndInvalidResult: bool = false
-    state demoNodesEmptyAndPopulatedResult: bool = false
-    state demoStatusHumanResult: bool = false
-    state demoMetricsHumanResult: bool = false
-    state demoPlacementHumanResult: bool = false
-    state demoWorkloadHumanResult: bool = false
-
-    action runDemoCliRender():
-        let r1 = do demoPressureLabels()
-        let r2 = do demoActionLabels()
-        let r3 = do demoEmptyRenderersAreExplicit()
-        let r4 = do demoTopologyHuman()
-        let r5 = do demoPredictEmptyAndPopulated()
-        let r6 = do demoValidationValidAndInvalid()
-        let r7 = do demoNodesEmptyAndPopulated()
-        let r8 = do demoStatusHuman()
-        let r9 = do demoMetricsHuman()
-        let r10 = do demoPlacementHuman()
-        let r11 = do demoWorkloadHuman()
-        demoPressureLabelsResult = r1
-        demoActionLabelsResult = r2
-        demoEmptyRenderersAreExplicitResult = r3
-        demoTopologyHumanResult = r4
-        demoPredictEmptyAndPopulatedResult = r5
-        demoValidationValidAndInvalidResult = r6
-        demoNodesEmptyAndPopulatedResult = r7
-        demoStatusHumanResult = r8
-        demoMetricsHumanResult = r9
-        demoPlacementHumanResult = r10
-        demoWorkloadHumanResult = r11
-
-    private view Home at "/fabric_cli_render":
-        box:
-            text "{demoPressureLabelsResult} {demoActionLabelsResult} {demoEmptyRenderersAreExplicitResult} {demoTopologyHumanResult}"
-            text "{demoPredictEmptyAndPopulatedResult} {demoValidationValidAndInvalidResult} {demoNodesEmptyAndPopulatedResult}"
-            text "{demoStatusHumanResult} {demoMetricsHumanResult} {demoPlacementHumanResult} {demoWorkloadHumanResult}"

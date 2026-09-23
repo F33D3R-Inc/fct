@@ -60,8 +60,8 @@ func hotp(key []byte, counter uint64) string {
 // clock skew on either side, in constant time.
 func totpValid(secret, code string, t time.Time) bool {
 	code = strings.TrimSpace(code)
-	if len(code) != 6 {
-		return false
+	if len(code) != 6 || strings.TrimSpace(secret) == "" {
+		return false // no secret is no enrollment — an empty key would still yield codes
 	}
 	for _, skew := range []time.Duration{0, -totpPeriod * time.Second, totpPeriod * time.Second} {
 		if subtle.ConstantTimeCompare([]byte(totpCode(secret, t.Add(skew))), []byte(code)) == 1 {

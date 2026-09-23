@@ -79,6 +79,7 @@ type App struct {
 	Procs      []*Proc
 	Jobs       []*Job
 	Daemons    []*Daemon
+	Shareds    []*Shared
 	Components []*Component
 	Layouts    []*Layout
 	Views      []*View
@@ -86,13 +87,17 @@ type App struct {
 	Files      []*File
 	Webhooks   []*Webhook
 	APIs       []*API
-	Streams    []*Stream
-	Triggers   []*Trigger
-	Theme      []ThemeVar   // base design tokens (the light palette)
-	DarkTheme  []ThemeVar   // `theme dark:` — token overrides applied under prefers-color-scheme: dark
-	Themes     []NamedTheme // `theme <name>:` — alternate palettes selectable at runtime
-	CSS        string       // raw stylesheet from `css:` blocks, emitted verbatim into the page
-	Line       int
+	Contract   *ContractDecl
+	// Source is the file this module was parsed from (its base name), for
+	// cross-module collision errors; "" for a string-compiled app.
+	Source    string
+	Streams   []*Stream
+	Triggers  []*Trigger
+	Theme     []ThemeVar   // base design tokens (the light palette)
+	DarkTheme []ThemeVar   // `theme dark:` — token overrides applied under prefers-color-scheme: dark
+	Themes    []NamedTheme // `theme <name>:` — alternate palettes selectable at runtime
+	CSS       string       // raw stylesheet from `css:` blocks, emitted verbatim into the page
+	Line      int
 }
 
 // Trigger is a programmatic event reaction: when the action named On completes
@@ -142,7 +147,24 @@ type API struct {
 	Status int
 	Rate   string
 	Since  string
-	Line   int
+	// `auth <scheme> bearer <param>`: the route authenticates with a credential
+	// the app issues and verifies itself (a third-party access token), not a
+	// session. The `Authorization: Bearer` value binds to action parameter
+	// Bearer, and the contract names the scheme as the route's x-auth.
+	AuthScheme string
+	Bearer     string
+	Line       int
+}
+
+// ContractDecl is `contract "/api/v2/contract" [rate <class>] [since "<date>"]`:
+// the app serves its own published contract under Path — the document, its
+// version, every version this deployment has served, and the server-computed
+// diff between two of them (see runtime/contract.go).
+type ContractDecl struct {
+	Path  string
+	Rate  string
+	Since string
+	Line  int
 }
 
 // Stream is one named event stream of the contract — a server-sent-events
@@ -154,11 +176,45 @@ type API struct {
 // Notify{…}` (every subscriber) or `emit Notify{…} to handle` (the
 // subscribers signed in as that actor). Requires names a zero-argument policy
 // a subscriber must pass to connect; without it the stream is open.
+//
+// The block form names each event apart from its payload type, so two events
+// may share one DTO, and documents it for the contract:
+//
+//	stream "/api/v2/events" requires member rate read since "2026-09-18":
+//	    post_deleted: WorkRemovedEvent since "2026-09-06" "A work was deleted."
+//	    work_removed: WorkRemovedEvent since "2026-09-13" "A watched work is gone."
+//
+// In the one-line form an event's name is its type's name.
 type Stream struct {
-	Path     string
-	Events   []string
-	Requires string
-	Line     int
+	Path string
+	// Connect/Disconnect are the block form's `connect -> action [as event]`
+	// and `disconnect -> action` lines: actions run as the subscriber, with
+	// the path's {params} as their arguments, when a connection opens (its
+	// failure refuses the connection; its reply, when `as event` names one,
+	// is sent to that connection first) and when it closes.
+	Connects   []StreamHook // every `connect -> action [as event]` line, in order
+	Disconnect string
+	Events     []StreamEvent
+	Requires   string
+	Rate       string // read | write | auth: the rate class a connect is metered against
+	Since      string
+	Line       int
+}
+
+// StreamHook is one `connect -> Action [as Event]` line.
+type StreamHook struct {
+	Action string
+	Event  string
+}
+
+// StreamEvent is one event a stream carries: the SSE `event:` name, its
+// payload wire type, and its contract documentation.
+type StreamEvent struct {
+	Name    string
+	Type    string
+	Since   string
+	Summary string
+	Line    int
 }
 
 // Emit puts one typed event on every stream that carries its type: `emit
@@ -167,6 +223,10 @@ type Stream struct {
 // commits, so a rolled-back action emits nothing. Action-only; it forces
 // server placement, since only the authority holds the subscribers.
 type Emit struct {
+	Event string // `emit name Dto{…}`: the stream event's name; "" = the one event carrying Dto
+	// On is `emit … on id`: the path parameters of the parameterized stream
+	// instance (`stream "/live/{id}/events"`) the event goes to, in order.
+	On    []Expr
 	Value Expr
 	To    Expr
 	Line  int
@@ -281,6 +341,20 @@ type RecordField struct {
 	Type     string
 	List     bool
 	Optional bool
+	// Description, Aliases (`also id`) and Enum (`one of "a", "b"`) are a
+	// message variant field's contract documentation: what it means, the
+	// other names a caller may send it under, and its closed set of values.
+	Description string
+	Aliases     []string
+	Enum        []string
+	// Nullable is `name: T or null`: a wire field that is always present
+	// (required) but may be null — an empty value ("" or nothing) crosses as
+	// null rather than being left out, which is what `T?` does.
+	Nullable bool
+	// Into is a pattern field's action parameter: `then_<field>: text? "…"
+	// into then_fields` gathers every body key starting with "then_" into
+	// one json object (key without the prefix -> value) bound to then_fields.
+	Into string
 	// Default is wire-schema-only (Type/Message fields, not Record/entity
 	// fields, which never set it): the raw literal text of a `= value`
 	// clause, e.g. `count: int = 1` or `item_var: text = "item"` — mirrors a
@@ -349,7 +423,9 @@ type Enum struct {
 // a query-string type is never a tagged union in the real surface, and nothing
 // stops a future one from being added the same way if that ever changes.
 type Type struct {
-	Name   string
+	Name string
+	// Schema is the contract name from `type Name as "schema":` ("" = Name).
+	Schema string
 	Query  bool
 	Fields []RecordField
 	Line   int
@@ -360,7 +436,10 @@ type Type struct {
 // directly as the wire discriminant — `{"type": "insert_node", ...}` — with no
 // separate rename step, unlike Rust's `#[serde(rename_all = "snake_case")]`.
 type Message struct {
-	Name     string
+	Name string
+	// Tag is the discriminant's field name, `message Name tag "event_type":`
+	// ("" = "type").
+	Tag      string
 	Variants []MessageVariant
 	Line     int
 }
@@ -369,7 +448,25 @@ type Message struct {
 type MessageVariant struct {
 	Name   string
 	Fields []RecordField
-	Line   int
+	// The block form's documentation and dispatch:
+	//
+	//	| frequency_upvote as "frequency.upvote" -> frequencyUpvote since "2026-09-06" "Upvote a mic request.":
+	//	    frequency_id: text "Frequency id; `id` is accepted too." also id
+	//
+	// Wire is the discriminant value when it is not the variant's own name
+	// (`as "…"`); Action is the action a dispatching route runs for it, its
+	// fields bound to that action's parameters by name; Since/Summary document
+	// it in the contract's x-mutation-events.
+	Wire    string
+	Action  string
+	Since   string
+	Summary string
+	// BodyParam/BodyType are `body envelope: WorkEnvelope`: the whole request
+	// body, decoded as that wire type, binds the action's parameter BodyParam
+	// (a variant whose body is itself a documented object).
+	BodyParam string
+	BodyType  string
+	Line      int
 }
 
 // Struct is a proc-local named-field composite type: `struct Name:` then one
@@ -538,6 +635,7 @@ type EntityField struct {
 	Type       string // int | text | bool | money | date | <Enum> | <EntityName>
 	Secret     bool   // @secret — encrypted at rest (AES-GCM under FACET_SECRET)
 	E2E        bool   // @e2e — end-to-end sealed: the client seals before sending and opens on read; the authority only ever holds ciphertext (never plaintext, never renders it)
+	Password   bool   // @password — stored as a one-way bcrypt hash of what is written; never readable, only checked by verifyPassword
 	ReadPolicy string // @requires(policy) — field served only to actors the policy admits; never sent over SSE
 	Optional   bool   // text? — the column is nullable
 	// Declarative constraints — enforced by the authority on every add/set, so
@@ -578,11 +676,20 @@ type State struct {
 // value is recomputed in whatever domain renders it (the client mirrors every
 // server cell it can see, so derivations cost zero round-trips). It is a
 // compile-time abstraction: DRY at the source, free at runtime.
+//
+// Params makes it a projection: `derive workCard(w: Work, me: int): CardDTO =
+// CardDTO{...}` is called in any expression position — `workCard(Work(id), me)`,
+// or per row in `list(workCard(w, me) in Work where …)` — and each call site is
+// the body with the arguments substituted for the parameters, so one definition
+// of a response shape serves every action that answers with it. A parameter is
+// a primitive, an enum, or an entity (a row, read as `w.field`, exactly like a
+// component's entity parameter).
 type Derive struct {
-	Name string
-	Type string
-	Expr Expr
-	Line int
+	Name   string
+	Params []Param
+	Type   string
+	Expr   Expr
+	Line   int
 }
 
 // Policy is a named predicate over the actor, its own parameters, and state. A
@@ -663,8 +770,20 @@ type Proc struct {
 type Service struct {
 	Name string
 	URL  string
-	Ops  []ServiceOp
-	Line int
+	// URLEnv (`at "…" env THEMIS_URL`) names an env var that, when set,
+	// replaces URL for this deployment; Headers (`header "X-Internal-Key"
+	// env INTERNAL_API_KEY`) are request headers whose values come from env
+	// vars — a credential never written in source.
+	URLEnv  string
+	Headers []ServiceHeader
+	Ops     []ServiceOp
+	Line    int
+}
+
+// ServiceHeader is one `header "Name" env VAR` clause of a service.
+type ServiceHeader struct {
+	Name string
+	Env  string
 }
 
 // ServiceOp is one operation a service exposes — a name, typed parameters, and an
@@ -757,6 +876,38 @@ type Establish struct {
 	Line  int
 }
 
+// Revoke ends a live session: `revoke s.sid` signs out whichever session has
+// that `session` key (the stable key an app stores on its own session rows), so
+// a credential the app revokes stops authenticating at the runtime, not merely
+// disappearing from the app's list. It takes effect only if the action commits.
+// Like Establish it changes who a request is, so it pins the action to the server.
+type Revoke struct {
+	Session Expr
+	Line    int
+}
+
+// Header is `header "HX-Redirect" <expr>`: a response header the action's
+// HTTP reply carries when it succeeds (a declared api route or a dispatched
+// message variant). The name is a literal the compiler vets — never one the
+// runtime itself owns (cookies, framing, content type, security policy).
+type Header struct {
+	Name  string
+	Value Expr
+	Line  int
+}
+
+func (Header) stmt() {}
+
+// Restate is `restate actor <expr> role <expr>`: every live session signed in
+// as that actor — on every instance — carries the new role from its next
+// request, without signing anyone out (an admin granting or removing a
+// platform role). Applied after the action commits.
+type Restate struct {
+	Actor Expr
+	Role  Expr
+	Line  int
+}
+
 // Check is one `check <expr> "message"` clause: a precondition over the action's
 // parameters (and actor) the authority evaluates before running the body. A
 // failing check aborts the action and returns its friendly message, so invalid
@@ -764,6 +915,14 @@ type Establish struct {
 type Check struct {
 	Cond Expr
 	Msg  string
+	// Code is `check … "message" code "unknown_policy"`: the machine-readable
+	// error code a declared route answers with (APIErrorDTO.error.code) when
+	// this check fails; "" = the status's own name.
+	Code string
+	// MsgExpr is the message when it interpolates (`"No league named
+	// {league}."`): the concatenation of its segments, evaluated in the
+	// action's scope when the check fails. nil for a literal message.
+	MsgExpr Expr
 	// Status is the HTTP status a declared `api` route answers with when this
 	// check fails — `check exists(...) "not found" status 404`. 0 means the
 	// default (422 Unprocessable Entity), which is also what every other
@@ -787,7 +946,7 @@ type Require struct {
 type Param struct {
 	Name     string
 	Type     string
-	List     bool // a `[T]` parameter (service operations only)
+	List     bool // a `[T]` parameter (a service operation, a proc, or an action)
 	Optional bool
 	// Ref makes the parameter a *reference* rather than a value: it is bound at
 	// the call site to the NAME of a declaration, not to the result of an
@@ -823,6 +982,24 @@ type Job struct {
 	Every   int  // seconds between runs; 0 = no interval
 	OnStart bool // also run once when the server starts
 	Line    int
+}
+
+// Shared is `shared name: Type` (or `shared name: [Type]`): one process-local,
+// in-memory cell that every proc and daemon body of this instance reads and
+// assigns by name — the language's counterpart of an Arc<RwLock<T>> that
+// concurrently running handlers share. A read (`name` in a proc expression)
+// is one atomic snapshot of the whole value; an assignment (`name = expr`)
+// replaces it atomically; neither blocks on anything but the cell itself, and
+// neither touches the durable store or its lock. It is deliberately NOT
+// state: nothing is persisted, nothing is per-session, nothing is synced to a
+// client, and only proc-shaped bodies (procs, daemons) may name it. A read
+// before the first assignment is a runtime error naming the cell, never a
+// silent zero value. See runtime/shared.go.
+type Shared struct {
+	Name string
+	Type string // element type when List is true
+	List bool
+	Line int
 }
 
 // Daemon is a detached, process-lifetime background task — the language's
@@ -991,7 +1168,11 @@ type IndexAssign struct {
 // see internal/ir/build.go's per-block lowering for the exact rule.
 type Return struct {
 	Value Expr // nil for a bare `return` (no declared return type)
-	Line  int
+	// Status is `return expr status N` (an action only): the 2xx a declared
+	// api route answers this reply with, instead of the route's own status
+	// (0 = the route's).
+	Status int
+	Line   int
 }
 
 // Loop is a proc-only `loop <cond>:` precondition (while-style) iteration: Cond
@@ -1098,6 +1279,24 @@ type Spawn struct {
 	Line int
 }
 
+// Detach starts a proc call concurrently and never joins it:
+// `detach ProcName(args)`. It is legal ONLY in a daemon body (internal/ir/
+// build.go's procBlock), and that is what makes it structured rather than a
+// leak: a daemon lives exactly as long as the process, so a task it detaches
+// is bounded by the same lifetime as the daemon that started it — the
+// structured-concurrency scope of a daemon is the process. It is the
+// primitive a server's accept loop needs to hand each connection to its own
+// concurrently running handler (`let c = accept(l)` then `detach
+// serveConn(c)`), which spawn/join cannot express: a handle spawned in one
+// trip through a loop can never be joined in a later one. The detached proc
+// runs with no caller to report to, so a failure is logged by the runtime
+// (runtime/daemon.go), exactly like a daemon body's own.
+type Detach struct {
+	Proc string
+	Args []Expr
+	Line int
+}
+
 // Join blocks until a previously `spawn`ed task finishes, consuming its
 // handle: `join h` (fire-and-forget — still a real barrier, since it blocks
 // until the goroutine finishes, but the result is discarded) or, bound,
@@ -1117,7 +1316,7 @@ type Join struct {
 // state. internal/ir/build.go's procBlock accepts this statement only while
 // lowering a daemon body (a real proc's own body still rejects it, exactly
 // like check/add/set/requires above) and resolves Action against the app's
-// already-built actions. runtime/server.go's execProcBlock (the "actcall" op)
+// already-built actions. runtime/proccompile.go (the "actcall" op)
 // runs it via s.runAction under the synthetic system actor — the exact
 // mechanism a Job/trigger already fires through — which is what acquires the
 // store lock only for this one call's duration, not the daemon's own
@@ -1131,11 +1330,13 @@ type Act struct {
 func (Assign) stmt()      {}
 func (ServiceCall) stmt() {}
 func (Establish) stmt()   {}
+func (Revoke) stmt()      {}
 func (Add) stmt()         {}
 func (Set) stmt()         {}
 func (Remove) stmt()      {}
 func (Clear) stmt()       {}
 func (ForStmt) stmt()     {}
+func (Restate) stmt()     {}
 func (Emit) stmt()        {}
 func (Let) stmt()         {}
 func (IndexAssign) stmt() {}
@@ -1148,6 +1349,7 @@ func (Break) stmt()       {}
 func (Continue) stmt()    {}
 func (ExprStmt) stmt()    {}
 func (Spawn) stmt()       {}
+func (Detach) stmt()      {}
 func (Join) stmt()        {}
 func (Act) stmt()         {}
 
@@ -1869,6 +2071,17 @@ type Agg struct {
 	Order string
 	Desc  bool
 	Limit Expr
+
+	// VarFromArg marks an item variable read off a bare argument of the value
+	// call — `list(card(p, me) in Pack)` rows through `p` — because nothing
+	// else names the row. The builder refuses it when that name is also a
+	// local in scope, where the guess could shadow it.
+	VarFromArg bool
+
+	// OrderExpr is `list(… by <expr>)` when the key is computed per row
+	// rather than a stored column (Order): `by count(l in Like where l.work
+	// == w.id) desc`. Evaluated in process; a bare column stays Order.
+	OrderExpr Expr
 }
 
 // Call is an effectful builtin invocation — `now()` (server clock, unix seconds)
@@ -1887,7 +2100,7 @@ type ListLit struct {
 }
 
 // Index is an indexed array read: `xs[i]`. Proc-only (see checkProcExpr in
-// internal/ir/build.go and evalInFrame in runtime/eval.go) — a proc-local
+// internal/ir/build.go and runtime/proccompile.go) — a proc-local
 // array lives in its own scope-frame, which is the only interpreter with the
 // bounds-checked read this needs; a compile-time check confirms Obj resolves
 // to a name the proc has already bound to an array value where that is
@@ -1924,7 +2137,7 @@ type Un struct {
 //
 // Proc-only, like ListLit's array: internal/ir/build.go's checkNoIndex now
 // also rejects a map literal outside a proc body, and runtime/eval.go's
-// evalInFrame is the only interpreter that knows the "map" IR kind this
+// runtime/proccompile.go is the only interpreter that knows the "map" IR kind this
 // lowers to — eval() (the flat scope evaluator every action/view/policy/
 // derive expression runs through) has no case for it, the same reason it has
 // none for "index".
@@ -1970,3 +2183,47 @@ func (Agg) expr()       {}
 func (Call) expr()      {}
 func (Bin) expr()       {}
 func (Un) expr()        {}
+
+// WalkExpr visits ex and every expression nested in it, parents first.
+func WalkExpr(ex Expr, visit func(Expr)) {
+	if ex == nil {
+		return
+	}
+	visit(ex)
+	switch t := ex.(type) {
+	case ListLit:
+		for _, e := range t.Elems {
+			WalkExpr(e, visit)
+		}
+	case MapLit:
+		for i := range t.Keys {
+			WalkExpr(t.Keys[i], visit)
+			WalkExpr(t.Vals[i], visit)
+		}
+	case StructLit:
+		for _, f := range t.Fields {
+			WalkExpr(f.Expr, visit)
+		}
+	case Index:
+		WalkExpr(t.Obj, visit)
+		WalkExpr(t.Idx, visit)
+	case Get:
+		WalkExpr(t.Obj, visit)
+	case EntityGet:
+		WalkExpr(t.Key, visit)
+	case Agg:
+		WalkExpr(t.Where, visit)
+		WalkExpr(t.Sel, visit)
+		WalkExpr(t.Limit, visit)
+		WalkExpr(t.OrderExpr, visit)
+	case Call:
+		for _, a := range t.Args {
+			WalkExpr(a, visit)
+		}
+	case Bin:
+		WalkExpr(t.L, visit)
+		WalkExpr(t.R, visit)
+	case Un:
+		WalkExpr(t.X, visit)
+	}
+}

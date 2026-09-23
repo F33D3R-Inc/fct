@@ -335,6 +335,156 @@ app FabricSelfHost:
         return allEq
 
     # ============================================================
+    # keyspace.rs as values: KeyspaceRule::new, Keyspace::{new, single,
+    # with_rule, with_fallback, for_kind, for_address, spanning_key,
+    # resolve}, and the Display of KeyspaceError / KeyspaceMiss. A routing
+    # key is packed as shard * 156 + y * 12 + x (RoutingKey::new's grid).
+    # ============================================================
+
+    proc routingKeyPack(shardId: int, x: int, y: int) -> int:
+        return shardId * 156 + y * 12 + x
+
+    # `impl Display for RoutingKey`: "{shard}/{x},{y}".
+    proc routingKeyPackedDisplay(packed: int) -> text:
+        let shardId = packed / 156
+        let idx = packed % 156
+        return "" + shardId + "/" + (idx % 12) + "," + (idx / 12)
+
+    struct KeyspaceError:
+        kind: text
+        value: text
+
+    proc keyspaceErrorDisplay(e: KeyspaceError) -> text:
+        if e.kind == "EmptyKind":
+            return "a keyspace rule must name a kind"
+        if e.kind == "EmptyAddressPrefix":
+            return "the keyspace rule for kind '" + e.value + "' must name a non-empty address prefix; use a fallback for 'everything else'"
+        if e.kind == "DuplicateKind":
+            return "kind '" + e.value + "' is declared by two keyspace rules"
+        return "address prefix '" + e.value + "' is declared by two keyspace rules"
+
+    struct KeyspaceRuleResult:
+        ok: bool
+        err: KeyspaceError
+        rule: RoutingRule
+
+    proc keyspaceRuleNew(kind: text, prefix: text, key: int) -> KeyspaceRuleResult:
+        let rule = RoutingRule{kind: kind, prefix: prefix, key: key}
+        if len(kind) == 0:
+            return KeyspaceRuleResult{ok: false, err: KeyspaceError{kind: "EmptyKind", value: ""}, rule: rule}
+        if len(prefix) == 0:
+            return KeyspaceRuleResult{ok: false, err: KeyspaceError{kind: "EmptyAddressPrefix", value: kind}, rule: rule}
+        return KeyspaceRuleResult{ok: true, err: KeyspaceError{kind: "", value: ""}, rule: rule}
+
+    struct Keyspace:
+        rules: [RoutingRule]
+        hasFallback: bool
+        fallbackKey: int
+
+    proc keyspaceNew() -> Keyspace:
+        return Keyspace{rules: [], hasFallback: false, fallbackKey: -1}
+
+    proc keyspaceSingle(key: int) -> Keyspace:
+        return Keyspace{rules: [], hasFallback: true, fallbackKey: key}
+
+    struct KeyspaceResult:
+        ok: bool
+        err: KeyspaceError
+        keyspace: Keyspace
+
+    proc keyspaceWithRule(ks: Keyspace, rule: RoutingRule) -> KeyspaceResult:
+        let dupKind = do ruleTableHasKind(ks.rules, rule.kind)
+        if dupKind:
+            return KeyspaceResult{ok: false, err: KeyspaceError{kind: "DuplicateKind", value: rule.kind}, keyspace: ks}
+        let dupPrefix = do ruleTableHasPrefixExact(ks.rules, rule.prefix)
+        if dupPrefix:
+            return KeyspaceResult{ok: false, err: KeyspaceError{kind: "DuplicateAddressPrefix", value: rule.prefix}, keyspace: ks}
+        let mut next = ks
+        next.rules = append(ks.rules, rule)
+        return KeyspaceResult{ok: true, err: KeyspaceError{kind: "", value: ""}, keyspace: next}
+
+    proc keyspaceWithFallback(ks: Keyspace, key: int) -> Keyspace:
+        let mut next = ks
+        next.hasFallback = true
+        next.fallbackKey = key
+        return next
+
+    struct KeyOption:
+        has: bool
+        key: int
+
+    proc keyspaceForKind(ks: Keyspace, kind: text) -> KeyOption:
+        let idx = do ruleIndexForKind(ks.rules, kind)
+        if idx == -1:
+            return KeyOption{has: false, key: -1}
+        return KeyOption{has: true, key: ks.rules[idx].key}
+
+    proc keyspaceForAddress(ks: Keyspace, address: text) -> KeyOption:
+        let idx = do ruleIndexForAddress(ks.rules, address)
+        if idx == -1:
+            return KeyOption{has: false, key: -1}
+        return KeyOption{has: true, key: ks.rules[idx].key}
+
+    proc keyspaceSpanningKey(ks: Keyspace) -> KeyOption:
+        let present = do spanningKeyPresent(ks.rules, ks.hasFallback, ks.fallbackKey)
+        if present:
+            return KeyOption{has: true, key: ks.fallbackKey}
+        return KeyOption{has: false, key: -1}
+
+    # KeyspaceMiss: kind "Unmapped" (kind/address are Options) or
+    # "Inconsistent" (both named, byKind != byAddress).
+    struct KeyspaceMiss:
+        kind: text
+        hasKind: bool
+        kindName: text
+        hasAddress: bool
+        address: text
+        byKind: int
+        byAddress: int
+
+    proc keyspaceMissDisplay(m: KeyspaceMiss) -> text:
+        if m.kind == "Inconsistent":
+            let byAddr = do routingKeyPackedDisplay(m.byAddress)
+            let byKind = do routingKeyPackedDisplay(m.byKind)
+            return "address '" + m.address + "' routes to " + byAddr + " but its kind '" + m.kindName + "' routes to " + byKind + "; the keyspace says these are different places, so this request cannot be served without putting the node where its own kind's queries will not look"
+        let mut what = "this request, which names neither a kind nor an address"
+        if m.hasKind && m.hasAddress:
+            what = "kind '" + m.kindName + "' or address '" + m.address + "'"
+        else:
+            if m.hasKind:
+                what = "kind '" + m.kindName + "'"
+            else:
+                if m.hasAddress:
+                    what = "address '" + m.address + "'"
+        return "no keyspace rule covers " + what + ", and no fallback is declared"
+
+    struct KeyspaceResolution:
+        ok: bool
+        key: int
+        miss: KeyspaceMiss
+
+    # Keyspace::resolve.
+    proc keyspaceResolve(ks: Keyspace, hasKind: bool, kind: text, hasAddress: bool, address: text) -> KeyspaceResolution:
+        let mut byKind = KeyOption{has: false, key: -1}
+        if hasKind:
+            byKind = do keyspaceForKind(ks, kind)
+        let mut byAddress = KeyOption{has: false, key: -1}
+        if hasAddress:
+            byAddress = do keyspaceForAddress(ks, address)
+        let noMiss = KeyspaceMiss{kind: "", hasKind: false, kindName: "", hasAddress: false, address: "", byKind: -1, byAddress: -1}
+        if byKind.has && byAddress.has && byKind.key != byAddress.key:
+            let miss = KeyspaceMiss{kind: "Inconsistent", hasKind: true, kindName: kind, hasAddress: true, address: address, byKind: byKind.key, byAddress: byAddress.key}
+            return KeyspaceResolution{ok: false, key: -1, miss: miss}
+        if byKind.has:
+            return KeyspaceResolution{ok: true, key: byKind.key, miss: noMiss}
+        if byAddress.has:
+            return KeyspaceResolution{ok: true, key: byAddress.key, miss: noMiss}
+        if ks.hasFallback:
+            return KeyspaceResolution{ok: true, key: ks.fallbackKey, miss: noMiss}
+        let miss2 = KeyspaceMiss{kind: "Unmapped", hasKind: hasKind, kindName: kind, hasAddress: hasAddress, address: address, byKind: -1, byAddress: -1}
+        return KeyspaceResolution{ok: false, key: -1, miss: miss2}
+
+    # ============================================================
     # SECOND PORT, SAME FILE: fabric-replication's `failover.rs` —
     # `FailoverAssessment::evaluate` and its private `ineligibility` helper.
     # ============================================================

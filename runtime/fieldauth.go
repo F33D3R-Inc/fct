@@ -8,7 +8,8 @@ package runtime
 // the server is the authority. Use a route/region guard to hide a field in a
 // server-rendered view.
 
-// gatedField is one entity field gated by a read policy.
+// gatedField is one entity field gated by a read policy ("" for a @password
+// field, or a @secret one without @requires, which no policy admits).
 type gatedField struct {
 	name   string
 	policy string
@@ -16,10 +17,24 @@ type gatedField struct {
 
 // indexGatedFields records, per entity, the fields carrying a `@requires` gate, so
 // the projection layer can find them in O(1). Built once at startup.
+//
+// A @password field is gated too, on no policy at all: gateForActor admits no
+// actor to a gate whose policy does not exist, so the hash is dropped from every
+// row projection — the API, the page bootstrap, the region endpoint, the stream
+// and an entity-typed reply — through the one door (visibleRows) that already
+// decides what a client receives. A @secret field is gated the same way unless
+// it also carries `@requires(policy)`, the explicit statement of who may
+// receive its plaintext (a creator their own stream key): publishing or
+// rendering the entity never serves it by default.
 func (s *Server) indexGatedFields() {
 	for _, e := range s.ir.Entities {
 		for _, f := range e.Fields {
-			if f.ReadPolicy != "" {
+			switch {
+			case f.Password:
+				s.gated[e.Name] = append(s.gated[e.Name], gatedField{name: f.Name})
+			case f.Secret:
+				s.gated[e.Name] = append(s.gated[e.Name], gatedField{name: f.Name, policy: f.ReadPolicy})
+			case f.ReadPolicy != "":
 				s.gated[e.Name] = append(s.gated[e.Name], gatedField{name: f.Name, policy: f.ReadPolicy})
 			}
 		}

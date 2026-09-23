@@ -389,7 +389,7 @@ func symbols(app *ast.App) map[string]symbol {
 		out[st.Name] = symbol{st.Line, "state " + st.Name + ": " + st.Type, 6, 13} // Variable
 	}
 	for _, d := range app.Derives {
-		out[d.Name] = symbol{d.Line, "derive " + d.Name + ": " + d.Type, 6, 13}
+		out[d.Name] = symbol{d.Line, "derive " + d.Name + paramList(d.Params) + ": " + d.Type, 6, 13}
 	}
 	for _, p := range app.Policies {
 		out[p.Name] = symbol{p.Line, "policy " + p.Name + paramList(p.Params), 3, 12} // Function
@@ -474,37 +474,42 @@ var typeNames = []string{"int", "text", "bool", "money", "date", "float"}
 var builtins = []string{
 	"now", "rand", "count", "sum", "abs", "min", "max", "floor", "round", "money",
 	"len", "upper", "lower", "trim", "replace", "slug", "year", "month", "day", "actor", "role", "verified",
-	"route", "session", "toFloat", "toInt", "toMoney",
+	"route", "session", "sessionToken", "toFloat", "toInt", "toMoney", "verifyPassword", "totpSecret", "totpValid", "randomToken",
 }
 
 func builtinDoc(name string) string {
 	docs := map[string]string{
-		"now":     "`now()` → int — the server clock (unix seconds). Effectful: pins its action to the authority.",
-		"rand":    "`rand(n)` → int — a server random in [0, n). Effectful.",
-		"count":   "`count(Entity)` → int — number of rows.",
-		"sum":     "`sum(Entity.field)` → int — total of a numeric field.",
-		"abs":     "`abs(n)` → int or float — absolute value, preserving whichever numeric flavor n is.",
-		"min":     "`min(a, b)` → int or float — the smaller of two values (both must be the same numeric type — no int/float promotion).",
-		"max":     "`max(a, b)` → int or float — the larger of two values (both must be the same numeric type — no int/float promotion).",
-		"floor":   "`floor(x)` → int — round toward negative infinity (proc-only for a float x; identity for an int).",
-		"round":   "`round(x)` → int — round-half-away-from-zero (proc-only for a float x; identity for an int).",
-		"toFloat": "`toFloat(n)` → float — explicit int→float conversion (proc-only; no automatic promotion).",
-		"toInt":   "`toInt(x)` → int — explicit float→int conversion, truncating toward zero (proc-only).",
-		"toMoney": "`toMoney(s)` → money — parse decimal text (\"12.34\") as a money amount, rounding to the nearest cent. Not proc-only.",
-		"len":     "`len(x)` → int — length of a string or list.",
-		"upper":   "`upper(s)` → text — uppercased.",
-		"lower":   "`lower(s)` → text — lowercased.",
-		"trim":    "`trim(s)` → text — whitespace-trimmed.",
-		"replace": "`replace(s, old, new)` → text — every occurrence of old replaced by new.",
-		"slug":    "`slug(s)` → text — a URL path segment: lower-cased, runs of non a-z/0-9 collapsed to `-`, no leading/trailing `-`.",
-		"money":   "`money(cents)` → text — format integer minor units as a 2-decimal string.",
-		"year":    "`year(t)` → int — UTC year of a date (unix seconds).",
-		"month":   "`month(t)` → int — UTC month (1–12).",
-		"day":     "`day(t)` → int — UTC day of month.",
-		"actor":   "`actor` — the signed-in username (or `\"guest\"`).",
-		"role":    "`role` — the actor's role (admin | member | guest).",
-		"route":   "`route` — the path being rendered (e.g. `/post/7`). Readable in a view only; a nav compares it to a destination to mark itself active.",
-		"session": "`session` — the caller's session id: stable per browser from first visit, before login and after (or `\"\"` for a cookieless machine caller).",
+		"now":            "`now()` → int — the server clock (unix seconds). Effectful: pins its action to the authority.",
+		"rand":           "`rand(n)` → int — a server random in [0, n). Effectful.",
+		"count":          "`count(Entity)` → int — number of rows.",
+		"sum":            "`sum(Entity.field)` → int — total of a numeric field.",
+		"abs":            "`abs(n)` → int or float — absolute value, preserving whichever numeric flavor n is.",
+		"min":            "`min(a, b)` → int or float — the smaller of two values (both must be the same numeric type — no int/float promotion).",
+		"max":            "`max(a, b)` → int or float — the larger of two values (both must be the same numeric type — no int/float promotion).",
+		"floor":          "`floor(x)` → int — round toward negative infinity (proc-only for a float x; identity for an int).",
+		"round":          "`round(x)` → int — round-half-away-from-zero (proc-only for a float x; identity for an int).",
+		"toFloat":        "`toFloat(n)` → float — explicit int→float conversion (proc-only; no automatic promotion).",
+		"toInt":          "`toInt(x)` → int — explicit float→int conversion, truncating toward zero (proc-only).",
+		"toMoney":        "`toMoney(s)` → money — parse decimal text (\"12.34\") as a money amount, rounding to the nearest cent. Not proc-only.",
+		"len":            "`len(x)` → int — length of a string or list.",
+		"upper":          "`upper(s)` → text — uppercased.",
+		"lower":          "`lower(s)` → text — lowercased.",
+		"trim":           "`trim(s)` → text — whitespace-trimmed.",
+		"replace":        "`replace(s, old, new)` → text — every occurrence of old replaced by new.",
+		"slug":           "`slug(s)` → text — a URL path segment: lower-cased, runs of non a-z/0-9 collapsed to `-`, no leading/trailing `-`.",
+		"money":          "`money(cents)` → text — format integer minor units as a 2-decimal string.",
+		"year":           "`year(t)` → int — UTC year of a date (unix seconds).",
+		"month":          "`month(t)` → int — UTC month (1–12).",
+		"day":            "`day(t)` → int — UTC day of month.",
+		"actor":          "`actor` — the signed-in username (or `\"guest\"`).",
+		"role":           "`role` — the actor's role (admin | member | guest).",
+		"route":          "`route` — the path being rendered (e.g. `/post/7`). Readable in a view only; a nav compares it to a destination to mark itself active.",
+		"session":        "`session` — the caller's session id: stable per browser from first visit, before login and after (or `\"\"` for a cookieless machine caller).",
+		"sessionToken":   "`sessionToken` — the caller's signed session credential, the value `Authorization: Bearer` accepts (and the session cookie carries). Readable in an action body only; hand it to a native client as its login token.",
+		"verifyPassword": "`verifyPassword(Entity(id).field, candidate)` → bool — does candidate match the @password field's stored hash. Authority-only.",
+		"totpSecret":     "`totpSecret()` → text — a fresh random base32 TOTP shared secret (RFC 6238) for an authenticator app. Authority-only.",
+		"totpValid":      "`totpValid(secret, code)` → bool — is code the current 6-digit TOTP for secret (±1 window of clock skew). Authority-only.",
+		"randomToken":    "`randomToken(n)` → text — n characters (a–z, 0–9) from the OS CSPRNG, for a backup code or a reset token. Authority-only.",
 	}
 	return docs[name]
 }

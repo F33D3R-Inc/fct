@@ -1,0 +1,740 @@
+import "catalog.fct"
+import "fqbtree.fct"
+import "pager.fct"
+
+app FqHeapSelfHost:
+    # fqheap.fct — self-hosted port of facetql/src/storage/heap.rs and
+    # location.rs: the record heap every node, edge and history entry lives
+    # in, as paged segment files (`facetql.heap.NNNNNN.seg`) described by
+    # catalog.fct.
+    #
+    # A record is bincode of HeapRecord (a u32 variant — Node 0, Edge 1,
+    # History 2 — then the value, with wal.fct's codecs) framed by
+    # binary.fct (magic, version, length, CRC — not encrypted again: the
+    # page is). A frame that fits a cell is appended to the active
+    # segment's last heap page, or to a new page; one that does not is
+    # written as a chain of overflow pages (each holding one slice, `extra`
+    # naming the next, written back to front) and a 12-byte stub cell
+    # ("FQOV", total length, first page) takes its place. A segment is full
+    # at 4096 pages; the next is rolled in the catalog. A RecordLocation is
+    # 14 little-endian bytes: segment u32, page u32, slot u16, length u32.
+    #
+    # heap.rs holds its open segment pagers behind a Mutex in an LRU of at
+    # most 64; here the heap is a value every call takes and returns, the
+    # same LRU inside it. Each pager this heap opens draws its page nonces
+    # from its own 4-byte base (the caller's session base and the heap's
+    # open count), so no two pagers — not even one segment reopened —
+    # repeat a nonce under the key.
+    struct FqLocation:
+        segment: int
+        page: int
+        slot: int
+        length: int
+
+    struct FqHeapRecord:
+        kind: text
+        node: Node
+        edge: Edge
+        entry: HistoryEntry
+
+    struct FqOpenSeg:
+        id: int
+        pager: FqPager
+        tick: int
+
+    struct FqHeap:
+        dir: text
+        key: [int]
+        nonceBase: int
+        opens: int
+        catalog: FqCatalog
+        open: [FqOpenSeg]
+        tick: int
+        capacity: int
+
+    struct FqHeapR:
+        ok: bool
+        err: text
+        heap: FqHeap
+
+    proc hpWithCatalog(h: FqHeap, c: FqCatalog) -> FqHeap:
+        return FqHeap{dir: h.dir, key: h.key, nonceBase: h.nonceBase, opens: h.opens, catalog: c, open: h.open, tick: h.tick, capacity: h.capacity}
+
+    proc hpWithOpen(h: FqHeap, open: [FqOpenSeg], tick: int, opens: int) -> FqHeap:
+        return FqHeap{dir: h.dir, key: h.key, nonceBase: h.nonceBase, opens: opens, catalog: h.catalog, open: open, tick: tick, capacity: h.capacity}
+
+    # ── locations ──────────────────────────────────────────────────────
+    proc hpLocEncode(l: FqLocation) -> [int]:
+        let a = do btPutN([], l.segment, 4)
+        let b = do btPutN(a, l.page, 4)
+        let c = do btPutN(b, l.slot, 2)
+        let d = do btPutN(c, l.length, 4)
+        return d
+
+    struct FqLocR:
+        ok: bool
+        err: text
+        loc: FqLocation
+
+    proc hpLocDecode(bs: [int]) -> FqLocR:
+        if len(bs) != 14:
+            return FqLocR{ok: false, err: "record location is " + len(bs) + " bytes, expected 14", loc: FqLocation{segment: 0, page: 0, slot: 0, length: 0}}
+        let s = do btGetN(bs, 0, 4)
+        let p = do btGetN(bs, 4, 4)
+        let sl = do btGetN(bs, 8, 2)
+        let ln = do btGetN(bs, 10, 4)
+        return FqLocR{ok: true, err: "", loc: FqLocation{segment: s, page: p, slot: sl, length: ln}}
+
+    # ── records ────────────────────────────────────────────────────────
+    proc hpNodeRecord(n: Node) -> FqHeapRecord:
+        let b = do operationBlank("insert")
+        return FqHeapRecord{kind: "node", node: n, edge: b.edge, entry: b.entry}
+
+    proc hpEdgeRecord(e: Edge) -> FqHeapRecord:
+        let b = do operationBlank("insert")
+        return FqHeapRecord{kind: "edge", node: b.node, edge: e, entry: b.entry}
+
+    proc hpHistoryRecord(h: HistoryEntry) -> FqHeapRecord:
+        let b = do operationBlank("insert")
+        return FqHeapRecord{kind: "history", node: b.node, edge: b.edge, entry: h}
+
+    proc hpEncodeRecord(r: FqHeapRecord) -> [int]:
+        if r.kind == "edge":
+            let e0 = do fqwPutUint([], 1, 4)
+            let e1 = do fqwPutString(e0, r.edge.from)
+            let e2 = do fqwPutString(e1, r.edge.to)
+            let e3 = do fqwPutString(e2, r.edge.kind)
+            let e4 = do fqwPutString(e3, r.edge.owner)
+            return e4
+        if r.kind == "history":
+            let h0 = do fqwPutUint([], 2, 4)
+            let h1 = do fqwPutString(h0, r.entry.address)
+            let h2 = do fqwPutUint(h1, r.entry.archivedAtUnix, 8)
+            let h3 = do fqwPutNode(h2, r.entry.node)
+            let h4 = do fqwPutUint(h3, r.entry.version, 8)
+            return h4
+        let n0 = do fqwPutUint([], 0, 4)
+        let n1 = do fqwPutNode(n0, r.node)
+        return n1
+
+    struct FqRecR:
+        ok: bool
+        err: text
+        record: FqHeapRecord
+
+    proc hpDecodeRecord(bs: [int]) -> FqRecR:
+        let blank = do hpNodeRecord(operationBlank("insert").node)
+        let c0 = FqwCur{buf: bs, pos: 0, err: ""}
+        let tag = do fqwGetUint(c0, 4)
+        if tag.cur.err != "":
+            return FqRecR{ok: false, err: tag.cur.err, record: blank}
+        if tag.v == 0:
+            let nd = do fqwGetNode(tag.cur)
+            if nd.cur.err != "":
+                return FqRecR{ok: false, err: nd.cur.err, record: blank}
+            let r0 = do hpNodeRecord(nd.node)
+            return FqRecR{ok: true, err: "", record: r0}
+        if tag.v == 1:
+            let f = do fqwGetString(tag.cur)
+            let t = do fqwGetString(f.cur)
+            let k = do fqwGetString(t.cur)
+            let o = do fqwGetString(k.cur)
+            if o.cur.err != "":
+                return FqRecR{ok: false, err: o.cur.err, record: blank}
+            let e = do edgeNew(f.v, t.v, k.v, o.v)
+            let r1 = do hpEdgeRecord(e)
+            return FqRecR{ok: true, err: "", record: r1}
+        if tag.v == 2:
+            let ad = do fqwGetString(tag.cur)
+            let at = do fqwGetUint(ad.cur, 8)
+            let nd2 = do fqwGetNode(at.cur)
+            let vr = do fqwGetUint(nd2.cur, 8)
+            if vr.cur.err != "":
+                return FqRecR{ok: false, err: vr.cur.err, record: blank}
+            let r2 = do hpHistoryRecord(HistoryEntry{address: ad.v, archivedAtUnix: at.v, node: nd2.node, version: vr.v})
+            return FqRecR{ok: true, err: "", record: r2}
+        return FqRecR{ok: false, err: "invalid value: integer `" + tag.v + "`, expected variant index 0 <= i < 3", record: blank}
+
+    # ── segments ───────────────────────────────────────────────────────
+    proc hpSegmentPath(id: int) -> text:
+        let mut digits = "" + id
+        loop len(digits) < 6:
+            digits = "0" + digits
+        return "facetql.heap." + digits + ".seg"
+
+    proc hpOpen(dir: text, key: [int], nonceBase: int) -> FqHeapR uses io.file:
+        let c = do ctOpen(dir, key)
+        let fresh = do ctFresh()
+        let h = FqHeap{dir: dir, key: key, nonceBase: nonceBase, opens: 0, catalog: fresh, open: [], tick: 0, capacity: 64}
+        if !c.ok:
+            return FqHeapR{ok: false, err: c.err, heap: h}
+        let h2 = do hpWithCatalog(h, c.catalog)
+        return FqHeapR{ok: true, err: "", heap: h2}
+
+    proc hpSegPages(c: FqCatalog, id: int) -> int:
+        let n = len(c.segments)
+        let mut i = 0
+        loop i < n:
+            if c.segments[i].id == id:
+                return c.segments[i].pages
+            i = i + 1
+        return -1
+
+    proc hpSetPages(h: FqHeap, id: int, pages: int) -> FqHeap:
+        let c = h.catalog
+        let mut segs = c.segments
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            if segs[i].id == id:
+                segs[i] = FqSegment{id: id, pages: pages, obsoleteBytes: segs[i].obsoleteBytes}
+            i = i + 1
+        let r = do hpWithCatalog(h, FqCatalog{formatVersion: c.formatVersion, pageSize: c.pageSize, nextSegment: c.nextSegment, activeSegment: c.activeSegment, segments: segs})
+        return r
+
+    struct FqSegPager:
+        ok: bool
+        err: text
+        heap: FqHeap
+        at: int
+
+    # hpPager: pager — a resident segment's pager (its use recorded), else
+    # the segment opened with the catalog's page count and admitted, the
+    # least recently used idle one flushed out beyond capacity.
+    proc hpPager(h: FqHeap, id: int) -> FqSegPager uses io.file:
+        let n = len(h.open)
+        let mut i = 0
+        loop i < n:
+            if h.open[i].id == id:
+                let mut open = h.open
+                open[i] = FqOpenSeg{id: id, pager: h.open[i].pager, tick: h.tick + 1}
+                let h2 = do hpWithOpen(h, open, h.tick + 1, h.opens)
+                return FqSegPager{ok: true, err: "", heap: h2, at: i}
+            i = i + 1
+        let pages = do hpSegPages(h.catalog, id)
+        if pages < 0:
+            return FqSegPager{ok: false, err: "heap segment " + id + " is not in the catalog — a record location refers to a segment that has been retired", heap: h, at: -1}
+        let base = (h.nonceBase * 65536 + h.opens) % 4294967296
+        let segPath = do hpSegmentPath(id)
+        let p0 = do pgrOpen(h.dir + segPath, 64, h.key, base)
+        let p1 = do pgrSetPageCount(p0, pages)
+        let mut open = append(h.open, FqOpenSeg{id: id, pager: p1, tick: h.tick + 1})
+        let mut tick = h.tick + 1
+        # evict down to capacity: the oldest segment that is not active
+        loop len(open) > h.capacity:
+            let no = len(open)
+            let mut victim = -1
+            let mut k = 0
+            loop k < no:
+                if open[k].id != h.catalog.activeSegment && open[k].id != id:
+                    if victim < 0 || open[k].tick < open[victim].tick:
+                        victim = k
+                k = k + 1
+            if victim < 0:
+                break
+            let fl = do pgrFlush(open[victim].pager)
+            if !fl.ok:
+                return FqSegPager{ok: false, err: fl.err, heap: h, at: -1}
+            let mut kept = []
+            let mut m = 0
+            loop m < no:
+                if m != victim:
+                    kept = append(kept, open[m])
+                m = m + 1
+            open = kept
+        let h2 = do hpWithOpen(h, open, tick, h.opens + 1)
+        let mut at = -1
+        let mut j = 0
+        loop j < len(open):
+            if open[j].id == id:
+                at = j
+            j = j + 1
+        return FqSegPager{ok: true, err: "", heap: h2, at: at}
+
+    proc hpPutPager(h: FqHeap, at: int, p: FqPager) -> FqHeap:
+        let mut open = h.open
+        open[at] = FqOpenSeg{id: open[at].id, pager: p, tick: open[at].tick}
+        let r = do hpWithOpen(h, open, h.tick, h.opens)
+        return r
+
+    proc hpActive(h: FqHeap) -> FqSegment:
+        let id = h.catalog.activeSegment
+        let pages = do hpSegPages(h.catalog, id)
+        let mut p = pages
+        if p < 0:
+            p = 0
+        return FqSegment{id: id, pages: p, obsoleteBytes: 0}
+
+    # hpRoll: roll — a new active segment in the catalog.
+    proc hpRoll(h: FqHeap) -> FqAlloc2:
+        let c = h.catalog
+        let id = c.nextSegment
+        let segs = append(c.segments, FqSegment{id: id, pages: 0, obsoleteBytes: 0})
+        let h2 = do hpWithCatalog(h, FqCatalog{formatVersion: c.formatVersion, pageSize: c.pageSize, nextSegment: id + 1, activeSegment: id, segments: segs})
+        return FqAlloc2{heap: h2, id: id}
+
+    struct FqAlloc2:
+        heap: FqHeap
+        id: int
+
+    struct FqAppended:
+        ok: bool
+        err: text
+        heap: FqHeap
+        loc: FqLocation
+
+    proc hpAppendErr(h: FqHeap, msg: text) -> FqAppended:
+        return FqAppended{ok: false, err: msg, heap: h, loc: FqLocation{segment: 0, page: 0, slot: 0, length: 0}}
+
+    # hpAppendCellTo: append_cell_to — into the segment's last heap page
+    # when it has room, else a new page (rolling a full segment when
+    # allowed).
+    proc hpAppendCellTo(h0: FqHeap, segment: int, pages: int, cell: [int], allowRoll: bool) -> FqAppended uses io.file:
+        let mut h = h0
+        if pages > 0:
+            let sp = do hpPager(h, segment)
+            if !sp.ok:
+                let e0 = do hpAppendErr(h, sp.err)
+                return e0
+            h = sp.heap
+            let rd = do pgrRead(h.open[sp.at].pager, pages - 1)
+            if !rd.ok:
+                let e1 = do hpAppendErr(h, rd.err)
+                return e1
+            h = do hpPutPager(h, sp.at, rd.pager)
+            let kind = do pgKind(rd.body)
+            if kind == 4:
+                let pushed = do pgPushCell(rd.body, cell)
+                if pushed.ok:
+                    let w = do pgrWrite(h.open[sp.at].pager, pages - 1, pushed.body)
+                    if !w.ok:
+                        let e2 = do hpAppendErr(h, w.err)
+                        return e2
+                    h = do hpPutPager(h, sp.at, w.pager)
+                    return FqAppended{ok: true, err: "", heap: h, loc: FqLocation{segment: segment, page: pages - 1, slot: pushed.index, length: len(cell)}}
+        let mut seg = segment
+        let mut pageId = pages
+        if allowRoll && pages >= 4096:
+            let rl = do hpRoll(h)
+            h = rl.heap
+            seg = rl.id
+            pageId = 0
+            h = do hpSetPages(h, seg, 1)
+        else:
+            h = do hpSetPages(h, segment, pages + 1)
+        let sp2 = do hpPager(h, seg)
+        if !sp2.ok:
+            let e3 = do hpAppendErr(h, sp2.err)
+            return e3
+        h = sp2.heap
+        let page = do pgNew(4)
+        let pushed2 = do pgPushCell(page, cell)
+        if !pushed2.ok:
+            let e4 = do hpAppendErr(h, "record of " + len(cell) + " bytes does not fit in an empty page")
+            return e4
+        let w2 = do pgrWrite(h.open[sp2.at].pager, pageId, pushed2.body)
+        if !w2.ok:
+            let e5 = do hpAppendErr(h, w2.err)
+            return e5
+        h = do hpPutPager(h, sp2.at, w2.pager)
+        return FqAppended{ok: true, err: "", heap: h, loc: FqLocation{segment: seg, page: pageId, slot: pushed2.index, length: len(cell)}}
+
+    # hpAppend: append — frame the record's bincode and store it, in one
+    # cell or as an overflow chain behind a stub.
+    proc hpAppend(h: FqHeap, r: FqHeapRecord) -> FqAppended uses io.file:
+        let plain = do hpEncodeRecord(r)
+        let fr = do bnEncodeFrame(plain)
+        if !fr.ok:
+            let e = do hpAppendErr(h, fr.err)
+            return e
+        let frame = fr.bytes
+        if len(frame) > 16328:
+            let ov = do hpAppendOverflow(h, frame)
+            return ov
+        let act = do hpActive(h)
+        let a = do hpAppendCellTo(h, act.id, act.pages, frame, true)
+        return a
+
+    proc hpAppendOverflow(h0: FqHeap, frame: [int]) -> FqAppended uses io.file:
+        let mut h = h0
+        let act = do hpActive(h)
+        let mut segment = act.id
+        let mut pages = act.pages
+        if act.pages >= 4096:
+            let rl = do hpRoll(h)
+            h = rl.heap
+            segment = rl.id
+            pages = 0
+        let sp = do hpPager(h, segment)
+        if !sp.ok:
+            let e0 = do hpAppendErr(h, sp.err)
+            return e0
+        h = sp.heap
+        let total = len(frame)
+        let nchunks = (total + 16327) / 16328
+        let mut next = 0
+        let mut ci = nchunks - 1
+        loop ci >= 0:
+            let from = ci * 16328
+            let mut to = from + 16328
+            if to > total:
+                to = total
+            let chunk = do btRange(frame, from, to)
+            let p0 = do pgNew(5)
+            let p1 = do pgSetExtra(p0, next)
+            let pushed = do pgPushCell(p1, chunk)
+            if !pushed.ok:
+                let e1 = do hpAppendErr(h, "overflow chunk does not fit in an empty page")
+                return e1
+            let pageId = pages
+            pages = pages + 1
+            let at = do hpFindOpen(h, segment)
+            let w = do pgrWrite(h.open[at].pager, pageId, pushed.body)
+            if !w.ok:
+                let e2 = do hpAppendErr(h, w.err)
+                return e2
+            h = do hpPutPager(h, at, w.pager)
+            h = do hpSetPages(h, segment, pages)
+            next = pageId
+            ci = ci - 1
+        let stub0 = [70, 81, 79, 86]
+        let stub1 = do btPutN(stub0, total, 4)
+        let stub = do btPutN(stub1, next, 4)
+        let a = do hpAppendCellTo(h, segment, pages, stub, false)
+        if !a.ok:
+            return a
+        return FqAppended{ok: true, err: "", heap: a.heap, loc: FqLocation{segment: segment, page: a.loc.page, slot: a.loc.slot, length: total}}
+
+    proc hpFindOpen(h: FqHeap, id: int) -> int:
+        let n = len(h.open)
+        let mut i = 0
+        loop i < n:
+            if h.open[i].id == id:
+                return i
+            i = i + 1
+        return -1
+
+    proc hpIsStub(cell: [int]) -> bool:
+        return len(cell) == 12 && cell[0] == 70 && cell[1] == 81 && cell[2] == 79 && cell[3] == 86
+
+    struct FqFrameR:
+        ok: bool
+        err: text
+        heap: FqHeap
+        frame: [int]
+
+    proc hpFrameErr(h: FqHeap, msg: text) -> FqFrameR:
+        return FqFrameR{ok: false, err: msg, heap: h, frame: []}
+
+    # hpReadFrame: read_frame — the cell, or the overflow chain behind a
+    # stub, bounded against a corrupt length or a cyclic chain.
+    proc hpReadFrame(h0: FqHeap, l: FqLocation) -> FqFrameR uses io.file:
+        let where = "segment " + l.segment + " page " + l.page + " slot " + l.slot
+        let sp = do hpPager(h0, l.segment)
+        if !sp.ok:
+            let e0 = do hpFrameErr(h0, sp.err)
+            return e0
+        let mut h = sp.heap
+        let rd = do pgrRead(h.open[sp.at].pager, l.page)
+        if !rd.ok:
+            let e1 = do hpFrameErr(h, rd.err)
+            return e1
+        h = do hpPutPager(h, sp.at, rd.pager)
+        let has = do pgHasCell(rd.body, l.slot)
+        if !has:
+            let e2 = do hpFrameErr(h, "no record at " + where)
+            return e2
+        let cell = do pgCell(rd.body, l.slot)
+        let stub = do hpIsStub(cell)
+        if !stub:
+            return FqFrameR{ok: true, err: "", heap: h, frame: cell}
+        let total = do btGetN(cell, 4, 4)
+        let mut next = do btGetN(cell, 8, 4)
+        if total > 13 + 67108864:
+            let e3 = do hpFrameErr(h, "overflow stub at " + where + " declares a " + total + "-byte record, over the " + (13 + 67108864) + "-byte maximum — the stub is corrupt")
+            return e3
+        let mut maxLinks = (total + 16327) / 16328
+        if maxLinks < 1:
+            maxLinks = 1
+        let mut links = 0
+        let mut frame = []
+        loop len(frame) < total:
+            links = links + 1
+            if links > maxLinks:
+                let e4 = do hpFrameErr(h, "overflow chain for " + where + " visited more than " + maxLinks + " pages without yielding " + total + " bytes — the chain is cyclic or corrupt")
+                return e4
+            let at = do hpFindOpen(h, l.segment)
+            let ch = do pgrRead(h.open[at].pager, next)
+            if !ch.ok:
+                let e5 = do hpFrameErr(h, ch.err)
+                return e5
+            h = do hpPutPager(h, at, ch.pager)
+            let kind = do pgKind(ch.body)
+            if kind != 5:
+                let e6 = do hpFrameErr(h, "overflow chain for " + where + " reached a non-overflow page")
+                return e6
+            let hc = do pgHasCell(ch.body, 0)
+            if !hc:
+                let e7 = do hpFrameErr(h, "overflow page has no chunk")
+                return e7
+            let chunk = do pgCell(ch.body, 0)
+            let joined = do btConcat(frame, chunk)
+            frame = joined
+            let nx = do pgExtra(ch.body)
+            next = nx
+        if len(frame) != total:
+            let e8 = do hpFrameErr(h, "overflow chain yielded " + len(frame) + " bytes, expected " + total)
+            return e8
+        return FqFrameR{ok: true, err: "", heap: h, frame: frame}
+
+    struct FqReadR:
+        ok: bool
+        err: text
+        heap: FqHeap
+        record: FqHeapRecord
+
+    proc hpRead(h: FqHeap, l: FqLocation) -> FqReadR uses io.file:
+        let blank = do hpNodeRecord(operationBlank("insert").node)
+        let f = do hpReadFrame(h, l)
+        if !f.ok:
+            return FqReadR{ok: false, err: f.err, heap: f.heap, record: blank}
+        let d = do bnDecodeFrame(f.frame)
+        if !d.ok:
+            return FqReadR{ok: false, err: d.err, heap: f.heap, record: blank}
+        let r = do hpDecodeRecord(d.bytes)
+        if !r.ok:
+            return FqReadR{ok: false, err: "failed to decode the record at segment " + l.segment + " page " + l.page + " slot " + l.slot + ": " + r.err, heap: f.heap, record: blank}
+        return FqReadR{ok: true, err: "", heap: f.heap, record: r.record}
+
+    # hpMarkObsolete: mark_obsolete — the segment's reclaimable bytes grow.
+    proc hpMarkObsolete(h: FqHeap, l: FqLocation) -> FqHeap:
+        let c = h.catalog
+        let mut segs = c.segments
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            if segs[i].id == l.segment:
+                segs[i] = FqSegment{id: segs[i].id, pages: segs[i].pages, obsoleteBytes: segs[i].obsoleteBytes + l.length}
+            i = i + 1
+        let r = do hpWithCatalog(h, FqCatalog{formatVersion: c.formatVersion, pageSize: c.pageSize, nextSegment: c.nextSegment, activeSegment: c.activeSegment, segments: segs})
+        return r
+
+    # hpCompactionCandidates: segments (not the active one, not empty)
+    # whose obsolete bytes reach ratio of their page capacity.
+    proc hpCompactionCandidates(h: FqHeap, ratio: float) -> [int]:
+        let c = h.catalog
+        let mut out = []
+        let n = len(c.segments)
+        let mut i = 0
+        loop i < n:
+            let s = c.segments[i]
+            if s.id != c.activeSegment && s.pages > 0:
+                let capacity = s.pages * 16356
+                if capacity > 0 && toFloat(s.obsoleteBytes) >= toFloat(capacity) * ratio:
+                    out = append(out, s.id)
+            i = i + 1
+        return out
+
+    # hpSync: sync — every open pager flushed, then the catalog saved.
+    proc hpSync(h0: FqHeap, catalogNonce: [int], tmpId: int) -> FqHeapR uses io.file:
+        let mut h = h0
+        let n = len(h.open)
+        let mut i = 0
+        loop i < n:
+            let fl = do pgrFlush(h.open[i].pager)
+            if !fl.ok:
+                return FqHeapR{ok: false, err: fl.err, heap: h}
+            h = do hpPutPager(h, i, fl.pager)
+            i = i + 1
+        let e = do ctSave(h.dir, h.catalog, h.key, catalogNonce, tmpId)
+        if e != "":
+            return FqHeapR{ok: false, err: e, heap: h}
+        return FqHeapR{ok: true, err: "", heap: h}
+
+    # hpScanSegment: scan_segment — every record in a segment's heap pages
+    # in page and slot order (overflow pages are skipped; a stub reads its
+    # chain), with its location; a page past the durable end is skipped,
+    # one that fails to verify refuses the scan.
+    struct FqScanned:
+        ok: bool
+        err: text
+        heap: FqHeap
+        locs: [FqLocation]
+        records: [FqHeapRecord]
+
+    proc hpScanSegment(h0: FqHeap, segment: int) -> FqScanned uses io.file:
+        let sp = do hpPager(h0, segment)
+        if !sp.ok:
+            return FqScanned{ok: false, err: sp.err, heap: h0, locs: [], records: []}
+        let mut h = sp.heap
+        let pages = h.open[sp.at].pager.pageCount
+        let mut locs = []
+        let mut recs = []
+        let mut pid = 0
+        loop pid < pages:
+            let at = do hpFindOpen(h, segment)
+            let rd = do pgrRead(h.open[at].pager, pid)
+            if !rd.ok:
+                if !contains(rd.err, "is past the end of"):
+                    return FqScanned{ok: false, err: "heap segment " + segment + " page " + pid + " did not verify: " + rd.err + ". Refusing to compact a segment that cannot be read in full — retiring it would discard whatever live records this page holds.", heap: h, locs: [], records: []}
+            else:
+                h = do hpPutPager(h, at, rd.pager)
+                let kind = do pgKind(rd.body)
+                if kind == 4:
+                    let n = do pgSlotCount(rd.body)
+                    let mut slot = 0
+                    loop slot < n:
+                        let cell = do pgCell(rd.body, slot)
+                        let stub = do hpIsStub(cell)
+                        let mut length = len(cell)
+                        if stub:
+                            let tl = do btGetN(cell, 4, 4)
+                            length = tl
+                        let l = FqLocation{segment: segment, page: pid, slot: slot, length: length}
+                        let r = do hpRead(h, l)
+                        if !r.ok:
+                            return FqScanned{ok: false, err: r.err, heap: h, locs: [], records: []}
+                        h = r.heap
+                        locs = append(locs, l)
+                        recs = append(recs, r.record)
+                        slot = slot + 1
+            pid = pid + 1
+        return FqScanned{ok: true, err: "", heap: h, locs: locs, records: recs}
+
+    # hpDropSegment: drop_segment — out of the catalog (saved), out of the
+    # open set, and its file removed (already absent is fine).
+    proc hpDropSegment(h0: FqHeap, segment: int, catalogNonce: [int], tmpId: int) -> FqHeapR uses io.file:
+        let c = h0.catalog
+        let mut segs = []
+        let n = len(c.segments)
+        let mut i = 0
+        loop i < n:
+            if c.segments[i].id != segment:
+                segs = append(segs, c.segments[i])
+            i = i + 1
+        let h1 = do hpWithCatalog(h0, FqCatalog{formatVersion: c.formatVersion, pageSize: c.pageSize, nextSegment: c.nextSegment, activeSegment: c.activeSegment, segments: segs})
+        let e = do ctSave(h1.dir, h1.catalog, h1.key, catalogNonce, tmpId)
+        if e != "":
+            return FqHeapR{ok: false, err: e, heap: h1}
+        let mut open = []
+        let no = len(h1.open)
+        let mut k = 0
+        loop k < no:
+            if h1.open[k].id != segment:
+                open = append(open, h1.open[k])
+            k = k + 1
+        let h2 = do hpWithOpen(h1, open, h1.tick, h1.opens)
+        let path = do hpSegmentPath(segment)
+        let rm = removeFile(h2.dir + path)
+        return FqHeapR{ok: true, err: "", heap: h2}
+
+    # ── test harness ───────────────────────────────────────────────────
+    state heapOut: text = ""
+
+    proc hpLocText(l: FqLocation) -> text:
+        return l.segment + ":" + l.page + ":" + l.slot + ":" + l.length
+
+    proc hpRecordText(r: FqHeapRecord) -> text:
+        if r.kind == "edge":
+            return "edge " + r.edge.from + ">" + r.edge.to + ":" + r.edge.kind + "@" + r.edge.owner
+        if r.kind == "history":
+            return "history " + r.entry.address + " v" + r.entry.version + " t" + r.entry.archivedAtUnix + " data=" + len(r.entry.node.data)
+        return "node " + r.node.address + " " + r.node.kind + " data=" + len(r.node.data) + " value=" + r.node.value
+
+    # hpScriptText: `node ADDR DATALEN`, `edge FROM TO KIND`, `history
+    # ADDR VERSION DATALEN` append (data is DATALEN copies of "x"), `read
+    # SEG:PAGE:SLOT:LEN`, `scan SEG`, `drop SEG`, `sync` — reporting each location / record.
+    proc hpScriptText(dir: text, keyHex: text, nonceBase: int, script: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let o = do hpOpen(dir, key, nonceBase)
+        if !o.ok:
+            return "error: " + o.err
+        let mut h = o.heap
+        let mut out = ""
+        let mut syncs = 0
+        let lines = split(script, "\n")
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let w = do pgrWords(lines[i])
+            if len(w) > 0:
+                let op = w[0]
+                if op == "node" || op == "history":
+                    let mut dl = toInt(w[2])
+                    if op == "history":
+                        dl = toInt(w[3])
+                    let mut data = ""
+                    let mut d = 0
+                    loop d < dl:
+                        data = data + "x"
+                        d = d + 1
+                    let coord = do coordinateNew(1, 2, 3, 250)
+                    let nd = Node{address: w[1], coordinate: coord, value: 7, kind: "Post", data: data, owner: "alice", hasClaimedBy: false, claimedBy: "", visibility: "private"}
+                    let mut rec = do hpNodeRecord(nd)
+                    if op == "history":
+                        let hr = do hpHistoryRecord(HistoryEntry{address: w[1], archivedAtUnix: 1700000000, node: nd, version: toInt(w[2])})
+                        rec = hr
+                    let a = do hpAppend(h, rec)
+                    if !a.ok:
+                        return out + "error: " + a.err
+                    h = a.heap
+                    let lt = do hpLocText(a.loc)
+                    out = out + "@" + lt + ";"
+                if op == "edge":
+                    let e = do edgeNew(w[1], w[2], w[3], "alice")
+                    let er = do hpEdgeRecord(e)
+                    let a2 = do hpAppend(h, er)
+                    if !a2.ok:
+                        return out + "error: " + a2.err
+                    h = a2.heap
+                    let lt2 = do hpLocText(a2.loc)
+                    out = out + "@" + lt2 + ";"
+                if op == "read":
+                    let f = split(w[1], ":")
+                    let l = FqLocation{segment: toInt(f[0]), page: toInt(f[1]), slot: toInt(f[2]), length: toInt(f[3])}
+                    let r = do hpRead(h, l)
+                    if !r.ok:
+                        out = out + "read error: " + r.err + ";"
+                    else:
+                        h = r.heap
+                        let rt = do hpRecordText(r.record)
+                        out = out + rt + ";"
+                if op == "scan":
+                    let sc = do hpScanSegment(h, toInt(w[1]))
+                    if !sc.ok:
+                        return out + "error: " + sc.err
+                    h = sc.heap
+                    let ns = len(sc.locs)
+                    let mut k = 0
+                    loop k < ns:
+                        let lt3 = do hpLocText(sc.locs[k])
+                        let rt3 = do hpRecordText(sc.records[k])
+                        out = out + "@" + lt3 + " " + rt3 + ";"
+                        k = k + 1
+                    out = out + "scan;"
+                if op == "drop":
+                    let dn = do fqwNonce(nonceBase + 2000000, syncs)
+                    let dr = do hpDropSegment(h, toInt(w[1]), dn, nonceBase * 100 + 50 + syncs)
+                    syncs = syncs + 1
+                    if !dr.ok:
+                        return out + "error: " + dr.err
+                    h = dr.heap
+                    out = out + "drop;"
+                if op == "sync":
+                    let nonce = do fqwNonce(nonceBase + 1000000, syncs)
+                    let sy = do hpSync(h, nonce, nonceBase * 100 + syncs)
+                    syncs = syncs + 1
+                    if !sy.ok:
+                        return out + "error: " + sy.err
+                    h = sy.heap
+                    out = out + "sync;"
+            i = i + 1
+        let ct = do ctText(h.catalog)
+        return out + "\n" + ct
+
+    action runHeap(dir: text, keyHex: text, nonceBase: int, script: text):
+        let r = do hpScriptText(dir, keyHex, nonceBase, script)
+        heapOut = r
+
+    view FqHeapHome at "/fqheap":
+        text "{heapOut}"

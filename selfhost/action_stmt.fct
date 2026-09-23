@@ -158,13 +158,21 @@ app ActionStmtSelfHost:
         body: [ActionStmt]
         elseBody: [ActionStmt]
         valid: bool
+        # status: a check's failure status or a return's own 2xx (0 =
+        # none); hasValue: a `return` that carries `value`; event: an
+        # emit's named stream event (payload in `value`); hasTo: an emit's
+        # `to <expr>` recipient, held in `key`.
+        status: int
+        hasValue: bool
+        event: text
+        hasTo: bool
 
     # actUnsupported: the one honest-degrade constructor every malformed
     # line below falls back to — every field at its neutral sentinel,
     # valid=false, matching stmt.fct's own "unsupported" Stmt kind.
     proc actUnsupported(lineIdx: int) -> ActionStmt:
         let noExpr = do emptyNode()
-        return ActionStmt{kind: "unsupported", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: false}
+        return ActionStmt{kind: "unsupported", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: false, status: 0, hasValue: false, event: "", hasTo: false}
 
     # ============================================================
     # STAGE 1: this file's own local raw-text scanning helpers — the ones
@@ -535,7 +543,29 @@ app ActionStmtSelfHost:
 
         let isCheck = do hasPrefixText(t, "check ")
         if isCheck:
-            let rest = do trimPrefixText(t, "check ")
+            let rest0 = do trimPrefixText(t, "check ")
+            # Trailing clauses, either order: `status N` (the failure status
+            # a declared api route answers with, 400-599) and
+            # `code "snake_case"` (the machine-readable failure code).
+            let mut rest = trim(rest0)
+            let mut status = 0
+            let mut code = ""
+            let mut pass = 0
+            loop pass < 2:
+                if status == 0:
+                    let cst = do actTrailingStatus(rest)
+                    if cst.status != 0:
+                        if cst.status < 400 || cst.status > 599:
+                            let us = do actUnsupported(lineIdx)
+                            return us
+                        status = cst.status
+                        rest = cst.rest
+                if code == "":
+                    let cc = do actTrailingCode(rest)
+                    if cc.code != "":
+                        code = cc.code
+                        rest = cc.rest
+                pass = pass + 1
             let ok = do checkStatementValid(rest)
             if !ok:
                 let u = do actUnsupported(lineIdx)
@@ -543,7 +573,7 @@ app ActionStmtSelfHost:
             let condSrc = do checkConditionText(rest)
             let condNode = do parseExprTree(condSrc)
             let msgRaw = do checkMessageRaw(rest)
-            return ActionStmt{kind: "check", lineIdx: lineIdx, cond: condNode, msg: msgRaw, policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+            return ActionStmt{kind: "check", lineIdx: lineIdx, cond: condNode, msg: msgRaw, policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: code, exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: status, hasValue: false, event: "", hasTo: false}
 
         # `requires` needs to hand back POSSIBLY MULTIPLE ActionStmt entries
         # from one line (`requires owns(id), admin`) — that shape doesn't
@@ -575,7 +605,7 @@ app ActionStmtSelfHost:
             if !ok:
                 let u = do actUnsupported(lineIdx)
                 return u
-            return ActionStmt{kind: "clear", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+            return ActionStmt{kind: "clear", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
         let isCall = do hasPrefixText(t, "call ")
         if isCall:
@@ -642,7 +672,134 @@ app ActionStmtSelfHost:
                 return s
             # Any other right-hand side is a plain expression bind.
             let val = do parseExprTree(rhs)
-            return ActionStmt{kind: "let", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: val, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: bindName, exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+            return ActionStmt{kind: "let", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: val, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: bindName, exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
+
+        # `return [expr] [status N]` — the action's reply (parser.go's
+        # return case); a bare `return` ends a no-return action early.
+        let isReturn = do hasPrefixText(t, "return ")
+        if t == "return" || isReturn:
+            let r0 = do trimPrefixText(t, "return")
+            let rst = do actTrailingStatus(trim(r0))
+            if rst.status != 0 && (rst.status < 200 || rst.status > 299 || rst.status == 204):
+                let ur = do actUnsupported(lineIdx)
+                return ur
+            let mut rv = noExpr
+            let hasV = rst.rest != ""
+            if hasV:
+                let ok2 = do parseExprConsumedAll(rst.rest)
+                if !ok2:
+                    let ur2 = do actUnsupported(lineIdx)
+                    return ur2
+                let v = do parseExprTree(rst.rest)
+                rv = v
+            return ActionStmt{kind: "return", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: rv, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: rst.status, hasValue: hasV, event: "", hasTo: false}
+
+        # `emit [event] Dto{…} [to <expr>]` — a typed stream event.
+        let isEmit = do hasPrefixText(t, "emit ")
+        if isEmit:
+            let e0 = do trimPrefixText(t, "emit ")
+            let mut rest = trim(e0)
+            let mut toNode = noExpr
+            let mut hasTo = false
+            let ti = do actIndexOutside(rest, " to ")
+            if ti >= 0:
+                let toSrc = trim(slice(rest, ti + 4, len(rest)))
+                let tok = do parseExprConsumedAll(toSrc)
+                if !tok:
+                    let ue = do actUnsupported(lineIdx)
+                    return ue
+                let tn = do parseExprTree(toSrc)
+                toNode = tn
+                hasTo = true
+                rest = trim(slice(rest, 0, ti))
+            # `emit … on a, b`: the parameterized stream instance.
+            let mut onArgs = []
+            let oi = do actIndexOutside(rest, " on ")
+            if oi >= 0:
+                let parts = do actSplitTopComma(trim(slice(rest, oi + 4, len(rest))))
+                let npo = len(parts)
+                let mut po = 0
+                loop po < npo:
+                    let psrc = trim(parts[po])
+                    let pok = do parseExprConsumedAll(psrc)
+                    if !pok:
+                        let ue3 = do actUnsupported(lineIdx)
+                        return ue3
+                    let pn = do parseExprTree(psrc)
+                    onArgs = append(onArgs, pn)
+                    po = po + 1
+                rest = trim(slice(rest, 0, oi))
+            let mut event = ""
+            let sp = do indexOf(rest, " ")
+            if sp > 0:
+                let w = slice(rest, 0, sp)
+                let wi = do isIdentToken(w)
+                let c0 = charAt(w, 0)
+                let upper = c0 >= "A" && c0 <= "Z"
+                if wi && !upper:
+                    event = w
+                    rest = trim(slice(rest, sp, len(rest)))
+            let vok = do parseExprConsumedAll(rest)
+            if !vok:
+                let ue2 = do actUnsupported(lineIdx)
+                return ue2
+            let ev = do parseExprTree(rest)
+            return ActionStmt{kind: "emit", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: toNode, field: "", value: ev, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: onArgs, procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: true, event: event, hasTo: hasTo}
+
+        # `revoke <expr>` — end the live session whose key is expr.
+        let isRevoke = do hasPrefixText(t, "revoke ")
+        if isRevoke:
+            let rk0 = do trimPrefixText(t, "revoke ")
+            let rsrc = trim(rk0)
+            let rok = do parseExprConsumedAll(rsrc)
+            if !rok:
+                let uv = do actUnsupported(lineIdx)
+                return uv
+            let rkn = do parseExprTree(rsrc)
+            return ActionStmt{kind: "revoke", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: rkn, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: true, event: "", hasTo: false}
+
+        # `header "Name" <expr>` — a response header on the action's reply.
+        let isHeader = do hasPrefixText(t, "header \"")
+        if isHeader:
+            let hcs = split(t, "")
+            let hn = len(hcs)
+            let mut q2 = 8
+            loop q2 < hn && hcs[q2] != "\"":
+                q2 = q2 + 1
+            let hname = slice(t, 8, q2)
+            let hrest = trim(slice(t, q2 + 1, hn))
+            let spaced = q2 + 1 < hn && (hcs[q2 + 1] == " " || hcs[q2 + 1] == "\t")
+            if q2 >= hn || !spaced || hrest == "":
+                let uh = do actUnsupported(lineIdx)
+                return uh
+            let hok = do parseExprConsumedAll(hrest)
+            if !hok:
+                let uh2 = do actUnsupported(lineIdx)
+                return uh2
+            let hv = do parseExprTree(hrest)
+            return ActionStmt{kind: "header", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: hname, value: hv, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: true, event: "", hasTo: false}
+
+        # `restate actor <expr> role <expr>` — re-role an account's live
+        # sessions.
+        let isRestate = do hasPrefixText(t, "restate ")
+        if isRestate:
+            let rs0 = do trimPrefixText(t, "restate ")
+            let rest = trim(rs0)
+            let ri = do actIndexOutside(rest, " role ")
+            let hasActor = do hasPrefixText(rest, "actor ")
+            if !hasActor || ri < 0:
+                let ur = do actUnsupported(lineIdx)
+                return ur
+            let whoSrc = trim(slice(rest, 6, ri))
+            let roleSrc = trim(slice(rest, ri + 6, len(rest)))
+            let wok = do parseExprConsumedAll(whoSrc)
+            let rok2 = do parseExprConsumedAll(roleSrc)
+            if !wok || !rok2:
+                let ur2 = do actUnsupported(lineIdx)
+                return ur2
+            let whoN = do parseExprTree(whoSrc)
+            let roleN = do parseExprTree(roleSrc)
+            return ActionStmt{kind: "restate", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: whoN, hasRole: true, role: roleN, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
         let isEstablish = do hasPrefixText(t, "establish ")
         if isEstablish:
@@ -653,7 +810,7 @@ app ActionStmtSelfHost:
         if isBareCall:
             let callNode = do parseExprTree(t)
             let ok = callNode.kind == "call"
-            return ActionStmt{kind: "exprStmt", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: callNode, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: ok}
+            return ActionStmt{kind: "exprStmt", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: callNode, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: ok, status: 0, hasValue: false, event: "", hasTo: false}
 
         # Default: `target = expr` — real parseAction's own DEFAULT case
         # uses the NAIVE first-`=` scan (`strings.IndexByte`), not the
@@ -670,11 +827,220 @@ app ActionStmtSelfHost:
             let u = do actUnsupported(lineIdx)
             return u
         let val = do parseExprTree(trim(slice(t, eq2 + 1, len(t))))
-        return ActionStmt{kind: "assign", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: val, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: target, exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+        return ActionStmt{kind: "assign", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: val, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: target, exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
     # actCallStmt: `Service.op(args)` (the shared shape of both bare `call
     # Service.op(args)` and bound `let name = call Service.op(args)`).
     # `bindName` is "" for the fire-and-forget form.
+    # actTrailingStatus: checkStatusRe (`\s+status\s+(\d{3})$`) — the
+    # trailing status clause, when anything precedes it.
+    struct ActStatus:
+        rest: text
+        status: int
+
+    proc actTrailingStatus(s: text) -> ActStatus:
+        let n = len(s)
+        if n < 11:
+            return ActStatus{rest: s, status: 0}
+        let digits = slice(s, n - 3, n)
+        let mut allDigits = true
+        let mut i = 0
+        loop i < 3:
+            let c = charAt(digits, i)
+            if c < "0" || c > "9":
+                allDigits = false
+            i = i + 1
+        if !allDigits:
+            return ActStatus{rest: s, status: 0}
+        let mut j = n - 4
+        let mut ws = 0
+        loop j >= 0 && (charAt(s, j) == " " || charAt(s, j) == "\t"):
+            ws = ws + 1
+            j = j - 1
+        if ws == 0 || j < 5:
+            return ActStatus{rest: s, status: 0}
+        if slice(s, j - 5, j + 1) != "status":
+            return ActStatus{rest: s, status: 0}
+        let k = j - 6
+        if k < 0 || (charAt(s, k) != " " && charAt(s, k) != "\t"):
+            return ActStatus{rest: s, status: 0}
+        let before = trim(slice(s, 0, k + 1))
+        if before == "":
+            return ActStatus{rest: s, status: 0}
+        return ActStatus{rest: before, status: toInt(digits)}
+
+    # actTrailingCode: parseCheck's checkCodeRe — a trailing
+    # `code "snake_case"` (a lowercase letter, then lowercase letters,
+    # digits and underscores) after whitespace.
+    struct ActCode:
+        rest: text
+        code: text
+
+    proc actTrailingCode(s: text) -> ActCode:
+        let none = ActCode{rest: s, code: ""}
+        let n = len(s)
+        if n < 8 || charAt(s, n - 1) != "\"":
+            return none
+        let mut q = n - 2
+        loop q >= 0 && charAt(s, q) != "\"":
+            q = q - 1
+        if q < 0:
+            return none
+        let code = slice(s, q + 1, n - 1)
+        if code == "":
+            return none
+        let cs = split(code, "")
+        if cs[0] < "a" || cs[0] > "z":
+            return none
+        let nc = len(cs)
+        let mut i = 1
+        loop i < nc:
+            let c = cs[i]
+            let ok = (c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c == "_"
+            if !ok:
+                return none
+            i = i + 1
+        let mut j = q - 1
+        let mut ws = 0
+        loop j >= 0 && (charAt(s, j) == " " || charAt(s, j) == "\t"):
+            ws = ws + 1
+            j = j - 1
+        if ws == 0 || j < 3 || slice(s, j - 3, j + 1) != "code":
+            return none
+        let k = j - 4
+        if k < 0 || (charAt(s, k) != " " && charAt(s, k) != "\t"):
+            return none
+        return ActCode{rest: trim(slice(s, 0, k + 1)), code: code}
+
+    proc actQuoteLit(v: text) -> text:
+        let cs = split(v, "")
+        let n = len(cs)
+        let mut out = "\""
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if c == "\"" || c == "\\":
+                out = out + "\\" + c
+            else:
+                if c == "\n":
+                    out = out + "\\n"
+                else:
+                    out = out + c
+            i = i + 1
+        return out + "\""
+
+    # actMatchStmt: parseActionBody's `match` — desugared on the spot into
+    # an `if <expr> == "value": … else: …` chain ending in the required
+    # else body.
+    proc actMatchStmt(texts: [text], parents: [int], lineIdx: int) -> ActionStmt:
+        let noExpr = do emptyNode()
+        let t = trim(texts[lineIdx])
+        let m0 = do trimPrefixText(t, "match ")
+        let m1 = do trimSuffixText(trim(m0), ":")
+        let exprS = trim(m1)
+        let endsColon = do hasSuffixText(t, ":")
+        let eok = do parseExprConsumedAll(exprS)
+        if exprS == "" || !endsColon || !eok:
+            let u = do actUnsupported(lineIdx)
+            return u
+        let subject = do parseExprTree(exprS)
+        let kids = do stmtChildrenOf(lineIdx, parents)
+        let mut vals = []
+        let mut bodies = []
+        let mut elseBody = []
+        let mut haveElse = false
+        let n = len(kids)
+        let mut i = 0
+        loop i < n:
+            let ct = trim(texts[kids[i]])
+            let isCase = do hasPrefixText(ct, "case ")
+            if isCase:
+                let v0 = do trimPrefixText(ct, "case ")
+                let v1 = do trimSuffixText(trim(v0), ":")
+                let vs = trim(v1)
+                let mut val = ""
+                let q = do hasPrefixText(vs, "\"")
+                if q:
+                    let inner = do lowerUnquoteAct(vs)
+                    val = inner
+                else:
+                    let isNum = do actIsIntText(vs)
+                    if !isNum:
+                        let u2 = do actUnsupported(lineIdx)
+                        return u2
+                    val = "" + toInt(vs)
+                if val in vals:
+                    let u3 = do actUnsupported(lineIdx)
+                    return u3
+                let body = do actionBlockStmts(texts, parents, kids[i])
+                if len(body) == 0:
+                    let u4 = do actUnsupported(lineIdx)
+                    return u4
+                vals = append(vals, val)
+                bodies = append(bodies, ActionStmt{kind: "block", lineIdx: kids[i], cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: body, elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false})
+            else:
+                if ct == "else:" || ct == "else":
+                    let eb = do actionBlockStmts(texts, parents, kids[i])
+                    if len(eb) == 0:
+                        let u5 = do actUnsupported(lineIdx)
+                        return u5
+                    elseBody = eb
+                    haveElse = true
+                else:
+                    let u6 = do actUnsupported(lineIdx)
+                    return u6
+            i = i + 1
+        if len(vals) == 0 || !haveElse:
+            let u7 = do actUnsupported(lineIdx)
+            return u7
+        let mut chain = elseBody
+        let mut k = len(vals) - 1
+        loop k >= 0:
+            let lit = do actQuoteLit(vals[k])
+            let litNode = do textLitNode(lit)
+            let eq = do binNode("==", subject, litNode)
+            let ifs = ActionStmt{kind: "if", lineIdx: lineIdx, cond: eq, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: bodies[k].body, elseBody: chain, valid: true, status: 0, hasValue: false, event: "", hasTo: false}
+            chain = [ifs]
+            k = k - 1
+        return chain[0]
+
+    proc actIsIntText(s: text) -> bool:
+        let mut body = s
+        if charAt(s, 0) == "-" || charAt(s, 0) == "+":
+            body = slice(s, 1, len(s))
+        if body == "":
+            return false
+        let cs = split(body, "")
+        let n = len(cs)
+        let mut i = 0
+        loop i < n:
+            if cs[i] < "0" || cs[i] > "9":
+                return false
+            i = i + 1
+        return true
+
+    # lowerUnquoteAct: strconv.Unquote of a `"…"` literal (escapes decoded).
+    proc lowerUnquoteAct(raw: text) -> text:
+        let n = len(raw)
+        let mut out = ""
+        let mut i = 1
+        loop i < n - 1:
+            let c = charAt(raw, i)
+            if c == "\\" && i + 1 < n - 1:
+                let e = charAt(raw, i + 1)
+                if e == "n":
+                    out = out + "\n"
+                else:
+                    if e == "t":
+                        out = out + "\t"
+                    else:
+                        out = out + e
+                i = i + 2
+            else:
+                out = out + c
+                i = i + 1
+        return out
+
     proc actCallStmt(rest: text, lineIdx: int, bindName: text) -> ActionStmt:
         let noExpr = do emptyNode()
         let open = do firstParenIndex(rest)
@@ -701,7 +1067,7 @@ app ActionStmtSelfHost:
         let mut kind = "call"
         if bindName != "":
             kind = "letCall"
-        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: svc, opName: op, callArgs: args, procName: "", bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: svc, opName: op, callArgs: args, procName: "", bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
     # actDoStmt: `ProcName(args)` (the shared shape of both bare `do
     # ProcName(args)` and bound `let name = do ProcName(args)`).
@@ -724,7 +1090,7 @@ app ActionStmtSelfHost:
         let mut kind = "do"
         if bindName != "":
             kind = "letDo"
-        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: args, procName: name, bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: args, procName: name, bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
     # actEstablishStmt: `establish actor <expr> [role <expr>]`. The
     # `" role "` search is a PLAIN substring index (real Go's own
@@ -755,7 +1121,7 @@ app ActionStmtSelfHost:
         if hasRole:
             let r = do parseExprTree(roleSrc)
             roleNode = r
-        return ActionStmt{kind: "establish", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: actorNode, hasRole: hasRole, role: roleNode, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+        return ActionStmt{kind: "establish", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: actorNode, hasRole: hasRole, role: roleNode, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
     # actAddStmt: `add Entity { f: expr, ... }`, including the multi-line
     # record-literal continuation (actCloseAddRecord, above). Field names
@@ -810,7 +1176,7 @@ app ActionStmtSelfHost:
         let mut kind = "add"
         if bindName != "":
             kind = "letAdd"
-        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: fieldNames, fieldValues: fieldValues, serviceName: "", opName: "", callArgs: [], procName: "", bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+        return ActionStmt{kind: kind, lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: fieldNames, fieldValues: fieldValues, serviceName: "", opName: "", callArgs: [], procName: "", bindName: bindName, actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
     # actSetStmt: the two real forms — `set Entity(key).field = expr`
     # (by-id) and `set item in Entity where cond:` (filtered, its own
@@ -872,7 +1238,7 @@ app ActionStmtSelfHost:
                         fieldValues = append(fieldValues, fval)
                 i = i + 1
             let overallValid = len(fieldNames) > 0
-            return ActionStmt{kind: "setWhere", lineIdx: lineIdx, cond: whereNode, msg: "", policyName: "", policyArgs: [], entity: hf[2], key: noExpr, field: "", value: noExpr, itemVar: hf[0], fieldNames: fieldNames, fieldValues: fieldValues, serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: overallValid}
+            return ActionStmt{kind: "setWhere", lineIdx: lineIdx, cond: whereNode, msg: "", policyName: "", policyArgs: [], entity: hf[2], key: noExpr, field: "", value: noExpr, itemVar: hf[0], fieldNames: fieldNames, fieldValues: fieldValues, serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: overallValid, status: 0, hasValue: false, event: "", hasTo: false}
         let eq = do actIndexAssign(rest)
         if eq < 0:
             let u = do actUnsupported(lineIdx)
@@ -887,7 +1253,7 @@ app ActionStmtSelfHost:
         if !fieldOk:
             let u = do actUnsupported(lineIdx)
             return u
-        return ActionStmt{kind: "set", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: lhsNode.text, key: lhsNode.children[0], field: lhsNode.field, value: valNode, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+        return ActionStmt{kind: "set", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: lhsNode.text, key: lhsNode.children[0], field: lhsNode.field, value: valNode, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
     # actForClausePos: splitForClauses' own keyword scan — the first
     # top-level identifier token equal to kw, or -1. Top level means: not
@@ -1061,7 +1427,7 @@ app ActionStmtSelfHost:
         if len(bodyStmts) == 0:
             let u = do actUnsupported(lineIdx)
             return u
-        return ActionStmt{kind: "for", lineIdx: lineIdx, cond: whereNode, msg: "", policyName: "", policyArgs: [], entity: fields[2], key: noExpr, field: "", value: noExpr, itemVar: fields[0], fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: orderField, orderDesc: orderDesc, limit: limitNode, hasLimit: hasLimit, body: bodyStmts, elseBody: [], valid: true}
+        return ActionStmt{kind: "for", lineIdx: lineIdx, cond: whereNode, msg: "", policyName: "", policyArgs: [], entity: fields[2], key: noExpr, field: "", value: noExpr, itemVar: fields[0], fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: orderField, orderDesc: orderDesc, limit: limitNode, hasLimit: hasLimit, body: bodyStmts, elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
     # actRemoveStmt: `remove Entity(key)` (by-id) or `remove item in Entity
     # where cond` (filtered — a single line, NOT a block, unlike `set`'s
@@ -1098,7 +1464,7 @@ app ActionStmtSelfHost:
                 return u
             let condSrc = trim(slice(rest, wi + 7, len(rest)))
             let condNode = do parseExprTree(condSrc)
-            return ActionStmt{kind: "removeWhere", lineIdx: lineIdx, cond: condNode, msg: "", policyName: "", policyArgs: [], entity: hf[2], key: noExpr, field: "", value: noExpr, itemVar: hf[0], fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+            return ActionStmt{kind: "removeWhere", lineIdx: lineIdx, cond: condNode, msg: "", policyName: "", policyArgs: [], entity: hf[2], key: noExpr, field: "", value: noExpr, itemVar: hf[0], fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
         let open = do firstParenIndex(rest)
         let close = do lastCharIndex(rest, ")")
         if open < 0 || close < open:
@@ -1106,7 +1472,7 @@ app ActionStmtSelfHost:
             return u
         let ent = trim(slice(rest, 0, open))
         let keyNode = do parseExprTree(trim(slice(rest, open + 1, close)))
-        return ActionStmt{kind: "remove", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: keyNode, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true}
+        return ActionStmt{kind: "remove", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: "", policyArgs: [], entity: ent, key: keyNode, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false}
 
     # actRequiresStmts: `requires <policy>` or `requires <policy>(args),
     # <policy2>, ...` — ONE line can produce SEVERAL real ast.Require
@@ -1127,7 +1493,7 @@ app ActionStmtSelfHost:
             if open < 0:
                 let nameOk = do isIdentToken(p)
                 if nameOk:
-                    out = append(out, ActionStmt{kind: "requires", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: p, policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true})
+                    out = append(out, ActionStmt{kind: "requires", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: p, policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false})
                 else:
                     let u1 = do actUnsupported(lineIdx)
                     out = append(out, u1)
@@ -1149,7 +1515,7 @@ app ActionStmtSelfHost:
                             let av = do parseExprTree(trim(argPieces[j]))
                             args = append(args, av)
                             j = j + 1
-                    out = append(out, ActionStmt{kind: "requires", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: name, policyArgs: args, entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true})
+                    out = append(out, ActionStmt{kind: "requires", lineIdx: lineIdx, cond: noExpr, msg: "", policyName: name, policyArgs: args, entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: [], elseBody: [], valid: true, status: 0, hasValue: false, event: "", hasTo: false})
             i = i + 1
         return out
 
@@ -1175,6 +1541,12 @@ app ActionStmtSelfHost:
             let t = trim(texts[lineIdx])
             let isRequires = do hasPrefixText(t, "requires ")
             let isIf = do hasPrefixText(t, "if ")
+            let isMatchS = do hasPrefixText(t, "match ")
+            if isMatchS:
+                let ms = do actMatchStmt(texts, parents, lineIdx)
+                out = append(out, ms)
+                i = i + 1
+                continue
             if isRequires:
                 let rs = do actRequiresStmts(t, lineIdx)
                 let rn = len(rs)
@@ -1214,7 +1586,7 @@ app ActionStmtSelfHost:
                         out = append(out, u)
                     else:
                         let cond = do parseExprTree(condText)
-                        out = append(out, ActionStmt{kind: "if", lineIdx: lineIdx, cond: cond, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: thenStmts, elseBody: elseStmts, valid: true})
+                        out = append(out, ActionStmt{kind: "if", lineIdx: lineIdx, cond: cond, msg: "", policyName: "", policyArgs: [], entity: "", key: noExpr, field: "", value: noExpr, itemVar: "", fieldNames: [], fieldValues: [], serviceName: "", opName: "", callArgs: [], procName: "", bindName: "", actor: noExpr, hasRole: false, role: noExpr, target: "", exprCall: noExpr, orderField: "", orderDesc: false, limit: noExpr, hasLimit: false, body: thenStmts, elseBody: elseStmts, valid: true, status: 0, hasValue: false, event: "", hasTo: false})
                     if consumedElse:
                         i = i + 2
                     else:

@@ -1,0 +1,2330 @@
+import "lower.fct"
+
+app ViewParseSelfHost:
+    # view_parse.fct — self-hosted port of internal/parser/parser.go's VIEW
+    # grammar: parseView's header (`view Name [at "/path"] [in Layout]
+    # [requires policy]`, `meta title/description`), parseNodes and every
+    # node parser it dispatches to (box/row/text/heading/image/icon/video/
+    # richtext/badge/tabs/match/for/stage/sprite/if/after/overlay/popover/
+    # typeahead/the ast.Controls table/input/link/select/form/upload/use/
+    # slot), stripNodeMods' trailing class/style/anchor modifiers, parseRange
+    # + splitForClauses, and the quoted-text scanners they all share
+    # (endOfQuoted/endOfInterp/indexTop/splitTop/matchParen/unquoteText/
+    # parseTextBody). The output is VNode, a one-struct rendering of the
+    # ast.Node sum type (see the kind list on VNode below), which
+    # view_build.fct lowers into ir.Node exactly as internal/ir/build.go's
+    # viewCtx does.
+    #
+    # Errors: a proc has no error channel, so a failed parse is a VNode of
+    # kind "!err" whose `value` is the parser's own message. parseNodes
+    # stops at the first one and returns it alone, which is exactly the
+    # first-error-wins shape Go's `if err != nil { return nil, err }` has.
+    #
+    # Positions: every scanner works on a rune list (split(s, "")) and
+    # slices with the rune-indexed `slice`, so a multi-byte character in a
+    # label is never split — the Go code's byte indexes and these rune
+    # indexes land on the same boundaries because every delimiter scanned
+    # for is ASCII.
+    struct VSeg:
+        lit: text
+        expr: [ExprNode]
+
+    struct VRange:
+        itemVar: text
+        coll: text
+        where: [ExprNode]
+        order: text
+        desc: bool
+        limit: [ExprNode]
+        more: text
+
+    struct VOption:
+        label: [VSeg]
+        value: text
+        val: [ExprNode]
+        from: [VRange]
+
+    struct VAssign:
+        target: text
+        value: ExprNode
+
+    # VNode kinds (ast type in parentheses): box row text heading image icon
+    # video richtext badge tabs tab(Tab) match case(MatchCase) else(Match.Else)
+    # button for stage sprite(Sprite) if after input control(Control: ctl is
+    # the keyword) overlay popover typeahead link select form upload use slot
+    # slotref(SlotRef) modified(Modified: children = [inner]) — plus "!err".
+    struct VNode:
+        kind: text
+        children: [VNode]
+        segs: [VSeg]
+        label: [VSeg]
+        pathSegs: [VSeg]
+        placeholder: [VSeg]
+        alt: [VSeg]
+        altSet: bool
+        poster: [VSeg]
+        autoplay: bool
+        loopFlag: bool
+        muted: bool
+        action: text
+        args: [ExprNode]
+        onChange: bool
+        debounce: int
+        expr: [ExprNode]
+        rng: [VRange]
+        bind: text
+        ctl: text
+        options: [VOption]
+        value: text
+        seconds: int
+        assigns: [VAssign]
+        width: int
+        height: int
+        x: [ExprNode]
+        y: [ExprNode]
+        facing: [ExprNode]
+        image: [ExprNode]
+        entity: text
+        field: text
+        name: text
+        classSegs: [VSeg]
+        style: text
+        anchor: text
+        hasElse: bool
+
+    proc vpNode(kind: text) -> VNode:
+        return VNode{kind: kind, children: [], segs: [], label: [], pathSegs: [], placeholder: [], alt: [], altSet: false, poster: [], autoplay: false, loopFlag: false, muted: false, action: "", args: [], onChange: false, debounce: 0, expr: [], rng: [], bind: "", ctl: "", options: [], value: "", seconds: 0, assigns: [], width: 0, height: 0, x: [], y: [], facing: [], image: [], entity: "", field: "", name: "", classSegs: [], style: "", anchor: "", hasElse: false}
+
+    proc vpSetChildren(n: VNode, v: [VNode]) -> VNode:
+        return VNode{kind: n.kind, children: v, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetSegs(n: VNode, v: [VSeg]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: v, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetLabel(n: VNode, v: [VSeg]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: v, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetPathSegs(n: VNode, v: [VSeg]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: v, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetPlaceholder(n: VNode, v: [VSeg]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: v, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetAlt(n: VNode, v: [VSeg]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: v, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetAltSet(n: VNode, v: bool) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: v, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetPoster(n: VNode, v: [VSeg]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: v, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetAutoplay(n: VNode, v: bool) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: v, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetLoopFlag(n: VNode, v: bool) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: v, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetMuted(n: VNode, v: bool) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: v, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetAction(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: v, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetArgs(n: VNode, v: [ExprNode]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: v, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetOnChange(n: VNode, v: bool) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: v, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetDebounce(n: VNode, v: int) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: v, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetExpr(n: VNode, v: [ExprNode]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: v, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetRng(n: VNode, v: [VRange]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: v, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetBind(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: v, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetCtl(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: v, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetOptions(n: VNode, v: [VOption]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: v, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetValue(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: v, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetSeconds(n: VNode, v: int) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: v, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetAssigns(n: VNode, v: [VAssign]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: v, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetWidth(n: VNode, v: int) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: v, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetHeight(n: VNode, v: int) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: v, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetX(n: VNode, v: [ExprNode]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: v, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetY(n: VNode, v: [ExprNode]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: v, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetFacing(n: VNode, v: [ExprNode]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: v, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetImage(n: VNode, v: [ExprNode]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: v, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetEntity(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: v, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetField(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: v, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetName(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: v, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetClassSegs(n: VNode, v: [VSeg]) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: v, style: n.style, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetStyle(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: v, anchor: n.anchor, hasElse: n.hasElse}
+
+    proc vpSetAnchor(n: VNode, v: text) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: v, hasElse: n.hasElse}
+
+    proc vpSetHasElse(n: VNode, v: bool) -> VNode:
+        return VNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, pathSegs: n.pathSegs, placeholder: n.placeholder, alt: n.alt, altSet: n.altSet, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, action: n.action, args: n.args, onChange: n.onChange, debounce: n.debounce, expr: n.expr, rng: n.rng, bind: n.bind, ctl: n.ctl, options: n.options, value: n.value, seconds: n.seconds, assigns: n.assigns, width: n.width, height: n.height, x: n.x, y: n.y, facing: n.facing, image: n.image, entity: n.entity, field: n.field, name: n.name, classSegs: n.classSegs, style: n.style, anchor: n.anchor, hasElse: v}
+
+
+    # ── errors ──────────────────────────────────────────────────────────────
+    proc vpErr(msg: text) -> VNode:
+        let e = do vpNode("!err")
+        let e2 = do vpSetValue(e, msg)
+        return e2
+
+    proc vpIsErr(n: VNode) -> bool:
+        return n.kind == "!err"
+
+    proc vpErrList(msg: text) -> [VNode]:
+        let e = do vpErr(msg)
+        return [e]
+
+    proc vpListErr(ns: [VNode]) -> text:
+        if len(ns) == 1:
+            if ns[0].kind == "!err":
+                return ns[0].value
+        return ""
+
+    # ── small text helpers (strings.* restated over runes) ──────────────────
+    proc vpHasPrefix(s: text, p: text) -> bool:
+        return slice(s, 0, len(p)) == p
+
+    proc vpHasSuffix(s: text, p: text) -> bool:
+        let n = len(s)
+        let m = len(p)
+        if m > n:
+            return false
+        return slice(s, n - m, n) == p
+
+    proc vpTrimSuffix(s: text, p: text) -> text:
+        let ok = do vpHasSuffix(s, p)
+        if ok:
+            return slice(s, 0, len(s) - len(p))
+        return s
+
+    proc vpTrimPrefix(s: text, p: text) -> text:
+        let ok = do vpHasPrefix(s, p)
+        if ok:
+            return slice(s, len(p), len(s))
+        return s
+
+    proc vpTrimRightSpace(s: text) -> text:
+        let mut n = len(s)
+        loop n > 0:
+            if charAt(s, n - 1) == " ":
+                n = n - 1
+            else:
+                break
+        return slice(s, 0, n)
+
+    proc vpIndexOf(s: text, sub: text) -> int:
+        let n = len(s)
+        let m = len(sub)
+        let mut i = 0
+        loop i + m <= n:
+            if slice(s, i, i + m) == sub:
+                return i
+            i = i + 1
+        return -1
+
+    proc vpLastIndexOf(s: text, sub: text) -> int:
+        let n = len(s)
+        let m = len(sub)
+        let mut i = n - m
+        loop i >= 0:
+            if slice(s, i, i + m) == sub:
+                return i
+            i = i - 1
+        return -1
+
+    proc vpCount(s: text, sub: text) -> int:
+        let parts = split(s, sub)
+        return len(parts) - 1
+
+    proc vpFirstWord(s: text) -> text:
+        let i = do vpIndexOf(s, " ")
+        if i >= 0:
+            return slice(s, 0, i)
+        return s
+
+    proc vpIsLetter(c: text) -> bool:
+        return c == "_" || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+
+    proc vpIsDigit(c: text) -> bool:
+        return c >= "0" && c <= "9"
+
+    proc vpIsIdent(s: text) -> bool:
+        if s == "":
+            return false
+        let cs = split(s, "")
+        let n = len(cs)
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            let l = do vpIsLetter(c)
+            if !l:
+                let d = do vpIsDigit(c)
+                if !(i > 0 && d):
+                    return false
+            i = i + 1
+        return true
+
+    proc vpIsUpper(s: text) -> bool:
+        if s == "":
+            return false
+        let c = charAt(s, 0)
+        return c >= "A" && c <= "Z"
+
+    # vpIsInt / vpAtoi: strconv.Atoi's accepted shape (optional sign, one or
+    # more ASCII digits) and its canonical value.
+    proc vpIsInt(s: text) -> bool:
+        let mut body = s
+        let c0 = charAt(s, 0)
+        if c0 == "-" || c0 == "+":
+            body = slice(s, 1, len(s))
+        if body == "":
+            return false
+        let cs = split(body, "")
+        let n = len(cs)
+        let mut i = 0
+        loop i < n:
+            let d = do vpIsDigit(cs[i])
+            if !d:
+                return false
+            i = i + 1
+        return true
+
+    proc vpAtoi(s: text) -> int:
+        return toInt(s)
+
+    # ── the quoted-value scanners (parser.go endOfQuoted/endOfInterp/
+    #    indexTop/matchParen/splitTop), on rune lists ─────────────────────
+    proc vpEndOfQuoted(cs: [text], i: int) -> int:
+        let n = len(cs)
+        let mut j = i + 1
+        loop j < n:
+            let c = cs[j]
+            if c == "\\":
+                j = j + 2
+                continue
+            if c == "\"":
+                return j
+            if c == "{":
+                let e = do vpEndOfInterp(cs, j)
+                if e >= 0:
+                    j = e
+            j = j + 1
+        return -1
+
+    proc vpEndOfInterp(cs: [text], i: int) -> int:
+        let n = len(cs)
+        let mut depth = 0
+        let mut j = i
+        loop j < n:
+            let c = cs[j]
+            if c == "\\":
+                j = j + 2
+                continue
+            if c == "{":
+                depth = depth + 1
+            if c == "}":
+                depth = depth - 1
+                if depth == 0:
+                    return j
+            if c == "\"":
+                let e = do vpEndOfQuoted(cs, j)
+                if e < 0:
+                    return -1
+                j = e
+            j = j + 1
+        return -1
+
+    proc vpMatchAt(cs: [text], i: int, sep: [text]) -> bool:
+        let m = len(sep)
+        if i + m > len(cs):
+            return false
+        let mut k = 0
+        loop k < m:
+            if cs[i + k] != sep[k]:
+                return false
+            k = k + 1
+        return true
+
+    proc vpIndexTop(s: text, sep: text) -> int:
+        let cs = split(s, "")
+        let ss = split(sep, "")
+        let n = len(cs)
+        let mut i = 0
+        loop i < n:
+            if cs[i] == "\"":
+                let e = do vpEndOfQuoted(cs, i)
+                if e < 0:
+                    return -1
+                i = e + 1
+                continue
+            let hit = do vpMatchAt(cs, i, ss)
+            if hit:
+                return i
+            i = i + 1
+        return -1
+
+    proc vpMatchParen(cs: [text], i: int) -> int:
+        let n = len(cs)
+        let mut depth = 0
+        let mut j = i
+        loop j < n:
+            let c = cs[j]
+            if c == "\"":
+                let e = do vpEndOfQuoted(cs, j)
+                if e < 0:
+                    return -1
+                j = e
+            if c == "(":
+                depth = depth + 1
+            if c == ")":
+                depth = depth - 1
+                if depth == 0:
+                    return j
+            j = j + 1
+        return -1
+
+    proc vpSplitTop(s: text, sep: text) -> [text]:
+        let cs = split(s, "")
+        let n = len(cs)
+        let mut out = []
+        let mut depth = 0
+        let mut inStr = false
+        let mut start = 0
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if c == "\"":
+                inStr = !inStr
+            else:
+                if !inStr:
+                    if c == "(" || c == "{" || c == "[":
+                        depth = depth + 1
+                    if c == ")" || c == "}" || c == "]":
+                        depth = depth - 1
+                    if c == sep && depth == 0:
+                        out = append(out, trim(slice(s, start, i)))
+                        start = i + 1
+            i = i + 1
+        out = append(out, trim(slice(s, start, n)))
+        return out
+
+    # vpEscapeInterpQuotes: escapeInterpQuotes — the bare `"` inside a
+    # `{…}` become `\"`, so the text body is a literal strconv.Unquote can
+    # decode; an escaped pair is copied as the pair it is.
+    proc vpEscapeInterpQuotes(body: text) -> text:
+        if !contains(body, "{"):
+            return body
+        let cs = split(body, "")
+        let n = len(cs)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if c == "\\" && i + 1 < n:
+                out = out + c + cs[i + 1]
+                i = i + 2
+                continue
+            if c == "{":
+                let end = do vpEndOfInterp(cs, i)
+                if end < 0:
+                    out = out + c
+                    i = i + 1
+                    continue
+                let mut j = i
+                loop j <= end:
+                    if cs[j] == "\\" && j + 1 <= end:
+                        out = out + cs[j] + cs[j + 1]
+                        j = j + 2
+                        continue
+                    if cs[j] == "\"":
+                        out = out + "\\\""
+                    else:
+                        out = out + cs[j]
+                    j = j + 1
+                i = end + 1
+                continue
+            out = out + c
+            i = i + 1
+        return out
+
+    # vpUnquote: parser.go's unquote — a plain quoted literal.
+    proc vpUnquoteOk(s: text) -> bool:
+        let u = do goUnquote(s)
+        return u.ok
+
+    proc vpUnquote(s: text) -> text:
+        let u = do goUnquote(s)
+        return u.value
+
+    # vpUnquoteTextOk: unquoteText's precondition — a quote at 0 whose close
+    # (endOfQuoted, interpolation-aware) is the last rune.
+    proc vpUnquoteTextOk(s: text) -> bool:
+        if len(s) < 2:
+            return false
+        if charAt(s, 0) != "\"":
+            return false
+        let cs = split(s, "")
+        let e = do vpEndOfQuoted(cs, 0)
+        return e == len(s) - 1
+
+    # ── expressions ─────────────────────────────────────────────────────────
+    proc vpExprOk(src: text) -> bool:
+        if trim(src) == "":
+            return false
+        let ok = do parseExprConsumedAll(src)
+        return ok
+
+    proc vpExpr(src: text) -> ExprNode:
+        let e = do parseExprTree(src)
+        return e
+
+    # ── interpolated text: parseText / parseTextBody ────────────────────────
+    # A VNode of kind "segs" carries the result in `segs`, or "!err".
+    proc vpTextBody(str: text) -> VNode:
+        let cs = split(str, "")
+        let n = len(cs)
+        let mut segs = []
+        let mut lit = ""
+        let mut i = 0
+        loop i < n:
+            if cs[i] == "{":
+                let end = do vpEndOfInterp(cs, i)
+                if end < 0:
+                    let e1 = do vpErr("unterminated `{` in text")
+                    return e1
+                if lit != "":
+                    segs = append(segs, VSeg{lit: lit, expr: []})
+                    lit = ""
+                let inner = slice(str, i + 1, end)
+                let ok = do vpExprOk(inner)
+                if !ok:
+                    let e2 = do vpErr("cannot parse `{" + inner + "}`")
+                    return e2
+                let ex = do vpExpr(inner)
+                segs = append(segs, VSeg{lit: "", expr: [ex]})
+                i = end + 1
+                continue
+            lit = lit + cs[i]
+            i = i + 1
+        if lit != "":
+            segs = append(segs, VSeg{lit: lit, expr: []})
+        let r = do vpNode("segs")
+        let r2 = do vpSetSegs(r, segs)
+        return r2
+
+    proc vpText(s: text) -> VNode:
+        let ok = do vpUnquoteTextOk(s)
+        if !ok:
+            let e = do vpErr("expected a quoted string, got " + s)
+            return e
+        let body = slice(s, 1, len(s) - 1)
+        let esc = do vpEscapeInterpQuotes(body)
+        let u = do goUnquote("\"" + esc + "\"")
+        if !u.ok:
+            let sq = do goQuote(s)
+            let e2 = do vpErr("invalid string " + sq)
+            return e2
+        let r = do vpTextBody(u.value)
+        return r
+
+    # vpExprList parses a comma-separated argument list (splitTop) into a
+    # "segs"-less carrier node whose `args` holds the expressions.
+    proc vpArgList(inner: text) -> VNode:
+        let mut args = []
+        if inner != "":
+            let parts = do vpSplitTop(inner, ",")
+            let n = len(parts)
+            let mut i = 0
+            loop i < n:
+                let a = trim(parts[i])
+                let ok = do vpExprOk(a)
+                if !ok:
+                    let e = do vpErr("cannot parse argument " + a)
+                    return e
+                let ex = do vpExpr(a)
+                args = append(args, ex)
+                i = i + 1
+        let r = do vpNode("args")
+        let r2 = do vpSetArgs(r, args)
+        return r2
+
+    # ── the source-line tree (source.Parse's build, over a view body) ───────
+    struct VLine:
+        text: text
+        kids: [VLine]
+
+    struct VLineList:
+        lines: [VLine]
+        next: int
+
+    proc vpIndentOf(raw: text) -> int:
+        let n = len(raw)
+        let mut i = 0
+        loop i < n:
+            if charAt(raw, i) != " ":
+                break
+            i = i + 1
+        return i
+
+    proc vpBuildLines(texts: [text], indents: [int], pos0: int, parentIndent: int) -> VLineList:
+        let n = len(texts)
+        let mut pos = pos0
+        let mut out = []
+        loop pos < n:
+            if indents[pos] <= parentIndent:
+                break
+            let sub = do vpBuildLines(texts, indents, pos + 1, indents[pos])
+            out = append(out, VLine{text: texts[pos], kids: sub.lines})
+            pos = sub.next
+        return VLineList{lines: out, next: pos}
+
+    # vpLinesOf: a body's raw text (as program.fct hands it over) into its
+    # line forest, blank lines and full-line comments dropped.
+    proc vpLinesOf(src: text) -> [VLine]:
+        let raws = split(src, "\n")
+        let mut texts = []
+        let mut indents = []
+        let n = len(raws)
+        let mut i = 0
+        loop i < n:
+            let t = trim(raws[i])
+            let isComment = do vpHasPrefix(t, "#")
+            if t != "" && !isComment:
+                texts = append(texts, t)
+                let ind = do vpIndentOf(raws[i])
+                indents = append(indents, ind)
+            i = i + 1
+        let built = do vpBuildLines(texts, indents, 0, -1)
+        return built.lines
+
+    # ── modifiers: stripNodeMods / trailingNodeMod ─────────────────────────
+    struct VMod:
+        ok: bool
+        kw: text
+        val: text
+        rest: text
+
+    proc vpTrailingMod(line: text) -> VMod:
+        let none = VMod{ok: false, kw: "", val: "", rest: ""}
+        let s = do vpTrimRightSpace(line)
+        let endsQ = do vpHasSuffix(s, "\"")
+        if !endsQ:
+            return none
+        let cs = split(s, "")
+        let n = len(cs)
+        let mut open = -1
+        let mut i = 0
+        loop i < n:
+            if cs[i] != "\"":
+                i = i + 1
+                continue
+            let e = do vpEndOfQuoted(cs, i)
+            if e < 0:
+                return none
+            if e == n - 1:
+                open = i
+                break
+            i = e + 1
+        if open < 0:
+            return none
+        let prefix = do vpTrimRightSpace(slice(s, 0, open))
+        let kws = ["class", "style", "anchor"]
+        let mut k = 0
+        loop k < 3:
+            let kw = kws[k]
+            let hs = do vpHasSuffix(prefix, kw)
+            if hs:
+                let base = slice(prefix, 0, len(prefix) - len(kw))
+                let bsp = do vpHasSuffix(base, " ")
+                if base != "" && bsp:
+                    let rest = do vpTrimRightSpace(base)
+                    return VMod{ok: true, kw: kw, val: slice(s, open + 1, n - 1), rest: rest}
+            k = k + 1
+        return none
+
+    proc vpIsAnchorName(s: text) -> bool:
+        if s == "":
+            return false
+        let cs = split(s, "")
+        let n = len(cs)
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            let l = do vpIsLetter(c)
+            let d = do vpIsDigit(c)
+            if !l && !d && c != "-":
+                return false
+            i = i + 1
+        return true
+
+    # vpStripMods returns a "mods" carrier: `value` = the cleaned line,
+    # classSegs/style/anchor = the captured modifiers (or "!err").
+    proc vpStripMods(line0: text) -> VNode:
+        let mut head = line0
+        let mut colon = ""
+        let trimmed = do vpTrimRightSpace(line0)
+        let hc = do vpHasSuffix(trimmed, ":")
+        if hc:
+            head = slice(trimmed, 0, len(trimmed) - 1)
+            colon = ":"
+        let mut line = head
+        let mut classSegs = []
+        let mut haveClass = false
+        let mut style = ""
+        let mut anchor = ""
+        loop true:
+            let m = do vpTrailingMod(line)
+            if !m.ok:
+                break
+            if m.kw == "class":
+                if !haveClass:
+                    let segsN = do vpTextBody(m.val)
+                    if segsN.kind == "!err":
+                        return segsN
+                    classSegs = segsN.segs
+                    haveClass = len(classSegs) > 0
+            if m.kw == "style":
+                if style == "":
+                    style = m.val
+            if m.kw == "anchor":
+                let an = do vpIsAnchorName(m.val)
+                if !an:
+                    let e = do vpErr("invalid anchor " + m.val + ": an anchor name is letters, digits, `-` and `_` — it is what a link spells back as `#name`")
+                    return e
+                if anchor == "":
+                    anchor = m.val
+            line = m.rest
+        let r0 = do vpNode("mods")
+        let r1 = do vpSetValue(r0, line + colon)
+        let r2 = do vpSetClassSegs(r1, classSegs)
+        let r3 = do vpSetStyle(r2, style)
+        let r4 = do vpSetAnchor(r3, anchor)
+        return r4
+
+    # ── parseRange / splitForClauses ────────────────────────────────────────
+    proc vpFields(s: text) -> [text]:
+        let parts = split(s, " ")
+        let mut out = []
+        let n = len(parts)
+        let mut i = 0
+        loop i < n:
+            let p = trim(parts[i])
+            if p != "":
+                out = append(out, p)
+            i = i + 1
+        return out
+
+    struct VClauses:
+        err: text
+        whereS: text
+        byS: text
+        limitS: text
+        moreS: text
+
+    proc vpClauseEnd(pos: [int], start: int, n: int) -> int:
+        let mut e = n
+        let mut k = 0
+        loop k < 4:
+            if pos[k] >= 0 && pos[k] > start && pos[k] < e:
+                e = pos[k]
+            k = k + 1
+        return e
+
+    proc vpSplitForClauses(rest: text) -> VClauses:
+        if trim(rest) == "":
+            return VClauses{err: "", whereS: "", byS: "", limitS: "", moreS: ""}
+        let names = ["where", "by", "limit", "more"]
+        let mut pos = [-1, -1, -1, -1]
+        let cs = split(rest, "")
+        let n = len(cs)
+        let mut inStr = false
+        let mut depth = 0
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if c == "\"":
+                inStr = !inStr
+                i = i + 1
+                continue
+            if inStr:
+                i = i + 1
+                continue
+            if c == "(" || c == "{":
+                depth = depth + 1
+                i = i + 1
+                continue
+            if c == ")" || c == "}":
+                depth = depth - 1
+                i = i + 1
+                continue
+            let st = do vpIsLetter(c)
+            if depth == 0 && st:
+                let mut j = i
+                loop j < n:
+                    let l = do vpIsLetter(cs[j])
+                    let d = do vpIsDigit(cs[j])
+                    if l || d:
+                        j = j + 1
+                    else:
+                        break
+                let w = slice(rest, i, j)
+                let mut k = 0
+                loop k < 4:
+                    if w == names[k] && pos[k] < 0:
+                        pos[k] = i
+                    k = k + 1
+                i = j
+                continue
+            i = i + 1
+        let mut bodies = ["", "", "", ""]
+        let mut k2 = 0
+        loop k2 < 4:
+            if pos[k2] >= 0:
+                let e = do vpClauseEnd(pos, pos[k2], n)
+                let body = trim(slice(rest, pos[k2] + len(names[k2]), e))
+                if body == "":
+                    return VClauses{err: "`" + names[k2] + "` needs a value", whereS: "", byS: "", limitS: "", moreS: ""}
+                bodies[k2] = body
+            k2 = k2 + 1
+        let mut first = n
+        let mut k3 = 0
+        loop k3 < 4:
+            if pos[k3] >= 0 && pos[k3] < first:
+                first = pos[k3]
+            k3 = k3 + 1
+        let leftover = trim(slice(rest, 0, first))
+        if leftover != "":
+            return VClauses{err: "unexpected " + leftover + " in for header (clauses are where/by/limit/more, in that order)", whereS: "", byS: "", limitS: "", moreS: ""}
+        return VClauses{err: "", whereS: bodies[0], byS: bodies[1], limitS: bodies[2], moreS: bodies[3]}
+
+    # vpRange: a "range" carrier whose rng holds the one VRange (or "!err").
+    proc vpRange(head: text) -> VNode:
+        let fields = do vpFields(head)
+        if len(fields) < 3 || fields[1] != "in":
+            let e = do vpErr("for needs `for item in Collection [where cond] [by field desc|asc] [limit n]:`")
+            return e
+        let i0 = do vpIsIdent(fields[0])
+        let i2 = do vpIsIdent(fields[2])
+        if !i0 || !i2:
+            let e = do vpErr("invalid for clause " + head)
+            return e
+        let mut rest = trim(slice(head, len(fields[0]), len(head)))
+        rest = trim(slice(rest, 2, len(rest)))
+        rest = trim(slice(rest, len(fields[2]), len(rest)))
+        let cl = do vpSplitForClauses(rest)
+        if cl.err != "":
+            let e = do vpErr(cl.err)
+            return e
+        let mut whereE = []
+        if cl.whereS != "":
+            let ok = do vpExprOk(cl.whereS)
+            if !ok:
+                let e = do vpErr("cannot parse where clause " + cl.whereS)
+                return e
+            let w = do vpExpr(cl.whereS)
+            whereE = [w]
+        let mut order = ""
+        let mut desc = false
+        if cl.byS != "":
+            let bp = do vpFields(cl.byS)
+            let mut idOk = false
+            if len(bp) >= 1:
+                let io = do vpIsIdent(bp[0])
+                idOk = io
+            if len(bp) < 1 || len(bp) > 2 || !idOk:
+                let e = do vpErr("ordering is `by field [desc|asc]`")
+                return e
+            order = bp[0]
+            if len(bp) == 2:
+                if bp[1] == "desc":
+                    desc = true
+                else:
+                    if bp[1] != "asc":
+                        let e = do vpErr("order direction must be `desc` or `asc`, got " + bp[1])
+                        return e
+        let mut limitE = []
+        if cl.limitS != "":
+            let ok = do vpExprOk(cl.limitS)
+            if !ok:
+                let e = do vpErr("limit needs an integer or expression, got " + cl.limitS)
+                return e
+            let l = do vpExpr(cl.limitS)
+            limitE = [l]
+        let mut more = ""
+        if cl.moreS != "":
+            let mi = do vpIsIdent(cl.moreS)
+            if !mi:
+                let e = do vpErr("`more` names the action that loads the next page — `more loadMore` — got " + cl.moreS)
+                return e
+            if len(limitE) == 0:
+                let e = do vpErr("`more` needs a `limit`: nothing is held back from an unbounded list, so there is no next page to load")
+                return e
+            more = cl.moreS
+        let rg = VRange{itemVar: fields[0], coll: fields[2], where: whereE, order: order, desc: desc, limit: limitE, more: more}
+        let r0 = do vpNode("range")
+        let r1 = do vpSetRng(r0, [rg])
+        return r1
+
+    # ── leaf nodes ──────────────────────────────────────────────────────────
+    proc vpSegsNode(kind: text, s: text) -> VNode:
+        let sn = do vpText(s)
+        if sn.kind == "!err":
+            return sn
+        let n0 = do vpNode(kind)
+        let n1 = do vpSetSegs(n0, sn.segs)
+        return n1
+
+    proc vpHeading(rest: text) -> VNode:
+        let q = do vpIndexOf(rest, "\"")
+        if q < 0:
+            let e = do vpErr("heading needs text: heading 2 \"Title\"")
+            return e
+        let lv = trim(slice(rest, 0, q))
+        if lv == "":
+            let e = do vpErr("heading needs a level: heading 2 \"Title\"")
+            return e
+        let ok = do vpExprOk(lv)
+        if !ok:
+            let e = do vpErr("cannot parse heading level " + lv)
+            return e
+        let lvl = do vpExpr(lv)
+        let sn = do vpText(trim(slice(rest, q, len(rest))))
+        if sn.kind == "!err":
+            return sn
+        let n0 = do vpNode("heading")
+        let n1 = do vpSetExpr(n0, [lvl])
+        let n2 = do vpSetSegs(n1, sn.segs)
+        return n2
+
+    # vpMediaClause: mediaClause — a "clause" carrier: value = remain,
+    # segs = the clause's segments, altSet = whether it was present.
+    proc vpMediaClause(rest: text, kw: text) -> VNode:
+        let i = do vpIndexTop(rest, kw + " ")
+        let c0 = do vpNode("clause")
+        if i < 0:
+            let c1 = do vpSetValue(c0, rest)
+            return c1
+        let sn = do vpText(trim(slice(rest, i + len(kw) + 1, len(rest))))
+        if sn.kind == "!err":
+            return sn
+        let c2 = do vpSetValue(c0, trim(slice(rest, 0, i)))
+        let c3 = do vpSetSegs(c2, sn.segs)
+        let c4 = do vpSetAltSet(c3, true)
+        return c4
+
+    proc vpImage(rest: text) -> VNode:
+        let cl = do vpMediaClause(rest, "alt")
+        if cl.kind == "!err":
+            return cl
+        let sn = do vpText(cl.value)
+        if sn.kind == "!err":
+            return sn
+        let n0 = do vpNode("image")
+        let n1 = do vpSetSegs(n0, sn.segs)
+        let n2 = do vpSetAlt(n1, cl.segs)
+        let n3 = do vpSetAltSet(n2, cl.altSet)
+        return n3
+
+    proc vpVideo(rest0: text) -> VNode:
+        let mut rest = rest0
+        let mut autoplay = false
+        let mut loopF = false
+        let mut muted = false
+        loop true:
+            let i = do vpLastIndexOf(rest, " ")
+            if i < 0:
+                break
+            let word = trim(slice(rest, i + 1, len(rest)))
+            let qc = do vpCount(slice(rest, 0, i), "\"")
+            if qc % 2 != 0:
+                break
+            if word == "autoplay":
+                autoplay = true
+            else:
+                if word == "loop":
+                    loopF = true
+                else:
+                    if word == "muted":
+                        muted = true
+                    else:
+                        let wi = do vpIsIdent(word)
+                        let endsQ = do vpHasSuffix(trim(slice(rest, 0, i)), "\"")
+                        if word != "" && charAt(word, 0) != "\"" && wi && endsQ:
+                            let e = do vpErr("video: unknown flag " + word + " (the playback flags are autoplay, loop, muted)")
+                            return e
+                        break
+            rest = trim(slice(rest, 0, i))
+        let a = do vpIndexTop(rest, "alt ")
+        let p = do vpIndexTop(rest, "poster ")
+        if a >= 0 && p > a:
+            let e = do vpErr("video clauses are ordered: video \"src\" [poster \"…\"] [alt \"…\"] [autoplay] [loop] [muted]")
+            return e
+        let altC = do vpMediaClause(rest, "alt")
+        if altC.kind == "!err":
+            return altC
+        let posterC = do vpMediaClause(altC.value, "poster")
+        if posterC.kind == "!err":
+            return posterC
+        if trim(posterC.value) == "":
+            let e = do vpErr("video needs a source")
+            return e
+        let sn = do vpText(posterC.value)
+        if sn.kind == "!err":
+            return sn
+        let n0 = do vpNode("video")
+        let n1 = do vpSetSegs(n0, sn.segs)
+        let n2 = do vpSetAlt(n1, altC.segs)
+        let n3 = do vpSetAltSet(n2, altC.altSet)
+        let n4 = do vpSetPoster(n3, posterC.segs)
+        let n5 = do vpSetAutoplay(n4, autoplay)
+        let n6 = do vpSetLoopFlag(n5, loopF)
+        let n7 = do vpSetMuted(n6, muted)
+        return n7
+
+    # vpCallTail: parseButton's `name` / `name(args…)` half, shared with
+    # parseControlAction. A "call" carrier: action + args (or "!err").
+    proc vpCallTail(call: text) -> VNode:
+        let mut name = call
+        let mut args = []
+        let open = do vpIndexOf(call, "(")
+        if open >= 0:
+            name = trim(slice(call, 0, open))
+            let close = do vpLastIndexOf(call, ")")
+            if close < open:
+                let e = do vpErr("missing `)` in action call")
+                return e
+            let inner = trim(slice(call, open + 1, close))
+            let al = do vpArgList(inner)
+            if al.kind == "!err":
+                return al
+            args = al.args
+        let ok = do vpIsIdent(name)
+        if !ok:
+            let e = do vpErr("invalid action reference " + name)
+            return e
+        let n0 = do vpNode("call")
+        let n1 = do vpSetAction(n0, name)
+        let n2 = do vpSetArgs(n1, args)
+        return n2
+
+    proc vpButton(s: text) -> VNode:
+        let arrow = do vpIndexTop(s, "->")
+        if arrow < 0:
+            let e = do vpErr("button needs an action: button \"Label\" -> actionName")
+            return e
+        let lab = do vpText(trim(slice(s, 0, arrow)))
+        if lab.kind == "!err":
+            return lab
+        let ct = do vpCallTail(trim(slice(s, arrow + 2, len(s))))
+        if ct.kind == "!err":
+            return ct
+        let n0 = do vpNode("button")
+        let n1 = do vpSetLabel(n0, lab.segs)
+        let n2 = do vpSetAction(n1, ct.action)
+        let n3 = do vpSetArgs(n2, ct.args)
+        return n3
+
+    proc vpLink(s: text) -> VNode:
+        let arrow = do vpIndexTop(s, "->")
+        if arrow < 0:
+            let e = do vpErr("link needs a destination: link \"Home\" -> \"/\"")
+            return e
+        let lab = do vpText(trim(slice(s, 0, arrow)))
+        if lab.kind == "!err":
+            return lab
+        let dst = do vpText(trim(slice(s, arrow + 2, len(s))))
+        if dst.kind == "!err":
+            return dst
+        let n0 = do vpNode("link")
+        let n1 = do vpSetLabel(n0, lab.segs)
+        let n2 = do vpSetPathSegs(n1, dst.segs)
+        return n2
+
+    proc vpDuration(s: text) -> int:
+        # -1 = invalid (parseDuration's error); seconds otherwise.
+        if len(s) < 2:
+            return -1
+        let unit = charAt(s, len(s) - 1)
+        let num = slice(s, 0, len(s) - 1)
+        let isI = do vpIsInt(num)
+        if !isI:
+            return -1
+        let n = toInt(num)
+        if n <= 0:
+            return -1
+        if unit == "s":
+            return n
+        if unit == "m":
+            return n * 60
+        if unit == "h":
+            return n * 3600
+        return -1
+
+    proc vpControlAction(s: text) -> VNode:
+        let arrowOk = do vpHasPrefix(s, "->")
+        if !arrowOk:
+            let e = do vpErr("`on change` needs a reaction: `on change -> actionName(args)`")
+            return e
+        let mut call = trim(slice(s, 2, len(s)))
+        let mut debounceMS = 400
+        let di = do vpIndexTop(call, " debounce ")
+        if di >= 0:
+            let durS = trim(slice(call, di + 10, len(call)))
+            call = trim(slice(call, 0, di))
+            let secs = do vpDuration(durS)
+            if secs < 0:
+                let e = do vpErr("invalid duration " + durS + " (use 30s, 5m, 2h)")
+                return e
+            debounceMS = secs * 1000
+        let ct = do vpCallTail(call)
+        if ct.kind == "!err":
+            return ct
+        let n1 = do vpSetDebounce(ct, debounceMS)
+        return n1
+
+    proc vpInput(s: text) -> VNode:
+        let hb = do vpHasPrefix(s, "bind ")
+        if !hb:
+            let e = do vpErr("input needs a binding: input bind stateName")
+            return e
+        let mut rest = trim(slice(s, 5, len(s)))
+        let mut onChange = ""
+        let oc = do vpIndexTop(rest, " on change")
+        if oc >= 0:
+            onChange = trim(slice(rest, oc + 10, len(rest)))
+            rest = trim(slice(rest, 0, oc))
+        let mut ph = []
+        let pi = do vpIndexTop(rest, "placeholder ")
+        if pi >= 0:
+            let p = do vpText(trim(slice(rest, pi + 12, len(rest))))
+            if p.kind == "!err":
+                return p
+            ph = p.segs
+            rest = trim(slice(rest, 0, pi))
+        let bi = do vpIsIdent(rest)
+        if !bi:
+            let e = do vpErr("invalid input binding " + rest)
+            return e
+        let n0 = do vpNode("input")
+        let n1 = do vpSetBind(n0, rest)
+        let n2 = do vpSetPlaceholder(n1, ph)
+        if onChange != "":
+            let ca = do vpControlAction(onChange)
+            if ca.kind == "!err":
+                return ca
+            let n3 = do vpSetOnChange(n2, true)
+            let n4 = do vpSetAction(n3, ca.action)
+            let n5 = do vpSetArgs(n4, ca.args)
+            let n6 = do vpSetDebounce(n5, ca.debounce)
+            return n6
+        return n2
+
+    proc vpBindHead(kw: text, head: text) -> text:
+        # "" = invalid; the bound name otherwise.
+        let hb = do vpHasPrefix(head, "bind ")
+        if !hb:
+            return ""
+        let b = trim(slice(head, 5, len(head)))
+        let ok = do vpIsIdent(b)
+        if !ok:
+            return ""
+        return b
+
+    proc vpTypeahead(s0: text) -> VNode:
+        let mut s = s0
+        let mut ph = []
+        let i = do vpIndexTop(s, "placeholder ")
+        if i >= 0:
+            let p = do vpText(trim(slice(s, i + 12, len(s))))
+            if p.kind == "!err":
+                return p
+            ph = p.segs
+            s = trim(slice(s, 0, i))
+        let hb = do vpHasPrefix(s, "bind ")
+        if !hb:
+            let e = do vpErr("typeahead needs: typeahead bind <cell> from <Entity>.<field>")
+            return e
+        let rest = trim(slice(s, 5, len(s)))
+        let fi = do vpIndexOf(rest, " from ")
+        if fi < 0:
+            let e = do vpErr("typeahead needs a source: typeahead bind <cell> from <Entity>.<field>")
+            return e
+        let bind = trim(slice(rest, 0, fi))
+        let src = trim(slice(rest, fi + 6, len(rest)))
+        let dot = do vpIndexOf(src, ".")
+        if dot < 0:
+            let e = do vpErr("typeahead source must be <Entity>.<field>")
+            return e
+        let ent = trim(slice(src, 0, dot))
+        let field = trim(slice(src, dot + 1, len(src)))
+        let b1 = do vpIsIdent(bind)
+        let b2 = do vpIsIdent(ent)
+        let b3 = do vpIsIdent(field)
+        if !b1 || !b2 || !b3:
+            let e = do vpErr("typeahead needs identifiers: bind <cell> from <Entity>.<field>")
+            return e
+        let n0 = do vpNode("typeahead")
+        let n1 = do vpSetBind(n0, bind)
+        let n2 = do vpSetEntity(n1, ent)
+        let n3 = do vpSetField(n2, field)
+        let n4 = do vpSetPlaceholder(n3, ph)
+        return n4
+
+    proc vpUpload(s: text) -> VNode:
+        let hb = do vpHasPrefix(s, "bind ")
+        if !hb:
+            let e = do vpErr("upload needs a binding: upload bind avatarUrl")
+            return e
+        let mut rest = trim(slice(s, 5, len(s)))
+        let mut label = [VSeg{lit: "Upload", expr: []}]
+        let lp = do vpIndexTop(rest, "label ")
+        if lp >= 0:
+            let l = do vpText(trim(slice(rest, lp + 6, len(rest))))
+            if l.kind == "!err":
+                return l
+            label = l.segs
+            rest = trim(slice(rest, 0, lp))
+        let ok = do vpIsIdent(rest)
+        if !ok:
+            let e = do vpErr("invalid upload binding " + rest)
+            return e
+        let n0 = do vpNode("upload")
+        let n1 = do vpSetBind(n0, rest)
+        let n2 = do vpSetLabel(n1, label)
+        return n2
+
+    proc vpOption(rest: text) -> VNode:
+        # an "option" carrier: label/value/expr(val) — or "!err".
+        let arrow = do vpIndexTop(rest, "->")
+        let o0 = do vpNode("option")
+        if arrow < 0:
+            let uq = do vpUnquoteOk(rest)
+            if !uq:
+                let e = do vpErr("expected a quoted string, got " + rest)
+                return e
+            let v = do vpUnquote(rest)
+            let hasBrace = contains(v, "{")
+            if hasBrace:
+                let e = do vpErr("option " + v + " interpolates, so it needs the value it stores")
+                return e
+            let o1 = do vpSetLabel(o0, [VSeg{lit: v, expr: []}])
+            let o2 = do vpSetValue(o1, v)
+            return o2
+        let lab = do vpText(trim(slice(rest, 0, arrow)))
+        if lab.kind == "!err":
+            return lab
+        let o3 = do vpSetLabel(o0, lab.segs)
+        let val = trim(slice(rest, arrow + 2, len(rest)))
+        let q = do vpHasPrefix(val, "\"")
+        if q:
+            let uq = do vpUnquoteOk(val)
+            if !uq:
+                let e = do vpErr("expected a quoted string, got " + val)
+                return e
+            let v = do vpUnquote(val)
+            let o4 = do vpSetValue(o3, v)
+            return o4
+        if val == "":
+            let e = do vpErr("option needs the value it stores: option \"Label\" -> \"value\"")
+            return e
+        let ok = do vpExprOk(val)
+        if !ok:
+            let e = do vpErr("cannot parse option value " + val)
+            return e
+        let ex = do vpExpr(val)
+        let o5 = do vpSetExpr(o3, [ex])
+        return o5
+
+    proc vpOptionOf(o: VNode, from: [VRange]) -> VOption:
+        return VOption{label: o.label, value: o.value, val: o.expr, from: from}
+
+    # vpOptions: parseOptions — an "options" carrier with `options` set.
+    proc vpOptions(kw: text, kids: [VLine]) -> VNode:
+        let mut out = []
+        let n = len(kids)
+        let mut i = 0
+        loop i < n:
+            let c = kids[i]
+            let isOpt = do vpHasPrefix(c.text, "option ")
+            let isFor = do vpHasPrefix(c.text, "for ")
+            let fw = do vpFirstWord(c.text)
+            if isOpt:
+                let o = do vpOption(trim(slice(c.text, 7, len(c.text))))
+                if o.kind == "!err":
+                    return o
+                let vo = do vpOptionOf(o, [])
+                out = append(out, vo)
+            else:
+                if isFor:
+                    let head = do vpTrimSuffix(trim(slice(c.text, 4, len(c.text))), ":")
+                    let rg = do vpRange(head)
+                    if rg.kind == "!err":
+                        return rg
+                    let mut oneOpt = false
+                    if len(c.kids) == 1:
+                        let hp = do vpHasPrefix(c.kids[0].text, "option ")
+                        oneOpt = hp
+                    if !oneOpt:
+                        let e = do vpErr("a `for` in a " + kw + " renders one option per row, so it holds exactly one `option \"Label\" -> value` line")
+                        return e
+                    let o = do vpOption(trim(slice(c.kids[0].text, 7, len(c.kids[0].text))))
+                    if o.kind == "!err":
+                        return o
+                    let vo = do vpOptionOf(o, rg.rng)
+                    out = append(out, vo)
+                else:
+                    if fw == "slot":
+                        let e = do vpErr("a `slot` cannot stand in a " + kw + "'s choice list")
+                        return e
+                    let e = do vpErr(kw + " children must be options: option \"Label\" -> \"value\", or a `for item in Collection:` holding one such line")
+                    return e
+            i = i + 1
+        let r0 = do vpNode("options")
+        let r1 = do vpSetOptions(r0, out)
+        return r1
+
+    # The ast.Controls table's parse-side columns (Hint, Labeled, Options).
+    proc vpIsControl(kw: text) -> bool:
+        return kw == "textarea" || kw == "checkbox" || kw == "toggle" || kw == "radio" || kw == "password" || kw == "newpassword"
+
+    proc vpControlHint(kw: text) -> bool:
+        return kw == "textarea" || kw == "password" || kw == "newpassword"
+
+    proc vpControlLabeled(kw: text) -> bool:
+        return kw == "checkbox" || kw == "toggle"
+
+    proc vpControl(kw: text, c: VLine) -> VNode:
+        let head0 = do vpTrimSuffix(trim(slice(c.text, len(kw), len(c.text))), ":")
+        let mut head = trim(head0)
+        let hint = do vpControlHint(kw)
+        let labeled = do vpControlLabeled(kw)
+        let mut ph = []
+        let mut label = []
+        if hint:
+            let i = do vpIndexTop(head, "placeholder ")
+            if i >= 0:
+                let p = do vpText(trim(slice(head, i + 12, len(head))))
+                if p.kind == "!err":
+                    return p
+                ph = p.segs
+                head = trim(slice(head, 0, i))
+        if labeled:
+            let i = do vpIndexTop(head, "label ")
+            if i >= 0:
+                let l = do vpText(trim(slice(head, i + 6, len(head))))
+                if l.kind == "!err":
+                    return l
+                label = l.segs
+                head = trim(slice(head, 0, i))
+        let hb = do vpHasPrefix(head, "bind ")
+        if !hb:
+            let e = do vpErr(kw + " needs a binding: " + kw + " bind <cell>")
+            return e
+        let bind = trim(slice(head, 5, len(head)))
+        let bi = do vpIsIdent(bind)
+        if !bi:
+            let e = do vpErr("invalid " + kw + " binding " + bind)
+            return e
+        let n0 = do vpNode("control")
+        let n1 = do vpSetCtl(n0, kw)
+        let n2 = do vpSetBind(n1, bind)
+        let n3 = do vpSetPlaceholder(n2, ph)
+        let n4 = do vpSetLabel(n3, label)
+        if kw == "radio":
+            let os = do vpOptions(kw, c.kids)
+            if os.kind == "!err":
+                return os
+            let n5 = do vpSetOptions(n4, os.options)
+            return n5
+        if len(c.kids) > 0:
+            let e = do vpErr(kw + " takes no children — it is one control, not a container")
+            return e
+        return n4
+
+    # ── block nodes ─────────────────────────────────────────────────────────
+    proc vpBlockHead(t: text, kwLen: int) -> text:
+        let h = do vpTrimSuffix(trim(slice(t, kwLen, len(t))), ":")
+        return h
+
+    proc vpWithKids(kind: text, kids: [VLine]) -> VNode:
+        let ks = do vpNodes(kids)
+        let e = do vpListErr(ks)
+        if e != "":
+            return ks[0]
+        let n0 = do vpNode(kind)
+        let n1 = do vpSetChildren(n0, ks)
+        return n1
+
+    proc vpTabs(c: VLine) -> VNode:
+        let head = do vpBlockHead(c.text, 5)
+        let hb = do vpHasPrefix(head, "bind ")
+        if !hb:
+            let e = do vpErr("tabs needs a binding: tabs bind cell")
+            return e
+        let bind = trim(slice(head, 5, len(head)))
+        let bi = do vpIsIdent(bind)
+        if !bi:
+            let e = do vpErr("invalid tabs binding " + bind)
+            return e
+        let mut tabs = []
+        let n = len(c.kids)
+        let mut i = 0
+        loop i < n:
+            let k = c.kids[i]
+            let isTab = do vpHasPrefix(k.text, "tab ")
+            if !isTab:
+                let e = do vpErr("tabs children must be tabs: tab \"Label\" -> \"value\":")
+                return e
+            let rest = do vpBlockHead(k.text, 4)
+            let arrow = do vpIndexTop(rest, "->")
+            if arrow < 0:
+                let e = do vpErr("tab needs a value: tab \"Label\" -> \"value\":")
+                return e
+            let lab = do vpText(trim(slice(rest, 0, arrow)))
+            if lab.kind == "!err":
+                return lab
+            let vs = trim(slice(rest, arrow + 2, len(rest)))
+            let uq = do vpUnquoteOk(vs)
+            if !uq:
+                let e = do vpErr("expected a quoted string, got " + vs)
+                return e
+            let v = do vpUnquote(vs)
+            let body = do vpWithKids("tab", k.kids)
+            if body.kind == "!err":
+                return body
+            let t1 = do vpSetLabel(body, lab.segs)
+            let t2 = do vpSetValue(t1, v)
+            tabs = append(tabs, t2)
+            i = i + 1
+        if len(tabs) == 0:
+            let e = do vpErr("tabs needs at least one `tab`")
+            return e
+        let n0 = do vpNode("tabs")
+        let n1 = do vpSetBind(n0, bind)
+        let n2 = do vpSetChildren(n1, tabs)
+        return n2
+
+    proc vpCaseValue(s: text) -> VNode:
+        let q = do vpHasPrefix(s, "\"")
+        let r = do vpNode("casevalue")
+        if q:
+            let uq = do vpUnquoteOk(s)
+            if !uq:
+                let e = do vpErr("expected a quoted string, got " + s)
+                return e
+            let v = do vpUnquote(s)
+            let r1 = do vpSetValue(r, v)
+            return r1
+        let isI = do vpIsInt(s)
+        if isI:
+            let n = toInt(s)
+            let r2 = do vpSetValue(r, "" + n)
+            return r2
+        let e = do vpErr("a case value is a compile-time constant: a quoted string (case \"draft\":) or a whole number (case 1:) — got " + s)
+        return e
+
+    proc vpMatch(c: VLine) -> VNode:
+        let exprS = do vpBlockHead(c.text, 6)
+        if exprS == "":
+            let e = do vpErr("match needs a value: match <expr>:")
+            return e
+        let ok = do vpExprOk(exprS)
+        if !ok:
+            let e = do vpErr("cannot parse match subject " + exprS)
+            return e
+        let subj = do vpExpr(exprS)
+        let mut arms = []
+        let mut hasElse = false
+        let mut nCases = 0
+        let n = len(c.kids)
+        let mut i = 0
+        loop i < n:
+            let k = c.kids[i]
+            let ct = trim(k.text)
+            let isCase = do vpHasPrefix(ct, "case ")
+            if isCase:
+                let cvS = do vpBlockHead(ct, 5)
+                let cv = do vpCaseValue(cvS)
+                if cv.kind == "!err":
+                    return cv
+                let body = do vpWithKids("case", k.kids)
+                if body.kind == "!err":
+                    return body
+                let a1 = do vpSetValue(body, cv.value)
+                arms = append(arms, a1)
+                nCases = nCases + 1
+            else:
+                if ct == "else:" || ct == "else":
+                    let body = do vpWithKids("else", k.kids)
+                    if body.kind == "!err":
+                        return body
+                    # m.Else = body: a body that parsed to no nodes is nil,
+                    # which Build reads as "no else branch".
+                    if len(body.children) > 0:
+                        arms = append(arms, body)
+                        hasElse = true
+                else:
+                    let e = do vpErr("match children must be cases: case \"value\": (or else:)")
+                    return e
+            i = i + 1
+        if nCases == 0:
+            let e = do vpErr("match needs at least one `case`")
+            return e
+        let n0 = do vpNode("match")
+        let n1 = do vpSetExpr(n0, [subj])
+        let n2 = do vpSetChildren(n1, arms)
+        let n3 = do vpSetHasElse(n2, hasElse)
+        return n3
+
+    proc vpFor(c: VLine) -> VNode:
+        let head = do vpBlockHead(c.text, 4)
+        let rg = do vpRange(head)
+        if rg.kind == "!err":
+            return rg
+        let body = do vpWithKids("for", c.kids)
+        if body.kind == "!err":
+            return body
+        let n1 = do vpSetRng(body, rg.rng)
+        return n1
+
+    proc vpSprite(t: text) -> VNode:
+        let rest = trim(slice(t, 7, len(t)))
+        let at = do vpIndexTop(rest, " at (")
+        if at < 0:
+            let e = do vpErr("sprite needs a position: sprite for x in Coll at (x, y) image <expr>")
+            return e
+        let rangeHead = trim(slice(rest, 0, at))
+        let tail = trim(slice(rest, at + 1, len(rest)))
+        let isFor = do vpHasPrefix(rangeHead, "for ")
+        if !isFor:
+            let e = do vpErr("sprite needs `sprite for <var> in <Coll> …`")
+            return e
+        let rg = do vpRange(trim(slice(rangeHead, 4, len(rangeHead))))
+        if rg.kind == "!err":
+            return rg
+        let coordPart = slice(tail, 3, len(tail))
+        if coordPart == "" || charAt(coordPart, 0) != "(":
+            let e = do vpErr("sprite position must be `at (x, y)`")
+            return e
+        let cps = split(coordPart, "")
+        let closeP = do vpMatchParen(cps, 0)
+        if closeP < 0:
+            let e = do vpErr("unclosed `(` in sprite position")
+            return e
+        let coords = slice(coordPart, 1, closeP)
+        let comma = do vpIndexTop(coords, ",")
+        if comma < 0:
+            let e = do vpErr("sprite position needs both coordinates: at (x, y)")
+            return e
+        let xs = trim(slice(coords, 0, comma))
+        let ys = trim(slice(coords, comma + 1, len(coords)))
+        let xok = do vpExprOk(xs)
+        let yok = do vpExprOk(ys)
+        if !xok || !yok:
+            let e = do vpErr("cannot parse sprite position")
+            return e
+        let xe = do vpExpr(xs)
+        let ye = do vpExpr(ys)
+        let after = trim(slice(coordPart, closeP + 1, len(coordPart)))
+        let imgIdx = do vpIndexTop(after, "image ")
+        if imgIdx < 0:
+            let e = do vpErr("sprite needs an image: image <expr>")
+            return e
+        let mut facing = []
+        let facingPart = trim(slice(after, 0, imgIdx))
+        if facingPart != "":
+            let fp = do vpHasPrefix(facingPart, "facing ")
+            if !fp:
+                let e = do vpErr("sprite's only modifier before `image` is `facing <expr>`")
+                return e
+            let fs = trim(slice(facingPart, 7, len(facingPart)))
+            let fok = do vpExprOk(fs)
+            if !fok:
+                let e = do vpErr("cannot parse sprite facing " + fs)
+                return e
+            let fe = do vpExpr(fs)
+            facing = [fe]
+        let imageTail = trim(slice(after, imgIdx + 6, len(after)))
+        let mut imgSrc = imageTail
+        let mut label = []
+        let li = do vpIndexTop(imageTail, "label ")
+        if li >= 0:
+            imgSrc = trim(slice(imageTail, 0, li))
+            let ls = do vpText(trim(slice(imageTail, li + 6, len(imageTail))))
+            if ls.kind == "!err":
+                return ls
+            label = ls.segs
+        let iok = do vpExprOk(imgSrc)
+        if !iok:
+            let e = do vpErr("cannot parse sprite image " + imgSrc)
+            return e
+        let ie = do vpExpr(imgSrc)
+        let n0 = do vpNode("sprite")
+        let n1 = do vpSetRng(n0, rg.rng)
+        let n2 = do vpSetX(n1, [xe])
+        let n3 = do vpSetY(n2, [ye])
+        let n4 = do vpSetFacing(n3, facing)
+        let n5 = do vpSetImage(n4, [ie])
+        let n6 = do vpSetLabel(n5, label)
+        return n6
+
+    proc vpStage(c: VLine) -> VNode:
+        let head = do vpBlockHead(c.text, 6)
+        let fs = do vpFields(head)
+        if len(fs) != 4 || fs[0] != "width" || fs[2] != "height":
+            let e = do vpErr("stage needs `stage width <int> height <int>:`")
+            return e
+        let wi = do vpIsInt(fs[1])
+        let hi = do vpIsInt(fs[3])
+        if !wi:
+            let e = do vpErr("stage width must be an integer, got " + fs[1])
+            return e
+        if !hi:
+            let e = do vpErr("stage height must be an integer, got " + fs[3])
+            return e
+        let w = toInt(fs[1])
+        let h = toInt(fs[3])
+        if w <= 0 || h <= 0:
+            let e = do vpErr("stage width/height must be positive")
+            return e
+        let mut tiles = []
+        let mut sprites = []
+        let n = len(c.kids)
+        let mut i = 0
+        loop i < n:
+            let k = c.kids[i]
+            let t = trim(k.text)
+            if len(k.kids) > 0:
+                let e = do vpErr("a stage's `tiles`/`sprite` lines take no children — they are draw parameters, not a body")
+                return e
+            let isTiles = do vpHasPrefix(t, "tiles from ")
+            let isSprite = do vpHasPrefix(t, "sprite ")
+            if isTiles:
+                if len(tiles) > 0:
+                    let e = do vpErr("stage takes at most one `tiles from …`")
+                    return e
+                let ts = trim(slice(t, 11, len(t)))
+                let tok = do vpExprOk(ts)
+                if !tok:
+                    let e = do vpErr("cannot parse tiles " + ts)
+                    return e
+                let te = do vpExpr(ts)
+                tiles = [te]
+            else:
+                if isSprite:
+                    let sp = do vpSprite(t)
+                    if sp.kind == "!err":
+                        return sp
+                    sprites = append(sprites, sp)
+                else:
+                    let e = do vpErr("stage children must be `tiles from <expr>` or `sprite for …`")
+                    return e
+            i = i + 1
+        if len(tiles) == 0 && len(sprites) == 0:
+            let e = do vpErr("stage needs at least a `tiles from …` or one `sprite for …`")
+            return e
+        let n0 = do vpNode("stage")
+        let n1 = do vpSetWidth(n0, w)
+        let n2 = do vpSetHeight(n1, h)
+        let n3 = do vpSetExpr(n2, tiles)
+        let n4 = do vpSetChildren(n3, sprites)
+        return n4
+
+    proc vpAfterForbidden(t: text) -> bool:
+        let kws = ["check ", "requires ", "add ", "set ", "remove ", "clear ", "call ", "do ", "let ", "establish "]
+        let n = len(kws)
+        let mut i = 0
+        loop i < n:
+            let hp = do vpHasPrefix(t, kws[i])
+            if hp:
+                return true
+            i = i + 1
+        return false
+
+    proc vpAfter(c: VLine) -> VNode:
+        let h0 = do vpTrimPrefix(c.text, "after")
+        let head = do vpTrimSuffix(trim(h0), ":")
+        if head == "":
+            let e = do vpErr("after needs a duration: `after 5s: cell = false`")
+            return e
+        let secs = do vpDuration(head)
+        if secs < 0:
+            let e = do vpErr("invalid duration " + head + " (use 30s, 5m, 2h)")
+            return e
+        if len(c.kids) == 0:
+            let e = do vpErr("after has no body: `after 5s: cell = false`")
+            return e
+        let mut body = []
+        let n = len(c.kids)
+        let mut i = 0
+        loop i < n:
+            let t = c.kids[i].text
+            let bad = do vpAfterForbidden(t)
+            if bad:
+                let fw = do vpFirstWord(t)
+                let e = do vpErr("after body can only assign a @client cell (`name = expr`) — " + fw + " needs the authority and cannot run in a client-side timer; put it in an action instead")
+                return e
+            let eq = do vpIndexOf(t, "=")
+            if eq < 0:
+                let fw = do vpFirstWord(t)
+                let e = do vpErr("after body can only assign a @client cell (`name = expr`), not " + fw)
+                return e
+            let target = trim(slice(t, 0, eq))
+            let ti = do vpIsIdent(target)
+            if !ti:
+                let e = do vpErr("invalid assignment target " + target)
+                return e
+            let vs = trim(slice(t, eq + 1, len(t)))
+            let vok = do vpExprOk(vs)
+            if !vok:
+                let e = do vpErr("cannot parse " + vs)
+                return e
+            let ve = do vpExpr(vs)
+            body = append(body, VAssign{target: target, value: ve})
+            i = i + 1
+        let n0 = do vpNode("after")
+        let n1 = do vpSetSeconds(n0, secs)
+        let n2 = do vpSetAssigns(n1, body)
+        return n2
+
+    proc vpBindBlock(kw: text, c: VLine) -> VNode:
+        let h0 = do vpTrimSuffix(trim(slice(c.text, len(kw), len(c.text))), ":")
+        let head = trim(h0)
+        let hb = do vpHasPrefix(head, "bind ")
+        if !hb:
+            let e = do vpErr(kw + " needs a bound cell: " + kw + " bind <cell>:")
+            return e
+        let bind = trim(slice(head, 5, len(head)))
+        let bi = do vpIsIdent(bind)
+        if !bi:
+            let e = do vpErr("invalid " + kw + " binding " + bind)
+            return e
+        let body = do vpWithKids(kw, c.kids)
+        if body.kind == "!err":
+            return body
+        let n1 = do vpSetBind(body, bind)
+        return n1
+
+    proc vpSelect(c: VLine) -> VNode:
+        let head = do vpBlockHead(c.text, 7)
+        let hb = do vpHasPrefix(head, "bind ")
+        if !hb:
+            let e = do vpErr("select needs a binding: select bind choice")
+            return e
+        let bind = trim(slice(head, 5, len(head)))
+        let bi = do vpIsIdent(bind)
+        if !bi:
+            let e = do vpErr("invalid select binding " + bind)
+            return e
+        let os = do vpOptions("select", c.kids)
+        if os.kind == "!err":
+            return os
+        let n0 = do vpNode("select")
+        let n1 = do vpSetBind(n0, bind)
+        let n2 = do vpSetOptions(n1, os.options)
+        return n2
+
+    proc vpForm(c: VLine) -> VNode:
+        let head = do vpBlockHead(c.text, 5)
+        let btn = do vpButton(head)
+        if btn.kind == "!err":
+            return btn
+        let body = do vpWithKids("form", c.kids)
+        if body.kind == "!err":
+            return body
+        let n1 = do vpSetAction(body, btn.action)
+        let n2 = do vpSetArgs(n1, btn.args)
+        let n3 = do vpSetLabel(n2, btn.label)
+        return n3
+
+    proc vpUse(s: text, kids: [VLine]) -> VNode:
+        let mut name = s
+        let mut args = []
+        let open = do vpIndexOf(s, "(")
+        if open >= 0:
+            name = trim(slice(s, 0, open))
+            let close = do vpLastIndexOf(s, ")")
+            if close < open:
+                let e = do vpErr("missing `)` in use(...)")
+                return e
+            let al = do vpArgList(trim(slice(s, open + 1, close)))
+            if al.kind == "!err":
+                return al
+            args = al.args
+        let ni = do vpIsIdent(name)
+        let nu = do vpIsUpper(name)
+        if !ni || !nu:
+            let e = do vpErr("invalid component name " + name)
+            return e
+        let body = do vpWithKids("use", kids)
+        if body.kind == "!err":
+            return body
+        let n1 = do vpSetName(body, name)
+        let n2 = do vpSetArgs(n1, args)
+        return n2
+
+    # ── parseNodes ──────────────────────────────────────────────────────────
+    proc vpOneNode(c: VLine, before: int) -> VNode:
+        let t = c.text
+        if t == "box:" || t == "box":
+            let b = do vpWithKids("box", c.kids)
+            return b
+        if t == "row:" || t == "row":
+            let r = do vpWithKids("row", c.kids)
+            return r
+        let p1 = do vpHasPrefix(t, "text ")
+        if p1:
+            let n1 = do vpSegsNode("text", trim(slice(t, 5, len(t))))
+            return n1
+        let p2 = do vpHasPrefix(t, "heading ")
+        if p2:
+            let n2 = do vpHeading(trim(slice(t, 8, len(t))))
+            return n2
+        let p3 = do vpHasPrefix(t, "image ")
+        if p3:
+            let n3 = do vpImage(trim(slice(t, 6, len(t))))
+            return n3
+        let p4 = do vpHasPrefix(t, "button ")
+        if p4:
+            let n4 = do vpButton(trim(slice(t, 7, len(t))))
+            return n4
+        let p5 = do vpHasPrefix(t, "icon ")
+        if p5:
+            let n5 = do vpSegsNode("icon", trim(slice(t, 5, len(t))))
+            return n5
+        let p6 = do vpHasPrefix(t, "video ")
+        if p6:
+            let n6 = do vpVideo(trim(slice(t, 6, len(t))))
+            return n6
+        let p7 = do vpHasPrefix(t, "richtext ")
+        if p7:
+            let n7 = do vpSegsNode("richtext", trim(slice(t, 9, len(t))))
+            return n7
+        let p8 = do vpHasPrefix(t, "badge ")
+        if p8:
+            let n8 = do vpSegsNode("badge", trim(slice(t, 6, len(t))))
+            return n8
+        let p9 = do vpHasPrefix(t, "tabs ")
+        if p9:
+            let n9 = do vpTabs(c)
+            return n9
+        let p10 = do vpHasPrefix(t, "match ")
+        if p10:
+            let n10 = do vpMatch(c)
+            return n10
+        let p11 = do vpHasPrefix(t, "for ")
+        if p11:
+            let n11 = do vpFor(c)
+            return n11
+        let p12 = do vpHasPrefix(t, "stage ")
+        if p12:
+            let n12 = do vpStage(c)
+            return n12
+        let p13 = do vpHasPrefix(t, "if ")
+        if p13:
+            let cs = do vpBlockHead(t, 3)
+            let ok = do vpExprOk(cs)
+            if !ok:
+                let e = do vpErr("cannot parse condition " + cs)
+                return e
+            let cond = do vpExpr(cs)
+            let body = do vpWithKids("if", c.kids)
+            if body.kind == "!err":
+                return body
+            let n13 = do vpSetExpr(body, [cond])
+            return n13
+        let p14 = do vpHasPrefix(t, "after ")
+        if p14:
+            let n14 = do vpAfter(c)
+            return n14
+        let p15 = do vpHasPrefix(t, "overlay ")
+        if p15:
+            let n15 = do vpBindBlock("overlay", c)
+            return n15
+        let p16 = do vpHasPrefix(t, "popover ")
+        if p16:
+            if before == 0:
+                let e = do vpErr("popover has no previous sibling to anchor beside — write it directly after the button (or other element) it opens beside")
+                return e
+            let n16 = do vpBindBlock("popover", c)
+            return n16
+        let p17 = do vpHasPrefix(t, "typeahead ")
+        if p17:
+            let n17 = do vpTypeahead(trim(slice(t, 10, len(t))))
+            return n17
+        let fw = do vpFirstWord(t)
+        let isCtl = do vpIsControl(fw)
+        if isCtl:
+            let n18 = do vpControl(fw, c)
+            return n18
+        let p19 = do vpHasPrefix(t, "input ")
+        if p19:
+            let n19 = do vpInput(trim(slice(t, 6, len(t))))
+            return n19
+        let p20 = do vpHasPrefix(t, "link ")
+        if p20:
+            let n20 = do vpLink(trim(slice(t, 5, len(t))))
+            return n20
+        let p21 = do vpHasPrefix(t, "select ")
+        if p21:
+            let n21 = do vpSelect(c)
+            return n21
+        let p22 = do vpHasPrefix(t, "form ")
+        if p22:
+            let n22 = do vpForm(c)
+            return n22
+        let p23 = do vpHasPrefix(t, "upload ")
+        if p23:
+            let n23 = do vpUpload(trim(slice(t, 7, len(t))))
+            return n23
+        let p24 = do vpHasPrefix(t, "use ")
+        if p24:
+            let n24 = do vpUse(trim(slice(t, 4, len(t))), c.kids)
+            return n24
+        if t == "slot" || t == "slot:":
+            let n25 = do vpNode("slot")
+            return n25
+        let p26 = do vpHasPrefix(t, "slot ")
+        if p26:
+            let nm = do vpBlockHead(t, 5)
+            let ni = do vpIsIdent(nm)
+            if !ni:
+                let e = do vpErr("invalid socket name " + nm + " after `slot`")
+                return e
+            let n26 = do vpNode("slotref")
+            let n27 = do vpSetName(n26, nm)
+            return n27
+        let e = do vpErr("unknown view node " + fw)
+        return e
+
+    proc vpNodes(lines: [VLine]) -> [VNode]:
+        let mut out = []
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let c0 = lines[i]
+            let mods = do vpStripMods(c0.text)
+            if mods.kind == "!err":
+                return [mods]
+            let c = VLine{text: mods.value, kids: c0.kids}
+            let nd = do vpOneNode(c, len(out))
+            if nd.kind == "!err":
+                return [nd]
+            if len(mods.classSegs) > 0 || mods.style != "" || mods.anchor != "":
+                let w0 = do vpNode("modified")
+                let w1 = do vpSetChildren(w0, [nd])
+                let w2 = do vpSetClassSegs(w1, mods.classSegs)
+                let w3 = do vpSetStyle(w2, mods.style)
+                let w4 = do vpSetAnchor(w3, mods.anchor)
+                out = append(out, w4)
+            else:
+                out = append(out, nd)
+            i = i + 1
+        return out
+
+    # ── parseView ───────────────────────────────────────────────────────────
+    struct VView:
+        err: text
+        name: text
+        path: text
+        params: [text]
+        layout: text
+        requires: text
+        titleSegs: [VSeg]
+        descSegs: [VSeg]
+        root: [VNode]
+        screen: bool
+
+    proc vpViewErr(msg: text) -> VView:
+        return VView{err: msg, name: "", path: "", params: [], layout: "", requires: "", titleSegs: [], descSegs: [], root: [], screen: false}
+
+    # vpPathParams: pathParams — the `:name` segments of a route, in order.
+    # A carrier VNode: `args`-less, the names in `options`? No — returned as
+    # a VView so the error channel is shared.
+    proc vpPathParams(path: text) -> VView:
+        let t0 = do vpTrimPrefix(path, "/")
+        let mut t = t0
+        loop true:
+            let hs = do vpHasPrefix(t, "/")
+            if !hs:
+                break
+            t = slice(t, 1, len(t))
+        loop true:
+            let he = do vpHasSuffix(t, "/")
+            if !he:
+                break
+            t = slice(t, 0, len(t) - 1)
+        let segs = split(t, "/")
+        let mut params = []
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            let sg = segs[i]
+            let hc = do vpHasPrefix(sg, ":")
+            if hc:
+                let nm = slice(sg, 1, len(sg))
+                let ok = do vpIsIdent(nm)
+                if !ok:
+                    let e = do vpViewErr("invalid route parameter " + sg)
+                    return e
+                if nm in params:
+                    let e = do vpViewErr("duplicate route parameter " + nm)
+                    return e
+                params = append(params, nm)
+            i = i + 1
+        return VView{err: "", name: "", path: path, params: params, layout: "", requires: "", titleSegs: [], descSegs: [], root: [], screen: false}
+
+    proc vpParseView(header0: text, bodySrc: text) -> VView:
+        let header = do vpTrimPrefix(header0, "private ")
+        let h0 = do vpTrimPrefix(header, "view")
+        let head0 = do vpTrimSuffix(trim(h0), ":")
+        let mut head = head0
+        let mut guard = ""
+        let ri = do vpIndexOf(head, " requires ")
+        if ri >= 0:
+            guard = trim(slice(head, ri + 10, len(head)))
+            let ok = do vpIsIdent(guard)
+            if !ok:
+                let e = do vpViewErr("invalid route guard policy " + guard)
+                return e
+            head = trim(slice(head, 0, ri))
+        let mut layout = ""
+        let li = do vpIndexOf(head, " in ")
+        if li >= 0:
+            layout = trim(slice(head, li + 4, len(head)))
+            let ok1 = do vpIsIdent(layout)
+            let ok2 = do vpIsUpper(layout)
+            if !ok1 || !ok2:
+                let e = do vpViewErr("invalid layout name " + layout)
+                return e
+            head = trim(slice(head, 0, li))
+        let mut name = head
+        let mut path = ""
+        let mut params = []
+        let ai = do vpIndexOf(head, " at ")
+        if ai >= 0:
+            name = trim(slice(head, 0, ai))
+            let ps = trim(slice(head, ai + 4, len(head)))
+            let uq = do vpUnquoteOk(ps)
+            if !uq:
+                let e = do vpViewErr("expected a quoted string, got " + ps)
+                return e
+            let p = do vpUnquote(ps)
+            path = p
+            let pp = do vpPathParams(p)
+            if pp.err != "":
+                return pp
+            params = pp.params
+        let nok = do vpIsIdent(name)
+        if !nok:
+            let e = do vpViewErr("invalid view name " + name)
+            return e
+        let lines = do vpLinesOf(bodySrc)
+        let mut body = []
+        let mut titleSegs = []
+        let mut descSegs = []
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let c = lines[i]
+            let t = trim(c.text)
+            let isT = do vpHasPrefix(t, "meta title ")
+            let isD = do vpHasPrefix(t, "meta description ")
+            let isM = do vpHasPrefix(t, "meta ")
+            if isT:
+                let sg = do vpText(trim(slice(t, 11, len(t))))
+                if sg.kind == "!err":
+                    let e = do vpViewErr(sg.value)
+                    return e
+                titleSegs = sg.segs
+            else:
+                if isD:
+                    let sg = do vpText(trim(slice(t, 17, len(t))))
+                    if sg.kind == "!err":
+                        let e = do vpViewErr(sg.value)
+                        return e
+                    descSegs = sg.segs
+                else:
+                    if t == "meta" || isM:
+                        let e = do vpViewErr("meta takes title or description: meta title \"…\"")
+                        return e
+                    body = append(body, c)
+            i = i + 1
+        let root = do vpNodes(body)
+        let re = do vpListErr(root)
+        if re != "":
+            let e = do vpViewErr(re)
+            return e
+        return VView{err: "", name: name, path: path, params: params, layout: layout, requires: guard, titleSegs: titleSegs, descSegs: descSegs, root: root, screen: false}
+
+    # ── components and layouts: parseComponent / parseLayout /
+    #    ast.SpliceLayout ─────────────────────────────────────────────────
+    # VParam: ast.Param — `ref` is "" (a value), "cell" or "action".
+    struct VParam:
+        name: text
+        type: text
+        list: bool
+        optional: bool
+        ref: text
+
+    struct VComp:
+        err: text
+        name: text
+        params: [VParam]
+        root: [VNode]
+
+    struct VLayout:
+        err: text
+        name: text
+        root: [VNode]
+
+    proc vpCompErr(msg: text) -> VComp:
+        return VComp{err: msg, name: "", params: [], root: []}
+
+    proc vpIsTypeName(s: text) -> bool:
+        if s == "int" || s == "text" || s == "bool" || s == "money" || s == "date" || s == "float" || s == "bytes" || s == "datetime":
+            return true
+        let i = do vpIsIdent(s)
+        let u = do vpIsUpper(s)
+        return i && u
+
+    # vpSignature: parseSignature(head, line, allowList=false, allowRef=true).
+    proc vpSignature(head: text) -> VComp:
+        let open = do vpIndexOf(head, "(")
+        if open < 0:
+            let ok0 = do vpIsIdent(head)
+            if !ok0:
+                let e0 = do vpCompErr("invalid action name " + head)
+                return e0
+            return VComp{err: "", name: head, params: [], root: []}
+        let name = trim(slice(head, 0, open))
+        let ok1 = do vpIsIdent(name)
+        if !ok1:
+            let e1 = do vpCompErr("invalid action name " + name)
+            return e1
+        let close = do vpLastIndexOf(head, ")")
+        if close < open:
+            let e2 = do vpCompErr("missing `)` in action signature")
+            return e2
+        let mut params = []
+        let inner = trim(slice(head, open + 1, close))
+        if inner != "":
+            let parts = split(inner, ",")
+            let n = len(parts)
+            let mut i = 0
+            loop i < n:
+                let p = parts[i]
+                let colon = do vpIndexOf(p, ":")
+                if colon < 0:
+                    let e3 = do vpCompErr("parameter " + trim(p) + " needs a type")
+                    return e3
+                let pn = trim(slice(p, 0, colon))
+                let mut pt = trim(slice(p, colon + 1, len(p)))
+                let pnOk = do vpIsIdent(pn)
+                if !pnOk:
+                    let e4 = do vpCompErr("invalid parameter " + trim(p))
+                    return e4
+                let mut ref = ""
+                if pt == "action":
+                    ref = "action"
+                else:
+                    let isCell = do vpHasPrefix(pt, "cell ")
+                    if isCell:
+                        ref = "cell"
+                        pt = trim(slice(pt, 5, len(pt)))
+                if ref == "action":
+                    params = append(params, VParam{name: pn, type: "", list: false, optional: false, ref: "action"})
+                else:
+                    let mut core = pt
+                    let mut optional = false
+                    let mut list = false
+                    let q = do vpHasSuffix(core, "?")
+                    if q:
+                        optional = true
+                        core = trim(slice(core, 0, len(core) - 1))
+                    let lb = do vpHasPrefix(core, "[")
+                    let rb = do vpHasSuffix(core, "]")
+                    if lb && rb:
+                        list = true
+                        core = trim(slice(core, 1, len(core) - 1))
+                    if ref == "cell" && optional:
+                        let e5 = do vpCompErr("cell parameter " + pn + " cannot be optional — it names a state cell, which either exists or does not")
+                        return e5
+                    if list && ref != "cell":
+                        let e6 = do vpCompErr("parameter " + pn + " cannot be a list")
+                        return e6
+                    let tn = do vpIsTypeName(core)
+                    if !tn:
+                        let e7 = do vpCompErr("invalid parameter " + trim(p))
+                        return e7
+                    params = append(params, VParam{name: pn, type: core, list: list, optional: optional, ref: ref})
+                i = i + 1
+        return VComp{err: "", name: name, params: params, root: []}
+
+    proc vpParseComponent(header: text, bodySrc: text) -> VComp:
+        let h0 = do vpTrimPrefix(trim(header), "component")
+        let head = do vpTrimSuffix(trim(h0), ":")
+        let sig = do vpSignature(trim(head))
+        if sig.err != "":
+            return sig
+        let up = do vpIsUpper(sig.name)
+        if !up:
+            let e0 = do vpCompErr("component name " + sig.name + " must be capitalized")
+            return e0
+        let lines = do vpLinesOf(bodySrc)
+        let nodes = do vpNodes(lines)
+        let ne = do vpListErr(nodes)
+        if ne != "":
+            let e1 = do vpCompErr(ne)
+            return e1
+        if len(nodes) == 0:
+            let e2 = do vpCompErr("component " + sig.name + " has no body")
+            return e2
+        return VComp{err: "", name: sig.name, params: sig.params, root: nodes}
+
+    proc vpParseLayout(header: text, bodySrc: text) -> VLayout:
+        let h0 = do vpTrimPrefix(trim(header), "layout")
+        let name = do vpTrimSuffix(trim(h0), ":")
+        let ok = do vpIsIdent(name)
+        let up = do vpIsUpper(name)
+        if !ok || !up:
+            return VLayout{err: "layout name " + name + " must be capitalized", name: "", root: []}
+        let lines = do vpLinesOf(bodySrc)
+        let nodes = do vpNodes(lines)
+        let ne = do vpListErr(nodes)
+        if ne != "":
+            return VLayout{err: ne, name: "", root: []}
+        let sp = do vpSpliceLayout(name, nodes, [])
+        if sp.err != "":
+            return VLayout{err: sp.err, name: "", root: []}
+        return VLayout{err: "", name: name, root: nodes}
+
+    # VSplice: spliceInto's result — the rebuilt nodes, the slots filled so
+    # far (a layout allows exactly one) and the first error.
+    struct VSplice:
+        err: text
+        nodes: [VNode]
+        filled: int
+
+    # vpSpliceInto: ast.spliceInto with SpliceLayout's fill (mode "layout")
+    # or SpliceFrame's (mode "frame": a `slot <name>` takes the fill whose
+    # name matches, fillNames/fills parallel).
+    proc vpSpliceInto(nodes: [VNode], inLoop: bool, mode: text, name: text, view: [VNode], fillNames: [text], fills: [VFill], filled0: int) -> VSplice:
+        let mut out = []
+        let mut filled = filled0
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let nd = nodes[i]
+            let k = nd.kind
+            if k == "slot" || k == "slotref":
+                if mode == "layout":
+                    if k == "slotref":
+                        return VSplice{err: "layout \"" + name + "\" uses `slot " + nd.name + "`; a named slot belongs to a wireframe frame, and a layout has one anonymous `slot` for the view it wraps", nodes: [], filled: filled}
+                    if inLoop:
+                        return VSplice{err: "layout \"" + name + "\" has a `slot` inside a `for`; a layout's slot may not sit in a repeating context, since the view it wraps is one tree and a `for` would render it once per row", nodes: [], filled: filled}
+                    filled = filled + 1
+                    if filled > 1:
+                        return VSplice{err: "layout \"" + name + "\" has more than one `slot`; a layout has exactly one, since the view it wraps is one tree", nodes: [], filled: filled}
+                    let nv = len(view)
+                    let mut v = 0
+                    loop v < nv:
+                        out = append(out, view[v])
+                        v = v + 1
+                else:
+                    if k != "slotref":
+                        return VSplice{err: "a wireframe frame uses `slot <name>`, not a bare `slot`", nodes: [], filled: filled}
+                    if inLoop:
+                        return VSplice{err: "`slot " + nd.name + "` sits inside a `for`; a socket's content may not land in a repeating context, since what snaps into a socket is one tree and a `for` would render it once per row", nodes: [], filled: filled}
+                    let nf = len(fillNames)
+                    let mut f = 0
+                    loop f < nf:
+                        if fillNames[f] == nd.name:
+                            let fs = fills[f].nodes
+                            let nfs = len(fs)
+                            let mut q = 0
+                            loop q < nfs:
+                                out = append(out, fs[q])
+                                q = q + 1
+                        f = f + 1
+                i = i + 1
+                continue
+            let recurse = k == "modified" || k == "box" || k == "row" || k == "if" || k == "for" || k == "overlay" || k == "popover" || k == "form" || k == "use" || k == "tabs" || k == "tab" || k == "match" || k == "case" || k == "else"
+            if !recurse:
+                out = append(out, nd)
+                i = i + 1
+                continue
+            let childLoop = inLoop || k == "for"
+            let sub = do vpSpliceInto(nd.children, childLoop, mode, name, view, fillNames, fills, filled)
+            if sub.err != "":
+                return sub
+            filled = sub.filled
+            if k == "modified":
+                if len(sub.nodes) == 1:
+                    let m1 = do vpSetChildren(nd, sub.nodes)
+                    out = append(out, m1)
+                else:
+                    let ns = len(sub.nodes)
+                    let mut s = 0
+                    loop s < ns:
+                        out = append(out, sub.nodes[s])
+                        s = s + 1
+            else:
+                let r1 = do vpSetChildren(nd, sub.nodes)
+                out = append(out, r1)
+            i = i + 1
+        return VSplice{err: "", nodes: out, filled: filled}
+
+    struct VFill:
+        nodes: [VNode]
+
+    proc vpSpliceLayout(name: text, layout: [VNode], view: [VNode]) -> VSplice:
+        let r = do vpSpliceInto(layout, false, "layout", name, view, [], [], 0)
+        if r.err != "":
+            return r
+        if r.filled == 0:
+            return VSplice{err: "layout \"" + name + "\" must contain a `slot`", nodes: [], filled: 0}
+        return r

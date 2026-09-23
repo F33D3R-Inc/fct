@@ -1,0 +1,2318 @@
+import "fqindex.fct"
+import "checkpoint.fct"
+import "unquote.fct"
+
+app FqEngineSelfHost:
+    # fqengine.fct — self-hosted port of engine.rs's write path over the
+    # paged store (fqindex.fct's heap + trees), wal.fct's log and
+    # checkpoint.fct's durable mark:
+    #
+    #   - apply_atomic: one mutation validated, checked against unique
+    #     indexes and declared references, logged as a standalone WAL
+    #     record and applied; several logged as a transaction frame
+    #     (BEGIN, each mutation, COMMIT — StagedCommit, fenced against the
+    #     checkpoint) and applied at its commit, then the frame settled;
+    #   - note_applied / checkpoint: every `interval` mutations, the oldest
+    #     half-dead segment drained (its live records re-appended and their
+    #     indexes repointed) and retired, the heap synced, every tree
+    #     committed, the checkpoint advanced to the last applied sequence
+    #     (never past an open frame), and the WAL rotated down to what the
+    #     checkpoint does not cover once it outgrows its threshold;
+    #   - the public mutations — insert (archiving the previous state),
+    #     delete (archiving, and cascading/restricting/clearing through
+    #     declared references), insert_edge / delete_edge, create/drop of
+    #     ordered and text indexes and of references, insert/revoke user —
+    #     each with its checks and messages;
+    #   - load + recovery.rs: the definition logs and the users log
+    #     replayed, then the WAL read (a torn tail truncated), validated,
+    #     its counters seeded past the checkpoint and every record in it,
+    #     its frames classified, and every record past the checkpoint
+    #     replayed in sequence order (a frame at its COMMIT) through the
+    #     same apply step — then a checkpoint.
+    #
+    # engine.rs keeps its state behind locks and atomics; a proc has none,
+    # so the engine is a value every call takes and returns. The record
+    # cache, metrics and read pins have no effect on what is stored and are
+    # not part of this port (with no concurrent reader, a drained segment
+    # is retired at the checkpoint that drained it).
+    struct FqEngine:
+        st: FqStore
+        wal: FqwHandle
+        ctr: FqwCounters
+        ck: FqCkpt
+        applied: int
+        pending: int
+        interval: int
+        rotateBytes: int
+        walNonce: int
+        walSeq: int
+        users: [UserRecord]
+
+    struct FqEngR:
+        ok: bool
+        err: text
+        eng: FqEngine
+
+    proc enWith(e: FqEngine, st: FqStore) -> FqEngine:
+        return FqEngine{st: st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}
+
+    proc enErr(e: FqEngine, msg: text) -> FqEngR:
+        return FqEngR{ok: false, err: msg, eng: e}
+
+    proc enOk(e: FqEngine) -> FqEngR:
+        return FqEngR{ok: true, err: "", eng: e}
+
+    proc enDir(e: FqEngine) -> text:
+        return e.st.ix.dir
+
+    proc enWalPath(e: FqEngine) -> text:
+        return e.st.ix.dir + "facetql.wal"
+
+    # ── the WAL ────────────────────────────────────────────────────────
+    struct FqEngSeq:
+        ok: bool
+        err: text
+        eng: FqEngine
+        seq: int
+
+    # enAppend: WalRecord::new(next_sequence(), tx, next_operation_id(),
+    # op) appended.
+    proc enAppend(e: FqEngine, txId: int, op: Operation) -> FqEngSeq uses io.file:
+        let seq = e.ctr.nextSequence
+        let opId = e.ctr.nextOperationId
+        let ctr = FqwCounters{nextSequence: seq + 1, nextTransactionId: e.ctr.nextTransactionId, nextOperationId: opId + 1}
+        let rec = do fqwRecord(seq, txId, opId, op)
+        let nonce = do fqwNonce(e.walNonce, e.walSeq)
+        let a = do fqwAppend(e.wal, rec, e.st.ix.key, nonce)
+        let e2 = FqEngine{st: e.st, wal: a.handle, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq + 1, users: e.users}
+        if !a.ok:
+            return FqEngSeq{ok: false, err: a.err, eng: e2, seq: seq}
+        return FqEngSeq{ok: true, err: "", eng: e2, seq: seq}
+
+    # enNextOperationId: next_operation_id — also a history version.
+    struct FqEngInt:
+        eng: FqEngine
+        v: int
+
+    proc enNextOperationId(e: FqEngine) -> FqEngInt:
+        let v = e.ctr.nextOperationId
+        let ctr = FqwCounters{nextSequence: e.ctr.nextSequence, nextTransactionId: e.ctr.nextTransactionId, nextOperationId: v + 1}
+        return FqEngInt{eng: FqEngine{st: e.st, wal: e.wal, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}, v: v}
+
+    # enArchiveNow: HistoryEntry::now — stamped with the clock and the next
+    # operation id as its version.
+    struct FqEngEntry:
+        eng: FqEngine
+        entry: HistoryEntry
+
+    proc enArchiveNow(e: FqEngine, node: Node) -> FqEngEntry:
+        let n = do enNextOperationId(e)
+        let t = now()
+        return FqEngEntry{eng: n.eng, entry: HistoryEntry{address: node.address, archivedAtUnix: t, node: node, version: n.v}}
+
+    # ── declared indexes and the unique check ──────────────────────────
+    proc enDeclared(e: FqEngine) -> Declared:
+        let mut dd = []
+        let nd = len(e.st.ix.data)
+        let mut i = 0
+        loop i < nd:
+            dd = append(dd, e.st.ix.data[i].def)
+            i = i + 1
+        let mut td = []
+        let nt = len(e.st.ix.text)
+        let mut j = 0
+        loop j < nt:
+            td = append(td, e.st.ix.text[j].def)
+            j = j + 1
+        return Declared{dataDefs: dd, textDefs: td}
+
+    # enScanData: every key of data index `at` under prefix, as bytes, in
+    # order (for_each_range with no start).
+    struct FqEngKeys:
+        ok: bool
+        err: text
+        eng: FqEngine
+        keys: [text]
+
+    proc enScanData(e: FqEngine, at: int, prefix: [int]) -> FqEngKeys uses io.file:
+        let sc = do btScan(e.st.ix.data[at].tree, prefix, false, [], false, 0)
+        let mut data = e.st.ix.data
+        data[at] = FqDataIx{def: data[at].def, tree: sc.tree}
+        let e2 = do enWith(e, stWith(e.st, e.st.heap, ixSets(e.st.ix, e.st.ix.opens, data, e.st.ix.text)))
+        return FqEngKeys{ok: sc.ok, err: sc.err, eng: e2, keys: sc.keys}
+
+    proc enKeyAddress(hexKey: text) -> text:
+        let kb = do fqwHexBytes(hexKey)
+        let a = do addressFromDataKey(kb)
+        if !a.found:
+            return ""
+        return bytesToText(a.address)
+
+    proc enDataFind(e: FqEngine, kind: text, field: text) -> int:
+        let n = len(e.st.ix.data)
+        let mut i = 0
+        loop i < n:
+            if e.st.ix.data[i].def.kind == kind && e.st.ix.data[i].def.field == field:
+                return i
+            i = i + 1
+        return -1
+
+    proc enOrderValue(data: text, field: text) -> [int]:
+        let parsed = do fjParse(data)
+        let mut v = parsed
+        if parsed.ok:
+            let g = do fjGet(parsed.v, field)
+            v = g
+        let dv = do fjDataValue(v)
+        let enc = do encodeDataValueForKey(dv)
+        return enc
+
+    # enCheckUnique: check_unique — an insert may not take a value a unique
+    # index already holds for another node (one this batch deletes or
+    # rewrites is released), nor share one with another insert of the
+    # batch.
+    proc enCheckUnique(e0: FqEngine, ops: [Operation]) -> FqEngR uses io.file:
+        let mut e = e0
+        let mut released = []
+        let n = len(ops)
+        let mut i = 0
+        loop i < n:
+            if ops[i].tag == "delete":
+                released = append(released, ops[i].name)
+            if ops[i].tag == "insert":
+                released = append(released, ops[i].node.address)
+            i = i + 1
+        let mut claimName = []
+        let mut claimKey = []
+        let mut claimAddr = []
+        let mut j = 0
+        loop j < n:
+            if ops[j].tag == "insert":
+                let node = ops[j].node
+                let nd = len(e.st.ix.data)
+                let mut k = 0
+                loop k < nd:
+                    let def = e.st.ix.data[k].def
+                    if def.kind == node.kind && def.unique:
+                        let prefix = do enOrderValue(node.data, def.field)
+                        let ph = do cryptoEncodeHex(prefix)
+                        let nc = len(claimName)
+                        let mut c = 0
+                        loop c < nc:
+                            if claimName[c] == def.name && claimKey[c] == ph:
+                                let q1 = do goQuote(def.name)
+                                let q2 = do goQuote(claimAddr[c])
+                                let q3 = do goQuote(node.address)
+                                let q4 = do goQuote(def.field)
+                                let f0 = do enErr(e, "unique index " + q1 + ": this batch gives both " + q2 + " and " + q3 + "                          the same " + q4)
+                                return f0
+                            c = c + 1
+                        let sc = do enScanData(e, k, prefix)
+                        e = sc.eng
+                        if !sc.ok:
+                            let f1 = do enErr(e, sc.err)
+                            return f1
+                        let ns = len(sc.keys)
+                        let mut s = 0
+                        loop s < ns:
+                            let holder = do enKeyAddress(sc.keys[s])
+                            if holder != "" && holder != node.address && !(holder in released):
+                                let r1 = do goQuote(def.name)
+                                let r2 = do goQuote(def.field)
+                                let r3 = do goQuote(holder)
+                                let f2 = do enErr(e, "unique index " + r1 + ": " + r2 + " is already held by " + r3)
+                                return f2
+                            s = s + 1
+                        claimName = append(claimName, def.name)
+                        claimKey = append(claimKey, ph)
+                        claimAddr = append(claimAddr, node.address)
+                    k = k + 1
+            j = j + 1
+        let ok = do enOk(e)
+        return ok
+
+    # ── references ─────────────────────────────────────────────────────
+    # A reference key is a JSON value; FqJR carries it (ok false = none).
+    proc enReferencingKey(node: Node, def: ReferenceDef) -> FqJR:
+        let p = do fjParse(node.data)
+        if !p.ok:
+            return p
+        let g = do fjGet(p.v, def.field)
+        if g.ok && g.v.kind == "null":
+            let n = do fjFail("null", 0)
+            return n
+        return g
+
+    proc enReferencedKey(node: Node, def: ReferenceDef) -> FqJR:
+        if !def.hasParentField:
+            return FqJR{ok: true, err: "", v: FqJ{kind: "str", b: false, s: node.address, f: 0.0, items: [], keys: []}, pos: 0}
+        let p = do fjParse(node.data)
+        if !p.ok:
+            return p
+        let g = do fjGet(p.v, def.parentField)
+        if g.ok && g.v.kind == "null":
+            let n = do fjFail("null", 0)
+            return n
+        return g
+
+    # enJsonEqual: serde_json::Value equality — numbers by their kind
+    # (an integer never equals a float) and value, arrays and objects
+    # member by member.
+    proc enJsonEqual(a: FqJ, b: FqJ) -> bool:
+        if a.kind != b.kind:
+            return false
+        if a.kind == "null":
+            return true
+        if a.kind == "bool":
+            return a.b == b.b
+        if a.kind == "int" || a.kind == "str":
+            return a.s == b.s
+        if a.kind == "float":
+            return a.f == b.f
+        if len(a.items) != len(b.items):
+            return false
+        let n = len(a.items)
+        let mut i = 0
+        loop i < n:
+            if a.kind == "obj" && a.keys[i] != b.keys[i]:
+                return false
+            let eq = do enJsonEqual(a.items[i], b.items[i])
+            if !eq:
+                return false
+            i = i + 1
+        return true
+
+    struct FqEngBool:
+        ok: bool
+        err: text
+        eng: FqEngine
+        v: bool
+
+    struct FqEngNode:
+        ok: bool
+        err: text
+        eng: FqEngine
+        found: bool
+        node: Node
+
+    proc enReadNode(e: FqEngine, address: text) -> FqEngNode uses io.file:
+        let r = do stNodeAt(e.st, address)
+        let e2 = do enWith(e, r.store)
+        return FqEngNode{ok: r.ok, err: r.err, eng: e2, found: r.found, node: r.node}
+
+    # enResolves: resolves_live (deleted empty) / resolves_committed — the
+    # referenced node is live: by address, or through the unique index on
+    # the parent field, skipping any address the batch deletes.
+    proc enResolves(e: FqEngine, def: ReferenceDef, key: FqJ, deleted: [text]) -> FqEngBool uses io.file:
+        if !def.hasParentField:
+            if key.kind != "str":
+                return FqEngBool{ok: true, err: "", eng: e, v: false}
+            if key.s in deleted:
+                return FqEngBool{ok: true, err: "", eng: e, v: false}
+            let r = do enReadNode(e, key.s)
+            if !r.ok:
+                return FqEngBool{ok: false, err: r.err, eng: r.eng, v: false}
+            return FqEngBool{ok: true, err: "", eng: r.eng, v: r.found && r.node.kind == def.parentKind}
+        let at = do enDataFind(e, def.parentKind, def.parentField)
+        if at < 0:
+            let q = do goQuote(def.name)
+            return FqEngBool{ok: false, err: "reference " + q + " cannot be enforced: the unique index over " + def.parentKind + "." + def.parentField + " it resolves through is gone", eng: e, v: false}
+        let dv = do fjDataValue(FqJR{ok: true, err: "", v: key, pos: 0})
+        let prefix = do encodeDataValueForKey(dv)
+        let sc = do enScanData(e, at, prefix)
+        if !sc.ok:
+            return FqEngBool{ok: false, err: sc.err, eng: sc.eng, v: false}
+        let n = len(sc.keys)
+        let mut i = 0
+        loop i < n:
+            let a = do enKeyAddress(sc.keys[i])
+            if a != "" && !(a in deleted):
+                return FqEngBool{ok: true, err: "", eng: sc.eng, v: true}
+            i = i + 1
+        return FqEngBool{ok: true, err: "", eng: sc.eng, v: false}
+
+    # enCheckReferences: check_references — every node the batch leaves
+    # inserted that references a parent names a live one (possibly one the
+    # same batch inserts), and not one the batch deletes.
+    proc enCheckReferences(e0: FqEngine, ops: [Operation]) -> FqEngR uses io.file:
+        let mut e = e0
+        if len(e.st.references) == 0:
+            let ok0 = do enOk(e)
+            return ok0
+        let mut insAddr = []
+        let mut insNode = []
+        let mut deleted = []
+        let n = len(ops)
+        let mut i = 0
+        loop i < n:
+            let op = ops[i]
+            if op.tag == "insert":
+                let mut ka = []
+                let mut kn = []
+                let m = len(insAddr)
+                let mut j = 0
+                loop j < m:
+                    if insAddr[j] != op.node.address:
+                        ka = append(ka, insAddr[j])
+                        kn = append(kn, insNode[j])
+                    j = j + 1
+                insAddr = append(ka, op.node.address)
+                insNode = append(kn, op.node)
+                let mut kd = []
+                let nd = len(deleted)
+                let mut d = 0
+                loop d < nd:
+                    if deleted[d] != op.node.address:
+                        kd = append(kd, deleted[d])
+                    d = d + 1
+                deleted = kd
+            if op.tag == "delete":
+                let mut ka2 = []
+                let mut kn2 = []
+                let m2 = len(insAddr)
+                let mut j2 = 0
+                loop j2 < m2:
+                    if insAddr[j2] != op.name:
+                        ka2 = append(ka2, insAddr[j2])
+                        kn2 = append(kn2, insNode[j2])
+                    j2 = j2 + 1
+                insAddr = ka2
+                insNode = kn2
+                if !(op.name in deleted):
+                    deleted = append(deleted, op.name)
+            i = i + 1
+        let ni = len(insNode)
+        let mut k = 0
+        loop k < ni:
+            let node = insNode[k]
+            let defs = do referencesForChild(e.st.references, node.kind)
+            let ndf = len(defs)
+            let mut f = 0
+            loop f < ndf:
+                let def = defs[f]
+                let key = do enReferencingKey(node, def)
+                if key.ok:
+                    let mut satisfied = false
+                    let mut c = 0
+                    loop c < ni:
+                        if insNode[c].kind == def.parentKind:
+                            let pk = do enReferencedKey(insNode[c], def)
+                            if pk.ok:
+                                let a = do fjText(pk.v)
+                                let b = do fjText(key.v)
+                                if a == b:
+                                    satisfied = true
+                        c = c + 1
+                    if !satisfied:
+                        let rs = do enResolves(e, def, key.v, deleted)
+                        e = rs.eng
+                        if !rs.ok:
+                            let f0 = do enErr(e, rs.err)
+                            return f0
+                        if !rs.v:
+                            let q = do goQuote(def.name)
+                            let kt = do fjText(key.v)
+                            let f1 = do enErr(e, "reference " + q + ": " + node.address + " holds " + def.field + "=" + kt + " which is not a live " + def.parentKind)
+                            return f1
+                f = f + 1
+            k = k + 1
+        let ok = do enOk(e)
+        return ok
+
+    # enStagedNode: staged_node — this batch's pending view of an address
+    # (a staged delete is none), otherwise the store's.
+    proc enStagedNode(e: FqEngine, stAddr: [text], stLive: [bool], stNodes: [Node], address: text) -> FqEngNode uses io.file:
+        let mut i = len(stAddr) - 1
+        loop i >= 0:
+            if stAddr[i] == address:
+                return FqEngNode{ok: true, err: "", eng: e, found: stLive[i], node: stNodes[i]}
+            i = i - 1
+        let r = do enReadNode(e, address)
+        return r
+
+    struct FqEngNodes:
+        ok: bool
+        err: text
+        eng: FqEngine
+        nodes: [Node]
+
+    # enReferencingNodes: referencing_nodes — the nodes (committed, or
+    # staged by this batch) whose reference field holds key.
+    proc enReferencingNodes(e0: FqEngine, def: ReferenceDef, key: FqJ, stAddr: [text], stLive: [bool], stNodes: [Node], kAddr: [text], kLive: [bool], kNodes: [Node]) -> FqEngNodes uses io.file:
+        let mut e = e0
+        let at = do enDataFind(e, def.kind, def.field)
+        if at < 0:
+            let q = do goQuote(def.name)
+            return FqEngNodes{ok: false, err: "reference " + q + " cannot be enforced: the index over " + def.kind + "." + def.field + " it finds referencing nodes through is gone", eng: e, nodes: []}
+        let dv = do fjDataValue(FqJR{ok: true, err: "", v: key, pos: 0})
+        let prefix = do encodeDataValueForKey(dv)
+        let sc = do enScanData(e, at, prefix)
+        e = sc.eng
+        if !sc.ok:
+            return FqEngNodes{ok: false, err: sc.err, eng: e, nodes: []}
+        let mut cands = []
+        let nk = len(sc.keys)
+        let mut i = 0
+        loop i < nk:
+            let a = do enKeyAddress(sc.keys[i])
+            if a != "" && !(a in cands):
+                cands = append(cands, a)
+            i = i + 1
+        # staged_kinds: every address the batch had staged live (its last
+        # staging) under the kind, when the closure began.
+        let ns = len(kAddr)
+        let mut j = 0
+        loop j < ns:
+            let mut last = true
+            let mut k2 = j + 1
+            loop k2 < ns:
+                if kAddr[k2] == kAddr[j]:
+                    last = false
+                k2 = k2 + 1
+            if last && kLive[j] && kNodes[j].kind == def.kind && !(kAddr[j] in cands):
+                cands = append(cands, kAddr[j])
+            j = j + 1
+        let sorted = do fqwSortText(cands)
+        let mut nodes = []
+        let nc = len(sorted)
+        let mut c = 0
+        loop c < nc:
+            let r = do enStagedNode(e, stAddr, stLive, stNodes, sorted[c])
+            e = r.eng
+            if !r.ok:
+                return FqEngNodes{ok: false, err: r.err, eng: e, nodes: []}
+            if r.found && r.node.kind == def.kind:
+                let rk = do enReferencingKey(r.node, def)
+                if rk.ok:
+                    let eq = do enJsonEqual(rk.v, key)
+                    if eq:
+                        nodes = append(nodes, r.node)
+            c = c + 1
+        return FqEngNodes{ok: true, err: "", eng: e, nodes: nodes}
+
+    # enWithFieldNull: with_field_null — the node with data[field] = null.
+    struct FqEngCleared:
+        ok: bool
+        err: text
+        node: Node
+
+    proc enWithFieldNull(node: Node, field: text) -> FqEngCleared:
+        let p = do fjParse(node.data)
+        if !p.ok:
+            return FqEngCleared{ok: false, err: "cannot clear " + node.address + "." + field + ": its data is not a JSON object (" + p.err + ")", node: node}
+        if p.v.kind != "obj":
+            return FqEngCleared{ok: false, err: "cannot clear " + node.address + "." + field + ": its data is not a JSON object", node: node}
+        let mut keys = p.v.keys
+        let mut items = p.v.items
+        let at = do fjKeyAt(keys, field)
+        let nul = do fjNull()
+        if at >= 0:
+            items[at] = nul
+        else:
+            keys = append(keys, field)
+            items = append(items, nul)
+        let obj = do fjSortMembers(keys, items)
+        let text = do fjText(obj)
+        return FqEngCleared{ok: true, err: "", node: Node{address: node.address, coordinate: node.coordinate, value: node.value, kind: node.kind, data: text, owner: node.owner, hasClaimedBy: node.hasClaimedBy, claimedBy: node.claimedBy, visibility: node.visibility}}
+
+    struct FqEngOps:
+        ok: bool
+        err: text
+        eng: FqEngine
+        ops: [Operation]
+
+    proc enMaxTransactionOps() -> int:
+        return 50000
+
+    # enLowerDelete: lower_delete_closure — each node archived and
+    # deleted; with references declared, the referencing nodes cascade,
+    # refuse the delete, or have the field cleared (archived, rewritten).
+    # It extends a batch already lowered (`ops`) and its staged view of
+    # addresses (last entry wins; live false = staged deleted).
+    struct FqEngLower:
+        ok: bool
+        kind: text
+        err: text
+        eng: FqEngine
+        ops: [Operation]
+        stAddr: [text]
+        stLive: [bool]
+        stNodes: [Node]
+
+    proc enLowerFail(e: FqEngine, kind: text, msg: text) -> FqEngLower:
+        return FqEngLower{ok: false, kind: kind, err: msg, eng: e, ops: [], stAddr: [], stLive: [], stNodes: []}
+
+    proc enLowerDeleteInto(e0: FqEngine, seeds: [Node], ops0: [Operation], stAddr0: [text], stLive0: [bool], stNodes0: [Node]) -> FqEngLower uses io.file:
+        let mut e = e0
+        let mut ops = ops0
+        let mut stAddr = stAddr0
+        let mut stLive = stLive0
+        let mut stNodes = stNodes0
+        if len(e.st.references) == 0:
+            let n = len(seeds)
+            let mut i = 0
+            loop i < n:
+                let a = do enArchiveNow(e, seeds[i])
+                e = a.eng
+                ops = append(ops, opArchive(a.entry))
+                stAddr = append(stAddr, seeds[i].address)
+                stLive = append(stLive, false)
+                stNodes = append(stNodes, seeds[i])
+                ops = append(ops, opDelete(seeds[i].address))
+                i = i + 1
+            return FqEngLower{ok: true, kind: "", err: "", eng: e, ops: ops, stAddr: stAddr, stLive: stLive, stNodes: stNodes}
+        let bound = do enMaxTransactionOps()
+        # staged_kinds: the batch's live staged nodes, as of the start.
+        let kAddr = stAddr0
+        let kLive = stLive0
+        let kNodes = stNodes0
+        let mut queue = seeds
+        let mut removed = []
+        let mut qi = 0
+        loop qi < len(queue):
+            let node = queue[qi]
+            qi = qi + 1
+            if node.address in removed:
+                continue
+            removed = append(removed, node.address)
+            let a2 = do enArchiveNow(e, node)
+            e = a2.eng
+            ops = append(ops, opArchive(a2.entry))
+            stAddr = append(stAddr, node.address)
+            stLive = append(stLive, false)
+            stNodes = append(stNodes, node)
+            ops = append(ops, opDelete(node.address))
+            let defs = do referencesForParent(e.st.references, node.kind)
+            let nd = len(defs)
+            let mut d = 0
+            loop d < nd:
+                let def = defs[d]
+                let key = do enReferencedKey(node, def)
+                if key.ok:
+                    let rn = do enReferencingNodes(e, def, key.v, stAddr, stLive, stNodes, kAddr, kLive, kNodes)
+                    e = rn.eng
+                    if !rn.ok:
+                        let f0 = do enLowerFail(e, "storage", rn.err)
+                        return f0
+                    let mut children = []
+                    let nc = len(rn.nodes)
+                    let mut c = 0
+                    loop c < nc:
+                        if !(rn.nodes[c].address in removed):
+                            children = append(children, rn.nodes[c])
+                        c = c + 1
+                    if len(children) > 0:
+                        if def.onDelete == "cascade":
+                            let mut ch = 0
+                            loop ch < len(children):
+                                queue = append(queue, children[ch])
+                                ch = ch + 1
+                        if def.onDelete == "restrict":
+                            let q = do goQuote(def.name)
+                            let f1 = do enLowerFail(e, "precondition", "delete refused, nothing applied: " + node.address + " is still referenced by " + children[0].address + " through " + q + " (" + len(children) + " in total), and that reference is declared restrict")
+                            return f1
+                        if def.onDelete == "set_null":
+                            let mut sn = 0
+                            loop sn < len(children):
+                                let child = children[sn]
+                                let cl = do enWithFieldNull(child, def.field)
+                                if !cl.ok:
+                                    let f2 = do enLowerFail(e, "invalid", cl.err)
+                                    return f2
+                                let a3 = do enArchiveNow(e, child)
+                                e = a3.eng
+                                ops = append(ops, opArchive(a3.entry))
+                                stAddr = append(stAddr, cl.node.address)
+                                stLive = append(stLive, true)
+                                stNodes = append(stNodes, cl.node)
+                                ops = append(ops, opInsert(cl.node))
+                                sn = sn + 1
+                d = d + 1
+            if len(ops) > bound:
+                let f3 = do enLowerFail(e, "invalid", "delete refused, nothing applied: deleting " + node.address + " cascades to more than the " + bound + " mutations this engine will stage in one frame. A cascade is atomic or it is not a cascade, so it is refused rather than split. Delete the referencing nodes in batches first, or raise FACETQL_MAX_TRANSACTION_OPS.")
+                return f3
+        return FqEngLower{ok: true, kind: "", err: "", eng: e, ops: ops, stAddr: stAddr, stLive: stLive, stNodes: stNodes}
+
+    proc enLowerDelete(e0: FqEngine, seeds: [Node]) -> FqEngOps uses io.file:
+        let r = do enLowerDeleteInto(e0, seeds, [], [], [], [])
+        return FqEngOps{ok: r.ok, err: r.err, eng: r.eng, ops: r.ops}
+
+    # ── apply_atomic ───────────────────────────────────────────────────
+    proc enApplyOne(e: FqEngine, op: Operation) -> FqEngR uses io.file:
+        let r = do stApply(e.st, op)
+        let e2 = do enWith(e, r.store)
+        if !r.ok:
+            let f = do enErr(e2, r.err)
+            return f
+        let ok = do enOk(e2)
+        return ok
+
+    proc enApplyAtomic(e0: FqEngine, ops: [Operation]) -> FqEngR uses io.file:
+        let mut e = e0
+        let n = len(ops)
+        if n == 0:
+            let ok0 = do enOk(e)
+            return ok0
+        let declared = do enDeclared(e)
+        if n == 1:
+            let v = do operationValidate(ops[0], declared)
+            if !v.ok:
+                let f0 = do enErr(e, v.err)
+                return f0
+        let u = do enCheckUnique(e, ops)
+        if !u.ok:
+            return u
+        let rf = do enCheckReferences(u.eng, ops)
+        if !rf.ok:
+            return rf
+        e = rf.eng
+        if n == 1:
+            let ap = do enAppend(e, 0, ops[0])
+            if !ap.ok:
+                let f1 = do enErr(ap.eng, ap.err)
+                return f1
+            let a1 = do enApplyOne(ap.eng, ops[0])
+            if !a1.ok:
+                return a1
+            let na = do enNoteApplied(a1.eng, ap.seq)
+            return na
+        let c = do enCommitFrame(e, ops)
+        return c
+
+    # enCommitFrame: Transaction::commit and the note_applied after it —
+    # every operation validated, then BEGIN (fenced), each operation,
+    # COMMIT, the operations applied, the frame settled.
+    proc enCommitFrame(e0: FqEngine, ops: [Operation]) -> FqEngR uses io.file:
+        let mut e = e0
+        let n = len(ops)
+        if n == 0:
+            let z = do enNoteApplied(e, 0)
+            return z
+        let declared = do enDeclared(e)
+        let mut i = 0
+        loop i < n:
+            let v2 = do operationValidate(ops[i], declared)
+            if !v2.ok:
+                let f2 = do enErr(e, v2.err)
+                return f2
+            i = i + 1
+        let txId = e.ctr.nextTransactionId
+        e = FqEngine{st: e.st, wal: e.wal, ctr: FqwCounters{nextSequence: e.ctr.nextSequence, nextTransactionId: txId + 1, nextOperationId: e.ctr.nextOperationId}, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}
+        let b = do enAppend(e, txId, fqwControl("begin"))
+        if !b.ok:
+            let f3 = do enErr(b.eng, b.err)
+            return f3
+        e = b.eng
+        let beginSeq = b.seq
+        let ck1 = do ckBeginFence(e.ck, beginSeq)
+        e = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: ck1, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}
+        let mut j = 0
+        loop j < n:
+            let sg = do enAppend(e, txId, ops[j])
+            if !sg.ok:
+                # the frame is dropped uncommitted: fence released, ABORT
+                # logged (its failure ignored).
+                let rel = do enReleaseFence(sg.eng, beginSeq)
+                let ab = do enAppend(rel, txId, fqwControl("abort"))
+                let f4 = do enErr(ab.eng, sg.err)
+                return f4
+            e = sg.eng
+            j = j + 1
+        let cm = do enAppend(e, txId, fqwControl("commit"))
+        if !cm.ok:
+            let rel2 = do enReleaseFence(cm.eng, beginSeq)
+            let ab2 = do enAppend(rel2, txId, fqwControl("abort"))
+            let f5 = do enErr(ab2.eng, cm.err)
+            return f5
+        e = cm.eng
+        let mut k = 0
+        loop k < n:
+            # a failed apply after COMMIT keeps the fence (the frame is
+            # committed; replay will redo it).
+            let ak = do enApplyOne(e, ops[k])
+            if !ak.ok:
+                return ak
+            e = ak.eng
+            k = k + 1
+        let settled = do enReleaseFence(e, beginSeq)
+        let na2 = do enNoteApplied(settled, cm.seq)
+        return na2
+
+
+    proc enReleaseFence(e: FqEngine, beginSeq: int) -> FqEngine:
+        let ck = do ckReleaseFence(e.ck, beginSeq)
+        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}
+
+    # enNoteApplied: note_applied — every `interval` mutations a
+    # checkpoint (whose failure leaves the mutation durable in the WAL).
+    proc enNoteApplied(e: FqEngine, seq: int) -> FqEngR uses io.file:
+        let mut applied = e.applied
+        if seq > applied:
+            applied = seq
+        let pending = e.pending + 1
+        let e2 = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: applied, pending: pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}
+        if pending < e.interval:
+            let ok = do enOk(e2)
+            return ok
+        let c = do enCheckpoint(e2)
+        if !c.ok:
+            let ok2 = do enOk(c.eng)
+            return ok2
+        return c
+
+    # ── checkpoint ─────────────────────────────────────────────────────
+    # enDrainSegment: drain_segment — every record of the segment that an
+    # index still points at is re-appended and its index entries
+    # repointed at the copy.
+    proc enDrainSegment(e0: FqEngine, segment: int) -> FqEngR uses io.file:
+        let mut e = e0
+        let sc = do hpScanSegment(e.st.heap, segment)
+        e = do enWith(e, stWith(e.st, sc.heap, e.st.ix))
+        if !sc.ok:
+            let f0 = do enErr(e, sc.err)
+            return f0
+        let n = len(sc.locs)
+        let mut i = 0
+        loop i < n:
+            let rec = sc.records[i]
+            let mut which = "primary"
+            let mut key = textToBytes(rec.node.address)
+            if rec.kind == "edge":
+                which = "edge_out"
+                key = do indexEdgeOutKey(rec.edge.from, rec.edge.kind, rec.edge.to)
+            if rec.kind == "history":
+                which = "history"
+                key = do indexHistoryKey(rec.entry.address, rec.entry.version)
+            let g = do stGet(e.st, which, key)
+            e = do enWith(e, g.store)
+            if !g.ok:
+                let f1 = do enErr(e, g.err)
+                return f1
+            if g.found:
+                let cur = do hpLocDecode(g.value)
+                if !cur.ok:
+                    let f2 = do enErr(e, cur.err)
+                    return f2
+                let l = sc.locs[i]
+                if cur.loc.segment == l.segment && cur.loc.page == l.page && cur.loc.slot == l.slot && cur.loc.length == l.length:
+                    let rr = do hpRead(e.st.heap, l)
+                    if !rr.ok:
+                        let f3 = do enErr(e, rr.err)
+                        return f3
+                    let ap = do hpAppend(rr.heap, rr.record)
+                    e = do enWith(e, stWith(e.st, ap.heap, e.st.ix))
+                    if !ap.ok:
+                        let f4 = do enErr(e, ap.err)
+                        return f4
+                    let enc = do hpLocEncode(ap.loc)
+                    let p1 = do stPut(e.st, which, key, enc)
+                    if !p1.ok:
+                        let f5 = do enErr(e, p1.err)
+                        return f5
+                    e = do enWith(e, p1.store)
+                    if rec.kind == "edge":
+                        let ik = do indexEdgeInKey(rec.edge.to, rec.edge.kind, rec.edge.from)
+                        let p2 = do stPut(e.st, "edge_in", ik, enc)
+                        if !p2.ok:
+                            let f6 = do enErr(e, p2.err)
+                            return f6
+                        e = do enWith(e, p2.store)
+            i = i + 1
+        let ok = do enOk(e)
+        return ok
+
+    # enCheckpoint: checkpoint_locked.
+    proc enCheckpoint(e0: FqEngine) -> FqEngR uses io.file:
+        let mut e = e0
+        let cands = do hpCompactionCandidates(e.st.heap, 0.5)
+        let mut drained = []
+        if len(cands) > 0:
+            let d = do enDrainSegment(e, cands[0])
+            if !d.ok:
+                return d
+            e = d.eng
+            drained = [cands[0]]
+        let f = do stFlush(e.st)
+        e = do enWith(e, f.store)
+        if !f.ok:
+            let f0 = do enErr(e, f.err)
+            return f0
+        let adv = do ckAdvance(e.ck, enDir(e), e.applied)
+        if !adv.ok:
+            let f1 = do enErr(e, adv.err)
+            return f1
+        e = FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: adv.ckpt, applied: e.applied, pending: 0, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}
+        let rot = do enRotateWal(e)
+        if !rot.ok:
+            return rot
+        e = rot.eng
+        let nd = len(drained)
+        let mut i = 0
+        loop i < nd:
+            let nonce = do stNonce(e.st)
+            let dr = do hpDropSegment(e.st.heap, drained[i], nonce, e.st.nonceBase * 1000 + e.st.seq)
+            e = do enWith(e, stBump(stWith(e.st, dr.heap, e.st.ix)))
+            if !dr.ok:
+                let f2 = do enErr(e, dr.err)
+                return f2
+            i = i + 1
+        let ok = do enOk(e)
+        return ok
+
+    # enRotateWal: rotate_wal — once the log reaches its threshold, it is
+    # rewritten (temp file, fsync, rename, directory fsync) keeping only the
+    # records the checkpoint does not cover.
+    proc enRotateWal(e0: FqEngine) -> FqEngR uses io.file:
+        let mut e = e0
+        let path = do enWalPath(e)
+        let size = fileSize(path)
+        if size < 0 || size < e.rotateBytes:
+            let ok0 = do enOk(e)
+            return ok0
+        let cr = do ckRead(enDir(e) + "facetql.checkpoint")
+        if !cr.ok:
+            let f0 = do enErr(e, cr.err)
+            return f0
+        let durable = cr.value
+        let rd = do fqwReadAll(path, e.st.ix.key)
+        if rd.err != "":
+            let f1 = do enErr(e, rd.err)
+            return f1
+        if rd.torn:
+            let f2 = do enErr(e, "refusing to rotate the WAL: its tail is torn (" + rd.tornDetail + "). A tear is repaired during startup recovery, so one here means the log changed underneath a running process.")
+            return f2
+        let mut kept = []
+        let n = len(rd.records)
+        let mut i = 0
+        loop i < n:
+            if rd.records[i].sequence > durable:
+                kept = append(kept, rd.records[i])
+            i = i + 1
+        if len(kept) == n:
+            let ok1 = do enOk(e)
+            return ok1
+        # the change scan's horizon moves to the highest dropped position
+        # before the file does.
+        let mut dropped = 0
+        let mut di = 0
+        loop di < n:
+            if rd.records[di].sequence <= durable && rd.records[di].operationId > dropped:
+                dropped = rd.records[di].operationId
+            di = di + 1
+        e = do enWith(e, stWithMeta(e.st, metaNoteHorizon(e.st.meta, dropped, false)))
+        let mut body = ""
+        let mut seq = e.walSeq
+        let nk = len(kept)
+        let mut k = 0
+        loop k < nk:
+            let nonce = do fqwNonce(e.walNonce, seq)
+            seq = seq + 1
+            let enc = do fqwEncodeFrame(kept[k], e.st.ix.key, nonce)
+            if !enc.ok:
+                let f3 = do enErr(e, enc.err)
+                return f3
+            body = body + enc.line + "\n"
+            k = k + 1
+        let tmp = enDir(e) + "facetql.wal." + e.walNonce + "." + seq + ".tmp"
+        let w = writeFile(tmp, body)
+        let s = syncFile(tmp)
+        let r = renameFile(tmp, path)
+        let h = FqwHandle{path: path, needsSeparator: false}
+        let e2 = FqEngine{st: e.st, wal: h, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: seq, users: e.users}
+        let ok2 = do enOk(e2)
+        return ok2
+
+    # ── the public mutations ───────────────────────────────────────────
+    # enInsert: insert — the node's previous state archived first.
+    proc enInsert(e0: FqEngine, node: Node) -> FqEngR uses io.file:
+        let r = do enReadNode(e0, node.address)
+        if !r.ok:
+            let f = do enErr(r.eng, r.err)
+            return f
+        let mut e = r.eng
+        let mut ops = []
+        if r.found:
+            let a = do enArchiveNow(e, r.node)
+            e = a.eng
+            ops = append(ops, opArchive(a.entry))
+        ops = append(ops, opInsert(node))
+        let out = do enApplyAtomic(e, ops)
+        return out
+
+    # FqKindR: a refusal with TransactionError's variant ("invalid",
+    # "precondition", "storage").
+    struct FqKindR:
+        ok: bool
+        kind: text
+        err: text
+        eng: FqEngine
+
+    # enDeleteK: delete — the node archived and deleted, or its reference
+    # closure; a failure carries its variant.
+    proc enDeleteK(e0: FqEngine, address: text) -> FqKindR uses io.file:
+        let r = do enReadNode(e0, address)
+        if !r.ok:
+            return FqKindR{ok: false, kind: "storage", err: r.err, eng: r.eng}
+        if !r.found:
+            let o = do enApplyAtomic(r.eng, [opDelete(address)])
+            return FqKindR{ok: o.ok, kind: "storage", err: o.err, eng: o.eng}
+        let lo = do enLowerDeleteInto(r.eng, [r.node], [], [], [], [])
+        if !lo.ok:
+            return FqKindR{ok: false, kind: lo.kind, err: lo.err, eng: lo.eng}
+        let out = do enApplyAtomic(lo.eng, lo.ops)
+        return FqKindR{ok: out.ok, kind: "storage", err: out.err, eng: out.eng}
+
+    proc enDelete(e0: FqEngine, address: text) -> FqEngR uses io.file:
+        let r = do enDeleteK(e0, address)
+        return FqEngR{ok: r.ok, err: r.err, eng: r.eng}
+
+    struct FqEngEdge:
+        ok: bool
+        err: text
+        eng: FqEngine
+        found: bool
+        edge: Edge
+
+    # enFindEdge: find_edge — the edge record the outgoing index names.
+    proc enFindEdge(e: FqEngine, from: text, to: text, kind: text) -> FqEngEdge uses io.file:
+        let blank = do edgeNew("", "", "", "")
+        let key = do indexEdgeOutKey(from, kind, to)
+        let g = do stGet(e.st, "edge_out", key)
+        let e2 = do enWith(e, g.store)
+        if !g.ok:
+            return FqEngEdge{ok: false, err: g.err, eng: e2, found: false, edge: blank}
+        if !g.found:
+            return FqEngEdge{ok: true, err: "", eng: e2, found: false, edge: blank}
+        let l = do hpLocDecode(g.value)
+        if !l.ok:
+            return FqEngEdge{ok: false, err: l.err, eng: e2, found: false, edge: blank}
+        let rr = do hpRead(e2.st.heap, l.loc)
+        let e3 = do enWith(e2, stWith(e2.st, rr.heap, e2.st.ix))
+        if !rr.ok:
+            return FqEngEdge{ok: false, err: rr.err, eng: e3, found: false, edge: blank}
+        if rr.record.kind != "edge":
+            return FqEngEdge{ok: false, err: "expected a edge record at " + hpLocText(l.loc) + ", found " + rr.record.kind + " — the index and the heap disagree", eng: e3, found: false, edge: blank}
+        return FqEngEdge{ok: true, err: "", eng: e3, found: true, edge: rr.record.edge}
+
+    proc enInsertEdge(e0: FqEngine, edge: Edge) -> FqEngR uses io.file:
+        let f = do stGet(e0.st, "primary", textToBytes(edge.from))
+        let e1 = do enWith(e0, f.store)
+        if !f.ok:
+            let x0 = do enErr(e1, f.err)
+            return x0
+        if !f.found:
+            let x1 = do enErr(e1, "edge 'from' address not found: " + edge.from)
+            return x1
+        let t = do stGet(e1.st, "primary", textToBytes(edge.to))
+        let e2 = do enWith(e1, t.store)
+        if !t.ok:
+            let x2 = do enErr(e2, t.err)
+            return x2
+        if !t.found:
+            let x3 = do enErr(e2, "edge 'to' address not found: " + edge.to)
+            return x3
+        let ex = do enFindEdge(e2, edge.from, edge.to, edge.kind)
+        if !ex.ok:
+            let x4 = do enErr(ex.eng, ex.err)
+            return x4
+        if ex.found && ex.edge.owner != edge.owner:
+            let x5 = do enErr(ex.eng, "edge " + edge.from + " -[" + edge.kind + "]-> " + edge.to + " is owned by " + ex.edge.owner)
+            return x5
+        let out = do enApplyAtomic(ex.eng, [opInsertEdge(edge)])
+        return out
+
+    proc enDeleteEdge(e0: FqEngine, from: text, to: text, kind: text) -> FqEngR uses io.file:
+        let ex = do enFindEdge(e0, from, to, kind)
+        if !ex.ok:
+            let x0 = do enErr(ex.eng, ex.err)
+            return x0
+        if !ex.found:
+            let x1 = do enErr(ex.eng, "edge not found: " + from + " -[" + kind + "]-> " + to)
+            return x1
+        let out = do enApplyAtomic(ex.eng, [opDeleteEdge(edgeIdNew(from, to, kind))])
+        return out
+
+    # enKindNodes: scan_candidates(Some(kind)) over the store.
+    proc enKindNodes(e: FqEngine, kind: text) -> FqEngNodes uses io.file:
+        let k = do stKindNodes(e.st, kind)
+        let e2 = do enWith(e, k.store)
+        return FqEngNodes{ok: k.ok, err: k.err, eng: e2, nodes: k.nodes}
+
+    proc enCreateIndex(e0: FqEngine, def: IndexDef) -> FqEngR uses io.file:
+        let mut e = e0
+        let v = do indexDefValidate(def)
+        if !v.ok:
+            let x0 = do enErr(e, v.err)
+            return x0
+        let dat = do stDataIxAt(e.st.ix, def.name)
+        if dat >= 0:
+            let ex = e.st.ix.data[dat].def
+            let same = do ixSameDef(ex, def)
+            if same:
+                let ok0 = do enOk(e)
+                return ok0
+            let x1 = do enErr(e, "index '" + ex.name + "' already exists, over " + ex.kind + "." + ex.field + " — drop it before                  redefining it")
+            return x1
+        let tat = do stTextIxAt(e.st.ix, def.name)
+        if tat >= 0:
+            let tx = e.st.ix.text[tat].def
+            let x2 = do enErr(e, "index '" + tx.name + "' already exists as an inverted index over " + tx.kind + "." + tx.field + " — one name names one index")
+            return x2
+        let other = do enDataFind(e, def.kind, def.field)
+        if other >= 0:
+            let x3 = do enErr(e, "index '" + e.st.ix.data[other].def.name + "' already covers " + def.kind + "." + def.field)
+            return x3
+        # check_backfill_admissible
+        let kn = do enKindNodes(e, def.kind)
+        e = kn.eng
+        if !kn.ok:
+            let x4 = do enErr(e, kn.err)
+            return x4
+        let mut seenKeys = []
+        let mut seenAddr = []
+        let nn = len(kn.nodes)
+        let mut i = 0
+        loop i < nn:
+            let node = kn.nodes[i]
+            let ck = do checkDataKeys([def], node.address, node.data)
+            if !ck.ok:
+                let x5 = do enErr(e, "cannot index " + def.kind + "." + def.field + ": node '" + node.address + "' " + ck.err)
+                return x5
+            if def.unique:
+                let enc = do enOrderValue(node.data, def.field)
+                let eh = do cryptoEncodeHex(enc)
+                let at = do fqwIndexOfText(seenKeys, eh)
+                if at >= 0:
+                    let x6 = do enErr(e, "cannot declare " + def.kind + "." + def.field + " unique: '" + seenAddr[at] + "' and '" + node.address + "' already share a value. Resolve the duplicates first — a constraint that is false when it is created is worse than none, because reads start trusting it.")
+                    return x6
+                seenKeys = append(seenKeys, eh)
+                seenAddr = append(seenAddr, node.address)
+            i = i + 1
+        let out = do enApplyAtomic(e, [opCreateIndex(def)])
+        return out
+
+    proc fqwIndexOfText(xs: [text], x: text) -> int:
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if xs[i] == x:
+                return i
+            i = i + 1
+        return -1
+
+    proc enCreateTextIndex(e0: FqEngine, def: TextIndexDef) -> FqEngR uses io.file:
+        let mut e = e0
+        let v = do textIndexDefValidate(def)
+        if !v.ok:
+            let x0 = do enErr(e, v.err)
+            return x0
+        let tat = do stTextIxAt(e.st.ix, def.name)
+        if tat >= 0:
+            let ex = e.st.ix.text[tat].def
+            if ex.kind == def.kind && ex.field == def.field:
+                let ok0 = do enOk(e)
+                return ok0
+            let x1 = do enErr(e, "index '" + ex.name + "' already exists, over " + ex.kind + "." + ex.field + " — drop it before redefining it")
+            return x1
+        let dat = do stDataIxAt(e.st.ix, def.name)
+        if dat >= 0:
+            let dx = e.st.ix.data[dat].def
+            let x2 = do enErr(e, "index '" + dx.name + "' already exists as an ordered index over " + dx.kind + "." + dx.field + " — one name names one index")
+            return x2
+        let nt = len(e.st.ix.text)
+        let mut j = 0
+        loop j < nt:
+            if e.st.ix.text[j].def.kind == def.kind && e.st.ix.text[j].def.field == def.field:
+                let x3 = do enErr(e, "index '" + e.st.ix.text[j].def.name + "' already covers the text of " + def.kind + "." + def.field)
+                return x3
+            j = j + 1
+        let kn = do enKindNodes(e, def.kind)
+        e = kn.eng
+        if !kn.ok:
+            let x4 = do enErr(e, kn.err)
+            return x4
+        let nn = len(kn.nodes)
+        let mut i = 0
+        loop i < nn:
+            let ck = do checkTextKeys([def], kn.nodes[i].address, kn.nodes[i].data)
+            if !ck.ok:
+                let x5 = do enErr(e, "cannot index " + def.kind + "." + def.field + ": node '" + kn.nodes[i].address + "' " + ck.err)
+                return x5
+            i = i + 1
+        let out = do enApplyAtomic(e, [opCreateTextIndex(def)])
+        return out
+
+    proc enDropIndex(e: FqEngine, name: text) -> FqEngR uses io.file:
+        let dat = do stDataIxAt(e.st.ix, name)
+        if dat < 0:
+            let tat = do stTextIxAt(e.st.ix, name)
+            if tat >= 0:
+                let o = do enApplyAtomic(e, [opDropTextIndex(name)])
+                return o
+            let x0 = do enErr(e, "no index named '" + name + "'")
+            return x0
+        let def = e.st.ix.data[dat].def
+        let deps = do referencesDependingOnIndex(e.st.references, def.kind, def.field)
+        if len(deps) > 0:
+            let q = do goQuote(deps[0].name)
+            let x1 = do enErr(e, "index '" + name + "' cannot be dropped: reference " + q + " is enforced through it (" + len(deps) + " in total). Drop the reference first.")
+            return x1
+        let out = do enApplyAtomic(e, [opDropIndex(name)])
+        return out
+
+    proc enCreateReference(e0: FqEngine, def: ReferenceDef) -> FqEngR uses io.file:
+        let mut e = e0
+        let v = do referenceDefValidate(def)
+        if !v.ok:
+            let x0 = do enErr(e, v.err)
+            return x0
+        let g = do referencesGet(e.st.references, def.name)
+        if g.found:
+            let ex = g.def
+            if ex.name == def.name && ex.kind == def.kind && ex.field == def.field && ex.parentKind == def.parentKind && ex.hasParentField == def.hasParentField && ex.parentField == def.parentField && ex.onDelete == def.onDelete:
+                let ok0 = do enOk(e)
+                return ok0
+            let x1 = do enErr(e, "reference '" + ex.name + "' already exists, over " + ex.kind + "." + ex.field + " → " + ex.parentKind + " — drop it before redefining it")
+            return x1
+        let q = do goQuote(def.name)
+        let ci = do enDataFind(e, def.kind, def.field)
+        if ci < 0:
+            let x2 = do enErr(e, "reference " + q + " needs an index over " + def.kind + "." + def.field + ": without one, deleting a " + def.parentKind + " would have to read every " + def.kind + ". Declare that index first.")
+            return x2
+        if def.hasParentField:
+            let pi = do enDataFind(e, def.parentKind, def.parentField)
+            if pi < 0:
+                let x3 = do enErr(e, "reference " + q + " points at " + def.parentKind + "." + def.parentField + ", which needs a unique index before anything can reference it")
+                return x3
+            if !e.st.ix.data[pi].def.unique:
+                let x4 = do enErr(e, "reference " + q + " points at " + def.parentKind + "." + def.parentField + ", which index '" + e.st.ix.data[pi].def.name + "' covers but does not make unique — a reference has to name exactly one node, and a value two nodes can hold names neither")
+                return x4
+        # check_reference_satisfied
+        let kn = do enKindNodes(e, def.kind)
+        e = kn.eng
+        if !kn.ok:
+            let x5 = do enErr(e, kn.err)
+            return x5
+        let nn = len(kn.nodes)
+        let mut i = 0
+        loop i < nn:
+            let node = kn.nodes[i]
+            let key = do enReferencingKey(node, def)
+            if key.ok:
+                let rs = do enResolves(e, def, key.v, [])
+                e = rs.eng
+                if !rs.ok:
+                    let x6 = do enErr(e, rs.err)
+                    return x6
+                if !rs.v:
+                    let kt = do fjText(key.v)
+                    let x7 = do enErr(e, "reference " + q + " cannot be declared: " + node.address + " holds " + def.field + "=" + kt + " which is not a live " + def.parentKind)
+                    return x7
+            i = i + 1
+        let out = do enApplyAtomic(e, [opCreateReference(def)])
+        return out
+
+    proc enDropReference(e: FqEngine, name: text) -> FqEngR uses io.file:
+        let g = do referencesGet(e.st.references, name)
+        if !g.found:
+            let x0 = do enErr(e, "no reference named '" + name + "'")
+            return x0
+        let out = do enApplyAtomic(e, [opDropReference(name)])
+        return out
+
+    # insert_user / revoke_user, and the in-memory identity set they keep.
+    proc enUsersPut(users: [UserRecord], u: UserRecord) -> [UserRecord]:
+        let mut out = []
+        let n = len(users)
+        let mut i = 0
+        loop i < n:
+            if users[i].tokenHash != u.tokenHash:
+                out = append(out, users[i])
+            i = i + 1
+        out = append(out, u)
+        return out
+
+    proc enUsersRemove(users: [UserRecord], hash: text) -> [UserRecord]:
+        let mut out = []
+        let n = len(users)
+        let mut i = 0
+        loop i < n:
+            if users[i].tokenHash != hash:
+                out = append(out, users[i])
+            i = i + 1
+        return out
+
+    proc enWithUsers(e: FqEngine, users: [UserRecord]) -> FqEngine:
+        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: users}
+
+    proc enInsertUser(e: FqEngine, u: UserRecord) -> FqEngR uses io.file:
+        let r = do enApplyAtomic(e, [opInsertUser(u)])
+        if !r.ok:
+            return r
+        let us = do enUsersPut(r.eng.users, u)
+        let e2 = do enWithUsers(r.eng, us)
+        let ok = do enOk(e2)
+        return ok
+
+    proc enRevokeUser(e: FqEngine, hash: text) -> FqEngR uses io.file:
+        let r = do enApplyAtomic(e, [opRevokeUser(hash)])
+        if !r.ok:
+            return r
+        let us = do enUsersRemove(r.eng.users, hash)
+        let e2 = do enWithUsers(r.eng, us)
+        let ok = do enOk(e2)
+        return ok
+
+    # ── load + recovery ────────────────────────────────────────────────
+    # enLoad: StorageEngine::load, then recovery::recover (Database::new).
+    proc enLoad(dir: text, key: [int], nonceBase: int, interval: int, rotateBytes: int) -> FqEngR uses io.file:
+        let ld = do stLoad(dir, key, nonceBase)
+        let h = FqwHandle{path: dir + "facetql.wal", needsSeparator: false}
+        let fresh = do fqwCountersFresh()
+        let e0 = FqEngine{st: ld.store, wal: h, ctr: fresh, ck: ckNew(), applied: 0, pending: 0, interval: interval, rotateBytes: rotateBytes, walNonce: nonceBase + 3, walSeq: 0, users: []}
+        if !ld.ok:
+            let f0 = do enErr(e0, ld.err)
+            return f0
+        let ul = do bnReadAll(dir + "facetql.users", key)
+        if ul.err != "":
+            let f1 = do enErr(e0, ul.err)
+            return f1
+        let mut users = []
+        let nu = len(ul.records)
+        let mut i = 0
+        loop i < nu:
+            let d = do bnUserOpDecode(ul.records[i].record)
+            if !d.ok:
+                let f2 = do enErr(e0, d.err)
+                return f2
+            if d.op.op == "put":
+                users = do enUsersPut(users, d.op.user)
+            else:
+                users = do enUsersRemove(users, d.op.revoked)
+            i = i + 1
+        let e1 = do enWithUsers(e0, users)
+        let e2 = do enWith(e1, stWithMeta(e1.st, metaSetUserLog(e1.st.meta, nu)))
+        let rc = do enRecover(e2)
+        return rc
+
+    # enNoteFloorHorizon: recovery.rs's note_scan_horizon — a checkpoint
+    # floor with no log behind it leaves no position the scan can vouch
+    # for (u64::MAX); a zero floor is a fresh database.
+    proc enNoteFloorHorizon(e: FqEngine, floor: int) -> FqEngine:
+        if floor == 0:
+            return e
+        let r = do enWith(e, stWithMeta(e.st, metaNoteHorizon(e.st.meta, 0, true)))
+        return r
+
+    proc enSetCounters(e: FqEngine, ctr: FqwCounters) -> FqEngine:
+        return FqEngine{st: e.st, wal: e.wal, ctr: ctr, ck: e.ck, applied: e.applied, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}
+
+    proc enNoteRecovered(e: FqEngine, seq: int) -> FqEngine:
+        let mut a = e.applied
+        if seq > a:
+            a = seq
+        return FqEngine{st: e.st, wal: e.wal, ctr: e.ctr, ck: e.ck, applied: a, pending: e.pending, interval: e.interval, rotateBytes: e.rotateBytes, walNonce: e.walNonce, walSeq: e.walSeq, users: e.users}
+
+    # enReplayOp: apply_recovery_operation — the committed operation
+    # through the same apply step (and the users set it maintains).
+    proc enReplayOp(e: FqEngine, op: Operation) -> FqEngR uses io.file:
+        let r = do enApplyOne(e, op)
+        if !r.ok:
+            return r
+        if op.tag == "insert_user":
+            let us = do enUsersPut(r.eng.users, op.user)
+            let e2 = do enWithUsers(r.eng, us)
+            let ok = do enOk(e2)
+            return ok
+        if op.tag == "revoke_user":
+            let us2 = do enUsersRemove(r.eng.users, op.name)
+            let e3 = do enWithUsers(r.eng, us2)
+            let ok2 = do enOk(e3)
+            return ok2
+        return r
+
+    # enRecover: recovery::recover.
+    proc enRecover(e0: FqEngine) -> FqEngR uses io.file:
+        let mut e = e0
+        let dir = do enDir(e)
+        let path = do enWalPath(e)
+        let fl = do ckRead(dir + "facetql.checkpoint")
+        if !fl.ok:
+            let f0 = do enErr(e, fl.err)
+            return f0
+        let floor = fl.value
+        let c0 = do fqwInitializeCounters(e.ctr, floor, 0, floor)
+        e = do enSetCounters(e, c0)
+        let exists = fileExists(path)
+        if !exists:
+            e = do enNoteFloorHorizon(e, floor)
+            let ok0 = do enOk(e)
+            return ok0
+        let rd = do fqwReadAll(path, e.st.ix.key)
+        if rd.err != "":
+            let f1 = do enErr(e, rd.err)
+            return f1
+        if len(rd.records) == 0:
+            e = do enNoteFloorHorizon(e, floor)
+        if rd.torn:
+            let cut = do fqwTruncateTornTail(path, rd.durableLen)
+        let v1 = do fqwValidateRecords(rd.records)
+        if v1 != "":
+            let f2 = do enErr(e, v1)
+            return f2
+        let v2 = do fqwValidateSequence(rd.records)
+        if v2 != "":
+            let f3 = do enErr(e, v2)
+            return f3
+        let mut maxSeq = 0
+        let mut maxTx = 0
+        let mut maxOp = 0
+        let n = len(rd.records)
+        let mut i = 0
+        loop i < n:
+            let r = rd.records[i]
+            if r.sequence > maxSeq:
+                maxSeq = r.sequence
+            if r.transactionId > maxTx:
+                maxTx = r.transactionId
+            if r.operationId > maxOp:
+                maxOp = r.operationId
+            i = i + 1
+        let c1 = do fqwInitializeCounters(e.ctr, maxSeq, maxTx, maxOp)
+        e = do enSetCounters(e, c1)
+        let cp = do ckRead(dir + "facetql.checkpoint")
+        let mut live = []
+        let mut j = 0
+        loop j < n:
+            if rd.records[j].sequence > cp.value:
+                live = append(live, rd.records[j])
+            j = j + 1
+        let cls = do fqwClassifyTransactions(live)
+        if cls.err != "":
+            let f4 = do enErr(e, cls.err)
+            return f4
+        # replay_in_sequence_order
+        let mut bufTx = []
+        let mut bufOps = []
+        let nl = len(live)
+        let mut k = 0
+        loop k < nl:
+            let r2 = live[k]
+            if r2.transactionId == 0:
+                let isCtl = do fqwIsControl(r2.op.tag)
+                if isCtl:
+                    let rs = do fqwReservedError(r2.sequence)
+                    let f5 = do enErr(e, rs)
+                    return f5
+                let ap = do enReplayOp(e, r2.op)
+                if !ap.ok:
+                    return ap
+                e = do enNoteRecovered(ap.eng, r2.sequence)
+            else:
+                let ci = do fqwIndexOfInt(cls.txIds, r2.transactionId)
+                if ci >= 0:
+                    if r2.op.tag == "commit":
+                        if r2.sequence != cls.commitSeqs[ci]:
+                            let f6 = do enErr(e, "transaction " + r2.transactionId + " COMMIT at sequence " + r2.sequence + " disagrees with classified commit sequence " + cls.commitSeqs[ci])
+                            return f6
+                        let nb = len(bufTx)
+                        let mut b = 0
+                        loop b < nb:
+                            if bufTx[b] == r2.transactionId:
+                                let ap2 = do enReplayOp(e, bufOps[b])
+                                if !ap2.ok:
+                                    return ap2
+                                e = ap2.eng
+                            b = b + 1
+                        e = do enNoteRecovered(e, r2.sequence)
+                    else:
+                        if r2.op.tag != "begin" && r2.op.tag != "abort":
+                            bufTx = append(bufTx, r2.transactionId)
+                            bufOps = append(bufOps, r2.op)
+            k = k + 1
+        let c = do enCheckpoint(e)
+        return c
+
+    proc fqwIndexOfInt(xs: [int], x: int) -> int:
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if xs[i] == x:
+                return i
+            i = i + 1
+        return -1
+
+    # ── the read path ──────────────────────────────────────────────────
+    # enCountRead: reads_total, which every top-level read bumps first.
+    proc enCountRead(e: FqEngine) -> FqEngine:
+        let r = do enWith(e, stWithMeta(e.st, metaCount(e.st.meta, 1, 0, 0, 0)))
+        return r
+
+    # enGet: get — a counted read of one node.
+    proc enGet(e: FqEngine, address: text) -> FqEngNode uses io.file:
+        let e1 = do enCountRead(e)
+        let r = do enReadNode(e1, address)
+        return r
+
+    proc enMaxScanRows() -> int:
+        return 100000
+
+    proc enMaxQueryOffset() -> int:
+        return 10000
+
+    proc enScanLimitExceeded(what: text) -> text:
+        let m = do enMaxScanRows()
+        return what + " would materialize more than " + m + " rows, the maximum one request may hold in memory. Narrow the query (a smaller `kind`/`owner` range, or a predicate), page through it, or raise FACETQL_MAX_SCAN_ROWS."
+
+    # enScanTree: for_each_range over a built-in tree — every (key, value)
+    # under prefix, as hex, in key order.
+    struct FqEngRange:
+        ok: bool
+        err: text
+        eng: FqEngine
+        keys: [text]
+        values: [text]
+
+    proc enScanTree(e: FqEngine, which: text, prefix: [int]) -> FqEngRange uses io.file:
+        let t = do ixTree(e.st.ix, which)
+        let sc = do btScan(t, prefix, false, [], false, 0)
+        let e2 = do enWith(e, stWith(e.st, e.st.heap, ixWith(e.st.ix, which, sc.tree)))
+        return FqEngRange{ok: sc.ok, err: sc.err, eng: e2, keys: sc.keys, values: sc.values}
+
+    struct FqEngRecord:
+        ok: bool
+        err: text
+        eng: FqEngine
+        record: FqHeapRecord
+
+    # enRecordAt: the heap record a location value names, of the kind the
+    # index promises (mismatched_record otherwise).
+    proc enRecordAt(e: FqEngine, locHex: text, want: text) -> FqEngRecord uses io.file:
+        let blank = do hpNodeRecord(operationBlank("insert").node)
+        let l = do hpLocDecode(fqwHexBytes(locHex))
+        if !l.ok:
+            return FqEngRecord{ok: false, err: l.err, eng: e, record: blank}
+        let r = do hpRead(e.st.heap, l.loc)
+        let e2 = do enWith(e, stWith(e.st, r.heap, e.st.ix))
+        if !r.ok:
+            return FqEngRecord{ok: false, err: r.err, eng: e2, record: blank}
+        if r.record.kind != want:
+            let mut w = want
+            if want == "history":
+                w = "history entry"
+            return FqEngRecord{ok: false, err: "expected a " + w + " record at " + hpLocText(l.loc) + ", found " + r.record.kind + " — the index and the heap disagree", eng: e2, record: blank}
+        return FqEngRecord{ok: true, err: "", eng: e2, record: r.record}
+
+    # enMultiGet: multi_get — the live nodes among the addresses, those the
+    # requester may read.
+    proc enMultiGet(e0: FqEngine, addresses: [text], hasRequester: bool, requester: text) -> FqEngNodes uses io.file:
+        if len(addresses) > 1000:
+            return FqEngNodes{ok: false, err: "multi-get asked for " + len(addresses) + " addresses; the maximum is 1000. Each one is an index descent and a record read, so the batch is bounded like any other scan.", eng: e0, nodes: []}
+        let mut e = do enCountRead(e0)
+        let mut out = []
+        let n = len(addresses)
+        let mut i = 0
+        loop i < n:
+            let r = do enReadNode(e, addresses[i])
+            e = r.eng
+            if !r.ok:
+                return FqEngNodes{ok: false, err: r.err, eng: e, nodes: []}
+            if r.found:
+                let mut visible = true
+                if hasRequester:
+                    visible = do nodeCanRead(r.node, requester)
+                if visible:
+                    out = append(out, r.node)
+            i = i + 1
+        return FqEngNodes{ok: true, err: "", eng: e, nodes: out}
+
+    struct FqEngHistory:
+        ok: bool
+        err: text
+        eng: FqEngine
+        entries: [HistoryEntry]
+
+    # enHistoryFor: history_for — every archived state, oldest version
+    # first.
+    proc enHistoryFor(e0: FqEngine, address: text) -> FqEngHistory uses io.file:
+        let prefix = do indexHistoryPrefix(address)
+        let sc = do enScanTree(e0, "history", prefix)
+        let mut e = sc.eng
+        if !sc.ok:
+            return FqEngHistory{ok: false, err: sc.err, eng: e, entries: []}
+        let cap = do enMaxScanRows()
+        let mut out = []
+        let n = len(sc.values)
+        let mut i = 0
+        loop i < n:
+            if len(out) >= cap:
+                let m = do enScanLimitExceeded("this node's history")
+                return FqEngHistory{ok: false, err: m, eng: e, entries: []}
+            let r = do enRecordAt(e, sc.values[i], "history")
+            e = r.eng
+            if !r.ok:
+                return FqEngHistory{ok: false, err: r.err, eng: e, entries: []}
+            out = append(out, r.record.entry)
+            i = i + 1
+        return FqEngHistory{ok: true, err: "", eng: e, entries: out}
+
+    struct FqEngEdges:
+        ok: bool
+        err: text
+        eng: FqEngine
+        edges: [Edge]
+
+    # enEdges: edges_from (outgoing index) / edges_to (incoming index).
+    proc enEdges(e0: FqEngine, address: text, outgoing: bool) -> FqEngEdges uses io.file:
+        let mut which = "edge_in"
+        let mut prefix = do indexEdgeInPrefix(address)
+        if outgoing:
+            which = "edge_out"
+            prefix = do indexEdgeOutPrefix(address)
+        let sc = do enScanTree(e0, which, prefix)
+        let mut e = sc.eng
+        if !sc.ok:
+            return FqEngEdges{ok: false, err: sc.err, eng: e, edges: []}
+        let cap = do enMaxScanRows()
+        let mut out = []
+        let n = len(sc.values)
+        let mut i = 0
+        loop i < n:
+            if len(out) >= cap:
+                let m = do enScanLimitExceeded("this node's edge list")
+                return FqEngEdges{ok: false, err: m, eng: e, edges: []}
+            let r = do enRecordAt(e, sc.values[i], "edge")
+            e = r.eng
+            if !r.ok:
+                return FqEngEdges{ok: false, err: r.err, eng: e, edges: []}
+            out = append(out, r.record.edge)
+            i = i + 1
+        return FqEngEdges{ok: true, err: "", eng: e, edges: out}
+
+    # enScanCandidates: scan_candidates — the live nodes of a kind (kind
+    # index), else of an owner (owner index), else every node (primary),
+    # in that index's order.
+    proc enScanCandidates(e0: FqEngine, hasKind: bool, kind: text, hasOwner: bool, owner: text) -> FqEngNodes uses io.file:
+        let mut e = e0
+        if !hasKind && !hasOwner:
+            let sc = do enScanTree(e, "primary", [])
+            e = sc.eng
+            if !sc.ok:
+                return FqEngNodes{ok: false, err: sc.err, eng: e, nodes: []}
+            let mut all = []
+            let n = len(sc.values)
+            let mut i = 0
+            loop i < n:
+                let r = do enRecordAt(e, sc.values[i], "node")
+                e = r.eng
+                if !r.ok:
+                    return FqEngNodes{ok: false, err: r.err, eng: e, nodes: []}
+                all = append(all, r.record.node)
+                i = i + 1
+            return FqEngNodes{ok: true, err: "", eng: e, nodes: all}
+        let mut which = "owner"
+        let mut prefix = do indexOwnerPrefix(owner)
+        if hasKind:
+            which = "kind"
+            prefix = do indexKindPrefix(kind)
+        let sc2 = do enScanTree(e, which, prefix)
+        e = sc2.eng
+        if !sc2.ok:
+            return FqEngNodes{ok: false, err: sc2.err, eng: e, nodes: []}
+        let pl = len(prefix)
+        let mut out = []
+        let m = len(sc2.keys)
+        let mut j = 0
+        loop j < m:
+            let kb = do fqwHexBytes(sc2.keys[j])
+            let addr = bytesToText(btRange(kb, pl, len(kb)))
+            let rn = do enReadNode(e, addr)
+            e = rn.eng
+            if !rn.ok:
+                return FqEngNodes{ok: false, err: rn.err, eng: e, nodes: []}
+            if rn.found:
+                out = append(out, rn.node)
+            j = j + 1
+        return FqEngNodes{ok: true, err: "", eng: e, nodes: out}
+
+    # enNodesByOwner: nodes_by_owner.
+    proc enNodesByOwner(e0: FqEngine, owner: text, hasRequester: bool, requester: text) -> FqEngNodes uses io.file:
+        let sc = do enScanCandidates(e0, false, "", true, owner)
+        if !sc.ok:
+            return sc
+        let cap = do enMaxScanRows()
+        let mut out = []
+        let n = len(sc.nodes)
+        let mut i = 0
+        loop i < n:
+            if len(out) >= cap:
+                let m = do enScanLimitExceeded("this owner's node list")
+                return FqEngNodes{ok: false, err: m, eng: sc.eng, nodes: []}
+            let mut visible = true
+            if hasRequester:
+                visible = do nodeCanRead(sc.nodes[i], requester)
+            if visible:
+                out = append(out, sc.nodes[i])
+            i = i + 1
+        return FqEngNodes{ok: true, err: "", eng: sc.eng, nodes: out}
+
+    # enQuery: query — kind and/or owner, what the requester may read,
+    # `offset` skipped, up to `limit`.
+    proc enQuery(e00: FqEngine, hasKind: bool, kind: text, hasOwner: bool, owner: text, hasRequester: bool, requester: text, limit: int, offset: int) -> FqEngNodes uses io.file:
+        let e0 = do enCountRead(e00)
+        if limit == 0:
+            return FqEngNodes{ok: true, err: "", eng: e0, nodes: []}
+        let mo = do enMaxQueryOffset()
+        if offset > mo:
+            return FqEngNodes{ok: false, err: "offset " + offset + " is above the maximum of " + mo + ". Deep offset paging re-reads and discards every row before the page, so its cost grows with the page number; use the keyset cursor (`after`, from a previous page's `next`) on POST /nodes/query, which costs the same at any depth. Raise FACETQL_MAX_QUERY_OFFSET to override.", eng: e0, nodes: []}
+        let sc = do enScanCandidates(e0, hasKind, kind, hasOwner, owner)
+        if !sc.ok:
+            return sc
+        let mut out = []
+        let mut skipped = 0
+        let n = len(sc.nodes)
+        let mut i = 0
+        loop i < n && len(out) < limit:
+            let node = sc.nodes[i]
+            let mut keep = true
+            if hasKind && node.kind != kind:
+                keep = false
+            if hasOwner && node.owner != owner:
+                keep = false
+            if keep && hasRequester:
+                keep = do nodeCanRead(node, requester)
+            if keep:
+                if skipped < offset:
+                    skipped = skipped + 1
+                else:
+                    out = append(out, node)
+            i = i + 1
+        return FqEngNodes{ok: true, err: "", eng: sc.eng, nodes: out}
+
+    # ── read harness text ──────────────────────────────────────────────
+    proc enNodeText(n: Node) -> text:
+        let mut claimed = "-"
+        if n.hasClaimedBy:
+            claimed = n.claimedBy
+        return n.address + "|" + n.kind + "|" + n.owner + "|" + n.value + "|" + n.visibility + "|" + claimed + "|" + n.data
+
+    proc enNodesText(ns: [Node]) -> text:
+        let mut out = "["
+        let n = len(ns)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let t = do enNodeText(ns[i])
+            out = out + t
+            i = i + 1
+        return out + "]"
+
+    proc enOpt(w: text) -> bool:
+        return w != "-"
+
+    # enReadText: `get A`, `multi A,B,… REQUESTER|-`, `history A`,
+    # `from A`, `to A`, `owner O REQUESTER|-`, `query KIND|- OWNER|-
+    # REQUESTER|- LIMIT OFFSET`, `;`-separated; each answer on its own
+    # line (`error: …` for a refusal).
+    proc enReadOps(e0: FqEngine, script: text) -> text uses io.file:
+        let mut e = e0
+        let mut out = ""
+        let ops = split(script, ";")
+        let n = len(ops)
+        let mut i = 0
+        loop i < n:
+            let line = trim(ops[i])
+            if line != "":
+                let w = split(line, " ")
+                let verb = w[0]
+                let mut res = ""
+                if verb == "get":
+                    let r = do enReadNode(e, w[1])
+                    e = r.eng
+                    if !r.ok:
+                        res = "error: " + r.err
+                    else:
+                        if r.found:
+                            res = do enNodeText(r.node)
+                        else:
+                            res = "none"
+                if verb == "multi":
+                    let hr = do enOpt(w[2])
+                    let m = do enMultiGet(e, split(w[1], ","), hr, w[2])
+                    e = m.eng
+                    if !m.ok:
+                        res = "error: " + m.err
+                    else:
+                        res = do enNodesText(m.nodes)
+                if verb == "history":
+                    let h = do enHistoryFor(e, w[1])
+                    e = h.eng
+                    if !h.ok:
+                        res = "error: " + h.err
+                    else:
+                        let mut hs = "["
+                        let nh = len(h.entries)
+                        let mut k = 0
+                        loop k < nh:
+                            if k > 0:
+                                hs = hs + ","
+                            let nt = do enNodeText(h.entries[k].node)
+                            hs = hs + "v" + h.entries[k].version + ":" + nt
+                            k = k + 1
+                        res = hs + "]"
+                if verb == "from" || verb == "to":
+                    let ed = do enEdges(e, w[1], verb == "from")
+                    e = ed.eng
+                    if !ed.ok:
+                        res = "error: " + ed.err
+                    else:
+                        let mut es = "["
+                        let ne = len(ed.edges)
+                        let mut k2 = 0
+                        loop k2 < ne:
+                            if k2 > 0:
+                                es = es + ","
+                            let x = ed.edges[k2]
+                            es = es + x.from + ">" + x.to + ":" + x.kind + "@" + x.owner
+                            k2 = k2 + 1
+                        res = es + "]"
+                if verb == "owner":
+                    let hr2 = do enOpt(w[2])
+                    let o = do enNodesByOwner(e, w[1], hr2, w[2])
+                    e = o.eng
+                    if !o.ok:
+                        res = "error: " + o.err
+                    else:
+                        res = do enNodesText(o.nodes)
+                if verb == "query":
+                    let hk = do enOpt(w[1])
+                    let ho = do enOpt(w[2])
+                    let hq = do enOpt(w[3])
+                    let q = do enQuery(e, hk, w[1], ho, w[2], hq, w[3], toInt(w[4]), toInt(w[5]))
+                    e = q.eng
+                    if !q.ok:
+                        res = "error: " + q.err
+                    else:
+                        res = do enNodesText(q.nodes)
+                out = out + res + "\n"
+            i = i + 1
+        return out
+
+    proc enReadText(dir: text, keyHex: text, nonceBase: int, script: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let ld = do enLoad(dir, key, nonceBase, 256, 67108864)
+        if !ld.ok:
+            return "error: " + ld.err
+        let r = do enReadOps(ld.eng, script)
+        return r
+
+    action runEngineRead(dir: text, keyHex: text, nonceBase: int, script: text):
+        let r = do enReadText(dir, keyHex, nonceBase, script)
+        engineOut = r
+
+    # ── the engine's JSON: serde's rendering of what the API returns ───
+    proc jNode(n: Node) -> text:
+        let mut claimed = "null"
+        if n.hasClaimedBy:
+            claimed = do fjQuote(n.claimedBy)
+        let mut vis = "Private"
+        if n.visibility == "public":
+            vis = "Public"
+        return "{\"address\":" + fjQuote(n.address) + ",\"coordinate\":{\"x\":" + n.coordinate.x + ",\"y\":" + n.coordinate.y + ",\"z\":" + n.coordinate.z + ",\"q\":" + n.coordinate.q + "},\"value\":" + n.value + ",\"kind\":" + fjQuote(n.kind) + ",\"data\":" + fjQuote(n.data) + ",\"owner\":" + fjQuote(n.owner) + ",\"claimed_by\":" + claimed + ",\"visibility\":\"" + vis + "\"}"
+
+    proc jNodes(ns: [Node]) -> text:
+        let mut out = "["
+        let n = len(ns)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let t = do jNode(ns[i])
+            out = out + t
+            i = i + 1
+        return out + "]"
+
+    proc jEdge(e: Edge) -> text:
+        return "{\"from\":" + fjQuote(e.from) + ",\"to\":" + fjQuote(e.to) + ",\"kind\":" + fjQuote(e.kind) + ",\"owner\":" + fjQuote(e.owner) + "}"
+
+    proc jEdges(es: [Edge]) -> text:
+        let mut out = "["
+        let n = len(es)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let t = do jEdge(es[i])
+            out = out + t
+            i = i + 1
+        return out + "]"
+
+    proc jHistory(hs: [HistoryEntry]) -> text:
+        let mut out = "["
+        let n = len(hs)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let nt = do jNode(hs[i].node)
+            out = out + "{\"address\":" + fjQuote(hs[i].address) + ",\"archived_at_unix\":" + hs[i].archivedAtUnix + ",\"node\":" + nt + ",\"version\":" + hs[i].version + "}"
+            i = i + 1
+        return out + "]"
+
+    proc jIndexInfo(name: text, kind: text, field: text, unique: bool, mode: text) -> text:
+        let mut u = "false"
+        if unique:
+            u = "true"
+        return "{\"name\":" + fjQuote(name) + ",\"kind\":" + fjQuote(kind) + ",\"field\":" + fjQuote(field) + ",\"unique\":" + u + ",\"mode\":\"" + mode + "\"}"
+
+    proc jReference(d: ReferenceDef) -> text:
+        let mut pf = "null"
+        if d.hasParentField:
+            pf = do fjQuote(d.parentField)
+        return "{\"name\":" + fjQuote(d.name) + ",\"kind\":" + fjQuote(d.kind) + ",\"field\":" + fjQuote(d.field) + ",\"parent_kind\":" + fjQuote(d.parentKind) + ",\"parent_field\":" + pf + ",\"on_delete\":\"" + d.onDelete + "\"}"
+
+    # ── list_* ─────────────────────────────────────────────────────────
+    # enListAllIndexes: list_all_indexes — ordered and inverted, by name.
+    proc enListAllIndexes(e: FqEngine) -> text:
+        let mut names = []
+        let mut rows = []
+        let nd = len(e.st.ix.data)
+        let mut i = 0
+        loop i < nd:
+            let d = e.st.ix.data[i].def
+            names = append(names, d.name)
+            let r = do jIndexInfo(d.name, d.kind, d.field, d.unique, "ordered")
+            rows = append(rows, r)
+            i = i + 1
+        let nt = len(e.st.ix.text)
+        let mut j = 0
+        loop j < nt:
+            let t = e.st.ix.text[j].def
+            names = append(names, t.name)
+            let r2 = do jIndexInfo(t.name, t.kind, t.field, false, "text")
+            rows = append(rows, r2)
+            j = j + 1
+        let sorted = do enSortRowsByName(names, rows)
+        return "[" + join(sorted, ",") + "]"
+
+    proc enSortRowsByName(names0: [text], rows0: [text]) -> [text]:
+        let mut names = names0
+        let mut rows = rows0
+        let n = len(names)
+        let mut i = 1
+        loop i < n:
+            let kn = names[i]
+            let kr = rows[i]
+            let mut j = i - 1
+            loop j >= 0 && qvCmpBytesE(textToBytes(names[j]), textToBytes(kn)) > 0:
+                names[j + 1] = names[j]
+                rows[j + 1] = rows[j]
+                j = j - 1
+            names[j + 1] = kn
+            rows[j + 1] = kr
+            i = i + 1
+        return rows
+
+    proc qvCmpBytesE(a: [int], b: [int]) -> int:
+        let na = len(a)
+        let nb = len(b)
+        let mut i = 0
+        loop i < na && i < nb:
+            if a[i] < b[i]:
+                return -1
+            if a[i] > b[i]:
+                return 1
+            i = i + 1
+        if na < nb:
+            return -1
+        if na > nb:
+            return 1
+        return 0
+
+    # enListReferences: list_references — by name.
+    proc enListReferences(e: FqEngine) -> text:
+        let mut names = []
+        let mut rows = []
+        let n = len(e.st.references)
+        let mut i = 0
+        loop i < n:
+            names = append(names, e.st.references[i].name)
+            let r = do jReference(e.st.references[i])
+            rows = append(rows, r)
+            i = i + 1
+        let sorted = do enSortRowsByName(names, rows)
+        return "[" + join(sorted, ",") + "]"
+
+    # enFindUserByHash: find_user_by_hash.
+    struct FqEngUser:
+        found: bool
+        user: UserRecord
+
+    proc enFindUserByHash(e: FqEngine, hash: text) -> FqEngUser:
+        let n = len(e.users)
+        let mut i = 0
+        loop i < n:
+            if e.users[i].tokenHash == hash:
+                return FqEngUser{found: true, user: e.users[i]}
+            i = i + 1
+        return FqEngUser{found: false, user: UserRecord{tokenHash: "", owner: "", role: "user"}}
+
+    # ── compact_user_log ───────────────────────────────────────────────
+    # The log rewritten to one Put per live identity once it holds more
+    # than max(4 × identities, 64) records.
+    proc enCompactUserLog(e: FqEngine) -> FqEngR uses io.file:
+        let mut threshold = len(e.users) * 4
+        if threshold < 64:
+            threshold = 64
+        if e.st.meta.userLog <= threshold:
+            let ok0 = do enOk(e)
+            return ok0
+        let mut recs = []
+        let n = len(e.users)
+        let mut i = 0
+        loop i < n:
+            let b = do bnUserOpEncode(BnUserOp{op: "put", user: e.users[i], revoked: ""})
+            recs = append(recs, BnRecord{offset: 0, record: b})
+            i = i + 1
+        let w = do bnRewriteRecords(enDir(e) + "facetql.users", recs, e.st.ix.key, e.st.nonceBase + 5000000, e.st.seq)
+        let e2 = do enWith(e, stBump(stWithMeta(e.st, metaSetUserLog(e.st.meta, n))))
+        if !w.ok:
+            let f = do enErr(e2, w.err)
+            return f
+        let ok = do enOk(e2)
+        return ok
+
+    # ── stats ──────────────────────────────────────────────────────────
+    proc enVersion() -> text:
+        return "0.13.0"
+
+    # enStatsJson: stats() — node/edge/user/history counts, the per-kind
+    # breakdown (the kind index walked, its first component counted), the
+    # read/write counters, storage, version, the server's runtime section
+    # (runtimeJson) and the cell table.
+    struct FqEngText:
+        ok: bool
+        err: text
+        eng: FqEngine
+        text: text
+
+    proc enStatsJson(e0: FqEngine, runtimeJson: text) -> FqEngText uses io.file:
+        let sc = do enScanTree(e0, "kind", [])
+        let e = sc.eng
+        if !sc.ok:
+            return FqEngText{ok: false, err: sc.err, eng: e, text: ""}
+        let mut kinds = []
+        let mut counts = []
+        let n = len(sc.keys)
+        let mut i = 0
+        loop i < n:
+            let kb = do fqwHexBytes(sc.keys[i])
+            let sp = do indexSplitComponent(kb)
+            if sp.ok:
+                let k = bytesToText(sp.component)
+                let last = len(kinds) - 1
+                if last >= 0 && kinds[last] == k:
+                    counts[last] = counts[last] + 1
+                else:
+                    kinds = append(kinds, k)
+                    counts = append(counts, 1)
+            i = i + 1
+        # a BTreeMap<String, u64>: by the kind's bytes (the index orders by
+        # its length prefix first).
+        let mut rows = []
+        let nk = len(kinds)
+        let mut j = 0
+        loop j < nk:
+            rows = append(rows, "{\"kind\":" + fjQuote(kinds[j]) + ",\"count\":" + counts[j] + "}")
+            j = j + 1
+        let sortedRows = do enSortRowsByName(kinds, rows)
+        let kj = "[" + join(sortedRows, ",") + "]"
+        let c = e.st.heap.catalog
+        let mut pages = 0
+        let mut obs = 0
+        let ns = len(c.segments)
+        let mut s2 = 0
+        loop s2 < ns:
+            pages = pages + c.segments[s2].pages
+            obs = obs + c.segments[s2].obsoleteBytes
+            s2 = s2 + 1
+        let m = e.st.meta
+        let storage = "{\"page_size\":" + c.pageSize + ",\"segments\":" + ns + ",\"pages\":" + pages + ",\"obsolete_bytes\":" + obs + "}"
+        let cells = do enCellsJson(m)
+        let body = "{\"node_count\":" + e.st.ix.primary.entries + ",\"edge_count\":" + e.st.ix.edgeOut.entries + ",\"user_count\":" + len(e.users) + ",\"history_entries\":" + e.st.ix.history.entries + ",\"kinds\":" + kj + ",\"reads_total\":" + m.reads + ",\"writes_total\":" + m.writes + ",\"storage\":" + storage + ",\"version\":\"" + enVersion() + "\",\"runtime\":" + runtimeJson + ",\"cells\":" + cells + "}"
+        return FqEngText{ok: true, err: "", eng: e, text: body}
+
+    # enCellsJson: CellTable::snapshot — occupied slots, busiest first,
+    # then by coordinate.
+    proc enCellsJson(m: FqCounts) -> text:
+        let mut idx = []
+        let mut i = 0
+        loop i < 256:
+            if m.cellKeys[i] != 0:
+                idx = append(idx, i)
+            i = i + 1
+        let n = len(idx)
+        let mut a = 1
+        loop a < n:
+            let v = idx[a]
+            let mut b = a - 1
+            loop b >= 0 && enCellAfter(m, idx[b], v):
+                idx[b + 1] = idx[b]
+                b = b - 1
+            idx[b + 1] = v
+            a = a + 1
+        let mut out = "["
+        let mut k = 0
+        loop k < n:
+            let at = idx[k]
+            let key = m.cellKeys[at]
+            if k > 0:
+                out = out + ","
+            out = out + "{\"x\":" + ((key >> 24) & 255) + ",\"y\":" + ((key >> 16) & 255) + ",\"z\":" + ((key >> 8) & 255) + ",\"q\":" + (key & 255) + ",\"reads\":" + m.cellReads[at] + ",\"writes\":" + m.cellWrites[at] + ",\"bytes_read\":" + m.cellBytesRead[at] + ",\"bytes_written\":" + m.cellBytesWritten[at] + "}"
+            k = k + 1
+        out = out + "]"
+        return "{\"capacity\":256,\"tracked\":" + n + ",\"overflow_reads\":" + m.overflowReads + ",\"overflow_writes\":" + m.overflowWrites + ",\"unattributed_writes\":" + m.unattributed + ",\"cells\":" + out + "}"
+
+    # enCellAfter: whether slot a sorts after slot b.
+    proc enCellAfter(m: FqCounts, a: int, b: int) -> bool:
+        let ta = m.cellReads[a] + m.cellWrites[a]
+        let tb = m.cellReads[b] + m.cellWrites[b]
+        if ta != tb:
+            return ta < tb
+        return (m.cellKeys[a] & 4294967295) > (m.cellKeys[b] & 4294967295)
+
+    # ── changes.rs: the durable change scan ────────────────────────────
+    # enChanges: scan — the WAL read whole, its committed durable units in
+    # position order, each insert/delete admitted under the caller's
+    # audience. status 200 carries the page's JSON, 410 the too-old
+    # refusal, 500 a log that does not read or hold together.
+    struct FqChanges:
+        status: int
+        body: text
+        eng: FqEngine
+
+    proc enChanges(e: FqEngine, after: int, limit: int, owner: text, isAdmin: bool) -> FqChanges uses io.file:
+        let rd = do fqwReadAll(enWalPath(e), e.st.ix.key)
+        if rd.err != "":
+            return FqChanges{status: 500, body: "storage error: " + rd.err, eng: e}
+        let recs = rd.records
+        let n = len(recs)
+        let mut earliestMax = false
+        let mut earliest = 0
+        if n == 0:
+            earliest = e.st.meta.horizon
+            earliestMax = e.st.meta.horizonMax
+        else:
+            if recs[0].sequence != 1:
+                earliest = recs[0].operationId
+        if earliestMax || after < earliest:
+            let mut et = "" + earliest
+            if earliestMax:
+                et = "18446744073709551615"
+            return FqChanges{status: 410, body: "cannot scan changes from " + after + ": the oldest position the write-ahead log still holds is " + et + " (" + n + " records retained). The log is checkpointed and rotated, so it is not infinite either — the changes between those two positions are gone from it and this server will not pretend otherwise by starting from the oldest record it happens to have. Reconcile from a full read instead.", eng: e}
+        let mut i = 1
+        loop i < n:
+            if recs[i].operationId <= recs[i - 1].operationId:
+                return FqChanges{status: 500, body: "storage error: WAL operation ID " + recs[i].operationId + " follows " + recs[i - 1].operationId + " at sequence " + recs[i].sequence + "; the change scan pages by position and requires file order and position order to be the same order", eng: e}
+            i = i + 1
+        let cls = do fqwClassifyTransactions(recs)
+        if cls.err != "":
+            return FqChanges{status: 500, body: "storage error: " + cls.err, eng: e}
+        let mut out = []
+        let mut next = after
+        let mut complete = true
+        let mut idx = 0
+        loop idx < n:
+            let tx = recs[idx].transactionId
+            let mut end = idx + 1
+            if tx != 0:
+                loop end < n && recs[end].transactionId == tx:
+                    end = end + 1
+            # frame_state
+            let mut state = "committed"
+            if tx != 0:
+                let ci = do fqwIndexOfInt(cls.txIds, tx)
+                if ci < 0:
+                    let mut aborted = false
+                    let mut a = idx
+                    loop a < end:
+                        if recs[a].op.tag == "abort":
+                            aborted = true
+                        a = a + 1
+                    if aborted || end != n:
+                        state = "terminal"
+                    else:
+                        state = "inflight"
+            if state == "inflight":
+                break
+            let start = idx
+            idx = end
+            if state == "committed" && recs[end - 1].operationId > after:
+                let emitted = do enEmitUnit(recs, start, end, after, owner, isAdmin)
+                let ne = len(emitted)
+                let mut k = 0
+                loop k < ne:
+                    out = append(out, emitted[k])
+                    k = k + 1
+                if ne > 0:
+                    let parts = split(emitted[ne - 1], ",")
+                    next = toInt(slice(parts[0], 7, len(parts[0])))
+                if len(out) >= limit && idx < n:
+                    complete = false
+                    break
+        let mut c = "true"
+        if !complete:
+            c = "false"
+        return FqChanges{status: 200, body: "{\"changes\":[" + join(out, ",") + "],\"next\":" + next + ",\"complete\":" + c + "}", eng: e}
+
+    # enEmitUnit: emit_unit — an insert after an archive of the same
+    # address in the unit is an update; a delete is attributed to (and
+    # admitted by) the state its archive removed, and withheld without one.
+    proc enEmitUnit(recs: [FqwRecord], start: int, end: int, after: int, owner: text, isAdmin: bool) -> [text]:
+        let mut archAddr = []
+        let mut archNodes = []
+        let mut out = []
+        let mut i = start
+        loop i < end:
+            let r = recs[i]
+            let op = r.op
+            if op.tag == "archive":
+                archAddr = append(archAddr, op.entry.address)
+                archNodes = append(archNodes, op.entry.node)
+            if op.tag == "insert":
+                let at = do enLastIndexOf(archAddr, op.node.address)
+                let mut change = "created"
+                if at >= 0:
+                    change = "updated"
+                let adm = do enAdmits(op.node, owner, isAdmin)
+                if r.operationId > after && adm:
+                    out = append(out, "{\"seq\":" + r.operationId + ",\"change\":\"" + change + "\",\"address\":" + fjQuote(op.node.address) + ",\"kind\":" + fjQuote(op.node.kind) + "}")
+            if op.tag == "delete":
+                let at2 = do enLastIndexOf(archAddr, op.name)
+                if at2 >= 0:
+                    let prev = archNodes[at2]
+                    let mut ka = []
+                    let mut kn = []
+                    let na = len(archAddr)
+                    let mut j = 0
+                    loop j < na:
+                        if archAddr[j] != op.name:
+                            ka = append(ka, archAddr[j])
+                            kn = append(kn, archNodes[j])
+                        j = j + 1
+                    archAddr = ka
+                    archNodes = kn
+                    let adm2 = do enAdmits(prev, owner, isAdmin)
+                    if r.operationId > after && adm2:
+                        out = append(out, "{\"seq\":" + r.operationId + ",\"change\":\"deleted\",\"address\":" + fjQuote(op.name) + ",\"kind\":" + fjQuote(prev.kind) + "}")
+            i = i + 1
+        return out
+
+    proc enLastIndexOf(xs: [text], x: text) -> int:
+        let mut i = len(xs) - 1
+        loop i >= 0:
+            if xs[i] == x:
+                return i
+            i = i - 1
+        return -1
+
+    # enAdmits: Audience::for_node(node).admits(owner, is_admin).
+    proc enAdmits(n: Node, owner: text, isAdmin: bool) -> bool:
+        if n.visibility == "public":
+            return true
+        return isAdmin || n.owner == owner
+
+    # ── test harness ───────────────────────────────────────────────────
+    state engineOut: text = ""
+
+    # enScriptText: fqindex.fct's ixScriptText vocabulary, through the
+    # engine: put/del/edge/unedge/index (`unique` as a fifth word makes it
+    # unique)/text/drop/ref NAME KIND FIELD PARENTKIND [PARENTFIELD|-]
+    # ONDELETE/unref/user HASH OWNER ROLE/revoke HASH/checkpoint. Each op
+    # prints `ok;` (a put/del that archived: `ok v=VERSION;`) or stops at
+    # `error: …`. The session ends without a checkpoint (as a crash would)
+    # unless the script checkpoints; then the checkpoint value.
+    # enScriptOp: one script op on the engine; on success `err` carries
+    # what the op prints (`ok;` or, for a put/del that archived,
+    # `ok v=VERSION;`).
+    proc enScriptOp(e0: FqEngine, line: text) -> FqEngR uses io.file:
+        let mut e = e0
+        let w = split(line, " ")
+        let verb = w[0]
+        let before = e.ctr.nextOperationId
+        let mut r = FqEngR{ok: false, err: "unknown engine op " + verb, eng: e}
+        let mut archives = false
+        if verb == "put":
+            let dataStart = len(w[0]) + len(w[1]) + len(w[2]) + len(w[3]) + 4
+            let data = slice(line, dataStart, len(line))
+            let ex = do stPeekNode(e.st, w[1])
+            e = do enWith(e, ex.store)
+            archives = ex.found
+            let nd = do ixScriptNode(w[1], w[2], w[3], data)
+            r = do enInsert(e, nd)
+        if verb == "del":
+            let ex2 = do stPeekNode(e.st, w[1])
+            e = do enWith(e, ex2.store)
+            archives = ex2.found
+            r = do enDelete(e, w[1])
+        if verb == "edge":
+            r = do enInsertEdge(e, edgeNew(w[1], w[2], w[3], "alice"))
+        if verb == "unedge":
+            r = do enDeleteEdge(e, w[1], w[2], w[3])
+        if verb == "index":
+            let uq = len(w) > 4 && w[4] == "unique"
+            r = do enCreateIndex(e, indexDefNew(w[1], w[2], w[3], uq))
+        if verb == "text":
+            r = do enCreateTextIndex(e, textIndexDefNew(w[1], w[2], w[3]))
+        if verb == "drop":
+            r = do enDropIndex(e, w[1])
+        if verb == "ref":
+            let hasPf = w[5] != "-"
+            let mut pf = ""
+            if hasPf:
+                pf = w[5]
+            r = do enCreateReference(e, referenceDefNew(w[1], w[2], w[3], w[4], hasPf, pf, w[6]))
+        if verb == "unref":
+            r = do enDropReference(e, w[1])
+        if verb == "user":
+            r = do enInsertUser(e, UserRecord{tokenHash: w[1], owner: w[2], role: w[3]})
+        if verb == "revoke":
+            r = do enRevokeUser(e, w[1])
+        if verb == "checkpoint":
+            r = do enCheckpoint(e)
+        if !r.ok:
+            return r
+        if archives:
+            return FqEngR{ok: true, err: "ok v=" + before + ";", eng: r.eng}
+        return FqEngR{ok: true, err: "ok;", eng: r.eng}
+
+    proc enScriptText(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes)
+        if !ld.ok:
+            return "error: " + ld.err
+        let mut e = ld.eng
+        let mut out = ""
+        let ops = split(script, ";")
+        let n = len(ops)
+        let mut i = 0
+        loop i < n:
+            let line = trim(ops[i])
+            if line != "":
+                let r = do enScriptOp(e, line)
+                if !r.ok:
+                    out = out + "error: " + r.err + ";"
+                else:
+                    e = r.eng
+                    out = out + r.err
+            i = i + 1
+        let cp = do ckRead(dir + "facetql.checkpoint")
+        return out + "|checkpoint=" + cp.value
+
+    action runEngine(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text):
+        let r = do enScriptText(dir, keyHex, nonceBase, interval, rotateBytes, script)
+        engineOut = r
+
+    view EngineHome at "/engine":
+        text "{engineOut}"

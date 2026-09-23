@@ -1,0 +1,659 @@
+import "fqquery.fct"
+
+app FqTxSelfHost:
+    # fqtx.fct — the rest of engine.rs's public writes, over fqengine.fct:
+    # execute_transaction (a batch of TxOperations lowered against the
+    # batch's own staged view — inserts archiving what they replace, node
+    # deletes through the reference closure, kind clears and predicate
+    # deletes, set_if with its precondition, edge inserts and deletes with
+    # their ownership checks — then the unique and reference checks and one
+    # transaction frame), claim, sequence_next and insert_with_edges.
+    struct TxOp:
+        tag: text
+        node: Node
+        address: text
+        edge: Edge
+        owner: text
+        isAdmin: bool
+        kind: text
+        hasWhere: bool
+        where: FqJ
+        field: text
+        expect: text
+        expectF: float
+        expectV: FqJ
+        set: FqJ
+
+    struct TxLowered:
+        ok: bool
+        kind: text
+        err: text
+        eng: FqEngine
+        ops: [Operation]
+
+    # txFail: a refusal of the batch, with TransactionError's variant —
+    # "invalid", "precondition" or "storage".
+    proc txFail(e: FqEngine, kind: text, msg: text) -> TxLowered:
+        return TxLowered{ok: false, kind: kind, err: msg, eng: e, ops: []}
+
+    # txSelectionMatches: selection_matches — of the kind, writable by the
+    # owner (or an admin), and the predicate (item variable `item`) true.
+    proc txSelectionMatches(node: Node, kind: text, hasWhere: bool, where: FqJ, owner: text, isAdmin: bool) -> QMatch:
+        if node.kind != kind:
+            return QMatch{ok: true, err: "", v: false}
+        let cw = do nodeCanWrite(node, owner)
+        if !(isAdmin || cw):
+            return QMatch{ok: true, err: "", v: false}
+        if !hasWhere:
+            return QMatch{ok: true, err: "", v: true}
+        let data = do qDataOf(node)
+        let r = do prEval(where, "item", data, 0)
+        if !r.ok:
+            return QMatch{ok: false, err: "predicate evaluation failed: " + r.err, v: false}
+        return QMatch{ok: true, err: "", v: r.v.kind == "bool" && r.v.b}
+
+    # txSetIfNext: set_if_next.
+    struct TxNext:
+        ok: bool
+        kind: text
+        err: text
+        node: Node
+
+    proc txSetIfNext(node: Node, field: text, expect: text, expectF: float, expectV: FqJ, set: FqJ) -> TxNext:
+        let mut keys = []
+        let mut items = []
+        if trim(node.data) != "":
+            let p = do fjParse(node.data)
+            if !p.ok:
+                return TxNext{ok: false, kind: "invalid", err: "set_if target " + node.address + " has undecodable `data`: " + p.err, node: node}
+            if p.v.kind == "obj":
+                keys = p.v.keys
+                items = p.v.items
+            else:
+                if p.v.kind != "null":
+                    return TxNext{ok: false, kind: "invalid", err: "set_if target " + node.address + " does not hold a JSON object in `data`", node: node}
+        let at = do fjKeyAt(keys, field)
+        let mut holds = false
+        if expect == "atmost":
+            if at >= 0 && (items[at].kind == "int" || items[at].kind == "float"):
+                holds = items[at].f <= expectF
+        if expect == "equals":
+            if at >= 0:
+                holds = do enJsonEqual(items[at], expectV)
+        if expect == "absent":
+            holds = at < 0 || items[at].kind == "null"
+        if !holds:
+            return TxNext{ok: false, kind: "precondition", err: "set_if precondition failed on " + node.address + "." + field, node: node}
+        let ns = len(set.keys)
+        let mut i = 0
+        loop i < ns:
+            let k = do fjKeyAt(keys, set.keys[i])
+            if k >= 0:
+                items[k] = set.items[i]
+            else:
+                keys = append(keys, set.keys[i])
+                items = append(items, set.items[i])
+            i = i + 1
+        let obj = do fjSortMembers(keys, items)
+        let text = do fjText(obj)
+        return TxNext{ok: true, kind: "", err: "", node: Node{address: node.address, coordinate: node.coordinate, value: node.value, kind: node.kind, data: text, owner: node.owner, hasClaimedBy: node.hasClaimedBy, claimedBy: node.claimedBy, visibility: node.visibility}}
+
+    # staged edges: (id text, live, edge) with the last entry winning.
+    proc txEdgeKey(from: text, to: text, kind: text) -> text:
+        return from + "\n" + to + "\n" + kind
+
+    # txLower: lower_transaction.
+    proc txLower(e0: FqEngine, txops: [TxOp]) -> TxLowered uses io.file:
+        let mut e = e0
+        let mut ops = []
+        let mut stAddr = []
+        let mut stLive = []
+        let mut stNodes = []
+        let mut seKeys = []
+        let mut seLive = []
+        let mut seEdges = []
+        let n = len(txops)
+        let mut i = 0
+        loop i < n:
+            let t = txops[i]
+            if t.tag == "insert":
+                let sn = do enStagedNode(e, stAddr, stLive, stNodes, t.node.address)
+                e = sn.eng
+                if !sn.ok:
+                    let f0 = do txFail(e, "storage", sn.err)
+                    return f0
+                if sn.found:
+                    if sn.node.owner != t.node.owner:
+                        let f1 = do txFail(e, "invalid", "transaction failed, nothing applied: address " + t.node.address + " is owned by " + sn.node.owner)
+                        return f1
+                    let a = do enArchiveNow(e, sn.node)
+                    e = a.eng
+                    ops = append(ops, opArchive(a.entry))
+                stAddr = append(stAddr, t.node.address)
+                stLive = append(stLive, true)
+                stNodes = append(stNodes, t.node)
+                ops = append(ops, opInsert(t.node))
+            if t.tag == "delete":
+                let mut stagedDeleted = false
+                let mut s = len(stAddr) - 1
+                loop s >= 0:
+                    if stAddr[s] == t.address:
+                        stagedDeleted = !stLive[s]
+                        break
+                    s = s - 1
+                if !stagedDeleted:
+                    let sn2 = do enStagedNode(e, stAddr, stLive, stNodes, t.address)
+                    e = sn2.eng
+                    if !sn2.ok:
+                        let f2 = do txFail(e, "storage", sn2.err)
+                        return f2
+                    if !sn2.found:
+                        let f3 = do txFail(e, "invalid", "transaction failed, nothing applied: delete target not found: " + t.address)
+                        return f3
+                    let ld = do enLowerDeleteInto(e, [sn2.node], ops, stAddr, stLive, stNodes)
+                    e = ld.eng
+                    if !ld.ok:
+                        let f4 = do txFail(e, ld.kind, ld.err)
+                        return f4
+                    ops = ld.ops
+                    stAddr = ld.stAddr
+                    stLive = ld.stLive
+                    stNodes = ld.stNodes
+            if t.tag == "clear" || t.tag == "deleteWhere":
+                # lower_selection over staged_selection: the kind index's
+                # addresses and every staged one, in address order.
+                let kp = do indexKindPrefix(t.kind)
+                let sc = do enScanTree(e, "kind", kp)
+                e = sc.eng
+                if !sc.ok:
+                    let f5 = do txFail(e, "invalid", sc.err)
+                    return f5
+                let mut cands = []
+                let pl = len(kp)
+                let nk = len(sc.keys)
+                let mut k = 0
+                loop k < nk:
+                    let kb = do fqwHexBytes(sc.keys[k])
+                    cands = do qSortedInsert(cands, bytesToText(btRange(kb, pl, len(kb))))
+                    k = k + 1
+                let nsa = len(stAddr)
+                let mut k2 = 0
+                loop k2 < nsa:
+                    cands = do qSortedInsert(cands, stAddr[k2])
+                    k2 = k2 + 1
+                let mut targets = []
+                let nc = len(cands)
+                let mut c = 0
+                loop c < nc:
+                    let sn3 = do enStagedNode(e, stAddr, stLive, stNodes, cands[c])
+                    e = sn3.eng
+                    if !sn3.ok:
+                        let f6 = do txFail(e, "storage", sn3.err)
+                        return f6
+                    if sn3.found:
+                        let m = do txSelectionMatches(sn3.node, t.kind, t.hasWhere, t.where, t.owner, t.isAdmin)
+                        if !m.ok:
+                            let f7 = do txFail(e, "invalid", m.err)
+                            return f7
+                        if m.v:
+                            targets = append(targets, cands[c])
+                    c = c + 1
+                let mut seeds = []
+                let nt = len(targets)
+                let mut ti = 0
+                loop ti < nt:
+                    let sn4 = do enStagedNode(e, stAddr, stLive, stNodes, targets[ti])
+                    e = sn4.eng
+                    if !sn4.ok:
+                        let f8 = do txFail(e, "storage", sn4.err)
+                        return f8
+                    if sn4.found:
+                        seeds = append(seeds, sn4.node)
+                    else:
+                        stAddr = append(stAddr, targets[ti])
+                        stLive = append(stLive, false)
+                        stNodes = append(stNodes, operationBlank("insert").node)
+                        ops = append(ops, opDelete(targets[ti]))
+                    ti = ti + 1
+                let ld2 = do enLowerDeleteInto(e, seeds, ops, stAddr, stLive, stNodes)
+                e = ld2.eng
+                if !ld2.ok:
+                    let f9 = do txFail(e, ld2.kind, ld2.err)
+                    return f9
+                ops = ld2.ops
+                stAddr = ld2.stAddr
+                stLive = ld2.stLive
+                stNodes = ld2.stNodes
+            if t.tag == "setIf":
+                let sn5 = do enStagedNode(e, stAddr, stLive, stNodes, t.address)
+                e = sn5.eng
+                if !sn5.ok:
+                    let f10 = do txFail(e, "storage", sn5.err)
+                    return f10
+                if !sn5.found:
+                    let f11 = do txFail(e, "precondition", "set_if target not found: " + t.address)
+                    return f11
+                let cw = do nodeCanWrite(sn5.node, t.owner)
+                if !(t.isAdmin || cw):
+                    let f12 = do txFail(e, "invalid", "transaction failed, nothing applied: not authorized to set_if " + t.address)
+                    return f12
+                let nx = do txSetIfNext(sn5.node, t.field, t.expect, t.expectF, t.expectV, t.set)
+                if !nx.ok:
+                    let f13 = do txFail(e, nx.kind, nx.err)
+                    return f13
+                let a2 = do enArchiveNow(e, sn5.node)
+                e = a2.eng
+                ops = append(ops, opArchive(a2.entry))
+                stAddr = append(stAddr, t.address)
+                stLive = append(stLive, true)
+                stNodes = append(stNodes, nx.node)
+                ops = append(ops, opInsert(nx.node))
+            if t.tag == "insertEdge":
+                let ends = [t.edge.from, t.edge.to]
+                let labels = ["from", "to"]
+                let mut j = 0
+                loop j < 2:
+                    let sn6 = do enStagedNode(e, stAddr, stLive, stNodes, ends[j])
+                    e = sn6.eng
+                    if !sn6.ok:
+                        let f14 = do txFail(e, "storage", sn6.err)
+                        return f14
+                    if !sn6.found:
+                        let f15 = do txFail(e, "invalid", "transaction failed, nothing applied: edge '" + labels[j] + "' address not found: " + ends[j])
+                        return f15
+                    j = j + 1
+                let ek = do txEdgeKey(t.edge.from, t.edge.to, t.edge.kind)
+                seKeys = append(seKeys, ek)
+                seLive = append(seLive, true)
+                seEdges = append(seEdges, t.edge)
+                ops = append(ops, opInsertEdge(t.edge))
+            if t.tag == "deleteEdge":
+                let ek2 = do txEdgeKey(t.edge.from, t.edge.to, t.edge.kind)
+                let mut at = -1
+                let mut q = len(seKeys) - 1
+                loop q >= 0:
+                    if seKeys[q] == ek2:
+                        at = q
+                        break
+                    q = q - 1
+                let mut skip = false
+                if at >= 0 && !seLive[at]:
+                    skip = true
+                if !skip:
+                    let mut found = false
+                    let mut edge = t.edge
+                    if at >= 0:
+                        found = true
+                        edge = seEdges[at]
+                    else:
+                        let fe = do enFindEdge(e, t.edge.from, t.edge.to, t.edge.kind)
+                        e = fe.eng
+                        if !fe.ok:
+                            let f16 = do txFail(e, "storage", fe.err)
+                            return f16
+                        found = fe.found
+                        edge = fe.edge
+                    if !found:
+                        let f17 = do txFail(e, "invalid", "transaction failed, nothing applied: delete target not found: edge " + t.edge.from + " -[" + t.edge.kind + "]-> " + t.edge.to)
+                        return f17
+                    let ecw = do edgeCanWrite(edge, t.owner)
+                    if !(t.isAdmin || ecw):
+                        let f18 = do txFail(e, "invalid", "transaction failed, nothing applied: not authorized to delete edge " + t.edge.from + " -[" + t.edge.kind + "]-> " + t.edge.to)
+                        return f18
+                    seKeys = append(seKeys, ek2)
+                    seLive = append(seLive, false)
+                    seEdges = append(seEdges, edge)
+                    ops = append(ops, opDeleteEdge(edgeIdNew(t.edge.from, t.edge.to, t.edge.kind)))
+            i = i + 1
+        return TxLowered{ok: true, kind: "", err: "", eng: e, ops: ops}
+
+    # txExecute: execute_transaction — lowered, bounded, checked, and
+    # committed as one frame (Transaction::commit).
+    proc txExecuteK(e0: FqEngine, txops: [TxOp]) -> FqKindR uses io.file:
+        let lw = do txLower(e0, txops)
+        if !lw.ok:
+            return FqKindR{ok: false, kind: lw.kind, err: lw.err, eng: lw.eng}
+        let e = lw.eng
+        let bound = do enMaxTransactionOps()
+        if len(lw.ops) > bound:
+            return FqKindR{ok: false, kind: "invalid", err: "transaction failed, nothing applied: it resolves to " + len(lw.ops) + " mutations, over the " + bound + " this engine will stage in one frame. Split the batch, or raise FACETQL_MAX_TRANSACTION_OPS.", eng: e}
+        let u = do enCheckUnique(e, lw.ops)
+        if !u.ok:
+            return FqKindR{ok: false, kind: "invalid", err: u.err, eng: u.eng}
+        let rf = do enCheckReferences(u.eng, lw.ops)
+        if !rf.ok:
+            return FqKindR{ok: false, kind: "invalid", err: rf.err, eng: rf.eng}
+        let c = do enCommitFrame(rf.eng, lw.ops)
+        return FqKindR{ok: c.ok, kind: "storage", err: c.err, eng: c.eng}
+
+    proc txExecute(e0: FqEngine, txops: [TxOp]) -> FqEngR uses io.file:
+        let r = do txExecuteK(e0, txops)
+        return FqEngR{ok: r.ok, err: r.err, eng: r.eng}
+
+    # txDeleteWhereTargets: delete_where_targets — the addresses a
+    # clear_kind / delete_where would select right now (the kind index in
+    # order, each live node read and matched), for the event a committed
+    # transaction publishes.
+    struct TxTargets:
+        ok: bool
+        err: text
+        eng: FqEngine
+        addrs: [text]
+
+    proc txDeleteWhereTargets(e0: FqEngine, kind: text, hasWhere: bool, where: FqJ, owner: text, isAdmin: bool) -> TxTargets uses io.file:
+        let kp = do indexKindPrefix(kind)
+        let sc = do enScanTree(e0, "kind", kp)
+        let mut e = sc.eng
+        if !sc.ok:
+            return TxTargets{ok: false, err: sc.err, eng: e, addrs: []}
+        let cap = do enMaxScanRows()
+        let mut out = []
+        let pl = len(kp)
+        let n = len(sc.keys)
+        let mut i = 0
+        loop i < n:
+            let kb = do fqwHexBytes(sc.keys[i])
+            let addr = bytesToText(btRange(kb, pl, len(kb)))
+            let r = do enReadNode(e, addr)
+            e = r.eng
+            if !r.ok:
+                return TxTargets{ok: false, err: r.err, eng: e, addrs: []}
+            if r.found:
+                let m = do txSelectionMatches(r.node, kind, hasWhere, where, owner, isAdmin)
+                if !m.ok:
+                    return TxTargets{ok: false, err: m.err, eng: e, addrs: []}
+                if m.v:
+                    if len(out) >= cap:
+                        let lim = do enScanLimitExceeded("this bulk delete")
+                        return TxTargets{ok: false, err: lim, eng: e, addrs: []}
+                    out = append(out, addr)
+            i = i + 1
+        return TxTargets{ok: true, err: "", eng: e, addrs: out}
+
+    # claim: the node claimed by the worker (an insert of the claimed state).
+    proc txClaim(e0: FqEngine, address: text, worker: text) -> FqEngR uses io.file:
+        let r = do enReadNode(e0, address)
+        if !r.ok:
+            let f0 = do enErr(r.eng, r.err)
+            return f0
+        if !r.found:
+            let f1 = do enErr(r.eng, "node not found")
+            return f1
+        if r.node.hasClaimedBy:
+            let f2 = do enErr(r.eng, "already claimed by " + r.node.claimedBy)
+            return f2
+        let nd = r.node
+        let claimed = Node{address: nd.address, coordinate: nd.coordinate, value: nd.value, kind: nd.kind, data: nd.data, owner: nd.owner, hasClaimedBy: true, claimedBy: worker, visibility: nd.visibility}
+        let out = do enInsert(r.eng, claimed)
+        return out
+
+    # sequence_next: a block of `count` numbers from the named counter.
+    struct TxSeq:
+        ok: bool
+        err: text
+        eng: FqEngine
+        start: text
+
+    proc txSequenceNext(e0: FqEngine, name: text, count: int, owner: text, isAdmin: bool) -> TxSeq uses io.file:
+        if count <= 0 || count > 100000:
+            return TxSeq{ok: false, err: "sequence block must be between 1 and 100000, got " + count, eng: e0, start: ""}
+        if name == "" || len(name) > 128 || contains(name, ":"):
+            let q = do ckQuote(name)
+            return TxSeq{ok: false, err: "sequence name must be 1..=128 characters and contain no ':', got " + q, eng: e0, start: ""}
+        let address = "__sequence:" + name
+        let r = do enReadNode(e0, address)
+        let mut e = r.eng
+        if !r.ok:
+            return TxSeq{ok: false, err: r.err, eng: e, start: ""}
+        let mut start = 1
+        let mut nodeOwner = owner
+        if r.found:
+            let cw = do nodeCanWrite(r.node, owner)
+            if !(isAdmin || cw):
+                let q2 = do ckQuote(name)
+                return TxSeq{ok: false, err: "not authorized to advance sequence " + q2 + ": it belongs to another owner", eng: e, start: ""}
+            nodeOwner = r.node.owner
+            let p = do fjParse(r.node.data)
+            if p.ok:
+                let g = do fjGet(p.v, "next")
+                if g.ok && g.v.kind == "int" && charAt(g.v.s, 0) != "-" && fjDigitsLE(g.v.s, "9223372036854775807"):
+                    start = toInt(g.v.s)
+        let next = start + count
+        if next < start:
+            let q3 = do ckQuote(name)
+            return TxSeq{ok: false, err: "sequence " + q3 + " is exhausted at " + start, eng: e, start: ""}
+        let coord = do coordinateNew(0, 0, 0, 0)
+        let nd = do nodeNew(coord, address, "__sequence", nodeOwner)
+        let withData = Node{address: nd.address, coordinate: nd.coordinate, value: nd.value, kind: nd.kind, data: "{\"next\":" + next + "}", owner: nd.owner, hasClaimedBy: nd.hasClaimedBy, claimedBy: nd.claimedBy, visibility: nd.visibility}
+        let ins = do enInsert(e, withData)
+        if !ins.ok:
+            return TxSeq{ok: false, err: ins.err, eng: ins.eng, start: ""}
+        return TxSeq{ok: true, err: "", eng: ins.eng, start: "" + start}
+
+    # insert_with_edges: the node (archiving what it replaces, if the owner
+    # may) and an edge to each target, in one frame.
+    proc txInsertWithEdges(e0: FqEngine, node: Node, targetTo: [text], targetKind: [text], isAdmin: bool) -> FqEngR uses io.file:
+        let r = do enReadNode(e0, node.address)
+        let mut e = r.eng
+        if !r.ok:
+            let f0 = do enErr(e, r.err)
+            return f0
+        let mut ops = []
+        if r.found:
+            let cw = do nodeCanWrite(r.node, node.owner)
+            if !(isAdmin || cw):
+                let f1 = do enErr(e, "not authorized to overwrite node '" + node.address + "':                              it belongs to another owner")
+                return f1
+            let a = do enArchiveNow(e, r.node)
+            e = a.eng
+            ops = append(ops, opArchive(a.entry))
+        ops = append(ops, opInsert(node))
+        let n = len(targetTo)
+        let mut i = 0
+        loop i < n:
+            let edge = do edgeNew(node.address, targetTo[i], targetKind[i], node.owner)
+            let ends = [edge.from, edge.to]
+            let labels = ["from", "to"]
+            let mut j = 0
+            loop j < 2:
+                if ends[j] != node.address:
+                    let g = do stGet(e.st, "primary", textToBytes(ends[j]))
+                    e = do enWith(e, g.store)
+                    if !g.ok:
+                        let f2 = do enErr(e, g.err)
+                        return f2
+                    if !g.found:
+                        let f3 = do enErr(e, "edge '" + labels[j] + "' address not found: " + ends[j])
+                        return f3
+                j = j + 1
+            ops = append(ops, opInsertEdge(edge))
+            i = i + 1
+        let out = do enApplyAtomic(e, ops)
+        return out
+
+    # ── harness: the engine script vocabulary plus these ───────────────
+    #   tx SUB~SUB~…   SUB: ins ADDR KIND OWNER DATA | del ADDR |
+    #                  edge F T K | unedge F T K OWNER ADMIN |
+    #                  clear KIND OWNER ADMIN | delwhere KIND OWNER ADMIN
+    #                  WHERE | setif ADDR FIELD OWNER ADMIN EXPECT SET
+    #                  (EXPECT: atmost:N | eq:JSON | absent)
+    #   claim ADDR WORKER | seq NAME COUNT OWNER ADMIN |
+    #   iwe ADDR KIND OWNER ADMIN TO:KIND,…|- DATA
+    proc txParseSub(s: text) -> TxOp:
+        let w = split(trim(s), " ")
+        let blank = do operationBlank("insert")
+        let n0 = do fjNull()
+        let e0 = do edgeNew("", "", "", "")
+        let mut t = TxOp{tag: "", node: blank.node, address: "", edge: e0, owner: "", isAdmin: false, kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0}
+        let verb = w[0]
+        if verb == "ins":
+            let ds = len(w[0]) + len(w[1]) + len(w[2]) + len(w[3]) + 4
+            let nd = do ixScriptNode(w[1], w[2], w[3], slice(trim(s), ds, len(trim(s))))
+            t = TxOp{tag: "insert", node: nd, address: "", edge: e0, owner: "", isAdmin: false, kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0}
+        if verb == "del":
+            t = TxOp{tag: "delete", node: blank.node, address: w[1], edge: e0, owner: "", isAdmin: false, kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0}
+        if verb == "edge":
+            let ed = do edgeNew(w[1], w[2], w[3], "alice")
+            t = TxOp{tag: "insertEdge", node: blank.node, address: "", edge: ed, owner: "", isAdmin: false, kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0}
+        if verb == "unedge":
+            let ed2 = do edgeNew(w[1], w[2], w[3], "")
+            t = TxOp{tag: "deleteEdge", node: blank.node, address: "", edge: ed2, owner: w[4], isAdmin: w[5] == "admin", kind: "", hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0}
+        if verb == "clear":
+            t = TxOp{tag: "clear", node: blank.node, address: "", edge: e0, owner: w[2], isAdmin: w[3] == "admin", kind: w[1], hasWhere: false, where: n0, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0}
+        if verb == "delwhere":
+            let p = do fjParse(w[4])
+            t = TxOp{tag: "deleteWhere", node: blank.node, address: "", edge: e0, owner: w[2], isAdmin: w[3] == "admin", kind: w[1], hasWhere: true, where: p.v, field: "", expect: "", expectF: 0.0, expectV: n0, set: n0}
+        if verb == "setif":
+            let ex = w[5]
+            let mut expect = "absent"
+            let mut ef = 0.0
+            let mut ev = n0
+            if slice(ex, 0, 7) == "atmost:":
+                expect = "atmost"
+                let pn = do fjParse(slice(ex, 7, len(ex)))
+                ef = pn.v.f
+            if slice(ex, 0, 3) == "eq:":
+                expect = "equals"
+                let pv = do fjParse(slice(ex, 3, len(ex)))
+                ev = pv.v
+            let ps = do fjParse(w[6])
+            t = TxOp{tag: "setIf", node: blank.node, address: w[1], edge: e0, owner: w[3], isAdmin: w[4] == "admin", kind: "", hasWhere: false, where: n0, field: w[2], expect: expect, expectF: ef, expectV: ev, set: ps.v}
+        return t
+
+    # txScriptOp: one op of this harness's vocabulary (tx, claim, seq,
+    # iwe, and fqengine.fct's enScriptOp for the rest); on success `err`
+    # carries what it prints.
+    proc txScriptOp(e: FqEngine, line: text) -> FqEngR uses io.file:
+        let w = split(line, " ")
+        let verb = w[0]
+        if verb == "tx":
+            let subs = split(slice(line, 3, len(line)), "~")
+            let mut tops = []
+            let ns = len(subs)
+            let mut k = 0
+            loop k < ns:
+                let sub = do txParseSub(subs[k])
+                tops = append(tops, sub)
+                k = k + 1
+            let r = do txExecute(e, tops)
+            if !r.ok:
+                return r
+            return FqEngR{ok: true, err: "ok;", eng: r.eng}
+        if verb == "claim":
+            let r2 = do txClaim(e, w[1], w[2])
+            if !r2.ok:
+                return r2
+            return FqEngR{ok: true, err: "ok;", eng: r2.eng}
+        if verb == "seq":
+            let sq = do txSequenceNext(e, w[1], toInt(w[2]), w[3], w[4] == "admin")
+            if !sq.ok:
+                return FqEngR{ok: false, err: sq.err, eng: sq.eng}
+            return FqEngR{ok: true, err: "ok start=" + sq.start + ";", eng: sq.eng}
+        if verb == "iwe":
+            let mut tos = []
+            let mut kinds = []
+            if w[5] != "-":
+                let ts = split(w[5], ",")
+                let nt = len(ts)
+                let mut ti = 0
+                loop ti < nt:
+                    let pr = split(ts[ti], ":")
+                    tos = append(tos, pr[0])
+                    kinds = append(kinds, pr[1])
+                    ti = ti + 1
+            let ds = len(w[0]) + len(w[1]) + len(w[2]) + len(w[3]) + len(w[4]) + len(w[5]) + 6
+            let nd = do ixScriptNode(w[1], w[2], w[3], slice(line, ds, len(line)))
+            let r3 = do txInsertWithEdges(e, nd, tos, kinds, w[4] == "admin")
+            if !r3.ok:
+                return r3
+            return FqEngR{ok: true, err: "ok edges=" + len(tos) + ";", eng: r3.eng}
+        let one = do enScriptOp(e, line)
+        return one
+
+    struct TxRun:
+        eng: FqEngine
+        out: text
+
+    proc txRunOps(e0: FqEngine, script: text) -> TxRun uses io.file:
+        let mut e = e0
+        let mut out = ""
+        let ops = split(script, ";")
+        let n = len(ops)
+        let mut i = 0
+        loop i < n:
+            let line = trim(ops[i])
+            if line != "":
+                let r = do txScriptOp(e, line)
+                if !r.ok:
+                    out = out + "error: " + r.err + ";"
+                else:
+                    e = r.eng
+                    out = out + r.err
+            i = i + 1
+        return TxRun{eng: e, out: out}
+
+    proc txScriptText(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes)
+        if !ld.ok:
+            return "error: " + ld.err
+        let run = do txRunOps(ld.eng, script)
+        let cp = do ckRead(dir + "facetql.checkpoint")
+        return run.out + "|checkpoint=" + cp.value
+
+    # txReportText: facetql_check's engine-report — open as Database::new
+    # does (load, recovery, compact_user_log), run the ops, then stats
+    # (the runtime section is the server's, so it is left null here), the
+    # users (sorted `owner:Role`), the declared indexes and references,
+    # the user log's record count, and one change scan per
+    # `after:limit:owner:admin`.
+    proc txReportText(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text, scans: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let ld = do enLoad(dir, key, nonceBase, interval, rotateBytes)
+        if !ld.ok:
+            return "error: " + ld.err
+        let cu = do enCompactUserLog(ld.eng)
+        if !cu.ok:
+            return "error: " + cu.err
+        let run = do txRunOps(cu.eng, script)
+        let mut e = run.eng
+        let st = do enStatsJson(e, "null")
+        e = st.eng
+        let mut users = []
+        let nu = len(e.users)
+        let mut i = 0
+        loop i < nu:
+            let mut role = "User"
+            if e.users[i].role == "admin":
+                role = "Admin"
+            users = append(users, e.users[i].owner + ":" + role)
+            i = i + 1
+        let sortedUsers = do fqwSortText(users)
+        let ix = do enListAllIndexes(e)
+        let refs = do enListReferences(e)
+        let ul = do bnReadAll(dir + "facetql.users", key)
+        let mut out = run.out + "\n" + st.text + "\n" + join(sortedUsers, ",") + "\n" + ix + "\n" + refs + "\nuserlog=" + len(ul.records)
+        let specs = split(scans, ";")
+        let ns = len(specs)
+        let mut k = 0
+        loop k < ns:
+            if specs[k] != "":
+                let f = split(specs[k], ":")
+                let c = do enChanges(e, toInt(f[0]), toInt(f[1]), f[2], f[3] == "admin")
+                e = c.eng
+                out = out + "\n" + c.status + " " + c.body
+            k = k + 1
+        return out
+
+    action runReport(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text, scans: text):
+        let r = do txReportText(dir, keyHex, nonceBase, interval, rotateBytes, script, scans)
+        txOut = r
+
+    state txOut: text = ""
+
+    action runTx(dir: text, keyHex: text, nonceBase: int, interval: int, rotateBytes: int, script: text):
+        let r = do txScriptText(dir, keyHex, nonceBase, interval, rotateBytes, script)
+        txOut = r
+
+    view TxHome at "/tx":
+        text "{txOut}"

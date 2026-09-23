@@ -1,0 +1,773 @@
+import "../../fabric_table.fct"
+
+app FabricTableCheck:
+    # Conformance scenarios for fabric_table.fct (fabric-routing table.rs),
+    # mirroring step for step the scratch Rust binary whose output is
+    # table_rust.tsv: every table.rs #[test] plus topology-ordering,
+    # availability, forget/require-proven-health, preference and range
+    # traces. Migrations are driven through fabric_migration_plan.fct's real
+    # Migration and published with tableObserveMigrationOf.
+
+    proc lbJoin(xs: [text], sep: text) -> text:
+        let mut s = ""
+        let mut i = 0
+        loop i < len(xs):
+            if i > 0:
+                s = s + sep
+            s = s + xs[i]
+            i = i + 1
+        return s
+
+    proc lbPush(t: text, s: text) -> text:
+        if t == "":
+            return s
+        return t + "#" + s
+
+    proc lbSetD(g: ReplGroup) -> text:
+        let mut xs = []
+        let mut i = 0
+        loop i < len(g.replicas):
+            let r = g.replicas[i]
+            let role = do replRoleLabel(r.isPrimary)
+            let st = do replStateLabel(r.state)
+            xs = append(xs, r.node + ":" + role + ":" + st)
+            i = i + 1
+        let j = do lbJoin(xs, ",")
+        return j
+
+    proc lbMigD(m: TableShardMigration) -> text:
+        let mut w = "-"
+        if m.hasWriteOwner:
+            w = m.writeOwner
+        return "" + m.shardId + ":" + m.source + ":" + m.destination + ":" + m.hasCutOver + ":" + w
+
+    proc lbTbl(t: TableRoutingTable) -> text:
+        let mut nodes = []
+        let mut i = 0
+        loop i < len(t.nodes):
+            let n = t.nodes[i]
+            nodes = append(nodes, n.id + ":" + n.region + ":" + n.availability)
+            i = i + 1
+        let mut shards = []
+        let mut k = 0
+        loop k < len(t.shards):
+            let e = t.shards[k]
+            let extras = do lbJoin(e.extraOwners, ",")
+            let mut ov = []
+            let mut ci = 0
+            loop ci < 156:
+                let cc = do coordinateAt(ci)
+                let o = do tableShardEntryOwnerOf(e, cc)
+                if o != e.owner:
+                    ov = append(ov, "" + cc.x + "," + cc.y + ">" + o)
+                ci = ci + 1
+            let ovj = do lbJoin(ov, ",")
+            let cells = do tableShardEntryScopedCells(e)
+            let mut sc = []
+            let mut si = 0
+            loop si < len(cells):
+                let cc = cells[si]
+                let rs = do tableShardEntryReplicaSetAt(e, cc)
+                let mut rd = "-"
+                if rs.has:
+                    rd = do lbSetD(rs.group)
+                let ms = do tableShardEntryMigrationAt(e, cc)
+                let mut md = "-"
+                if ms.has:
+                    md = do lbMigD(ms.migration)
+                sc = append(sc, "" + cc.x + "," + cc.y + "[" + rd + "][" + md + "]")
+                si = si + 1
+            let scj = do lbJoin(sc, ";")
+            let mut rsd = "-"
+            if e.hasReplicas:
+                rsd = do lbSetD(e.replicas)
+            let mut msd = "-"
+            if e.hasMigration:
+                msd = do lbMigD(e.migration)
+            shards = append(shards, "" + e.shardId + ":" + e.owner + ":" + extras + ":" + ovj + ":R[" + rsd + "]:M[" + msd + "]:S[" + scj + "]")
+            k = k + 1
+        let nj = do lbJoin(nodes, ";")
+        let sj = do lbJoin(shards, ";")
+        return "g" + t.generation + "|" + nj + "|" + sj
+
+    proc lbRoute(r: Route) -> text:
+        let mut cc = "-"
+        if r.hasCoordinate:
+            cc = "" + r.coordinate.x + "," + r.coordinate.y
+        return "" + r.shardId + ":" + cc + ":" + r.node + ":" + r.region + ":" + r.servedBy + ":" + r.kind + ":" + r.generation
+
+    proc lbErr(e: RoutingError) -> text:
+        let m = do routingErrorMessage(e)
+        let r = do routingErrorIsRetryable(e)
+        return "err:" + m + ":" + r
+
+    proc lbRes(r: TableResolveResult) -> text:
+        if r.ok:
+            let s = do lbRoute(r.route)
+            return s
+        let e = do lbErr(r.err)
+        return e
+
+    proc lbCands(r: TableCandidatesResult) -> text:
+        if !r.ok:
+            let e = do lbErr(r.err)
+            return e
+        let mut xs = []
+        let mut i = 0
+        loop i < len(r.routes):
+            let s = do lbRoute(r.routes[i])
+            xs = append(xs, s)
+            i = i + 1
+        let j = do lbJoin(xs, ";")
+        return j
+
+    proc lbSegs(r: TableResolveRangeResult) -> text:
+        if !r.ok:
+            let e = do lbErr(r.err)
+            return e
+        let mut xs = []
+        let mut i = 0
+        loop i < len(r.segments):
+            let s = r.segments[i]
+            let l = do routeSegmentLen(s)
+            let rt = do lbRoute(s.route)
+            xs = append(xs, "" + s.range.start.x + "," + s.range.start.y + "-" + s.range.end.x + "," + s.range.end.y + ":" + l + ":" + rt)
+            i = i + 1
+        let j = do lbJoin(xs, ";")
+        return j
+
+    proc lbTopology() -> TableTopology:
+        let a0 = do tableTopologyNodeNew("db-a", "phoenix")
+        let a = do tableTopologyNodeAddShard(a0, 42)
+        let b = do tableTopologyNodeNew("db-b", "dallas")
+        return TableTopology{nodes: [a, b]}
+
+    proc lbKeyAt(x: int, y: int) -> RoutingKey:
+        let r = do routingKeyNew(42, Coordinate{x: x, y: y})
+        return r.key
+
+    proc lbKey() -> RoutingKey:
+        let k = do lbKeyAt(7, 3)
+        return k
+
+    proc lbPref(kind: text) -> ReadPreference:
+        return ReadPreference{kind: kind, region: ""}
+
+    proc lbRegion(region: text) -> ReadPreference:
+        return ReadPreference{kind: "PreferRegion", region: region}
+
+    proc lbReadIntent(kind: text) -> RouteIntent:
+        let p = do lbPref(kind)
+        return RouteIntent{isWrite: false, readPref: p}
+
+    proc lbWriteIntent() -> RouteIntent:
+        let p = do lbPref("Primary")
+        return RouteIntent{isWrite: true, readPref: p}
+
+    proc lbReplicaSet() -> ReplGroup:
+        let g = do replGroupBootstrap(42, 3, "db-a", "phoenix")
+        let a = do replOpAdd("db-b", "dallas")
+        let r1 = do replGroupApply(g, a)
+        let s = do replOpBeginSeed("db-b")
+        let r2 = do replGroupApply(r1.group, s)
+        let y = do replOpMarkInSync("db-b")
+        let r3 = do replGroupApply(r2.group, y)
+        return r3.group
+
+    proc lbMigration() -> Migration:
+        let shard = do shardNew(42, "social")
+        let reason = do migrationReasonRebalance()
+        let pr = do migrationPlanNew(MigrationId{value: 1}, shard, "db-a", "db-b", reason, 1000)
+        let m = do migrationNew(pr.plan)
+        return m
+
+    proc lbTwoCelled() -> TableRoutingTable:
+        let topo = do lbTopology()
+        let t = do tableFromTopology(topo)
+        let r0 = do topologyRegistryNew()
+        let r1 = do topologyRegistryPlace(r0, "db-a", 42, Coordinate{x: 0, y: 0}, "phoenix")
+        let r2 = do topologyRegistryPlace(r1, "db-a", 42, Coordinate{x: 1, y: 0}, "phoenix")
+        let t2 = do tableApplyPlacements(t, r2)
+        return t2
+
+    proc lbObserve(t: TableRoutingTable, m: Migration) -> TableRoutingTable:
+        let r = do tableObserveMigrationOf(t, m, false, Coordinate{x: 0, y: 0})
+        return r.table
+
+    proc lbObserveAt(t: TableRoutingTable, m: Migration, x: int, y: int) -> TableRoutingTable:
+        let r = do tableObserveMigrationOf(t, m, true, Coordinate{x: x, y: y})
+        return r.table
+
+    proc lbReadAt(t: TableRoutingTable, x: int, y: int, pref: ReadPreference) -> text:
+        let k = do lbKeyAt(x, y)
+        let r = do tableResolveRead(t, k, pref)
+        let s = do lbRes(r)
+        return s
+
+    proc lbWriteAt(t: TableRoutingTable, x: int, y: int) -> text:
+        let k = do lbKeyAt(x, y)
+        let r = do tableResolveWrite(t, k)
+        let s = do lbRes(r)
+        return s
+
+    proc lbCandsAt(t: TableRoutingTable, x: int, y: int, pref: ReadPreference) -> text:
+        let k = do lbKeyAt(x, y)
+        let req = do routeRequestRead(k, pref)
+        let r = do tableCandidates(t, req)
+        let s = do lbCands(r)
+        return s
+
+    proc lbCaughtUpCopy(m0: Migration) -> Migration:
+        let a = do migrationBeginCopy(m0, 2000)
+        let b = do migrationRecordCopy(a.value, 156, 4096, 3000)
+        let c = do migrationBeginCatchUp(b.value, 4000)
+        return c.value
+
+    proc tTopology() -> text:
+        let mut t = ""
+        let topo = do lbTopology()
+        let tb = do tableFromTopology(topo)
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        let w0 = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w0)
+        let b0 = do tableTopologyNodeNew("db-b", "dallas")
+        let b = do tableTopologyNodeAddShard(b0, 42)
+        let tb2 = do tableApplyTopology(tb, TableTopology{nodes: [b]})
+        let d1 = do lbTbl(tb2)
+        t = do lbPush(t, d1)
+        let w1 = do lbWriteAt(tb2, 7, 3)
+        t = do lbPush(t, w1)
+        let k999r = do routingKeyNew(999, Coordinate{x: 0, y: 0})
+        let w2r = do tableResolveWrite(tb2, k999r.key)
+        let w2 = do lbRes(w2r)
+        t = do lbPush(t, w2)
+        let bad = RoutingKey{shardId: 42, coordinate: Coordinate{x: 12, y: 0}}
+        let pp = do lbPref("Primary")
+        let r3r = do tableResolveRead(tb2, bad, pp)
+        let r3 = do lbRes(r3r)
+        t = do lbPush(t, r3)
+        return t
+
+    proc tTopologyOrder() -> text:
+        let mut t = ""
+        let z0 = do tableTopologyNodeNew("db-z", "r1")
+        let z1 = do tableTopologyNodeAddShard(z0, 3)
+        let z = do tableTopologyNodeAddShard(z1, 1)
+        let c0 = do tableTopologyNodeNew("db-c", "r2")
+        let c1 = do tableTopologyNodeAddShard(c0, 1)
+        let c = do tableTopologyNodeAddShard(c1, 2)
+        let m0 = do tableTopologyNodeNew("db-m", "r1")
+        let m1 = do tableTopologyNodeAddShard(m0, 2)
+        let m2 = do tableTopologyNodeAddShard(m1, 3)
+        let m = do tableTopologyNodeAddShard(m2, 1)
+        let a = do tableTopologyNodeNew("db-a", "r3")
+        let mut tb = do tableFromTopology(TableTopology{nodes: [z, c, m, a]})
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        let n10 = do tableTopologyNodeNew("db-c", "r9")
+        let n11 = do tableTopologyNodeAddShard(n10, 3)
+        let n1 = do tableTopologyNodeAddShard(n11, 7)
+        let n20 = do tableTopologyNodeNew("db-z", "r1")
+        let n2 = do tableTopologyNodeAddShard(n20, 3)
+        tb = do tableApplyTopology(tb, TableTopology{nodes: [n1, n2]})
+        let d1 = do lbTbl(tb)
+        t = do lbPush(t, d1)
+        let s1 = do tableSetAvailability(tb, "db-q", "Serviceable")
+        t = do lbPush(t, "" + s1.changed)
+        tb = s1.table
+        let s2 = do tableSetAvailability(tb, "db-m", "Serviceable")
+        t = do lbPush(t, "" + s2.changed)
+        tb = s2.table
+        tb = do tableRegisterNode(tb, "db-m", "r7")
+        tb = do tableRegisterNode(tb, "db-0", "r0")
+        let d2 = do lbTbl(tb)
+        t = do lbPush(t, d2)
+        let f1 = do tableForgetShard(tb, 2)
+        t = do lbPush(t, "" + f1.removed)
+        let f2 = do tableForgetShard(f1.table, 2)
+        t = do lbPush(t, "" + f2.removed)
+        tb = f2.table
+        let d3 = do lbTbl(tb)
+        t = do lbPush(t, d3)
+        let pp = do lbPref("Primary")
+        let k7 = do routingKeyNew(7, Coordinate{x: 0, y: 0})
+        let r1 = do tableResolveRead(tb, k7.key, pp)
+        let s3 = do lbRes(r1)
+        t = do lbPush(t, s3)
+        tb = do tableRequireProvenHealth(tb, true)
+        let r2 = do tableResolveRead(tb, k7.key, pp)
+        let s4 = do lbRes(r2)
+        t = do lbPush(t, s4)
+        let k1 = do routingKeyNew(1, Coordinate{x: 0, y: 0})
+        let r3 = do tableResolveRead(tb, k1.key, pp)
+        let s5 = do lbRes(r3)
+        t = do lbPush(t, s5)
+        let d4 = do lbTbl(tb)
+        t = do lbPush(t, d4)
+        return t
+
+    proc tReplicas() -> text:
+        let mut t = ""
+        let topo = do lbTopology()
+        let tb0 = do tableFromTopology(topo)
+        let rs = do lbReplicaSet()
+        let sr = do tableSetReplicaSet(tb0, rs, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + sr.ok)
+        let tb = sr.table
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        let w = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w)
+        let af = do lbPref("AnyFresh")
+        let c1 = do lbCandsAt(tb, 7, 3, af)
+        t = do lbPush(t, c1)
+        let dal = do lbRegion("dallas")
+        let r1 = do lbReadAt(tb, 7, 3, dal)
+        t = do lbPush(t, r1)
+        let c2 = do lbCandsAt(tb, 7, 3, dal)
+        t = do lbPush(t, c2)
+        let nw = do lbRegion("nowhere")
+        let c3 = do lbCandsAt(tb, 7, 3, nw)
+        t = do lbPush(t, c3)
+        let ac = do lbPref("AnyCopy")
+        let c4 = do lbCandsAt(tb, 7, 3, ac)
+        t = do lbPush(t, c4)
+        let pp = do lbPref("Primary")
+        let c5 = do lbCandsAt(tb, 7, 3, pp)
+        t = do lbPush(t, c5)
+        return t
+
+    proc tFailedPrimary() -> text:
+        let mut t = ""
+        let topo = do lbTopology()
+        let tb0 = do tableFromTopology(topo)
+        let rs0 = do lbReplicaSet()
+        let fo = do replOpMarkFailed("db-a")
+        let rs1 = do replGroupApply(rs0, fo)
+        let sr = do tableSetReplicaSet(tb0, rs1.group, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + sr.ok)
+        let mut tb = sr.table
+        let w = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w)
+        let af = do lbPref("AnyFresh")
+        let r1 = do lbReadAt(tb, 7, 3, af)
+        t = do lbPush(t, r1)
+        let pp = do lbPref("Primary")
+        let r2 = do lbReadAt(tb, 7, 3, pp)
+        t = do lbPush(t, r2)
+        let th = do lagThresholdsDefault()
+        let rep = do replReportNew(42, "db-b", 10, 5000, 0)
+        let ob = do replGroupObserve(rs1.group, rep, th)
+        let sr2 = do tableSetReplicaSet(tb, ob.group, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + sr2.ok)
+        tb = sr2.table
+        let r3 = do lbReadAt(tb, 7, 3, af)
+        t = do lbPush(t, r3)
+        let ac = do lbPref("AnyCopy")
+        let c1 = do lbCandsAt(tb, 7, 3, ac)
+        t = do lbPush(t, c1)
+        let d = do lbTbl(tb)
+        t = do lbPush(t, d)
+        return t
+
+    proc tUnreachable() -> text:
+        let mut t = ""
+        let topo = do lbTopology()
+        let tb0 = do tableFromTopology(topo)
+        let s1 = do tableSetAvailability(tb0, "db-a", "Unreachable")
+        t = do lbPush(t, "" + s1.changed)
+        let w = do lbWriteAt(s1.table, 7, 3)
+        t = do lbPush(t, w)
+        let d = do lbTbl(s1.table)
+        t = do lbPush(t, d)
+        let tb1 = do tableFromTopology(topo)
+        let rs = do lbReplicaSet()
+        let sr = do tableSetReplicaSet(tb1, rs, false, Coordinate{x: 0, y: 0})
+        let s2 = do tableSetAvailability(sr.table, "db-a", "Unreachable")
+        let af = do lbPref("AnyFresh")
+        let c1 = do lbCandsAt(s2.table, 7, 3, af)
+        t = do lbPush(t, c1)
+        let w2 = do lbWriteAt(s2.table, 7, 3)
+        t = do lbPush(t, w2)
+        return t
+
+    proc tMigration() -> text:
+        let mut t = ""
+        let topo = do lbTopology()
+        let tb0 = do tableFromTopology(topo)
+        let m0 = do lbMigration()
+        let o0 = do tableObserveMigrationOf(tb0, m0, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + o0.ok)
+        let mut tb = o0.table
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        let pp = do lbPref("Primary")
+        let w0 = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w0)
+        let r0 = do lbReadAt(tb, 7, 3, pp)
+        t = do lbPush(t, r0)
+        let a = do migrationBeginCopy(m0, 2000)
+        let b = do migrationAcceptWrite(a.value, 0)
+        let c = do migrationRecordCopy(b.value, 156, 4096, 3000)
+        let d = do migrationBeginCatchUp(c.value, 4000)
+        let e = do migrationRecordApplied(d.value, 0, 4100)
+        let mut m = e.value
+        tb = do lbObserve(tb, m)
+        let d1 = do lbTbl(tb)
+        t = do lbPush(t, d1)
+        let r1 = do lbReadAt(tb, 7, 3, pp)
+        t = do lbPush(t, r1)
+        let w1 = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w1)
+        let f = do migrationBeginCutover(m, 5000)
+        m = f.value
+        tb = do lbObserve(tb, m)
+        let r2 = do lbReadAt(tb, 7, 3, pp)
+        t = do lbPush(t, r2)
+        let w2 = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w2)
+        let d2 = do lbTbl(tb)
+        t = do lbPush(t, d2)
+        let g = do migrationCompleteCutover(m, 5100)
+        m = g.value
+        tb = do lbObserve(tb, m)
+        let w3 = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w3)
+        let r3 = do lbReadAt(tb, 7, 3, pp)
+        t = do lbPush(t, r3)
+        let af = do lbPref("AnyFresh")
+        let c3 = do lbCandsAt(tb, 7, 3, af)
+        t = do lbPush(t, c3)
+        let h = do migrationComplete(m, 6000)
+        m = h.value
+        tb = do lbObserve(tb, m)
+        let d3 = do lbTbl(tb)
+        t = do lbPush(t, d3)
+        let w4 = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w4)
+        return t
+
+    proc tAbort() -> text:
+        let mut t = ""
+        let topo = do lbTopology()
+        let mut tb = do tableFromTopology(topo)
+        let m0 = do lbMigration()
+        let a = do migrationBeginCopy(m0, 2000)
+        tb = do lbObserve(tb, a.value)
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        let b = do migrationAbort(a.value, 2500, "destination ran out of disk")
+        tb = do lbObserve(tb, b.value)
+        let d1 = do lbTbl(tb)
+        t = do lbPush(t, d1)
+        let w = do lbWriteAt(tb, 7, 3)
+        t = do lbPush(t, w)
+        let empty = do tableNew()
+        let o = do tableObserveMigrationOf(empty, m0, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + o.ok)
+        let d2 = do lbTbl(o.table)
+        t = do lbPush(t, d2)
+        let w2 = do lbWriteAt(o.table, 7, 3)
+        t = do lbPush(t, w2)
+        return t
+
+    proc tRange() -> text:
+        let mut t = ""
+        let topo = do lbTopology()
+        let tb0 = do tableFromTopology(topo)
+        let r0 = do topologyRegistryNew()
+        let r1 = do topologyRegistryPlace(r0, "db-b", 42, Coordinate{x: 1, y: 0}, "dallas")
+        let r2 = do topologyRegistryPlace(r1, "db-b", 42, Coordinate{x: 2, y: 0}, "dallas")
+        let tb = do tableApplyPlacements(tb0, r2)
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        let rr = do coordinateRangeNew(Coordinate{x: 0, y: 0}, Coordinate{x: 4, y: 0})
+        let rd = do lbReadIntent("Primary")
+        let s1 = do tableResolveRange(tb, 42, rr.range, rd)
+        let g1 = do lbSegs(s1)
+        t = do lbPush(t, g1)
+        let rr2 = do coordinateRangeNew(Coordinate{x: 10, y: 0}, Coordinate{x: 3, y: 1})
+        let wr = do lbWriteIntent()
+        let s2 = do tableResolveRange(tb, 42, rr2.range, wr)
+        let g2 = do lbSegs(s2)
+        t = do lbPush(t, g2)
+        let s3 = do tableResolveRange(tb, 9, rr.range, rd)
+        let g3 = do lbSegs(s3)
+        t = do lbPush(t, g3)
+        let plain = do tableFromTopology(topo)
+        let s4 = do tableResolveScan(plain, [42], rd)
+        let g4 = do lbSegs(s4)
+        t = do lbPush(t, g4)
+        let rdf = do lbReadIntent("AnyFresh")
+        let s5 = do tableResolveScan(tb, [42, 42], rdf)
+        let g5 = do lbSegs(s5)
+        t = do lbPush(t, g5)
+        let s6 = do tableResolveScan(tb, [42, 5], rd)
+        let g6 = do lbSegs(s6)
+        t = do lbPush(t, g6)
+        return t
+
+    proc lbSib(t0: text, tb: TableRoutingTable) -> text:
+        let pp = do lbPref("Primary")
+        let r = do lbReadAt(tb, 1, 0, pp)
+        let w = do lbWriteAt(tb, 1, 0)
+        let t1 = do lbPush(t0, r)
+        let t2 = do lbPush(t1, w)
+        return t2
+
+    proc tCellMigration() -> text:
+        let mut t = ""
+        let mut tb = do lbTwoCelled()
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        let m0 = do lbMigration()
+        let o = do tableObserveMigrationOf(tb, m0, true, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + o.ok)
+        tb = o.table
+        t = do lbSib(t, tb)
+        let mut m = do lbCaughtUpCopy(m0)
+        tb = do lbObserveAt(tb, m, 0, 0)
+        t = do lbSib(t, tb)
+        let pp = do lbPref("Primary")
+        let r0 = do lbReadAt(tb, 0, 0, pp)
+        t = do lbPush(t, r0)
+        let a = do migrationBeginCutover(m, 5000)
+        m = a.value
+        tb = do lbObserveAt(tb, m, 0, 0)
+        let w0 = do lbWriteAt(tb, 0, 0)
+        t = do lbPush(t, w0)
+        t = do lbSib(t, tb)
+        let b = do migrationCompleteCutover(m, 5100)
+        m = b.value
+        tb = do lbObserveAt(tb, m, 0, 0)
+        let r1 = do lbReadAt(tb, 0, 0, pp)
+        t = do lbPush(t, r1)
+        t = do lbSib(t, tb)
+        let d1 = do lbTbl(tb)
+        t = do lbPush(t, d1)
+        let c = do migrationComplete(m, 6000)
+        m = c.value
+        tb = do lbObserveAt(tb, m, 0, 0)
+        let d2 = do lbTbl(tb)
+        t = do lbPush(t, d2)
+        let w1 = do lbWriteAt(tb, 0, 0)
+        t = do lbPush(t, w1)
+        t = do lbSib(t, tb)
+        return t
+
+    proc tCellReplicas() -> text:
+        let mut t = ""
+        let tb0 = do lbTwoCelled()
+        let rs = do lbReplicaSet()
+        let sr = do tableSetReplicaSet(tb0, rs, true, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + sr.ok)
+        let mut tb = sr.table
+        let af = do lbPref("AnyFresh")
+        let c1 = do lbCandsAt(tb, 0, 0, af)
+        t = do lbPush(t, c1)
+        let r1 = do lbReadAt(tb, 1, 0, af)
+        t = do lbPush(t, r1)
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        tb = do tableClearReplicaSet(tb, 42, true, Coordinate{x: 0, y: 0})
+        let d1 = do lbTbl(tb)
+        t = do lbPush(t, d1)
+        tb = do tableClearReplicaSet(tb, 42, true, Coordinate{x: 0, y: 0})
+        tb = do tableClearReplicaSet(tb, 42, false, Coordinate{x: 0, y: 0})
+        tb = do tableClearReplicaSet(tb, 77, false, Coordinate{x: 0, y: 0})
+        let d2 = do lbTbl(tb)
+        t = do lbPush(t, d2)
+        return t
+
+    proc tShardWide() -> text:
+        let mut t = ""
+        let tb0 = do lbTwoCelled()
+        let rs = do lbReplicaSet()
+        let sr = do tableSetReplicaSet(tb0, rs, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + sr.ok)
+        let mut tb = sr.table
+        let af = do lbPref("AnyFresh")
+        let r1 = do lbReadAt(tb, 0, 0, af)
+        t = do lbPush(t, r1)
+        let r2 = do lbReadAt(tb, 1, 0, af)
+        t = do lbPush(t, r2)
+        let po = do replOpPromote("db-b")
+        let promoted = do replGroupApply(rs, po)
+        let sr2 = do tableSetReplicaSet(tb, promoted.group, true, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + sr2.ok)
+        tb = sr2.table
+        let w1 = do lbWriteAt(tb, 0, 0)
+        t = do lbPush(t, w1)
+        let w2 = do lbWriteAt(tb, 1, 0)
+        t = do lbPush(t, w2)
+        let d0 = do lbTbl(tb)
+        t = do lbPush(t, d0)
+        tb = do tableClearReplicaSet(tb, 42, false, Coordinate{x: 0, y: 0})
+        let d1 = do lbTbl(tb)
+        t = do lbPush(t, d1)
+        return t
+
+    proc tRangeFenced() -> text:
+        let mut t = ""
+        let mut tb = do lbTwoCelled()
+        let m0 = do lbMigration()
+        let mv0 = do lbCaughtUpCopy(m0)
+        let a = do migrationBeginCutover(mv0, 5000)
+        let b = do migrationCompleteCutover(a.value, 5100)
+        tb = do lbObserveAt(tb, b.value, 0, 0)
+        let rr = do coordinateRangeNew(Coordinate{x: 0, y: 0}, Coordinate{x: 1, y: 0})
+        let rd = do lbReadIntent("Primary")
+        let s1 = do tableResolveRange(tb, 42, rr.range, rd)
+        let g1 = do lbSegs(s1)
+        t = do lbPush(t, g1)
+        let f0 = do migrationBeginCopy(m0, 6000)
+        let f1 = do migrationRecordCopy(f0.value, 156, 4096, 6500)
+        let f2 = do migrationBeginCatchUp(f1.value, 7000)
+        let f3 = do migrationBeginCutover(f2.value, 7500)
+        tb = do lbObserveAt(tb, f3.value, 1, 0)
+        let wr = do lbWriteIntent()
+        let s2 = do tableResolveRange(tb, 42, rr.range, wr)
+        let g2 = do lbSegs(s2)
+        t = do lbPush(t, g2)
+        let w = do lbWriteAt(tb, 0, 0)
+        t = do lbPush(t, w)
+        let d = do lbTbl(tb)
+        t = do lbPush(t, d)
+        return t
+
+    proc tNeedsShard() -> text:
+        let mut t = ""
+        let tb0 = do tableNew()
+        let rs = do lbReplicaSet()
+        let s1 = do tableSetReplicaSet(tb0, rs, true, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + s1.ok)
+        let m = do lbMigration()
+        let o1 = do tableObserveMigrationOf(s1.table, m, true, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + o1.ok)
+        let d0 = do lbTbl(o1.table)
+        t = do lbPush(t, d0)
+        let s2 = do tableSetReplicaSet(o1.table, rs, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + s2.ok)
+        let d1 = do lbTbl(s2.table)
+        t = do lbPush(t, d1)
+        let o2 = do tableObserveMigrationOf(s2.table, m, true, Coordinate{x: 12, y: 0})
+        t = do lbPush(t, "" + o2.ok)
+        let s3 = do tableSetReplicaSet(o2.table, rs, true, Coordinate{x: 0, y: 13})
+        t = do lbPush(t, "" + s3.ok)
+        let empty77 = do replGroupNew(77, 3)
+        let s4 = do tableSetReplicaSet(s3.table, empty77, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + s4.ok)
+        let u0 = do replGroupNew(78, 3)
+        let q = do replOpAdd("db-q", "quebec")
+        let u1 = do replGroupApply(u0, q)
+        let p = do replOpAdd("db-p", "paris")
+        let u2 = do replGroupApply(u1.group, p)
+        let s5 = do tableSetReplicaSet(s4.table, u2.group, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + s5.ok)
+        let tb = s5.table
+        let d2 = do lbTbl(tb)
+        t = do lbPush(t, d2)
+        let k78 = do routingKeyNew(78, Coordinate{x: 0, y: 0})
+        let pp = do lbPref("Primary")
+        let ac = do lbPref("AnyCopy")
+        let r1 = do tableResolveRead(tb, k78.key, pp)
+        let e1 = do lbRes(r1)
+        t = do lbPush(t, e1)
+        let r2 = do tableResolveRead(tb, k78.key, ac)
+        let e2 = do lbRes(r2)
+        t = do lbPush(t, e2)
+        let r3 = do tableResolveWrite(tb, k78.key)
+        let e3 = do lbRes(r3)
+        t = do lbPush(t, e3)
+        return t
+
+    proc tGeneration() -> text:
+        let mut t = ""
+        let mut tb = do lbTwoCelled()
+        t = do lbPush(t, "" + tb.generation)
+        let rs = do lbReplicaSet()
+        let s1 = do tableSetReplicaSet(tb, rs, true, Coordinate{x: 0, y: 0})
+        tb = s1.table
+        t = do lbPush(t, "" + tb.generation)
+        let m = do lbMigration()
+        tb = do lbObserveAt(tb, m, 0, 0)
+        t = do lbPush(t, "" + tb.generation)
+        tb = do tableClearReplicaSet(tb, 42, true, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + tb.generation)
+        let pp = do lbPref("Primary")
+        let r = do lbReadAt(tb, 1, 0, pp)
+        t = do lbPush(t, r)
+        let d = do lbTbl(tb)
+        t = do lbPush(t, d)
+        return t
+
+    proc tScanFails() -> text:
+        let mut t = ""
+        let topo = do lbTopology()
+        let tb0 = do tableFromTopology(topo)
+        let r0 = do topologyRegistryNew()
+        let r1 = do topologyRegistryPlace(r0, "db-b", 42, Coordinate{x: 3, y: 0}, "dallas")
+        let tb1 = do tableApplyPlacements(tb0, r1)
+        let s = do tableSetAvailability(tb1, "db-b", "Unreachable")
+        let tb = s.table
+        let rd = do lbReadIntent("Primary")
+        let sc = do tableResolveScan(tb, [42], rd)
+        let g = do lbSegs(sc)
+        t = do lbPush(t, g)
+        let pp = do lbPref("Primary")
+        let a = do lbReadAt(tb, 3, 0, pp)
+        t = do lbPush(t, a)
+        let b = do lbReadAt(tb, 4, 0, pp)
+        t = do lbPush(t, b)
+        let d = do lbTbl(tb)
+        t = do lbPush(t, d)
+        return t
+
+    state tblTopology: text = ""
+    state tblTopologyOrder: text = ""
+    state tblReplicas: text = ""
+    state tblFailedPrimary: text = ""
+    state tblUnreachable: text = ""
+    state tblMigration: text = ""
+    state tblAbort: text = ""
+    state tblRange: text = ""
+    state tblCellMigration: text = ""
+    state tblCellReplicas: text = ""
+    state tblShardWide: text = ""
+    state tblRangeFenced: text = ""
+    state tblNeedsShard: text = ""
+    state tblGeneration: text = ""
+    state tblScanFails: text = ""
+
+    action runTableCheck():
+        let a = do tTopology()
+        let b = do tTopologyOrder()
+        let c = do tReplicas()
+        let d = do tFailedPrimary()
+        let e = do tUnreachable()
+        let f = do tMigration()
+        let g = do tAbort()
+        let h = do tRange()
+        let i = do tCellMigration()
+        let j = do tCellReplicas()
+        let k = do tShardWide()
+        let l = do tRangeFenced()
+        let m = do tNeedsShard()
+        let n = do tGeneration()
+        let o = do tScanFails()
+        tblTopology = a
+        tblTopologyOrder = b
+        tblReplicas = c
+        tblFailedPrimary = d
+        tblUnreachable = e
+        tblMigration = f
+        tblAbort = g
+        tblRange = h
+        tblCellMigration = i
+        tblCellReplicas = j
+        tblShardWide = k
+        tblRangeFenced = l
+        tblNeedsShard = m
+        tblGeneration = n
+        tblScanFails = o

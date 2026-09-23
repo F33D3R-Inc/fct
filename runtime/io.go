@@ -50,14 +50,20 @@ func (s *Server) resolveDataPath(reqPath string) (string, error) {
 	if reqPath == "" {
 		return "", fmt.Errorf("empty file path")
 	}
-	if filepath.IsAbs(reqPath) {
-		return "", fmt.Errorf("path %q must be relative to the sandboxed data directory, not absolute", reqPath)
-	}
 	root, err := filepath.Abs(s.dataDir)
 	if err != nil {
 		return "", fmt.Errorf("resolving data directory: %w", err)
 	}
-	full := filepath.Clean(filepath.Join(root, reqPath))
+	var full string
+	if filepath.IsAbs(reqPath) {
+		// An absolute path is accepted only when it already names a place
+		// inside the sandbox (a command run with `facet exec` is handed paths
+		// by its operator, who writes them either way); the prefix check below
+		// is the same gate a relative path passes.
+		full = filepath.Clean(reqPath)
+	} else {
+		full = filepath.Clean(filepath.Join(root, reqPath))
+	}
 	if full != root && !strings.HasPrefix(full, root+string(os.PathSeparator)) {
 		return "", fmt.Errorf("path %q escapes the sandboxed data directory", reqPath)
 	}
@@ -112,6 +118,286 @@ func (s *Server) ioWriteFile(path, content string) (any, error) {
 	return true, nil
 }
 
+// ioAppendFile implements `appendFile(path: text, content: text) -> bool`
+// (io.file): opens (creating) the file in append mode, writes content at
+// end-of-file, and fsyncs before returning — so a true result is a
+// durability boundary, the way a write-ahead log's append must be. The
+// directory entry is fsynced too when the file was just created, since a
+// new name is metadata a crash could otherwise lose. Same sandbox and
+// error shape as ioWriteFile; parent directories are created as needed.
+func (s *Server) ioAppendFile(path, content string) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("appendFile: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return nil, fmt.Errorf("appendFile: %q: %v", path, err)
+	}
+	_, statErr := os.Stat(full)
+	created := os.IsNotExist(statErr)
+	f, err := os.OpenFile(full, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("appendFile: %q: permission denied", path)
+		}
+		return nil, fmt.Errorf("appendFile: %q: %v", path, err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("appendFile: %q: %v", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("appendFile: %q: sync: %v", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("appendFile: %q: %v", path, err)
+	}
+	if created {
+		if err := syncDir(filepath.Dir(full)); err != nil {
+			return nil, fmt.Errorf("appendFile: %q: sync directory: %v", path, err)
+		}
+	}
+	return true, nil
+}
+
+// ioFileExists implements `fileExists(path: text) -> bool` (io.file): whether
+// a regular file is at path inside the sandbox. A missing file is an answer,
+// not an error — the one question readFile cannot be asked without failing
+// (a first boot has no log yet). A sandbox escape is still an error.
+func (s *Server) ioFileExists(path string) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("fileExists: %w", err)
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return nil, fmt.Errorf("fileExists: %q: %v", path, err)
+	}
+	return info.Mode().IsRegular(), nil
+}
+
+// ioTruncateFile implements `truncateFile(path: text, size: int) -> bool`
+// (io.file): cuts the file to size bytes, then fsyncs the file and its
+// directory so the new length itself survives a crash — the repair a torn
+// log tail needs before anything may be appended after it. A negative size
+// or a missing file is an error.
+func (s *Server) ioTruncateFile(path string, size int) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("truncateFile: %w", err)
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("truncateFile: %q: negative size %d", path, size)
+	}
+	f, err := os.OpenFile(full, os.O_WRONLY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("truncateFile: %q not found", path)
+		}
+		return nil, fmt.Errorf("truncateFile: %q: %v", path, err)
+	}
+	if err := f.Truncate(int64(size)); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("truncateFile: %q: %v", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("truncateFile: %q: sync: %v", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("truncateFile: %q: %v", path, err)
+	}
+	if err := syncDir(filepath.Dir(full)); err != nil {
+		return nil, fmt.Errorf("truncateFile: %q: sync directory: %v", path, err)
+	}
+	return true, nil
+}
+
+// syncDir fsyncs a directory so a change to one of its entries (a created
+// name, a file's new length) is durable, the POSIX way: open it read-only
+// and Sync the handle.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// ioFileSize implements `fileSize(path: text) -> int`: the file's length in
+// bytes, or -1 when there is no such file — the paged-file counterpart of
+// fileExists, since a pager needs the length (how many whole pages a file
+// holds) and not merely whether it is there.
+func (s *Server) ioFileSize(path string) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("fileSize: %w", err)
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return -1, nil
+		}
+		return nil, fmt.Errorf("fileSize: %q: %v", path, err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("fileSize: %q is a directory", path)
+	}
+	return int(info.Size()), nil
+}
+
+// ioReadFileAt implements `readFileAt(path: text, offset: int, n: int) ->
+// bytes`: exactly n bytes starting at offset, as a byte buffer. A read that
+// cannot supply all n bytes is an error naming the offset — never a short
+// buffer a caller could mistake for a whole page.
+func (s *Server) ioReadFileAt(path string, offset, n int) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("readFileAt: %w", err)
+	}
+	if offset < 0 || n < 0 {
+		return nil, fmt.Errorf("readFileAt: %q: negative offset %d or length %d", path, offset, n)
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("readFileAt: %q not found", path)
+		}
+		return nil, fmt.Errorf("readFileAt: %q: %v", path, err)
+	}
+	defer f.Close()
+	data := make([]byte, n)
+	if _, err := f.ReadAt(data, int64(offset)); err != nil {
+		return nil, fmt.Errorf("readFileAt: %q: failed to read %d bytes at offset %d: %v", path, n, offset, err)
+	}
+	buf := make([]any, n)
+	for i, b := range data {
+		buf[i] = int(b)
+	}
+	return buf, nil
+}
+
+// ioWriteFileAt implements `writeFileAt(path: text, offset: int, data: bytes)
+// -> bool`: write the byte buffer at offset, creating the file (and its
+// directory) when absent and never truncating it. Not synced — a paged file
+// is written page by page and made durable once, by syncFile, the way a
+// buffer pool flushes before it fsyncs.
+func (s *Server) ioWriteFileAt(path string, offset int, content any) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("writeFileAt: %w", err)
+	}
+	if offset < 0 {
+		return nil, fmt.Errorf("writeFileAt: %q: negative offset %d", path, offset)
+	}
+	arr, ok := content.([]any)
+	if !ok {
+		return nil, fmt.Errorf("writeFileAt: %q: content is not a byte buffer", path)
+	}
+	data := make([]byte, len(arr))
+	for i, v := range arr {
+		b := toInt(v)
+		if b < 0 || b > 255 {
+			return nil, fmt.Errorf("writeFileAt: %q: byte value %d out of range (must be 0-255)", path, b)
+		}
+		data[i] = byte(b)
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return nil, fmt.Errorf("writeFileAt: %q: %v", path, err)
+	}
+	f, err := os.OpenFile(full, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("writeFileAt: %q: %v", path, err)
+	}
+	if _, err := f.WriteAt(data, int64(offset)); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("writeFileAt: %q: failed to write %d bytes at offset %d: %v", path, len(data), offset, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("writeFileAt: %q: %v", path, err)
+	}
+	return true, nil
+}
+
+// ioSyncFile implements `syncFile(path: text) -> bool`: fsync the file and
+// then its directory, so both its bytes and its name are on stable storage.
+func (s *Server) ioSyncFile(path string) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("syncFile: %w", err)
+	}
+	f, err := os.OpenFile(full, os.O_RDWR, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("syncFile: %q not found", path)
+		}
+		return nil, fmt.Errorf("syncFile: %q: %v", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("syncFile: %q: %v", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("syncFile: %q: %v", path, err)
+	}
+	if err := syncDir(filepath.Dir(full)); err != nil {
+		return nil, fmt.Errorf("syncFile: %q: sync directory: %v", path, err)
+	}
+	return true, nil
+}
+
+// ioRenameFile implements `renameFile(from: text, to: text) -> bool`: an
+// atomic rename within the data directory (replacing `to`), then an fsync of
+// the directory so the new name survives a crash — the publish step of a
+// write-temp-then-rename update.
+func (s *Server) ioRenameFile(from, to string) (any, error) {
+	src, err := s.resolveDataPath(from)
+	if err != nil {
+		return nil, fmt.Errorf("renameFile: %w", err)
+	}
+	dst, err := s.resolveDataPath(to)
+	if err != nil {
+		return nil, fmt.Errorf("renameFile: %w", err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("renameFile: %q not found", from)
+		}
+		return nil, fmt.Errorf("renameFile: %q -> %q: %v", from, to, err)
+	}
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		return nil, fmt.Errorf("renameFile: %q: sync directory: %v", to, err)
+	}
+	return true, nil
+}
+
+// ioRemoveFile implements `removeFile(path: text) -> bool`: the file under
+// the data directory deleted, then an fsync of the directory so the removal
+// survives a crash. A file already absent is not an error — the goal state
+// (no such file) holds — so a retried cleanup after a crash between "stop
+// referencing it" and "delete it" converges instead of failing.
+func (s *Server) ioRemoveFile(path string) (any, error) {
+	full, err := s.resolveDataPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("removeFile: %w", err)
+	}
+	if err := os.Remove(full); err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return nil, fmt.Errorf("removeFile: %q: %v", path, err)
+	}
+	if err := syncDir(filepath.Dir(full)); err != nil {
+		return nil, fmt.Errorf("removeFile: %q: sync directory: %v", path, err)
+	}
+	return true, nil
+}
+
 // ioReadFileBytes is ioReadFile's counterpart for a declared `file ... bytes
 // at ...` resource (a `let x = read Name()` statement over a bytes-typed
 // file — see internal/ir/build.go's ast.FileOp case): reads the file's raw
@@ -146,7 +432,7 @@ func (s *Server) ioReadFileBytes(path string) (any, error) {
 // resource (a `write Name(content)` statement, content a byte-buffer array):
 // every element that can ever reach here was already range-checked to 0-255
 // by whatever produced it (bytes(n)'s zero-fill, or an index-write's own
-// 0-255 check in runtime/server.go's execProcBlock "indexset" case), so the
+// 0-255 check in runtime/proccompile.go "indexset" case), so the
 // re-check below is defensive rather than load-bearing. Same sandbox,
 // parent-dir creation, and overwrite semantics as ioWriteFile.
 func (s *Server) ioWriteFileBytes(path string, content any) (any, error) {

@@ -212,7 +212,6 @@ func (s *Server) sidForRequest(r *http.Request) string {
 		return ""
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	ses, live := s.sessions[sid]
 	// Stateless servers: a request can land on a cold instance, so rehydrate the
 	// session from the shared store on a local cache miss (as `session` does).
@@ -223,10 +222,24 @@ func (s *Server) sidForRequest(r *http.Request) string {
 			live = true
 		}
 	}
-	if live && time.Now().Before(ses.expires) {
-		return sid
+	now := time.Now()
+	if !live || !now.Before(ses.expires) {
+		s.mu.Unlock()
+		return ""
 	}
-	return ""
+	// A signed-in caller slides its session forward exactly as Server.session
+	// does for a cookie, so a native client presenting `Bearer` stays signed in
+	// while it is active. Only an existing, signed-in session is touched: a
+	// guest's or an anonymous read writes nothing.
+	slid := ses.actor != "" && ses.actor != roleGuest
+	if slid {
+		ses.expires = now.Add(sessionTTL)
+	}
+	s.mu.Unlock()
+	if slid {
+		s.persistSession(sid)
+	}
+	return sid
 }
 
 // apiScope resolves the JSON API's caller to an evaluation scope, from the same

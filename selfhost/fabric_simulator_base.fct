@@ -1,5 +1,6 @@
 import "fabric_core.fct"
 import "fabric_controller_target.fct"
+import "fabric_fmt.fct"
 
 app FabricSimulatorBaseSelfHost:
     # Self-hosting port of fabric-simulator's four leaf files — clock.rs
@@ -46,21 +47,12 @@ app FabricSimulatorBaseSelfHost:
     # ============================================================
     # RNG — SplitMix64, the load-bearing piece
     # ============================================================
-    # `rng.rs`'s own real cargo tests (`the_same_seed_gives_the_same_
-    # sequence`, `different_seeds_diverge_immediately`,
-    # `floats_stay_in_the_unit_interval`) assert properties, not concrete
-    # numbers, so a reference sequence was computed independently — a
-    # direct Python re-transcription of the exact same algorithm rng.rs
-    # declares (`state = state.wrapping_add(GOLDEN); z = (z^(z>>30))
-    # .wrapping_mul(A); z = (z^(z>>27)).wrapping_mul(B); z^(z>>31)`), using
-    # Python's arbitrary-precision ints explicitly masked to 64 bits at
-    # every step to emulate `wrapping_add`/`wrapping_mul` bit-for-bit — and
-    # cross-checked line-by-line against rng.rs itself before trusting a
-    # single digit. The demo procs below hardcode that reference
-    # sequence's values (see each proc's own comment for the exact seed
-    # and draw index) and compare this port's own output against them with
-    # `==`/`floatApproxEquals`, not merely "two copies of my own code
-    # agree with each other".
+    # `rng.rs`'s own cargo tests (`the_same_seed_gives_the_same_sequence`,
+    # `different_seeds_diverge_immediately`, `floats_stay_in_the_unit_
+    # interval`) assert properties, not numbers, so the demo procs at the
+    # bottom return digests of concrete draws that
+    # fabric_simulator_base_test.go compares with values printed by the real
+    # crate for the same seeds and calls.
     #
     # Three real facts about this language's operators had to be checked
     # against `runtime/eval.go` (not assumed) before the port could be
@@ -324,48 +316,8 @@ app FabricSimulatorBaseSelfHost:
             return "heal"
         return "hot-shard"
 
-    # pow10/textPadLeftChar/floatFixed: `{:.1}`-style fixed-decimal float
-    # formatting, needed only for `HotShard`'s Display arm below. This
-    # language's `+` concatenation stringifies a float via this runtime's
-    # own shortest round-trip `toStr` (confirmed against
-    # `fabric_cli_render.fct`'s own header, which reads `runtime/eval.go`
-    # for exactly this fact), not `{:.N}`, so the real formatting logic is
-    # ported here rather than approximated — the same real gap, and the
-    # same fix, `fabric_cli_render.fct`'s own header already documents in
-    # full (scale by `10^decimals`, round, split int/fraction, zero-pad
-    # the fraction), restated locally here for this file's one call site
-    # rather than importing that file for one helper.
-    proc pow10(n: int) -> int:
-        let mut result = 1
-        let mut i = 0
-        loop i < n:
-            result = result * 10
-            i = i + 1
-        return result
-
-    proc textPadLeftChar(s: text, width: int, padChar: text) -> text:
-        let mut result = s
-        loop len(result) < width:
-            result = padChar + result
-        return result
-
-    proc floatFixed(v: float, decimals: int) -> text:
-        let neg = v < 0.0
-        let av = abs(v)
-        let scale = do pow10(decimals)
-        let scaleFloat = toFloat(scale)
-        let scaledFloat = av * scaleFloat
-        let scaled = round(scaledFloat)
-        let intPart = scaled / scale
-        let fracPart = scaled % scale
-        let fracRaw = "" + fracPart
-        let fracText = do textPadLeftChar(fracRaw, decimals, "0")
-        let mut result = "" + intPart
-        if decimals > 0:
-            result = result + "." + fracText
-        if neg:
-            result = "-" + result
-        return result
+    # Rust `{:.N}` float formatting (HotShard's Display arm) is
+    # fabric_fmt.fct's fmtFixed: the exact binary value, ties to even.
 
     # faultDisplay: `impl Display for Fault` verbatim, arm by arm. The
     # `HotShard` arm delegates to `actionTargetDisplay`
@@ -384,7 +336,7 @@ app FabricSimulatorBaseSelfHost:
         if f.kind == "HealRegion":
             return "region '" + f.region + "' rejoined the Fabric"
         let targetText = do actionTargetDisplay(f.target)
-        let multiplierText = do floatFixed(f.multiplier, 1)
+        let multiplierText = do fmtFixed(f.multiplier, 1)
         return targetText + " running " + multiplierText + "x for " + f.durationMs + "ms"
 
     # ============================================================
@@ -465,175 +417,148 @@ app FabricSimulatorBaseSelfHost:
         return 0.6 + 0.8 * triangle
 
     # ============================================================
-    # DEMOS — each hand-traces this port against either the real Rust
-    # source's own logic (Fault/SimClock/ClassProfile/diurnal) or a
-    # reference sequence independently computed from rng.rs's own exact
-    # algorithm (Rng) — see this file's header for how that reference was
-    # produced. `floatApproxEquals` mirrors `fabric_ml.fct`'s own helper
-    # of the same name/epsilon.
+    # DEMOS — each returns a text digest of this port's own values for a
+    # fixed set of inputs; fabric_simulator_base_test.go compares every
+    # digest with the string a scratch Rust binary linking fabric-simulator
+    # printed for the same inputs. u64 values are compared as their i64 bit
+    # pattern (this language's `int`); floats as `round(v * 10^k)` ints
+    # (Rust's `f64::round` and this runtime's `round()` are both
+    # half-away-from-zero).
     # ============================================================
-    proc floatApproxEquals(a: float, b: float) -> bool:
-        let diff = abs(a - b)
-        return diff < 0.0000001
+    private proc baseIntsLine(values: [int]) -> text:
+        let n = len(values)
+        let mut s = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                s = s + "|"
+            s = s + values[i]
+            i = i + 1
+        return s
 
-    state demoSimClockResult: bool = false
+    private proc baseBoolText(b: bool) -> text:
+        if b:
+            return "true"
+        return "false"
 
-    # demoSimClock: `SimClock::new(1000, 250)` then three `advance()`
-    # calls — `now_ms` = 1000 + n*250 at each step, `tick_ms(0)` clamps to
-    # 1 (`SimClock::new(0, 0)`).
-    proc demoSimClock() -> bool:
+    # demoSimClock: `SimClock::new(1000, 250)`, its accessors, three
+    # `advance()` calls; `SimClock::new(0, 0)` clamps the tick to 1.
+    proc demoSimClock() -> text:
         let c0 = do simClockNew(1000, 250)
-        let startOk = c0.startMs == 1000 && c0.tickMs == 250 && c0.ticks == 0
         let a1 = do simClockAdvance(c0)
         let a2 = do simClockAdvance(a1.clock)
         let a3 = do simClockAdvance(a2.clock)
-        let seqOk = a1.nowMs == 1250 && a2.nowMs == 1500 && a3.nowMs == 1750 && a3.clock.ticks == 3
-        let zeroTick = do simClockNew(0, 0)
-        let clampOk = zeroTick.tickMs == 1 && zeroTick.startMs == 0
-        return startOk && seqOk && clampOk
+        let start = do simClockStartMs(a3.clock)
+        let tick = do simClockTickMs(a3.clock)
+        let ticks = do simClockTicks(a3.clock)
+        let now = do simClockNowMs(a3.clock)
+        let zero = do simClockNew(0, 0)
+        let zeroAdvanced = do simClockAdvance(zero)
+        let line = do baseIntsLine([c0.startMs, c0.tickMs, c0.ticks, a1.nowMs, a2.nowMs, a3.nowMs, start, tick, ticks, now, zero.tickMs, zeroAdvanced.nowMs])
+        return line
 
-    state demoFaultResult: bool = false
-
-    # demoFault: one instance of each of the five variants, `label()` and
-    # `Display` checked against the exact strings fault.rs's own source
-    # produces for the same field values.
-    # Every `do Foo(args)` below is bound to its own fresh `let` and
-    # compared on a SEPARATE statement, never `let x = do Foo(args) ==
-    # "literal"` inline — confirmed against `storage.fct`'s own header
-    # ("`do ProcName(args)` may only appear as a bare fire-and-forget
-    # statement, or as the RHS of a FRESH `let name = do ProcName(args)`
-    # binding — never as a loop-body reassignment, and never nested
-    # inside another expression") and confirmed empirically against THIS
-    # `facet` binary: `let x = do Foo(args) == "literal"` fails to parse
-    # ("unexpected \")\" in expression"/"unexpected <name> in expression"
-    # depending on the literal), the same documented constraint, not a
-    # new gap.
-    proc demoFault() -> bool:
+    # demoFault: `label()` and `Display` for every variant, with HotShard
+    # multipliers chosen to exercise `{:.1}` rounding.
+    proc demoFault() -> text:
         let n1 = do dbmsIdNew("n1")
-        let loss = do faultNodeLoss(n1)
-        let lossLabel = do faultLabel(loss)
-        let lossOk = lossLabel == "node-loss"
-        let lossDisplayText = do faultDisplay(loss)
-        let lossDisplayOk = lossDisplayText == "node 'n1' lost"
-        let recovery = do faultNodeRecovery(n1)
-        let recoveryLabel = do faultLabel(recovery)
-        let recoveryOk = recoveryLabel == "node-recovery"
-        let recoveryDisplayText = do faultDisplay(recovery)
-        let recoveryDisplayOk = recoveryDisplayText == "node 'n1' recovered"
-        let partition = do faultPartitionRegion("us-east")
-        let partitionLabel = do faultLabel(partition)
-        let partitionOk = partitionLabel == "partition"
-        let partitionDisplayText = do faultDisplay(partition)
-        let partitionDisplayOk = partitionDisplayText == "region 'us-east' partitioned from the Fabric"
-        let heal = do faultHealRegion("us-east")
-        let healLabel = do faultLabel(heal)
-        let healOk = healLabel == "heal"
-        let healDisplayText = do faultDisplay(heal)
-        let healDisplayOk = healDisplayText == "region 'us-east' rejoined the Fabric"
-        let target = do actionTargetNew(3, Coordinate{x: 7, y: 2})
-        let hot = do faultHotShard(target, 2.5, 4000)
-        let hotLabel = do faultLabel(hot)
-        let hotOk = hotLabel == "hot-shard"
-        let hotDisplayText = do faultDisplay(hot)
-        let hotDisplayOk = hotDisplayText == "shard 3 (7,2) running 2.5x for 4000ms"
-        return lossOk && lossDisplayOk && recoveryOk && recoveryDisplayOk && partitionOk && partitionDisplayOk && healOk && healDisplayOk && hotOk && hotDisplayOk
+        let t1 = do actionTargetNew(3, Coordinate{x: 7, y: 2})
+        let t2 = do actionTargetNew(1, Coordinate{x: 0, y: 0})
+        let t3 = do actionTargetNew(12, Coordinate{x: 11, y: 12})
+        let f1 = do faultNodeLoss(n1)
+        let f2 = do faultNodeRecovery(n1)
+        let f3 = do faultPartitionRegion("us-east")
+        let f4 = do faultHealRegion("us-west")
+        let f5 = do faultHotShard(t1, 2.5, 4000)
+        let f6 = do faultHotShard(t2, 6.0, 20000)
+        let f7 = do faultHotShard(t3, 0.25, 1)
+        let f8 = do faultHotShard(t3, 2.25, 0)
+        let f9 = do faultHotShard(t2, 0.05, 1500)
+        let f10 = do faultHotShard(t1, 1234.56, 400000)
+        let faults = [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10]
+        let n = len(faults)
+        let mut s = ""
+        let mut i = 0
+        loop i < n:
+            let label = do faultLabel(faults[i])
+            let display = do faultDisplay(faults[i])
+            if i > 0:
+                s = s + ";"
+            s = s + label + "=" + display
+            i = i + 1
+        return s
 
-    state demoRngSeed42SequenceResult: bool = false
-
-    # demoRngSeed42Sequence: `Rng::new(42)`, five `next_u64()` draws,
-    # compared against the independently computed reference sequence (see
-    # this file's header) — the fifth draw (`16015981125662989062`
-    # unsigned, `-2430762948046562554` as this language's signed `int`)
-    # has its top bit set, the exact case `shiftRightLogical64` and this
-    # file's header fact (c) exist for.
-    proc demoRngSeed42Sequence() -> bool:
+    # demoRngSeed42Sequence: `Rng::new(42)`, five `next_u64()` draws.
+    proc demoRngSeed42Sequence() -> text:
         let r0 = do rngNew(42)
         let d1 = do rngNextU64(r0)
         let d2 = do rngNextU64(d1.rng)
         let d3 = do rngNextU64(d2.rng)
         let d4 = do rngNextU64(d3.rng)
         let d5 = do rngNextU64(d4.rng)
-        let v1Ok = d1.value == 2949826092126892291
-        let v2Ok = d2.value == 5139283748462763858
-        let v3Ok = d3.value == 6349198060258255764
-        let v4Ok = d4.value == 701532786141963250
-        let v5Ok = d5.value == -2430762948046562554
-        return v1Ok && v2Ok && v3Ok && v4Ok && v5Ok
-
-    state demoRngSameSeedSameSequenceResult: bool = false
+        let line = do baseIntsLine([d1.value, d2.value, d3.value, d4.value, d5.value])
+        return line
 
     # demoRngSameSeedSameSequence: `the_same_seed_gives_the_same_sequence`
-    # verbatim — two independent `Rng::new(42)` streams, 1000 draws each,
-    # every draw must match.
-    proc demoRngSameSeedSameSequence() -> bool:
+    # — two `Rng::new(42)` streams, 1000 draws each, all equal; plus the
+    # wrapping sum of the draws.
+    proc demoRngSameSeedSameSequence() -> text:
         let a0 = do rngNew(42)
         let b0 = do rngNew(42)
         let mut a = a0
         let mut b = b0
         let mut allMatch = true
+        let mut sum = 0
         let mut i = 0
         loop i < 1000:
             let da = do rngNextU64(a)
             let db = do rngNextU64(b)
             if da.value != db.value:
                 allMatch = false
+            sum = sum + da.value
             a = da.rng
             b = db.rng
             i = i + 1
-        return allMatch
+        let matched = do baseBoolText(allMatch)
+        return matched + "|" + sum
 
-    state demoRngDifferentSeedsDivergeResult: bool = false
-
-    # demoRngDifferentSeedsDiverge: `different_seeds_diverge_immediately`
-    # verbatim, cross-checked against the reference sequence's own
-    # seed-1/seed-2 first-draw values too.
-    proc demoRngDifferentSeedsDiverge() -> bool:
+    # demoRngDifferentSeedsDiverge: `different_seeds_diverge_immediately`.
+    proc demoRngDifferentSeedsDiverge() -> text:
         let ra = do rngNew(1)
         let rb = do rngNew(2)
         let da = do rngNextU64(ra)
         let db = do rngNextU64(rb)
-        let referenceOk = da.value == -1612297016619662647 && db.value == -4627371582388691390
-        return da.value != db.value && referenceOk
-
-    state demoRngFloatsStayInUnitIntervalResult: bool = false
+        let differ = do baseBoolText(da.value != db.value)
+        return differ + "|" + da.value + "|" + db.value
 
     # demoRngFloatsStayInUnitInterval: `floats_stay_in_the_unit_interval`
-    # verbatim (10,000 draws from seed 7, every value in `[0.0, 1.0)`),
-    # plus the reference sequence's own first five seed-7 values compared
-    # exactly.
-    proc demoRngFloatsStayInUnitInterval() -> bool:
+    # (10 000 draws from seed 7 after the first five, every one in
+    # [0, 1)); the first five as round(v * 1e15), the sum as round(s * 1e6).
+    proc demoRngFloatsStayInUnitInterval() -> text:
         let r0 = do rngNew(7)
         let f1 = do rngNextF64(r0)
         let f2 = do rngNextF64(f1.rng)
         let f3 = do rngNextF64(f2.rng)
         let f4 = do rngNextF64(f3.rng)
         let f5 = do rngNextF64(f4.rng)
-        let ref1 = do floatApproxEquals(f1.value, 0.9237001069304558)
-        let ref2 = do floatApproxEquals(f2.value, 0.995512885175621)
-        let ref3 = do floatApproxEquals(f3.value, 0.43603040534905735)
-        let ref4 = do floatApproxEquals(f4.value, 0.1486813431554158)
-        let ref5 = do floatApproxEquals(f5.value, 0.03193655805714979)
         let mut rng = f5.rng
         let mut inRange = true
+        let mut sum = 0.0
         let mut i = 0
         loop i < 10000:
             let drawn = do rngNextF64(rng)
             if drawn.value < 0.0 || drawn.value >= 1.0:
                 inRange = false
+            sum = sum + drawn.value
             rng = drawn.rng
             i = i + 1
-        return ref1 && ref2 && ref3 && ref4 && ref5 && inRange
+        let firsts = do baseIntsLine([round(f1.value * 1000000000000000.0), round(f2.value * 1000000000000000.0), round(f3.value * 1000000000000000.0), round(f4.value * 1000000000000000.0), round(f5.value * 1000000000000000.0)])
+        let inRangeText = do baseBoolText(inRange)
+        return firsts + "|" + inRangeText + "|" + round(sum * 1000000.0)
 
-    state demoRngBelowResult: bool = false
-
-    # demoRngBelow: seed 42, four draws discarded, the 5th draw
-    # (`16015981125662989062` unsigned — top bit set, same draw
-    # `demoRngSeed42Sequence` already isolates) fed into `below(1000)`.
-    # The reference computation (real Python arbitrary-precision `%`, no
-    # sign ambiguity) gives `62` — the value `unsignedMod64` must
-    # reproduce despite the raw draw being negative as this language's
-    # signed `int`.
-    proc demoRngBelow() -> bool:
+    # demoRngBelow: seed 42 with four draws discarded, then `below(1000)`
+    # (the fifth draw has its top bit set) and `below(0)` (no draw); then
+    # a seed-3 stream through `below(n)` for a spread of n.
+    proc demoRngBelow() -> text:
         let r0 = do rngNew(42)
         let d1 = do rngNextU64(r0)
         let d2 = do rngNextU64(d1.rng)
@@ -641,90 +566,95 @@ app FabricSimulatorBaseSelfHost:
         let d4 = do rngNextU64(d3.rng)
         let belowOutcome = do rngBelow(d4.rng, 1000)
         let zero = do rngBelow(d4.rng, 0)
-        return belowOutcome.value == 62 && zero.value == 0
+        let after = do rngNextU64(zero.rng)
+        let ns = [1, 2, 3, 7, 12, 156, 1000, 1000003, 4294967311, 600000]
+        let m = len(ns)
+        let s0 = do rngNew(3)
+        let mut rng = s0
+        let mut values = [belowOutcome.value, zero.value, after.value]
+        let mut i = 0
+        loop i < m:
+            let drawn = do rngBelow(rng, ns[i])
+            values = append(values, drawn.value)
+            rng = drawn.rng
+            i = i + 1
+        let line = do baseIntsLine(values)
+        return line
 
-    state demoRngRangeResult: bool = false
-
-    # demoRngRange: `Rng::new(99).range(10.0, 20.0)` first draw, reference
-    # value `18.1170249885434`.
-    proc demoRngRange() -> bool:
+    # demoRngRange: `Rng::new(99)` through three `range` calls, as
+    # round(v * 1e12).
+    proc demoRngRange() -> text:
         let r0 = do rngNew(99)
-        let drawn = do rngRange(r0, 10.0, 20.0)
-        let ok = do floatApproxEquals(drawn.value, 18.1170249885434)
-        return ok
+        let a = do rngRange(r0, 10.0, 20.0)
+        let b = do rngRange(a.rng, -5.0, 5.0)
+        let c = do rngRange(b.rng, 0.5, 1.5)
+        let line = do baseIntsLine([round(a.value * 1000000000000.0), round(b.value * 1000000000000.0), round(c.value * 1000000000000.0)])
+        return line
 
-    state demoRngChanceResult: bool = false
-
-    # demoRngChance: `Rng::new(5)`'s first `next_f64()` is
-    # `0.5575480192032958`, so `chance(0.5)` must be false (the value is
-    # not `< 0.5`) and `chance(0.6)` must be true.
-    proc demoRngChance() -> bool:
+    # demoRngChance: from the same `Rng::new(5)` state, `chance(0.5)` and
+    # `chance(0.6)`, plus that state's first `next_f64()` as round(v*1e15).
+    proc demoRngChance() -> text:
         let r0 = do rngNew(5)
         let low = do rngChance(r0, 0.5)
         let high = do rngChance(r0, 0.6)
-        return low.value == false && high.value == true
+        let first = do rngNextF64(r0)
+        let lowText = do baseBoolText(low.value)
+        let highText = do baseBoolText(high.value)
+        return lowText + "|" + highText + "|" + round(first.value * 1000000000000000.0)
 
-    state demoRngForkResult: bool = false
-
-    # demoRngFork: `Rng::new(42).fork()` — the parent's post-draw state
-    # (`4354685564936845396`), the child's freshly-seeded state
-    # (`-5271293442898752234`), and the child's own first draw
-    # (`5113007443819495584`), all from the independently computed
-    # reference.
-    proc demoRngFork() -> bool:
+    # demoRngFork: `Rng::new(42).fork()` — the parent's state after the
+    # draw, the child's state, the child's first draw and the parent's next.
+    proc demoRngFork() -> text:
         let r0 = do rngNew(42)
         let outcome = do rngFork(r0)
-        let parentOk = outcome.rng.state == 4354685564936845396
-        let childSeedOk = outcome.forked.state == -5271293442898752234
         let childDraw = do rngNextU64(outcome.forked)
-        let childDrawOk = childDraw.value == 5113007443819495584
-        return parentOk && childSeedOk && childDrawOk
+        let parentDraw = do rngNextU64(outcome.rng)
+        let line = do baseIntsLine([r0.state, outcome.rng.state, outcome.forked.state, childDraw.value, parentDraw.value])
+        return line
 
-    state demoClassProfileResult: bool = false
+    # demoClassProfile: every `class_profile` arm — base_ops, read_ratio*1e6,
+    # read/write latency, bytes_per_op, write_ratio()*1e6.
+    proc demoClassProfile() -> text:
+        let classes = ["ReadHeavy", "WriteHeavy", "Mixed", "EventHeavy", "Media", "Realtime", "Unknown"]
+        let n = len(classes)
+        let mut s = ""
+        let mut i = 0
+        loop i < n:
+            let p = do classProfile(classes[i])
+            let writeRatio = do classProfileWriteRatio(p)
+            if i > 0:
+                s = s + ";"
+            s = s + classes[i] + ":" + round(p.baseOps) + ":" + round(p.readRatio * 1000000.0) + ":" + round(p.readLatencyUs) + ":" + round(p.writeLatencyUs) + ":" + p.bytesPerOp + ":" + round(writeRatio * 1000000.0)
+            i = i + 1
+        return s
 
-    # demoClassProfile: all seven arms' `base_ops`/`read_ratio`/
-    # `*_latency_us`/`bytes_per_op` checked against workload.rs's own
-    # literals, plus `write_ratio()` for two of them.
-    proc demoClassProfile() -> bool:
-        let readHeavy = do classProfile("ReadHeavy")
-        let readHeavyOk = readHeavy.baseOps == 800.0 && readHeavy.readRatio == 0.92 && readHeavy.readLatencyUs == 400.0 && readHeavy.writeLatencyUs == 1200.0 && readHeavy.bytesPerOp == 512
-        let readHeavyWriteRatio = do classProfileWriteRatio(readHeavy)
-        let readHeavyWriteRatioOk = do floatApproxEquals(readHeavyWriteRatio, 0.08)
-        let writeHeavy = do classProfile("WriteHeavy")
-        let writeHeavyOk = writeHeavy.baseOps == 400.0 && writeHeavy.readRatio == 0.15 && writeHeavy.readLatencyUs == 900.0 && writeHeavy.writeLatencyUs == 2500.0 && writeHeavy.bytesPerOp == 1024
-        let mixed = do classProfile("Mixed")
-        let mixedOk = mixed.baseOps == 500.0 && mixed.readRatio == 0.55 && mixed.bytesPerOp == 768
-        let eventHeavy = do classProfile("EventHeavy")
-        let eventHeavyOk = eventHeavy.baseOps == 1200.0 && eventHeavy.readRatio == 0.35 && eventHeavy.bytesPerOp == 256
-        let media = do classProfile("Media")
-        let mediaOk = media.baseOps == 150.0 && media.readRatio == 0.85 && media.writeLatencyUs == 9000.0 && media.bytesPerOp == 65536
-        let realtime = do classProfile("Realtime")
-        let realtimeOk = realtime.baseOps == 2000.0 && realtime.readRatio == 0.60 && realtime.bytesPerOp == 128
-        let unknown = do classProfile("Unknown")
-        let unknownOk = unknown.baseOps == 100.0 && unknown.readRatio == 0.50 && unknown.readLatencyUs == 1000.0 && unknown.writeLatencyUs == 1000.0 && unknown.bytesPerOp == 512
-        let unknownWriteRatio = do classProfileWriteRatio(unknown)
-        let unknownWriteRatioOk = do floatApproxEquals(unknownWriteRatio, 0.50)
-        return readHeavyOk && readHeavyWriteRatioOk && writeHeavyOk && mixedOk && eventHeavyOk && mediaOk && realtimeOk && unknownOk && unknownWriteRatioOk
+    # demoDiurnal: the triangle wave at trough, peak, mid-rise, the offset
+    # wraparound, a zero period (clamped to 1) and three simulator-shaped
+    # instants, as round(v * 1e12).
+    proc demoDiurnal() -> text:
+        let v1 = do diurnal(0, 1000, 0)
+        let v2 = do diurnal(500, 1000, 0)
+        let v3 = do diurnal(250, 1000, 0)
+        let v4 = do diurnal(999, 1000, 1)
+        let v5 = do diurnal(5, 0, 0)
+        let v6 = do diurnal(1700000001000, 600000, 263293)
+        let v7 = do diurnal(1700000040000, 600000, 47711)
+        let v8 = do diurnal(1700000005000, 600000, 505177)
+        let line = do baseIntsLine([round(v1 * 1000000000000.0), round(v2 * 1000000000000.0), round(v3 * 1000000000000.0), round(v4 * 1000000000000.0), round(v5 * 1000000000000.0), round(v6 * 1000000000000.0), round(v7 * 1000000000000.0), round(v8 * 1000000000000.0)])
+        return line
 
-    state demoDiurnalResult: bool = false
-
-    # demoDiurnal: four hand-computed points on the triangle wave —
-    # trough at `position == 0` (`0.6`), peak at `position == period/2`
-    # (`1.4`), the exact midpoint of the rising edge (`1.0`), and the
-    # offset wraparound (`now_ms + offset_ms == period`, wraps to position
-    # 0, so `0.6` again) — plus `period_ms == 0` clamped to 1.
-    proc demoDiurnal() -> bool:
-        let trough = do diurnal(0, 1000, 0)
-        let peak = do diurnal(500, 1000, 0)
-        let midRise = do diurnal(250, 1000, 0)
-        let wraps = do diurnal(999, 1000, 1)
-        let clamped = do diurnal(5, 0, 0)
-        let troughOk = do floatApproxEquals(trough, 0.6)
-        let peakOk = do floatApproxEquals(peak, 1.4)
-        let midRiseOk = do floatApproxEquals(midRise, 1.0)
-        let wrapsOk = do floatApproxEquals(wraps, 0.6)
-        let clampedOk = do floatApproxEquals(clamped, 0.6)
-        return troughOk && peakOk && midRiseOk && wrapsOk && clampedOk
+    state demoSimClockResult: text = ""
+    state demoFaultResult: text = ""
+    state demoRngSeed42SequenceResult: text = ""
+    state demoRngSameSeedSameSequenceResult: text = ""
+    state demoRngDifferentSeedsDivergeResult: text = ""
+    state demoRngFloatsStayInUnitIntervalResult: text = ""
+    state demoRngBelowResult: text = ""
+    state demoRngRangeResult: text = ""
+    state demoRngChanceResult: text = ""
+    state demoRngForkResult: text = ""
+    state demoClassProfileResult: text = ""
+    state demoDiurnalResult: text = ""
 
     action runFabricSimulatorBaseDemo():
         let r1 = do demoSimClock()

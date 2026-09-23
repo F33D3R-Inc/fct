@@ -1,0 +1,351 @@
+app PageSelfHost:
+    # page.fct — self-hosted port of facetql/src/storage/page.rs: the
+    # fixed-size, self-verifying slotted page every durable FacetQL
+    # structure is built from. A page body is PAGE_BODY_LEN bytes held as
+    # a byte list ([int], 0..255) in exactly its on-disk layout:
+    #
+    #   offset  size  field
+    #   0       4     "FQPG"
+    #   4       1     kind (1 meta, 2 leaf, 3 branch, 4 heap, 5 overflow)
+    #   5       1     format version (1)
+    #   6       2     slot count (u16 LE)
+    #   8       2     free_end — start of the cell area (u16 LE)
+    #   10      2     reserved
+    #   12      4     extra (u32 LE; a branch's leftmost child)
+    #   16      4     CRC-32 of the body with these 4 bytes excluded
+    #   20      4     reserved
+    #   24      ...   slot directory: count × (offset u16, len u16)
+    #   free_end..    cells, allocated downward from the end
+    #
+    # A page is a value here: every mutation returns the new body (and,
+    # where page.rs returns a bool / Option, whether it happened). The
+    # byte layout, the CRC and every decode check are page.rs's, so a page
+    # this file encodes is one the Rust engine decodes and vice versa.
+
+    proc pgSize() -> int:
+        return 16384
+
+    proc pgBodyLen() -> int:
+        return 16356
+
+    proc pgHeaderLen() -> int:
+        return 24
+
+    proc pgSlotLen() -> int:
+        return 4
+
+    proc pgMaxCellLen() -> int:
+        return 16356 - 24 - 4
+
+    # PageKind's on-disk byte.
+    proc pgKindMeta() -> int:
+        return 1
+
+    proc pgKindLeaf() -> int:
+        return 2
+
+    proc pgKindBranch() -> int:
+        return 3
+
+    proc pgKindHeap() -> int:
+        return 4
+
+    proc pgKindOverflow() -> int:
+        return 5
+
+    # ── little-endian fields ────────────────────────────────────────────
+    proc pgGet16(b: [int], at: int) -> int:
+        return b[at] + b[at + 1] * 256
+
+    proc pgGet32(b: [int], at: int) -> int:
+        return b[at] + b[at + 1] * 256 + b[at + 2] * 65536 + b[at + 3] * 16777216
+
+    proc pgPut16(b0: [int], at: int, v: int) -> [int]:
+        let mut b = b0
+        b[at] = v % 256
+        b[at + 1] = (v / 256) % 256
+        return b
+
+    proc pgPut32(b0: [int], at: int, v: int) -> [int]:
+        let mut b = b0
+        b[at] = v % 256
+        b[at + 1] = (v / 256) % 256
+        b[at + 2] = (v / 65536) % 256
+        b[at + 3] = (v / 16777216) % 256
+        return b
+
+    # pgNew: Page::new — an empty page of `kind`.
+    proc pgNew(kind: int) -> [int]:
+        let mut b = bytes(16356)
+        b[0] = 70
+        b[1] = 81
+        b[2] = 80
+        b[3] = 71
+        b[4] = kind
+        b[5] = 1
+        let c = do pgPut16(b, 6, 0)
+        let f = do pgPut16(c, 8, 16356)
+        let e = do pgPut32(f, 12, 0)
+        return e
+
+    proc pgKind(b: [int]) -> int:
+        return b[4]
+
+    proc pgExtra(b: [int]) -> int:
+        let v = do pgGet32(b, 12)
+        return v
+
+    proc pgSetExtra(b: [int], value: int) -> [int]:
+        let r = do pgPut32(b, 12, value)
+        return r
+
+    proc pgSlotCount(b: [int]) -> int:
+        let v = do pgGet16(b, 6)
+        return v
+
+    proc pgFreeEnd(b: [int]) -> int:
+        let v = do pgGet16(b, 8)
+        return v
+
+    proc pgSlotOffset(b: [int], index: int) -> int:
+        let v = do pgGet16(b, 24 + index * 4)
+        return v
+
+    proc pgSlotLength(b: [int], index: int) -> int:
+        let v = do pgGet16(b, 24 + index * 4 + 2)
+        return v
+
+    proc pgSetSlot(b0: [int], index: int, offset: int, length: int) -> [int]:
+        let at = 24 + index * 4
+        let a = do pgPut16(b0, at, offset)
+        let c = do pgPut16(a, at + 2, length)
+        return c
+
+    # pgCell: the bytes of cell `index` ([] when the slot does not exist —
+    # pgHasCell tells the two apart, since a cell may itself be empty).
+    proc pgHasCell(b: [int], index: int) -> bool:
+        let n = do pgSlotCount(b)
+        return index >= 0 && index < n
+
+    proc pgCell(b: [int], index: int) -> [int]:
+        let has = do pgHasCell(b, index)
+        if !has:
+            return []
+        let offset = do pgSlotOffset(b, index)
+        let length = do pgSlotLength(b, index)
+        let mut out = bytes(length)
+        let mut i = 0
+        loop i < length:
+            out[i] = b[offset + i]
+            i = i + 1
+        return out
+
+    # pgFreeSpace: contiguous free bytes between the directory and cells.
+    proc pgFreeSpace(b: [int]) -> int:
+        let n = do pgSlotCount(b)
+        let fe = do pgFreeEnd(b)
+        let dirEnd = 24 + n * 4
+        if fe < dirEnd:
+            return 0
+        return fe - dirEnd
+
+    # pgReclaimableSpace: free bytes including holes a compact recovers.
+    proc pgReclaimableSpace(b: [int]) -> int:
+        let n = do pgSlotCount(b)
+        let mut used = 0
+        let mut i = 0
+        loop i < n:
+            let l = do pgSlotLength(b, i)
+            used = used + l
+            i = i + 1
+        return 16356 - 24 - n * 4 - used
+
+    # pgCompact: rewrite the cell area with no holes, slot numbering kept.
+    proc pgCompact(b0: [int]) -> [int]:
+        let n = do pgSlotCount(b0)
+        let mut offs = []
+        let mut lens = []
+        let mut i = 0
+        loop i < n:
+            let o = do pgSlotOffset(b0, i)
+            let l = do pgSlotLength(b0, i)
+            offs = append(offs, o)
+            lens = append(lens, l)
+            i = i + 1
+        let mut b = b0
+        let mut freeEnd = 16356
+        let mut k = 0
+        loop k < n:
+            # cells are copied out first (page.rs collects them before
+            # writing), so an overlapping move can never read a byte it
+            # has already overwritten.
+            let cell = do pgCell(b0, k)
+            freeEnd = freeEnd - lens[k]
+            let mut j = 0
+            loop j < lens[k]:
+                b[freeEnd + j] = cell[j]
+                j = j + 1
+            let s = do pgSetSlot(b, k, freeEnd, lens[k])
+            b = s
+            k = k + 1
+        let r = do pgPut16(b, 8, freeEnd)
+        return r
+
+    struct PgEdit:
+        ok: bool
+        index: int
+        body: [int]
+
+    # pgInsertCell: insert_cell — a new cell at slot `index`, later slots
+    # shifted up by one; ok false when the page is full.
+    proc pgInsertCell(b0: [int], index: int, data: [int]) -> PgEdit:
+        let count = do pgSlotCount(b0)
+        let dl = len(data)
+        if index < 0 || index > count || dl > 16328:
+            return PgEdit{ok: false, index: index, body: b0}
+        let needed = dl + 4
+        let mut b = b0
+        let fs = do pgFreeSpace(b0)
+        if fs < needed:
+            let rs = do pgReclaimableSpace(b0)
+            if rs < needed:
+                return PgEdit{ok: false, index: index, body: b0}
+            let c = do pgCompact(b0)
+            b = c
+        let dirEnd = 24 + count * 4
+        # shift the directory tail right by one slot (back to front, so
+        # the overlapping move reads each byte before overwriting it)
+        let mut j = dirEnd - 1
+        loop j >= 24 + index * 4:
+            b[j + 4] = b[j]
+            j = j - 1
+        let fe = do pgFreeEnd(b)
+        let freeEnd = fe - dl
+        let mut k = 0
+        loop k < dl:
+            b[freeEnd + k] = data[k]
+            k = k + 1
+        let a1 = do pgPut16(b, 8, freeEnd)
+        let a2 = do pgPut16(a1, 6, count + 1)
+        let a3 = do pgSetSlot(a2, index, freeEnd, dl)
+        return PgEdit{ok: true, index: index, body: a3}
+
+    # pgPushCell: push_cell — append after the last cell.
+    proc pgPushCell(b: [int], data: [int]) -> PgEdit:
+        let n = do pgSlotCount(b)
+        let r = do pgInsertCell(b, n, data)
+        return r
+
+    # pgRemoveCell: remove_cell — later slots shift down (renumbers; never
+    # on a heap page).
+    proc pgRemoveCell(b0: [int], index: int) -> [int]:
+        let count = do pgSlotCount(b0)
+        if index < 0 || index >= count:
+            return b0
+        let mut b = b0
+        let dirEnd = 24 + count * 4
+        let mut j = 24 + (index + 1) * 4
+        loop j < dirEnd:
+            b[j - 4] = b[j]
+            j = j + 1
+        let r = do pgPut16(b, 6, count - 1)
+        return r
+
+    # pgReplaceCell: replace_cell — same size overwrites in place; a
+    # different size removes the slot and reinserts at the same index.
+    proc pgReplaceCell(b0: [int], index: int, data: [int]) -> PgEdit:
+        let count = do pgSlotCount(b0)
+        if index < 0 || index >= count:
+            return PgEdit{ok: false, index: index, body: b0}
+        let oldLen = do pgSlotLength(b0, index)
+        let dl = len(data)
+        if oldLen == dl:
+            let offset = do pgSlotOffset(b0, index)
+            let mut b = b0
+            let mut i = 0
+            loop i < dl:
+                b[offset + i] = data[i]
+                i = i + 1
+            return PgEdit{ok: true, index: index, body: b}
+        let removed = do pgRemoveCell(b0, index)
+        let ins = do pgInsertCell(removed, index, data)
+        return ins
+
+    # pgCrcTable: the reflected CRC-32 (IEEE, 0xEDB88320) byte table.
+    proc pgCrcTable() -> [int]:
+        let mut t = []
+        let mut n = 0
+        loop n < 256:
+            let mut c = n
+            let mut k = 0
+            loop k < 8:
+                if (c & 1) == 1:
+                    c = (c >> 1) ^ 3988292384
+                else:
+                    c = c >> 1
+                k = k + 1
+            t = append(t, c)
+            n = n + 1
+        return t
+
+    # pgComputeCrc: crc32_parts over the body with bytes 16..20 excluded.
+    proc pgComputeCrc(b: [int]) -> int:
+        let t = do pgCrcTable()
+        let mut crc = 4294967295
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            if i < 16 || i >= 20:
+                crc = t[(crc ^ b[i]) & 255] ^ (crc >> 8)
+            i = i + 1
+        return crc ^ 4294967295
+
+    # pgEncode: encode — the body with its CRC brought up to date.
+    proc pgEncode(b: [int]) -> [int]:
+        let crc = do pgComputeCrc(b)
+        let r = do pgPut32(b, 16, crc)
+        return r
+
+    struct PgDecoded:
+        ok: bool
+        err: text
+        body: [int]
+
+    proc pgDecodeErr(msg: text) -> PgDecoded:
+        return PgDecoded{ok: false, err: msg, body: []}
+
+    # pgDecode: Page::decode — every check, in page.rs's order.
+    proc pgDecode(bs: [int]) -> PgDecoded:
+        let n = len(bs)
+        if n != 16356:
+            let e0 = do pgDecodeErr("page body is " + n + " bytes, expected 16356")
+            return e0
+        if bs[0] != 70 || bs[1] != 81 || bs[2] != 80 || bs[3] != 71:
+            let e1 = do pgDecodeErr("page magic mismatch — not a FacetQL page")
+            return e1
+        if bs[5] != 1:
+            let e2 = do pgDecodeErr("page format version " + bs[5] + " is not supported by this build (expected 1)")
+            return e2
+        if bs[4] < 1 || bs[4] > 5:
+            let e3 = do pgDecodeErr("unknown page kind " + bs[4])
+            return e3
+        let stored = do pgGet32(bs, 16)
+        let crc = do pgComputeCrc(bs)
+        if stored != crc:
+            let e4 = do pgDecodeErr("page checksum mismatch — the page is corrupt")
+            return e4
+        let count = do pgSlotCount(bs)
+        let freeEnd = do pgFreeEnd(bs)
+        let dirEnd = 24 + count * 4
+        if dirEnd > freeEnd || freeEnd > 16356:
+            let e5 = do pgDecodeErr("page directory/cell areas overlap: " + count + " slots, free_end " + freeEnd)
+            return e5
+        let mut i = 0
+        loop i < count:
+            let offset = do pgSlotOffset(bs, i)
+            let length = do pgSlotLength(bs, i)
+            if offset < freeEnd || offset + length > 16356:
+                let e6 = do pgDecodeErr("page slot " + i + " points outside the cell area (offset " + offset + ", length " + length + ")")
+                return e6
+            i = i + 1
+        return PgDecoded{ok: true, err: "", body: bs}

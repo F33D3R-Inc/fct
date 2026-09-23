@@ -1,0 +1,95 @@
+import "fabric_facetql_poller.fct"
+import "fabric_daemon_config.fct"
+
+app FabricDaemonTelemetrySelfHost:
+    # Port of fabric/crates/fabric-daemon/src/telemetry.rs and lib.rs's
+    # `facetql_telemetry`: where the control loop's evidence comes from.
+    #
+    # The live source is FacetQL's own counters: `GET /stats` on every
+    # instance that has a control-plane credential, differenced into rates
+    # by fabric_facetql_poller.fct and delivered as the ordinary
+    # fabric-protocol messages the runtime ingests — one ingestion path.
+    # A source is still a parameter of the loop (DaemonSample in, runtime
+    # out), because a simulated fleet is an equally legitimate source; the
+    # loop reports which one it is watching by name.
+    #
+    # Names are prefixed `dtl` / `daemon` / `Daemon`.
+
+    # Sample: protocol messages for the runtime (telemetry only — liveness
+    # has one authority, the prober) and per-instance notes for the admin
+    # surface.
+    struct DaemonSample:
+        messages: [FabricMessage]
+        noteIds: [text]
+        notes: [text]
+
+    proc daemonSampleEmpty() -> DaemonSample:
+        return DaemonSample{messages: [], noteIds: [], notes: []}
+
+    # FacetqlTelemetry::describe.
+    proc daemonFacetqlDescribe(instances: int) -> text:
+        return "facetql /stats over " + instances + " instance(s)"
+
+    # One poll outcome as the admin surface's `last_sample`. A failed
+    # `/stats` read is a real fact and is reported, but it is deliberately
+    # not liveness: the token could be wrong while the instance serves.
+    proc daemonPollNote(o: PollOutcome) -> text:
+        if o.kind == "Sampled":
+            return "sampled"
+        if o.kind == "Baseline":
+            return "baseline taken"
+        if o.kind == "Skipped":
+            return "interval spanned a restart or no time"
+        let shown = do fqlErrorDisplay(o.err)
+        return "failed: " + shown
+
+    # lib.rs facetql_telemetry: every backend that declares a credential and
+    # holds at least one cell becomes a poll target, its counters attributed
+    # to the first cell it holds. One without a credential simply produces
+    # no telemetry (and the admin port says `telemetry: false`).
+    proc daemonTelemetryTargets(settings: DaemonSettings) -> [PollTarget]:
+        let mut targets = []
+        let n = len(settings.backends)
+        let mut k = 0
+        loop k < n:
+            let b = settings.backends[k]
+            if b.hasToken && len(b.placements) > 0:
+                let endpoint = do fqlEndpointNew(b.id, b.url, b.token)
+                if endpoint.ok:
+                    let cell = b.placements[0]
+                    targets = append(targets, pollTargetNew(endpoint.v, cell.shard, Coordinate{x: cell.x, y: cell.y}, b.region))
+            k = k + 1
+        return targets
+
+    struct DaemonTelemetry:
+        poller: TelemetryPoller
+
+    proc daemonFacetqlTelemetry(settings: DaemonSettings) -> DaemonTelemetry:
+        let targets = do daemonTelemetryTargets(settings)
+        let poller = do telemetryPollerNew(targets)
+        return DaemonTelemetry{poller: poller}
+
+    proc daemonTelemetryDescribe(t: DaemonTelemetry) -> text:
+        let n = do telemetryPollerLen(t.poller)
+        return daemonFacetqlDescribe(n)
+
+    struct DaemonTelemetrySampled:
+        telemetry: DaemonTelemetry
+        sample: DaemonSample
+
+    # FacetqlTelemetry::sample: one sweep's evidence, plus what went wrong
+    # getting it.
+    proc daemonTelemetrySample(t: DaemonTelemetry) -> DaemonTelemetrySampled uses io.net:
+        let round = do telemetryPollerPollOnce(t.poller)
+        let mut sample = do daemonSampleEmpty()
+        let n = len(round.ids)
+        let mut k = 0
+        loop k < n:
+            let o = round.outcomes[k]
+            if o.kind == "Sampled":
+                let m = do protoEmptyFabricMessage()
+                sample.messages = append(sample.messages, FabricMessage{kind: "Telemetry", registerNode: m.registerNode, heartbeat: m.heartbeat, topology: m.topology, telemetry: o.batch, workload: m.workload})
+            sample.noteIds = append(sample.noteIds, round.ids[k])
+            sample.notes = append(sample.notes, daemonPollNote(o))
+            k = k + 1
+        return DaemonTelemetrySampled{telemetry: DaemonTelemetry{poller: round.poller}, sample: sample}

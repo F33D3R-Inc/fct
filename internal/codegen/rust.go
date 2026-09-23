@@ -59,9 +59,12 @@ func GenerateRust(s Schema) (string, error) {
 
 	for _, m := range s.Messages {
 		b.WriteString("#[derive(Debug, Clone, Serialize, Deserialize)]\n")
-		b.WriteString("#[serde(tag = \"type\", rename_all = \"snake_case\")]\n")
+		fmt.Fprintf(&b, "#[serde(tag = %q, rename_all = \"snake_case\")]\n", m.TagName())
 		fmt.Fprintf(&b, "pub enum %s {\n", m.Name)
 		for _, v := range m.Variants {
+			if v.Wire != "" {
+				fmt.Fprintf(&b, "    #[serde(rename = %q)]\n", v.Wire)
+			}
 			fmt.Fprintf(&b, "    %s {\n", snakeToUpperCamel(v.Name))
 			for _, f := range v.Fields {
 				writeRustFieldAttrs(&b, "        ", f, m.Name+"_"+v.Name, enums, &defaultFns)

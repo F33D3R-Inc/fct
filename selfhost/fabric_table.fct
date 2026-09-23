@@ -1,5 +1,6 @@
 import "fabric_routing.fct"
 import "fabric_replication.fct"
+import "fabric_migration_plan.fct"
 
 app FabricTableSelfHost:
     # Self-hosting port of fabric/crates/fabric-routing/src/table.rs (1598L)
@@ -152,8 +153,9 @@ app FabricTableSelfHost:
     # established enum convention (fabric_routing.fct's `RoutingError.kind`,
     # fabric_replication.fct's `ReplicaState`).
     #
-    # `HashMap<String, NodeEntry>` / `BTreeMap<u64, ShardEntry>` (`nodes`/
-    # `shards` on `RoutingTable`) and every `HashMap<Coordinate, X>` on
+    # `BTreeMap<String, NodeEntry>` / `BTreeMap<u64, ShardEntry>` (`nodes`/
+    # `shards` on `RoutingTable`, kept sorted by key so they iterate in the
+    # BTreeMap's order) and every `HashMap<Coordinate, X>` on
     # `ShardEntry` (`overrides`, `cell_replicas`, `cell_migrations`) restate
     # as linear arrays searched by key equality, the SAME map-as-array
     # convention fabric_routing.fct's own `TopologyRegistry` and
@@ -626,6 +628,37 @@ app FabricTableSelfHost:
             i = i + 1
         return found
 
+    # `RoutingTable.nodes` is a `BTreeMap<String, NodeEntry>` and `.shards` a
+    # `BTreeMap<u64, ShardEntry>`: both iterate in key order, so inserts
+    # keep these arrays sorted by node id (byte order) and shard id.
+    proc tableNodeInsertSorted(nodes: [TableNodeEntry], entry: TableNodeEntry) -> [TableNodeEntry]:
+        let mut out = []
+        let mut placed = false
+        let mut i = 0
+        loop i < len(nodes):
+            if !placed && entry.id < nodes[i].id:
+                out = append(out, entry)
+                placed = true
+            out = append(out, nodes[i])
+            i = i + 1
+        if !placed:
+            out = append(out, entry)
+        return out
+
+    proc tableShardInsertSorted(shards: [TableShardEntry], entry: TableShardEntry) -> [TableShardEntry]:
+        let mut out = []
+        let mut placed = false
+        let mut i = 0
+        loop i < len(shards):
+            if !placed && entry.shardId < shards[i].shardId:
+                out = append(out, entry)
+                placed = true
+            out = append(out, shards[i])
+            i = i + 1
+        if !placed:
+            out = append(out, entry)
+        return out
+
     struct TableNodeLookup:
         found: bool
         entry: TableNodeEntry
@@ -657,7 +690,7 @@ app FabricTableSelfHost:
         let idx = do tableNodeIndexOf(table.nodes, id)
         let mut nodes = table.nodes
         if idx == -1:
-            nodes = append(nodes, TableNodeEntry{id: id, region: region, availability: "Unknown"})
+            nodes = do tableNodeInsertSorted(nodes, TableNodeEntry{id: id, region: region, availability: "Unknown"})
         else:
             nodes[idx] = TableNodeEntry{id: id, region: region, availability: nodes[idx].availability}
         return TableRoutingTable{nodes: nodes, shards: table.shards, generation: table.generation + 1, requireProvenHealth: table.requireProvenHealth}
@@ -767,7 +800,7 @@ app FabricTableSelfHost:
                 let mut shards = t.shards
                 if idx == -1:
                     let newEntry = do tableShardEntryNew(shardId, node.id)
-                    shards = append(shards, newEntry)
+                    shards = do tableShardInsertSorted(shards, newEntry)
                 else:
                     let entry = shards[idx]
                     if entry.owner != node.id:
@@ -816,6 +849,32 @@ app FabricTableSelfHost:
 
     # tableApplyPlacements: `RoutingTable::apply_placements` — coordinate-
     # level placements, the reason a shard's grid can be split across nodes.
+    # tableTopologyOfCore: fabric_core's `Topology` (the type the real
+    # `apply_topology` / `from_topology` take) as this file's TableTopology.
+    proc tableTopologyOfCore(topology: Topology) -> TableTopology:
+        let mut out = []
+        let mut i = 0
+        loop i < len(topology.nodes):
+            let n = topology.nodes[i]
+            let mut ids = []
+            let mut j = 0
+            loop j < len(n.shards):
+                ids = append(ids, n.shards[j].id)
+                j = j + 1
+            out = append(out, TableTopologyNode{id: n.id.value, region: n.region, shardIds: ids})
+            i = i + 1
+        return TableTopology{nodes: out}
+
+    proc tableApplyCoreTopology(table: TableRoutingTable, topology: Topology) -> TableRoutingTable:
+        let t = do tableTopologyOfCore(topology)
+        let r = do tableApplyTopology(table, t)
+        return r
+
+    proc tableFromCoreTopology(topology: Topology) -> TableRoutingTable:
+        let t = do tableTopologyOfCore(topology)
+        let r = do tableFromTopology(t)
+        return r
+
     proc tableApplyPlacements(table: TableRoutingTable, registry: TopologyRegistry) -> TableRoutingTable:
         let placements = do topologyRegistryPlacements(registry)
         let mut t = table
@@ -830,7 +889,7 @@ app FabricTableSelfHost:
             if idx == -1:
                 let newEntry = do tableShardEntryNew(p.shardId, p.dbmsId)
                 let withOverride = do tableShardEntrySetOverride(newEntry, p.coordinate, p.dbmsId)
-                shards = append(shards, withOverride)
+                shards = do tableShardInsertSorted(shards, withOverride)
             else:
                 let updated = do tableShardEntrySetOverride(shards[idx], p.coordinate, p.dbmsId)
                 shards[idx] = updated
@@ -863,7 +922,7 @@ app FabricTableSelfHost:
                 if !hasOwner:
                     return TableSetReplicaSetResult{ok: false, table: table}
                 let newEntry = do tableShardEntryNew(shardId, owner)
-                shards = append(shards, newEntry)
+                shards = do tableShardInsertSorted(shards, newEntry)
         else:
             let validCoord = do coordinateIsValid(scope)
             if !validCoord || idx0 == -1:
@@ -920,6 +979,18 @@ app FabricTableSelfHost:
         shards[idx] = updated
         return TableRoutingTable{nodes: table.nodes, shards: shards, generation: table.generation + 1, requireProvenHealth: table.requireProvenHealth}
 
+    # tableMigrationPhaseOf: the two facts of a real `Migration` (from
+    # fabric_migration_plan.fct) that `observe_migration` / `ShardMigration::
+    # from_migration` read — its phase and when authority moved.
+    proc tableMigrationPhaseOf(m: Migration) -> TableMigrationPhase:
+        return TableMigrationPhase{phase: m.phase, cutoverCompletedAtMs: m.cutoverCompletedAtMs}
+
+    # tableShardMigrationOf: `ShardMigration::from_migration(&migration)`.
+    proc tableShardMigrationOf(m: Migration) -> TableShardMigration:
+        let state = do tableMigrationPhaseOf(m)
+        let snap = do tableShardMigrationFromState(state, m.plan.shardId, m.plan.source, m.plan.destination)
+        return snap
+
     struct TableObserveMigrationResult:
         ok: bool
         table: TableRoutingTable
@@ -939,8 +1010,8 @@ app FabricTableSelfHost:
         if !hasScope:
             if idx == -1:
                 let newEntry = do tableShardEntryNew(shardId, snapshot.source)
-                shards = append(shards, newEntry)
-                idx = len(shards) - 1
+                shards = do tableShardInsertSorted(shards, newEntry)
+                idx = do tableShardIndexOf(shards, shardId)
         else:
             let validCoord = do coordinateIsValid(scope)
             if !validCoord:
@@ -984,6 +1055,13 @@ app FabricTableSelfHost:
         finalShards[idx] = updated
         let newTable = TableRoutingTable{nodes: table.nodes, shards: finalShards, generation: table.generation + 1, requireProvenHealth: table.requireProvenHealth}
         return TableObserveMigrationResult{ok: true, table: newTable}
+
+    # tableObserveMigrationOf: `RoutingTable::observe_migration(&migration,
+    # scope)` taking the real `Migration` rather than its projected fields.
+    proc tableObserveMigrationOf(table: TableRoutingTable, m: Migration, hasScope: bool, scope: Coordinate) -> TableObserveMigrationResult:
+        let state = do tableMigrationPhaseOf(m)
+        let r = do tableObserveMigration(table, state, m.plan.shardId, m.plan.source, m.plan.destination, hasScope, scope)
+        return r
 
     # tableShardEntrySetOverrideList: the plain-array insert-or-overwrite
     # step `tableObserveMigration`'s cutover-completion branch needs (the

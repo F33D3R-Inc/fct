@@ -108,7 +108,7 @@ func (s *Server) consoleCmd(out io.Writer, line string, actor, role *string) boo
 		for _, a := range s.ir.Actions {
 			ps := make([]string, len(a.Params))
 			for i, p := range a.Params {
-				ps[i] = p.Name + ": " + p.Type
+				ps[i] = p.Name + ": " + paramTypeName(p)
 			}
 			fmt.Fprintf(out, "  %s(%s)  [%s]\n", a.Name, strings.Join(ps, ", "), a.Placement)
 		}

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"facet/internal/ast"
+	"facet/internal/parser"
 )
 
 // TestToolchainVersionCoversControls is a forcing function, not a feature
@@ -43,5 +44,46 @@ func TestToolchainVersionCoversControls(t *testing.T) {
 		t.Fatalf("ast.Controls gained %s since ToolchainVersion was last bumped (%s) — "+
 			"bump ToolchainVersion, explain why in its comment, then add %s to `known` here",
 			strings.Join(unknown, ", "), ToolchainVersion, strings.Join(unknown, ", "))
+	}
+}
+
+// TestToolchainVersionCoversBuiltins is TestToolchainVersionCoversControls for
+// the builtin table (internal/parser/builtins.go): a builtin added — or moved
+// to a different site — without bumping ToolchainVersion makes a manifest's
+// `facet` range claim a toolchain that cannot compile the program. The fix is
+// to bump ToolchainVersion (explaining why in its comment), then update this
+// list.
+func TestToolchainVersionCoversBuiltins(t *testing.T) {
+	known := map[string]parser.BuiltinSite{}
+	for _, n := range strings.Fields(`abs ago byteLen charAt commas compact contains day first floor fromIso fromJson
+		iso join len lower max min money month now rand replace round slice slug split take toFloat toInt toMoney trim upper year`) {
+		known[n] = parser.SiteEverywhere
+	}
+	for _, n := range strings.Fields(`canonicalJson ecdsaP256Verify ed25519Verify fileDigest floatBits floatFromBits formatIn
+		fromLocal given print randomToken sha256Hex shuffleOrder totpSecret totpValid verifyPassword zoneValid`) {
+		known[n] = parser.SiteAuthority
+	}
+	for _, n := range strings.Fields(`accept aesGcmAuthentic aesGcmOpen aesGcmSeal append appendFile bytes bytesToText channel
+		closeConn connError connOpen connect envSet envVar fileExists fileSize httpGet httpPost listen listenOn monoMs nowMs signals
+		pollBytes randomBytes readBytes readFile readFileAt readStdin recv removeFile renameFile send setTimeoutMs
+		shutdownConn sleepMs syncFile textToBytes truncateFile writeBytes writeFile writeFileAt writeStderr writeStdout`) {
+		known[n] = parser.SiteProc
+	}
+	var changed []string
+	for n, want := range known {
+		if got, ok := parser.BuiltinSiteOf(n); !ok || got != want {
+			changed = append(changed, n)
+		}
+	}
+	for _, n := range parser.Builtins() {
+		if _, ok := known[n]; !ok {
+			changed = append(changed, n)
+		}
+	}
+	if len(changed) > 0 {
+		sort.Strings(changed)
+		t.Fatalf("the builtin table changed (%s) since ToolchainVersion was last bumped (%s) — "+
+			"bump ToolchainVersion, explain why in its comment, then update `known` here",
+			strings.Join(changed, ", "), ToolchainVersion)
 	}
 }

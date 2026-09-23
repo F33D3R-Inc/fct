@@ -1,0 +1,600 @@
+import "../../fabric_migration_plan.fct"
+
+app FabricMigrationCheck:
+    # Conformance scenarios for fabric_migration_plan.fct's Migration port.
+    # Every proc below mirrors, step for step, the scratch Rust binary that
+    # linked fabric-migration by path and printed the expected digests in
+    # fabric_leaf_b_test.go (migration.rs / phase.rs #[test]s ported input
+    # for input, plus restart/budget/wrong-phase traces).
+
+    proc lbOpt(v: int) -> text:
+        return "" + v
+
+    proc lbOutcome(has: bool, o: MigrationOutcome) -> text:
+        if !has:
+            return "-"
+        if o.kind == "completed":
+            return "completed@" + o.atMs
+        return o.kind + "@" + o.atMs + ":" + o.detail
+
+    proc lbMig(m: Migration) -> text:
+        let p = m.plan
+        let pr = m.progress
+        let mut fence = "-"
+        if m.hasFence:
+            fence = "" + m.fence.atMs + ":" + m.fence.lastWrite
+        let outcome = do lbOutcome(m.hasOutcome, m.outcome)
+        let mut hist = ""
+        let mut i = 0
+        loop i < len(m.history):
+            let h = m.history[i]
+            let f = do migrationPhaseLabel(h.fromPhase)
+            let t = do migrationPhaseLabel(h.toPhase)
+            if i > 0:
+                hist = hist + ";"
+            hist = hist + f + ">" + t + "@" + h.atMs
+            if h.hasNote:
+                hist = hist + ":" + h.note
+            i = i + 1
+        let wo = do migrationWriteOwner(m)
+        let mut w = "-"
+        if wo.has:
+            w = wo.node
+        let phase = do migrationPhaseLabel(m.phase)
+        let idLabel = do migrationIdLabel(p.id)
+        let reason = do migrationReasonLabel(p.reason)
+        let pending = do migrationPendingWritesOf(m)
+        let cut = do migrationHasCutOverOf(m)
+        let term = do migrationIsTerminal(m)
+        let read = do migrationReadOwner(m)
+        return phase + "|" + idLabel + ":" + p.shardId + ":" + p.source + ":" + p.destination + ":" + reason + ":" + p.createdAtMs + ":" + p.atoms + ":" + p.maxCutoverPendingWrites + "|" + pr.atomsTotal + ":" + pr.atomsCopied + ":" + pr.bytesCopied + ":" + pr.pendingWrites + ":" + pr.phaseStartedAtMs + ":" + pr.updatedAtMs + "|" + m.sourceHighWater + "|" + m.destinationApplied + "|" + fence + "|" + m.cutoverCompletedAtMs + "|" + outcome + "|" + hist + "|" + pending + "|" + cut + "|" + term + "|" + read + "|" + w
+
+    proc lbStatus(s: MigrationStatus) -> text:
+        let outcome = do lbOutcome(s.hasOutcome, s.outcome)
+        let idLabel = do migrationIdLabel(s.id)
+        let phase = do migrationPhaseLabel(s.phase)
+        let mut w = "-"
+        if s.hasWriteOwner:
+            w = s.writeOwner
+        return idLabel + ":" + s.shardId + ":" + s.source + ":" + s.destination + ":" + phase + ":" + s.atomsCopied + ":" + s.atomsTotal + ":" + s.bytesCopied + ":" + s.pendingWrites + ":" + round(s.fraction * 1000000.0) + ":" + s.phaseAgeMs + ":" + s.readOwner + ":" + w + ":" + outcome
+
+    proc lbR(r: MigrationResult) -> text:
+        if r.ok:
+            return "ok"
+        let d = do migrationErrorDisplay(r.err)
+        return "err:" + d
+
+    proc lbW(r: MigrationWriteResult) -> text:
+        if r.ok:
+            return r.route
+        let d = do migrationErrorDisplay(r.err)
+        return "err:" + d
+
+    proc lbMigration() -> Migration:
+        let shard = do shardNew(42, "social")
+        let reason = do migrationReasonRebalance()
+        let pr = do migrationPlanNew(MigrationId{value: 1}, shard, "db-a", "db-b", reason, 1000)
+        let m = do migrationNew(pr.plan)
+        return m
+
+    struct LbTrace:
+        t: text
+        m: Migration
+
+    proc lbPush(t: text, s: text) -> text:
+        if t == "":
+            return s
+        return t + "#" + s
+
+    # caught_up(): begin_copy(2000); accept 0, 1; record_copy(156, 4096,
+    # 3000); begin_catch_up(4000); record_applied(1, 4100).
+    proc lbCaughtUp(t0: text) -> LbTrace:
+        let mut t = t0
+        let m0 = do lbMigration()
+        let a = do migrationBeginCopy(m0, 2000)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationAcceptWrite(a.value, 0)
+        let sb = do lbW(b)
+        t = do lbPush(t, sb)
+        let c = do migrationAcceptWrite(b.value, 1)
+        let sc = do lbW(c)
+        t = do lbPush(t, sc)
+        let d = do migrationRecordCopy(c.value, 156, 4096, 3000)
+        let sd = do lbR(d)
+        t = do lbPush(t, sd)
+        let e = do migrationBeginCatchUp(d.value, 4000)
+        let se = do lbR(e)
+        t = do lbPush(t, se)
+        let f = do migrationRecordApplied(e.value, 1, 4100)
+        let sf = do lbR(f)
+        t = do lbPush(t, sf)
+        let dm = do lbMig(f.value)
+        t = do lbPush(t, dm)
+        return LbTrace{t: t, m: f.value}
+
+    proc lbPhaseTable() -> text:
+        let mut s = ""
+        let mut a = 0
+        loop a < 8:
+            let mut b = 0
+            loop b < 8:
+                let can = do phaseCanAdvanceTo(a, b)
+                if can:
+                    s = s + "1"
+                else:
+                    s = s + "0"
+                b = b + 1
+            a = a + 1
+        s = s + "#"
+        let mut p = 0
+        loop p < 8:
+            let l = do migrationPhaseLabel(p)
+            let t = do phaseIsTerminal(p)
+            let pc = do phaseIsPreCutover(p)
+            let ab = do phaseAllowsAbort(p)
+            let f = do phaseIsFenced(p)
+            s = s + l + ":" + t + ":" + pc + ":" + ab + ":" + f + ";"
+            p = p + 1
+        return s
+
+    proc lbPlanProgress() -> text:
+        let r0 = do migrationReasonHotspot(0.92)
+        let r1 = do migrationReasonRebalance()
+        let r2 = do migrationReasonDrainNode()
+        let r3 = do migrationReasonRegionLocality("us-east")
+        let r4 = do migrationReasonCapacityPressure()
+        let r5 = do migrationReasonOperator("n")
+        let reasons = [r0, r1, r2, r3, r4, r5]
+        let mut s = ""
+        let mut i = 0
+        loop i < 6:
+            let l = do migrationReasonLabel(reasons[i])
+            if i > 0:
+                s = s + ","
+            s = s + l
+            i = i + 1
+        let id42 = do migrationIdLabel(MigrationId{value: 42})
+        let id0 = do migrationIdLabel(MigrationId{value: 0})
+        let dflt = do migrationDefaultMaxCutoverPendingWrites()
+        s = s + "|" + id42 + "|" + id0 + "|" + dflt
+        let totals = [156, 156, 156, 156, 0, 3]
+        let copies = [0, 78, 100, 156, 0, 1]
+        let mut k = 0
+        loop k < 6:
+            let base = do migrationProgressNew(totals[k], 5000)
+            let mut p = base
+            p.atomsCopied = copies[k]
+            let cf = do migrationProgressCopyFraction(p)
+            let done = do migrationProgressIsCopyComplete(p)
+            let age = do migrationProgressPhaseAgeMs(p, 8000)
+            let age2 = do migrationProgressPhaseAgeMs(p, 1000)
+            s = s + "#" + round(cf * 1000000.0) + ":" + done + ":" + age + ":" + age2
+            let mut ph = 0
+            loop ph < 8:
+                let of = do migrationProgressOverallFraction(p, ph)
+                s = s + ":" + round(of * 1000000.0)
+                ph = ph + 1
+            k = k + 1
+        return s
+
+    proc lbPlanNew() -> text:
+        let shard = do shardNew(1, "social")
+        let reason = do migrationReasonRebalance()
+        let bad = do migrationPlanNew(MigrationId{value: 1}, shard, "db-a", "db-a", reason, 0)
+        let e = do migrationErrorDisplay(bad.err)
+        let shard7 = do shardNew(7, "x")
+        let hot = do migrationReasonHotspot(1.5)
+        let good = do migrationPlanNew(MigrationId{value: 9}, shard7, "s", "d", hot, 77)
+        let tightened = do migrationPlanWithMaxCutoverPendingWrites(good.plan, 3)
+        let m = do migrationNew(tightened)
+        let d = do lbMig(m)
+        let mut okFlags = ""
+        if bad.ok || !good.ok:
+            okFlags = "BADFLAGS"
+        return okFlags + "err:" + e + "#" + d
+
+    proc lbReadsServable() -> text:
+        let mut t = ""
+        let m0 = do lbMigration()
+        let d0 = do lbMig(m0)
+        t = do lbPush(t, d0)
+        let a = do migrationBeginCopy(m0, 2000)
+        let sa = do lbR(a)
+        let da = do lbMig(a.value)
+        t = do lbPush(t, sa)
+        t = do lbPush(t, da)
+        let b = do migrationRecordCopy(a.value, 156, 1, 3000)
+        let sb = do lbR(b)
+        let db = do lbMig(b.value)
+        t = do lbPush(t, sb)
+        t = do lbPush(t, db)
+        let c = do migrationBeginCatchUp(b.value, 4000)
+        let sc = do lbR(c)
+        let dc = do lbMig(c.value)
+        t = do lbPush(t, sc)
+        t = do lbPush(t, dc)
+        let d = do migrationBeginCutover(c.value, 5000)
+        let sd = do lbR(d)
+        let dd = do lbMig(d.value)
+        t = do lbPush(t, sd)
+        t = do lbPush(t, dd)
+        let e = do migrationCompleteCutover(d.value, 5100)
+        let se = do lbR(e)
+        let de = do lbMig(e.value)
+        t = do lbPush(t, se)
+        t = do lbPush(t, de)
+        let f = do migrationComplete(e.value, 6000)
+        let sf = do lbR(f)
+        let df = do lbMig(f.value)
+        t = do lbPush(t, sf)
+        t = do lbPush(t, df)
+        let st = do migrationStatus(f.value, 7000)
+        let ss = do lbStatus(st)
+        t = do lbPush(t, ss)
+        return t
+
+    proc lbUndrained() -> text:
+        let cu = do lbCaughtUp("")
+        let mut t = cu.t
+        let a = do migrationAcceptWrite(cu.m, 2)
+        let sa = do lbW(a)
+        t = do lbPush(t, sa)
+        let b = do migrationBeginCutover(a.value, 5000)
+        let sb = do lbR(b)
+        let db = do lbMig(b.value)
+        t = do lbPush(t, sb)
+        t = do lbPush(t, db)
+        let c = do migrationCompleteCutover(b.value, 5100)
+        let sc = do lbR(c)
+        let dc = do lbMig(c.value)
+        t = do lbPush(t, sc)
+        t = do lbPush(t, dc)
+        let d = do migrationRecordApplied(c.value, 2, 5150)
+        let sd = do lbR(d)
+        t = do lbPush(t, sd)
+        let e = do migrationCompleteCutover(d.value, 5200)
+        let se = do lbR(e)
+        let de = do lbMig(e.value)
+        t = do lbPush(t, se)
+        t = do lbPush(t, de)
+        return t
+
+    proc lbNoDoubleApply() -> text:
+        let cu = do lbCaughtUp("")
+        let mut t = cu.t
+        let a = do migrationBeginCutover(cu.m, 5000)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationCompleteCutover(a.value, 5100)
+        let sb = do lbR(b)
+        t = do lbPush(t, sb)
+        let c = do migrationAcceptWrite(b.value, 1)
+        let sc = do lbW(c)
+        t = do lbPush(t, sc)
+        let d = do migrationAcceptWrite(c.value, 2)
+        let sd = do lbW(d)
+        t = do lbPush(t, sd)
+        let e = do migrationAcceptWrite(d.value, 2)
+        let se = do lbW(e)
+        t = do lbPush(t, se)
+        let f = do migrationAcceptWrite(e.value, 5)
+        let sf = do lbW(f)
+        t = do lbPush(t, sf)
+        let df = do lbMig(f.value)
+        t = do lbPush(t, df)
+        return t
+
+    proc lbFenced() -> text:
+        let cu = do lbCaughtUp("")
+        let mut t = cu.t
+        let a = do migrationBeginCutover(cu.m, 5000)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationAcceptWrite(a.value, 2)
+        let sb = do lbW(b)
+        t = do lbPush(t, sb)
+        let st = do migrationStatus(b.value, 5500)
+        let ss = do lbStatus(st)
+        t = do lbPush(t, ss)
+        return t
+
+    proc lbReplay() -> text:
+        let mut t = ""
+        let m0 = do lbMigration()
+        let a = do migrationBeginCopy(m0, 2000)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationAcceptWrite(a.value, 7)
+        let sb = do lbW(b)
+        t = do lbPush(t, sb)
+        let c = do migrationAcceptWrite(b.value, 7)
+        let sc = do lbW(c)
+        t = do lbPush(t, sc)
+        let d = do migrationAcceptWrite(c.value, 3)
+        let sd = do lbW(d)
+        t = do lbPush(t, sd)
+        let dm = do lbMig(d.value)
+        t = do lbPush(t, dm)
+        return t
+
+    proc lbUnknownWrite() -> text:
+        let mut t = ""
+        let m0 = do lbMigration()
+        let z = do migrationRecordApplied(m0, 0, 1500)
+        let sz = do lbR(z)
+        t = do lbPush(t, sz)
+        let a = do migrationBeginCopy(z.value, 2000)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationAcceptWrite(a.value, 3)
+        let sb = do lbW(b)
+        t = do lbPush(t, sb)
+        let c = do migrationRecordApplied(b.value, 9, 2500)
+        let sc = do lbR(c)
+        t = do lbPush(t, sc)
+        let d = do migrationRecordApplied(c.value, 2, 2600)
+        let sd = do lbR(d)
+        t = do lbPush(t, sd)
+        let e = do migrationRecordApplied(d.value, 2, 2700)
+        let se = do lbR(e)
+        t = do lbPush(t, se)
+        let f = do migrationRecordApplied(e.value, 1, 2800)
+        let sf = do lbR(f)
+        t = do lbPush(t, sf)
+        let dm = do lbMig(f.value)
+        t = do lbPush(t, dm)
+        return t
+
+    proc lbCopyIncomplete() -> text:
+        let mut t = ""
+        let m0 = do lbMigration()
+        let a = do migrationRecordCopy(m0, 1, 1, 1500)
+        let s1 = do lbR(a)
+        t = do lbPush(t, s1)
+        let b = do migrationBeginCatchUp(a.value, 1600)
+        let s2 = do lbR(b)
+        t = do lbPush(t, s2)
+        let c = do migrationBeginCopy(b.value, 2000)
+        let s3 = do lbR(c)
+        t = do lbPush(t, s3)
+        let d = do migrationBeginCopy(c.value, 2100)
+        let s4 = do lbR(d)
+        t = do lbPush(t, s4)
+        let e = do migrationRecordCopy(d.value, 100, 1, 2500)
+        let s5 = do lbR(e)
+        t = do lbPush(t, s5)
+        let f = do migrationBeginCatchUp(e.value, 3000)
+        let s6 = do lbR(f)
+        t = do lbPush(t, s6)
+        let g = do migrationRecordCopy(f.value, 157, 9, 3100)
+        let s7 = do lbR(g)
+        t = do lbPush(t, s7)
+        let h = do migrationRecordCopy(g.value, 99, 9, 3200)
+        let s8 = do lbR(h)
+        t = do lbPush(t, s8)
+        let i = do migrationRecordCopy(h.value, 100, 0, 900)
+        let s9 = do lbR(i)
+        t = do lbPush(t, s9)
+        let j = do migrationBeginCutover(i.value, 3300)
+        let s10 = do lbR(j)
+        t = do lbPush(t, s10)
+        let dm = do lbMig(j.value)
+        t = do lbPush(t, dm)
+        return t
+
+    proc lbAbort() -> text:
+        let cu = do lbCaughtUp("")
+        let mut t = cu.t
+        let a = do migrationBeginCutover(cu.m, 5000)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationAbort(a.value, 5050, "destination disk failed")
+        let sb = do lbR(b)
+        let db = do lbMig(b.value)
+        t = do lbPush(t, sb)
+        t = do lbPush(t, db)
+        let c = do migrationAbort(b.value, 5060, "again")
+        let sc = do lbR(c)
+        t = do lbPush(t, sc)
+        let d = do migrationFail(c.value, 5070, "late")
+        let sd = do lbR(d)
+        t = do lbPush(t, sd)
+        let e = do migrationAcceptWrite(d.value, 2)
+        let se = do lbW(e)
+        t = do lbPush(t, se)
+        let st = do migrationStatus(e.value, 6000)
+        let ss = do lbStatus(st)
+        t = do lbPush(t, ss)
+        let cu2 = do lbCaughtUp(t)
+        t = cu2.t
+        let f = do migrationBeginCutover(cu2.m, 5000)
+        let sf = do lbR(f)
+        t = do lbPush(t, sf)
+        let g = do migrationCompleteCutover(f.value, 5100)
+        let sg = do lbR(g)
+        t = do lbPush(t, sg)
+        let h = do migrationAbort(g.value, 5200, "changed my mind")
+        let sh = do lbR(h)
+        let dh = do lbMig(h.value)
+        t = do lbPush(t, sh)
+        t = do lbPush(t, dh)
+        let m3 = do lbMigration()
+        let i = do migrationAbort(m3, 1100, "never mind")
+        let si = do lbR(i)
+        let di = do lbMig(i.value)
+        t = do lbPush(t, si)
+        t = do lbPush(t, di)
+        return t
+
+    proc lbFailCleanup() -> text:
+        let cu = do lbCaughtUp("")
+        let mut t = cu.t
+        let a = do migrationBeginCutover(cu.m, 5000)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationCompleteCutover(a.value, 5100)
+        let sb = do lbR(b)
+        t = do lbPush(t, sb)
+        let c = do migrationFail(b.value, 5300, "source cleanup timed out")
+        let sc = do lbR(c)
+        let dc = do lbMig(c.value)
+        t = do lbPush(t, sc)
+        t = do lbPush(t, dc)
+        let d = do migrationComplete(c.value, 5400)
+        let sd = do lbR(d)
+        t = do lbPush(t, sd)
+        let st = do migrationStatus(d.value, 5000)
+        let ss = do lbStatus(st)
+        t = do lbPush(t, ss)
+        return t
+
+    proc lbStatusCheck() -> text:
+        let mut t = ""
+        let m0 = do lbMigration()
+        let a = do migrationBeginCopy(m0, 2000)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationRecordCopy(a.value, 78, 2048, 2500)
+        let sb = do lbR(b)
+        t = do lbPush(t, sb)
+        let st = do migrationStatus(b.value, 3000)
+        let ss = do lbStatus(st)
+        t = do lbPush(t, ss)
+        let dm = do lbMig(b.value)
+        t = do lbPush(t, dm)
+        return t
+
+    proc lbRestart() -> text:
+        let mut t = ""
+        let shard = do shardNew(5, "social")
+        let reason = do migrationReasonOperator("move it")
+        let pr = do migrationPlanNew(MigrationId{value: 3}, shard, "n1", "n2", reason, 100)
+        let plan = do migrationPlanWithMaxCutoverPendingWrites(pr.plan, 2)
+        let mut m = do migrationNew(plan)
+        let a = do migrationRestartCopy(m, 150, "early")
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationCompleteCutover(a.value, 160)
+        let sb = do lbR(b)
+        t = do lbPush(t, sb)
+        let c = do migrationComplete(b.value, 170)
+        let sc = do lbR(c)
+        t = do lbPush(t, sc)
+        let d = do migrationBeginCopy(c.value, 200)
+        let sd = do lbR(d)
+        t = do lbPush(t, sd)
+        m = d.value
+        let mut seq = 0
+        loop seq < 5:
+            let w = do migrationAcceptWrite(m, seq)
+            let sw = do lbW(w)
+            t = do lbPush(t, sw)
+            m = w.value
+            seq = seq + 1
+        let e = do migrationRecordCopy(m, 156, 999, 300)
+        let se = do lbR(e)
+        t = do lbPush(t, se)
+        let f = do migrationBeginCatchUp(e.value, 400)
+        let sf = do lbR(f)
+        t = do lbPush(t, sf)
+        let g = do migrationRecordApplied(f.value, 1, 410)
+        let sg = do lbR(g)
+        t = do lbPush(t, sg)
+        let h = do migrationBeginCutover(g.value, 420)
+        let sh = do lbR(h)
+        t = do lbPush(t, sh)
+        let i = do migrationRestartCopy(h.value, 430, "bad destination disk")
+        let si = do lbR(i)
+        let di = do lbMig(i.value)
+        t = do lbPush(t, si)
+        t = do lbPush(t, di)
+        let j = do migrationRecordCopy(i.value, 156, 5, 440)
+        let sj = do lbR(j)
+        t = do lbPush(t, sj)
+        let k = do migrationBeginCatchUp(j.value, 450)
+        let sk = do lbR(k)
+        t = do lbPush(t, sk)
+        let l = do migrationRecordApplied(k.value, 3, 460)
+        let sl = do lbR(l)
+        t = do lbPush(t, sl)
+        let n = do migrationBeginCutover(l.value, 470)
+        let sn = do lbR(n)
+        let dn = do lbMig(n.value)
+        t = do lbPush(t, sn)
+        t = do lbPush(t, dn)
+        let o = do migrationBeginCutover(n.value, 480)
+        let so = do lbR(o)
+        t = do lbPush(t, so)
+        let p = do migrationRecordApplied(o.value, 4, 490)
+        let sp = do lbR(p)
+        t = do lbPush(t, sp)
+        let q = do migrationCompleteCutover(p.value, 500)
+        let sq = do lbR(q)
+        t = do lbPush(t, sq)
+        let r = do migrationAcceptWrite(q.value, 4)
+        let sr = do lbW(r)
+        t = do lbPush(t, sr)
+        let s = do migrationAcceptWrite(r.value, 9)
+        let ss = do lbW(s)
+        t = do lbPush(t, ss)
+        let u = do migrationComplete(s.value, 600)
+        let su = do lbR(u)
+        let du = do lbMig(u.value)
+        t = do lbPush(t, su)
+        t = do lbPush(t, du)
+        let v = do migrationAbort(u.value, 700, "x")
+        let sv = do lbR(v)
+        t = do lbPush(t, sv)
+        let x = do migrationBeginCopy(v.value, 800)
+        let sx = do lbR(x)
+        t = do lbPush(t, sx)
+        let st = do migrationStatus(x.value, 650)
+        let sst = do lbStatus(st)
+        t = do lbPush(t, sst)
+        return t
+
+    state migPhaseTable: text = ""
+    state migPlanProgress: text = ""
+    state migPlanNew: text = ""
+    state migReadsServable: text = ""
+    state migUndrained: text = ""
+    state migNoDoubleApply: text = ""
+    state migFenced: text = ""
+    state migReplay: text = ""
+    state migUnknownWrite: text = ""
+    state migCopyIncomplete: text = ""
+    state migAbort: text = ""
+    state migFailCleanup: text = ""
+    state migStatus: text = ""
+    state migRestart: text = ""
+
+    action runMigrationCheck():
+        let a = do lbPhaseTable()
+        let b = do lbPlanProgress()
+        let c = do lbPlanNew()
+        let d = do lbReadsServable()
+        let e = do lbUndrained()
+        let f = do lbNoDoubleApply()
+        let g = do lbFenced()
+        let h = do lbReplay()
+        let i = do lbUnknownWrite()
+        let j = do lbCopyIncomplete()
+        let k = do lbAbort()
+        let l = do lbFailCleanup()
+        let m = do lbStatusCheck()
+        let n = do lbRestart()
+        migPhaseTable = a
+        migPlanProgress = b
+        migPlanNew = c
+        migReadsServable = d
+        migUndrained = e
+        migNoDoubleApply = f
+        migFenced = g
+        migReplay = h
+        migUnknownWrite = i
+        migCopyIncomplete = j
+        migAbort = k
+        migFailCleanup = l
+        migStatus = m
+        migRestart = n

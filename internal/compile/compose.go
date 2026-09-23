@@ -56,6 +56,7 @@ func isPresentational(f *ast.App) bool {
 		len(f.States) == 0 && len(f.Derives) == 0 && len(f.Policies) == 0 &&
 		len(f.Actions) == 0 && len(f.Procs) == 0 && len(f.Jobs) == 0 && len(f.Services) == 0 && len(f.Files) == 0 &&
 		len(f.Webhooks) == 0 && len(f.Triggers) == 0 && len(f.Views) == 0 &&
+		len(f.APIs) == 0 && len(f.Streams) == 0 && f.Contract == nil &&
 		len(f.Mounts) == 0 && len(f.Sockets) == 0 && len(f.Frame) == 0 && !f.Auth
 }
 
@@ -185,6 +186,7 @@ func compose(facets []*ast.App) (*ast.App, error) {
 		app.Procs = append(app.Procs, b.Procs...)
 		app.Jobs = append(app.Jobs, b.Jobs...)
 		app.Daemons = append(app.Daemons, b.Daemons...)
+		app.Shareds = append(app.Shareds, b.Shareds...)
 		app.Components = append(app.Components, b.Components...)
 		app.Layouts = append(app.Layouts, b.Layouts...)
 		app.Services = append(app.Services, b.Services...)

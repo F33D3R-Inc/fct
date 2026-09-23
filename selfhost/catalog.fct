@@ -1,0 +1,209 @@
+import "binary.fct"
+
+app CatalogSelfHost:
+    # catalog.fct — self-hosted port of facetql/src/storage/catalog.rs: the
+    # small durable file that says how to open the physical storage — the
+    # database format generation, the page size, and the heap segments
+    # (their page counts and reclaimable bytes), which one is being
+    # appended to, and the next segment id.
+    #
+    # On disk it is one binary.fct record frame around crypto.rs's sealed
+    # bincode of CatalogData, so a truncated or damaged catalog is reported
+    # as such rather than decoding into segments that do not exist. It is
+    # rewritten whole on every change: a temp file written and fsynced,
+    # renamed over `facetql.catalog`, the directory fsynced — a reader sees
+    # the old catalog or the new one, never half of one.
+    #
+    # bincode 1.x legacy encoding: four u32 (format_version, page_size,
+    # next_segment, active_segment), then the segments as a u64 count and
+    # per segment u32 id, u32 pages, u64 obsolete_bytes, all little-endian.
+    struct FqSegment:
+        id: int
+        pages: int
+        obsoleteBytes: int
+
+    struct FqCatalog:
+        formatVersion: int
+        pageSize: int
+        nextSegment: int
+        activeSegment: int
+        segments: [FqSegment]
+
+    struct FqCatalogR:
+        ok: bool
+        err: text
+        catalog: FqCatalog
+
+    proc ctFormatVersion() -> int:
+        return 1
+
+    # ctFresh: a new database's catalog — one empty active segment 0.
+    proc ctFresh() -> FqCatalog:
+        return FqCatalog{formatVersion: 1, pageSize: 16384, nextSegment: 1, activeSegment: 0, segments: [FqSegment{id: 0, pages: 0, obsoleteBytes: 0}]}
+
+    proc ctEncode(c: FqCatalog) -> [int]:
+        let o1 = do fqwPutUint([], c.formatVersion, 4)
+        let o2 = do fqwPutUint(o1, c.pageSize, 4)
+        let o3 = do fqwPutUint(o2, c.nextSegment, 4)
+        let o4 = do fqwPutUint(o3, c.activeSegment, 4)
+        let mut out = do fqwPutUint(o4, len(c.segments), 8)
+        let n = len(c.segments)
+        let mut i = 0
+        loop i < n:
+            let s = c.segments[i]
+            let a = do fqwPutUint(out, s.id, 4)
+            let b = do fqwPutUint(a, s.pages, 4)
+            let d = do fqwPutUint(b, s.obsoleteBytes, 8)
+            out = d
+            i = i + 1
+        return out
+
+    proc ctErr(msg: text) -> FqCatalogR:
+        return FqCatalogR{ok: false, err: msg, catalog: FqCatalog{formatVersion: 0, pageSize: 0, nextSegment: 0, activeSegment: 0, segments: []}}
+
+    proc ctDecodePlain(bs: [int]) -> FqCatalogR:
+        let fv = do fqwGetUint(FqwCur{buf: bs, pos: 0, err: ""}, 4)
+        let ps = do fqwGetUint(fv.cur, 4)
+        let ns = do fqwGetUint(ps.cur, 4)
+        let as = do fqwGetUint(ns.cur, 4)
+        let cnt = do fqwGetUint(as.cur, 8)
+        let mut cur = cnt.cur
+        let mut segs = []
+        let mut i = 0
+        loop i < cnt.v && cur.err == "":
+            let id = do fqwGetUint(cur, 4)
+            let pg = do fqwGetUint(id.cur, 4)
+            let ob = do fqwGetUint(pg.cur, 8)
+            cur = ob.cur
+            segs = append(segs, FqSegment{id: id.v, pages: pg.v, obsoleteBytes: ob.v})
+            i = i + 1
+        if cur.err != "":
+            let e = do ctErr("failed to decode catalog: " + cur.err)
+            return e
+        return FqCatalogR{ok: true, err: "", catalog: FqCatalog{formatVersion: fv.v, pageSize: ps.v, nextSegment: ns.v, activeSegment: as.v, segments: segs}}
+
+    # ctDecode: decode — frame, then decrypt, then bincode, each failure
+    # named as catalog.rs names it.
+    proc ctDecode(bs: [int], key: [int]) -> FqCatalogR:
+        let fr = do bnDecodeFrame(bs)
+        if !fr.ok:
+            let e0 = do ctErr("catalog is unreadable: " + fr.err)
+            return e0
+        let dec = do cryptoDecrypt(key, fr.bytes)
+        if !dec.ok:
+            let e1 = do ctErr("failed to decrypt the catalog: " + dec.err + " — wrong FACETQL_MASTER_KEY, or the file is damaged")
+            return e1
+        let r = do ctDecodePlain(dec.plaintext)
+        return r
+
+    # ctOpen: Catalog::open — the file under dir, or a fresh catalog when
+    # there is none; another format generation or page size is refused.
+    proc ctOpen(dir: text, key: [int]) -> FqCatalogR uses io.file:
+        let path = dir + "facetql.catalog"
+        let size = fileSize(path)
+        if size < 0:
+            let fresh = do ctFresh()
+            return FqCatalogR{ok: true, err: "", catalog: fresh}
+        let mut bs = []
+        if size > 0:
+            let r = readFileAt(path, 0, size)
+            bs = r
+        let d = do ctDecode(bs, key)
+        if !d.ok:
+            return d
+        let c = d.catalog
+        if c.formatVersion != 1:
+            let e0 = do ctErr("database format version " + c.formatVersion + " is not supported by this build (expected 1). The physical layout changed; recreate the data directory.")
+            return e0
+        if c.pageSize != 16384:
+            let e1 = do ctErr("database was created with a " + c.pageSize + "-byte page size; this build uses 16384")
+            return e1
+        return d
+
+    # ctSave: save — sealed, framed, written whole to a temp file, fsynced,
+    # renamed over the catalog (renameFile fsyncs the directory).
+    proc ctSave(dir: text, c: FqCatalog, key: [int], nonce: [int], tmpId: int) -> text uses io.file:
+        let plain = do ctEncode(c)
+        let sealed = do cryptoEncrypt(key, nonce, plain)
+        let fr = do bnEncodeFrame(sealed)
+        if !fr.ok:
+            return fr.err
+        let tmp = dir + "facetql.catalog.fct." + tmpId + ".tmp"
+        let w = writeFileAt(tmp, 0, fr.bytes)
+        let s = syncFile(tmp)
+        let r = renameFile(tmp, dir + "facetql.catalog")
+        return ""
+
+    # ── test harness ───────────────────────────────────────────────────
+    state catalogOut: text = ""
+
+    proc ctText(c: FqCatalog) -> text:
+        let mut out = "v" + c.formatVersion + " page=" + c.pageSize + " next=" + c.nextSegment + " active=" + c.activeSegment + " segs="
+        let n = len(c.segments)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let s = c.segments[i]
+            out = out + s.id + ":" + s.pages + ":" + s.obsoleteBytes
+            i = i + 1
+        return out
+
+    proc ctReadText(dir: text, keyHex: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let r = do ctOpen(dir, key)
+        if !r.ok:
+            return "error: " + r.err
+        let t = do ctText(r.catalog)
+        return t
+
+    # ctWriteText: open, apply `segs id:pages:obsolete,…` and `active N`
+    # and `next N`, save.
+    proc ctWriteText(dir: text, keyHex: text, nonceBase: int, spec: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let r = do ctOpen(dir, key)
+        if !r.ok:
+            return "error: " + r.err
+        let mut c = r.catalog
+        let parts = split(trim(spec), " ")
+        let np = len(parts)
+        let mut i = 0
+        loop i + 1 < np:
+            let k = parts[i]
+            let v = parts[i + 1]
+            if k == "active":
+                c = FqCatalog{formatVersion: c.formatVersion, pageSize: c.pageSize, nextSegment: c.nextSegment, activeSegment: toInt(v), segments: c.segments}
+            if k == "version":
+                c = FqCatalog{formatVersion: toInt(v), pageSize: c.pageSize, nextSegment: c.nextSegment, activeSegment: c.activeSegment, segments: c.segments}
+            if k == "pagesize":
+                c = FqCatalog{formatVersion: c.formatVersion, pageSize: toInt(v), nextSegment: c.nextSegment, activeSegment: c.activeSegment, segments: c.segments}
+            if k == "next":
+                c = FqCatalog{formatVersion: c.formatVersion, pageSize: c.pageSize, nextSegment: toInt(v), activeSegment: c.activeSegment, segments: c.segments}
+            if k == "segs":
+                let items = split(v, ",")
+                let mut segs = []
+                let ni = len(items)
+                let mut j = 0
+                loop j < ni:
+                    let f = split(items[j], ":")
+                    segs = append(segs, FqSegment{id: toInt(f[0]), pages: toInt(f[1]), obsoleteBytes: toInt(f[2])})
+                    j = j + 1
+                c = FqCatalog{formatVersion: c.formatVersion, pageSize: c.pageSize, nextSegment: c.nextSegment, activeSegment: c.activeSegment, segments: segs}
+            i = i + 2
+        let nonce = do fqwNonce(nonceBase, 0)
+        let e = do ctSave(dir, c, key, nonce, nonceBase)
+        if e != "":
+            return "error: " + e
+        let t = do ctText(c)
+        return t
+
+    action runCatalogRead(dir: text, keyHex: text):
+        let r = do ctReadText(dir, keyHex)
+        catalogOut = r
+
+    action runCatalogWrite(dir: text, keyHex: text, nonceBase: int, spec: text):
+        let r = do ctWriteText(dir, keyHex, nonceBase, spec)
+        catalogOut = r
+
+    view CatalogHome at "/catalog":
+        text "{catalogOut}"

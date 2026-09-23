@@ -1,167 +1,27 @@
 import "fabric_core.fct"
 import "fabric_telemetry.fct"
+import "fabric_json.fct"
 
 app FabricProtocolSelfHost:
-    # Self-hosting port of fabric/crates/fabric-protocol/src/ — the fleet
-    # control-plane wire protocol: message.rs (52L: ProtocolVersion,
-    # FabricMessage, FabricResponse), node.rs (33L: NodeRegistration,
-    # NodeHeartbeat), topology.rs (17L: TopologyReport, Placement),
-    # observation.rs (68L: TelemetryBatch, TelemetrySample,
-    # WorkloadObservation), transport.rs (109L: ProtocolError,
-    # ProtocolServer::decode/encode/handle). Every file in the crate read in
-    # full, plus src/bin/facet-protocol.rs (the axum/tokio binary) and
-    # fabric-daemon/src/admin.rs + control.rs, before writing a line here.
+    # Port of fabric/crates/fabric-protocol/src: message.rs (ProtocolVersion,
+    # FabricMessage, FabricResponse), node.rs (NodeRegistration,
+    # NodeHeartbeat), topology.rs (TopologyReport, Placement ->
+    # ProtocolPlacement), observation.rs (TelemetryBatch, TelemetrySample and
+    # its metrics(), WorkloadObservation) and transport.rs (ProtocolError and
+    # its Display, ProtocolServer::decode/encode/handle, authorized,
+    # PROTOCOL_TOKEN_ENV). The axum router/listener and the facet-protocol
+    # binary are socket wiring and are not ported.
     #
-    # ============================================================
-    # INVESTIGATION: fabric-protocol has NO length-prefixed binary framing
-    # ============================================================
-    # This task was briefed expecting something shaped like heap.fct's
-    # magic+version+length+CRC record frame. That is not what
-    # fabric-protocol is. Its wire format is plain JSON
-    # (`serde_json::from_slice`/`to_vec`) carried inside an HTTP POST body —
-    # `src/bin/facet-protocol.rs` is an axum `Router` with one route,
-    # `/v1/message`, using axum's own `Json<T>` extractor/response wrapper.
-    # There is no magic number, no version byte, no explicit length prefix
-    # and no checksum anywhere in this crate — HTTP's own `Content-Length`
-    # and TCP's own stream guarantees are the entire framing layer, and
-    # neither is `fabric-protocol`'s code to own.
+    # The wire format is serde_json with serde's default, externally tagged
+    # enums: {"Heartbeat":{...}} for a newtype/struct variant, the bare
+    # string "Acknowledged" for the unit variant, DbmsId as its bare string,
+    # Shard as {id, workload_domain}. Decoding and encoding go through
+    # fabric_json.fct, which follows serde_json's own number, string and
+    # float rules; fabric_leaf_a_test.go checks both directions against the
+    # real crate (testdata/fabric_check).
     #
-    # What IS real, pure, self-contained, crypto-free logic — and the thing
-    # this file actually ports — is `ProtocolServer::decode`/`encode`/
-    # `handle` in transport.rs:
-    #   - `decode(payload: &[u8]) -> Result<FabricMessage, ProtocolError>`:
-    #     parses a JSON payload into the tagged `FabricMessage` enum.
-    #   - `handle(&self, message: FabricMessage) -> FabricResponse`: pure
-    #     dispatch, no I/O, no `&mut self` state (transport.rs's own doc
-    #     comment is explicit that this must stay stateless — see NOTES
-    #     FAB-SEC-001 — so it is genuinely a pure function of its input,
-    #     not a stub of a stateful thing).
-    #   - `encode(response: &FabricResponse) -> Result<Vec<u8>, ProtocolError>`:
-    #     serializes the tagged `FabricResponse` enum back to JSON.
-    # These three functions have zero dependency on `SocketAddr`/axum/tokio
-    # — `ProtocolServer` only carries an address as inert data `decode`/
-    # `encode`/`handle` never touch (`address()` is a plain getter). The
-    # actual socket-accept loop (`TcpListener::bind`, `axum::serve`, the
-    # `async fn message` handler in facet-protocol.rs) is exactly the
-    # "application wiring, not self-hostable logic" this task's brief
-    # describes, and is NOT ported here.
-    #
-    # fabric-daemon's admin.rs/control.rs were also read in full as the
-    # fallback candidate: they are axum HTTP handlers even more tangled
-    # with `tokio::sync::oneshot`/`mpsc` channel plumbing than
-    # fabric-protocol's own bin — genuinely less separable, not more — so
-    # fabric-protocol remains the better port target. (admin.rs's
-    # `authorized` constant-time token comparison is real pure logic too,
-    # but it is HTTP-bearer-token auth, not message framing — out of this
-    # file's scope; noted here for whoever ports fabric-daemon next.)
-    #
-    # ============================================================
-    # WIRE FORMAT: serde's default externally-tagged enum representation
-    # ============================================================
-    # Every `FabricMessage`/`FabricResponse` variant is derived
-    # `Serialize`/`Deserialize` with no `#[serde(...)]` representation
-    # attribute anywhere in message.rs, so serde's DEFAULT applies:
-    #   - A variant carrying data (every `FabricMessage` variant; `Registered`
-    #     /`OptimizationProposal`/`Rejected` on `FabricResponse`) is
-    #     `{"VariantName": <payload>}`.
-    #   - A unit variant (`FabricResponse::Acknowledged` — the only one) is
-    #     the JSON STRING `"Acknowledged"`, NOT `{"Acknowledged":null}`. This
-    #     is easy to miss and is handled explicitly below.
-    # No field anywhere in this crate carries a `#[serde(rename...)]`, so
-    # every JSON key below is the Rust field's own snake_case name verbatim
-    # (`node_id`, `timestamp_ms`, `software_version`, `operations_per_second`,
-    # …).
-    #
-    # ============================================================
-    # REPRESENTATION CHOICES
-    # ============================================================
-    # `Coordinate`/`DbmsId`/`CellWorkloadMetrics` are reused directly via
-    # `import "fabric_core.fct"`/`import "fabric_telemetry.fct"` (their
-    # canonical declarations) rather than restated locally — cross-file
-    # struct/proc reuse is confirmed to work fully in this directory; the
-    # earlier "every file must restate its own copy" convention was a stale
-    # over-generalization from an unrelated view-route collision, corrected
-    # this round.
-    #
-    # `ProtocolShard` (this file's own name — real Rust type is `Shard`,
-    # renamed here only to avoid colliding with fabric_core.fct's own,
-    # differently-shaped `Shard` struct now that both are reachable from one
-    # compile unit) is deliberately the WIRE subset only — `id`+
-    # `workload_domain` — because the real `#[derive(Serialize)] pub struct
-    # Shard` has `#[serde(skip)]` on both `grid`/`storage`
-    # (fabric-core/src/shard.rs): those two fields never exist on the wire
-    # at all, so this file's `ProtocolShard` has no fields for them, rather
-    # than inventing a full `Grid`/`ShardStorage` no message here ever
-    # carries.
-    # `DbmsId(pub String)` is a derived-Serialize newtype struct, which
-    # serde's default `serialize_newtype_struct` forwards transparently — it
-    # is a bare JSON STRING on the wire, never `{"0": "..."}` — confirmed by
-    # reading `serde`'s own newtype-struct serialization contract, not
-    # assumed.
-    #
-    # Every enum (`FabricMessage`, `FabricResponse`) is ported with this
-    # directory's established text-tagged-struct convention (predicate.fct's
-    # `Field`, fabric_routing.fct's `RoutingError`): `kind` names the live
-    # variant, every payload field is always present but only the ones
-    # `kind` names are meaningful.
-    #
-    # ============================================================
-    # A REAL GAP THIS PORT HAD TO SOLVE FOR REAL: JSON, AGAIN
-    # ============================================================
-    # `facet lang` still has no JSON type. fabric_plan.fct already solved
-    # this once for validating/skipping+extracting flat string/array fields
-    # out of a `serde_json::Value`-shaped body; this file needed the same
-    # kind of extraction for NESTED objects, numbers and booleans, which
-    # fabric_plan.fct's own extractors did not need and do not provide.
-    # Rather than duplicate fabric_plan.fct's three near-identical
-    # string/array scan loops verbatim (this file cannot `import` it and
-    # stay consistent with this directory's per-file self-containment
-    # convention — see fabric_telemetry.fct's header for the same
-    # conclusion), the scan is factored ONE level further here:
-    # `protoJsonObjectRawField` finds a member's raw [start,end) span for
-    # ANY value shape once, and `protoJsonObjectStringField`/
-    # `NumberField`/`BoolField`/the nested-object and nested-array callers
-    # all specialize that one scan instead of re-scanning from scratch —
-    # genuinely less duplicative than restating the same loop four times,
-    # not a second implementation of fabric_plan.fct's algorithm.
-    #
-    # Number values are decoded via this language's own `toInt`/`toFloat`
-    # builtins (confirmed by reading runtime/eval.go: both parse numeric
-    # TEXT through `strconv`, not just coerce an already-numeric runtime
-    # value) once this scanner has located the exact numeric literal's
-    # text span — so no digit-by-digit parser had to be hand-written.
-    # Encoding a number back to JSON text uses the mirror-image fact,
-    # also confirmed by reading runtime/eval.go: the `+` operator, when
-    # either operand is `text`, calls `toStr` on the other operand, whose
-    # `float64` branch is `strconv.FormatFloat(t, 'g', -1, 64)` — Go's
-    # shortest-round-trip decimal formatting, the same class of guarantee
-    # `serde_json`'s own float formatter makes, and `int`'s branch is exact
-    # decimal digits. `"" + someFloat`/`"" + someInt` is this file's
-    # `floatToText`/`intToText`, and it needed no separate helper proc.
-    #
-    # ONE NAMED, HONEST SIMPLIFICATION: JSON string escaping on the ENCODE
-    # side only escapes `"` and `\` — every text field this protocol
-    # actually carries (node ids, regions, protocol tags, coordinate/action/
-    # reason labels) is an ASCII identifier or short label in every real
-    # call site in the fabric/ tree, the same scope decision
-    # fabric_plan.fct's own header already made and justified for its
-    # `planAsciiPrintableTable`. On the DECODE side, `\uXXXX` escapes ARE
-    # supported (restricted to the printable-ASCII result, same as
-    # fabric_plan.fct's `planAsciiCharOk`) so a real `serde_json`-encoded
-    # payload round-trips.
-    #
-    # ANOTHER NAMED SIMPLIFICATION, same shape as fabric_plan.fct's own: a
-    # decode failure's error text is a fixed placeholder ("invalid JSON
-    # body") rather than a byte-for-byte reproduction of `serde_json`'s own
-    # diagnostic — reproducing `serde_json`'s error formatter is porting a
-    # dependency, not this crate's own logic.
-    #
-    # `ProtocolVersion`/its `V1` constant are ported for completeness
-    # (message.rs defines them) but are honestly unused by `decode`/
-    # `encode`/`handle` in the real Rust source too — grepped, confirmed:
-    # nothing in fabric-protocol's own src/ ever constructs or reads a
-    # `ProtocolVersion` value. Restated as dead weight here because that is
-    # exactly what it is upstream, not silently dropped.
+    # Enums are text-tagged structs (`kind` names the variant; only that
+    # variant's fields are meaningful).
 
     # ============================================================
     # WIRE DATA MODEL
@@ -187,12 +47,16 @@ app FabricProtocolSelfHost:
         softwareVersion: text
         region: text
 
+    # node.rs NodeRegistration::new: the protocol tag is always "facet/1".
+    proc nodeRegistrationNew(nodeId: DbmsId, softwareVersion: text, region: text) -> NodeRegistration:
+        return NodeRegistration{protocol: "facet/1", nodeId: nodeId, softwareVersion: softwareVersion, region: region}
+
     struct NodeHeartbeat:
         nodeId: DbmsId
         timestampMs: int
         healthy: bool
 
-    struct Placement:
+    struct ProtocolPlacement:
         coordinate: Coordinate
         dbmsId: DbmsId
         region: text
@@ -200,7 +64,7 @@ app FabricProtocolSelfHost:
     struct TopologyReport:
         nodeId: DbmsId
         timestampMs: int
-        placements: [Placement]
+        placements: [ProtocolPlacement]
 
     struct TelemetrySample:
         coordinate: Coordinate
@@ -218,6 +82,12 @@ app FabricProtocolSelfHost:
         # `#[serde(default)]` in the real source: absent on the wire decodes
         # as false, not a decode failure.
         cellBreakdownPartial: bool
+
+    # observation.rs TelemetrySample::metrics: reads/writes are the total
+    # scaled by the ratios; the three byte rates are always 0.
+    proc telemetrySampleMetrics(s: TelemetrySample) -> WorkloadMetrics:
+        let total = s.operationsPerSecond
+        return WorkloadMetrics{operationsPerSecond: total, readsPerSecond: total * s.readRatio, writesPerSecond: total * s.writeRatio, readLatencyUs: s.readLatencyUs, writeLatencyUs: s.writeLatencyUs, cpuUtilization: s.cpuUtilization, memoryUtilization: s.memoryUtilization, storageBytesPerSecond: 0, networkInBytesPerSecond: 0, networkOutBytesPerSecond: 0, queueDepth: s.queueDepth, cellBreakdown: s.cellBreakdown, cellBreakdownPartial: s.cellBreakdownPartial}
 
     struct TelemetryBatch:
         timestampMs: int
@@ -274,938 +144,243 @@ app FabricProtocolSelfHost:
         return FabricResponse{kind: "", registeredNodeId: "", proposalCoordinate: "", proposalAction: "", proposalExpectedGain: 0.0, proposalEstimatedCost: 0.0, proposalConfidence: 0.0, rejectedReason: ""}
 
     # ============================================================
-    # JSON TOOLKIT (restated technique from fabric_plan.fct's SECTION 1;
-    # generalized to nested objects/numbers/bools — see header)
+    # DECODE — serde's derived Deserialize over serde_json (fabric_json.fct)
     # ============================================================
-    struct ProtoStrField:
-        ok: bool
-        value: text
+    # The schema of every wire type, as the derives declare them: field
+    # names and order, #[serde(default)] on TelemetrySample's two breakdown
+    # fields, Shard without its #[serde(skip)] grid/storage, DbmsId (a
+    # newtype around String) as "string", the externally tagged enums.
+    proc protoSchema() -> [SjType]:
+        let coordinate = sjStructType("Coordinate", "struct Coordinate", ["x", "y"], ["u8", "u8"], [false, false])
+        let cell = sjStructType("CellWorkloadMetrics", "struct CellWorkloadMetrics", ["x", "y", "z", "q", "reads_per_second", "writes_per_second", "bytes_read_per_second", "bytes_written_per_second"], ["u8", "u8", "u8", "u8", "f64", "f64", "f64", "f64"], [false, false, false, false, false, false, false, false])
+        let shard = sjStructType("Shard", "struct Shard", ["id", "workload_domain"], ["u64", "string"], [false, false])
+        let reg = sjStructType("NodeRegistration", "struct NodeRegistration", ["protocol", "node_id", "software_version", "region"], ["string", "string", "string", "string"], [false, false, false, false])
+        let hb = sjStructType("NodeHeartbeat", "struct NodeHeartbeat", ["node_id", "timestamp_ms", "healthy"], ["string", "u64", "bool"], [false, false, false])
+        let placement = sjStructType("Placement", "struct Placement", ["coordinate", "dbms_id", "region"], ["Coordinate", "string", "string"], [false, false, false])
+        let topo = sjStructType("TopologyReport", "struct TopologyReport", ["node_id", "timestamp_ms", "placements"], ["string", "u64", "Vec<Placement>"], [false, false, false])
+        let sample = sjStructType("TelemetrySample", "struct TelemetrySample", ["coordinate", "operations_per_second", "read_ratio", "write_ratio", "read_latency_us", "write_latency_us", "cpu_utilization", "memory_utilization", "queue_depth", "cell_breakdown", "cell_breakdown_partial"], ["Coordinate", "f64", "f64", "f64", "f64", "f64", "f64", "f64", "u64", "Vec<CellWorkloadMetrics>", "bool"], [false, false, false, false, false, false, false, false, false, true, true])
+        let batch = sjStructType("TelemetryBatch", "struct TelemetryBatch", ["timestamp_ms", "node_id", "shard", "samples"], ["u64", "string", "Shard", "Vec<TelemetrySample>"], [false, false, false, false])
+        let obs = sjStructType("WorkloadObservation", "struct WorkloadObservation", ["node_id", "coordinate", "timestamp_ms", "operations_per_second", "read_ratio", "write_ratio"], ["string", "Coordinate", "u64", "f64", "f64", "f64"], [false, false, false, false, false, false])
+        let message = sjEnumType("FabricMessage", "enum FabricMessage", ["RegisterNode", "Heartbeat", "Topology", "Telemetry", "Workload"], ["NodeRegistration", "NodeHeartbeat", "TopologyReport", "TelemetryBatch", "WorkloadObservation"], ["newtype", "newtype", "newtype", "newtype", "newtype"])
+        let registered = sjStructType("FabricResponse::Registered", "struct variant FabricResponse::Registered", ["node_id"], ["string"], [false])
+        let proposal = sjStructType("FabricResponse::OptimizationProposal", "struct variant FabricResponse::OptimizationProposal", ["coordinate", "action", "expected_gain", "estimated_cost", "confidence"], ["string", "string", "f64", "f64", "f64"], [false, false, false, false, false])
+        let rejected = sjStructType("FabricResponse::Rejected", "struct variant FabricResponse::Rejected", ["reason"], ["string"], [false])
+        let response = sjEnumType("FabricResponse", "enum FabricResponse", ["Acknowledged", "Registered", "OptimizationProposal", "Rejected"], ["", "FabricResponse::Registered", "FabricResponse::OptimizationProposal", "FabricResponse::Rejected"], ["unit", "struct", "struct", "struct"])
+        return [coordinate, cell, shard, reg, hb, placement, sjVecType("Vec<Placement>", "Placement"), topo, sjVecType("Vec<CellWorkloadMetrics>", "CellWorkloadMetrics"), sample, sjVecType("Vec<TelemetrySample>", "TelemetrySample"), batch, obs, message, sjVecType("Vec<FabricMessage>", "FabricMessage"), registered, proposal, rejected, response]
 
-    struct ProtoStrNextField:
-        ok: bool
-        value: text
-        next: int
+    # From a decoded (already type-checked) value to the port's structs.
+    proc protoCoordinateOf(v: SjV) -> Coordinate:
+        return Coordinate{x: v.items[0].u, y: v.items[1].u}
 
-    struct ProtoRawField:
-        present: bool
-        start: int
-        end: int
+    proc protoCellOf(v: SjV) -> CellWorkloadMetrics:
+        return CellWorkloadMetrics{x: v.items[0].u, y: v.items[1].u, z: v.items[2].u, q: v.items[3].u, readsPerSecond: v.items[4].f, writesPerSecond: v.items[5].f, bytesReadPerSecond: v.items[6].f, bytesWrittenPerSecond: v.items[7].f}
 
-    struct ProtoNumField:
-        ok: bool
-        raw: text
-
-    struct ProtoBoolField:
-        ok: bool
-        value: bool
-
-    struct ProtoArrayField:
-        present: bool
-        count: int
-        elemStarts: [int]
-        elemEnds: [int]
-
-    private proc protoHexDigitValue(c: text) -> int:
-        if c == "0":
-            return 0
-        if c == "1":
-            return 1
-        if c == "2":
-            return 2
-        if c == "3":
-            return 3
-        if c == "4":
-            return 4
-        if c == "5":
-            return 5
-        if c == "6":
-            return 6
-        if c == "7":
-            return 7
-        if c == "8":
-            return 8
-        if c == "9":
-            return 9
-        if c == "a" || c == "A":
-            return 10
-        if c == "b" || c == "B":
-            return 11
-        if c == "c" || c == "C":
-            return 12
-        if c == "d" || c == "D":
-            return 13
-        if c == "e" || c == "E":
-            return 14
-        if c == "f" || c == "F":
-            return 15
-        return -1
-
-    private proc protoHex4ToCodepoint(hex4: text) -> int:
-        if len(hex4) != 4:
-            return -1
-        let d0 = do protoHexDigitValue(charAt(hex4, 0))
-        let d1 = do protoHexDigitValue(charAt(hex4, 1))
-        let d2 = do protoHexDigitValue(charAt(hex4, 2))
-        let d3 = do protoHexDigitValue(charAt(hex4, 3))
-        if d0 == -1 || d1 == -1 || d2 == -1 || d3 == -1:
-            return -1
-        return d0 * 4096 + d1 * 256 + d2 * 16 + d3
-
-    private proc protoAsciiPrintableTable() -> [text]:
-        return [" ", "!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ";", "<", "=", ">", "?", "@", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "[", "\\", "]", "^", "_", "`", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "{", "|", "}", "~"]
-
-    private proc protoAsciiCharOk(b: int) -> ProtoStrField:
-        if b < 32 || b > 126:
-            return ProtoStrField{ok: false, value: ""}
-        let table = do protoAsciiPrintableTable()
-        let idx = b - 32
-        return ProtoStrField{ok: true, value: table[idx]}
-
-    private proc protoIsJsonWs(c: text) -> bool:
-        return c == " " || c == "\t" || c == "\n" || c == "\r"
-
-    private proc protoJsonSkipWs(s: text, i: int) -> int:
-        let n = len(s)
-        let mut j = i
-        loop j < n:
-            let c = charAt(s, j)
-            let isWs = do protoIsJsonWs(c)
-            if isWs:
-                j = j + 1
-            else:
-                return j
-        return j
-
-    private proc protoJsonSkipLiteral(s: text, i: int, lit: text) -> int:
-        let litLen = len(lit)
-        let n = len(s)
-        if i + litLen > n:
-            return -1
-        let candidate = slice(s, i, i + litLen)
-        if candidate == lit:
-            return i + litLen
-        return -1
-
-    private proc protoIsDigit(c: text) -> bool:
-        return c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
-
-    private proc protoJsonSkipDigits(s: text, i: int) -> int:
-        let n = len(s)
-        let mut j = i
-        loop j < n:
-            let c = charAt(s, j)
-            let isD = do protoIsDigit(c)
-            if isD:
-                j = j + 1
-            else:
-                return j
-        return j
-
-    private proc protoJsonSkipNumber(s: text, i: int) -> int:
-        let n = len(s)
-        let mut j = i
-        if j < n:
-            let c0 = charAt(s, j)
-            if c0 == "-":
-                j = j + 1
-        if j >= n:
-            return -1
-        let c1 = charAt(s, j)
-        let isD1 = do protoIsDigit(c1)
-        if !isD1:
-            return -1
-        let afterInt = do protoJsonSkipDigits(s, j)
-        let mut k = afterInt
-        if k < n:
-            let cdot = charAt(s, k)
-            if cdot == ".":
-                let afterDot = do protoJsonSkipDigits(s, k + 1)
-                if afterDot == k + 1:
-                    return -1
-                k = afterDot
-        if k < n:
-            let ce = charAt(s, k)
-            if ce == "e" || ce == "E":
-                let mut m = k + 1
-                if m < n:
-                    let sign = charAt(s, m)
-                    if sign == "+" || sign == "-":
-                        m = m + 1
-                let afterExp = do protoJsonSkipDigits(s, m)
-                if afterExp == m:
-                    return -1
-                k = afterExp
-        return k
-
-    private proc protoJsonSimpleEscape(esc: text) -> ProtoStrField:
-        if esc == "\"":
-            return ProtoStrField{ok: true, value: "\""}
-        if esc == "\\":
-            return ProtoStrField{ok: true, value: "\\"}
-        if esc == "/":
-            return ProtoStrField{ok: true, value: "/"}
-        if esc == "b":
-            return ProtoStrField{ok: false, value: ""}
-        if esc == "f":
-            return ProtoStrField{ok: false, value: ""}
-        if esc == "n":
-            return ProtoStrField{ok: true, value: "\n"}
-        if esc == "r":
-            return ProtoStrField{ok: true, value: "\r"}
-        if esc == "t":
-            return ProtoStrField{ok: true, value: "\t"}
-        return ProtoStrField{ok: false, value: ""}
-
-    private proc protoJsonReadString(s: text, i: int) -> ProtoStrNextField:
-        let n = len(s)
-        if i >= n:
-            return ProtoStrNextField{ok: false, value: "", next: -1}
-        let open = charAt(s, i)
-        if open != "\"":
-            return ProtoStrNextField{ok: false, value: "", next: -1}
-        let mut j = i + 1
-        let mut out = ""
-        loop j < n:
-            let c = charAt(s, j)
-            if c == "\"":
-                return ProtoStrNextField{ok: true, value: out, next: j + 1}
-            if c == "\\":
-                if j + 1 >= n:
-                    return ProtoStrNextField{ok: false, value: "", next: -1}
-                let esc = charAt(s, j + 1)
-                if esc == "u":
-                    if j + 6 > n:
-                        return ProtoStrNextField{ok: false, value: "", next: -1}
-                    let hex4 = slice(s, j + 2, j + 6)
-                    let code = do protoHex4ToCodepoint(hex4)
-                    if code == -1:
-                        return ProtoStrNextField{ok: false, value: "", next: -1}
-                    let charRes = do protoAsciiCharOk(code)
-                    if !charRes.ok:
-                        return ProtoStrNextField{ok: false, value: "", next: -1}
-                    out = out + charRes.value
-                    j = j + 6
-                else:
-                    let simple = do protoJsonSimpleEscape(esc)
-                    if !simple.ok:
-                        return ProtoStrNextField{ok: false, value: "", next: -1}
-                    out = out + simple.value
-                    j = j + 2
-            else:
-                out = out + c
-                j = j + 1
-        return ProtoStrNextField{ok: false, value: "", next: -1}
-
-    private proc protoJsonSkipValue(s: text, i: int) -> int:
-        let n = len(s)
-        if i >= n:
-            return -1
-        let c = charAt(s, i)
-        if c == "\"":
-            let r = do protoJsonReadString(s, i)
-            if !r.ok:
-                return -1
-            return r.next
-        if c == "{":
-            let after = do protoJsonSkipObject(s, i)
-            return after
-        if c == "[":
-            let after = do protoJsonSkipArray(s, i)
-            return after
-        if c == "t":
-            let after = do protoJsonSkipLiteral(s, i, "true")
-            return after
-        if c == "f":
-            let after = do protoJsonSkipLiteral(s, i, "false")
-            return after
-        if c == "n":
-            let after = do protoJsonSkipLiteral(s, i, "null")
-            return after
-        let isMinus = c == "-"
-        let isDigit = do protoIsDigit(c)
-        if isMinus || isDigit:
-            let after = do protoJsonSkipNumber(s, i)
-            return after
-        return -1
-
-    private proc protoJsonSkipObject(s: text, i: int) -> int:
-        let n = len(s)
-        let afterBrace = i + 1
-        let afterWs1 = do protoJsonSkipWs(s, afterBrace)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "}":
-                return afterWs1 + 1
-        let mut pos = afterWs1
-        loop pos <= n:
-            if pos >= n:
-                return -1
-            let ck = charAt(s, pos)
-            if ck != "\"":
-                return -1
-            let keyRes = do protoJsonReadString(s, pos)
-            if !keyRes.ok:
-                return -1
-            let afterKeyWs = do protoJsonSkipWs(s, keyRes.next)
-            if afterKeyWs >= n:
-                return -1
-            let colon = charAt(s, afterKeyWs)
-            if colon != ":":
-                return -1
-            let afterColonWs = do protoJsonSkipWs(s, afterKeyWs + 1)
-            let afterValue = do protoJsonSkipValue(s, afterColonWs)
-            if afterValue == -1:
-                return -1
-            let afterValueWs = do protoJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return -1
-            let sep = charAt(s, afterValueWs)
-            if sep == "}":
-                return afterValueWs + 1
-            if sep != ",":
-                return -1
-            let afterCommaWs = do protoJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return -1
-
-    private proc protoJsonSkipArray(s: text, i: int) -> int:
-        let n = len(s)
-        let afterBracket = i + 1
-        let afterWs1 = do protoJsonSkipWs(s, afterBracket)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "]":
-                return afterWs1 + 1
-        let mut pos = afterWs1
-        loop pos <= n:
-            if pos >= n:
-                return -1
-            let afterValue = do protoJsonSkipValue(s, pos)
-            if afterValue == -1:
-                return -1
-            let afterValueWs = do protoJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return -1
-            let sep = charAt(s, afterValueWs)
-            if sep == "]":
-                return afterValueWs + 1
-            if sep != ",":
-                return -1
-            let afterCommaWs = do protoJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return -1
-
-    proc protoJsonValidate(body: text) -> bool:
-        let n = len(body)
-        let start = do protoJsonSkipWs(body, 0)
-        let afterValue = do protoJsonSkipValue(body, start)
-        if afterValue == -1:
-            return false
-        let afterWs = do protoJsonSkipWs(body, afterValue)
-        return afterWs == n
-
-    # protoJsonObjectRawField: locates member `key`'s value inside object
-    # `s` and returns its raw [start,end) span, for ANY value shape — the
-    # one generalized scan every string/number/bool/object/array field
-    # accessor below specializes (see header for why this differs from
-    # fabric_plan.fct's own three separately-duplicated loops).
-    private proc protoJsonObjectRawField(s: text, key: text) -> ProtoRawField:
-        let n = len(s)
-        let start = do protoJsonSkipWs(s, 0)
-        if start >= n:
-            return ProtoRawField{present: false, start: 0, end: 0}
-        let open = charAt(s, start)
-        if open != "{":
-            return ProtoRawField{present: false, start: 0, end: 0}
-        let afterBrace = start + 1
-        let afterWs1 = do protoJsonSkipWs(s, afterBrace)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "}":
-                return ProtoRawField{present: false, start: 0, end: 0}
-        let mut pos = afterWs1
-        loop pos <= n:
-            if pos >= n:
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let ck = charAt(s, pos)
-            if ck != "\"":
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let keyRes = do protoJsonReadString(s, pos)
-            if !keyRes.ok:
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let afterKeyWs = do protoJsonSkipWs(s, keyRes.next)
-            if afterKeyWs >= n:
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let colon = charAt(s, afterKeyWs)
-            if colon != ":":
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let afterColonWs = do protoJsonSkipWs(s, afterKeyWs + 1)
-            if afterColonWs >= n:
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let afterValue = do protoJsonSkipValue(s, afterColonWs)
-            if afterValue == -1:
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let isMatch = keyRes.value == key
-            if isMatch:
-                return ProtoRawField{present: true, start: afterColonWs, end: afterValue}
-            let afterValueWs = do protoJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let sep = charAt(s, afterValueWs)
-            if sep == "}":
-                return ProtoRawField{present: false, start: 0, end: 0}
-            if sep != ",":
-                return ProtoRawField{present: false, start: 0, end: 0}
-            let afterCommaWs = do protoJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return ProtoRawField{present: false, start: 0, end: 0}
-
-    private proc protoJsonObjectStringField(s: text, key: text) -> ProtoStrField:
-        let f = do protoJsonObjectRawField(s, key)
-        if !f.present:
-            return ProtoStrField{ok: false, value: ""}
-        let c = charAt(s, f.start)
-        if c != "\"":
-            return ProtoStrField{ok: false, value: ""}
-        let r = do protoJsonReadString(s, f.start)
-        if !r.ok:
-            return ProtoStrField{ok: false, value: ""}
-        return ProtoStrField{ok: true, value: r.value}
-
-    private proc protoJsonObjectNumberField(s: text, key: text) -> ProtoNumField:
-        let f = do protoJsonObjectRawField(s, key)
-        if !f.present:
-            return ProtoNumField{ok: false, raw: ""}
-        let c = charAt(s, f.start)
-        let isMinus = c == "-"
-        let isDigit = do protoIsDigit(c)
-        if !isMinus && !isDigit:
-            return ProtoNumField{ok: false, raw: ""}
-        let raw = slice(s, f.start, f.end)
-        return ProtoNumField{ok: true, raw: raw}
-
-    private proc protoJsonObjectBoolField(s: text, key: text) -> ProtoBoolField:
-        let f = do protoJsonObjectRawField(s, key)
-        if !f.present:
-            return ProtoBoolField{ok: false, value: false}
-        let raw = slice(s, f.start, f.end)
-        if raw == "true":
-            return ProtoBoolField{ok: true, value: true}
-        if raw == "false":
-            return ProtoBoolField{ok: true, value: false}
-        return ProtoBoolField{ok: false, value: false}
-
-    # protoJsonObjectObjectField: like protoJsonObjectRawField, but requires
-    # the value to actually open with `{` — the nested-struct-field
-    # accessor every `coordinate`/`shard` reader below uses.
-    private proc protoJsonObjectObjectField(s: text, key: text) -> ProtoRawField:
-        let f = do protoJsonObjectRawField(s, key)
-        if !f.present:
-            return ProtoRawField{present: false, start: 0, end: 0}
-        let c = charAt(s, f.start)
-        if c != "{":
-            return ProtoRawField{present: false, start: 0, end: 0}
-        return f
-
-    private proc protoJsonScanArrayElems(s: text, i: int) -> ProtoArrayField:
-        let n = len(s)
-        let afterBracket = i + 1
-        let afterWs1 = do protoJsonSkipWs(s, afterBracket)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "]":
-                return ProtoArrayField{present: true, count: 0, elemStarts: [], elemEnds: []}
-        let mut pos = afterWs1
-        let mut starts = []
-        let mut ends = []
-        loop pos <= n:
-            if pos >= n:
-                return ProtoArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let afterValue = do protoJsonSkipValue(s, pos)
-            if afterValue == -1:
-                return ProtoArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            starts = append(starts, pos)
-            ends = append(ends, afterValue)
-            let afterValueWs = do protoJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return ProtoArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let sep = charAt(s, afterValueWs)
-            if sep == "]":
-                let total = len(starts)
-                return ProtoArrayField{present: true, count: total, elemStarts: starts, elemEnds: ends}
-            if sep != ",":
-                return ProtoArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let afterCommaWs = do protoJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return ProtoArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-
-    private proc protoJsonObjectArrayField(s: text, key: text) -> ProtoArrayField:
-        let f = do protoJsonObjectRawField(s, key)
-        if !f.present:
-            return ProtoArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-        let c = charAt(s, f.start)
-        if c != "[":
-            return ProtoArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-        let arr = do protoJsonScanArrayElems(s, f.start)
-        return arr
-
-    private proc protoJsonEscapeText(s: text) -> text:
-        let n = len(s)
+    proc protoSampleOf(v: SjV) -> TelemetrySample:
+        let mut cells = []
+        let cv = v.items[9]
         let mut i = 0
-        let mut out = ""
-        loop i < n:
-            let c = charAt(s, i)
-            if c == "\"":
-                out = out + "\\\""
-            else:
-                if c == "\\":
-                    out = out + "\\\\"
-                else:
-                    out = out + c
+        loop i < len(cv.items):
+            cells = append(cells, protoCellOf(cv.items[i]))
             i = i + 1
-        return out
+        let partial = v.items[10].kind == "bool" && v.items[10].b
+        return TelemetrySample{coordinate: protoCoordinateOf(v.items[0]), operationsPerSecond: v.items[1].f, readRatio: v.items[2].f, writeRatio: v.items[3].f, readLatencyUs: v.items[4].f, writeLatencyUs: v.items[5].f, cpuUtilization: v.items[6].f, memoryUtilization: v.items[7].f, queueDepth: v.items[8].u, cellBreakdown: cells, cellBreakdownPartial: partial}
 
-    # ============================================================
-    # STRUCT-LEVEL PARSERS (decode direction)
-    # ============================================================
-    struct ProtoCoordinateResult:
-        ok: bool
-        value: Coordinate
+    proc protoMessageOf(v: SjV) -> FabricMessage:
+        let empty = protoEmptyFabricMessage()
+        let p = v.items[0]
+        if v.s == "RegisterNode":
+            let r = NodeRegistration{protocol: p.items[0].s, nodeId: DbmsId{value: p.items[1].s}, softwareVersion: p.items[2].s, region: p.items[3].s}
+            return FabricMessage{kind: "RegisterNode", registerNode: r, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: empty.telemetry, workload: empty.workload}
+        if v.s == "Heartbeat":
+            let h = NodeHeartbeat{nodeId: DbmsId{value: p.items[0].s}, timestampMs: p.items[1].u, healthy: p.items[2].b}
+            return FabricMessage{kind: "Heartbeat", registerNode: empty.registerNode, heartbeat: h, topology: empty.topology, telemetry: empty.telemetry, workload: empty.workload}
+        if v.s == "Topology":
+            let mut placements = []
+            let pv = p.items[2]
+            let mut i = 0
+            loop i < len(pv.items):
+                let e = pv.items[i]
+                placements = append(placements, ProtocolPlacement{coordinate: protoCoordinateOf(e.items[0]), dbmsId: DbmsId{value: e.items[1].s}, region: e.items[2].s})
+                i = i + 1
+            let t = TopologyReport{nodeId: DbmsId{value: p.items[0].s}, timestampMs: p.items[1].u, placements: placements}
+            return FabricMessage{kind: "Topology", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: t, telemetry: empty.telemetry, workload: empty.workload}
+        if v.s == "Telemetry":
+            let mut samples = []
+            let sv = p.items[3]
+            let mut j = 0
+            loop j < len(sv.items):
+                samples = append(samples, protoSampleOf(sv.items[j]))
+                j = j + 1
+            let sh = p.items[2]
+            let b = TelemetryBatch{timestampMs: p.items[0].u, nodeId: DbmsId{value: p.items[1].s}, shard: ProtocolShard{id: sh.items[0].u, workloadDomain: sh.items[1].s}, samples: samples}
+            return FabricMessage{kind: "Telemetry", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: b, workload: empty.workload}
+        let w = WorkloadObservation{nodeId: p.items[0].s, coordinate: protoCoordinateOf(p.items[1]), timestampMs: p.items[2].u, operationsPerSecond: p.items[3].f, readRatio: p.items[4].f, writeRatio: p.items[5].f}
+        return FabricMessage{kind: "Workload", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: empty.telemetry, workload: w}
 
-    proc protoParseCoordinate(s: text) -> ProtoCoordinateResult:
-        let xf = do protoJsonObjectNumberField(s, "x")
-        if !xf.ok:
-            return ProtoCoordinateResult{ok: false, value: Coordinate{x: 0, y: 0}}
-        let yf = do protoJsonObjectNumberField(s, "y")
-        if !yf.ok:
-            return ProtoCoordinateResult{ok: false, value: Coordinate{x: 0, y: 0}}
-        let xv = toInt(xf.raw)
-        let yv = toInt(yf.raw)
-        return ProtoCoordinateResult{ok: true, value: Coordinate{x: xv, y: yv}}
+    proc protoResponseOf(v: SjV) -> FabricResponse:
+        let e = protoEmptyFabricResponse()
+        if v.s == "Registered":
+            return FabricResponse{kind: "Registered", registeredNodeId: v.items[0].items[0].s, proposalCoordinate: "", proposalAction: "", proposalExpectedGain: 0.0, proposalEstimatedCost: 0.0, proposalConfidence: 0.0, rejectedReason: ""}
+        if v.s == "OptimizationProposal":
+            let p = v.items[0]
+            return FabricResponse{kind: "OptimizationProposal", registeredNodeId: "", proposalCoordinate: p.items[0].s, proposalAction: p.items[1].s, proposalExpectedGain: p.items[2].f, proposalEstimatedCost: p.items[3].f, proposalConfidence: p.items[4].f, rejectedReason: ""}
+        if v.s == "Rejected":
+            return FabricResponse{kind: "Rejected", registeredNodeId: "", proposalCoordinate: "", proposalAction: "", proposalExpectedGain: 0.0, proposalEstimatedCost: 0.0, proposalConfidence: 0.0, rejectedReason: v.items[0].items[0].s}
+        return FabricResponse{kind: "Acknowledged", registeredNodeId: e.registeredNodeId, proposalCoordinate: e.proposalCoordinate, proposalAction: e.proposalAction, proposalExpectedGain: e.proposalExpectedGain, proposalEstimatedCost: e.proposalEstimatedCost, proposalConfidence: e.proposalConfidence, rejectedReason: e.rejectedReason}
 
-    struct ProtoShardResult:
-        ok: bool
-        value: ProtocolShard
+    # transport.rs ProtocolError and its Display.
+    struct ProtocolError:
+        kind: text
+        message: text
 
-    proc protoParseShard(s: text) -> ProtoShardResult:
-        let idf = do protoJsonObjectNumberField(s, "id")
-        if !idf.ok:
-            return ProtoShardResult{ok: false, value: ProtocolShard{id: 0, workloadDomain: ""}}
-        let wdf = do protoJsonObjectStringField(s, "workload_domain")
-        if !wdf.ok:
-            return ProtoShardResult{ok: false, value: ProtocolShard{id: 0, workloadDomain: ""}}
-        let idv = toInt(idf.raw)
-        return ProtoShardResult{ok: true, value: ProtocolShard{id: idv, workloadDomain: wdf.value}}
+    proc protocolErrorDisplay(e: ProtocolError) -> text:
+        if e.kind == "InvalidMessage":
+            return "invalid message: " + e.message
+        if e.kind == "Serialization":
+            return "serialization error: " + e.message
+        return "I/O error: " + e.message
 
-    struct ProtoCellMetricsResult:
-        ok: bool
-        value: CellWorkloadMetrics
-
-    proc protoParseCellWorkloadMetrics(s: text) -> ProtoCellMetricsResult:
-        let zero = CellWorkloadMetrics{x: 0, y: 0, z: 0, q: 0, readsPerSecond: 0.0, writesPerSecond: 0.0, bytesReadPerSecond: 0.0, bytesWrittenPerSecond: 0.0}
-        let xf = do protoJsonObjectNumberField(s, "x")
-        if !xf.ok:
-            return ProtoCellMetricsResult{ok: false, value: zero}
-        let yf = do protoJsonObjectNumberField(s, "y")
-        if !yf.ok:
-            return ProtoCellMetricsResult{ok: false, value: zero}
-        let zf = do protoJsonObjectNumberField(s, "z")
-        if !zf.ok:
-            return ProtoCellMetricsResult{ok: false, value: zero}
-        let qf = do protoJsonObjectNumberField(s, "q")
-        if !qf.ok:
-            return ProtoCellMetricsResult{ok: false, value: zero}
-        let rpsF = do protoJsonObjectNumberField(s, "reads_per_second")
-        if !rpsF.ok:
-            return ProtoCellMetricsResult{ok: false, value: zero}
-        let wpsF = do protoJsonObjectNumberField(s, "writes_per_second")
-        if !wpsF.ok:
-            return ProtoCellMetricsResult{ok: false, value: zero}
-        let brpsF = do protoJsonObjectNumberField(s, "bytes_read_per_second")
-        if !brpsF.ok:
-            return ProtoCellMetricsResult{ok: false, value: zero}
-        let bwpsF = do protoJsonObjectNumberField(s, "bytes_written_per_second")
-        if !bwpsF.ok:
-            return ProtoCellMetricsResult{ok: false, value: zero}
-        let value = CellWorkloadMetrics{x: toInt(xf.raw), y: toInt(yf.raw), z: toInt(zf.raw), q: toInt(qf.raw), readsPerSecond: toFloat(rpsF.raw), writesPerSecond: toFloat(wpsF.raw), bytesReadPerSecond: toFloat(brpsF.raw), bytesWrittenPerSecond: toFloat(bwpsF.raw)}
-        return ProtoCellMetricsResult{ok: true, value: value}
-
-    struct ProtoCellMetricsArrayResult:
-        ok: bool
-        value: [CellWorkloadMetrics]
-
-    proc protoParseCellWorkloadMetricsArray(s: text) -> ProtoCellMetricsArrayResult:
-        let scan = do protoJsonScanArrayElems(s, 0)
-        if !scan.present:
-            return ProtoCellMetricsArrayResult{ok: false, value: []}
-        let mut out = []
-        let mut i = 0
-        let n = scan.count
-        loop i < n:
-            let elemStart = scan.elemStarts[i]
-            let elemEnd = scan.elemEnds[i]
-            let elemText = slice(s, elemStart, elemEnd)
-            let parsed = do protoParseCellWorkloadMetrics(elemText)
-            if !parsed.ok:
-                return ProtoCellMetricsArrayResult{ok: false, value: []}
-            out = append(out, parsed.value)
-            i = i + 1
-        return ProtoCellMetricsArrayResult{ok: true, value: out}
-
-    struct ProtoNodeRegistrationResult:
-        ok: bool
-        value: NodeRegistration
-
-    proc protoParseNodeRegistration(s: text) -> ProtoNodeRegistrationResult:
-        let zero = NodeRegistration{protocol: "", nodeId: DbmsId{value: ""}, softwareVersion: "", region: ""}
-        let protoF = do protoJsonObjectStringField(s, "protocol")
-        if !protoF.ok:
-            return ProtoNodeRegistrationResult{ok: false, value: zero}
-        let nodeIdF = do protoJsonObjectStringField(s, "node_id")
-        if !nodeIdF.ok:
-            return ProtoNodeRegistrationResult{ok: false, value: zero}
-        let swF = do protoJsonObjectStringField(s, "software_version")
-        if !swF.ok:
-            return ProtoNodeRegistrationResult{ok: false, value: zero}
-        let regionF = do protoJsonObjectStringField(s, "region")
-        if !regionF.ok:
-            return ProtoNodeRegistrationResult{ok: false, value: zero}
-        let value = NodeRegistration{protocol: protoF.value, nodeId: DbmsId{value: nodeIdF.value}, softwareVersion: swF.value, region: regionF.value}
-        return ProtoNodeRegistrationResult{ok: true, value: value}
-
-    struct ProtoNodeHeartbeatResult:
-        ok: bool
-        value: NodeHeartbeat
-
-    proc protoParseNodeHeartbeat(s: text) -> ProtoNodeHeartbeatResult:
-        let zero = NodeHeartbeat{nodeId: DbmsId{value: ""}, timestampMs: 0, healthy: false}
-        let nodeIdF = do protoJsonObjectStringField(s, "node_id")
-        if !nodeIdF.ok:
-            return ProtoNodeHeartbeatResult{ok: false, value: zero}
-        let tsF = do protoJsonObjectNumberField(s, "timestamp_ms")
-        if !tsF.ok:
-            return ProtoNodeHeartbeatResult{ok: false, value: zero}
-        let healthyF = do protoJsonObjectBoolField(s, "healthy")
-        if !healthyF.ok:
-            return ProtoNodeHeartbeatResult{ok: false, value: zero}
-        let value = NodeHeartbeat{nodeId: DbmsId{value: nodeIdF.value}, timestampMs: toInt(tsF.raw), healthy: healthyF.value}
-        return ProtoNodeHeartbeatResult{ok: true, value: value}
-
-    struct ProtoPlacementResult:
-        ok: bool
-        value: Placement
-
-    proc protoParsePlacement(s: text) -> ProtoPlacementResult:
-        let zero = Placement{coordinate: Coordinate{x: 0, y: 0}, dbmsId: DbmsId{value: ""}, region: ""}
-        let coordF = do protoJsonObjectObjectField(s, "coordinate")
-        if !coordF.present:
-            return ProtoPlacementResult{ok: false, value: zero}
-        let coordText = slice(s, coordF.start, coordF.end)
-        let coordParsed = do protoParseCoordinate(coordText)
-        if !coordParsed.ok:
-            return ProtoPlacementResult{ok: false, value: zero}
-        let dbmsIdF = do protoJsonObjectStringField(s, "dbms_id")
-        if !dbmsIdF.ok:
-            return ProtoPlacementResult{ok: false, value: zero}
-        let regionF = do protoJsonObjectStringField(s, "region")
-        if !regionF.ok:
-            return ProtoPlacementResult{ok: false, value: zero}
-        let value = Placement{coordinate: coordParsed.value, dbmsId: DbmsId{value: dbmsIdF.value}, region: regionF.value}
-        return ProtoPlacementResult{ok: true, value: value}
-
-    struct ProtoPlacementArrayResult:
-        ok: bool
-        value: [Placement]
-
-    proc protoParsePlacementArray(s: text) -> ProtoPlacementArrayResult:
-        let scan = do protoJsonScanArrayElems(s, 0)
-        if !scan.present:
-            return ProtoPlacementArrayResult{ok: false, value: []}
-        let mut out = []
-        let mut i = 0
-        let n = scan.count
-        loop i < n:
-            let elemStart = scan.elemStarts[i]
-            let elemEnd = scan.elemEnds[i]
-            let elemText = slice(s, elemStart, elemEnd)
-            let parsed = do protoParsePlacement(elemText)
-            if !parsed.ok:
-                return ProtoPlacementArrayResult{ok: false, value: []}
-            out = append(out, parsed.value)
-            i = i + 1
-        return ProtoPlacementArrayResult{ok: true, value: out}
-
-    struct ProtoTopologyReportResult:
-        ok: bool
-        value: TopologyReport
-
-    proc protoParseTopologyReport(s: text) -> ProtoTopologyReportResult:
-        let zero = TopologyReport{nodeId: DbmsId{value: ""}, timestampMs: 0, placements: []}
-        let nodeIdF = do protoJsonObjectStringField(s, "node_id")
-        if !nodeIdF.ok:
-            return ProtoTopologyReportResult{ok: false, value: zero}
-        let tsF = do protoJsonObjectNumberField(s, "timestamp_ms")
-        if !tsF.ok:
-            return ProtoTopologyReportResult{ok: false, value: zero}
-        let placementsF = do protoJsonObjectArrayField(s, "placements")
-        if !placementsF.present:
-            return ProtoTopologyReportResult{ok: false, value: zero}
-        let placementsArrText = do protoRawArrayText(s, "placements")
-        let placementsParsed = do protoParsePlacementArray(placementsArrText)
-        if !placementsParsed.ok:
-            return ProtoTopologyReportResult{ok: false, value: zero}
-        let value = TopologyReport{nodeId: DbmsId{value: nodeIdF.value}, timestampMs: toInt(tsF.raw), placements: placementsParsed.value}
-        return ProtoTopologyReportResult{ok: true, value: value}
-
-    # protoRawArrayText: re-locates and slices out the FULL `[...]` text of
-    # an array field by key (protoJsonObjectArrayField already validated its
-    # shape; this just re-derives the same [start,end) span via
-    # protoJsonObjectRawField so the caller has the bracket-inclusive text
-    # protoParse*Array's own `protoJsonScanArrayElems(s, 0)` contract needs).
-    private proc protoRawArrayText(s: text, key: text) -> text:
-        let f = do protoJsonObjectRawField(s, key)
-        if !f.present:
-            return "[]"
-        return slice(s, f.start, f.end)
-
-    struct ProtoTelemetrySampleResult:
-        ok: bool
-        value: TelemetrySample
-
-    proc protoParseTelemetrySample(s: text) -> ProtoTelemetrySampleResult:
-        let zero = TelemetrySample{coordinate: Coordinate{x: 0, y: 0}, operationsPerSecond: 0.0, readRatio: 0.0, writeRatio: 0.0, readLatencyUs: 0.0, writeLatencyUs: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, queueDepth: 0, cellBreakdown: [], cellBreakdownPartial: false}
-        let coordF = do protoJsonObjectObjectField(s, "coordinate")
-        if !coordF.present:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let coordText = slice(s, coordF.start, coordF.end)
-        let coordParsed = do protoParseCoordinate(coordText)
-        if !coordParsed.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let opsF = do protoJsonObjectNumberField(s, "operations_per_second")
-        if !opsF.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let readRatioF = do protoJsonObjectNumberField(s, "read_ratio")
-        if !readRatioF.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let writeRatioF = do protoJsonObjectNumberField(s, "write_ratio")
-        if !writeRatioF.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let readLatF = do protoJsonObjectNumberField(s, "read_latency_us")
-        if !readLatF.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let writeLatF = do protoJsonObjectNumberField(s, "write_latency_us")
-        if !writeLatF.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let cpuF = do protoJsonObjectNumberField(s, "cpu_utilization")
-        if !cpuF.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let memF = do protoJsonObjectNumberField(s, "memory_utilization")
-        if !memF.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let queueF = do protoJsonObjectNumberField(s, "queue_depth")
-        if !queueF.ok:
-            return ProtoTelemetrySampleResult{ok: false, value: zero}
-        let breakdownRaw = do protoJsonObjectRawField(s, "cell_breakdown")
-        let mut breakdown = []
-        if breakdownRaw.present:
-            let breakdownC = charAt(s, breakdownRaw.start)
-            if breakdownC != "[":
-                return ProtoTelemetrySampleResult{ok: false, value: zero}
-            let breakdownText = slice(s, breakdownRaw.start, breakdownRaw.end)
-            let breakdownParsed = do protoParseCellWorkloadMetricsArray(breakdownText)
-            if !breakdownParsed.ok:
-                return ProtoTelemetrySampleResult{ok: false, value: zero}
-            breakdown = breakdownParsed.value
-        let partialF = do protoJsonObjectBoolField(s, "cell_breakdown_partial")
-        let mut partial = false
-        if partialF.ok:
-            partial = partialF.value
-        let value = TelemetrySample{coordinate: coordParsed.value, operationsPerSecond: toFloat(opsF.raw), readRatio: toFloat(readRatioF.raw), writeRatio: toFloat(writeRatioF.raw), readLatencyUs: toFloat(readLatF.raw), writeLatencyUs: toFloat(writeLatF.raw), cpuUtilization: toFloat(cpuF.raw), memoryUtilization: toFloat(memF.raw), queueDepth: toInt(queueF.raw), cellBreakdown: breakdown, cellBreakdownPartial: partial}
-        return ProtoTelemetrySampleResult{ok: true, value: value}
-
-    struct ProtoTelemetrySampleArrayResult:
-        ok: bool
-        value: [TelemetrySample]
-
-    proc protoParseTelemetrySampleArray(s: text) -> ProtoTelemetrySampleArrayResult:
-        let scan = do protoJsonScanArrayElems(s, 0)
-        if !scan.present:
-            return ProtoTelemetrySampleArrayResult{ok: false, value: []}
-        let mut out = []
-        let mut i = 0
-        let n = scan.count
-        loop i < n:
-            let elemStart = scan.elemStarts[i]
-            let elemEnd = scan.elemEnds[i]
-            let elemText = slice(s, elemStart, elemEnd)
-            let parsed = do protoParseTelemetrySample(elemText)
-            if !parsed.ok:
-                return ProtoTelemetrySampleArrayResult{ok: false, value: []}
-            out = append(out, parsed.value)
-            i = i + 1
-        return ProtoTelemetrySampleArrayResult{ok: true, value: out}
-
-    struct ProtoTelemetryBatchResult:
-        ok: bool
-        value: TelemetryBatch
-
-    proc protoParseTelemetryBatch(s: text) -> ProtoTelemetryBatchResult:
-        let zero = TelemetryBatch{timestampMs: 0, nodeId: DbmsId{value: ""}, shard: ProtocolShard{id: 0, workloadDomain: ""}, samples: []}
-        let tsF = do protoJsonObjectNumberField(s, "timestamp_ms")
-        if !tsF.ok:
-            return ProtoTelemetryBatchResult{ok: false, value: zero}
-        let nodeIdF = do protoJsonObjectStringField(s, "node_id")
-        if !nodeIdF.ok:
-            return ProtoTelemetryBatchResult{ok: false, value: zero}
-        let shardF = do protoJsonObjectObjectField(s, "shard")
-        if !shardF.present:
-            return ProtoTelemetryBatchResult{ok: false, value: zero}
-        let shardText = slice(s, shardF.start, shardF.end)
-        let shardParsed = do protoParseShard(shardText)
-        if !shardParsed.ok:
-            return ProtoTelemetryBatchResult{ok: false, value: zero}
-        let samplesText = do protoRawArrayText(s, "samples")
-        let samplesParsed = do protoParseTelemetrySampleArray(samplesText)
-        if !samplesParsed.ok:
-            return ProtoTelemetryBatchResult{ok: false, value: zero}
-        let value = TelemetryBatch{timestampMs: toInt(tsF.raw), nodeId: DbmsId{value: nodeIdF.value}, shard: shardParsed.value, samples: samplesParsed.value}
-        return ProtoTelemetryBatchResult{ok: true, value: value}
-
-    struct ProtoWorkloadObservationResult:
-        ok: bool
-        value: WorkloadObservation
-
-    proc protoParseWorkloadObservation(s: text) -> ProtoWorkloadObservationResult:
-        let zero = WorkloadObservation{nodeId: "", coordinate: Coordinate{x: 0, y: 0}, timestampMs: 0, operationsPerSecond: 0.0, readRatio: 0.0, writeRatio: 0.0}
-        let nodeIdF = do protoJsonObjectStringField(s, "node_id")
-        if !nodeIdF.ok:
-            return ProtoWorkloadObservationResult{ok: false, value: zero}
-        let coordF = do protoJsonObjectObjectField(s, "coordinate")
-        if !coordF.present:
-            return ProtoWorkloadObservationResult{ok: false, value: zero}
-        let coordText = slice(s, coordF.start, coordF.end)
-        let coordParsed = do protoParseCoordinate(coordText)
-        if !coordParsed.ok:
-            return ProtoWorkloadObservationResult{ok: false, value: zero}
-        let tsF = do protoJsonObjectNumberField(s, "timestamp_ms")
-        if !tsF.ok:
-            return ProtoWorkloadObservationResult{ok: false, value: zero}
-        let opsF = do protoJsonObjectNumberField(s, "operations_per_second")
-        if !opsF.ok:
-            return ProtoWorkloadObservationResult{ok: false, value: zero}
-        let readRatioF = do protoJsonObjectNumberField(s, "read_ratio")
-        if !readRatioF.ok:
-            return ProtoWorkloadObservationResult{ok: false, value: zero}
-        let writeRatioF = do protoJsonObjectNumberField(s, "write_ratio")
-        if !writeRatioF.ok:
-            return ProtoWorkloadObservationResult{ok: false, value: zero}
-        let value = WorkloadObservation{nodeId: nodeIdF.value, coordinate: coordParsed.value, timestampMs: toInt(tsF.raw), operationsPerSecond: toFloat(opsF.raw), readRatio: toFloat(readRatioF.raw), writeRatio: toFloat(writeRatioF.raw)}
-        return ProtoWorkloadObservationResult{ok: true, value: value}
-
-    # ============================================================
-    # TOP-LEVEL WIRE API — the direct port of transport.rs's
-    # ProtocolServer::decode/handle/encode
-    # ============================================================
     struct ProtoDecodeResult:
         ok: bool
         message: FabricMessage
         error: text
 
-    # protocolDecode: `ProtocolServer::decode(payload: &[u8]) ->
-    # Result<FabricMessage, ProtocolError>`. `payload` is `text` here, not
-    # `[int]` bytes — this crate's real wire payload IS UTF-8 JSON text (the
-    # HTTP body axum's `Json<T>` extractor already decoded from bytes before
-    # `serde_json` ever sees it), the same representation choice
-    # fabric_plan.fct's own `body: text` already made for the identical
-    # real shape (a JSON request body) — not a narrowing, the actual type
-    # of the data on this wire.
+    # ProtocolServer::decode: serde_json::from_slice::<FabricMessage>, a
+    # failure mapped to ProtocolError::Serialization(serde error Display);
+    # `error` is that ProtocolError's Display. The payload is the UTF-8
+    # body as text.
     proc protocolDecode(payload: text) -> ProtoDecodeResult:
-        let valid = do protoJsonValidate(payload)
-        let empty = do protoEmptyFabricMessage()
-        if !valid:
-            return ProtoDecodeResult{ok: false, message: empty, error: "invalid JSON body"}
-        let reg = do protoJsonObjectRawField(payload, "RegisterNode")
-        if reg.present:
-            let inner = slice(payload, reg.start, reg.end)
-            let parsed = do protoParseNodeRegistration(inner)
-            if !parsed.ok:
-                return ProtoDecodeResult{ok: false, message: empty, error: "invalid JSON body"}
-            let msg = FabricMessage{kind: "RegisterNode", registerNode: parsed.value, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: empty.telemetry, workload: empty.workload}
-            return ProtoDecodeResult{ok: true, message: msg, error: ""}
-        let hb = do protoJsonObjectRawField(payload, "Heartbeat")
-        if hb.present:
-            let inner = slice(payload, hb.start, hb.end)
-            let parsed = do protoParseNodeHeartbeat(inner)
-            if !parsed.ok:
-                return ProtoDecodeResult{ok: false, message: empty, error: "invalid JSON body"}
-            let msg = FabricMessage{kind: "Heartbeat", registerNode: empty.registerNode, heartbeat: parsed.value, topology: empty.topology, telemetry: empty.telemetry, workload: empty.workload}
-            return ProtoDecodeResult{ok: true, message: msg, error: ""}
-        let topo = do protoJsonObjectRawField(payload, "Topology")
-        if topo.present:
-            let inner = slice(payload, topo.start, topo.end)
-            let parsed = do protoParseTopologyReport(inner)
-            if !parsed.ok:
-                return ProtoDecodeResult{ok: false, message: empty, error: "invalid JSON body"}
-            let msg = FabricMessage{kind: "Topology", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: parsed.value, telemetry: empty.telemetry, workload: empty.workload}
-            return ProtoDecodeResult{ok: true, message: msg, error: ""}
-        let tel = do protoJsonObjectRawField(payload, "Telemetry")
-        if tel.present:
-            let inner = slice(payload, tel.start, tel.end)
-            let parsed = do protoParseTelemetryBatch(inner)
-            if !parsed.ok:
-                return ProtoDecodeResult{ok: false, message: empty, error: "invalid JSON body"}
-            let msg = FabricMessage{kind: "Telemetry", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: parsed.value, workload: empty.workload}
-            return ProtoDecodeResult{ok: true, message: msg, error: ""}
-        let wl = do protoJsonObjectRawField(payload, "Workload")
-        if wl.present:
-            let inner = slice(payload, wl.start, wl.end)
-            let parsed = do protoParseWorkloadObservation(inner)
-            if !parsed.ok:
-                return ProtoDecodeResult{ok: false, message: empty, error: "invalid JSON body"}
-            let msg = FabricMessage{kind: "Workload", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: empty.telemetry, workload: parsed.value}
-            return ProtoDecodeResult{ok: true, message: msg, error: ""}
-        return ProtoDecodeResult{ok: false, message: empty, error: "invalid JSON body"}
+        let d = sjDecode(protoSchema(), payload, "FabricMessage")
+        if !d.ok:
+            return ProtoDecodeResult{ok: false, message: protoEmptyFabricMessage(), error: protocolErrorDisplay(ProtocolError{kind: "Serialization", message: d.err})}
+        return ProtoDecodeResult{ok: true, message: protoMessageOf(d.v), error: ""}
 
-    # protocolHandle: `ProtocolServer::handle(&self, message: FabricMessage)
-    # -> FabricResponse` — byte-for-byte the same dispatch as transport.rs:
-    # RegisterNode threads the node id back as Registered; every other
-    # variant is Acknowledged. Pure, no state, matching the real source's
-    # own documented constraint (see this file's header).
+    struct ProtoDecodeMessagesResult:
+        ok: bool
+        messages: [FabricMessage]
+        error: text
+
+    # serde_json::from_slice::<Vec<FabricMessage>> (fabric-cli's session
+    # file): `error` is serde_json::Error's Display exactly.
+    proc protocolDecodeMessages(payload: text) -> ProtoDecodeMessagesResult:
+        let d = sjDecode(protoSchema(), payload, "Vec<FabricMessage>")
+        if !d.ok:
+            return ProtoDecodeMessagesResult{ok: false, messages: [], error: d.err}
+        let mut out = []
+        let mut i = 0
+        loop i < len(d.v.items):
+            out = append(out, protoMessageOf(d.v.items[i]))
+            i = i + 1
+        return ProtoDecodeMessagesResult{ok: true, messages: out, error: ""}
+
+    struct ProtoResponseResult:
+        ok: bool
+        response: FabricResponse
+        error: text
+
+    # serde_json::from_slice::<FabricResponse>: what a node reads back;
+    # `error` is serde_json::Error's Display.
+    proc protocolDecodeResponse(payload: text) -> ProtoResponseResult:
+        let d = sjDecode(protoSchema(), payload, "FabricResponse")
+        if !d.ok:
+            return ProtoResponseResult{ok: false, response: protoEmptyFabricResponse(), error: d.err}
+        return ProtoResponseResult{ok: true, response: protoResponseOf(d.v), error: ""}
+
+    # transport.rs `ProtocolServer::handle`: RegisterNode is answered
+    # Registered with its node id, every other message Acknowledged.
     proc protocolHandle(message: FabricMessage) -> FabricResponse:
         if message.kind == "RegisterNode":
             return FabricResponse{kind: "Registered", registeredNodeId: message.registerNode.nodeId.value, proposalCoordinate: "", proposalAction: "", proposalExpectedGain: 0.0, proposalEstimatedCost: 0.0, proposalConfidence: 0.0, rejectedReason: ""}
         return FabricResponse{kind: "Acknowledged", registeredNodeId: "", proposalCoordinate: "", proposalAction: "", proposalExpectedGain: 0.0, proposalEstimatedCost: 0.0, proposalConfidence: 0.0, rejectedReason: ""}
 
-    # protocolEncode: `ProtocolServer::encode(response: &FabricResponse) ->
-    # Result<Vec<u8>, ProtocolError>`. Returns `text` for the identical
-    # reason `protocolDecode` takes `text` (see its own comment) — the real
-    # Rust returns `Vec<u8>` only because that is what `axum::Json`'s
-    # response body plumbing wants next; the bytes ARE this UTF-8 text.
-    # `Acknowledged` is a unit variant — serialized as the bare JSON string
-    # "Acknowledged", NOT `{"Acknowledged":null}` — see this file's header.
+    # ============================================================
+    # ENCODE — serde_json::to_string / to_vec
+    # ============================================================
+    # ProtocolServer::encode: the response as serde_json writes it (the unit
+    # variant as the bare string "Acknowledged").
     proc protocolEncode(response: FabricResponse) -> text:
-        if response.kind == "Acknowledged":
-            return "\"Acknowledged\""
         if response.kind == "Registered":
-            let idEsc = do protoJsonEscapeText(response.registeredNodeId)
-            return "{\"Registered\":{\"node_id\":\"" + idEsc + "\"}}"
+            return "{\"Registered\":{\"node_id\":" + sjQuote(response.registeredNodeId) + "}}"
         if response.kind == "OptimizationProposal":
-            let coordEsc = do protoJsonEscapeText(response.proposalCoordinate)
-            let actionEsc = do protoJsonEscapeText(response.proposalAction)
-            let gainText = "" + response.proposalExpectedGain
-            let costText = "" + response.proposalEstimatedCost
-            let confText = "" + response.proposalConfidence
-            return "{\"OptimizationProposal\":{\"coordinate\":\"" + coordEsc + "\",\"action\":\"" + actionEsc + "\",\"expected_gain\":" + gainText + ",\"estimated_cost\":" + costText + ",\"confidence\":" + confText + "}}"
+            return "{\"OptimizationProposal\":{\"coordinate\":" + sjQuote(response.proposalCoordinate) + ",\"action\":" + sjQuote(response.proposalAction) + ",\"expected_gain\":" + sjF64Text(response.proposalExpectedGain) + ",\"estimated_cost\":" + sjF64Text(response.proposalEstimatedCost) + ",\"confidence\":" + sjF64Text(response.proposalConfidence) + "}}"
         if response.kind == "Rejected":
-            let reasonEsc = do protoJsonEscapeText(response.rejectedReason)
-            return "{\"Rejected\":{\"reason\":\"" + reasonEsc + "\"}}"
-        # Defensive-total fallback for a `kind` this text-tagged struct
-        # convention CAN represent but the real Rust enum cannot (an
-        # invalid/empty tag) — `handle` above only ever produces
-        # "Registered"/"Acknowledged", so this path is unreached by this
-        # file's own pipeline; kept so `protocolEncode` stays total the way
-        # every other proc in this codebase is, per LANGUAGE.md.
+            return "{\"Rejected\":{\"reason\":" + sjQuote(response.rejectedReason) + "}}"
         return "\"Acknowledged\""
+
+    proc protocolVersionJson(v: ProtocolVersion) -> text:
+        return "{\"major\":" + v.major + ",\"minor\":" + v.minor + "}"
+
+    proc nodeRegistrationJson(r: NodeRegistration) -> text:
+        return "{\"protocol\":" + sjQuote(r.protocol) + ",\"node_id\":" + dbmsIdJson(r.nodeId) + ",\"software_version\":" + sjQuote(r.softwareVersion) + ",\"region\":" + sjQuote(r.region) + "}"
+
+    proc nodeHeartbeatJson(h: NodeHeartbeat) -> text:
+        return "{\"node_id\":" + dbmsIdJson(h.nodeId) + ",\"timestamp_ms\":" + sjU64Text(h.timestampMs) + ",\"healthy\":" + sjBoolText(h.healthy) + "}"
+
+    proc protocolPlacementJson(p: ProtocolPlacement) -> text:
+        return "{\"coordinate\":" + coordinateJson(p.coordinate) + ",\"dbms_id\":" + dbmsIdJson(p.dbmsId) + ",\"region\":" + sjQuote(p.region) + "}"
+
+    proc topologyReportJson(t: TopologyReport) -> text:
+        let mut parts = []
+        let mut i = 0
+        loop i < len(t.placements):
+            parts = append(parts, protocolPlacementJson(t.placements[i]))
+            i = i + 1
+        return "{\"node_id\":" + dbmsIdJson(t.nodeId) + ",\"timestamp_ms\":" + sjU64Text(t.timestampMs) + ",\"placements\":[" + join(parts, ",") + "]}"
+
+    proc protocolShardJson(s: ProtocolShard) -> text:
+        return "{\"id\":" + sjU64Text(s.id) + ",\"workload_domain\":" + sjQuote(s.workloadDomain) + "}"
+
+    proc telemetrySampleJson(s: TelemetrySample) -> text:
+        return "{\"coordinate\":" + coordinateJson(s.coordinate) + ",\"operations_per_second\":" + sjF64Text(s.operationsPerSecond) + ",\"read_ratio\":" + sjF64Text(s.readRatio) + ",\"write_ratio\":" + sjF64Text(s.writeRatio) + ",\"read_latency_us\":" + sjF64Text(s.readLatencyUs) + ",\"write_latency_us\":" + sjF64Text(s.writeLatencyUs) + ",\"cpu_utilization\":" + sjF64Text(s.cpuUtilization) + ",\"memory_utilization\":" + sjF64Text(s.memoryUtilization) + ",\"queue_depth\":" + sjU64Text(s.queueDepth) + ",\"cell_breakdown\":" + cellWorkloadMetricsArrayJson(s.cellBreakdown) + ",\"cell_breakdown_partial\":" + sjBoolText(s.cellBreakdownPartial) + "}"
+
+    proc telemetryBatchJson(b: TelemetryBatch) -> text:
+        let mut parts = []
+        let mut i = 0
+        loop i < len(b.samples):
+            parts = append(parts, telemetrySampleJson(b.samples[i]))
+            i = i + 1
+        return "{\"timestamp_ms\":" + sjU64Text(b.timestampMs) + ",\"node_id\":" + dbmsIdJson(b.nodeId) + ",\"shard\":" + protocolShardJson(b.shard) + ",\"samples\":[" + join(parts, ",") + "]}"
+
+    proc workloadObservationJson(w: WorkloadObservation) -> text:
+        return "{\"node_id\":" + sjQuote(w.nodeId) + ",\"coordinate\":" + coordinateJson(w.coordinate) + ",\"timestamp_ms\":" + sjU64Text(w.timestampMs) + ",\"operations_per_second\":" + sjF64Text(w.operationsPerSecond) + ",\"read_ratio\":" + sjF64Text(w.readRatio) + ",\"write_ratio\":" + sjF64Text(w.writeRatio) + "}"
+
+    # serde_json::to_string(&FabricMessage): what a node sends.
+    proc protocolEncodeMessage(m: FabricMessage) -> text:
+        if m.kind == "RegisterNode":
+            return "{\"RegisterNode\":" + nodeRegistrationJson(m.registerNode) + "}"
+        if m.kind == "Heartbeat":
+            return "{\"Heartbeat\":" + nodeHeartbeatJson(m.heartbeat) + "}"
+        if m.kind == "Topology":
+            return "{\"Topology\":" + topologyReportJson(m.topology) + "}"
+        if m.kind == "Telemetry":
+            return "{\"Telemetry\":" + telemetryBatchJson(m.telemetry) + "}"
+        return "{\"Workload\":" + workloadObservationJson(m.workload) + "}"
+
+    # transport.rs `authorized`: constant-time comparison over the bytes, the
+    # length difference folded in as its low byte.
+    proc protocolAuthorized(presented: text, expected: text) -> bool:
+        let p = textToBytes(presented)
+        let e = textToBytes(expected)
+        let np = len(p)
+        let ne = len(e)
+        let mut difference = (np ^ ne) & 255
+        let mut n = np
+        if ne > n:
+            n = ne
+        let mut i = 0
+        loop i < n:
+            let mut left = 0
+            if i < np:
+                left = p[i]
+            let mut right = 0
+            if i < ne:
+                right = e[i]
+            difference = difference | (left ^ right)
+            i = i + 1
+        return difference == 0
+
+    proc protocolTokenEnv() -> text:
+        return "FABRIC_PROTOCOL_TOKEN"
 
     # ============================================================
     # DEMOS — round-trip and corrupt/truncated-frame rejection, mirroring

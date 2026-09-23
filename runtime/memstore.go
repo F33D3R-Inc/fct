@@ -473,6 +473,26 @@ func (s *memStore) DeleteSession(sid string) error {
 	delete(s.sessions, sid)
 	return nil
 }
+func (s *memStore) RestateSessions(actor, role string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ps := range s.sessions {
+		if ps.Actor == actor {
+			ps.Role = role
+		}
+	}
+	return nil
+}
+func (s *memStore) DeleteVisitorSessions(visitor string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sid, ps := range s.sessions {
+		if ps.Visitor == visitor {
+			delete(s.sessions, sid)
+		}
+	}
+	return nil
+}
 func (s *memStore) PurgeExpiredSessions() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

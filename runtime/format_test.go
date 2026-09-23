@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"encoding/json"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -94,15 +93,8 @@ func TestClientFormattingMatchesTheServer(t *testing.T) {
 	if err != nil {
 		t.Skip("node not installed; cannot check the client mirror")
 	}
-	raw, err := os.ReadFile("assets/facet.js")
-	if err != nil {
-		t.Fatalf("reading the shipped client: %v", err)
-	}
-	src := string(raw)
 	var script strings.Builder
-	for _, fn := range []string{"ago", "compact", "commas", "toInt", "toStr", "evCall"} {
-		script.WriteString(extractFunction(t, src, fn) + "\n")
-	}
+	script.WriteString(clientBuiltinPrelude(t))
 	type in struct {
 		Ago     []int    `json:"ago"`
 		Compact []int    `json:"compact"`

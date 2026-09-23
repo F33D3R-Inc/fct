@@ -277,10 +277,18 @@
         // A wire-type literal: a plain object, as runtime/eval.go builds it.
         const o = {};
         list(e.fields).forEach((f, i) => { o[f] = ev(e.args[i], sc); });
+        // An optional field left empty is absent (runtime/eval.go's omitEmpty).
+        list(e.nulls).forEach((f) => { if (o[f] == null || o[f] === "") o[f] = null; });
+        list(e.omit).forEach((f) => { const v = o[f]; if (v == null || v === "" || (Array.isArray(v) && v.length === 0)) delete o[f]; });
         return o;
       }
       case "ref":
         return sc[e.name];
+      case "index": { // a list's element or a json object's member (runtime/eval.go's indexValue)
+        const o = ev(e.obj, sc), k = ev(e.key, sc);
+        if (Array.isArray(o)) { const i = toInt(k); return i >= 0 && i < o.length ? o[i] : null; }
+        return o && typeof o === "object" ? (o[toStr(k)] ?? null) : null;
+      }
       case "get": {
         const o = ev(e.obj, sc);
         return o && typeof o === "object" ? o[e.field] : null;
@@ -310,6 +318,13 @@
           // The rows, ordered/capped/shaped exactly as runtime/eval.go's "list".
           let out = rows.slice();
           if (e.order) out.sort((a, b) => { const c = cmpVal(a[e.order], b[e.order]); return e.desc ? -c : c; });
+          if (e.orderBy) { // a computed key per row (`by <expr>`), read fresh per row
+            const kh = Object.prototype.hasOwnProperty.call(sc, e.var), kp = sc[e.var];
+            const keyed = out.map((r, i) => { sc[e.var] = r; return { r, i, k: evRow(e.orderBy, sc) }; });
+            if (kh) sc[e.var] = kp; else delete sc[e.var];
+            keyed.sort((a, b) => { const c = cmpVal(a.k, b.k); return c !== 0 ? (e.desc ? -c : c) : a.i - b.i; });
+            out = keyed.map((x) => x.r);
+          }
           if (e.limit) { const lim = toInt(ev(e.limit, sc)); if (lim >= 0 && out.length > lim) out = out.slice(0, lim); }
           if (!e.sel) return out;
           const had = Object.prototype.hasOwnProperty.call(sc, e.var);
@@ -323,6 +338,14 @@
         // evaluated once per row with the item var bound to it, exactly as
         // reduceAgg does it in runtime/eval.go. evRow, not ev, for the reason the
         // filter above uses it: a nested aggregate has no address of its own here.
+        if (e.vtype === "text") { // min/max over a text column (markTextAggs)
+          let best = "", have = false;
+          for (const r of rows) {
+            const t = r[e.field] == null ? "" : String(r[e.field]);
+            if (!have || (e.op === "min" ? t < best : t > best)) { best = t; have = true; }
+          }
+          return best;
+        }
         let total = 0, n = 0, lo = 0, hi = 0;
         const selHad = e.sel && Object.prototype.hasOwnProperty.call(sc, e.var);
         const selPrev = e.sel ? sc[e.var] : undefined;
@@ -469,36 +492,122 @@
     try { return ev(e, sc); } finally { unaddressed--; }
   }
 
-  // evCall mirrors runtime/eval.go: now/rand are defensive only (placed on the
-  // server), the rest are the pure standard library.
+  // evCall mirrors runtime/eval.go's callBuiltin for every builtin
+  // internal/parser's builtinSites marks SiteEverywhere — the only builtins the
+  // compiler lets a view, a policy, a derive or a browser-placed action call.
+  // now/rand are defensive only (an action using them is placed on the server
+  // unless it writes only @client state). runtime/builtinparity_test.go runs
+  // this function and the server's over the same inputs and fails on any
+  // missing case or differing answer.
   function evCall(e, sc) {
     const a = (i) => (e.args && i < e.args.length ? ev(e.args[i], sc) : null);
     switch (e.name) {
       case "now": return Math.floor(Date.now() / 1000);
       case "rand": { const n = toInt(a(0)); return n > 0 ? Math.floor(Math.random() * n) : 0; }
-      case "abs": { const n = toInt(a(0)); return n < 0 ? -n : n; }
-      case "min": { const x = toInt(a(0)), y = toInt(a(1)); return x < y ? x : y; }
-      case "max": { const x = toInt(a(0)), y = toInt(a(1)); return x > y ? x : y; }
-      case "floor": case "round": return toInt(a(0));
+      // A number with a fractional part is a float (eval.go's isFloatVal):
+      // abs/min/max/floor/round keep float arithmetic for it, int otherwise.
+      case "abs": { const v = a(0); if (isFloatNum(v)) return Math.abs(v); const n = toInt(v); return n < 0 ? -n : n; }
+      case "min": { const v = a(0), w = a(1); if (isFloatNum(v) || isFloatNum(w)) { const x = toFloatJS(v), y = toFloatJS(w); return x < y ? x : y; } const x = toInt(v), y = toInt(w); return x < y ? x : y; }
+      case "max": { const v = a(0), w = a(1); if (isFloatNum(v) || isFloatNum(w)) { const x = toFloatJS(v), y = toFloatJS(w); return x > y ? x : y; } const x = toInt(v), y = toInt(w); return x > y ? x : y; }
+      case "floor": { const v = a(0); return isFloatNum(v) ? Math.floor(v) : toInt(v); }
+      case "round": { const v = a(0); return isFloatNum(v) ? roundAway(v) : toInt(v); }
+      case "toFloat": return toFloatJS(a(0));
+      case "toInt": return toInt(a(0));
       case "toMoney": return toMoney(a(0));
       case "money": return money(toInt(a(0)));
+      case "fromJson": return fromJsonJS(toStr(a(0)));
+      case "join": { const l = a(0); return Array.isArray(l) ? l.map(toStr).join(toStr(a(1))) : ""; }
+      case "first": { const v = a(0); return Array.isArray(v) && v.length ? v[0] : null; }
       case "len": { const v = a(0); return Array.isArray(v) ? v.length : Array.from(toStr(v)).length; }
-      case "upper": return toStr(a(0)).toUpperCase();
-      case "lower": return toStr(a(0)).toLowerCase();
-      case "trim": return toStr(a(0)).trim();
+      case "byteLen": return utf8Len(toStr(a(0)));
+      case "upper": return mapCase(toStr(a(0)), true);
+      case "lower": return mapCase(toStr(a(0)), false);
+      case "trim": return goTrim(toStr(a(0)));
       case "contains": return toStr(a(0)).includes(toStr(a(1)));
-      case "replace": return toStr(a(0)).replaceAll(toStr(a(1)), toStr(a(2)));
-      case "slug": return toStr(a(0)).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      case "replace": {
+        const s = toStr(a(0)), old = toStr(a(1)), nw = toStr(a(2));
+        if (old !== "") return s.split(old).join(nw);
+        // Go's strings.ReplaceAll with an empty old: new at every rune boundary.
+        const r = Array.from(s); return nw + r.join(nw) + (r.length ? nw : "");
+      }
+      case "slug": return mapCase(toStr(a(0)), false).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      case "split": { const s = toStr(a(0)), sep = toStr(a(1)); return sep === "" ? Array.from(s) : s.split(sep); }
+      case "slice": return runeSlice(toStr(a(0)), toInt(a(1)), toInt(a(2)));
+      case "charAt": { const i = toInt(a(1)); return i < 0 ? "" : runeSlice(toStr(a(0)), i, i + 1); }
+      case "take": { let n = toInt(a(1)); if (n < 0) n = 0; return runeSlice(toStr(a(0)), 0, n); }
       case "ago": return ago(toInt(a(0)), Math.floor(Date.now() / 1000));
       case "iso": return isoJS(toInt(a(0)));
+      case "fromIso": return fromIsoJS(toStr(a(0)));
       case "compact": return compact(toInt(a(0)));
       case "commas": return commas(toInt(a(0)));
-      case "take": { const r = Array.from(toStr(a(0))); let n = toInt(a(1)); if (n < 0) n = 0; return r.slice(0, n).join(""); }
       case "year": return new Date(toInt(a(0)) * 1000).getUTCFullYear();
       case "month": return new Date(toInt(a(0)) * 1000).getUTCMonth() + 1;
       case "day": return new Date(toInt(a(0)) * 1000).getUTCDate();
     }
     return null;
+  }
+  // ── builtin helpers (each mirrors the runtime/eval.go function it names) ──
+  function isFloatNum(v) { return typeof v === "number" && !Number.isInteger(v) && isFinite(v); }
+  // roundAway is Go's math.Round: half away from zero (Math.round is half up).
+  function roundAway(x) { return x < 0 ? -Math.round(-x) : Math.round(x); }
+  // runeSlice: code points [start, end), both clamped into range, never an error.
+  function runeSlice(s, start, end) {
+    const r = Array.from(s), n = r.length;
+    if (start < 0) start = 0; if (start > n) start = n;
+    if (end < 0) end = 0; if (end > n) end = n;
+    if (end < start) end = start;
+    return r.slice(start, end).join("");
+  }
+  // utf8Len: the UTF-8 byte length (a JS string's .length counts UTF-16 units).
+  function utf8Len(s) {
+    let n = 0;
+    for (const ch of s) { const c = ch.codePointAt(0); n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4; }
+    return n;
+  }
+  // mapCase is Go's strings.ToUpper/ToLower: each code point mapped on its own
+  // (no special-casing expansions such as ß → SS, no context such as final
+  // sigma); a mapping that would change the length keeps the code point, except
+  // U+0130, whose simple lowercase is i.
+  function mapCase(s, up) {
+    let out = "";
+    for (const ch of s) {
+      const m = up ? ch.toUpperCase() : ch.toLowerCase();
+      if (Array.from(m).length === 1) out += m;
+      else out += !up && ch === "\u0130" ? "i" : ch;
+    }
+    return out;
+  }
+  // goTrim is Go's strings.TrimSpace: unicode.IsSpace at both ends (which
+  // includes U+0085 and excludes U+FEFF, unlike String#trim).
+  const GO_SPACE = "[\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
+  const GO_TRIM = new RegExp("^" + GO_SPACE + "+|" + GO_SPACE + "+$", "g");
+  function goTrim(s) { return s.replace(GO_TRIM, ""); }
+  // fromJsonJS is json.Unmarshal into an any: nothing for text that is not
+  // JSON, and nothing for a number JSON can spell but a float64 cannot hold.
+  function fromJsonJS(t) {
+    try {
+      return JSON.parse(t, (k, v) => { if (typeof v === "number" && !isFinite(v)) throw 0; return v; });
+    } catch (e) { return null; }
+  }
+  // fromIsoJS is format.go's fromIso: time.Parse(time.RFC3339, s) — the full
+  // date, T, the time, optional fraction, and Z or a ±hh:mm offset, nothing
+  // looser — as unix seconds, 0 when it does not parse.
+  function fromIsoJS(s) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/.exec(s);
+    if (!m) return 0;
+    const y = +m[1], mo = +m[2], d = +m[3], h = +m[4], mi = +m[5], se = +m[6];
+    const dim = [31, (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0 ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (mo < 1 || mo > 12 || d < 1 || d > dim[mo - 1] || h > 23 || mi > 59 || se > 59) return 0;
+    let off = 0;
+    if (m[7] !== "Z") {
+      const oh = +m[9], om = +m[10];
+      if (oh > 23 || om > 59) return 0;
+      off = (m[8] === "-" ? -1 : 1) * (oh * 3600 + om * 60);
+    }
+    const t = new Date(0);
+    t.setUTCFullYear(y, mo - 1, d);
+    t.setUTCHours(h, mi, se, 0);
+    return Math.floor(t.getTime() / 1000) - off;
   }
   // ── formatting (mirrors runtime/format.go exactly; integer arithmetic only) ──
   function ago(ts, now) {
@@ -518,6 +627,7 @@
   // truncated off, so a first paint from the server and a client re-render
   // of the same second produce byte-identical text.
   function isoJS(ts) {
+    if (ts === 0) return ""; // the unset instant (runtime/format.go's iso)
     const d = new Date(ts * 1000);
     const p2 = (n) => (n < 10 ? "0" : "") + n;
     return d.getUTCFullYear() + "-" + p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) +
@@ -560,16 +670,17 @@
   // mirror: same FA_NUMERIC shape as toInt, rounded (not truncated) to the
   // nearest cent so a third decimal digit doesn't just vanish.
   function toMoney(v) {
-    const t = typeof v === "string" ? v.trim() : toStr(v);
+    const t = typeof v === "string" ? goTrim(v) : toStr(v);
     if (!FA_NUMERIC.test(t)) return 0;
-    return Math.round(Number(t) * 100);
+    return roundAway(Number(t) * 100);
   }
   // toFloatJS mirrors eval.go's toFloat: the same FA_NUMERIC shape, no
   // truncation — the actual decimal value, for a `float`-typed control or
   // state cell (see coerce/controlValue below).
   function toFloatJS(v) {
     if (typeof v === "number") return v;
-    const t = typeof v === "string" ? v.trim() : toStr(v);
+    if (typeof v === "boolean") return v ? 1 : 0;
+    const t = typeof v === "string" ? goTrim(v) : toStr(v);
     if (!FA_NUMERIC.test(t)) return 0;
     return Number(t);
   }
@@ -592,9 +703,10 @@
     if (typeof v === "number") return Math.trunc(v);
     if (v === true) return 1;
     if (typeof v === "string") {
-      const t = v.trim();
+      const t = goTrim(v);
       if (!FA_NUMERIC.test(t)) return 0;
-      return Math.trunc(Number(t));
+      const n = Number(t);
+      return isFinite(n) ? Math.trunc(n) : 0;
     }
     return 0;
   }
@@ -606,7 +718,30 @@
   // and this path is total, so the choice is between an element that does not
   // exist and the nearest one that does.
   function headingLevel(v) { const n = toInt(v); return n < 1 ? 1 : n > 6 ? 6 : n; }
-  function toStr(v) { if (v == null) return ""; if (typeof v === "boolean") return v ? "true" : "false"; return "" + v; }
+  // toStr mirrors eval.go's toStr: a whole number in int64 range prints as
+  // its digits, any other number the way Go's FormatFloat(f, 'g', -1, 64)
+  // does, a list its elements joined by commas, an object nothing.
+  function toStr(v) {
+    if (typeof v === "string") return v;
+    if (v == null) return "";
+    if (typeof v === "boolean") return v ? "true" : "false";
+    if (typeof v === "number") return Number.isSafeInteger(v) ? "" + v : numStr(v);
+    if (Array.isArray(v)) return v.map(toStr).join(",");
+    if (typeof v === "object") return "";
+    return "" + v;
+  }
+  function numStr(f) {
+    if (isNaN(f)) return "NaN";
+    if (!isFinite(f)) return f > 0 ? "+Inf" : "-Inf";
+    if (Number.isInteger(f) && f >= -9223372036854775808 && f < 9223372036854775808) return BigInt(f).toString();
+    const [mant, e] = f.toExponential().split("e");
+    const exp = +e;
+    if (exp < -4 || exp >= 21 || (exp >= 6 && !Number.isInteger(f)) || Number.isInteger(f)) {
+      const ae = Math.abs(exp);
+      return mant + "e" + (exp < 0 ? "-" : "+") + (ae < 10 ? "0" : "") + ae;
+    }
+    return "" + f;
+  }
   function eq(a, b) {
     if (typeof a === "string" || typeof b === "string") return toStr(a) === toStr(b);
     if (typeof a === "boolean" || typeof b === "boolean") return truthy(a) === truthy(b);
@@ -1978,7 +2113,7 @@
     for (const st of list(body)) {
       switch (st.op) {
         case "check":
-          if (!truthy(ev(st.value, scope))) { ctx.error = st.msg || "Something went wrong."; return false; }
+          if (!truthy(ev(st.value, scope))) { ctx.error = (st.key ? toStr(ev(st.key, scope)) : st.msg) || "Something went wrong."; return false; }
           break;
         case "let":
           scope[st.target] = ev(st.value, scope);

@@ -1,0 +1,220 @@
+import "fabric_runtime_mechanism.fct"
+import "fabric_simulator_cluster.fct"
+
+app FabricExecutorSelfHost:
+    # fabric-controller's `PlacementExecutor` trait and the closed set of its
+    # implementations. fct has no trait objects, so `Box<dyn PlacementExecutor>`
+    # is a struct whose `kind` selects the implementation and the dispatch
+    # procs below switch on it. This file sits between
+    # fabric_controller_plan.fct (the types the trait speaks) and
+    # fabric_controller_core.fct (the controller that drives it), so every
+    # implementation is written once and the controller's submit/advance/abort
+    # are written once for all of them.
+
+    # ============================================================
+    # controller.rs — the `PlacementExecutor` trait, as a closed struct
+    # (simplification 1). `kind` selects the implementation; "stub" is the
+    # crate's own test mechanism. `startedPhases`/`startedAtMs` are the
+    # stub's `BTreeMap<PlanPhase, u64>` as parallel arrays. "fabric-placement"
+    # carries fabric-runtime's PlacementMechanism in `mechanism`;
+    # "simulated-placement" carries fabric-simulator's SimExecutor in
+    # `simulated` (fabric_simulator_cluster.fct), which OWNS the simulated
+    # ClusterState it edits — the value-semantics form of the crate's
+    # `Rc<RefCell<ClusterState>>`, read and written back by the Simulation
+    # through `executorSimulated` / `executorWithSimulated`.
+    # ============================================================
+    struct Executor:
+        kind: text
+        name: text
+        removes: [DbmsId]
+        startedPhases: [text]
+        startedAtMs: [int]
+        mechanism: PlacementMechanism
+        simulated: SimExecutor
+
+    proc stubExecutorNew() -> Executor:
+        let unused = do executorNoMechanism()
+        let noSim = do executorNoSimulated()
+        return Executor{kind: "stub", name: "stub", removes: [], startedPhases: [], startedAtMs: [], mechanism: unused, simulated: noSim}
+
+    # executorNoMechanism: the `mechanism` slot of an executor that is not
+    # the placement mechanism (never read for those kinds).
+    proc executorNoMechanism() -> PlacementMechanism:
+        let fabric = do placementFabricNew()
+        let m = do placementMechanismNew(fabric)
+        return m
+
+    # executorNoSimulated: the `simulated` slot of an executor that is not
+    # the simulated mechanism (never read for those kinds).
+    proc executorNoSimulated() -> SimExecutor:
+        let world = do clusterStateEmpty()
+        let sim = do simExecutorNew(world)
+        return sim
+
+    # placementMechanismExecutor: fabric-runtime's PlacementMechanism,
+    # registered under its MECHANISM_NAME.
+    proc placementMechanismExecutor(m: PlacementMechanism) -> Executor:
+        let name = do mechanismName()
+        let noSim = do executorNoSimulated()
+        return Executor{kind: name, name: name, removes: [], startedPhases: [], startedAtMs: [], mechanism: m, simulated: noSim}
+
+    # simulatedPlacementExecutor: fabric-simulator's SimExecutor, registered
+    # under its own name ("simulated-placement").
+    proc simulatedPlacementExecutor(sim: SimExecutor) -> Executor:
+        let name = do simExecutorName(sim)
+        let unused = do executorNoMechanism()
+        return Executor{kind: name, name: name, removes: [], startedPhases: [], startedAtMs: [], mechanism: unused, simulated: sim}
+
+    # stubExecutorDropping: `StubExecutor::dropping(removes)` — a mechanism
+    # whose plans remove exactly these nodes instead of the source.
+    proc stubExecutorDropping(removes: [DbmsId]) -> Executor:
+        let unused = do executorNoMechanism()
+        let noSim = do executorNoSimulated()
+        return Executor{kind: "stub", name: "stub", removes: removes, startedPhases: [], startedAtMs: [], mechanism: unused, simulated: noSim}
+
+    proc executorWithMechanism(ex: Executor, m: PlacementMechanism) -> Executor:
+        return Executor{kind: ex.kind, name: ex.name, removes: ex.removes, startedPhases: ex.startedPhases, startedAtMs: ex.startedAtMs, mechanism: m, simulated: ex.simulated}
+
+    proc executorSimulated(ex: Executor) -> SimExecutor:
+        return ex.simulated
+
+    proc executorWithSimulated(ex: Executor, sim: SimExecutor) -> Executor:
+        return Executor{kind: ex.kind, name: ex.name, removes: ex.removes, startedPhases: ex.startedPhases, startedAtMs: ex.startedAtMs, mechanism: ex.mechanism, simulated: sim}
+
+    proc executorName(ex: Executor) -> text:
+        return ex.name
+
+    # executorSupports: stub — `!matches!(action, NoAction)`.
+    proc executorSupports(ex: Executor, action: OptimizationAction) -> bool:
+        if ex.kind == "fabric-placement":
+            let mech = do mechanismSupports(ex.mechanism, action)
+            return mech
+        if ex.kind == "simulated-placement":
+            let simSupports = do simExecutorSupports(ex.simulated, action)
+            return simSupports
+        if ex.kind == "stub":
+            return action.kind != "NoAction"
+        return false
+
+    # executorPlan: stub — needs a named destination; Prepare/Transfer/
+    # Cutover/Cleanup at Coordinate scope; adds=[destination]; removes=
+    # [source] unless `dropping` overrode them.
+    proc executorPlan(ex: Executor, request: PlanRequest) -> PlacementPlanNewResult:
+        if ex.kind == "fabric-placement":
+            let mechPlan = do mechanismPlan(ex.mechanism, request)
+            return mechPlan
+        if ex.kind == "simulated-placement":
+            let simPlan = do simExecutorPlan(ex.simulated, request)
+            return simPlan
+        if ex.kind != "stub":
+            let label = do controllerPlanActionLabel(request.action)
+            let unsupported = do planErrorUnsupportedAction(label)
+            let zero = do placementPlanZero()
+            return PlacementPlanNewResult{ok: false, value: zero, err: unsupported}
+        if !request.hasDestination:
+            let infeasible = do planErrorInfeasible("stub needs a named destination")
+            let zero2 = do placementPlanZero()
+            return PlacementPlanNewResult{ok: false, value: zero2, err: infeasible}
+        let mut removes = ex.removes
+        if len(removes) == 0:
+            removes = [DbmsId{value: request.source.dbmsId}]
+        let planned = do placementPlanNew(request.target, request.action, "coordinate", ["prepare", "transfer", "cutover", "cleanup"], [request.destination], removes)
+        return planned
+
+    proc executorStartedIndexOf(phases: [text], phase: text) -> int:
+        let n = len(phases)
+        let mut i = 0
+        loop i < n:
+            if phases[i] == phase:
+                return i
+            i = i + 1
+        return -1
+
+    struct ExecutorBeginResult:
+        ok: bool
+        fault: ExecutionFault
+        executor: Executor
+
+    # executorBeginPhase: stub — `started.insert(phase, at_ms)`; Ok(()).
+    proc executorBeginPhase(ex: Executor, plan: PlacementPlan, phase: text, atMs: int) -> ExecutorBeginResult:
+        if ex.kind == "fabric-placement":
+            let began = do mechanismBeginPhase(ex.mechanism, plan, phase, atMs)
+            let withMech = do executorWithMechanism(ex, began.mechanism)
+            return ExecutorBeginResult{ok: began.ok, fault: began.fault, executor: withMech}
+        if ex.kind == "simulated-placement":
+            let simBegan = do simExecutorBeginPhase(ex.simulated, plan, phase, atMs)
+            let withSim = do executorWithSimulated(ex, simBegan.executor)
+            return ExecutorBeginResult{ok: simBegan.ok, fault: simBegan.fault, executor: withSim}
+        if ex.kind != "stub":
+            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
+            return ExecutorBeginResult{ok: false, fault: fault, executor: ex}
+        let idx = do executorStartedIndexOf(ex.startedPhases, phase)
+        let mut phases = ex.startedPhases
+        let mut times = ex.startedAtMs
+        if idx == -1:
+            phases = append(phases, phase)
+            times = append(times, atMs)
+        else:
+            times[idx] = atMs
+        let noFault = do executionFaultInternal("")
+        return ExecutorBeginResult{ok: true, fault: noFault, executor: Executor{kind: ex.kind, name: ex.name, removes: ex.removes, startedPhases: phases, startedAtMs: times, mechanism: ex.mechanism, simulated: ex.simulated}}
+
+    struct ExecutorPollResult:
+        ok: bool
+        progress: PhaseProgress
+        fault: ExecutionFault
+        executor: Executor
+
+    # executorPollPhase: stub — NotStarted if the phase never began;
+    # Complete once `at_ms > started`, else Running{0.5}.
+    proc executorPollPhase(ex: Executor, plan: PlacementPlan, phase: text, atMs: int) -> ExecutorPollResult:
+        if ex.kind == "fabric-placement":
+            let polled = do mechanismPollPhase(ex.mechanism, plan, phase, atMs)
+            let withMech = do executorWithMechanism(ex, polled.mechanism)
+            return ExecutorPollResult{ok: polled.ok, progress: polled.progress, fault: polled.fault, executor: withMech}
+        if ex.kind == "simulated-placement":
+            let simPolled = do simExecutorPollPhase(ex.simulated, plan, phase, atMs)
+            let withSim = do executorWithSimulated(ex, simPolled.executor)
+            return ExecutorPollResult{ok: simPolled.ok, progress: simPolled.progress, fault: simPolled.fault, executor: withSim}
+        let complete = do phaseProgressComplete()
+        if ex.kind != "stub":
+            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
+            return ExecutorPollResult{ok: false, progress: complete, fault: fault, executor: ex}
+        let idx = do executorStartedIndexOf(ex.startedPhases, phase)
+        if idx == -1:
+            let notStarted = do executionFaultNotStarted(phase)
+            return ExecutorPollResult{ok: false, progress: complete, fault: notStarted, executor: ex}
+        let noFault = do executionFaultInternal("")
+        if atMs > ex.startedAtMs[idx]:
+            return ExecutorPollResult{ok: true, progress: complete, fault: noFault, executor: ex}
+        let running = do phaseProgressRunning(0.5)
+        return ExecutorPollResult{ok: true, progress: running, fault: noFault, executor: ex}
+
+    struct ExecutorAbortResult:
+        ok: bool
+        outcome: RollbackOutcome
+        fault: ExecutionFault
+        executor: Executor
+
+    # executorAbort: stub — Irreversible("authority already moved") once
+    # Cutover is among the completed phases, Restored otherwise.
+    proc executorAbort(ex: Executor, plan: PlacementPlan, completed: [text], atMs: int) -> ExecutorAbortResult:
+        if ex.kind == "fabric-placement":
+            let aborted = do mechanismAbort(ex.mechanism, plan, completed, atMs)
+            let withMech = do executorWithMechanism(ex, aborted.mechanism)
+            return ExecutorAbortResult{ok: aborted.ok, outcome: aborted.outcome, fault: aborted.fault, executor: withMech}
+        if ex.kind == "simulated-placement":
+            let simAborted = do simExecutorAbort(ex.simulated, plan, completed, atMs)
+            let withSim = do executorWithSimulated(ex, simAborted.executor)
+            return ExecutorAbortResult{ok: simAborted.ok, outcome: simAborted.outcome, fault: simAborted.fault, executor: withSim}
+        let restored = do rollbackOutcomeRestored()
+        if ex.kind != "stub":
+            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
+            return ExecutorAbortResult{ok: false, outcome: restored, fault: fault, executor: ex}
+        let noFault = do executionFaultInternal("")
+        let cutOver = do planPhaseArrayContains(completed, "cutover")
+        if cutOver:
+            let irreversible = do rollbackOutcomeIrreversible("authority already moved")
+            return ExecutorAbortResult{ok: true, outcome: irreversible, fault: noFault, executor: ex}
+        return ExecutorAbortResult{ok: true, outcome: restored, fault: noFault, executor: ex}
+

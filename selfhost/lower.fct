@@ -1,5 +1,6 @@
 import "ir_expr.fct"
 import "expr.fct"
+import "unquote.fct"
 
 app LowerSelfHost:
     # Self-hosting port of internal/ir/build.go's `lower(ex ast.Expr, inline
@@ -48,12 +49,13 @@ app LowerSelfHost:
     #   agg   -> agg (op, coll, field, var, where?, sel?) — where/sel are
     #       0-or-1-element lists on both sides, lowered when present.
     #
+    # astate (pending/failed/dirty/touched) -> astate (op, name); struct
+    #   -> struct (name, fields, args parallel).
+    #
     # Out of scope, because the self-hosted parser cannot produce the node
-    # (not because this file could not lower it): ast.StructLit
-    # (`Name{f: v}` — expr_tree.fct has no struct-literal atom), ast.Asset
+    # (not because this file could not lower it): ast.Asset
     # (`asset("...")`, a compile-time file inlining with no parser support
-    # here), ast.ActState (`pending(action)`-style action-state reads),
-    # and every operator the parser's own header lists as unsupported
+    # here), and every operator the parser's own header lists as unsupported
     # (`%`, `<<`/`>>`, membership `in`). Anything that reaches lowerNode
     # with a kind outside the list above degrades to ir_expr.fct's
     # `emptyIR()` sentinel (kind "") — the honest "unsupported" answer this
@@ -102,6 +104,9 @@ app LowerSelfHost:
 
     # lowerUnquote: strconv.Unquote over the tokenizer's raw `"..."` token.
     proc lowerUnquote(raw: text) -> text:
+        let u = do goUnquote(raw)
+        if u.ok:
+            return u.value
         let n = len(raw)
         let mut start = 0
         let mut end = n
@@ -157,22 +162,281 @@ app LowerSelfHost:
         let x = do lowerCloneList(e.x)
         let where = do lowerCloneList(e.where)
         let sel = do lowerCloneList(e.sel)
-        return IRExpr{kind: e.kind, hasVal: e.hasVal, val: e.val, vtype: e.vtype, name: e.name, field: e.field, obj: obj, key: key, op: e.op, args: args, keys: keys, fields: e.fields, l: l, r: r, x: x, itemVar: e.itemVar, where: where, sel: sel, order: "", desc: false, limit: []}
+        let limit = do lowerCloneList(e.limit)
+        let orderBy = do lowerCloneList(e.orderBy)
+        return IRExpr{kind: e.kind, hasVal: e.hasVal, val: e.val, vtype: e.vtype, name: e.name, field: e.field, obj: obj, key: key, op: e.op, args: args, keys: keys, fields: e.fields, l: l, r: r, x: x, itemVar: e.itemVar, where: where, sel: sel, order: e.order, desc: e.desc, limit: limit, orderBy: orderBy, omit: e.omit, nulls: e.nulls}
 
     # lowerNodeList: lower() mapped over a child list (a call's args, a
     # list's elements, a map's keys/values, an agg's 0-or-1 where/sel).
+    # lowerNodeList / lowerNode: lower() with just an inline table and the
+    # enum names (no parameterized derives, no post passes).
     proc lowerNodeList(ns: [ExprNode], inlineNames: [text], inlineExprs: [IRExpr], enumNames: [text]) -> [IRExpr]:
+        let ctx = do lowCtxBasic(inlineNames, inlineExprs, enumNames)
+        let r = do lowerListC(ns, ctx)
+        return r
+
+    proc lowerNode(n: ExprNode, inlineNames: [text], inlineExprs: [IRExpr], enumNames: [text]) -> IRExpr:
+        let ctx = do lowCtxBasic(inlineNames, inlineExprs, enumNames)
+        let r = do lowerC(n, ctx)
+        return r
+
+    # LowCtx: everything env.low reads — the inline table (zero-argument
+    # policies and derives), the enum names, the parameterized derives
+    # (expanded at every call, expandDerive), and the three post passes'
+    # tables: text-typed entity fields (markTextAggs), entity derives a
+    # list may order by (deriveOrders), wire types' optional fields
+    # (markOmits).
+    struct LowFn:
+        name: text
+        params: [text]
+        body: IRExpr
+        # ret: the derive's declared type, as written (`T`, `[T]`, `T?`).
+        ret: text
+
+    struct LowCtx:
+        inlineNames: [text]
+        inlineExprs: [IRExpr]
+        enumNames: [text]
+        fns: [LowFn]
+        textFieldKeys: [text]
+        deriveKeys: [text]
+        deriveExprs: [IRExpr]
+        wireOptKeys: [text]
+        # wireNullKeys: "Type.field" of every `T or null` wire-type field,
+        # in declaration order (markOmits' Nulls).
+        wireNullKeys: [text]
+
+    proc lowCtxBasic(inlineNames: [text], inlineExprs: [IRExpr], enumNames: [text]) -> LowCtx:
+        return LowCtx{inlineNames: inlineNames, inlineExprs: inlineExprs, enumNames: enumNames, fns: [], textFieldKeys: [], deriveKeys: [], deriveExprs: [], wireOptKeys: [], wireNullKeys: []}
+
+    proc lowerFindFn(ctx: LowCtx, name: text) -> int:
+        let n = len(ctx.fns)
+        let mut i = 0
+        loop i < n:
+            if ctx.fns[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    # lowFull: env.low — lower(), then markTextAggs, deriveOrders and
+    # markOmits over the result.
+    proc lowFull(n: ExprNode, ctx: LowCtx) -> IRExpr:
+        let l = do lowerC(n, ctx)
+        let a = do lowMarkTextAggs(l, ctx)
+        let b = do lowDeriveOrders(a, ctx)
+        let c = do lowMarkOmits(b, ctx)
+        return c
+
+    # lowMapKids: rebuild x with f applied to every child Kids() visits
+    # (l r x obj key where sel limit keys args) — one proc per pass,
+    # selected by `pass`.
+    proc lowPass(x: IRExpr, ctx: LowCtx, pass: text) -> IRExpr:
+        let l = do lowPassList(x.l, ctx, pass)
+        let r = do lowPassList(x.r, ctx, pass)
+        let xx = do lowPassList(x.x, ctx, pass)
+        let obj = do lowPassList(x.obj, ctx, pass)
+        let key = do lowPassList(x.key, ctx, pass)
+        let wh = do lowPassList(x.where, ctx, pass)
+        let sel = do lowPassList(x.sel, ctx, pass)
+        let lim = do lowPassList(x.limit, ctx, pass)
+        let keys = do lowPassList(x.keys, ctx, pass)
+        let args = do lowPassList(x.args, ctx, pass)
+        let mut ob = x.orderBy
+        if pass == "omit":
+            let o2 = do lowPassList(x.orderBy, ctx, pass)
+            ob = o2
+        return IRExpr{kind: x.kind, hasVal: x.hasVal, val: x.val, vtype: x.vtype, name: x.name, field: x.field, obj: obj, key: key, op: x.op, args: args, keys: keys, fields: x.fields, l: l, r: r, x: xx, itemVar: x.itemVar, where: wh, sel: sel, order: x.order, desc: x.desc, limit: lim, orderBy: ob, omit: x.omit, nulls: x.nulls}
+
+    proc lowPassList(xs: [IRExpr], ctx: LowCtx, pass: text) -> [IRExpr]:
+        let mut out = []
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            let mut y = xs[i]
+            if pass == "text":
+                let t = do lowMarkTextAggs(xs[i], ctx)
+                y = t
+            if pass == "order":
+                let o = do lowDeriveOrders(xs[i], ctx)
+                y = o
+            if pass == "omit":
+                let m = do lowMarkOmits(xs[i], ctx)
+                y = m
+            out = append(out, y)
+            i = i + 1
+        return out
+
+    # lowMarkTextAggs: markTextAggs — min/max of a text field is text.
+    proc lowMarkTextAggs(x0: IRExpr, ctx: LowCtx) -> IRExpr:
+        let x = do lowPass(x0, ctx, "text")
+        if x.kind == "agg" && (x.op == "min" || x.op == "max") && x.field != "":
+            if (x.name + "." + x.field) in ctx.textFieldKeys:
+                return IRExpr{kind: x.kind, hasVal: x.hasVal, val: x.val, vtype: "text", name: x.name, field: x.field, obj: x.obj, key: x.key, op: x.op, args: x.args, keys: x.keys, fields: x.fields, l: x.l, r: x.r, x: x.x, itemVar: x.itemVar, where: x.where, sel: x.sel, order: x.order, desc: x.desc, limit: x.limit, orderBy: x.orderBy, omit: x.omit, nulls: x.nulls}
+        return x
+
+    # lowDeriveOrders: deriveOrders — a list ordered `by` an entity derive
+    # orders by that derive's expression over the item (`$item` when the
+    # list binds no variable).
+    proc lowDeriveOrders(x0: IRExpr, ctx: LowCtx) -> IRExpr:
+        let mut x = x0
+        if x0.kind == "agg" && x0.order != "":
+            let at = do lowerFindName(ctx.deriveKeys, x0.name + "." + x0.order)
+            if at >= 0:
+                let mut v = x0.itemVar
+                if v == "":
+                    v = "$item"
+                let rowRef = do irRef(v)
+                let ob = do lowSubstParams(ctx.deriveExprs[at], ["$row"], [rowRef], [], [])
+                x = IRExpr{kind: x0.kind, hasVal: x0.hasVal, val: x0.val, vtype: x0.vtype, name: x0.name, field: x0.field, obj: x0.obj, key: x0.key, op: x0.op, args: x0.args, keys: x0.keys, fields: x0.fields, l: x0.l, r: x0.r, x: x0.x, itemVar: v, where: x0.where, sel: x0.sel, order: "", desc: x0.desc, limit: x0.limit, orderBy: [ob.e], omit: x0.omit, nulls: x0.nulls}
+        let y = do lowPass(x, ctx, "order")
+        return y
+
+    # lowMarkOmits: markOmits — a wire-type literal lists its optional
+    # fields (first marking wins).
+    proc lowMarkOmits(x0: IRExpr, ctx: LowCtx) -> IRExpr:
+        let x = do lowPass(x0, ctx, "omit")
+        if x.kind == "struct" && len(x.omit) == 0:
+            let mut omit = []
+            let n = len(x.fields)
+            let mut i = 0
+            loop i < n:
+                if (x.name + "." + x.fields[i]) in ctx.wireOptKeys:
+                    omit = append(omit, x.fields[i])
+                i = i + 1
+            # every `T or null` field of the type, in declaration order
+            let mut nulls = []
+            let pre = x.name + "."
+            let nn = len(ctx.wireNullKeys)
+            let mut k = 0
+            loop k < nn:
+                let key = ctx.wireNullKeys[k]
+                if len(key) > len(pre) && slice(key, 0, len(pre)) == pre:
+                    nulls = append(nulls, slice(key, len(pre), len(key)))
+                k = k + 1
+            return IRExpr{kind: x.kind, hasVal: x.hasVal, val: x.val, vtype: x.vtype, name: x.name, field: x.field, obj: x.obj, key: x.key, op: x.op, args: x.args, keys: x.keys, fields: x.fields, l: x.l, r: x.r, x: x.x, itemVar: x.itemVar, where: x.where, sel: x.sel, order: x.order, desc: x.desc, limit: x.limit, orderBy: x.orderBy, omit: omit, nulls: nulls}
+        return x
+
+    # ── parameterized derives: expandDerive / substParams / irNames ─────
+    proc lowIrNames(x: IRExpr, acc: [text]) -> [text]:
+        let mut out = acc
+        if x.kind == "ref" && !(x.name in out):
+            out = append(out, x.name)
+        if x.itemVar != "" && !(x.itemVar in out):
+            out = append(out, x.itemVar)
+        let lists = [x.l, x.r, x.x, x.obj, x.key, x.where, x.sel, x.limit, x.keys, x.args, x.orderBy]
+        let nl = len(lists)
+        let mut i = 0
+        loop i < nl:
+            let ks = lists[i]
+            let nk = len(ks)
+            let mut j = 0
+            loop j < nk:
+                let a = do lowIrNames(ks[j], out)
+                out = a
+                j = j + 1
+            i = i + 1
+        return out
+
+    struct LowSubst:
+        e: IRExpr
+        taken: [text]
+
+    struct LowSubstList:
+        es: [IRExpr]
+        taken: [text]
+
+    proc lowSubstList(xs: [IRExpr], names: [text], vals: [IRExpr], argNames: [text], taken0: [text]) -> LowSubstList:
+        let mut out = []
+        let mut taken = taken0
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            let r = do lowSubstParams(xs[i], names, vals, argNames, taken)
+            out = append(out, r.e)
+            taken = r.taken
+            i = i + 1
+        return LowSubstList{es: out, taken: taken}
+
+    proc lowSubstParams(x: IRExpr, names: [text], vals: [IRExpr], argNames: [text], taken0: [text]) -> LowSubst:
+        let mut taken = taken0
+        if x.kind == "ref":
+            let at = do lowerFindName(names, x.name)
+            if at >= 0:
+                let c = do lowerCloneExpr(vals[at])
+                return LowSubst{e: c, taken: taken}
+        if x.kind == "get":
+            let o = do lowSubstList(x.obj, names, vals, argNames, taken)
+            let obj = o.es[0]
+            if obj.kind == "eget" && obj.field == "":
+                return LowSubst{e: IRExpr{kind: obj.kind, hasVal: obj.hasVal, val: obj.val, vtype: obj.vtype, name: obj.name, field: x.field, obj: obj.obj, key: obj.key, op: obj.op, args: obj.args, keys: obj.keys, fields: obj.fields, l: obj.l, r: obj.r, x: obj.x, itemVar: obj.itemVar, where: obj.where, sel: obj.sel, order: obj.order, desc: obj.desc, limit: obj.limit, orderBy: obj.orderBy, omit: obj.omit, nulls: obj.nulls}, taken: o.taken}
+            let g = do irGet(obj, x.field)
+            return LowSubst{e: g, taken: o.taken}
+        if x.kind == "agg":
+            let lim = do lowSubstList(x.limit, names, vals, argNames, taken)
+            taken = lim.taken
+            let mut inNames = names
+            let mut inVals = vals
+            let mut v = x.itemVar
+            if x.itemVar != "":
+                let mut nn = []
+                let mut nv = []
+                let nb = len(names)
+                let mut i = 0
+                loop i < nb:
+                    if names[i] != x.itemVar:
+                        nn = append(nn, names[i])
+                        nv = append(nv, vals[i])
+                    i = i + 1
+                if x.itemVar in argNames:
+                    let mut fresh = x.itemVar
+                    let mut k = 2
+                    loop fresh in taken:
+                        fresh = x.itemVar + k
+                        k = k + 1
+                    taken = append(taken, fresh)
+                    let fr = do irRef(fresh)
+                    nn = append(nn, x.itemVar)
+                    nv = append(nv, fr)
+                    v = fresh
+                inNames = nn
+                inVals = nv
+            let w = do lowSubstList(x.where, inNames, inVals, argNames, taken)
+            let s = do lowSubstList(x.sel, inNames, inVals, argNames, w.taken)
+            let ob = do lowSubstList(x.orderBy, inNames, inVals, argNames, s.taken)
+            return LowSubst{e: IRExpr{kind: x.kind, hasVal: x.hasVal, val: x.val, vtype: x.vtype, name: x.name, field: x.field, obj: x.obj, key: x.key, op: x.op, args: x.args, keys: x.keys, fields: x.fields, l: x.l, r: x.r, x: x.x, itemVar: v, where: w.es, sel: s.es, order: x.order, desc: x.desc, limit: lim.es, orderBy: ob.es, omit: x.omit, nulls: x.nulls}, taken: ob.taken}
+        let l = do lowSubstList(x.l, names, vals, argNames, taken)
+        let r = do lowSubstList(x.r, names, vals, argNames, l.taken)
+        let xx = do lowSubstList(x.x, names, vals, argNames, r.taken)
+        let obj2 = do lowSubstList(x.obj, names, vals, argNames, xx.taken)
+        let key = do lowSubstList(x.key, names, vals, argNames, obj2.taken)
+        let args = do lowSubstList(x.args, names, vals, argNames, key.taken)
+        let keys = do lowSubstList(x.keys, names, vals, argNames, args.taken)
+        return LowSubst{e: IRExpr{kind: x.kind, hasVal: x.hasVal, val: x.val, vtype: x.vtype, name: x.name, field: x.field, obj: obj2.es, key: key.es, op: x.op, args: args.es, keys: keys.es, fields: x.fields, l: l.es, r: r.es, x: xx.es, itemVar: x.itemVar, where: x.where, sel: x.sel, order: x.order, desc: x.desc, limit: x.limit, orderBy: x.orderBy, omit: x.omit, nulls: x.nulls}, taken: keys.taken}
+
+    proc lowerExpandDerive(fn: LowFn, args: [IRExpr]) -> IRExpr:
+        let mut argNames = []
+        let n = len(fn.params)
+        let mut i = 0
+        loop i < n && i < len(args):
+            let a = do lowIrNames(args[i], argNames)
+            argNames = a
+            i = i + 1
+        let taken = do lowIrNames(fn.body, argNames)
+        let r = do lowSubstParams(fn.body, fn.params, args, argNames, taken)
+        return r.e
+
+    proc lowerListC(ns: [ExprNode], ctx: LowCtx) -> [IRExpr]:
         let n = len(ns)
         let mut out = []
         let mut i = 0
         loop i < n:
-            let e = do lowerNode(ns[i], inlineNames, inlineExprs, enumNames)
+            let e = do lowerC(ns[i], ctx)
             out = append(out, e)
             i = i + 1
         return out
 
     # lowerNode: lower(), case by case (see the header for the table).
-    proc lowerNode(n: ExprNode, inlineNames: [text], inlineExprs: [IRExpr], enumNames: [text]) -> IRExpr:
+    proc lowerC(n: ExprNode, ctx: LowCtx) -> IRExpr:
         if n.kind == "int":
             let iv = do lowerIntText(n.text)
             let ilit = do irLit(iv, "int")
@@ -189,46 +453,50 @@ app LowerSelfHost:
             let tlit = do irLit(tv, "text")
             return tlit
         if n.kind == "ref":
-            let at = do lowerFindName(inlineNames, n.text)
+            let at = do lowerFindName(ctx.inlineNames, n.text)
             if at >= 0:
-                let copied = do lowerCloneExpr(inlineExprs[at])
+                let copied = do lowerCloneExpr(ctx.inlineExprs[at])
                 return copied
             let ref = do irRef(n.text)
             return ref
         if n.kind == "bin":
-            let bl = do lowerNode(n.children[0], inlineNames, inlineExprs, enumNames)
-            let br = do lowerNode(n.children[1], inlineNames, inlineExprs, enumNames)
+            let bl = do lowerC(n.children[0], ctx)
+            let br = do lowerC(n.children[1], ctx)
             let bin = do irBin(n.text, bl, br)
             return bin
         if n.kind == "un":
-            let ux = do lowerNode(n.children[0], inlineNames, inlineExprs, enumNames)
+            let ux = do lowerC(n.children[0], ctx)
             let un = do irUn(n.text, ux)
             return un
         if n.kind == "get":
             let gobj = n.children[0]
             if gobj.kind == "ref":
-                let enumAt = do lowerFindName(enumNames, gobj.text)
+                let enumAt = do lowerFindName(ctx.enumNames, gobj.text)
                 if enumAt >= 0:
                     let member = do irLit(n.text, "text")
                     return member
-            let gl = do lowerNode(gobj, inlineNames, inlineExprs, enumNames)
+            let gl = do lowerC(gobj, ctx)
             let get = do irGet(gl, n.text)
             return get
         if n.kind == "entityGet":
-            let ek = do lowerNode(n.children[0], inlineNames, inlineExprs, enumNames)
+            let ek = do lowerC(n.children[0], ctx)
             let eget = do irEGet(n.text, ek, n.field)
             return eget
         if n.kind == "index":
-            let xo = do lowerNode(n.children[0], inlineNames, inlineExprs, enumNames)
-            let xk = do lowerNode(n.children[1], inlineNames, inlineExprs, enumNames)
+            let xo = do lowerC(n.children[0], ctx)
+            let xk = do lowerC(n.children[1], ctx)
             let index = do irIndex(xo, xk)
             return index
         if n.kind == "call":
-            let cargs = do lowerNodeList(n.children, inlineNames, inlineExprs, enumNames)
+            let cargs = do lowerListC(n.children, ctx)
             let call = do irCall(n.text, cargs)
+            let fi = do lowerFindFn(ctx, n.text)
+            if fi >= 0:
+                let ex = do lowerExpandDerive(ctx.fns[fi], cargs)
+                return ex
             return call
         if n.kind == "list":
-            let elems = do lowerNodeList(n.children, inlineNames, inlineExprs, enumNames)
+            let elems = do lowerListC(n.children, ctx)
             let list = do irList(elems)
             return list
         if n.kind == "map":
@@ -237,18 +505,34 @@ app LowerSelfHost:
             let mut mvals = []
             let mut pi = 0
             loop pi < np:
-                let mk = do lowerNode(n.pairs[pi].key, inlineNames, inlineExprs, enumNames)
-                let mv = do lowerNode(n.pairs[pi].value, inlineNames, inlineExprs, enumNames)
+                let mk = do lowerC(n.pairs[pi].key, ctx)
+                let mv = do lowerC(n.pairs[pi].value, ctx)
                 mkeys = append(mkeys, mk)
                 mvals = append(mvals, mv)
                 pi = pi + 1
             let map = do irMap(mkeys, mvals)
             return map
         if n.kind == "agg":
-            let aw = do lowerNodeList(n.whereClause, inlineNames, inlineExprs, enumNames)
-            let asel = do lowerNodeList(n.sel, inlineNames, inlineExprs, enumNames)
-            let agg = do irAgg(n.text, n.coll, n.field, n.itemVar, aw, asel)
-            return agg
+            let aw = do lowerListC(n.whereClause, ctx)
+            let asel = do lowerListC(n.sel, ctx)
+            let alim = do lowerListC(n.limit, ctx)
+            let aord = do lowerListC(n.orderBy, ctx)
+            return IRExpr{kind: "agg", hasVal: false, val: "", vtype: "", name: n.coll, field: n.field, obj: [], key: [], op: n.text, args: [], keys: [], fields: [], l: [], r: [], x: [], itemVar: n.itemVar, where: aw, sel: asel, order: n.order, desc: n.desc, limit: alim, orderBy: aord, omit: [], nulls: []}
+        if n.kind == "astate":
+            let ast0 = do irAState(n.text, n.field)
+            return ast0
+        if n.kind == "struct":
+            let sn = len(n.pairs)
+            let mut sfields = []
+            let mut svals = []
+            let mut si = 0
+            loop si < sn:
+                sfields = append(sfields, n.pairs[si].key.text)
+                let sv = do lowerC(n.pairs[si].value, ctx)
+                svals = append(svals, sv)
+                si = si + 1
+            let st = do irStruct(n.text, sfields, svals)
+            return st
         let unsupported = do emptyIR()
         return unsupported
 

@@ -1,0 +1,476 @@
+import "fabric_daemon_config.fct"
+
+app FabricDaemonStatusSelfHost:
+    # Port of fabric/crates/fabric-daemon/src/status.rs: the snapshot the
+    # operator port answers with, and its JSON exactly as serde_json writes
+    # the derived Serialize (field order, `null` for None, u64 unsigned,
+    # floats in serde_json's shortest form), plus the admin routes' bodies
+    # (admin.rs): /fleet, /placements, /actions, /actions/history as the
+    # plain serializations, and /routing, which goes through
+    # `serde_json::json!` and so through a Value whose objects are BTreeMaps
+    # — its keys, nested ones included, come out sorted.
+    #
+    # daemonStatusFromJson is the other direction: the snapshot read back
+    # from its JSON (what an operator's client of GET /status does), so the
+    # port and the crate can each read what the other wrote.
+    #
+    # `StatusHandle` (an RwLock<Arc<Status>> swapped once per cycle) is the
+    # process's; here a snapshot is a value and publishing it is storing it.
+    # Names are prefixed `dst` / `daemon` / `Daemon`.
+
+    struct DaemonBackendStatus:
+        id: text
+        url: text
+        region: text
+        availability: text
+        health: text
+        lastProbe: text
+        hasLastProbeAtMs: bool
+        lastProbeAtMs: int
+        hasSilenceMs: bool
+        silenceMs: int
+        heartbeats: int
+        telemetry: bool
+        hasLastSample: bool
+        lastSample: text
+
+    struct DaemonMigrationStatus:
+        phase: text
+        source: text
+        destination: text
+        readOwner: text
+        writeFenced: bool
+        hasCutOver: bool
+
+    struct DaemonPlacementStatus:
+        shard: int
+        x: int
+        y: int
+        holder: text
+        region: text
+        hasMigration: bool
+        migration: DaemonMigrationStatus
+
+    struct DaemonActionStatus:
+        id: int
+        shard: int
+        x: int
+        y: int
+        action: text
+        mechanism: text
+        state: text
+        hasPhase: bool
+        phase: text
+        hasFraction: bool
+        fraction: float
+        source: text
+        hasDestination: bool
+        destination: text
+        admittedAtMs: int
+        hasCutOver: bool
+        bytesCopied: int
+        hasResidentBytes: bool
+        residentBytes: int
+
+    struct DaemonDecisionCounters:
+        proposed: int
+        admitted: int
+        refused: int
+        hasLastRefusal: bool
+        lastRefusal: text
+
+    struct DaemonKeyspaceStatus:
+        rules: [text]
+        hasFallback: bool
+        fallback: text
+        spansOnePlace: bool
+
+    struct DaemonStoreStatus:
+        hasConfigured: bool
+        configured: text
+        state: text
+        hasLastError: bool
+        lastError: text
+        writes: int
+
+    struct DaemonCopyingStatus:
+        id: int
+        destination: text
+
+    struct DaemonRefusedCopy:
+        id: int
+        reason: text
+
+    struct DaemonMoverStatus:
+        copying: [DaemonCopyingStatus]
+        refused: [DaemonRefusedCopy]
+
+    struct DaemonStatus:
+        version: text
+        startedAtMs: int
+        snapshotAtMs: int
+        clockMs: int
+        cycles: int
+        draining: bool
+        dataListen: text
+        adminListen: text
+        routingGeneration: int
+        placementGeneration: int
+        telemetrySource: text
+        observations: int
+        profiles: int
+        hotCells: int
+        keyspace: DaemonKeyspaceStatus
+        backends: [DaemonBackendStatus]
+        placements: [DaemonPlacementStatus]
+        inFlight: [DaemonActionStatus]
+        decisions: DaemonDecisionCounters
+        placementStore: DaemonStoreStatus
+        movers: DaemonMoverStatus
+        history: [OutcomeReport]
+
+    # CARGO_PKG_VERSION of fabric-daemon.
+    proc daemonVersion() -> text:
+        return "0.1.0"
+
+    proc daemonDecisionCountersDefault() -> DaemonDecisionCounters:
+        return DaemonDecisionCounters{proposed: 0, admitted: 0, refused: 0, hasLastRefusal: false, lastRefusal: ""}
+
+    proc daemonMigrationStatusNone() -> DaemonMigrationStatus:
+        return DaemonMigrationStatus{phase: "", source: "", destination: "", readOwner: "", writeFenced: false, hasCutOver: false}
+
+    # daemon.rs `starting`: the snapshot between binding and the first
+    # cycle. It claims nothing.
+    proc daemonStartingStatus(settings: DaemonSettings, data: text, admin: text, nowMs: int) -> DaemonStatus:
+        let keyspace = DaemonKeyspaceStatus{rules: [], hasFallback: false, fallback: "", spansOnePlace: false}
+        let store = DaemonStoreStatus{hasConfigured: settings.hasPlacementStore, configured: settings.placementStore, state: "starting", hasLastError: false, lastError: "", writes: 0}
+        return DaemonStatus{version: daemonVersion(), startedAtMs: nowMs, snapshotAtMs: nowMs, clockMs: 0, cycles: 0, draining: false, dataListen: data, adminListen: admin, routingGeneration: 0, placementGeneration: 0, telemetrySource: "starting", observations: 0, profiles: 0, hotCells: 0, keyspace: keyspace, backends: [], placements: [], inFlight: [], decisions: daemonDecisionCountersDefault(), placementStore: store, movers: DaemonMoverStatus{copying: [], refused: []}, history: []}
+
+    # ------------------------------------------------------------ writing
+
+    proc dstU(n: int) -> text:
+        let t = do sjU64Text(n)
+        return t
+
+    proc dstF(f: float) -> text:
+        let t = do sjF64Text(f)
+        return t
+
+    proc dstS(s: text) -> text:
+        let t = do sjQuote(s)
+        return t
+
+    proc dstB(b: bool) -> text:
+        if b:
+            return "true"
+        return "false"
+
+    proc dstOptU(has: bool, n: int) -> text:
+        if has:
+            return dstU(n)
+        return "null"
+
+    proc dstOptS(has: bool, s: text) -> text:
+        if has:
+            return dstS(s)
+        return "null"
+
+    proc dstList(items: [text]) -> text:
+        let mut out = "["
+        let n = len(items)
+        let mut k = 0
+        loop k < n:
+            if k > 0:
+                out = out + ","
+            out = out + items[k]
+            k = k + 1
+        return out + "]"
+
+    proc daemonBackendStatusJson(b: DaemonBackendStatus) -> text:
+        return "{\"id\":" + dstS(b.id) + ",\"url\":" + dstS(b.url) + ",\"region\":" + dstS(b.region) + ",\"availability\":" + dstS(b.availability) + ",\"health\":" + dstS(b.health) + ",\"last_probe\":" + dstS(b.lastProbe) + ",\"last_probe_at_ms\":" + dstOptU(b.hasLastProbeAtMs, b.lastProbeAtMs) + ",\"silence_ms\":" + dstOptU(b.hasSilenceMs, b.silenceMs) + ",\"heartbeats\":" + dstU(b.heartbeats) + ",\"telemetry\":" + dstB(b.telemetry) + ",\"last_sample\":" + dstOptS(b.hasLastSample, b.lastSample) + "}"
+
+    proc dstMigrationJson(m: DaemonMigrationStatus) -> text:
+        return "{\"phase\":" + dstS(m.phase) + ",\"source\":" + dstS(m.source) + ",\"destination\":" + dstS(m.destination) + ",\"read_owner\":" + dstS(m.readOwner) + ",\"write_fenced\":" + dstB(m.writeFenced) + ",\"has_cut_over\":" + dstB(m.hasCutOver) + "}"
+
+    proc daemonPlacementStatusJson(p: DaemonPlacementStatus) -> text:
+        let mut migration = "null"
+        if p.hasMigration:
+            migration = dstMigrationJson(p.migration)
+        return "{\"shard\":" + dstU(p.shard) + ",\"x\":" + p.x + ",\"y\":" + p.y + ",\"holder\":" + dstS(p.holder) + ",\"region\":" + dstS(p.region) + ",\"migration\":" + migration + "}"
+
+    proc daemonActionStatusJson(a: DaemonActionStatus) -> text:
+        let mut fraction = "null"
+        if a.hasFraction:
+            fraction = dstF(a.fraction)
+        return "{\"id\":" + dstU(a.id) + ",\"shard\":" + dstU(a.shard) + ",\"x\":" + a.x + ",\"y\":" + a.y + ",\"action\":" + dstS(a.action) + ",\"mechanism\":" + dstS(a.mechanism) + ",\"state\":" + dstS(a.state) + ",\"phase\":" + dstOptS(a.hasPhase, a.phase) + ",\"fraction\":" + fraction + ",\"source\":" + dstS(a.source) + ",\"destination\":" + dstOptS(a.hasDestination, a.destination) + ",\"admitted_at_ms\":" + dstU(a.admittedAtMs) + ",\"has_cut_over\":" + dstB(a.hasCutOver) + ",\"bytes_copied\":" + dstU(a.bytesCopied) + ",\"resident_bytes\":" + dstOptU(a.hasResidentBytes, a.residentBytes) + "}"
+
+    # PressureLevel / OutcomeVerdict as serde writes their variant names.
+    proc dstPressureVariant(label: text) -> text:
+        if label == "elevated":
+            return "Elevated"
+        if label == "high":
+            return "High"
+        if label == "critical":
+            return "Critical"
+        return "Normal"
+
+    proc dstVerdictVariant(label: text) -> text:
+        if label == "improved":
+            return "Improved"
+        if label == "unchanged":
+            return "Unchanged"
+        if label == "regressed":
+            return "Regressed"
+        if label == "rolled-back":
+            return "RolledBack"
+        if label == "failed":
+            return "Failed"
+        return "NotMeasured"
+
+    proc dstSnapshotJson(m: MeasurementSnapshot) -> text:
+        return "{\"taken_at_ms\":" + dstU(m.takenAtMs) + ",\"operations_per_second\":" + dstF(m.operationsPerSecond) + ",\"read_ratio\":" + dstF(m.readRatio) + ",\"write_ratio\":" + dstF(m.writeRatio) + ",\"read_latency_us\":" + dstF(m.readLatencyUs) + ",\"write_latency_us\":" + dstF(m.writeLatencyUs) + ",\"cpu_utilization\":" + dstF(m.cpuUtilization) + ",\"memory_utilization\":" + dstF(m.memoryUtilization) + ",\"queue_depth\":" + dstU(m.queueDepth) + ",\"pressure_score\":" + dstF(m.pressureScore) + ",\"pressure\":\"" + dstPressureVariant(m.pressure) + "\"}"
+
+    proc dstOutcomeJson(o: ExecutionOutcome) -> text:
+        return "{\"before\":" + dstSnapshotJson(o.before) + ",\"after\":" + dstSnapshotJson(o.after) + ",\"expected_gain\":" + dstF(o.expectedGain) + ",\"realized_gain\":" + dstF(o.realizedGain) + ",\"gain_ratio\":" + dstF(o.gainRatio) + ",\"latency_delta_us\":" + dstF(o.latencyDeltaUs) + ",\"throughput_delta\":" + dstF(o.throughputDelta) + ",\"verdict\":\"" + dstVerdictVariant(o.verdict) + "\"}"
+
+    proc dstActionJson(a: OptimizationAction) -> text:
+        if a.kind == "Replicate" || a.kind == "Move":
+            return "{\"" + a.kind + "\":{\"target\":" + dstS(a.target) + "}}"
+        if a.kind == "Colocate":
+            return "{\"Colocate\":{\"target\":{\"x\":" + a.coordinate.x + ",\"y\":" + a.coordinate.y + "}}}"
+        return "\"" + a.kind + "\""
+
+    # OutcomeReport's derived Serialize.
+    proc daemonOutcomeReportJson(r: OutcomeReport) -> text:
+        let mut measurement = "null"
+        if r.hasMeasurement:
+            measurement = dstOutcomeJson(r.measurement)
+        return "{\"action_id\":" + dstU(r.actionId.value) + ",\"target\":{\"shard_id\":" + dstU(r.target.shardId) + ",\"coordinate\":{\"x\":" + r.target.coordinate.x + ",\"y\":" + r.target.coordinate.y + "}},\"action\":" + dstActionJson(r.action) + ",\"action_label\":" + dstS(r.actionLabel) + ",\"mechanism\":" + dstS(r.mechanism) + ",\"confidence\":" + dstF(r.confidence) + ",\"expected_gain\":" + dstF(r.expectedGain) + ",\"estimated_cost\":" + dstF(r.estimatedCost) + ",\"realized_gain\":" + dstF(r.realizedGain) + ",\"gain_ratio\":" + dstF(r.gainRatio) + ",\"verdict\":\"" + dstVerdictVariant(r.verdict) + "\",\"admitted_at_ms\":" + dstU(r.admittedAtMs) + ",\"concluded_at_ms\":" + dstU(r.concludedAtMs) + ",\"measurement\":" + measurement + ",\"failure\":" + dstOptS(r.hasFailure, r.failure) + "}"
+
+    proc daemonBackendsJson(bs: [DaemonBackendStatus]) -> text:
+        let mut items = []
+        let n = len(bs)
+        let mut k = 0
+        loop k < n:
+            items = append(items, daemonBackendStatusJson(bs[k]))
+            k = k + 1
+        return dstList(items)
+
+    proc daemonPlacementsJson(ps: [DaemonPlacementStatus]) -> text:
+        let mut items = []
+        let n = len(ps)
+        let mut k = 0
+        loop k < n:
+            items = append(items, daemonPlacementStatusJson(ps[k]))
+            k = k + 1
+        return dstList(items)
+
+    proc daemonActionsJson(acts: [DaemonActionStatus]) -> text:
+        let mut items = []
+        let n = len(acts)
+        let mut k = 0
+        loop k < n:
+            items = append(items, daemonActionStatusJson(acts[k]))
+            k = k + 1
+        return dstList(items)
+
+    proc daemonHistoryJson(rs: [OutcomeReport]) -> text:
+        let mut items = []
+        let n = len(rs)
+        let mut k = 0
+        loop k < n:
+            items = append(items, daemonOutcomeReportJson(rs[k]))
+            k = k + 1
+        return dstList(items)
+
+    # Status's derived Serialize: GET /status.
+    proc daemonStatusJson(s: DaemonStatus) -> text:
+        let mut rules = []
+        let nr = len(s.keyspace.rules)
+        let mut r = 0
+        loop r < nr:
+            rules = append(rules, dstS(s.keyspace.rules[r]))
+            r = r + 1
+        let keyspace = "{\"rules\":" + dstList(rules) + ",\"fallback\":" + dstOptS(s.keyspace.hasFallback, s.keyspace.fallback) + ",\"spans_one_place\":" + dstB(s.keyspace.spansOnePlace) + "}"
+        let d = s.decisions
+        let decisions = "{\"proposed\":" + dstU(d.proposed) + ",\"admitted\":" + dstU(d.admitted) + ",\"refused\":" + dstU(d.refused) + ",\"last_refusal\":" + dstOptS(d.hasLastRefusal, d.lastRefusal) + "}"
+        let st = s.placementStore
+        let store = "{\"configured\":" + dstOptS(st.hasConfigured, st.configured) + ",\"state\":" + dstS(st.state) + ",\"last_error\":" + dstOptS(st.hasLastError, st.lastError) + ",\"writes\":" + dstU(st.writes) + "}"
+        let mut copying = []
+        let nc = len(s.movers.copying)
+        let mut c = 0
+        loop c < nc:
+            copying = append(copying, "{\"id\":" + dstU(s.movers.copying[c].id) + ",\"destination\":" + dstS(s.movers.copying[c].destination) + "}")
+            c = c + 1
+        let mut refused = []
+        let nf = len(s.movers.refused)
+        let mut f = 0
+        loop f < nf:
+            refused = append(refused, "{\"id\":" + dstU(s.movers.refused[f].id) + ",\"reason\":" + dstS(s.movers.refused[f].reason) + "}")
+            f = f + 1
+        let movers = "{\"copying\":" + dstList(copying) + ",\"refused\":" + dstList(refused) + "}"
+        return "{\"version\":" + dstS(s.version) + ",\"started_at_ms\":" + dstU(s.startedAtMs) + ",\"snapshot_at_ms\":" + dstU(s.snapshotAtMs) + ",\"clock_ms\":" + dstU(s.clockMs) + ",\"cycles\":" + dstU(s.cycles) + ",\"draining\":" + dstB(s.draining) + ",\"data_listen\":" + dstS(s.dataListen) + ",\"admin_listen\":" + dstS(s.adminListen) + ",\"routing_generation\":" + dstU(s.routingGeneration) + ",\"placement_generation\":" + dstU(s.placementGeneration) + ",\"telemetry_source\":" + dstS(s.telemetrySource) + ",\"observations\":" + dstU(s.observations) + ",\"profiles\":" + dstU(s.profiles) + ",\"hot_cells\":" + dstU(s.hotCells) + ",\"keyspace\":" + keyspace + ",\"backends\":" + daemonBackendsJson(s.backends) + ",\"placements\":" + daemonPlacementsJson(s.placements) + ",\"in_flight\":" + daemonActionsJson(s.inFlight) + ",\"decisions\":" + decisions + ",\"placement_store\":" + store + ",\"movers\":" + movers + ",\"history\":" + daemonHistoryJson(s.history) + "}"
+
+    # GET /routing: `json!({...})`, a Value, so every object's keys sorted.
+    proc daemonRoutingJson(s: DaemonStatus) -> text:
+        let mut items = []
+        let n = len(s.placements)
+        let mut k = 0
+        loop k < n:
+            let p = s.placements[k]
+            let mut migration = "null"
+            if p.hasMigration:
+                let m = p.migration
+                migration = "{\"destination\":" + dstS(m.destination) + ",\"has_cut_over\":" + dstB(m.hasCutOver) + ",\"phase\":" + dstS(m.phase) + ",\"read_owner\":" + dstS(m.readOwner) + ",\"source\":" + dstS(m.source) + ",\"write_fenced\":" + dstB(m.writeFenced) + "}"
+            items = append(items, "{\"holder\":" + dstS(p.holder) + ",\"migration\":" + migration + ",\"region\":" + dstS(p.region) + ",\"shard\":" + dstU(p.shard) + ",\"x\":" + p.x + ",\"y\":" + p.y + "}")
+            k = k + 1
+        return "{\"placement_generation\":" + dstU(s.placementGeneration) + ",\"placements\":" + dstList(items) + ",\"routing_generation\":" + dstU(s.routingGeneration) + ",\"snapshot_at_ms\":" + dstU(s.snapshotAtMs) + "}"
+
+    # ------------------------------------------------------------ reading
+
+    proc dstGet(v: SjV, name: text) -> SjV:
+        let n = len(v.keys)
+        let mut k = 0
+        loop k < n:
+            if v.keys[k] == name:
+                return v.items[k]
+            k = k + 1
+        return sjNull()
+
+    proc dstText(v: SjV, name: text) -> text:
+        let f = do dstGet(v, name)
+        return f.s
+
+    proc dstInt(v: SjV, name: text) -> int:
+        let f = do dstGet(v, name)
+        return f.u
+
+    proc dstNum(f: SjV) -> float:
+        if f.num == "u64":
+            let u = do sjU64Float(f.u)
+            return u
+        if f.num == "i64":
+            return toFloat(f.u)
+        return f.f
+
+    proc dstFloat(v: SjV, name: text) -> float:
+        let f = do dstGet(v, name)
+        let x = do dstNum(f)
+        return x
+
+    proc dstBool(v: SjV, name: text) -> bool:
+        let f = do dstGet(v, name)
+        return f.b
+
+    proc dstHas(v: SjV, name: text) -> bool:
+        let f = do dstGet(v, name)
+        return f.kind != "null"
+
+    proc dstBackendFrom(v: SjV) -> DaemonBackendStatus:
+        return DaemonBackendStatus{id: dstText(v, "id"), url: dstText(v, "url"), region: dstText(v, "region"), availability: dstText(v, "availability"), health: dstText(v, "health"), lastProbe: dstText(v, "last_probe"), hasLastProbeAtMs: dstHas(v, "last_probe_at_ms"), lastProbeAtMs: dstInt(v, "last_probe_at_ms"), hasSilenceMs: dstHas(v, "silence_ms"), silenceMs: dstInt(v, "silence_ms"), heartbeats: dstInt(v, "heartbeats"), telemetry: dstBool(v, "telemetry"), hasLastSample: dstHas(v, "last_sample"), lastSample: dstText(v, "last_sample")}
+
+    proc dstPlacementFrom(v: SjV) -> DaemonPlacementStatus:
+        let m = do dstGet(v, "migration")
+        let mut migration = do daemonMigrationStatusNone()
+        if m.kind != "null":
+            migration = DaemonMigrationStatus{phase: dstText(m, "phase"), source: dstText(m, "source"), destination: dstText(m, "destination"), readOwner: dstText(m, "read_owner"), writeFenced: dstBool(m, "write_fenced"), hasCutOver: dstBool(m, "has_cut_over")}
+        return DaemonPlacementStatus{shard: dstInt(v, "shard"), x: dstInt(v, "x"), y: dstInt(v, "y"), holder: dstText(v, "holder"), region: dstText(v, "region"), hasMigration: m.kind != "null", migration: migration}
+
+    proc dstActionFrom(v: SjV) -> DaemonActionStatus:
+        return DaemonActionStatus{id: dstInt(v, "id"), shard: dstInt(v, "shard"), x: dstInt(v, "x"), y: dstInt(v, "y"), action: dstText(v, "action"), mechanism: dstText(v, "mechanism"), state: dstText(v, "state"), hasPhase: dstHas(v, "phase"), phase: dstText(v, "phase"), hasFraction: dstHas(v, "fraction"), fraction: dstFloat(v, "fraction"), source: dstText(v, "source"), hasDestination: dstHas(v, "destination"), destination: dstText(v, "destination"), admittedAtMs: dstInt(v, "admitted_at_ms"), hasCutOver: dstBool(v, "has_cut_over"), bytesCopied: dstInt(v, "bytes_copied"), hasResidentBytes: dstHas(v, "resident_bytes"), residentBytes: dstInt(v, "resident_bytes")}
+
+    proc dstPressureLabel(variant: text) -> text:
+        return lower(variant)
+
+    proc dstVerdictLabel(variant: text) -> text:
+        if variant == "RolledBack":
+            return "rolled-back"
+        if variant == "NotMeasured":
+            return "not-measured"
+        return lower(variant)
+
+    proc dstSnapshotFrom(v: SjV) -> MeasurementSnapshot:
+        return MeasurementSnapshot{takenAtMs: dstInt(v, "taken_at_ms"), operationsPerSecond: dstFloat(v, "operations_per_second"), readRatio: dstFloat(v, "read_ratio"), writeRatio: dstFloat(v, "write_ratio"), readLatencyUs: dstFloat(v, "read_latency_us"), writeLatencyUs: dstFloat(v, "write_latency_us"), cpuUtilization: dstFloat(v, "cpu_utilization"), memoryUtilization: dstFloat(v, "memory_utilization"), queueDepth: dstInt(v, "queue_depth"), pressureScore: dstFloat(v, "pressure_score"), pressure: dstPressureLabel(dstText(v, "pressure"))}
+
+    proc dstActionFromJson(v: SjV) -> OptimizationAction:
+        if v.kind == "str":
+            return OptimizationAction{kind: v.s, target: "", coordinate: Coordinate{x: 0, y: 0}}
+        let kind = v.keys[0]
+        let body = v.items[0]
+        let target = do dstGet(body, "target")
+        if kind == "Colocate":
+            return OptimizationAction{kind: kind, target: "", coordinate: Coordinate{x: dstInt(target, "x"), y: dstInt(target, "y")}}
+        return OptimizationAction{kind: kind, target: target.s, coordinate: Coordinate{x: 0, y: 0}}
+
+    proc daemonOutcomeReportFrom(v: SjV) -> OutcomeReport:
+        let target = do dstGet(v, "target")
+        let coordinate = do dstGet(target, "coordinate")
+        let m = do dstGet(v, "measurement")
+        let mut measurement = do executionOutcomeZero()
+        if m.kind != "null":
+            measurement = ExecutionOutcome{before: dstSnapshotFrom(dstGet(m, "before")), after: dstSnapshotFrom(dstGet(m, "after")), expectedGain: dstFloat(m, "expected_gain"), realizedGain: dstFloat(m, "realized_gain"), gainRatio: dstFloat(m, "gain_ratio"), latencyDeltaUs: dstFloat(m, "latency_delta_us"), throughputDelta: dstFloat(m, "throughput_delta"), verdict: dstVerdictLabel(dstText(m, "verdict"))}
+        return OutcomeReport{actionId: ActionId{value: dstInt(v, "action_id")}, target: ActionTarget{shardId: dstInt(target, "shard_id"), coordinate: Coordinate{x: dstInt(coordinate, "x"), y: dstInt(coordinate, "y")}}, action: dstActionFromJson(dstGet(v, "action")), actionLabel: dstText(v, "action_label"), mechanism: dstText(v, "mechanism"), confidence: dstFloat(v, "confidence"), expectedGain: dstFloat(v, "expected_gain"), estimatedCost: dstFloat(v, "estimated_cost"), realizedGain: dstFloat(v, "realized_gain"), gainRatio: dstFloat(v, "gain_ratio"), verdict: dstVerdictLabel(dstText(v, "verdict")), admittedAtMs: dstInt(v, "admitted_at_ms"), concludedAtMs: dstInt(v, "concluded_at_ms"), hasMeasurement: m.kind != "null", measurement: measurement, hasFailure: dstHas(v, "failure"), failure: dstText(v, "failure")}
+
+    struct DaemonStatusRead:
+        ok: bool
+        err: text
+        status: DaemonStatus
+
+    # The snapshot read back from GET /status's body.
+    proc daemonStatusFromJson(src: text) -> DaemonStatusRead:
+        let parsed = do sjDecode([sjVecType("Vec<Value>", "value")], src, "value")
+        let empty = DaemonStatus{version: "", startedAtMs: 0, snapshotAtMs: 0, clockMs: 0, cycles: 0, draining: false, dataListen: "", adminListen: "", routingGeneration: 0, placementGeneration: 0, telemetrySource: "", observations: 0, profiles: 0, hotCells: 0, keyspace: DaemonKeyspaceStatus{rules: [], hasFallback: false, fallback: "", spansOnePlace: false}, backends: [], placements: [], inFlight: [], decisions: daemonDecisionCountersDefault(), placementStore: DaemonStoreStatus{hasConfigured: false, configured: "", state: "", hasLastError: false, lastError: "", writes: 0}, movers: DaemonMoverStatus{copying: [], refused: []}, history: []}
+        if !parsed.ok:
+            return DaemonStatusRead{ok: false, err: parsed.err, status: empty}
+        let v = parsed.v
+        let ks = do dstGet(v, "keyspace")
+        let ruleValues = do dstGet(ks, "rules")
+        let mut rules = []
+        let mut k = 0
+        loop k < len(ruleValues.items):
+            rules = append(rules, ruleValues.items[k].s)
+            k = k + 1
+        let mut backends = []
+        let bv = do dstGet(v, "backends")
+        k = 0
+        loop k < len(bv.items):
+            backends = append(backends, dstBackendFrom(bv.items[k]))
+            k = k + 1
+        let mut placements = []
+        let pv = do dstGet(v, "placements")
+        k = 0
+        loop k < len(pv.items):
+            placements = append(placements, dstPlacementFrom(pv.items[k]))
+            k = k + 1
+        let mut inFlight = []
+        let av = do dstGet(v, "in_flight")
+        k = 0
+        loop k < len(av.items):
+            inFlight = append(inFlight, dstActionFrom(av.items[k]))
+            k = k + 1
+        let dv = do dstGet(v, "decisions")
+        let decisions = DaemonDecisionCounters{proposed: dstInt(dv, "proposed"), admitted: dstInt(dv, "admitted"), refused: dstInt(dv, "refused"), hasLastRefusal: dstHas(dv, "last_refusal"), lastRefusal: dstText(dv, "last_refusal")}
+        let sv = do dstGet(v, "placement_store")
+        let store = DaemonStoreStatus{hasConfigured: dstHas(sv, "configured"), configured: dstText(sv, "configured"), state: dstText(sv, "state"), hasLastError: dstHas(sv, "last_error"), lastError: dstText(sv, "last_error"), writes: dstInt(sv, "writes")}
+        let mv = do dstGet(v, "movers")
+        let cv = do dstGet(mv, "copying")
+        let mut copying = []
+        k = 0
+        loop k < len(cv.items):
+            copying = append(copying, DaemonCopyingStatus{id: dstInt(cv.items[k], "id"), destination: dstText(cv.items[k], "destination")})
+            k = k + 1
+        let rv = do dstGet(mv, "refused")
+        let mut refused = []
+        k = 0
+        loop k < len(rv.items):
+            refused = append(refused, DaemonRefusedCopy{id: dstInt(rv.items[k], "id"), reason: dstText(rv.items[k], "reason")})
+            k = k + 1
+        let hv = do dstGet(v, "history")
+        let mut history = []
+        k = 0
+        loop k < len(hv.items):
+            history = append(history, daemonOutcomeReportFrom(hv.items[k]))
+            k = k + 1
+        let keyspace = DaemonKeyspaceStatus{rules: rules, hasFallback: dstHas(ks, "fallback"), fallback: dstText(ks, "fallback"), spansOnePlace: dstBool(ks, "spans_one_place")}
+        let status = DaemonStatus{version: dstText(v, "version"), startedAtMs: dstInt(v, "started_at_ms"), snapshotAtMs: dstInt(v, "snapshot_at_ms"), clockMs: dstInt(v, "clock_ms"), cycles: dstInt(v, "cycles"), draining: dstBool(v, "draining"), dataListen: dstText(v, "data_listen"), adminListen: dstText(v, "admin_listen"), routingGeneration: dstInt(v, "routing_generation"), placementGeneration: dstInt(v, "placement_generation"), telemetrySource: dstText(v, "telemetry_source"), observations: dstInt(v, "observations"), profiles: dstInt(v, "profiles"), hotCells: dstInt(v, "hot_cells"), keyspace: keyspace, backends: backends, placements: placements, inFlight: inFlight, decisions: decisions, placementStore: store, movers: DaemonMoverStatus{copying: copying, refused: refused}, history: history}
+        return DaemonStatusRead{ok: true, err: "", status: status}

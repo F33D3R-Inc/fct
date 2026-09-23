@@ -3,8 +3,8 @@ package runtime
 import "fmt"
 
 // taskHandle is the runtime value a `let h = spawn ProcName(args)` statement
-// binds into the spawning proc's frame (see execProcBlock's "spawn" case,
-// below) — an opaque handle to a goroutine already running, joined exactly
+// binds into the spawning proc's frame (see proccompile.go's "spawn" case,
+// there) — an opaque handle to a goroutine already running, joined exactly
 // once by a later `join h` in the same block (internal/ir/build.go's
 // checkSpawnsJoined proves that join exists at compile time).
 //

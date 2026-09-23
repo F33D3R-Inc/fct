@@ -1,102 +1,20 @@
+import "fabric_telemetry.fct"
+
 app FabricReplicationSelfHost:
-    # Self-hosting port of fabric/crates/fabric-replication/src/ — replica.rs
-    # (331L), placement.rs (451L), set.rs (737L). failover.rs is NOT ported
-    # here: it is already self-hosted, in fabric.fct, as `ReplicaEntry` /
-    # `FailoverPolicy` / the `failover*` proc family (see that file's own
-    # header, "SECOND PORT, SAME FILE").
+    # Self-hosting port of fabric/crates/fabric-replication: replica.rs,
+    # set.rs, placement.rs and failover.rs, over one real ReplGroup (the
+    # ReplicaSet). fabric.fct's ReplicaEntry-based failover* procs are an
+    # older, narrower view kept for their callers; replFailover* here is the
+    # full FailoverAssessment.
     #
-    # ============================================================
-    # WHY THIS FILE, WHY THESE THREE FILES TOGETHER
-    # ============================================================
-    # This crate's own lib.rs doc comment poses three questions and refuses
-    # to answer the third: "where should copies live" (placement.rs), "what
-    # state is each copy in, is it safe to read/write" (replica.rs + set.rs),
-    # "should we fail over right now" (failover.rs, out of scope here,
-    # already done). The three files ported in THIS file are exactly the
-    # first two questions, and they are one coherent unit: replica.rs defines
-    # the lifecycle graph a single copy obeys, set.rs is the only thing
-    # allowed to move a copy through that graph (an explicit operation, or
-    # the mechanical consequence of a health report), and placement.rs reads
-    # a set produced by set.rs to decide what should change about it. None of
-    # the three touches I/O, a clock of its own, or randomness — confirmed by
-    # reading all three in full, not assumed from their own doc comments.
-    #
-    # ============================================================
-    # REPRESENTATION CHOICES (read together with fabric.fct's own failover
-    # port, which this file deliberately does NOT reuse structurally — see
-    # below)
-    # ============================================================
-    # `ReplicaState` / `ReplicaRole` are five- and two-way enums. fabric.fct's
-    # own `ReplicaEntry.state` already restated `ReplicaState` as a small int
-    # (0..4) for its OWN narrow purpose (failover's read-only, throwaway
-    # snapshot of a set at one instant). This file restates the SAME Rust
-    # enum as a `text` tag ("absent"/"seeding"/"inSync"/"lagging"/"failed")
-    # instead, matching the newer, more self-documenting convention this
-    # selfhost directory settled on for enums since (`fabric_routing.fct`'s
-    # own `RoutingError.kind: text`, e.g. `"NoWritableReplica"`, read
-    # directly): a text tag reads at the call site without a decoder ring,
-    # and every place this file compares `state` does so by NAME
-    # (`state == "inSync"`), never by arithmetic — there would be nothing to
-    # gain and a real "magic number" risk to invent by going back to ints.
-    # `ReplicaRole` becomes a plain `isPrimary: bool` field (two variants,
-    # both already boolean-shaped in every one of replica.rs's own methods —
-    # `is_primary()` is a direct read of exactly this fact).
-    #
-    # This file's own `ReplRecord`/`ReplGroup` are therefore NOT the same
-    # type as fabric.fct's `ReplicaEntry`: that one is a deliberately
-    # narrowed, throwaway VIEW built by a caller for one `evaluate()` call;
-    # this file's `ReplGroup` is the actual `ReplicaSet` — the thing that
-    # OWNS the copies, is mutated by real operations, and is what a caller
-    # would build a `ReplicaEntry` array FROM to ask fabric.fct's failover
-    # question. Merging them was considered and rejected: `ReplicaEntry` has
-    # no `region` (failover never reads region) and this file's `ReplGroup`
-    # has no failover policy knobs (this crate never decides to fail over).
-    # Keeping them distinct, real, named types — rather than forcing one
-    # bloated struct to serve two call sites that read different fields — is
-    # the actual "root solution" here, not a shortcut.
-    #
-    # `last_report_ms: Option<u64>` / `unreachable_since_ms: Option<u64>` are
-    # each a plain `int` field with `-1` meaning "unset" — restating
-    # fabric.fct's own reasoning verbatim (a real millisecond clock reading
-    # is never negative, so `-1` can never collide with a genuine value).
-    #
-    # `ReplicaOperation`'s six variants (only `Add`/`region` carries a second
-    # payload field) become one `ReplOp` struct with a text `kind` tag plus
-    # `node`/`region` fields left "" when a variant does not use them — the
-    # exact shape `fabric_routing.fct`'s `RoutingError` already uses for a
-    # multi-variant Rust enum with per-variant payloads.
-    #
-    # ============================================================
-    # CORRECTION: THERE IS NO LANGUAGE GAP HERE
-    # ============================================================
-    # `set.rs`'s own `ReplicaOperation::Add` handler re-sorts `self.replicas`
-    # by node id after every insert, and `placement.rs`'s `surplus()` sorts
-    # droppable replicas by node id before taking the worst ones, and
-    # `best_candidate`'s comparator ends in a node-id tiebreak. An earlier
-    # revision of this file claimed this directory has no lexicographic
-    # `<`/`<=` on `text` and no sort builtin, and worked around that claimed
-    # gap by relying on the CALLER supplying candidates/replicas in node-id
-    # order instead of computing a real tiebreak. That claim is WRONG:
-    # `<`/`<=` on `text` do genuine byte-wise comparison in this language
-    # (confirmed live via `facet console` — see reference.fct's header for
-    # the correction, and fabric.fct's own `failoverBestCandidateIndex`,
-    # fixed the same way this session). There is also no sort BUILTIN, which
-    # is real and unchanged, but a hand-written insertion sort is the
-    # established idiom for it elsewhere in this directory
-    # (`query.fct`'s `sortRowsAscending`, `triggers.fct`'s
-    # `sortTextAscending`). `replGroupReadTargets`, `replPlanBestCandidateIndex`,
-    # and `replPlanSurplus` below now each carry a REAL node-id tiebreak/sort,
-    # matching real Rust's `sort_by`/`min_by` exactly for any caller-supplied
-    # order, not just node-id-ordered input.
-    #
-    # DEFERRED, HONESTLY: `ReplicaReport::from_observation` (reads a
-    # `fabric_telemetry::Observation`) is NOT ported — fabric-telemetry is
-    # still untouched by this survey, so there is no `Observation` type on
-    # this side yet to build it from. `ReplicaReport::new` /
-    # `ReplicaReport::unreachable` (the two constructors this crate's own
-    # callers use when a caller already has shard/node/timestamp/lag in
-    # hand, which is the entire input surface `ReplGroup`'s own procs below
-    # need) ARE fully ported.
+    # Representation: ReplicaState is a text tag ("absent" / "seeding" /
+    # "inSync" / "lagging" / "failed"; replStateLabel gives Rust's label),
+    # ReplicaRole is `isPrimary`, `Option<u64>` fields are -1 when None,
+    # ReplicaOperation is ReplOp {kind, node, region}, ReplicationError and
+    # PlacementError are ReplError {kind, ...} with replErrorDisplay giving
+    # both Display impls. The replica list is kept sorted by node id, as
+    # `ReplicaSet::apply(Add)` keeps it. Conformance:
+    # fabric_leaf_b_test.go's TestFabricLeafBReplication.
 
     # ============================================================
     # replica.rs — ReplicaState, ReplicaRole, ReplicaLag, ReplicaReport,
@@ -226,6 +144,45 @@ app FabricReplicationSelfHost:
 
     proc replErrorNone() -> ReplError:
         return ReplError{kind: "", shardId: 0, node: "", fromState: "", toState: "", state: "", expectedShard: 0, actualShard: 0}
+
+    # `ReplicaState::label` over this file's text tags.
+    proc replStateLabel(state: text) -> text:
+        if state == "inSync":
+            return "in-sync"
+        return state
+
+    # `ReplicaRole::label`.
+    proc replRoleLabel(isPrimary: bool) -> text:
+        if isPrimary:
+            return "primary"
+        return "secondary"
+
+    # replErrorDisplay: `impl Display for ReplicationError` (set.rs) and
+    # `impl Display for PlacementError` (placement.rs), arm for arm, keyed
+    # off `kind`.
+    proc replErrorDisplay(e: ReplError) -> text:
+        if e.kind == "duplicateReplica":
+            return "shard " + e.shardId + " already has a replica on node '" + e.node + "'"
+        if e.kind == "unknownReplica":
+            return "shard " + e.shardId + " has no replica on node '" + e.node + "'"
+        if e.kind == "illegalTransition":
+            let f = do replStateLabel(e.fromState)
+            let t = do replStateLabel(e.toState)
+            return "replica on '" + e.node + "' cannot go from " + f + " to " + t
+        if e.kind == "primaryCannotSeed":
+            return "replica on '" + e.node + "' is the primary and cannot seed; promote another copy first"
+        if e.kind == "notPromotable":
+            let st = do replStateLabel(e.state)
+            return "replica on '" + e.node + "' is " + st + " and only an in-sync copy may be promoted"
+        if e.kind == "primaryNotRemovable":
+            return "replica on '" + e.node + "' is the primary; promote another copy before removing it"
+        if e.kind == "wrongShard":
+            return "report is for shard " + e.actualShard + ", this set is shard " + e.expectedShard
+        if e.kind == "zeroReplicationFactor":
+            return "replication factor must be at least 1"
+        if e.kind == "duplicateCandidate":
+            return "node '" + e.node + "' appears twice in the candidate list"
+        return "unknown replica operation '" + e.kind + "'"
 
     struct ReplOp:
         kind: text
@@ -516,7 +473,8 @@ app FabricReplicationSelfHost:
                 let err = ReplError{kind: "duplicateReplica", shardId: group.shardId, node: op.node, fromState: "", toState: "", state: "", expectedShard: 0, actualShard: 0}
                 return ReplOpResult{ok: false, changed: false, group: group, transition: noTransition, error: err}
             let newRecord = ReplRecord{shardId: group.shardId, node: op.node, region: op.region, isPrimary: false, state: "absent", pendingWrites: 0, applyLagMs: 0, lastReportMs: -1, unreachableSinceMs: -1}
-            let grown = append(group.replicas, newRecord)
+            let appended = append(group.replicas, newRecord)
+            let grown = do replRecordArraySortByNodeAscending(appended)
             let newGroup = ReplGroup{shardId: group.shardId, desiredFactor: group.desiredFactor, replicas: grown}
             return ReplOpResult{ok: true, changed: false, group: newGroup, transition: noTransition, error: noError}
         if op.kind == "beginSeed":
@@ -897,6 +855,202 @@ app FabricReplicationSelfHost:
         let noError = do replErrorNone()
         return ReplPlanResult{ok: true, plan: plan, error: noError}
 
+    # `ReplicaReport::from_observation`: the observation supplies when and
+    # which shard (and its existence is the reachability evidence); lag is
+    # passed in.
+    proc replReportFromObservation(node: text, observation: Observation, pendingWrites: int, applyLagMs: int) -> ReplReport:
+        return ReplReport{shardId: observation.shard.id, node: node, timestampMs: observation.timestampMs, pendingWrites: pendingWrites, applyLagMs: applyLagMs, reachable: true}
+
+    # ============================================================
+    # failover.rs — FailoverPolicy, Ineligibility, PromotionCandidate,
+    # FailoverBlocker, FailoverAssessment, over this file's real ReplGroup
+    # (fabric.fct's ReplicaEntry-based failover* procs are a narrower view
+    # kept for their existing callers).
+    # ============================================================
+
+    struct ReplFailoverPolicy:
+        primarySilenceMs: int
+        maxPromotionPendingWrites: int
+        maxPromotionApplyLagMs: int
+        maxCandidateSilenceMs: int
+
+    proc replFailoverPolicyDefault() -> ReplFailoverPolicy:
+        return ReplFailoverPolicy{primarySilenceMs: 30000, maxPromotionPendingWrites: 0, maxPromotionApplyLagMs: 0, maxCandidateSilenceMs: 30000}
+
+    # Ineligibility: `has` false is `None`; kind is the Rust variant name
+    # ("NotInSync" carries `state`, the other payloads ride in `value`).
+    struct ReplIneligibility:
+        has: bool
+        kind: text
+        state: text
+        value: int
+
+    proc replIneligibilityDisplay(i: ReplIneligibility) -> text:
+        if i.kind == "NotInSync":
+            let l = do replStateLabel(i.state)
+            return "replica is " + l
+        if i.kind == "WouldLoseWrites":
+            return "" + i.value + " unapplied writes would be lost"
+        if i.kind == "TooFarBehind":
+            return "" + i.value + "ms behind the primary"
+        if i.kind == "HealthTooStale":
+            return "no health report for " + i.value + "ms"
+        return "no health report has ever arrived"
+
+    proc replFailoverBlockerDisplay(kind: text) -> text:
+        if kind == "PrimaryStillServing":
+            return "the primary is still serving writes"
+        if kind == "SetIsEmpty":
+            return "the shard has no replicas to promote"
+        if kind == "NoInSyncSecondary":
+            return "no secondary holds a current copy"
+        return "every in-sync secondary fails the failover policy"
+
+    struct ReplPromotionCandidate:
+        node: text
+        region: text
+        state: text
+        pendingWrites: int
+        applyLagMs: int
+        silenceMs: int
+        ineligibility: ReplIneligibility
+
+    proc replPromotionCandidateIsEligible(c: ReplPromotionCandidate) -> bool:
+        return !c.ineligibility.has
+
+    struct ReplFailoverAssessment:
+        shardId: int
+        assessedAtMs: int
+        hasPrimary: bool
+        primary: text
+        primaryState: text
+        primarySilenceMs: int
+        primaryNeedsReplacement: bool
+        candidates: [ReplPromotionCandidate]
+        blockers: [text]
+
+    # `fn ineligibility`: the first reason, in the real order.
+    proc replFailoverIneligibility(state: text, pendingWrites: int, applyLagMs: int, silenceMs: int, policy: ReplFailoverPolicy) -> ReplIneligibility:
+        if state != "inSync":
+            return ReplIneligibility{has: true, kind: "NotInSync", state: state, value: 0}
+        if silenceMs == -1:
+            return ReplIneligibility{has: true, kind: "NeverReported", state: "", value: 0}
+        if silenceMs > policy.maxCandidateSilenceMs:
+            return ReplIneligibility{has: true, kind: "HealthTooStale", state: "", value: silenceMs}
+        if pendingWrites > policy.maxPromotionPendingWrites:
+            return ReplIneligibility{has: true, kind: "WouldLoseWrites", state: "", value: pendingWrites}
+        if applyLagMs > policy.maxPromotionApplyLagMs:
+            return ReplIneligibility{has: true, kind: "TooFarBehind", state: "", value: applyLagMs}
+        return ReplIneligibility{has: false, kind: "", state: "", value: 0}
+
+    # The candidate comparator: eligible first, then fewer pending writes,
+    # then less apply lag, then node id. True when `a` sorts strictly after
+    # `b`.
+    private proc replCandidateAfter(a: ReplPromotionCandidate, b: ReplPromotionCandidate) -> bool:
+        let ae = !a.ineligibility.has
+        let be = !b.ineligibility.has
+        if ae != be:
+            return be
+        if a.pendingWrites != b.pendingWrites:
+            return a.pendingWrites > b.pendingWrites
+        if a.applyLagMs != b.applyLagMs:
+            return a.applyLagMs > b.applyLagMs
+        return a.node > b.node
+
+    # `FailoverAssessment::evaluate`: pure; reads the set, writes nothing.
+    proc replFailoverEvaluate(group: ReplGroup, nowMs: int, policy: ReplFailoverPolicy) -> ReplFailoverAssessment:
+        let primary = do replGroupPrimary(group)
+        let mut primarySilence = -1
+        let mut needs = true
+        if primary.found:
+            let s = do replRecordSilenceMs(primary.record, nowMs)
+            primarySilence = s
+            let fresh = do replStateIsFresh(primary.record.state)
+            needs = !fresh || (primarySilence != -1 && primarySilence > policy.primarySilenceMs)
+        let secondaries = do replGroupSecondaries(group)
+        let mut candidates = []
+        let mut i = 0
+        loop i < len(secondaries):
+            let r = secondaries[i]
+            let silence = do replRecordSilenceMs(r, nowMs)
+            let inel = do replFailoverIneligibility(r.state, r.pendingWrites, r.applyLagMs, silence, policy)
+            candidates = append(candidates, ReplPromotionCandidate{node: r.node, region: r.region, state: r.state, pendingWrites: r.pendingWrites, applyLagMs: r.applyLagMs, silenceMs: silence, ineligibility: inel})
+            i = i + 1
+        let n = len(candidates)
+        let mut k = 1
+        loop k < n:
+            let mut j = k
+            loop j > 0:
+                let after = do replCandidateAfter(candidates[j - 1], candidates[j])
+                if after:
+                    let tmp = candidates[j - 1]
+                    candidates[j - 1] = candidates[j]
+                    candidates[j] = tmp
+                    j = j - 1
+                else:
+                    break
+            k = k + 1
+        let mut anyEligible = false
+        let mut anyInSync = false
+        let mut c = 0
+        loop c < n:
+            if !candidates[c].ineligibility.has:
+                anyEligible = true
+            if candidates[c].state == "inSync":
+                anyInSync = true
+            c = c + 1
+        let mut blockers = []
+        if !needs:
+            blockers = append(blockers, "PrimaryStillServing")
+        else:
+            if len(group.replicas) == 0:
+                blockers = append(blockers, "SetIsEmpty")
+            else:
+                if !anyEligible:
+                    if anyInSync:
+                        blockers = append(blockers, "EveryCandidateIneligible")
+                    else:
+                        blockers = append(blockers, "NoInSyncSecondary")
+        let mut pNode = ""
+        let mut pState = ""
+        if primary.found:
+            pNode = primary.record.node
+            pState = primary.record.state
+        return ReplFailoverAssessment{shardId: group.shardId, assessedAtMs: nowMs, hasPrimary: primary.found, primary: pNode, primaryState: pState, primarySilenceMs: primarySilence, primaryNeedsReplacement: needs, candidates: candidates, blockers: blockers}
+
+    struct ReplCandidateLookup:
+        found: bool
+        candidate: ReplPromotionCandidate
+
+    # `best_candidate`: the first eligible candidate in ranked order.
+    proc replFailoverBestCandidate(a: ReplFailoverAssessment) -> ReplCandidateLookup:
+        let mut i = 0
+        loop i < len(a.candidates):
+            if !a.candidates[i].ineligibility.has:
+                return ReplCandidateLookup{found: true, candidate: a.candidates[i]}
+            i = i + 1
+        let none = ReplIneligibility{has: false, kind: "", state: "", value: 0}
+        return ReplCandidateLookup{found: false, candidate: ReplPromotionCandidate{node: "", region: "", state: "", pendingWrites: 0, applyLagMs: 0, silenceMs: -1, ineligibility: none}}
+
+    struct ReplOpOption:
+        has: bool
+        op: ReplOp
+
+    # `promotion`: names the Promote operation; never applies it.
+    proc replFailoverPromotion(a: ReplFailoverAssessment) -> ReplOpOption:
+        let empty = ReplOp{kind: "", node: "", region: ""}
+        if !a.primaryNeedsReplacement:
+            return ReplOpOption{has: false, op: empty}
+        let best = do replFailoverBestCandidate(a)
+        if !best.found:
+            return ReplOpOption{has: false, op: empty}
+        let op = do replOpPromote(best.candidate.node)
+        return ReplOpOption{has: true, op: op}
+
+    proc replFailoverIsStuck(a: ReplFailoverAssessment) -> bool:
+        let p = do replFailoverPromotion(a)
+        return a.primaryNeedsReplacement && !p.has
+
     # ============================================================
     # DEMO / BUILD-CHECK FIXTURES — hand-verified against the real crate's
     # own unit tests, read in full from set.rs and placement.rs (traced
@@ -1109,28 +1263,9 @@ app FabricReplicationSelfHost:
         let plan = result.plan
         return result.ok && len(plan.additions) == 0 && plan.shortfall == 1
 
-    # P4 (new — proves the `replPlanSurplus` fix, not a restatement of a real
-    # Rust unit test: placement.rs's own test module never exercises surplus
-    # removal at all). Bootstrap db-a/phoenix (primary), then Add three
-    # secondaries in SCRAMBLED, non-node-id order — db-x, then db-b, then
-    # db-m — each seeded and marked in sync. `replGroupApply`'s "add" arm
-    # (unchanged by this task, and a distinct site from the three fixed
-    # here) does not re-sort on insert, so `group.replicas` stays in exactly
-    # that add order: db-a, db-x, db-b, db-m. With factor 2, healthyCount=4
-    # (all inSync) and excess=2, so two of the three secondaries must be
-    # named as removals.
-    #
-    # Ascending by node id, the droppable secondaries are db-b < db-m <
-    # db-x; the real Rust worst-first order (`sort_by` ascending then
-    # `.rev().take(2)`) is [db-x, db-m] — exactly what this fixed
-    # `replPlanSurplus` now returns. Before the fix, the code took "the last
-    # `excess` of the droppable array in CALLER-supplied order" — the
-    # storage order [db-x, db-b, db-m] — whose last two are [db-b, db-m]:
-    # both a different SET (wrongly drops db-b, spares db-x, the actual
-    # highest-node-id secondary) and a different order. That the fixed
-    # result differs from what the old order-dependent code would have
-    # produced, for this exact scrambled input, is the proof the fix changes
-    # real behavior rather than only relabeling it.
+    # P4: three secondaries added out of node order (db-x, db-b, db-m),
+    # all in sync, planned at factor 2: the surplus is the two highest node
+    # ids, worst first — [db-x, db-m] — as placement.rs's `surplus` names it.
     proc demoP4SurplusTieBrokenByNodeIdScrambledOrder() -> bool:
         let g0 = do replGroupBootstrap(11, 3, "db-a", "phoenix")
         let addX = do replOpAdd("db-x", "dallas")

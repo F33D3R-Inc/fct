@@ -1,0 +1,654 @@
+import "fabric_facetql_client.fct"
+import "fabric_routing.fct"
+
+app FabricFacetqlPlacementSelfHost:
+    # Self-hosting port of fabric/crates/fabric-facetql/src/placement.rs —
+    # Fabric's durable topology stored in FacetQL, one node per placement
+    # under the reserved kind `__fabric_placement`, every update a real
+    # compare-and-set:
+    #
+    #   * create: `POST /node` with if_absent (409 Conflict: someone
+    #     created that cell first), at version 1;
+    #   * update: one `set_if` op expecting the stored version, merging the
+    #     whole record and version + 1 (412 PreconditionFailed: someone
+    #     else moved it, nothing written); refusing to change the cell;
+    #   * remove: `set_if` (expecting the version, empty set) and
+    #     `delete_node` in one all-or-nothing batch;
+    #   * load/get: the kind walked with the keyset cursor, never an
+    #     offset; get filters by address so another kind at that address
+    #     can never decode as a placement.
+    #
+    # Placement, Coordinate (the fabric grid cell) and TopologyRegistry are
+    # fabric_routing.fct's / fabric_core.fct's ports, reused. The node's
+    # FacetQL coordinate stays at the origin: the grid cell lives in the
+    # node's data as `x`/`y`, never marshalled into the 4-axis coordinate.
+
+    proc placementKind() -> text:
+        return "__fabric_placement"
+
+    struct StoredPlacement:
+        placement: Placement
+        version: int
+
+    # placementAddressOf: address_of — the registry key is the address.
+    proc placementAddressOf(shardId: int, coordinate: Coordinate) -> text:
+        return placementKind() + ":" + shardId + ":" + coordinate.x + ":" + coordinate.y
+
+    proc storedPlacementAddress(s: StoredPlacement) -> text:
+        let a = do placementAddressOf(s.placement.shardId, s.placement.coordinate)
+        return a
+
+    # PlacementData, serialized in declaration order (to_json).
+    proc placementDataJson(p: Placement, version: int) -> text:
+        return "{" + fqlMember("dbms_id", sjQuote(p.dbmsId)) + "," + fqlMember("shard_id", sjU64Text(p.shardId)) + "," + fqlMember("x", "" + p.coordinate.x) + "," + fqlMember("y", "" + p.coordinate.y) + "," + fqlMember("region", sjQuote(p.region)) + "," + fqlMember("version", sjU64Text(version)) + "}"
+
+    # placementDataSetMap: to_set_map — the same record as a serde_json
+    # Map (key order), the `set` of an update's set_if.
+    proc placementDataSetMap(p: Placement, version: int) -> SjV:
+        let o = do fqlJObj(["dbms_id", "shard_id", "x", "y", "region", "version"], [fqlJStr(p.dbmsId), fqlJInt(p.shardId), fqlJInt(p.coordinate.x), fqlJInt(p.coordinate.y), fqlJStr(p.region), fqlJInt(version)])
+        return o
+
+    struct StoredPlacementR:
+        ok: bool
+        err: FqlError
+        v: StoredPlacement
+
+    proc storedPlacementBlank() -> StoredPlacement:
+        return StoredPlacement{placement: Placement{dbmsId: "", shardId: 0, coordinate: Coordinate{x: 0, y: 0}, region: ""}, version: 0}
+
+    # placementDecode: decode_placement — PlacementData from a node's data;
+    # anything else is a Decode error naming the node, never a defaulted
+    # placement.
+    proc placementDecode(node: FqlNode) -> StoredPlacementR:
+        let blank = do storedPlacementBlank()
+        let context = "placement node " + node.address
+        let schema = [sjStructType("PlacementData", "struct PlacementData", ["dbms_id", "shard_id", "x", "y", "region", "version"], ["string", "u64", "u8", "u8", "string", "u64"], [false, false, false, false, false, false])]
+        let d = do sjDecode(schema, node.data, "PlacementData")
+        if !d.ok:
+            return StoredPlacementR{ok: false, err: fqlErrDecode(context, d.err), v: blank}
+        let v = d.v
+        let none = do fqlErrNone()
+        let p = Placement{dbmsId: fqlAt(v, "dbms_id").s, shardId: fqlU(v, "shard_id"), coordinate: Coordinate{x: fqlU(v, "x"), y: fqlU(v, "y")}, region: fqlAt(v, "region").s}
+        return StoredPlacementR{ok: true, err: none, v: StoredPlacement{placement: p, version: fqlU(v, "version")}}
+
+    struct PlacementStore:
+        client: FqlClient
+
+    proc placementStoreNew(client: FqlClient) -> PlacementStore:
+        return PlacementStore{client: client}
+
+    # placementStoreCreate: create at version 1, create-once.
+    proc placementStoreCreate(store: PlacementStore, placement: Placement) -> StoredPlacementR uses io.net:
+        let req = FqlCreateNodeRequest{address: placementAddressOf(placement.shardId, placement.coordinate), kind: placementKind(), x: 0, y: 0, z: 0, q: 0, data: placementDataJson(placement, 1), public: false, ifAbsent: true}
+        let r = do fqlCreateNode(store.client, req)
+        if !r.ok:
+            let blank = do storedPlacementBlank()
+            return StoredPlacementR{ok: false, err: r.err, v: blank}
+        return StoredPlacementR{ok: true, err: r.err, v: StoredPlacement{placement: placement, version: 1}}
+
+    # placementStoreUpdate: move a placement only if it is still at the
+    # version read — one set_if with expect_eq.
+    proc placementStoreUpdate(store: PlacementStore, current: StoredPlacement, next: Placement) -> StoredPlacementR uses io.net:
+        let address = do storedPlacementAddress(current)
+        let blank = do storedPlacementBlank()
+        if next.shardId != current.placement.shardId || next.coordinate.x != current.placement.coordinate.x || next.coordinate.y != current.placement.coordinate.y:
+            return StoredPlacementR{ok: false, err: fqlErrConfiguration("an update cannot change the cell a placement addresses (" + address + "); remove it and create the new cell instead"), v: blank}
+        let version = current.version + 1
+        let op = do fqlTxSetIf(address, "version", fqlExpectVersion(current.version), placementDataSetMap(next, version))
+        let r = do fqlTransaction(store.client, [op])
+        if !r.ok:
+            return StoredPlacementR{ok: false, err: r.err, v: blank}
+        return StoredPlacementR{ok: true, err: r.err, v: StoredPlacement{placement: next, version: version}}
+
+    # placementStoreRemove: set_if + delete_node, all or nothing.
+    proc placementStoreRemove(store: PlacementStore, current: StoredPlacement) -> FqlUnitResult uses io.net:
+        let address = do storedPlacementAddress(current)
+        let cas = do fqlTxSetIf(address, "version", fqlExpectVersion(current.version), fqlJObj([], []))
+        let del = do fqlTxDeleteNode(address)
+        let r = do fqlTransaction(store.client, [cas, del])
+        return r
+
+    struct StoredPlacementsR:
+        ok: bool
+        err: FqlError
+        v: [StoredPlacement]
+
+    proc placementKindQuery() -> FqlQueryRequest:
+        let d = do fqlQueryRequestDefault()
+        return FqlQueryRequest{hasKind: true, kind: placementKind(), hasOwner: d.hasOwner, owner: d.owner, hasWhere: d.hasWhere, whereValue: d.whereValue, hasItemVar: d.hasItemVar, itemVar: d.itemVar, hasOrder: d.hasOrder, order: d.order, desc: d.desc, hasAfter: d.hasAfter, after: d.after, hasLimit: d.hasLimit, limit: d.limit}
+
+    # placementStoreLoad: every stored placement, by cursor.
+    proc placementStoreLoad(store: PlacementStore) -> StoredPlacementsR uses io.net:
+        let nodes = do fqlQueryAll(store.client, placementKindQuery())
+        if !nodes.ok:
+            return StoredPlacementsR{ok: false, err: nodes.err, v: []}
+        let mut out = []
+        let n = len(nodes.v)
+        let mut i = 0
+        loop i < n:
+            let d = do placementDecode(nodes.v[i])
+            if !d.ok:
+                return StoredPlacementsR{ok: false, err: d.err, v: []}
+            out = append(out, d.v)
+            i = i + 1
+        return StoredPlacementsR{ok: true, err: nodes.err, v: out}
+
+    # load_registry: the durable map as a live TopologyRegistry, and each
+    # placement's version by address (the HashMap, as a list keyed by
+    # storedPlacementAddress — a later entry for an address replaces an
+    # earlier one, as HashMap::insert does).
+    struct PlacementRegistryR:
+        ok: bool
+        err: FqlError
+        registry: TopologyRegistry
+        versions: [StoredPlacement]
+
+    proc placementVersionsIndexOf(versions: [StoredPlacement], address: text) -> int:
+        let n = len(versions)
+        let mut i = 0
+        loop i < n:
+            if storedPlacementAddress(versions[i]) == address:
+                return i
+            i = i + 1
+        return -1
+
+    proc placementStoreLoadRegistry(store: PlacementStore) -> PlacementRegistryR uses io.net:
+        let stored = do placementStoreLoad(store)
+        let mut registry = topologyRegistryNew()
+        if !stored.ok:
+            return PlacementRegistryR{ok: false, err: stored.err, registry: registry, versions: []}
+        let mut versions = []
+        let n = len(stored.v)
+        let mut i = 0
+        loop i < n:
+            let entry = stored.v[i]
+            registry = topologyRegistryPlace(registry, entry.placement.dbmsId, entry.placement.shardId, entry.placement.coordinate, entry.placement.region)
+            let at = do placementVersionsIndexOf(versions, storedPlacementAddress(entry))
+            if at >= 0:
+                versions[at] = entry
+            else:
+                versions = append(versions, entry)
+            i = i + 1
+        return PlacementRegistryR{ok: true, err: stored.err, registry: registry, versions: versions}
+
+    struct StoredPlacementOptR:
+        ok: bool
+        err: FqlError
+        found: bool
+        v: StoredPlacement
+
+    # placementStoreGet: one placement by its cell, filtered by kind.
+    proc placementStoreGet(store: PlacementStore, shardId: int, coordinate: Coordinate) -> StoredPlacementOptR uses io.net:
+        let address = do placementAddressOf(shardId, coordinate)
+        let blank = do storedPlacementBlank()
+        let nodes = do fqlQueryAll(store.client, placementKindQuery())
+        if !nodes.ok:
+            return StoredPlacementOptR{ok: false, err: nodes.err, found: false, v: blank}
+        let n = len(nodes.v)
+        let mut i = 0
+        loop i < n:
+            if nodes.v[i].address == address:
+                let d = do placementDecode(nodes.v[i])
+                return StoredPlacementOptR{ok: d.ok, err: d.err, found: d.ok, v: d.v}
+            i = i + 1
+        return StoredPlacementOptR{ok: true, err: nodes.err, found: false, v: blank}
+
+    # ── placement.rs's #[test]s, input for input ──────────────────────
+    proc placementTestPlacement() -> Placement:
+        return Placement{dbmsId: "db-a", shardId: 7, coordinate: Coordinate{x: 3, y: 4}, region: "us-east"}
+
+    proc placementTestNode(address: text, data: text) -> FqlNode:
+        return FqlNode{address: address, coordinate: FqlCoordinate{x: 0, y: 0, z: 0, q: 0}, value: 0, kind: placementKind(), data: data, owner: "fabric", hasClaimedBy: false, claimedBy: "", visibility: "Private"}
+
+    proc demoTheAddressIsTheRegistryKey() -> bool:
+        let a = do placementAddressOf(7, Coordinate{x: 3, y: 4})
+        let stored = StoredPlacement{placement: placementTestPlacement(), version: 1}
+        let b = do storedPlacementAddress(stored)
+        return a == "__fabric_placement:7:3:4" && b == "__fabric_placement:7:3:4"
+
+    proc demoAPlacementRoundTripsThroughItsStoredForm() -> bool:
+        let p = do placementTestPlacement()
+        let json = do placementDataJson(p, 3)
+        let d = do placementDecode(placementTestNode("__fabric_placement:7:3:4", json))
+        return d.ok && d.v.version == 3 && d.v.placement.dbmsId == p.dbmsId && d.v.placement.shardId == p.shardId && d.v.placement.coordinate.x == p.coordinate.x && d.v.placement.coordinate.y == p.coordinate.y && d.v.placement.region == p.region
+
+    proc demoTheFabricCellLivesInDataNotInFacetqlsCoordinate() -> bool:
+        let json = do placementDataJson(placementTestPlacement(), 1)
+        let v = do fqlParseValue(json)
+        let x = do fqlAt(v.v, "x")
+        let y = do fqlAt(v.v, "y")
+        return sjValueText(x) == "3" && sjValueText(y) == "4" && !fqlHas(v.v, "z") && !fqlHas(v.v, "q")
+
+    proc demoTheSetMapOfAnUpdateCarriesEveryFieldIncludingTheNewVersion() -> bool:
+        let m = do placementDataSetMap(placementTestPlacement(), 2)
+        return sjValueText(fqlAt(m, "version")) == "2" && sjValueText(fqlAt(m, "dbms_id")) == "\"db-a\"" && sjValueText(fqlAt(m, "region")) == "\"us-east\"" && sjValueText(fqlAt(m, "shard_id")) == "7"
+
+    proc demoUndecodableDataIsAnErrorNotADefaultedPlacement() -> bool:
+        let d = do placementDecode(placementTestNode("__fabric_placement:7:3:4", "not json"))
+        return !d.ok && d.err.kind == "Decode" && contains(fqlErrorDisplay(d.err), "__fabric_placement:7:3:4")
+
+    state placementOut: text = ""
+
+    action placementRunDemos:
+        let a = do demoTheAddressIsTheRegistryKey()
+        let b = do demoAPlacementRoundTripsThroughItsStoredForm()
+        let c = do demoTheFabricCellLivesInDataNotInFacetqlsCoordinate()
+        let d = do demoTheSetMapOfAnUpdateCarriesEveryFieldIncludingTheNewVersion()
+        let e = do demoUndecodableDataIsAnErrorNotADefaultedPlacement()
+        placementOut = "" + a + "," + b + "," + c + "," + d + "," + e
+
+    # ── the client/placement trace (fabric_check's `fql-trace`) ───────
+    # The same calls, in the same order, as fql.rs's `trace`, one result
+    # line each: a value's rendering or fqlErrLine.
+    proc fqlTraceStatsLine(r: FqlStatsResult) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        let t = do sjValueText(fqlStatsValue(r.v))
+        return t
+
+    proc fqlTraceNodesLine(r: FqlNodesResult) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        let t = do fqlNodesJson(r.v)
+        return t
+
+    proc fqlTracePageLine(r: FqlPageResult) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        return fqlNodesJson(r.v.nodes) + "|" + r.v.next + "|" + fqlBoolText(fqlQueryPageHasMore(r.v))
+
+    proc fqlTraceNodeLine(r: FqlNodeResult) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        if !r.found:
+            return "None"
+        let t = do fqlNodesJson([r.v])
+        return t
+
+    proc fqlTraceCountLine(r: FqlCountResult) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        return "" + r.v
+
+    proc fqlTraceUnitLine(r: FqlUnitResult) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        return "Ok"
+
+    proc fqlTraceClaimLine(r: FqlClaimResult) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        return fqlBoolText(r.won)
+
+    proc storedPlacementLine(s: StoredPlacement) -> text:
+        return storedPlacementAddress(s) + " v" + s.version + " " + s.placement.dbmsId + " " + s.placement.shardId + " " + s.placement.region
+
+    proc fqlTraceStoredLine(r: StoredPlacementR) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        let t = do storedPlacementLine(r.v)
+        return t
+
+    proc fqlTraceStoredListLine(r: StoredPlacementsR) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        let mut parts = []
+        let n = len(r.v)
+        let mut i = 0
+        loop i < n:
+            parts = append(parts, storedPlacementLine(r.v[i]))
+            i = i + 1
+        return join(parts, ",")
+
+    proc fqlTraceStoredOptLine(r: StoredPlacementOptR) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        if !r.found:
+            return "None"
+        let t = do storedPlacementLine(r.v)
+        return t
+
+    proc fqlTraceSortText(xs0: [text]) -> [text]:
+        let mut xs = xs0
+        let n = len(xs)
+        let mut i = 1
+        loop i < n:
+            let k = xs[i]
+            let mut j = i - 1
+            loop j >= 0 && xs[j] > k:
+                xs[j + 1] = xs[j]
+                j = j - 1
+            xs[j + 1] = k
+            i = i + 1
+        return xs
+
+    proc fqlTraceRegistryLine(r: PlacementRegistryR) -> text:
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        let mut keyed = []
+        let n = len(r.versions)
+        let mut i = 0
+        loop i < n:
+            keyed = append(keyed, storedPlacementAddress(r.versions[i]) + "=v" + r.versions[i].version)
+            i = i + 1
+        let sorted = do fqlTraceSortText(keyed)
+        let loc = do topologyRegistryLocate(r.registry, 9001, Coordinate{x: 1, y: 2})
+        let mut located = "None"
+        if loc.found:
+            located = loc.placement.dbmsId + " " + loc.placement.region
+        return "" + topologyRegistryLen(r.registry) + " " + join(sorted, ",") + " " + located
+
+    proc fqlTracePlacement(shardId: int, dbms: text, region: text, x: int, y: int) -> Placement:
+        return Placement{dbmsId: dbms, shardId: shardId, coordinate: Coordinate{x: x, y: y}, region: region}
+
+    proc fqlTraceWhere() -> SjV:
+        let w = do fqlJObj(["op", "left", "right"], [fqlJStr("<"), fqlJStr("x"), fqlJInt(1)])
+        return w
+
+    proc fqlTraceScript(base: text, token: text, dead: text) -> text uses io.net:
+        let ep = do fqlEndpointNew("db-trace", base, token)
+        let c = do fqlClientNew(ep.v)
+        let mut out = []
+        out = append(out, fqlTraceStatsLine(fqlStats(c)))
+        out = append(out, fqlTraceStatsLine(fqlStats(c)))
+        out = append(out, fqlTraceNodesLine(fqlListNodes(c, true, "__fabric_placement", false, "", true, 500, true, 0)))
+        out = append(out, fqlTraceNodesLine(fqlListNodes(c, false, "", true, "o w&n=r/é+*", false, 0, false, 0)))
+        out = append(out, fqlTraceNodesLine(fqlListNodes(c, false, "", false, "", false, 0, false, 0)))
+        let full = FqlQueryRequest{hasKind: true, kind: "Post", hasOwner: true, owner: "alice", hasWhere: true, whereValue: fqlTraceWhere(), hasItemVar: true, itemVar: "p", hasOrder: true, order: "title", desc: true, hasAfter: true, after: "Y3Vyc29y", hasLimit: true, limit: 10}
+        out = append(out, fqlTracePageLine(fqlQuery(c, full)))
+        out = append(out, fqlTraceNodesLine(fqlQueryAll(c, full)))
+        out = append(out, fqlTraceNodeLine(fqlGetNode(c, "p:1 /é?#")))
+        out = append(out, fqlTraceNodeLine(fqlGetNode(c, "gone")))
+        out = append(out, fqlTraceNodesLine(fqlMultiget(c, ["a", "b\"c"])))
+        out = append(out, fqlTraceCountLine(fqlCount(c, full)))
+        out = append(out, fqlTraceUnitLine(fqlCreateNode(c, FqlCreateNodeRequest{address: "x:1", kind: "K", x: 1, y: 2, z: 3, q: 4, data: "{\"a\":1}", public: true, ifAbsent: true})))
+        let set = do fqlJObj(["version", "b"], [fqlJInt(2), fqlJArr([fqlJFloat(1.5), fqlJStr("x"), sjNull()])])
+        let ops = [fqlTxInsertNode("Entity:1", "Entity", 0, 0, 0, 0, "{}", false), fqlTxDeleteNode("Entity:1"), fqlTxEdge("insert_edge", "a", "b", "rel"), fqlTxEdge("delete_edge", "a", "b", "rel"), fqlTxClearKind("Entity"), fqlTxDeleteWhere("Entity", false, sjNull()), fqlTxDeleteWhere("__session", true, fqlTraceWhere()), fqlTxSetIf("__cron:nightly", "next_run", fqlExpectAtMost(1000.0), set), fqlTxSetIf("p:1", "version", fqlExpectVersion(1), set), fqlTxSetIf("p:1", "version", fqlExpectAbsent(true), set)]
+        out = append(out, fqlTraceUnitLine(fqlTransaction(c, ops)))
+        out = append(out, fqlTraceClaimLine(fqlClaim(c, "__fabric_placement:7:3:4")))
+        out = append(out, fqlTraceClaimLine(fqlClaim(c, "held")))
+        out = append(out, fqlTraceClaimLine(fqlClaim(c, "../x y?z")))
+        out = append(out, fqlTraceStatsLine(fqlStats(c)))
+        out = append(out, fqlTraceStatsLine(fqlStats(c)))
+        out = append(out, fqlTraceStatsLine(fqlStats(c)))
+        out = append(out, fqlTraceNodeLine(fqlGetNode(c, "bad")))
+        out = append(out, fqlTracePageLine(fqlQuery(c, fqlQueryRequestDefault())))
+        out = append(out, fqlTraceCountLine(fqlCount(c, fqlQueryRequestDefault())))
+        let store = do placementStoreNew(c)
+        let created = do placementStoreCreate(store, fqlTracePlacement(9001, "db-a", "us-east", 1, 2))
+        out = append(out, fqlTraceStoredLine(created))
+        let mut v1 = StoredPlacement{placement: fqlTracePlacement(9001, "db-a", "us-east", 1, 2), version: 1}
+        if created.ok:
+            v1 = created.v
+        let updated = do placementStoreUpdate(store, v1, fqlTracePlacement(9001, "db-b", "eu-west", 1, 2))
+        out = append(out, fqlTraceStoredLine(updated))
+        out = append(out, fqlTraceStoredLine(placementStoreUpdate(store, v1, fqlTracePlacement(9002, "db-b", "eu-west", 1, 2))))
+        let mut v2 = StoredPlacement{placement: fqlTracePlacement(9001, "db-b", "eu-west", 1, 2), version: 2}
+        if updated.ok:
+            v2 = updated.v
+        out = append(out, fqlTraceUnitLine(placementStoreRemove(store, v2)))
+        out = append(out, fqlTraceStoredListLine(placementStoreLoad(store)))
+        out = append(out, fqlTraceStoredOptLine(placementStoreGet(store, 9001, Coordinate{x: 1, y: 2})))
+        out = append(out, fqlTraceStoredOptLine(placementStoreGet(store, 9001, Coordinate{x: 5, y: 5})))
+        out = append(out, fqlTraceStoredListLine(placementStoreLoad(store)))
+        out = append(out, fqlTraceRegistryLine(placementStoreLoadRegistry(store)))
+        let mut ev = 0
+        loop ev < 2:
+            let opened = do fqlOpenEvents(c)
+            if opened.ok:
+                let closedEv = do httpStreamClose(opened.stream)
+                out = append(out, "Ok " + opened.stream.status)
+            else:
+                out = append(out, fqlErrLine(opened.err))
+            ev = ev + 1
+        let deadEp = do fqlEndpointNew("db-dead", dead, token)
+        let dc = do fqlClientNew(deadEp.v)
+        out = append(out, fqlTraceStatsLine(fqlStats(dc)))
+        return join(out, "\n")
+
+    state fqlTraceOut: text = ""
+
+    action fqlTraceRun(base: text, token: text, dead: text):
+        let r = do fqlTraceScript(base, token, dead)
+        fqlTraceOut = r
+
+    # ── live flows (fabric-facetql/tests/live.rs), against a real FacetQL ─
+    # Each returns `name=value` lines the Go test asserts on.
+    state fqlLiveOut: text = ""
+
+    proc fqlLiveClient(base: text, token: text) -> FqlClient:
+        let ep = do fqlEndpointNew("db-live", base, token)
+        let c = do fqlClientNew(ep.v)
+        return c
+
+    proc fqlLivePlacement(shardId: int, dbms: text, region: text) -> Placement:
+        return Placement{dbmsId: dbms, shardId: shardId, coordinate: Coordinate{x: 1, y: 2}, region: region}
+
+    proc fqlLiveErr(ok: bool, e: FqlError) -> text:
+        if ok:
+            return "ok"
+        return e.kind
+
+    # stats_reads_the_engines_own_counters
+    proc fqlLiveStats(base: text, token: text) -> text uses io.net:
+        let c = do fqlLiveClient(base, token)
+        let first = do fqlStats(c)
+        let second = do fqlStats(c)
+        let mut out = ["first=" + fqlLiveErr(first.ok, first.err), "second=" + fqlLiveErr(second.ok, second.err)]
+        out = append(out, "readsMonotonic=" + (second.v.readsTotal >= first.v.readsTotal))
+        out = append(out, "writesMonotonic=" + (second.v.writesTotal >= first.v.writesTotal))
+        out = append(out, "pageSize=" + second.v.storage.pageSize)
+        out = append(out, "hasVersion=" + second.v.hasVersion)
+        out = append(out, "maxConcurrent=" + second.v.runtime.requests.maxConcurrent)
+        return join(out, "\n")
+
+    # a_placement_is_written_and_read_back
+    proc fqlLiveWriteRead(base: text, token: text, shard: int) -> text uses io.net:
+        let store = do placementStoreNew(fqlLiveClient(base, token))
+        let stored = do placementStoreCreate(store, fqlLivePlacement(shard, "db-a", "us-east"))
+        let mut out = ["create=" + fqlLiveErr(stored.ok, stored.err), "createVersion=" + stored.v.version]
+        let back = do placementStoreGet(store, shard, Coordinate{x: 1, y: 2})
+        out = append(out, "get=" + fqlLiveErr(back.ok, back.err) + " found=" + back.found)
+        out = append(out, "readBack=" + storedPlacementLine(back.v))
+        out = append(out, "address=" + storedPlacementAddress(back.v))
+        let reg = do placementStoreLoadRegistry(store)
+        let loc = do topologyRegistryLocate(reg.registry, shard, Coordinate{x: 1, y: 2})
+        out = append(out, "registry=" + fqlLiveErr(reg.ok, reg.err) + " located=" + loc.found + " dbms=" + loc.placement.dbmsId)
+        let at = do placementVersionsIndexOf(reg.versions, storedPlacementAddress(back.v))
+        let mut version = -1
+        if at >= 0:
+            version = reg.versions[at].version
+        out = append(out, "registryVersion=" + version)
+        let conflict = do placementStoreCreate(store, fqlLivePlacement(shard, "db-b", "eu-west"))
+        out = append(out, "secondCreate=" + fqlLiveErr(conflict.ok, conflict.err))
+        let rm = do placementStoreRemove(store, back.v)
+        out = append(out, "cleanup=" + fqlLiveErr(rm.ok, rm.err))
+        return join(out, "\n")
+
+    # a_stale_update_is_refused_by_the_engines_compare_and_set
+    proc fqlLiveStale(base: text, token: text, shard: int) -> text uses io.net:
+        let store = do placementStoreNew(fqlLiveClient(base, token))
+        let v1 = do placementStoreCreate(store, fqlLivePlacement(shard, "db-a", "us-east"))
+        let mut out = ["create=" + fqlLiveErr(v1.ok, v1.err)]
+        let v2 = do placementStoreUpdate(store, v1.v, fqlLivePlacement(shard, "db-b", "eu-west"))
+        out = append(out, "firstUpdate=" + fqlLiveErr(v2.ok, v2.err) + " v" + v2.v.version)
+        let stale = do placementStoreUpdate(store, v1.v, fqlLivePlacement(shard, "db-c", "ap-south"))
+        out = append(out, "staleUpdate=" + fqlLiveErr(stale.ok, stale.err))
+        out = append(out, "staleUpdateText=" + fqlErrorDisplay(stale.err))
+        let current = do placementStoreGet(store, shard, Coordinate{x: 1, y: 2})
+        out = append(out, "current=" + storedPlacementLine(current.v))
+        let staleRemove = do placementStoreRemove(store, v1.v)
+        out = append(out, "staleRemove=" + fqlLiveErr(staleRemove.ok, staleRemove.err))
+        let still = do placementStoreGet(store, shard, Coordinate{x: 1, y: 2})
+        out = append(out, "survived=" + still.found)
+        let rm = do placementStoreRemove(store, current.v)
+        out = append(out, "remove=" + fqlLiveErr(rm.ok, rm.err))
+        let gone = do placementStoreGet(store, shard, Coordinate{x: 1, y: 2})
+        out = append(out, "gone=" + fqlLiveErr(gone.ok, gone.err) + " found=" + gone.found)
+        return join(out, "\n")
+
+    # a_bad_token_fails_closed_rather_than_reading_as_healthy (the client
+    # half; the poller half waits for poller.rs's port)
+    proc fqlLiveBadToken(base: text) -> text uses io.net:
+        let c = do fqlLiveClient(base, "not-a-real-token")
+        let r = do fqlStats(c)
+        return "stats=" + fqlLiveErr(r.ok, r.err) + "\nunhealthy=" + fqlErrorImpliesUnhealthy(r.err) + "\ntext=" + fqlErrorDisplay(r.err)
+
+    # a_kind_larger_than_one_page_is_walked_by_cursor
+    proc fqlLiveCursor(base: text, token: text, shard: int, rows: int) -> text uses io.net:
+        let store = do placementStoreNew(fqlLiveClient(base, token))
+        let mut created = []
+        let mut failures = 0
+        let mut i = 0
+        loop i < rows:
+            let r = do placementStoreCreate(store, Placement{dbmsId: "db-" + i, shardId: shard + i, coordinate: Coordinate{x: 1, y: 2}, region: "us-east"})
+            if r.ok:
+                created = append(created, r.v)
+            else:
+                failures = failures + 1
+            i = i + 1
+        let loaded = do placementStoreLoad(store)
+        let mut ours = []
+        let n = len(loaded.v)
+        let mut j = 0
+        loop j < n:
+            let s = loaded.v[j].placement.shardId
+            if s >= shard && s < shard + rows:
+                ours = append(ours, storedPlacementAddress(loaded.v[j]))
+            j = j + 1
+        let sorted = do fqlTraceSortText(ours)
+        let mut distinct = 0
+        let mut k = 0
+        loop k < len(sorted):
+            if k == 0 || sorted[k] != sorted[k - 1]:
+                distinct = distinct + 1
+            k = k + 1
+        let mut cleanupFailures = 0
+        let mut m = 0
+        loop m < len(created):
+            let rm = do placementStoreRemove(store, created[m])
+            if !rm.ok:
+                cleanupFailures = cleanupFailures + 1
+            m = m + 1
+        return "createFailures=" + failures + "\nload=" + fqlLiveErr(loaded.ok, loaded.err) + "\nours=" + len(ours) + "\ndistinct=" + distinct + "\ncleanupFailures=" + cleanupFailures
+
+    # claim_has_exactly_one_winner
+    proc fqlLiveClaim(base: text, token: text, shard: int) -> text uses io.net:
+        let c = do fqlLiveClient(base, token)
+        let store = do placementStoreNew(c)
+        let stored = do placementStoreCreate(store, fqlLivePlacement(shard, "db-a", "us-east"))
+        let address = do storedPlacementAddress(stored.v)
+        let first = do fqlClaim(c, address)
+        let second = do fqlClaim(c, address)
+        let missing = do fqlClaim(c, "__fabric_placement:0:99:99")
+        let listed = do fqlListNodes(c, true, "__fabric_placement", false, "", true, 500, true, 0)
+        let mut present = false
+        let mut i = 0
+        loop i < len(listed.v):
+            if listed.v[i].address == address:
+                present = true
+            i = i + 1
+        let rm = do placementStoreRemove(store, stored.v)
+        return "create=" + fqlLiveErr(stored.ok, stored.err) + "\nfirst=" + fqlLiveErr(first.ok, first.err) + " " + first.won + "\nsecond=" + fqlLiveErr(second.ok, second.err) + " " + second.won + "\nmissing=" + fqlLiveErr(missing.ok, missing.err) + "\nlisted=" + fqlLiveErr(listed.ok, listed.err) + " " + present + "\ncleanup=" + fqlLiveErr(rm.ok, rm.err)
+
+    # The rest of the client surface against the real engine: point read
+    # (percent-encoded address), multiget, count, a predicate query page,
+    # and a raw all-or-nothing transaction.
+    proc fqlLiveSurface(base: text, token: text) -> text uses io.net:
+        let c = do fqlLiveClient(base, token)
+        let a1 = do fqlCreateNode(c, FqlCreateNodeRequest{address: "fqlive:a 1/é", kind: "FqLive", x: 1, y: 2, z: 3, q: 4, data: "{\"n\":1,\"tag\":\"x\"}", public: false, ifAbsent: false})
+        let a2 = do fqlCreateNode(c, FqlCreateNodeRequest{address: "fqlive:b", kind: "FqLive", x: 0, y: 0, z: 0, q: 0, data: "{\"n\":5}", public: true, ifAbsent: false})
+        let got = do fqlGetNode(c, "fqlive:a 1/é")
+        let missing = do fqlGetNode(c, "fqlive:nope")
+        let multi = do fqlMultiget(c, ["fqlive:b", "fqlive:nope", "fqlive:a 1/é"])
+        let d = do fqlQueryRequestDefault()
+        let byKind = FqlQueryRequest{hasKind: true, kind: "FqLive", hasOwner: false, owner: "", hasWhere: false, whereValue: d.whereValue, hasItemVar: false, itemVar: "", hasOrder: false, order: "", desc: false, hasAfter: false, after: "", hasLimit: false, limit: 0}
+        let count = do fqlCount(c, byKind)
+        let w = do fqlParseValue("{\"kind\":\"bin\",\"op\":\">\",\"l\":{\"kind\":\"get\",\"obj\":{\"kind\":\"ref\",\"name\":\"item\"},\"field\":\"n\"},\"r\":{\"kind\":\"lit\",\"val\":2}}")
+        let filtered = FqlQueryRequest{hasKind: true, kind: "FqLive", hasOwner: false, owner: "", hasWhere: true, whereValue: w.v, hasItemVar: false, itemVar: "", hasOrder: false, order: "", desc: false, hasAfter: false, after: "", hasLimit: true, limit: 10}
+        let page = do fqlQuery(c, filtered)
+        let mut pageAddrs = []
+        let mut i = 0
+        loop i < len(page.v.nodes):
+            pageAddrs = append(pageAddrs, page.v.nodes[i].address)
+            i = i + 1
+        let set = do fqlJObj(["n"], [fqlJInt(6)])
+        let refused = do fqlTransaction(c, [fqlTxSetIf("fqlive:b", "n", fqlExpectVersion(4), set), fqlTxDeleteNode("fqlive:a 1/é")])
+        let afterRefused = do fqlCount(c, byKind)
+        let applied = do fqlTransaction(c, [fqlTxSetIf("fqlive:b", "n", fqlExpectVersion(5), set), fqlTxDeleteNode("fqlive:a 1/é")])
+        let b = do fqlGetNode(c, "fqlive:b")
+        let cleared = do fqlTransaction(c, [fqlTxClearKind("FqLive")])
+        let afterClear = do fqlCount(c, byKind)
+        let mut multiAddrs = []
+        let mut j = 0
+        loop j < len(multi.v):
+            multiAddrs = append(multiAddrs, multi.v[j].address)
+            j = j + 1
+        let mut out = ["create=" + fqlLiveErr(a1.ok, a1.err) + "," + fqlLiveErr(a2.ok, a2.err)]
+        out = append(out, "get=" + fqlLiveErr(got.ok, got.err) + " " + got.found + " " + got.v.address + " " + fqlEncodeCoordinate(got.v.coordinate) + " " + got.v.data + " " + got.v.visibility)
+        out = append(out, "missing=" + fqlLiveErr(missing.ok, missing.err) + " " + missing.found)
+        out = append(out, "multiget=" + fqlLiveErr(multi.ok, multi.err) + " " + join(fqlTraceSortText(multiAddrs), ","))
+        out = append(out, "count=" + fqlLiveErr(count.ok, count.err) + " " + count.v)
+        out = append(out, "query=" + fqlLiveErr(page.ok, page.err) + " " + join(pageAddrs, ",") + " next=" + page.v.next)
+        out = append(out, "refused=" + fqlLiveErr(refused.ok, refused.err) + " count=" + afterRefused.v)
+        out = append(out, "applied=" + fqlLiveErr(applied.ok, applied.err) + " b=" + b.v.data)
+        out = append(out, "cleared=" + fqlLiveErr(cleared.ok, cleared.err) + " count=" + afterClear.v)
+        return join(out, "\n")
+
+    # open_events against the real server: subscribe, write, and see the
+    # write's frame arrive on the stream; a bad token is refused.
+    proc fqlLiveEvents(base: text, token: text) -> text uses io.net:
+        let c = do fqlLiveClient(base, token)
+        let opened = do fqlOpenEvents(c)
+        let w = do fqlCreateNode(c, FqlCreateNodeRequest{address: "fqevents:1", kind: "FqEvents", x: 0, y: 0, z: 0, q: 0, data: "{}", public: false, ifAbsent: false})
+        let mut s = opened.stream
+        let mut seen = ""
+        let t0 = monoMs()
+        loop !contains(seen, "fqevents:1") && !s.ended && monoMs() - t0 < 5000:
+            s = httpStreamPump(s, 50)
+            seen = seen + bytesToText(s.data)
+            s = httpStreamWithData(s, [])
+        let closed = do httpStreamClose(s)
+        let bad = do fqlOpenEvents(fqlLiveClient(base, "not-a-real-token"))
+        let del = do fqlTransaction(c, [fqlTxClearKind("FqEvents")])
+        return "opened=" + opened.ok + " " + opened.stream.status + " " + httpHeaderValue(opened.stream.headers, "content-type") + "\nwrite=" + w.ok + "\nseen=" + contains(seen, "\"event\":\"node_created\"") + " " + contains(seen, "fqevents:1") + "\nbad=" + fqlErrLine(bad.err)
+
+    proc fqlLiveFlow(flow: text, base: text, token: text, shard: int, rows: int) -> text uses io.net:
+        if flow == "events":
+            let r = do fqlLiveEvents(base, token)
+            return r
+        if flow == "stats":
+            let r = do fqlLiveStats(base, token)
+            return r
+        if flow == "writeRead":
+            let r = do fqlLiveWriteRead(base, token, shard)
+            return r
+        if flow == "stale":
+            let r = do fqlLiveStale(base, token, shard)
+            return r
+        if flow == "badToken":
+            let r = do fqlLiveBadToken(base)
+            return r
+        if flow == "cursor":
+            let r = do fqlLiveCursor(base, token, shard, rows)
+            return r
+        if flow == "claim":
+            let r = do fqlLiveClaim(base, token, shard)
+            return r
+        let r = do fqlLiveSurface(base, token)
+        return r
+
+    action fqlLiveRun(flow: text, base: text, token: text, shard: int, rows: int):
+        let r = do fqlLiveFlow(flow, base, token, shard, rows)
+        fqlLiveOut = r

@@ -247,14 +247,14 @@ func TestArrayDeclarationErrors(t *testing.T) {
 			"is not declared",
 		},
 		{
-			"array indexing outside a proc is rejected",
+			"indexing a value that is neither a list nor json outside a proc is rejected",
 			`app A:
-    state flags: [int] = []
+    state name: text = "x"
     view Home at "/":
         box:
-            text "{flags[0]}"
+            text "{name[0]}"
 `,
-			"only available inside a proc",
+			"neither",
 		},
 	}
 	for _, c := range cases {

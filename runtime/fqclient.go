@@ -30,6 +30,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -294,6 +295,8 @@ type fqHTTPError struct {
 	Status     int    // e.g. 403
 	StatusText string // e.g. "403 Forbidden"
 	Body       string // the engine's own message, verbatim
+	// RetryAfter is a 429's Retry-After (0 when it named none).
+	RetryAfter time.Duration
 }
 
 func (e *fqHTTPError) Error() string {
@@ -317,19 +320,58 @@ func fqStatus(err error) int {
 // the status is still returned alongside so callers (e.g. deleteNode) can treat
 // a 404 as a benign, idempotent outcome without inspecting the error.
 func (c *fqClient) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
-	var rdr io.Reader
+	var payload []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, 0, fmt.Errorf("facetql marshal %s %s: %w", method, path, err)
 		}
-		rdr = bytes.NewReader(b)
+		payload = b
 	}
+	// A 429 is FacetQL's rate limiter asking this identity to slow down, not a
+	// failure of the request: wait the Retry-After it names (bounded) and send
+	// it again, so a burst — a cold start loading every entity at once — is
+	// paced instead of aborting.
+	for attempt := 0; ; attempt++ {
+		data, status, err := c.doOnce(ctx, method, path, body != nil, payload)
+		if status != http.StatusTooManyRequests || attempt >= fqRateRetries {
+			return data, status, err
+		}
+		wait := fqRetryAfter(err)
+		select {
+		case <-ctx.Done():
+			return data, status, err
+		case <-time.After(wait):
+		}
+	}
+}
+
+// fqRateRetries bounds how often one request is re-sent after a 429.
+const fqRateRetries = 8
+
+// fqRetryAfter is how long to wait before re-sending after a 429: the
+// response's Retry-After seconds when it gave one (at most 5s), else 250ms.
+func fqRetryAfter(err error) time.Duration {
+	if he, ok := err.(*fqHTTPError); ok && he.RetryAfter > 0 {
+		if he.RetryAfter > 5*time.Second {
+			return 5 * time.Second
+		}
+		return he.RetryAfter
+	}
+	return 250 * time.Millisecond
+}
+
+func (c *fqClient) doOnce(ctx context.Context, method, path string, hasBody bool, payload []byte) ([]byte, int, error) {
+	var rdr io.Reader
+	if hasBody {
+		rdr = bytes.NewReader(payload)
+	}
+	body := hasBody
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
 	if err != nil {
 		return nil, 0, fmt.Errorf("facetql build request %s %s: %w", method, path, err)
 	}
-	if body != nil {
+	if body {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.token != "" {
@@ -342,11 +384,15 @@ func (c *fqClient) do(ctx context.Context, method, path string, body any) ([]byt
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return data, resp.StatusCode, &fqHTTPError{
+		he := &fqHTTPError{
 			Method: method, Path: path,
 			Status: resp.StatusCode, StatusText: resp.Status,
 			Body: strings.TrimSpace(string(data)),
 		}
+		if secs, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && secs >= 0 {
+			he.RetryAfter = time.Duration(secs) * time.Second
+		}
+		return data, resp.StatusCode, he
 	}
 	return data, resp.StatusCode, nil
 }

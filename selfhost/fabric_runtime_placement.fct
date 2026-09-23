@@ -1,0 +1,791 @@
+import "fabric_runtime_registry.fct"
+import "fabric_table.fct"
+import "fabric_controller_target.fct"
+
+app FabricRuntimePlacementSelfHost:
+    # Port of fabric/crates/fabric-runtime/src/placement.rs: the routing
+    # table, the per-cell replica sets, the in-flight migrations and the
+    # placement map, kept consistent. Every migration step goes through
+    # fabricStepMigration, which re-snapshots the migration into routing
+    # before it returns, so no caller can advance a phase without routing
+    # learning it.
+    #
+    # Conventions: `&mut self` -> functional update (a proc returns the new
+    # PlacementFabric, bundled in a *Result with anything else it returns);
+    # BTreeMap keyed by ActionTarget (or (ActionTarget, node)) -> array kept
+    # sorted by that key; Option -> has/val; Result -> ok + err.
+    # DbmsId is plain text here, as in fabric_table.fct.
+
+    struct TransferProgress:
+        atomsCopied: int
+        bytesCopied: int
+        atMs: int
+
+    proc transferProgressDefault() -> TransferProgress:
+        return TransferProgress{atomsCopied: 0, bytesCopied: 0, atMs: 0}
+
+    # CopyVerdict: kind "pending" | "verified" (rows, atMs) | "failed"
+    # (reason, atMs). kind is the Rust label().
+    struct CopyVerdict:
+        kind: text
+        rows: int
+        atMs: int
+        reason: text
+
+    proc copyVerdictPending() -> CopyVerdict:
+        return CopyVerdict{kind: "pending", rows: 0, atMs: 0, reason: ""}
+
+    proc copyVerdictVerified(rows: int, atMs: int) -> CopyVerdict:
+        return CopyVerdict{kind: "verified", rows: rows, atMs: atMs, reason: ""}
+
+    proc copyVerdictFailed(reason: text, atMs: int) -> CopyVerdict:
+        return CopyVerdict{kind: "failed", rows: 0, atMs: atMs, reason: reason}
+
+    proc copyVerdictIsVerified(v: CopyVerdict) -> bool:
+        return v.kind == "verified"
+
+    proc copyVerdictLabel(v: CopyVerdict) -> text:
+        return v.kind
+
+    # FabricError: kind "NoMigration" | "NoReplicaSet" | "UnroutableTarget"
+    # (target) | "Migration" | "Replication" | "Placement" (the wrapped
+    # error's Display in `detail`; a Migration error's own kind in
+    # `migrationKind`, which is what the mechanism matches on).
+    struct FabricError:
+        kind: text
+        target: ActionTarget
+        migrationKind: text
+        detail: text
+
+    proc fabricErrorNone() -> FabricError:
+        return FabricError{kind: "", target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, migrationKind: "", detail: ""}
+
+    proc fabricErrorOf(kind: text, target: ActionTarget) -> FabricError:
+        return FabricError{kind: kind, target: target, migrationKind: "", detail: ""}
+
+    proc fabricErrorFromMigration(e: MigrationError) -> FabricError:
+        let shown = do migrationErrorDisplay(e)
+        let none = do fabricErrorNone()
+        return FabricError{kind: "Migration", target: none.target, migrationKind: e.kind, detail: shown}
+
+    proc fabricErrorFromReplication(e: ReplError) -> FabricError:
+        let shown = do replErrorDisplay(e)
+        let none = do fabricErrorNone()
+        return FabricError{kind: "Replication", target: none.target, migrationKind: "", detail: shown}
+
+    proc fabricErrorFromPlacement(e: ReplError) -> FabricError:
+        let shown = do replErrorDisplay(e)
+        let none = do fabricErrorNone()
+        return FabricError{kind: "Placement", target: none.target, migrationKind: "", detail: shown}
+
+    proc fabricErrorDisplay(e: FabricError) -> text:
+        let target = do actionTargetDisplay(e.target)
+        if e.kind == "NoMigration":
+            return "no migration is in flight for " + target
+        if e.kind == "NoReplicaSet":
+            return target + " has no replica set"
+        if e.kind == "UnroutableTarget":
+            return "routing knows no placement for " + target + ", so a change to it could not be published"
+        return e.detail
+
+    struct TargetSet:
+        target: ActionTarget
+        group: ReplGroup
+
+    struct TargetMigration:
+        target: ActionTarget
+        migration: Migration
+
+    struct TargetTransfer:
+        target: ActionTarget
+        node: text
+        progress: TransferProgress
+
+    struct TargetVerdict:
+        target: ActionTarget
+        node: text
+        verdict: CopyVerdict
+
+    struct TargetSize:
+        target: ActionTarget
+        bytes: int
+
+    struct PlacementFabric:
+        routing: TableRoutingTable
+        topology: TopologyRegistry
+        sets: [TargetSet]
+        migrations: [TargetMigration]
+        transfers: [TargetTransfer]
+        verifications: [TargetVerdict]
+        sizes: [TargetSize]
+        generation: int
+        nextMigration: int
+        rule: ReplRule
+        thresholds: LagThresholds
+
+    proc placementFabricNew() -> PlacementFabric:
+        let rule = do replRuleDefault()
+        let f = do placementFabricWithRule(rule)
+        return f
+
+    proc placementFabricWithRule(rule: ReplRule) -> PlacementFabric:
+        let routing = do tableNew()
+        let topology = do topologyRegistryNew()
+        let thresholds = do lagThresholdsDefault()
+        return PlacementFabric{routing: routing, topology: topology, sets: [], migrations: [], transfers: [], verifications: [], sizes: [], generation: 1, nextMigration: 1, rule: rule, thresholds: thresholds}
+
+    # ------------------------------------------------------ keyed lookups
+
+    private proc targetNodeLess(ta: ActionTarget, na: text, tb: ActionTarget, nb: text) -> bool:
+        let same = do actionTargetEquals(ta, tb)
+        if !same:
+            let less = do actionTargetLess(ta, tb)
+            return less
+        return na < nb
+
+    private proc setIndexOf(f: PlacementFabric, target: ActionTarget) -> int:
+        let n = len(f.sets)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(f.sets[i].target, target)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    private proc migrationIndexOf(f: PlacementFabric, target: ActionTarget) -> int:
+        let n = len(f.migrations)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(f.migrations[i].target, target)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    private proc transferIndexOf(f: PlacementFabric, target: ActionTarget, node: text) -> int:
+        let n = len(f.transfers)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(f.transfers[i].target, target)
+            if same && f.transfers[i].node == node:
+                return i
+            i = i + 1
+        return -1
+
+    private proc verdictIndexOf(f: PlacementFabric, target: ActionTarget, node: text) -> int:
+        let n = len(f.verifications)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(f.verifications[i].target, target)
+            if same && f.verifications[i].node == node:
+                return i
+            i = i + 1
+        return -1
+
+    private proc sizeIndexOf(f: PlacementFabric, target: ActionTarget) -> int:
+        let n = len(f.sizes)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(f.sizes[i].target, target)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    private proc insertSet(items: [TargetSet], entry: TargetSet) -> [TargetSet]:
+        let mut out = []
+        let mut placed = false
+        let n = len(items)
+        let mut i = 0
+        loop i < n:
+            let before = do actionTargetLess(entry.target, items[i].target)
+            if !placed && before:
+                out = append(out, entry)
+                placed = true
+            out = append(out, items[i])
+            i = i + 1
+        if !placed:
+            out = append(out, entry)
+        return out
+
+    private proc insertMigration(items: [TargetMigration], entry: TargetMigration) -> [TargetMigration]:
+        let mut out = []
+        let mut placed = false
+        let n = len(items)
+        let mut i = 0
+        loop i < n:
+            let before = do actionTargetLess(entry.target, items[i].target)
+            if !placed && before:
+                out = append(out, entry)
+                placed = true
+            out = append(out, items[i])
+            i = i + 1
+        if !placed:
+            out = append(out, entry)
+        return out
+
+    private proc insertTransfer(items: [TargetTransfer], entry: TargetTransfer) -> [TargetTransfer]:
+        let mut out = []
+        let mut placed = false
+        let n = len(items)
+        let mut i = 0
+        loop i < n:
+            let before = do targetNodeLess(entry.target, entry.node, items[i].target, items[i].node)
+            if !placed && before:
+                out = append(out, entry)
+                placed = true
+            out = append(out, items[i])
+            i = i + 1
+        if !placed:
+            out = append(out, entry)
+        return out
+
+    private proc insertVerdict(items: [TargetVerdict], entry: TargetVerdict) -> [TargetVerdict]:
+        let mut out = []
+        let mut placed = false
+        let n = len(items)
+        let mut i = 0
+        loop i < n:
+            let before = do targetNodeLess(entry.target, entry.node, items[i].target, items[i].node)
+            if !placed && before:
+                out = append(out, entry)
+                placed = true
+            out = append(out, items[i])
+            i = i + 1
+        if !placed:
+            out = append(out, entry)
+        return out
+
+    private proc insertSize(items: [TargetSize], entry: TargetSize) -> [TargetSize]:
+        let mut out = []
+        let mut placed = false
+        let n = len(items)
+        let mut i = 0
+        loop i < n:
+            let before = do actionTargetLess(entry.target, items[i].target)
+            if !placed && before:
+                out = append(out, entry)
+                placed = true
+            out = append(out, items[i])
+            i = i + 1
+        if !placed:
+            out = append(out, entry)
+        return out
+
+    private proc withRouting(f: PlacementFabric, routing: TableRoutingTable) -> PlacementFabric:
+        return PlacementFabric{routing: routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+
+    private proc withSets(f: PlacementFabric, sets: [TargetSet]) -> PlacementFabric:
+        return PlacementFabric{routing: f.routing, topology: f.topology, sets: sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+
+    private proc withMigrations(f: PlacementFabric, migrations: [TargetMigration]) -> PlacementFabric:
+        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+
+    private proc withTransfers(f: PlacementFabric, transfers: [TargetTransfer], verifications: [TargetVerdict]) -> PlacementFabric:
+        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: transfers, verifications: verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+
+    # ---------------------------------------------------------- accessors
+
+    proc placementFabricRouting(f: PlacementFabric) -> TableRoutingTable:
+        return f.routing
+
+    proc placementFabricTopology(f: PlacementFabric) -> TopologyRegistry:
+        return f.topology
+
+    proc placementFabricGeneration(f: PlacementFabric) -> int:
+        return f.generation
+
+    proc placementFabricRule(f: PlacementFabric) -> ReplRule:
+        return f.rule
+
+    struct ReplGroupOption:
+        has: bool
+        val: ReplGroup
+
+    proc placementFabricReplicaSet(f: PlacementFabric, target: ActionTarget) -> ReplGroupOption:
+        let idx = do setIndexOf(f, target)
+        if idx == -1:
+            let empty = do replGroupNew(target.shardId, 0)
+            return ReplGroupOption{has: false, val: empty}
+        return ReplGroupOption{has: true, val: f.sets[idx].group}
+
+    struct MigrationOption:
+        has: bool
+        val: Migration
+
+    proc placementFabricMigration(f: PlacementFabric, target: ActionTarget) -> MigrationOption:
+        let idx = do migrationIndexOf(f, target)
+        if idx == -1:
+            let zero = do placementFabricZeroMigration()
+            return MigrationOption{has: false, val: zero}
+        return MigrationOption{has: true, val: f.migrations[idx].migration}
+
+    # A placeholder Migration for an absent Option (never read when has is
+    # false): a real plan, since the struct carries one.
+    proc placementFabricZeroMigration() -> Migration:
+        let shard = do shardNew(0, "")
+        let reason = do migrationReasonRebalance()
+        let planned = do migrationPlanNew(MigrationId{value: 0}, shard, "-", "--", reason, 0)
+        let m = do migrationNew(planned.plan)
+        return m
+
+    struct TransferOption:
+        has: bool
+        val: TransferProgress
+
+    proc placementFabricTransfer(f: PlacementFabric, target: ActionTarget, node: text) -> TransferOption:
+        let idx = do transferIndexOf(f, target, node)
+        if idx == -1:
+            let zero = do transferProgressDefault()
+            return TransferOption{has: false, val: zero}
+        return TransferOption{has: true, val: f.transfers[idx].progress}
+
+    struct CopyVerdictOption:
+        has: bool
+        val: CopyVerdict
+
+    proc placementFabricVerification(f: PlacementFabric, target: ActionTarget, node: text) -> CopyVerdictOption:
+        let idx = do verdictIndexOf(f, target, node)
+        if idx == -1:
+            let pending = do copyVerdictPending()
+            return CopyVerdictOption{has: false, val: pending}
+        return CopyVerdictOption{has: true, val: f.verifications[idx].verdict}
+
+    struct SizeOption:
+        has: bool
+        val: int
+
+    proc placementFabricSize(f: PlacementFabric, target: ActionTarget) -> SizeOption:
+        let idx = do sizeIndexOf(f, target)
+        if idx == -1:
+            return SizeOption{has: false, val: 0}
+        return SizeOption{has: true, val: f.sizes[idx].bytes}
+
+    # ---------------------------------------------------------- ingestion
+
+    # adoptTopology: replace the placement map, register every placed node
+    # with routing, rebuild routing's coordinate overrides; the generation
+    # moves only if the (shard, cell) -> node map actually changed.
+    proc placementFabricAdoptTopology(f: PlacementFabric, topology: TopologyRegistry) -> PlacementFabric:
+        let before = f.topology
+        let mut routing = f.routing
+        let placements = do topologyRegistryPlacements(topology)
+        let n = len(placements)
+        let mut i = 0
+        loop i < n:
+            let registered = do tableRegisterNode(routing, placements[i].dbmsId, placements[i].region)
+            routing = registered
+            i = i + 1
+        let applied = do tableApplyPlacements(routing, topology)
+        let same = do placementMapsEqual(before, topology)
+        let mut generation = f.generation
+        if !same:
+            generation = generation + 1
+        return PlacementFabric{routing: applied, topology: topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+
+    # placement_map equality: same keys, same holder for each key.
+    proc placementMapsEqual(a: TopologyRegistry, b: TopologyRegistry) -> bool:
+        let pa = do topologyRegistryPlacements(a)
+        let pb = do topologyRegistryPlacements(b)
+        if len(pa) != len(pb):
+            return false
+        let n = len(pa)
+        let mut i = 0
+        loop i < n:
+            let found = do topologyRegistryLocate(b, pa[i].shardId, pa[i].coordinate)
+            if !found.found:
+                return false
+            if found.placement.dbmsId != pa[i].dbmsId:
+                return false
+            i = i + 1
+        return true
+
+    # observeNodes: routing owns placement, the runtime owns liveness. A
+    # degraded node stays routable; silence is what makes one unroutable.
+    proc placementFabricObserveNodes(f: PlacementFabric, nodes: NodeRegistry, nowMs: int, deadlineMs: int) -> PlacementFabric:
+        let mut routing = f.routing
+        let n = len(nodes.nodes)
+        let mut i = 0
+        loop i < n:
+            let node = nodes.nodes[i]
+            let registered = do tableRegisterNode(routing, node.id, node.region)
+            let health = do registeredNodeHealth(node, nowMs, deadlineMs)
+            let mut availability = "Serviceable"
+            if health == "unreachable":
+                availability = "Unreachable"
+            let set = do tableSetAvailability(registered, node.id, availability)
+            routing = set.table
+            i = i + 1
+        let out = do withRouting(f, routing)
+        return out
+
+    proc placementFabricRecordSize(f: PlacementFabric, target: ActionTarget, bytes: int) -> PlacementFabric:
+        let idx = do sizeIndexOf(f, target)
+        let mut sizes = f.sizes
+        if idx == -1:
+            let inserted = do insertSize(sizes, TargetSize{target: target, bytes: bytes})
+            sizes = inserted
+        else:
+            sizes[idx] = TargetSize{target: target, bytes: bytes}
+        return PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: sizes, generation: f.generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+
+    # recordTransfer: cumulative, each field only ever grows.
+    proc placementFabricRecordTransfer(f: PlacementFabric, target: ActionTarget, node: text, atomsCopied: int, bytesCopied: int, atMs: int) -> PlacementFabric:
+        let idx = do transferIndexOf(f, target, node)
+        let mut transfers = f.transfers
+        if idx == -1:
+            let entry = TargetTransfer{target: target, node: node, progress: TransferProgress{atomsCopied: max(0, atomsCopied), bytesCopied: max(0, bytesCopied), atMs: max(0, atMs)}}
+            let inserted = do insertTransfer(transfers, entry)
+            transfers = inserted
+        else:
+            let p = transfers[idx].progress
+            transfers[idx] = TargetTransfer{target: target, node: node, progress: TransferProgress{atomsCopied: max(p.atomsCopied, atomsCopied), bytesCopied: max(p.bytesCopied, bytesCopied), atMs: max(p.atMs, atMs)}}
+        let out = do withTransfers(f, transfers, f.verifications)
+        return out
+
+    # demandVerification: idempotent; never overwrites a filed verdict.
+    proc placementFabricDemandVerification(f: PlacementFabric, target: ActionTarget, node: text) -> PlacementFabric:
+        let idx = do verdictIndexOf(f, target, node)
+        if idx != -1:
+            return f
+        let pending = do copyVerdictPending()
+        let inserted = do insertVerdict(f.verifications, TargetVerdict{target: target, node: node, verdict: pending})
+        let out = do withTransfers(f, f.transfers, inserted)
+        return out
+
+    # recordVerification: the latest verdict wins, in both directions.
+    proc placementFabricRecordVerification(f: PlacementFabric, target: ActionTarget, node: text, verdict: CopyVerdict) -> PlacementFabric:
+        let idx = do verdictIndexOf(f, target, node)
+        let mut verifications = f.verifications
+        if idx == -1:
+            let inserted = do insertVerdict(verifications, TargetVerdict{target: target, node: node, verdict: verdict})
+            verifications = inserted
+        else:
+            verifications[idx] = TargetVerdict{target: target, node: node, verdict: verdict}
+        let out = do withTransfers(f, f.transfers, verifications)
+        return out
+
+    struct PlacementFabricResult:
+        ok: bool
+        err: FabricError
+        fabric: PlacementFabric
+
+    # observeReplica: fold a health report into the cell's set, re-publish.
+    proc placementFabricObserveReplica(f: PlacementFabric, target: ActionTarget, report: ReplReport) -> PlacementFabricResult:
+        let idx = do setIndexOf(f, target)
+        if idx == -1:
+            let e = do fabricErrorOf("NoReplicaSet", target)
+            return PlacementFabricResult{ok: false, err: e, fabric: f}
+        let observed = do replGroupObserve(f.sets[idx].group, report, f.thresholds)
+        if !observed.ok:
+            let e2 = do fabricErrorFromReplication(observed.error)
+            return PlacementFabricResult{ok: false, err: e2, fabric: f}
+        let mut sets = f.sets
+        sets[idx] = TargetSet{target: target, group: observed.group}
+        let updated = do withSets(f, sets)
+        let published = do placementFabricPublishReplicaSet(updated, target)
+        let none = do fabricErrorNone()
+        return PlacementFabricResult{ok: true, err: none, fabric: published}
+
+    # ---------------------------------------------------------- write path
+
+    struct AcceptWriteResult:
+        ok: bool
+        err: FabricError
+        route: text
+        fabric: PlacementFabric
+
+    # acceptWrite / recordApplied: delegate to the migration. Neither can
+    # change what routing snapshots (phase and cutover decide that), so
+    # neither re-publishes.
+    proc placementFabricAcceptWrite(f: PlacementFabric, target: ActionTarget, seq: int) -> AcceptWriteResult:
+        let idx = do migrationIndexOf(f, target)
+        if idx == -1:
+            let e = do fabricErrorOf("NoMigration", target)
+            return AcceptWriteResult{ok: false, err: e, route: "", fabric: f}
+        let accepted = do migrationAcceptWrite(f.migrations[idx].migration, seq)
+        if !accepted.ok:
+            let e2 = do fabricErrorFromMigration(accepted.err)
+            return AcceptWriteResult{ok: false, err: e2, route: "", fabric: f}
+        let mut migrations = f.migrations
+        migrations[idx] = TargetMigration{target: target, migration: accepted.value}
+        let out = do withMigrations(f, migrations)
+        let none = do fabricErrorNone()
+        return AcceptWriteResult{ok: true, err: none, route: accepted.route, fabric: out}
+
+    proc placementFabricRecordApplied(f: PlacementFabric, target: ActionTarget, seq: int, atMs: int) -> PlacementFabricResult:
+        let idx = do migrationIndexOf(f, target)
+        if idx == -1:
+            let e = do fabricErrorOf("NoMigration", target)
+            return PlacementFabricResult{ok: false, err: e, fabric: f}
+        let applied = do migrationRecordApplied(f.migrations[idx].migration, seq, atMs)
+        if !applied.ok:
+            let e2 = do fabricErrorFromMigration(applied.err)
+            return PlacementFabricResult{ok: false, err: e2, fabric: f}
+        let mut migrations = f.migrations
+        migrations[idx] = TargetMigration{target: target, migration: applied.value}
+        let out = do withMigrations(f, migrations)
+        let none = do fabricErrorNone()
+        return PlacementFabricResult{ok: true, err: none, fabric: out}
+
+    # ------------------------------------------------------------ lookups
+
+    proc placementFabricResolveRead(f: PlacementFabric, target: ActionTarget, preference: ReadPreference) -> TableResolveResult:
+        let key = do routingKeyNew(target.shardId, target.coordinate)
+        if !key.ok:
+            let empty = do tableEmptyRoute()
+            return TableResolveResult{ok: false, route: empty, err: key.err}
+        let r = do tableResolveRead(f.routing, key.key, preference)
+        return r
+
+    proc placementFabricResolveWrite(f: PlacementFabric, target: ActionTarget) -> TableResolveResult:
+        let key = do routingKeyNew(target.shardId, target.coordinate)
+        if !key.ok:
+            let empty = do tableEmptyRoute()
+            return TableResolveResult{ok: false, route: empty, err: key.err}
+        let r = do tableResolveWrite(f.routing, key.key)
+        return r
+
+    # placedCells: every cell of shardId the placement map knows, in
+    # target order.
+    proc placementFabricPlacedCells(f: PlacementFabric, shardId: int) -> [ActionTarget]:
+        let placements = do topologyRegistryPlacements(f.topology)
+        let mut cells = []
+        let n = len(placements)
+        let mut i = 0
+        loop i < n:
+            if placements[i].shardId == shardId:
+                cells = append(cells, ActionTarget{shardId: placements[i].shardId, coordinate: placements[i].coordinate})
+            i = i + 1
+        let sorted = do actionTargetArraySortAscending(cells)
+        return sorted
+
+    # candidates: routing's node table (in node-id order) with how many
+    # placements each holds; any node not known unreachable is serviceable.
+    proc placementFabricCandidates(f: PlacementFabric) -> [ReplCandidate]:
+        let nodes = do tableNodes(f.routing)
+        let placements = do topologyRegistryPlacements(f.topology)
+        let mut out = []
+        let n = len(nodes)
+        let m = len(placements)
+        let mut i = 0
+        loop i < n:
+            let mut hosted = 0
+            let mut j = 0
+            loop j < m:
+                if placements[j].dbmsId == nodes[i].id:
+                    hosted = hosted + 1
+                j = j + 1
+            out = append(out, ReplCandidate{node: nodes[i].id, region: nodes[i].region, serviceable: nodes[i].availability != "Unreachable", hostedReplicas: hosted})
+            i = i + 1
+        return out
+
+    struct PlanAdditionResult:
+        ok: bool
+        err: FabricError
+        has: bool
+        node: text
+        region: text
+
+    # planAddition: the node the replication planner would add next to the
+    # cell's set (bootstrapping one from the source if the cell has none),
+    # asking for one more copy than the set effectively holds.
+    proc placementFabricPlanAddition(f: PlacementFabric, target: ActionTarget, source: text, sourceRegion: text) -> PlanAdditionResult:
+        let idx = do setIndexOf(f, target)
+        let bootstrapped = do replGroupBootstrap(target.shardId, f.rule.factor, source, sourceRegion)
+        let mut cellSet = bootstrapped
+        if idx != -1:
+            cellSet = f.sets[idx].group
+        let effective = do replGroupEffectiveSize(cellSet)
+        let factor = do replFactorNew(min(effective + 1, 255))
+        if !factor.ok:
+            let e = do fabricErrorFromPlacement(factor.error)
+            return PlanAdditionResult{ok: false, err: e, has: false, node: "", region: ""}
+        let rule = ReplRule{factor: factor.factor, spread: f.rule.spread}
+        let candidates = do placementFabricCandidates(f)
+        let planned = do replPlan(rule, cellSet, candidates)
+        if !planned.ok:
+            let e2 = do fabricErrorFromPlacement(planned.error)
+            return PlanAdditionResult{ok: false, err: e2, has: false, node: "", region: ""}
+        let none = do fabricErrorNone()
+        if len(planned.plan.additions) == 0:
+            return PlanAdditionResult{ok: true, err: none, has: false, node: "", region: ""}
+        let first = planned.plan.additions[0]
+        return PlanAdditionResult{ok: true, err: none, has: true, node: first.node, region: first.region}
+
+    # -------------------------------------------- mechanism operations
+
+    # ensureReplicaSet: bootstrap the cell's set from its current holder
+    # (the one place a copy is in sync without seeding) and publish it.
+    proc placementFabricEnsureReplicaSet(f: PlacementFabric, target: ActionTarget, source: text, sourceRegion: text) -> PlacementFabric:
+        let idx = do setIndexOf(f, target)
+        if idx != -1:
+            return f
+        let group = do replGroupBootstrap(target.shardId, f.rule.factor, source, sourceRegion)
+        let sets = do insertSet(f.sets, TargetSet{target: target, group: group})
+        let updated = do withSets(f, sets)
+        let published = do placementFabricPublishReplicaSet(updated, target)
+        return published
+
+    # applyReplica: apply one replica operation and re-publish the set.
+    proc placementFabricApplyReplica(f: PlacementFabric, target: ActionTarget, op: ReplOp) -> PlacementFabricResult:
+        let idx = do setIndexOf(f, target)
+        if idx == -1:
+            let e = do fabricErrorOf("NoReplicaSet", target)
+            return PlacementFabricResult{ok: false, err: e, fabric: f}
+        let applied = do replGroupApply(f.sets[idx].group, op)
+        if !applied.ok:
+            let e2 = do fabricErrorFromReplication(applied.error)
+            return PlacementFabricResult{ok: false, err: e2, fabric: f}
+        let mut sets = f.sets
+        sets[idx] = TargetSet{target: target, group: applied.group}
+        let updated = do withSets(f, sets)
+        let published = do placementFabricPublishReplicaSet(updated, target)
+        let none = do fabricErrorNone()
+        return PlacementFabricResult{ok: true, err: none, fabric: published}
+
+    # startMigration: register a coordinate-scoped migration (one atom) and
+    # tell routing about it before it moves at all. Routing refusing the
+    # cell-scoped publication (it knows no such shard) is surfaced, not
+    # swallowed. The migration id is consumed even when planning fails.
+    proc placementFabricStartMigration(f: PlacementFabric, target: ActionTarget, source: text, sourceRegion: text, destination: text, reason: MigrationReason, atMs: int) -> PlacementFabricResult:
+        let id = MigrationId{value: f.nextMigration}
+        let bumped = PlacementFabric{routing: f.routing, topology: f.topology, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: f.generation, nextMigration: f.nextMigration + 1, rule: f.rule, thresholds: f.thresholds}
+        let shard = do shardNew(target.shardId, sourceRegion)
+        let planned = do migrationPlanNew(id, shard, source, destination, reason, atMs)
+        if !planned.ok:
+            let e = do fabricErrorFromMigration(planned.err)
+            return PlacementFabricResult{ok: false, err: e, fabric: bumped}
+        let p = planned.plan
+        let onePlan = MigrationPlan{id: p.id, shardId: p.shardId, source: p.source, destination: p.destination, reason: p.reason, createdAtMs: p.createdAtMs, atoms: 1, maxCutoverPendingWrites: p.maxCutoverPendingWrites}
+        let migration = do migrationNew(onePlan)
+        let observed = do tableObserveMigrationOf(bumped.routing, migration, true, target.coordinate)
+        if !observed.ok:
+            let e2 = do fabricErrorOf("UnroutableTarget", target)
+            return PlacementFabricResult{ok: false, err: e2, fabric: bumped}
+        let withTable = do withRouting(bumped, observed.table)
+        let idx = do migrationIndexOf(withTable, target)
+        let mut migrations = withTable.migrations
+        if idx == -1:
+            let inserted = do insertMigration(migrations, TargetMigration{target: target, migration: migration})
+            migrations = inserted
+        else:
+            migrations[idx] = TargetMigration{target: target, migration: migration}
+        let out = do withMigrations(withTable, migrations)
+        let none = do fabricErrorNone()
+        return PlacementFabricResult{ok: true, err: none, fabric: out}
+
+    # MigrationStep: the closed set of steps the mechanism takes on a
+    # migration (Rust passes a closure to step_migration). op is one of
+    # beginCopy | recordCopy | beginCatchUp | beginCutover |
+    # completeCutover | complete | abort | fail.
+    struct MigrationStep:
+        op: text
+        atMs: int
+        atoms: int
+        bytes: int
+        note: text
+
+    proc migrationStepOf(op: text, atMs: int) -> MigrationStep:
+        return MigrationStep{op: op, atMs: atMs, atoms: 0, bytes: 0, note: ""}
+
+    proc migrationStepRecordCopy(atoms: int, bytes: int, atMs: int) -> MigrationStep:
+        return MigrationStep{op: "recordCopy", atMs: atMs, atoms: atoms, bytes: bytes, note: ""}
+
+    proc migrationStepWithNote(op: text, atMs: int, note: text) -> MigrationStep:
+        return MigrationStep{op: op, atMs: atMs, atoms: 0, bytes: 0, note: note}
+
+    private proc applyMigrationStep(m: Migration, step: MigrationStep) -> MigrationResult:
+        if step.op == "beginCopy":
+            let r1 = do migrationBeginCopy(m, step.atMs)
+            return r1
+        if step.op == "recordCopy":
+            let r2 = do migrationRecordCopy(m, step.atoms, step.bytes, step.atMs)
+            return r2
+        if step.op == "beginCatchUp":
+            let r3 = do migrationBeginCatchUp(m, step.atMs)
+            return r3
+        if step.op == "beginCutover":
+            let r4 = do migrationBeginCutover(m, step.atMs)
+            return r4
+        if step.op == "completeCutover":
+            let r5 = do migrationCompleteCutover(m, step.atMs)
+            return r5
+        if step.op == "complete":
+            let r6 = do migrationComplete(m, step.atMs)
+            return r6
+        if step.op == "abort":
+            let r7 = do migrationAbort(m, step.atMs, step.note)
+            return r7
+        let r8 = do migrationFail(m, step.atMs, step.note)
+        return r8
+
+    # stepMigration: THE invariant — every phase change goes through here,
+    # and routing re-snapshots the migration on the way out whether the
+    # step succeeded or not (a failed step leaves the migration unchanged,
+    # exactly as Rust's `&mut` methods leave it on Err).
+    proc placementFabricStepMigration(f: PlacementFabric, target: ActionTarget, step: MigrationStep) -> PlacementFabricResult:
+        let idx = do migrationIndexOf(f, target)
+        if idx == -1:
+            let e = do fabricErrorOf("NoMigration", target)
+            return PlacementFabricResult{ok: false, err: e, fabric: f}
+        let stepped = do applyMigrationStep(f.migrations[idx].migration, step)
+        let mut current = f.migrations[idx].migration
+        if stepped.ok:
+            current = stepped.value
+        let mut migrations = f.migrations
+        migrations[idx] = TargetMigration{target: target, migration: current}
+        let observed = do tableObserveMigrationOf(f.routing, current, true, target.coordinate)
+        let mut routing = f.routing
+        if observed.ok:
+            routing = observed.table
+        let updated = do withMigrations(f, migrations)
+        let out = do withRouting(updated, routing)
+        if !stepped.ok:
+            let e2 = do fabricErrorFromMigration(stepped.err)
+            return PlacementFabricResult{ok: false, err: e2, fabric: out}
+        let none = do fabricErrorNone()
+        return PlacementFabricResult{ok: true, err: none, fabric: out}
+
+    # commitMove: at the instant authority moves, the coordinate's placement
+    # and its route move together.
+    proc placementFabricCommitMove(f: PlacementFabric, target: ActionTarget, destination: text, region: text) -> PlacementFabric:
+        let moved = do topologyRegistryMoveCoordinate(f.topology, target.shardId, target.coordinate, destination, region)
+        let mut generation = f.generation
+        if moved.moved:
+            generation = generation + 1
+        let registered = do tableRegisterNode(f.routing, destination, region)
+        let applied = do tableApplyPlacements(registered, moved.registry)
+        return PlacementFabric{routing: applied, topology: moved.registry, sets: f.sets, migrations: f.migrations, transfers: f.transfers, verifications: f.verifications, sizes: f.sizes, generation: generation, nextMigration: f.nextMigration, rule: f.rule, thresholds: f.thresholds}
+
+    # clearTransfer: forget the copy's progress AND its verdict, so a later
+    # attempt on the same target starts from nothing.
+    proc placementFabricClearTransfer(f: PlacementFabric, target: ActionTarget, node: text) -> PlacementFabric:
+        let mut transfers = []
+        let nt = len(f.transfers)
+        let mut i = 0
+        loop i < nt:
+            let same = do actionTargetEquals(f.transfers[i].target, target)
+            if !(same && f.transfers[i].node == node):
+                transfers = append(transfers, f.transfers[i])
+            i = i + 1
+        let mut verifications = []
+        let nv = len(f.verifications)
+        let mut j = 0
+        loop j < nv:
+            let same2 = do actionTargetEquals(f.verifications[j].target, target)
+            if !(same2 && f.verifications[j].node == node):
+                verifications = append(verifications, f.verifications[j])
+            j = j + 1
+        let out = do withTransfers(f, transfers, verifications)
+        return out
+
+    # publishReplicaSet: always scoped to the cell, never shard-wide.
+    proc placementFabricPublishReplicaSet(f: PlacementFabric, target: ActionTarget) -> PlacementFabric:
+        let idx = do setIndexOf(f, target)
+        if idx == -1:
+            return f
+        let published = do tableSetReplicaSet(f.routing, f.sets[idx].group, true, target.coordinate)
+        let out = do withRouting(f, published.table)
+        return out

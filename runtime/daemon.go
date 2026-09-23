@@ -14,7 +14,7 @@ package runtime
 //   - A daemon runs on THIS instance, unconditionally, with no cross-instance
 //     coordination at all, and its Body is real imperative code — the same
 //     statement vocabulary a `proc` has (loop/if/spawn/join/I-O), plus `act
-//     ActionName(args)` (ir.Stmt's "actcall" op — see execProcBlock's case)
+//     ActionName(args)` (ir.Stmt's "actcall" op — see proccompile.go's case)
 //     for touching entity/session state.
 //
 // A daemon is never joined — there is no handle for anything to hold. If its
@@ -23,7 +23,9 @@ package runtime
 // life (no restart policy — a real supervisor, if fabric-daemon ever needs
 // one, is future work, not something to fake here).
 import (
+	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"facet/internal/ir"
@@ -44,6 +46,39 @@ func (s *Server) startDaemons() {
 		}
 	}
 }
+
+// RunDaemons runs a program that is a service rather than a command — one
+// with daemons and no `proc main` (`facet exec server.fct`): its `on start`
+// jobs run first, inline and in order, exactly as StartJobs runs them before
+// a server's daemons (so a daemon may rely on the state they set up — a
+// listener's configuration, a published snapshot); then every daemon is
+// started as startDaemons starts it, and the call returns only when all of
+// them have ended (a ticking daemon never does), so the process lives as
+// long as its service does.
+func (s *Server) RunDaemons() error {
+	if len(s.ir.Daemons) == 0 {
+		return fmt.Errorf("%s has no daemon to run", s.ir.App)
+	}
+	s.runOnStartJobs()
+	var wg sync.WaitGroup
+	for i := range s.ir.Daemons {
+		d := &s.ir.Daemons[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if d.Every > 0 {
+				s.runDaemonTicking(d)
+			} else {
+				s.runDaemonOnce(d)
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
+}
+
+// HasMain reports whether the program declares `proc main` (a command).
+func (s *Server) HasMain() bool { return s.byProc["main"] != nil }
 
 // runDaemonTicking runs d.Body once per Every-second tick, forever, on this
 // instance alone (no ReserveCron — see this file's doc for why that dedup is
@@ -83,8 +118,41 @@ func (s *Server) runDaemonBody(d *ir.Daemon) {
 			s.obs.log.Error("daemon panicked", slog.String("daemon", d.Name), slog.Any("panic", r))
 		}
 	}()
-	fr := &frame{vars: map[string]any{}}
-	if _, err := s.execProcBlock(d.Body, fr); err != nil {
+	pc := s.codeFor(d, nil, d.Body)
+	fr := pc.newFrame()
+	_, err := runStmts(pc.body, fr)
+	pc.release(fr)
+	if err != nil {
 		s.obs.log.Error("daemon failed", slog.String("daemon", d.Name), slog.Any("error", err))
 	}
+}
+
+// detachProc implements `detach ProcName(args)` (see ast.Detach's doc; the
+// statement lowers to the "$detach" intrinsic): it starts the named proc on
+// its own goroutine and returns at once. Only a daemon body can reach this
+// (internal/ir/build.go refuses detach anywhere else), so the task it starts
+// shares the daemon's process lifetime and, like the daemon's own body, runs
+// under no request's lock. Nothing joins it, so a failure or a panic is
+// logged here — the same treatment runDaemonBody gives a daemon's — and ends
+// only that task.
+//
+// args is copied: the caller's argument slice may be a stack buffer that is
+// reused the moment this returns.
+func (s *Server) detachProc(name string, args []any) (any, error) {
+	p := s.byProc[name]
+	if p == nil {
+		return nil, fmt.Errorf("detach calls unknown proc %q", name)
+	}
+	vals := append([]any(nil), args...)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.obs.log.Error("detached proc panicked", slog.String("proc", name), slog.Any("panic", r))
+			}
+		}()
+		if _, err := s.runProcLocked(p, vals); err != nil {
+			s.obs.log.Error("detached proc failed", slog.String("proc", name), slog.Any("error", err))
+		}
+	}()
+	return true, nil
 }

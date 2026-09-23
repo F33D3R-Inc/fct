@@ -45,7 +45,25 @@ import (
 // row — TestToolchainVersionCoversControls in this package fails the build
 // the day that's forgotten again, though it only catches Controls, not every
 // way the language can grow.
-var ToolchainVersion = "1.32.0"
+//
+// Bumped 1.32.0 → 1.33.0 when the drift recurred at a far larger scale: the
+// declarations `contract`, `api`, `stream`, `message`, `webhook`, `service`,
+// `stage`, the action statements `establish`/`revoke`/`restate`/`header` and
+// `check … code`, the `type X as` wire DTOs, dozens of builtins, and the
+// one-table builtin placement (internal/parser/builtins.go, which now refuses
+// a proc-only builtin in a view) all landed with this still at 1.32.0, so a
+// 1.32.0 toolchain could not compile facets/api/main.fct (`unexpected
+// "contract"`) while every manifest's ">=1.32.0" claimed it could.
+// TestToolchainVersionCoversBuiltins now pins the builtin table the same way
+// TestToolchainVersionCoversControls pins ast.Controls.
+//
+// Bumped 1.33.0 → 1.34.0 for what the fabric port added to the language:
+// float literals with an exponent (`1e22`, `2.5E-3`); `proc main(args:
+// [text]) -> int` as a command's entry point (`facet exec`), lowered as a
+// daemon-context body (listen/accept/detach/act allowed); and the builtins
+// listenOn (a listener bound to one address), nowMs (the wall clock in
+// milliseconds) and signals (SIGINT/SIGTERM delivered on a channel).
+var ToolchainVersion = "1.34.0"
 
 // CheckToolchainRange reports whether the running ToolchainVersion satisfies a
 // `facet` manifest range, returning a clear "upgrade the toolchain" error when

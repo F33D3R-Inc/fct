@@ -152,18 +152,8 @@ func TestClientToIntMatchesServer(t *testing.T) {
 	}
 
 	var script strings.Builder
+	script.WriteString(clientBuiltinPrelude(t))
 	script.WriteString(`
-const FA_NUMERIC = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
-function toInt(v) {
-  if (typeof v === "number") return Math.trunc(v);
-  if (v === true) return 1;
-  if (typeof v === "string") {
-    const t = v.trim();
-    if (!FA_NUMERIC.test(t)) return 0;
-    return Math.trunc(Number(t));
-  }
-  return 0;
-}
 const cases = `)
 	script.WriteString("[")
 	for i, c := range tointCases {
@@ -201,7 +191,7 @@ func TestClientMirrorIsTheShippedSource(t *testing.T) {
 	for _, want := range []string{
 		`const FA_NUMERIC = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;`,
 		`if (!FA_NUMERIC.test(t)) return 0;`,
-		`return Math.trunc(Number(t));`,
+		`return isFinite(n) ? Math.trunc(n) : 0;`,
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("assets/facet.js no longer contains %q — the mirror checked by\n"+

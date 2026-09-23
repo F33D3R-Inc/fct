@@ -1,0 +1,1797 @@
+app FabricJsonSelfHost:
+    # serde_json, as the fabric crates use it: the wire format of
+    # fabric-protocol (serde_json::from_slice / to_vec) and the `--json` output
+    # of fabric-cli (serde_json::to_string_pretty). Shared by every fabric_*
+    # port that has a serde shape; every name here is prefixed `sj`.
+    #
+    # Reader: sjDecode(types, src, name) is serde_json::from_slice::<T> for a
+    # T described by a schema table (SjType: derived structs, Vec, externally
+    # tagged enums, the primitives): serde_json's Deserializer (de.rs,
+    # read.rs) driven the way serde's derived visitors drive it, so it
+    # accepts and refuses exactly what the real type does — unknown fields
+    # skipped by ignore_value, duplicate/missing fields, a struct's array
+    # form, #[serde(default)], the u8/u64/f64 number classes, string escapes
+    # and surrogates — and a refusal's text is serde_json::Error's Display,
+    # " at line L column C" included, positioned where serde_json positions
+    # it. Floats use serde_json's default (non-float_roundtrip) algorithm,
+    # f64_from_parts. The decoded value is an SjV tree ("obj" items in field
+    # order, "absent" for a defaulted field, "enum" with the variant in `s`).
+    #
+    # Writer: sjQuote (serde_json's string escaping), sjU64Text (a u64 held
+    # in an int's 64 bits), sjF64Text (the shortest round-trip text as
+    # serde_json writes it, `null` for a non-finite value), and sjPretty
+    # (serde_json's PrettyFormatter over compact output).
+
+    struct SjV:
+        kind: text
+        b: bool
+        s: text
+        num: text
+        u: int
+        f: float
+        items: [SjV]
+        keys: [text]
+
+
+    proc sjNull() -> SjV:
+        return SjV{kind: "null", b: false, s: "", num: "", u: 0, f: 0.0, items: [], keys: []}
+
+    proc sjAbsent() -> SjV:
+        return SjV{kind: "absent", b: false, s: "", num: "", u: 0, f: 0.0, items: [], keys: []}
+
+    proc sjWs(bs: [int], p0: int) -> int:
+        let n = len(bs)
+        let mut p = p0
+        loop p < n && (bs[p] == 32 || bs[p] == 9 || bs[p] == 10 || bs[p] == 13):
+            p = p + 1
+        return p
+
+    proc sjIsDigit(c: int) -> bool:
+        return c >= 48 && c <= 57
+
+    # u64 comparison of two ints holding u64 bit patterns.
+    proc sjU64Gt(a: int, b: int) -> bool:
+        let m = 1 << 63
+        return (a ^ m) > (b ^ m)
+
+    # `u as f64` for a u64 held in an int (round to nearest, ties to even:
+    # halve with the dropped bit folded in as a sticky bit, then double).
+    proc sjU64Float(a: int) -> float:
+        if a >= 0:
+            return toFloat(a)
+        let half = ((a >> 1) & 9223372036854775807) | (a & 1)
+        return toFloat(half) * 2.0
+
+    proc sjIsInf(f: float) -> bool:
+        let bits = floatBits(f)
+        return ((bits >> 52) & 2047) == 2047
+
+    # serde_json's overflow!(a * 10 + d, u64::MAX).
+    proc sjMulOverflows(a: int, d: int) -> bool:
+        let lim = 1844674407370955161
+        return !sjU64Gt(lim, a) && (sjU64Gt(a, lim) || d > 5)
+
+    proc sjRange(bs: [int], from: int, to: int) -> [int]:
+        let mut out = bytes(to - from)
+        let mut i = from
+        loop i < to:
+            out[i - from] = bs[i]
+            i = i + 1
+        return out
+
+    # ============================================================
+    # Positions and errors — serde_json's Error Display is
+    # "<message> at line L column C" for an error with a position (line
+    # 1-based, column = bytes since the line's start), the bare message for
+    # one without (a visitor error nothing positioned before it reached the
+    # top).
+    # ============================================================
+    proc sjPosition(bs: [int], idx: int) -> text:
+        let mut line = 1
+        let mut start = 0
+        let mut k = 0
+        loop k < idx:
+            if bs[k] == 10:
+                line = line + 1
+                start = k + 1
+            k = k + 1
+        return " at line " + line + " column " + (idx - start)
+
+    # One deserialization step: the value, or an error; `i` is the reader's
+    # index afterwards either way (a later fix_position reads it); `posd`
+    # says whether `err` already carries its position.
+    #
+    # An error also carries serde_json's Error::classify category ("syntax",
+    # "eof" or "data": every serde::de::Error::custom message — invalid
+    # type/value/length, unknown/missing/duplicate field, unknown variant —
+    # is ErrorCode::Message, i.e. data) and its serde_path_to_error path:
+    # the segments (a map key or struct field name, "[i]" for a sequence
+    # element, an enum variant, "?" for a key that never finished) of the
+    # innermost tracked seed the error surfaced in, root first.
+    struct SjD:
+        ok: bool
+        err: text
+        posd: bool
+        i: int
+        v: SjV
+        cat: text
+        path: [text]
+
+    proc sjOk(i: int, v: SjV) -> SjD:
+        return SjD{ok: true, err: "", posd: true, i: i, v: v, cat: "", path: []}
+
+    # Error::classify for a serde_json ErrorCode message.
+    proc sjCategory(code: text) -> text:
+        if slice(code, 0, 17) == "EOF while parsing":
+            return "eof"
+        let syntax = ["expected `:`", "expected `,` or `]`", "expected `,` or `}`", "expected ident", "expected value", "expected `\"`", "invalid escape", "invalid number", "number out of range", "invalid unicode code point", "control character (\\u0000-\\u001F) found while parsing a string", "key must be a string", "invalid value: expected key to be a number in quotes", "float key must be finite (got NaN or +/-inf)", "lone leading surrogate in hex escape", "trailing comma", "trailing characters", "unexpected end of hex escape", "recursion limit exceeded"]
+        let mut k = 0
+        loop k < len(syntax):
+            if syntax[k] == code:
+                return "syntax"
+            k = k + 1
+        return "data"
+
+    # peek_position's index: one past `i`, capped at the input length.
+    proc sjPeekAt(n: int, i: int) -> int:
+        if i + 1 < n:
+            return i + 1
+        return n
+
+    # `self.error(code)`: positioned at the reader index.
+    proc sjErr(bs: [int], i: int, code: text) -> SjD:
+        return SjD{ok: false, err: code + sjPosition(bs, i), posd: true, i: i, v: sjNull(), cat: sjCategory(code), path: []}
+
+    # `self.peek_error(code)`: positioned one past the reader index.
+    proc sjPeekErr(bs: [int], i: int, code: text) -> SjD:
+        let mut at = i + 1
+        if at > len(bs):
+            at = len(bs)
+        return SjD{ok: false, err: code + sjPosition(bs, at), posd: true, i: i, v: sjNull(), cat: sjCategory(code), path: []}
+
+    # A visitor's error (serde::de::Error::custom and friends): no position.
+    proc sjRaw(i: int, msg: text) -> SjD:
+        return SjD{ok: false, err: msg, posd: false, i: i, v: sjNull(), cat: "data", path: []}
+
+    # `self.fix_position(err)`: an unpositioned error takes the reader index.
+    proc sjFix(bs: [int], d: SjD, i: int) -> SjD:
+        if d.ok || d.posd:
+            return d
+        return SjD{ok: false, err: d.err + sjPosition(bs, i), posd: true, i: i, v: d.v, cat: d.cat, path: d.path}
+
+    proc sjAt(d: SjD, i: int) -> SjD:
+        return SjD{ok: d.ok, err: d.err, posd: d.posd, i: i, v: d.v, cat: d.cat, path: d.path}
+
+    # An error that surfaced inside the tracked seed whose segment is `seg`
+    # (serde_path_to_error's TrackedSeed / CaptureKey chains): `seg` goes in
+    # front of whatever path the error already has.
+    proc sjUnder(d: SjD, seg: text) -> SjD:
+        if d.ok:
+            return d
+        let mut out = d
+        let mut p = [seg]
+        let mut k = 0
+        loop k < len(d.path):
+            p = append(p, d.path[k])
+            k = k + 1
+        out.path = p
+        return out
+
+    # Path's Display, or "" where serde_path_to_error::Error's Display
+    # leaves it out (no segments, or only `?` ones).
+    proc sjPathText(path: [text]) -> text:
+        let mut known = false
+        let mut k = 0
+        loop k < len(path):
+            if path[k] != "?":
+                known = true
+            k = k + 1
+        if !known:
+            return ""
+        let mut out = ""
+        let mut j = 0
+        loop j < len(path):
+            let seg = path[j]
+            if j > 0 && slice(seg, 0, 1) != "[":
+                out = out + "."
+            out = out + seg
+            j = j + 1
+        return out
+
+    # ============================================================
+    # Numbers — de.rs parse_integer / parse_number / parse_long_integer /
+    # parse_decimal(_overflow) / parse_exponent(_overflow) / f64_from_parts
+    # (default features). The value node records serde_json's ParserNumber:
+    # num "u64" (u = the u64 bits), "i64" (u = the value) or "f64" (f).
+    # ============================================================
+    proc sjNumV(num: text, u: int, f: float) -> SjV:
+        return SjV{kind: "num", b: false, s: "", num: num, u: u, f: f, items: [], keys: []}
+
+    proc sjF64V(f: float) -> SjV:
+        return sjNumV("f64", 0, f)
+
+    proc sjFromParts(bs: [int], i: int, positive: bool, sig: int, exp0: int) -> SjD:
+        let mut f = sjU64Float(sig)
+        let mut exponent = exp0
+        loop true:
+            let mut ae = exponent
+            if ae < 0:
+                ae = 0 - ae
+            if ae <= 308:
+                let pow = toFloat("1e" + ae)
+                if exponent >= 0:
+                    f = f * pow
+                    if sjIsInf(f):
+                        return sjErr(bs, i, "number out of range")
+                else:
+                    f = f / pow
+                break
+            if f == 0.0:
+                break
+            if exponent >= 0:
+                return sjErr(bs, i, "number out of range")
+            f = f / toFloat("1e308")
+            exponent = exponent + 308
+        if !positive:
+            f = 0.0 - f
+            if f == 0.0:
+                f = floatFromBits(1 << 63)
+        return sjOk(i, sjF64V(f))
+
+    proc sjSatI32(v: int) -> int:
+        if v > 2147483647:
+            return 2147483647
+        if v < -2147483648:
+            return -2147483648
+        return v
+
+    # parse_exponent: `i` is at the 'e'/'E'.
+    proc sjExponent(bs: [int], i0: int, positive: bool, sig: int, start: int) -> SjD:
+        let n = len(bs)
+        let mut i = i0 + 1
+        let mut posExp = true
+        if i < n && (bs[i] == 43 || bs[i] == 45):
+            posExp = bs[i] == 43
+            i = i + 1
+        if i >= n:
+            return sjErr(bs, i, "EOF while parsing a value")
+        let first = bs[i]
+        i = i + 1
+        if !sjIsDigit(first):
+            return sjErr(bs, i, "invalid number")
+        let mut exp = first - 48
+        loop i < n && sjIsDigit(bs[i]):
+            let d = bs[i] - 48
+            i = i + 1
+            if exp >= 214748364 && (exp > 214748364 || d > 7):
+                if sig != 0 && posExp:
+                    return sjErr(bs, i, "number out of range")
+                loop i < n && sjIsDigit(bs[i]):
+                    i = i + 1
+                let mut z = 0.0
+                if !positive:
+                    z = floatFromBits(1 << 63)
+                return sjOk(i, sjF64V(z))
+            exp = exp * 10 + d
+        let mut fin = start + exp
+        if !posExp:
+            fin = start - exp
+        return sjFromParts(bs, i, positive, sig, sjSatI32(fin))
+
+    # parse_decimal: `i` is at the '.'.
+    proc sjDecimal(bs: [int], i0: int, positive: bool, sig0: int, before: int) -> SjD:
+        let n = len(bs)
+        let mut i = i0 + 1
+        let mut sig = sig0
+        let mut after = 0
+        loop i < n && sjIsDigit(bs[i]):
+            let d = bs[i] - 48
+            if sjMulOverflows(sig, d):
+                loop i < n && sjIsDigit(bs[i]):
+                    i = i + 1
+                if i < n && (bs[i] == 101 || bs[i] == 69):
+                    return sjExponent(bs, i, positive, sig, before + after)
+                return sjFromParts(bs, i, positive, sig, before + after)
+            sig = sig * 10 + d
+            after = after - 1
+            i = i + 1
+        if after == 0:
+            if i < n:
+                return sjPeekErr(bs, i, "invalid number")
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        if i < n && (bs[i] == 101 || bs[i] == 69):
+            return sjExponent(bs, i, positive, sig, before + after)
+        return sjFromParts(bs, i, positive, sig, before + after)
+
+    # parse_integer: `i` is at the first digit (after a '-' already eaten).
+    proc sjInteger(bs: [int], i0: int, positive: bool) -> SjD:
+        let n = len(bs)
+        let mut i = i0
+        if i >= n:
+            return sjErr(bs, i, "EOF while parsing a value")
+        let c = bs[i]
+        i = i + 1
+        let mut sig = 0
+        if c == 48:
+            if i < n && sjIsDigit(bs[i]):
+                return sjPeekErr(bs, i, "invalid number")
+        else:
+            if !sjIsDigit(c):
+                return sjErr(bs, i, "invalid number")
+            sig = c - 48
+            loop i < n && sjIsDigit(bs[i]):
+                let d = bs[i] - 48
+                if sjMulOverflows(sig, d):
+                    let mut exp = 0
+                    loop i < n && sjIsDigit(bs[i]):
+                        i = i + 1
+                        exp = exp + 1
+                    if i < n && bs[i] == 46:
+                        return sjDecimal(bs, i, positive, sig, exp)
+                    if i < n && (bs[i] == 101 || bs[i] == 69):
+                        return sjExponent(bs, i, positive, sig, exp)
+                    return sjFromParts(bs, i, positive, sig, exp)
+                sig = sig * 10 + d
+                i = i + 1
+        if i < n && bs[i] == 46:
+            return sjDecimal(bs, i, positive, sig, 0)
+        if i < n && (bs[i] == 101 || bs[i] == 69):
+            return sjExponent(bs, i, positive, sig, 0)
+        if positive:
+            return sjOk(i, sjNumV("u64", sig, sjU64Float(sig)))
+        let neg = 0 - sig
+        if neg >= 0:
+            let mut nf = 0.0 - sjU64Float(sig)
+            if sig == 0:
+                nf = floatFromBits(1 << 63)
+            return sjOk(i, sjF64V(nf))
+        return sjOk(i, sjNumV("i64", neg, toFloat(neg)))
+
+    # A number starting at `i` (a '-' or a digit).
+    proc sjAnyNumber(bs: [int], i: int) -> SjD:
+        if bs[i] == 45:
+            return sjInteger(bs, i + 1, false)
+        return sjInteger(bs, i, true)
+
+    # ============================================================
+    # Strings — read.rs parse_str (validating: escapes, surrogate pairs,
+    # raw control characters refused) and ignore_str (for skipped values:
+    # \u escapes only need four hex digits).
+    # ============================================================
+    proc sjUtf8(cp: int) -> [int]:
+        if cp < 128:
+            return [cp]
+        if cp < 2048:
+            return [192 | (cp >> 6), 128 | (cp & 63)]
+        if cp < 65536:
+            return [224 | (cp >> 12), 128 | ((cp >> 6) & 63), 128 | (cp & 63)]
+        return [240 | (cp >> 18), 128 | ((cp >> 12) & 63), 128 | ((cp >> 6) & 63), 128 | (cp & 63)]
+
+    # decode_hex_escape: four hex digits at `i`; u = the code unit.
+    proc sjHex4(bs: [int], i: int) -> SjD:
+        let n = len(bs)
+        if i + 4 > n:
+            return sjErr(bs, n, "EOF while parsing a string")
+        let mut v = 0
+        let mut k = 0
+        let mut bad = false
+        loop k < 4:
+            let c = bs[i + k]
+            let mut d = -1
+            if c >= 48 && c <= 57:
+                d = c - 48
+            if c >= 97 && c <= 102:
+                d = c - 87
+            if c >= 65 && c <= 70:
+                d = c - 55
+            if d < 0:
+                bad = true
+            v = v * 16 + d
+            k = k + 1
+        if bad:
+            return sjErr(bs, i + 4, "invalid escape")
+        return sjOk(i + 4, sjNumV("u64", v, 0.0))
+
+    # str::from_utf8's validity (no overlongs, no surrogates, <= U+10FFFF).
+    proc sjValidUtf8(bs: [int]) -> bool:
+        let n = len(bs)
+        let mut i = 0
+        loop i < n:
+            let c = bs[i]
+            if c < 128:
+                i = i + 1
+            else:
+                let mut w = 0
+                let mut lo = 128
+                let mut hi = 191
+                if c >= 194 && c <= 223:
+                    w = 2
+                if c >= 224 && c <= 239:
+                    w = 3
+                    if c == 224:
+                        lo = 160
+                    if c == 237:
+                        hi = 159
+                if c >= 240 && c <= 244:
+                    w = 4
+                    if c == 240:
+                        lo = 144
+                    if c == 244:
+                        hi = 143
+                if w == 0 || i + w > n:
+                    return false
+                if bs[i + 1] < lo || bs[i + 1] > hi:
+                    return false
+                let mut k = 2
+                loop k < w:
+                    if bs[i + k] < 128 || bs[i + k] > 191:
+                        return false
+                    k = k + 1
+                i = i + w
+        return true
+
+    # parse_str: `i` is just past the opening quote; the value is the
+    # decoded text. Validated as UTF-8 once the closing quote is reached
+    # (as_str), so an escape or control-character error comes first. Each
+    # raw run is checked on its own: escapes only ever add whole characters,
+    # so the string is valid exactly when every raw run is.
+    proc sjStr(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let mut out = ""
+        let mut i = i0
+        let mut badUtf8 = false
+        loop true:
+            let start = i
+            loop i < n && bs[i] != 34 && bs[i] != 92 && bs[i] >= 32:
+                i = i + 1
+            if i > start:
+                let chunk = sjRange(bs, start, i)
+                if !sjValidUtf8(chunk):
+                    badUtf8 = true
+                out = out + bytesToText(chunk)
+            if i >= n:
+                return sjErr(bs, n, "EOF while parsing a string")
+            let c = bs[i]
+            if c == 34:
+                if badUtf8:
+                    return sjErr(bs, i + 1, "invalid unicode code point")
+                return sjOk(i + 1, SjV{kind: "str", b: false, s: out, num: "", u: 0, f: 0.0, items: [], keys: []})
+            if c != 92:
+                return sjErr(bs, i + 1, "control character (\\u0000-\\u001F) found while parsing a string")
+            i = i + 1
+            if i >= n:
+                return sjErr(bs, i, "EOF while parsing a string")
+            let e = bs[i]
+            i = i + 1
+            if e == 34 || e == 92 || e == 47:
+                out = out + bytesToText([e])
+            else:
+                if e == 98 || e == 102 || e == 110 || e == 114 || e == 116:
+                    let mut b = 8
+                    if e == 102:
+                        b = 12
+                    if e == 110:
+                        b = 10
+                    if e == 114:
+                        b = 13
+                    if e == 116:
+                        b = 9
+                    out = out + bytesToText([b])
+                else:
+                    if e != 117:
+                        return sjErr(bs, i, "invalid escape")
+                    let h = sjHex4(bs, i)
+                    if !h.ok:
+                        return h
+                    i = h.i
+                    let cp = h.v.u
+                    if cp >= 56320 && cp <= 57343:
+                        return sjErr(bs, i, "lone leading surrogate in hex escape")
+                    if cp >= 55296 && cp <= 56319:
+                        if i >= n:
+                            return sjErr(bs, i, "EOF while parsing a string")
+                        if bs[i] != 92:
+                            return sjErr(bs, i + 1, "unexpected end of hex escape")
+                        i = i + 1
+                        if i >= n:
+                            return sjErr(bs, i, "EOF while parsing a string")
+                        if bs[i] != 117:
+                            return sjErr(bs, i + 1, "unexpected end of hex escape")
+                        i = i + 1
+                        let lo = sjHex4(bs, i)
+                        if !lo.ok:
+                            return lo
+                        i = lo.i
+                        if lo.v.u < 56320 || lo.v.u > 57343:
+                            return sjErr(bs, i, "lone leading surrogate in hex escape")
+                        out = out + bytesToText(sjUtf8(65536 + ((cp - 55296) << 10) + (lo.v.u - 56320)))
+                    else:
+                        out = out + bytesToText(sjUtf8(cp))
+        return sjErr(bs, n, "EOF while parsing a string")
+
+    # ignore_str: `i` just past the opening quote.
+    proc sjIgnoreStr(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let mut i = i0
+        loop true:
+            loop i < n && bs[i] != 34 && bs[i] != 92 && bs[i] >= 32:
+                i = i + 1
+            if i >= n:
+                return sjErr(bs, n, "EOF while parsing a string")
+            if bs[i] == 34:
+                return sjOk(i + 1, sjNull())
+            if bs[i] != 92:
+                return sjErr(bs, i, "control character (\\u0000-\\u001F) found while parsing a string")
+            i = i + 1
+            if i >= n:
+                return sjErr(bs, i, "EOF while parsing a string")
+            let e = bs[i]
+            i = i + 1
+            if e == 117:
+                let h = sjHex4(bs, i)
+                if !h.ok:
+                    return h
+                i = h.i
+            else:
+                if !(e == 34 || e == 92 || e == 47 || e == 98 || e == 102 || e == 110 || e == 114 || e == 116):
+                    return sjErr(bs, i, "invalid escape")
+        return sjErr(bs, n, "EOF while parsing a string")
+
+    # parse_ident: the rest of `true`/`false`/`null` from `i`.
+    proc sjIdent(bs: [int], i0: int, rest: text) -> SjD:
+        let want = textToBytes(rest)
+        let n = len(bs)
+        let mut i = i0
+        let mut k = 0
+        loop k < len(want):
+            if i >= n:
+                return sjErr(bs, i, "EOF while parsing a value")
+            let c = bs[i]
+            i = i + 1
+            if c != want[k]:
+                return sjErr(bs, i, "expected ident")
+            k = k + 1
+        return sjOk(i, sjNull())
+
+    # ============================================================
+    # Skipping a value (an unknown field's) — de.rs ignore_value and
+    # ignore_integer/decimal/exponent: an explicit stack of open frames.
+    # ============================================================
+    proc sjIgnoreNumber(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let mut i = i0
+        if i >= n:
+            return sjErr(bs, i, "invalid number")
+        let c = bs[i]
+        i = i + 1
+        if c == 48:
+            if i < n && sjIsDigit(bs[i]):
+                return sjPeekErr(bs, i, "invalid number")
+        else:
+            if !sjIsDigit(c):
+                return sjErr(bs, i, "invalid number")
+            loop i < n && sjIsDigit(bs[i]):
+                i = i + 1
+        if i < n && bs[i] == 46:
+            i = i + 1
+            let before = i
+            loop i < n && sjIsDigit(bs[i]):
+                i = i + 1
+            if i == before:
+                return sjPeekErr(bs, i, "invalid number")
+        if i < n && (bs[i] == 101 || bs[i] == 69):
+            i = i + 1
+            if i < n && (bs[i] == 43 || bs[i] == 45):
+                i = i + 1
+            if i >= n:
+                return sjErr(bs, i, "invalid number")
+            let d = bs[i]
+            i = i + 1
+            if !sjIsDigit(d):
+                return sjErr(bs, i, "invalid number")
+            loop i < n && sjIsDigit(bs[i]):
+                i = i + 1
+        return sjOk(i, sjNull())
+
+    proc sjPop(stack: [int]) -> [int]:
+        let mut out = []
+        let mut k = 0
+        loop k < len(stack) - 1:
+            out = append(out, stack[k])
+            k = k + 1
+        return out
+
+    proc sjIgnoreValue(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let mut i = i0
+        let mut stack = []
+        loop true:
+            i = sjWs(bs, i)
+            if i >= n:
+                return sjPeekErr(bs, i, "EOF while parsing a value")
+            let c = bs[i]
+            let mut opened = 0
+            if c == 110 || c == 116 || c == 102:
+                let mut rest = "ull"
+                if c == 116:
+                    rest = "rue"
+                if c == 102:
+                    rest = "alse"
+                let id = sjIdent(bs, i + 1, rest)
+                if !id.ok:
+                    return id
+                i = id.i
+            else:
+                if c == 45 || sjIsDigit(c):
+                    let mut from = i
+                    if c == 45:
+                        from = i + 1
+                    let num = sjIgnoreNumber(bs, from)
+                    if !num.ok:
+                        return num
+                    i = num.i
+                else:
+                    if c == 34:
+                        let s = sjIgnoreStr(bs, i + 1)
+                        if !s.ok:
+                            return s
+                        i = s.i
+                    else:
+                        if c == 91 || c == 123:
+                            opened = c
+                            i = i + 1
+                        else:
+                            return sjPeekErr(bs, i, "expected value")
+            let mut frame = opened
+            let mut acceptComma = false
+            if opened == 0:
+                if len(stack) == 0:
+                    return sjOk(i, sjNull())
+                frame = stack[len(stack) - 1]
+                stack = sjPop(stack)
+                acceptComma = true
+            let mut descend = false
+            loop !descend:
+                i = sjWs(bs, i)
+                if i >= n:
+                    if frame == 91:
+                        return sjPeekErr(bs, i, "EOF while parsing a list")
+                    return sjPeekErr(bs, i, "EOF while parsing an object")
+                let p = bs[i]
+                if p == 44 && acceptComma:
+                    i = i + 1
+                    descend = true
+                else:
+                    if (p == 93 && frame == 91) || (p == 125 && frame == 123):
+                        i = i + 1
+                        if len(stack) == 0:
+                            return sjOk(i, sjNull())
+                        frame = stack[len(stack) - 1]
+                        stack = sjPop(stack)
+                        acceptComma = true
+                    else:
+                        if acceptComma:
+                            if frame == 91:
+                                return sjPeekErr(bs, i, "expected `,` or `]`")
+                            return sjPeekErr(bs, i, "expected `,` or `}`")
+                        descend = true
+            if frame == 123:
+                i = sjWs(bs, i)
+                if i >= n:
+                    return sjPeekErr(bs, i, "EOF while parsing an object")
+                if bs[i] != 34:
+                    return sjPeekErr(bs, i, "key must be a string")
+                let key = sjIgnoreStr(bs, i + 1)
+                if !key.ok:
+                    return key
+                i = sjWs(bs, key.i)
+                if i >= n:
+                    return sjPeekErr(bs, i, "EOF while parsing an object")
+                if bs[i] != 58:
+                    return sjPeekErr(bs, i, "expected `:`")
+                i = i + 1
+            stack = append(stack, frame)
+        return sjOk(i, sjNull())
+
+    # ============================================================
+    # Typed deserialization — serde's derived Deserialize driven over
+    # serde_json's Deserializer, by a schema table.
+    # ============================================================
+    # A type: kind "struct" (fields/types/defaults, `expecting` the derive's
+    # "struct Name"), "vec" (types[0] the element), "enum" (fields = variant
+    # names, types = payload type ("" for a unit variant), variantKinds =
+    # "unit" / "newtype" / "struct"), "option" (types[0] the inner type).
+    # Primitive type names ("u8", "u16", "u32", "u64", "usize", "f64",
+    # "bool", "string", "unit", and "value" for serde_json::Value) need no
+    # entry; a newtype
+    # struct around String (DbmsId) is "string".
+    struct SjType:
+        name: text
+        kind: text
+        expecting: text
+        fields: [text]
+        types: [text]
+        defaults: [bool]
+        variantKinds: [text]
+
+    proc sjStructType(name: text, expecting: text, fields: [text], types: [text], defaults: [bool]) -> SjType:
+        return SjType{name: name, kind: "struct", expecting: expecting, fields: fields, types: types, defaults: defaults, variantKinds: []}
+
+    # A #[serde(deny_unknown_fields)] struct: an unknown key is refused
+    # ("unknown field `k`, expected ..."), raised right after the key string
+    # and positioned by deserialize_struct once end_map has run. Marked by
+    # variantKinds = ["deny_unknown_fields"] (unused by a plain struct).
+    proc sjStructTypeDeny(name: text, expecting: text, fields: [text], types: [text], defaults: [bool]) -> SjType:
+        return SjType{name: name, kind: "struct", expecting: expecting, fields: fields, types: types, defaults: defaults, variantKinds: ["deny_unknown_fields"]}
+
+    proc sjVecType(name: text, elem: text) -> SjType:
+        return SjType{name: name, kind: "vec", expecting: "a sequence", fields: [], types: [elem], defaults: [], variantKinds: []}
+
+    # Option<T>: serde_json's deserialize_option — `null` is None (an
+    # "absent" node, like a defaulted field), anything else is T. A struct
+    # field of this type that is missing from an object is None too (serde's
+    # missing_field for an Option), though a short array form still refuses
+    # it unless the field is #[serde(default)].
+    proc sjOptionType(name: text, inner: text) -> SjType:
+        return SjType{name: name, kind: "option", expecting: "option", fields: [], types: [inner], defaults: [], variantKinds: []}
+
+    proc sjIsOption(types: [SjType], name: text) -> bool:
+        let t = do sjLookup(types, name)
+        return t.kind == "option"
+
+    proc sjEnumType(name: text, expecting: text, variants: [text], types: [text], kinds: [text]) -> SjType:
+        return SjType{name: name, kind: "enum", expecting: expecting, fields: variants, types: types, defaults: [], variantKinds: kinds}
+
+    # Rust's `{:?}` of a str, as serde's Unexpected::Str shows it.
+    proc sjDebugStr(s: text) -> text:
+        let bs = textToBytes(s)
+        let mut out = "\""
+        let mut start = 0
+        let mut j = 0
+        loop j < len(bs):
+            let b = bs[j]
+            if b < 32 || b == 34 || b == 92 || b == 127:
+                if j > start:
+                    out = out + bytesToText(sjRange(bs, start, j))
+                if b == 34:
+                    out = out + "\\\""
+                else:
+                    if b == 92:
+                        out = out + "\\\\"
+                    else:
+                        if b == 10:
+                            out = out + "\\n"
+                        else:
+                            if b == 13:
+                                out = out + "\\r"
+                            else:
+                                if b == 9:
+                                    out = out + "\\t"
+                                else:
+                                    if b == 0:
+                                        out = out + "\\0"
+                                    else:
+                                        let mut hex = ""
+                                        if b >= 16:
+                                            hex = sjHexDigit(b >> 4)
+                                        out = out + "\\u{" + hex + sjHexDigit(b & 15) + "}"
+                start = j + 1
+            j = j + 1
+        if len(bs) > start:
+            out = out + bytesToText(sjRange(bs, start, len(bs)))
+        return out + "\""
+
+    # Lower-case hex digits of a non-negative int (`{:x}`).
+    proc sjHexText(v: int) -> text:
+        if v < 16:
+            return sjHexDigit(v)
+        return sjHexText(v / 16) + sjHexDigit(v % 16)
+
+    # serde's Unexpected::Float: the float as serde_json writes it.
+    proc sjFloatUnexpected(f: float) -> text:
+        return "floating point `" + sjF64Text(f) + "`"
+
+    proc sjNumUnexpected(v: SjV) -> text:
+        if v.num == "u64":
+            return "integer `" + sjU64Text(v.u) + "`"
+        if v.num == "i64":
+            return "integer `" + v.u + "`"
+        return sjFloatUnexpected(v.f)
+
+    # peek_invalid_type: `i` is at the (whitespace-skipped) peeked byte.
+    proc sjPeekInvalidType(bs: [int], i: int, expected: text) -> SjD:
+        let c = bs[i]
+        let mut unexp = ""
+        let mut at = i
+        if c == 110 || c == 116 || c == 102:
+            let mut rest = "ull"
+            unexp = "null"
+            if c == 116:
+                rest = "rue"
+                unexp = "boolean `true`"
+            if c == 102:
+                rest = "alse"
+                unexp = "boolean `false`"
+            let id = sjIdent(bs, i + 1, rest)
+            if !id.ok:
+                return id
+            at = id.i
+        else:
+            if c == 45 || sjIsDigit(c):
+                let num = sjAnyNumber(bs, i)
+                if !num.ok:
+                    return num
+                at = num.i
+                unexp = sjNumUnexpected(num.v)
+            else:
+                if c == 34:
+                    let s = sjStr(bs, i + 1)
+                    if !s.ok:
+                        return s
+                    at = s.i
+                    unexp = "string " + sjDebugStr(s.v.s)
+                else:
+                    if c == 91:
+                        unexp = "sequence"
+                    else:
+                        if c == 123:
+                            unexp = "map"
+                        else:
+                            return sjPeekErr(bs, i, "expected value")
+        return sjErr(bs, at, "invalid type: " + unexp + ", expected " + expected)
+
+    proc sjLookup(types: [SjType], name: text) -> SjType:
+        let mut k = 0
+        loop k < len(types):
+            if types[k].name == name:
+                return types[k]
+            k = k + 1
+        return SjType{name: name, kind: name, expecting: name, fields: [], types: [], defaults: [], variantKinds: []}
+
+    # deserialize_number + the primitive visitor for u8/u16/u64/f64.
+    proc sjDeNumber(bs: [int], i0: int, kind: text) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        let c = bs[i]
+        if !(c == 45 || sjIsDigit(c)):
+            return sjPeekInvalidType(bs, i, kind)
+        let num = sjAnyNumber(bs, i)
+        if !num.ok:
+            return num
+        let v = num.v
+        if kind == "f64":
+            return sjOk(num.i, sjF64V(v.f))
+        if v.num == "f64":
+            return sjErr(bs, num.i, "invalid type: " + sjNumUnexpected(v) + ", expected " + kind)
+        let mut max = -1
+        if kind == "u8":
+            max = 255
+        if kind == "u16":
+            max = 65535
+        if kind == "u32":
+            max = 4294967295
+        if v.num == "i64" || (max >= 0 && sjU64Gt(v.u, max)):
+            return sjErr(bs, num.i, "invalid value: " + sjNumUnexpected(v) + ", expected " + kind)
+        return sjOk(num.i, v)
+
+    proc sjDeBool(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        let c = bs[i]
+        if c == 116 || c == 102:
+            let mut rest = "rue"
+            if c == 102:
+                rest = "alse"
+            let id = sjIdent(bs, i + 1, rest)
+            if !id.ok:
+                return id
+            return sjOk(id.i, SjV{kind: "bool", b: c == 116, s: "", num: "", u: 0, f: 0.0, items: [], keys: []})
+        return sjPeekInvalidType(bs, i, "a boolean")
+
+    proc sjDeString(bs: [int], i0: int, expected: text) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        if bs[i] == 34:
+            return sjStr(bs, i + 1)
+        return sjPeekInvalidType(bs, i, expected)
+
+    proc sjDeUnit(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        if bs[i] == 110:
+            let id = sjIdent(bs, i + 1, "ull")
+            if !id.ok:
+                return id
+            return sjOk(id.i, sjNull())
+        return sjPeekInvalidType(bs, i, "unit")
+
+    # SeqAccess::has_next_element: -1 when the list ends (at `i`), else the
+    # index of the next element; an error otherwise.
+    proc sjNextElement(bs: [int], i0: int, first: bool) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a list")
+        let c = bs[i]
+        if c == 93:
+            return sjOk(i, sjNumV("i64", -1, 0.0))
+        if first:
+            return sjOk(i, sjNumV("i64", i, 0.0))
+        if c == 44:
+            let j = sjWs(bs, i + 1)
+            if j >= n:
+                return sjPeekErr(bs, j, "EOF while parsing a value")
+            if bs[j] == 93:
+                return sjPeekErr(bs, j, "trailing comma")
+            return sjOk(j, sjNumV("i64", j, 0.0))
+        return sjPeekErr(bs, i, "expected `,` or `]`")
+
+    # end_seq: evaluated whether or not the elements succeeded; `i` is
+    # where the reader is afterwards.
+    proc sjEndSeq(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a list")
+        if bs[i] == 93:
+            return sjOk(i + 1, sjNull())
+        if bs[i] == 44:
+            let j = sjWs(bs, i + 1)
+            if j < n && bs[j] == 93:
+                return sjPeekErr(bs, j, "trailing comma")
+            return sjPeekErr(bs, j, "trailing characters")
+        return sjPeekErr(bs, i, "trailing characters")
+
+    proc sjEndMap(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing an object")
+        if bs[i] == 125:
+            return sjOk(i + 1, sjNull())
+        if bs[i] == 44:
+            return sjPeekErr(bs, i, "trailing comma")
+        return sjPeekErr(bs, i, "trailing characters")
+
+    # `match (ret, self.end_x()) { ... }` then fix_position.
+    proc sjClose(bs: [int], ret: SjD, end: SjD) -> SjD:
+        if !ret.ok:
+            return sjFix(bs, ret, end.i)
+        if !end.ok:
+            return end
+        return sjOk(end.i, ret.v)
+
+    proc sjParseColon(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing an object")
+        if bs[i] != 58:
+            return sjPeekErr(bs, i, "expected `:`")
+        return sjOk(i + 1, sjNull())
+
+    proc sjDeVec(types: [SjType], bs: [int], i0: int, t: SjType, depth: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        if bs[i] != 91:
+            return sjPeekInvalidType(bs, i, t.expecting)
+        if depth - 1 == 0:
+            return sjPeekErr(bs, i, "recursion limit exceeded")
+        let mut k = i + 1
+        let mut items = []
+        let mut first = true
+        let mut idx = 0
+        let mut ret = sjOk(k, sjNull())
+        let mut done = false
+        loop !done:
+            let nx = sjNextElement(bs, k, first)
+            first = false
+            if !nx.ok:
+                ret = nx
+                k = nx.i
+                done = true
+            else:
+                if nx.v.u < 0:
+                    k = nx.i
+                    done = true
+                else:
+                    let el = sjDeAny(types, bs, nx.v.u, t.types[0], depth - 1)
+                    k = el.i
+                    if !el.ok:
+                        ret = sjUnder(el, "[" + idx + "]")
+                        done = true
+                    else:
+                        items = append(items, el.v)
+                        idx = idx + 1
+        if ret.ok:
+            ret = sjOk(k, SjV{kind: "arr", b: false, s: "", num: "", u: 0, f: 0.0, items: items, keys: []})
+        return sjClose(bs, ret, sjEndSeq(bs, k))
+
+    proc sjDeStruct(types: [SjType], bs: [int], i0: int, t: SjType, depth: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        let nf = len(t.fields)
+        let mut vals = []
+        let mut present = []
+        let mut z = 0
+        loop z < nf:
+            vals = append(vals, sjAbsent())
+            present = append(present, false)
+            z = z + 1
+        if (bs[i] == 91 || bs[i] == 123) && depth - 1 == 0:
+            return sjPeekErr(bs, i, "recursion limit exceeded")
+        let mut k = i + 1
+        let mut ret = sjOk(k, sjNull())
+        if bs[i] == 91:
+            let mut first = true
+            let mut f = 0
+            loop f < nf && ret.ok:
+                let nx = sjNextElement(bs, k, first)
+                first = false
+                if !nx.ok:
+                    ret = nx
+                    k = nx.i
+                else:
+                    if nx.v.u < 0:
+                        k = nx.i
+                        if !t.defaults[f]:
+                            ret = sjRaw(k, "invalid length " + f + ", expected " + t.expecting + " with " + nf + " elements")
+                    else:
+                        let el = sjDeAny(types, bs, nx.v.u, t.types[f], depth - 1)
+                        k = el.i
+                        if !el.ok:
+                            ret = sjUnder(el, "[" + f + "]")
+                        else:
+                            vals[f] = el.v
+                            present[f] = true
+                f = f + 1
+            if ret.ok:
+                ret = sjOk(k, SjV{kind: "obj", b: false, s: "", num: "", u: 0, f: 0.0, items: vals, keys: t.fields})
+            return sjClose(bs, ret, sjEndSeq(bs, k))
+        if bs[i] != 123:
+            return sjPeekInvalidType(bs, i, t.expecting)
+        let mut first = true
+        let mut done = false
+        loop !done:
+            let w = sjWs(bs, k)
+            if w >= n:
+                ret = sjUnder(sjPeekErr(bs, w, "EOF while parsing an object"), "?")
+                k = w
+                done = true
+            else:
+                let mut p = w
+                let mut stop = false
+                if bs[w] == 125:
+                    k = w
+                    done = true
+                    stop = true
+                else:
+                    if bs[w] == 44 && !first:
+                        p = sjWs(bs, w + 1)
+                    else:
+                        if first:
+                            first = false
+                        else:
+                            ret = sjUnder(sjPeekErr(bs, w, "expected `,` or `}`"), "?")
+                            k = w
+                            done = true
+                            stop = true
+                if !stop:
+                    if p >= n:
+                        ret = sjUnder(sjPeekErr(bs, p, "EOF while parsing a value"), "?")
+                        k = p
+                        done = true
+                    else:
+                        if bs[p] != 34:
+                            let mut code = "key must be a string"
+                            if bs[p] == 125:
+                                code = "trailing comma"
+                            ret = sjUnder(sjPeekErr(bs, p, code), "?")
+                            k = p
+                            done = true
+                        else:
+                            let key = sjStr(bs, p + 1)
+                            k = key.i
+                            if !key.ok:
+                                ret = sjUnder(key, "?")
+                                done = true
+                            else:
+                                let mut f = -1
+                                let mut fi = 0
+                                loop fi < nf:
+                                    if t.fields[fi] == key.v.s:
+                                        f = fi
+                                    fi = fi + 1
+                                if f >= 0 && present[f]:
+                                    ret = sjRaw(k, "duplicate field `" + t.fields[f] + "`")
+                                    done = true
+                                else:
+                                  if f < 0 && len(t.variantKinds) == 1 && t.variantKinds[0] == "deny_unknown_fields":
+                                    ret = sjUnder(sjRaw(k, "unknown field `" + key.v.s + "`, " + sjOneOfFields(t.fields)), key.v.s)
+                                    done = true
+                                  else:
+                                      let colon = sjParseColon(bs, k)
+                                      k = colon.i
+                                      if !colon.ok:
+                                          ret = colon
+                                          done = true
+                                      else:
+                                          let mut val = sjIgnoreValue(bs, k)
+                                          if f >= 0:
+                                              val = sjDeAny(types, bs, k, t.types[f], depth - 1)
+                                          k = val.i
+                                          if !val.ok:
+                                              ret = sjUnder(val, key.v.s)
+                                              done = true
+                                          else:
+                                              if f >= 0:
+                                                  vals[f] = val.v
+                                                  present[f] = true
+        if ret.ok:
+            let mut m = 0
+            loop m < nf && ret.ok:
+                if !present[m] && !t.defaults[m] && !sjIsOption(types, t.types[m]):
+                    ret = sjRaw(k, "missing field `" + t.fields[m] + "`")
+                m = m + 1
+        if ret.ok:
+            ret = sjOk(k, SjV{kind: "obj", b: false, s: "", num: "", u: 0, f: 0.0, items: vals, keys: t.fields})
+        return sjClose(bs, ret, sjEndMap(bs, k))
+
+    proc sjOneOf(names: [text]) -> text:
+        let n = len(names)
+        if n == 0:
+            return "there are no variants"
+        if n == 1:
+            return "expected `" + names[0] + "`"
+        if n == 2:
+            return "expected `" + names[0] + "` or `" + names[1] + "`"
+        let mut list = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                list = list + ", "
+            list = list + "`" + names[i] + "`"
+            i = i + 1
+        return "expected one of " + list
+
+    # serde's OneOf for field names (no names: "there are no fields").
+    proc sjOneOfFields(names: [text]) -> text:
+        if len(names) == 0:
+            return "there are no fields"
+        let t = do sjOneOf(names)
+        return t
+
+    proc sjDeEnum(types: [SjType], bs: [int], i0: int, t: SjType, depth: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        let c = bs[i]
+        if c != 123 && c != 34:
+            return sjPeekErr(bs, i, "expected value")
+        if c == 123 && depth - 1 == 0:
+            return sjPeekErr(bs, i, "recursion limit exceeded")
+        let mut at = i
+        if c == 123:
+            at = i + 1
+        let w = sjWs(bs, at)
+        if w >= n:
+            if c == 123:
+                return sjPeekErr(bs, w, "EOF while parsing an object")
+            return sjPeekErr(bs, w, "EOF while parsing a value")
+        if bs[w] != 34:
+            if bs[w] == 125:
+                return sjPeekErr(bs, w, "expected value")
+            return sjPeekErr(bs, w, "key must be a string")
+        let id = sjStr(bs, w + 1)
+        if !id.ok:
+            return id
+        let mut vi = -1
+        let mut k = 0
+        loop k < len(t.fields):
+            if t.fields[k] == id.v.s:
+                vi = k
+            k = k + 1
+        if vi < 0:
+            return sjErr(bs, id.i, "unknown variant `" + id.v.s + "`, " + sjOneOf(t.fields))
+        let vk = t.variantKinds[vi]
+        if c == 34:
+            if vk == "unit":
+                return sjOk(id.i, SjV{kind: "enum", b: false, s: id.v.s, num: "", u: 0, f: 0.0, items: [], keys: []})
+            return sjUnder(sjRaw(id.i, "invalid type: unit variant, expected " + vk + " variant"), id.v.s)
+        let colon = sjParseColon(bs, id.i)
+        if !colon.ok:
+            return sjUnder(colon, id.v.s)
+        let mut payload = sjDeUnit(bs, colon.i)
+        if vk != "unit":
+            payload = sjDeAny(types, bs, colon.i, t.types[vi], depth - 1)
+        if !payload.ok:
+            return sjUnder(payload, id.v.s)
+        let e = sjWs(bs, payload.i)
+        if e >= n:
+            return sjErr(bs, e, "EOF while parsing an object")
+        if bs[e] != 125:
+            return sjErr(bs, e, "expected value")
+        let mut items = []
+        if vk != "unit":
+            items = [payload.v]
+        return sjOk(e + 1, SjV{kind: "enum", b: false, s: id.v.s, num: "", u: 0, f: 0.0, items: items, keys: []})
+
+    # One value of type `name` at `i`.
+    proc sjDeAny(types: [SjType], bs: [int], i: int, name: text, depth: int) -> SjD:
+        if name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "f64":
+            return sjDeNumber(bs, i, name)
+        if name == "usize":
+            return sjDeNumber(bs, i, "usize")
+        if name == "value":
+            return sjDeValue(bs, i, depth)
+        if name == "bool":
+            return sjDeBool(bs, i)
+        if name == "string":
+            return sjDeString(bs, i, "a string")
+        if name == "unit":
+            return sjDeUnit(bs, i)
+        let t = sjLookup(types, name)
+        if t.kind == "option":
+            let w = sjWs(bs, i)
+            if w < len(bs) && bs[w] == 110:
+                let id = sjIdent(bs, w + 1, "ull")
+                if !id.ok:
+                    return id
+                return sjOk(id.i, sjAbsent())
+            return sjDeAny(types, bs, i, t.types[0], depth)
+        if t.kind == "struct":
+            return sjDeStruct(types, bs, i, t, depth)
+        if t.kind == "vec":
+            return sjDeVec(types, bs, i, t, depth)
+        return sjDeEnum(types, bs, i, t, depth)
+
+    # serde_json::Value — deserialize_any with serde_json's ValueVisitor:
+    # objects become a Map (keys in byte order, a repeated key keeping its
+    # last value), numbers keep their ParserNumber class, and nesting past
+    # the recursion limit (128) is refused where serde_json refuses it.
+    proc sjDeValue(bs: [int], i0: int, depth: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        let c = bs[i]
+        if c == 110 || c == 116 || c == 102:
+            let mut rest = "ull"
+            if c == 116:
+                rest = "rue"
+            if c == 102:
+                rest = "alse"
+            let id = sjIdent(bs, i + 1, rest)
+            if !id.ok:
+                return id
+            if c == 110:
+                return sjOk(id.i, sjNull())
+            return sjOk(id.i, SjV{kind: "bool", b: c == 116, s: "", num: "", u: 0, f: 0.0, items: [], keys: []})
+        if c == 45 || sjIsDigit(c):
+            let num = sjAnyNumber(bs, i)
+            return num
+        if c == 34:
+            let st = sjStr(bs, i + 1)
+            return st
+        if c != 91 && c != 123:
+            return sjPeekErr(bs, i, "expected value")
+        if depth - 1 == 0:
+            return sjPeekErr(bs, i, "recursion limit exceeded")
+        let mut k = i + 1
+        let mut ret = sjOk(k, sjNull())
+        if c == 91:
+            let mut items = []
+            let mut first = true
+            let mut done = false
+            loop !done:
+                let nx = sjNextElement(bs, k, first)
+                first = false
+                if !nx.ok:
+                    ret = nx
+                    k = nx.i
+                    done = true
+                else:
+                    if nx.v.u < 0:
+                        k = nx.i
+                        done = true
+                    else:
+                        let el = sjDeValue(bs, nx.v.u, depth - 1)
+                        k = el.i
+                        if !el.ok:
+                            ret = sjUnder(el, "[" + len(items) + "]")
+                            done = true
+                        else:
+                            items = append(items, el.v)
+            if ret.ok:
+                ret = sjOk(k, SjV{kind: "arr", b: false, s: "", num: "", u: 0, f: 0.0, items: items, keys: []})
+            return sjClose(bs, ret, sjEndSeq(bs, k))
+        let mut keys = []
+        let mut vals = []
+        let mut first = true
+        let mut firstKey = false
+        let mut done = false
+        loop !done:
+            let w = sjWs(bs, k)
+            if w >= n:
+                ret = sjUnder(sjPeekErr(bs, w, "EOF while parsing an object"), "?")
+                k = w
+                done = true
+            else:
+                let mut p = w
+                let mut stop = false
+                if bs[w] == 125:
+                    k = w
+                    done = true
+                    stop = true
+                else:
+                    if bs[w] == 44 && !first:
+                        p = sjWs(bs, w + 1)
+                        firstKey = false
+                    else:
+                        if first:
+                            first = false
+                            firstKey = true
+                        else:
+                            ret = sjUnder(sjPeekErr(bs, w, "expected `,` or `}`"), "?")
+                            k = w
+                            done = true
+                            stop = true
+                if !stop:
+                    if p >= n:
+                        ret = sjUnder(sjPeekErr(bs, p, "EOF while parsing a value"), "?")
+                        k = p
+                        done = true
+                    else:
+                        if bs[p] != 34:
+                            let mut code = "key must be a string"
+                            if bs[p] == 125:
+                                code = "trailing comma"
+                            ret = sjUnder(sjPeekErr(bs, p, code), "?")
+                            k = p
+                            done = true
+                        else:
+                            let key = sjStr(bs, p + 1)
+                            k = key.i
+                            if !key.ok:
+                                ret = sjUnder(key, "?")
+                                done = true
+                            else:
+                              if firstKey && key.v.s == "$serde_json::private::RawValue":
+                                let rcolon = sjParseColon(bs, k)
+                                k = rcolon.i
+                                ret = rcolon
+                                if rcolon.ok:
+                                    let rs = do sjRawString(bs, k)
+                                    k = rs.i
+                                    ret = sjUnder(rs, key.v.s)
+                                    if rs.ok:
+                                        ret = do sjRawValue(rs)
+                                done = true
+                              else:
+                                let colon = sjParseColon(bs, k)
+                                k = colon.i
+                                if !colon.ok:
+                                    ret = colon
+                                    done = true
+                                else:
+                                    let val = sjDeValue(bs, k, depth - 1)
+                                    k = val.i
+                                    if !val.ok:
+                                        ret = sjUnder(val, key.v.s)
+                                        done = true
+                                    else:
+                                        let mut at = -1
+                                        let mut q = 0
+                                        loop q < len(keys) && at < 0:
+                                            if keys[q] == key.v.s:
+                                                at = q
+                                            q = q + 1
+                                        if at >= 0:
+                                            vals[at] = val.v
+                                        else:
+                                            keys = append(keys, key.v.s)
+                                            vals = append(vals, val.v)
+        if ret.ok && !(firstKey && len(keys) == 0):
+            let o = do sjObject(keys, vals)
+            ret = sjOk(k, o)
+        return sjClose(bs, ret, sjEndMap(bs, k))
+
+    # KeyClass::RawValue (serde_json's raw_value feature, on in the fabric
+    # workspace): a map whose first key is the RawValue token is
+    # next_value_seed(BoxedFromString) — a string (sjRawString; its errors
+    # surface inside that seed) — then, back in visit_map,
+    # serde_json::from_str of it (sjRawValue; its error, made with
+    # de::Error::custom, keeps the inner message and position).
+    proc sjRawString(bs: [int], i0: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        if bs[i] != 34:
+            return sjPeekInvalidType(bs, i, "raw value")
+        let st = sjStr(bs, i + 1)
+        return st
+
+    proc sjRawValue(st: SjD) -> SjD:
+        let inner = sjDecode([], st.v.s, "value")
+        if !inner.ok:
+            return SjD{ok: false, err: inner.err, posd: true, i: st.i, v: sjNull(), cat: "data", path: []}
+        return sjOk(st.i, inner.v)
+
+    # sjObject: a serde_json Map from members already free of repeated keys
+    # — sorted by key bytes, as its BTreeMap keeps them.
+    proc sjObject(keys0: [text], vals0: [SjV]) -> SjV:
+        let mut keys = keys0
+        let mut vals = vals0
+        let n = len(keys)
+        let mut i = 1
+        loop i < n:
+            let k = keys[i]
+            let v = vals[i]
+            let mut j = i - 1
+            loop j >= 0 && keys[j] > k:
+                keys[j + 1] = keys[j]
+                vals[j + 1] = vals[j]
+                j = j - 1
+            keys[j + 1] = k
+            vals[j + 1] = v
+            i = i + 1
+        return SjV{kind: "obj", b: false, s: "", num: "", u: 0, f: 0.0, items: vals, keys: keys}
+
+    # `category` / `path` (a failure only): serde_json's Error::classify
+    # ("syntax" | "eof" | "data") and serde_path_to_error's path as its
+    # Error Display shows it ("" when it leaves the path out).
+    struct SjDecoded:
+        ok: bool
+        err: text
+        v: SjV
+        category: text
+        path: text
+
+    # serde_json::from_slice::<T>: the value, then only whitespace (end()).
+    # `err` is serde_json::Error's Display.
+    proc sjDecode(types: [SjType], src: text, name: text) -> SjDecoded:
+        let bs = textToBytes(src)
+        let r = do sjDecodeBytes(types, bs, name)
+        return r
+
+    # sjDecodeBytes: the same over raw bytes (which need not be UTF-8).
+    proc sjDecodeBytes(types: [SjType], bs: [int], name: text) -> SjDecoded:
+        let d = sjDeAny(types, bs, 0, name, 128)
+        if !d.ok:
+            return SjDecoded{ok: false, err: d.err, v: sjNull(), category: d.cat, path: sjPathText(d.path)}
+        let e = sjWs(bs, d.i)
+        if e < len(bs):
+            let t = sjPeekErr(bs, e, "trailing characters")
+            return SjDecoded{ok: false, err: t.err, v: sjNull(), category: t.cat, path: ""}
+        return SjDecoded{ok: true, err: "", v: d.v, category: "", path: ""}
+
+
+    # ---- serde_json::Value accessors ----
+
+    struct SjGet:
+        has: bool
+        v: SjV
+
+    # Value::get(name): the member of an object, None for anything else.
+    proc sjGet(v: SjV, name: text) -> SjGet:
+        if v.kind == "obj":
+            let mut k = 0
+            loop k < len(v.keys):
+                if v.keys[k] == name:
+                    return SjGet{has: true, v: v.items[k]}
+                k = k + 1
+        return SjGet{has: false, v: sjNull()}
+
+    struct SjOptText:
+        has: bool
+        s: text
+
+    # `.get(name).and_then(Value::as_str)`: a string member, absent when
+    # missing, null or not a string.
+    proc sjStrField(v: SjV, name: text) -> SjOptText:
+        let g = do sjGet(v, name)
+        if g.has && g.v.kind == "str":
+            return SjOptText{has: true, s: g.v.s}
+        return SjOptText{has: false, s: ""}
+
+    # ---- writing ----
+
+    proc sjHexDigit(d: int) -> text:
+        return charAt("0123456789abcdef", d)
+
+    # serde_json's string escaping: `"` `\` and the C0 controls (\b \f \n \r
+    # \t by name, the rest as \u00xx); everything else verbatim.
+    proc sjQuote(s: text) -> text:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut clean = true
+        let mut i = 0
+        loop i < n && clean:
+            if bs[i] < 32 || bs[i] == 34 || bs[i] == 92:
+                clean = false
+            i = i + 1
+        if clean:
+            return "\"" + s + "\""
+        let mut out = "\""
+        let mut start = 0
+        let mut j = 0
+        loop j < n:
+            let b = bs[j]
+            if b < 32 || b == 34 || b == 92:
+                if j > start:
+                    out = out + bytesToText(sjRange(bs, start, j))
+                if b == 34:
+                    out = out + "\\\""
+                else:
+                    if b == 92:
+                        out = out + "\\\\"
+                    else:
+                        if b == 8:
+                            out = out + "\\b"
+                        else:
+                            if b == 12:
+                                out = out + "\\f"
+                            else:
+                                if b == 10:
+                                    out = out + "\\n"
+                                else:
+                                    if b == 13:
+                                        out = out + "\\r"
+                                    else:
+                                        if b == 9:
+                                            out = out + "\\t"
+                                        else:
+                                            out = out + "\\u00" + sjHexDigit(b >> 4) + sjHexDigit(b & 15)
+                start = j + 1
+            j = j + 1
+        if n > start:
+            out = out + bytesToText(sjRange(bs, start, n))
+        return out + "\""
+
+    # Decimal addition of two non-negative digit strings.
+    proc sjDecAdd(a: text, b: text) -> text:
+        let mut i = len(a) - 1
+        let mut j = len(b) - 1
+        let mut carry = 0
+        let mut out = ""
+        loop i >= 0 || j >= 0 || carry > 0:
+            let mut s = carry
+            if i >= 0:
+                s = s + toInt(charAt(a, i))
+            if j >= 0:
+                s = s + toInt(charAt(b, j))
+            out = "" + (s % 10) + out
+            carry = s / 10
+            i = i - 1
+            j = j - 1
+        return out
+
+    # A u64 held in an int's 64 bits, written unsigned.
+    proc sjU64Text(n: int) -> text:
+        if n >= 0:
+            return "" + n
+        let low = n + 9223372036854775807 + 1
+        return sjDecAdd("9223372036854775808", "" + low)
+
+    struct SjDigits:
+        digits: text
+        kk: int
+
+    proc sjStripZeros(d: text) -> text:
+        let mut end = len(d)
+        loop end > 1 && charAt(d, end - 1) == "0":
+            end = end - 1
+        return slice(d, 0, end)
+
+    # The shortest round-trip digits of a finite a > 0, with value
+    # 0.<digits> x 10^kk. Non-integral values (and integers of 2^63 and
+    # above) take this runtime's own shortest formatting ("" + a, Go's
+    # FormatFloat(a, 'g', -1)), which picks the same digits ryu does; an
+    # integer below 2^53 is its own shortest form; an integer in
+    # [2^53, 2^63) is searched directly against its rounding interval.
+    proc sjShortest(a: float) -> SjDigits:
+        let isWhole = a < 9223372036854775808.0 && toFloat(floor(a)) == a
+        if isWhole:
+            let n = floor(a)
+            let full = "" + n
+            if n < 9007199254740992:
+                return SjDigits{digits: sjStripZeros(full), kk: len(full)}
+            let bits = floatBits(a)
+            let biased = (bits >> 52) & 2047
+            let mant = bits & 4503599627370495
+            let ulp = 1 << (biased - 1075)
+            let inclusive = mant % 2 == 0
+            let mut lowerGap = ulp
+            if mant == 0:
+                lowerGap = ulp / 2
+            let mut k = 18
+            loop k >= 1:
+                let p = toInt("1" + slice("000000000000000000", 0, k))
+                let r = n % p
+                let q = n / p
+                let downOk = 2 * r < lowerGap || (2 * r == lowerGap && inclusive)
+                let upOk = 2 * (p - r) < ulp || (2 * (p - r) == ulp && inclusive)
+                if downOk || upOk:
+                    let mut chosen = q
+                    if upOk && !downOk:
+                        chosen = q + 1
+                    if upOk && downOk:
+                        if p - r < r:
+                            chosen = q + 1
+                        if p - r == r && q % 2 == 1:
+                            chosen = q + 1
+                    let ct = "" + chosen
+                    return SjDigits{digits: sjStripZeros(ct), kk: len(ct) + k}
+                k = k - 1
+            return SjDigits{digits: sjStripZeros(full), kk: len(full)}
+        let g = "" + a
+        let parts = split(g, "e")
+        let mant = parts[0]
+        let mut e10 = 0
+        if len(parts) > 1:
+            e10 = toInt(parts[1])
+        let halves = split(mant, ".")
+        let intPart = halves[0]
+        let mut frac = ""
+        if len(halves) > 1:
+            frac = halves[1]
+        let mut digits = intPart + frac
+        let mut kk = len(intPart) + e10
+        loop len(digits) > 1 && charAt(digits, 0) == "0":
+            digits = slice(digits, 1, len(digits))
+            kk = kk - 1
+        return SjDigits{digits: sjStripZeros(digits), kk: kk}
+
+    proc sjZeros(n: int) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            out = out + "0"
+            i = i + 1
+        return out
+
+    # The layout serde_json 1.0.151 writes a finite f64 in: ryu's format64
+    # cases (plain up to 16 integer digits, `0.000ddd` down to 1e-5,
+    # otherwise scientific), with a positive exponent written `e+N`.
+    proc sjRyuLayout(d: text, kk: int) -> text:
+        let length = len(d)
+        let k = kk - length
+        if k >= 0 && kk <= 16:
+            return d + sjZeros(kk - length) + ".0"
+        if kk > 0 && kk <= 16:
+            return slice(d, 0, kk) + "." + slice(d, kk, length)
+        if kk > -5 && kk <= 0:
+            return "0." + sjZeros(0 - kk) + d
+        let mut exp = "e" + (kk - 1)
+        if kk - 1 >= 0:
+            exp = "e+" + (kk - 1)
+        if length == 1:
+            return d + exp
+        return charAt(d, 0) + "." + slice(d, 1, length) + exp
+
+    # An f64 as serde_json writes it: ryu's shortest text, `null` when not
+    # finite.
+    proc sjF64Text(f: float) -> text:
+        if f != f || sjIsInf(f):
+            return "null"
+        let neg = floatBits(f) < 0
+        let mut a = f
+        if neg:
+            a = 0.0 - f
+        let mut body = "0.0"
+        if a != 0.0:
+            let sd = sjShortest(a)
+            body = sjRyuLayout(sd.digits, sd.kk)
+        if neg:
+            return "-" + body
+        return body
+
+    # sjValueText: serde_json::Value's Display (to_string) — compact, keys
+    # in the order held, numbers by their class. An "absent" node (a
+    # defaulted or None field of a typed decode) writes as null.
+    proc sjValueText(v: SjV) -> text:
+        if v.kind == "null" || v.kind == "absent":
+            return "null"
+        if v.kind == "bool":
+            return sjBoolText(v.b)
+        if v.kind == "num":
+            if v.num == "u64":
+                return sjU64Text(v.u)
+            if v.num == "i64":
+                return "" + v.u
+            return sjF64Text(v.f)
+        if v.kind == "str":
+            return sjQuote(v.s)
+        let n = len(v.items)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            if v.kind == "obj":
+                out = out + sjQuote(v.keys[i]) + ":"
+            out = out + sjValueText(v.items[i])
+            i = i + 1
+        if v.kind == "obj":
+            return "{" + out + "}"
+        return "[" + out + "]"
+
+    proc sjBoolText(b: bool) -> text:
+        if b:
+            return "true"
+        return "false"
+
+    proc sjIndent(depth: int) -> text:
+        let mut out = ""
+        let mut i = 0
+        loop i < depth:
+            out = out + "  "
+            i = i + 1
+        return out
+
+    # serde_json::to_string_pretty over the compact text of the same value:
+    # PrettyFormatter's two-space indent, `": "` after a key, and `[]`/`{}`
+    # for an empty array/object.
+    proc sjPretty(compact: text) -> text:
+        let cs = split(compact, "")
+        let n = len(cs)
+        let mut out = ""
+        let mut depth = 0
+        let mut inStr = false
+        let mut esc = false
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if inStr:
+                out = out + c
+                if esc:
+                    esc = false
+                else:
+                    if c == "\\":
+                        esc = true
+                    else:
+                        if c == "\"":
+                            inStr = false
+            else:
+                if c == "\"":
+                    inStr = true
+                    out = out + c
+                else:
+                    if c == "{" || c == "[":
+                        let mut close = "]"
+                        if c == "{":
+                            close = "}"
+                        if i + 1 < n && cs[i + 1] == close:
+                            out = out + c + close
+                            i = i + 1
+                        else:
+                            depth = depth + 1
+                            out = out + c + "\n" + sjIndent(depth)
+                    else:
+                        if c == "}" || c == "]":
+                            depth = depth - 1
+                            out = out + "\n" + sjIndent(depth) + c
+                        else:
+                            if c == ",":
+                                out = out + ",\n" + sjIndent(depth)
+                            else:
+                                if c == ":":
+                                    out = out + ": "
+                                else:
+                                    out = out + c
+            i = i + 1
+        return out

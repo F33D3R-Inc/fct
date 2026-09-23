@@ -1,0 +1,973 @@
+import "fabric_runtime.fct"
+import "fabric.fct"
+import "fabric_json.fct"
+
+app FabricDaemonConfigSelfHost:
+    # Port of fabric/crates/fabric-daemon/src/config.rs: what an operator
+    # declares (ConfigFile, the JSON `fabricd --config` reads, parsed with
+    # serde's own deny_unknown_fields semantics and error text by
+    # fabric_json.fct's sjDecode), and what the daemon refuses to start without
+    # (Settings::resolve, every check in its order, every ConfigError's
+    # Display text). Secrets are named by environment variable and read from
+    # a DaemonEnv, the MapEnv of the Rust tests; the process environment is
+    # the caller's to supply. `SocketAddr`'s parser and Display are ported
+    # from core::net (parser.rs, ip_addr.rs, socket_addr.rs) because a listen
+    # address is both validated and printed back on the admin port.
+    #
+    # Seams, stated: `Keyspace` / `KeyspaceRule` belong to fabric-facetql's
+    # front door; their port is fabric.fct's (the one the front door and the
+    # mover ports share, a RoutingKey packed into one int). The resolved
+    # keyspace is built with it — its KeyspaceRule::new / with_rule checks
+    # and KeyspaceError text — and kept beside it with each key's full u64
+    # shard id (DaemonKeyspace), because the admin port prints keys and a
+    # packed key cannot carry a shard id above u64::MAX / 156. Backend::new's
+    # URL check (the only one config.rs makes of it) is restated here.
+    # FrontDoorConfig is carried as the one field config.rs sets
+    # (read_preference); the rest are the front door's defaults.
+    #
+    # u64 settings are held in an int's 64 bits (sjU64Text prints them).
+    # Every name here is prefixed `dc` / `daemon` / `Daemon`.
+
+    # ------------------------------------------------------------ constants
+
+    proc dcDefaultDataListen() -> text:
+        return "0.0.0.0:7710"
+
+    proc dcDefaultAdminListen() -> text:
+        return "127.0.0.1:7711"
+
+    proc dcDefaultAdminTokenEnv() -> text:
+        return "FABRIC_ADMIN_TOKEN"
+
+    # ------------------------------------------------------------ the environment
+
+    # MapEnv: a fixed map. Built from pairs, a later pair for the same name
+    # replaces an earlier one (BTreeMap::collect).
+    struct DaemonEnv:
+        names: [text]
+        values: [text]
+
+    struct DaemonEnvGet:
+        has: bool
+        value: text
+
+    proc daemonEnvOf(names: [text], values: [text]) -> DaemonEnv:
+        return DaemonEnv{names: names, values: values}
+
+    proc daemonEnvGet(env: DaemonEnv, name: text) -> DaemonEnvGet:
+        let n = len(env.names)
+        let mut found = false
+        let mut value = ""
+        let mut k = 0
+        loop k < n:
+            if env.names[k] == name:
+                found = true
+                value = env.values[k]
+            k = k + 1
+        return DaemonEnvGet{has: found, value: value}
+
+    # ------------------------------------------------------------ SocketAddr
+
+    # A parsed socket address: `parts` is the four octets (v4) or the eight
+    # 16-bit segments (v6).
+    struct DaemonAddr:
+        v6: bool
+        parts: [int]
+        scope: int
+        port: int
+
+    # One Parser step: `ok`, the value, and the index after it (unchanged on
+    # failure, which is read_atomically).
+    struct DcNum:
+        ok: bool
+        n: int
+        i: int
+
+    struct DcParts:
+        ok: bool
+        parts: [int]
+        count: int
+        ipv4: bool
+        i: int
+
+    proc dcDigit(c: int, radix: int) -> int:
+        if c >= 48 && c <= 57:
+            return c - 48
+        if radix == 16:
+            if c >= 97 && c <= 102:
+                return c - 87
+            if c >= 65 && c <= 70:
+                return c - 55
+        return -1
+
+    # read_radix_max_digits: at most `maxDigits` digits (one more fails the
+    # whole number), no leading zero unless allowed, and the result must fit
+    # `limit`.
+    proc dcRadixMaxDigits(bs: [int], i0: int, radix: int, maxDigits: int, allowZeroPrefix: bool, limit: int) -> DcNum:
+        let n = len(bs)
+        if i0 >= n:
+            return DcNum{ok: false, n: 0, i: i0}
+        let first = do dcDigit(bs[i0], radix)
+        if first < 0:
+            return DcNum{ok: false, n: 0, i: i0}
+        let mut result = first
+        let mut count = 1
+        let mut i = i0 + 1
+        loop i < n:
+            let d = do dcDigit(bs[i], radix)
+            if d < 0:
+                break
+            if count >= maxDigits:
+                return DcNum{ok: false, n: 0, i: i0}
+            result = result * radix + d
+            count = count + 1
+            i = i + 1
+        if !allowZeroPrefix && first == 0 && count > 1:
+            return DcNum{ok: false, n: 0, i: i0}
+        if result > limit:
+            return DcNum{ok: false, n: 0, i: i0}
+        return DcNum{ok: true, n: result, i: i}
+
+    # read_decimal: any number of digits, checked against `limit`.
+    proc dcDecimal(bs: [int], i0: int, limit: int) -> DcNum:
+        let n = len(bs)
+        if i0 >= n:
+            return DcNum{ok: false, n: 0, i: i0}
+        let first = do dcDigit(bs[i0], 10)
+        if first < 0:
+            return DcNum{ok: false, n: 0, i: i0}
+        let mut result = first
+        let mut i = i0 + 1
+        loop i < n:
+            let d = do dcDigit(bs[i], 10)
+            if d < 0:
+                break
+            result = result * 10 + d
+            if result > limit:
+                return DcNum{ok: false, n: 0, i: i0}
+            i = i + 1
+        return DcNum{ok: true, n: result, i: i}
+
+    proc dcGiven(bs: [int], i: int, c: int) -> bool:
+        return i < len(bs) && bs[i] == c
+
+    proc dcIpv4(bs: [int], i0: int) -> DcParts:
+        let mut parts = []
+        let mut i = i0
+        let mut g = 0
+        loop g < 4:
+            let mut j = i
+            if g > 0:
+                let sep = do dcGiven(bs, j, 46)
+                if !sep:
+                    return DcParts{ok: false, parts: [], count: 0, ipv4: false, i: i0}
+                j = j + 1
+            let octet = do dcRadixMaxDigits(bs, j, 10, 3, false, 255)
+            if !octet.ok:
+                return DcParts{ok: false, parts: [], count: 0, ipv4: false, i: i0}
+            parts = append(parts, octet.n)
+            i = octet.i
+            g = g + 1
+        return DcParts{ok: true, parts: parts, count: 4, ipv4: false, i: i}
+
+    # read_ipv6_addr's read_groups: up to `limit` groups; an embedded IPv4
+    # tail counts as two and ends the run.
+    proc dcIpv6Groups(bs: [int], i0: int, limit: int) -> DcParts:
+        let mut groups = []
+        let mut i = i0
+        let mut g = 0
+        loop g < limit:
+            if g < limit - 1:
+                let mut j = i
+                let mut sepOk = true
+                if g > 0:
+                    sepOk = dcGiven(bs, j, 58)
+                    j = j + 1
+                if sepOk:
+                    let v4 = do dcIpv4(bs, j)
+                    if v4.ok:
+                        groups = append(groups, v4.parts[0] * 256 + v4.parts[1])
+                        groups = append(groups, v4.parts[2] * 256 + v4.parts[3])
+                        return DcParts{ok: true, parts: groups, count: g + 2, ipv4: true, i: v4.i}
+            let mut k = i
+            if g > 0:
+                let sep = do dcGiven(bs, k, 58)
+                if !sep:
+                    return DcParts{ok: true, parts: groups, count: g, ipv4: false, i: i}
+                k = k + 1
+            let group = do dcRadixMaxDigits(bs, k, 16, 4, true, 65535)
+            if !group.ok:
+                return DcParts{ok: true, parts: groups, count: g, ipv4: false, i: i}
+            groups = append(groups, group.n)
+            i = group.i
+            g = g + 1
+        return DcParts{ok: true, parts: groups, count: limit, ipv4: false, i: i}
+
+    proc dcIpv6(bs: [int], i0: int) -> DcParts:
+        let head = do dcIpv6Groups(bs, i0, 8)
+        if head.count == 8:
+            return DcParts{ok: true, parts: head.parts, count: 8, ipv4: false, i: head.i}
+        if head.ipv4:
+            return DcParts{ok: false, parts: [], count: 0, ipv4: false, i: i0}
+        let c1 = do dcGiven(bs, head.i, 58)
+        let c2 = do dcGiven(bs, head.i + 1, 58)
+        if !c1 || !c2:
+            return DcParts{ok: false, parts: [], count: 0, ipv4: false, i: i0}
+        let tail = do dcIpv6Groups(bs, head.i + 2, 8 - (head.count + 1))
+        let mut segs = []
+        let mut k = 0
+        loop k < 8:
+            segs = append(segs, 0)
+            k = k + 1
+        let mut h = 0
+        loop h < head.count:
+            segs[h] = head.parts[h]
+            h = h + 1
+        let mut t = 0
+        loop t < tail.count:
+            segs[8 - tail.count + t] = tail.parts[t]
+            t = t + 1
+        return DcParts{ok: true, parts: segs, count: 8, ipv4: false, i: tail.i}
+
+    # read_port: `:` then a u16.
+    proc dcPort(bs: [int], i: int) -> DcNum:
+        let colon = do dcGiven(bs, i, 58)
+        if !colon:
+            return DcNum{ok: false, n: 0, i: i}
+        let port = do dcDecimal(bs, i + 1, 65535)
+        if !port.ok:
+            return DcNum{ok: false, n: 0, i: i}
+        return port
+
+    struct DaemonAddrResult:
+        ok: bool
+        addr: DaemonAddr
+
+    proc dcAddrFail() -> DaemonAddrResult:
+        return DaemonAddrResult{ok: false, addr: DaemonAddr{v6: false, parts: [], scope: 0, port: 0}}
+
+    # `SocketAddr::from_str`: a v4 socket address, else a v6 one, and nothing
+    # may be left over.
+    proc daemonParseSocketAddr(s: text) -> DaemonAddrResult:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let v4 = do dcIpv4(bs, 0)
+        if v4.ok:
+            let port = do dcPort(bs, v4.i)
+            if port.ok:
+                if port.i != n:
+                    let f = do dcAddrFail()
+                    return f
+                return DaemonAddrResult{ok: true, addr: DaemonAddr{v6: false, parts: v4.parts, scope: 0, port: port.n}}
+        let open = do dcGiven(bs, 0, 91)
+        if !open:
+            let f2 = do dcAddrFail()
+            return f2
+        let ip = do dcIpv6(bs, 1)
+        if !ip.ok:
+            let f3 = do dcAddrFail()
+            return f3
+        let mut i = ip.i
+        let mut scope = 0
+        let pct = do dcGiven(bs, i, 37)
+        if pct:
+            let sc = do dcDecimal(bs, i + 1, 4294967295)
+            if sc.ok:
+                scope = sc.n
+                i = sc.i
+        let close = do dcGiven(bs, i, 93)
+        if !close:
+            let f4 = do dcAddrFail()
+            return f4
+        let port2 = do dcPort(bs, i + 1)
+        if !port2.ok || port2.i != n:
+            let f5 = do dcAddrFail()
+            return f5
+        return DaemonAddrResult{ok: true, addr: DaemonAddr{v6: true, parts: ip.parts, scope: scope, port: port2.n}}
+
+    proc dcHex(v: int) -> text:
+        let t = do sjHexText(v)
+        return t
+
+    proc dcSegments(segs: [int], from: int, to: int) -> text:
+        let mut out = ""
+        let mut k = from
+        loop k < to:
+            if k > from:
+                out = out + ":"
+            out = out + dcHex(segs[k])
+            k = k + 1
+        return out
+
+    # Ipv6Addr's Display: an IPv4-mapped address as ::ffff:a.b.c.d,
+    # otherwise the longest run (of two or more) of zero segments as `::`.
+    proc daemonIpv6Text(segs: [int]) -> text:
+        let mut mapped = segs[5] == 65535
+        let mut k = 0
+        loop k < 5:
+            if segs[k] != 0:
+                mapped = false
+            k = k + 1
+        if mapped:
+            return "::ffff:" + (segs[6] / 256) + "." + (segs[6] % 256) + "." + (segs[7] / 256) + "." + (segs[7] % 256)
+        let mut bestStart = 0
+        let mut bestLen = 0
+        let mut curStart = 0
+        let mut curLen = 0
+        let mut i = 0
+        loop i < 8:
+            if segs[i] == 0:
+                if curLen == 0:
+                    curStart = i
+                curLen = curLen + 1
+                if curLen > bestLen:
+                    bestStart = curStart
+                    bestLen = curLen
+            else:
+                curLen = 0
+            i = i + 1
+        if bestLen > 1:
+            return dcSegments(segs, 0, bestStart) + "::" + dcSegments(segs, bestStart + bestLen, 8)
+        return dcSegments(segs, 0, 8)
+
+    # The host part as a listener binds it: dotted IPv4, bare IPv6 (with
+    # its zone as `%scope`).
+    proc daemonAddrHost(a: DaemonAddr) -> text:
+        if !a.v6:
+            return "" + a.parts[0] + "." + a.parts[1] + "." + a.parts[2] + "." + a.parts[3]
+        let ip = do daemonIpv6Text(a.parts)
+        if a.scope == 0:
+            return ip
+        return ip + "%" + a.scope
+
+    # SocketAddr's Display.
+    proc daemonAddrText(a: DaemonAddr) -> text:
+        if !a.v6:
+            return "" + a.parts[0] + "." + a.parts[1] + "." + a.parts[2] + "." + a.parts[3] + ":" + a.port
+        let ip = do daemonIpv6Text(a.parts)
+        if a.scope == 0:
+            return "[" + ip + "]:" + a.port
+        return "[" + ip + "%" + a.scope + "]:" + a.port
+
+    # ------------------------------------------------------------ the declared file
+
+    struct DaemonCellRef:
+        shard: int
+        x: int
+        y: int
+
+    struct DaemonBackendFile:
+        id: text
+        url: text
+        region: text
+        hasTokenEnv: bool
+        tokenEnv: text
+        placements: [DaemonCellRef]
+
+    struct DaemonKeyspaceRuleFile:
+        kind: text
+        addressPrefix: text
+        shard: int
+        x: int
+        y: int
+
+    struct DaemonKeyspaceFile:
+        rules: [DaemonKeyspaceRuleFile]
+        hasFallback: bool
+        fallback: DaemonCellRef
+
+    struct DaemonCadence:
+        livenessProbeMs: int
+        telemetryPollMs: int
+        controlCycleMs: int
+
+    # ConfigFile. `policy` is PolicyFile::resolve applied (every absent
+    # threshold is ControllerPolicy::default's).
+    struct DaemonConfigFile:
+        dataListen: text
+        adminListen: text
+        adminTokenEnv: text
+        backends: [DaemonBackendFile]
+        keyspace: DaemonKeyspaceFile
+        cadence: DaemonCadence
+        policy: ControllerPolicy
+        hasSilenceBudgetMs: bool
+        silenceBudgetMs: int
+        probeTimeoutMs: int
+        placementCapacity: int
+        hasReadPreference: bool
+        readPreference: ReadPreference
+        hasPlacementStore: bool
+        placementStore: text
+        drainMs: int
+        decisionCooldownMs: int
+
+    # The derive's schemas, as fabric_json.fct's sjDecode tables: every
+    # struct is #[serde(deny_unknown_fields)]; `defaults` marks each
+    # field-level #[serde(default)].
+    proc dcConfigTypes() -> [SjType]:
+        let cell = do sjStructTypeDeny("CellRef", "struct CellRef", ["shard", "x", "y"], ["u64", "u8", "u8"], [false, false, false])
+        let backend = do sjStructTypeDeny("BackendFile", "struct BackendFile", ["id", "url", "region", "token_env", "placements"], ["string", "string", "string", "Option<String>", "Vec<CellRef>"], [false, false, true, true, true])
+        let rule = do sjStructTypeDeny("KeyspaceRuleFile", "struct KeyspaceRuleFile", ["kind", "address_prefix", "shard", "x", "y"], ["string", "string", "u64", "u8", "u8"], [false, false, false, false, false])
+        let keyspace = do sjStructTypeDeny("KeyspaceFile", "struct KeyspaceFile", ["rules", "fallback"], ["Vec<KeyspaceRuleFile>", "Option<CellRef>"], [true, true])
+        let cadence = do sjStructTypeDeny("CadenceFile", "struct CadenceFile", ["liveness_probe_ms", "telemetry_poll_ms", "control_cycle_ms"], ["u64", "u64", "u64"], [true, true, true])
+        let policy = do sjStructTypeDeny("PolicyFile", "struct PolicyFile", ["max_decision_age_ms", "min_confidence", "min_replicas", "max_node_utilization", "max_concurrent_actions", "max_actions_per_node", "phase_timeout_ms", "measurement_settle_ms", "measurement_deadline_ms", "outcome_noise_floor"], ["Option<u64>", "Option<f64>", "Option<usize>", "Option<f64>", "Option<usize>", "Option<usize>", "Option<u64>", "Option<u64>", "Option<u64>", "Option<f64>"], [false, false, false, false, false, false, false, false, false, false])
+        let region = do sjStructTypeDeny("ReadPreferenceFile::PreferRegion", "struct variant ReadPreferenceFile::PreferRegion", ["region"], ["string"], [false])
+        let pref = do sjEnumType("ReadPreferenceFile", "enum ReadPreferenceFile", ["primary", "any_fresh", "prefer_region", "any_copy"], ["", "", "ReadPreferenceFile::PreferRegion", ""], ["unit", "unit", "struct", "unit"])
+        let config = do sjStructTypeDeny("ConfigFile", "struct ConfigFile", ["data_listen", "admin_listen", "admin_token_env", "backends", "keyspace", "cadence", "policy", "silence_budget_ms", "probe_timeout_ms", "placement_capacity", "read_preference", "placement_store", "drain_ms", "decision_cooldown_ms"], ["string", "string", "string", "Vec<BackendFile>", "KeyspaceFile", "CadenceFile", "PolicyFile", "Option<u64>", "u64", "usize", "Option<ReadPreferenceFile>", "Option<String>", "u64", "u64"], [true, true, true, false, true, true, true, true, true, true, true, true, true, true])
+        return [cell, sjVecType("Vec<CellRef>", "CellRef"), sjOptionType("Option<CellRef>", "CellRef"), sjOptionType("Option<String>", "string"), backend, sjVecType("Vec<BackendFile>", "BackendFile"), rule, sjVecType("Vec<KeyspaceRuleFile>", "KeyspaceRuleFile"), keyspace, cadence, sjOptionType("Option<u64>", "u64"), sjOptionType("Option<f64>", "f64"), sjOptionType("Option<usize>", "usize"), policy, region, pref, sjOptionType("Option<ReadPreferenceFile>", "ReadPreferenceFile"), config]
+
+    # Typed-value readers: `absent` takes the field's default, `null` is
+    # None.
+    proc dcPresent(v: SjV) -> bool:
+        return v.kind != "absent" && v.kind != "null"
+
+    proc dcText(v: SjV, fallback: text) -> text:
+        if v.kind == "str":
+            return v.s
+        return fallback
+
+    proc dcInt(v: SjV, fallback: int) -> int:
+        if v.kind == "num":
+            return v.u
+        return fallback
+
+    proc dcFloat(v: SjV, fallback: float) -> float:
+        if v.kind == "num":
+            if v.num == "u64":
+                return sjU64Float(v.u)
+            if v.num == "i64":
+                return toFloat(v.u)
+            return v.f
+        return fallback
+
+    proc dcCell(v: SjV) -> DaemonCellRef:
+        return DaemonCellRef{shard: v.items[0].u, x: v.items[1].u, y: v.items[2].u}
+
+    proc dcCells(v: SjV) -> [DaemonCellRef]:
+        let mut out = []
+        if v.kind != "arr":
+            return out
+        let n = len(v.items)
+        let mut k = 0
+        loop k < n:
+            out = append(out, dcCell(v.items[k]))
+            k = k + 1
+        return out
+
+    proc dcBackend(v: SjV) -> DaemonBackendFile:
+        let tokenEnv = v.items[3]
+        let hasToken = do dcPresent(tokenEnv)
+        return DaemonBackendFile{id: v.items[0].s, url: v.items[1].s, region: dcText(v.items[2], "default"), hasTokenEnv: hasToken, tokenEnv: dcText(tokenEnv, ""), placements: dcCells(v.items[4])}
+
+    proc dcKeyspace(v: SjV) -> DaemonKeyspaceFile:
+        let none = DaemonCellRef{shard: 0, x: 0, y: 0}
+        if v.kind != "obj":
+            return DaemonKeyspaceFile{rules: [], hasFallback: false, fallback: none}
+        let mut rules = []
+        let rv = v.items[0]
+        if rv.kind == "arr":
+            let n = len(rv.items)
+            let mut k = 0
+            loop k < n:
+                let r = rv.items[k]
+                rules = append(rules, DaemonKeyspaceRuleFile{kind: r.items[0].s, addressPrefix: r.items[1].s, shard: r.items[2].u, x: r.items[3].u, y: r.items[4].u})
+                k = k + 1
+        let fb = v.items[1]
+        let hasFb = do dcPresent(fb)
+        if hasFb:
+            return DaemonKeyspaceFile{rules: rules, hasFallback: true, fallback: dcCell(fb)}
+        return DaemonKeyspaceFile{rules: rules, hasFallback: false, fallback: none}
+
+    proc dcCadence(v: SjV) -> DaemonCadence:
+        if v.kind != "obj":
+            return DaemonCadence{livenessProbeMs: 5000, telemetryPollMs: 15000, controlCycleMs: 5000}
+        return DaemonCadence{livenessProbeMs: dcInt(v.items[0], 5000), telemetryPollMs: dcInt(v.items[1], 15000), controlCycleMs: dcInt(v.items[2], 5000)}
+
+    # PolicyFile::resolve.
+    proc dcPolicy(v: SjV) -> ControllerPolicy:
+        let base = do controllerPolicyDefault()
+        if v.kind != "obj":
+            return base
+        return ControllerPolicy{maxDecisionAgeMs: dcInt(v.items[0], base.maxDecisionAgeMs), minConfidence: dcFloat(v.items[1], base.minConfidence), minReplicas: dcInt(v.items[2], base.minReplicas), maxNodeUtilization: dcFloat(v.items[3], base.maxNodeUtilization), maxConcurrentActions: dcInt(v.items[4], base.maxConcurrentActions), maxActionsPerNode: dcInt(v.items[5], base.maxActionsPerNode), phaseTimeoutMs: dcInt(v.items[6], base.phaseTimeoutMs), measurementSettleMs: dcInt(v.items[7], base.measurementSettleMs), measurementDeadlineMs: dcInt(v.items[8], base.measurementDeadlineMs), outcomeNoiseFloor: dcFloat(v.items[9], base.outcomeNoiseFloor)}
+
+    # `From<&ReadPreferenceFile> for ReadPreference`.
+    proc dcReadPreference(v: SjV) -> ReadPreference:
+        if v.s == "primary":
+            return ReadPreference{kind: "Primary", region: ""}
+        if v.s == "any_fresh":
+            return ReadPreference{kind: "AnyFresh", region: ""}
+        if v.s == "prefer_region":
+            return ReadPreference{kind: "PreferRegion", region: v.items[0].items[0].s}
+        return ReadPreference{kind: "AnyCopy", region: ""}
+
+    struct DaemonConfigParse:
+        ok: bool
+        err: text
+        file: DaemonConfigFile
+
+    proc dcEmptyFile() -> DaemonConfigFile:
+        let policy = do controllerPolicyDefault()
+        let none = DaemonCellRef{shard: 0, x: 0, y: 0}
+        return DaemonConfigFile{dataListen: "", adminListen: "", adminTokenEnv: "", backends: [], keyspace: DaemonKeyspaceFile{rules: [], hasFallback: false, fallback: none}, cadence: DaemonCadence{livenessProbeMs: 5000, telemetryPollMs: 15000, controlCycleMs: 5000}, policy: policy, hasSilenceBudgetMs: false, silenceBudgetMs: 0, probeTimeoutMs: 2000, placementCapacity: 64, hasReadPreference: false, readPreference: ReadPreference{kind: "Primary", region: ""}, hasPlacementStore: false, placementStore: "", drainMs: 30000, decisionCooldownMs: 300000}
+
+    # `serde_json::from_str::<ConfigFile>`: the file, or serde_json's error
+    # text.
+    proc daemonParseConfig(src: text) -> DaemonConfigParse:
+        let r = do sjDecode(dcConfigTypes(), src, "ConfigFile")
+        if !r.ok:
+            return DaemonConfigParse{ok: false, err: r.err, file: dcEmptyFile()}
+        let v = r.v
+        let mut backends = []
+        let bv = v.items[3]
+        let nb = len(bv.items)
+        let mut k = 0
+        loop k < nb:
+            backends = append(backends, dcBackend(bv.items[k]))
+            k = k + 1
+        let silence = v.items[7]
+        let pref = v.items[10]
+        let store = v.items[11]
+        let file = DaemonConfigFile{dataListen: dcText(v.items[0], dcDefaultDataListen()), adminListen: dcText(v.items[1], dcDefaultAdminListen()), adminTokenEnv: dcText(v.items[2], dcDefaultAdminTokenEnv()), backends: backends, keyspace: dcKeyspace(v.items[4]), cadence: dcCadence(v.items[5]), policy: dcPolicy(v.items[6]), hasSilenceBudgetMs: dcPresent(silence), silenceBudgetMs: dcInt(silence, 0), probeTimeoutMs: dcInt(v.items[8], 2000), placementCapacity: dcInt(v.items[9], defaultPlacementCapacity()), hasReadPreference: dcPresent(pref), readPreference: dcReadPreference(pref), hasPlacementStore: dcPresent(store), placementStore: dcText(store, ""), drainMs: dcInt(v.items[12], 30000), decisionCooldownMs: dcInt(v.items[13], 300000)}
+        return DaemonConfigParse{ok: true, err: "", file: file}
+
+    # ------------------------------------------------------------ the keyspace (front door seam)
+
+    struct DaemonKeyspaceRule:
+        kind: text
+        addressPrefix: text
+        key: RoutingKey
+
+    struct DaemonKeyspace:
+        rules: [DaemonKeyspaceRule]
+        hasFallback: bool
+        fallback: RoutingKey
+        packed: Keyspace
+
+    struct DaemonKeyspaceStep:
+        ok: bool
+        err: text
+        keyspace: DaemonKeyspace
+
+    proc daemonKeyspaceNew() -> DaemonKeyspace:
+        let key = RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}
+        return DaemonKeyspace{rules: [], hasFallback: false, fallback: key, packed: keyspaceNew()}
+
+    proc dcPack(key: RoutingKey) -> int:
+        let packed = do routingKeyPack(key.shardId, key.coordinate.x, key.coordinate.y)
+        return packed
+
+    # KeyspaceRule::new then Keyspace::with_rule, with KeyspaceError's
+    # Display on refusal.
+    proc daemonKeyspaceWithRule(ks: DaemonKeyspace, kind: text, addressPrefix: text, key: RoutingKey) -> DaemonKeyspaceStep:
+        let rule = do keyspaceRuleNew(kind, addressPrefix, dcPack(key))
+        if !rule.ok:
+            return DaemonKeyspaceStep{ok: false, err: keyspaceErrorDisplay(rule.err), keyspace: ks}
+        let added = do keyspaceWithRule(ks.packed, rule.rule)
+        if !added.ok:
+            return DaemonKeyspaceStep{ok: false, err: keyspaceErrorDisplay(added.err), keyspace: ks}
+        let mut out = ks
+        out.rules = append(ks.rules, DaemonKeyspaceRule{kind: kind, addressPrefix: addressPrefix, key: key})
+        out.packed = added.keyspace
+        return DaemonKeyspaceStep{ok: true, err: "", keyspace: out}
+
+    proc daemonKeyspaceWithFallback(ks: DaemonKeyspace, key: RoutingKey) -> DaemonKeyspace:
+        let mut out = ks
+        out.hasFallback = true
+        out.fallback = key
+        out.packed = keyspaceWithFallback(ks.packed, dcPack(key))
+        return out
+
+    struct DaemonKeyOption:
+        has: bool
+        key: RoutingKey
+
+    # Keyspace::spanning_key.
+    proc daemonKeyspaceSpanningKey(ks: DaemonKeyspace) -> DaemonKeyOption:
+        if !ks.hasFallback:
+            return DaemonKeyOption{has: false, key: ks.fallback}
+        let n = len(ks.rules)
+        let mut k = 0
+        loop k < n:
+            let r = ks.rules[k].key
+            if r.shardId != ks.fallback.shardId || r.coordinate.x != ks.fallback.coordinate.x || r.coordinate.y != ks.fallback.coordinate.y:
+                return DaemonKeyOption{has: false, key: ks.fallback}
+            k = k + 1
+        return DaemonKeyOption{has: true, key: ks.fallback}
+
+    # ------------------------------------------------------------ what it becomes
+
+    struct DaemonResolvedBackend:
+        id: text
+        url: text
+        region: text
+        hasToken: bool
+        token: text
+        placements: [DaemonCellRef]
+
+    struct DaemonSettings:
+        dataListen: DaemonAddr
+        adminListen: DaemonAddr
+        adminToken: text
+        backends: [DaemonResolvedBackend]
+        keyspace: DaemonKeyspace
+        topology: TopologyRegistry
+        readPreference: ReadPreference
+        cadence: DaemonCadence
+        policy: ControllerPolicy
+        silenceBudgetMs: int
+        probeTimeoutMs: int
+        placementCapacity: int
+        hasPlacementStore: bool
+        placementStore: text
+        drainMs: int
+        decisionCooldownMs: int
+
+    struct DaemonSettingsResult:
+        ok: bool
+        err: text
+        settings: DaemonSettings
+
+    proc dcEmptySettings() -> DaemonSettings:
+        let none = DaemonAddr{v6: false, parts: [0, 0, 0, 0], scope: 0, port: 0}
+        let key = RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}
+        let topology = do topologyRegistryNew()
+        let policy = do controllerPolicyDefault()
+        return DaemonSettings{dataListen: none, adminListen: none, adminToken: "", backends: [], keyspace: daemonKeyspaceNew(), topology: topology, readPreference: ReadPreference{kind: "Primary", region: ""}, cadence: DaemonCadence{livenessProbeMs: 0, telemetryPollMs: 0, controlCycleMs: 0}, policy: policy, silenceBudgetMs: 0, probeTimeoutMs: 0, placementCapacity: 0, hasPlacementStore: false, placementStore: "", drainMs: 0, decisionCooldownMs: 0}
+
+    # ConfigError::Invalid(reason) — its Display is the reason itself.
+    proc dcInvalid(reason: text) -> DaemonSettingsResult:
+        return DaemonSettingsResult{ok: false, err: reason, settings: dcEmptySettings()}
+
+    proc daemonCellText(c: DaemonCellRef) -> text:
+        let shard = do sjU64Text(c.shard)
+        return "shard " + shard + " (" + c.x + "," + c.y + ")"
+
+    proc dcCellIndex(c: DaemonCellRef) -> int:
+        return c.y * 12 + c.x
+
+    proc dcCellValid(c: DaemonCellRef) -> bool:
+        return c.x < 12 && c.y < 13
+
+    struct DcHolders:
+        shards: [int]
+        indexes: [int]
+        ids: [text]
+
+    proc dcHolderOf(h: DcHolders, shard: int, index: int) -> int:
+        let n = len(h.shards)
+        let mut k = 0
+        loop k < n:
+            if h.shards[k] == shard && h.indexes[k] == index:
+                return k
+            k = k + 1
+        return -1
+
+    # Backend::new's URL check, as the ConfigError::Invalid config.rs makes of
+    # FacetqlError::Configuration.
+    proc daemonBackendUrl(id: text, url: text) -> DaemonEnvGet:
+        let mut base = trim(url)
+        loop len(base) > 0 && slice(base, len(base) - 1, len(base)) == "/":
+            base = slice(base, 0, len(base) - 1)
+        let http = slice(base, 0, 7) == "http://"
+        let https = slice(base, 0, 8) == "https://"
+        if !http && !https:
+            return DaemonEnvGet{has: false, value: "facetql endpoint misconfigured: FacetQL backend '" + id + "' has a base URL that is not http(s): " + base}
+        return DaemonEnvGet{has: true, value: base}
+
+    proc dcListen(field: text, value: text) -> DaemonAddrResult:
+        let r = do daemonParseSocketAddr(value)
+        return r
+
+    # The cell a keyspace names must be one some backend holds, and
+    # addressable.
+    proc dcKeyFor(h: DcHolders, cell: DaemonCellRef) -> DaemonKeyspaceStep:
+        let key = RoutingKey{shardId: cell.shard, coordinate: Coordinate{x: cell.x, y: cell.y}}
+        let mut empty = do daemonKeyspaceNew()
+        empty.fallback = key
+        let index = do dcCellIndex(cell)
+        let held = do dcHolderOf(h, cell.shard, index)
+        let shown = do daemonCellText(cell)
+        if held < 0:
+            return DaemonKeyspaceStep{ok: false, err: "the keyspace routes to " + shown + ", which no backend declares a placement for: every request that resolved there would be misdirected", keyspace: empty}
+        let routed = do routingKeyNew(cell.shard, Coordinate{x: cell.x, y: cell.y})
+        if !routed.ok:
+            let why = do routingErrorMessage(routed.err)
+            let shard = do sjU64Text(cell.shard)
+            return DaemonKeyspaceStep{ok: false, err: "cell shard " + shard + " (" + cell.x + "," + cell.y + ") is not addressable: " + why, keyspace: empty}
+        return DaemonKeyspaceStep{ok: true, err: "", keyspace: empty}
+
+    # resolve_keyspace.
+    proc dcResolveKeyspace(file: DaemonKeyspaceFile, h: DcHolders) -> DaemonKeyspaceStep:
+        let mut ks = do daemonKeyspaceNew()
+        let n = len(file.rules)
+        let mut k = 0
+        loop k < n:
+            let rule = file.rules[k]
+            let cell = DaemonCellRef{shard: rule.shard, x: rule.x, y: rule.y}
+            let placed = do dcKeyFor(h, cell)
+            if !placed.ok:
+                return placed
+            let step = do daemonKeyspaceWithRule(ks, rule.kind, rule.addressPrefix, placed.keyspace.fallback)
+            if !step.ok:
+                return step
+            ks = step.keyspace
+            k = k + 1
+        if file.hasFallback:
+            let fb = do dcKeyFor(h, file.fallback)
+            if !fb.ok:
+                return fb
+            ks = daemonKeyspaceWithFallback(ks, fb.keyspace.fallback)
+        if n == 0 && !file.hasFallback:
+            return DaemonKeyspaceStep{ok: false, err: "the keyspace declares no rules and no fallback, so no request has a route: declare a fallback for the single-instance case", keyspace: ks}
+        return DaemonKeyspaceStep{ok: true, err: "", keyspace: ks}
+
+    # Settings::resolve: every check, in config.rs's order.
+    proc daemonResolveSettings(file: DaemonConfigFile, env: DaemonEnv) -> DaemonSettingsResult:
+        let data = do dcListen("data_listen", file.dataListen)
+        if !data.ok:
+            return dcInvalid("data_listen '" + file.dataListen + "' is not an address: invalid socket address syntax")
+        let admin = do dcListen("admin_listen", file.adminListen)
+        if !admin.ok:
+            return dcInvalid("admin_listen '" + file.adminListen + "' is not an address: invalid socket address syntax")
+        let adminToken = do daemonEnvGet(env, file.adminTokenEnv)
+        if !adminToken.has || adminToken.value == "":
+            return dcInvalid("environment variable " + file.adminTokenEnv + " is not set: the admin surface reports the fleet's shape and accepts reports about work in flight, so it is never served unauthenticated")
+        if len(file.backends) == 0:
+            return dcInvalid("no backends are declared: a front door with nothing behind it can serve nothing")
+        let mut seen = []
+        let mut backends = []
+        let mut topology = do topologyRegistryNew()
+        let mut holders = DcHolders{shards: [], indexes: [], ids: []}
+        let nb = len(file.backends)
+        let mut b = 0
+        loop b < nb:
+            let backend = file.backends[b]
+            if trim(backend.id) == "":
+                return dcInvalid("a backend with an empty id cannot be routed to")
+            let mut dup = false
+            let mut s = 0
+            loop s < len(seen):
+                if seen[s] == backend.id:
+                    dup = true
+                s = s + 1
+            if dup:
+                return dcInvalid("backend '" + backend.id + "' is declared twice; two addresses for one identity is two different fleets")
+            seen = append(seen, backend.id)
+            let mut hasToken = false
+            let mut token = ""
+            if backend.hasTokenEnv:
+                let got = do daemonEnvGet(env, backend.tokenEnv)
+                if !got.has || got.value == "":
+                    return dcInvalid("environment variable " + backend.tokenEnv + " is not set: no API token for FacetQL instance '" + backend.id + "'")
+                hasToken = true
+                token = got.value
+            let np = len(backend.placements)
+            let mut p = 0
+            loop p < np:
+                let cell = backend.placements[p]
+                let valid = do dcCellValid(cell)
+                let shown = do daemonCellText(cell)
+                if !valid:
+                    return dcInvalid("backend '" + backend.id + "' declares " + shown + ", which is outside the 12x13 grid")
+                let index = do dcCellIndex(cell)
+                let other = do dcHolderOf(holders, cell.shard, index)
+                if other >= 0:
+                    return dcInvalid(shown + " is declared on both '" + holders.ids[other] + "' and '" + backend.id + "'; a cell has exactly one holder, and moving it is a decision this daemon makes, not a thing declared twice")
+                holders.shards = append(holders.shards, cell.shard)
+                holders.indexes = append(holders.indexes, index)
+                holders.ids = append(holders.ids, backend.id)
+                topology = topologyRegistryPlace(topology, backend.id, cell.shard, Coordinate{x: cell.x, y: cell.y}, backend.region)
+                p = p + 1
+            let url = do daemonBackendUrl(backend.id, backend.url)
+            if !url.has:
+                return dcInvalid(url.value)
+            backends = append(backends, DaemonResolvedBackend{id: backend.id, url: backend.url, region: backend.region, hasToken: hasToken, token: token, placements: backend.placements})
+            b = b + 1
+        let keyspace = do dcResolveKeyspace(file.keyspace, holders)
+        if !keyspace.ok:
+            return dcInvalid(keyspace.err)
+        if file.hasPlacementStore:
+            let name = file.placementStore
+            let mut found = -1
+            let mut q = 0
+            loop q < len(backends):
+                if found < 0 && backends[q].id == name:
+                    found = q
+                q = q + 1
+            if found < 0:
+                return dcInvalid("placement_store names '" + name + "', which is not a declared backend")
+            if !backends[found].hasToken:
+                return dcInvalid("placement_store is '" + name + "', but that backend declares no token_env: Fabric's own control state is written with Fabric's own credential, never the client's")
+        let cadence = file.cadence
+        if cadence.livenessProbeMs == 0:
+            return dcInvalid("liveness_probe_ms must be greater than zero")
+        if cadence.telemetryPollMs == 0:
+            return dcInvalid("telemetry_poll_ms must be greater than zero")
+        if cadence.controlCycleMs == 0:
+            return dcInvalid("control_cycle_ms must be greater than zero")
+        let mut silence = 0
+        if file.hasSilenceBudgetMs:
+            silence = file.silenceBudgetMs
+        else:
+            silence = dcSaturatingMul3(cadence.livenessProbeMs)
+        let shorter = do sjU64Gt(cadence.livenessProbeMs, silence)
+        if shorter:
+            return dcInvalid("silence_budget_ms (" + sjU64Text(silence) + ") is shorter than one probe interval (" + sjU64Text(cadence.livenessProbeMs) + "): every instance would be declared unreachable between probes")
+        let mut readPreference = ReadPreference{kind: "Primary", region: ""}
+        if file.hasReadPreference:
+            readPreference = file.readPreference
+        let mut probeTimeout = file.probeTimeoutMs
+        if probeTimeout == 0:
+            probeTimeout = 1
+        let mut capacity = file.placementCapacity
+        if capacity == 0:
+            capacity = 1
+        let settings = DaemonSettings{dataListen: data.addr, adminListen: admin.addr, adminToken: adminToken.value, backends: backends, keyspace: keyspace.keyspace, topology: topology, readPreference: readPreference, cadence: cadence, policy: file.policy, silenceBudgetMs: silence, probeTimeoutMs: probeTimeout, placementCapacity: capacity, hasPlacementStore: file.hasPlacementStore, placementStore: file.placementStore, drainMs: file.drainMs, decisionCooldownMs: file.decisionCooldownMs}
+        return DaemonSettingsResult{ok: true, err: "", settings: settings}
+
+    # u64::saturating_mul(3).
+    proc dcSaturatingMul3(v: int) -> int:
+        let limit = 6148914691236517205
+        let over = do sjU64Gt(v, limit)
+        if over:
+            return -1
+        return v * 3
+
+    # ConfigError::Parse's Display for a file that did not parse.
+    proc daemonParseErrorText(path: text, error: text) -> text:
+        return "could not parse the configuration at " + path + ": " + error
+
+    # ConfigError::Read's Display.
+    proc daemonReadErrorText(path: text, error: text) -> text:
+        return "could not read the configuration at " + path + ": " + error
+
+    # Settings::resolve over config text already read: the parse error (as
+    # ConfigError::Parse for `path`) or the resolution.
+    proc daemonSettingsFromText(path: text, src: text, env: DaemonEnv) -> DaemonSettingsResult:
+        let parsed = do daemonParseConfig(src)
+        if !parsed.ok:
+            return DaemonSettingsResult{ok: false, err: daemonParseErrorText(path, parsed.err), settings: dcEmptySettings()}
+        let resolved = do daemonResolveSettings(parsed.file, env)
+        return resolved
+
+    # Settings::backend.
+    proc daemonSettingsBackend(s: DaemonSettings, id: text) -> DaemonResolvedBackend:
+        let n = len(s.backends)
+        let mut k = 0
+        loop k < n:
+            if s.backends[k].id == id:
+                return s.backends[k]
+            k = k + 1
+        return DaemonResolvedBackend{id: "", url: "", region: "", hasToken: false, token: "", placements: []}
+
+    proc daemonSettingsHasBackend(s: DaemonSettings, id: text) -> bool:
+        let n = len(s.backends)
+        let mut k = 0
+        loop k < n:
+            if s.backends[k].id == id:
+                return true
+            k = k + 1
+        return false
+
+    # ------------------------------------------------------------ Debug, redacted
+
+    # f64's `{:?}`: shortest round-trip digits, as a decimal with at least
+    # one fractional digit, or in exponent form below 1e-4 / from 1e16.
+    proc daemonF64Debug(f: float) -> text:
+        if f == 0.0:
+            let bits = floatBits(f)
+            if bits < 0:
+                return "-0.0"
+            return "0.0"
+        let mut sign = ""
+        let mut a = f
+        if f < 0.0:
+            sign = "-"
+            a = 0.0 - f
+        let d = do sjShortest(a)
+        let digits = d.digits
+        let exp = d.kk - 1
+        let n = len(digits)
+        if a < 0.0001 || a >= 10000000000000000.0:
+            let mut mant = slice(digits, 0, 1)
+            if n > 1:
+                mant = mant + "." + slice(digits, 1, n)
+            return sign + mant + "e" + exp
+        if exp < 0:
+            return sign + "0." + sjZeros(0 - exp - 1) + digits
+        if n <= exp + 1:
+            return sign + digits + sjZeros(exp + 1 - n) + ".0"
+        return sign + slice(digits, 0, exp + 1) + "." + slice(digits, exp + 1, n)
+
+    proc dcDebugCoordinate(x: int, y: int) -> text:
+        return "Coordinate { x: " + x + ", y: " + y + " }"
+
+    proc dcDebugKey(k: RoutingKey) -> text:
+        return "RoutingKey { shard_id: " + sjU64Text(k.shardId) + ", coordinate: " + dcDebugCoordinate(k.coordinate.x, k.coordinate.y) + " }"
+
+    proc dcDebugCell(c: DaemonCellRef) -> text:
+        return "CellRef { shard: " + sjU64Text(c.shard) + ", x: " + c.x + ", y: " + c.y + " }"
+
+    # `impl Debug for ResolvedBackend`: the token is `Some("<redacted>")`.
+    proc daemonResolvedBackendDebug(b: DaemonResolvedBackend) -> text:
+        let mut token = "None"
+        if b.hasToken:
+            token = "Some(\"<redacted>\")"
+        let mut cells = ""
+        let n = len(b.placements)
+        let mut k = 0
+        loop k < n:
+            if k > 0:
+                cells = cells + ", "
+            cells = cells + dcDebugCell(b.placements[k])
+            k = k + 1
+        return "ResolvedBackend { id: DbmsId(" + sjDebugStr(b.id) + "), url: " + sjDebugStr(b.url) + ", region: " + sjDebugStr(b.region) + ", token: " + token + ", placements: [" + cells + "] }"
+
+    proc dcDebugReadPreference(p: ReadPreference) -> text:
+        if p.kind == "PreferRegion":
+            return "PreferRegion { region: " + sjDebugStr(p.region) + " }"
+        return p.kind
+
+    # `impl Debug for Settings`: every field, the admin token as
+    # "<redacted>". The topology is a HashMap in the crate, so its entry
+    # order is only fixed for at most one placement.
+    proc daemonSettingsDebug(s: DaemonSettings) -> text:
+        let mut backends = ""
+        let nb = len(s.backends)
+        let mut b = 0
+        loop b < nb:
+            if b > 0:
+                backends = backends + ", "
+            backends = backends + daemonResolvedBackendDebug(s.backends[b])
+            b = b + 1
+        let mut rules = ""
+        let nr = len(s.keyspace.rules)
+        let mut r = 0
+        loop r < nr:
+            let rule = s.keyspace.rules[r]
+            if r > 0:
+                rules = rules + ", "
+            rules = rules + "KeyspaceRule { kind: " + sjDebugStr(rule.kind) + ", address_prefix: " + sjDebugStr(rule.addressPrefix) + ", key: " + dcDebugKey(rule.key) + " }"
+            r = r + 1
+        let mut fallback = "None"
+        if s.keyspace.hasFallback:
+            fallback = "Some(" + dcDebugKey(s.keyspace.fallback) + ")"
+        let placements = do topologyRegistryPlacements(s.topology)
+        let mut topo = ""
+        let np = len(placements)
+        let mut p = 0
+        loop p < np:
+            let pl = placements[p]
+            if p > 0:
+                topo = topo + ", "
+            let coord = do dcDebugCoordinate(pl.coordinate.x, pl.coordinate.y)
+            topo = topo + "(" + sjU64Text(pl.shardId) + ", " + coord + "): Placement { dbms_id: DbmsId(" + sjDebugStr(pl.dbmsId) + "), shard_id: " + sjU64Text(pl.shardId) + ", coordinate: " + coord + ", region: " + sjDebugStr(pl.region) + " }"
+            p = p + 1
+        let q = s.policy
+        let policy = "ControllerPolicy { max_decision_age_ms: " + sjU64Text(q.maxDecisionAgeMs) + ", min_confidence: " + daemonF64Debug(q.minConfidence) + ", min_replicas: " + sjU64Text(q.minReplicas) + ", max_node_utilization: " + daemonF64Debug(q.maxNodeUtilization) + ", max_concurrent_actions: " + sjU64Text(q.maxConcurrentActions) + ", max_actions_per_node: " + sjU64Text(q.maxActionsPerNode) + ", phase_timeout_ms: " + sjU64Text(q.phaseTimeoutMs) + ", measurement_settle_ms: " + sjU64Text(q.measurementSettleMs) + ", measurement_deadline_ms: " + sjU64Text(q.measurementDeadlineMs) + ", outcome_noise_floor: " + daemonF64Debug(q.outcomeNoiseFloor) + " }"
+        let mut store = "None"
+        if s.hasPlacementStore:
+            store = "Some(DbmsId(" + sjDebugStr(s.placementStore) + "))"
+        let c = s.cadence
+        return "Settings { data_listen: " + daemonAddrText(s.dataListen) + ", admin_listen: " + daemonAddrText(s.adminListen) + ", admin_token: \"<redacted>\", backends: [" + backends + "], keyspace: Keyspace { rules: [" + rules + "], fallback: " + fallback + " }, topology: TopologyRegistry { placements: {" + topo + "} }, front_door: FrontDoorConfig { read_preference: " + dcDebugReadPreference(s.readPreference) + ", fence_retry_budget: 2s, fence_retry_interval: 50ms, upstream_timeout: 35s, max_body_bytes: 4194304 }, cadence: CadenceFile { liveness_probe_ms: " + sjU64Text(c.livenessProbeMs) + ", telemetry_poll_ms: " + sjU64Text(c.telemetryPollMs) + ", control_cycle_ms: " + sjU64Text(c.controlCycleMs) + " }, policy: " + policy + ", silence_budget_ms: " + sjU64Text(s.silenceBudgetMs) + ", probe_timeout_ms: " + sjU64Text(s.probeTimeoutMs) + ", placement_capacity: " + sjU64Text(s.placementCapacity) + ", placement_store: " + store + ", drain_ms: " + sjU64Text(s.drainMs) + ", decision_cooldown_ms: " + sjU64Text(s.decisionCooldownMs) + " }"

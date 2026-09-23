@@ -1,0 +1,243 @@
+import "fabric_protocol.fct"
+
+app FabricRuntimeRegistrySelfHost:
+    # Port of fabric/crates/fabric-runtime/src/state.rs and registry.rs: the
+    # latest observation per location, and the fleet inventory (who is
+    # registered, when each node last reported, and whether that still counts
+    # as alive). Conventions: `&mut self` -> functional update; BTreeMap ->
+    # array kept sorted by key; HashMap -> insertion-ordered array (Rust's
+    # iteration order there is unspecified, and nothing reads it in order);
+    # Option<u64> -> has/val fields.
+
+    # ------------------------------------------------------------ state.rs
+
+    struct LocationKey:
+        dbmsId: text
+        shardId: int
+        coordinate: Coordinate
+
+    proc locationKeyNew(dbmsId: text, shardId: int, coordinate: Coordinate) -> LocationKey:
+        return LocationKey{dbmsId: dbmsId, shardId: shardId, coordinate: coordinate}
+
+    proc locationKeyEquals(a: LocationKey, b: LocationKey) -> bool:
+        return a.dbmsId == b.dbmsId && a.shardId == b.shardId && a.coordinate.x == b.coordinate.x && a.coordinate.y == b.coordinate.y
+
+    struct LocationEntry:
+        key: LocationKey
+        observation: Observation
+
+    struct FabricState:
+        latest: [LocationEntry]
+
+    proc fabricStateNew() -> FabricState:
+        return FabricState{latest: []}
+
+    private proc fabricStateIndexOf(state: FabricState, key: LocationKey) -> int:
+        let n = len(state.latest)
+        let mut i = 0
+        loop i < n:
+            let same = do locationKeyEquals(state.latest[i].key, key)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    # record: keyed by (node, observation's shard id, observation's coordinate).
+    proc fabricStateRecord(state: FabricState, dbmsId: text, observation: Observation) -> FabricState:
+        let key = LocationKey{dbmsId: dbmsId, shardId: observation.shard.id, coordinate: observation.coordinate}
+        let idx = do fabricStateIndexOf(state, key)
+        let mut latest = state.latest
+        if idx == -1:
+            latest = append(latest, LocationEntry{key: key, observation: observation})
+        else:
+            latest[idx] = LocationEntry{key: key, observation: observation}
+        return FabricState{latest: latest}
+
+    struct ObservationOption:
+        has: bool
+        val: Observation
+
+    proc fabricStateLatest(state: FabricState, dbmsId: text, shardId: int, coordinate: Coordinate) -> ObservationOption:
+        let key = LocationKey{dbmsId: dbmsId, shardId: shardId, coordinate: coordinate}
+        let idx = do fabricStateIndexOf(state, key)
+        if idx == -1:
+            let zero = do fabricStateZeroObservation()
+            return ObservationOption{has: false, val: zero}
+        return ObservationOption{has: true, val: state.latest[idx].observation}
+
+    proc fabricStateZeroObservation() -> Observation:
+        let metrics = do workloadMetricsDefault()
+        return Observation{timestampMs: 0, shard: ObservationShard{id: 0, workloadDomain: ""}, coordinate: Coordinate{x: 0, y: 0}, metrics: metrics}
+
+    proc fabricStateLen(state: FabricState) -> int:
+        return len(state.latest)
+
+    proc fabricStateIsEmpty(state: FabricState) -> bool:
+        return len(state.latest) == 0
+
+    proc fabricStateObservations(state: FabricState) -> [Observation]:
+        let mut out = []
+        let n = len(state.latest)
+        let mut i = 0
+        loop i < n:
+            out = append(out, state.latest[i].observation)
+            i = i + 1
+        return out
+
+    # forNode: everything most recently reported by one node.
+    proc fabricStateForNode(state: FabricState, dbmsId: text) -> [Observation]:
+        let mut out = []
+        let n = len(state.latest)
+        let mut i = 0
+        loop i < n:
+            if state.latest[i].key.dbmsId == dbmsId:
+                out = append(out, state.latest[i].observation)
+            i = i + 1
+        return out
+
+    # --------------------------------------------------------- registry.rs
+
+    proc defaultHeartbeatDeadlineMs() -> int:
+        return 30000
+
+    # NodeHealth: "healthy" | "degraded" | "unreachable" (the Rust labels).
+    proc nodeHealthIsServiceable(health: text) -> bool:
+        return health == "healthy"
+
+    proc nodeHealthLabel(health: text) -> text:
+        return health
+
+    struct RegisteredNode:
+        id: text
+        protocol: text
+        softwareVersion: text
+        region: text
+        registeredAtMs: int
+        hasLastHeartbeat: bool
+        lastHeartbeatMs: int
+        reportedHealthy: bool
+        heartbeats: int
+
+    private proc registeredNodeNew(registration: NodeRegistration, atMs: int) -> RegisteredNode:
+        return RegisteredNode{id: registration.nodeId.value, protocol: registration.protocol, softwareVersion: registration.softwareVersion, region: registration.region, registeredAtMs: atMs, hasLastHeartbeat: false, lastHeartbeatMs: 0, reportedHealthy: false, heartbeats: 0}
+
+    proc registeredNodeZero() -> RegisteredNode:
+        return RegisteredNode{id: "", protocol: "", softwareVersion: "", region: "", registeredAtMs: 0, hasLastHeartbeat: false, lastHeartbeatMs: 0, reportedHealthy: false, heartbeats: 0}
+
+    # health: never-reported is unreachable; silence past the deadline
+    # (saturating) is unreachable; otherwise the node's own self-report.
+    proc registeredNodeHealth(node: RegisteredNode, nowMs: int, deadlineMs: int) -> text:
+        if !node.hasLastHeartbeat:
+            return "unreachable"
+        let silence = max(nowMs - node.lastHeartbeatMs, 0)
+        if silence > deadlineMs:
+            return "unreachable"
+        if node.reportedHealthy:
+            return "healthy"
+        return "degraded"
+
+    struct SilenceOption:
+        has: bool
+        val: int
+
+    proc registeredNodeSilenceMs(node: RegisteredNode, nowMs: int) -> SilenceOption:
+        if !node.hasLastHeartbeat:
+            return SilenceOption{has: false, val: 0}
+        return SilenceOption{has: true, val: max(nowMs - node.lastHeartbeatMs, 0)}
+
+    # HeartbeatError::UnknownNode's Display.
+    proc heartbeatErrorUnknownNodeDisplay(id: text) -> text:
+        return "unknown node '" + id + "': register before sending heartbeats"
+
+    struct NodeRegistry:
+        nodes: [RegisteredNode]
+
+    proc nodeRegistryNew() -> NodeRegistry:
+        return NodeRegistry{nodes: []}
+
+    private proc nodeRegistryIndexOf(reg: NodeRegistry, id: text) -> int:
+        let n = len(reg.nodes)
+        let mut i = 0
+        loop i < n:
+            if reg.nodes[i].id == id:
+                return i
+            i = i + 1
+        return -1
+
+    struct NodeRegisterResult:
+        created: bool
+        registry: NodeRegistry
+
+    # register: replaces any existing record outright (a restart must prove
+    # liveness again); `created` is BTreeMap::insert(..).is_none().
+    proc nodeRegistryRegister(reg: NodeRegistry, registration: NodeRegistration, atMs: int) -> NodeRegisterResult:
+        let node = do registeredNodeNew(registration, atMs)
+        let idx = do nodeRegistryIndexOf(reg, node.id)
+        if idx != -1:
+            let mut replaced = reg.nodes
+            replaced[idx] = node
+            return NodeRegisterResult{created: false, registry: NodeRegistry{nodes: replaced}}
+        let n = len(reg.nodes)
+        let mut out = []
+        let mut placed = false
+        let mut i = 0
+        loop i < n:
+            if !placed && node.id < reg.nodes[i].id:
+                out = append(out, node)
+                placed = true
+            out = append(out, reg.nodes[i])
+            i = i + 1
+        if !placed:
+            out = append(out, node)
+        return NodeRegisterResult{created: true, registry: NodeRegistry{nodes: out}}
+
+    struct NodeHeartbeatResult:
+        ok: bool
+        err: text
+        registry: NodeRegistry
+
+    # heartbeat: refused for an unregistered node; keeps the newest timestamp.
+    proc nodeRegistryHeartbeat(reg: NodeRegistry, beat: NodeHeartbeat) -> NodeHeartbeatResult:
+        let idx = do nodeRegistryIndexOf(reg, beat.nodeId.value)
+        if idx == -1:
+            let msg = do heartbeatErrorUnknownNodeDisplay(beat.nodeId.value)
+            return NodeHeartbeatResult{ok: false, err: msg, registry: reg}
+        let node = reg.nodes[idx]
+        let mut last = beat.timestampMs
+        if node.hasLastHeartbeat:
+            last = max(node.lastHeartbeatMs, beat.timestampMs)
+        let mut nodes = reg.nodes
+        nodes[idx] = RegisteredNode{id: node.id, protocol: node.protocol, softwareVersion: node.softwareVersion, region: node.region, registeredAtMs: node.registeredAtMs, hasLastHeartbeat: true, lastHeartbeatMs: last, reportedHealthy: beat.healthy, heartbeats: node.heartbeats + 1}
+        return NodeHeartbeatResult{ok: true, err: "", registry: NodeRegistry{nodes: nodes}}
+
+    struct RegisteredNodeOption:
+        has: bool
+        val: RegisteredNode
+
+    proc nodeRegistryGet(reg: NodeRegistry, id: text) -> RegisteredNodeOption:
+        let idx = do nodeRegistryIndexOf(reg, id)
+        if idx == -1:
+            let zero = do registeredNodeZero()
+            return RegisteredNodeOption{has: false, val: zero}
+        return RegisteredNodeOption{has: true, val: reg.nodes[idx]}
+
+    proc nodeRegistryNodes(reg: NodeRegistry) -> [RegisteredNode]:
+        return reg.nodes
+
+    proc nodeRegistryUnhealthy(reg: NodeRegistry, nowMs: int, deadlineMs: int) -> [RegisteredNode]:
+        let mut out = []
+        let n = len(reg.nodes)
+        let mut i = 0
+        loop i < n:
+            let health = do registeredNodeHealth(reg.nodes[i], nowMs, deadlineMs)
+            let serviceable = do nodeHealthIsServiceable(health)
+            if !serviceable:
+                out = append(out, reg.nodes[i])
+            i = i + 1
+        return out
+
+    proc nodeRegistryLen(reg: NodeRegistry) -> int:
+        return len(reg.nodes)
+
+    proc nodeRegistryIsEmpty(reg: NodeRegistry) -> bool:
+        return len(reg.nodes) == 0

@@ -154,6 +154,9 @@ func swiftParams(ps []ir.Param) string {
 		case "bool":
 			t = "Bool"
 		}
+		if p.List {
+			t = "[" + t + "]"
+		}
 		out = append(out, fmt.Sprintf("%s: %s", p.Name, t))
 	}
 	return strings.Join(out, ", ")
@@ -277,14 +280,17 @@ func tsClient(graph *ir.IR, ents []ir.Entity, acts []ir.Action) string {
 }
 
 func tsParamType(p ir.Param) string {
+	t := "string"
 	switch p.Type {
 	case "int", "money", "date", "float":
-		return "number"
+		t = "number"
 	case "bool":
-		return "boolean"
-	default:
-		return "string"
+		t = "boolean"
 	}
+	if p.List {
+		return t + "[]"
+	}
+	return t
 }
 
 func mobileReadme(graph *ir.IR) string {

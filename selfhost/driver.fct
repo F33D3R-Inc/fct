@@ -6,40 +6,26 @@
 # text` that answers with the same JSON shape encoding/json.Marshal(*ir.IR)
 # produces for the declarations this file covers.
 #
-# SCOPE, STATED HONESTLY: this driver assembles the DECLARATION half of a
-# compiled app — enums, records, structs, states (with correct per-type
-# zero defaults), top-level derives (with real dependency sets), policies,
-# entities (fields, including enum/relation resolution, @unique/@softdelete
-# index and archived-field injection, entity-level read/derive), actions
-# (via action_lower.fct's real placement inference), procs (via
-# proc_lower.fct), services, jobs, webhooks, and triggers — plus the
-# fixed `auth` entity/actions table when `auth` is declared. It does NOT
-# assemble views/pages/bindings/routes/depGraph, nor
-# types/messages/daemons/components/files/api/stream/theme/css/assets: the
-# view-compilation stage (segs -> binding ids, `for`/`if` -> dynamic
-# regions, dependency graphs) is real-compiler logic that lives entirely in
-# internal/ir/build.go's viewCtx and internal/codegen, with THOUSANDS of
-# lines and no self-hosted port anywhere in this directory — confirmed by
-# grep, not assumed. driver_test.go compares only the keys this file
-# actually emits against the same keys of the real compiler's own IR JSON,
-# so "passing" here means "the declaration-level IR matches exactly," not
-# "the whole app round-trips."
+# SCOPE: the whole compiled graph for a plain `app` — enums, records,
+# structs, states (with the built-in `theme` cell a dark/named palette
+# injects), top-level derives, policies, entities (with parser.go's
+# qualifyRowRefs applied to `read:`/derive bodies, and every index the view
+# compiler infers), actions (including the @e2e seal set), procs, daemons,
+# services, jobs, webhooks, triggers, the `auth` table, the theme maps and
+# css — and, through view_build.fct, every view: pages, routes, bindings,
+# the top-level view and depGraph. compileFile resolves `import`s the way
+# compile.File does (depth-first collection, private-name mangling,
+# mergeInto) through the io.file capability. driver_test.go compares the
+# WHOLE IR against the real compiler for every example app.
 #
-# A second, real gap surfaced while wiring this: the self-hosted parser's
-# `parseExprTree` (expr.fct, used for entity `read:`/`derive` bodies and
-# state defaults) never runs `qualifyRowRefs` the way internal/parser/
-# parser.go's real parseEntity does — a bare field name inside an entity's
-# `read:`/`derive` expression is NOT rewritten to `Get{Ref{"$row"}, name}`
-# here the way the real compiler rewrites it before Build ever sees the
-# expression. Any example whose entity read/derive references a bare field
-# name (not `actor`) will disagree with the real compiler on exactly that
-# expression's `ref` vs `get` shape. Reported, not silently patched over —
-# fixing it means porting qualifyRowRefs itself, which is out of this
-# slice's scope.
+# Not yet here: components/`use`, layouts, wire types/messages, files,
+# api/stream declarations, assets and `css from` — a program that uses one
+# of the view-side ones is refused by name rather than compiled wrongly.
 import "program.fct"
 import "action_lower.fct"
 import "proc_lower.fct"
 import "ir_graph.fct"
+import "wire_build.fct"
 
 app DriverSelfHost:
     # ── literal ExprNode builders for synthesized defaults ──────────────
@@ -51,16 +37,16 @@ app DriverSelfHost:
     # a bool/text/list cell, so this driver recomputes the correct default
     # itself rather than trusting that filler.
     private proc driverIntLit(text0: text) -> ExprNode:
-        return ExprNode{kind: "int", text: text0, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+        return ExprNode{kind: "int", text: text0, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: [], order: "", desc: false, limit: [], orderBy: [], varFromArg: false}
 
     private proc driverBoolLit(text0: text) -> ExprNode:
-        return ExprNode{kind: "bool", text: text0, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+        return ExprNode{kind: "bool", text: text0, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: [], order: "", desc: false, limit: [], orderBy: [], varFromArg: false}
 
     private proc driverTextLit(quoted: text) -> ExprNode:
-        return ExprNode{kind: "text", text: quoted, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+        return ExprNode{kind: "text", text: quoted, field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: [], order: "", desc: false, limit: [], orderBy: [], varFromArg: false}
 
     private proc driverEmptyListLit() -> ExprNode:
-        return ExprNode{kind: "list", text: "", field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: []}
+        return ExprNode{kind: "list", text: "", field: "", itemVar: "", coll: "", children: [], pairs: [], whereClause: [], sel: [], order: "", desc: false, limit: [], orderBy: [], varFromArg: false}
 
     proc driverStateDefaultNode(sd: StateDecl) -> ExprNode:
         if sd.hasDefault:
@@ -124,8 +110,14 @@ app DriverSelfHost:
             if len(e.where) > 0:
                 let t9 = do driverDepsWalk(e.where[0], stateNames, entityNames, acc3)
                 acc3 = t9
+            if len(e.sel) > 0:
+                let t9s = do driverDepsWalk(e.sel[0], stateNames, entityNames, acc3)
+                acc3 = t9s
+            if len(e.limit) > 0:
+                let t9l = do driverDepsWalk(e.limit[0], stateNames, entityNames, acc3)
+                acc3 = t9l
             return acc3
-        if e.kind == "call" || e.kind == "list":
+        if e.kind == "call" || e.kind == "list" || e.kind == "struct":
             let mut acc4 = acc
             let n = len(e.args)
             let mut i = 0
@@ -178,38 +170,520 @@ app DriverSelfHost:
         let mut readPolicy = ""
         if f.hasRequiresPolicy:
             readPolicy = f.requiresPolicy
-        return IRField{name: f.name, type: ftype, ref: ref, enumName: enumName, index: idx, secret: f.secret, e2e: f.e2e, readPolicy: readPolicy, optional: f.isOptional, unique: f.unique, required: f.required, hasMin: f.hasMin, min: f.minValue, hasMax: f.hasMax, max: f.maxValue, matches: f.matchesPattern, onDelete: onDel}
+        return IRField{name: f.name, type: ftype, ref: ref, enumName: enumName, index: idx, secret: f.secret, e2e: f.e2e, password: f.password, readPolicy: readPolicy, optional: f.isOptional, unique: f.unique, required: f.required, hasMin: f.hasMin, min: f.minValue, hasMax: f.hasMax, max: f.maxValue, matches: f.matchesPattern, onDelete: onDel}
 
     proc driverArchivedField() -> IRField:
-        return IRField{name: "archived", type: "bool", ref: "", enumName: "", index: true, secret: false, e2e: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
+        return IRField{name: "archived", type: "bool", ref: "", enumName: "", index: true, secret: false, e2e: false, password: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
 
-    proc driverEntityIR(ed: EntityDecl, enumNames: [text], entityNames: [text], inlineNames: [text], inlineExprs: [IRExpr]) -> IREntity:
+    # driverParseFile: parseFile — `file Name: text|bytes at "path"`, one
+    # line, no body.
+    struct DriverFile:
+        err: text
+        name: text
+        type: text
+        path: text
+
+    proc driverParseFile(rd: RawDecl) -> DriverFile:
+        let ln = "line " + rd.line + ": "
+        if trim(rd.bodySrc) != "":
+            return DriverFile{err: ln + "file declares no body — `read`/`write` are proc statements, not part of the declaration", name: "", type: "", path: ""}
+        let r0 = do vpTrimPrefix(trim(rd.header), "file")
+        let rest = trim(r0)
+        let colon = do vpIndexOf(rest, ":")
+        if colon < 0:
+            return DriverFile{err: ln + "file needs a type: file Name: text at \"path.txt\"", name: "", type: "", path: ""}
+        let name = trim(slice(rest, 0, colon))
+        let tail = trim(slice(rest, colon + 1, len(rest)))
+        let at = do vpIndexOf(tail, " at ")
+        if at < 0:
+            return DriverFile{err: ln + "file needs a path: file Name: text at \"path.txt\"", name: "", type: "", path: ""}
+        let typ = trim(slice(tail, 0, at))
+        let u = do goUnquote(trim(slice(tail, at + 4, len(tail))))
+        if !u.ok || u.value == "":
+            return DriverFile{err: ln + "file needs a quoted path: file Name: text at \"path.txt\"", name: "", type: "", path: ""}
+        let ni = do vpIsIdent(name)
+        let nq = do goQuote(name)
+        if !ni:
+            return DriverFile{err: ln + "invalid file name " + nq, name: "", type: "", path: ""}
+        if typ != "text" && typ != "bytes":
+            let tq = do goQuote(typ)
+            return DriverFile{err: ln + "file " + nq + " type must be text or bytes, got " + tq, name: "", type: "", path: ""}
+        return DriverFile{err: "", name: name, type: typ, path: u.value}
+
+    # ── declaration checks Build makes (records, entities, states,
+    #    services, webhooks, triggers) ───────────────────────────────────
+    proc driverIsPrimitive(t: text) -> bool:
+        return t == "int" || t == "text" || t == "bool" || t == "money" || t == "date" || t == "float" || t == "datetime"
+
+    # driverDeclDiag: the structural refusals that need no expression
+    # typing — the first one, or "".
+    # driverBraceErr: braceErr — the one diagnostic for a quoted position
+    # that does not interpolate.
+    proc driverBraceErr(pos: text, s: text, snip: text, fix: text) -> text:
+        let sq = do goQuote(s)
+        return pos + " does not interpolate, so " + sq + " renders `" + snip + "` as literal text — " + fix + ". `{…}` interpolates in node text, labels, placeholders, `class`, `meta` and link/image destinations, and nowhere else; braces around a name the scope does not define are literal everywhere"
+
+    proc driverDeclDiag(prog: Program, enumNames: [text], entityNames: [text], policyNames: [text], policyParamCounts: [int], litNames: [text]) -> text:
+        # theme tokens and service URLs are fixed at compile time
+        let nth = len(prog.themes)
+        let mut th = 0
+        loop th < nth:
+            let nv = len(prog.themes[th].vars)
+            let mut tv = 0
+            loop tv < nv:
+                let v = prog.themes[th].vars[tv]
+                let snip = do driverLitInterp(v.value, litNames)
+                if snip != "":
+                    let nq = do goQuote(v.name)
+                    let be = do driverBraceErr("theme token " + nq, v.value, snip, "a theme token is a CSS value emitted once into the page's stylesheet, so it cannot read the app's data — switch whole palettes with `theme <name>:` blocks and the built-in `theme` cell instead")
+                    return be
+                tv = tv + 1
+            th = th + 1
+        let nsv0 = len(prog.services)
+        let mut sv0 = 0
+        loop sv0 < nsv0:
+            let snip2 = do driverLitInterp(prog.services[sv0].url, litNames)
+            if snip2 != "":
+                let sq2 = do goQuote(prog.services[sv0].name)
+                let be2 = do driverBraceErr("service " + sq2 + "'s base URL", prog.services[sv0].url, snip2, "a service's base URL is fixed at compile time — it is where the authority connects, not something a render decides; put the varying part in the operation's arguments")
+                return be2
+            sv0 = sv0 + 1
+        # records are flat
+        let nr = len(prog.records)
+        let mut ri = 0
+        loop ri < nr:
+            let rd = prog.records[ri]
+            let nf = len(rd.fields)
+            let mut fi = 0
+            loop fi < nf:
+                let f = rd.fields[fi]
+                let prim = do driverIsPrimitive(f.typeCore)
+                if !prim && !(f.typeCore in enumNames):
+                    let fq = do goQuote(f.name)
+                    let tq = do goQuote(f.typeCore)
+                    return "record field " + fq + " has type " + tq + " — a record field must be a primitive, an enum, or a list of those (records are flat: no nested records or entities)"
+                fi = fi + 1
+            ri = ri + 1
+        # entities
+        let ne = len(prog.entities)
+        let mut ei = 0
+        loop ei < ne:
+            let ed = prog.entities[ei]
+            let enq = do goQuote(ed.name)
+            if ed.ephemeral && ed.softDelete:
+                return "entity " + enq + " is @ephemeral, so @softdelete has nothing to archive into — drop one"
+            let nd = len(ed.derives)
+            let mut di = 0
+            loop di < nd:
+                let dh = ed.derives[di].line
+                let colon = do indexOf(dh, ":")
+                let paren = do indexOf(dh, "(")
+                if paren >= 0 && (colon < 0 || paren < colon):
+                    let dq = do goQuote(ed.derives[di].name)
+                    return "entity " + enq + "'s derive " + dq + " is computed from the row itself, so it takes no parameters — declare a parameterized derive at the app level"
+                di = di + 1
+            let nf2 = len(ed.fields)
+            let mut fj = 0
+            loop fj < nf2:
+                let f2 = ed.fields[fj]
+                let fq2 = do goQuote(f2.name)
+                if f2.onDeleteRestrict && f2.onDeleteSetNull:
+                    return "field " + fq2 + " cannot be both @restrict and @setNull — @restrict refuses the delete while a reference remains, @setNull clears this field instead; pick one"
+                if f2.onDeleteSetNull && !f2.isOptional:
+                    return "field " + fq2 + " is @setNull but not optional — write `" + f2.name + ": " + f2.typeCore + "?` so the column has a null to hold once the referenced row is deleted"
+                if (f2.onDeleteRestrict || f2.onDeleteSetNull) && !(f2.typeCore in entityNames):
+                    return "field " + fq2 + " has an on-delete modifier (@restrict/@setNull) but is not a relation to another entity"
+                if f2.hasRequiresPolicy:
+                    let pat = do vbFind(policyNames, f2.requiresPolicy)
+                    let pq = do goQuote(f2.requiresPolicy)
+                    if pat < 0:
+                        return "field " + ed.name + "." + f2.name + " @requires unknown policy " + pq
+                    if policyParamCounts[pat] != 0:
+                        return "field " + ed.name + "." + f2.name + " @requires row-level policy " + pq + "; a field gate must be a zero-argument policy"
+                fj = fj + 1
+            ei = ei + 1
+        # states: the built-in `route`
+        let ns = len(prog.states)
+        let mut si = 0
+        loop si < ns:
+            if prog.states[si].name == "route":
+                return "state \"route\" collides with the built-in `route` (the path being rendered) — rename the cell"
+            si = si + 1
+        # service replies
+        let nsv = len(prog.services)
+        let mut vi = 0
+        loop vi < nsv:
+            let sv = prog.services[vi]
+            let no = len(sv.ops)
+            let mut oi = 0
+            loop oi < no:
+                let op = sv.ops[oi]
+                if op.hasRet && op.retCore == "bytes" && op.retIsList:
+                    return sv.name + "." + op.name + " returns [bytes] — a service answers one file per call"
+                let prim2 = do driverIsPrimitive(op.retCore)
+                if op.hasRet && op.retCore != "" && op.retCore != "bytes" && !prim2 && !(op.retCore in enumNames):
+                    let mut isRec = false
+                    let mut rk = 0
+                    loop rk < nr:
+                        if prog.records[rk].name == op.retCore:
+                            isRec = true
+                        rk = rk + 1
+                    if !isRec:
+                        let rq = do goQuote(op.retCore)
+                        return sv.name + "." + op.name + " returns unknown type " + rq + " — declare a `record " + op.retCore + ": …` for a structured reply, or use a primitive/enum"
+                oi = oi + 1
+            vi = vi + 1
+        return ""
+
+    # driverReservedWebhook: reservedWebhookPath.
+    proc driverReservedWebhook(p: text) -> bool:
+        if p in ["/", "/event", "/live", "/api", "/upload", "/admin", "/facet.js", "/healthz", "/readyz", "/metrics", "/billing/webhook"]:
+            return true
+        let pres = ["/api/", "/uploads/", "/admin/", "/auth/", "/dev/"]
+        let mut i = 0
+        loop i < 5:
+            let pl = len(pres[i])
+            if len(p) >= pl && slice(p, 0, pl) == pres[i]:
+                return true
+            i = i + 1
+        return false
+
+    # driverRouteDiag: Build 4d (webhooks) and 4e (triggers) over the built
+    # actions.
+    proc driverRouteDiag(prog: Program, actions: [IRAction], litNames: [text]) -> text:
+        let mut seen = []
+        let nw = len(prog.webhooks)
+        let mut wi = 0
+        loop wi < nw:
+            let wh = prog.webhooks[wi]
+            let pq = do goQuote(wh.path)
+            let at = do wFindAction(actions, wh.action)
+            if at < 0:
+                let aq = do goQuote(wh.action)
+                return "line " + wh.line + ": webhook " + pq + " targets unknown action " + aq
+            let sat = do vbFind(seen, wh.path)
+            if sat >= 0:
+                return "line " + wh.line + ": webhook path " + pq + " redeclared (first at line " + prog.webhooks[sat].line + ")"
+            let res = do driverReservedWebhook(wh.path)
+            if res:
+                return "line " + wh.line + ": webhook path " + pq + " collides with a route the runtime reserves"
+            let snip = do driverLitInterp(wh.path, litNames)
+            if snip != "":
+                return "line " + wh.line + ": webhook path " + pq + " does not interpolate, so " + pq + " renders `" + snip + "` as literal text — a webhook path is a fixed endpoint an external system POSTs to, so it is literal — read the varying part out of the body in the action it targets. `{…}` interpolates in node text, labels, placeholders, `class`, `meta` and link/image destinations, and nowhere else; braces around a name the scope does not define are literal everywhere"
+            seen = append(seen, wh.path)
+            wi = wi + 1
+        # triggers: known source, a zero-argument server reaction, no cycle
+        let mut keys = []
+        let mut froms = []
+        let mut tos = []
+        let nt = len(prog.triggers)
+        let mut ti = 0
+        loop ti < nt:
+            let tr = prog.triggers[ti]
+            let src = do wFindAction(actions, tr.onAction)
+            if src < 0:
+                return "trigger `on " + tr.onAction + "` names unknown action \"" + tr.onAction + "\""
+            let rx = do wFindAction(actions, tr.reactionAction)
+            let rq = do goQuote(tr.reactionAction)
+            if rx < 0:
+                return "trigger reaction " + rq + " is not a defined action"
+            if actions[rx].placement != "server":
+                return "trigger reaction " + rq + " is client-placed; a reaction runs on the server authority, so it must be authoritative"
+            if len(actions[rx].params) != 0:
+                return "trigger reaction " + rq + " takes arguments; a reaction runs a zero-argument action"
+            let key = tr.onAction + " -> " + tr.reactionAction
+            if key in keys:
+                return "trigger `on " + key + "` redeclared"
+            keys = append(keys, key)
+            froms = append(froms, tr.onAction)
+            tos = append(tos, tr.reactionAction)
+            ti = ti + 1
+        let cyc = do driverTriggerCycle(froms, tos)
+        if cyc != "":
+            return "trigger cycle: " + cyc + " — reactions would never terminate"
+        return ""
+
+    # driverTriggerCycle: triggerCycle — DFS over sources in sorted order,
+    # each node's edges in declaration order; the first back edge's cycle.
+    struct DrCyc:
+        color: [int]
+        stack: [text]
+        found: text
+
+    proc driverTriggerCycle(froms: [text], tos: [text]) -> text:
+        let mut nodes = []
+        let n = len(froms)
+        let mut i = 0
+        loop i < n:
+            if !(froms[i] in nodes):
+                nodes = append(nodes, froms[i])
+            i = i + 1
+        let sorted = do vbSortText(nodes)
+        let mut all = sorted
+        let mut j = 0
+        loop j < n:
+            if !(tos[j] in all):
+                all = append(all, tos[j])
+            j = j + 1
+        let mut color = []
+        let na = len(all)
+        let mut k = 0
+        loop k < na:
+            color = append(color, 0)
+            k = k + 1
+        let mut st = DrCyc{color: color, stack: [], found: ""}
+        let ns = len(sorted)
+        let mut s = 0
+        loop s < ns:
+            let at = do vbFind(all, sorted[s])
+            if st.color[at] == 0:
+                let r = do driverCycDfs(all, froms, tos, sorted[s], st)
+                if r.found != "":
+                    return r.found
+                st = r
+            s = s + 1
+        return ""
+
+    proc driverCycDfs(all: [text], froms: [text], tos: [text], node: text, st0: DrCyc) -> DrCyc:
+        let at = do vbFind(all, node)
+        let mut color = st0.color
+        color[at] = 1
+        let mut st = DrCyc{color: color, stack: append(st0.stack, node), found: ""}
+        let n = len(froms)
+        let mut i = 0
+        loop i < n:
+            if froms[i] == node:
+                let m = tos[i]
+                let mat = do vbFind(all, m)
+                if st.color[mat] == 1:
+                    let mut start = 0
+                    let ls = len(st.stack)
+                    let mut q = ls - 1
+                    loop q >= 0:
+                        if st.stack[q] == m:
+                            start = q
+                        q = q - 1
+                    let mut path = ""
+                    let mut p = start
+                    loop p < ls:
+                        path = path + st.stack[p] + " -> "
+                        p = p + 1
+                    return DrCyc{color: st.color, stack: st.stack, found: path + m}
+                if st.color[mat] == 0:
+                    let r = do driverCycDfs(all, froms, tos, m, st)
+                    if r.found != "":
+                        return r
+                    st = r
+            i = i + 1
+        let mut c2 = st.color
+        c2[at] = 2
+        let mut popped = []
+        let ls2 = len(st.stack)
+        let mut pi = 0
+        loop pi < ls2 - 1:
+            popped = append(popped, st.stack[pi])
+            pi = pi + 1
+        return DrCyc{color: c2, stack: popped, found: ""}
+
+    # driverLitInterp: litInterp — the first `{…}` in s whose contents
+    # parse as an expression reading only names in scope.
+    proc driverLitInterp(s: text, defined: [text]) -> text:
+        let cs = split(s, "")
+        let n = len(cs)
+        let mut i = 0
+        loop i < n:
+            if cs[i] == "{":
+                let mut end = -1
+                let mut j = i + 1
+                loop j < n && end < 0:
+                    if cs[j] == "}":
+                        end = j
+                    j = j + 1
+                if end < 0:
+                    return ""
+                let inner = slice(s, i + 1, end)
+                let perr = do epParseError(inner)
+                if perr == "" && trim(inner) != "":
+                    let ex = do parseExprTree(inner)
+                    let names = do freeNames(ex)
+                    if len(names) > 0:
+                        let mut ok = true
+                        let nn = len(names)
+                        let mut k = 0
+                        loop k < nn:
+                            if !(names[k] in defined):
+                                ok = false
+                            k = k + 1
+                        if ok:
+                            return "{" + inner + "}"
+                i = end
+            i = i + 1
+        return ""
+
+    # driverPureDiag: checkPure — an authority-only builtin refused first,
+    # then check() (every stage and name), then no now/rand and no print.
+    proc driverPureDiag(ex: ExprNode, locals: [text], ctx: text, stateNames: [text], entityNames: [text], fieldKeys: [text], enumNames: [text], inlineNames: [text], ce: CallEnv) -> text:
+        let nodes = do allNodes(ex)
+        let secrets = ["verifyPassword", "totpSecret", "totpValid", "randomToken", "fileDigest", "ed25519Verify", "ecdsaP256Verify", "sha256Hex", "canonicalJson", "shuffleOrder"]
+        let mut lastSecret = ""
+        let nn = len(nodes)
+        let mut i = 0
+        loop i < nn:
+            if nodes[i].kind == "call" && (nodes[i].text in secrets):
+                lastSecret = nodes[i].text
+            i = i + 1
+        if lastSecret != "":
+            return ctx + " cannot call " + lastSecret + "(...); it handles an authentication secret and runs only on the authority. Call it from an action body instead"
+        let d = do exprCheckTreeC(ex, locals, stateNames, entityNames, fieldKeys, enumNames, inlineNames, ce)
+        if d != "":
+            return d
+        let impure = do nodesHaveImpure(nodes)
+        if impure:
+            return ctx + " cannot use an effectful builtin (now/rand); it must be pure so it can run on any client. Compute it in an action instead"
+        let prints = do nodesHavePrint(nodes)
+        if prints:
+            return ctx + " cannot call print(...); it is a server-only debugging aid with no client implementation. Call it from an action body or a proc instead"
+        return ""
+
+    # driverExprDiag: the declaration expressions Build checks — state
+    # initial values (literal text rule), policies, derives, entity
+    # derives and read gates — the first refusal, or "".
+    proc driverExprDiag(prog: Program, allStates: [StateDecl], stateNames: [text], entityNames: [text], entities: [IREntity], enumNames: [text], inlineNames: [text], ce: CallEnv) -> text:
+        let mut fieldKeys = []
+        let ne = len(entities)
+        let mut ei = 0
+        loop ei < ne:
+            let nf = len(entities[ei].fields)
+            let mut fi = 0
+            loop fi < nf:
+                fieldKeys = append(fieldKeys, entities[ei].name + "." + entities[ei].fields[fi].name)
+                fi = fi + 1
+            ei = ei + 1
+        let actorScope = do withActor([])
+        let ns = len(prog.states)
+        let mut si = 0
+        loop si < ns:
+            let dn = do driverStateDefaultNode(prog.states[si])
+            let dnodes = do allNodes(dn)
+            let ld = do checkLiteralExpr(dnodes, [], stateNames, entityNames, enumNames, inlineNames)
+            if ld != "":
+                return ld
+            si = si + 1
+        let np = len(prog.policies)
+        let mut pi = 0
+        loop pi < np:
+            let pd = prog.policies[pi]
+            let plocals = do withActor(pd.paramNames)
+            let pdg = do driverPureDiag(pd.predicate, plocals, "a policy", stateNames, entityNames, fieldKeys, enumNames, inlineNames, ce)
+            if pdg != "":
+                return pdg
+            pi = pi + 1
+        let nd = len(prog.derives)
+        let mut di = 0
+        loop di < nd:
+            let wd = do wParseDerive(prog.derives[di].line, prog.derives[di].cont)
+            if wd.err == "":
+                let mut dlocals = actorScope
+                let mut ctx = "a derive"
+                let npar = len(wd.params)
+                if npar > 0:
+                    let dq = do goQuote(wd.name)
+                    ctx = "derive " + dq
+                    let mut pk = 0
+                    loop pk < npar:
+                        dlocals = append(dlocals, wd.params[pk].name)
+                        pk = pk + 1
+                let mut dsc = do tyEmptyScope()
+                let mut dp = 0
+                loop dp < npar:
+                    let pt = do tyDeclType(ce.ty, wd.params[dp].type, wd.params[dp].list)
+                    if pt.core != "":
+                        let pl = do tyLabel(pt)
+                        dsc = do tyScopeWith(dsc, wd.params[dp].name, pl)
+                    dp = dp + 1
+                if npar > 0:
+                    let rv = do tyParse(wd.type)
+                    let mut ret = do tyDeclType(ce.ty, rv.core, rv.list)
+                    if rv.core in ce.ty.wireNames:
+                        ret = rv
+                    if ret.core == "":
+                        return "derive \"" + wd.name + "\" returns unknown type \"" + wd.type + "\""
+                let dce = CallEnv{fnNames: ce.fnNames, fnArities: ce.fnArities, procNames: ce.procNames, procArities: ce.procArities, procDerives: ce.procDerives, listNames: ce.listNames, jsonNames: ce.jsonNames, deriveKeys: ce.deriveKeys, inAction: false, inDerive: npar > 0, inProc: false, ty: ce.ty, tsc: dsc}
+                let ddg = do driverPureDiag(wd.expr, dlocals, ctx, stateNames, entityNames, fieldKeys, enumNames, inlineNames, dce)
+                if ddg != "":
+                    return ddg
+                if npar > 0:
+                    let dad = do tyDeriveArgsDiag(ce.ty, wd.expr, dsc)
+                    if dad != "":
+                        return dad
+                    let rv2 = do tyParse(wd.type)
+                    let mut ret2 = do tyDeclType(ce.ty, rv2.core, rv2.list)
+                    if rv2.core in ce.ty.wireNames:
+                        ret2 = rv2
+                    let got = do tyExpr(ce.ty, wd.expr, dsc)
+                    let asg = do tyAssignable(ce.ty, got, ret2)
+                    if !asg:
+                        let rl2 = do tyLabel(ret2)
+                        let gl = do tyLabel(got)
+                        return "derive \"" + wd.name + "\" is declared " + rl2 + ", but its definition is " + gl
+            di = di + 1
+        let rowScope = do withActor(["$row"])
+        let mut ej = 0
+        loop ej < len(prog.entities):
+            let ed = prog.entities[ej]
+            let enq = do goQuote(ed.name)
+            let nde = len(ed.derives)
+            let mut dk = 0
+            loop dk < nde:
+                let dq2 = do goQuote(ed.derives[dk].name)
+                let edg = do driverPureDiag(ed.derives[dk].expr, rowScope, "entity " + enq + "'s derive " + dq2, stateNames, entityNames, fieldKeys, enumNames, inlineNames, ce)
+                if edg != "":
+                    return edg
+                dk = dk + 1
+            ej = ej + 1
+        return ""
+
+    # driverEntityIR: Build step 1 for one entity — its fields, then each
+    # carried derive and its `read:` gate lowered through env.low with the
+    # entity's own field types (markTextAggs) and every earlier entity
+    # derive (deriveOrders) in the context, which it returns grown.
+    struct DriverEntityOut:
+        ent: IREntity
+        ctx: LowCtx
+
+    proc driverEntityIR(ed: EntityDecl, enumNames: [text], entityNames: [text], ctx0: LowCtx) -> DriverEntityOut:
         let mut fields = []
+        let mut textKeys = ctx0.textFieldKeys
         let fn = len(ed.fields)
         let mut fi = 0
         loop fi < fn:
             let irf = do driverEntityFieldIR(ed.fields[fi], enumNames, entityNames)
             fields = append(fields, irf)
+            if irf.type == "text":
+                textKeys = append(textKeys, ed.name + "." + irf.name)
             fi = fi + 1
         if ed.softDelete:
             let af = do driverArchivedField()
             fields = append(fields, af)
+        let mut ctx = LowCtx{inlineNames: ctx0.inlineNames, inlineExprs: ctx0.inlineExprs, enumNames: ctx0.enumNames, fns: ctx0.fns, textFieldKeys: textKeys, deriveKeys: ctx0.deriveKeys, deriveExprs: ctx0.deriveExprs, wireOptKeys: ctx0.wireOptKeys, wireNullKeys: ctx0.wireNullKeys}
+        let mut readList = []
+        if ed.hasRead:
+            let rl = do lowFull(ed.readExpr, ctx)
+            readList = [rl]
         let mut derives = []
         let dn = len(ed.derives)
         let mut di = 0
         loop di < dn:
             let dd = ed.derives[di]
-            let lowered = do lowerNode(dd.expr, inlineNames, inlineExprs, enumNames)
-            derives = append(derives, IRDerive{name: dd.name, type: dd.typeCore, expr: [lowered], deps: []})
+            let lowered = do lowFull(dd.expr, ctx)
+            derives = append(derives, IRDerive{name: dd.name, params: [], type: dd.typeCore, expr: [lowered], deps: []})
+            ctx = LowCtx{inlineNames: ctx.inlineNames, inlineExprs: ctx.inlineExprs, enumNames: ctx.enumNames, fns: ctx.fns, textFieldKeys: ctx.textFieldKeys, deriveKeys: append(ctx.deriveKeys, ed.name + "." + dd.name), deriveExprs: append(ctx.deriveExprs, lowered), wireOptKeys: ctx.wireOptKeys, wireNullKeys: ctx.wireNullKeys}
             di = di + 1
-        let mut readList = []
-        if ed.hasRead:
-            let rl = do lowerNode(ed.readExpr, inlineNames, inlineExprs, enumNames)
-            readList = [rl]
-        return IREntity{name: ed.name, softDelete: ed.softDelete, ephemeral: ed.ephemeral, fields: fields, read: readList, derives: derives}
+        let ent = IREntity{name: ed.name, softDelete: ed.softDelete, ephemeral: ed.ephemeral, fields: fields, read: readList, derives: derives}
+        return DriverEntityOut{ent: ent, ctx: ctx}
 
     # ── state lowering (placement + private flag + correct zero default) ─
-    proc driverStateIR(sd: StateDecl, enumNames: [text], inlineNames: [text], inlineExprs: [IRExpr]) -> IRState:
+    proc driverStateIR(sd: StateDecl, ctx: LowCtx) -> IRState:
         let mut placement = "server"
         let mut private = false
         if sd.placement == "client":
@@ -217,7 +691,7 @@ app DriverSelfHost:
         if sd.placement == "private":
             private = true
         let defNode = do driverStateDefaultNode(sd)
-        let lowered = do lowerNode(defNode, inlineNames, inlineExprs, enumNames)
+        let lowered = do lowFull(defNode, ctx)
         let mut styp = sd.typeCore
         let mut selem = ""
         if sd.isList:
@@ -228,7 +702,7 @@ app DriverSelfHost:
     # ── the fixed `auth` table (mirrors internal/ir/build.go's
     #    reservedUserEntity + authActions() verbatim) ─────────────────────
     proc driverAuthPlainField(name0: text, type0: text, secret0: bool) -> IRField:
-        return IRField{name: name0, type: type0, ref: "", enumName: "", index: false, secret: secret0, e2e: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
+        return IRField{name: name0, type: type0, ref: "", enumName: "", index: false, secret: secret0, e2e: false, password: false, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
 
     proc driverAuthEntity() -> IREntity:
         let mut fields = []
@@ -236,7 +710,8 @@ app DriverSelfHost:
         fields = append(fields, f_id)
         let f_username = do driverAuthPlainField("username", "text", false)
         fields = append(fields, f_username)
-        let f_password = do driverAuthPlainField("password", "text", false)
+        # parser.go/build.go: FacetUser.password is @password (bcrypt-hashed).
+        let f_password = IRField{name: "password", type: "text", ref: "", enumName: "", index: false, secret: false, e2e: false, password: true, readPolicy: "", optional: false, unique: false, required: false, hasMin: false, min: 0, hasMax: false, max: 0, matches: "", onDelete: ""}
         fields = append(fields, f_password)
         let f_role = do driverAuthPlainField("role", "text", false)
         fields = append(fields, f_role)
@@ -293,8 +768,30 @@ app DriverSelfHost:
         return acts
 
     # ── the end-to-end driver ────────────────────────────────────────────
-    proc compileGraph(src: text) -> IRGraph:
+    struct DriverOut:
+        graph: IRGraph
+        err: text
+
+    proc compileGraph(src: text) -> DriverOut:
         let prog = do parseProgramSrc(src)
+        let out = do compileProgram(prog)
+        return out
+
+    proc compileProgram(prog: Program) -> DriverOut:
+        let r = do compileProgramV(prog, false, [])
+        return r
+
+    # compileProgramV: Build over a Program; a composed (layered) build
+    # hands its screens over already spliced (composedViews) instead of
+    # having them parsed from the Program's own views.
+    proc compileProgramV(prog: Program, composed: bool, composedViews: [VView]) -> DriverOut:
+        if len(prog.parseErrors) > 0:
+            let pe = do driverFailed(prog, prog.parseErrors[0])
+            return pe
+        # Build's built-in theme switch: any `theme dark:` or named palette
+        # injects a `@client` text cell `theme` after the declared states,
+        # unless the author declared their own.
+        let allStates = do driverStatesWithTheme(prog)
 
         # Pass 0: enums (name set needed by entity field + state resolution).
         let mut enums = []
@@ -347,6 +844,32 @@ app DriverSelfHost:
             structs = append(structs, IRRecord{name: sd2.name, fields: sfields})
             si2 = si2 + 1
 
+        # Wire schema (`type` / `message`): resolved before anything that
+        # can name one (an action's reply, an emit, a stream).
+        let mut wtypes = []
+        let mut wmsgs = []
+        let nrd = len(prog.rawDecls)
+        let mut rdi = 0
+        loop rdi < nrd:
+            let rd = prog.rawDecls[rdi]
+            if rd.kw == "type":
+                let wt = do wParseType(rd.header, rd.bodySrc)
+                wtypes = append(wtypes, wt)
+            if rd.kw == "message":
+                let wm = do wParseMessage(rd.header, rd.bodySrc, rd.line, rd.bodyLineNos)
+                wmsgs = append(wmsgs, wm)
+            rdi = rdi + 1
+        let wire = do wBuild(wtypes, wmsgs, enumNames)
+        if wire.err != "":
+            let wf = do driverFailed(prog, wire.err)
+            return wf
+        let mut recordNames = []
+        let nrn = len(prog.records)
+        let mut rni = 0
+        loop rni < nrn:
+            recordNames = append(recordNames, prog.records[rni].name)
+            rni = rni + 1
+
         # Entity name set (needed for relation-field resolution).
         let mut entityNames = []
         let en2 = len(prog.entities)
@@ -355,18 +878,70 @@ app DriverSelfHost:
             entityNames = append(entityNames, prog.entities[eni].name)
             eni = eni + 1
 
-        # Policies (zero-arg ones become part of the inline table) + the
-        # inline table's other half, top-level derives.
+        # env.low's tables: which wire-type fields are optional (markOmits).
+        let mut wireOptKeys = []
+        let mut wireNullKeys = []
+        let nwt = len(wire.types)
+        let mut wti = 0
+        loop wti < nwt:
+            let wt2 = wire.types[wti]
+            let nwf = len(wt2.fields)
+            let mut wfi = 0
+            loop wfi < nwf:
+                if wt2.fields[wfi].optional:
+                    wireOptKeys = append(wireOptKeys, wt2.name + "." + wt2.fields[wfi].name)
+                if wt2.fields[wfi].nullable:
+                    wireNullKeys = append(wireNullKeys, wt2.name + "." + wt2.fields[wfi].name)
+                wfi = wfi + 1
+            wti = wti + 1
+        let mut lowCtx = LowCtx{inlineNames: [], inlineExprs: [], enumNames: enumNames, fns: [], textFieldKeys: [], deriveKeys: [], deriveExprs: [], wireOptKeys: wireOptKeys, wireNullKeys: wireNullKeys}
+
+        # Entities (Build step 1), growing env.low's field-type and
+        # entity-derive tables as they go.
+        let mut entities = []
+        let mut eni3 = 0
+        loop eni3 < en2:
+            let eo = do driverEntityIR(prog.entities[eni3], enumNames, entityNames, lowCtx)
+            entities = append(entities, eo.ent)
+            lowCtx = eo.ctx
+            eni3 = eni3 + 1
+        if prog.hasAuth:
+            let authEnt = do driverAuthEntity()
+            entities = append(entities, authEnt)
+
+        # States (step 2).
+        let mut states = []
+        let stn = len(allStates)
+        let mut sti = 0
+        loop sti < stn:
+            let irSt = do driverStateIR(allStates[sti], lowCtx)
+            states = append(states, irSt)
+            sti = sti + 1
+        let mut stateNames = []
+        let mut stj = 0
+        loop stj < stn:
+            stateNames = append(stateNames, allStates[stj].name)
+            stj = stj + 1
+
+        # Policies (step 3; zero-arg ones join the inline table).
+        let mut polProcNames = []
+        let npp = len(prog.procs)
+        let mut ppj = 0
+        loop ppj < npp:
+            polProcNames = append(polProcNames, prog.procs[ppj].name)
+            ppj = ppj + 1
         let mut policies = []
         let mut policyNames = []
         let mut policyParamCounts = []
-        let mut inlineNames = []
-        let mut inlineExprs = []
         let pn = len(prog.policies)
         let mut pi = 0
         loop pi < pn:
             let pd = prog.policies[pi]
-            let lowered = do lowerNode(pd.predicate, inlineNames, inlineExprs, enumNames)
+            let ppd = do procCallDiag(pd.predicate, polProcNames, [])
+            if ppd != "":
+                let ppf = do driverFailed(prog, ppd)
+                return ppf
+            let lowered = do lowFull(pd.predicate, lowCtx)
             let mut pparams = []
             let ppn = len(pd.paramNames)
             let mut ppi = 0
@@ -377,39 +952,52 @@ app DriverSelfHost:
             policyNames = append(policyNames, pd.name)
             policyParamCounts = append(policyParamCounts, ppn)
             if ppn == 0:
-                inlineNames = append(inlineNames, pd.name)
-                inlineExprs = append(inlineExprs, lowered)
+                lowCtx = LowCtx{inlineNames: append(lowCtx.inlineNames, pd.name), inlineExprs: append(lowCtx.inlineExprs, lowered), enumNames: lowCtx.enumNames, fns: lowCtx.fns, textFieldKeys: lowCtx.textFieldKeys, deriveKeys: lowCtx.deriveKeys, deriveExprs: lowCtx.deriveExprs, wireOptKeys: lowCtx.wireOptKeys, wireNullKeys: lowCtx.wireNullKeys}
             pi = pi + 1
 
-        # Top-level derives — each lowered against the inline table
-        # (policies + every earlier derive) as it stood before this one was
-        # added, then folded into the table itself (see driverBuildDerives).
-        let builtDerives = do driverBuildDerives(prog.derives, enumNames, entityNames, prog.states, inlineNames, inlineExprs)
+        # Top-level derives (step 3b).
+        let builtDerives = do driverBuildDerives(prog.derives, entityNames, stateNames, lowCtx, polProcNames)
+        let tyEnv = do driverTyEnv(prog, wtypes, enumNames, entityNames)
+        if builtDerives.err != "":
+            let dfl = do driverFailed(prog, builtDerives.err)
+            return dfl
+        lowCtx = builtDerives.ctx
 
-        # Entities.
-        let mut entities = []
-        let mut eni3 = 0
-        loop eni3 < en2:
-            let irEnt = do driverEntityIR(prog.entities[eni3], enumNames, entityNames, builtDerives.inlineNames, builtDerives.inlineExprs)
-            entities = append(entities, irEnt)
-            eni3 = eni3 + 1
-        if prog.hasAuth:
-            let authEnt = do driverAuthEntity()
-            entities = append(entities, authEnt)
-
-        # States.
-        let mut states = []
-        let stn = len(prog.states)
-        let mut sti = 0
-        loop sti < stn:
-            let irSt = do driverStateIR(prog.states[sti], enumNames, builtDerives.inlineNames, builtDerives.inlineExprs)
-            states = append(states, irSt)
-            sti = sti + 1
-        let mut stateNames = []
-        let mut stj = 0
-        loop stj < stn:
-            stateNames = append(stateNames, prog.states[stj].name)
-            stj = stj + 1
+        # Build's refusals over the declarations themselves.
+        let mut declLitNames = do withActor(stateNames)
+        declLitNames = do appendAllText(declLitNames, entityNames)
+        declLitNames = do appendAllText(declLitNames, lowCtx.inlineNames)
+        let declDiag = do driverDeclDiag(prog, enumNames, entityNames, policyNames, policyParamCounts, declLitNames)
+        if declDiag != "":
+            let ddf = do driverFailed(prog, declDiag)
+            return ddf
+        let mut pceFns = []
+        let mut pceArities = []
+        let npd = len(builtDerives.derives)
+        let mut pdi = 0
+        loop pdi < npd:
+            if len(builtDerives.derives[pdi].params) > 0:
+                pceFns = append(pceFns, builtDerives.derives[pdi].name)
+                pceArities = append(pceArities, len(builtDerives.derives[pdi].params))
+            pdi = pdi + 1
+        let mut pceProcArities = []
+        let mut ppa = 0
+        loop ppa < len(prog.procs):
+            pceProcArities = append(pceProcArities, len(prog.procs[ppa].paramNames))
+            ppa = ppa + 1
+        let mut pceEntityDerives = []
+        let mut ped = 0
+        loop ped < len(prog.entities):
+            let mut pedk = 0
+            loop pedk < len(prog.entities[ped].derives):
+                pceEntityDerives = append(pceEntityDerives, prog.entities[ped].name + "." + prog.entities[ped].derives[pedk].name)
+                pedk = pedk + 1
+            ped = ped + 1
+        let declCalls = CallEnv{fnNames: pceFns, fnArities: pceArities, procNames: polProcNames, procArities: pceProcArities, procDerives: builtDerives.procDerives, listNames: [], jsonNames: [], deriveKeys: pceEntityDerives, inAction: false, inDerive: false, inProc: false, ty: tyEnv, tsc: tyEmptyScope()}
+        let exprDiag = do driverExprDiag(prog, allStates, stateNames, entityNames, entities, enumNames, lowCtx.inlineNames, declCalls)
+        if exprDiag != "":
+            let edf = do driverFailed(prog, exprDiag)
+            return edf
 
         # Services.
         let mut services = []
@@ -424,8 +1012,55 @@ app DriverSelfHost:
                 let op = sv.ops[opi]
                 ops = append(ops, IRServiceOp{name: op.name, params: op.paramNames, ret: op.retCore, retList: op.retIsList})
                 opi = opi + 1
-            services = append(services, IRService{name: sv.name, url: sv.url, ops: ops})
+            services = append(services, IRService{name: sv.name, url: sv.url, urlEnv: sv.urlEnv, headerNames: sv.headerNames, headerEnvs: sv.headerEnvs, ops: ops})
             svi = svi + 1
+
+        # Files (3d″): declared file resources a proc's `read`/`write`
+        # operate on, registered before any proc body is built.
+        let mut files = []
+        let mut fileNames = []
+        let mut fileTypes = []
+        let mut filePaths = []
+        let nfd = len(prog.rawDecls)
+        let mut fdi = 0
+        loop fdi < nfd:
+            if prog.rawDecls[fdi].kw == "file":
+                let fd = do driverParseFile(prog.rawDecls[fdi])
+                if fd.err != "":
+                    let ffl = do driverFailed(prog, fd.err)
+                    return ffl
+                let fq = do goQuote(fd.name)
+                if fd.name in fileNames:
+                    let ffd = do driverFailed(prog, "line " + prog.rawDecls[fdi].line + ": file " + fq + " redeclared")
+                    return ffd
+                let absP = do vpHasPrefix(fd.path, "/")
+                if absP:
+                    let pq = do goQuote(fd.path)
+                    let ffa = do driverFailed(prog, "line " + prog.rawDecls[fdi].line + ": file " + fq + " path " + pq + " must be relative to the sandboxed data directory, not absolute")
+                    return ffa
+                files = append(files, IRFile{name: fd.name, type: fd.type, path: fd.path})
+                fileNames = append(fileNames, fd.name)
+                fileTypes = append(fileTypes, fd.type)
+                filePaths = append(filePaths, fd.path)
+            fdi = fdi + 1
+
+        # The struct table a proc's `local.field = expr` write checks against.
+        let mut structFieldKeys = []
+        let mut structFieldTypes = []
+        let nsd = len(prog.structs)
+        let mut sdi = 0
+        loop sdi < nsd:
+            let sdd = prog.structs[sdi]
+            let nsf = len(sdd.fields)
+            let mut sfj = 0
+            loop sfj < nsf:
+                structFieldKeys = append(structFieldKeys, sdd.name + "." + sdd.fields[sfj].name)
+                let mut sft = sdd.fields[sfj].typeCore
+                if sdd.fields[sfj].isList:
+                    sft = "[" + sft + "]"
+                structFieldTypes = append(structFieldTypes, sft)
+                sfj = sfj + 1
+            sdi = sdi + 1
 
         # Procs (name/paramCount/ret/retList env, then real lowering).
         let mut procNames = []
@@ -445,8 +1080,11 @@ app DriverSelfHost:
         let mut pci2 = 0
         loop pci2 < pcn:
             let pd2 = prog.procs[pci2]
-            let irp = do lowerProcSrc(pd2.headerLine, pd2.bodySrc, procNames, procRets, procRetLists, [], [], [], enumNames)
-            procs = append(procs, irp)
+            let lp = do plLowerProcS(pd2.name, pd2.headerLine, pd2.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, pd2.renameFrom, pd2.renameTo, structFieldKeys, structFieldTypes)
+            if lp.diag != "":
+                let pf = do driverFailed(prog, lp.diag)
+                return pf
+            procs = append(procs, lp.proc)
             pci2 = pci2 + 1
 
         # Entity field env for action lowering: "Entity.field" / "Entity.derive".
@@ -467,6 +1105,18 @@ app DriverSelfHost:
                 dki = dki + 1
             efi = efi + 1
 
+        let mut e2eFieldKeys = []
+        let mut e2i = 0
+        loop e2i < en2:
+            let ent2 = prog.entities[e2i]
+            let nfe = len(ent2.fields)
+            let mut fe = 0
+            loop fe < nfe:
+                if ent2.fields[fe].e2e:
+                    e2eFieldKeys = append(e2eFieldKeys, ent2.name + "." + ent2.fields[fe].name)
+                fe = fe + 1
+            e2i = e2i + 1
+
         let mut structNames = []
         let mut stni = 0
         loop stni < sn2:
@@ -478,10 +1128,17 @@ app DriverSelfHost:
         # procs, structs. Mirrors action_lower_test.go's alowEnvArgs, built
         # here directly from the Program instead of round-tripped through
         # a compiled Go graph.
+        let mut privateStateNames = []
+        let npst = len(allStates)
+        let mut psti = 0
+        loop psti < npst:
+            if allStates[psti].placement == "private":
+                privateStateNames = append(privateStateNames, allStates[psti].name)
+            psti = psti + 1
         let mut statePlacements = []
         let mut stk = 0
         loop stk < stn:
-            statePlacements = append(statePlacements, prog.states[stk].placement)
+            statePlacements = append(statePlacements, allStates[stk].placement)
             stk = stk + 1
         # ALowEnv.statePlacements expects "server"/"client" only (never
         # "infer"/"private" — see alowStatePlacement's callers); recompute
@@ -490,7 +1147,7 @@ app DriverSelfHost:
         let mut stk2 = 0
         loop stk2 < stn:
             let mut p = "server"
-            if prog.states[stk2].placement == "client":
+            if allStates[stk2].placement == "client":
                 p = "client"
             alowPlacements = append(alowPlacements, p)
             stk2 = stk2 + 1
@@ -521,7 +1178,7 @@ app DriverSelfHost:
             procEnvParamCounts = append(procEnvParamCounts, len(prog.procs[pci3].paramNames))
             pci3 = pci3 + 1
 
-        let env = ALowEnv{stateNames: stateNames, statePlacements: alowPlacements, entityNames: entityNames, entityFields: entityFieldKeys, entityDerives: entityDeriveKeys, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: builtDerives.inlineNames, inlineExprs: builtDerives.inlineExprs, serviceNames: serviceEnvNames, serviceOps: serviceEnvOps, serviceArgCounts: serviceEnvArgCounts, serviceRets: serviceEnvRets, serviceRetLists: serviceEnvRetLists, procNames: procNames, procParamCounts: procEnvParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames}
+        let env = ALowEnv{stateNames: stateNames, statePlacements: alowPlacements, entityNames: entityNames, entityFields: entityFieldKeys, entityDerives: entityDeriveKeys, enumNames: enumNames, policyNames: policyNames, policyParamCounts: policyParamCounts, inlineNames: lowCtx.inlineNames, inlineExprs: lowCtx.inlineExprs, serviceNames: serviceEnvNames, serviceOps: serviceEnvOps, serviceArgCounts: serviceEnvArgCounts, serviceRets: serviceEnvRets, serviceRetLists: serviceEnvRetLists, procNames: procNames, procParamCounts: procEnvParamCounts, procRets: procRets, procRetLists: procRetLists, structNames: structNames, renameFrom: [], renameTo: [], e2eFields: e2eFieldKeys, actionParams: [], wireTypes: wire.names, actionName: "", actionRet: "", recordNames: recordNames, low: lowCtx, privateStates: privateStateNames, ty: tyEnv, tsc: tyEmptyScope()}
 
         # Actions.
         let mut actions = []
@@ -529,7 +1186,16 @@ app DriverSelfHost:
         let mut ai = 0
         loop ai < an:
             let ad = prog.actions[ai]
-            let ira = do lowerActionSrc(ad.name, ad.paramNames, ad.paramTypes, ad.optimistic, ad.bodySrc, env)
+            let aenv = ALowEnv{stateNames: env.stateNames, statePlacements: env.statePlacements, entityNames: env.entityNames, entityFields: env.entityFields, entityDerives: env.entityDerives, enumNames: env.enumNames, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, serviceNames: env.serviceNames, serviceOps: env.serviceOps, serviceArgCounts: env.serviceArgCounts, serviceRets: env.serviceRets, serviceRetLists: env.serviceRetLists, procNames: env.procNames, procParamCounts: env.procParamCounts, procRets: env.procRets, procRetLists: env.procRetLists, structNames: env.structNames, renameFrom: ad.renameFrom, renameTo: ad.renameTo, e2eFields: env.e2eFields, actionParams: [], wireTypes: env.wireTypes, actionName: "", actionRet: "", recordNames: env.recordNames, low: env.low, privateStates: env.privateStates, ty: env.ty, tsc: env.tsc}
+            if ad.retErr != "":
+                let re = do driverFailed(prog, ad.retErr)
+                return re
+            let ira = do lowerActionSrcFull(ad.name, ad.paramNames, ad.paramTypes, ad.paramLists, ad.paramOptionals, ad.optimistic, ad.ret, ad.retList, ad.bodySrc, aenv)
+            # lowerActionSrc's refusal is an unnamed action carrying the
+            # diagnostic as its reason.
+            if ira.name == "":
+                let af = do driverFailed(prog, ira.reason)
+                return af
             actions = append(actions, ira)
             ai = ai + 1
         if prog.hasAuth:
@@ -539,6 +1205,60 @@ app DriverSelfHost:
             loop aai < aan:
                 actions = append(actions, authActs[aai])
                 aai = aai + 1
+
+        # Daemons (Build 4b′): each body lowered against the user actions'
+        # signatures (auth's built-ins are injected after this pass).
+        let mut sigNames = []
+        let mut sigServer = []
+        let mut sigCounts = []
+        let mut sgi = 0
+        loop sgi < an:
+            sigNames = append(sigNames, actions[sgi].name)
+            sigServer = append(sigServer, actions[sgi].placement == "server")
+            sigCounts = append(sigCounts, len(actions[sgi].params))
+            sgi = sgi + 1
+        let mut daemons = []
+        let mut daemonNames = []
+        let ndm = len(prog.daemons)
+        let mut dmi = 0
+        loop dmi < ndm:
+            let dd = prog.daemons[dmi]
+            if dd.err != "":
+                let fd = do driverFailed(prog, dd.err)
+                return fd
+            if dd.name in daemonNames:
+                let fd2 = do driverFailed(prog, "daemon \"" + dd.name + "\" redeclared")
+                return fd2
+            daemonNames = append(daemonNames, dd.name)
+            let ld = do plLowerDaemon(dd.name, dd.uses, dd.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, sigNames, sigServer, sigCounts, dd.renameFrom, dd.renameTo, structFieldKeys, structFieldTypes)
+            if ld.diag != "":
+                let fd3 = do driverFailed(prog, ld.diag)
+                return fd3
+            daemons = append(daemons, IRDaemon{name: dd.name, every: dd.every, body: ld.body})
+            dmi = dmi + 1
+
+        # Declared routes (4d′/4d‴/4d″): api endpoints bound to their
+        # actions (a client-placed target moves to the authority), the
+        # contract route, the streams, and every emit checked against them.
+        let mut clientStates = []
+        let ncs = len(allStates)
+        let mut csi = 0
+        loop csi < ncs:
+            if allStates[csi].placement == "client":
+                clientStates = append(clientStates, allStates[csi].name)
+            csi = csi + 1
+        let routesB = do wBuildRoutes(actions, prog.rawDecls, clientStates, policyNames, policyParamCounts, wire.names, wire.messages)
+        if routesB.err != "":
+            let rf = do driverFailed(prog, routesB.err)
+            return rf
+        actions = routesB.actions
+        let mut litNames = do withActor(stateNames)
+        litNames = do appendAllText(litNames, entityNames)
+        litNames = do appendAllText(litNames, lowCtx.inlineNames)
+        let rtd = do driverRouteDiag(prog, actions, litNames)
+        if rtd != "":
+            let rtf = do driverFailed(prog, rtd)
+            return rtf
 
         # Jobs.
         let mut jobs = []
@@ -567,48 +1287,1591 @@ app DriverSelfHost:
             triggers = append(triggers, IRTrigger{on: tr.onAction, action: tr.reactionAction})
             tri = tri + 1
 
+        # Views -> pages (Build step 5), then the index flags the view
+        # compiler accumulated (every field a `for`'s where compares or its
+        # `by` orders on) stamped onto the entity fields.
+        let mut ceFns = []
+        let mut ceFnArities = []
+        let ndv = len(builtDerives.derives)
+        let mut dvi = 0
+        loop dvi < ndv:
+            if len(builtDerives.derives[dvi].params) > 0:
+                ceFns = append(ceFns, builtDerives.derives[dvi].name)
+                ceFnArities = append(ceFnArities, len(builtDerives.derives[dvi].params))
+            dvi = dvi + 1
+        let mut ceLists = []
+        let mut ceJson = []
+        let nce = len(allStates)
+        let mut cei = 0
+        loop cei < nce:
+            if allStates[cei].isList:
+                ceLists = append(ceLists, allStates[cei].name)
+            else:
+                if allStates[cei].typeCore == "json":
+                    ceJson = append(ceJson, allStates[cei].name)
+            cei = cei + 1
+        let callEnv = CallEnv{fnNames: ceFns, fnArities: ceFnArities, procNames: procNames, procArities: procEnvParamCounts, procDerives: builtDerives.procDerives, listNames: ceLists, jsonNames: ceJson, deriveKeys: entityDeriveKeys, inAction: false, inDerive: false, inProc: false, ty: tyEnv, tsc: tyEmptyScope()}
+        let venv = do driverViewEnv(prog, allStates, enumNames, entityNames, entities, alowPlacements, lowCtx, policyNames, policyParamCounts, callEnv)
+        let mut vviews = composedViews
+        let mut nvw = len(prog.views)
+        if composed:
+            nvw = 0
+        let mut vwi = 0
+        loop vwi < nvw:
+            let ve = prog.views[vwi]
+            let vv = do vpParseView(ve.header, ve.bodySrc)
+            if ve.private && vv.err == "":
+                vviews = append(vviews, VView{err: "", name: ve.name, path: vv.path, params: vv.params, layout: vv.layout, requires: vv.requires, titleSegs: vv.titleSegs, descSegs: vv.descSegs, root: vv.root, screen: false})
+            else:
+                vviews = append(vviews, vv)
+            vwi = vwi + 1
+        let mut vcomps = []
+        let ncm = len(prog.components)
+        let mut cmi = 0
+        loop cmi < ncm:
+            let vc = do vpParseComponent(prog.components[cmi].headerLine, prog.components[cmi].bodySrc)
+            vcomps = append(vcomps, vc)
+            cmi = cmi + 1
+        let mut vlayouts = []
+        let nlo = len(prog.layouts)
+        let mut loi = 0
+        loop loi < nlo:
+            let vl = do vpParseLayout(prog.layouts[loi].headerLine, prog.layouts[loi].bodySrc)
+            if vl.err != "":
+                let lf = do driverFailed(prog, vl.err)
+                return lf
+            let lnames = do driverLayoutNames(vlayouts)
+            if vl.name in lnames:
+                let lf2 = do driverFailed(prog, "layout \"" + vl.name + "\" redeclared")
+                return lf2
+            vlayouts = append(vlayouts, vl)
+            loi = loi + 1
+        let builtComps = do vbBuildComponents(venv, vcomps)
+        if builtComps.err != "":
+            let cf = do driverFailed(prog, builtComps.err)
+            return cf
+        let built = do vbBuildPages(venv, vviews, vlayouts, builtComps)
         let noneVal = do jNone()
-        return IRGraph{app: prog.name, auth: prog.hasAuth, entities: entities, records: records, structs: structs, enums: enums, types: [], messages: [], states: states, derives: builtDerives.derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: [], components: [], services: services, files: [], webhooks: webhooks, triggers: triggers, theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
+        if built.err != "":
+            let failed = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
+            return DriverOut{graph: failed, err: built.err}
+        let stamped = do driverStampIndexes(entities, built.indexKeys, built.queriedKeys)
+        if stamped.err != "":
+            let failed2 = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
+            return DriverOut{graph: failed2, err: stamped.err}
+        let mut topView = []
+        let mut topBindings = []
+        if len(built.pages) > 0:
+            topView = built.pages[0].view
+            topBindings = built.pages[0].bindings
+        let depGraph = do vbDepGraphJVal(built.pages)
+        let themeBase = do driverThemeMap(prog, "base", "")
+        let themeDark = do driverThemeMap(prog, "dark", "")
+        let themesNamed = do driverNamedThemes(prog)
+        let g = IRGraph{app: prog.name, auth: prog.hasAuth, entities: stamped.entities, records: records, structs: structs, enums: enums, types: wire.types, messages: wire.messages, states: states, derives: builtDerives.derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: daemons, components: built.components, services: services, files: files, webhooks: webhooks, apis: routesB.apis, contract: routesB.contract, streams: routesB.streams, triggers: triggers, theme: themeBase, themeDark: themeDark, themes: themesNamed, css: prog.css, assets: noneVal, routes: built.routes, pages: built.pages, bindings: topBindings, view: topView, depGraph: depGraph}
+        return DriverOut{graph: g, err: ""}
 
-    # driverBuildDerives: the real single-pass shape of Go's step 3b — each
-    # derive lowered against the inline table as it stood BEFORE this
-    # derive was added (so it can read an earlier derive, never a later
-    # one), then added to the table for the next one, with its own real
-    # dependency set (over states + entities, per driverDepsOf).
-    struct DriverDerivesResult:
-        derives: [IRDerive]
-        inlineNames: [text]
-        inlineExprs: [IRExpr]
+    proc driverEmptyOut(p: Program) -> DriverOut:
+        let o = do driverFailed(p, "")
+        return o
 
-    proc driverBuildDerives(decls: [DeriveDeclFull], enumNames: [text], entityNames: [text], stateDecls: [StateDecl], inlineNames0: [text], inlineExprs0: [IRExpr]) -> DriverDerivesResult:
-        let mut names = inlineNames0
-        let mut exprs = inlineExprs0
+    proc driverLayoutNames(ls: [VLayout]) -> [text]:
         let mut out = []
+        let n = len(ls)
+        let mut i = 0
+        loop i < n:
+            out = append(out, ls[i].name)
+            i = i + 1
+        return out
+
+    proc driverFailed(prog: Program, msg: text) -> DriverOut:
+        let noneVal = do jNone()
+        let g = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
+        return DriverOut{graph: g, err: msg}
+
+    proc driverStatesWithTheme(prog: Program) -> [StateDecl]:
+        let mut hasAlt = false
+        let nt = len(prog.themes)
+        let mut ti = 0
+        loop ti < nt:
+            if prog.themes[ti].kind != "base":
+                hasAlt = true
+            ti = ti + 1
+        let mut declared = false
+        let ns = len(prog.states)
+        let mut si = 0
+        loop si < ns:
+            if prog.states[si].name == "theme":
+                declared = true
+            si = si + 1
+        if !hasAlt || declared:
+            return prog.states
+        let def = do emptyNode()
+        return append(prog.states, StateDecl{name: "theme", typeCore: "text", isList: false, isOptional: false, placement: "client", hasDefault: false, defaultSrc: "", default: def, valid: true})
+
+    # driverThemeMap: the base (`kind` "base") or dark token table as the
+    # JVal ir_graph.fct spells — keys sorted as encoding/json sorts a map,
+    # a repeated token keeping its last value.
+    proc driverThemeMap(prog: Program, kind: text, name: text) -> JVal:
+        let mut keys = []
+        let mut vals = []
+        let nt = len(prog.themes)
+        let mut ti = 0
+        loop ti < nt:
+            let tb = prog.themes[ti]
+            if tb.kind == kind && tb.name == name:
+                let nv = len(tb.vars)
+                let mut vi = 0
+                loop vi < nv:
+                    let at = do vbFind(keys, tb.vars[vi].name)
+                    if at >= 0:
+                        vals[at] = tb.vars[vi].value
+                    else:
+                        keys = append(keys, tb.vars[vi].name)
+                        vals = append(vals, tb.vars[vi].value)
+                    vi = vi + 1
+            ti = ti + 1
+        let sorted = do vbSortText(keys)
+        let mut jv = []
+        let n = len(sorted)
+        let mut i = 0
+        loop i < n:
+            let at2 = do vbFind(keys, sorted[i])
+            jv = append(jv, JVal{kind: "str", s: vals[at2], keys: [], vals: []})
+            i = i + 1
+        return JVal{kind: "obj", s: "", keys: sorted, vals: jv}
+
+    proc driverNamedThemes(prog: Program) -> JVal:
+        let mut names = []
+        let nt = len(prog.themes)
+        let mut ti = 0
+        loop ti < nt:
+            if prog.themes[ti].kind == "named":
+                let a = do vbAddUnique(names, prog.themes[ti].name)
+                names = a
+            ti = ti + 1
+        let sorted = do vbSortText(names)
+        let mut jv = []
+        let n = len(sorted)
+        let mut i = 0
+        loop i < n:
+            let m = do driverThemeMap(prog, "named", sorted[i])
+            jv = append(jv, m)
+            i = i + 1
+        return JVal{kind: "obj", s: "", keys: sorted, vals: jv}
+
+    # driverViewEnv: the name/type tables viewCtx reads off Build's env, taken
+    # from the Program and the already-lowered declarations.
+    proc driverViewEnv(prog: Program, allStates: [StateDecl], enumNames: [text], entityNames: [text], entities: [IREntity], placements: [text], lowCtx: LowCtx, policyNames: [text], policyParamCounts: [int], calls: CallEnv) -> VEnv:
         let mut stateNames = []
-        let sn = len(stateDecls)
+        let mut stateClient = []
+        let mut stateTypes = []
+        let mut stateLists = []
+        let mut privateNames = []
+        let sn = len(allStates)
         let mut si = 0
         loop si < sn:
-            stateNames = append(stateNames, stateDecls[si].name)
+            let sd = allStates[si]
+            stateNames = append(stateNames, sd.name)
+            stateClient = append(stateClient, placements[si] == "client")
+            stateTypes = append(stateTypes, sd.typeCore)
+            stateLists = append(stateLists, sd.isList)
+            if sd.placement == "private":
+                privateNames = append(privateNames, sd.name)
             si = si + 1
+        let mut fieldKeys = []
+        let mut fieldTypes = []
+        let mut e2eKeys = []
+        let mut enumFieldKeys = []
+        let mut enumFieldEnums = []
+        let mut deriveKeys = []
+        let en = len(prog.entities)
+        let mut ei = 0
+        loop ei < en:
+            let ir = entities[ei]
+            let nf = len(ir.fields)
+            let mut fi = 0
+            loop fi < nf:
+                let f = ir.fields[fi]
+                fieldKeys = append(fieldKeys, ir.name + "." + f.name)
+                fieldTypes = append(fieldTypes, f.type)
+                if f.e2e:
+                    e2eKeys = append(e2eKeys, ir.name + "." + f.name)
+                if f.enumName != "":
+                    enumFieldKeys = append(enumFieldKeys, ir.name + "." + f.name)
+                    enumFieldEnums = append(enumFieldEnums, f.enumName)
+                fi = fi + 1
+            let nd = len(prog.entities[ei].derives)
+            let mut di = 0
+            loop di < nd:
+                deriveKeys = append(deriveKeys, ir.name + "." + prog.entities[ei].derives[di].name)
+                di = di + 1
+            ei = ei + 1
+        let mut enumMemberKeys = []
+        let nen = len(prog.enums)
+        let mut ni = 0
+        loop ni < nen:
+            let ed = prog.enums[ni]
+            let nv = len(ed.values)
+            let mut vi = 0
+            loop vi < nv:
+                enumMemberKeys = append(enumMemberKeys, ed.name + "." + ed.values[vi].name)
+                vi = vi + 1
+            ni = ni + 1
+        let mut actionNames = []
+        let mut actionParamCounts = []
+        let na = len(prog.actions)
+        let mut ai = 0
+        loop ai < na:
+            actionNames = append(actionNames, prog.actions[ai].name)
+            actionParamCounts = append(actionParamCounts, len(prog.actions[ai].paramNames))
+            ai = ai + 1
+        if prog.hasAuth:
+            let authActs = do driverAuthActions()
+            let nau = len(authActs)
+            let mut au = 0
+            loop au < nau:
+                actionNames = append(actionNames, authActs[au].name)
+                actionParamCounts = append(actionParamCounts, len(authActs[au].params))
+                au = au + 1
+        return VEnv{stateNames: stateNames, stateClient: stateClient, stateTypes: stateTypes, stateLists: stateLists, privateNames: privateNames, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, deriveKeys: deriveKeys, e2eKeys: e2eKeys, enumFieldKeys: enumFieldKeys, enumFieldEnums: enumFieldEnums, enumNames: enumNames, enumMemberKeys: enumMemberKeys, inlineNames: lowCtx.inlineNames, inlineExprs: lowCtx.inlineExprs, actionNames: actionNames, actionParamCounts: actionParamCounts, policyNames: policyNames, policyParamCounts: policyParamCounts, low: lowCtx, calls: calls}
+
+    struct DriverStamped:
+        entities: [IREntity]
+        err: text
+
+    # driverStampIndexes: Build's closing loop — an index flag on every field
+    # the view compiler marked, and the @secret refusal for any field a
+    # where/by read at all (an encrypted column cannot be filtered).
+    proc driverStampIndexes(entities: [IREntity], indexKeys: [text], queriedKeys: [text]) -> DriverStamped:
+        let mut out = []
+        let n = len(entities)
+        let mut i = 0
+        loop i < n:
+            let e = entities[i]
+            let mut fields = []
+            let nf = len(e.fields)
+            let mut fi = 0
+            loop fi < nf:
+                let f = e.fields[fi]
+                let key = e.name + "." + f.name
+                if f.secret && (key in queriedKeys):
+                    return DriverStamped{entities: [], err: "field \"" + f.name + "\" is @secret and cannot be used in a `where`, `by`, or relation; it is encrypted at rest"}
+                let idx = f.index || (key in indexKeys)
+                fields = append(fields, IRField{name: f.name, type: f.type, ref: f.ref, enumName: f.enumName, index: idx, secret: f.secret, e2e: f.e2e, password: f.password, readPolicy: f.readPolicy, optional: f.optional, unique: f.unique, required: f.required, hasMin: f.hasMin, min: f.min, hasMax: f.hasMax, max: f.max, matches: f.matches, onDelete: f.onDelete})
+                fi = fi + 1
+            out = append(out, IREntity{name: e.name, softDelete: e.softDelete, ephemeral: e.ephemeral, fields: fields, read: e.read, derives: e.derives})
+            i = i + 1
+        return DriverStamped{entities: out, err: ""}
+
+    # driverBuildDerives: Go's step 3b — every derive parsed in full
+    # (parameters, continuation lines), a redeclaration refused, then built
+    # in dependency order (deriveOrder): a parameterized derive becomes a
+    # function its callers expand (LowFn), a plain one joins the inline
+    # table, each lowered through env.low against everything built so far.
+    struct DriverDerivesResult:
+        err: text
+        derives: [IRDerive]
+        ctx: LowCtx
+        procDerives: [text]
+
+    # driverTyEnv: the typed names exprtype.fct reads — build.go's
+    # stateTypes/stateList, entFieldType (an enum field reads as text, a
+    # soft-deleting entity has `archived`), records, wireFieldTypes (the
+    # `type` declarations), procSigs, deriveFns (a parameterized derive's
+    # declared type: a primitive, enum, entity or wire type) and inlineType
+    # (a zero-argument derive's declared type text; a zero-argument policy
+    # is a bool).
+    proc driverTyEnv(prog: Program, wtypes: [WType], enumNames: [text], entityNames: [text]) -> TyEnv:
+        let mut te = do tyEmptyEnv()
+        let mut stateNames = []
+        let mut stateTypes = []
+        let ns = len(prog.states)
+        let mut i = 0
+        loop i < ns:
+            stateNames = append(stateNames, prog.states[i].name)
+            let mut lt = prog.states[i].typeCore
+            if prog.states[i].isList:
+                lt = "[" + lt + "]"
+            stateTypes = append(stateTypes, lt)
+            i = i + 1
+        let mut fieldKeys = []
+        let mut fieldTypes = []
+        let ne = len(prog.entities)
+        let mut e = 0
+        loop e < ne:
+            let ed = prog.entities[e]
+            fieldKeys = append(fieldKeys, ed.name + ".id")
+            fieldTypes = append(fieldTypes, "int")
+            let nf = len(ed.fields)
+            let mut f = 0
+            loop f < nf:
+                let mut ft = ed.fields[f].typeCore
+                if ft in enumNames:
+                    ft = "text"
+                fieldKeys = append(fieldKeys, ed.name + "." + ed.fields[f].name)
+                fieldTypes = append(fieldTypes, ft)
+                f = f + 1
+            if ed.softDelete:
+                fieldKeys = append(fieldKeys, ed.name + ".archived")
+                fieldTypes = append(fieldTypes, "bool")
+            e = e + 1
+        let mut recordNames = []
+        let mut recKeys = []
+        let mut recTypes = []
+        let nr = len(prog.records)
+        let mut r = 0
+        loop r < nr:
+            let rd = prog.records[r]
+            recordNames = append(recordNames, rd.name)
+            let nrf = len(rd.fields)
+            let mut rf = 0
+            loop rf < nrf:
+                let mut rt = rd.fields[rf].typeCore
+                if rd.fields[rf].isList:
+                    rt = "[" + rt + "]"
+                recKeys = append(recKeys, rd.name + "." + rd.fields[rf].name)
+                recTypes = append(recTypes, rt)
+                rf = rf + 1
+            r = r + 1
+        let mut wireNames = []
+        let mut wireKeys = []
+        let mut wireTypes = []
+        let nw = len(wtypes)
+        let mut w = 0
+        loop w < nw:
+            let wt = wtypes[w]
+            wireNames = append(wireNames, wt.name)
+            let nwf = len(wt.fields)
+            let mut wf = 0
+            loop wf < nwf:
+                let mut wft = wt.fields[wf].type
+                if wt.fields[wf].list:
+                    wft = "[" + wft + "]"
+                wireKeys = append(wireKeys, wt.name + "." + wt.fields[wf].name)
+                wireTypes = append(wireTypes, wft)
+                wf = wf + 1
+            w = w + 1
+        let mut procNames = []
+        let mut procRets = []
+        let npr = len(prog.procs)
+        let mut p = 0
+        loop p < npr:
+            let pd = prog.procs[p]
+            procNames = append(procNames, pd.name)
+            let mut pr = ""
+            if pd.hasRet:
+                pr = pd.retCore
+                if pd.retIsList:
+                    pr = "[" + pr + "]"
+            procRets = append(procRets, pr)
+            p = p + 1
+        let mut inlineNames = []
+        let mut inlineTypes = []
+        let npo = len(prog.policies)
+        let mut po = 0
+        loop po < npo:
+            if len(prog.policies[po].paramNames) == 0:
+                inlineNames = append(inlineNames, prog.policies[po].name)
+                inlineTypes = append(inlineTypes, "bool")
+            po = po + 1
+        te = TyEnv{stateNames: stateNames, stateTypes: stateTypes, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, enumNames: enumNames, recordNames: recordNames, recFieldKeys: recKeys, recFieldTypes: recTypes, wireNames: wireNames, wireFieldKeys: wireKeys, wireFieldTypes: wireTypes, procNames: procNames, procRets: procRets, deriveNames: [], deriveRets: [], deriveParams: [], inlineNames: inlineNames, inlineTypes: inlineTypes}
+        let mut deriveNames = []
+        let mut deriveRets = []
+        let mut deriveParams = []
+        let nd = len(prog.derives)
+        let mut d = 0
+        loop d < nd:
+            let wd = do wParseDerive(prog.derives[d].line, prog.derives[d].cont)
+            if wd.err == "":
+                if len(wd.params) > 0:
+                    let rv = do tyParse(wd.type)
+                    let mut ret = do tyDeclType(te, rv.core, rv.list)
+                    if rv.core in wireNames:
+                        ret = rv
+                    deriveNames = append(deriveNames, wd.name)
+                    let rl = do tyLabel(ret)
+                    deriveRets = append(deriveRets, rl)
+                    let mut enc = ""
+                    let nq = len(wd.params)
+                    let mut q = 0
+                    loop q < nq:
+                        if q > 0:
+                            enc = enc + ","
+                        let mut lf = "S"
+                        if wd.params[q].list:
+                            lf = "L"
+                        enc = enc + wd.params[q].name + "|" + wd.params[q].type + "|" + lf
+                        q = q + 1
+                    deriveParams = append(deriveParams, enc)
+                else:
+                    inlineNames = append(inlineNames, wd.name)
+                    inlineTypes = append(inlineTypes, wd.type)
+            d = d + 1
+        return TyEnv{stateNames: stateNames, stateTypes: stateTypes, entityNames: entityNames, fieldKeys: fieldKeys, fieldTypes: fieldTypes, enumNames: enumNames, recordNames: recordNames, recFieldKeys: recKeys, recFieldTypes: recTypes, wireNames: wireNames, wireFieldKeys: wireKeys, wireFieldTypes: wireTypes, procNames: procNames, procRets: procRets, deriveNames: deriveNames, deriveRets: deriveRets, deriveParams: deriveParams, inlineNames: inlineNames, inlineTypes: inlineTypes}
+
+    proc driverBuildDerives(decls: [DeriveDeclFull], entityNames: [text], stateNames: [text], ctx0: LowCtx, procNames: [text]) -> DriverDerivesResult:
+        let mut parsed = []
+        let mut seen = []
         let n = len(decls)
         let mut i = 0
         loop i < n:
-            let dd = decls[i]
-            let lowered = do lowerNode(dd.expr, names, exprs, enumNames)
-            let deps = do driverDepsOf(lowered, stateNames, entityNames)
-            out = append(out, IRDerive{name: dd.name, type: dd.typeCore, expr: [lowered], deps: deps})
-            names = append(names, dd.name)
-            exprs = append(exprs, lowered)
+            let wd = do wParseDerive(decls[i].line, decls[i].cont)
+            if wd.err != "":
+                return DriverDerivesResult{err: wd.err, derives: [], ctx: ctx0, procDerives: []}
+            if wd.name in seen:
+                return DriverDerivesResult{err: "derive \"" + wd.name + "\" redeclared", derives: [], ctx: ctx0, procDerives: []}
+            seen = append(seen, wd.name)
+            parsed = append(parsed, wd)
             i = i + 1
-        return DriverDerivesResult{derives: out, inlineNames: names, inlineExprs: exprs}
+        let ord = do wDeriveOrder(parsed)
+        if ord.err != "":
+            return DriverDerivesResult{err: ord.err, derives: [], ctx: ctx0, procDerives: []}
+        let mut ctx = ctx0
+        let mut out = []
+        let mut procDerives = []
+        let no = len(ord.order)
+        let mut k = 0
+        loop k < no:
+            let d = parsed[ord.order[k]]
+            if len(d.params) > 0:
+                # a projection calling a proc (directly or through another
+                # projection that does) is itself usable only in actions
+                let cp = do callsAnyName(d.expr, procNames)
+                let cd = do callsAnyName(d.expr, procDerives)
+                let aob = do authorityOnlyBuiltins()
+                let ca = do callsAnyName(d.expr, aob)
+                if cp || cd || ca:
+                    procDerives = append(procDerives, d.name)
+            else:
+                let pdg = do procCallDiag(d.expr, procNames, procDerives)
+                if pdg != "":
+                    return DriverDerivesResult{err: pdg, derives: [], ctx: ctx0, procDerives: []}
+            let lowered = do lowFull(d.expr, ctx)
+            let deps = do driverDepsOf(lowered, stateNames, entityNames)
+            if len(d.params) > 0:
+                let mut pnames = []
+                let mut iparams = []
+                let np = len(d.params)
+                let mut pi = 0
+                loop pi < np:
+                    pnames = append(pnames, d.params[pi].name)
+                    iparams = append(iparams, IRParam{name: d.params[pi].name, type: d.params[pi].type, optional: d.params[pi].optional, list: false})
+                    pi = pi + 1
+                out = append(out, IRDerive{name: d.name, params: iparams, type: d.type, expr: [lowered], deps: deps})
+                ctx = LowCtx{inlineNames: ctx.inlineNames, inlineExprs: ctx.inlineExprs, enumNames: ctx.enumNames, fns: append(ctx.fns, LowFn{name: d.name, params: pnames, body: lowered, ret: d.type}), textFieldKeys: ctx.textFieldKeys, deriveKeys: ctx.deriveKeys, deriveExprs: ctx.deriveExprs, wireOptKeys: ctx.wireOptKeys, wireNullKeys: ctx.wireNullKeys}
+            else:
+                out = append(out, IRDerive{name: d.name, params: [], type: d.type, expr: [lowered], deps: deps})
+                ctx = LowCtx{inlineNames: append(ctx.inlineNames, d.name), inlineExprs: append(ctx.inlineExprs, lowered), enumNames: ctx.enumNames, fns: ctx.fns, textFieldKeys: ctx.textFieldKeys, deriveKeys: ctx.deriveKeys, deriveExprs: ctx.deriveExprs, wireOptKeys: ctx.wireOptKeys, wireNullKeys: ctx.wireNullKeys}
+            k = k + 1
+        return DriverDerivesResult{err: "", derives: out, ctx: ctx, procDerives: procDerives}
 
     # ── the live driver: whole-source in, IR JSON out ───────────────────
     proc compileSrc(src: text) -> text:
-        let g = do compileGraph(src)
-        let j = do irGraphJSON(g)
+        # compile.String: a snippet has no file to resolve imports or a
+        # sibling stylesheet against.
+        let imps = do driverImportsOf(src)
+        if len(imps) > 0:
+            return "{\"error\":\"import is only supported when compiling from a file (run `facet \u003ccommand\u003e \u003cfile.fct\u003e`)\"}"
+        let p0 = do parseProgramSrc(src)
+        let nr = len(p0.rawDecls)
+        let mut ri = 0
+        loop ri < nr:
+            if p0.rawDecls[ri].kw == "cssfrom" && len(p0.parseErrors) == 0:
+                return "{\"error\":\"css from \\\"...\\\" is only supported when compiling from a file (run `facet \u003ccommand\u003e \u003cfile.fct\u003e`)\"}"
+            ri = ri + 1
+        let out = do compileGraph(src)
+        if out.err != "":
+            let q = do jsonQuote(out.err)
+            return "{\"error\":" + q + "}"
+        let j = do irGraphJSON(out.graph)
+        return j
+
+    # ── imports: compile.File's collectModules + mergeInto ───────────────
+    # A whole app is its entry file plus every file it imports, collected
+    # depth-first (entry first, a shared module pulled in once, an import
+    # cycle refused) and flat-merged into the entry's declarations in that
+    # order. Files are read through the io.file capability, so every path
+    # here is relative to the runtime's sandboxed data directory; `root` is
+    # that directory's absolute path, which import resolution (Go's
+    # filepath.Join + Abs) and private-name mangling (an FNV-32a of each
+    # module's absolute path) both need.
+    proc driverReadFile(path: text) -> text uses io.file:
+        let src = readFile(path)
+        return src
+
+    proc driverImportsOf(src: text) -> [text]:
+        let lines = split(src, "\n")
+        let mut out = []
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let raw = lines[i]
+            let t = trim(raw)
+            let isComment = do vpHasPrefix(t, "#")
+            let indented = do vpHasPrefix(raw, " ")
+            if t != "" && !isComment && !indented:
+                let isImport = do vpHasPrefix(t, "import ")
+                if !isImport:
+                    break
+                let q = trim(slice(t, 7, len(t)))
+                let uq = do vpUnquote(q)
+                out = append(out, uq)
+            i = i + 1
+        return out
+
+    # driverCleanPath: filepath.Clean over a slash-separated absolute path.
+    proc driverCleanPath(p: text) -> text:
+        let parts = split(p, "/")
+        let mut out = []
+        let n = len(parts)
+        let mut i = 0
+        loop i < n:
+            let seg = parts[i]
+            if seg == "" || seg == ".":
+                i = i + 1
+                continue
+            if seg == "..":
+                if len(out) > 0:
+                    let mut keep = []
+                    let mut j = 0
+                    loop j < len(out) - 1:
+                        keep = append(keep, out[j])
+                        j = j + 1
+                    out = keep
+                i = i + 1
+                continue
+            out = append(out, seg)
+            i = i + 1
+        let mut r = ""
+        let m = len(out)
+        let mut k = 0
+        loop k < m:
+            r = r + "/" + out[k]
+            k = k + 1
+        if r == "":
+            return "/"
+        return r
+
+    proc driverDirOf(p: text) -> text:
+        let i = do vpLastIndexOf(p, "/")
+        if i <= 0:
+            return "/"
+        return slice(p, 0, i)
+
+    proc driverBaseOf(p: text) -> text:
+        let i = do vpLastIndexOf(p, "/")
+        return slice(p, i + 1, len(p))
+
+    # driverFNV32a: hash/fnv's 32-bit FNV-1a over the path's UTF-8 bytes,
+    # spelled as fileSuffix spells it (%08x).
+    proc driverFNV32a(s: text) -> text:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut h = 2166136261
+        let mut i = 0
+        loop i < n:
+            h = h ^ bs[i]
+            h = (h * 16777619) % 4294967296
+            i = i + 1
+        let digits = "0123456789abcdef"
+        let mut out = ""
+        let mut k = 0
+        loop k < 8:
+            let d = h % 16
+            out = charAt(digits, d) + out
+            h = h / 16
+            k = k + 1
+        return out
+
+    struct DriverModule:
+        abs: text
+        src: text
+
+    struct DriverCollect:
+        mods: [DriverModule]
+        visited: [text]
+        err: text
+
+    proc driverCollect(root: text, abs: text, visited0: [text], stack: [text]) -> DriverCollect:
+        if abs in stack:
+            let b = do driverBaseOf(abs)
+            return DriverCollect{mods: [], visited: visited0, err: "import cycle through " + b}
+        let pre = root + "/"
+        let under = do vpHasPrefix(abs, pre)
+        if !under:
+            return DriverCollect{mods: [], visited: visited0, err: abs + " is outside the data directory " + root}
+        let rel = slice(abs, len(pre), len(abs))
+        let src = do driverReadFile(rel)
+        let mut mods = [DriverModule{abs: abs, src: src}]
+        let mut visited = visited0
+        let imports = do driverImportsOf(src)
+        let dir = do driverDirOf(abs)
+        let n = len(imports)
+        let mut i = 0
+        loop i < n:
+            let imp = imports[i]
+            let isAbs = do vpHasPrefix(imp, "/")
+            let mut joined = dir + "/" + imp
+            if isAbs:
+                joined = imp
+            let impAbs = do driverCleanPath(joined)
+            if impAbs in visited:
+                i = i + 1
+                continue
+            visited = append(visited, impAbs)
+            let sub = do driverCollect(root, impAbs, visited, append(stack, abs))
+            if sub.err != "":
+                return sub
+            visited = sub.visited
+            let m = len(sub.mods)
+            let mut k = 0
+            loop k < m:
+                mods = append(mods, sub.mods[k])
+                k = k + 1
+            i = i + 1
+        return DriverCollect{mods: mods, visited: visited, err: ""}
+
+    # driverMerge: mergeInto — src's declarations after dst's own. Exactly
+    # the kinds Go merges: webhooks/triggers/api/streams and the dark/named
+    # palettes stay the entry file's own.
+    # driverRouteCollisions: checkRouteCollisions — two modules declaring
+    # one HTTP route (an api method+path, a stream path, a webhook path) or
+    # a second contract, named with both files.
+    proc driverRouteCollisions(mods: [Program], files: [text]) -> text:
+        let mut keys = []
+        let mut owners = []
+        let n = len(mods)
+        let mut i = 0
+        loop i < n:
+            let m = mods[i]
+            let src = do driverBaseOf(files[i])
+            let mut mine = []
+            let mut lines = []
+            let nr = len(m.rawDecls)
+            let mut r = 0
+            loop r < nr:
+                let rd = m.rawDecls[r]
+                if rd.kw == "api":
+                    let ap = do wParseAPI(rd.header)
+                    if ap.err == "":
+                        mine = append(mine, "api " + ap.method + " " + ap.path)
+                        lines = append(lines, rd.line)
+                if rd.kw == "stream":
+                    let st = do wParseStream(rd.header, rd.bodySrc)
+                    if st.err == "":
+                        mine = append(mine, "stream " + st.path)
+                        lines = append(lines, rd.line)
+                r = r + 1
+            let nw = len(m.webhooks)
+            let mut w = 0
+            loop w < nw:
+                mine = append(mine, "webhook " + m.webhooks[w].path)
+                lines = append(lines, m.webhooks[w].line)
+                w = w + 1
+            let mut c = 0
+            loop c < nr:
+                if m.rawDecls[c].kw == "contract":
+                    mine = append(mine, "contract")
+                    lines = append(lines, m.rawDecls[c].line)
+                c = c + 1
+            let nm = len(mine)
+            let mut k = 0
+            loop k < nm:
+                let at = do vbFind(keys, mine[k])
+                if at >= 0:
+                    let prev = split(owners[at], "\t")
+                    if prev[0] != src:
+                        return src + ":" + lines[k] + ": " + mine[k] + " is already declared in " + prev[0] + ":" + prev[1]
+                else:
+                    keys = append(keys, mine[k])
+                    owners = append(owners, src + "\t" + lines[k])
+                k = k + 1
+            i = i + 1
+        return ""
+
+    private proc driverDupIn(kind: text, names: [text]) -> text:
+        let mut seen = []
+        let n = len(names)
+        let mut i = 0
+        loop i < n:
+            if names[i] in seen:
+                return kind + " \"" + names[i] + "\" is declared more than once (check your imported modules)"
+            seen = append(seen, names[i])
+            i = i + 1
+        return ""
+
+    private proc driverDeclName(line: text, kw: text) -> text:
+        let r0 = do vpTrimPrefix(trim(line), kw)
+        let r = trim(r0)
+        let cs = split(r, "")
+        let mut out = ""
+        let n = len(cs)
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if c == "(" || c == ":" || c == " " || c == "\t":
+                break
+            out = out + c
+            i = i + 1
+        return out
+
+    # driverCheckDuplicates: checkDuplicates — the first name declared twice
+    # within a kind across the merged graph.
+    proc driverCheckDuplicates(p: Program) -> text:
+        let mut a = []
+        let n1 = len(p.entities)
+        let mut i1 = 0
+        loop i1 < n1:
+            a = append(a, p.entities[i1].name)
+            i1 = i1 + 1
+        let e1 = do driverDupIn("entity", a)
+        if e1 != "":
+            return e1
+        let mut b = []
+        let n2 = len(p.records)
+        let mut i2 = 0
+        loop i2 < n2:
+            b = append(b, p.records[i2].name)
+            i2 = i2 + 1
+        let e2 = do driverDupIn("record", b)
+        if e2 != "":
+            return e2
+        let mut c = []
+        let n3 = len(p.structs)
+        let mut i3 = 0
+        loop i3 < n3:
+            c = append(c, p.structs[i3].name)
+            i3 = i3 + 1
+        let e3 = do driverDupIn("struct", c)
+        if e3 != "":
+            return e3
+        let mut d = []
+        let n4 = len(p.enums)
+        let mut i4 = 0
+        loop i4 < n4:
+            d = append(d, p.enums[i4].name)
+            i4 = i4 + 1
+        let e4 = do driverDupIn("enum", d)
+        if e4 != "":
+            return e4
+        let mut e = []
+        let n5 = len(p.states)
+        let mut i5 = 0
+        loop i5 < n5:
+            e = append(e, p.states[i5].name)
+            i5 = i5 + 1
+        let e5 = do driverDupIn("state", e)
+        if e5 != "":
+            return e5
+        let mut f = []
+        let n6 = len(p.derives)
+        let mut i6 = 0
+        loop i6 < n6:
+            let dn = do driverDeclName(p.derives[i6].line, "derive")
+            f = append(f, dn)
+            i6 = i6 + 1
+        let e6 = do driverDupIn("derive", f)
+        if e6 != "":
+            return e6
+        let mut g = []
+        let n7 = len(p.policies)
+        let mut i7 = 0
+        loop i7 < n7:
+            g = append(g, p.policies[i7].name)
+            i7 = i7 + 1
+        let e7 = do driverDupIn("policy", g)
+        if e7 != "":
+            return e7
+        let mut h = []
+        let n8 = len(p.actions)
+        let mut i8 = 0
+        loop i8 < n8:
+            h = append(h, p.actions[i8].name)
+            i8 = i8 + 1
+        let e8 = do driverDupIn("action", h)
+        if e8 != "":
+            return e8
+        let mut pr = []
+        let n9 = len(p.procs)
+        let mut i9 = 0
+        loop i9 < n9:
+            pr = append(pr, p.procs[i9].name)
+            i9 = i9 + 1
+        let e9 = do driverDupIn("proc", pr)
+        if e9 != "":
+            return e9
+        let mut jb = []
+        let n10 = len(p.jobs)
+        let mut i10 = 0
+        loop i10 < n10:
+            jb = append(jb, p.jobs[i10].name)
+            i10 = i10 + 1
+        let e10 = do driverDupIn("job", jb)
+        if e10 != "":
+            return e10
+        let mut dm = []
+        let n11 = len(p.daemons)
+        let mut i11 = 0
+        loop i11 < n11:
+            dm = append(dm, p.daemons[i11].name)
+            i11 = i11 + 1
+        let e11 = do driverDupIn("daemon", dm)
+        if e11 != "":
+            return e11
+        let mut cm = []
+        let n12 = len(p.components)
+        let mut i12 = 0
+        loop i12 < n12:
+            cm = append(cm, p.components[i12].header.name)
+            i12 = i12 + 1
+        let e12 = do driverDupIn("component", cm)
+        if e12 != "":
+            return e12
+        let mut ly = []
+        let n13 = len(p.layouts)
+        let mut i13 = 0
+        loop i13 < n13:
+            let ln = do driverDeclName(p.layouts[i13].headerLine, "layout")
+            ly = append(ly, ln)
+            i13 = i13 + 1
+        let e13 = do driverDupIn("layout", ly)
+        if e13 != "":
+            return e13
+        let mut vw = []
+        let n14 = len(p.views)
+        let mut i14 = 0
+        loop i14 < n14:
+            vw = append(vw, p.views[i14].name)
+            i14 = i14 + 1
+        let e14 = do driverDupIn("view", vw)
+        return e14
+
+    proc driverMerge(dst: Program, src: Program) -> Program:
+        let mut themes = dst.themes
+        let nt = len(src.themes)
+        let mut ti = 0
+        loop ti < nt:
+            if src.themes[ti].kind == "base":
+                themes = append(themes, src.themes[ti])
+            ti = ti + 1
+        let mut css = dst.css
+        if css == "":
+            css = src.css
+        else:
+            if src.css != "":
+                css = css + "\n" + src.css
+        let entities = do driverCatEntities(dst.entities, src.entities)
+        let records = do driverCatRecords(dst.records, src.records)
+        let structs = do driverCatStructs(dst.structs, src.structs)
+        let enums = do driverCatEnums(dst.enums, src.enums)
+        let states = do driverCatStates(dst.states, src.states)
+        let derives = do driverCatDerives(dst.derives, src.derives)
+        let policies = do driverCatPolicies(dst.policies, src.policies)
+        let actions = do driverCatActions(dst.actions, src.actions)
+        let procs = do driverCatProcs(dst.procs, src.procs)
+        let jobs = do driverCatJobs(dst.jobs, src.jobs)
+        let daemons = do driverCatDaemons(dst.daemons, src.daemons)
+        let components = do driverCatComponents(dst.components, src.components)
+        let views = do driverCatViews(dst.views, src.views)
+        let services = do driverCatServices(dst.services, src.services)
+        # mergeInto carries types, messages and files across, and the HTTP
+        # surface a module declares next to its domain — its api routes,
+        # streams, webhooks, triggers and (the first) contract route.
+        let mut dstHasContract = false
+        let ndc = len(dst.rawDecls)
+        let mut dci = 0
+        loop dci < ndc:
+            if dst.rawDecls[dci].kw == "contract":
+                dstHasContract = true
+            dci = dci + 1
+        let mut rawDecls = dst.rawDecls
+        let nrd = len(src.rawDecls)
+        let mut rdi = 0
+        loop rdi < nrd:
+            let rk = src.rawDecls[rdi].kw
+            if rk == "type" || rk == "message" || rk == "file" || rk == "api" || rk == "stream":
+                rawDecls = append(rawDecls, src.rawDecls[rdi])
+            if rk == "contract" && !dstHasContract:
+                rawDecls = append(rawDecls, src.rawDecls[rdi])
+            rdi = rdi + 1
+        let mut webhooks = dst.webhooks
+        let nwh = len(src.webhooks)
+        let mut whi = 0
+        loop whi < nwh:
+            webhooks = append(webhooks, src.webhooks[whi])
+            whi = whi + 1
+        let mut triggers = dst.triggers
+        let ntr = len(src.triggers)
+        let mut tri = 0
+        loop tri < ntr:
+            triggers = append(triggers, src.triggers[tri])
+            tri = tri + 1
+        let mut layouts = dst.layouts
+        let nly = len(src.layouts)
+        let mut lyi = 0
+        loop lyi < nly:
+            layouts = append(layouts, src.layouts[lyi])
+            lyi = lyi + 1
+        let mut parseErrors = dst.parseErrors
+        let npe = len(src.parseErrors)
+        let mut pei = 0
+        loop pei < npe:
+            parseErrors = append(parseErrors, src.parseErrors[pei])
+            pei = pei + 1
+        return Program{name: dst.name, hasAuth: dst.hasAuth || src.hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: [], parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: dst.kind, into: dst.into, mounts: dst.mounts, sockets: dst.sockets, hasFrame: dst.hasFrame, frameSrc: dst.frameSrc, hasContent: dst.hasContent, contentSrc: dst.contentSrc, unknownKeywords: dst.unknownKeywords}
+
+    proc driverCatEntities(a: [EntityDecl], b: [EntityDecl]) -> [EntityDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatRecords(a: [RecordDecl], b: [RecordDecl]) -> [RecordDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatStructs(a: [StructDecl], b: [StructDecl]) -> [StructDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatEnums(a: [EnumDecl], b: [EnumDecl]) -> [EnumDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatStates(a: [StateDecl], b: [StateDecl]) -> [StateDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatDerives(a: [DeriveDeclFull], b: [DeriveDeclFull]) -> [DeriveDeclFull]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatPolicies(a: [PolicyDeclFull], b: [PolicyDeclFull]) -> [PolicyDeclFull]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatActions(a: [ActionDecl], b: [ActionDecl]) -> [ActionDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatProcs(a: [ProcDecl], b: [ProcDecl]) -> [ProcDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatJobs(a: [JobDecl], b: [JobDecl]) -> [JobDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatDaemons(a: [DaemonDecl], b: [DaemonDecl]) -> [DaemonDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatComponents(a: [ComponentEntry], b: [ComponentEntry]) -> [ComponentEntry]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatViews(a: [ViewEntry], b: [ViewEntry]) -> [ViewEntry]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCatServices(a: [ServiceDecl], b: [ServiceDecl]) -> [ServiceDecl]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    # driverMangle: manglePrivate — this module's private procs and views
+    # renamed `name~<fnv32a(abs)>`, and every same-file call to a private
+    # proc rewritten to match, before the module is merged.
+    proc driverMangle(prog: Program, abs: text) -> Program:
+        let suffix = do driverFNV32a(abs)
+        let mut from = []
+        let mut to = []
+        let np = len(prog.privateProcs)
+        let mut i = 0
+        loop i < np:
+            from = append(from, prog.privateProcs[i])
+            to = append(to, prog.privateProcs[i] + "~" + suffix)
+            i = i + 1
+        let mut views = []
+        let nv = len(prog.views)
+        let mut vi = 0
+        loop vi < nv:
+            let v = prog.views[vi]
+            if v.private:
+                views = append(views, ViewEntry{name: v.name + "~" + suffix, path: v.path, headerValid: v.headerValid, body: v.body, header: v.header, bodySrc: v.bodySrc, private: true})
+            else:
+                views = append(views, v)
+            vi = vi + 1
+        if len(from) == 0:
+            return Program{name: prog.name, hasAuth: prog.hasAuth, entities: prog.entities, records: prog.records, structs: prog.structs, enums: prog.enums, states: prog.states, derives: prog.derives, policies: prog.policies, procs: prog.procs, actions: prog.actions, webhooks: prog.webhooks, jobs: prog.jobs, services: prog.services, components: prog.components, triggers: prog.triggers, views: views, themes: prog.themes, css: prog.css, daemons: prog.daemons, privateProcs: [], parseErrors: prog.parseErrors, layouts: prog.layouts, rawDecls: prog.rawDecls, kind: prog.kind, into: prog.into, mounts: prog.mounts, sockets: prog.sockets, hasFrame: prog.hasFrame, frameSrc: prog.frameSrc, hasContent: prog.hasContent, contentSrc: prog.contentSrc, unknownKeywords: prog.unknownKeywords}
+        let mut procs = []
+        let npr = len(prog.procs)
+        let mut pi = 0
+        loop pi < npr:
+            let pd = prog.procs[pi]
+            let at = do vbFind(from, pd.name)
+            let mut name = pd.name
+            if at >= 0:
+                name = to[at]
+            procs = append(procs, ProcDecl{name: name, paramNames: pd.paramNames, paramTypes: pd.paramTypes, paramLists: pd.paramLists, paramOptionals: pd.paramOptionals, hasRet: pd.hasRet, retCore: pd.retCore, retIsList: pd.retIsList, retIsOptional: pd.retIsOptional, uses: pd.uses, headerValid: pd.headerValid, body: pd.body, bodyValid: pd.bodyValid, headerLine: pd.headerLine, bodySrc: pd.bodySrc, renameFrom: from, renameTo: to})
+            pi = pi + 1
+        let mut actions = []
+        let na = len(prog.actions)
+        let mut ai = 0
+        loop ai < na:
+            let ad = prog.actions[ai]
+            actions = append(actions, ActionDecl{name: ad.name, paramNames: ad.paramNames, paramTypes: ad.paramTypes, paramOptionals: ad.paramOptionals, optimistic: ad.optimistic, headerValid: ad.headerValid, requires: ad.requires, body: ad.body, bodyValid: ad.bodyValid, bodySrc: ad.bodySrc, renameFrom: from, renameTo: to, paramLists: ad.paramLists, ret: ad.ret, retList: ad.retList, retErr: ad.retErr})
+            ai = ai + 1
+        let mut daemons = []
+        let nd = len(prog.daemons)
+        let mut di = 0
+        loop di < nd:
+            let dd = prog.daemons[di]
+            daemons = append(daemons, DaemonDecl{name: dd.name, every: dd.every, uses: dd.uses, bodySrc: dd.bodySrc, err: dd.err, renameFrom: from, renameTo: to})
+            di = di + 1
+        return Program{name: prog.name, hasAuth: prog.hasAuth, entities: prog.entities, records: prog.records, structs: prog.structs, enums: prog.enums, states: prog.states, derives: prog.derives, policies: prog.policies, procs: procs, actions: actions, webhooks: prog.webhooks, jobs: prog.jobs, services: prog.services, components: prog.components, triggers: prog.triggers, views: views, themes: prog.themes, css: prog.css, daemons: daemons, privateProcs: [], parseErrors: prog.parseErrors, layouts: prog.layouts, rawDecls: prog.rawDecls, kind: prog.kind, into: prog.into, mounts: prog.mounts, sockets: prog.sockets, hasFrame: prog.hasFrame, frameSrc: prog.frameSrc, hasContent: prog.hasContent, contentSrc: prog.contentSrc, unknownKeywords: prog.unknownKeywords}
+
+    # ── layered composition: internal/compile/compose.go ───────────────
+    proc driverIsLayered(mods: [Program]) -> bool:
+        let n = len(mods)
+        let mut i = 0
+        loop i < n:
+            let k = mods[i].kind
+            if k == "playground" || k == "wireframe" || k == "ui" || k == "data":
+                return true
+            i = i + 1
+        return false
+
+    proc driverIsPresentational(f: Program) -> bool:
+        let contributes = len(f.components) > 0 || len(f.layouts) > 0 || f.css != "" || len(f.themes) > 0
+        if !contributes:
+            return false
+        if len(f.entities) > 0 || len(f.records) > 0 || len(f.enums) > 0 || len(f.states) > 0 || len(f.derives) > 0 || len(f.policies) > 0:
+            return false
+        if len(f.actions) > 0 || len(f.procs) > 0 || len(f.jobs) > 0 || len(f.services) > 0 || len(f.webhooks) > 0 || len(f.triggers) > 0 || len(f.views) > 0:
+            return false
+        if len(f.mounts) > 0 || len(f.sockets) > 0 || f.hasFrame || f.hasAuth:
+            return false
+        return true
+
+    struct DriverComposed:
+        err: text
+        prog: Program
+        views: [VView]
+
+    proc driverComposeErr(p: Program, msg: text) -> DriverComposed:
+        return DriverComposed{err: msg, prog: p, views: []}
+
+    proc driverFrameOf(f: Program) -> [VNode]:
+        let lines = do vpLinesOf(f.frameSrc)
+        let nodes = do vpNodes(lines)
+        return nodes
+
+    proc driverJoinCSS(a: text, b: text) -> text:
+        if a == "":
+            return b
+        if b == "":
+            return a
+        return a + "\n" + b
+
+    proc driverAppendThemes(a: [ProgThemeBlock], b: [ProgThemeBlock]) -> [ProgThemeBlock]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc driverCompose(mods: [Program]) -> DriverComposed:
+        let n = len(mods)
+        let mut pgAt = -1
+        let mut wfs = []
+        let mut bricks = []
+        let mut atoms = []
+        let mut i = 0
+        loop i < n:
+            let f = mods[i]
+            if len(f.parseErrors) > 0:
+                let e0 = do driverComposeErr(f, f.parseErrors[0])
+                return e0
+            if f.kind == "playground":
+                if pgAt >= 0:
+                    let e1 = do driverComposeErr(f, "two playgrounds (\"" + mods[pgAt].name + "\" and \"" + f.name + "\") — an app has exactly one baseplate")
+                    return e1
+                pgAt = i
+            if f.kind == "wireframe":
+                wfs = append(wfs, i)
+            if f.kind == "ui" || f.kind == "data":
+                bricks = append(bricks, i)
+            if f.kind == "app":
+                let pres = do driverIsPresentational(f)
+                if !pres:
+                    let e2 = do driverComposeErr(f, "plain `app` \"" + f.name + "\" cannot be mixed into a layered build — make it a `ui`/`data` facet (or strip it to presentation: components, layouts, theme, css), or build from a playground")
+                    return e2
+                atoms = append(atoms, i)
+            i = i + 1
+        if pgAt < 0:
+            let e3 = do driverComposeErr(mods[0], "a layered app needs a `playground` baseplate to build from")
+            return e3
+        let pg = mods[pgAt]
+        # wireframes and their sockets
+        let mut wfNames = []
+        let mut sockNames = []
+        let mut sockOwners = []
+        let mut sockAccepts = []
+        let nw = len(wfs)
+        let mut wi = 0
+        loop wi < nw:
+            let w = mods[wfs[wi]]
+            if w.name in wfNames:
+                let e4 = do driverComposeErr(w, "two wireframes are both named \"" + w.name + "\"")
+                return e4
+            if !w.hasFrame:
+                let e4b = do driverComposeErr(w, "wireframe \"" + w.name + "\" needs a `frame:` block")
+                return e4b
+            wfNames = append(wfNames, w.name)
+            let ns = len(w.sockets)
+            let mut si = 0
+            loop si < ns:
+                let sk = w.sockets[si]
+                if sk.err != "":
+                    let e5 = do driverComposeErr(w, sk.err)
+                    return e5
+                let at = do vbFind(sockNames, sk.name)
+                if at >= 0:
+                    let e6 = do driverComposeErr(w, "socket \"" + sk.name + "\" is declared by both wireframe \"" + sockOwners[at] + "\" and \"" + w.name + "\" — socket names must be unique")
+                    return e6
+                sockNames = append(sockNames, sk.name)
+                sockOwners = append(sockOwners, w.name)
+                sockAccepts = append(sockAccepts, sk.accept)
+                si = si + 1
+            wi = wi + 1
+        # fill: (owner, socket) -> content, in brick order
+        let mut fillOwner = []
+        let mut fillSocket = []
+        let mut fillNodes = []
+        let nb = len(bricks)
+        let mut bi = 0
+        loop bi < nb:
+            let b = mods[bricks[bi]]
+            let at2 = do vbFind(sockNames, b.into)
+            if at2 < 0:
+                let sorted = do vbSortText(sockNames)
+                let mut hint = " (the wireframe declares no sockets)"
+                if len(sorted) > 0:
+                    let mut joined = ""
+                    let nsn = len(sorted)
+                    let mut ji = 0
+                    loop ji < nsn:
+                        if ji > 0:
+                            joined = joined + ", "
+                        joined = joined + sorted[ji]
+                        ji = ji + 1
+                    hint = " (sockets: " + joined + ")"
+                let e7 = do driverComposeErr(b, b.kind + " facet \"" + b.name + "\" snaps into socket \"" + b.into + "\", but no wireframe declares it" + hint)
+                return e7
+            if sockAccepts[at2] != b.kind:
+                let e8 = do driverComposeErr(b, "socket \"" + b.into + "\" accepts `" + sockAccepts[at2] + "` facets, but \"" + b.name + "\" is a `" + b.kind + "` facet — the bricks don't fit")
+                return e8
+            if !b.hasContent:
+                let e8b = do driverComposeErr(b, b.kind + " facet \"" + b.name + "\" needs a `content:` block to fill socket \"" + b.into + "\"")
+                return e8b
+            if b.kind == "ui" && len(b.entities) > 0:
+                let e8c = do driverComposeErr(b, "ui facet \"" + b.name + "\" may not declare an entity — move durable data into a `data` facet")
+                return e8c
+            let clines = do vpLinesOf(b.contentSrc)
+            let content = do vpNodes(clines)
+            let ce = do vpListErr(content)
+            if ce != "":
+                let e9 = do driverComposeErr(b, ce)
+                return e9
+            let owner = sockOwners[at2]
+            let mut found = -1
+            let nf = len(fillOwner)
+            let mut fi = 0
+            loop fi < nf:
+                if fillOwner[fi] == owner && fillSocket[fi] == b.into:
+                    found = fi
+                fi = fi + 1
+            if found >= 0:
+                let mut merged = fillNodes[found].nodes
+                let nc = len(content)
+                let mut ci = 0
+                loop ci < nc:
+                    merged = append(merged, content[ci])
+                    ci = ci + 1
+                fillNodes[found] = VFill{nodes: merged}
+            else:
+                fillOwner = append(fillOwner, owner)
+                fillSocket = append(fillSocket, b.into)
+                fillNodes = append(fillNodes, VFill{nodes: content})
+            bi = bi + 1
+        # the composite app
+        let mut themes = pg.themes
+        let mut css = pg.css
+        let mut hasAuth = pg.hasAuth
+        let mut wj = 0
+        loop wj < nw:
+            let w2 = mods[wfs[wj]]
+            let t1 = do driverAppendThemes(themes, w2.themes)
+            themes = t1
+            let c1 = do driverJoinCSS(css, w2.css)
+            css = c1
+            wj = wj + 1
+        let mut app = Program{name: pg.name, hasAuth: false, entities: [], records: [], structs: [], enums: [], states: [], derives: [], policies: [], procs: [], actions: [], webhooks: [], jobs: [], services: [], components: [], triggers: [], views: [], themes: [], css: "", daemons: [], privateProcs: [], parseErrors: [], layouts: [], rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: []}
+        let mut policyNames = []
+        let mut policyCounts = []
+        let mut bj = 0
+        loop bj < nb:
+            let b2 = mods[bricks[bj]]
+            hasAuth = hasAuth || b2.hasAuth
+            let entities = do driverCatEntities(app.entities, b2.entities)
+            let enums = do driverCatEnums(app.enums, b2.enums)
+            let states = do driverCatStates(app.states, b2.states)
+            let derives = do driverCatDerives(app.derives, b2.derives)
+            let policies = do driverCatPolicies(app.policies, b2.policies)
+            let actions = do driverCatActions(app.actions, b2.actions)
+            let procs = do driverCatProcs(app.procs, b2.procs)
+            let jobs = do driverCatJobs(app.jobs, b2.jobs)
+            let daemons = do driverCatDaemons(app.daemons, b2.daemons)
+            let components = do driverCatComponents(app.components, b2.components)
+            let services = do driverCatServices(app.services, b2.services)
+            let mut layouts = app.layouts
+            let nly = len(b2.layouts)
+            let mut lyi = 0
+            loop lyi < nly:
+                layouts = append(layouts, b2.layouts[lyi])
+                lyi = lyi + 1
+            app = Program{name: app.name, hasAuth: false, entities: entities, records: [], structs: [], enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: [], jobs: jobs, services: services, components: components, triggers: [], views: [], themes: [], css: "", daemons: daemons, privateProcs: [], parseErrors: [], layouts: layouts, rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: []}
+            let t2 = do driverAppendThemes(themes, b2.themes)
+            themes = t2
+            let c2 = do driverJoinCSS(css, b2.css)
+            css = c2
+            let npl = len(b2.policies)
+            let mut pli = 0
+            loop pli < npl:
+                policyNames = append(policyNames, b2.policies[pli].name)
+                policyCounts = append(policyCounts, len(b2.policies[pli].paramNames))
+                pli = pli + 1
+            bj = bj + 1
+        let mut components2 = app.components
+        let mut layouts2 = app.layouts
+        let na = len(atoms)
+        let mut ai = 0
+        loop ai < na:
+            let a = mods[atoms[ai]]
+            let cc = do driverCatComponents(components2, a.components)
+            components2 = cc
+            let nly2 = len(a.layouts)
+            let mut l2 = 0
+            loop l2 < nly2:
+                layouts2 = append(layouts2, a.layouts[l2])
+                l2 = l2 + 1
+            let t3 = do driverAppendThemes(themes, a.themes)
+            themes = t3
+            let c3 = do driverJoinCSS(css, a.css)
+            css = c3
+            ai = ai + 1
+        # screens: every mount, then every brick view spliced into its frame
+        if len(pg.mounts) == 0:
+            let e10 = do driverComposeErr(pg, "playground \"" + pg.name + "\" must `mount <Wireframe>`")
+            return e10
+        let mut views = []
+        let mut seenPaths = []
+        let mut seenNames = []
+        let nm = len(pg.mounts)
+        let mut mi = 0
+        loop mi < nm:
+            let m = pg.mounts[mi]
+            if m.err != "":
+                let e11 = do driverComposeErr(pg, m.err)
+                return e11
+            let wat = do vbFind(wfNames, m.wireframe)
+            if wat < 0:
+                let e12 = do driverComposeErr(pg, "playground \"" + pg.name + "\" mounts wireframe \"" + m.wireframe + "\", which was not found (did you import it?)")
+                return e12
+            if m.requires != "":
+                let pat = do vbFind(policyNames, m.requires)
+                if pat < 0:
+                    let e13 = do driverComposeErr(pg, "screen \"" + m.wireframe + "\" (at \"" + m.path + "\") requires policy \"" + m.requires + "\", which is not defined in any data facet")
+                    return e13
+                if policyCounts[pat] != 0:
+                    let e14 = do driverComposeErr(pg, "screen guard \"" + m.requires + "\" must be a zero-argument policy")
+                    return e14
+            let dp = do vbFind(seenPaths, m.path)
+            if dp >= 0:
+                let e15 = do driverComposeErr(pg, "two screens mount at \"" + m.path + "\" (\"" + seenNames[dp] + "\" and \"" + m.wireframe + "\")")
+                return e15
+            seenPaths = append(seenPaths, m.path)
+            seenNames = append(seenNames, m.wireframe)
+            let w3 = mods[wfs[wat]]
+            let frame = do driverFrameOf(w3)
+            let fe = do vpListErr(frame)
+            if fe != "":
+                let e16 = do driverComposeErr(pg, fe)
+                return e16
+            let mut names = []
+            let mut fills = []
+            let nf2 = len(fillOwner)
+            let mut f2 = 0
+            loop f2 < nf2:
+                if fillOwner[f2] == w3.name:
+                    names = append(names, fillSocket[f2])
+                    fills = append(fills, fillNodes[f2])
+                f2 = f2 + 1
+            let sp = do vpSpliceInto(frame, false, "frame", "", [], names, fills, 0)
+            if sp.err != "":
+                let e17 = do driverComposeErr(pg, sp.err)
+                return e17
+            views = append(views, VView{err: "", name: m.wireframe, path: m.path, params: [], layout: "", requires: m.requires, titleSegs: [], descSegs: [], root: sp.nodes, screen: true})
+            mi = mi + 1
+        let mut bk = 0
+        loop bk < nb:
+            let b3 = mods[bricks[bk]]
+            let nbv = len(b3.views)
+            if nbv > 0:
+                let oat = do vbFind(sockNames, b3.into)
+                let owner2 = sockOwners[oat]
+                let wat2 = do vbFind(wfNames, owner2)
+                let w4 = mods[wfs[wat2]]
+                let frame2 = do driverFrameOf(w4)
+                let mut bv = 0
+                loop bv < nbv:
+                    let ve = b3.views[bv]
+                    let v = do vpParseView(ve.header, ve.bodySrc)
+                    if v.err != "":
+                        let e18 = do driverComposeErr(b3, v.err)
+                        return e18
+                    if v.layout != "":
+                        let e19 = do driverComposeErr(b3, b3.kind + " facet \"" + b3.name + "\": view \"" + v.name + "\" may not name a layout — the wireframe that owns socket \"" + b3.into + "\" is this screen's chrome")
+                        return e19
+                    if v.path == "":
+                        let e20 = do driverComposeErr(b3, b3.kind + " facet \"" + b3.name + "\": view \"" + v.name + "\" needs an explicit route — write `view " + v.name + " at \"/path\":`")
+                        return e20
+                    let dp2 = do vbFind(seenPaths, v.path)
+                    if dp2 >= 0:
+                        let e21 = do driverComposeErr(b3, "two screens mount at \"" + v.path + "\" (\"" + seenNames[dp2] + "\" and \"" + v.name + "\")")
+                        return e21
+                    seenPaths = append(seenPaths, v.path)
+                    seenNames = append(seenNames, v.name)
+                    let mut names2 = []
+                    let mut fills2 = []
+                    let mut swappedIn = false
+                    let nf3 = len(fillOwner)
+                    let mut f3 = 0
+                    loop f3 < nf3:
+                        if fillOwner[f3] == owner2:
+                            names2 = append(names2, fillSocket[f3])
+                            if fillSocket[f3] == b3.into:
+                                fills2 = append(fills2, VFill{nodes: v.root})
+                                swappedIn = true
+                            else:
+                                fills2 = append(fills2, fillNodes[f3])
+                        f3 = f3 + 1
+                    if !swappedIn:
+                        names2 = append(names2, b3.into)
+                        fills2 = append(fills2, VFill{nodes: v.root})
+                    let sp2 = do vpSpliceInto(frame2, false, "frame", "", [], names2, fills2, 0)
+                    if sp2.err != "":
+                        let e22 = do driverComposeErr(b3, sp2.err)
+                        return e22
+                    views = append(views, VView{err: "", name: v.name, path: v.path, params: v.params, layout: "", requires: v.requires, titleSegs: v.titleSegs, descSegs: v.descSegs, root: sp2.nodes, screen: true})
+                    bv = bv + 1
+            bk = bk + 1
+        let out = Program{name: app.name, hasAuth: hasAuth, entities: app.entities, records: [], structs: [], enums: app.enums, states: app.states, derives: app.derives, policies: app.policies, procs: app.procs, actions: app.actions, webhooks: [], jobs: app.jobs, services: app.services, components: components2, triggers: [], views: [], themes: themes, css: css, daemons: app.daemons, privateProcs: [], parseErrors: [], layouts: layouts2, rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: []}
+        return DriverComposed{err: "", prog: out, views: views}
+
+    # driverCSSFrom: collectModules' `css from "styles.css"` pass — each
+    # sibling stylesheet (relative to this module's own directory) read and
+    # folded into the module's CSS after its inline blocks, in order.
+    struct DriverCSSOut:
+        prog: Program
+        err: text
+
+    proc driverCSSFrom(root: text, abs: text, p: Program) -> DriverCSSOut:
+        let base = do driverBaseOf(abs)
+        let dir = do driverDirOf(abs)
+        let mut css = p.css
+        let mut kept = []
+        let nr = len(p.rawDecls)
+        let mut i = 0
+        loop i < nr:
+            let rd = p.rawDecls[i]
+            if rd.kw != "cssfrom":
+                kept = append(kept, rd)
+                i = i + 1
+                continue
+            let r0 = do vpTrimPrefix(trim(rd.header), "css from")
+            let u = do goUnquote(trim(r0))
+            if !u.ok:
+                return DriverCSSOut{prog: p, err: base + ": line " + rd.line + ": css from needs a quoted path: css from \"styles.css\""}
+            if u.value == "":
+                return DriverCSSOut{prog: p, err: base + ": line " + rd.line + ": css from path is empty"}
+            let isAbs = do vpHasPrefix(u.value, "/")
+            let mut cssAbs = dir + "/" + u.value
+            if isAbs:
+                cssAbs = u.value
+            let clean = do driverCleanPath(cssAbs)
+            let pre = root + "/"
+            let under = do vpHasPrefix(clean, pre)
+            let mut exists = false
+            if under:
+                let ex = do driverFileExists(slice(clean, len(pre), len(clean)))
+                exists = ex
+            if !exists:
+                let q = do goQuote(u.value)
+                return DriverCSSOut{prog: p, err: base + ":" + rd.line + ": css from " + q + ": open " + clean + ": no such file or directory"}
+            let body = do driverReadFile(slice(clean, len(pre), len(clean)))
+            if css == "":
+                css = body
+            else:
+                if body != "":
+                    css = css + "\n" + body
+            i = i + 1
+        let out = Program{name: p.name, hasAuth: p.hasAuth, entities: p.entities, records: p.records, structs: p.structs, enums: p.enums, states: p.states, derives: p.derives, policies: p.policies, procs: p.procs, actions: p.actions, webhooks: p.webhooks, jobs: p.jobs, services: p.services, components: p.components, triggers: p.triggers, views: p.views, themes: p.themes, css: css, daemons: p.daemons, privateProcs: p.privateProcs, parseErrors: p.parseErrors, layouts: p.layouts, rawDecls: kept, kind: p.kind, into: p.into, mounts: p.mounts, sockets: p.sockets, hasFrame: p.hasFrame, frameSrc: p.frameSrc, hasContent: p.hasContent, contentSrc: p.contentSrc, unknownKeywords: p.unknownKeywords}
+        return DriverCSSOut{prog: out, err: ""}
+
+    proc driverFileExists(path: text) -> bool uses io.file:
+        let e = fileExists(path)
+        return e
+
+    proc compileFileJSON(root: text, rel: text) -> text:
+        let entry = do driverCleanPath(root + "/" + rel)
+        let col = do driverCollect(root, entry, [], [])
+        if col.err != "":
+            let q0 = do jsonQuote(col.err)
+            return "{\"error\":" + q0 + "}"
+        let mut mods = []
+        let n = len(col.mods)
+        let mut i = 0
+        loop i < n:
+            let p0 = do parseProgramSrc(col.mods[i].src)
+            let p1 = do driverMangle(p0, col.mods[i].abs)
+            if len(p1.parseErrors) > 0:
+                mods = append(mods, p1)
+                i = i + 1
+                continue
+            let cf = do driverCSSFrom(root, col.mods[i].abs, p1)
+            if cf.err != "":
+                let qf = do jsonQuote(cf.err)
+                return "{\"error\":" + qf + "}"
+            mods = append(mods, cf.prog)
+            i = i + 1
+        let layered = do driverIsLayered(mods)
+        let mut out = do driverEmptyOut(mods[0])
+        if layered:
+            let comp = do driverCompose(mods)
+            if comp.err != "":
+                let qc = do jsonQuote(comp.err)
+                return "{\"error\":" + qc + "}"
+            let dupC = do driverCheckDuplicates(comp.prog)
+            if dupC != "":
+                let qd = do jsonQuote(dupC)
+                return "{\"error\":" + qd + "}"
+            let o1 = do compileProgramV(comp.prog, true, comp.views)
+            out = o1
+        else:
+            let mut files = []
+            let mut fi = 0
+            loop fi < n:
+                files = append(files, col.mods[fi].abs)
+                fi = fi + 1
+            let rc = do driverRouteCollisions(mods, files)
+            if rc != "":
+                let qr = do jsonQuote(rc)
+                return "{\"error\":" + qr + "}"
+            let mut prog = mods[0]
+            let mut k = 1
+            loop k < n:
+                let merged = do driverMerge(prog, mods[k])
+                prog = merged
+                k = k + 1
+            let dup = do driverCheckDuplicates(prog)
+            if dup != "":
+                let qd2 = do jsonQuote(dup)
+                return "{\"error\":" + qd2 + "}"
+            let o2 = do compileProgram(prog)
+            out = o2
+        if out.err != "":
+            let q = do jsonQuote(out.err)
+            return "{\"error\":" + q + "}"
+        let j = do irGraphJSON(out.graph)
         return j
 
     state compiledOut: text = ""
+
+    action runCompileFile(root: text, rel: text):
+        let out = do compileFileJSON(root, rel)
+        compiledOut = out
 
     action runCompileSrc(src: text):
         let out = do compileSrc(src)

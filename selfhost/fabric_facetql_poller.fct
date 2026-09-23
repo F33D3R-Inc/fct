@@ -1,0 +1,335 @@
+import "fabric_facetql_placement.fct"
+import "fabric_runtime.fct"
+
+app FabricFacetqlPollerSelfHost:
+    # Self-hosting port of fabric/crates/fabric-facetql/src/poller.rs — the
+    # live telemetry source: poll `GET /stats` on each FacetQL instance,
+    # difference consecutive samples (fabric_stats.fct's port of
+    # sample.rs), and feed the SAME FabricMessage values the replay path
+    # produces into fabric_runtime.fct's FabricRuntime — one ingestion path,
+    # one scoring path.
+    #
+    # Failing closed, as the Rust does: an instance that does not answer,
+    # or refuses the token, gets an unhealthy heartbeat and no telemetry —
+    # never silence the last good poll keeps papering over, never zeros.
+    # A version learned from `stats.version` (or changed by a rolling
+    # upgrade) is re-registered exactly once before that round's heartbeat.
+    #
+    # Clocks: a sample's elapsed time is measured on the monotonic clock
+    # (fabric_stats.fct's statsSampleTake reads monoMs(), millisecond
+    # resolution where Instant has nanoseconds); the labels — a sample's
+    # takenAtMs and poll_into's heartbeat timestamp_ms — are wall-clock
+    # epoch milliseconds from now(), whose resolution is a whole second.
+    # The client's per-operation deadline is the Rust poller's 10 s request
+    # timeout; its separate 5 s connect timeout is the runtime's connect
+    # bound.
+
+    proc pollerUnknownVersion() -> text:
+        return "unknown"
+
+    struct PollTarget:
+        endpoint: FqlEndpoint
+        shardId: int
+        coordinate: Coordinate
+        region: text
+
+    proc pollTargetNew(endpoint: FqlEndpoint, shardId: int, coordinate: Coordinate, region: text) -> PollTarget:
+        return PollTarget{endpoint: endpoint, shardId: shardId, coordinate: coordinate, region: region}
+
+    struct PollTargetR:
+        ok: bool
+        err: FqlError
+        v: PollTarget
+
+    # pollTargetFromPlacement: a target for a durable placement — refusing
+    # a credential that belongs to another instance.
+    proc pollTargetFromPlacement(placement: Placement, endpoint: FqlEndpoint) -> PollTargetR:
+        let t = do pollTargetNew(endpoint, placement.shardId, placement.coordinate, placement.region)
+        if endpoint.dbmsId != placement.dbmsId:
+            return PollTargetR{ok: false, err: fqlErrConfiguration("placement names DBMS '" + placement.dbmsId + "' but the endpoint is for '" + endpoint.dbmsId + "'"), v: t}
+        let none = do fqlErrNone()
+        return PollTargetR{ok: true, err: none, v: t}
+
+    # PollOutcome: kind is "Sampled" (batch), "Baseline", "Skipped" or
+    # "Failed" (err).
+    struct PollOutcome:
+        kind: text
+        batch: TelemetryBatch
+        err: FqlError
+
+    proc pollOutcomeIsHealthy(o: PollOutcome) -> bool:
+        return o.kind != "Failed"
+
+    proc pollOutcomeOf(kind: text, err: FqlError) -> PollOutcome:
+        let m = do protoEmptyFabricMessage()
+        return PollOutcome{kind: kind, batch: m.telemetry, err: err}
+
+    struct PollTargetState:
+        target: PollTarget
+        client: FqlClient
+        hasPrevious: bool
+        previous: StatsSample
+        hasVersion: bool
+        version: text
+        hasAnnounced: bool
+        announcedVersion: text
+
+    struct TelemetryPoller:
+        targets: [PollTargetState]
+
+    # telemetryPollerNew: every target's client bounded by a 10 s deadline
+    # — a sequential sweep must not stall behind one wedged instance.
+    proc telemetryPollerNew(targets: [PollTarget]) -> TelemetryPoller:
+        let mut states = []
+        let n = len(targets)
+        let mut i = 0
+        loop i < n:
+            let blank = do statsSampleFixture(0, 0, 0)
+            states = append(states, PollTargetState{target: targets[i], client: fqlClientWithTimeout(targets[i].endpoint, 10000), hasPrevious: false, previous: blank, hasVersion: false, version: "", hasAnnounced: false, announcedVersion: ""})
+            i = i + 1
+        return TelemetryPoller{targets: states}
+
+    proc telemetryPollerLen(p: TelemetryPoller) -> int:
+        return len(p.targets)
+
+    proc pollerRegistration(id: text, version: text, region: text) -> FabricMessage:
+        let m = do protoEmptyFabricMessage()
+        let reg = do nodeRegistrationNew(DbmsId{value: id}, version, region)
+        return FabricMessage{kind: "RegisterNode", registerNode: reg, heartbeat: m.heartbeat, topology: m.topology, telemetry: m.telemetry, workload: m.workload}
+
+    # register_targets: every target into the node registry — which holds
+    # it unreachable until a heartbeat proves otherwise.
+    proc telemetryPollerRegisterTargets(p: TelemetryPoller, rt: FabricRuntime) -> FabricRuntime:
+        let mut current = rt
+        let n = len(p.targets)
+        let mut i = 0
+        loop i < n:
+            let t = p.targets[i].target
+            let r = do fabricRuntimeHandle(current, pollerRegistration(t.endpoint.dbmsId, pollerUnknownVersion(), t.region))
+            current = r.runtime
+            i = i + 1
+        return current
+
+    struct PollTargetStep:
+        state: PollTargetState
+        outcome: PollOutcome
+
+    proc pollTarget(state: PollTargetState) -> PollTargetStep uses io.net:
+        let none = do fqlErrNone()
+        let stats = do fqlStats(state.client)
+        if !stats.ok:
+            let failed = do pollOutcomeOf("Failed", stats.err)
+            return PollTargetStep{state: state, outcome: failed}
+        let sample = do statsSampleTake(stats.v)
+        let next = PollTargetState{target: state.target, client: state.client, hasPrevious: true, previous: sample, hasVersion: stats.v.hasVersion, version: stats.v.version, hasAnnounced: state.hasAnnounced, announcedVersion: state.announcedVersion}
+        if !state.hasPrevious:
+            let baseline = do pollOutcomeOf("Baseline", none)
+            return PollTargetStep{state: next, outcome: baseline}
+        let diff = do statsSampleDifference(state.previous, sample)
+        if !diff.has:
+            let skipped = do pollOutcomeOf("Skipped", none)
+            return PollTargetStep{state: next, outcome: skipped}
+        let metrics = diff.metrics
+        let ratios = do statsRatios(metrics)
+        let t = state.target
+        let s = TelemetrySample{coordinate: t.coordinate, operationsPerSecond: metrics.operationsPerSecond, readRatio: ratios.read, writeRatio: ratios.write, readLatencyUs: metrics.readLatencyUs, writeLatencyUs: metrics.writeLatencyUs, cpuUtilization: metrics.cpuUtilization, memoryUtilization: metrics.memoryUtilization, queueDepth: metrics.queueDepth, cellBreakdown: metrics.cellBreakdown, cellBreakdownPartial: metrics.cellBreakdownPartial}
+        let batch = TelemetryBatch{timestampMs: sample.takenAtMs, nodeId: DbmsId{value: t.endpoint.dbmsId}, shard: ProtocolShard{id: t.shardId, workloadDomain: t.region}, samples: [s]}
+        return PollTargetStep{state: next, outcome: PollOutcome{kind: "Sampled", batch: batch, err: none}}
+
+    struct PollRound:
+        poller: TelemetryPoller
+        ids: [text]
+        outcomes: [PollOutcome]
+
+    # poll_once: every target, sequentially, in configuration order.
+    proc telemetryPollerPollOnce(p: TelemetryPoller) -> PollRound uses io.net:
+        let mut states = []
+        let mut ids = []
+        let mut outcomes = []
+        let n = len(p.targets)
+        let mut i = 0
+        loop i < n:
+            let step = do pollTarget(p.targets[i])
+            states = append(states, step.state)
+            ids = append(ids, p.targets[i].target.endpoint.dbmsId)
+            outcomes = append(outcomes, step.outcome)
+            i = i + 1
+        return PollRound{poller: TelemetryPoller{targets: states}, ids: ids, outcomes: outcomes}
+
+    struct PollIntoResult:
+        poller: TelemetryPoller
+        runtime: FabricRuntime
+        ids: [text]
+        outcomes: [PollOutcome]
+
+    # poll_into: a (re-)registration for a newly learned version, then a
+    # heartbeat — healthy iff the instance answered — then the batch, if an
+    # interval was measurable.
+    proc telemetryPollerPollInto(p: TelemetryPoller, rt: FabricRuntime) -> PollIntoResult uses io.net:
+        let round = do telemetryPollerPollOnce(p)
+        let timestampMs = now() * 1000
+        let mut current = rt
+        let mut states = []
+        let n = len(round.poller.targets)
+        let mut i = 0
+        loop i < n:
+            let st = round.poller.targets[i]
+            let outcome = round.outcomes[i]
+            let mut next = st
+            let changed = st.hasVersion && (!st.hasAnnounced || st.version != st.announcedVersion)
+            if changed:
+                let r = do fabricRuntimeHandle(current, pollerRegistration(st.target.endpoint.dbmsId, st.version, st.target.region))
+                current = r.runtime
+                next = PollTargetState{target: st.target, client: st.client, hasPrevious: st.hasPrevious, previous: st.previous, hasVersion: st.hasVersion, version: st.version, hasAnnounced: true, announcedVersion: st.version}
+            let m = do protoEmptyFabricMessage()
+            let beat = FabricMessage{kind: "Heartbeat", registerNode: m.registerNode, heartbeat: NodeHeartbeat{nodeId: DbmsId{value: round.ids[i]}, timestampMs: timestampMs, healthy: pollOutcomeIsHealthy(outcome)}, topology: m.topology, telemetry: m.telemetry, workload: m.workload}
+            let hb = do fabricRuntimeHandle(current, beat)
+            current = hb.runtime
+            if outcome.kind == "Sampled":
+                let tm = FabricMessage{kind: "Telemetry", registerNode: m.registerNode, heartbeat: m.heartbeat, topology: m.topology, telemetry: outcome.batch, workload: m.workload}
+                let tr = do fabricRuntimeHandle(current, tm)
+                current = tr.runtime
+            states = append(states, next)
+            i = i + 1
+        return PollIntoResult{poller: TelemetryPoller{targets: states}, runtime: current, ids: round.ids, outcomes: round.outcomes}
+
+    # run: poll_into `rounds` times, sleeping `intervalMs` between rounds
+    # (not before the first); the last round's outcomes. The first round
+    # can only establish baselines, so one round yields no telemetry.
+    proc telemetryPollerRun(p: TelemetryPoller, rt: FabricRuntime, intervalMs: int, rounds: int) -> PollIntoResult uses io.net:
+        let mut last = PollIntoResult{poller: p, runtime: rt, ids: [], outcomes: []}
+        let mut round = 0
+        loop round < rounds:
+            if round > 0:
+                let slept = sleepMs(intervalMs)
+            last = telemetryPollerPollInto(last.poller, last.runtime)
+            round = round + 1
+        return last
+
+    # ── poller.rs's #[test]s, input for input ─────────────────────────
+    proc pollerTestEndpoint(id: text) -> FqlEndpoint:
+        let r = do fqlEndpointNew(id, "http://127.0.0.1:8892", "token")
+        return r.v
+
+    proc pollerTestPlacement(id: text) -> Placement:
+        return Placement{dbmsId: id, shardId: 7, coordinate: Coordinate{x: 1, y: 2}, region: "us-east"}
+
+    proc demoATargetBuiltFromAPlacementInheritsItsCell() -> bool:
+        let r = do pollTargetFromPlacement(pollerTestPlacement("db-a"), pollerTestEndpoint("db-a"))
+        return r.ok && r.v.shardId == 7 && r.v.coordinate.x == 1 && r.v.coordinate.y == 2 && r.v.region == "us-east"
+
+    proc demoACredentialForAnotherInstanceIsRefused() -> bool:
+        let r = do pollTargetFromPlacement(pollerTestPlacement("db-a"), pollerTestEndpoint("db-b"))
+        return !r.ok && r.err.kind == "Configuration" && contains(fqlErrorDisplay(r.err), "db-b")
+
+    proc demoTheEmittedSampleRoundTripsBackToTheMeasuredMetrics() -> bool:
+        let first = do statsSampleFixture(0, 100, 20)
+        let second = do statsSampleFixture(1, 190, 30)
+        let diff = do statsSampleDifference(first, second)
+        let metrics = diff.metrics
+        let ratios = do statsRatios(metrics)
+        let s = TelemetrySample{coordinate: Coordinate{x: 0, y: 0}, operationsPerSecond: metrics.operationsPerSecond, readRatio: ratios.read, writeRatio: ratios.write, readLatencyUs: metrics.readLatencyUs, writeLatencyUs: metrics.writeLatencyUs, cpuUtilization: metrics.cpuUtilization, memoryUtilization: metrics.memoryUtilization, queueDepth: metrics.queueDepth, cellBreakdown: metrics.cellBreakdown, cellBreakdownPartial: metrics.cellBreakdownPartial}
+        let back = do telemetrySampleMetrics(s)
+        return diff.has && abs(back.readsPerSecond - 90.0) < 0.000000001 && abs(back.writesPerSecond - 10.0) < 0.000000001 && abs(back.operationsPerSecond - metrics.operationsPerSecond) < 0.000000001
+
+    proc demoAFailedPollIsNotHealthy() -> bool:
+        let failed = do pollOutcomeOf("Failed", fqlErrTransport("refused"))
+        let none = do fqlErrNone()
+        return !pollOutcomeIsHealthy(failed) && pollOutcomeIsHealthy(pollOutcomeOf("Baseline", none)) && pollOutcomeIsHealthy(pollOutcomeOf("Skipped", none))
+
+    # an_unreachable_instance_is_marked_unhealthy_not_left_alone: port 1 on
+    # loopback refuses immediately.
+    proc demoAnUnreachableInstanceIsMarkedUnhealthyNotLeftAlone() -> text uses io.net:
+        let ep = do fqlEndpointNew("db-dead", "http://127.0.0.1:1", "token")
+        let poller = do telemetryPollerNew([pollTargetNew(ep.v, 0, Coordinate{x: 0, y: 0}, "us-east")])
+        let rt0 = do fabricRuntimeNew()
+        let rt = do telemetryPollerRegisterTargets(poller, rt0)
+        let r = do telemetryPollerPollInto(poller, rt)
+        let node = do nodeRegistryGet(r.runtime.nodes, "db-dead")
+        let health = do registeredNodeHealth(node.val, fabricRuntimeClockMs(r.runtime), defaultHeartbeatDeadlineMs())
+        return "outcomes=" + len(r.outcomes) + "\nhealthy=" + pollOutcomeIsHealthy(r.outcomes[0]) + "\nfailure=" + r.outcomes[0].err.kind + "\nregistered=" + node.has + "\nreportedHealthy=" + node.val.reportedHealthy + "\nhealth=" + health + "\nanalyzer=" + workloadAnalyzerLen(r.runtime.analyzer) + "\nobservations=" + len(fabricRuntimeObservations(r.runtime))
+
+    # ── live flows (tests/live.rs), against a real FacetQL ─────────────
+    # polling_stats_drives_the_existing_optimizer_path: the first round is
+    # a baseline; then real traffic until the (second-granularity) clock
+    # has moved on; the second round is a measured interval that reaches
+    # the analyzer and is scored by the same optimizer/predictor.
+    proc pollerLiveOptimizerPath(base: text, token: text) -> text uses io.net:
+        let client = do fqlLiveClient(base, token)
+        let poller0 = do telemetryPollerNew([pollTargetNew(client.endpoint, 9003, Coordinate{x: 4, y: 5}, "us-east")])
+        let rt0 = do fabricRuntimeNew()
+        let rt1 = do telemetryPollerRegisterTargets(poller0, rt0)
+        let registered = do nodeRegistryGet(rt1.nodes, "db-live")
+        let before = do registeredNodeHealth(registered.val, fabricRuntimeClockMs(rt1), defaultHeartbeatDeadlineMs())
+        let first = do telemetryPollerPollInto(poller0, rt1)
+        let mut requests = 0
+        loop requests < 25:
+            let l = do fqlListNodes(client, true, "__fabric_placement", false, "", true, 1, false, 0)
+            requests = requests + 1
+        let slept = sleepMs(250)
+        let second = do telemetryPollerPollInto(first.poller, first.runtime)
+        let node = do nodeRegistryGet(second.runtime.nodes, "db-live")
+        let after = do registeredNodeHealth(node.val, fabricRuntimeClockMs(second.runtime), defaultHeartbeatDeadlineMs())
+        let profiles = do workloadAnalyzerProfiles(second.runtime.analyzer)
+        let mut out = ["registeredBefore=" + before, "firstOutcome=" + first.outcomes[0].kind, "secondOutcome=" + second.outcomes[0].kind, "healthAfter=" + after, "version=" + node.val.softwareVersion, "profiles=" + len(profiles)]
+        if len(profiles) > 0:
+            let p = profiles[0]
+            let prediction = do workloadPredictorPredictHotspot(second.runtime.optimizer.predictor, p)
+            let decision = do fabricRuntimeOptimize(second.runtime, p)
+            out = append(out, "opsPositive=" + (p.operationsPerSecond > 0.0))
+            out = append(out, "coordinate=" + p.coordinate.x + "," + p.coordinate.y)
+            out = append(out, "scored=" + (prediction.probability >= 0.0 && prediction.probability <= 1.0) + " " + decision.shardId)
+        return join(out, "\n")
+
+    # a_bad_token_fails_closed_rather_than_reading_as_healthy — the poller
+    # half: unhealthy, not serviceable, no telemetry invented.
+    proc pollerLiveBadToken(base: text) -> text uses io.net:
+        let ep = do fqlEndpointNew("db-badtoken", base, "not-a-real-token")
+        let poller = do telemetryPollerNew([pollTargetNew(ep.v, 9004, Coordinate{x: 0, y: 0}, "us-east")])
+        let rt0 = do fabricRuntimeNew()
+        let rt = do telemetryPollerRegisterTargets(poller, rt0)
+        let r = do telemetryPollerPollInto(poller, rt)
+        let node = do nodeRegistryGet(r.runtime.nodes, "db-badtoken")
+        let health = do registeredNodeHealth(node.val, fabricRuntimeClockMs(r.runtime), defaultHeartbeatDeadlineMs())
+        return "healthy=" + pollOutcomeIsHealthy(r.outcomes[0]) + "\nfailure=" + r.outcomes[0].err.kind + "\nserviceable=" + nodeHealthIsServiceable(health) + "\nanalyzer=" + workloadAnalyzerLen(r.runtime.analyzer)
+
+    state pollerOut: text = ""
+
+    action pollerRunDemos:
+        let a = do demoATargetBuiltFromAPlacementInheritsItsCell()
+        let b = do demoACredentialForAnotherInstanceIsRefused()
+        let c = do demoTheEmittedSampleRoundTripsBackToTheMeasuredMetrics()
+        let d = do demoAFailedPollIsNotHealthy()
+        pollerOut = "" + a + "," + b + "," + c + "," + d
+
+    action pollerRunUnreachable:
+        let r = do demoAnUnreachableInstanceIsMarkedUnhealthyNotLeftAlone()
+        pollerOut = r
+
+    action pollerRunLive(flow: text, base: text, token: text):
+        let r = do pollerLiveFlow(flow, base, token)
+        pollerOut = r
+
+    # run: three rounds 100 ms apart — a baseline, then two measured
+    # intervals — ending healthy with telemetry in the analyzer.
+    proc pollerLiveRun(base: text, token: text) -> text uses io.net:
+        let client = do fqlLiveClient(base, token)
+        let poller = do telemetryPollerNew([pollTargetNew(client.endpoint, 9006, Coordinate{x: 2, y: 3}, "us-east")])
+        let rt0 = do fabricRuntimeNew()
+        let rt = do telemetryPollerRegisterTargets(poller, rt0)
+        let t0 = monoMs()
+        let r = do telemetryPollerRun(poller, rt, 100, 3)
+        let elapsed = monoMs() - t0
+        let node = do nodeRegistryGet(r.runtime.nodes, "db-live")
+        let health = do registeredNodeHealth(node.val, fabricRuntimeClockMs(r.runtime), defaultHeartbeatDeadlineMs())
+        return "outcome=" + r.outcomes[0].kind + "\nhealth=" + health + "\nobservations=" + (len(fabricRuntimeObservations(r.runtime)) >= 2) + "\nwaited=" + (elapsed >= 200)
+
+    proc pollerLiveFlow(flow: text, base: text, token: text) -> text uses io.net:
+        if flow == "run":
+            let r = do pollerLiveRun(base, token)
+            return r
+        if flow == "optimizer":
+            let r = do pollerLiveOptimizerPath(base, token)
+            return r
+        let r = do pollerLiveBadToken(base)
+        return r

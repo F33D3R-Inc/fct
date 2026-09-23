@@ -693,15 +693,9 @@ func TestParseExprConsumedAllDetectsTrailingGarbage(t *testing.T) {
 		// exercised only here, separately, and is not claimed to match the
 		// real Go parser's own (real-error) behavior for the same input.
 		{"3 4", false}, // two atoms, no operator between them
-		{"", true},     // empty input: 0 tokens: exprEnd(kinds,texts,0) never
-		// advances past position 0 (there is nothing to consume), and
-		// len(kinds)==0, so "0 == 0" is vacuously true — this subset's
-		// parseExprConsumedAll reports an empty string as "fully consumed"
-		// (there is no leftover token), not as "a valid expression" (it
-		// isn't one; this proc only ever answers the leftover-tokens
-		// question, exactly mirroring parseExpr's own `p.pos !=
-		// len(p.toks)` check, which is likewise blind to whether p.pos==0
-		// resulted from a real atom or from nothing at all).
+		{"", false},    // empty input: parser.ParseExpr refuses it ("unexpected end of
+		// expression"), and so does the self-hosted parser now that it is a
+		// faithful recursive-descent port with the real error path.
 	}
 	for _, c := range cases {
 		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
@@ -1135,18 +1129,12 @@ func TestExprArenaMatchesGoParserRound4(t *testing.T) {
 // established pattern this mirrors) — never silently misparsed, never a
 // crash.
 //
-//   - "foo(x)": UPDATED in round 5 — "foo" is not a builtin name, but round
-//     5 now implements the real grammar's own fallback for exactly this case
-//     (`Entity(key).field`-shaped syntax, ast.EntityGet — see expr.fct's
-//     ROUND 5 SCOPE NOTE). This port's isEntityLookupStartAt now returns
-//     true for "foo(x)" (not a builtin, not a reserved aggregate/action-
-//     state name), so it IS now fully consumed, as a real EntityGet — the
-//     opposite of round 4's documented behavior for this exact input, and a
-//     deliberate, intentional change (not a regression): round 4's own
-//     SCOPE NOTE named this precise gap as what a future round would close.
-//     See TestEntityLookupDisambiguation, below, for the shape-level proof
-//     (cross-checked against the real Go parser) that this is now a genuine,
-//     correct ast.EntityGet, not a guess.
+//   - "foo(x)": "foo" is not a builtin name, but it is lower-case, so the
+//     real grammar reads it as a call — of a parameterized derive — and so
+//     does isCallStartAt; only a capitalized name is an entity lookup
+//     (`Entity(key).field`, ast.EntityGet). See TestEntityLookupDisambiguation,
+//     below, for the shape-level proof cross-checked against the real Go
+//     parser.
 //   - "min(a, b)" / "max(x)": UPDATED in round 6 — `min`/`max` are now in
 //     isCallNameTok (they are in the real isBuiltinCall list), and
 //     isCallStartAt applies the real grammar's own disambiguation
@@ -1170,7 +1158,7 @@ func TestCallDisambiguationAndOutOfScopeNames(t *testing.T) {
 		src  string
 		want bool
 	}{
-		{"foo(x)", true},          // round 5: non-builtin, non-reserved name + `(` is now a real EntityGet
+		{"foo(x)", true},          // a lower-case non-builtin, non-reserved name + `(` is a call (a parameterized derive)
 		{"min(a, b)", true},       // round 6: a top-level comma means the two-argument scalar builtin Call, exactly as argListHasComma decides
 		{"max(x)", false},         // real Go: "max needs a field: max(x.field)" — numericAgg with no field/sel is a hard error, so this port refuses to start the agg here too (isAggStartAt)
 		{"count(x)", true},        // real Go: valid whole-collection Agg{Op:"count",Coll:"x"} — count/exists never need a field, so this IS in scope, not "still unconsumed" (an earlier round's comment here was stale)
@@ -1282,10 +1270,9 @@ var exprCasesRound5 = []string{
 	"Order(x).total == 0",
 	"-Post(id).amount",
 	"Post(id).amount + 1.5",
-	// the headline disambiguation case: a non-builtin, non-reserved name
-	// followed by `(` is a real entity lookup now (round 4 left this
-	// unconsumed — see TestCallDisambiguationAndOutOfScopeNames's own
-	// updated doc for the exact behavior change)
+	// the headline disambiguation case: a lower-case non-builtin,
+	// non-reserved name followed by `(` is a call — of a parameterized
+	// derive — since only a capitalized name is an entity lookup
 	"foo(x)",
 
 	// map literals: empty, single, multi-entry
@@ -1415,21 +1402,9 @@ func TestFloatTrailingDotConsumedAll(t *testing.T) {
 		// overshooting past the end of the token stream; consumedAll is
 		// false either way, since 2 real tokens exist and neither `*End`
 		// path leaves position 2 exactly.
-		{"3.14.5", true}, // SURPRISING but correct for this honest port: 3
-		// tokens ("3.14", ".", "5"), and postfixEnd's `.` case unconditionally
-		// advances 2 tokens for ANY `.` (this subset never validates that
-		// what follows a `.` is really an IDENT — a pre-existing round-3
-		// limitation of postfixEnd/postfixNodes' field-name handling,
-		// unrelated to floats specifically, just newly reachable via a
-		// float's own trailing-dot edge case): "3.14" then "." then "5" is
-		// formally fully consumed as Get(Lit(3.14), field="5"), even though
-		// "5" is a NUMBER token, not a real field-name IDENT. The real Go
-		// parser's fieldName() DOES check this and returns a real error
-		// ("expected a field name after `.`") — see this test's own doc for
-		// why "3.14.5" is therefore never used in a shapesEqual cross-check
-		// (parser.ParseExpr would fail with an error, not build a tree at
-		// all), only tested here for the honest-but-surprising consumedAll
-		// answer this port actually gives.
+		{"3.14.5", false}, // "3.14" "." "5": a field name must follow `.`, and
+		// "5" is a number — parser.ParseExpr's fieldName() refuses it ("expected
+		// a field name after `.`"), and the self-hosted port now does the same.
 	}
 	for _, c := range cases {
 		d := postExprJSON(t, ts, "runParseExprConsumedAll", c.src)
@@ -1456,7 +1431,7 @@ func TestEntityLookupDisambiguation(t *testing.T) {
 		"Post(id)",       // entity lookup: bare, no field
 		"Post(id).title", // entity lookup: with field
 		"len(x)",         // builtin call: unaffected by entity-lookup addition
-		"foo(x)",         // non-builtin, non-reserved: now a real entity lookup
+		"foo(x)",         // lower-case non-builtin, non-reserved: a call (a parameterized derive), not a lookup
 		"Widget(1).name",
 		"Order(a + b).total",
 	}

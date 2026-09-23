@@ -1,4 +1,5 @@
 import "expr.fct"
+import "exprtype.fct"
 
 app CheckSelfHost:
     # Partial, honest self-hosting port of internal/ir/build.go's expression
@@ -180,6 +181,52 @@ app CheckSelfHost:
             i = i + 1
         return out
 
+    # procCallDiag: checkBuiltins' proc rule outside an action — a proc,
+    # or a parameterized derive that calls one, runs only on the authority,
+    # so a view, policy or plain derive may not call it.
+    proc procCallDiag(n: ExprNode, procNames: [text], procDerives: [text]) -> text:
+        let nodes = do allNodes(n)
+        let nn = len(nodes)
+        let mut i = 0
+        loop i < nn:
+            let x = nodes[i]
+            let aob = do authorityOnlyBuiltins()
+            if x.kind == "call" && (x.text in aob):
+                let ad = do authorityOnlyDiag(x.text)
+                return ad
+            if x.kind == "call":
+                if x.text in procDerives:
+                    return "derive \"" + x.text + "\" calls a proc, so it runs only on the authority — use it in an action, not a view or policy"
+                if x.text in procNames:
+                    return "proc \"" + x.text + "\" runs on the authority, so it can be called only in an action or a derive used by one (a view or policy is evaluated where no proc runs) — bind it in the action and pass the value"
+            i = i + 1
+        return ""
+
+    # authorityOnlyDiag: authorityOnlyCall outside an action, proc or
+    # derive — a builtin only the server implements.
+    proc authorityOnlyDiagIn(name: text, ce: CallEnv) -> text:
+        if ce.inAction || ce.inDerive || ce.inProc:
+            return ""
+        let d = do authorityOnlyDiag(name)
+        return d
+
+    proc authorityOnlyDiag(name: text) -> text:
+        return name + " runs only on the authority, so it can be called only in an action, a proc, or a derive used by one — not in a view or policy"
+
+    proc authorityOnlyBuiltins() -> [text]:
+        return ["ed25519Verify", "ecdsaP256Verify", "sha256Hex", "canonicalJson", "shuffleOrder", "fromLocal", "formatIn", "zoneValid"]
+
+    # callsAnyName: whether n calls any of names, anywhere.
+    proc callsAnyName(n: ExprNode, names: [text]) -> bool:
+        let nodes = do allNodes(n)
+        let nn = len(nodes)
+        let mut i = 0
+        loop i < nn:
+            if nodes[i].kind == "call" && (nodes[i].text in names):
+                return true
+            i = i + 1
+        return false
+
     proc allNodes(n: ExprNode) -> [ExprNode]:
         let mut out = [n]
         let mut i = 0
@@ -217,15 +264,15 @@ app CheckSelfHost:
     # restated with -1 as its "not a pure builtin" second return.
     # ============================================================
     proc pureBuiltinArity(name: text) -> int:
-        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits"]:
+        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits"]:
             return 1
         if name == "print":
             return 1
         if name == "append":
             return 2
-        if name in ["min", "max", "contains", "take", "split", "charAt"]:
+        if name in ["min", "max", "contains", "take", "split", "join", "charAt"]:
             return 2
-        if name in ["slice", "replace"]:
+        if name in ["slice", "replace", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic"]:
             return 3
         return -1
 
@@ -233,9 +280,89 @@ app CheckSelfHost:
     proc isFieldAgg(op: text) -> bool:
         return op == "sum" || op == "avg" || op == "min" || op == "max"
 
+    # CallEnv: what a call may name besides a builtin — the parameterized
+    # derives (fnNames/fnArities), the procs (procNames/procArities), and
+    # which of those derives call a proc (procDerives, action-only).
+    struct CallEnv:
+        fnNames: [text]
+        fnArities: [int]
+        procNames: [text]
+        procArities: [int]
+        procDerives: [text]
+        # listNames / jsonNames: the names in scope holding a list or a
+        # `json` value — what `x[i]` may index outside a proc.
+        listNames: [text]
+        jsonNames: [text]
+        # deriveKeys: "Entity.derive" — an entity derive reads like a field
+        # in `Entity(k).derive` (never in an aggregate's `.field`).
+        deriveKeys: [text]
+        # inAction: the expression is in an action body, where a proc (and
+        # a derive that calls one) may be called, and a local may hold a
+        # list or json value.
+        inAction: bool
+        # inDerive: the expression is a parameterized derive's body, which
+        # may call a proc (the derive then being usable only in actions).
+        inDerive: bool
+        # inProc: a proc body — procs and authority-only builtins callable.
+        inProc: bool
+        # ty / tsc: the program's typed names and the typed locals in scope
+        # (an action's parameters and lets, a derive's parameters) — what
+        # exprtype.fct's checks read.
+        ty: TyEnv
+        tsc: TyScope
+
+    proc emptyCallEnv() -> CallEnv:
+        return CallEnv{fnNames: [], fnArities: [], procNames: [], procArities: [], procDerives: [], listNames: [], jsonNames: [], deriveKeys: [], inAction: false, inDerive: false, inProc: false, ty: tyEmptyEnv(), tsc: tyEmptyScope()}
+
+    # indexIsJson / indexIsList: checkIndexable's exprType test on an
+    # index's object — a list (a list-valued name, split(...), list(...)) or
+    # a `json` value (a json-valued name, fromJson(...), or a member of one).
+    proc indexIsJson(n: ExprNode, ce: CallEnv) -> bool:
+        if n.kind == "ref":
+            return (n.text in ce.jsonNames) || ce.inAction
+        if n.kind == "call":
+            return n.text == "fromJson"
+        if n.kind == "index" && len(n.children) > 0:
+            let j = do indexIsJson(n.children[0], ce)
+            return j
+        return false
+
+    proc indexIsList(n: ExprNode, ce: CallEnv) -> bool:
+        if n.kind == "ref":
+            return (n.text in ce.listNames) || ce.inAction
+        if n.kind == "call":
+            return n.text == "split"
+        if n.kind == "agg":
+            return n.text == "list"
+        if n.kind == "list":
+            return true
+        return false
+
+    # indexDiag: checkIndexable — `x[i]` outside a proc reads a list or a
+    # json value; a map literal is proc-only.
+    proc indexDiag(nodes: [ExprNode], ce: CallEnv) -> text:
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let x = nodes[i]
+            if x.kind == "index":
+                let mut ok = false
+                if len(x.children) > 0:
+                    let l = do indexIsList(x.children[0], ce)
+                    let j = do indexIsJson(x.children[0], ce)
+                    ok = l || j
+                if !ok:
+                    return "indexing (`x[i]`) outside a proc reads a list or a `json` value; this is neither (arrays and maps are proc-local values)"
+            if x.kind == "map":
+                return "a map literal (`{...}`) is only available inside a proc — maps are proc-local values, not readable from an action, view, policy, or derive yet"
+            i = i + 1
+        return ""
+
     # callArityDiag: checkBuiltins' ast.Call arm, one message per builtin
-    # family, verbatim.
-    proc callArityDiag(n: ExprNode) -> text:
+    # family, verbatim — then a parameterized derive's arity (and whether
+    # it calls a proc), a proc's, and the pure builtins'. Outside an action
+    # (the only place this runs) a proc or proc-calling derive is refused.
+    proc callArityDiag(n: ExprNode, ce: CallEnv) -> text:
         let name = n.text
         let argc = len(n.children)
         if name == "now":
@@ -246,17 +373,84 @@ app CheckSelfHost:
             if argc != 1:
                 return "rand(n) takes exactly one argument (an exclusive upper bound)"
             return ""
-        if name == "readFile" || name == "httpGet" || name == "listen" || name == "accept" || name == "closeConn":
+        if name == "readFile" || name == "httpGet" || name == "fileExists" || name == "fileSize" || name == "syncFile" || name == "removeFile" || name == "listen" || name == "accept" || name == "closeConn" || name == "connError" || name == "connOpen" || name == "shutdownConn" || name == "writeStdout" || name == "writeStderr" || name == "envVar" || name == "envSet" || name == "randomBytes":
             if argc != 1:
                 return name + "(...) takes exactly one argument"
             return ""
-        if name == "writeFile" || name == "httpPost" || name == "readBytes" || name == "writeBytes":
+        if name == "writeFile" || name == "httpPost" || name == "appendFile" || name == "truncateFile" || name == "renameFile" || name == "readBytes" || name == "writeBytes" || name == "connect" || name == "setTimeoutMs" || name == "listenOn":
             if argc != 2:
                 return name + "(...) takes exactly two arguments"
+            return ""
+        if name == "readFileAt" || name == "writeFileAt" || name == "pollBytes":
+            if argc != 3:
+                return name + "(...) takes exactly three arguments"
+            return ""
+        if name == "readStdin":
+            if argc != 0:
+                return "readStdin() takes no arguments"
             return ""
         if name == "channel":
             if argc != 0:
                 return "channel() takes no arguments"
+            return ""
+        if name == "sleepMs":
+            if argc != 1:
+                return "sleepMs(ms) takes exactly one argument (milliseconds, 0-600000)"
+            return ""
+        if name == "monoMs" || name == "nowMs" || name == "signals":
+            if argc != 0:
+                return name + "() takes no arguments"
+            return ""
+        if name == "given":
+            # given(p): one of the action's own parameters, by name.
+            let isRef = argc == 1 && n.children[0].kind == "ref"
+            if !isRef || !ce.inAction:
+                return "given(p) takes one of the action's own parameters by name, in the action's body"
+            return ""
+        if name == "totpSecret":
+            if argc != 0:
+                return "totpSecret() takes no arguments"
+            return ""
+        if name == "verifyPassword":
+            if argc != 2:
+                return "verifyPassword(stored, candidate) takes exactly two arguments: a @password field and the candidate text"
+            return ""
+        if name == "randomToken":
+            if argc != 1:
+                return "randomToken(n) takes exactly one argument: the token's length in characters"
+            return ""
+        if name == "fileDigest":
+            if argc != 1:
+                return "fileDigest(file) takes exactly one argument: an uploaded file (a `bytes` value)"
+            return ""
+        if name == "ed25519Verify" || name == "ecdsaP256Verify":
+            if argc != 3:
+                return name + "(publicKey, message, signature) takes exactly three arguments"
+            let a1 = do authorityOnlyDiagIn(name, ce)
+            return a1
+        if name == "fromLocal" || name == "formatIn" || name == "zoneValid":
+            let mut want = 1
+            if name == "fromLocal":
+                want = 2
+            if name == "formatIn":
+                want = 3
+            if argc != want:
+                return name + " takes " + want + " argument(s): fromLocal(wallClock, zone), formatIn(unixSeconds, zone, layout), zoneValid(zone)"
+            let a4 = do authorityOnlyDiagIn(name, ce)
+            return a4
+        if name == "sha256Hex" || name == "canonicalJson":
+            if argc != 1:
+                return name + "(value) takes exactly one argument"
+            let a2 = do authorityOnlyDiagIn(name, ce)
+            return a2
+        if name == "shuffleOrder":
+            if argc != 2:
+                return "shuffleOrder(seed, n) takes exactly two arguments: the seed text and how many positions to permute"
+            let a3 = do authorityOnlyDiagIn(name, ce)
+            return a3
+        if name == "totpValid":
+            if argc != 2:
+                return "totpValid(secret, code) takes exactly two arguments: the shared secret and the presented code"
             return ""
         if name == "recv":
             if argc != 1:
@@ -266,12 +460,35 @@ app CheckSelfHost:
             if argc != 2:
                 return "send(ch, value) takes exactly two arguments"
             return ""
+        let fi = do indexOfName(ce.fnNames, name)
+        if fi >= 0:
+            if argc != ce.fnArities[fi]:
+                return "derive \"" + name + "\" takes " + ce.fnArities[fi] + " argument(s), got " + argc
+            if (name in ce.procDerives) && !ce.inAction && !ce.inDerive:
+                return "derive \"" + name + "\" calls a proc, so it runs only on the authority — use it in an action, not a view or policy"
+            return ""
+        let pi = do indexOfName(ce.procNames, name)
+        if pi >= 0:
+            if ce.inAction || ce.inDerive || ce.inProc:
+                if ce.procArities[pi] >= 0 && argc != ce.procArities[pi]:
+                    return "proc \"" + name + "\" takes " + ce.procArities[pi] + " argument(s), got " + argc
+                return ""
+            return "proc \"" + name + "\" runs on the authority, so it can be called only in an action or a derive used by one (a view or policy is evaluated where no proc runs) — bind it in the action and pass the value"
         let arity = do pureBuiltinArity(name)
         if arity < 0:
-            return "unknown builtin \"" + name + "\""
+            return "unknown function \"" + name + "\" — neither a builtin (see `facet lang`) nor a derive declared with parameters"
         if argc != arity:
             return name + " takes " + arity + " argument(s), got " + argc
         return ""
+
+    proc indexOfName(xs: [text], x: text) -> int:
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if xs[i] == x:
+                return i
+            i = i + 1
+        return -1
 
     # aggDiag: checkBuiltins' ast.Agg arm — the collection must be an
     # entity; a field aggregate with no general reduced value needs a
@@ -324,23 +541,28 @@ app CheckSelfHost:
             return op + "(" + target + ") names an unknown state cell \"" + target + "\""
         return ""
 
-    proc builtinDiag(n: ExprNode, entityNames: [text], entityFields: [text]) -> text:
+    proc builtinDiag(n: ExprNode, entityNames: [text], entityFields: [text], ce: CallEnv) -> text:
+        if n.kind == "get":
+            let rd = do tyRecordFieldDiag(ce.ty, n, ce.tsc)
+            return rd
         if n.kind == "agg":
             let d = do aggDiag(n, entityNames, entityFields)
             return d
         if n.kind == "call":
-            let d2 = do callArityDiag(n)
+            let d2 = do callArityDiag(n, ce)
             return d2
         if n.kind == "entityGet":
+            if (n.text + "." + n.field) in ce.deriveKeys:
+                return ""
             let d3 = do entityGetDiag(n, entityFields)
             return d3
         return ""
 
-    proc checkBuiltins(nodes: [ExprNode], entityNames: [text], entityFields: [text]) -> text:
+    proc checkBuiltins(nodes: [ExprNode], entityNames: [text], entityFields: [text], ce: CallEnv) -> text:
         let n = len(nodes)
         let mut i = 0
         loop i < n:
-            let d = do builtinDiag(nodes[i], entityNames, entityFields)
+            let d = do builtinDiag(nodes[i], entityNames, entityFields, ce)
             if d != "":
                 return d
             i = i + 1
@@ -354,9 +576,16 @@ app CheckSelfHost:
     # false, the only way check() ever calls it).
     # ============================================================
     proc ioCapability(name: text) -> text:
-        if name == "readFile" || name == "writeFile":
+        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile":
             return "io.file"
-        if name == "httpGet" || name == "httpPost":
+        if name == "httpGet" || name == "httpPost" || name == "connect":
+            return "io.net"
+        if name == "writeStdout" || name == "writeStderr" || name == "readStdin" || name == "signals":
+            return "io.console"
+        if name == "envVar" || name == "envSet":
+            return "io.env"
+        # netConnCap's builtins, named by the capability a proc declares.
+        if name == "readBytes" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "connError" || name == "pollBytes" || name == "connOpen" || name == "shutdownConn":
             return "io.net"
         return ""
 
@@ -381,11 +610,11 @@ app CheckSelfHost:
                     return n.text + "(...) is only available inside a proc that declares `uses " + capName + "` — it is a real I/O effect, and only a proc is unconditionally server-executed with no client mirror to disagree with it"
             return ""
         if rule == "concurrency":
-            if n.kind == "call" && (n.text == "channel" || n.text == "send" || n.text == "recv"):
+            if n.kind == "call" && (n.text == "channel" || n.text == "send" || n.text == "recv" || n.text == "sleepMs" || n.text == "monoMs" || n.text == "nowMs" || n.text == "signals"):
                 return n.text + "(...) is only available inside a proc body — it is real, blocking concurrency machinery, and only a proc is unconditionally server-executed with no client mirror to disagree with it"
             return ""
         if rule == "daemon":
-            if n.kind == "call" && (n.text == "listen" || n.text == "accept" || n.text == "readBytes" || n.text == "writeBytes" || n.text == "closeConn"):
+            if n.kind == "call" && (n.text == "listen" || n.text == "listenOn" || n.text == "accept"):
                 return n.text + "(...) is only available inside a daemon body — it can block indefinitely, and only a daemon runs detached from every request's lock (see `daemon Name uses io.net.listen:`)"
             return ""
         return ""
@@ -438,6 +667,19 @@ app CheckSelfHost:
                 let mergedSel = do appendAllText(out, selKept)
                 out = mergedSel
                 m = m + 1
+            let mut ob = 0
+            loop ob < len(n.orderBy):
+                let obNames = do freeNames(n.orderBy[ob])
+                let obKept = do dropName(obNames, n.itemVar)
+                let mergedOb = do appendAllText(out, obKept)
+                out = mergedOb
+                ob = ob + 1
+            let mut li = 0
+            loop li < len(n.limit):
+                let limNames = do freeNames(n.limit[li])
+                let mergedLim = do appendAllText(out, limNames)
+                out = mergedLim
+                li = li + 1
             return out
         let mut i = 0
         loop i < len(n.children):
@@ -447,9 +689,11 @@ app CheckSelfHost:
             i = i + 1
         let mut j = 0
         loop j < len(n.pairs):
-            let keyNames = do freeNames(n.pairs[j].key)
-            let mergedKey = do appendAllText(out, keyNames)
-            out = mergedKey
+            # a struct literal's keys are field names, not references
+            if n.kind != "struct":
+                let keyNames = do freeNames(n.pairs[j].key)
+                let mergedKey = do appendAllText(out, keyNames)
+                out = mergedKey
             let valNames = do freeNames(n.pairs[j].value)
             let mergedVal = do appendAllText(out, valNames)
             out = mergedVal
@@ -524,7 +768,7 @@ app CheckSelfHost:
             i = i + 1
         return out + "\""
 
-    proc indexOfFrom(s: text, ch: text, from: int) -> int:
+    private proc indexOfFrom(s: text, ch: text, from: int) -> int:
         let n = len(s)
         let mut i = from
         loop i < n:
@@ -565,6 +809,47 @@ app CheckSelfHost:
                         let ok = do allResolve(names, locals, stateNames, entityNames, enumNames, inlineNames)
                         if ok:
                             return "{" + inner + "}"
+            i = i + 1
+        return ""
+
+    # litInterpLocals: litInterp in a proc body, whose scope is exactly its
+    # own parameters and locals.
+    proc litInterpLocals(s: text, locals: [text]) -> text:
+        let n = len(s)
+        let mut i = 0
+        loop i < n:
+            if charAt(s, i) == "{":
+                let end = do indexOfFrom(s, "}", i)
+                if end < 0:
+                    return ""
+                let inner = slice(s, i + 1, end)
+                i = end
+                let parses = do innerParses(inner)
+                if parses:
+                    let tree = do parseExprTree(inner)
+                    let names = do freeNames(tree)
+                    if len(names) > 0:
+                        let mut ok = true
+                        let nn = len(names)
+                        let mut k = 0
+                        loop k < nn:
+                            if !(names[k] in locals):
+                                ok = false
+                            k = k + 1
+                        if ok:
+                            return "{" + inner + "}"
+            i = i + 1
+        return ""
+
+    # checkProcLiteralExpr: the literal rule over a proc expression.
+    proc checkProcLiteralExpr(nodes: [ExprNode], locals: [text]) -> text:
+        let lits = do textLits(nodes)
+        let mut i = 0
+        loop i < len(lits):
+            let snip = do litInterpLocals(lits[i], locals)
+            if snip != "":
+                let d = do braceDiag(lits[i], snip)
+                return d
             i = i + 1
         return ""
 
@@ -641,14 +926,47 @@ app CheckSelfHost:
     # STAGE 6: check / checkPure — build.go's exact rule order.
     # ============================================================
     proc exprCheckTree(tree: ExprNode, locals: [text], stateNames: [text], entityNames: [text], entityFields: [text], enumNames: [text], inlineNames: [text]) -> text:
+        let ce = do emptyCallEnv()
+        let d = do exprCheckTreeC(tree, locals, stateNames, entityNames, entityFields, enumNames, inlineNames, ce)
+        return d
+
+    # exprStructureDiag: check()'s stages before name resolution —
+    # builtins, bitwise, indexing, I/O, concurrency, daemon-only.
+    proc exprStructureDiag(tree: ExprNode, entityNames: [text], entityFields: [text], ce: CallEnv) -> text:
         let nodes = do allNodes(tree)
-        let d1 = do checkBuiltins(nodes, entityNames, entityFields)
+        let d1 = do checkBuiltins(nodes, entityNames, entityFields, ce)
         if d1 != "":
             return d1
         let d2 = do firstNodeDiag(nodes, "bitwise")
         if d2 != "":
             return d2
-        let d3 = do firstNodeDiag(nodes, "index")
+        let dw = do tyWireLitsDiag(ce.ty, tree, ce.tsc)
+        if dw != "":
+            return dw
+        let d3 = do indexDiag(nodes, ce)
+        if d3 != "":
+            return d3
+        let d5 = do firstNodeDiag(nodes, "io")
+        if d5 != "":
+            return d5
+        let d6 = do firstNodeDiag(nodes, "concurrency")
+        if d6 != "":
+            return d6
+        let d7 = do firstNodeDiag(nodes, "daemon")
+        return d7
+
+    proc exprCheckTreeC(tree: ExprNode, locals: [text], stateNames: [text], entityNames: [text], entityFields: [text], enumNames: [text], inlineNames: [text], ce: CallEnv) -> text:
+        let nodes = do allNodes(tree)
+        let d1 = do checkBuiltins(nodes, entityNames, entityFields, ce)
+        if d1 != "":
+            return d1
+        let d2 = do firstNodeDiag(nodes, "bitwise")
+        if d2 != "":
+            return d2
+        let dw = do tyWireLitsDiag(ce.ty, tree, ce.tsc)
+        if dw != "":
+            return dw
+        let d3 = do indexDiag(nodes, ce)
         if d3 != "":
             return d3
         let d5 = do firstNodeDiag(nodes, "io")
@@ -689,11 +1007,11 @@ app CheckSelfHost:
             i = i + 1
         return false
 
-    proc hasImpure(nodes: [ExprNode]) -> bool:
-        let r = do hasCallNamed(nodes, ["now", "rand"])
+    proc nodesHaveImpure(nodes: [ExprNode]) -> bool:
+        let r = do hasCallNamed(nodes, ["now", "rand", "randomBytes"])
         return r
 
-    proc hasPrint(nodes: [ExprNode]) -> bool:
+    proc nodesHavePrint(nodes: [ExprNode]) -> bool:
         let r = do hasCallNamed(nodes, ["print"])
         return r
 
@@ -706,10 +1024,10 @@ app CheckSelfHost:
             return d
         let tree = do parseExprTree(src)
         let nodes = do allNodes(tree)
-        let impure = do hasImpure(nodes)
+        let impure = do nodesHaveImpure(nodes)
         if impure:
             return ctx + " cannot use an effectful builtin (now/rand); it must be pure so it can run on any client. Compute it in an action instead"
-        let prints = do hasPrint(nodes)
+        let prints = do nodesHavePrint(nodes)
         if prints:
             return ctx + " cannot call print(...); it is a server-only debugging aid with no client implementation. Call it from an action body or a proc instead"
         return ""

@@ -1,7 +1,11 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -193,5 +197,29 @@ func TestFQClientHasNoOffsetPagedListing(t *testing.T) {
 		if strings.Contains(string(src), gone) {
 			t.Errorf("fqclient.go still contains %q — the deep-offset path is back", gone)
 		}
+	}
+}
+
+// A 429 from FacetQL's rate limiter is waited out (its Retry-After) and the
+// request re-sent, body intact, rather than failing the caller.
+func TestFQClientRetriesRateLimit(t *testing.T) {
+	var calls int
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if calls < 3 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	c := &fqClient{baseURL: srv.URL, http: srv.Client()}
+	_, status, err := c.do(context.Background(), http.MethodPost, "/node", map[string]any{"a": 1})
+	if err != nil || status != 200 || calls != 3 || bodies[2] != `{"a":1}` {
+		t.Fatalf("status %d err %v calls %d bodies %q", status, err, calls, bodies)
 	}
 }

@@ -1,0 +1,177 @@
+# unquote.fct — Go's strconv.Unquote for a double-quoted literal, the one
+# decoder the real parser uses for every quoted string (parser.go's
+# unquote, expr.go's string tokens, theme values): the simple escapes
+# (\a \b \f \n \r \t \v \\ \"), \xNN, \NNN (octal), \uNNNN and
+# \UNNNNNNNN, with a bare quote, a raw newline or an unknown escape
+# refused.
+
+app UnquoteSelfHost:
+    struct GoUnq:
+        ok: bool
+        value: text
+
+    private proc unqHexVal(c: text) -> int:
+        let digits = "0123456789abcdef"
+        let lc = lower(c)
+        let mut i = 0
+        loop i < 16:
+            if charAt(digits, i) == lc:
+                return i
+            i = i + 1
+        return -1
+
+    # unqRune: the text of one code point (UTF-8 encoded through a byte
+    # buffer, since text is built from runes).
+    proc unqRune(cp: int) -> text:
+        let mut n = 1
+        if cp >= 128:
+            n = 2
+        if cp >= 2048:
+            n = 3
+        if cp >= 65536:
+            n = 4
+        let mut b = bytes(n)
+        if n == 1:
+            b[0] = cp
+        if n == 2:
+            b[0] = 192 + cp / 64
+            b[1] = 128 + cp % 64
+        if n == 3:
+            b[0] = 224 + cp / 4096
+            b[1] = 128 + (cp / 64) % 64
+            b[2] = 128 + cp % 64
+        if n == 4:
+            b[0] = 240 + cp / 262144
+            b[1] = 128 + (cp / 4096) % 64
+            b[2] = 128 + (cp / 64) % 64
+            b[3] = 128 + cp % 64
+        let t = bytesToText(b)
+        return t
+
+    # unqBytes: raw bytes (from \x / octal escapes) as text — Go appends
+    # them unchanged, so consecutive ones may form one UTF-8 rune.
+    proc unqBytes(bs: [int]) -> text:
+        let n = len(bs)
+        let mut b = bytes(n)
+        let mut i = 0
+        loop i < n:
+            b[i] = bs[i]
+            i = i + 1
+        let t = bytesToText(b)
+        return t
+
+    proc goUnquote(s: text) -> GoUnq:
+        let bad = GoUnq{ok: false, value: ""}
+        let n = len(s)
+        if n < 2:
+            return bad
+        if charAt(s, 0) != "\"" || charAt(s, n - 1) != "\"":
+            return bad
+        let cs = split(slice(s, 1, n - 1), "")
+        let m = len(cs)
+        let mut out = ""
+        let mut pend = []
+        let mut i = 0
+        loop i < m:
+            let c = cs[i]
+            if c == "\n" || c == "\"":
+                return bad
+            let isByte = c == "\\" && i + 1 < m && (cs[i + 1] == "x" || (cs[i + 1] >= "0" && cs[i + 1] <= "7"))
+            if !isByte && len(pend) > 0:
+                let fl = do unqBytes(pend)
+                out = out + fl
+                pend = []
+            if c != "\\":
+                out = out + c
+                i = i + 1
+                continue
+            if i + 1 >= m:
+                return bad
+            let e = cs[i + 1]
+            i = i + 2
+            if e == "a":
+                let r = do unqRune(7)
+                out = out + r
+                continue
+            if e == "b":
+                let r = do unqRune(8)
+                out = out + r
+                continue
+            if e == "f":
+                let r = do unqRune(12)
+                out = out + r
+                continue
+            if e == "n":
+                out = out + "\n"
+                continue
+            if e == "r":
+                out = out + "\r"
+                continue
+            if e == "t":
+                out = out + "\t"
+                continue
+            if e == "v":
+                let r = do unqRune(11)
+                out = out + r
+                continue
+            if e == "\\" || e == "\"":
+                out = out + e
+                continue
+            if e == "x" || e == "u" || e == "U":
+                let mut k = 2
+                if e == "u":
+                    k = 4
+                if e == "U":
+                    k = 8
+                if i + k > m:
+                    return bad
+                let mut v = 0
+                let mut j = 0
+                loop j < k:
+                    let h = do unqHexVal(cs[i + j])
+                    if h < 0:
+                        return bad
+                    v = v * 16 + h
+                    j = j + 1
+                i = i + k
+                if e == "x":
+                    pend = append(pend, v)
+                    continue
+                if v > 1114111 || (v >= 55296 && v <= 57343):
+                    return bad
+                let r = do unqRune(v)
+                out = out + r
+                continue
+            if e >= "0" && e <= "7":
+                if i + 2 > m:
+                    return bad
+                let mut v = 0
+                let digs = [e, cs[i], cs[i + 1]]
+                let mut j = 0
+                loop j < 3:
+                    let d = digs[j]
+                    if d < "0" || d > "7":
+                        return bad
+                    let dv = do unqHexVal(d)
+                    v = v * 8 + dv
+                    j = j + 1
+                if v > 255:
+                    return bad
+                i = i + 2
+                pend = append(pend, v)
+                continue
+            return bad
+        if len(pend) > 0:
+            let fl2 = do unqBytes(pend)
+            out = out + fl2
+        return GoUnq{ok: true, value: out}
+
+    # goQuote: fmt's %q of a string — quoted, with `"`, `\` and the common
+    # control characters escaped.
+    proc goQuote(s: text) -> text:
+        let a = replace(s, "\\", "\\\\")
+        let b = replace(a, "\"", "\\\"")
+        let c = replace(b, "\n", "\\n")
+        let d = replace(c, "\t", "\\t")
+        let e = replace(d, "\r", "\\r")
+        return "\"" + e + "\""

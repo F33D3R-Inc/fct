@@ -1,0 +1,347 @@
+import "../../fabric_stats.fct"
+
+app FabricStatsCheck:
+    # fabric_stats.fct against the scratch Rust binary that printed
+    # stats_decode_rust.tsv (serde_json::from_slice::<EngineStats> over a
+    # corpus of FacetQL bodies — wire.rs's two #[test] bodies, every
+    # missing / mistyped / duplicated / unknown field shape, the positional
+    # form, syntax errors inside ignored fields, and 60 random bodies
+    # encoded by serde_json) and sample_rust.tsv (StatsSample::difference
+    # over sample.rs's #[test] inputs and further intervals, CPU, queue and
+    # per-cell cases).
+
+    proc lbHexVal(c: int) -> int:
+        if c >= 48 && c <= 57:
+            return c - 48
+        return c - 87
+
+    proc lbUnhex(h: text) -> [int]:
+        let hb = textToBytes(h)
+        let mut out = []
+        let mut i = 0
+        loop i + 1 < len(hb):
+            let a = do lbHexVal(hb[i])
+            let b = do lbHexVal(hb[i + 1])
+            out = append(out, a * 16 + b)
+            i = i + 2
+        return out
+
+    proc lbDecode(hexInput: text) -> text:
+        let bs = do lbUnhex(hexInput)
+        let r = do statsDecodeEngineStats(bytesToText(bs))
+        if r.ok:
+            let d = do statsDigestEngineStats(r.stats)
+            return "ok:" + d
+        return "err:" + r.err
+
+    proc lbBatch(hexList: text) -> text:
+        let items = split(hexList, ",")
+        let mut out = []
+        let mut i = 0
+        loop i < len(items):
+            let r = do lbDecode(items[i])
+            out = append(out, r)
+            i = i + 1
+        return join(out, "\n")
+
+    state statsResult: text = ""
+
+    action runStatsDecodeCases(tag: text, hexList: text):
+        let r = do lbBatch(hexList)
+        statsResult = tag + "|" + r
+
+    # One line per fct-built EngineStats: its JSON (for the Rust side to
+    # decode) and the digest of fct's own decode of that JSON — serde_json's
+    # default float parsing is not round-trip exact, so the check is that
+    # both decoders read the same text to the same value.
+    proc lbEncodeAll() -> text:
+        let xs = do lbSamples()
+        let mut out = []
+        let mut i = 0
+        loop i < len(xs):
+            let j = do statsJsonEngineStats(xs[i])
+            let back = do statsDecodeEngineStats(j)
+            let d = do statsDigestEngineStats(back.stats)
+            out = append(out, j + "\t" + d)
+            i = i + 1
+        return join(out, "\n")
+
+    proc lbFb(f: float) -> text:
+        return "" + floatBits(f)
+
+    proc lbSamples() -> [EngineStats]:
+        let mut out = []
+        let mut k = 0
+        let mut x = 88172645463325252
+        loop k < 40:
+            let mut s = do statsDefaultEngineStatsLike()
+            x = x ^ (x << 13)
+            x = x ^ ((x >> 7) & 144115188075855871)
+            x = x ^ (x << 17)
+            s.nodeCount = x & 1099511627775
+            s.readsTotal = (x >> 3) & 9223372036854775807
+            s.writesTotal = k * 1000003
+            let mut st = s.storage
+            st.pageSize = (x >> 9) & 4294967295
+            s.storage = st
+            let mut kinds = []
+            let mut j = 0
+            loop j < k % 3:
+                kinds = append(kinds, KindCount{kind: "K" + j + "é\"\\\n" + k, count: x & 65535})
+                j = j + 1
+            s.kinds = kinds
+            if k % 2 == 0:
+                s.hasVersion = true
+                s.version = "v" + k + "\t\u0001"
+            let mut rt = s.runtime
+            let mut w = rt.window
+            if k % 3 != 0:
+                w.hasCpuUtilization = true
+                w.cpuUtilization = floatFromBits((x >> 2) & 4611686018427387903)
+            let mut rl = w.readLatency
+            rl.count = k
+            rl.hasP99Us = k % 4 == 1
+            rl.p99Us = x & 1048575
+            w.readLatency = rl
+            rt.window = w
+            let mut p = rt.process
+            p.hasCpuSecondsTotal = k % 5 != 2
+            p.cpuSecondsTotal = toFloat(k) * 0.37 + 1.0 / 3.0
+            p.hasMemoryUtilization = true
+            p.memoryUtilization = toFloat(x & 1023) / 1000.0
+            p.hasMemoryLimitSource = k % 2 == 1
+            p.memoryLimitSource = "cgroup"
+            p.hasCpuCores = true
+            p.cpuCores = k % 17
+            rt.process = p
+            let mut rq = rt.requests
+            rq.inFlight = k * 13
+            rq.maxConcurrent = 512
+            rt.requests = rq
+            rt.uptimeSeconds = x & 16777215
+            s.runtime = rt
+            let mut ca = s.cells
+            let mut cells = []
+            let mut c = 0
+            loop c < k % 4:
+                cells = append(cells, CellStats{x: c, y: (x >> c) & 255, z: 7, q: 255, reads: x & 4294967295, writes: c, bytesRead: k, bytesWritten: 0})
+                c = c + 1
+            ca.cells = cells
+            ca.overflowReads = k % 2
+            s.cells = ca
+            out = append(out, s)
+            k = k + 1
+        return out
+
+    proc statsDefaultEngineStatsLike() -> EngineStats:
+        let z = do statsZeroEngineStats()
+        let rt = do statsDefaultRuntimeStats()
+        let ca = do statsDefaultCellAttribution()
+        let mut s = z
+        s.runtime = rt
+        s.cells = ca
+        return s
+
+    state encodeResult: text = ""
+
+    action runStatsEncode():
+        let r = do lbEncodeAll()
+        encodeResult = r
+
+    # ---- StatsSample::difference ----
+
+    proc lbMetrics(o: WorkloadMetricsOption) -> text:
+        if !o.has:
+            return "none"
+        let m = o.metrics
+        let mut cells = []
+        let mut i = 0
+        loop i < len(m.cellBreakdown):
+            let c = m.cellBreakdown[i]
+            cells = append(cells, "(" + c.x + "," + c.y + "," + c.z + "," + c.q + "," + floatBits(c.readsPerSecond) + "," + floatBits(c.writesPerSecond) + "," + floatBits(c.bytesReadPerSecond) + "," + floatBits(c.bytesWrittenPerSecond) + ")")
+            i = i + 1
+        let r = do statsRatios(m)
+        let hot = do workloadMetricsIsHot(m)
+        let qhot = do workloadMetricsIsQueueHot(m)
+        return "" + floatBits(m.operationsPerSecond) + "," + floatBits(m.readsPerSecond) + "," + floatBits(m.writesPerSecond) + "," + floatBits(m.readLatencyUs) + "," + floatBits(m.writeLatencyUs) + "," + floatBits(m.cpuUtilization) + "," + floatBits(m.memoryUtilization) + "," + m.storageBytesPerSecond + "," + m.networkInBytesPerSecond + "," + m.networkOutBytesPerSecond + "," + m.queueDepth + ",[" + join(cells, ";") + "]," + m.cellBreakdownPartial + "|" + floatBits(r.read) + "," + floatBits(r.write) + "|" + hot + ":" + qhot
+
+    proc lbD(a: StatsSample, b: StatsSample) -> text:
+        let o = do statsSampleDifference(a, b)
+        let t = do lbMetrics(o)
+        return t
+
+    proc lbS(ns: int, r: int, w: int) -> StatsSample:
+        let s = do statsSampleFixtureAt(ns, r, w)
+        return s
+
+    proc lbPush(t: text, s: text) -> text:
+        if t == "":
+            return s
+        return t + "#" + s
+
+    proc lbRates() -> text:
+        let mut t = ""
+        let starts = [0, 0, 0, 0, 7, 5000, 0, 0, 0, 0]
+        let ends = [2000000000, 1000000000, 1000000000, 0, 1000000007, 4000, 1500000000, 333333333, 3, 123456789012]
+        let r0 = [100, 0, 5000000, 0, 7, 1, 100, 1, 0, 10]
+        let w0 = [10, 0, 1000, 0, 7, 1, 10, 1, 0, 10]
+        let r1 = [300, 10, 3, 10, 7, 2, 300, 12345, 9, 10]
+        let w1 = [30, 0, 0, 10, 7, 2, 30, 678, 1, 5]
+        let mut i = 0
+        loop i < 10:
+            let a = do lbS(starts[i], r0[i], w0[i])
+            let b = do lbS(ends[i], r1[i], w1[i])
+            let d = do lbD(a, b)
+            t = do lbPush(t, d)
+            i = i + 1
+        return t
+
+    proc lbCpuCase(hb: bool, cb: float, ha: bool, ca: float, hcb: bool, coresB: int, hca: bool, coresA: int, ns: int) -> text:
+        let mut b = do lbS(0, 0, 0)
+        b.hasCpuSecondsTotal = hb
+        b.cpuSecondsTotal = cb
+        b.hasCpuCores = hcb
+        b.cpuCores = coresB
+        let mut a = do lbS(ns, 0, 0)
+        a.hasCpuSecondsTotal = ha
+        a.cpuSecondsTotal = ca
+        a.hasCpuCores = hca
+        a.cpuCores = coresA
+        let d = do lbD(b, a)
+        return d
+
+    proc lbCpu() -> text:
+        let mut t = ""
+        let s = 1000000000
+        let c1 = do lbCpuCase(true, 1.0, true, 2.0, true, 2, true, 2, s)
+        t = do lbPush(t, c1)
+        let c2 = do lbCpuCase(false, 0.0, false, 0.0, false, 0, false, 0, s)
+        t = do lbPush(t, c2)
+        let c3 = do lbCpuCase(true, 5.0, true, 5.0, true, 4, true, 4, s)
+        t = do lbPush(t, c3)
+        let c4 = do lbCpuCase(true, 1.0, true, 9.0, true, 2, true, 2, s)
+        t = do lbPush(t, c4)
+        let c5 = do lbCpuCase(true, 3.0, true, 2.0, true, 2, true, 2, s)
+        t = do lbPush(t, c5)
+        let c6 = do lbCpuCase(true, 1.0, true, 2.0, true, 2, true, 0, s)
+        t = do lbPush(t, c6)
+        let c7 = do lbCpuCase(true, 1.0, true, 2.0, false, 0, true, 3, 700000000)
+        t = do lbPush(t, c7)
+        let c8 = do lbCpuCase(false, 0.0, true, 2.0, true, 2, true, 2, s)
+        t = do lbPush(t, c8)
+        let c9 = do lbCpuCase(true, 0.1, true, 0.35, true, 8, true, 8, 250000000)
+        t = do lbPush(t, c9)
+        return t
+
+    proc lbQueue() -> text:
+        let mut t = ""
+        let infs = [512, 5, 0, 7, 1, 2, 1, 3, 1, 900, 1, 5]
+        let maxs = [512, 512, 0, 0, 3, 3, 8, 8000, 20000, 512, 7, 7]
+        let mut i = 0
+        loop i < 12:
+            let b = do lbS(0, 0, 0)
+            let mut a = do lbS(1000000000, 0, 0)
+            a.inFlight = infs[i]
+            a.maxConcurrent = maxs[i]
+            a.hasMemoryUtilization = true
+            a.memoryUtilization = 0.5
+            a.hasReadLatencyP99Us = true
+            a.readLatencyP99Us = infs[i]
+            a.hasWriteLatencyP99Us = maxs[i] % 2 == 0
+            a.writeLatencyP99Us = maxs[i]
+            let d = do lbD(b, a)
+            t = do lbPush(t, d)
+            i = i + 1
+        return t
+
+    proc lbCell(x: int, r: int, w: int, br: int, bw: int) -> CellStats:
+        let c = do statsCellFixture(x, r, w, br, bw)
+        return c
+
+    proc lbCells() -> text:
+        let mut t = ""
+        let mut b1 = do lbS(0, 0, 0)
+        let c11 = do lbCell(1, 100, 10, 1000, 100)
+        let c12 = do lbCell(2, 50, 5, 500, 50)
+        b1.cells = [c11, c12]
+        let mut a1 = do lbS(1000000000, 0, 0)
+        let c13 = do lbCell(1, 300, 10, 3000, 100)
+        let c14 = do lbCell(2, 50, 25, 500, 250)
+        let c15 = do lbCell(3, 40, 0, 400, 0)
+        a1.cells = [c13, c14, c15]
+        let d1 = do lbD(b1, a1)
+        t = do lbPush(t, d1)
+        let b2 = do lbS(0, 0, 0)
+        let mut a2 = do lbS(1000000000, 0, 0)
+        let c21 = do lbCell(1, 10, 0, 100, 0)
+        a2.cells = [c21]
+        a2.overflowReads = 3
+        let d2 = do lbD(b2, a2)
+        t = do lbPush(t, d2)
+        let mut b3 = do lbS(0, 0, 0)
+        let c31 = do lbCell(4, 10, 10, 10, 10)
+        let c32 = do lbCell(5, 1, 1, 1, 1)
+        b3.cells = [c31, c32]
+        let mut a3 = do lbS(3000000000, 0, 0)
+        let e1 = do lbCell(5, 11, 1, 2, 2)
+        let e2 = do lbCell(6, 0, 10, 0, 0)
+        let e3 = do lbCell(4, 5, 5, 5, 5)
+        let mut e4 = do lbCell(7, 5, 5, 0, 0)
+        e4.y = 9
+        e4.q = 2
+        let e5 = do lbCell(8, 10, 0, 7, 7)
+        let e6 = do lbCell(9, 0, 0, 0, 0)
+        a3.cells = [e1, e2, e3, e4, e5, e6]
+        a3.overflowWrites = 1
+        let d3 = do lbD(b3, a3)
+        t = do lbPush(t, d3)
+        return t
+
+    state sampleRates: text = ""
+    state sampleCpu: text = ""
+    state sampleQueue: text = ""
+    state sampleCells: text = ""
+
+    action runSampleCheck():
+        let a = do lbRates()
+        let b = do lbCpu()
+        let c = do lbQueue()
+        let d = do lbCells()
+        sampleRates = a
+        sampleCpu = b
+        sampleQueue = c
+        sampleCells = d
+
+    # f64 bit patterns and their serde_json text (sjF64Text), for the Rust
+    # side to print the same bits with serde_json::to_string.
+    proc lbFloatTexts() -> text:
+        let mut out = []
+        let mut x = 7046029254386353131
+        let mut k = 0
+        loop k < 400:
+            x = x ^ (x << 13)
+            x = x ^ ((x >> 7) & 144115188075855871)
+            x = x ^ (x << 17)
+            let mut bits = x
+            if k % 4 == 1:
+                bits = x & -4503599627370496
+            if k % 4 == 2:
+                bits = (x & 9223372036854775807) >> (k % 60)
+            let f = floatFromBits(bits)
+            let t = do sjF64Text(f)
+            out = append(out, "" + bits + "\t" + t)
+            k = k + 1
+        let specials = [0, -9223372036854775807 - 1, 1, 4607182418800017408, 4611686018427387904, 4621819117588971520, 4890909195324358656, 4895412794951729152, 4368491638549381120, 4363988038922010624, 9218868437227405311, 4503599627370495, 4503599627370496, 4741671816366391296, 4746175415993761792]
+        let mut j = 0
+        loop j < len(specials):
+            let f = floatFromBits(specials[j])
+            let t = do sjF64Text(f)
+            out = append(out, "" + specials[j] + "\t" + t)
+            j = j + 1
+        return join(out, "\n")
+
+    state floatResult: text = ""
+
+    action runFloatTexts():
+        let r = do lbFloatTexts()
+        floatResult = r

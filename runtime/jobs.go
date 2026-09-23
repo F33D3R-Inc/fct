@@ -47,23 +47,13 @@ type jobQueue struct {
 // workers executes it. Returns immediately; workers and schedulers run in the
 // background.
 func (s *Server) StartJobs() {
-	s.mu.Lock()
-	s.ensureSession(systemSID)
-	s.mu.Unlock()
 
 	// Phase 6: the declarative retention sweep (no-op unless FACET_RETENTION is set)
 	// runs for the process lifetime, independent of the periodic-job machinery.
 	s.startRetention()
 
 	// `on start` jobs run inline, in declared order, before periodic work begins.
-	for _, j := range s.ir.Jobs {
-		if !j.OnStart {
-			continue
-		}
-		if act := s.byAction[j.Action]; act != nil {
-			s.runAction(systemSID, act, nil)
-		}
-	}
+	s.runOnStartJobs()
 
 	// Daemons (runtime/daemon.go) start here too — the same boot point an
 	// `on start` job runs at — but each in its own goroutine: unlike an
@@ -237,4 +227,24 @@ func (c *cluster) id() string {
 		return "solo"
 	}
 	return c.instanceID
+}
+
+// runOnStartJobs runs every `on start` job inline, in declared order, under
+// the synthetic system session — the setup a program's daemons are promised
+// has happened before they start, whether the process is a server
+// (StartJobs) or a service run by `facet exec` (RunDaemons).
+func (s *Server) runOnStartJobs() {
+	s.mu.Lock()
+	s.ensureSession(systemSID)
+	s.mu.Unlock()
+	for _, j := range s.ir.Jobs {
+		if !j.OnStart {
+			continue
+		}
+		if act := s.byAction[j.Action]; act != nil {
+			if _, status, msg := s.runAction(systemSID, act, nil); status != http.StatusOK {
+				s.obs.log.Error("on start job failed", slog.String("job", j.Name), slog.Int("status", status), slog.String("error", msg))
+			}
+		}
+	}
 }

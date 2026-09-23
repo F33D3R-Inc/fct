@@ -107,6 +107,11 @@ func tokenize(s string) []token {
 					j++
 				}
 			}
+			// An exponent (`1e22`, `2.5E-3`) also makes a float: `e`/`E`,
+			// an optional sign, then at least one digit. Without the digit
+			// the `e` is left alone (an identifier), so no program that
+			// compiled before reads differently.
+			j = exponentEnd(s, j)
 			toks = append(toks, token{tNum, s[i:j]})
 			i = j
 		case isIdentStart(c):
@@ -255,30 +260,25 @@ func (p *exprParser) parsePostfix() (ast.Expr, error) {
 					return nil, err
 				}
 				atom = as
-			case isBuiltinCall(ref.Name):
+			case IsBuiltinCall(ref.Name) || !isUpper(ref.Name):
+				// A builtin, or a parameterized derive (`workCard(w, me)`) — any
+				// lower-case name in call position is a call, since an entity is
+				// capitalized; the builder knows which projections exist and
+				// refuses a name that is neither ("unknown function").
 				cl, err := p.parseCall(ref.Name)
 				if err != nil {
 					return nil, err
 				}
 				atom = cl
 			default:
-				// Anything else in call position is an entity lookup, `Post(id)` —
-				// including a lower-case name, which the self-hosted parser
-				// (selfhost/) parses to the same shape and the builder then
-				// rejects as an unknown entity. What differs for a lower-case name
-				// is only the diagnostic when the lookup fails to close: an entity
-				// is capitalized by convention, so `replace(s, a, b)` is a
-				// function this language does not have, and saying so beats
-				// reporting a `)` missing from a lookup the author never wrote.
+				// A capitalized name in call position is an entity lookup,
+				// `Post(id)`.
 				p.pos++
 				key, err := p.parseBinary(0)
 				if err != nil {
 					return nil, err
 				}
 				if c, ok := p.peek(); !ok || c.kind != tRParen {
-					if !isUpper(ref.Name) {
-						return nil, &Error{p.line, fmt.Sprintf("unknown function %q — see `facet lang` for the builtins", ref.Name)}
-					}
 					return nil, &Error{p.line, "missing `)` in entity lookup"}
 				}
 				p.pos++
@@ -482,21 +482,49 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 			itemVar = aggRowVar(where)
 		}
 	}
+	// `list(card(p, me) in Pack)`: a projection call whose row argument is a
+	// bare name — nothing reads `p.field`, so the row is the first bare-name
+	// argument of the call.
+	varFromArg := false
+	if itemVar == "" && op == "list" {
+		if call, ok := sel.(ast.Call); ok {
+			for _, a := range call.Args {
+				if r, ok := a.(ast.Ref); ok {
+					itemVar, varFromArg = r.Name, true
+					break
+				}
+			}
+		}
+	}
 
 	// `list(...)`'s own clauses, in the order a view's `for` takes them:
 	// `by field [desc|asc]`, then `limit expr`.
 	var order string
+	var orderExpr ast.Expr
 	var desc bool
 	var limit ast.Expr
 	if op == "list" {
 		if b, ok := p.peek(); ok && b.kind == tIdent && b.text == "by" {
 			p.pos++
-			f, ok := p.peek()
-			if !ok || f.kind != tIdent {
-				return nil, &Error{p.line, "list(...) ordering is `by field [desc|asc]`"}
+			if f, ok := p.peek(); !ok || f.kind == tRParen {
+				return nil, &Error{p.line, "list(...) ordering is `by field [desc|asc]` or `by <expression over the row> [desc|asc]`"}
 			}
-			order = f.text
-			p.pos++
+			key, err := p.parseBinary(0)
+			if err != nil {
+				return nil, err
+			}
+			switch k := key.(type) {
+			case ast.Ref:
+				order = k.Name // a stored column (or an entity derive)
+			case ast.Get:
+				if r, ok := k.Obj.(ast.Ref); ok && r.Name == itemVar && itemVar != "" {
+					order = k.Field // `by x.field`: the column itself
+				} else {
+					orderExpr = key
+				}
+			default:
+				orderExpr = key
+			}
 			if d, ok := p.peek(); ok && d.kind == tIdent && (d.text == "desc" || d.text == "asc") {
 				desc = d.text == "desc"
 				p.pos++
@@ -519,7 +547,7 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 		return nil, &Error{p.line, fmt.Sprintf("missing `)` in %s(...)", op)}
 	}
 	p.pos++
-	return ast.Agg{Op: op, Coll: coll, Field: field, Var: itemVar, Where: where, Sel: sel, Order: order, Desc: desc, Limit: limit}, nil
+	return ast.Agg{Op: op, Coll: coll, Field: field, Var: itemVar, Where: where, Sel: sel, Order: order, Desc: desc, Limit: limit, VarFromArg: varFromArg, OrderExpr: orderExpr}, nil
 }
 
 // aggRowVar reports the name an aggregate's reduced value reads its row through:
@@ -527,46 +555,58 @@ func (p *exprParser) parseAgg(op string) (ast.Expr, error) {
 // pre-order walk because "leftmost" has to mean the same thing to a reader as it
 // does here — `l.qty * l.unitPrice` reads its row through `l`, and so does
 // `abs(l.delta)` and `Product(l.product).price`.
-func aggRowVar(ex ast.Expr) string {
+func aggRowVar(ex ast.Expr) string { return freeRowVar(ex, nil) }
+
+// freeRowVar is aggRowVar's walk, skipping the item variables the aggregates it
+// descends into bind: a nested aggregate's own item variable is its own, so the
+// outer row is the leftmost member access on any other name — in
+// `exists(b in Block where b.owner == me && b.target == a.id)` that is `a`, even
+// though `b.owner` comes first.
+func freeRowVar(ex ast.Expr, bound map[string]bool) string {
 	switch t := ex.(type) {
 	case ast.Get:
 		if r, ok := t.Obj.(ast.Ref); ok {
+			if bound[r.Name] {
+				return ""
+			}
 			return r.Name
 		}
-		return aggRowVar(t.Obj)
+		return freeRowVar(t.Obj, bound)
 	case ast.EntityGet:
-		return aggRowVar(t.Key)
+		return freeRowVar(t.Key, bound)
 	case ast.StructLit:
 		// A DTO shaped from the row: the first field that reads it names it.
 		for _, fi := range t.Fields {
-			if v := aggRowVar(fi.Expr); v != "" {
+			if v := freeRowVar(fi.Expr, bound); v != "" {
 				return v
 			}
 		}
 	case ast.Agg:
-		// A nested aggregate's own item variable is its own; the outer row is
-		// whatever its filter or value reads besides that.
+		inner := map[string]bool{t.Var: true}
+		for n := range bound {
+			inner[n] = true
+		}
 		for _, sub := range []ast.Expr{t.Where, t.Sel} {
-			if v := aggRowVar(sub); v != "" && v != t.Var {
+			if v := freeRowVar(sub, inner); v != "" {
 				return v
 			}
 		}
 	case ast.Bin:
-		if v := aggRowVar(t.L); v != "" {
+		if v := freeRowVar(t.L, bound); v != "" {
 			return v
 		}
-		return aggRowVar(t.R)
+		return freeRowVar(t.R, bound)
 	case ast.Un:
-		return aggRowVar(t.X)
+		return freeRowVar(t.X, bound)
 	case ast.Call:
 		for _, a := range t.Args {
-			if v := aggRowVar(a); v != "" {
+			if v := freeRowVar(a, bound); v != "" {
 				return v
 			}
 		}
 	case ast.ListLit:
 		for _, el := range t.Elems {
-			if v := aggRowVar(el); v != "" {
+			if v := freeRowVar(el, bound); v != "" {
 				return v
 			}
 		}
@@ -641,29 +681,13 @@ func (p *exprParser) parseCall(name string) (ast.Expr, error) {
 	return ast.Call{Name: name, Args: args}, nil
 }
 
-// isBuiltinCall reports whether name is an invocable builtin in call position:
-// the effectful clock/RNG plus the pure standard library (string/math/date).
-func isBuiltinCall(name string) bool {
-	switch name {
-	case "now", "rand", // effectful (pinned to the authority)
-		"print",                                        // debug output (server-only, but callable from action AND proc bodies — see internal/ir/build.go's printCap)
-		"abs", "min", "max", "floor", "round", "money", // math / money
-		"toFloat", "toInt", // explicit int<->float conversion — not proc-only, float is a real type everywhere
-		"floatBits", "floatFromBits", // IEEE-754 bit-cast float<->int — not proc-only, same reason
-		"toMoney",                                                                                          // explicit text->money conversion — not proc-only, money is a real type everywhere
-		"len", "upper", "lower", "trim", "contains", "take", "split", "slice", "charAt", "replace", "slug", // string
-		"textToBytes", "bytesToText", "byteLen", // UTF-8 <-> raw byte buffer conversion (proc-only, same reason "bytes" is)
-		"year", "month", "day", // date
-		"ago", "compact", "commas", "iso", // formatting (render-time text)
-		"append",                // array (proc-only — see internal/ir/build.go's checkBuiltins)
-		"bytes",                 // byte-buffer constructor (proc-only, same reason as append)
-		"readFile", "writeFile", // file I/O (proc-only, capability-gated — see checkNoIO/checkProcCapabilities)
-		"httpGet", "httpPost", // HTTP client (proc-only, capability-gated — same as above)
-		"listen", "accept", "readBytes", "writeBytes", "closeConn", // inbound TCP (daemon-only, capability-gated — see checkDaemonOnlyBuiltins/checkProcCapabilities)
-		"channel", "send", "recv": // structured concurrency's channel primitive (proc-only — see checkNoConcurrency)
-		return true
-	}
-	return false
+// IsBuiltinCall reports whether name is an invocable builtin in call position.
+// Exported for the builder, which refuses a parameterized derive — called the
+// same way — that would take one of these names. Every builtin, and where it
+// may run, is listed once in builtinSites (builtins.go).
+func IsBuiltinCall(name string) bool {
+	_, ok := builtinSites[name]
+	return ok
 }
 
 func aggArgHint(op string) string {
@@ -718,7 +742,7 @@ func (p *exprParser) parseAtom() (ast.Expr, error) {
 		return nil, &Error{p.line, fmt.Sprintf("unexpected %q in expression", t.text)}
 	case tNum:
 		p.pos++
-		if strings.Contains(t.text, ".") {
+		if strings.ContainsAny(t.text, ".eE") {
 			// A float literal (`3.14`, `0.5`) — the tokenizer only ever produces
 			// this shape for `<digits>.<digits>` (see tokenize), so ParseFloat
 			// cannot fail here. `float` is a real scalar type, distinct from
@@ -909,4 +933,23 @@ func isIdentStart(c byte) bool {
 }
 func isIdentChar(c byte) bool {
 	return isIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+// exponentEnd returns where a float literal's exponent part starting at j
+// ends — j itself when there is none (see tokenize's number case).
+func exponentEnd(s string, j int) int {
+	if j >= len(s) || (s[j] != 'e' && s[j] != 'E') {
+		return j
+	}
+	k := j + 1
+	if k < len(s) && (s[k] == '+' || s[k] == '-') {
+		k++
+	}
+	if k >= len(s) || s[k] < '0' || s[k] > '9' {
+		return j
+	}
+	for k < len(s) && s[k] >= '0' && s[k] <= '9' {
+		k++
+	}
+	return k
 }

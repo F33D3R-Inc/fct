@@ -1,128 +1,24 @@
 import "fabric_core.fct"
 
 app FabricTelemetrySelfHost:
-    # Self-hosting port of fabric/crates/fabric-telemetry/src/ in full —
-    # observation.rs (30L: Observation + its one constructor) and metrics.rs
-    # (105L: CellWorkloadMetrics, WorkloadMetrics + its five real methods:
-    # total_operations, is_cpu_hot, is_memory_hot, is_queue_hot, is_hot) —
-    # PLUS fabric/crates/fabric-workload/src/ in full — analyzer.rs (81L:
-    # WorkloadKey, WorkloadAnalyzer) and profile.rs (146L: PressureLevel,
-    # WorkloadProfile, WorkloadProfile::from_metrics + its private
-    # calculate_pressure). Both crates read in full before writing a line
-    # here; no method or struct field of either was skipped.
+    # Port of fabric/crates/fabric-telemetry/src (metrics.rs: CellWorkload-
+    # Metrics, WorkloadMetrics and its hot checks; observation.rs:
+    # Observation) and fabric/crates/fabric-workload/src (profile.rs:
+    # PressureLevel, WorkloadProfile::from_metrics and calculate_pressure;
+    # analyzer.rs: WorkloadKey, WorkloadAnalyzer), with each type's serde
+    # shape. One file because fabric-workload consumes fabric-telemetry's
+    # types at their exact shape.
     #
-    # ============================================================
-    # WHY BOTH CRATES ARE ONE FILE, NOT TWO
-    # ============================================================
-    # This task's own brief left the split/combine choice to judgment, after
-    # reading both. fabric-workload's ENTIRE input surface is fabric-
-    # telemetry's own types, consumed at their exact real shape with zero
-    # narrowing or divergence: `WorkloadAnalyzer::observe` takes an
-    # `&Observation` and reads `observation.shard.id`, `observation.
-    # coordinate`, and `observation.metrics` (cloned) verbatim;
-    # `WorkloadProfile::from_metrics` takes an owned `WorkloadMetrics` and
-    # copies `cell_breakdown`/`cell_breakdown_partial` straight through
-    # unchanged. There is no case here — unlike fabric_routing.fct's
-    # deliberately NARROWER redeclaration of `Coordinate` for a packed-int
-    # RoutingKey, or fabric_replication.fct's deliberately DIFFERENT-shaped
-    # `ReplGroup` vs. fabric.fct's `ReplicaEntry` — where two files reading
-    # the same real-world thing at different fidelity justifies two
-    # separate, independently named types. Here it is the SAME shape read
-    # by two crates. This selfhost directory has no cross-file `import`
-    # (confirmed directly: fabric_routing.fct's own header states plainly
-    # "this file does not `import` fabric.fct", and every existing file's
-    # `facet check` runs and passes as a fully standalone app — verified by
-    # running it on fabric_core.fct, fabric_routing.fct, and
-    # fabric_replication.fct individually before writing this file). Given
-    # no import mechanism, splitting `Observation`/`WorkloadMetrics`/
-    # `CellWorkloadMetrics` into a separate `fabric_workload.fct` would force
-    # a SECOND, independently-maintained copy of an IDENTICAL shape — a real
-    # drift risk with no offsetting benefit, since nothing about the two
-    # crates' concerns is actually independent the way replication's
-    # placement/replica/set trio is from failover. One file is the root
-    # solution; two would be needless duplication dressed up as modularity.
-    #
-    # ============================================================
-    # REPRESENTATION CHOICES
-    # ============================================================
-    # `Coordinate` (`fabric_core::Coordinate`, `{x: u8, y: u8}`) is
-    # redeclared locally below, field-for-field, for the exact same reason
-    # fabric_routing.fct's header already gives for redeclaring it there:
-    # no cross-file import exists in this language, so every file that
-    # needs it owns its own copy.
-    #
-    # `Observation.shard`: the real Rust field is `shard: Shard`
-    # (`fabric_core::Shard`) — a FULL struct that also carries a 156-atom
-    # `Grid` and a `ShardStorage` map, both already ported in fabric_core.fct
-    # at real cost (`gridNew` alone builds 156 `Atom`s). Before assuming that
-    # full shape was needed here, every real read of `observation.shard`
-    # anywhere in the fabric/ tree was grepped, not guessed: fabric-
-    # telemetry itself never reads it; fabric-workload's analyzer.rs reads
-    # only `.id` (twice); fabric-replication's replica.rs
-    # (`ReplicaReport::from_observation`) reads only `.id`; fabric-
-    # simulator's simulation.rs (the one other real caller in the whole
-    # workspace) reads only `.id`, in every one of its eight call sites.
-    # Nothing, anywhere, ever reads an Observation's shard's grid or
-    # storage. So `Observation.shard` here is `ObservationShard{id,
-    # workloadDomain}` — the two plain identity fields `Shard` itself
-    # carries at its own top level (`pub id: u64`, `pub workload_domain:
-    # String`), never its two internal, `#[serde(skip)]`-marked fields
-    # (`grid`, `storage`) that no consumer of an Observation's shard ever
-    # touches. This is a deliberate, narrower, HONEST representation — the
-    # same kind of call fabric_replication.fct's own header already makes
-    # for `ReplRecord` vs. fabric.fct's `ReplicaEntry` — not a shortcut, and
-    # it is named `ObservationShard`, never `Shard`, so nobody mistakes it
-    # for fabric_core.fct's real, full type.
-    #
-    # `PressureLevel`'s four variants (`Normal`/`Elevated`/`High`/
-    # `Critical`) become a `text` tag — "normal"/"elevated"/"high"/
-    # "critical" — matching fabric_replication.fct's `ReplicaState`
-    # convention (a descriptive level, compared everywhere by name), not
-    # fabric_routing.fct's `RoutingError.kind` convention (Rust-variant-
-    # named error tags like "NoWritableReplica"): this is a level, not an
-    # error taxonomy.
-    #
-    # `WorkloadAnalyzer`'s `HashMap<WorkloadKey, WorkloadProfile>` is
-    # restated as a linearly-searched `[WorkloadProfileEntry]`, the SAME
-    # array-instead-of-map convention fabric_core.fct's `ShardStorage` and
-    # fabric_routing.fct's `TopologyRegistry` already establish, for the
-    # identical reason (no native map type in this language).
-    #
-    # ============================================================
-    # CLOSING fabric_replication.fct's DEFERRED `ReplicaReport::from_observation`
-    # ============================================================
-    # fabric_replication.fct's own header (read in full before writing this
-    # file, per this task's instruction) explains why it stopped short:
-    # `ReplicaReport::from_observation(node, observation, lag)` needed a
-    # `fabric_telemetry::Observation` type that did not exist yet on this
-    # side. It now does (below). The real Rust method is:
-    #
-    #   shard_id: observation.shard.id, node, timestamp_ms:
-    #   observation.timestamp_ms, lag, reachable: true
-    #
-    # fabric_replication.fct's ALREADY-PORTED `replReportNew(shardId: int,
-    # node: text, timestampMs: int, pendingWrites: int, applyLagMs: int) ->
-    # ReplReport` (that file's `ReplRecord`/`ReplReport` flatten Rust's
-    # `ReplicaLag{pending_writes, apply_lag_ms}` into two plain fields
-    # directly on the report, per that file's own header) already has
-    # EXACTLY this signature — it sets `reachable: true` unconditionally,
-    # the same as `from_observation` does. So the entire composition, once
-    # a future round is allowed to touch fabric_replication.fct, is
-    # reusing that constructor unmodified, with the two fields an
-    # Observation supplies pulled off of it, and the two fields telemetry
-    # does not carry (lag is a replication-specific quantity, per the real
-    # method's own doc comment) supplied by the caller exactly as today:
-    #
-    #   do replReportNew(observation.shard.id, node, observation.timestampMs,
-    #                     pendingWrites, applyLagMs)
-    #
-    # No new function is added here for this: writing one would either
-    # duplicate `replReportNew`'s own body under a second name (real rework
-    # of an already-correct proc, for no behavioral gain) or reach into
-    # fabric_replication.fct to add it there — out of scope this round, per
-    # this task's own instruction not to touch that file's content. This
-    # comment is the complete, exact wiring a future task needs; nothing
-    # about it is hypothetical or approximate.
+    # Representation: Observation.shard is ObservationShard{id,
+    # workloadDomain} — Shard's serialized fields (its grid/storage are
+    # #[serde(skip)] and nothing in either crate reads them).
+    # PressureLevel is its lower-case label ("normal".."critical",
+    # fabric-cli's pressure_label text; pressureLevelVariant gives the
+    # variant name). The analyzer's HashMap is an insertion-ordered array
+    # (Rust iterates it in unspecified order; callers here sort when order
+    # matters). f64::clamp / f64::max keep their NaN rules (clampFloat,
+    # f64Max) and `u64 as f64` is sjU64Float. fabric_leaf_a_test.go checks
+    # all of it against digests printed by the real crates.
 
     # ============================================================
     # observation.rs / metrics.rs — fabric-telemetry, ported in full.
@@ -178,7 +74,7 @@ app FabricTelemetrySelfHost:
         return m.memoryUtilization >= 0.80
 
     proc workloadMetricsIsQueueHot(m: WorkloadMetrics) -> bool:
-        return m.queueDepth >= 10000
+        return !sjU64Gt(10000, m.queueDepth)
 
     proc workloadMetricsIsHot(m: WorkloadMetrics) -> bool:
         let cpuHot = do workloadMetricsIsCpuHot(m)
@@ -247,9 +143,25 @@ app FabricTelemetrySelfHost:
     # clampFloat: `f64::clamp` — this language has no clamp builtin (only
     # `min`/`max`, same-numeric-type, per `facet lang`), so it is `max(lo,
     # min(v, hi))`, the textbook expansion `clamp` itself compiles to.
+    # f64::clamp exactly: a NaN passes through unchanged (min/max would
+    # turn it into a bound).
     proc clampFloat(v: float, lo: float, hi: float) -> float:
-        let capped = min(v, hi)
-        return max(lo, capped)
+        let mut x = v
+        if x < lo:
+            x = lo
+        if x > hi:
+            x = hi
+        return x
+
+    # f64::max: when one side is NaN the other is returned.
+    proc f64Max(a: float, b: float) -> float:
+        if a != a:
+            return b
+        if b != b:
+            return a
+        if a > b:
+            return a
+        return b
 
     # workloadPressureScore: profile.rs's private `calculate_pressure`,
     # restated verbatim — same four weighted, clamped terms (cpu 0.35,
@@ -258,9 +170,9 @@ app FabricTelemetrySelfHost:
     proc workloadPressureScore(m: WorkloadMetrics) -> float:
         let cpu = do clampFloat(m.cpuUtilization, 0.0, 1.0)
         let memory = do clampFloat(m.memoryUtilization, 0.0, 1.0)
-        let queueRaw = toFloat(m.queueDepth) / 10000.0
+        let queueRaw = sjU64Float(m.queueDepth) / 10000.0
         let queue = do clampFloat(queueRaw, 0.0, 1.0)
-        let worstLatency = max(m.readLatencyUs, m.writeLatencyUs)
+        let worstLatency = f64Max(m.readLatencyUs, m.writeLatencyUs)
         let latencyRaw = worstLatency / 100000.0
         let latency = do clampFloat(latencyRaw, 0.0, 1.0)
         return (cpu * 0.35) + (memory * 0.20) + (queue * 0.25) + (latency * 0.20)
@@ -367,6 +279,45 @@ app FabricTelemetrySelfHost:
 
     proc workloadAnalyzerIsEmpty(analyzer: WorkloadAnalyzer) -> bool:
         return len(analyzer.entries) == 0
+
+    # ============================================================
+    # SERDE SHAPES — serde_json::to_string of each derived type
+    # ============================================================
+    proc cellWorkloadMetricsJson(c: CellWorkloadMetrics) -> text:
+        return "{\"x\":" + c.x + ",\"y\":" + c.y + ",\"z\":" + c.z + ",\"q\":" + c.q + ",\"reads_per_second\":" + sjF64Text(c.readsPerSecond) + ",\"writes_per_second\":" + sjF64Text(c.writesPerSecond) + ",\"bytes_read_per_second\":" + sjF64Text(c.bytesReadPerSecond) + ",\"bytes_written_per_second\":" + sjF64Text(c.bytesWrittenPerSecond) + "}"
+
+    proc cellWorkloadMetricsArrayJson(cells: [CellWorkloadMetrics]) -> text:
+        let mut parts = []
+        let mut i = 0
+        loop i < len(cells):
+            parts = append(parts, cellWorkloadMetricsJson(cells[i]))
+            i = i + 1
+        return "[" + join(parts, ",") + "]"
+
+    proc workloadMetricsJson(m: WorkloadMetrics) -> text:
+        return "{\"operations_per_second\":" + sjF64Text(m.operationsPerSecond) + ",\"reads_per_second\":" + sjF64Text(m.readsPerSecond) + ",\"writes_per_second\":" + sjF64Text(m.writesPerSecond) + ",\"read_latency_us\":" + sjF64Text(m.readLatencyUs) + ",\"write_latency_us\":" + sjF64Text(m.writeLatencyUs) + ",\"cpu_utilization\":" + sjF64Text(m.cpuUtilization) + ",\"memory_utilization\":" + sjF64Text(m.memoryUtilization) + ",\"storage_bytes_per_second\":" + sjU64Text(m.storageBytesPerSecond) + ",\"network_in_bytes_per_second\":" + sjU64Text(m.networkInBytesPerSecond) + ",\"network_out_bytes_per_second\":" + sjU64Text(m.networkOutBytesPerSecond) + ",\"queue_depth\":" + sjU64Text(m.queueDepth) + ",\"cell_breakdown\":" + cellWorkloadMetricsArrayJson(m.cellBreakdown) + ",\"cell_breakdown_partial\":" + sjBoolText(m.cellBreakdownPartial) + "}"
+
+    # The observation's shard as fabric-core's Shard serializes (grid and
+    # storage are #[serde(skip)]).
+    proc observationShardJson(s: ObservationShard) -> text:
+        return "{\"id\":" + sjU64Text(s.id) + ",\"workload_domain\":" + sjQuote(s.workloadDomain) + "}"
+
+    proc observationJson(o: Observation) -> text:
+        return "{\"timestamp_ms\":" + sjU64Text(o.timestampMs) + ",\"shard\":" + observationShardJson(o.shard) + ",\"coordinate\":" + coordinateJson(o.coordinate) + ",\"metrics\":" + workloadMetricsJson(o.metrics) + "}"
+
+    # PressureLevel's variant name (this port keeps the lower-case label as
+    # its tag, which is fabric-cli's pressure_label text).
+    proc pressureLevelVariant(level: text) -> text:
+        if level == "critical":
+            return "Critical"
+        if level == "high":
+            return "High"
+        if level == "elevated":
+            return "Elevated"
+        return "Normal"
+
+    proc workloadProfileJson(p: WorkloadProfile) -> text:
+        return "{\"shard_id\":" + sjU64Text(p.shardId) + ",\"coordinate\":" + coordinateJson(p.coordinate) + ",\"operations_per_second\":" + sjF64Text(p.operationsPerSecond) + ",\"read_ratio\":" + sjF64Text(p.readRatio) + ",\"write_ratio\":" + sjF64Text(p.writeRatio) + ",\"read_latency_us\":" + sjF64Text(p.readLatencyUs) + ",\"write_latency_us\":" + sjF64Text(p.writeLatencyUs) + ",\"cpu_utilization\":" + sjF64Text(p.cpuUtilization) + ",\"memory_utilization\":" + sjF64Text(p.memoryUtilization) + ",\"storage_bytes_per_second\":" + sjU64Text(p.storageBytesPerSecond) + ",\"network_in_bytes_per_second\":" + sjU64Text(p.networkInBytesPerSecond) + ",\"network_out_bytes_per_second\":" + sjU64Text(p.networkOutBytesPerSecond) + ",\"queue_depth\":" + sjU64Text(p.queueDepth) + ",\"cell_breakdown\":" + cellWorkloadMetricsArrayJson(p.cellBreakdown) + ",\"cell_breakdown_partial\":" + sjBoolText(p.cellBreakdownPartial) + ",\"pressure_score\":" + sjF64Text(p.pressureScore) + ",\"pressure\":\"" + pressureLevelVariant(p.pressure) + "\"}"
 
     # ============================================================
     # DEMO / BUILD-CHECK FIXTURES — each proc below hand-traces one piece

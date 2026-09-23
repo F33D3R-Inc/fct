@@ -5,7 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -41,7 +44,7 @@ func (s *Server) compileAPIs() []compiledAPI {
 	out := make([]compiledAPI, 0, len(s.ir.APIs))
 	for _, a := range s.ir.APIs {
 		act := s.byAction[a.Action]
-		if act == nil {
+		if act == nil && a.Dispatch == "" {
 			continue
 		}
 		var segs []string
@@ -205,6 +208,10 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 		apiError(w, http.StatusTooManyRequests, "rate limited")
 		return true
 	}
+	if a.decl.Dispatch != "" {
+		s.serveDispatch(w, r, a.decl)
+		return true
+	}
 
 	// Bind the action's parameters by name.
 	bound := map[string]any{}
@@ -213,16 +220,33 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 			bound[name] = pathVals[i]
 		}
 	}
+	// `auth <scheme> bearer <param>`: the app-issued credential binds from
+	// the Authorization header, and only from there (never the query or body).
+	if a.decl.Bearer != "" {
+		h := r.Header.Get("Authorization")
+		tok := ""
+		if strings.HasPrefix(h, "Bearer ") {
+			tok = strings.TrimSpace(h[len("Bearer "):])
+		}
+		if tok == "" {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			apiError(w, http.StatusUnauthorized, "a bearer token ("+a.decl.Auth+") is required")
+			return true
+		}
+		bound[a.decl.Bearer] = tok
+	}
 	q := r.URL.Query()
 	for _, p := range a.act.Params {
 		if _, ok := bound[p.Name]; ok {
 			continue
 		}
-		if v := q.Get(p.Name); v != "" || q.Has(p.Name) {
+		if p.List && q.Has(p.Name) {
+			bound[p.Name] = q[p.Name] // every repeat of the key, each comma-split by paramArg
+		} else if v := q.Get(p.Name); v != "" || q.Has(p.Name) {
 			bound[p.Name] = v
 		}
 	}
-	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete {
 		if bytesParams(a) != nil {
 			// A `bytes`-typed body parameter uploads a file: the request is
 			// multipart/form-data, not JSON (internal/ir/build.go refuses a
@@ -265,12 +289,12 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 				apiError(w, http.StatusBadRequest, fmt.Sprintf("missing parameter %q", p.Name))
 				return true
 			}
-			args[i] = zero(p.Type)
+			args[i] = nil // absent: the action binds its zero, and given(p) is false
 			continue
 		}
-		cv, ok := coerceParam(v, p.Type)
+		cv, ok := paramArg(v, p)
 		if !ok {
-			apiError(w, http.StatusBadRequest, fmt.Sprintf("parameter %q expects %s", p.Name, p.Type))
+			apiError(w, http.StatusBadRequest, fmt.Sprintf("parameter %q expects %s", p.Name, paramTypeName(p)))
 			return true
 		}
 		args[i] = cv
@@ -296,13 +320,25 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 	if sid == "" && r.Method != http.MethodGet {
 		sid = s.session(w, r)
 	}
-	_, value, status, msg := s.runActionValue(sid, a.act, args)
+	value, after, status, msg, meta := s.runActionReply(sid, a.act, args)
 	if status != http.StatusOK {
-		apiError(w, status, msg)
+		apiErrorCode(w, status, meta.code, msg)
 		return true
+	}
+	okStatus := a.decl.Status
+	if meta.status != 0 {
+		okStatus = meta.status // `return … status N`
+	}
+	setReplyHeaders(w, meta.headers)
+	if sid != "" {
+		s.adoptSession(w, sid, after)
 	}
 	if a.decl.Status == http.StatusNoContent {
 		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	if a.decl.Ret == "bytes" {
+		s.serveFileReply(w, r, toStr(value), okStatus)
 		return true
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -329,15 +365,87 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 			return true
 		}
 	}
-	w.WriteHeader(a.decl.Status)
+	w.WriteHeader(okStatus)
 	w.Write(body)
 	return true
 }
 
+// apiError answers a declared route's failure as the contract's error
+// envelope (APIErrorDTO): `{"error": {"code": …, "message": …}}`, the code
+// the status's own name in snake_case (`not_found`, `unprocessable_entity`)
+// so a client can branch on it without parsing the human message.
 func apiError(w http.ResponseWriter, status int, msg string) {
+	apiErrorCode(w, status, "", msg)
+}
+
+// apiErrorCode is apiError with the app's own error code — a failed check's
+// `code "…"` — in place of the status's name ("" = the status's name).
+func apiErrorCode(w http.ResponseWriter, status int, code, msg string) {
+	if code == "" {
+		code = errorCode(status)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{"error": msg})
+	json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": code, "message": msg}})
+}
+
+// setReplyHeaders applies the response headers a committed action set with
+// `header "Name" expr` (names vetted at compile time, values at run time).
+func setReplyHeaders(w http.ResponseWriter, headers [][2]string) {
+	for _, h := range headers {
+		w.Header().Set(h[0], h[1])
+	}
+}
+
+// errorCode is an HTTP status's name as a snake_case code.
+//
+// Five statuses answer with the name the legacy API already taught its
+// clients instead: a missing session is `unauthenticated`, a throttled call
+// `rate_limited`, an internal failure `server_error`, a failed upstream
+// `upstream_unavailable`, and a missing dependency `unavailable`.
+func errorCode(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "unauthenticated"
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	case http.StatusInternalServerError:
+		return "server_error"
+	case http.StatusBadGateway:
+		return "upstream_unavailable"
+	case http.StatusServiceUnavailable:
+		return "unavailable"
+	}
+	text := http.StatusText(status)
+	if text == "" {
+		return "error"
+	}
+	return strings.ReplaceAll(strings.ToLower(strings.NewReplacer("-", " ", "'", "").Replace(text)), " ", "_")
+}
+
+// serveFileReply answers an action's `-> bytes` reply: the stored file
+// itself, with the Content-Type its name implies, as a private download.
+func (s *Server) serveFileReply(w http.ResponseWriter, r *http.Request, ref string, status int) {
+	durable, ok := mediaDurableRef(ref)
+	if !ok {
+		apiError(w, http.StatusNotFound, "no file")
+		return
+	}
+	name := strings.TrimPrefix(durable, mediaPathPrefix)
+	data, err := os.ReadFile(filepath.Join(s.uploadDir, name))
+	if err != nil {
+		apiError(w, http.StatusNotFound, "no file")
+		return
+	}
+	ct := mime.TypeByExtension(filepath.Ext(name))
+	if ct == "" {
+		ct = http.DetectContentType(data)
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.WriteHeader(status)
+	w.Write(data)
 }
 
 // rateClass answers the limiter a route's rate class meters against, created
@@ -360,4 +468,168 @@ func (s *Server) rateClass(class string) *rateLimiter {
 	l := newRateLimiter(per)
 	s.rateClasses[class] = l
 	return l
+}
+
+// serveDispatch answers a dispatching route (`api POST "/events" -> Mutation`):
+// the body — a JSON object or a form — is one variant of the message, chosen
+// by its tag field; the variant's fields (or their aliases) bind its action's
+// parameters by name, and the action runs under the caller's session with its
+// own gates. Its reply is the response (204 when it has none).
+func (s *Server) serveDispatch(w http.ResponseWriter, r *http.Request, decl ir.API) {
+	var msg *ir.WireMessage
+	for i := range s.ir.Messages {
+		if s.ir.Messages[i].Name == decl.Dispatch {
+			msg = &s.ir.Messages[i]
+		}
+	}
+	if msg == nil {
+		apiError(w, http.StatusInternalServerError, "no such message "+decl.Dispatch)
+		return
+	}
+	body := map[string]any{}
+	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if ct == "application/x-www-form-urlencoded" || ct == "multipart/form-data" {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := r.ParseForm(); err != nil {
+			apiError(w, http.StatusBadRequest, "the request body could not be read")
+			return
+		}
+		for k, vs := range r.PostForm {
+			if len(vs) == 1 {
+				body[k] = vs[0]
+			} else {
+				body[k] = anySlice(vs)
+			}
+		}
+	} else if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil && err.Error() != "EOF" {
+		apiError(w, http.StatusBadRequest, "request body must be a JSON object")
+		return
+	}
+	tag := toStr(body[msg.TagName()])
+	var v *ir.WireMessageVariant
+	for i := range msg.Variants {
+		if msg.Variants[i].WireName() == tag {
+			v = &msg.Variants[i]
+		}
+	}
+	if v == nil {
+		apiError(w, http.StatusBadRequest, fmt.Sprintf("unknown %s %q", msg.TagName(), tag))
+		return
+	}
+	act := s.byAction[v.Action]
+	fields := map[string]ir.WireField{}
+	for _, f := range v.Fields {
+		fields[f.Name] = f
+		if f.Into != "" {
+			// A pattern field (`then_<field>`): every key with the prefix,
+			// the prefix dropped, as one object.
+			prefix := strings.TrimSuffix(f.Name, "<field>")
+			gathered := map[string]any{}
+			for k, x := range body {
+				if strings.HasPrefix(k, prefix) && len(k) > len(prefix) {
+					gathered[strings.TrimPrefix(k, prefix)] = x
+				}
+			}
+			if len(gathered) > 0 {
+				body[f.Into] = gathered
+			}
+		}
+	}
+	args := make([]any, len(act.Params))
+	for i, p := range act.Params {
+		if p.Name == v.BodyParam {
+			args[i] = body // the whole body is this variant's documented object
+			continue
+		}
+		raw, ok := body[p.Name]
+		if f, carried := fields[p.Name]; carried && !ok {
+			for _, alias := range f.Aliases {
+				if raw, ok = body[alias]; ok {
+					break
+				}
+			}
+		}
+		if ok && raw == nil {
+			ok = false
+		}
+		if f, carried := fields[p.Name]; carried && !ok && f.Default != "" {
+			// The variant's own default (`on: bool = true`) for an absent field.
+			var d any
+			if json.Unmarshal([]byte(f.Default), &d) == nil {
+				raw, ok = d, true
+			}
+		}
+		if !ok {
+			if !p.Optional {
+				apiError(w, http.StatusBadRequest, fmt.Sprintf("%s requires %q", tag, p.Name))
+				return
+			}
+			args[i] = nil // absent: the action binds its zero, and given(p) is false
+			continue
+		}
+		if p.Type == "text" && !p.List {
+			// A structured value in a text field (legacy clients send
+			// `rules` / `poll_option_images` as real arrays where the contract
+			// types them as text): bind its JSON text, which the action reads
+			// back with fromJson — the same bytes a string-encoding client sends.
+			switch raw.(type) {
+			case []any, map[string]any:
+				raw = canonicalJSON(raw)
+			}
+		}
+		if str, isText := raw.(string); isText && p.Type == "json" {
+			// A json parameter sent as text (a form can carry only text; a
+			// client may also send the object JSON-encoded): decode it.
+			var decoded any
+			if json.Unmarshal([]byte(str), &decoded) == nil {
+				raw = decoded
+			}
+		}
+		cv, good := paramArg(raw, p)
+		if !good {
+			apiError(w, http.StatusBadRequest, fmt.Sprintf("%s: %q expects %s", tag, p.Name, paramTypeName(p)))
+			return
+		}
+		args[i] = cv
+	}
+	sid := s.sidForRequest(r)
+	if len(act.Requires) > 0 && sid == "" {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		apiError(w, http.StatusUnauthorized, "sign in to call this endpoint")
+		return
+	}
+	if sid == "" {
+		sid = s.session(w, r)
+	}
+	value, after, status, errMsg, meta := s.runActionReply(sid, act, args)
+	if status != http.StatusOK {
+		apiErrorCode(w, status, meta.code, errMsg)
+		return
+	}
+	s.adoptSession(w, sid, after)
+	setReplyHeaders(w, meta.headers)
+	replyStatus := meta.status
+	if act.Ret == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	out, err := json.Marshal(value)
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "reply could not be encoded")
+		return
+	}
+	if replyStatus == 0 {
+		replyStatus = http.StatusOK
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(replyStatus)
+	w.Write(out)
+}
+
+func anySlice(vs []string) []any {
+	out := make([]any, len(vs))
+	for i, v := range vs {
+		out[i] = v
+	}
+	return out
 }

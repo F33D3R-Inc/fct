@@ -265,26 +265,28 @@ func TestShortCircuitTruthTablePreservesResult(t *testing.T) {
 }
 
 // TestShortCircuitTruthTablePreservesResultInFrame is the same
-// correctness-preservation check, but through evalInFrame (the proc-body
-// evaluator) instead of eval() (the action/view evaluator) — the two must
-// never disagree, and both must match applyBin's ground truth when nothing
-// is actually short-circuited away.
+// correctness-preservation check, but through the proc engine (the proc-body
+// evaluator, proccompile.go) instead of eval() (the action/view evaluator) —
+// the two must never disagree, and both must match applyBin's ground truth
+// when nothing is actually short-circuited away.
 func TestShortCircuitTruthTablePreservesResultInFrame(t *testing.T) {
 	lit := func(v bool) *ir.Expr { return &ir.Expr{Kind: "lit", Val: v, VType: "bool"} }
 	bin := func(op string, l, r *ir.Expr) *ir.Expr { return &ir.Expr{Kind: "bin", Op: op, L: l, R: r} }
-	fr := &frame{vars: map[string]any{}}
-	s := &Server{}
+	s := &Server{ir: &ir.IR{}}
 
 	for _, op := range []string{"&&", "||"} {
 		for _, l := range []bool{false, true} {
 			for _, r := range []bool{false, true} {
 				want := applyBin(op, l, r).(bool)
-				got, err := s.evalInFrame(bin(op, lit(l), lit(r)), fr)
+				c := &procCompiler{s: s}
+				c.push()
+				ex := c.expr(bin(op, lit(l), lit(r)))
+				got, err := ex(&pfr{})
 				if err != nil {
-					t.Fatalf("evalInFrame(%v %s %v): unexpected error %v", l, op, r, err)
+					t.Fatalf("proc engine (%v %s %v): unexpected error %v", l, op, r, err)
 				}
 				if got != want {
-					t.Errorf("evalInFrame(%v %s %v) = %v, want %v (applyBin ground truth)", l, op, r, got, want)
+					t.Errorf("proc engine (%v %s %v) = %v, want %v (applyBin ground truth)", l, op, r, got, want)
 				}
 			}
 		}

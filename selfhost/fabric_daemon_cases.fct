@@ -1,0 +1,445 @@
+import "fabric_daemon_control.fct"
+import "fabric_daemon_admin.fct"
+
+app FabricDaemonCases:
+    # Conformance fixtures for the fabric-daemon port. Each mode answers one
+    # line per input line in exactly the text testdata/fabric_check's
+    # `daemon-*` modes print from the real crate (src/daemon.rs), and
+    # fabric_daemon_test.go compares the two. Names are prefixed `dca`.
+
+    proc dcaJoin(parts: [text], sep: text) -> text:
+        let mut out = ""
+        let n = len(parts)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + sep
+            out = out + parts[i]
+            i = i + 1
+        return out
+
+    proc dcaKeyText(k: RoutingKey) -> text:
+        let t = do routingKeyDisplay(k)
+        return t
+
+    # (shard, y, x) ordering, the shard unsigned.
+    proc dcaPlacementBefore(a: Placement, b: Placement) -> bool:
+        if a.shardId != b.shardId:
+            let gt = do sjU64Gt(b.shardId, a.shardId)
+            return gt
+        if a.coordinate.y != b.coordinate.y:
+            return a.coordinate.y < b.coordinate.y
+        return a.coordinate.x < b.coordinate.x
+
+    proc dcaSortedPlacements(ps: [Placement]) -> [Placement]:
+        let mut out = ps
+        let n = len(out)
+        let mut i = 1
+        loop i < n:
+            let mut j = i
+            loop j > 0 && dcaPlacementBefore(out[j], out[j - 1]):
+                let tmp = out[j]
+                out[j] = out[j - 1]
+                out[j - 1] = tmp
+                j = j - 1
+            i = i + 1
+        return out
+
+    # settings_digest in testdata/fabric_check/src/daemon.rs.
+    proc dcaSettingsDigest(s: DaemonSettings) -> text:
+        let mut out = []
+        out = append(out, "data=" + daemonAddrText(s.dataListen))
+        out = append(out, "admin=" + daemonAddrText(s.adminListen))
+        out = append(out, "token=" + s.adminToken)
+        let mut backends = []
+        let nb = len(s.backends)
+        let mut b = 0
+        loop b < nb:
+            let be = s.backends[b]
+            let mut cells = []
+            let nc = len(be.placements)
+            let mut c = 0
+            loop c < nc:
+                let cell = be.placements[c]
+                cells = append(cells, sjU64Text(cell.shard) + "/" + cell.x + "," + cell.y)
+                c = c + 1
+            let mut token = "~"
+            if be.hasToken:
+                token = be.token
+            backends = append(backends, be.id + "|" + be.url + "|" + be.region + "|" + token + "|" + dcaJoin(cells, " "))
+            b = b + 1
+        out = append(out, "backends=[" + dcaJoin(backends, ";") + "]")
+        let mut rules = []
+        let nr = len(s.keyspace.rules)
+        let mut r = 0
+        loop r < nr:
+            let rule = s.keyspace.rules[r]
+            rules = append(rules, rule.kind + " / " + rule.addressPrefix + "* -> " + dcaKeyText(rule.key))
+            r = r + 1
+        out = append(out, "rules=[" + dcaJoin(rules, ";") + "]")
+        let mut fallback = "-"
+        if s.keyspace.hasFallback:
+            fallback = dcaKeyText(s.keyspace.fallback)
+        out = append(out, "fallback=" + fallback)
+        let span = do daemonKeyspaceSpanningKey(s.keyspace)
+        let mut spanText = "-"
+        if span.has:
+            spanText = dcaKeyText(span.key)
+        out = append(out, "span=" + spanText)
+        let placements = do dcaSortedPlacements(topologyRegistryPlacements(s.topology))
+        let mut ps = []
+        let np = len(placements)
+        let mut p = 0
+        loop p < np:
+            let pl = placements[p]
+            ps = append(ps, sjU64Text(pl.shardId) + "/" + pl.coordinate.x + "," + pl.coordinate.y + "@" + pl.dbmsId + "/" + pl.region)
+            p = p + 1
+        out = append(out, "topology=[" + dcaJoin(ps, " ") + "]")
+        let mut pref = s.readPreference.kind
+        if pref == "PreferRegion":
+            pref = "PreferRegion:" + s.readPreference.region
+        out = append(out, "read=" + pref)
+        out = append(out, "cadence=" + sjU64Text(s.cadence.livenessProbeMs) + "," + sjU64Text(s.cadence.telemetryPollMs) + "," + sjU64Text(s.cadence.controlCycleMs))
+        let q = s.policy
+        out = append(out, "policy=" + sjU64Text(q.maxDecisionAgeMs) + "," + sjF64Text(q.minConfidence) + "," + sjU64Text(q.minReplicas) + "," + sjF64Text(q.maxNodeUtilization) + "," + sjU64Text(q.maxConcurrentActions) + "," + sjU64Text(q.maxActionsPerNode) + "," + sjU64Text(q.phaseTimeoutMs) + "," + sjU64Text(q.measurementSettleMs) + "," + sjU64Text(q.measurementDeadlineMs) + "," + sjF64Text(q.outcomeNoiseFloor))
+        out = append(out, "silence=" + sjU64Text(s.silenceBudgetMs))
+        out = append(out, "probe=" + sjU64Text(s.probeTimeoutMs))
+        out = append(out, "capacity=" + sjU64Text(s.placementCapacity))
+        let mut store = "-"
+        if s.hasPlacementStore:
+            store = s.placementStore
+        out = append(out, "store=" + store)
+        out = append(out, "drain=" + sjU64Text(s.drainMs))
+        out = append(out, "cooldown=" + sjU64Text(s.decisionCooldownMs))
+        return dcaJoin(out, " ")
+
+    # A `daemon-config` line: {"text": <config>, "env": [[name, value], ...]};
+    # with `debug`, a resolved Settings answers as its redacted Debug.
+    proc dcaConfigCase(line: text, debug: bool) -> text:
+        let parsed = do sjDecode([sjVecType("Vec<Value>", "value")], line, "value")
+        let textField = do dcaJ(parsed.v, "text")
+        let envField = do dcaJ(parsed.v, "env")
+        let mut names = []
+        let mut values = []
+        if envField.kind == "arr":
+            let n = len(envField.items)
+            let mut k = 0
+            loop k < n:
+                let pair = envField.items[k]
+                names = append(names, pair.items[0].s)
+                values = append(values, pair.items[1].s)
+                k = k + 1
+        let env = do daemonEnvOf(names, values)
+        let file = do daemonParseConfig(textField.s)
+        if !file.ok:
+            return "PARSE\t" + file.err
+        let resolved = do daemonResolveSettings(file.file, env)
+        if !resolved.ok:
+            return "ERR\t" + resolved.err
+        if debug:
+            return "OK\t" + daemonSettingsDebug(resolved.settings)
+        return "OK\t" + dcaSettingsDigest(resolved.settings)
+
+    # A `daemon-status` line: GET /status's body, read back and written again,
+    # then each admin route's body for that snapshot.
+    proc dcaStatusCase(line: text) -> text:
+        let read = do daemonStatusFromJson(line)
+        if !read.ok:
+            return "ERR\t" + read.err
+        let s = read.status
+        return daemonStatusJson(s) + "\t" + daemonBackendsJson(s.backends) + "\t" + daemonPlacementsJson(s.placements) + "\t" + daemonRoutingJson(s) + "\t" + daemonActionsJson(s.inFlight) + "\t" + daemonHistoryJson(s.history)
+
+    # A `daemon-probe` line, `kind|status|error`: `reached|healthy|describe`.
+    proc dcaProbeCase(line: text) -> text:
+        let parts = split(line, "|")
+        let status = toInt(parts[1])
+        let mut error = parts[2]
+        let mut k = 3
+        loop k < len(parts):
+            error = error + "|" + parts[k]
+            k = k + 1
+        let mut p = daemonProbeUnreachable(error)
+        if parts[0] == "Serving":
+            p = daemonProbeServing(status)
+        if parts[0] == "Answering":
+            p = daemonProbeAnswering(status)
+        return "" + daemonProbeReached(p) + "|" + daemonProbeHealthy(p) + "|" + daemonProbeDescribe(p)
+
+    # A `daemon-sweep` line, {"timeout_ms": N, "targets": [[id, url], ...]}:
+    # one real sweep, `id=describe` per target.
+    proc dcaSweepCase(line: text) -> text uses io.net:
+        let v = do sjDecode([sjVecType("Vec<Value>", "value")], line, "value")
+        let timeout = do dcaJ(v.v, "timeout_ms")
+        let ts = do dcaJ(v.v, "targets")
+        let mut targets = []
+        let n = len(ts.items)
+        let mut k = 0
+        loop k < n:
+            targets = append(targets, DaemonProbeTarget{id: ts.items[k].items[0].s, url: ts.items[k].items[1].s})
+            k = k + 1
+        let probes = do daemonSweep(targets, timeout.u)
+        let mut out = []
+        k = 0
+        loop k < n:
+            out = append(out, targets[k].id + "=" + daemonProbeDescribe(probes[k]))
+            k = k + 1
+        return dcaJoin(out, ";")
+
+    # A `daemon-telemetry` line (a config case): the live source built from
+    # the resolved settings and sampled once, `describe|messages|id=note;...`.
+    proc dcaTelemetryCase(line: text) -> text uses io.net:
+        let parsed = do sjDecode([sjVecType("Vec<Value>", "value")], line, "value")
+        let textField = do dcaJ(parsed.v, "text")
+        let envField = do dcaJ(parsed.v, "env")
+        let mut names = []
+        let mut values = []
+        let n = len(envField.items)
+        let mut k = 0
+        loop k < n:
+            names = append(names, envField.items[k].items[0].s)
+            values = append(values, envField.items[k].items[1].s)
+            k = k + 1
+        let resolved = do daemonSettingsFromText("", textField.s, daemonEnvOf(names, values))
+        if !resolved.ok:
+            return "ERR\t" + resolved.err
+        let t = do daemonFacetqlTelemetry(resolved.settings)
+        let sampled = do daemonTelemetrySample(t)
+        let mut notes = []
+        let m = len(sampled.sample.noteIds)
+        let mut j = 0
+        loop j < m:
+            notes = append(notes, sampled.sample.noteIds[j] + "=" + sampled.sample.notes[j])
+            j = j + 1
+        return daemonTelemetryDescribe(sampled.telemetry) + "|" + len(sampled.sample.messages) + "|" + dcaJoin(notes, ";")
+
+    # ---- daemon-control: control.rs driven by a script (see
+    # testdata/fabric_check/src/daemon_control.rs for the same script run
+    # through the crate's own control-loop body) ----
+
+    proc dcaJ(v: SjV, name: text) -> SjV:
+        let n = len(v.keys)
+        let mut k = 0
+        loop k < n:
+            if v.keys[k] == name:
+                return v.items[k]
+            k = k + 1
+        return sjNull()
+
+    proc dcaU(v: SjV, name: text) -> int:
+        let f = do dcaJ(v, name)
+        return f.u
+
+    proc dcaVerdict(v: SjV) -> CopyVerdict:
+        let kind = dcaJ(v, "kind").s
+        if kind == "Verified":
+            return copyVerdictVerified(dcaU(v, "rows"), dcaU(v, "at_ms"))
+        if kind == "Failed":
+            return copyVerdictFailed(dcaJ(v, "reason").s, dcaU(v, "at_ms"))
+        return copyVerdictPending()
+
+    proc dcaMoverReport(v: SjV) -> MoverReport:
+        let resident = do dcaJ(v, "resident")
+        return MoverReport{rowsCopied: dcaU(v, "rows"), bytesCopied: dcaU(v, "bytes"), hasResidentBytes: resident.kind == "num", residentBytes: resident.u, snapshotComplete: dcaJ(v, "snapshot_complete").b, observedWrites: dcaU(v, "observed"), appliedWrites: dcaU(v, "applied"), verdict: dcaVerdict(dcaJ(v, "verdict"))}
+
+    # One scripted cycle: control.rs `cycle` with the sweep and the sample
+    # taken from the step (used only when due, as there), no store.
+    proc dcaCycle(c: DaemonControl, now: int, step: SjV) -> DaemonControl:
+        let mut out = do daemonControlTickClock(c, now)
+        let due = do daemonControlProbeDue(out, now)
+        if due:
+            let ps = do dcaJ(step, "probes")
+            let mut ids = []
+            let mut probes = []
+            let n = len(ps.items)
+            let mut k = 0
+            loop k < n:
+                let p = ps.items[k]
+                ids = append(ids, p.items[0].s)
+                let mut probe = daemonProbeUnreachable("")
+                if p.items[1].s == "Serving":
+                    probe = daemonProbeServing(p.items[2].u)
+                else:
+                    if p.items[1].s == "Answering":
+                        probe = daemonProbeAnswering(p.items[2].u)
+                    else:
+                        probe = daemonProbeUnreachable(p.items[3].s)
+                probes = append(probes, probe)
+                k = k + 1
+            out = daemonControlApplyProbes(out, now, ids, probes)
+        let pollDue = do daemonControlPollDue(out, now)
+        if pollDue:
+            let sv = do dcaJ(step, "sample")
+            let mut sample = do daemonSampleEmpty()
+            let notes = do dcaJ(sv, "notes")
+            let nn = len(notes.items)
+            let mut j = 0
+            loop j < nn:
+                sample.noteIds = append(sample.noteIds, notes.items[j].items[0].s)
+                sample.notes = append(sample.notes, notes.items[j].items[1].s)
+                j = j + 1
+            let messages = do dcaJ(sv, "messages")
+            let nm = len(messages.items)
+            let mut m = 0
+            loop m < nm:
+                let decoded = do protocolDecode(messages.items[m].s)
+                sample.messages = append(sample.messages, decoded.message)
+                m = m + 1
+            out = daemonControlApplySample(out, now, sample)
+        let middle = do daemonControlCycleMiddle(out, now)
+        let finished = do daemonControlFinishCycle(middle.control, now)
+        return finished
+
+    proc dcaAnswer(ok: bool, message: text) -> text:
+        if ok:
+            return "ok:" + message
+        return "err:" + message
+
+    proc dcaReportLines(r: DaemonShutdownReport) -> text:
+        let lines = do daemonShutdownLines(r)
+        return "exit=" + daemonShutdownExitCode(r) + "|" + dcaJoin(lines, "|")
+
+    proc dcaControlCase(line: text) -> text:
+        let parsed = do sjDecode([sjVecType("Vec<Value>", "value")], line, "value")
+        let script = parsed.v
+        let envv = do dcaJ(script, "env")
+        let mut names = []
+        let mut values = []
+        let ne = len(envv.items)
+        let mut e = 0
+        loop e < ne:
+            names = append(names, envv.items[e].items[0].s)
+            values = append(values, envv.items[e].items[1].s)
+            e = e + 1
+        let resolved = do daemonSettingsFromText("", dcaJ(script, "config").s, daemonEnvOf(names, values))
+        if !resolved.ok:
+            return "settings: " + resolved.err
+        let settings = resolved.settings
+        let mut c = do daemonControlNew(settings, dcaJ(script, "telemetry").s, 0, daemonBootstrapDeclared(settings))
+        let mut out = []
+        let steps = do dcaJ(script, "steps")
+        let n = len(steps.items)
+        let mut k = 0
+        loop k < n:
+            let step = steps.items[k]
+            let op = dcaJ(step, "op").s
+            let now = do dcaU(step, "now")
+            if op == "boot":
+                c = daemonControlNew(settings, dcaJ(script, "telemetry").s, now, daemonBootstrapDeclared(settings))
+                out = append(out, "boot")
+            if op == "cycle":
+                c = dcaCycle(c, now, step)
+                out = append(out, daemonStatusJson(c.status))
+            if op == "transfer":
+                let resident = do dcaJ(step, "resident")
+                let atoms = min(dcaU(step, "atoms"), 1)
+                let id = do dcaU(step, "id")
+                let answered = do daemonControlRecordTransfer(c, id, atoms, dcaU(step, "bytes"), resident.kind == "num", resident.u, now)
+                c = answered.control
+                if answered.ok:
+                    let applied = do daemonControlApplyAccepted(c, id)
+                    c = daemonControlPublishStatus(applied.control, now)
+                out = append(out, dcaAnswer(answered.ok, answered.message) + "|" + daemonStatusJson(c.status))
+            if op == "copy":
+                let id2 = do dcaU(step, "id")
+                let answered2 = do daemonControlRecordCopy(c, id2, dcaMoverReport(dcaJ(step, "report")), now)
+                c = answered2.control
+                if answered2.ok:
+                    let applied2 = do daemonControlApplyAccepted(c, id2)
+                    c = daemonControlPublishStatus(applied2.control, now)
+                out = append(out, dcaAnswer(answered2.ok, answered2.message) + "|" + daemonStatusJson(c.status))
+            if op == "abort":
+                let answered3 = do daemonControlAbort(c, dcaU(step, "id"))
+                let published = do daemonControlPublishRouting(answered3.control)
+                c = daemonControlPublishStatus(published.control, now)
+                out = append(out, dcaAnswer(answered3.ok, answered3.message) + "|" + daemonStatusJson(c.status))
+            if op == "drain":
+                let begun = do daemonControlDrainBegin(c, now)
+                c = begun.control
+                let mut last = now
+                let cycles = do dcaJ(step, "cycles")
+                let nc = len(cycles.items)
+                let mut j = 0
+                let mut stop = false
+                loop j < nc && !stop:
+                    let at = do dcaU(cycles.items[j], "now")
+                    let unfinished = do daemonControlDrainUnfinished(c)
+                    if !unfinished || !sjU64Gt(begun.deadlineMs, at):
+                        stop = true
+                    else:
+                        c = dcaCycle(c, at, cycles.items[j])
+                        last = at
+                    j = j + 1
+                let reported = do daemonControlDrainReport(c, begun.report)
+                let report = do daemonDrainFinishStore(c, reported)
+                let published2 = do daemonControlPublishRouting(c)
+                c = daemonControlPublishStatus(published2.control, last)
+                out = append(out, dcaReportLines(report) + "|" + daemonStatusJson(c.status))
+            k = k + 1
+        return dcaJoin(out, "\t")
+
+    # A `daemon-admin` line: one request to the operator port, the loop
+    # answering as the case says; `status|content-type|allow|body|asked`.
+    proc dcaAdminCase(line: text) -> text:
+        let parsed = do sjDecode([sjVecType("Vec<Value>", "value")], line, "value")
+        let v = parsed.v
+        let snapshot = do daemonStatusFromJson(dcaJ(v, "status").s)
+        let hv = do dcaJ(v, "headers")
+        let mut headers = []
+        let mut k = 0
+        loop k < len(hv.items):
+            headers = append(headers, HttpHeader{name: hv.items[k].items[0].s, value: hv.items[k].items[1].s})
+            k = k + 1
+        let req = DaemonAdminRequest{method: dcaJ(v, "method").s, target: dcaJ(v, "path").s, headers: headers, body: dcaJ(v, "body").s}
+        let routed = do daemonAdminRoute(req, snapshot.status, dcaJ(v, "token").s)
+        let mut response = routed.response
+        let mut asked = "-"
+        if routed.ask:
+            let a = routed.request
+            if a.kind == "Abort":
+                asked = "Abort " + sjU64Text(a.id)
+            else:
+                let mut resident = "None"
+                if a.hasResident:
+                    resident = "Some(" + sjU64Text(a.residentBytes) + ")"
+                asked = "Transfer " + sjU64Text(a.id) + " " + a.atomsCopied + " " + sjU64Text(a.bytesCopied) + " " + resident
+            let reply = do dcaJ(v, "reply")
+            let mut kind = reply.s
+            let mut message = ""
+            if reply.kind == "obj":
+                kind = reply.keys[0]
+                message = reply.items[0].s
+            if kind == "stopped":
+                asked = "-"
+            response = daemonAdminAnswer(kind, message)
+        return "" + response.status + "|" + response.contentType + "|" + response.allow + "|" + sjQuote(response.body) + "|" + asked
+
+    proc dcaRun(mode: text, input: text) -> text uses io.net:
+        let lines = split(input, "\n")
+        let mut out = []
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            if mode == "daemon-config":
+                out = append(out, dcaConfigCase(lines[i], false))
+            if mode == "daemon-probe":
+                out = append(out, dcaProbeCase(lines[i]))
+            if mode == "daemon-sweep":
+                out = append(out, dcaSweepCase(lines[i]))
+            if mode == "daemon-telemetry":
+                out = append(out, dcaTelemetryCase(lines[i]))
+            if mode == "daemon-control":
+                out = append(out, dcaControlCase(lines[i]))
+            if mode == "daemon-admin":
+                out = append(out, dcaAdminCase(lines[i]))
+            if mode == "daemon-status":
+                out = append(out, dcaStatusCase(lines[i]))
+            if mode == "daemon-settings-debug":
+                out = append(out, dcaConfigCase(lines[i], true))
+            i = i + 1
+        return dcaJoin(out, "\n")
+
+    state daemonCaseOut: text = ""
+
+    action runDaemonCases(mode: text, input: text):
+        let out = do dcaRun(mode, input)
+        daemonCaseOut = out

@@ -2,130 +2,21 @@ import "fabric_core.fct"
 import "fabric_telemetry.fct"
 
 app FabricMlSelfHost:
-    # Self-hosting port of fabric/crates/fabric-ml/src/ IN FULL — features.rs
-    # (58L: WorkloadFeatures + its one `From<&WorkloadProfile>` conversion)
-    # and predictor.rs (147L: HotspotPrediction, AnomalyScore,
-    # WorkloadPredictor + its four real methods: predict_hotspot,
-    # detect_anomaly, and their two private helpers hotspot_probability/
-    # anomaly_score, plus the public threshold() getter). lib.rs (8L) is
-    # just re-exports, nothing to port. Both files read in full before
-    # writing a line here; no method or field was skipped. `cargo test -p
-    # fabric-ml --lib` confirmed: 0 tests exist in this crate (no
-    # `#[cfg(test)]` module anywhere), so every check below is a hand-trace
-    # against the real Rust source, not a pre-existing test port.
+    # Port of fabric/crates/fabric-ml/src: features.rs (WorkloadFeatures and
+    # its From<&WorkloadProfile>) and predictor.rs (HotspotPrediction with
+    # its threshold, AnomalyScore, WorkloadPredictor: new/default,
+    # predict_hotspot, detect_anomaly, threshold, and the private
+    # hotspot_probability/anomaly_score), with each type's serde shape.
+    # predictor.rs's three #[test]s are ported input for input in
+    # fabric_leaf_a_test.go (ml digest).
     #
-    # ============================================================
-    # IMPORTANT CORRECTION TO THIS TASK'S OWN BRIEF — fabric-workload is
-    # NOT untouched.
-    # ============================================================
-    # This task's brief describes `fabric-workload` (profile.rs 145L +
-    # analyzer.rs 80L + lib.rs 11L) as "fully untouched" and asks for it to
-    # be ported together with fabric-ml in one new file. That is incorrect:
-    # `fct/selfhost/fabric_telemetry.fct` (read in full before writing this
-    # file, per this task's own instruction) already ports fabric-workload
-    # COMPLETELY — its own header says so explicitly ("PLUS fabric/crates/
-    # fabric-workload/src/ in full — analyzer.rs (81L: WorkloadKey,
-    # WorkloadAnalyzer) and profile.rs (146L: PressureLevel, WorkloadProfile,
-    # WorkloadProfile::from_metrics + its private calculate_pressure)"), and
-    # line-by-line comparison against the real Rust confirms every field,
-    # every method, and every boundary condition is present there:
-    #   - `PressureLevel::from_score`      -> `pressureLevelFromScore`
-    #   - `WorkloadProfile::from_metrics`  -> `workloadProfileFromMetrics`
-    #     (private `calculate_pressure`   -> `workloadPressureScore`)
-    #   - `WorkloadProfile::is_hot`        -> `workloadProfileIsHot`
-    #   - `WorkloadKey::new`               -> `workloadKeyNew` (+ `Eq`/`Hash`
-    #     stand-in `workloadKeyEquals`, since this language has no derived
-    #     trait machinery)
-    #   - `WorkloadAnalyzer::{new,observe,profile,hot_coordinates,profiles,
-    #     len,is_empty}` -> `workloadAnalyzer{New,Observe,Profile,
-    #     HotCoordinates,Profiles,Len,IsEmpty}`, `HashMap<WorkloadKey,
-    #     WorkloadProfile>` restated as the linear-scan `[WorkloadProfileEntry]`
-    #     this directory's own established convention already uses elsewhere.
-    # `fabric-workload` and `fabric-telemetry`'s "analyzer" concerns are, on
-    # inspection, THE SAME real thing, not two distinct crates covering
-    # different concerns: `fabric-workload` is not an independent leaf with
-    # its own subject matter — it is entirely telemetry's own consumer,
-    # built on nothing but `fabric_telemetry::{Observation, WorkloadMetrics,
-    # CellWorkloadMetrics}` read at their exact real shape (grepped directly
-    # in fabric-workload/src/{analyzer,profile}.rs: no other crate is
-    # imported besides `fabric_core` for `Coordinate`/`Shard`). That is
-    # exactly the reasoning fabric_telemetry.fct's own header already gives
-    # for combining the two crates into one file, and having read both
-    # crates independently for this task, that reasoning holds up.
+    # `u64 as f64` is sjU64Float (fabric_json), `f64::clamp` is
+    # fabric_telemetry's clampFloat (NaN passes through) and `f64::max` its
+    # f64Max (a NaN side yields the other side).
     #
-    # So there is no fabric-workload logic left to port, and this file does
-    # NOT duplicate `WorkloadKey`/`WorkloadAnalyzer`/`PressureLevel`/
-    # `WorkloadProfile::from_metrics` — that would be exact rework of
-    # already-correct, already-verified code, forbidden by this task's own
-    # root-solutions rule. This file is named `fabric_ml.fct`, not
-    # `fabric_workload.fct`, so it does not claim to contain a port it does
-    # not: it ports ONLY the genuinely unported crate, fabric-ml.
-    #
-    # ============================================================
-    # WHY A SEPARATE FILE, NOT MERGED INTO fabric_telemetry.fct
-    # ============================================================
-    # This task's own brief leaves the split/combine choice to judgment.
-    # Unlike fabric-workload's relationship to fabric-telemetry (identical
-    # shape, zero narrowing, the same real concern), fabric-ml IS a
-    # genuinely distinct concern from telemetry/workload: it is a baseline
-    # PREDICTION model (`WorkloadPredictor::{predict_hotspot,detect_anomaly}`)
-    # that reads a `WorkloadProfile` as input but computes its own separate
-    # numerical feature vector and its own separate scoring formulas found
-    # nowhere in fabric-telemetry or fabric-workload. Since this task's
-    # instructions were not to edit fabric_telemetry.fct, and since this
-    # directory's established convention has no cross-file `import`
-    # (confirmed again here, same as fabric_telemetry.fct's own header
-    # already confirmed for fabric_routing.fct/fabric_replication.fct), a
-    # separate `fabric_ml.fct` is the only option that (a) does not touch
-    # the already-correct existing file and (b) does not force a fake
-    # single-file merge of two files' unrelated demo/state sections. The
-    # cost is the same one every other file in this directory already pays:
-    # `Coordinate` and `WorkloadProfile`'s exact shape are restated below,
-    # field-for-field identical to fabric_telemetry.fct's own copies (which
-    # are themselves the real Rust shape) — the SAME "no import mechanism
-    # exists, so every file owns its own copy" convention fabric_core.fct's
-    # and fabric_routing.fct's own headers already establish for
-    # `Coordinate` itself.
-    #
-    # ============================================================
-    # REPRESENTATION CHOICES
-    # ============================================================
-    # `WorkloadProfile` here is NOT narrowed the way fabric_telemetry.fct's
-    # own `ObservationShard` deliberately narrows `Shard` — every real field
-    # `fabric_workload::WorkloadProfile` carries is restated here too (even
-    # `cellBreakdown`/`cellBreakdownPartial`/`pressure`, which
-    # `WorkloadFeatures::from` never reads), because `WorkloadPredictor::
-    # predict_hotspot`/`detect_anomaly` take the real type BY REFERENCE, not
-    # a hand-picked subset of it — narrowing the input type itself (as
-    # opposed to narrowing which of its fields get read internally) would be
-    # a real, dishonest divergence from the actual function signature, not
-    # an honest one like `ObservationShard`'s documented case.
-    #
-    # `WorkloadFeatures`'s three `u64`-as-`f64` casts (`storage_bytes_per_
-    # second as f64`, `network_in_bytes_per_second as f64`,
-    # `network_out_bytes_per_second as f64`) and its `queue_depth as f64`
-    # cast are all `toFloat(...)`, this language's int-to-float conversion
-    # builtin (already used the same way in fabric_telemetry.fct's own
-    # `toFloat(m.queueDepth)`).
-    #
-    # `f64::clamp`/`f64::max` (no clamp builtin, per fabric_telemetry.fct's
-    # own header) are restated via the identical `clampFloat(v, lo, hi) =
-    # max(lo, min(v, hi))` helper fabric_telemetry.fct already defines —
-    # duplicated here rather than imported, for the same no-cross-file-
-    # import reason as `Coordinate`/`WorkloadProfile` above.
-    #
-    # ONE GENUINE, HONEST OBSERVATION about the real Rust logic itself (not
-    # a porting gap): `WorkloadPredictor.hotspot_threshold` — set by `new()`/
-    # `Default` and readable via `threshold()` — is NEVER actually consulted
-    # by `hotspot_probability` or by `HotspotPrediction::is_likely_hot`
-    # (which hardcodes its own `>= 0.80` literal, independent of whatever
-    # threshold the predictor was constructed with). This is exactly what
-    # the real source does — verified by reading predictor.rs's full body,
-    # not a porting mistake — so `workloadPredictorHotspotThreshold` is
-    # restated as a plain stored-and-returned field with no effect on
-    # `workloadPredictorPredictHotspot`'s own math, matching the real
-    # (apparently unfinished/baseline) behavior exactly rather than "fixing"
-    # it into a threshold that actually gates something.
+    # `HotspotPrediction` carries the `threshold` its predictor judged it
+    # by, and `is_likely_hot` is `probability >= threshold` — the predictor's
+    # configured threshold gates the decision, exactly as predictor.rs does.
 
     # ============================================================
     # SHARED SHAPE — Coordinate is fabric_core.fct's own and
@@ -164,7 +55,7 @@ app FabricMlSelfHost:
     # `queue_depth` are the four fields cast `as f64`; every other field
     # copies straight through unchanged, same as the real struct literal.
     proc workloadFeaturesFromProfile(profile: WorkloadProfile) -> WorkloadFeatures:
-        return WorkloadFeatures{coordinate: profile.coordinate, operationsPerSecond: profile.operationsPerSecond, readRatio: profile.readRatio, writeRatio: profile.writeRatio, readLatencyUs: profile.readLatencyUs, writeLatencyUs: profile.writeLatencyUs, cpuUtilization: profile.cpuUtilization, memoryUtilization: profile.memoryUtilization, storageBytesPerSecond: toFloat(profile.storageBytesPerSecond), networkInBytesPerSecond: toFloat(profile.networkInBytesPerSecond), networkOutBytesPerSecond: toFloat(profile.networkOutBytesPerSecond), queueDepth: toFloat(profile.queueDepth), pressureScore: profile.pressureScore}
+        return WorkloadFeatures{coordinate: profile.coordinate, operationsPerSecond: profile.operationsPerSecond, readRatio: profile.readRatio, writeRatio: profile.writeRatio, readLatencyUs: profile.readLatencyUs, writeLatencyUs: profile.writeLatencyUs, cpuUtilization: profile.cpuUtilization, memoryUtilization: profile.memoryUtilization, storageBytesPerSecond: sjU64Float(profile.storageBytesPerSecond), networkInBytesPerSecond: sjU64Float(profile.networkInBytesPerSecond), networkOutBytesPerSecond: sjU64Float(profile.networkOutBytesPerSecond), queueDepth: sjU64Float(profile.queueDepth), pressureScore: profile.pressureScore}
 
     # ============================================================
     # predictor.rs — HotspotPrediction, AnomalyScore, WorkloadPredictor.
@@ -172,11 +63,14 @@ app FabricMlSelfHost:
     struct HotspotPrediction:
         coordinate: Coordinate
         probability: float
+        # The predictor's own hotspot_threshold, carried so is_likely_hot
+        # answers against the threshold that produced the probability.
+        threshold: float
 
-    # hotspotPredictionIsLikelyHot: hardcoded `>= 0.80`, independent of any
-    # predictor's own configurable threshold — see this file's header.
+    # hotspotPredictionIsLikelyHot: against the threshold the prediction
+    # carries (predictor.rs `probability >= threshold`).
     proc hotspotPredictionIsLikelyHot(p: HotspotPrediction) -> bool:
-        return p.probability >= 0.80
+        return p.probability >= p.threshold
 
     struct AnomalyScore:
         coordinate: Coordinate
@@ -206,7 +100,7 @@ app FabricMlSelfHost:
     # `self.hotspot_threshold` at all, exactly like the real method body.
     proc workloadPredictorHotspotProbability(features: WorkloadFeatures) -> float:
         let pressure = features.pressureScore
-        let worstLatency = max(features.readLatencyUs, features.writeLatencyUs)
+        let worstLatency = f64Max(features.readLatencyUs, features.writeLatencyUs)
         let latencyRaw = worstLatency / 100000.0
         let latencyPressure = do clampFloat(latencyRaw, 0.0, 1.0)
         let queueRaw = features.queueDepth / 10000.0
@@ -220,7 +114,7 @@ app FabricMlSelfHost:
     proc workloadPredictorPredictHotspot(predictor: WorkloadPredictor, profile: WorkloadProfile) -> HotspotPrediction:
         let features = do workloadFeaturesFromProfile(profile)
         let probability = do workloadPredictorHotspotProbability(features)
-        return HotspotPrediction{coordinate: features.coordinate, probability: probability}
+        return HotspotPrediction{coordinate: features.coordinate, probability: probability, threshold: predictor.hotspotThreshold}
 
     # workloadPredictorAnomalyScore: private `anomaly_score` — four
     # over-threshold terms (cpu over 0.80 scaled by 0.20, memory over 0.80
@@ -230,14 +124,14 @@ app FabricMlSelfHost:
     # clamped), weighted 0.30/0.20/0.25/0.25 and summed, then clamped once.
     proc workloadPredictorAnomalyScore(features: WorkloadFeatures) -> float:
         let cpuRaw = (features.cpuUtilization - 0.80) / 0.20
-        let cpuAnomaly = max(cpuRaw, 0.0)
+        let cpuAnomaly = f64Max(cpuRaw, 0.0)
         let memoryRaw = (features.memoryUtilization - 0.80) / 0.20
-        let memoryAnomaly = max(memoryRaw, 0.0)
+        let memoryAnomaly = f64Max(memoryRaw, 0.0)
         let queueRaw = (features.queueDepth - 10000.0) / 10000.0
-        let queueAnomaly = max(queueRaw, 0.0)
-        let latency = max(features.readLatencyUs, features.writeLatencyUs)
+        let queueAnomaly = f64Max(queueRaw, 0.0)
+        let latency = f64Max(features.readLatencyUs, features.writeLatencyUs)
         let latencyRaw = (latency - 50000.0) / 50000.0
-        let latencyAnomaly = max(latencyRaw, 0.0)
+        let latencyAnomaly = f64Max(latencyRaw, 0.0)
         let score = (cpuAnomaly * 0.30) + (memoryAnomaly * 0.20) + (queueAnomaly * 0.25) + (latencyAnomaly * 0.25)
         let clamped = do clampFloat(score, 0.0, 1.0)
         return clamped
@@ -262,12 +156,24 @@ app FabricMlSelfHost:
     # can assert against a human-readable expected value without that
     # unrelated float-formatting noise; it changes nothing about the ported
     # logic itself.
-    proc floatApproxEquals(a: float, b: float) -> bool:
+    private proc floatApproxEquals(a: float, b: float) -> bool:
         let diff = abs(a - b)
         return diff < 0.0000001
 
     # workloadProfileZero is fabric_telemetry.fct's own (imported above),
     # not redeclared here — identical shape confirmed before this dedup.
+
+    # ============================================================
+    # SERDE SHAPES — serde_json::to_string of each derived type
+    # ============================================================
+    proc workloadFeaturesJson(f: WorkloadFeatures) -> text:
+        return "{\"coordinate\":" + coordinateJson(f.coordinate) + ",\"operations_per_second\":" + sjF64Text(f.operationsPerSecond) + ",\"read_ratio\":" + sjF64Text(f.readRatio) + ",\"write_ratio\":" + sjF64Text(f.writeRatio) + ",\"read_latency_us\":" + sjF64Text(f.readLatencyUs) + ",\"write_latency_us\":" + sjF64Text(f.writeLatencyUs) + ",\"cpu_utilization\":" + sjF64Text(f.cpuUtilization) + ",\"memory_utilization\":" + sjF64Text(f.memoryUtilization) + ",\"storage_bytes_per_second\":" + sjF64Text(f.storageBytesPerSecond) + ",\"network_in_bytes_per_second\":" + sjF64Text(f.networkInBytesPerSecond) + ",\"network_out_bytes_per_second\":" + sjF64Text(f.networkOutBytesPerSecond) + ",\"queue_depth\":" + sjF64Text(f.queueDepth) + ",\"pressure_score\":" + sjF64Text(f.pressureScore) + "}"
+
+    proc hotspotPredictionJson(p: HotspotPrediction) -> text:
+        return "{\"coordinate\":" + coordinateJson(p.coordinate) + ",\"probability\":" + sjF64Text(p.probability) + ",\"threshold\":" + sjF64Text(p.threshold) + "}"
+
+    proc anomalyScoreJson(a: AnomalyScore) -> text:
+        return "{\"coordinate\":" + coordinateJson(a.coordinate) + ",\"score\":" + sjF64Text(a.score) + "}"
 
     # ============================================================
     # DEMO / BUILD-CHECK FIXTURES — each proc below hand-traces one piece
@@ -299,8 +205,8 @@ app FabricMlSelfHost:
     # latencyPressure=max(50000,30000)/100000=0.5, queuePressure=5000/10000
     # =0.5, resourcePressure=0.90*0.6+0.50*0.4=0.74. probability =
     # 0.64*0.45 + 0.5*0.15 + 0.5*0.20 + 0.74*0.20
-    #           = 0.288 + 0.075 + 0.10 + 0.148 = 0.611, below the hardcoded
-    # 0.80 is_likely_hot line -> not likely hot.
+    #           = 0.288 + 0.075 + 0.10 + 0.148 = 0.611, below the default
+    # 0.75 threshold -> not likely hot.
     proc demoPredictHotspotModerate() -> bool:
         let profile = WorkloadProfile{shardId: 42, coordinate: Coordinate{x: 3, y: 4}, operationsPerSecond: 400.0, readRatio: 0.75, writeRatio: 0.25, readLatencyUs: 50000.0, writeLatencyUs: 30000.0, cpuUtilization: 0.90, memoryUtilization: 0.50, storageBytesPerSecond: 7, networkInBytesPerSecond: 8, networkOutBytesPerSecond: 9, queueDepth: 5000, cellBreakdown: [], cellBreakdownPartial: false, pressureScore: 0.64, pressure: "elevated"}
         let predictor = do workloadPredictorDefault()
@@ -330,7 +236,7 @@ app FabricMlSelfHost:
     # queuePressure=20000/10000=2.0 -> clamp 1.0, resourcePressure=
     # 1.0*0.6+1.0*0.4=1.0. probability = 1.0*0.45+1.0*0.15+1.0*0.20+1.0*0.20
     # = 1.0 exactly, clamp is a no-op here but IS exercised on the
-    # pre-clamp per-term values above. is_likely_hot: 1.0 >= 0.80 -> true.
+    # pre-clamp per-term values above. is_likely_hot: 1.0 >= 0.75 -> true.
     # anomaly: cpuAnomaly=(1.0-0.80)/0.20=1.0, memoryAnomaly=1.0,
     # queueAnomaly=(20000-10000)/10000=1.0, latency=200000, latencyAnomaly=
     # (200000-50000)/50000=3.0 (unclamped per-term, per the real source).

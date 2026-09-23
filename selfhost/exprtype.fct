@@ -1,0 +1,603 @@
+import "expr_tokens.fct"
+
+app ExprTypeSelfHost:
+    # exprtype.fct — self-hosted port of internal/ir/types.go: the static
+    # type of an expression outside a proc (exprType), what may be assigned
+    # to what (assignable, with money/date/entity ids unified to int and an
+    # enum to text), and the checks built on them — a component's value
+    # argument against its parameter (checkArgType), a wire literal's field
+    # values against the type's schema (checkWireLits /
+    # checkWireFieldValue), a derive's definition and call arguments against
+    # its declaration. Like the Go, an expression whose type cannot be
+    # proved is "unknown" and constrains nothing.
+    #
+    # A type is written as its label: `int`, `Post`, `[text]`; "" is
+    # unknown. TyEnv holds the program's typed names (parallel lists, keyed
+    # "Owner.field" where a field belongs to a declaration); TyScope the
+    # locals in scope with a known type, and the `let x = call …` binds
+    # that hold a record (build.go's locRecords).
+    struct VT:
+        core: text
+        list: bool
+
+    struct TyEnv:
+        stateNames: [text]
+        stateTypes: [text]
+        entityNames: [text]
+        fieldKeys: [text]
+        fieldTypes: [text]
+        enumNames: [text]
+        recordNames: [text]
+        recFieldKeys: [text]
+        recFieldTypes: [text]
+        wireNames: [text]
+        wireFieldKeys: [text]
+        wireFieldTypes: [text]
+        procNames: [text]
+        procRets: [text]
+        deriveNames: [text]
+        deriveRets: [text]
+        # deriveParams: per parameterized derive, its parameters as
+        # "name|type|list" entries joined by ",".
+        deriveParams: [text]
+        inlineNames: [text]
+        inlineTypes: [text]
+
+    struct TyScope:
+        names: [text]
+        types: [text]
+        recNames: [text]
+        recTypes: [text]
+
+    proc tyEmptyEnv() -> TyEnv:
+        return TyEnv{stateNames: [], stateTypes: [], entityNames: [], fieldKeys: [], fieldTypes: [], enumNames: [], recordNames: [], recFieldKeys: [], recFieldTypes: [], wireNames: [], wireFieldKeys: [], wireFieldTypes: [], procNames: [], procRets: [], deriveNames: [], deriveRets: [], deriveParams: [], inlineNames: [], inlineTypes: []}
+
+    proc tyEmptyScope() -> TyScope:
+        return TyScope{names: [], types: [], recNames: [], recTypes: []}
+
+    proc tyUnknown() -> VT:
+        return VT{core: "", list: false}
+
+    proc tyOf(core: text) -> VT:
+        return VT{core: core, list: false}
+
+    proc tyParse(label: text) -> VT:
+        if len(label) >= 2 && charAt(label, 0) == "[":
+            return VT{core: slice(label, 1, len(label) - 1), list: true}
+        return VT{core: label, list: false}
+
+    proc tyLabel(t: VT) -> text:
+        if t.list:
+            return "[" + t.core + "]"
+        return t.core
+
+    proc tyKnown(t: VT) -> bool:
+        return t.core != ""
+
+    proc tyEq(a: VT, b: VT) -> bool:
+        return a.core == b.core && a.list == b.list
+
+    # tyLookup: the value parallel to key in keys, "" when absent (the last
+    # entry wins, as a map assignment would).
+    proc tyLookup(keys: [text], vals: [text], key: text) -> text:
+        let mut i = len(keys) - 1
+        loop i >= 0:
+            if keys[i] == key:
+                return vals[i]
+            i = i - 1
+        return ""
+
+    proc tyHas(keys: [text], key: text) -> bool:
+        return key in keys
+
+    # tyScopeWith: sc with name bound to type label t (replacing a binding
+    # of the same name).
+    proc tyScopeWith(sc: TyScope, name: text, t: text) -> TyScope:
+        return TyScope{names: append(sc.names, name), types: append(sc.types, t), recNames: sc.recNames, recTypes: sc.recTypes}
+
+    proc tyIsPrimitive(core: text) -> bool:
+        return core in ["int", "text", "bool", "money", "date", "float", "datetime"]
+
+    # tyUnify: unify — money and date are ints, an entity (its id) is an
+    # int, an enum is text.
+    proc tyUnify(te: TyEnv, core: text) -> text:
+        if core == "money" || core == "date":
+            return "int"
+        if core == "":
+            return ""
+        if core in te.enumNames:
+            return "text"
+        if core in te.entityNames:
+            return "int"
+        return core
+
+    proc tyAssignable(te: TyEnv, got: VT, want: VT) -> bool:
+        if got.core == "" || want.core == "":
+            return true
+        if got.list != want.list:
+            return false
+        let g = do tyUnify(te, got.core)
+        let w = do tyUnify(te, want.core)
+        return g == w || w == "text"
+
+    proc tyNumeric(te: TyEnv, t: VT) -> VT:
+        let u = do tyUnify(te, t.core)
+        if t.list || u != "int":
+            return VT{core: "", list: false}
+        return t
+
+    proc tyArith(te: TyEnv, l0: VT, r0: VT) -> VT:
+        let l = do tyNumeric(te, l0)
+        let r = do tyNumeric(te, r0)
+        if l.core == r.core && l.list == r.list:
+            return l
+        if l.core != "" && r.core != "":
+            return VT{core: "int", list: false}
+        return VT{core: "", list: false}
+
+    # tyDeclType: declType — a declared type the language has (a primitive,
+    # an enum, an entity), unknown otherwise.
+    proc tyDeclType(te: TyEnv, core: text, list: bool) -> VT:
+        let prim = do tyIsPrimitive(core)
+        if !prim && !(core in te.enumNames) && !(core in te.entityNames):
+            return VT{core: "", list: false}
+        return VT{core: core, list: list}
+
+    proc tyEntityField(te: TyEnv, entity: text, field: text) -> text:
+        if field == "id":
+            let has = do tyHas(te.fieldKeys, entity + ".id")
+            if !has:
+                return "int"
+        let t = do tyLookup(te.fieldKeys, te.fieldTypes, entity + "." + field)
+        return t
+
+    # tyExpr: exprType.
+    proc tyExpr(te: TyEnv, n: ExprNode, sc: TyScope) -> VT:
+        let unknown = VT{core: "", list: false}
+        let k = n.kind
+        if k == "int" || k == "text" || k == "bool":
+            return VT{core: k, list: false}
+        if k == "ref":
+            let name = n.text
+            if name in sc.names:
+                let lt = do tyLookup(sc.names, sc.types, name)
+                let pv = do tyParse(lt)
+                return pv
+            if name in te.stateNames:
+                let st = do tyLookup(te.stateNames, te.stateTypes, name)
+                let ps = do tyParse(st)
+                return ps
+            if name in te.inlineNames:
+                # inlineType is the declared type text as the core, as
+                # build.go records it (vtype{core: d.Type}).
+                let it = do tyLookup(te.inlineNames, te.inlineTypes, name)
+                return VT{core: it, list: false}
+            if name in ["actor", "role", "tenantRole", "route", "session", "sessionToken"]:
+                return VT{core: "text", list: false}
+            if name == "verified":
+                return VT{core: "bool", list: false}
+            if name == "tenant":
+                return VT{core: "int", list: false}
+            return unknown
+        if k == "astate":
+            if n.text == "failed":
+                return VT{core: "text", list: false}
+            return VT{core: "bool", list: false}
+        if k == "get":
+            let obj = n.children[0]
+            if obj.kind == "ref":
+                if obj.text in te.enumNames:
+                    return VT{core: obj.text, list: false}
+                if obj.text in sc.recNames:
+                    let rb = do tyLookup(sc.recNames, sc.recTypes, obj.text)
+                    let rt = do tyParse(rb)
+                    if !rt.list:
+                        let ft = do tyLookup(te.recFieldKeys, te.recFieldTypes, rt.core + "." + n.text)
+                        let pf = do tyParse(ft)
+                        return pf
+            let ot = do tyExpr(te, obj, sc)
+            if ot.core != "" && !ot.list && (ot.core in te.entityNames):
+                let ef = do tyEntityField(te, ot.core, n.text)
+                return VT{core: ef, list: false}
+            return unknown
+        if k == "entityGet":
+            if n.field == "":
+                return VT{core: n.text, list: false}
+            let eg = do tyEntityField(te, n.text, n.field)
+            return VT{core: eg, list: false}
+        if k == "agg":
+            let op = n.text
+            if op == "count":
+                return VT{core: "int", list: false}
+            if op == "exists":
+                return VT{core: "bool", list: false}
+            if op == "list":
+                if len(n.sel) > 0:
+                    let inner = do tyScopeWith(sc, n.itemVar, n.coll)
+                    let vt = do tyExpr(te, n.sel[0], inner)
+                    return VT{core: vt.core, list: true}
+                return VT{core: n.coll, list: true}
+            if len(n.sel) > 0:
+                let inner2 = do tyScopeWith(sc, n.itemVar, n.coll)
+                let st2 = do tyExpr(te, n.sel[0], inner2)
+                return st2
+            let af = do tyEntityField(te, n.coll, n.field)
+            return VT{core: af, list: false}
+        if k == "call":
+            let name = n.text
+            if name in te.procNames:
+                let pr = do tyLookup(te.procNames, te.procRets, name)
+                let pp = do tyParse(pr)
+                return pp
+            if name in te.deriveNames:
+                let dr = do tyLookup(te.deriveNames, te.deriveRets, name)
+                let pd = do tyParse(dr)
+                return pd
+            if name in ["upper", "lower", "trim", "ago", "compact", "commas", "take", "replace", "slug", "money", "totpSecret", "randomToken", "join", "sha256Hex", "canonicalJson", "formatIn", "fileDigest"]:
+                return VT{core: "text", list: false}
+            if name == "toMoney":
+                return VT{core: "money", list: false}
+            if name in ["contains", "verifyPassword", "totpValid", "given", "ed25519Verify", "ecdsaP256Verify", "zoneValid"]:
+                return VT{core: "bool", list: false}
+            if name == "iso":
+                return VT{core: "datetime", list: false}
+            if name in ["fromIso", "fromLocal", "len", "year", "month", "day", "rand"]:
+                return VT{core: "int", list: false}
+            if name == "fromJson":
+                return VT{core: "json", list: false}
+            if name == "first":
+                if len(n.children) == 1:
+                    let lt2 = do tyExpr(te, n.children[0], sc)
+                    if lt2.list:
+                        return VT{core: lt2.core, list: false}
+                return unknown
+            if name == "shuffleOrder":
+                return VT{core: "int", list: true}
+            if name == "now":
+                return VT{core: "date", list: false}
+            if name == "abs" || name == "floor" || name == "round":
+                if len(n.children) == 1:
+                    let a1 = do tyExpr(te, n.children[0], sc)
+                    let na = do tyNumeric(te, a1)
+                    return na
+                return unknown
+            if name == "min" || name == "max":
+                if len(n.children) != 2:
+                    return unknown
+                let x0 = do tyExpr(te, n.children[0], sc)
+                let x1 = do tyExpr(te, n.children[1], sc)
+                let a = do tyNumeric(te, x0)
+                let b = do tyNumeric(te, x1)
+                if a.core == b.core && a.list == b.list:
+                    return a
+                if a.core != "" && b.core != "":
+                    return VT{core: "int", list: false}
+            return unknown
+        if k == "index":
+            let ixt = do tyExpr(te, n.children[0], sc)
+            if ixt.list:
+                return VT{core: ixt.core, list: false}
+            if ixt.core == "json":
+                return VT{core: "json", list: false}
+            return unknown
+        if k == "struct":
+            if n.text in te.wireNames:
+                return VT{core: n.text, list: false}
+            return unknown
+        if k == "list":
+            let ne = len(n.children)
+            let mut el = unknown
+            let mut i = 0
+            loop i < ne:
+                let xt = do tyExpr(te, n.children[i], sc)
+                if i == 0:
+                    el = xt
+                else:
+                    if xt.core != el.core || xt.list != el.list:
+                        return unknown
+                i = i + 1
+            if el.core == "" || el.list:
+                return unknown
+            return VT{core: el.core, list: true}
+        if k == "bin":
+            let op = n.text
+            if op in ["==", "!=", "<", "<=", ">", ">=", "&&", "||", "in"]:
+                return VT{core: "bool", list: false}
+            if op == "+":
+                let l = do tyExpr(te, n.children[0], sc)
+                let r = do tyExpr(te, n.children[1], sc)
+                if l.list && r.list:
+                    return l
+                let ul = do tyUnify(te, l.core)
+                let ur = do tyUnify(te, r.core)
+                if (l.core != "" && !l.list && ul == "text") || (r.core != "" && !r.list && ur == "text"):
+                    return VT{core: "text", list: false}
+                let ar = do tyArith(te, l, r)
+                return ar
+            if op in ["-", "*", "/", "%"]:
+                let l2 = do tyExpr(te, n.children[0], sc)
+                let r2 = do tyExpr(te, n.children[1], sc)
+                let ar2 = do tyArith(te, l2, r2)
+                return ar2
+            return unknown
+        if k == "un":
+            if n.text == "!":
+                return VT{core: "bool", list: false}
+            if n.text == "-":
+                let ux = do tyExpr(te, n.children[0], sc)
+                let nu = do tyNumeric(te, ux)
+                return nu
+        return unknown
+
+    # tyIsRowExpr: isRowExpr — a local typed as a row (of entity, when
+    # given), or `Entity(key)` itself.
+    proc tyIsRowExpr(n: ExprNode, sc: TyScope, entity: text) -> bool:
+        if n.kind == "ref":
+            if !(n.text in sc.names):
+                return false
+            let lt = do tyLookup(sc.names, sc.types, n.text)
+            let vt = do tyParse(lt)
+            let prim = do tyIsPrimitive(vt.core)
+            return !vt.list && vt.core != "" && (entity == "" || vt.core == entity) && !prim
+        if n.kind == "entityGet":
+            return n.field == "" && (entity == "" || n.text == entity)
+        return false
+
+    proc tyIdOrType(got: VT) -> text:
+        if got.core == "int":
+            return "an int"
+        let l = do tyLabel(got)
+        return "a " + l
+
+    # tyDescribeArg: describeArg.
+    proc tyDescribeArg(n: ExprNode, got: VT) -> text:
+        if n.kind == "get" && n.children[0].kind == "ref":
+            let r = n.children[0].text
+            if got.core != "":
+                let io = do tyIdOrType(got)
+                return "`" + r + "." + n.text + "`, " + io
+            return "`" + r + "." + n.text + "`"
+        if n.kind == "int" || n.kind == "text" || n.kind == "bool" || n.kind == "float":
+            return "the literal " + n.text
+        if n.kind == "ref":
+            let io2 = do tyIdOrType(got)
+            return "`" + n.text + "`, " + io2
+        if n.kind == "entityGet":
+            let io3 = do tyIdOrType(got)
+            return "`" + n.text + "(…)." + n.field + "`, " + io3
+        if got.core != "":
+            let l = do tyLabel(got)
+            return l
+        return "an expression"
+
+    # tyArgDiag: checkArgType for component `use` argument i (1-based in
+    # the message).
+    proc tyArgDiag(te: TyEnv, comp: text, pname: text, ptype: text, plist: bool, i: int, arg: ExprNode, sc: TyScope) -> text:
+        let want = do tyDeclType(te, ptype, plist)
+        let got = do tyExpr(te, arg, sc)
+        let ok = do tyAssignable(te, got, want)
+        if !ok:
+            let wl = do tyLabel(want)
+            let gl = do tyLabel(got)
+            return "component \"" + comp + "\" parameter \"" + pname + "\" is " + wl + ", but argument " + (i + 1) + " is " + gl
+        if want.core != "" && !want.list && (want.core in te.entityNames):
+            let row = do tyIsRowExpr(arg, sc, want.core)
+            if !row:
+                let da = do tyDescribeArg(arg, got)
+                return "component \"" + comp + "\" parameter \"" + pname + "\" is a " + want.core + " row, but argument " + (i + 1) + " (" + da + ") is not one — pass the row itself, the variable a `for x in " + want.core + "` binds, not its id"
+        return ""
+
+    # tyDeriveArgDiag: checkDeriveArg — a bare local with no recorded type
+    # may be a row and is accepted.
+    proc tyDeriveArgDiag(te: TyEnv, name: text, pname: text, ptype: text, plist: bool, i: int, arg: ExprNode, sc: TyScope) -> text:
+        let want = do tyDeclType(te, ptype, plist)
+        let got = do tyExpr(te, arg, sc)
+        let ok = do tyAssignable(te, got, want)
+        if !ok:
+            let wl = do tyLabel(want)
+            let gl = do tyLabel(got)
+            return "derive \"" + name + "\" parameter \"" + pname + "\" is " + wl + ", but argument " + (i + 1) + " is " + gl
+        if want.core != "" && !want.list && (want.core in te.entityNames):
+            let row = do tyIsRowExpr(arg, sc, want.core)
+            if !row:
+                if arg.kind == "ref" && !(arg.text in sc.names):
+                    return ""
+                let da = do tyDescribeArg(arg, got)
+                return "derive \"" + name + "\" parameter \"" + pname + "\" is a " + want.core + " row, but argument " + (i + 1) + " (" + da + ") is not one — pass the row itself (the variable a `list(… in " + want.core + " …)` binds, or `" + want.core + "(id)`), not its id"
+        return ""
+
+    # tyDeriveArgsDiag: checkDeriveArgs — every call of a parameterized
+    # derive in the expression, each argument against its parameter, an
+    # aggregate's row variable typed inside it.
+    proc tyDeriveArgsDiag(te: TyEnv, n: ExprNode, sc: TyScope) -> text:
+        let k = n.kind
+        if k == "call":
+            if n.text in te.deriveNames:
+                let enc = do tyLookup(te.deriveNames, te.deriveParams, n.text)
+                let mut ps = []
+                if enc != "":
+                    ps = split(enc, ",")
+                if len(ps) == len(n.children):
+                    let np = len(ps)
+                    let mut i = 0
+                    loop i < np:
+                        let f = split(ps[i], "|")
+                        let d = do tyDeriveArgDiag(te, n.text, f[0], f[1], f[2] == "L", i, n.children[i], sc)
+                        if d != "":
+                            return d
+                        i = i + 1
+            let nc = len(n.children)
+            let mut j = 0
+            loop j < nc:
+                let d2 = do tyDeriveArgsDiag(te, n.children[j], sc)
+                if d2 != "":
+                    return d2
+                j = j + 1
+            return ""
+        if k == "agg":
+            let mut inner = sc
+            if n.itemVar != "":
+                inner = do tyScopeWith(sc, n.itemVar, n.coll)
+            let subs = [n.whereClause, n.sel]
+            let mut s = 0
+            loop s < 2:
+                let xs = subs[s]
+                let nx = len(xs)
+                let mut x = 0
+                loop x < nx:
+                    let d3 = do tyDeriveArgsDiag(te, xs[x], inner)
+                    if d3 != "":
+                        return d3
+                    x = x + 1
+                s = s + 1
+            let nl = len(n.limit)
+            let mut l = 0
+            loop l < nl:
+                let d4 = do tyDeriveArgsDiag(te, n.limit[l], sc)
+                if d4 != "":
+                    return d4
+                l = l + 1
+            return ""
+        if k == "get" || k == "entityGet" || k == "bin" || k == "un" || k == "list":
+            let nc2 = len(n.children)
+            let mut m = 0
+            loop m < nc2:
+                let d5 = do tyDeriveArgsDiag(te, n.children[m], sc)
+                if d5 != "":
+                    return d5
+                m = m + 1
+            return ""
+        if k == "struct":
+            let npr = len(n.pairs)
+            let mut q = 0
+            loop q < npr:
+                let d6 = do tyDeriveArgsDiag(te, n.pairs[q].value, sc)
+                if d6 != "":
+                    return d6
+                q = q + 1
+        return ""
+
+    # tyWireFieldDiag: checkWireFieldValue — one field of a wire literal.
+    proc tyWireFieldDiag(te: TyEnv, typ: text, fname: text, value: ExprNode, sc: TyScope) -> text:
+        let key = typ + "." + fname
+        if !(key in te.wireFieldKeys):
+            return ""
+        let wl = do tyLookup(te.wireFieldKeys, te.wireFieldTypes, key)
+        let want = do tyParse(wl)
+        if value.kind == "list" && !want.list && want.core != "json":
+            return typ + "." + fname + " is one value (a " + want.core + "), but this value is a list"
+        let got = do tyExpr(te, value, sc)
+        if got.core == "":
+            return ""
+        if got.list != want.list:
+            if want.core == "json":
+                return ""
+            let mut wWhat = "one value"
+            if want.list:
+                wWhat = "a list"
+            let mut gWhat = "one value"
+            if got.list:
+                gWhat = "a list"
+            return typ + "." + fname + " is " + wWhat + ", but this value is " + gWhat
+        let ug = do tyUnify(te, got.core)
+        if want.core == "datetime":
+            if ug in ["text", "int", "money", "date"]:
+                return typ + "." + fname + " is an instant (datetime, RFC 3339 on the wire) — fill it with iso(<unix seconds>), not a " + got.core
+        let kw = do tyJsonKind(te, want.core)
+        let kg = do tyJsonKind(te, got.core)
+        if want.core != "datetime" && kw != "" && kg != "" && kw != kg:
+            return typ + "." + fname + " is a " + kw + " on the wire, but this value is a " + kg
+        if (want.core in te.wireNames) && (got.core in te.wireNames) && want.core != got.core:
+            return typ + "." + fname + " is a " + want.core + ", but this value is a " + got.core
+        return ""
+
+    proc tyJsonKind(te: TyEnv, core: text) -> text:
+        let u = do tyUnify(te, core)
+        if u in ["int", "money", "number", "float", "date"]:
+            return "number"
+        if u == "text":
+            return "string"
+        if u == "bool":
+            return "boolean"
+        return ""
+
+    # tyWireLitsDiag: checkWireLits — every wire-type literal in the
+    # expression: each field named exists, is set once, and holds a value
+    # of its type; an aggregate's row variable is typed inside it.
+    proc tyWireLitsDiag(te: TyEnv, n: ExprNode, sc: TyScope) -> text:
+        let k = n.kind
+        if k == "struct":
+            if n.text in te.wireNames:
+                let mut seen = []
+                let np = len(n.pairs)
+                let mut i = 0
+                loop i < np:
+                    let fname = n.pairs[i].key.text
+                    let has = do tyHas(te.wireFieldKeys, n.text + "." + fname)
+                    if !has:
+                        return "type \"" + n.text + "\" has no field \"" + fname + "\""
+                    if fname in seen:
+                        return "field \"" + fname + "\" set twice in a " + n.text + "{...} literal"
+                    seen = append(seen, fname)
+                    let fd = do tyWireFieldDiag(te, n.text, fname, n.pairs[i].value, sc)
+                    if fd != "":
+                        return fd
+                    let sub = do tyWireLitsDiag(te, n.pairs[i].value, sc)
+                    if sub != "":
+                        return sub
+                    i = i + 1
+            return ""
+        if k == "bin" || k == "un" || k == "get" || k == "entityGet" || k == "call" || k == "list":
+            let nc = len(n.children)
+            let mut j = 0
+            loop j < nc:
+                let d = do tyWireLitsDiag(te, n.children[j], sc)
+                if d != "":
+                    return d
+                j = j + 1
+            return ""
+        if k == "agg":
+            let mut inner = sc
+            if n.itemVar != "":
+                inner = do tyScopeWith(sc, n.itemVar, n.coll)
+            let subs = [n.whereClause, n.sel, n.limit]
+            let mut s = 0
+            loop s < 3:
+                let xs = subs[s]
+                let nx = len(xs)
+                let mut x = 0
+                loop x < nx:
+                    let d2 = do tyWireLitsDiag(te, xs[x], inner)
+                    if d2 != "":
+                        return d2
+                    x = x + 1
+                s = s + 1
+        return ""
+
+    # tyRecordFieldDiag: checkBuiltins' record rule — `v.field` on a
+    # `let`-bound record names a field it has, and a list of records must be
+    # iterated first.
+    proc tyRecordFieldDiag(te: TyEnv, n: ExprNode, sc: TyScope) -> text:
+        if n.kind != "get" || n.children[0].kind != "ref":
+            return ""
+        let r = n.children[0].text
+        if r in te.enumNames:
+            return ""
+        if !(r in sc.recNames):
+            return ""
+        let rb = do tyLookup(sc.recNames, sc.recTypes, r)
+        let rt = do tyParse(rb)
+        if rt.list:
+            return "\"" + r + "\" is a list of " + rt.core + " — access a field on one element, not the whole list"
+        let has = do tyHas(te.recFieldKeys, rt.core + "." + n.text)
+        if !has:
+            return "record " + rt.core + " has no field \"" + n.text + "\""
+        return ""
+
+    state exprTypeOut: text = ""
+
+    action runExprType():
+        exprTypeOut = "ok"
+
+    view ExprTypeHome at "/exprtype":
+        text "{exprTypeOut}"

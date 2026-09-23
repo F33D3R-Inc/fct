@@ -176,3 +176,29 @@ func TestBytesDeclarationErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestBytesFillIntListStructField: a byte buffer is an [int] whose writes are
+// range-checked, so it fills an `[int]` struct field — the same thing it
+// already does for a `-> [int]` proc return — while a field of any other
+// element type still refuses it.
+func TestBytesFillIntListStructField(t *testing.T) {
+	ok := `app A:
+    struct Frame:
+        payload: [int]
+    proc mk(n: int) -> Frame:
+        let mut buf = bytes(n)
+        buf[0] = 7
+        return Frame{payload: buf}
+    state result: int = 0
+    action run:
+        result = 1
+`
+	if _, err := String(ok); err != nil {
+		t.Fatalf("bytes into an [int] field refused: %v", err)
+	}
+	bad := strings.Replace(ok, "payload: [int]", "payload: [text]", 1)
+	_, err := String(bad)
+	if err == nil || !strings.Contains(err.Error(), `field "payload" of Frame{...} wants [text], got bytes`) {
+		t.Fatalf("bytes into a [text] field: want a refusal, got %v", err)
+	}
+}

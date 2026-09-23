@@ -197,7 +197,7 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			return v
 		}
 		switch t.Name {
-		case "actor", "role", "tenantRole", "route", "session":
+		case "actor", "role", "tenantRole", "route", "session", "sessionToken":
 			return vtype{core: "text"}
 		case "verified":
 			return vtype{core: "bool"}
@@ -266,6 +266,12 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 		}
 
 	case ast.Call:
+		if sig, ok := e.procSigs[t.Name]; ok { // a proc call is its declared return type
+			return vtype{core: sig.ret, list: sig.retList}
+		}
+		if fn, ok := e.deriveFns[t.Name]; ok { // a projection is its declared type
+			return fn.ret
+		}
 		switch t.Name {
 		case "upper", "lower", "trim", "ago", "compact", "commas", "take", "replace", "slug":
 			return vtype{core: "text"}
@@ -277,8 +283,41 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			// toMoney()'s the inverse: it *parses* text into a money amount, so
 			// (unlike money()) the money type is what it returns, not what it reads.
 			return vtype{core: "money"}
-		case "contains":
+		case "contains", "verifyPassword", "totpValid":
 			return vtype{core: "bool"}
+		case "totpSecret", "randomToken":
+			return vtype{core: "text"}
+		case "iso":
+			return vtype{core: "datetime"}
+		case "fromIso":
+			return vtype{core: "int"}
+		case "join":
+			return vtype{core: "text"}
+		case "fromJson":
+			return vtype{core: "json"}
+		case "given":
+			return vtype{core: "bool"}
+		case "first":
+			// The element type of the list it is handed.
+			if len(t.Args) == 1 {
+				if lt := e.exprType(t.Args[0], sc); lt.list {
+					return vtype{core: lt.core}
+				}
+			}
+		case "ed25519Verify", "ecdsaP256Verify":
+			return vtype{core: "bool"}
+		case "sha256Hex", "canonicalJson":
+			return vtype{core: "text"}
+		case "shuffleOrder":
+			return vtype{core: "int", list: true}
+		case "fromLocal":
+			return vtype{core: "int"}
+		case "formatIn":
+			return vtype{core: "text"}
+		case "zoneValid":
+			return vtype{core: "bool"}
+		case "fileDigest":
+			return vtype{core: "text"}
 		case "len", "year", "month", "day", "rand":
 			return vtype{core: "int"}
 		case "now":
@@ -302,6 +341,23 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			if a.known() && b.known() {
 				return vtype{core: "int"}
 			}
+		}
+
+	case ast.Index:
+		// A list's element, or a json value's member (json again).
+		ot := e.exprType(t.Obj, sc)
+		if ot.list {
+			return vtype{core: ot.core}
+		}
+		if ot.core == "json" {
+			return vtype{core: "json"}
+		}
+
+	case ast.StructLit:
+		// A wire-type literal is a value of that type (a proc-local struct never
+		// reaches a view expression — see checkNoIndex).
+		if e.wireTypes[t.Type] {
+			return vtype{core: t.Type}
 		}
 
 	case ast.ListLit:
@@ -331,6 +387,10 @@ func (e *env) exprType(ex ast.Expr, sc scope) vtype {
 			// `+` is concatenation when either side is text and addition otherwise —
 			// the same disjunction eval.go makes at runtime.
 			l, r := e.exprType(t.L, sc), e.exprType(t.R, sc)
+			if l.list && r.list {
+				// `a + b` over two lists joins them, left then right.
+				return l
+			}
 			if (l.known() && !l.list && e.unify(l.core) == "text") || (r.known() && !r.list && e.unify(r.core) == "text") {
 				return vtype{core: "text"}
 			}

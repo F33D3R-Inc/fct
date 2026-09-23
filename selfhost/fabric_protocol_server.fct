@@ -1,0 +1,164 @@
+import "fabric_protocol.fct"
+import "http_server.fct"
+
+app FabricProtocolServer:
+    # Port of fabric/crates/fabric-protocol's HTTP listener: the router and
+    # auth middleware in src/transport.rs (`router`, `message`,
+    # `require_token`) and the `facet-protocol` binary (src/bin/
+    # facet-protocol.rs). Run it as a command:
+    #
+    #   FABRIC_PROTOCOL_TOKEN=... facet exec selfhost/fabric_protocol_server.fct
+    #
+    # The answers are axum 0.8's, status for status and byte for byte: a
+    # route_layer'd token check on /v1/message (so an unauthorized request is
+    # refused before its method or body is looked at, and a refused non-POST
+    # still carries `allow: POST`), then the Json extractor's content-type
+    # check (415), its 2 MiB body limit (413) and its serde errors (400 for
+    # syntax/EOF, 422 for data, each prefixed with serde_path_to_error's
+    # path), then ProtocolServer::handle.
+
+    proc protocolServerAddress() -> text:
+        return "127.0.0.1"
+
+    proc protocolServerPort() -> int:
+        return 7700
+
+    # axum's DefaultBodyLimit.
+    proc protocolServerBodyLimit() -> int:
+        return 2097152
+
+    # `HeaderValue::to_str`: visible ASCII and tab only, else no value.
+    proc protocolServerHeaderText(value: text) -> text:
+        let bs = textToBytes(value)
+        let mut i = 0
+        loop i < len(bs):
+            let b = bs[i]
+            if !(b == 9 || (b >= 32 && b < 127)):
+                return ""
+            i = i + 1
+        return value
+
+    # The first `x-api-key` header, as `HeaderMap::get` sees it.
+    proc protocolServerPresented(headers: [HttpHeader]) -> text:
+        let mut i = 0
+        loop i < len(headers):
+            if headers[i].name == "x-api-key":
+                let v = do protocolServerHeaderText(headers[i].value)
+                return v
+            i = i + 1
+        return ""
+
+    # axum's `json_content_type`: the header parses as a mime type whose type
+    # is `application` and whose subtype is `json` or has a `+json` suffix.
+    proc protocolServerIsJson(headers: [HttpHeader]) -> bool:
+        let raw = httpHeaderValue(headers, "content-type")
+        if !httpHasHeader(headers, "content-type"):
+            return false
+        let visible = do protocolServerHeaderText(raw)
+        if visible == "":
+            return false
+        let parts = split(visible, ";")
+        let essence = lower(trim(parts[0]))
+        let halves = split(essence, "/")
+        if len(halves) != 2:
+            return false
+        let kind = halves[0]
+        let sub = halves[1]
+        if kind != "application" || sub == "":
+            return false
+        if sub == "json":
+            return true
+        let plus = split(sub, "+")
+        return len(plus) >= 2 && plus[len(plus) - 1] == "json" && plus[0] != ""
+
+    proc protocolServerEmpty(status: int, headers: [HttpHeader]) -> HttpServerResponse:
+        return HttpServerResponse{status: status, reason: "", headers: headers, body: ""}
+
+    # route: the router for one request. tooLarge says the body exceeded the
+    # server's own read limit and was not read.
+    proc protocolServerRoute(req: HttpServerRequest, token: text, tooLarge: bool) -> HttpServerResponse:
+        if req.path != "/v1/message":
+            let notFound = do protocolServerEmpty(404, [])
+            return notFound
+        let presented = do protocolServerPresented(req.headers)
+        let allowed = do protocolAuthorized(presented, token)
+        if !allowed:
+            let refused = do httpServerPlain(401, "missing or invalid x-api-key\n")
+            if req.method != "POST":
+                return HttpServerResponse{status: 401, reason: "", headers: refused.headers + [HttpHeader{name: "allow", value: "POST"}], body: refused.body}
+            return refused
+        if req.method != "POST":
+            let notAllowed = do protocolServerEmpty(405, [HttpHeader{name: "allow", value: "POST"}])
+            return notAllowed
+        let isJson = do protocolServerIsJson(req.headers)
+        if !isJson:
+            let unsupported = do httpServerPlain(415, "Expected request with `Content-Type: application/json`")
+            return unsupported
+        let limit = do protocolServerBodyLimit()
+        if tooLarge || len(textToBytes(req.body)) > limit:
+            let large = do httpServerPlain(413, "Failed to buffer the request body: length limit exceeded")
+            return large
+        let d = sjDecode(protoSchema(), req.body, "FabricMessage")
+        if !d.ok:
+            let mut detail = d.err
+            if d.path != "":
+                detail = d.path + ": " + d.err
+            if d.category == "data":
+                let unprocessable = do httpServerPlain(422, "Failed to deserialize the JSON body into the target type: " + detail)
+                return unprocessable
+            let bad = do httpServerPlain(400, "Failed to parse the request body as JSON: " + detail)
+            return bad
+        let message = protoMessageOf(d.v)
+        let response = do protocolHandle(message)
+        let body = do protocolEncode(response)
+        return HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "application/json"}], body: body}
+
+    proc protocolServerServeConn(c: int, token: text) uses io.net.listen:
+        let limit = do protocolServerBodyLimit()
+        let mut pending = []
+        let mut open = true
+        let mut closed = false
+        loop open:
+            let req = do httpServerReadRequest(c, pending, limit)
+            if req.state == 0:
+                open = false
+            else:
+                if req.state == -1:
+                    let refused = do httpServerRefuse(c, 400, req.err)
+                    closed = true
+                    open = false
+                else:
+                    let tooLarge = req.state == -2
+                    let answer = do protocolServerRoute(req, token, tooLarge)
+                    let keep = do httpServerKeepAlive(req)
+                    # A body over the limit was never read, so the connection
+                    # cannot carry another request; like hyper, the answer
+                    # itself does not say so, and the rest is drained.
+                    let stay = keep && !tooLarge
+                    let wrote = do httpServerWriteResponse(c, req.method, answer, keep)
+                    if tooLarge:
+                        let lingered = do httpServerLingerClose(c)
+                        closed = true
+                        open = false
+                    else:
+                        pending = req.rest
+                        open = wrote && stay
+        if !closed:
+            let done = closeConn(c)
+
+    # main: facet-protocol.rs — refuse to serve without a credential, then
+    # listen on 127.0.0.1:7700 and serve every connection concurrently.
+    proc main(args: [text]) -> int uses io.net.listen, io.console, io.env:
+        let tokenName = do protocolTokenEnv()
+        let token = envVar(tokenName)
+        if token == "":
+            writeStderr("facet-protocol: environment variable " + tokenName + " is not set: this listener accepts node registrations, heartbeats, topology and telemetry reports, so it is never served unauthenticated\n")
+            return 1
+        let address = do protocolServerAddress()
+        let port = do protocolServerPort()
+        writeStdout("Facet Protocol listening on " + address + ":" + port + "\n")
+        let l = listenOn(address, port)
+        loop true:
+            let c = accept(l)
+            detach protocolServerServeConn(c, token)
+        return 0

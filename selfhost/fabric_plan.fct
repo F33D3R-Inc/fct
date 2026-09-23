@@ -1,700 +1,166 @@
 import "fabric.fct"
+import "fabric_json.fct"
 
 app FabricPlanSelfHost:
-    # Self-hosting port of fabric/crates/fabric-facetql/src/frontdoor/plan.rs
-    # — the front door's request-CLASSIFICATION logic: given an HTTP method,
-    # path, query string and body, plus the declared Keyspace (ported in
-    # fabric.fct, imported above), decide whether a request is Colocated
-    # (forward to the one backend every key it touches resolves to),
-    # Broadcast (send to every backend, with or without requiring agreement),
-    # Subscribe (fan-in every backend's SSE stream), or Refuse (there is no
-    # correct answer through a router, and every refusal names why).
+    # Self-hosting port of fabric/crates/fabric-facetql/src/frontdoor/plan.rs:
+    # classify one FacetQL request (method, raw path, raw query, raw body)
+    # against the declared Keyspace (fabric.fct's keyspace port) as
+    # Colocated, Broadcast, Subscribe or Refuse.
     #
-    # ============================================================
-    # WHY THIS FILE, AND WHY SEPARATE FROM fabric.fct:
-    # ============================================================
-    # fabric.fct's own header calls this module out by name: "frontdoor/
-    # plan.rs (the module keyspace.rs feeds) is ALSO pure and arguably more
-    # central, but it is ~980 lines dispatching on axum's Method/HTTP path/
-    # route-specific body shapes for every one of FacetQL's ~30 routes...
-    # sized for a port of its own, not a shared file with something else."
-    # This file is that port. It imports fabric.fct rather than duplicating
-    # it, reusing three things directly: the `RoutingRule` struct, the
-    # packed-int `RoutingKey` convention (`shard_id * 156 +
-    # coordinate.index()`), and — most importantly — the actual matching
-    # ALGORITHM (`ruleIndexForKind`/`ruleIndexForAddress`/
-    # `spanningKeyPresent`) that `Keyspace::resolve`/`spanning_key` are built
-    # from. This file does not re-derive longest-prefix-match; it calls
-    # fabric.fct's own procs for it, exactly as the real `plan()` calls the
-    # real `Keyspace::resolve` once per request and refuses to second-guess
-    # it. (fabric.fct's own two higher-level procs, `keyspaceResolveStatus`/
-    # `keyspaceResolveKey`, are NOT reused directly: they collapse the
-    # `Inconsistent` case to a single status code and lose the two
-    # DIFFERING keys a `Refusal::Keyspace(Inconsistent{by_kind, by_address,
-    # ..})` message needs to print both of. `planKeyspaceResolve`, below,
-    # re-derives `Keyspace::resolve`'s exact match using the same
-    # `ruleIndexForKind`/`ruleIndexForAddress` primitives, just wired to a
-    # richer result shape — new orchestration over old algorithm, not a
-    # second copy of the algorithm.)
+    # The body is read exactly as plan.rs reads it: serde_json::from_slice
+    # into a Value (fabric_json.fct: serde_json's own parser, so a
+    # MalformedBody refusal carries serde_json's own error text and
+    # position, and a repeated key keeps its last value), then
+    # `.get(name).and_then(as_str)` / `as_array`. Path segments are
+    # percent_encoding::percent_decode_str(..).decode_utf8() (any byte, with
+    # std's Utf8Error text on invalid UTF-8); query values are
+    # decode_utf8_lossy (U+FFFD per maximal invalid subpart).
     #
-    # ============================================================
-    # A REAL GAP THIS PORT HAD TO SOLVE FOR REAL: JSON AND PERCENT-DECODING
-    # ============================================================
-    # `plan()` reads the route-specific parts of a JSON request body
-    # (`serde_json::Value`, `.get(name).and_then(Value::as_str)`, iterating
-    # `operations`/`addresses` arrays) and percent-decodes the URL path and
-    # query string. `facet lang` has no JSON type and no
-    # `replace`/percent-decode/`chr`/`ord` builtin (LANGUAGE.md's builtin
-    # list, checked fresh: `abs, ago, channel, charAt, commas, compact,
-    # contains, day, floor, httpGet, httpPost, len, lower, max, min, money,
-    # month, now, rand, readFile, recv, round, send, slice, split, take,
-    # toFloat, toInt, trim, upper, writeFile, year` — nothing JSON- or
-    # byte-decode-shaped). Rather than fake this ("assume the body already
-    # has the field we want" or "skip body-dependent routes"), this file
-    # writes the real, small pieces of both a request actually needs:
-    #   - A recursive-descent JSON validator/skipper (`planJsonSkipValue`
-    #     and friends) that recognizes every JSON value shape (string,
-    #     number, true/false/null, array, object) well enough to (a)
-    #     confirm a body is syntactically valid JSON at all — matching
-    #     `serde_json::from_slice::<Value>`'s own "parses to exactly one
-    #     value, nothing trailing but whitespace" contract — and (b) walk
-    #     an object's members or an array's elements to find/extract exactly
-    #     the string/array fields `plan.rs` itself ever reads
-    #     (`planJsonObjectStringField`, `planJsonObjectArrayField`). This is
-    #     a real, general JSON grammar recognizer, not a fixed-shape scanner
-    #     that only works for the exact bodies this file's own demo fixtures
-    #     use — it is exercised on nested objects/arrays/numbers/booleans in
-    #     the transaction demo below (`"set":{}`, `"x":0`, `"public":false`)
-    #     purely as VALUES TO SKIP, which is exactly the shape `plan.rs`
-    #     itself never inspects either (it only ever reads `type`/`kind`/
-    #     `address`/`from`/`to`/`channel`/`addresses`/`operations`).
-    #   - A percent-decoder (`planPercentDecodeSegment`, path segments;
-    #     `planPercentDecodeLossy`, query values) built on a 128-entry
-    #     lookup table (`planAsciiTable`) mapping every byte 0..127 to its
-    #     one-character text value via a `\u00XX` escape literal per entry —
-    #     `internal/parser/expr.go`'s `unquote`/`unquoteText` call Go's own
-    #     `strconv.Unquote` on the raw source text (confirmed by reading
-    #     `parser.go` directly, not assumed), so a fct string literal
-    #     supports the FULL Go escape grammar, `\uXXXX` included, and this
-    #     table is exactly `chr()` for the ASCII range, built at zero
-    #     runtime cost from literals rather than a builtin this language
-    #     does not have.
-    #
-    # ============================================================
-    # HONESTLY DEFERRED, NOT FAKED: NON-ASCII PERCENT-DECODING
-    # ============================================================
-    # `percent_encoding::percent_decode_str(..).decode_utf8()` decodes
-    # arbitrary multi-byte UTF-8 sequences from `%XX` groups (a real `Post:é`
-    # address, say). Building that in fct would need either a codepoint ->
-    # character builtin beyond the 0..127 `\uXXXX` table above (there isn't
-    # one — this is a real, confirmed language gap, exactly the kind
-    # LANGUAGE.md says to name rather than route around) or a literal table
-    # covering every one of Unicode's ~1.1 million code points, which is not
-    # a serious option. This port's percent-decoder therefore succeeds for
-    # `%XX` where the decoded byte is 0..127 (every ASCII character,
-    # including the `:` in `Post%3A17`, which is the one case `plan.rs`'s own
-    # tests actually exercise) and refuses — rather than silently
-    # mis-decoding — a `%XX` whose byte is 128..255, exactly the honest
-    # "port for real or flag what's deferred" split this task calls for.
-    # `query_param`'s own decode is `decode_utf8_lossy` (never fails) in the
-    # real source; this port's mirror (`planPercentDecodeLossy`) matches the
-    # "never fails" half by leaving an undecodable `%XX` in the output
-    # verbatim rather than replacing it with U+FFFD, which is a smaller,
-    # clearly-scoped approximation of the "lossy" behavior (query params in
-    # every route this file dispatches on are ASCII kind/limit/cursor values
-    # in practice; this only differs from Rust on a query value containing a
-    # literal, un-decodable, high-byte percent escape).
-    #
-    # ============================================================
-    # REPRESENTATION — every Rust enum here becomes a real named struct with
-    # a numeric `code`/`kind` discriminant field plus every variant's own
-    # payload fields (meaningful only for the matching code) — the exact
-    # convention fabric.fct's own `MigrationState`/`ReplicaEntry` already
-    # use for the identical reason (a proc returns one scalar, so a sum type
-    # with variant-specific payloads restates as one flat struct), never an
-    # opaque arena-of-ints or magic-number-tag trick: every field below has a
-    # real name and a comment saying which code it belongs to.
-    #   - `RouteIntent::Read(ReadPreference) | Write` -> `PlanRouteIntent {
-    #     isWrite: bool, readPref: PlanReadPreference }` (readPref ignored
-    #     when isWrite is true, exactly mirroring `Write` carrying no data).
-    #   - `ReadPreference`'s four variants -> `PlanReadPreference { code:
-    #     int, region: text }` (0=Primary 1=AnyFresh 2=PreferRegion
-    #     3=AnyCopy; `region` meaningful only for code 2). `plan()` itself
-    #     never branches on a `ReadPreference`'s variant — it only clones the
-    #     caller's own preference into every `Read` intent it builds — so
-    #     this port carries it through opaquely, exactly as the source does.
-    #   - `Plan`'s four variants -> `PlanValue { kind: int, keys:
-    #     [PlanKeyIntent], broadcastAgreement: int, broadcastWhat: text,
-    #     refusal: PlanRefusal }` (0=Colocated 1=Broadcast 2=Subscribe
-    #     3=Refuse).
-    #   - `Refusal`'s six variants -> `PlanRefusal`, one `code` (0..6) plus
-    #     every variant's own fields (see the struct's own comment below).
-    #   - `KeyspaceMiss`'s two variants are folded into `PlanRefusal` itself
-    #     (`keyspaceMissCode` 0=Unmapped 1=Inconsistent) rather than a
-    #     separate struct, since a `Refusal::Keyspace(KeyspaceMiss)` is
-    #     always constructed and consumed together in this file — nothing
-    #     here ever holds a bare `KeyspaceMiss` on its own.
-    # `Method` is carried as plain `text` ("GET"/"POST"/"PUT"/"DELETE") —
-    # this port has no HTTP framework type to reuse and every comparison
-    # `plan()` itself makes against a `Method` is string-shaped equality
-    # anyway (`&Method::GET`, etc.).
-    #
-    # ============================================================
-    # ONE DELIBERATE, NAMED SIMPLIFICATION: `serde_json`'s OWN ERROR TEXT
-    # ============================================================
-    # `Refusal::MalformedBody { context, message }`'s `message` is
-    # `error.to_string()` from `serde_json`'s own parse-error `Display` in
-    # the real source (e.g. "expected value at line 1 column 1"). This port
-    # has no serde-equivalent error formatter to reuse or reimplement
-    # faithfully (that would mean porting serde_json's own diagnostic
-    # engine, a project on its own), so `planRefusalMalformedBody` is called
-    # with a fixed, honest placeholder ("invalid JSON body") wherever the
-    # real code's `message` field would hold a serde-generated string.
-    # Every OTHER `MalformedBody` message in this file (`"no `addresses`
-    # array"`, `"no `channel`"`, `"operations[3] has no `type`"`, etc.) is
-    # `plan.rs`'s OWN literal text, reproduced exactly — only the JSON
-    # parser's own error prose is approximated, never the routing decision,
-    # the refusal SHAPE, or the HTTP status it maps to (`Refusal::status()`
-    # is ported exactly, in `planRefusalStatus`, below).
-    #
-    # ============================================================
-    # SCOPE CUT, NAMED PER THE TASK BRIEF'S OWN COLLISION-AVOIDANCE RULE:
-    # ============================================================
-    # `Refusal::SpansBackends` and `Refusal::MissingCredential` are ported in
-    # full (struct fields, `status()`, `Display`, and a builder proc each)
-    # for completeness of the `Refusal` type this file owns, but neither is
-    # ever CONSTRUCTED by `planRequest` below — reading `plan.rs` in full
-    # confirms neither variant is built anywhere inside the `plan()`/
-    # `transaction_plan()` functions this file ports; `SpansBackends` is
-    # built one layer up, at DISPATCH time (after planning, once two
-    # `Colocated` keys are discovered to resolve to different backends —
-    # outside plan.rs's own file, and outside this task's scope), and
-    # `MissingCredential` is checked by auth middleware before `plan()` is
-    # ever called at all. Both are real, correctly-shaped, and demoed via
-    # `planRefusalStatus`/`planRefusalDisplay` below (see
-    # `planDemoMissingCredentialMessage`) even though `planRequest` itself
-    # never produces them — this is the honest boundary of `plan.rs`'s own
-    # file, not a gap in this port of it.
+    # Representation: RouteIntent -> PlanRouteIntent {isWrite, readPref};
+    # ReadPreference -> PlanReadPreference {code 0=Primary 1=AnyFresh
+    # 2=PreferRegion 3=AnyCopy, region}; Plan -> PlanValue {kind
+    # 0=Colocated 1=Broadcast 2=Subscribe 3=Refuse, ...}; Refusal ->
+    # PlanRefusal {code 0=UnknownRoute 1=MalformedPath 2=MalformedBody
+    # 3=Keyspace 4=SpansBackends 5=NotProxyable 6=MissingCredential, and
+    # each variant's fields}. Routing keys are fabric.fct's packed ints.
+    # SpansBackends and MissingCredential are built by the dispatch stage /
+    # auth middleware, never by plan() itself; they are here for status()
+    # and Display.
 
     # ============================================================
-    # SECTION 1: A REAL, SMALL JSON VALIDATOR/EXTRACTOR
+    # SECTION 1: BYTES, UTF-8, PERCENT-DECODING AND QUERY STRINGS
     # ============================================================
-    struct PlanJsonStrResult:
-        ok: bool
-        value: text
-        next: int
 
-    struct PlanJsonField:
-        ok: bool
-        value: text
-
-    struct PlanJsonArrayField:
-        present: bool
-        count: int
-        elemStarts: [int]
-        elemEnds: [int]
-
-    proc planHexDigitValue(c: text) -> int:
-        if c == "0":
-            return 0
-        if c == "1":
-            return 1
-        if c == "2":
-            return 2
-        if c == "3":
-            return 3
-        if c == "4":
-            return 4
-        if c == "5":
-            return 5
-        if c == "6":
-            return 6
-        if c == "7":
-            return 7
-        if c == "8":
-            return 8
-        if c == "9":
-            return 9
-        if c == "a" || c == "A":
-            return 10
-        if c == "b" || c == "B":
-            return 11
-        if c == "c" || c == "C":
-            return 12
-        if c == "d" || c == "D":
-            return 13
-        if c == "e" || c == "E":
-            return 14
-        if c == "f" || c == "F":
-            return 15
+    proc planHexDigitValue(c: int) -> int:
+        if c >= 48 && c <= 57:
+            return c - 48
+        if c >= 97 && c <= 102:
+            return c - 87
+        if c >= 65 && c <= 70:
+            return c - 55
         return -1
 
-    proc planHex4ToCodepoint(hex4: text) -> int:
-        if len(hex4) != 4:
-            return -1
-        let d0 = do planHexDigitValue(charAt(hex4, 0))
-        let d1 = do planHexDigitValue(charAt(hex4, 1))
-        let d2 = do planHexDigitValue(charAt(hex4, 2))
-        let d3 = do planHexDigitValue(charAt(hex4, 3))
-        if d0 == -1 || d1 == -1 || d2 == -1 || d3 == -1:
-            return -1
-        return d0 * 4096 + d1 * 256 + d2 * 16 + d3
-
-    # planAsciiPrintableTable: this port's `chr()` for the PRINTABLE ASCII
-    # range (0x20 space .. 0x7E tilde, 95 values), built from ordinary
-    # single-character text literals (index 0 = space, index 94 = tilde).
-    # An earlier draft of this table tried to cover the full 0..127 byte
-    # range using `\u00XX`-style escape literals for the control-character
-    # entries (Go's `strconv.Unquote`, which `internal/parser/parser.go`'s
-    # own `unquote` calls directly on a fct string literal's source text,
-    # decodes `\uXXXX` for any code point — confirmed by reading parser.go).
-    # That is a correct fact about how `.fct` SOURCE is compiled, but this
-    # port never got a chance to exercise it: authoring those escapes
-    # through this agent session's own tool-call channel silently decoded
-    # them into raw control bytes before they ever reached disk, corrupting
-    # the literal. Rather than fight that authoring-time hazard, this table
-    # is scoped down to the range every real caller actually needs — a
-    # percent-encoded ASCII address/query value and a JSON string's simple
-    # escapes are printable characters in every case this file's own demo
-    # fixtures (and `plan.rs`'s own tests) exercise — and `planAsciiCharOk`,
-    # below, honestly refuses (ok: false) a byte outside 0x20..0x7E rather
-    # than guessing at it. See this file's header for the identical
-    # reasoning already applied to bytes >= 128.
-    proc planAsciiPrintableTable() -> [text]:
-        return [" ", "!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ";", "<", "=", ">", "?", "@", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "[", "\\", "]", "^", "_", "`", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "{", "|", "}", "~"]
-
-    proc planAsciiCharOk(b: int) -> PlanJsonField:
-        if b < 32 || b > 126:
-            return PlanJsonField{ok: false, value: ""}
-        let table = do planAsciiPrintableTable()
-        let idx = b - 32
-        return PlanJsonField{ok: true, value: table[idx]}
-
-    proc planIsJsonWs(c: text) -> bool:
-        return c == " " || c == "\t" || c == "\n" || c == "\r"
-
-    proc planJsonSkipWs(s: text, i: int) -> int:
-        let n = len(s)
-        let mut j = i
-        loop j < n:
-            let c = charAt(s, j)
-            let isWs = do planIsJsonWs(c)
-            if isWs:
-                j = j + 1
-            else:
-                return j
-        return j
-
-    proc planJsonSkipLiteral(s: text, i: int, lit: text) -> int:
-        let litLen = len(lit)
-        let n = len(s)
-        if i + litLen > n:
-            return -1
-        let candidate = slice(s, i, i + litLen)
-        if candidate == lit:
-            return i + litLen
-        return -1
-
-    proc planIsDigit(c: text) -> bool:
-        return c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
-
-    proc planJsonSkipDigits(s: text, i: int) -> int:
-        let n = len(s)
-        let mut j = i
-        loop j < n:
-            let c = charAt(s, j)
-            let isD = do planIsDigit(c)
-            if isD:
-                j = j + 1
-            else:
-                return j
-        return j
-
-    # planJsonSkipNumber: JSON's number grammar (`-`? int frac? exp?),
-    # restated as a hand-written scanner since there is no numeric-literal
-    # sub-parser to reuse. Only needs to SKIP correctly (this port never
-    # extracts a JSON number's value — nothing `plan.rs` reads is numeric),
-    # but a malformed number (bad exponent, bare `-`, trailing `.` with no
-    # digits) still reports -1 so the surrounding validator refuses the
-    # whole body rather than silently accepting garbage.
-    proc planJsonSkipNumber(s: text, i: int) -> int:
-        let n = len(s)
-        let mut j = i
-        if j < n:
-            let c0 = charAt(s, j)
-            if c0 == "-":
-                j = j + 1
-        if j >= n:
-            return -1
-        let c1 = charAt(s, j)
-        let isD1 = do planIsDigit(c1)
-        if !isD1:
-            return -1
-        let afterInt = do planJsonSkipDigits(s, j)
-        let mut k = afterInt
-        if k < n:
-            let cdot = charAt(s, k)
-            if cdot == ".":
-                let afterDot = do planJsonSkipDigits(s, k + 1)
-                if afterDot == k + 1:
-                    return -1
-                k = afterDot
-        if k < n:
-            let ce = charAt(s, k)
-            if ce == "e" || ce == "E":
-                let mut m = k + 1
-                if m < n:
-                    let sign = charAt(s, m)
-                    if sign == "+" || sign == "-":
-                        m = m + 1
-                let afterExp = do planJsonSkipDigits(s, m)
-                if afterExp == m:
-                    return -1
-                k = afterExp
-        return k
-
-    proc planJsonSimpleEscape(esc: text) -> PlanJsonField:
-        if esc == "\"":
-            return PlanJsonField{ok: true, value: "\""}
-        if esc == "\\":
-            return PlanJsonField{ok: true, value: "\\"}
-        if esc == "/":
-            return PlanJsonField{ok: true, value: "/"}
-        if esc == "b":
-            return PlanJsonField{ok: false, value: ""}
-        if esc == "f":
-            return PlanJsonField{ok: false, value: ""}
-        if esc == "n":
-            return PlanJsonField{ok: true, value: "\n"}
-        if esc == "r":
-            return PlanJsonField{ok: true, value: "\r"}
-        if esc == "t":
-            return PlanJsonField{ok: true, value: "\t"}
-        return PlanJsonField{ok: false, value: ""}
-
-    # planJsonReadString: `i` must point at the opening `"`. Decodes the
-    # standard JSON string escapes (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`,
-    # `\t`, `\uXXXX`) — a `\uXXXX` above code point 127 is refused (ok:
-    # false) rather than mis-decoded, per this file's header note on the
-    # ASCII-only table.
-    proc planJsonReadString(s: text, i: int) -> PlanJsonStrResult:
-        let n = len(s)
-        if i >= n:
-            return PlanJsonStrResult{ok: false, value: "", next: -1}
-        let open = charAt(s, i)
-        if open != "\"":
-            return PlanJsonStrResult{ok: false, value: "", next: -1}
-        let mut j = i + 1
-        let mut out = ""
-        loop j < n:
-            let c = charAt(s, j)
-            if c == "\"":
-                return PlanJsonStrResult{ok: true, value: out, next: j + 1}
-            if c == "\\":
-                if j + 1 >= n:
-                    return PlanJsonStrResult{ok: false, value: "", next: -1}
-                let esc = charAt(s, j + 1)
-                if esc == "u":
-                    if j + 6 > n:
-                        return PlanJsonStrResult{ok: false, value: "", next: -1}
-                    let hex4 = slice(s, j + 2, j + 6)
-                    let code = do planHex4ToCodepoint(hex4)
-                    if code == -1:
-                        return PlanJsonStrResult{ok: false, value: "", next: -1}
-                    let charRes = do planAsciiCharOk(code)
-                    if !charRes.ok:
-                        return PlanJsonStrResult{ok: false, value: "", next: -1}
-                    out = out + charRes.value
-                    j = j + 6
+    # percent_encoding::percent_decode: every `%` followed by two hex digits
+    # becomes that byte; anything else passes through.
+    proc planPercentDecodeBytes(s: text) -> [int]:
+        let bs = textToBytes(s)
+        let n = len(bs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let c = bs[i]
+            if c == 37 && i + 2 < n:
+                let h = do planHexDigitValue(bs[i + 1])
+                let l = do planHexDigitValue(bs[i + 2])
+                if h >= 0 && l >= 0:
+                    out = append(out, h * 16 + l)
+                    i = i + 3
                 else:
-                    let simple = do planJsonSimpleEscape(esc)
-                    if !simple.ok:
-                        return PlanJsonStrResult{ok: false, value: "", next: -1}
-                    out = out + simple.value
-                    j = j + 2
+                    out = append(out, c)
+                    i = i + 1
             else:
-                out = out + c
-                j = j + 1
-        return PlanJsonStrResult{ok: false, value: "", next: -1}
+                out = append(out, c)
+                i = i + 1
+        return out
 
-    # planJsonSkipValue: the recursive dispatcher every array/object walker
-    # below calls once per element/member value. Returns the index just
-    # past the value, or -1 on any malformed input.
-    proc planJsonSkipValue(s: text, i: int) -> int:
-        let n = len(s)
-        if i >= n:
-            return -1
-        let c = charAt(s, i)
-        if c == "\"":
-            let r = do planJsonReadString(s, i)
-            if !r.ok:
-                return -1
-            return r.next
-        if c == "{":
-            let after = do planJsonSkipObject(s, i)
-            return after
-        if c == "[":
-            let after = do planJsonSkipArray(s, i)
-            return after
-        if c == "t":
-            let after = do planJsonSkipLiteral(s, i, "true")
-            return after
-        if c == "f":
-            let after = do planJsonSkipLiteral(s, i, "false")
-            return after
-        if c == "n":
-            let after = do planJsonSkipLiteral(s, i, "null")
-            return after
-        let isMinus = c == "-"
-        let isDigit = do planIsDigit(c)
-        if isMinus || isDigit:
-            let after = do planJsonSkipNumber(s, i)
-            return after
-        return -1
+    proc planUtf8Width(c: int) -> int:
+        if c < 128:
+            return 1
+        if c >= 194 && c <= 223:
+            return 2
+        if c >= 224 && c <= 239:
+            return 3
+        if c >= 240 && c <= 244:
+            return 4
+        return 0
 
-    # planJsonSkipObject: `i` points at `{`. Validates and skips a whole
-    # object (every key must be a JSON string), returning the index just
-    # past the closing `}`, or -1 on any malformed input.
-    proc planJsonSkipObject(s: text, i: int) -> int:
-        let n = len(s)
-        let afterBrace = i + 1
-        let afterWs1 = do planJsonSkipWs(s, afterBrace)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "}":
-                return afterWs1 + 1
-        let mut pos = afterWs1
-        loop pos <= n:
-            if pos >= n:
-                return -1
-            let ck = charAt(s, pos)
-            if ck != "\"":
-                return -1
-            let keyRes = do planJsonReadString(s, pos)
-            if !keyRes.ok:
-                return -1
-            let afterKeyWs = do planJsonSkipWs(s, keyRes.next)
-            if afterKeyWs >= n:
-                return -1
-            let colon = charAt(s, afterKeyWs)
-            if colon != ":":
-                return -1
-            let afterColonWs = do planJsonSkipWs(s, afterKeyWs + 1)
-            let afterValue = do planJsonSkipValue(s, afterColonWs)
-            if afterValue == -1:
-                return -1
-            let afterValueWs = do planJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return -1
-            let sep = charAt(s, afterValueWs)
-            if sep == "}":
-                return afterValueWs + 1
-            if sep != ",":
-                return -1
-            let afterCommaWs = do planJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return -1
+    proc planIsCont(c: int) -> bool:
+        return c >= 128 && c <= 191
 
-    proc planJsonSkipArray(s: text, i: int) -> int:
-        let n = len(s)
-        let afterBracket = i + 1
-        let afterWs1 = do planJsonSkipWs(s, afterBracket)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "]":
-                return afterWs1 + 1
-        let mut pos = afterWs1
-        loop pos <= n:
-            if pos >= n:
-                return -1
-            let afterValue = do planJsonSkipValue(s, pos)
-            if afterValue == -1:
-                return -1
-            let afterValueWs = do planJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return -1
-            let sep = charAt(s, afterValueWs)
-            if sep == "]":
-                return afterValueWs + 1
-            if sep != ",":
-                return -1
-            let afterCommaWs = do planJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return -1
+    # One step of core::str::run_utf8_validation at `i`: `len` > 0 is a valid
+    # char of that many bytes; otherwise `errLen` is Utf8Error::error_len
+    # (1..3, or 0 for None: the input ended inside a sequence).
+    struct PlanUtf8Step:
+        len: int
+        errLen: int
 
-    # planJsonValidate: the whole-body check mirroring
-    # `serde_json::from_slice::<Value>` — parses exactly one top-level value
-    # and requires nothing but whitespace to follow it.
-    proc planJsonValidate(body: text) -> bool:
-        let n = len(body)
-        let start = do planJsonSkipWs(body, 0)
-        let afterValue = do planJsonSkipValue(body, start)
-        if afterValue == -1:
-            return false
-        let afterWs = do planJsonSkipWs(body, afterValue)
-        return afterWs == n
+    proc planUtf8Step(bs: [int], i: int) -> PlanUtf8Step:
+        let n = len(bs)
+        let first = bs[i]
+        let w = do planUtf8Width(first)
+        if w == 1:
+            return PlanUtf8Step{len: 1, errLen: 0}
+        if w == 0:
+            return PlanUtf8Step{len: 0, errLen: 1}
+        if i + 1 >= n:
+            return PlanUtf8Step{len: 0, errLen: 0}
+        let b1 = bs[i + 1]
+        if w == 2:
+            let ok = do planIsCont(b1)
+            if !ok:
+                return PlanUtf8Step{len: 0, errLen: 1}
+            return PlanUtf8Step{len: 2, errLen: 0}
+        let mut secondOk = false
+        if w == 3:
+            secondOk = (first == 224 && b1 >= 160 && b1 <= 191) || (first >= 225 && first <= 236 && b1 >= 128 && b1 <= 191) || (first == 237 && b1 >= 128 && b1 <= 159) || (first >= 238 && first <= 239 && b1 >= 128 && b1 <= 191)
+        if w == 4:
+            secondOk = (first == 240 && b1 >= 144 && b1 <= 191) || (first >= 241 && first <= 243 && b1 >= 128 && b1 <= 191) || (first == 244 && b1 >= 128 && b1 <= 143)
+        if !secondOk:
+            return PlanUtf8Step{len: 0, errLen: 1}
+        if i + 2 >= n:
+            return PlanUtf8Step{len: 0, errLen: 0}
+        let c2 = do planIsCont(bs[i + 2])
+        if !c2:
+            return PlanUtf8Step{len: 0, errLen: 2}
+        if w == 3:
+            return PlanUtf8Step{len: 3, errLen: 0}
+        if i + 3 >= n:
+            return PlanUtf8Step{len: 0, errLen: 0}
+        let c3 = do planIsCont(bs[i + 3])
+        if !c3:
+            return PlanUtf8Step{len: 0, errLen: 3}
+        return PlanUtf8Step{len: 4, errLen: 0}
 
-    # planJsonObjectStringField: `serde_json::Value::get(name).and_then(
-    # Value::as_str)` restated as a scan — requires `s` (after leading
-    # whitespace) to be an object at all (matching `.get()`'s own None for
-    # any non-object base value), then walks its members; a present field
-    # whose value is not a JSON string is treated identically to an absent
-    # one (ok: false), exactly matching `.as_str()` returning `None` for a
-    # non-string `Value`.
-    proc planJsonObjectStringField(s: text, key: text) -> PlanJsonField:
-        let n = len(s)
-        let start = do planJsonSkipWs(s, 0)
-        if start >= n:
-            return PlanJsonField{ok: false, value: ""}
-        let open = charAt(s, start)
-        if open != "{":
-            return PlanJsonField{ok: false, value: ""}
-        let afterBrace = start + 1
-        let afterWs1 = do planJsonSkipWs(s, afterBrace)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "}":
-                return PlanJsonField{ok: false, value: ""}
-        let mut pos = afterWs1
-        loop pos <= n:
-            if pos >= n:
-                return PlanJsonField{ok: false, value: ""}
-            let ck = charAt(s, pos)
-            if ck != "\"":
-                return PlanJsonField{ok: false, value: ""}
-            let keyRes = do planJsonReadString(s, pos)
-            if !keyRes.ok:
-                return PlanJsonField{ok: false, value: ""}
-            let afterKeyWs = do planJsonSkipWs(s, keyRes.next)
-            if afterKeyWs >= n:
-                return PlanJsonField{ok: false, value: ""}
-            let colon = charAt(s, afterKeyWs)
-            if colon != ":":
-                return PlanJsonField{ok: false, value: ""}
-            let afterColonWs = do planJsonSkipWs(s, afterKeyWs + 1)
-            if afterColonWs >= n:
-                return PlanJsonField{ok: false, value: ""}
-            let vch = charAt(s, afterColonWs)
-            let isMatch = keyRes.value == key
-            if isMatch && vch == "\"":
-                let valRes = do planJsonReadString(s, afterColonWs)
-                if !valRes.ok:
-                    return PlanJsonField{ok: false, value: ""}
-                return PlanJsonField{ok: true, value: valRes.value}
-            let afterValue = do planJsonSkipValue(s, afterColonWs)
-            if afterValue == -1:
-                return PlanJsonField{ok: false, value: ""}
-            let afterValueWs = do planJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return PlanJsonField{ok: false, value: ""}
-            let sep = charAt(s, afterValueWs)
-            if sep == "}":
-                return PlanJsonField{ok: false, value: ""}
-            if sep != ",":
-                return PlanJsonField{ok: false, value: ""}
-            let afterCommaWs = do planJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return PlanJsonField{ok: false, value: ""}
-
-    # planJsonScanArrayElems: `i` points at the `[` of a value already
-    # confirmed to be an array. Records each element's own [start, end) span
-    # in `s` rather than a generically-typed parsed value (this port has no
-    # "any JSON value" leaf — see query.fct's own header for the identical,
-    # previously-confirmed gap) — a caller that needs an element's content
-    # slices it out and reads it with `planJsonReadString`/
-    # `planJsonObjectStringField` directly, exactly mirroring
-    # `serde_json::Value::Array`'s own elements being read one at a time.
-    proc planJsonScanArrayElems(s: text, i: int) -> PlanJsonArrayField:
-        let n = len(s)
-        let afterBracket = i + 1
-        let afterWs1 = do planJsonSkipWs(s, afterBracket)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "]":
-                return PlanJsonArrayField{present: true, count: 0, elemStarts: [], elemEnds: []}
-        let mut pos = afterWs1
-        let mut starts = []
-        let mut ends = []
-        loop pos <= n:
-            if pos >= n:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let afterValue = do planJsonSkipValue(s, pos)
-            if afterValue == -1:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            starts = append(starts, pos)
-            ends = append(ends, afterValue)
-            let afterValueWs = do planJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let sep = charAt(s, afterValueWs)
-            if sep == "]":
-                let total = len(starts)
-                return PlanJsonArrayField{present: true, count: total, elemStarts: starts, elemEnds: ends}
-            if sep != ",":
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let afterCommaWs = do planJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-
-    proc planJsonObjectArrayField(s: text, key: text) -> PlanJsonArrayField:
-        let n = len(s)
-        let start = do planJsonSkipWs(s, 0)
-        if start >= n:
-            return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-        let open = charAt(s, start)
-        if open != "{":
-            return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-        let afterBrace = start + 1
-        let afterWs1 = do planJsonSkipWs(s, afterBrace)
-        if afterWs1 < n:
-            let c0 = charAt(s, afterWs1)
-            if c0 == "}":
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-        let mut pos = afterWs1
-        loop pos <= n:
-            if pos >= n:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let ck = charAt(s, pos)
-            if ck != "\"":
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let keyRes = do planJsonReadString(s, pos)
-            if !keyRes.ok:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let afterKeyWs = do planJsonSkipWs(s, keyRes.next)
-            if afterKeyWs >= n:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let colon = charAt(s, afterKeyWs)
-            if colon != ":":
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let afterColonWs = do planJsonSkipWs(s, afterKeyWs + 1)
-            if afterColonWs >= n:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let vch = charAt(s, afterColonWs)
-            let isMatch = keyRes.value == key
-            if isMatch && vch == "[":
-                let arr = do planJsonScanArrayElems(s, afterColonWs)
-                return arr
-            let afterValue = do planJsonSkipValue(s, afterColonWs)
-            if afterValue == -1:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let afterValueWs = do planJsonSkipWs(s, afterValue)
-            if afterValueWs >= n:
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let sep = charAt(s, afterValueWs)
-            if sep == "}":
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            if sep != ",":
-                return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-            let afterCommaWs = do planJsonSkipWs(s, afterValueWs + 1)
-            pos = afterCommaWs
-        return PlanJsonArrayField{present: false, count: 0, elemStarts: [], elemEnds: []}
-
-    # ============================================================
-    # SECTION 2: PERCENT-DECODING AND QUERY STRINGS
-    # ============================================================
     struct PlanDecodeResult:
         ok: bool
         value: text
+
+    # str::from_utf8, failing with Utf8Error's Display text.
+    proc planDecodeUtf8(bs: [int]) -> PlanDecodeResult:
+        let n = len(bs)
+        let mut i = 0
+        loop i < n:
+            let st = do planUtf8Step(bs, i)
+            if st.len == 0:
+                if st.errLen == 0:
+                    return PlanDecodeResult{ok: false, value: "incomplete utf-8 byte sequence from index " + i}
+                return PlanDecodeResult{ok: false, value: "invalid utf-8 sequence of " + st.errLen + " bytes from index " + i}
+            i = i + st.len
+        return PlanDecodeResult{ok: true, value: bytesToText(bs)}
+
+    # String::from_utf8_lossy: each maximal invalid subpart (the rest of
+    # the input when it ends inside a sequence) becomes one U+FFFD.
+    proc planDecodeUtf8Lossy(bs: [int]) -> text:
+        let n = len(bs)
+        let mut out = []
+        let mut i = 0
+        loop i < n:
+            let st = do planUtf8Step(bs, i)
+            if st.len > 0:
+                let mut k = 0
+                loop k < st.len:
+                    out = append(out, bs[i + k])
+                    k = k + 1
+                i = i + st.len
+            else:
+                out = append(out, 239)
+                out = append(out, 191)
+                out = append(out, 189)
+                if st.errLen == 0:
+                    i = n
+                else:
+                    i = i + st.errLen
+        return bytesToText(out)
 
     struct PlanSegmentsResult:
         ok: bool
@@ -705,141 +171,83 @@ app FabricPlanSelfHost:
         present: bool
         value: text
 
-    # planPercentDecodeSegment: `decode_segments`'s per-segment decode.
-    # Fails (ok: false) on a truncated/invalid `%XX` escape or one whose
-    # byte is 128..255 — see this file's header for why that upper range is
-    # honestly out of scope rather than guessed at.
-    proc planPercentDecodeSegment(s: text) -> PlanDecodeResult:
-        let n = len(s)
-        let mut i = 0
-        let mut out = ""
-        loop i < n:
-            let c = charAt(s, i)
-            if c == "%":
-                if i + 3 > n:
-                    return PlanDecodeResult{ok: false, value: ""}
-                let h1 = charAt(s, i + 1)
-                let h2 = charAt(s, i + 2)
-                let d1 = do planHexDigitValue(h1)
-                let d2 = do planHexDigitValue(h2)
-                if d1 == -1 || d2 == -1:
-                    return PlanDecodeResult{ok: false, value: ""}
-                let byteVal = d1 * 16 + d2
-                let charRes = do planAsciiCharOk(byteVal)
-                if !charRes.ok:
-                    return PlanDecodeResult{ok: false, value: ""}
-                out = out + charRes.value
-                i = i + 3
-            else:
-                out = out + c
-                i = i + 1
-        return PlanDecodeResult{ok: true, value: out}
-
-    # planDecodeSegments: `decode_segments` — split on `/`, drop empty
-    # segments (so `/nodes/` and `/nodes` classify the same way), decode
-    # each one, and fail the whole path on the first bad segment.
+    # decode_segments: split on '/', drop empty segments, percent-decode
+    # each, refuse one that is not UTF-8.
     proc planDecodeSegments(path: text) -> PlanSegmentsResult:
         let raw = split(path, "/")
-        let n = len(raw)
-        let mut i = 0
         let mut segs = []
-        loop i < n:
+        let mut i = 0
+        loop i < len(raw):
             let seg = raw[i]
             if len(seg) > 0:
-                let decoded = do planPercentDecodeSegment(seg)
+                let bytesOut = do planPercentDecodeBytes(seg)
+                let decoded = do planDecodeUtf8(bytesOut)
                 if !decoded.ok:
-                    let reason = "'" + seg + "' is not valid UTF-8 (this port's percent-decoder only spans ASCII byte values; see this file's header)"
+                    let reason = "'" + seg + "' is not valid UTF-8: " + decoded.value
                     return PlanSegmentsResult{ok: false, reason: reason, segments: []}
                 segs = append(segs, decoded.value)
             i = i + 1
         return PlanSegmentsResult{ok: true, reason: "", segments: segs}
 
-    proc planJoinFrom(parts: [text], startIdx: int, sep: text) -> text:
-        let n = len(parts)
-        let mut out = ""
-        let mut i = startIdx
-        loop i < n:
-            if i == startIdx:
-                out = parts[i]
-            else:
-                out = out + sep + parts[i]
-            i = i + 1
-        return out
-
-    proc planReplacePlusWithSpace(s: text) -> text:
-        let parts = split(s, "+")
-        let out = do planJoinFrom(parts, 0, " ")
-        return out
-
-    # planPercentDecodeLossy: `query_param`'s own `decode_utf8_lossy` half —
-    # never fails; an undecodable `%XX` (bad hex, or byte >= 128) is left in
-    # the output verbatim rather than replaced with U+FFFD (see header).
-    proc planPercentDecodeLossy(s: text) -> text:
+    # The (rune) index of the first `sep` in `s`, or -1.
+    proc planIndexOf(s: text, sep: text) -> int:
         let n = len(s)
+        let m = len(sep)
         let mut i = 0
-        let mut out = ""
-        loop i < n:
-            let c = charAt(s, i)
-            if c == "%" && i + 3 <= n:
-                let h1 = charAt(s, i + 1)
-                let h2 = charAt(s, i + 2)
-                let d1 = do planHexDigitValue(h1)
-                let d2 = do planHexDigitValue(h2)
-                if d1 != -1 && d2 != -1:
-                    let byteVal = d1 * 16 + d2
-                    let charRes = do planAsciiCharOk(byteVal)
-                    if charRes.ok:
-                        out = out + charRes.value
-                        i = i + 3
-                    else:
-                        out = out + c
-                        i = i + 1
-                else:
-                    out = out + c
-                    i = i + 1
-            else:
-                out = out + c
-                i = i + 1
-        return out
+        loop i + m <= n:
+            if slice(s, i, i + m) == sep:
+                return i
+            i = i + 1
+        return -1
 
-    # planQueryParam: `query_param` — find the first `key=value` pair (a
-    # pair with no `=` at all is skipped, matching `split_once` returning
-    # `None`), `+` decoded to a space, then percent-decoded lossily. A value
-    # itself containing `=` is rejoined (`split` breaks on every `=`, unlike
-    # `split_once`, which only ever breaks on the first).
+    # query_param: the first `&`-separated pair with an `=` whose key is
+    # `name`; its value with `+` as space, percent-decoded lossily.
     proc planQueryParam(hasQuery: bool, query: text, name: text) -> PlanQueryParamResult:
         if !hasQuery:
             return PlanQueryParamResult{present: false, value: ""}
         let pairs = split(query, "&")
-        let n = len(pairs)
         let mut i = 0
-        loop i < n:
+        loop i < len(pairs):
             let pair = pairs[i]
-            let eqParts = split(pair, "=")
-            if len(eqParts) >= 2:
-                let key = eqParts[0]
+            let eq = do planIndexOf(pair, "=")
+            if eq >= 0:
+                let key = slice(pair, 0, eq)
                 if key == name:
-                    let rawValue = do planJoinFrom(eqParts, 1, "=")
-                    let plusReplaced = do planReplacePlusWithSpace(rawValue)
-                    let decoded = do planPercentDecodeLossy(plusReplaced)
+                    let rawValue = slice(pair, eq + 1, len(pair))
+                    let spaced = join(split(rawValue, "+"), " ")
+                    let bs = do planPercentDecodeBytes(spaced)
+                    let decoded = do planDecodeUtf8Lossy(bs)
                     return PlanQueryParamResult{present: true, value: decoded}
             i = i + 1
         return PlanQueryParamResult{present: false, value: ""}
 
+    struct PlanBody:
+        ok: bool
+        value: SjV
+        message: text
+
+    # json(): serde_json::from_slice::<Value>, the error as its Display.
+    proc planJson(body: text) -> PlanBody:
+        let r = do sjDecode([], body, "value")
+        return PlanBody{ok: r.ok, value: r.v, message: r.err}
+
+    # field(): a string field, absent when missing, null or not a string.
+    proc planField(v: SjV, name: text) -> SjOptText:
+        let f = do sjStrField(v, name)
+        return f
+
     # ============================================================
-    # SECTION 3: KEYSPACE-AS-A-VALUE, AND THE ONE LOOKUP
+    # SECTION 2: KEYSPACE-AS-A-VALUE, AND THE ONE LOOKUP
     # ============================================================
-    # `PlanKeyspace` bundles fabric.fct's own three loose values (a
-    # `[RoutingRule]` table, `hasFallback`, `fallbackKey`) into one real
-    # struct purely so `planRequest`'s own signature can take one `ks:
-    # PlanKeyspace` parameter the way the real `plan()` takes one `keyspace:
-    # &Keyspace` — fabric.fct itself is NOT changed (this task's own
-    # collision-avoidance rule): this struct lives here, wrapping fabric.fct's
-    # values, not replacing them.
+    # The Keyspace plan() is handed (the same three fields as fabric.fct's
+    # Keyspace).
     struct PlanKeyspace:
         rules: [RoutingRule]
         hasFallback: bool
         fallbackKey: int
+
+    proc planKeyspaceOf(ks: PlanKeyspace) -> Keyspace:
+        return Keyspace{rules: ks.rules, hasFallback: ks.hasFallback, fallbackKey: ks.fallbackKey}
 
     # PlanResolveResult: `Result<RoutingKey, KeyspaceMiss>` flattened.
     # missCode: -1 = Ok (key holds the answer), 0 = Unmapped, 1 =
@@ -854,39 +262,19 @@ app FabricPlanSelfHost:
         missByKind: int
         missByAddress: int
 
-    # planKeyspaceResolve: `Keyspace::resolve`, restated using fabric.fct's
-    # own `ruleIndexForKind`/`ruleIndexForAddress` (the load-bearing
-    # longest-prefix-match algorithm, reused verbatim, not re-derived) —
-    # see this file's header for why `keyspaceResolveStatus`/
-    # `keyspaceResolveKey` are not reused directly here.
+    # Keyspace::resolve (fabric.fct's keyspaceResolve).
     proc planKeyspaceResolve(ks: PlanKeyspace, hasKind: bool, kind: text, hasAddress: bool, address: text) -> PlanResolveResult:
-        let rules = ks.rules
-        let mut kindIdx = -1
-        if hasKind:
-            let ki = do ruleIndexForKind(rules, kind)
-            kindIdx = ki
-        let mut addrIdx = -1
-        if hasAddress:
-            let ai = do ruleIndexForAddress(rules, address)
-            addrIdx = ai
-        if kindIdx != -1 && addrIdx != -1:
-            let byKind = rules[kindIdx].key
-            let byAddr = rules[addrIdx].key
-            if byKind != byAddr:
-                return PlanResolveResult{missCode: 1, key: -1, missHasKind: hasKind, missKind: kind, missHasAddress: hasAddress, missAddress: address, missByKind: byKind, missByAddress: byAddr}
-            return PlanResolveResult{missCode: -1, key: byKind, missHasKind: false, missKind: "", missHasAddress: false, missAddress: "", missByKind: -1, missByAddress: -1}
-        if kindIdx != -1:
-            let k = rules[kindIdx].key
-            return PlanResolveResult{missCode: -1, key: k, missHasKind: false, missKind: "", missHasAddress: false, missAddress: "", missByKind: -1, missByAddress: -1}
-        if addrIdx != -1:
-            let k = rules[addrIdx].key
-            return PlanResolveResult{missCode: -1, key: k, missHasKind: false, missKind: "", missHasAddress: false, missAddress: "", missByKind: -1, missByAddress: -1}
-        if ks.hasFallback:
-            return PlanResolveResult{missCode: -1, key: ks.fallbackKey, missHasKind: false, missKind: "", missHasAddress: false, missAddress: "", missByKind: -1, missByAddress: -1}
-        return PlanResolveResult{missCode: 0, key: -1, missHasKind: hasKind, missKind: kind, missHasAddress: hasAddress, missAddress: address, missByKind: -1, missByAddress: -1}
+        let k = do planKeyspaceOf(ks)
+        let r = do keyspaceResolve(k, hasKind, kind, hasAddress, address)
+        if r.ok:
+            return PlanResolveResult{missCode: -1, key: r.key, missHasKind: false, missKind: "", missHasAddress: false, missAddress: "", missByKind: -1, missByAddress: -1}
+        let mut code = 0
+        if r.miss.kind == "Inconsistent":
+            code = 1
+        return PlanResolveResult{missCode: code, key: -1, missHasKind: r.miss.hasKind, missKind: r.miss.kindName, missHasAddress: r.miss.hasAddress, missAddress: r.miss.address, missByKind: r.miss.byKind, missByAddress: r.miss.byAddress}
 
     # ============================================================
-    # SECTION 4: ROUTE INTENT, KEY INTENT
+    # SECTION 3: ROUTE INTENT, KEY INTENT
     # ============================================================
     struct PlanReadPreference:
         code: int
@@ -902,7 +290,7 @@ app FabricPlanSelfHost:
         origin: text
 
     # ============================================================
-    # SECTION 5: REFUSAL — struct, status(), Display
+    # SECTION 4: REFUSAL — struct, status(), Display
     # ============================================================
     # code: 0=UnknownRoute 1=MalformedPath 2=MalformedBody 3=Keyspace
     #       4=SpansBackends 5=NotProxyable 6=MissingCredential (-1 = none,
@@ -964,29 +352,19 @@ app FabricPlanSelfHost:
         return 500
 
     proc planRoutingKeyDisplay(packed: int) -> text:
-        let shardId = packed / 156
-        let idx = packed % 156
-        let y = idx / 12
-        let x = idx % 12
-        return shardId + "/" + x + "," + y
+        let t = do routingKeyPackedDisplay(packed)
+        return t
+
+    proc planKeyspaceMissOf(r: PlanRefusal) -> KeyspaceMiss:
+        let mut kind = "Unmapped"
+        if r.keyspaceMissCode == 1:
+            kind = "Inconsistent"
+        return KeyspaceMiss{kind: kind, hasKind: r.missHasKind, kindName: r.missKind, hasAddress: r.missHasAddress, address: r.missAddress, byKind: r.missByKind, byAddress: r.missByAddress}
 
     proc planKeyspaceMissDisplay(r: PlanRefusal) -> text:
-        if r.keyspaceMissCode == 1:
-            let byAddrStr = do planRoutingKeyDisplay(r.missByAddress)
-            let byKindStr = do planRoutingKeyDisplay(r.missByKind)
-            return "address '" + r.missAddress + "' routes to " + byAddrStr + " but its kind '" + r.missKind + "' routes to " + byKindStr + "; the keyspace says these are different places, so this request cannot be served without putting the node where its own kind's queries will not look"
-        let mut what = ""
-        if r.missHasKind && r.missHasAddress:
-            what = "kind '" + r.missKind + "' or address '" + r.missAddress + "'"
-        else:
-            if r.missHasKind:
-                what = "kind '" + r.missKind + "'"
-            else:
-                if r.missHasAddress:
-                    what = "address '" + r.missAddress + "'"
-                else:
-                    what = "this request, which names neither a kind nor an address"
-        return "no keyspace rule covers " + what + ", and no fallback is declared"
+        let m = do planKeyspaceMissOf(r)
+        let t = do keyspaceMissDisplay(m)
+        return t
 
     # planRefusalDisplay: `impl Display for Refusal`, restated exactly
     # (including the byte-for-byte `MissingCredential` message the real
@@ -1002,7 +380,7 @@ app FabricPlanSelfHost:
             let miss = do planKeyspaceMissDisplay(r)
             return "fabric front door: " + miss
         if r.code == 4:
-            let joined = do planJoinFrom(r.spansNodes, 0, ", ")
+            let joined = join(r.spansNodes, ", ")
             return "fabric front door: " + r.spansWhat + " spans " + len(r.spansNodes) + " backends (" + joined + "), and this request cannot be split without losing the guarantee it was made for; nothing was forwarded"
         if r.code == 5:
             return "fabric front door: " + r.notProxyableWhat + " cannot be served across a split fleet: " + r.reason + "; address one FacetQL instance directly"
@@ -1011,7 +389,7 @@ app FabricPlanSelfHost:
         return ""
 
     # ============================================================
-    # SECTION 6: PLAN VALUE, AND THE colocated()/spanning() HELPERS
+    # SECTION 5: PLAN VALUE, AND THE colocated()/spanning() HELPERS
     # ============================================================
     # kind: 0=Colocated 1=Broadcast 2=Subscribe 3=Refuse
     struct PlanValue:
@@ -1062,7 +440,7 @@ app FabricPlanSelfHost:
         return v
 
     # ============================================================
-    # SECTION 7: THE BATCH — transaction_plan
+    # SECTION 6: THE BATCH — transaction_plan
     # ============================================================
     struct PlanTxTouchResult:
         refused: bool
@@ -1099,54 +477,49 @@ app FabricPlanSelfHost:
         let v = do planValueColocated(newKeys)
         return PlanTxTouchResult{refused: false, plan: v}
 
-    proc planTransactionKeys(body: text, opsArr: PlanJsonArrayField, ks: PlanKeyspace) -> PlanValue:
-        let n = opsArr.count
+    proc planTransactionKeys(ops: [SjV], ks: PlanKeyspace) -> PlanValue:
+        let n = len(ops)
         let mut i = 0
         let mut keys = []
         let w = PlanRouteIntent{isWrite: true, readPref: PlanReadPreference{code: 0, region: ""}}
         loop i < n:
-            let elemStart = opsArr.elemStarts[i]
-            let elemEnd = opsArr.elemEnds[i]
-            let elemText = slice(body, elemStart, elemEnd)
-            let typeField = do planJsonObjectStringField(elemText, "type")
-            if !typeField.ok:
+            let op = ops[i]
+            let typeField = do planField(op, "type")
+            if !typeField.has:
                 let msg = "operations[" + i + "] has no `type`"
                 let refusal = do planRefusalMalformedBody("POST /transaction", msg)
                 let v = do planValueRefuse(refusal)
                 return v
-            let opType = typeField.value
+            let opType = typeField.s
             if opType == "insert_node":
-                let kindField = do planJsonObjectStringField(elemText, "kind")
-                let addressField = do planJsonObjectStringField(elemText, "address")
-                let res = do planTransactionAddTouch(keys, i, opType, kindField.ok, kindField.value, addressField.ok, addressField.value, ks, w)
+                let kindField = do planField(op, "kind")
+                let addressField = do planField(op, "address")
+                let res = do planTransactionAddTouch(keys, i, opType, kindField.has, kindField.s, addressField.has, addressField.s, ks, w)
                 if res.refused:
                     return res.plan
                 keys = res.plan.keys
             else:
-                let isDeleteNodeOrSetIf = opType == "delete_node" || opType == "set_if"
-                if isDeleteNodeOrSetIf:
-                    let addressField = do planJsonObjectStringField(elemText, "address")
-                    let res = do planTransactionAddTouch(keys, i, opType, false, "", addressField.ok, addressField.value, ks, w)
+                if opType == "delete_node" || opType == "set_if":
+                    let addressField = do planField(op, "address")
+                    let res = do planTransactionAddTouch(keys, i, opType, false, "", addressField.has, addressField.s, ks, w)
                     if res.refused:
                         return res.plan
                     keys = res.plan.keys
                 else:
-                    let isClearOrDeleteWhere = opType == "clear_kind" || opType == "delete_where"
-                    if isClearOrDeleteWhere:
-                        let kindField = do planJsonObjectStringField(elemText, "kind")
-                        let res = do planTransactionAddTouch(keys, i, opType, kindField.ok, kindField.value, false, "", ks, w)
+                    if opType == "clear_kind" || opType == "delete_where":
+                        let kindField = do planField(op, "kind")
+                        let res = do planTransactionAddTouch(keys, i, opType, kindField.has, kindField.s, false, "", ks, w)
                         if res.refused:
                             return res.plan
                         keys = res.plan.keys
                     else:
-                        let isEdgeOp = opType == "insert_edge" || opType == "delete_edge"
-                        if isEdgeOp:
-                            let fromField = do planJsonObjectStringField(elemText, "from")
-                            let res1 = do planTransactionAddTouch(keys, i, opType, false, "", fromField.ok, fromField.value, ks, w)
+                        if opType == "insert_edge" || opType == "delete_edge":
+                            let fromField = do planField(op, "from")
+                            let res1 = do planTransactionAddTouch(keys, i, opType, false, "", fromField.has, fromField.s, ks, w)
                             if res1.refused:
                                 return res1.plan
-                            let toField = do planJsonObjectStringField(elemText, "to")
-                            let res2 = do planTransactionAddTouch(res1.plan.keys, i, opType, false, "", toField.ok, toField.value, ks, w)
+                            let toField = do planField(op, "to")
+                            let res2 = do planTransactionAddTouch(res1.plan.keys, i, opType, false, "", toField.has, toField.s, ks, w)
                             if res2.refused:
                                 return res2.plan
                             keys = res2.plan.keys
@@ -1156,63 +529,57 @@ app FabricPlanSelfHost:
                             let v = do planValueRefuse(refusal)
                             return v
             i = i + 1
+        if len(keys) == 0:
+            let v = do planSpanning(ks, w, "an empty POST /transaction", "it touches no address and no kind, so nothing decides which backend should answer it")
+            return v
         let v = do planValueColocated(keys)
         return v
 
+    # transaction_plan.
     proc planTransactionPlan(body: text, ks: PlanKeyspace) -> PlanValue:
-        let validBody = do planJsonValidate(body)
-        if !validBody:
-            let refusal = do planRefusalMalformedBody("POST /transaction", "invalid JSON body")
+        let parsed = do planJson(body)
+        if !parsed.ok:
+            let refusal = do planRefusalMalformedBody("POST /transaction", parsed.message)
             let v = do planValueRefuse(refusal)
             return v
-        let opsArr = do planJsonObjectArrayField(body, "operations")
-        if !opsArr.present:
+        let ops = do sjGet(parsed.value, "operations")
+        if !ops.has || ops.v.kind != "arr":
             let refusal = do planRefusalMalformedBody("POST /transaction", "no `operations` array")
             let v = do planValueRefuse(refusal)
             return v
-        if opsArr.count == 0:
-            let w = PlanRouteIntent{isWrite: true, readPref: PlanReadPreference{code: 0, region: ""}}
-            let v = do planSpanning(ks, w, "an empty POST /transaction", "it touches no address and no kind, so nothing decides which backend should answer it")
-            return v
-        let v = do planTransactionKeys(body, opsArr, ks)
+        let v = do planTransactionKeys(ops.v.items, ks)
         return v
 
     # ============================================================
-    # SECTION 8: /nodes/multiget
+    # SECTION 7: /nodes/multiget
     # ============================================================
-    proc planMultigetKeys(body: text, addrArr: PlanJsonArrayField, ks: PlanKeyspace, readIntent: PlanRouteIntent) -> PlanValue:
-        let n = addrArr.count
+    proc planMultigetKeys(addresses: [SjV], ks: PlanKeyspace, readIntent: PlanRouteIntent) -> PlanValue:
+        let n = len(addresses)
         let mut i = 0
         let mut keys = []
         loop i < n:
-            let startIdx = addrArr.elemStarts[i]
-            let ch = charAt(body, startIdx)
-            if ch != "\"":
+            let a = addresses[i]
+            if a.kind != "str":
                 let msg = "addresses[" + i + "] is not a string"
                 let refusal = do planRefusalMalformedBody("POST /nodes/multiget", msg)
                 let v = do planValueRefuse(refusal)
                 return v
-            let strRes = do planJsonReadString(body, startIdx)
-            if !strRes.ok:
-                let msg = "addresses[" + i + "] is not a string"
-                let refusal = do planRefusalMalformedBody("POST /nodes/multiget", msg)
-                let v = do planValueRefuse(refusal)
-                return v
-            let address = strRes.value
-            let resolved = do planKeyspaceResolve(ks, false, "", true, address)
+            let resolved = do planKeyspaceResolve(ks, false, "", true, a.s)
             if resolved.missCode != -1:
                 let refusal = do planKeyspaceMissToRefusal(resolved)
                 let v = do planValueRefuse(refusal)
                 return v
-            let origin = "addresses[" + i + "] '" + address + "'"
-            let ki = PlanKeyIntent{key: resolved.key, intent: readIntent, origin: origin}
-            keys = append(keys, ki)
+            let origin = "addresses[" + i + "] '" + a.s + "'"
+            keys = append(keys, PlanKeyIntent{key: resolved.key, intent: readIntent, origin: origin})
             i = i + 1
+        if len(keys) == 0:
+            let v = do planSpanning(ks, readIntent, "an empty POST /nodes/multiget", "it names no address, so nothing decides which backend should answer it")
+            return v
         let v = do planValueColocated(keys)
         return v
 
     # ============================================================
-    # SECTION 9: THE MAIN ENTRY POINT — `plan()` itself
+    # SECTION 8: THE MAIN ENTRY POINT — `plan()` itself
     # ============================================================
     # planRequest: restates `plan()`'s whole match, arm for arm, in the
     # source's own order (the arms never actually overlap — method + path
@@ -1237,14 +604,14 @@ app FabricPlanSelfHost:
 
         # ── one node, addressed ────────────────────────────────────
         if method == "POST" && n == 1 && segs[0] == "node":
-            let validBody = do planJsonValidate(body)
-            if !validBody:
-                let refusal = do planRefusalMalformedBody("POST /node", "invalid JSON body")
+            let parsed = do planJson(body)
+            if !parsed.ok:
+                let refusal = do planRefusalMalformedBody("POST /node", parsed.message)
                 let v = do planValueRefuse(refusal)
                 return v
-            let kindField = do planJsonObjectStringField(body, "kind")
-            let addressField = do planJsonObjectStringField(body, "address")
-            let v = do planColocated1(ks, "POST /node", writeIntent, kindField.ok, kindField.value, addressField.ok, addressField.value)
+            let kindField = do planField(parsed.value, "kind")
+            let addressField = do planField(parsed.value, "address")
+            let v = do planColocated1(ks, "POST /node", writeIntent, kindField.has, kindField.s, addressField.has, addressField.s)
             return v
 
         if method == "GET" && n == 2 && segs[0] == "node":
@@ -1297,65 +664,62 @@ app FabricPlanSelfHost:
 
         if method == "POST" && n == 2 && segs[0] == "nodes" && (segs[1] == "query" || segs[1] == "count" || segs[1] == "count_by"):
             let context = path
-            let validBody = do planJsonValidate(body)
-            if !validBody:
-                let refusal = do planRefusalMalformedBody(context, "invalid JSON body")
+            let parsed = do planJson(body)
+            if !parsed.ok:
+                let refusal = do planRefusalMalformedBody(context, parsed.message)
                 let v = do planValueRefuse(refusal)
                 return v
-            let kindField = do planJsonObjectStringField(body, "kind")
-            if kindField.ok:
-                let v = do planColocated1(ks, context, readIntent, true, kindField.value, false, "")
+            let kindField = do planField(parsed.value, "kind")
+            if kindField.has:
+                let v = do planColocated1(ks, context, readIntent, true, kindField.s, false, "")
                 return v
             let v = do planSpanning(ks, readIntent, "a kind-less predicate query", "it selects across every kind, and the keyset cursor it pages with is opaque and backend-local, so two backends' pages cannot be merged into one resumable sequence")
             return v
 
         if method == "POST" && n == 2 && segs[0] == "nodes" && segs[1] == "multiget":
-            let validBody = do planJsonValidate(body)
-            if !validBody:
-                let refusal = do planRefusalMalformedBody("POST /nodes/multiget", "invalid JSON body")
+            let parsed = do planJson(body)
+            if !parsed.ok:
+                let refusal = do planRefusalMalformedBody("POST /nodes/multiget", parsed.message)
                 let v = do planValueRefuse(refusal)
                 return v
-            let addrArr = do planJsonObjectArrayField(body, "addresses")
-            if !addrArr.present:
+            let addrArr = do sjGet(parsed.value, "addresses")
+            if !addrArr.has || addrArr.v.kind != "arr":
                 let refusal = do planRefusalMalformedBody("POST /nodes/multiget", "no `addresses` array")
                 let v = do planValueRefuse(refusal)
                 return v
-            if addrArr.count == 0:
-                let v = do planSpanning(ks, readIntent, "an empty POST /nodes/multiget", "it names no address, so nothing decides which backend should answer it")
-                return v
-            let v = do planMultigetKeys(body, addrArr, ks, readIntent)
+            let v = do planMultigetKeys(addrArr.v.items, ks, readIntent)
             return v
 
         # ── edges ───────────────────────────────────────────────────
         if (method == "POST" || method == "DELETE") && n == 1 && segs[0] == "edge":
             let context = method + " /edge"
-            let validBody = do planJsonValidate(body)
-            if !validBody:
-                let refusal = do planRefusalMalformedBody(context, "invalid JSON body")
+            let parsed = do planJson(body)
+            if !parsed.ok:
+                let refusal = do planRefusalMalformedBody(context, parsed.message)
                 let v = do planValueRefuse(refusal)
                 return v
-            let fromField = do planJsonObjectStringField(body, "from")
-            if !fromField.ok:
+            let fromField = do planField(parsed.value, "from")
+            if !fromField.has:
                 let refusal = do planRefusalMalformedBody(context, "no `from` address")
                 let v = do planValueRefuse(refusal)
                 return v
-            let toField = do planJsonObjectStringField(body, "to")
-            if !toField.ok:
-                let refusal = do planRefusalMalformedBody(context, "no `to` address")
-                let v = do planValueRefuse(refusal)
-                return v
-            let fromResolved = do planKeyspaceResolve(ks, false, "", true, fromField.value)
+            let fromResolved = do planKeyspaceResolve(ks, false, "", true, fromField.s)
             if fromResolved.missCode != -1:
                 let refusal = do planKeyspaceMissToRefusal(fromResolved)
                 let v = do planValueRefuse(refusal)
                 return v
-            let toResolved = do planKeyspaceResolve(ks, false, "", true, toField.value)
+            let toField = do planField(parsed.value, "to")
+            if !toField.has:
+                let refusal = do planRefusalMalformedBody(context, "no `to` address")
+                let v = do planValueRefuse(refusal)
+                return v
+            let toResolved = do planKeyspaceResolve(ks, false, "", true, toField.s)
             if toResolved.missCode != -1:
                 let refusal = do planKeyspaceMissToRefusal(toResolved)
                 let v = do planValueRefuse(refusal)
                 return v
-            let fromOrigin = "from '" + fromField.value + "'"
-            let toOrigin = "to '" + toField.value + "'"
+            let fromOrigin = "from '" + fromField.s + "'"
+            let toOrigin = "to '" + toField.s + "'"
             let fromKi = PlanKeyIntent{key: fromResolved.key, intent: writeIntent, origin: fromOrigin}
             let toKi = PlanKeyIntent{key: toResolved.key, intent: writeIntent, origin: toOrigin}
             let v = do planValueColocated([fromKi, toKi])
@@ -1372,17 +736,17 @@ app FabricPlanSelfHost:
             return v
 
         if method == "POST" && n == 1 && segs[0] == "publish":
-            let validBody = do planJsonValidate(body)
-            if !validBody:
-                let refusal = do planRefusalMalformedBody("POST /publish", "invalid JSON body")
+            let parsed = do planJson(body)
+            if !parsed.ok:
+                let refusal = do planRefusalMalformedBody("POST /publish", parsed.message)
                 let v = do planValueRefuse(refusal)
                 return v
-            let channelField = do planJsonObjectStringField(body, "channel")
-            if !channelField.ok:
+            let channelField = do planField(parsed.value, "channel")
+            if !channelField.has:
                 let refusal = do planRefusalMalformedBody("POST /publish", "no `channel`")
                 let v = do planValueRefuse(refusal)
                 return v
-            let v = do planColocated1(ks, "POST /publish", writeIntent, true, channelField.value, false, "")
+            let v = do planColocated1(ks, "POST /publish", writeIntent, true, channelField.s, false, "")
             return v
 
         # ── per-instance state ─────────────────────────────────────
@@ -1417,7 +781,7 @@ app FabricPlanSelfHost:
         return v
 
     # ============================================================
-    # SECTION 10: DEMO / HAND-TRACED VERIFICATION FIXTURES — restating
+    # SECTION 9: DEMO / HAND-TRACED VERIFICATION FIXTURES — restating
     # plan.rs's own eleven `#[test]` functions, one demo proc per test (or
     # per small cluster of the same test's assertions), each returning a
     # text/int summary of the facts that test checks. Expected values are

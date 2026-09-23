@@ -1,0 +1,221 @@
+import "../../fabric_frontdoor.fct"
+
+# The front door under test (selfhost/fabric_frontdoor_test.go): the fleets of
+# fabric-facetql's tests/front_door.rs and the routing tables its scenarios
+# publish — built by the ported fabric-routing table, fabric-migration state
+# machine and fabric-replication replica set, never by hand — plus actions
+# exposing the door's pure decision procs to the conformance checks.
+app FrontDoorFixture:
+    state fxOut: text = ""
+
+    # key(n): RoutingKey::new(n, (0,0)), packed as fabric.fct packs it.
+    proc fxKey(shard: int) -> int:
+        return shard * 156
+
+    proc fxRegistry(placeOneOn: text) -> TopologyRegistry:
+        let r0 = do topologyRegistryNew()
+        let r1 = do topologyRegistryPlace(r0, placeOneOn, 1, Coordinate{x: 0, y: 0}, "eu")
+        let r2 = do topologyRegistryPlace(r1, "db-b", 2, Coordinate{x: 0, y: 0}, "us")
+        return r2
+
+    proc fxBaseRouting() -> TableRoutingTable:
+        let reg = do fxRegistry("db-a")
+        let t = do tableApplyPlacements(tableNew(), reg)
+        return t
+
+    # fxFencedCutover: shard 1's migration db-a -> db-b driven through its
+    # real state machine to Cutover, where writes are fenced everywhere.
+    proc fxFencedCutover() -> Migration:
+        let shard = do shardNew(1, "app")
+        let planned = do migrationPlanNew(MigrationId{value: 1}, shard, "db-a", "db-b", migrationReasonRebalance(), 0)
+        let m0 = do migrationNew(planned.plan)
+        let m1 = do migrationBeginCopy(m0, 1)
+        let m2 = do migrationRecordCopy(m1.value, shardAtomCount(shard), 4096, 2)
+        let m3 = do migrationBeginCatchUp(m2.value, 3)
+        let m4 = do migrationBeginCutover(m3.value, 4)
+        return m4.value
+
+    # fxRouting: the tables a scenario publishes, by name.
+    proc fxRouting(name: text) -> TableRoutingTable:
+        let base = do fxBaseRouting()
+        if name == "fenced":
+            let m = do fxFencedCutover()
+            let r = do tableObserveMigrationOf(base, m, true, Coordinate{x: 0, y: 0})
+            return r.table
+        if name == "broken":
+            let r = do tableSetReplicaSet(base, replGroupNew(1, 3), false, Coordinate{x: 0, y: 0})
+            return r.table
+        if name == "a-unreachable":
+            let r = do tableSetAvailability(base, "db-a", "Unreachable")
+            return r.table
+        if name == "forget-shard-1":
+            let r = do tableForgetShard(base, 1)
+            return r.table
+        if name == "placed-on-c":
+            let reg = do fxRegistry("db-c")
+            let t = do tableApplyPlacements(tableNew(), reg)
+            return t
+        if name == "single":
+            let r0 = do topologyRegistryNew()
+            let r1 = do topologyRegistryPlace(r0, "db-a", 1, Coordinate{x: 0, y: 0}, "eu")
+            let t = do tableApplyPlacements(tableNew(), r1)
+            return t
+        return base
+
+    # fxInstall: the Rust test's `Fleet::spawn` ("split": Post and User on
+    # two shards on two instances, a 400ms fence budget re-checked every
+    # 20ms, a 5s upstream bound) or its single-FacetQL door ("single":
+    # Keyspace::single(key(1)), the default config).
+    proc fxInstall(fleetName: text, port: int, urlA: text, urlB: text) -> text:
+        let a = do fdBackendNew("db-a", urlA)
+        let b = do fdBackendNew("db-b", urlB)
+        if fleetName == "single":
+            let ks = PlanKeyspace{rules: [], hasFallback: true, fallbackKey: fxKey(1)}
+            let f = do fdFleetNew(ks, [a.backend], fxRouting("single"))
+            do fdInstall(fdConfigDefault(port), f.fleet)
+            return f.err
+        let rules = [RoutingRule{kind: "Post", prefix: "Post:", key: fxKey(1)}, RoutingRule{kind: "User", prefix: "User:", key: fxKey(2)}]
+        let ks = PlanKeyspace{rules: rules, hasFallback: false, fallbackKey: -1}
+        let f = do fdFleetNew(ks, [a.backend, b.backend], fxBaseRouting())
+        let d = do fdConfigDefault(port)
+        let config = FdConfig{readPref: d.readPref, fenceRetryBudgetMs: 400, fenceRetryIntervalMs: 20, upstreamTimeoutMs: 5000, maxBodyBytes: d.maxBodyBytes, port: port}
+        do fdInstall(config, f.fleet)
+        return f.err
+
+    action fxStart(fleetName: text, port: int, urlA: text, urlB: text):
+        let err = do fxInstall(fleetName, port, urlA, urlB)
+        fxOut = err
+
+    proc fxPublishNamed(name: text) -> int:
+        do fdPublishRouting(fxRouting(name))
+        let g = do fdGeneration()
+        return g
+
+    action fxPublish(name: text):
+        let g = do fxPublishNamed(name)
+        fxOut = "" + g
+
+    # ── the pure decisions, one input at a time ──────────────────────
+    proc fxAgreeText(ls: int, lb: text, rs: int, rb: text) -> text:
+        let v = do fdAnswersAgree(ls, lb, rs, rb)
+        return "" + v
+
+    action fxAgree(ls: int, lb: text, rs: int, rb: text):
+        let v = do fxAgreeText(ls, lb, rs, rb)
+        fxOut = v
+
+    # fxRoutingErrorOf: one RoutingError of each kind, as the Rust unit test
+    # `every_routing_failure_has_a_status_a_client_can_act_on` builds them.
+    proc fxRoutingErrorOf(kind: text) -> RoutingError:
+        if kind == "WriteFenced":
+            let e = do routingErrorWriteFenced(1, "a", "b")
+            return e
+        if kind == "NoWritableReplica":
+            let e = do routingErrorNoWritableReplica(1)
+            return e
+        if kind == "NoLiveOwner":
+            let e = do routingErrorNoLiveOwner(1, ["a"])
+            return e
+        if kind == "NoReadableReplica":
+            let e = do routingErrorNoReadableReplica(1)
+            return e
+        if kind == "UnknownShard":
+            let e = do routingErrorUnknownShard(1)
+            return e
+        if kind == "InvalidCoordinate":
+            let e = do routingErrorInvalidCoordinate(99, 0)
+            return e
+        if kind == "InvalidAddress":
+            let e = do routingErrorInvalidAddress("x", "nope")
+            return e
+        if kind == "InvalidRange":
+            let e = do routingErrorInvalidRange(Coordinate{x: 1, y: 1}, Coordinate{x: 0, y: 0})
+            return e
+        let e = do routingErrorUnknownNode("ghost")
+        return e
+
+    # fxStatusText: `status|retry-after|body` of the door's response to one
+    # routing failure.
+    proc fxStatusText(kind: text) -> text:
+        let e = do fxRoutingErrorOf(kind)
+        let none = do planRefusalNone()
+        let r = do fdDoorErrorResponse(FdDoorError{kind: "Routing", refusal: none, routing: e, node: ""})
+        let ra = do httpHeaderValue(r.headers, "retry-after")
+        return "" + r.status + "|" + ra + "|" + r.body
+
+    action fxStatus(kind: text):
+        let v = do fxStatusText(kind)
+        fxOut = v
+
+    proc fxCredentialText(headerLines: text, hasQuery: bool, query: text) -> text:
+        let hs = do httpHeadersFromLines(headerLines)
+        let v = do fdCarriesCredential(hs, hasQuery, query)
+        return "" + v
+
+    action fxCredential(headerLines: text, hasQuery: bool, query: text):
+        let v = do fxCredentialText(headerLines, hasQuery, query)
+        fxOut = v
+
+    proc fxBackendText(id: text, url: text) -> text:
+        let r = do fdBackendNew(id, url)
+        return "" + r.ok + "|" + r.err + "|" + r.backend.baseUrl
+
+    action fxBackend(id: text, url: text):
+        let v = do fxBackendText(id, url)
+        fxOut = v
+
+    proc fxNoBackendsText() -> text:
+        let ks = PlanKeyspace{rules: [], hasFallback: true, fallbackKey: fxKey(1)}
+        let f = do fdFleetNew(ks, [], tableNew())
+        return "" + f.ok + "|" + f.err
+
+    action fxNoBackends:
+        let v = do fxNoBackendsText()
+        fxOut = v
+
+    # fxSpansText: the Rust unit test
+    # `a_request_spanning_two_backends_is_refused_naming_both_halves` —
+    # db-a and db-b serviceable, shard 1 on db-a, shard 2 on db-b; two write
+    # keys, then the first alone.
+    proc fxSpansText() -> text:
+        let t0 = do tableNew()
+        let t1 = do tableRegisterNode(t0, "db-a", "eu")
+        let t2 = do tableRegisterNode(t1, "db-b", "us")
+        let t3 = do tableSetAvailability(t2, "db-a", "Serviceable")
+        let t4 = do tableSetAvailability(t3.table, "db-b", "Serviceable")
+        let reg0 = do topologyRegistryNew()
+        let reg1 = do topologyRegistryPlace(reg0, "db-a", 1, Coordinate{x: 0, y: 0}, "eu")
+        let reg2 = do topologyRegistryPlace(reg1, "db-b", 2, Coordinate{x: 0, y: 0}, "us")
+        let routing = do tableApplyPlacements(t4.table, reg2)
+        let a = do fdBackendNew("db-a", "http://a")
+        let b = do fdBackendNew("db-b", "http://b")
+        let ks = PlanKeyspace{rules: [], hasFallback: true, fallbackKey: fxKey(1)}
+        let f = do fdFleetNew(ks, [a.backend, b.backend], routing)
+        let w = PlanRouteIntent{isWrite: true, readPref: PlanReadPreference{code: 0, region: ""}}
+        let k1 = PlanKeyIntent{key: fxKey(1), intent: w, origin: "operations[0] 'Post:1'"}
+        let k2 = PlanKeyIntent{key: fxKey(2), intent: w, origin: "operations[1] 'User:2'"}
+        let both = do fdResolveOnce(f.fleet, [k1, k2])
+        let status = do planRefusalStatus(both.err.refusal)
+        let msg = do planRefusalDisplay(both.err.refusal)
+        let one = do fdResolveOnce(f.fleet, [k1])
+        return both.err.kind + "|" + status + "|" + msg + "|" + one.ok + "|" + one.backend.id
+
+    action fxSpans:
+        let v = do fxSpansText()
+        fxOut = v
+
+    proc fxFrameEndText(s: text) -> text:
+        let n = do fdFrameEnd(textToBytes(s))
+        return "" + n
+
+    action fxFrameEnd(s: text):
+        let v = do fxFrameEndText(s)
+        fxOut = v
+
+    proc fxHopText(name: text) -> text:
+        let v = do fdIsHopByHop(name)
+        return "" + v
+
+    action fxHop(name: text):
+        let v = do fxHopText(name)
+        fxOut = v

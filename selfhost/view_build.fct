@@ -1,0 +1,3318 @@
+import "view_parse.fct"
+import "check.fct"
+import "ir_graph.fct"
+
+app ViewBuildSelfHost:
+    # view_build.fct — self-hosted port of internal/ir/build.go's VIEW
+    # compiler: viewCtx.nodes (every ast.Node kind view_parse.fct produces),
+    # lowerSegs (top-level interpolations -> page-local binding ids `b0…`,
+    # in-region ones -> inline Expr segments), lowerRange (+ itemFields /
+    # comparedItemFields / markQueried / markIndex — the view-driven index
+    # inference), lowerOptions, the dynamic-region ids (`l`/`f`/`m`/`t`/`g`/
+    # `u` + the shared `b` counter) with their dependency edges (depsIR /
+    # nodeDeps / optionDeps), link destination classification (route
+    # expression / external URL / path template / anchor), and Build's
+    # step 5: views -> pages -> routes, the first page's view/bindings/
+    # depGraph lifted to the top level, then the call-arity, link-route and
+    # anchor validations.
+    #
+    # Components (`use`) and layouts (`in Layout`) are not lowered here: a
+    # page that uses one is refused with a diagnostic naming the missing
+    # port rather than compiled into a tree that silently lacks it.
+    #
+    # Errors travel in VCtx.err (first error wins, as Go's early return
+    # does); every lowering step checks it before doing more work.
+    struct VEnv:
+        stateNames: [text]
+        stateClient: [bool]
+        stateTypes: [text]
+        stateLists: [bool]
+        privateNames: [text]
+        entityNames: [text]
+        fieldKeys: [text]
+        fieldTypes: [text]
+        deriveKeys: [text]
+        e2eKeys: [text]
+        enumFieldKeys: [text]
+        enumFieldEnums: [text]
+        enumNames: [text]
+        enumMemberKeys: [text]
+        inlineNames: [text]
+        inlineExprs: [IRExpr]
+        actionNames: [text]
+        actionParamCounts: [int]
+        policyNames: [text]
+        policyParamCounts: [int]
+        low: LowCtx
+        # calls: the parameterized derives and procs a call may name (a
+        # view may call neither a proc nor a derive that calls one).
+        calls: CallEnv
+
+    struct VScope:
+        locals: [text]
+        inRegion: bool
+        varNames: [text]
+        varTypes: [text]
+
+    struct VRes:
+        nodes: [IRNode]
+        ctx: VCtx
+
+    # VGlobal: the parts of Build's env that the view compiler grows as it
+    # goes and every later page must see — component tables, per-component
+    # dependency sets and region edges (compDeps/compRegions), the
+    # specialization counter, the expanded templates (e.special) and the
+    # expansion stack that refuses recursion. It rides inside VCtx so it
+    # flows through every lowering step's return value.
+    struct VTextList:
+        items: [text]
+
+    struct VRegion:
+        keys: [text]
+        ids: [text]
+
+    struct VGlobal:
+        comps: [VComp]
+        compSlot: [text]
+        depNames: [text]
+        deps: [VTextList]
+        regNames: [text]
+        regions: [VRegion]
+        nspec: int
+        special: [IRComponent]
+        specStack: [text]
+
+    struct VSegRes:
+        segs: [IRSeg]
+        ctx: VCtx
+
+    struct VPagesOut:
+        err: text
+        pages: [IRPage]
+        routes: [IRRoute]
+        indexKeys: [text]
+        queriedKeys: [text]
+        components: [IRComponent]
+
+    struct VCtx:
+        pfx: text
+        bindings: [IRBinding]
+        depKeys: [text]
+        depIds: [text]
+        callNames: [text]
+        callArgc: [int]
+        callVia: [text]
+        links: [text]
+        indexKeys: [text]
+        queriedKeys: [text]
+        nb: int
+        nl: int
+        nf: int
+        nu: int
+        ng: int
+        err: text
+        g: VGlobal
+        slotOK: bool
+        slot: [IRNode]
+
+    proc vbCtxG(pfx: text, g: VGlobal) -> VCtx:
+        return VCtx{pfx: pfx, bindings: [], depKeys: [], depIds: [], callNames: [], callArgc: [], callVia: [], links: [], indexKeys: [], queriedKeys: [], nb: 0, nl: 0, nf: 0, nu: 0, ng: 0, err: "", g: g, slotOK: false, slot: []}
+
+    proc vcSetPfx(n: VCtx, v: text) -> VCtx:
+        return VCtx{pfx: v, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetBindings(n: VCtx, v: [IRBinding]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: v, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetDepKeys(n: VCtx, v: [text]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: v, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetDepIds(n: VCtx, v: [text]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: v, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetCallNames(n: VCtx, v: [text]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: v, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetCallArgc(n: VCtx, v: [int]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: v, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetCallVia(n: VCtx, v: [text]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: v, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetLinks(n: VCtx, v: [text]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: v, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetIndexKeys(n: VCtx, v: [text]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: v, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetQueriedKeys(n: VCtx, v: [text]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: v, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetNb(n: VCtx, v: int) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: v, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetNl(n: VCtx, v: int) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: v, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetNf(n: VCtx, v: int) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: v, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetNu(n: VCtx, v: int) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: v, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetNg(n: VCtx, v: int) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: v, err: n.err, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetErr(n: VCtx, v: text) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: v, g: n.g, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetG(n: VCtx, v: VGlobal) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: v, slotOK: n.slotOK, slot: n.slot}
+
+    proc vcSetSlotOK(n: VCtx, v: bool) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: v, slot: n.slot}
+
+    proc vcSetSlot(n: VCtx, v: [IRNode]) -> VCtx:
+        return VCtx{pfx: n.pfx, bindings: n.bindings, depKeys: n.depKeys, depIds: n.depIds, callNames: n.callNames, callArgc: n.callArgc, callVia: n.callVia, links: n.links, indexKeys: n.indexKeys, queriedKeys: n.queriedKeys, nb: n.nb, nl: n.nl, nf: n.nf, nu: n.nu, ng: n.ng, err: n.err, g: n.g, slotOK: n.slotOK, slot: v}
+
+    proc vbNode(kind: text) -> IRNode:
+        return IRNode{kind: kind, children: [], segs: [], label: [], action: "", args: [], debounce: 0, id: "", itemVar: "", coll: "", where: [], order: "", desc: false, limit: [], more: "", cond: [], seconds: 0, body: [], level: [], bind: "", placeholder: [], alt: [], poster: [], autoplay: false, loopFlag: false, muted: false, path: "", pathSegs: [], route: false, external: false, name: "", options: [], value: "", val: [], class: "", style: "", classSegs: [], anchor: "", width: 0, height: 0, tiles: [], x: [], y: [], facing: [], image: []}
+
+    proc vbSetChildren(n: IRNode, v: [IRNode]) -> IRNode:
+        return IRNode{kind: n.kind, children: v, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetSegs(n: IRNode, v: [IRSeg]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: v, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetLabel(n: IRNode, v: [IRSeg]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: v, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetAction(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: v, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetArgs(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: v, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetDebounce(n: IRNode, v: int) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: v, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetId(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: v, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetItemVar(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: v, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetColl(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: v, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetWhere(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: v, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetOrder(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: v, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetDesc(n: IRNode, v: bool) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: v, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetLimit(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: v, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetMore(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: v, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetCond(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: v, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetSeconds(n: IRNode, v: int) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: v, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetBody(n: IRNode, v: [IRStmt]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: v, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetLevel(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: v, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetBind(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: v, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetPlaceholder(n: IRNode, v: [IRSeg]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: v, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetAlt(n: IRNode, v: [IRSeg]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: v, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetPoster(n: IRNode, v: [IRSeg]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: v, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetAutoplay(n: IRNode, v: bool) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: v, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetLoopFlag(n: IRNode, v: bool) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: v, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetMuted(n: IRNode, v: bool) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: v, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetPath(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: v, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetPathSegs(n: IRNode, v: [IRSeg]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: v, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetRoute(n: IRNode, v: bool) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: v, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetExternal(n: IRNode, v: bool) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: v, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetName(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: v, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetOptions(n: IRNode, v: [IROption]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: v, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetValue(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: v, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetVal(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: v, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetClass(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: v, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetStyle(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: v, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetClassSegs(n: IRNode, v: [IRSeg]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: v, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetAnchor(n: IRNode, v: text) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: v, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetWidth(n: IRNode, v: int) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: v, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetHeight(n: IRNode, v: int) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: v, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetTiles(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: v, x: n.x, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetX(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: v, y: n.y, facing: n.facing, image: n.image}
+
+    proc vbSetY(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: v, facing: n.facing, image: n.image}
+
+    proc vbSetFacing(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: v, image: n.image}
+
+    proc vbSetImage(n: IRNode, v: [IRExpr]) -> IRNode:
+        return IRNode{kind: n.kind, children: n.children, segs: n.segs, label: n.label, action: n.action, args: n.args, debounce: n.debounce, id: n.id, itemVar: n.itemVar, coll: n.coll, where: n.where, order: n.order, desc: n.desc, limit: n.limit, more: n.more, cond: n.cond, seconds: n.seconds, body: n.body, level: n.level, bind: n.bind, placeholder: n.placeholder, alt: n.alt, poster: n.poster, autoplay: n.autoplay, loopFlag: n.loopFlag, muted: n.muted, path: n.path, pathSegs: n.pathSegs, route: n.route, external: n.external, name: n.name, options: n.options, value: n.value, val: n.val, class: n.class, style: n.style, classSegs: n.classSegs, anchor: n.anchor, width: n.width, height: n.height, tiles: n.tiles, x: n.x, y: n.y, facing: n.facing, image: v}
+
+    # ── env lookups ─────────────────────────────────────────────────────────
+    proc vbFind(names: [text], name: text) -> int:
+        let n = len(names)
+        let mut i = 0
+        loop i < n:
+            if names[i] == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc vbIsState(env: VEnv, name: text) -> bool:
+        return name in env.stateNames
+
+    proc vbIsClient(env: VEnv, name: text) -> bool:
+        let i = do vbFind(env.stateNames, name)
+        if i < 0:
+            return false
+        return env.stateClient[i]
+
+    proc vbStateType(env: VEnv, name: text) -> text:
+        let i = do vbFind(env.stateNames, name)
+        if i < 0:
+            return ""
+        return env.stateTypes[i]
+
+    proc vbStateList(env: VEnv, name: text) -> bool:
+        let i = do vbFind(env.stateNames, name)
+        if i < 0:
+            return false
+        return env.stateLists[i]
+
+    proc vbIsEntity(env: VEnv, name: text) -> bool:
+        return name in env.entityNames
+
+    proc vbHasField(env: VEnv, ent: text, field: text) -> bool:
+        return (ent + "." + field) in env.fieldKeys
+
+    proc vbIsEnum(env: VEnv, name: text) -> bool:
+        return name in env.enumNames
+
+    proc vbIsPrimitive(t: text) -> bool:
+        return t == "int" || t == "text" || t == "bool" || t == "money" || t == "date" || t == "float" || t == "datetime"
+
+    proc vbLow(env: VEnv, ex: ExprNode) -> IRExpr:
+        let le = do lowFull(ex, env.low)
+        return le
+
+    proc vbAddUnique(xs: [text], x: text) -> [text]:
+        if x in xs:
+            return xs
+        return append(xs, x)
+
+    proc vbSortText(xs: [text]) -> [text]:
+        let mut out = xs
+        let n = len(out)
+        let mut i = 1
+        loop i < n:
+            let v = out[i]
+            let mut j = i - 1
+            loop j >= 0:
+                if out[j] > v:
+                    out[j + 1] = out[j]
+                    j = j - 1
+                else:
+                    break
+            out[j + 1] = v
+            i = i + 1
+        return out
+
+    # ── depsIR ──────────────────────────────────────────────────────────────
+    proc vbDepsWalk(env: VEnv, e: IRExpr, acc: [text]) -> [text]:
+        let mut out = acc
+        if e.kind == "ref":
+            let st = do vbIsState(env, e.name)
+            let en = do vbIsEntity(env, e.name)
+            if st || en:
+                let a = do vbAddUnique(out, e.name)
+                out = a
+            return out
+        if e.kind == "get":
+            if len(e.obj) > 0:
+                let a = do vbDepsWalk(env, e.obj[0], out)
+                out = a
+            return out
+        if e.kind == "eget":
+            let en = do vbIsEntity(env, e.name)
+            if en:
+                let a = do vbAddUnique(out, e.name)
+                out = a
+            if len(e.key) > 0:
+                let b = do vbDepsWalk(env, e.key[0], out)
+                out = b
+            return out
+        if e.kind == "astate":
+            if e.op == "dirty" || e.op == "touched":
+                let a = do vbAddUnique(out, e.name)
+                return a
+            let b = do vbAddUnique(out, "@act:" + e.name)
+            return b
+        if e.kind == "agg":
+            let en = do vbIsEntity(env, e.name)
+            if en:
+                let a = do vbAddUnique(out, e.name)
+                out = a
+            if len(e.where) > 0:
+                let b = do vbDepsWalk(env, e.where[0], out)
+                out = b
+            if len(e.sel) > 0:
+                let c = do vbDepsWalk(env, e.sel[0], out)
+                out = c
+            if len(e.limit) > 0:
+                let d = do vbDepsWalk(env, e.limit[0], out)
+                out = d
+            return out
+        if e.kind == "call" || e.kind == "list" || e.kind == "struct":
+            let n = len(e.args)
+            let mut i = 0
+            loop i < n:
+                let a = do vbDepsWalk(env, e.args[i], out)
+                out = a
+                i = i + 1
+            return out
+        if e.kind == "bin":
+            if len(e.l) > 0:
+                let a = do vbDepsWalk(env, e.l[0], out)
+                out = a
+            if len(e.r) > 0:
+                let b = do vbDepsWalk(env, e.r[0], out)
+                out = b
+            return out
+        if e.kind == "un":
+            if len(e.x) > 0:
+                let a = do vbDepsWalk(env, e.x[0], out)
+                out = a
+            return out
+        return out
+
+    proc vbDepsList(env: VEnv, es: [IRExpr], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(es)
+        let mut i = 0
+        loop i < n:
+            let a = do vbDepsWalk(env, es[i], out)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbDeps(env: VEnv, es: [IRExpr]) -> [text]:
+        let raw = do vbDepsList(env, es, [])
+        let s = do vbSortText(raw)
+        return s
+
+    # nodeDeps: every state/entity read anywhere in a lowered node tree.
+    proc vbSegDeps(env: VEnv, segs: [IRSeg], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            let a = do vbDepsList(env, segs[i].expr, out)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbNodeDepsWalk(env: VEnv, nodes: [IRNode], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let nd = nodes[i]
+            let a1 = do vbSegDeps(env, nd.segs, out)
+            let a2 = do vbSegDeps(env, nd.label, a1)
+            let a3 = do vbSegDeps(env, nd.placeholder, a2)
+            let a4 = do vbSegDeps(env, nd.pathSegs, a3)
+            let a5 = do vbSegDeps(env, nd.classSegs, a4)
+            let a6 = do vbSegDeps(env, nd.alt, a5)
+            let a7 = do vbSegDeps(env, nd.poster, a6)
+            out = a7
+            let no = len(nd.options)
+            let mut oi = 0
+            loop oi < no:
+                let ao = do vbSegDeps(env, nd.options[oi].label, out)
+                out = ao
+                oi = oi + 1
+            let b1 = do vbDepsList(env, nd.cond, out)
+            let b2 = do vbDepsList(env, nd.where, b1)
+            let b3 = do vbDepsList(env, nd.limit, b2)
+            let b4 = do vbDepsList(env, nd.val, b3)
+            let b5 = do vbDepsList(env, nd.args, b4)
+            out = b5
+            if nd.coll != "":
+                let st = do vbIsState(env, nd.coll)
+                let en = do vbIsEntity(env, nd.coll)
+                if st || en:
+                    let c = do vbAddUnique(out, nd.coll)
+                    out = c
+            let d = do vbNodeDepsWalk(env, nd.children, out)
+            out = d
+            i = i + 1
+        return out
+
+    proc vbNodeDeps(env: VEnv, nodes: [IRNode]) -> [text]:
+        let raw = do vbNodeDepsWalk(env, nodes, [])
+        let s = do vbSortText(raw)
+        return s
+
+    # ── ctx edges ───────────────────────────────────────────────────────────
+    proc vbAddDep(c: VCtx, dep: text, id: text) -> VCtx:
+        let c1 = do vcSetDepKeys(c, append(c.depKeys, dep))
+        let c2 = do vcSetDepIds(c1, append(c.depIds, id))
+        return c2
+
+    proc vbAddDeps(c: VCtx, deps: [text], id: text) -> VCtx:
+        let mut out = c
+        let n = len(deps)
+        let mut i = 0
+        loop i < n:
+            let a = do vbAddDep(out, deps[i], id)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbFail(c: VCtx, msg: text) -> VCtx:
+        if c.err != "":
+            return c
+        let c1 = do vcSetErr(c, msg)
+        return c1
+
+    proc vbFailRes(c: VCtx, msg: text) -> VRes:
+        let c1 = do vbFail(c, msg)
+        return VRes{nodes: [], ctx: c1}
+
+    proc vbAddCall(c: VCtx, name: text, argc: int, via: text) -> VCtx:
+        let c1 = do vcSetCallNames(c, append(c.callNames, name))
+        let c2 = do vcSetCallArgc(c1, append(c.callArgc, argc))
+        let c3 = do vcSetCallVia(c2, append(c.callVia, via))
+        return c3
+
+    proc vbMarkQueried(c: VCtx, ent: text, field: text) -> VCtx:
+        let k = do vbAddUnique(c.queriedKeys, ent + "." + field)
+        let c1 = do vcSetQueriedKeys(c, k)
+        return c1
+
+    proc vbMarkIndex(c: VCtx, ent: text, field: text) -> VCtx:
+        let c1 = do vbMarkQueried(c, ent, field)
+        if field == "id":
+            return c1
+        let k = do vbAddUnique(c1.indexKeys, ent + "." + field)
+        let c2 = do vcSetIndexKeys(c1, k)
+        return c2
+
+    # ── scope ───────────────────────────────────────────────────────────────
+    proc vbScopeWith(sc: VScope, v: text) -> VScope:
+        let locals = append(sc.locals, v)
+        let mut names = []
+        let mut types = []
+        let n = len(sc.varNames)
+        let mut i = 0
+        loop i < n:
+            if sc.varNames[i] != v:
+                names = append(names, sc.varNames[i])
+                types = append(types, sc.varTypes[i])
+            i = i + 1
+        return VScope{locals: locals, inRegion: true, varNames: names, varTypes: types}
+
+    proc vbScopeType(sc: VScope, v: text, t: text) -> VScope:
+        return VScope{locals: sc.locals, inRegion: sc.inRegion, varNames: append(sc.varNames, v), varTypes: append(sc.varTypes, t)}
+
+    # vbTyScope: the scope's typed locals as exprtype.fct reads them.
+    proc vbTyScope(sc: VScope) -> TyScope:
+        return TyScope{names: sc.varNames, types: sc.varTypes, recNames: [], recTypes: []}
+
+    proc vbRegion(sc: VScope) -> VScope:
+        return VScope{locals: sc.locals, inRegion: true, varNames: sc.varNames, varTypes: sc.varTypes}
+
+    proc vbVarType(sc: VScope, v: text) -> text:
+        # "" = no type recorded for v.
+        let n = len(sc.varNames)
+        let mut i = n - 1
+        loop i >= 0:
+            if sc.varNames[i] == v:
+                return sc.varTypes[i]
+            i = i - 1
+        return ""
+
+    proc vbHasVarType(sc: VScope, v: text) -> bool:
+        return v in sc.varNames
+
+    proc vbRowEntity(env: VEnv, sc: VScope, name: text) -> text:
+        let t = do vbVarType(sc, name)
+        if t == "":
+            return ""
+        let en = do vbIsEntity(env, t)
+        if en:
+            return t
+        return ""
+
+    proc vbBindRange(env: VEnv, sc: VScope, rg: VRange) -> VScope:
+        let child = do vbScopeWith(sc, rg.itemVar)
+        let en = do vbIsEntity(env, rg.coll)
+        if en:
+            let c1 = do vbScopeType(child, rg.itemVar, rg.coll)
+            return c1
+        let sl = do vbStateList(env, rg.coll)
+        if sl:
+            let st = do vbStateType(env, rg.coll)
+            let c2 = do vbScopeType(child, rg.itemVar, st)
+            return c2
+        return child
+
+    # ── expression checks (checkView = checkPure + checkRowFields) ─────────
+    proc vbCheckRowFields(env: VEnv, ex: ExprNode, sc: VScope) -> text:
+        if ex.kind == "get":
+            let obj = ex.children[0]
+            if obj.kind == "ref":
+                let ent = do vbRowEntity(env, sc, obj.text)
+                if ent != "":
+                    let hf = do vbHasField(env, ent, ex.text)
+                    let hd = (ent + "." + ex.text) in env.deriveKeys
+                    if ex.text != "id" && !hf && !hd:
+                        return "entity \"" + ent + "\" has no field \"" + ex.text + "\" (in `" + obj.text + "." + ex.text + "`)"
+            let r = do vbCheckRowFields(env, obj, sc)
+            return r
+        if ex.kind == "entityGet" || ex.kind == "call" || ex.kind == "list" || ex.kind == "bin" || ex.kind == "un":
+            let n = len(ex.children)
+            let mut i = 0
+            loop i < n:
+                let d = do vbCheckRowFields(env, ex.children[i], sc)
+                if d != "":
+                    return d
+                i = i + 1
+            return ""
+        if ex.kind == "agg":
+            let mut inner = sc
+            if ex.itemVar != "":
+                let w = do vbScopeWith(sc, ex.itemVar)
+                let t = do vbScopeType(w, ex.itemVar, ex.coll)
+                inner = t
+            let nw = len(ex.whereClause)
+            if nw > 0:
+                let d1 = do vbCheckRowFields(env, ex.whereClause[0], inner)
+                if d1 != "":
+                    return d1
+            if len(ex.sel) > 0:
+                let d2 = do vbCheckRowFields(env, ex.sel[0], inner)
+                return d2
+            return ""
+        return ""
+
+    proc vbCheckPure(env: VEnv, ex: ExprNode, locals: [text], what: text) -> text:
+        # checkPureIn: an authority-only builtin first (the last one the
+        # walk meets names the diagnostic, as Go's capability map keeps it).
+        let all0 = do allNodes(ex)
+        let secrets = ["verifyPassword", "totpSecret", "totpValid", "randomToken", "fileDigest", "ed25519Verify", "ecdsaP256Verify", "sha256Hex", "canonicalJson", "shuffleOrder"]
+        let mut lastSecret = ""
+        let na0 = len(all0)
+        let mut ai0 = 0
+        loop ai0 < na0:
+            if all0[ai0].kind == "call" && (all0[ai0].text in secrets):
+                lastSecret = all0[ai0].text
+            ai0 = ai0 + 1
+        if lastSecret != "":
+            return what + " cannot call " + lastSecret + "(...); it handles an authentication secret and runs only on the authority. Call it from an action body instead"
+        let d = do exprCheckTreeC(ex, locals, env.stateNames, env.entityNames, env.fieldKeys, env.enumNames, env.inlineNames, env.calls)
+        if d != "":
+            return d
+        let nodes = do allNodes(ex)
+        let impure = do nodesHaveImpure(nodes)
+        if impure:
+            return what + " cannot use an effectful builtin (now/rand); it must be pure so it can run on any client. Compute it in an action instead"
+        let prints = do nodesHavePrint(nodes)
+        if prints:
+            return what + " cannot call print(...); it is a server-only debugging aid with no client implementation. Call it from an action body or a proc instead"
+        return ""
+
+    proc vbCheckView(env: VEnv, ex: ExprNode, sc: VScope, what: text) -> text:
+        let locals = do viewScope(sc.locals)
+        let d = do vbCheckPure(env, ex, locals, what)
+        if d != "":
+            return d
+        let r = do vbCheckRowFields(env, ex, sc)
+        return r
+
+    proc vbCheckNoPrivate(env: VEnv, ex: ExprNode) -> text:
+        if len(env.privateNames) == 0:
+            return ""
+        let le = do vbLow(env, ex)
+        let deps = do vbDepsWalk(env, le, [])
+        let n = len(deps)
+        let mut i = 0
+        loop i < n:
+            if deps[i] in env.privateNames:
+                return "\"" + deps[i] + "\" is @private (server-only) and cannot be rendered — it can gate logic, key policies, and feed services, but interpolating it would leak it to the client. Render a non-private value (e.g. the handle) instead"
+            i = i + 1
+        return ""
+
+    proc vbIsRowExpr(env: VEnv, ex: ExprNode, sc: VScope) -> bool:
+        if ex.kind == "ref":
+            let has = do vbHasVarType(sc, ex.text)
+            if !has:
+                return false
+            let t = do vbVarType(sc, ex.text)
+            let prim = do vbIsPrimitive(t)
+            let isList = do vpHasPrefix(t, "[")
+            return t != "" && !prim && !isList
+        if ex.kind == "entityGet":
+            return ex.field == ""
+        return false
+
+    proc vbRowName(ex: ExprNode) -> text:
+        if ex.kind == "ref":
+            return "`" + ex.text + "`"
+        if ex.kind == "entityGet":
+            return "`" + ex.text + "(…)`"
+        return "this"
+
+    proc vbE2EFieldRead(env: VEnv, ex: ExprNode, sc: VScope) -> bool:
+        if ex.kind == "entityGet":
+            return (ex.text + "." + ex.field) in env.e2eKeys
+        if ex.kind == "get":
+            let obj = ex.children[0]
+            if obj.kind == "ref":
+                let ent = do vbRowEntity(env, sc, obj.text)
+                if ent != "":
+                    return (ent + "." + ex.text) in env.e2eKeys
+        return false
+
+    proc vbContainsE2E(env: VEnv, ex: ExprNode, sc: VScope) -> bool:
+        let direct = do vbE2EFieldRead(env, ex, sc)
+        if direct:
+            return true
+        if ex.kind == "get" || ex.kind == "entityGet" || ex.kind == "bin" || ex.kind == "un" || ex.kind == "call":
+            let n = len(ex.children)
+            let mut i = 0
+            loop i < n:
+                let c = do vbContainsE2E(env, ex.children[i], sc)
+                if c:
+                    return true
+                i = i + 1
+            return false
+        if ex.kind == "agg":
+            if len(ex.whereClause) > 0:
+                let w = do vbContainsE2E(env, ex.whereClause[0], sc)
+                if w:
+                    return true
+            if len(ex.sel) > 0:
+                let s = do vbContainsE2E(env, ex.sel[0], sc)
+                return s
+        return false
+
+    # ── lowerSegs ───────────────────────────────────────────────────────────
+    proc vbSeg(lit: text, bind: text, expr: [IRExpr], e2e: bool) -> IRSeg:
+        return IRSeg{lit: lit, bind: bind, expr: expr, e2e: e2e}
+
+    proc vbLowerSegs(env: VEnv, segs: [VSeg], sc: VScope, openable: bool, c0: VCtx) -> VSegRes:
+        let mut c = c0
+        let mut out = []
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            let s = segs[i]
+            if len(s.expr) == 0:
+                let ls = do vbSeg(s.lit, "", [], false)
+                out = append(out, ls)
+                i = i + 1
+                continue
+            let ex = s.expr[0]
+            let d1 = do vbCheckView(env, ex, sc, "a view")
+            if d1 != "":
+                let f1 = do vbFail(c, d1)
+                return VSegRes{segs: [], ctx: f1}
+            let isRow = do vbIsRowExpr(env, ex, sc)
+            if isRow:
+                let rn = do vbRowName(ex)
+                let f2 = do vbFail(c, rn + " is a whole row and cannot be rendered as text — interpolate one of its fields, or pass it to a component")
+                return VSegRes{segs: [], ctx: f2}
+            let d3 = do vbCheckNoPrivate(env, ex)
+            if d3 != "":
+                let f3 = do vbFail(c, d3)
+                return VSegRes{segs: [], ctx: f3}
+            let e2e = do vbContainsE2E(env, ex, sc)
+            if e2e:
+                if !openable:
+                    let f4 = do vbFail(c, "an @e2e (sealed) value can only be rendered as a text or badge node — it is opened on the client and cannot fill an attribute, a button label, richtext, or page metadata")
+                    return VSegRes{segs: [], ctx: f4}
+                let alone = do vbE2EFieldRead(env, ex, sc)
+                if !alone:
+                    let f5 = do vbFail(c, "an @e2e value must stand alone in its interpolation (e.g. `{dm.body}`) — it can't be combined with other text or expressions, since the whole ciphertext is opened on the client at once")
+                    return VSegRes{segs: [], ctx: f5}
+            let le = do vbLow(env, ex)
+            if sc.inRegion:
+                let rs = do vbSeg("", "", [le], e2e)
+                out = append(out, rs)
+            else:
+                let id = c.pfx + "b" + c.nb
+                let c1 = do vcSetNb(c, c.nb + 1)
+                let deps = do vbDeps(env, [le])
+                let c2 = do vcSetBindings(c1, append(c1.bindings, IRBinding{id: id, expr: [le], deps: deps}))
+                let c3 = do vbAddDeps(c2, deps, id)
+                c = c3
+                let bs = do vbSeg("", id, [], e2e)
+                out = append(out, bs)
+            i = i + 1
+        return VSegRes{segs: out, ctx: c}
+
+    proc vbLiteralSegs(segs: [IRSeg]) -> text:
+        # "{" marks "not all literal" (a literal can never be that byte).
+        let mut out = ""
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            if segs[i].bind != "" || len(segs[i].expr) > 0:
+                return "{"
+            out = out + segs[i].lit
+            i = i + 1
+        return out
+
+    # ── lowerRange ──────────────────────────────────────────────────────────
+    proc vbItemFields(le: IRExpr, itemVar: text, acc: [text]) -> [text]:
+        let mut out = acc
+        if le.kind == "get" && len(le.obj) > 0:
+            if le.obj[0].kind == "ref" && le.obj[0].name == itemVar:
+                let a = do vbAddUnique(out, le.field)
+                out = a
+        let o1 = do vbItemFieldsList(le.obj, itemVar, out)
+        let o2 = do vbItemFieldsList(le.key, itemVar, o1)
+        let o3 = do vbItemFieldsList(le.l, itemVar, o2)
+        let o4 = do vbItemFieldsList(le.r, itemVar, o3)
+        let o5 = do vbItemFieldsList(le.x, itemVar, o4)
+        let o6 = do vbItemFieldsList(le.args, itemVar, o5)
+        return o6
+
+    proc vbItemFieldsList(es: [IRExpr], itemVar: text, acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(es)
+        let mut i = 0
+        loop i < n:
+            let a = do vbItemFields(es[i], itemVar, out)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbItemField(x: [IRExpr], itemVar: text) -> text:
+        if len(x) == 0:
+            return ""
+        let e = x[0]
+        if e.kind == "get" && len(e.obj) > 0:
+            if e.obj[0].kind == "ref" && e.obj[0].name == itemVar:
+                return e.field
+        return ""
+
+    proc vbComparedItemFields(le: IRExpr, itemVar: text, acc: [text]) -> [text]:
+        let mut out = acc
+        if le.kind == "bin":
+            if le.op == "&&" || le.op == "||":
+                if len(le.l) > 0:
+                    let a = do vbComparedItemFields(le.l[0], itemVar, out)
+                    out = a
+                if len(le.r) > 0:
+                    let b = do vbComparedItemFields(le.r[0], itemVar, out)
+                    out = b
+                return out
+            if le.op == "==" || le.op == "!=" || le.op == "<" || le.op == "<=" || le.op == ">" || le.op == ">=":
+                let fl = do vbItemField(le.l, itemVar)
+                if fl != "":
+                    let a2 = do vbAddUnique(out, fl)
+                    out = a2
+                let fr = do vbItemField(le.r, itemVar)
+                if fr != "":
+                    let b2 = do vbAddUnique(out, fr)
+                    out = b2
+            return out
+        if le.kind == "un" && le.op == "!":
+            if len(le.x) > 0:
+                let c = do vbComparedItemFields(le.x[0], itemVar, out)
+                return c
+        return out
+
+    struct VRangeRes:
+        node: IRNode
+        ctx: VCtx
+
+    proc vbLowerRange(env: VEnv, rg: VRange, node0: IRNode, sc: VScope, c0: VCtx) -> VRangeRes:
+        let mut c = c0
+        let isEnt = do vbIsEntity(env, rg.coll)
+        if !isEnt:
+            let isSt = do vbIsState(env, rg.coll)
+            if !isSt:
+                let f1 = do vbFail(c, "`for` over unknown collection \"" + rg.coll + "\" (an entity or a list state)")
+                return VRangeRes{node: node0, ctx: f1}
+            let isL = do vbStateList(env, rg.coll)
+            if !isL:
+                let f2 = do vbFail(c, "`for x in " + rg.coll + "` needs a list — \"" + rg.coll + "\" is a scalar state, not a `[T]` collection")
+                return VRangeRes{node: node0, ctx: f2}
+        let n1 = do vbSetItemVar(node0, rg.itemVar)
+        let n2 = do vbSetColl(n1, rg.coll)
+        let n3 = do vbSetOrder(n2, rg.order)
+        let n3b = do vbSetDesc(n3, rg.desc)
+        let mut node = n3b
+        if len(rg.limit) > 0:
+            let d = do vbCheckView(env, rg.limit[0], sc, "a `limit`")
+            if d != "":
+                let f3 = do vbFail(c, d)
+                return VRangeRes{node: node, ctx: f3}
+            let ll = do vbLow(env, rg.limit[0])
+            let n4 = do vbSetLimit(node, [ll])
+            node = n4
+        if rg.more != "":
+            if node.kind != "list":
+                let f4 = do vbFail(c, "`more` belongs to a `for` list; a choice list renders every option and has no next page")
+                return VRangeRes{node: node, ctx: f4}
+            let n5 = do vbSetMore(node, rg.more)
+            node = n5
+            let c1 = do vbAddCall(c, rg.more, 0, "`more`")
+            c = c1
+        if len(rg.where) > 0:
+            let wl0 = do viewScope(sc.locals)
+            let wlocals = append(wl0, rg.itemVar)
+            let d1 = do vbCheckPure(env, rg.where[0], wlocals, "a `where` filter")
+            if d1 != "":
+                let f5 = do vbFail(c, d1)
+                return VRangeRes{node: node, ctx: f5}
+            let bsc = do vbBindRange(env, sc, rg)
+            let d2 = do vbCheckRowFields(env, rg.where[0], bsc)
+            if d2 != "":
+                let f6 = do vbFail(c, d2)
+                return VRangeRes{node: node, ctx: f6}
+            let wl = do vbLow(env, rg.where[0])
+            let n6 = do vbSetWhere(node, [wl])
+            node = n6
+            if isEnt:
+                let read = do vbItemFields(wl, rg.itemVar, [])
+                let nr = len(read)
+                let mut ri = 0
+                loop ri < nr:
+                    let hf = do vbHasField(env, rg.coll, read[ri])
+                    if hf:
+                        let cq = do vbMarkQueried(c, rg.coll, read[ri])
+                        c = cq
+                    ri = ri + 1
+                let cmp = do vbComparedItemFields(wl, rg.itemVar, [])
+                let nc = len(cmp)
+                let mut ci = 0
+                loop ci < nc:
+                    let hf2 = do vbHasField(env, rg.coll, cmp[ci])
+                    if hf2:
+                        let cm = do vbMarkIndex(c, rg.coll, cmp[ci])
+                        c = cm
+                    ci = ci + 1
+        if rg.order != "":
+            if !isEnt:
+                let f7 = do vbFail(c, "ordering `by " + rg.order + "` requires \"" + rg.coll + "\" to be an entity")
+                return VRangeRes{node: node, ctx: f7}
+            let hf3 = do vbHasField(env, rg.coll, rg.order)
+            if !hf3:
+                let f8 = do vbFail(c, "entity \"" + rg.coll + "\" has no field \"" + rg.order + "\" to order by")
+                return VRangeRes{node: node, ctx: f8}
+            let cm2 = do vbMarkIndex(c, rg.coll, rg.order)
+            c = cm2
+        return VRangeRes{node: node, ctx: c}
+
+    # ── lowerOptions ────────────────────────────────────────────────────────
+    struct VOptRes:
+        flat: [IROption]
+        kids: [IRNode]
+        ctx: VCtx
+
+    proc vbDynamicOptions(opts: [VOption]) -> bool:
+        let n = len(opts)
+        let mut i = 0
+        loop i < n:
+            if len(opts[i].val) > 0 || len(opts[i].from) > 0:
+                return true
+            i = i + 1
+        return false
+
+    proc vbCheckOptionLit(env: VEnv, o: VOption, sc: VScope, cell: text) -> text:
+        let locals = do viewScope(sc.locals)
+        let bad = do litInterp(o.value, locals, env.stateNames, env.entityNames, env.enumNames, env.inlineNames)
+        if bad != "":
+            return "an option's value is the identity its bound cell stores, so it is a literal the compiler compares — " + bad + " would never be evaluated"
+        let isEnum = do vbIsEnum(env, cell)
+        if isEnum:
+            let key = cell + "." + o.value
+            if !(key in env.enumMemberKeys):
+                return "enum \"" + cell + "\" has no member \"" + o.value + "\""
+        return ""
+
+    proc vbFieldType(env: VEnv, ent: text, field: text) -> text:
+        # "{" = unknown field.
+        if field == "id":
+            return "int"
+        let i = do vbFind(env.fieldKeys, ent + "." + field)
+        if i < 0:
+            return "{"
+        return env.fieldTypes[i]
+
+    proc vbCheckOptionValue(env: VEnv, kw: text, bind: text, cell: text, o: VOption, sc: VScope) -> text:
+        let v = o.val[0]
+        if v.kind == "get":
+            let obj = v.children[0]
+            if obj.kind != "ref":
+                return ""
+            let ent = do vbRowEntity(env, sc, obj.text)
+            if ent == "":
+                return ""
+            let got = do vbFieldType(env, ent, v.text)
+            if got == "{":
+                return "entity \"" + ent + "\" has no field \"" + v.text + "\", so `option ... -> " + obj.text + "." + v.text + "` has nothing to store"
+            if got != cell:
+                return kw + " binds \"" + bind + "\", which is " + cell + ", but the option value `" + obj.text + "." + v.text + "` is " + got
+            return ""
+        if v.kind == "int" || v.kind == "text" || v.kind == "bool" || v.kind == "float":
+            if v.kind != cell:
+                return kw + " binds \"" + bind + "\", which is " + cell + ", but the option value is " + v.kind
+        return ""
+
+    proc vbLowerOptions(env: VEnv, kw: text, bind: text, opts: [VOption], sc: VScope, c0: VCtx) -> VOptRes:
+        let mut c = c0
+        let cell = do vbStateType(env, bind)
+        let isEnum = do vbIsEnum(env, cell)
+        let dyn = do vbDynamicOptions(opts)
+        let n = len(opts)
+        if !dyn:
+            let mut flat = []
+            let mut i = 0
+            loop i < n:
+                let o = opts[i]
+                let ls = do vbLowerSegs(env, o.label, sc, false, c)
+                c = ls.ctx
+                if c.err != "":
+                    return VOptRes{flat: [], kids: [], ctx: c}
+                let d = do vbCheckOptionLit(env, o, sc, cell)
+                if d != "":
+                    let f = do vbFail(c, d)
+                    return VOptRes{flat: [], kids: [], ctx: f}
+                flat = append(flat, IROption{label: ls.segs, value: o.value})
+                i = i + 1
+            if len(flat) == 0:
+                if !isEnum:
+                    let f2 = do vbFail(c, kw + " on \"" + bind + "\" needs options (or a `@client` enum cell to default them)")
+                    return VOptRes{flat: [], kids: [], ctx: f2}
+                let pre = cell + "."
+                let nm = len(env.enumMemberKeys)
+                let mut mi = 0
+                loop mi < nm:
+                    let k = env.enumMemberKeys[mi]
+                    let hp = do vpHasPrefix(k, pre)
+                    if hp:
+                        let m = slice(k, len(pre), len(k))
+                        flat = append(flat, IROption{label: [IRSeg{lit: m, bind: "", expr: [], e2e: false}], value: m})
+                    mi = mi + 1
+            return VOptRes{flat: flat, kids: [], ctx: c}
+        if isEnum:
+            let f3 = do vbFail(c, kw + " binds \"" + bind + "\", whose type is the enum \"" + cell + "\" — its choices are that enum's members, and a value computed from data cannot be proven to be one of them")
+            return VOptRes{flat: [], kids: [], ctx: f3}
+        if cell != "text" && cell != "int":
+            let f4 = do vbFail(c, kw + " binds \"" + bind + "\"; a choice drawn from data stores whatever its value expression evaluates to, so the cell must be text or int")
+            return VOptRes{flat: [], kids: [], ctx: f4}
+        let mut kids = []
+        let mut j = 0
+        loop j < n:
+            let o = opts[j]
+            let nd0 = do vbNode("option")
+            let mut nd = nd0
+            let mut osc = sc
+            if len(o.from) > 0:
+                let nk = do vbNode("options")
+                let rr = do vbLowerRange(env, o.from[0], nk, sc, c)
+                c = rr.ctx
+                if c.err != "":
+                    return VOptRes{flat: [], kids: [], ctx: c}
+                nd = rr.node
+                let bs = do vbBindRange(env, sc, o.from[0])
+                osc = bs
+            let ls = do vbLowerSegs(env, o.label, osc, false, c)
+            c = ls.ctx
+            if c.err != "":
+                return VOptRes{flat: [], kids: [], ctx: c}
+            let nl = do vbSetLabel(nd, ls.segs)
+            nd = nl
+            if len(o.val) == 0:
+                let d = do vbCheckOptionLit(env, o, osc, cell)
+                if d != "":
+                    let f5 = do vbFail(c, d)
+                    return VOptRes{flat: [], kids: [], ctx: f5}
+                let nv = do vbSetValue(nd, o.value)
+                nd = nv
+            else:
+                let ol = do viewScope(osc.locals)
+                let d1 = do vbCheckPure(env, o.val[0], ol, "an option value")
+                if d1 != "":
+                    let f6 = do vbFail(c, d1)
+                    return VOptRes{flat: [], kids: [], ctx: f6}
+                let d2 = do vbCheckNoPrivate(env, o.val[0])
+                if d2 != "":
+                    let f7 = do vbFail(c, d2)
+                    return VOptRes{flat: [], kids: [], ctx: f7}
+                let e2 = do vbContainsE2E(env, o.val[0], osc)
+                if e2:
+                    let f8 = do vbFail(c, "an @e2e (sealed) value cannot be an option's value — the authority holds only its ciphertext, so it is not an identity anything can be selected by")
+                    return VOptRes{flat: [], kids: [], ctx: f8}
+                let d3 = do vbCheckOptionValue(env, kw, bind, cell, o, osc)
+                if d3 != "":
+                    let f9 = do vbFail(c, d3)
+                    return VOptRes{flat: [], kids: [], ctx: f9}
+                let vl = do vbLow(env, o.val[0])
+                let nv2 = do vbSetVal(nd, [vl])
+                nd = nv2
+            kids = append(kids, nd)
+            j = j + 1
+        return VOptRes{flat: [], kids: kids, ctx: c}
+
+    proc vbOptionDeps(env: VEnv, id: text, kids: [IRNode], sc: VScope, c: VCtx) -> VCtx:
+        if len(kids) == 0 || sc.inRegion:
+            return c
+        let deps = do vbNodeDeps(env, kids)
+        let c1 = do vbAddDeps(c, deps, id)
+        return c1
+
+    # ── link destinations ───────────────────────────────────────────────────
+    proc vbLinkShape(segs: [IRSeg]) -> text:
+        # A dynamic segment is spelled "{" — no URL path can contain it.
+        let mut out = ""
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            if segs[i].bind != "" || len(segs[i].expr) > 0:
+                out = out + "{"
+            else:
+                out = out + segs[i].lit
+            i = i + 1
+        return out
+
+    proc vbRenderShape(segs: [IRSeg]) -> text:
+        let mut out = ""
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            if segs[i].bind != "" || len(segs[i].expr) > 0:
+                out = out + "{…}"
+            else:
+                out = out + segs[i].lit
+            i = i + 1
+        return out
+
+    proc vbIsRouteExpr(segs: [IRSeg]) -> bool:
+        let mut seen = false
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            let s = segs[i]
+            if s.bind == "" && len(s.expr) == 0:
+                if s.lit != "":
+                    return false
+            else:
+                if seen:
+                    return false
+                seen = true
+            i = i + 1
+        return seen
+
+    proc vbDestScheme(shape: text) -> text:
+        # "" = no scheme; the lower-cased scheme otherwise.
+        let n = len(shape)
+        let mut i = 0
+        loop i < n:
+            let c = charAt(shape, i)
+            let isAlpha = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+            if isAlpha:
+                i = i + 1
+                continue
+            let other = (c >= "0" && c <= "9") || c == "+" || c == "-" || c == "."
+            if i > 0 && other:
+                i = i + 1
+                continue
+            if c == ":" && i > 0:
+                return lower(slice(shape, 0, i))
+            return ""
+        return ""
+
+    proc vbCheckExternal(scheme: text, shape: text, segs: [IRSeg]) -> text:
+        let rs = do vbRenderShape(segs)
+        if scheme == "mailto":
+            if contains(shape, "{"):
+                return "link path \"" + rs + "\" interpolates a `mailto:` address: an address is not a path, so there is no segment for a value to be escaped into — write the address literally"
+            if trim(slice(shape, 7, len(shape))) == "":
+                return "link path \"mailto:\" has no address"
+            return ""
+        let pre = scheme + "://"
+        let hp = do vpHasPrefix(shape, pre)
+        if !hp:
+            return "link path \"" + rs + "\" is missing `//` after the scheme: an " + scheme + " destination is " + scheme + "://host/path"
+        let rest = slice(shape, len(pre), len(shape))
+        let mut authority = rest
+        let n = len(rest)
+        let mut i = 0
+        loop i < n:
+            let c = charAt(rest, i)
+            if c == "/" || c == "?" || c == "#":
+                authority = slice(rest, 0, i)
+                break
+            i = i + 1
+        if authority == "":
+            return "link path \"" + rs + "\" has no host"
+        if contains(authority, "{"):
+            return "link path \"" + rs + "\" interpolates its host: an external destination's scheme and host must be literal text the author wrote"
+        return ""
+
+    proc vbValidAnchorName(s: text) -> bool:
+        let ok = do vpIsAnchorName(s)
+        return ok
+
+    proc vbTrimSlashes(s: text) -> text:
+        let mut a = 0
+        let mut b = len(s)
+        loop a < b:
+            if charAt(s, a) == "/":
+                a = a + 1
+            else:
+                break
+        loop b > a:
+            if charAt(s, b - 1) == "/":
+                b = b - 1
+            else:
+                break
+        return slice(s, a, b)
+
+    proc vbRouteMatches(pattern: text, path: text) -> bool:
+        let tp = do vbTrimSlashes(pattern)
+        let tc = do vbTrimSlashes(path)
+        let ps = split(tp, "/")
+        let cs = split(tc, "/")
+        if len(ps) != len(cs):
+            return false
+        let n = len(ps)
+        let mut i = 0
+        loop i < n:
+            if contains(cs[i], "{"):
+                i = i + 1
+                continue
+            let isParam = do vpHasPrefix(ps[i], ":")
+            if isParam:
+                if cs[i] == "":
+                    return false
+                i = i + 1
+                continue
+            if ps[i] != cs[i]:
+                return false
+            i = i + 1
+        return true
+
+    # ── viewCtx.nodes ───────────────────────────────────────────────────────
+    proc vbOk(nodes: [IRNode], c: VCtx) -> VRes:
+        return VRes{nodes: nodes, ctx: c}
+
+    proc vbNodes(env: VEnv, ins: [VNode], sc: VScope, c0: VCtx) -> VRes:
+        let mut c = c0
+        let mut out = []
+        let n = len(ins)
+        let mut i = 0
+        loop i < n:
+            let r = do vbOne(env, ins[i], sc, c)
+            c = r.ctx
+            if c.err != "":
+                return VRes{nodes: [], ctx: c}
+            let m = len(r.nodes)
+            let mut k = 0
+            loop k < m:
+                out = append(out, r.nodes[k])
+                k = k + 1
+            i = i + 1
+        return VRes{nodes: out, ctx: c}
+
+    proc vbSegsLeaf(env: VEnv, kind: text, segs: [VSeg], sc: VScope, openable: bool, c: VCtx) -> VRes:
+        let ls = do vbLowerSegs(env, segs, sc, openable, c)
+        if ls.ctx.err != "":
+            return VRes{nodes: [], ctx: ls.ctx}
+        let n0 = do vbNode(kind)
+        let n1 = do vbSetSegs(n0, ls.segs)
+        return VRes{nodes: [n1], ctx: ls.ctx}
+
+    proc vbKidsBlock(env: VEnv, kind: text, kids: [VNode], sc: VScope, c: VCtx) -> VRes:
+        let r = do vbNodes(env, kids, sc, c)
+        if r.ctx.err != "":
+            return r
+        let n0 = do vbNode(kind)
+        let n1 = do vbSetChildren(n0, r.nodes)
+        return VRes{nodes: [n1], ctx: r.ctx}
+
+    # vbArgs lowers a button/form/on-change argument list (checkView each).
+    struct VArgsRes:
+        args: [IRExpr]
+        ctx: VCtx
+
+    proc vbArgs(env: VEnv, args: [ExprNode], sc: VScope, c: VCtx) -> VArgsRes:
+        let mut out = []
+        let n = len(args)
+        let mut i = 0
+        loop i < n:
+            let d = do vbCheckView(env, args[i], sc, "a view")
+            if d != "":
+                let f = do vbFail(c, d)
+                return VArgsRes{args: [], ctx: f}
+            let le = do vbLow(env, args[i])
+            out = append(out, le)
+            i = i + 1
+        return VArgsRes{args: out, ctx: c}
+
+    proc vbClientBind(env: VEnv, kw: text, bind: text, why: text) -> text:
+        let st = do vbIsState(env, bind)
+        if !st:
+            return kw + " binds unknown state \"" + bind + "\""
+        let cl = do vbIsClient(env, bind)
+        if !cl:
+            return kw + " binds \"" + bind + "\", which is authoritative; " + why
+        return ""
+
+    proc vbTypeLabel(t: text, isList: bool) -> text:
+        if isList:
+            return "[" + t + "]"
+        return t
+
+    proc vbOne(env: VEnv, t: VNode, sc: VScope, c: VCtx) -> VRes:
+        let k = t.kind
+        if k == "modified":
+            let inner = do vbNodes(env, t.children, sc, c)
+            if inner.ctx.err != "":
+                return inner
+            let cs = do vbLowerSegs(env, t.classSegs, sc, false, inner.ctx)
+            if cs.ctx.err != "":
+                return VRes{nodes: [], ctx: cs.ctx}
+            let locals = do viewScope(sc.locals)
+            let bad = do litInterp(t.style, locals, env.stateNames, env.entityNames, env.enumNames, env.inlineNames)
+            if bad != "":
+                let f = do vbFailRes(cs.ctx, "`style` is a stylesheet fragment and stays literal — " + bad + " would never be evaluated; carry the varying part in a class instead")
+                return f
+            let lit = do vbLiteralSegs(cs.segs)
+            let mut out = []
+            let n = len(inner.nodes)
+            let mut i = 0
+            loop i < n:
+                let mut nd = inner.nodes[i]
+                if len(cs.segs) > 0:
+                    if lit != "{":
+                        let a = do vbSetClass(nd, lit)
+                        nd = a
+                    else:
+                        let b = do vbSetClassSegs(nd, cs.segs)
+                        nd = b
+                if t.style != "":
+                    let s1 = do vbSetStyle(nd, t.style)
+                    nd = s1
+                if t.anchor != "":
+                    let a1 = do vbSetAnchor(nd, t.anchor)
+                    nd = a1
+                out = append(out, nd)
+                i = i + 1
+            return VRes{nodes: out, ctx: cs.ctx}
+        if k == "box" || k == "row":
+            let r = do vbKidsBlock(env, k, t.children, sc, c)
+            return r
+        if k == "text" || k == "badge":
+            let r = do vbSegsLeaf(env, k, t.segs, sc, true, c)
+            return r
+        if k == "icon" || k == "richtext":
+            let r = do vbSegsLeaf(env, k, t.segs, sc, false, c)
+            return r
+        if k == "heading":
+            let lvl = t.expr[0]
+            let ll = do viewScope(sc.locals)
+            let d = do vbCheckPure(env, lvl, ll, "a heading level")
+            if d != "":
+                let f = do vbFailRes(c, d)
+                return f
+            if lvl.kind == "int" || (lvl.kind == "un" && lvl.text == "-" && lvl.children[0].kind == "int"):
+                let mut v = 0
+                if lvl.kind == "int":
+                    v = toInt(lvl.text)
+                else:
+                    v = 0 - toInt(lvl.children[0].text)
+                if v < 1 || v > 6:
+                    let f2 = do vbFailRes(c, "a heading level is between 1 and 6, but this one is " + v + " — there is no <h" + v + "> element")
+                    return f2
+            let lt = do tyExpr(env.calls.ty, lvl, vbTyScope(sc))
+            let lok = do tyAssignable(env.calls.ty, lt, VT{core: "int", list: false})
+            if !lok:
+                let ltl = do tyLabel(lt)
+                let fty = do vbFailRes(c, "a heading level is a number between 1 and 6, but this one is " + ltl + ". There is no conversion into it: toInt(\"two\") is 0 with no diagnostic anywhere, so a text level would render an element nobody asked for rather than fail")
+                return fty
+            let le = do vbLow(env, lvl)
+            let deps = do vbDeps(env, [le])
+            if len(deps) > 0:
+                let f3 = do vbFailRes(c, "a heading level cannot read \"" + deps[0] + "\": a heading is a leaf with no region of its own, so there is nothing to re-render it when that changes")
+                return f3
+            let ls = do vbLowerSegs(env, t.segs, sc, true, c)
+            if ls.ctx.err != "":
+                return VRes{nodes: [], ctx: ls.ctx}
+            let n0 = do vbNode("heading")
+            let n1 = do vbSetLevel(n0, [le])
+            let n2 = do vbSetSegs(n1, ls.segs)
+            return VRes{nodes: [n2], ctx: ls.ctx}
+        if k == "image":
+            let s1 = do vbLowerSegs(env, t.segs, sc, false, c)
+            if s1.ctx.err != "":
+                return VRes{nodes: [], ctx: s1.ctx}
+            let s2 = do vbLowerSegs(env, t.alt, sc, false, s1.ctx)
+            if s2.ctx.err != "":
+                return VRes{nodes: [], ctx: s2.ctx}
+            let n0 = do vbNode("image")
+            let n1 = do vbSetSegs(n0, s1.segs)
+            let n2 = do vbSetAlt(n1, s2.segs)
+            return VRes{nodes: [n2], ctx: s2.ctx}
+        if k == "video":
+            let s1 = do vbLowerSegs(env, t.segs, sc, false, c)
+            if s1.ctx.err != "":
+                return VRes{nodes: [], ctx: s1.ctx}
+            let s2 = do vbLowerSegs(env, t.alt, sc, false, s1.ctx)
+            if s2.ctx.err != "":
+                return VRes{nodes: [], ctx: s2.ctx}
+            let s3 = do vbLowerSegs(env, t.poster, sc, false, s2.ctx)
+            if s3.ctx.err != "":
+                return VRes{nodes: [], ctx: s3.ctx}
+            let n0 = do vbNode("video")
+            let n1 = do vbSetSegs(n0, s1.segs)
+            let n2 = do vbSetAlt(n1, s2.segs)
+            let n3 = do vbSetPoster(n2, s3.segs)
+            let n4 = do vbSetAutoplay(n3, t.autoplay)
+            let n5 = do vbSetLoopFlag(n4, t.loopFlag)
+            let n6 = do vbSetMuted(n5, t.muted || t.autoplay)
+            return VRes{nodes: [n6], ctx: s3.ctx}
+        if k == "tabs":
+            let r = do vbTabs(env, t, sc, c)
+            return r
+        if k == "match":
+            let r = do vbMatch(env, t, sc, c)
+            return r
+        if k == "button":
+            let ls = do vbLowerSegs(env, t.label, sc, false, c)
+            if ls.ctx.err != "":
+                return VRes{nodes: [], ctx: ls.ctx}
+            let ar = do vbArgs(env, t.args, sc, ls.ctx)
+            if ar.ctx.err != "":
+                return VRes{nodes: [], ctx: ar.ctx}
+            let c2 = do vbAddCall(ar.ctx, t.action, len(t.args), "")
+            let n0 = do vbNode("button")
+            let n1 = do vbSetSegs(n0, ls.segs)
+            let n2 = do vbSetAction(n1, t.action)
+            let n3 = do vbSetArgs(n2, ar.args)
+            return VRes{nodes: [n3], ctx: c2}
+        if k == "for":
+            let r = do vbFor(env, t, sc, c)
+            return r
+        if k == "stage":
+            let r = do vbStage(env, t, sc, c)
+            return r
+        if k == "if":
+            let d = do vbCheckView(env, t.expr[0], sc, "a view")
+            if d != "":
+                let f = do vbFailRes(c, d)
+                return f
+            let cond = do vbLow(env, t.expr[0])
+            let n0 = do vbNode("if")
+            let n1 = do vbSetCond(n0, [cond])
+            let mut node = n1
+            let mut cc = c
+            if !sc.inRegion:
+                let id = cc.pfx + "f" + cc.nf
+                let c1 = do vcSetNf(cc, cc.nf + 1)
+                let deps = do vbDeps(env, [cond])
+                let c2 = do vbAddDeps(c1, deps, id)
+                cc = c2
+                let n2 = do vbSetId(node, id)
+                node = n2
+            let rsc = do vbRegion(sc)
+            let kids = do vbNodes(env, t.children, rsc, cc)
+            if kids.ctx.err != "":
+                return kids
+            let n3 = do vbSetChildren(node, kids.nodes)
+            return VRes{nodes: [n3], ctx: kids.ctx}
+        if k == "after":
+            let mut body = []
+            let n = len(t.assigns)
+            let mut i = 0
+            loop i < n:
+                let as = t.assigns[i]
+                let st = do vbIsState(env, as.target)
+                if !st:
+                    let f = do vbFailRes(c, "after assigns unknown state \"" + as.target + "\"")
+                    return f
+                let cl = do vbIsClient(env, as.target)
+                if !cl:
+                    let f2 = do vbFailRes(c, "after assigns \"" + as.target + "\", which is authoritative; a timer runs client-side with no round trip, so it needs a @client state — declare it `@client` or flip it from an action instead")
+                    return f2
+                let d = do vbCheckView(env, as.value, sc, "an `after` assignment")
+                if d != "":
+                    let f3 = do vbFailRes(c, d)
+                    return f3
+                let v = do vbLow(env, as.value)
+                let s = do irAssign(as.target, v)
+                body = append(body, s)
+                i = i + 1
+            let n0 = do vbNode("after")
+            let n1 = do vbSetSeconds(n0, t.seconds)
+            let n2 = do vbSetBody(n1, body)
+            return VRes{nodes: [n2], ctx: c}
+        if k == "input":
+            let d = do vbClientBind(env, "input", t.bind, "two-way input requires a @client state")
+            if d != "":
+                let f = do vbFailRes(c, d)
+                return f
+            let id = c.pfx + "b" + c.nb
+            let c1 = do vcSetNb(c, c.nb + 1)
+            let c2 = do vbAddDep(c1, t.bind, id)
+            let ph = do vbLowerSegs(env, t.placeholder, sc, false, c2)
+            if ph.ctx.err != "":
+                return VRes{nodes: [], ctx: ph.ctx}
+            let n0 = do vbNode("input")
+            let n1 = do vbSetBind(n0, t.bind)
+            let n2 = do vbSetPlaceholder(n1, ph.segs)
+            let n3 = do vbSetId(n2, id)
+            if t.onChange:
+                let ar = do vbArgs(env, t.args, sc, ph.ctx)
+                if ar.ctx.err != "":
+                    return VRes{nodes: [], ctx: ar.ctx}
+                let n4 = do vbSetArgs(n3, ar.args)
+                let n5 = do vbSetAction(n4, t.action)
+                let n6 = do vbSetDebounce(n5, t.debounce)
+                let c3 = do vbAddCall(ar.ctx, t.action, len(t.args), "`on change`")
+                return VRes{nodes: [n6], ctx: c3}
+            return VRes{nodes: [n3], ctx: ph.ctx}
+        if k == "control":
+            let r = do vbControl(env, t, sc, c)
+            return r
+        if k == "overlay" || k == "popover":
+            let d = do vbClientBind(env, k, t.bind, "a " + k + " toggles client-side, so it needs a @client state")
+            if d != "":
+                let f = do vbFailRes(c, d)
+                return f
+            let ty = do vbStateType(env, t.bind)
+            if ty != "bool":
+                let f2 = do vbFailRes(c, k + " binds \"" + t.bind + "\", which is not a bool; " + k + " is shown while a bool cell is true")
+                return f2
+            let n0 = do vbNode(k)
+            let n1 = do vbSetBind(n0, t.bind)
+            let mut node = n1
+            let mut cc = c
+            if !sc.inRegion:
+                let id = cc.pfx + "f" + cc.nf
+                let c1 = do vcSetNf(cc, cc.nf + 1)
+                let c2 = do vbAddDep(c1, t.bind, id)
+                cc = c2
+                let n2 = do vbSetId(node, id)
+                node = n2
+            let rsc = do vbRegion(sc)
+            let kids = do vbNodes(env, t.children, rsc, cc)
+            if kids.ctx.err != "":
+                return kids
+            let n3 = do vbSetChildren(node, kids.nodes)
+            return VRes{nodes: [n3], ctx: kids.ctx}
+        if k == "typeahead":
+            let d = do vbClientBind(env, "typeahead", t.bind, "it needs a @client text state")
+            if d != "":
+                let f = do vbFailRes(c, d)
+                return f
+            let ty = do vbStateType(env, t.bind)
+            if ty != "text":
+                let f2 = do vbFailRes(c, "typeahead binds \"" + t.bind + "\", which is not text")
+                return f2
+            let ie = do vbIsEntity(env, t.entity)
+            if !ie:
+                let f3 = do vbFailRes(c, "typeahead reads unknown entity \"" + t.entity + "\"")
+                return f3
+            let hf = do vbHasField(env, t.entity, t.field)
+            if !hf:
+                let f4 = do vbFailRes(c, "entity \"" + t.entity + "\" has no field \"" + t.field + "\" for typeahead")
+                return f4
+            let id = c.pfx + "b" + c.nb
+            let c1 = do vcSetNb(c, c.nb + 1)
+            let c2 = do vbAddDep(c1, t.bind, id)
+            let ph = do vbLowerSegs(env, t.placeholder, sc, false, c2)
+            if ph.ctx.err != "":
+                return VRes{nodes: [], ctx: ph.ctx}
+            let n0 = do vbNode("typeahead")
+            let n1 = do vbSetBind(n0, t.bind)
+            let n2 = do vbSetColl(n1, t.entity)
+            let n3 = do vbSetValue(n2, t.field)
+            let n4 = do vbSetPlaceholder(n3, ph.segs)
+            let n5 = do vbSetId(n4, id)
+            return VRes{nodes: [n5], ctx: ph.ctx}
+        if k == "link":
+            let r = do vbLink(env, t, sc, c)
+            return r
+        if k == "select":
+            let d = do vbClientBind(env, "select", t.bind, "two-way input requires a @client state")
+            if d != "":
+                let f = do vbFailRes(c, d)
+                return f
+            let lo = do vbLowerOptions(env, "select", t.bind, t.options, sc, c)
+            if lo.ctx.err != "":
+                return VRes{nodes: [], ctx: lo.ctx}
+            let id = lo.ctx.pfx + "b" + lo.ctx.nb
+            let c1 = do vcSetNb(lo.ctx, lo.ctx.nb + 1)
+            let c2 = do vbAddDep(c1, t.bind, id)
+            let c3 = do vbOptionDeps(env, id, lo.kids, sc, c2)
+            let n0 = do vbNode("select")
+            let n1 = do vbSetBind(n0, t.bind)
+            let n2 = do vbSetOptions(n1, lo.flat)
+            let n3 = do vbSetChildren(n2, lo.kids)
+            let n4 = do vbSetId(n3, id)
+            return VRes{nodes: [n4], ctx: c3}
+        if k == "form":
+            let ls = do vbLowerSegs(env, t.label, sc, false, c)
+            if ls.ctx.err != "":
+                return VRes{nodes: [], ctx: ls.ctx}
+            let ar = do vbArgs(env, t.args, sc, ls.ctx)
+            if ar.ctx.err != "":
+                return VRes{nodes: [], ctx: ar.ctx}
+            let c2 = do vbAddCall(ar.ctx, t.action, len(t.args), "")
+            let kids = do vbNodes(env, t.children, sc, c2)
+            if kids.ctx.err != "":
+                return kids
+            let n0 = do vbNode("form")
+            let n1 = do vbSetAction(n0, t.action)
+            let n2 = do vbSetLabel(n1, ls.segs)
+            let n3 = do vbSetArgs(n2, ar.args)
+            let n4 = do vbSetChildren(n3, kids.nodes)
+            return VRes{nodes: [n4], ctx: kids.ctx}
+        if k == "upload":
+            let d = do vbClientBind(env, "upload", t.bind, "it must store the URL in a @client state")
+            if d != "":
+                let f = do vbFailRes(c, d)
+                return f
+            let id = c.pfx + "b" + c.nb
+            let c1 = do vcSetNb(c, c.nb + 1)
+            let c2 = do vbAddDep(c1, t.bind, id)
+            let ls = do vbLowerSegs(env, t.label, sc, false, c2)
+            if ls.ctx.err != "":
+                return VRes{nodes: [], ctx: ls.ctx}
+            let n0 = do vbNode("upload")
+            let n1 = do vbSetBind(n0, t.bind)
+            let n2 = do vbSetLabel(n1, ls.segs)
+            let n3 = do vbSetId(n2, id)
+            return VRes{nodes: [n3], ctx: ls.ctx}
+        if k == "use":
+            let r = do vbUse(env, t, sc, c)
+            return r
+        if k == "slot":
+            if !c.slotOK:
+                let f = do vbFailRes(c, "`slot` may only appear inside a layout or a component")
+                return f
+            return VRes{nodes: c.slot, ctx: c}
+        if k == "slotref":
+            let f = do vbFailRes(c, "`slot " + t.name + "` may only appear inside a wireframe frame")
+            return f
+        let fz = do vbFailRes(c, "unknown view node kind " + k)
+        return fz
+
+    proc vbTabs(env: VEnv, t: VNode, sc: VScope, c0: VCtx) -> VRes:
+        let st = do vbIsState(env, t.bind)
+        if !st:
+            let f = do vbFailRes(c0, "tabs binds unknown state \"" + t.bind + "\"")
+            return f
+        let cl = do vbIsClient(env, t.bind)
+        if !cl:
+            let f2 = do vbFailRes(c0, "tabs binds \"" + t.bind + "\", which is authoritative; switching tabs is local, so it requires a @client state")
+            return f2
+        let n0 = do vbNode("tabs")
+        let n1 = do vbSetBind(n0, t.bind)
+        let mut node = n1
+        let mut c = c0
+        if !sc.inRegion:
+            let id = c.pfx + "t" + c.nf
+            let c1 = do vcSetNf(c, c.nf + 1)
+            let c2 = do vbAddDep(c1, t.bind, id)
+            c = c2
+            let n2 = do vbSetId(node, id)
+            node = n2
+        let rsc = do vbRegion(sc)
+        let locals = do viewScope(sc.locals)
+        let mut tabs = []
+        let n = len(t.children)
+        let mut i = 0
+        loop i < n:
+            let tb = t.children[i]
+            let bad = do litInterp(tb.value, locals, env.stateNames, env.entityNames, env.enumNames, env.inlineNames)
+            if bad != "":
+                let f3 = do vbFailRes(c, "a tab value is the identity its bound cell takes when that tab is active, so it is a literal the compiler compares — " + bad + " would never be evaluated")
+                return f3
+            let kids = do vbNodes(env, tb.children, rsc, c)
+            if kids.ctx.err != "":
+                return kids
+            let ls = do vbLowerSegs(env, tb.label, rsc, false, kids.ctx)
+            if ls.ctx.err != "":
+                return VRes{nodes: [], ctx: ls.ctx}
+            c = ls.ctx
+            let a0 = do vbNode("tab")
+            let a1 = do vbSetLabel(a0, ls.segs)
+            let a2 = do vbSetValue(a1, tb.value)
+            let a3 = do vbSetChildren(a2, kids.nodes)
+            tabs = append(tabs, a3)
+            i = i + 1
+        let n3 = do vbSetChildren(node, tabs)
+        if n3.id != "":
+            let deps = do vbNodeDeps(env, tabs)
+            let c4 = do vbAddDeps(c, deps, n3.id)
+            c = c4
+        return VRes{nodes: [n3], ctx: c}
+
+    proc vbMatchEnum(env: VEnv, e: ExprNode, sc: VScope) -> text:
+        if e.kind == "ref":
+            let ty = do vbStateType(env, e.text)
+            if ty != "":
+                let ie = do vbIsEnum(env, ty)
+                if ie:
+                    return ty
+            return ""
+        if e.kind == "get":
+            let obj = e.children[0]
+            if obj.kind == "ref":
+                let ent = do vbRowEntity(env, sc, obj.text)
+                if ent != "":
+                    let i = do vbFind(env.enumFieldKeys, ent + "." + e.text)
+                    if i >= 0:
+                        return env.enumFieldEnums[i]
+        return ""
+
+    proc vbMatch(env: VEnv, t: VNode, sc: VScope, c0: VCtx) -> VRes:
+        let mut c = c0
+        let subj = t.expr[0]
+        let d = do vbCheckView(env, subj, sc, "a `match`")
+        if d != "":
+            let f = do vbFailRes(c, d)
+            return f
+        let enumName = do vbMatchEnum(env, subj, sc)
+        let cond = do vbLow(env, subj)
+        let rsc = do vbRegion(sc)
+        let locals = do viewScope(sc.locals)
+        let mut seen = []
+        let mut arms = []
+        let n = len(t.children)
+        let mut i = 0
+        loop i < n:
+            let arm = t.children[i]
+            if arm.kind == "case":
+                if arm.value in seen:
+                    let f1 = do vbFailRes(c, "duplicate match case \"" + arm.value + "\"")
+                    return f1
+                seen = append(seen, arm.value)
+                let bad = do litInterp(arm.value, locals, env.stateNames, env.entityNames, env.enumNames, env.inlineNames)
+                if bad != "":
+                    let f2 = do vbFailRes(c, "a case value is a compile-time constant compared against the matched value — " + bad + " would never be evaluated")
+                    return f2
+                if enumName != "":
+                    if !((enumName + "." + arm.value) in env.enumMemberKeys):
+                        let f3 = do vbFailRes(c, "enum \"" + enumName + "\" has no member \"" + arm.value + "\"")
+                        return f3
+                let kids = do vbNodes(env, arm.children, rsc, c)
+                if kids.ctx.err != "":
+                    return kids
+                c = kids.ctx
+                let a0 = do vbNode("case")
+                let a1 = do vbSetValue(a0, arm.value)
+                let a2 = do vbSetChildren(a1, kids.nodes)
+                arms = append(arms, a2)
+            else:
+                let kids = do vbNodes(env, arm.children, rsc, c)
+                if kids.ctx.err != "":
+                    return kids
+                c = kids.ctx
+                let e0 = do vbNode("else")
+                let e1 = do vbSetChildren(e0, kids.nodes)
+                arms = append(arms, e1)
+            i = i + 1
+        if !t.hasElse:
+            if enumName != "":
+                let pre = enumName + "."
+                let mut missing = ""
+                let nm = len(env.enumMemberKeys)
+                let mut mi = 0
+                loop mi < nm:
+                    let key = env.enumMemberKeys[mi]
+                    let hp = do vpHasPrefix(key, pre)
+                    if hp:
+                        let m = slice(key, len(pre), len(key))
+                        if !(m in seen):
+                            if missing != "":
+                                missing = missing + ", "
+                            missing = missing + m
+                    mi = mi + 1
+                if missing != "":
+                    let f4 = do vbFailRes(c, "match on enum \"" + enumName + "\" is not exhaustive: missing " + missing + " (add the case(s) or an `else`)")
+                    return f4
+            else:
+                let f5 = do vbFailRes(c, "match must be exhaustive: add an `else` branch (the matched value's type is open, so coverage can't be proven)")
+                return f5
+        let n0 = do vbNode("match")
+        let n1 = do vbSetCond(n0, [cond])
+        let n2 = do vbSetChildren(n1, arms)
+        let mut node = n2
+        if !sc.inRegion:
+            let id = c.pfx + "m" + c.nf
+            let c1 = do vcSetNf(c, c.nf + 1)
+            let d1 = do vbDeps(env, [cond])
+            let c2 = do vbAddDeps(c1, d1, id)
+            let d2 = do vbNodeDeps(env, arms)
+            let c3 = do vbAddDeps(c2, d2, id)
+            c = c3
+            let n3 = do vbSetId(node, id)
+            node = n3
+        return VRes{nodes: [node], ctx: c}
+
+    proc vbFor(env: VEnv, t: VNode, sc: VScope, c0: VCtx) -> VRes:
+        let rg = t.rng[0]
+        let n0 = do vbNode("list")
+        let rr = do vbLowerRange(env, rg, n0, sc, c0)
+        if rr.ctx.err != "":
+            return VRes{nodes: [], ctx: rr.ctx}
+        let mut node = rr.node
+        let mut c = rr.ctx
+        if !sc.inRegion:
+            let id = c.pfx + "l" + c.nl
+            let c1 = do vcSetNl(c, c.nl + 1)
+            let c2 = do vbAddDep(c1, rg.coll, id)
+            c = c2
+            if len(node.where) > 0:
+                let dw = do vbDeps(env, node.where)
+                let c3 = do vbAddDeps(c, dw, id)
+                c = c3
+            if len(node.limit) > 0:
+                let dl = do vbDeps(env, node.limit)
+                let c4 = do vbAddDeps(c, dl, id)
+                c = c4
+            let n1 = do vbSetId(node, id)
+            node = n1
+        let child = do vbBindRange(env, sc, rg)
+        let kids = do vbNodes(env, t.children, child, c)
+        if kids.ctx.err != "":
+            return kids
+        c = kids.ctx
+        let n2 = do vbSetChildren(node, kids.nodes)
+        if n2.id != "":
+            let dk = do vbNodeDeps(env, kids.nodes)
+            let c5 = do vbAddDeps(c, dk, n2.id)
+            c = c5
+        return VRes{nodes: [n2], ctx: c}
+
+    proc vbStage(env: VEnv, t: VNode, sc: VScope, c0: VCtx) -> VRes:
+        let mut c = c0
+        let n0 = do vbNode("stage")
+        let n1 = do vbSetWidth(n0, t.width)
+        let n2 = do vbSetHeight(n1, t.height)
+        let mut node = n2
+        if len(t.expr) > 0:
+            let d = do vbCheckView(env, t.expr[0], sc, "a stage's `tiles`")
+            if d != "":
+                let f = do vbFailRes(c, d)
+                return f
+            let tl = do vbLow(env, t.expr[0])
+            let n3 = do vbSetTiles(node, [tl])
+            node = n3
+        if !sc.inRegion:
+            let id = c.pfx + "g" + c.ng
+            let c1 = do vcSetNg(c, c.ng + 1)
+            c = c1
+            if len(node.tiles) > 0:
+                let dt = do vbDeps(env, node.tiles)
+                let c2 = do vbAddDeps(c, dt, id)
+                c = c2
+            let n4 = do vbSetId(node, id)
+            node = n4
+        let mut sprites = []
+        let n = len(t.children)
+        let mut i = 0
+        loop i < n:
+            let sp = t.children[i]
+            let rg = sp.rng[0]
+            let s0 = do vbNode("sprite")
+            let rr = do vbLowerRange(env, rg, s0, sc, c)
+            if rr.ctx.err != "":
+                return VRes{nodes: [], ctx: rr.ctx}
+            c = rr.ctx
+            let mut spn = rr.node
+            let child = do vbBindRange(env, sc, rg)
+            let dx = do vbCheckView(env, sp.x[0], child, "a sprite's `x`")
+            if dx != "":
+                let f1 = do vbFailRes(c, dx)
+                return f1
+            let lx = do vbLow(env, sp.x[0])
+            let s1 = do vbSetX(spn, [lx])
+            let dy = do vbCheckView(env, sp.y[0], child, "a sprite's `y`")
+            if dy != "":
+                let f2 = do vbFailRes(c, dy)
+                return f2
+            let ly = do vbLow(env, sp.y[0])
+            let s2 = do vbSetY(s1, [ly])
+            spn = s2
+            if len(sp.facing) > 0:
+                let df = do vbCheckView(env, sp.facing[0], child, "a sprite's `facing`")
+                if df != "":
+                    let f3 = do vbFailRes(c, df)
+                    return f3
+                let lf = do vbLow(env, sp.facing[0])
+                let s3 = do vbSetFacing(spn, [lf])
+                spn = s3
+            let di = do vbCheckView(env, sp.image[0], child, "a sprite's `image`")
+            if di != "":
+                let f4 = do vbFailRes(c, di)
+                return f4
+            let li = do vbLow(env, sp.image[0])
+            let s4 = do vbSetImage(spn, [li])
+            spn = s4
+            if len(sp.label) > 0:
+                let ls = do vbLowerSegs(env, sp.label, child, false, c)
+                if ls.ctx.err != "":
+                    return VRes{nodes: [], ctx: ls.ctx}
+                c = ls.ctx
+                let s5 = do vbSetLabel(spn, ls.segs)
+                spn = s5
+            if node.id != "":
+                let c6 = do vbAddDep(c, rg.coll, node.id)
+                let mut exprs = []
+                let e1 = do vbAppendExprs(exprs, spn.where)
+                let e2 = do vbAppendExprs(e1, spn.limit)
+                let e3 = do vbAppendExprs(e2, spn.x)
+                let e4 = do vbAppendExprs(e3, spn.y)
+                let e5 = do vbAppendExprs(e4, spn.facing)
+                let e6 = do vbAppendExprs(e5, spn.image)
+                exprs = e6
+                let mut cc = c6
+                let ne = len(exprs)
+                let mut ei = 0
+                loop ei < ne:
+                    let de = do vbDeps(env, [exprs[ei]])
+                    let c7 = do vbAddDeps(cc, de, node.id)
+                    cc = c7
+                    ei = ei + 1
+                c = cc
+            sprites = append(sprites, spn)
+            i = i + 1
+        let n5 = do vbSetChildren(node, sprites)
+        return VRes{nodes: [n5], ctx: c}
+
+    proc vbAppendExprs(a: [IRExpr], b: [IRExpr]) -> [IRExpr]:
+        let mut out = a
+        let n = len(b)
+        let mut i = 0
+        loop i < n:
+            out = append(out, b[i])
+            i = i + 1
+        return out
+
+    proc vbControlCell(kw: text) -> text:
+        if kw == "textarea" || kw == "password" || kw == "newpassword":
+            return "text"
+        if kw == "checkbox" || kw == "toggle":
+            return "bool"
+        return ""
+
+    proc vbControlRule(kw: text) -> text:
+        if kw == "textarea":
+            return "a textarea edits a text cell"
+        if kw == "checkbox":
+            return "a checkbox toggles a bool cell"
+        if kw == "toggle":
+            return "a toggle flips a bool cell"
+        if kw == "radio":
+            return "a radio group stores one of its option values, so it needs a text or enum cell"
+        return "a password box edits a text cell"
+
+    proc vbControlIRKind(kw: text) -> text:
+        if kw == "toggle":
+            return "checkbox"
+        if kw == "password" || kw == "newpassword":
+            return "input"
+        return kw
+
+    proc vbControlVariant(kw: text) -> text:
+        if kw == "toggle":
+            return "switch"
+        if kw == "password":
+            return "current-password"
+        if kw == "newpassword":
+            return "new-password"
+        return ""
+
+    proc vbControl(env: VEnv, t: VNode, sc: VScope, c0: VCtx) -> VRes:
+        let kw = t.ctl
+        let d = do vbClientBind(env, kw, t.bind, "two-way input requires a @client state")
+        if d != "":
+            let f = do vbFailRes(c0, d)
+            return f
+        let got = do vbStateType(env, t.bind)
+        let isList = do vbStateList(env, t.bind)
+        let isEnum = do vbIsEnum(env, got)
+        let tl = do vbTypeLabel(got, isList)
+        let rule = do vbControlRule(kw)
+        if isList:
+            let f1 = do vbFailRes(c0, kw + " binds \"" + t.bind + "\", which is " + tl + "; a control writes one value, not a list")
+            return f1
+        let cell = do vbControlCell(kw)
+        let dyn = do vbDynamicOptions(t.options)
+        if cell != "" && got != cell:
+            let f2 = do vbFailRes(c0, kw + " binds \"" + t.bind + "\", which is " + tl + ", but " + rule)
+            return f2
+        if cell == "" && !dyn && got != "text" && !isEnum:
+            let f3 = do vbFailRes(c0, kw + " binds \"" + t.bind + "\", which is " + tl + ", but " + rule)
+            return f3
+        let irKind = do vbControlIRKind(kw)
+        let variant = do vbControlVariant(kw)
+        let ls = do vbLowerSegs(env, t.label, sc, false, c0)
+        if ls.ctx.err != "":
+            return VRes{nodes: [], ctx: ls.ctx}
+        let hs = do vbLowerSegs(env, t.placeholder, sc, false, ls.ctx)
+        if hs.ctx.err != "":
+            return VRes{nodes: [], ctx: hs.ctx}
+        let n0 = do vbNode(irKind)
+        let n1 = do vbSetBind(n0, t.bind)
+        let n2 = do vbSetValue(n1, variant)
+        let n3 = do vbSetLabel(n2, ls.segs)
+        let n4 = do vbSetPlaceholder(n3, hs.segs)
+        let mut node = n4
+        let mut c = hs.ctx
+        if kw == "radio":
+            let lo = do vbLowerOptions(env, kw, t.bind, t.options, sc, c)
+            if lo.ctx.err != "":
+                return VRes{nodes: [], ctx: lo.ctx}
+            c = lo.ctx
+            let n5 = do vbSetOptions(node, lo.flat)
+            let n6 = do vbSetChildren(n5, lo.kids)
+            node = n6
+        let id = c.pfx + "b" + c.nb
+        let c1 = do vcSetNb(c, c.nb + 1)
+        let c2 = do vbAddDep(c1, t.bind, id)
+        let c3 = do vbOptionDeps(env, id, node.children, sc, c2)
+        let n7 = do vbSetId(node, id)
+        return VRes{nodes: [n7], ctx: c3}
+
+    proc vbLink(env: VEnv, t: VNode, sc: VScope, c0: VCtx) -> VRes:
+        let ls = do vbLowerSegs(env, t.label, sc, false, c0)
+        if ls.ctx.err != "":
+            return VRes{nodes: [], ctx: ls.ctx}
+        let ps = do vbLowerSegs(env, t.pathSegs, sc, false, ls.ctx)
+        if ps.ctx.err != "":
+            return VRes{nodes: [], ctx: ps.ctx}
+        let mut c = ps.ctx
+        let n0 = do vbNode("link")
+        let mut node = n0
+        let shape = do vbLinkShape(ps.segs)
+        let scheme = do vbDestScheme(shape)
+        let rs = do vbRenderShape(ps.segs)
+        let isRoute = do vbIsRouteExpr(ps.segs)
+        let slash2 = do vpHasPrefix(shape, "//")
+        let hash = do vpHasPrefix(shape, "#")
+        let slash = do vpHasPrefix(shape, "/")
+        let dyn = do vpHasPrefix(shape, "{")
+        if isRoute:
+            let n1 = do vbSetRoute(node, true)
+            node = n1
+        else:
+            if scheme != "":
+                if scheme != "https" && scheme != "http" && scheme != "mailto":
+                    let f = do vbFailRes(c, "link path \"" + rs + "\" uses the \"" + scheme + "\" scheme, which is not a destination: a link goes to a path of this app (\"/docs\"), an anchor on a page (\"#install\"), or an external https/http/mailto URL")
+                    return f
+                let ex = do vbCheckExternal(scheme, shape, ps.segs)
+                if ex != "":
+                    let f2 = do vbFailRes(c, ex)
+                    return f2
+                let n2 = do vbSetExternal(node, true)
+                node = n2
+            else:
+                if slash2:
+                    let f3 = do vbFailRes(c, "link path \"" + shape + "\" is protocol-relative, which leaves this app while looking like a path: write the scheme (\"https:" + shape + "\") or a single leading `/`")
+                    return f3
+                if hash || slash:
+                    let hi = do vpIndexOf(shape, "#")
+                    let mut path = shape
+                    let mut frag = ""
+                    if hi >= 0:
+                        path = slice(shape, 0, hi)
+                        frag = slice(shape, hi + 1, len(shape))
+                        let va = do vbValidAnchorName(frag)
+                        if !va:
+                            let f4 = do vbFailRes(c, "link path \"" + rs + "\" names \"" + frag + "\", which is not an anchor name: an anchor is literal text of letters, digits, `-` and `_`")
+                            return f4
+                    if path != "":
+                        let c1 = do vcSetLinks(c, append(c.links, path))
+                        c = c1
+                else:
+                    if dyn:
+                        let f5 = do vbFailRes(c, "link path \"" + rs + "\" starts with an interpolation but is not one: a destination either starts with a literal `/` (a path the compiler can check, e.g. \"/post/{p.id}\") or is a single interpolation supplying the whole route (e.g. \"{href}\")")
+                        return f5
+                    let f6 = do vbFailRes(c, "link path \"" + shape + "\" must start with `/`")
+                    return f6
+        let n3 = do vbSetLabel(node, ls.segs)
+        let lit = do vbLiteralSegs(ps.segs)
+        if lit != "{":
+            let n4 = do vbSetPath(n3, lit)
+            return VRes{nodes: [n4], ctx: c}
+        let n5 = do vbSetPathSegs(n3, ps.segs)
+        return VRes{nodes: [n5], ctx: c}
+
+    # ── Build step 5: views -> pages -> routes, then the cross-page checks ─
+    proc vbLowerASCII(s: text) -> text:
+        let cs = split(s, "")
+        let mut out = ""
+        let n = len(cs)
+        let mut i = 0
+        loop i < n:
+            let c = cs[i]
+            if c >= "A" && c <= "Z":
+                out = out + lower(c)
+            else:
+                out = out + c
+            i = i + 1
+        return out
+
+    proc vbDepGraphKeys(c: VCtx) -> [text]:
+        let mut keys = []
+        let n = len(c.depKeys)
+        let mut i = 0
+        loop i < n:
+            let a = do vbAddUnique(keys, c.depKeys[i])
+            keys = a
+            i = i + 1
+        let s = do vbSortText(keys)
+        return s
+
+    proc vbDepIdsOf(c: VCtx, key: text) -> [text]:
+        let mut out = []
+        let n = len(c.depKeys)
+        let mut i = 0
+        loop i < n:
+            if c.depKeys[i] == key:
+                out = append(out, c.depIds[i])
+            i = i + 1
+        return out
+
+    proc vbTextListJSON(xs: [text]) -> text:
+        let mut out = "["
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let q = do jsonQuote(xs[i])
+            out = out + q
+            i = i + 1
+        return out + "]"
+
+    proc vbWalkAnchors(nodes: [IRNode], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            if nodes[i].anchor != "":
+                let a = do vbAddUnique(out, nodes[i].anchor)
+                out = a
+            let b = do vbWalkAnchors(nodes[i].children, out)
+            out = b
+            i = i + 1
+        return out
+
+    proc vbMissingAnchor(nodes: [IRNode], anchors: [text]) -> text:
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let nd = nodes[i]
+            if nd.kind == "link" && !nd.external:
+                let mut shape = nd.path
+                if len(nd.pathSegs) > 0:
+                    let s = do vbLinkShape(nd.pathSegs)
+                    shape = s
+                let hi = do vpIndexOf(shape, "#")
+                if hi >= 0:
+                    let frag = slice(shape, hi + 1, len(shape))
+                    if frag != "" && !(frag in anchors):
+                        return frag
+            let m = do vbMissingAnchor(nd.children, anchors)
+            if m != "":
+                return m
+            i = i + 1
+        return ""
+
+    proc vbPagesErr(msg: text) -> VPagesOut:
+        return VPagesOut{err: msg, pages: [], routes: [], indexKeys: [], queriedKeys: [], components: []}
+
+    proc vbBuildPages(env: VEnv, views: [VView], layouts: [VLayout], comps: VCompsOut) -> VPagesOut:
+        let mut pages = []
+        let mut paths = []
+        let mut pathViews = []
+        let mut carry = comps.ctx
+        let nv = len(views)
+        let mut i = 0
+        loop i < nv:
+            let v = views[i]
+            if v.err != "":
+                let e0 = do vbPagesErr(v.err)
+                return e0
+            if v.requires != "":
+                let pi = do vbFind(env.policyNames, v.requires)
+                if pi < 0:
+                    let e1 = do vbPagesErr("view \"" + v.name + "\" requires unknown policy \"" + v.requires + "\"")
+                    return e1
+                if env.policyParamCounts[pi] != 0:
+                    let e2 = do vbPagesErr("view \"" + v.name + "\" route guard \"" + v.requires + "\" is row-level; a route guard must be a zero-argument policy")
+                    return e2
+            let mut root = v.root
+            if v.layout != "":
+                let mut li = -1
+                let nly = len(layouts)
+                let mut lj = 0
+                loop lj < nly:
+                    if layouts[lj].name == v.layout:
+                        li = lj
+                    lj = lj + 1
+                if li < 0:
+                    let e3 = do vbPagesErr("view \"" + v.name + "\" uses unknown layout \"" + v.layout + "\"")
+                    return e3
+                let sp = do vpSpliceLayout(v.layout, layouts[li].root, v.root)
+                if sp.err != "":
+                    let e3b = do vbPagesErr(sp.err)
+                    return e3b
+                root = sp.nodes
+            let mut ptypes = []
+            let np = len(v.params)
+            let mut pj = 0
+            loop pj < np:
+                ptypes = append(ptypes, "text")
+                pj = pj + 1
+            let sc = VScope{locals: v.params, inRegion: false, varNames: v.params, varTypes: ptypes}
+            let c0 = do vbCtxFrom("", carry)
+            let r = do vbNodes(env, root, sc, c0)
+            if r.ctx.err != "":
+                let e4 = do vbPagesErr(r.ctx.err)
+                return e4
+            let mut path = v.path
+            if path == "":
+                if i == 0:
+                    path = "/"
+                else:
+                    let lo = do vbLowerASCII(v.name)
+                    path = "/" + lo
+            let sl = do vpHasPrefix(path, "/")
+            if !sl:
+                let e5 = do vbPagesErr("view \"" + v.name + "\" route \"" + path + "\" must start with `/`")
+                return e5
+            let locals0 = do viewScope(v.params)
+            let bad = do litInterp(path, locals0, env.stateNames, env.entityNames, env.enumNames, env.inlineNames)
+            if bad != "":
+                let e6 = do vbPagesErr("view \"" + v.name + "\"'s route holds " + bad + ": a route's dynamic segment is written `:name`")
+                return e6
+            let pv = do vbFind(paths, path)
+            if pv >= 0:
+                let e7 = do vbPagesErr("views \"" + v.name + "\" and \"" + pathViews[pv] + "\" both map to route \"" + path + "\"")
+                return e7
+            paths = append(paths, path)
+            pathViews = append(pathViews, v.name)
+            let msc = VScope{locals: v.params, inRegion: true, varNames: v.params, varTypes: ptypes}
+            let ts = do vbLowerSegs(env, v.titleSegs, msc, false, r.ctx)
+            if ts.ctx.err != "":
+                let e8 = do vbPagesErr(ts.ctx.err)
+                return e8
+            let ds = do vbLowerSegs(env, v.descSegs, msc, false, ts.ctx)
+            if ds.ctx.err != "":
+                let e9 = do vbPagesErr(ds.ctx.err)
+                return e9
+            let c = ds.ctx
+            let keys = do vbDepGraphKeys(c)
+            let mut vals = []
+            let nk = len(keys)
+            let mut ki = 0
+            loop ki < nk:
+                let ids = do vbDepIdsOf(c, keys[ki])
+                let j = do vbTextListJSON(ids)
+                vals = append(vals, j)
+                ki = ki + 1
+            pages = append(pages, IRPage{name: v.name, path: path, params: v.params, requires: v.requires, screen: v.screen, view: r.nodes, bindings: c.bindings, depKeys: keys, depVals: vals, title: ts.segs, desc: ds.segs})
+            let tk = do vbTakeShared(carry, c)
+            carry = tk
+            i = i + 1
+        let mut routes = []
+        let npg = len(pages)
+        let mut ri = 0
+        loop ri < npg:
+            routes = append(routes, IRRoute{path: pages[ri].path, requires: pages[ri].requires})
+            ri = ri + 1
+        let callNames = carry.callNames
+        let callArgc = carry.callArgc
+        let callVia = carry.callVia
+        let links = carry.links
+        let mut components = comps.components
+        let nsp = len(carry.g.special)
+        let mut spi = 0
+        loop spi < nsp:
+            components = append(components, carry.g.special[spi])
+            spi = spi + 1
+        # every action a button/form/on-change/more calls exists, arity-correct.
+        let nc = len(callNames)
+        let mut ci = 0
+        loop ci < nc:
+            let ai = do vbFind(env.actionNames, callNames[ci])
+            let mut src = callVia[ci]
+            if src == "":
+                src = "button"
+            if ai < 0:
+                let e10 = do vbPagesErr(src + " references unknown action \"" + callNames[ci] + "\"")
+                return e10
+            let want = env.actionParamCounts[ai]
+            if want != callArgc[ci]:
+                if callVia[ci] == "`more`":
+                    let e11 = do vbPagesErr(src + " names action \"" + callNames[ci] + "\", which takes " + want + " argument(s); loading the next page invokes a zero-argument action")
+                    return e11
+                let e12 = do vbPagesErr("action \"" + callNames[ci] + "\" takes " + want + " argument(s), got " + callArgc[ci])
+                return e12
+            ci = ci + 1
+        # every internal link lands on a route some page serves.
+        let nli = len(links)
+        let mut li = 0
+        loop li < nli:
+            let mut matched = false
+            let mut pk = 0
+            loop pk < npg:
+                let m = do vbRouteMatches(pages[pk].path, links[li])
+                if m:
+                    matched = true
+                    break
+                pk = pk + 1
+            if !matched:
+                let shown = replace(links[li], "{", "{…}")
+                let e13 = do vbPagesErr("link to \"" + shown + "\", but no view serves that route")
+                return e13
+            li = li + 1
+        # every `#anchor` a link names is declared on some node.
+        let mut anchors = []
+        let mut ai2 = 0
+        loop ai2 < npg:
+            let a = do vbWalkAnchors(pages[ai2].view, anchors)
+            anchors = a
+            ai2 = ai2 + 1
+        let ncomp = len(components)
+        let mut ci2 = 0
+        loop ci2 < ncomp:
+            let a2 = do vbWalkAnchors(components[ci2].view, anchors)
+            anchors = a2
+            ci2 = ci2 + 1
+        let mut mi = 0
+        loop mi < npg:
+            let miss = do vbMissingAnchor(pages[mi].view, anchors)
+            if miss != "":
+                let e14 = do vbPagesErr("link to \"#" + miss + "\", but no node declares that anchor: write `anchor \"" + miss + "\"` on the node it should scroll to")
+                return e14
+            mi = mi + 1
+        let mut mc = 0
+        loop mc < ncomp:
+            let miss2 = do vbMissingAnchor(components[mc].view, anchors)
+            if miss2 != "":
+                let e15 = do vbPagesErr("link to \"#" + miss2 + "\", but no node declares that anchor: write `anchor \"" + miss2 + "\"` on the node it should scroll to")
+                return e15
+            mc = mc + 1
+        return VPagesOut{err: "", pages: pages, routes: routes, indexKeys: carry.indexKeys, queriedKeys: carry.queriedKeys, components: components}
+
+    # vbDepGraphJVal: the first page's depGraph as the JVal ir_graph.fct's
+    # top-level emitter spells (an empty object when there are no pages).
+    proc vbDepGraphJVal(pages: [IRPage]) -> JVal:
+        let mut keys = []
+        let mut vals = []
+        if len(pages) > 0:
+            let p = pages[0]
+            let n = len(p.depKeys)
+            let mut i = 0
+            loop i < n:
+                keys = append(keys, p.depKeys[i])
+                let arr = do jsonParse(p.depVals[i])
+                vals = append(vals, arr)
+                i = i + 1
+        return JVal{kind: "obj", s: "", keys: keys, vals: vals}
+
+    # ── components (build.go 3d + component.go) ─────────────────────────
+    proc vbCtxFrom(pfx: text, parent: VCtx) -> VCtx:
+        let c0 = do vbCtxG(pfx, parent.g)
+        let c1 = do vcSetCallNames(c0, parent.callNames)
+        let c2 = do vcSetCallArgc(c1, parent.callArgc)
+        let c3 = do vcSetCallVia(c2, parent.callVia)
+        let c4 = do vcSetLinks(c3, parent.links)
+        let c5 = do vcSetIndexKeys(c4, parent.indexKeys)
+        let c6 = do vcSetQueriedKeys(c5, parent.queriedKeys)
+        return c6
+
+    # vbTakeShared: `into` with the flowing parts (global state, calls,
+    # links, index marks, first error) of `from`.
+    proc vbTakeShared(into: VCtx, from: VCtx) -> VCtx:
+        let c1 = do vcSetG(into, from.g)
+        let c2 = do vcSetCallNames(c1, from.callNames)
+        let c3 = do vcSetCallArgc(c2, from.callArgc)
+        let c4 = do vcSetCallVia(c3, from.callVia)
+        let c5 = do vcSetLinks(c4, from.links)
+        let c6 = do vcSetIndexKeys(c5, from.indexKeys)
+        let c7 = do vcSetQueriedKeys(c6, from.queriedKeys)
+        if from.err != "" && c7.err == "":
+            let c8 = do vcSetErr(c7, from.err)
+            return c8
+        return c7
+
+    proc vbGlobalNew(comps: [VComp], compSlot: [text]) -> VGlobal:
+        return VGlobal{comps: comps, compSlot: compSlot, depNames: [], deps: [], regNames: [], regions: [], nspec: 0, special: [], specStack: []}
+
+    proc vbGWith(g: VGlobal, depNames: [text], deps: [VTextList], regNames: [text], regions: [VRegion], nspec: int, special: [IRComponent], specStack: [text]) -> VGlobal:
+        return VGlobal{comps: g.comps, compSlot: g.compSlot, depNames: depNames, deps: deps, regNames: regNames, regions: regions, nspec: nspec, special: special, specStack: specStack}
+
+    proc vbFindComp(g: VGlobal, name: text) -> int:
+        let n = len(g.comps)
+        let mut i = 0
+        loop i < n:
+            if g.comps[i].name == name:
+                return i
+            i = i + 1
+        return -1
+
+    proc vbHasRefParam(ps: [VParam]) -> bool:
+        let n = len(ps)
+        let mut i = 0
+        loop i < n:
+            if ps[i].ref != "":
+                return true
+            i = i + 1
+        return false
+
+    proc vbIsTemplate(g: VGlobal, name: text) -> bool:
+        let at = do vbFindComp(g, name)
+        if at < 0:
+            return false
+        if name in g.compSlot:
+            return true
+        let r = do vbHasRefParam(g.comps[at].params)
+        return r
+
+    proc vbValueParams(ps: [VParam]) -> [VParam]:
+        let mut out = []
+        let n = len(ps)
+        let mut i = 0
+        loop i < n:
+            if ps[i].ref == "":
+                out = append(out, ps[i])
+            i = i + 1
+        return out
+
+    proc vbIrParams(ps: [VParam]) -> [IRParam]:
+        let mut out = []
+        let n = len(ps)
+        let mut i = 0
+        loop i < n:
+            out = append(out, IRParam{name: ps[i].name, type: ps[i].type, optional: ps[i].optional, list: ps[i].list})
+            i = i + 1
+        return out
+
+    # vbParamScope: paramTypes — a value parameter whose type is a
+    # primitive, an enum or an entity is typed (a list as "[T]").
+    proc vbParamScope(env: VEnv, ps: [VParam], inRegion: bool) -> VScope:
+        let mut locals = []
+        let mut names = []
+        let mut types = []
+        let n = len(ps)
+        let mut i = 0
+        loop i < n:
+            let p = ps[i]
+            locals = append(locals, p.name)
+            if p.ref == "":
+                let prim = do vbIsPrimitive(p.type)
+                let en = do vbIsEnum(env, p.type)
+                let ent = do vbIsEntity(env, p.type)
+                if prim || en || ent:
+                    names = append(names, p.name)
+                    if p.list:
+                        types = append(types, "[" + p.type + "]")
+                    else:
+                        types = append(types, p.type)
+            i = i + 1
+        return VScope{locals: locals, inRegion: inRegion, varNames: names, varTypes: types}
+
+    proc vbCountSlots(nodes: [VNode]) -> int:
+        let mut n = 0
+        let m = len(nodes)
+        let mut i = 0
+        loop i < m:
+            let k = nodes[i].kind
+            if k == "slot":
+                n = n + 1
+            else:
+                if k == "modified" || k == "box" || k == "row" || k == "for" || k == "if" || k == "overlay" || k == "form" || k == "use" || k == "tabs" || k == "tab" || k == "match" || k == "case" || k == "else":
+                    let c = do vbCountSlots(nodes[i].children)
+                    n = n + c
+            i = i + 1
+        return n
+
+    # ── substitution (component.go substNode/substExpr) ────────────────
+    proc vbRename(s: text, from: [text], to: [text]) -> text:
+        let at = do vbFind(from, s)
+        if at < 0:
+            return s
+        return to[at]
+
+    proc vbSubstExprs(xs: [ExprNode], from: [text], to: [text]) -> [ExprNode]:
+        let mut out = []
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            let e = do vbSubstExpr(xs[i], from, to)
+            out = append(out, e)
+            i = i + 1
+        return out
+
+    proc vbSubstExpr(ex: ExprNode, from: [text], to: [text]) -> ExprNode:
+        let k = ex.kind
+        if k == "ref":
+            let r = do vbRename(ex.text, from, to)
+            return ExprNode{kind: k, text: r, field: ex.field, itemVar: ex.itemVar, coll: ex.coll, children: ex.children, pairs: ex.pairs, whereClause: ex.whereClause, sel: ex.sel, order: ex.order, desc: ex.desc, limit: ex.limit, orderBy: ex.orderBy, varFromArg: ex.varFromArg}
+        if k == "astate":
+            let a = do vbRename(ex.field, from, to)
+            return ExprNode{kind: k, text: ex.text, field: a, itemVar: ex.itemVar, coll: ex.coll, children: ex.children, pairs: ex.pairs, whereClause: ex.whereClause, sel: ex.sel, order: ex.order, desc: ex.desc, limit: ex.limit, orderBy: ex.orderBy, varFromArg: ex.varFromArg}
+        if k == "get" || k == "entityGet" || k == "call" || k == "list" || k == "bin" || k == "un":
+            let kids = do vbSubstExprs(ex.children, from, to)
+            return ExprNode{kind: k, text: ex.text, field: ex.field, itemVar: ex.itemVar, coll: ex.coll, children: kids, pairs: ex.pairs, whereClause: ex.whereClause, sel: ex.sel, order: ex.order, desc: ex.desc, limit: ex.limit, orderBy: ex.orderBy, varFromArg: ex.varFromArg}
+        if k == "agg":
+            let v = do vbRename(ex.itemVar, from, to)
+            let c = do vbRename(ex.coll, from, to)
+            let w = do vbSubstExprs(ex.whereClause, from, to)
+            let sl = do vbSubstExprs(ex.sel, from, to)
+            return ExprNode{kind: k, text: ex.text, field: ex.field, itemVar: v, coll: c, children: ex.children, pairs: ex.pairs, whereClause: w, sel: sl, order: ex.order, desc: ex.desc, limit: ex.limit, orderBy: ex.orderBy, varFromArg: ex.varFromArg}
+        return ex
+
+    proc vbSubstSegs(segs: [VSeg], from: [text], to: [text]) -> [VSeg]:
+        let mut out = []
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            let e = do vbSubstExprs(segs[i].expr, from, to)
+            out = append(out, VSeg{lit: segs[i].lit, expr: e})
+            i = i + 1
+        return out
+
+    proc vbSubstRange(rg: VRange, from: [text], to: [text]) -> VRange:
+        let v = do vbRename(rg.itemVar, from, to)
+        let c = do vbRename(rg.coll, from, to)
+        let w = do vbSubstExprs(rg.where, from, to)
+        let l = do vbSubstExprs(rg.limit, from, to)
+        return VRange{itemVar: v, coll: c, where: w, order: rg.order, desc: rg.desc, limit: l, more: rg.more}
+
+    proc vbSubstOptions(opts: [VOption], from: [text], to: [text]) -> [VOption]:
+        let mut out = []
+        let n = len(opts)
+        let mut i = 0
+        loop i < n:
+            let o = opts[i]
+            let l = do vbSubstSegs(o.label, from, to)
+            let v = do vbSubstExprs(o.val, from, to)
+            let mut fr = []
+            if len(o.from) > 0:
+                let r = do vbSubstRange(o.from[0], from, to)
+                fr = [r]
+            out = append(out, VOption{label: l, value: o.value, val: v, from: fr})
+            i = i + 1
+        return out
+
+    proc vbSubstNodes(nodes: [VNode], from: [text], to: [text]) -> [VNode]:
+        let mut out = []
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let s = do vbSubstNode(nodes[i], from, to)
+            out = append(out, s)
+            i = i + 1
+        return out
+
+    # vbSubstNode: substNode's cases exactly — a kind it does not list
+    # (popover, stage, after, slot) is returned untouched, as Go does.
+    proc vbSubstNode(nd: VNode, from: [text], to: [text]) -> VNode:
+        let k = nd.kind
+        if k == "modified":
+            let cs = do vbSubstSegs(nd.classSegs, from, to)
+            let kids = do vbSubstNodes(nd.children, from, to)
+            let m1 = do vpSetClassSegs(nd, cs)
+            let m2 = do vpSetChildren(m1, kids)
+            return m2
+        if k == "box" || k == "row":
+            let kids = do vbSubstNodes(nd.children, from, to)
+            let b = do vpSetChildren(nd, kids)
+            return b
+        if k == "text" || k == "richtext" || k == "badge" || k == "icon":
+            let sg = do vbSubstSegs(nd.segs, from, to)
+            let t1 = do vpSetSegs(nd, sg)
+            return t1
+        if k == "heading":
+            let lv = do vbSubstExprs(nd.expr, from, to)
+            let sg2 = do vbSubstSegs(nd.segs, from, to)
+            let h1 = do vpSetExpr(nd, lv)
+            let h2 = do vpSetSegs(h1, sg2)
+            return h2
+        if k == "image" || k == "video":
+            let sg3 = do vbSubstSegs(nd.segs, from, to)
+            let al = do vbSubstSegs(nd.alt, from, to)
+            let i1 = do vpSetSegs(nd, sg3)
+            let i2 = do vpSetAlt(i1, al)
+            return i2
+        if k == "link":
+            let lb = do vbSubstSegs(nd.label, from, to)
+            let ps = do vbSubstSegs(nd.pathSegs, from, to)
+            let l1 = do vpSetLabel(nd, lb)
+            let l2 = do vpSetPathSegs(l1, ps)
+            return l2
+        if k == "button" || k == "form":
+            let lb2 = do vbSubstSegs(nd.label, from, to)
+            let ac = do vbRename(nd.action, from, to)
+            let ar = do vbSubstExprs(nd.args, from, to)
+            let kids2 = do vbSubstNodes(nd.children, from, to)
+            let b1 = do vpSetLabel(nd, lb2)
+            let b2 = do vpSetAction(b1, ac)
+            let b3 = do vpSetArgs(b2, ar)
+            let b4 = do vpSetChildren(b3, kids2)
+            return b4
+        if k == "input" || k == "control" || k == "select" || k == "upload" || k == "typeahead":
+            let bd = do vbRename(nd.bind, from, to)
+            let ph = do vbSubstSegs(nd.placeholder, from, to)
+            let lb3 = do vbSubstSegs(nd.label, from, to)
+            let op = do vbSubstOptions(nd.options, from, to)
+            let c1 = do vpSetBind(nd, bd)
+            let c2 = do vpSetPlaceholder(c1, ph)
+            let c3 = do vpSetLabel(c2, lb3)
+            let c4 = do vpSetOptions(c3, op)
+            return c4
+        if k == "overlay":
+            let bd2 = do vbRename(nd.bind, from, to)
+            let kids3 = do vbSubstNodes(nd.children, from, to)
+            let o1 = do vpSetBind(nd, bd2)
+            let o2 = do vpSetChildren(o1, kids3)
+            return o2
+        if k == "tabs":
+            let bd3 = do vbRename(nd.bind, from, to)
+            let mut tabs = []
+            let nt = len(nd.children)
+            let mut ti = 0
+            loop ti < nt:
+                let tb = nd.children[ti]
+                let tl = do vbSubstSegs(tb.label, from, to)
+                let tk = do vbSubstNodes(tb.children, from, to)
+                let t2 = do vpSetLabel(tb, tl)
+                let t3 = do vpSetChildren(t2, tk)
+                tabs = append(tabs, t3)
+                ti = ti + 1
+            let tb1 = do vpSetBind(nd, bd3)
+            let tb2 = do vpSetChildren(tb1, tabs)
+            return tb2
+        if k == "match":
+            let mx = do vbSubstExprs(nd.expr, from, to)
+            let mut arms = []
+            let na = len(nd.children)
+            let mut ai = 0
+            loop ai < na:
+                let ak = do vbSubstNodes(nd.children[ai].children, from, to)
+                let a2 = do vpSetChildren(nd.children[ai], ak)
+                arms = append(arms, a2)
+                ai = ai + 1
+            let mt1 = do vpSetExpr(nd, mx)
+            let mt2 = do vpSetChildren(mt1, arms)
+            return mt2
+        if k == "for":
+            let rg = do vbSubstRange(nd.rng[0], from, to)
+            let fk = do vbSubstNodes(nd.children, from, to)
+            let f1 = do vpSetRng(nd, [rg])
+            let f2 = do vpSetChildren(f1, fk)
+            return f2
+        if k == "if":
+            let cd = do vbSubstExprs(nd.expr, from, to)
+            let ik = do vbSubstNodes(nd.children, from, to)
+            let if1 = do vpSetExpr(nd, cd)
+            let if2 = do vpSetChildren(if1, ik)
+            return if2
+        if k == "use":
+            let ua = do vbSubstExprs(nd.args, from, to)
+            let uk = do vbSubstNodes(nd.children, from, to)
+            let u1 = do vpSetArgs(nd, ua)
+            let u2 = do vpSetChildren(u1, uk)
+            return u2
+        return nd
+
+    # ── componentBinders / mentionedNames ───────────────────────────────
+    proc vbBindersExpr(ex: ExprNode, acc: [text]) -> [text]:
+        let mut out = acc
+        let k = ex.kind
+        if k == "agg":
+            if ex.itemVar != "":
+                let a = do vbAddUnique(out, ex.itemVar)
+                out = a
+            let b = do vbBindersExprs(ex.whereClause, out)
+            let c = do vbBindersExprs(ex.sel, b)
+            return c
+        if k == "get" || k == "entityGet" || k == "call" || k == "list" || k == "bin" || k == "un":
+            let d = do vbBindersExprs(ex.children, out)
+            return d
+        return out
+
+    proc vbBindersExprs(xs: [ExprNode], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            let a = do vbBindersExpr(xs[i], out)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbBindersSegs(segs: [VSeg], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            let a = do vbBindersExprs(segs[i].expr, out)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbBindersOptions(opts: [VOption], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(opts)
+        let mut i = 0
+        loop i < n:
+            let o = opts[i]
+            let a = do vbBindersSegs(o.label, out)
+            let b = do vbBindersExprs(o.val, a)
+            out = b
+            if len(o.from) > 0:
+                let c = do vbAddUnique(out, o.from[0].itemVar)
+                let d = do vbBindersExprs(o.from[0].where, c)
+                let e = do vbBindersExprs(o.from[0].limit, d)
+                out = e
+            i = i + 1
+        return out
+
+    proc vbBindersNodes(nodes: [VNode], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let nd = nodes[i]
+            let k = nd.kind
+            if k == "modified":
+                let a1 = do vbBindersSegs(nd.classSegs, out)
+                let a2 = do vbBindersNodes(nd.children, a1)
+                out = a2
+            if k == "box" || k == "row" || k == "overlay":
+                let b1 = do vbBindersNodes(nd.children, out)
+                out = b1
+            if k == "text" || k == "richtext" || k == "badge" || k == "icon":
+                let c1 = do vbBindersSegs(nd.segs, out)
+                out = c1
+            if k == "heading":
+                let d1 = do vbBindersExprs(nd.expr, out)
+                let d2 = do vbBindersSegs(nd.segs, d1)
+                out = d2
+            if k == "image" || k == "video":
+                let e1 = do vbBindersSegs(nd.segs, out)
+                let e2 = do vbBindersSegs(nd.alt, e1)
+                out = e2
+            if k == "link":
+                let f1 = do vbBindersSegs(nd.label, out)
+                let f2 = do vbBindersSegs(nd.pathSegs, f1)
+                out = f2
+            if k == "button":
+                let g1 = do vbBindersSegs(nd.label, out)
+                let g2 = do vbBindersExprs(nd.args, g1)
+                out = g2
+            if k == "input" || k == "typeahead":
+                let h1 = do vbBindersSegs(nd.placeholder, out)
+                out = h1
+            if k == "control":
+                let i1 = do vbBindersSegs(nd.label, out)
+                let i2 = do vbBindersSegs(nd.placeholder, i1)
+                let i3 = do vbBindersOptions(nd.options, i2)
+                out = i3
+            if k == "upload":
+                let j1 = do vbBindersSegs(nd.label, out)
+                out = j1
+            if k == "select":
+                let k1 = do vbBindersOptions(nd.options, out)
+                out = k1
+            if k == "form":
+                let l1 = do vbBindersSegs(nd.label, out)
+                let l2 = do vbBindersExprs(nd.args, l1)
+                let l3 = do vbBindersNodes(nd.children, l2)
+                out = l3
+            if k == "for":
+                let rg = nd.rng[0]
+                let m1 = do vbAddUnique(out, rg.itemVar)
+                let m2 = do vbBindersExprs(rg.where, m1)
+                let m3 = do vbBindersExprs(rg.limit, m2)
+                let m4 = do vbBindersNodes(nd.children, m3)
+                out = m4
+            if k == "if":
+                let n1 = do vbBindersExprs(nd.expr, out)
+                let n2 = do vbBindersNodes(nd.children, n1)
+                out = n2
+            if k == "tabs":
+                let nt = len(nd.children)
+                let mut ti = 0
+                loop ti < nt:
+                    let o1 = do vbBindersSegs(nd.children[ti].label, out)
+                    let o2 = do vbBindersNodes(nd.children[ti].children, o1)
+                    out = o2
+                    ti = ti + 1
+            if k == "match":
+                let p1 = do vbBindersExprs(nd.expr, out)
+                out = p1
+                let na = len(nd.children)
+                let mut ai = 0
+                loop ai < na:
+                    let p2 = do vbBindersNodes(nd.children[ai].children, out)
+                    out = p2
+                    ai = ai + 1
+            if k == "use":
+                let q1 = do vbBindersExprs(nd.args, out)
+                let q2 = do vbBindersNodes(nd.children, q1)
+                out = q2
+            i = i + 1
+        return out
+
+    proc vbComponentBinders(comp: VComp) -> [text]:
+        let mut out = []
+        let n = len(comp.params)
+        let mut i = 0
+        loop i < n:
+            if comp.params[i].ref == "":
+                let a = do vbAddUnique(out, comp.params[i].name)
+                out = a
+            i = i + 1
+        let r = do vbBindersNodes(comp.root, out)
+        return r
+
+    proc vbMentionedExpr(e: IRExpr, acc: [text]) -> [text]:
+        let mut out = acc
+        if e.name != "":
+            let a = do vbAddUnique(out, e.name)
+            out = a
+        if e.itemVar != "":
+            let b = do vbAddUnique(out, e.itemVar)
+            out = b
+        let c1 = do vbMentionedExprs(e.obj, out)
+        let c2 = do vbMentionedExprs(e.key, c1)
+        let c3 = do vbMentionedExprs(e.where, c2)
+        let c4 = do vbMentionedExprs(e.l, c3)
+        let c5 = do vbMentionedExprs(e.r, c4)
+        let c6 = do vbMentionedExprs(e.x, c5)
+        let c7 = do vbMentionedExprs(e.args, c6)
+        return c7
+
+    proc vbMentionedExprs(es: [IRExpr], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(es)
+        let mut i = 0
+        loop i < n:
+            let a = do vbMentionedExpr(es[i], out)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbMentionedSegs(segs: [IRSeg], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(segs)
+        let mut i = 0
+        loop i < n:
+            let a = do vbMentionedExprs(segs[i].expr, out)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbMentionedNames(nodes: [IRNode], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            let nd = nodes[i]
+            let a1 = do vbMentionedSegs(nd.segs, out)
+            let a2 = do vbMentionedSegs(nd.label, a1)
+            let a3 = do vbMentionedSegs(nd.placeholder, a2)
+            let a4 = do vbMentionedSegs(nd.pathSegs, a3)
+            let a5 = do vbMentionedSegs(nd.classSegs, a4)
+            let a6 = do vbMentionedSegs(nd.alt, a5)
+            let a7 = do vbMentionedSegs(nd.poster, a6)
+            out = a7
+            let no = len(nd.options)
+            let mut oi = 0
+            loop oi < no:
+                let ao = do vbMentionedSegs(nd.options[oi].label, out)
+                out = ao
+                oi = oi + 1
+            let b1 = do vbMentionedExprs(nd.cond, out)
+            let b2 = do vbMentionedExprs(nd.where, b1)
+            let b3 = do vbMentionedExprs(nd.limit, b2)
+            let b4 = do vbMentionedExprs(nd.val, b3)
+            let b5 = do vbMentionedExprs(nd.args, b4)
+            out = b5
+            let names = [nd.coll, nd.bind, nd.action, nd.more, nd.itemVar]
+            let mut ni = 0
+            loop ni < 5:
+                if names[ni] != "":
+                    let c = do vbAddUnique(out, names[ni])
+                    out = c
+                ni = ni + 1
+            let d = do vbMentionedNames(nd.children, out)
+            out = d
+            i = i + 1
+        return out
+
+    # ── specialize ──────────────────────────────────────────────────────
+    struct VSpec:
+        name: text
+        ctx: VCtx
+
+    proc vbSpecialize(env: VEnv, comp: VComp, from0: [text], to0: [text], kids: [IRNode], parent: VCtx) -> VSpec:
+        let g0 = parent.g
+        if comp.name in g0.specStack:
+            let mut chain = ""
+            let ns = len(g0.specStack)
+            let mut si = 0
+            loop si < ns:
+                chain = chain + g0.specStack[si] + " → "
+                si = si + 1
+            let f0 = do vbFail(parent, "component \"" + comp.name + "\" is recursive (" + chain + comp.name + "); a component with a `slot` or a reference parameter is expanded at its call site, so it cannot use itself")
+            return VSpec{name: "", ctx: f0}
+        let binders = do vbComponentBinders(comp)
+        let nsub = len(from0)
+        let mut k = 0
+        loop k < nsub:
+            if from0[k] in binders:
+                let f1 = do vbFail(parent, "component \"" + comp.name + "\" binds its own name \"" + from0[k] + "\" (a loop variable or another parameter), so its reference parameter \"" + from0[k] + "\" cannot be resolved — rename one of them")
+                return VSpec{name: "", ctx: f1}
+            if to0[k] in binders:
+                let f2 = do vbFail(parent, "cannot pass \"" + to0[k] + "\" to component \"" + comp.name + "\": its body binds a name \"" + to0[k] + "\" of its own, which would shadow it — rename the loop variable or parameter inside " + comp.name)
+                return VSpec{name: "", ctx: f2}
+            k = k + 1
+        let nspec = g0.nspec + 1
+        let name = comp.name + "#" + nspec
+        let g1 = do vbGWith(g0, g0.depNames, g0.deps, g0.regNames, g0.regions, nspec, g0.special, append(g0.specStack, comp.name))
+        let mut from = from0
+        let mut to = to0
+        if len(kids) > 0:
+            let mentioned = do vbMentionedNames(kids, [])
+            let mut af = []
+            let mut at = []
+            let nb = len(binders)
+            let mut bi = 0
+            loop bi < nb:
+                if binders[bi] in mentioned:
+                    af = append(af, binders[bi])
+                    at = append(at, binders[bi] + "$c" + nspec)
+                bi = bi + 1
+            if len(af) > 0:
+                let mut kk = 0
+                loop kk < nsub:
+                    let pos = do vbFind(af, from0[kk])
+                    if pos >= 0:
+                        at[pos] = to0[kk]
+                    else:
+                        af = append(af, from0[kk])
+                        at = append(at, to0[kk])
+                    kk = kk + 1
+                from = af
+                to = at
+        let vp0 = do vbValueParams(comp.params)
+        let mut vp = []
+        let nvp = len(vp0)
+        let mut vi = 0
+        loop vi < nvp:
+            let rn = do vbRename(vp0[vi].name, from, to)
+            vp = append(vp, VParam{name: rn, type: vp0[vi].type, list: vp0[vi].list, optional: vp0[vi].optional, ref: ""})
+            vi = vi + 1
+        let sc = do vbParamScope(env, vp, true)
+        let p1 = do vcSetG(parent, g1)
+        let svc0 = do vbCtxFrom("c" + nspec + ".", p1)
+        let svc1 = do vcSetSlotOK(svc0, true)
+        let svc = do vcSetSlot(svc1, kids)
+        let body = do vbSubstNodes(comp.root, from, to)
+        let r = do vbNodes(env, body, sc, svc)
+        if r.ctx.err != "":
+            let pf = do vbTakeShared(parent, r.ctx)
+            return VSpec{name: "", ctx: pf}
+        let g2 = r.ctx.g
+        let mut stack = []
+        let nst = len(g2.specStack)
+        let mut sk = 0
+        loop sk < nst - 1:
+            stack = append(stack, g2.specStack[sk])
+            sk = sk + 1
+        let deps0 = do vbNodeDeps(env, r.nodes)
+        let mut deps = []
+        let nd = len(deps0)
+        let mut di = 0
+        loop di < nd:
+            let isParam = do vbParamNamed(vp, deps0[di])
+            if !isParam:
+                deps = append(deps, deps0[di])
+            di = di + 1
+        let ip = do vbIrParams(vp)
+        let g3 = do vbGWith(g2, append(g2.depNames, name), append(g2.deps, VTextList{items: deps}), append(g2.regNames, name), append(g2.regions, VRegion{keys: r.ctx.depKeys, ids: r.ctx.depIds}), g2.nspec, append(g2.special, IRComponent{name: name, params: ip, view: r.nodes}), stack)
+        let r2 = do vcSetG(r.ctx, g3)
+        let out = do vbTakeShared(parent, r2)
+        return VSpec{name: name, ctx: out}
+
+    proc vbParamNamed(ps: [VParam], name: text) -> bool:
+        let n = len(ps)
+        let mut i = 0
+        loop i < n:
+            if ps[i].name == name:
+                return true
+            i = i + 1
+        return false
+
+    # vbCheckTemplate: checkTemplate — the template expanded once against
+    # synthetic cells/actions in a sandbox. Everything the sandbox grows is
+    # discarded except what Go's shallow env copy shares back: the index
+    # and queried marks.
+    proc vbCheckTemplate(env: VEnv, comp: VComp, parent: VCtx) -> VCtx:
+        let mut stateNames = env.stateNames
+        let mut stateClient = env.stateClient
+        let mut stateTypes = env.stateTypes
+        let mut stateLists = env.stateLists
+        let mut actionNames = env.actionNames
+        let mut actionCounts = env.actionParamCounts
+        let mut from = []
+        let mut to = []
+        let n = len(comp.params)
+        let mut i = 0
+        loop i < n:
+            let p = comp.params[i]
+            if p.ref == "cell":
+                let syn = "cell$" + comp.name + "$" + p.name
+                stateNames = append(stateNames, syn)
+                stateClient = append(stateClient, true)
+                stateTypes = append(stateTypes, p.type)
+                stateLists = append(stateLists, p.list)
+                from = append(from, p.name)
+                to = append(to, syn)
+            if p.ref == "action":
+                let syn2 = "action$" + comp.name + "$" + p.name
+                actionNames = append(actionNames, syn2)
+                actionCounts = append(actionCounts, -1)
+                from = append(from, p.name)
+                to = append(to, syn2)
+            i = i + 1
+        let senv = VEnv{stateNames: stateNames, stateClient: stateClient, stateTypes: stateTypes, stateLists: stateLists, privateNames: env.privateNames, entityNames: env.entityNames, fieldKeys: env.fieldKeys, fieldTypes: env.fieldTypes, deriveKeys: env.deriveKeys, e2eKeys: env.e2eKeys, enumFieldKeys: env.enumFieldKeys, enumFieldEnums: env.enumFieldEnums, enumNames: env.enumNames, enumMemberKeys: env.enumMemberKeys, inlineNames: env.inlineNames, inlineExprs: env.inlineExprs, actionNames: actionNames, actionParamCounts: actionCounts, policyNames: env.policyNames, policyParamCounts: env.policyParamCounts, low: env.low, calls: env.calls}
+        let g = parent.g
+        let sg = do vbGWith(g, g.depNames, g.deps, g.regNames, g.regions, g.nspec, [], [])
+        let sandbox = do vcSetG(parent, sg)
+        let sp = do vbSpecialize(senv, comp, from, to, [], sandbox)
+        if sp.ctx.err != "":
+            let f = do vbFail(parent, sp.ctx.err)
+            return f
+        let c1 = do vcSetIndexKeys(parent, sp.ctx.indexKeys)
+        let c2 = do vcSetQueriedKeys(c1, sp.ctx.queriedKeys)
+        return c2
+
+    # ── `use` (viewCtx.nodes' ast.Use arm) ──────────────────────────────
+    proc vbTextLits(ex: ExprNode, acc: [text]) -> [text]:
+        let mut out = acc
+        if ex.kind == "text":
+            let v = do lowerUnquote(ex.text)
+            out = append(out, v)
+            return out
+        let a = do vbTextLitsList(ex.children, out)
+        let b = do vbTextLitsList(ex.whereClause, a)
+        let c = do vbTextLitsList(ex.sel, b)
+        return c
+
+    proc vbTextLitsList(xs: [ExprNode], acc: [text]) -> [text]:
+        let mut out = acc
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            let a = do vbTextLits(xs[i], out)
+            out = a
+            i = i + 1
+        return out
+
+    proc vbUse(env: VEnv, t: VNode, sc: VScope, c0: VCtx) -> VRes:
+        let mut c = c0
+        let at = do vbFindComp(c.g, t.name)
+        if at < 0:
+            let f0 = do vbFailRes(c, "use of unknown component \"" + t.name + "\"")
+            return f0
+        let comp = c.g.comps[at]
+        let params = comp.params
+        if len(t.args) != len(params):
+            let f1 = do vbFailRes(c, "component \"" + t.name + "\" takes " + len(params) + " argument(s), got " + len(t.args))
+            return f1
+        if len(t.children) > 0 && !(t.name in c.g.compSlot):
+            let f2 = do vbFailRes(c, "component \"" + t.name + "\" takes no children — it has no `slot`. Add a `slot` to " + t.name + " where the block should render, or remove the block")
+            return f2
+        let mut from = []
+        let mut to = []
+        let mut valArgs = []
+        let np = len(params)
+        let mut i = 0
+        loop i < np:
+            let p = params[i]
+            let arg = t.args[i]
+            if p.ref == "":
+                let ad = do tyArgDiag(env.calls.ty, t.name, p.name, p.type, p.list, i, arg, vbTyScope(sc))
+                if ad != "":
+                    let fa = do vbFailRes(c, ad)
+                    return fa
+                valArgs = append(valArgs, arg)
+            else:
+                if arg.kind != "ref":
+                    let mut noun = "state cell"
+                    if p.ref == "action":
+                        noun = "action"
+                    let f3 = do vbFailRes(c, "component \"" + t.name + "\" parameter \"" + p.name + "\" is a reference — pass the name of a " + noun + ", not an expression")
+                    return f3
+                let nm = arg.text
+                if p.ref == "cell":
+                    let st = do vbIsState(env, nm)
+                    if !st:
+                        let f4 = do vbFailRes(c, "component \"" + t.name + "\" parameter \"" + p.name + "\" needs a state cell; \"" + nm + "\" is not one")
+                        return f4
+                    let gt = do vbStateType(env, nm)
+                    let gl = do vbStateList(env, nm)
+                    if gt != p.type || gl != p.list:
+                        let want = do vbTypeLabel(p.type, p.list)
+                        let got = do vbTypeLabel(gt, gl)
+                        let f5 = do vbFailRes(c, "component \"" + t.name + "\" parameter \"" + p.name + "\" is `cell " + want + "`, but \"" + nm + "\" is " + got)
+                        return f5
+                if p.ref == "action":
+                    if !(nm in env.actionNames):
+                        let f6 = do vbFailRes(c, "component \"" + t.name + "\" parameter \"" + p.name + "\" needs an action; \"" + nm + "\" is not one")
+                        return f6
+                from = append(from, p.name)
+                to = append(to, nm)
+            i = i + 1
+        let mut useName = t.name
+        let isT = do vbIsTemplate(c.g, t.name)
+        if isT:
+            let mut kids = []
+            if len(t.children) > 0:
+                let rsc = do vbRegion(sc)
+                let kr = do vbNodes(env, t.children, rsc, c)
+                if kr.ctx.err != "":
+                    return kr
+                c = kr.ctx
+                kids = kr.nodes
+            let sp = do vbSpecialize(env, comp, from, to, kids, c)
+            if sp.ctx.err != "":
+                return VRes{nodes: [], ctx: sp.ctx}
+            c = sp.ctx
+            useName = sp.name
+        let ri = do vbFind(c.g.regNames, useName)
+        if ri >= 0:
+            let rg = c.g.regions[ri]
+            let nk = len(rg.keys)
+            let mut rk = 0
+            loop rk < nk:
+                let ad = do vbAddDep(c, rg.keys[rk], rg.ids[rk])
+                c = ad
+                rk = rk + 1
+        # checkUseArgs: a text literal in an argument that would have
+        # interpolated is a template mistake, refused.
+        let loc = do viewScope(sc.locals)
+        let na = len(t.args)
+        let mut ai = 0
+        loop ai < na && ai < np:
+            let lits = do vbTextLits(t.args[ai], [])
+            let nl = len(lits)
+            let mut li = 0
+            loop li < nl:
+                let bad = do litInterp(lits[li], loc, env.stateNames, env.entityNames, env.enumNames, env.inlineNames)
+                if bad != "":
+                    let f7 = do vbFailRes(c, "argument " + (ai + 1) + " (" + params[ai].name + ") of component \"" + t.name + "\" holds " + bad + ": a component argument is an expression, not a template")
+                    return f7
+                li = li + 1
+            ai = ai + 1
+        let mut args = []
+        let mut deps = []
+        let nv = len(valArgs)
+        let mut vi = 0
+        loop vi < nv:
+            let d = do vbCheckView(env, valArgs[vi], sc, "a view")
+            if d != "":
+                let f8 = do vbFailRes(c, d)
+                return f8
+            let le = do vbLow(env, valArgs[vi])
+            args = append(args, le)
+            let dl = do vbDepsWalk(env, le, deps)
+            deps = dl
+            vi = vi + 1
+        let di = do vbFind(c.g.depNames, useName)
+        if di >= 0:
+            let cd = c.g.deps[di].items
+            let ncd = len(cd)
+            let mut ci = 0
+            loop ci < ncd:
+                let au = do vbAddUnique(deps, cd[ci])
+                deps = au
+                ci = ci + 1
+        let n0 = do vbNode("use")
+        let n1 = do vbSetName(n0, useName)
+        let mut node = do vbSetArgs(n1, args)
+        if !sc.inRegion:
+            let id = c.pfx + "u" + c.nu
+            let c1 = do vcSetNu(c, c.nu + 1)
+            let sorted = do vbSortText(deps)
+            let c2 = do vbAddDeps(c1, sorted, id)
+            c = c2
+            let n2 = do vbSetId(node, id)
+            node = n2
+        return VRes{nodes: [node], ctx: c}
+
+    # vbBuildComponents: 3d — register every component, validate its
+    # parameters and slot count, check each template once in a sandbox,
+    # and lower each plain component (namespaced `k<n>.` region ids).
+    struct VCompsOut:
+        err: text
+        components: [IRComponent]
+        ctx: VCtx
+
+    proc vbBuildComponents(env: VEnv, comps: [VComp]) -> VCompsOut:
+        let mut names = []
+        let mut slots = []
+        let n = len(comps)
+        let mut i = 0
+        loop i < n:
+            let cm = comps[i]
+            if cm.err != "":
+                let c0 = do vbCtx("")
+                return VCompsOut{err: cm.err, components: [], ctx: c0}
+            if cm.name in names:
+                let c1 = do vbCtx("")
+                return VCompsOut{err: "component \"" + cm.name + "\" redeclared", components: [], ctx: c1}
+            names = append(names, cm.name)
+            let ent = do vbIsEntity(env, cm.name)
+            if ent:
+                let c2 = do vbCtx("")
+                return VCompsOut{err: "component \"" + cm.name + "\" collides with an entity name", components: [], ctx: c2}
+            let mut pseen = []
+            let np = len(cm.params)
+            let mut pi = 0
+            loop pi < np:
+                let p = cm.params[pi]
+                if p.name in pseen:
+                    let c3 = do vbCtx("")
+                    return VCompsOut{err: "component \"" + cm.name + "\" has duplicate parameter \"" + p.name + "\"", components: [], ctx: c3}
+                pseen = append(pseen, p.name)
+                let prim = do vbIsPrimitive(p.type)
+                let en = do vbIsEnum(env, p.type)
+                if p.ref == "cell" && !prim && !en:
+                    let c4 = do vbCtx("")
+                    return VCompsOut{err: "component \"" + cm.name + "\" parameter \"" + p.name + "\" is `cell " + p.type + "`, but \"" + p.type + "\" is not a state type (a primitive or an enum)", components: [], ctx: c4}
+                let pe = do vbIsEntity(env, p.type)
+                if p.ref == "" && !prim && !en && !pe:
+                    let c5 = do vbCtx("")
+                    return VCompsOut{err: "component \"" + cm.name + "\" parameter \"" + p.name + "\" has unknown type \"" + p.type + "\" — a parameter is a primitive (int/text/bool/money/date), an enum, or an entity (a row: `" + p.name + ": Post`)", components: [], ctx: c5}
+                pi = pi + 1
+            let ns = do vbCountSlots(cm.root)
+            if ns > 1:
+                let c6 = do vbCtx("")
+                return VCompsOut{err: "component \"" + cm.name + "\" has " + ns + " `slot`s; a component has at most one, since its children are one tree", components: [], ctx: c6}
+            if ns == 1:
+                slots = append(slots, cm.name)
+            i = i + 1
+        let g = do vbGlobalNew(comps, slots)
+        let mut carry = do vbCtxG("", g)
+        let mut out = []
+        let mut j = 0
+        loop j < n:
+            let cm2 = comps[j]
+            let isT = do vbIsTemplate(carry.g, cm2.name)
+            if isT:
+                let ct = do vbCheckTemplate(env, cm2, carry)
+                if ct.err != "":
+                    return VCompsOut{err: ct.err, components: [], ctx: ct}
+                carry = ct
+            else:
+                let sc = do vbParamScope(env, cm2.params, true)
+                let cvc = do vbCtxFrom("k" + len(carry.g.regNames) + ".", carry)
+                let r = do vbNodes(env, cm2.root, sc, cvc)
+                if r.ctx.err != "":
+                    return VCompsOut{err: r.ctx.err, components: [], ctx: r.ctx}
+                let g2 = r.ctx.g
+                let deps0 = do vbNodeDeps(env, r.nodes)
+                let mut deps = []
+                let nd = len(deps0)
+                let mut di = 0
+                loop di < nd:
+                    let isP = do vbParamNamed(cm2.params, deps0[di])
+                    if !isP:
+                        deps = append(deps, deps0[di])
+                    di = di + 1
+                let g3 = do vbGWith(g2, append(g2.depNames, cm2.name), append(g2.deps, VTextList{items: deps}), append(g2.regNames, cm2.name), append(g2.regions, VRegion{keys: r.ctx.depKeys, ids: r.ctx.depIds}), g2.nspec, g2.special, g2.specStack)
+                let r2 = do vcSetG(r.ctx, g3)
+                let tk = do vbTakeShared(carry, r2)
+                carry = tk
+                let ip = do vbIrParams(cm2.params)
+                out = append(out, IRComponent{name: cm2.name, params: ip, view: r.nodes})
+            j = j + 1
+        return VCompsOut{err: "", components: out, ctx: carry}
+
+    proc vbCtx(pfx: text) -> VCtx:
+        let g = do vbGlobalNew([], [])
+        let c = do vbCtxG(pfx, g)
+        return c

@@ -1,0 +1,56 @@
+import "../../http_server.fct"
+
+# An echo server on http_server.fct (selfhost/http_server_test.go): every
+# request answered with what was parsed out of it; /stream answers with a
+# chunked body of two pieces. A 16-byte body limit, so 413 is easy to reach.
+app HttpServerEcho:
+    shared echoPort: int
+
+    proc echoConfigure(p: int):
+        echoPort = p
+
+    action echoStart(p: int):
+        do echoConfigure(p)
+
+    proc echoAnswer(req: HttpServerRequest) -> HttpServerResponse:
+        let mut hs = ""
+        let mut i = 0
+        loop i < len(req.headers):
+            hs = hs + req.headers[i].name + "=" + req.headers[i].value + ";"
+            i = i + 1
+        let body = req.method + "|" + req.target + "|" + req.path + "|" + req.hasQuery + "|" + req.query + "|" + req.version + "|" + hs + "|" + req.body
+        return HttpServerResponse{status: 200, reason: "", headers: [HttpHeader{name: "content-type", value: "text/plain"}], body: body}
+
+    proc echoConn(c: int) uses io.net.listen:
+        let mut pending = []
+        let mut open = true
+        loop open:
+            let req = do httpServerReadRequest(c, pending, 16)
+            if req.state == 0:
+                open = false
+            if req.state == -1:
+                let r = do httpServerRefuse(c, 400, "bad request: " + req.err)
+                return
+            if req.state == -2:
+                let r = do httpServerRefuse(c, 413, "too large")
+                return
+            if req.state == 1:
+                pending = req.rest
+                let keep = do httpServerKeepAlive(req)
+                if req.path == "/stream":
+                    let s = do httpServerStartStream(c, 200, [HttpHeader{name: "content-type", value: "text/event-stream"}])
+                    let a = do httpServerWriteChunk(c, textToBytes("data: one\n\n"))
+                    let b = do httpServerWriteChunk(c, textToBytes("data: twö\n\n"))
+                    let e = do httpServerEndStream(c)
+                    open = keep
+                else:
+                    let r = do echoAnswer(req)
+                    let wrote = do httpServerWriteResponse(c, req.method, r, keep)
+                    open = wrote && keep
+        let closed = closeConn(c)
+
+    daemon Echo uses io.net.listen:
+        let l = listen(echoPort)
+        loop true:
+            let c = accept(l)
+            detach echoConn(c)

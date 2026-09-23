@@ -121,7 +121,7 @@ func TestDeclaredAPIRoutes(t *testing.T) {
 	if code != 201 || obj["title"] != "Hello" || obj["author"] != "ada" {
 		t.Fatalf("create = %d %v", code, obj)
 	}
-	if code, obj, _ := ada.do("POST", "/api/v2/works", `{"title":""}`); code != 422 || obj["error"] != "a title is required" {
+	if code, obj, _ := ada.do("POST", "/api/v2/works", `{"title":""}`); code != 422 || errMessage(obj) != "a title is required" {
 		t.Fatalf("a failed check is 422 with its message: %d %v", code, obj)
 	}
 	// The write class is metered on its own: a burst of writes is refused
@@ -156,7 +156,7 @@ func TestDeclaredAPIRoutes(t *testing.T) {
 	if again.StatusCode != 304 {
 		t.Fatalf("matching If-None-Match should be 304, got %d", again.StatusCode)
 	}
-	if code, obj, _ := guest.do("GET", "/api/v2/works/99", ""); code != 404 || obj["error"] != "no such work" {
+	if code, obj, _ := guest.do("GET", "/api/v2/works/99", ""); code != 404 || errMessage(obj) != "no such work" {
 		t.Fatalf("a check with status 404 answers 404: %d %v", code, obj)
 	}
 	code, _, arr := guest.do("GET", "/api/v2/works?q=ell&limit=5", "")
@@ -188,14 +188,14 @@ func TestDeclaredAPIRoutes(t *testing.T) {
 		t.Errorf("the 404 a check can answer must be in the contract: %v", get["responses"])
 	}
 	post := paths["/api/v2/works"].(map[string]any)["post"].(map[string]any)
-	if post["x-auth"] != "session" || post["x-rate-limit"] != "write" || post["security"] == nil {
+	if rl, _ := post["x-rate-limit"].(map[string]any); post["x-auth"] != "session" || rl["limiter"] != "write" || rl["keyed_by"] != "ip" || post["security"] == nil {
 		t.Errorf("POST extensions: %v", post)
 	}
 	if _, has := post["responses"].(map[string]any)["201"]; !has {
 		t.Errorf("POST success status missing: %v", post["responses"])
 	}
 	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
-	for _, want := range []string{"WorkDTO", "Work", "APIError"} {
+	for _, want := range []string{"WorkDTO", "Work", "APIErrorDTO", "apiErrorBody"} {
 		if schemas[want] == nil {
 			t.Errorf("schema %s missing from the contract", want)
 		}

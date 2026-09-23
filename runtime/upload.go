@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -134,4 +135,23 @@ func safeExt(filename string) string {
 		}
 	}
 	return ext
+}
+
+// fileDigest is the hex sha256 of a stored upload's content (the value a
+// `bytes` parameter holds, "/uploads/<name>"), or "" when it is not one.
+func (s *Server) fileDigest(ref string) string {
+	durable, ok := mediaDurableRef(ref)
+	if !ok {
+		return ""
+	}
+	f, err := os.Open(filepath.Join(s.uploadDir, strings.TrimPrefix(durable, mediaPathPrefix)))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

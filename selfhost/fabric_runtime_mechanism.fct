@@ -1,0 +1,578 @@
+import "fabric_runtime_placement.fct"
+import "fabric_controller_plan.fct"
+
+app FabricRuntimeMechanismSelfHost:
+    # Port of fabric/crates/fabric-runtime/src/mechanism.rs: the
+    # PlacementExecutor the controller drives, on top of the real routing,
+    # replication and migration ports.
+    #
+    #   Prepare   declare the copy and begin seeding   migration: Planned
+    #   Transfer  bulk copy, then close the write gap  migration: Copying -> CatchingUp
+    #   Cutover   fence, drain, move authority         migration: Cutover -> Cleanup
+    #   Cleanup   release the source's copy            migration: Completed
+    #
+    # A Replicate uses only Prepare and Transfer. NotCaughtUp and
+    # CutoverNotDrained are waits (Running), never faults.
+    #
+    # Rust shares the PlacementFabric between the runtime and this executor
+    # through Rc<RefCell<_>>; here the mechanism owns it (`fabric`) and the
+    # runtime reads and writes it through the controller's executor entry
+    # (see fabric_executor.fct). Every proc that can change it returns the
+    # updated mechanism, including on a fault: Rust's RefCell mutations made
+    # before an early `?` return persist, and so do these.
+
+    proc mechanismName() -> text:
+        return "fabric-placement"
+
+    struct MechJob:
+        target: ActionTarget
+        effect: text
+        source: text
+        sourceRegion: text
+        destination: text
+        destinationRegion: text
+        hasPhase: bool
+        phase: text
+
+    struct PlacementMechanism:
+        fabric: PlacementFabric
+        jobs: [MechJob]
+
+    proc placementMechanismNew(fabric: PlacementFabric) -> PlacementMechanism:
+        return PlacementMechanism{fabric: fabric, jobs: []}
+
+    proc placementMechanismWithFabric(m: PlacementMechanism, fabric: PlacementFabric) -> PlacementMechanism:
+        return PlacementMechanism{fabric: fabric, jobs: m.jobs}
+
+    private proc mechJobIndexOf(jobs: [MechJob], target: ActionTarget) -> int:
+        let n = len(jobs)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(jobs[i].target, target)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    private proc mechJobsPut(jobs: [MechJob], job: MechJob) -> [MechJob]:
+        let idx = do mechJobIndexOf(jobs, job.target)
+        if idx != -1:
+            let mut replaced = jobs
+            replaced[idx] = job
+            return replaced
+        let mut out = []
+        let mut placed = false
+        let n = len(jobs)
+        let mut i = 0
+        loop i < n:
+            let before = do actionTargetLess(job.target, jobs[i].target)
+            if !placed && before:
+                out = append(out, job)
+                placed = true
+            out = append(out, jobs[i])
+            i = i + 1
+        if !placed:
+            out = append(out, job)
+        return out
+
+    private proc mechJobsRemove(jobs: [MechJob], target: ActionTarget) -> [MechJob]:
+        let mut out = []
+        let n = len(jobs)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(jobs[i].target, target)
+            if !same:
+                out = append(out, jobs[i])
+            i = i + 1
+        return out
+
+    private proc mechJobZero() -> MechJob:
+        return MechJob{target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, effect: "", source: "", sourceRegion: "", destination: "", destinationRegion: "", hasPhase: false, phase: ""}
+
+    private proc mechNoFault() -> ExecutionFault:
+        let f = do executionFaultInternal("")
+        return f
+
+    private proc mechFailed(phase: text, reason: text) -> ExecutionFault:
+        let f = do executionFaultPhaseFailed(phase, reason)
+        return f
+
+    # checkDestination: a destination routing knows to be unreachable is a
+    # fault, never something to wait on.
+    private proc mechCheckDestination(m: PlacementMechanism, node: text) -> bool:
+        let entry = do tableNodeLookup(m.fabric.routing, node)
+        if entry.found && entry.entry.availability == "Unreachable":
+            return false
+        return true
+
+    private proc mechLostFault(node: text) -> ExecutionFault:
+        let f = do executionFaultDestinationLost(DbmsId{value: node})
+        return f
+
+    struct MechJobLookup:
+        ok: bool
+        job: MechJob
+        fault: ExecutionFault
+
+    # job: the in-flight job for target, which must be in `phase`.
+    private proc mechJob(m: PlacementMechanism, target: ActionTarget, phase: text) -> MechJobLookup:
+        let idx = do mechJobIndexOf(m.jobs, target)
+        let notStarted = do executionFaultNotStarted(phase)
+        let zero = do mechJobZero()
+        if idx == -1:
+            return MechJobLookup{ok: false, job: zero, fault: notStarted}
+        let job = m.jobs[idx]
+        if !job.hasPhase || job.phase != phase:
+            return MechJobLookup{ok: false, job: zero, fault: notStarted}
+        let none = do mechNoFault()
+        return MechJobLookup{ok: true, job: job, fault: none}
+
+    # transferFraction: bytes over the reported cell size when one is known,
+    # otherwise all-or-nothing on the atom.
+    private proc mechTransferFraction(m: PlacementMechanism, job: MechJob, target: ActionTarget) -> float:
+        let progress = do placementFabricTransfer(m.fabric, target, job.destination)
+        if !progress.has:
+            return 0.0
+        let size = do placementFabricSize(m.fabric, target)
+        if size.has && size.val > 0:
+            let fraction = toFloat(progress.val.bytesCopied) / toFloat(size.val)
+            let clamped = do clampFloat(fraction, 0.0, 1.0)
+            return clamped
+        if progress.val.atomsCopied > 0:
+            return 1.0
+        return 0.0
+
+    # migrationReason: the closest true statement about the optimizer action.
+    proc mechMigrationReason(action: OptimizationAction, destinationRegion: text) -> MigrationReason:
+        if action.kind == "Move":
+            let r1 = do migrationReasonRebalance()
+            return r1
+        if action.kind == "Isolate":
+            let r2 = do migrationReasonCapacityPressure()
+            return r2
+        if action.kind == "Colocate":
+            let r3 = do migrationReasonRegionLocality(destinationRegion)
+            return r3
+        let label = do controllerPlanActionLabel(action)
+        let r4 = do migrationReasonOperator("action '" + label + "'")
+        return r4
+
+    struct MechPrepareResult:
+        ok: bool
+        job: MechJob
+        fault: ExecutionFault
+        fabric: PlacementFabric
+
+    private proc mechBeginPrepare(m: PlacementMechanism, target: ActionTarget, plan: PlacementPlan, atMs: int) -> MechPrepareResult:
+        let zero = do mechJobZero()
+        if len(plan.adds) == 0:
+            let f0 = do executionFaultInternal("plan adds no copy")
+            return MechPrepareResult{ok: false, job: zero, fault: f0, fabric: m.fabric}
+        let destination = plan.adds[0].value
+        let mut effect = "relocate"
+        if len(plan.removes) == 0:
+            effect = "add-copy"
+        let located = do topologyRegistryLocate(m.fabric.topology, target.shardId, target.coordinate)
+        if !located.found:
+            let shown = do actionTargetDisplay(target)
+            let f1 = do executionFaultInternal(shown + " is no longer placed")
+            return MechPrepareResult{ok: false, job: zero, fault: f1, fabric: m.fabric}
+        let entry = do tableNodeLookup(m.fabric.routing, destination)
+        if !entry.found:
+            let f2 = do executionFaultInternal("node '" + destination + "' is not in the routing table, so its region is unknown and a copy placed there could not be spread correctly")
+            return MechPrepareResult{ok: false, job: zero, fault: f2, fabric: m.fabric}
+        let job = MechJob{target: target, effect: effect, source: located.placement.dbmsId, sourceRegion: located.placement.region, destination: destination, destinationRegion: entry.entry.region, hasPhase: true, phase: "prepare"}
+        let ensured = do placementFabricEnsureReplicaSet(m.fabric, target, job.source, job.sourceRegion)
+        let addOp = do replOpAdd(job.destination, job.destinationRegion)
+        let added = do placementFabricApplyReplica(ensured, target, addOp)
+        if !added.ok:
+            let shown2 = do fabricErrorDisplay(added.err)
+            let f3 = do mechFailed("prepare", shown2)
+            return MechPrepareResult{ok: false, job: zero, fault: f3, fabric: added.fabric}
+        let seedOp = do replOpBeginSeed(job.destination)
+        let seeding = do placementFabricApplyReplica(added.fabric, target, seedOp)
+        if !seeding.ok:
+            let shown3 = do fabricErrorDisplay(seeding.err)
+            let f4 = do mechFailed("prepare", shown3)
+            return MechPrepareResult{ok: false, job: zero, fault: f4, fabric: seeding.fabric}
+        let mut fabric = seeding.fabric
+        if effect == "relocate":
+            let reason = do mechMigrationReason(plan.action, job.destinationRegion)
+            let started = do placementFabricStartMigration(fabric, target, job.source, job.sourceRegion, job.destination, reason, atMs)
+            if !started.ok:
+                let shown4 = do fabricErrorDisplay(started.err)
+                let f5 = do mechFailed("prepare", shown4)
+                return MechPrepareResult{ok: false, job: zero, fault: f5, fabric: started.fabric}
+            fabric = started.fabric
+        let none = do mechNoFault()
+        return MechPrepareResult{ok: true, job: job, fault: none, fabric: fabric}
+
+    struct MechPollResult:
+        ok: bool
+        progress: PhaseProgress
+        fault: ExecutionFault
+        mechanism: PlacementMechanism
+
+    private proc mechPollOk(m: PlacementMechanism, fabric: PlacementFabric, progress: PhaseProgress) -> MechPollResult:
+        let none = do mechNoFault()
+        return MechPollResult{ok: true, progress: progress, fault: none, mechanism: PlacementMechanism{fabric: fabric, jobs: m.jobs}}
+
+    private proc mechPollFault(m: PlacementMechanism, fabric: PlacementFabric, fault: ExecutionFault) -> MechPollResult:
+        let complete = do phaseProgressComplete()
+        return MechPollResult{ok: false, progress: complete, fault: fault, mechanism: PlacementMechanism{fabric: fabric, jobs: m.jobs}}
+
+    # pollCutover: drive the cutover as far as it goes this poll — fence,
+    # mark the destination in sync and promote it (each once), wait on a
+    # demanded verification, drain, then move authority and the placement
+    # map in the same step.
+    private proc mechPollCutover(m: PlacementMechanism, target: ActionTarget, atMs: int) -> MechPollResult:
+        let lookup = do mechJob(m, target, "cutover")
+        if !lookup.ok:
+            let r0 = do mechPollFault(m, m.fabric, lookup.fault)
+            return r0
+        let job = lookup.job
+        let migration = do placementFabricMigration(m.fabric, target)
+        if !migration.has:
+            let notStarted = do executionFaultNotStarted("cutover")
+            let r1 = do mechPollFault(m, m.fabric, notStarted)
+            return r1
+        let mut fabric = m.fabric
+        if migration.val.phase == 2:
+            let fence = do migrationStepOf("beginCutover", atMs)
+            let fenced = do placementFabricStepMigration(fabric, target, fence)
+            fabric = fenced.fabric
+            if !fenced.ok:
+                if fenced.err.kind == "Migration" && fenced.err.migrationKind == "NotCaughtUp":
+                    let waiting = do phaseProgressRunning(0.5)
+                    let r2 = do mechPollOk(m, fabric, waiting)
+                    return r2
+                let shown = do fabricErrorDisplay(fenced.err)
+                let f1 = do mechFailed("cutover", shown)
+                let r3 = do mechPollFault(m, fabric, f1)
+                return r3
+        let cellSet = do placementFabricReplicaSet(fabric, target)
+        if cellSet.has:
+            let replica = do replGroupGet(cellSet.val, job.destination)
+            if replica.found:
+                if replica.record.state != "inSync":
+                    let syncOp = do replOpMarkInSync(job.destination)
+                    let synced = do placementFabricApplyReplica(fabric, target, syncOp)
+                    fabric = synced.fabric
+                    if !synced.ok:
+                        let shown2 = do fabricErrorDisplay(synced.err)
+                        let f2 = do mechFailed("cutover", shown2)
+                        let r4 = do mechPollFault(m, fabric, f2)
+                        return r4
+                if !replica.record.isPrimary:
+                    let promoteOp = do replOpPromote(job.destination)
+                    let promoted = do placementFabricApplyReplica(fabric, target, promoteOp)
+                    fabric = promoted.fabric
+                    if !promoted.ok:
+                        let shown3 = do fabricErrorDisplay(promoted.err)
+                        let f3 = do mechFailed("cutover", shown3)
+                        let r5 = do mechPollFault(m, fabric, f3)
+                        return r5
+        let verdict = do placementFabricVerification(fabric, target, job.destination)
+        if verdict.has:
+            if verdict.val.kind == "pending":
+                let checking = do phaseProgressRunning(0.9)
+                let r6 = do mechPollOk(m, fabric, checking)
+                return r6
+            if verdict.val.kind == "failed":
+                let shownTarget = do actionTargetDisplay(target)
+                let f4 = do mechFailed("cutover", "the copy of " + shownTarget + " onto '" + job.destination + "' did not verify against its source: " + verdict.val.reason)
+                let r7 = do mechPollFault(m, fabric, f4)
+                return r7
+        let finish = do migrationStepOf("completeCutover", atMs)
+        let finished = do placementFabricStepMigration(fabric, target, finish)
+        fabric = finished.fabric
+        if !finished.ok:
+            if finished.err.kind == "Migration" && finished.err.migrationKind == "CutoverNotDrained":
+                let draining = do phaseProgressRunning(0.9)
+                let r8 = do mechPollOk(m, fabric, draining)
+                return r8
+            let shown5 = do fabricErrorDisplay(finished.err)
+            let f5 = do mechFailed("cutover", shown5)
+            let r9 = do mechPollFault(m, fabric, f5)
+            return r9
+        let committed = do placementFabricCommitMove(fabric, target, job.destination, job.destinationRegion)
+        let complete = do phaseProgressComplete()
+        let r10 = do mechPollOk(m, committed, complete)
+        return r10
+
+    # ------------------------------------------ the PlacementExecutor surface
+
+    proc mechanismSupports(m: PlacementMechanism, action: OptimizationAction) -> bool:
+        return action.kind == "Replicate" || action.kind == "Move" || action.kind == "Isolate" || action.kind == "Colocate"
+
+    # plan: a named destination for Replicate/Move/Colocate; Isolate lets the
+    # replication planner choose; Split and NoAction are unsupported. A
+    # Replicate moves no authority, so it has no Cutover and removes nothing.
+    proc mechanismPlan(m: PlacementMechanism, request: PlanRequest) -> PlacementPlanNewResult:
+        let zero = do placementPlanZero()
+        let target = request.target
+        let kind = request.action.kind
+        let mut destination = ""
+        if kind == "Replicate" || kind == "Move" || kind == "Colocate":
+            if !request.hasDestination:
+                let e1 = do planErrorInfeasible("action names no destination")
+                return PlacementPlanNewResult{ok: false, value: zero, err: e1}
+            destination = request.destination.value
+        else:
+            if kind == "Isolate":
+                let chosen = do placementFabricPlanAddition(m.fabric, target, request.source.dbmsId, request.source.region)
+                if !chosen.ok:
+                    let shown = do fabricErrorDisplay(chosen.err)
+                    let e2 = do planErrorInfeasible(shown)
+                    return PlacementPlanNewResult{ok: false, value: zero, err: e2}
+                if !chosen.has:
+                    let e3 = do planErrorInfeasible("no serviceable node is available to isolate onto")
+                    return PlacementPlanNewResult{ok: false, value: zero, err: e3}
+                destination = chosen.node
+            else:
+                let label = do controllerPlanActionLabel(request.action)
+                let e4 = do planErrorUnsupportedAction(label)
+                return PlacementPlanNewResult{ok: false, value: zero, err: e4}
+        if destination == request.source.dbmsId:
+            let shownTarget = do actionTargetDisplay(target)
+            let e5 = do planErrorInfeasible(shownTarget + " is already on '" + destination + "'")
+            return PlacementPlanNewResult{ok: false, value: zero, err: e5}
+        let mut phases = ["prepare", "transfer", "cutover", "cleanup"]
+        let mut removes = [DbmsId{value: request.source.dbmsId}]
+        if kind == "Replicate":
+            phases = ["prepare", "transfer"]
+            removes = []
+        let planned = do placementPlanNew(target, request.action, "coordinate", phases, [DbmsId{value: destination}], removes)
+        if !planned.ok:
+            return planned
+        let size = do placementFabricSize(m.fabric, target)
+        let estimated = do placementPlanWithEstimate(planned.value, size.val, 0)
+        return PlacementPlanNewResult{ok: true, value: estimated, err: planned.err}
+
+    struct MechBeginResult:
+        ok: bool
+        fault: ExecutionFault
+        mechanism: PlacementMechanism
+
+    proc mechanismBeginPhase(m: PlacementMechanism, plan: PlacementPlan, phase: text, atMs: int) -> MechBeginResult:
+        let target = plan.target
+        let none = do mechNoFault()
+        if phase == "prepare":
+            let prepared = do mechBeginPrepare(m, target, plan, atMs)
+            let afterPrepare = PlacementMechanism{fabric: prepared.fabric, jobs: m.jobs}
+            if !prepared.ok:
+                return MechBeginResult{ok: false, fault: prepared.fault, mechanism: afterPrepare}
+            let reachable = do mechCheckDestination(afterPrepare, prepared.job.destination)
+            if !reachable:
+                let lost = do mechLostFault(prepared.job.destination)
+                return MechBeginResult{ok: false, fault: lost, mechanism: afterPrepare}
+            let jobs = do mechJobsPut(m.jobs, prepared.job)
+            return MechBeginResult{ok: true, fault: none, mechanism: PlacementMechanism{fabric: prepared.fabric, jobs: jobs}}
+        let idx = do mechJobIndexOf(m.jobs, target)
+        if idx == -1:
+            let notStarted = do executionFaultNotStarted(phase)
+            return MechBeginResult{ok: false, fault: notStarted, mechanism: m}
+        let job = m.jobs[idx]
+        let reachable2 = do mechCheckDestination(m, job.destination)
+        if !reachable2:
+            let lost2 = do mechLostFault(job.destination)
+            return MechBeginResult{ok: false, fault: lost2, mechanism: m}
+        let mut fabric = m.fabric
+        if phase == "transfer" && job.effect == "relocate":
+            let copy = do migrationStepOf("beginCopy", atMs)
+            let copying = do placementFabricStepMigration(fabric, target, copy)
+            fabric = copying.fabric
+            if !copying.ok:
+                let shown = do fabricErrorDisplay(copying.err)
+                let f1 = do mechFailed(phase, shown)
+                return MechBeginResult{ok: false, fault: f1, mechanism: PlacementMechanism{fabric: fabric, jobs: m.jobs}}
+        if phase == "cutover" && job.effect == "relocate":
+            let fence = do migrationStepOf("beginCutover", atMs)
+            let fenced = do placementFabricStepMigration(fabric, target, fence)
+            fabric = fenced.fabric
+            if !fenced.ok:
+                let waiting = fenced.err.kind == "Migration" && fenced.err.migrationKind == "NotCaughtUp"
+                if !waiting:
+                    let shown2 = do fabricErrorDisplay(fenced.err)
+                    let f2 = do mechFailed(phase, shown2)
+                    return MechBeginResult{ok: false, fault: f2, mechanism: PlacementMechanism{fabric: fabric, jobs: m.jobs}}
+        let mut jobs = m.jobs
+        jobs[idx] = MechJob{target: job.target, effect: job.effect, source: job.source, sourceRegion: job.sourceRegion, destination: job.destination, destinationRegion: job.destinationRegion, hasPhase: true, phase: phase}
+        return MechBeginResult{ok: true, fault: none, mechanism: PlacementMechanism{fabric: fabric, jobs: jobs}}
+
+    proc mechanismPollPhase(m: PlacementMechanism, plan: PlacementPlan, phase: text, atMs: int) -> MechPollResult:
+        let target = plan.target
+        let lookup = do mechJob(m, target, phase)
+        if !lookup.ok:
+            let r0 = do mechPollFault(m, m.fabric, lookup.fault)
+            return r0
+        let job = lookup.job
+        let reachable = do mechCheckDestination(m, job.destination)
+        if !reachable:
+            let lost = do mechLostFault(job.destination)
+            let r1 = do mechPollFault(m, m.fabric, lost)
+            return r1
+        let complete = do phaseProgressComplete()
+        if phase == "prepare":
+            let r2 = do mechPollOk(m, m.fabric, complete)
+            return r2
+        if phase == "cutover":
+            let r3 = do mechPollCutover(m, target, atMs)
+            return r3
+        let mut fabric = m.fabric
+        if phase == "cleanup":
+            let removeOp = do replOpRemove(job.source)
+            let removed = do placementFabricApplyReplica(fabric, target, removeOp)
+            fabric = removed.fabric
+            if !removed.ok:
+                let shown = do fabricErrorDisplay(removed.err)
+                let f1 = do mechFailed(phase, shown)
+                let r4 = do mechPollFault(m, fabric, f1)
+                return r4
+            let done = do migrationStepOf("complete", atMs)
+            let completed = do placementFabricStepMigration(fabric, target, done)
+            fabric = completed.fabric
+            if !completed.ok:
+                let shown2 = do fabricErrorDisplay(completed.err)
+                let f2 = do mechFailed(phase, shown2)
+                let r5 = do mechPollFault(m, fabric, f2)
+                return r5
+            let cleared = do placementFabricClearTransfer(fabric, target, job.destination)
+            let r6 = do mechPollOk(m, cleared, complete)
+            return r6
+        # transfer
+        let fraction = do mechTransferFraction(m, job, target)
+        let reported = do placementFabricTransfer(fabric, target, job.destination)
+        let progress = reported.val
+        let atoms = min(progress.atomsCopied, 1)
+        let running = do phaseProgressRunning(fraction)
+        if job.effect == "add-copy":
+            if atoms < 1:
+                let r7 = do mechPollOk(m, fabric, running)
+                return r7
+            let cellSet = do placementFabricReplicaSet(fabric, target)
+            let mut inSync = false
+            if cellSet.has:
+                let replica = do replGroupGet(cellSet.val, job.destination)
+                inSync = replica.found && replica.record.state == "inSync"
+            if !inSync:
+                let syncOp = do replOpMarkInSync(job.destination)
+                let synced = do placementFabricApplyReplica(fabric, target, syncOp)
+                fabric = synced.fabric
+                if !synced.ok:
+                    let shown3 = do fabricErrorDisplay(synced.err)
+                    let f3 = do mechFailed(phase, shown3)
+                    let r8 = do mechPollFault(m, fabric, f3)
+                    return r8
+            let cleared2 = do placementFabricClearTransfer(fabric, target, job.destination)
+            let r9 = do mechPollOk(m, cleared2, complete)
+            return r9
+        let migration = do placementFabricMigration(fabric, target)
+        if !migration.has:
+            let notStarted = do executionFaultNotStarted(phase)
+            let r10 = do mechPollFault(m, fabric, notStarted)
+            return r10
+        let migrationPhase = migration.val.phase
+        if migrationPhase == 1:
+            let record = do migrationStepRecordCopy(atoms, progress.bytesCopied, atMs)
+            let recorded = do placementFabricStepMigration(fabric, target, record)
+            fabric = recorded.fabric
+            if !recorded.ok:
+                let shown4 = do fabricErrorDisplay(recorded.err)
+                let f4 = do mechFailed(phase, shown4)
+                let r11 = do mechPollFault(m, fabric, f4)
+                return r11
+        let after = do placementFabricMigration(fabric, target)
+        let mut copied = false
+        if after.has:
+            let complete2 = do migrationProgressIsCopyComplete(after.val.progress)
+            copied = complete2
+        if !copied:
+            let r12 = do mechPollOk(m, fabric, running)
+            return r12
+        if migrationPhase == 1:
+            let catchUp = do migrationStepOf("beginCatchUp", atMs)
+            let caught = do placementFabricStepMigration(fabric, target, catchUp)
+            fabric = caught.fabric
+            if !caught.ok:
+                let shown5 = do fabricErrorDisplay(caught.err)
+                let f5 = do mechFailed(phase, shown5)
+                let r13 = do mechPollFault(m, fabric, f5)
+                return r13
+        let r14 = do mechPollOk(m, fabric, complete)
+        return r14
+
+    struct MechAbortResult:
+        ok: bool
+        outcome: RollbackOutcome
+        fault: ExecutionFault
+        mechanism: PlacementMechanism
+
+    private proc mechAbortFault(fabric: PlacementFabric, jobs: [MechJob], err: FabricError) -> MechAbortResult:
+        let shown = do fabricErrorDisplay(err)
+        let fault = do executionFaultInternal(shown)
+        let restored = do rollbackOutcomeRestored()
+        return MechAbortResult{ok: false, outcome: restored, fault: fault, mechanism: PlacementMechanism{fabric: fabric, jobs: jobs}}
+
+    # abort: undo what can be undone. After complete_cutover the source is
+    # no longer authoritative, so the answer is Irreversible and the
+    # migration is failed (ownership stays with the destination).
+    proc mechanismAbort(m: PlacementMechanism, plan: PlacementPlan, completed: [text], atMs: int) -> MechAbortResult:
+        let target = plan.target
+        let none = do mechNoFault()
+        let restored = do rollbackOutcomeRestored()
+        let idx = do mechJobIndexOf(m.jobs, target)
+        if idx == -1:
+            return MechAbortResult{ok: true, outcome: restored, fault: none, mechanism: m}
+        let job = m.jobs[idx]
+        let jobs = do mechJobsRemove(m.jobs, target)
+        let mut fabric = m.fabric
+        let migration = do placementFabricMigration(fabric, target)
+        let mut cutOver = false
+        if migration.has:
+            let moved = do migrationHasCutOverOf(migration.val)
+            cutOver = moved
+        if cutOver:
+            let shownTarget = do actionTargetDisplay(target)
+            let reason = "authority for " + shownTarget + " already moved to '" + job.destination + "'"
+            let fail = do migrationStepWithNote("fail", atMs, reason)
+            let failed = do placementFabricStepMigration(fabric, target, fail)
+            if !failed.ok:
+                let r0 = do mechAbortFault(failed.fabric, jobs, failed.err)
+                return r0
+            let irreversible = do rollbackOutcomeIrreversible(reason)
+            return MechAbortResult{ok: true, outcome: irreversible, fault: none, mechanism: PlacementMechanism{fabric: failed.fabric, jobs: jobs}}
+        let cellSet = do placementFabricReplicaSet(fabric, target)
+        let mut promoted = false
+        if cellSet.has:
+            let primary = do replGroupPrimary(cellSet.val)
+            promoted = primary.found && primary.record.node == job.destination
+        if promoted:
+            let promoteOp = do replOpPromote(job.source)
+            let back = do placementFabricApplyReplica(fabric, target, promoteOp)
+            fabric = back.fabric
+            if !back.ok:
+                let r1 = do mechAbortFault(fabric, jobs, back.err)
+                return r1
+        let cellSet2 = do placementFabricReplicaSet(fabric, target)
+        let mut holdsCopy = false
+        if cellSet2.has:
+            let copy = do replGroupGet(cellSet2.val, job.destination)
+            holdsCopy = copy.found
+        if holdsCopy:
+            let removeOp = do replOpRemove(job.destination)
+            let dropped = do placementFabricApplyReplica(fabric, target, removeOp)
+            fabric = dropped.fabric
+            if !dropped.ok:
+                let r2 = do mechAbortFault(fabric, jobs, dropped.err)
+                return r2
+        let stillMigrating = do placementFabricMigration(fabric, target)
+        if job.effect == "relocate" && stillMigrating.has:
+            let rollback = do migrationStepWithNote("abort", atMs, "rolled back by the controller")
+            let rolled = do placementFabricStepMigration(fabric, target, rollback)
+            fabric = rolled.fabric
+            if !rolled.ok:
+                let r3 = do mechAbortFault(fabric, jobs, rolled.err)
+                return r3
+        let cleared = do placementFabricClearTransfer(fabric, target, job.destination)
+        return MechAbortResult{ok: true, outcome: restored, fault: none, mechanism: PlacementMechanism{fabric: cleared, jobs: jobs}}

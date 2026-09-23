@@ -3,6 +3,7 @@ package compile
 import (
 	"fmt"
 	"hash/fnv"
+	"reflect"
 
 	"facet/internal/ast"
 )
@@ -51,10 +52,11 @@ func manglePrivate(app *ast.App, abs string) {
 	// Every place a proc is invoked by name within this same file's AST needs
 	// the identical rewrite, or a private proc's own callers would still
 	// resolve to the pre-mangle name and fail to find it once mergeInto
-	// combines this file's declarations with another's. A proc is called
-	// from exactly two statement shapes — Do and Spawn — never from an
-	// expression (ast.Call is builtins only), so only statement bodies need
-	// walking, not every Expr in the file.
+	// combines this file's declarations with another's. A proc is invoked by
+	// the Do/Spawn/Detach statements and, inline, by an ast.Call anywhere an
+	// expression can appear (`let x = helper(a) + 1`, a condition, a struct
+	// literal field, an action's expressions) — so statement bodies get the
+	// Do/Spawn/Detach rewrite and the whole file's AST gets the Call rewrite.
 	for _, p := range app.Procs {
 		rewriteProcCalls(p.Body, renamed)
 	}
@@ -63,6 +65,65 @@ func manglePrivate(app *ast.App, abs string) {
 	}
 	for _, d := range app.Daemons {
 		rewriteProcCalls(d.Body, renamed)
+	}
+	rewriteInlineCalls(reflect.ValueOf(app).Elem(), renamed, map[uintptr]bool{})
+}
+
+// rewriteInlineCalls renames every ast.Call reachable from v whose name is a
+// renamed private proc. Expressions are stored by value inside interfaces,
+// slices and struct fields throughout the AST, so this walks it generically:
+// an interface's dynamic value is copied, rewritten and stored back; a
+// pointer is followed once (seen guards against revisiting shared nodes).
+// Only settable locations are rewritten — every Expr the parser builds sits
+// in an exported field, a slice element or a map value.
+func rewriteInlineCalls(v reflect.Value, renamed map[string]string, seen map[uintptr]bool) {
+	switch v.Kind() {
+	case reflect.Ptr:
+		if v.IsNil() || seen[v.Pointer()] {
+			return
+		}
+		seen[v.Pointer()] = true
+		rewriteInlineCalls(v.Elem(), renamed, seen)
+	case reflect.Interface:
+		if v.IsNil() || !v.CanSet() {
+			return
+		}
+		inner := v.Elem()
+		if inner.Kind() == reflect.Ptr {
+			rewriteInlineCalls(inner, renamed, seen)
+			return
+		}
+		cp := reflect.New(inner.Type()).Elem()
+		cp.Set(inner)
+		rewriteInlineCalls(cp, renamed, seen)
+		v.Set(cp)
+	case reflect.Struct:
+		if !v.CanAddr() {
+			return
+		}
+		if call, ok := v.Addr().Interface().(*ast.Call); ok {
+			if m, hit := renamed[call.Name]; hit {
+				call.Name = m
+			}
+		}
+		for i := 0; i < v.NumField(); i++ {
+			if f := v.Field(i); f.CanSet() {
+				rewriteInlineCalls(f, renamed, seen)
+			}
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i++ {
+			rewriteInlineCalls(v.Index(i), renamed, seen)
+		}
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			val := iter.Value()
+			cp := reflect.New(val.Type()).Elem()
+			cp.Set(val)
+			rewriteInlineCalls(cp, renamed, seen)
+			v.SetMapIndex(iter.Key(), cp)
+		}
 	}
 }
 
@@ -83,6 +144,11 @@ func rewriteProcCalls(body []ast.Stmt, renamed map[string]string) {
 				body[i] = st
 			}
 		case ast.Spawn:
+			if m, ok := renamed[st.Proc]; ok {
+				st.Proc = m
+				body[i] = st
+			}
+		case ast.Detach:
 			if m, ok := renamed[st.Proc]; ok {
 				st.Proc = m
 				body[i] = st

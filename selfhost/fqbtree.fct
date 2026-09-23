@@ -1,0 +1,1232 @@
+import "pager.fct"
+
+app FqBTreeSelfHost:
+    # fqbtree.fct — self-hosted port of facetql/src/storage/btree.rs: the
+    # copy-on-write B+tree every FacetQL index is, stored in one paged file
+    # through pager.fct.
+    #
+    # Pages 0 and 1 are the two meta pages ("FQBT", generation, root,
+    # entry count, high-water page count, free list); a commit writes the
+    # next generation into the older slot, so a crash leaves the previous
+    # meta intact. Every page a transaction modifies is first copied to a
+    # freshly allocated page (cow), so nothing a durable meta references is
+    # overwritten before the new meta is; a released page is reused only
+    # once two generations have passed. Leaf cells are `key_len u16 | key |
+    # value`, branch cells `key_len u16 | child u32 | key` with the
+    # leftmost child in the page's extra word. The algorithms — search,
+    # seek with its ascent, split points, the root split and collapse,
+    # removal without rebalancing — are btree.rs's step for step, so a tree
+    # this file builds is the tree facetql builds, page for page, and
+    # either reads the other's file.
+    #
+    # btree.rs keeps its state behind a Mutex and pins generations for
+    # concurrent snapshot readers; a proc is single-threaded and has no
+    # shared state, so the tree is a value every call takes and returns and
+    # no reader is ever pinned (the reuse rule then reduces to "two
+    # generations old").
+    struct FqFree:
+        generation: int
+        page: int
+
+    struct FqBTree:
+        pager: FqPager
+        generation: int
+        root: int
+        entries: int
+        free: [FqFree]
+        dirty: [int]
+
+    struct FqBtR:
+        ok: bool
+        err: text
+        tree: FqBTree
+
+    struct FqBtPage:
+        ok: bool
+        err: text
+        tree: FqBTree
+        body: [int]
+
+    struct FqBtKV:
+        found: bool
+        key: [int]
+        value: [int]
+
+    struct FqBtGet:
+        ok: bool
+        err: text
+        tree: FqBTree
+        entry: FqBtKV
+
+    proc btMaxKey() -> int:
+        return 1024
+
+    proc btMaxValue() -> int:
+        return 4096
+
+    proc btMaxDepth() -> int:
+        return 64
+
+    proc btWith(t: FqBTree, pager: FqPager) -> FqBTree:
+        return FqBTree{pager: pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty}
+
+    proc btDeep(op: text) -> text:
+        return "tree " + op + " exceeded 64 levels — a B+tree this deep cannot be built by any legitimate insert, so the index holds a cyclic or otherwise impossible child pointer. The index is derived state and can be rebuilt from the record heap, which is the authoritative copy."
+
+    proc btKindName(k: int) -> text:
+        if k == 1:
+            return "Meta"
+        if k == 2:
+            return "Leaf"
+        if k == 3:
+            return "Branch"
+        if k == 4:
+            return "Heap"
+        return "Overflow"
+
+    # ── byte helpers ────────────────────────────────────────────────────
+    proc btCmp(a: [int], b: [int]) -> int:
+        let na = len(a)
+        let nb = len(b)
+        let mut i = 0
+        loop i < na && i < nb:
+            if a[i] < b[i]:
+                return -1
+            if a[i] > b[i]:
+                return 1
+            i = i + 1
+        if na < nb:
+            return -1
+        if na > nb:
+            return 1
+        return 0
+
+    proc btRange(bs: [int], from: int, to: int) -> [int]:
+        let mut out = bytes(to - from)
+        let mut i = from
+        loop i < to:
+            out[i - from] = bs[i]
+            i = i + 1
+        return out
+
+    proc btConcat(a: [int], b: [int]) -> [int]:
+        let na = len(a)
+        let nb = len(b)
+        let mut out = bytes(na + nb)
+        let mut i = 0
+        loop i < na:
+            out[i] = a[i]
+            i = i + 1
+        let mut j = 0
+        loop j < nb:
+            out[na + j] = b[j]
+            j = j + 1
+        return out
+
+    proc btHasPrefix(key: [int], prefix: [int]) -> bool:
+        let n = len(prefix)
+        if len(key) < n:
+            return false
+        let mut i = 0
+        loop i < n:
+            if key[i] != prefix[i]:
+                return false
+            i = i + 1
+        return true
+
+    # ── cells ───────────────────────────────────────────────────────────
+    proc btLeafCell(key: [int], value: [int]) -> [int]:
+        let nk = len(key)
+        let head = [nk % 256, (nk / 256) % 256]
+        let a = do btConcat(head, key)
+        let b = do btConcat(a, value)
+        return b
+
+    proc btLeafKey(cell: [int]) -> [int]:
+        if len(cell) < 2:
+            return []
+        let n = cell[0] + cell[1] * 256
+        if len(cell) < 2 + n:
+            return []
+        let r = do btRange(cell, 2, 2 + n)
+        return r
+
+    proc btLeafValue(cell: [int]) -> [int]:
+        if len(cell) < 2:
+            return []
+        let n = cell[0] + cell[1] * 256
+        if len(cell) < 2 + n:
+            return []
+        let r = do btRange(cell, 2 + n, len(cell))
+        return r
+
+    proc btBranchCell(key: [int], child: int) -> [int]:
+        let nk = len(key)
+        let head = [nk % 256, (nk / 256) % 256, child % 256, (child / 256) % 256, (child / 65536) % 256, (child / 16777216) % 256]
+        let r = do btConcat(head, key)
+        return r
+
+    proc btBranchKey(cell: [int]) -> [int]:
+        if len(cell) < 6:
+            return []
+        let n = cell[0] + cell[1] * 256
+        if len(cell) < 6 + n:
+            return []
+        let r = do btRange(cell, 6, 6 + n)
+        return r
+
+    proc btBranchChild(cell: [int]) -> int:
+        if len(cell) < 6:
+            return 0
+        return cell[2] + cell[3] * 256 + cell[4] * 65536 + cell[5] * 16777216
+
+    struct FqSlot:
+        slot: int
+        child: int
+
+    proc btBranchChildAt(page: [int], slot: int) -> int:
+        if slot == 0:
+            let e = do pgExtra(page)
+            return e
+        let has = do pgHasCell(page, slot - 1)
+        if !has:
+            return 0
+        let cell = do pgCell(page, slot - 1)
+        let c = do btBranchChild(cell)
+        return c
+
+    proc btBranchChildFor(page: [int], key: [int]) -> FqSlot:
+        let mut slot = 0
+        let n = do pgSlotCount(page)
+        let mut i = 0
+        loop i < n:
+            let cell = do pgCell(page, i)
+            let bk = do btBranchKey(cell)
+            let c = do btCmp(bk, key)
+            if c <= 0:
+                slot = i + 1
+            else:
+                break
+            i = i + 1
+        let child = do btBranchChildAt(page, slot)
+        return FqSlot{slot: slot, child: child}
+
+    proc btSetBranchChild(page: [int], slot: int, child: int) -> [int]:
+        if slot == 0:
+            let r = do pgSetExtra(page, child)
+            return r
+        let has = do pgHasCell(page, slot - 1)
+        if !has:
+            return page
+        let cell = do pgCell(page, slot - 1)
+        let bk = do btBranchKey(cell)
+        let updated = do btBranchCell(bk, child)
+        let r2 = do pgReplaceCell(page, slot - 1, updated)
+        return r2.body
+
+    struct FqSearch:
+        index: int
+        found: bool
+
+    proc btLeafSearch(page: [int], key: [int]) -> FqSearch:
+        let mut low = 0
+        let mut high = do pgSlotCount(page)
+        loop low < high:
+            let mid = (low + high) / 2
+            let cell = do pgCell(page, mid)
+            let lk = do btLeafKey(cell)
+            let c = do btCmp(lk, key)
+            if c < 0:
+                low = mid + 1
+            else:
+                if c > 0:
+                    high = mid
+                else:
+                    return FqSearch{index: mid, found: true}
+        return FqSearch{index: low, found: false}
+
+    # btCells: page_cells — every cell, flattened: the cell bytes of each
+    # in turn with their lengths alongside (a list of lists is not a type).
+    struct FqCells:
+        lens: [int]
+        data: [int]
+
+    proc btPageCells(page: [int]) -> FqCells:
+        let n = do pgSlotCount(page)
+        let mut lens = []
+        let mut data = []
+        let mut i = 0
+        loop i < n:
+            let cell = do pgCell(page, i)
+            lens = append(lens, len(cell))
+            let nc = len(cell)
+            let mut j = 0
+            loop j < nc:
+                data = append(data, cell[j])
+                j = j + 1
+            i = i + 1
+        return FqCells{lens: lens, data: data}
+
+    proc btCellAt(cs: FqCells, index: int) -> [int]:
+        let mut off = 0
+        let mut i = 0
+        loop i < index:
+            off = off + cs.lens[i]
+            i = i + 1
+        let r = do btRange(cs.data, off, off + cs.lens[index])
+        return r
+
+    # btCellsEdit: cells with `index` replaced (replace) or `cell` inserted
+    # before it.
+    proc btCellsEdit(cs: FqCells, index: int, cell: [int], replace: bool) -> FqCells:
+        let n = len(cs.lens)
+        let mut lens = []
+        let mut data = []
+        let mut i = 0
+        loop i <= n:
+            if i == index:
+                lens = append(lens, len(cell))
+                let nc = len(cell)
+                let mut k = 0
+                loop k < nc:
+                    data = append(data, cell[k])
+                    k = k + 1
+            if i < n && !(replace && i == index):
+                let c = do btCellAt(cs, i)
+                lens = append(lens, len(c))
+                let nc2 = len(c)
+                let mut k2 = 0
+                loop k2 < nc2:
+                    data = append(data, c[k2])
+                    k2 = k2 + 1
+            i = i + 1
+        return FqCells{lens: lens, data: data}
+
+    proc btFits(cs: FqCells, from: int, to: int) -> bool:
+        let mut used = 0
+        let mut i = from
+        loop i < to:
+            used = used + cs.lens[i] + 4
+            i = i + 1
+        return used <= 16328 + 4
+
+    # btSplitPoint: split_point — the byte midpoint, then the nearest
+    # candidate either way where both halves fit; -1 when none does.
+    proc btSplitPoint(cs: FqCells) -> int:
+        let n = len(cs.lens)
+        if n < 2:
+            return -1
+        let mut total = 0
+        let mut i = 0
+        loop i < n:
+            total = total + cs.lens[i] + 4
+            i = i + 1
+        let mut midpoint = 1
+        let mut running = 0
+        let mut j = 0
+        loop j < n:
+            running = running + cs.lens[j] + 4
+            if running * 2 >= total:
+                midpoint = j
+                if midpoint < 1:
+                    midpoint = 1
+                break
+            j = j + 1
+        let mut offset = 0
+        loop offset < n:
+            let mut which = 0
+            loop which < 2:
+                let mut candidate = midpoint + offset
+                if which == 1:
+                    candidate = midpoint - offset
+                    if candidate < 0:
+                        candidate = 0
+                if candidate != 0 && candidate < n:
+                    let a = do btFits(cs, 0, candidate)
+                    let b = do btFits(cs, candidate, n)
+                    if a && b:
+                        return candidate
+                which = which + 1
+            offset = offset + 1
+        return -1
+
+    struct FqBuilt:
+        ok: bool
+        body: [int]
+
+    proc btBuildPage(kind: int, extra: int, cs: FqCells, from: int, to: int) -> FqBuilt:
+        let p0 = do pgNew(kind)
+        let mut page = do pgSetExtra(p0, extra)
+        let mut i = from
+        loop i < to:
+            let c = do btCellAt(cs, i)
+            let r = do pgPushCell(page, c)
+            if !r.ok:
+                return FqBuilt{ok: false, body: []}
+            page = r.body
+            i = i + 1
+        return FqBuilt{ok: true, body: page}
+
+    proc btPrefixUpper(prefix: [int]) -> FqBtKV:
+        let mut n = len(prefix)
+        loop n > 0:
+            let last = prefix[n - 1]
+            if last != 255:
+                let mut out = bytes(n)
+                let mut i = 0
+                loop i < n - 1:
+                    out[i] = prefix[i]
+                    i = i + 1
+                out[n - 1] = last + 1
+                return FqBtKV{found: true, key: out, value: []}
+            n = n - 1
+        return FqBtKV{found: false, key: [], value: []}
+
+    # ── meta ────────────────────────────────────────────────────────────
+    struct FqMeta:
+        ok: bool
+        generation: int
+        root: int
+        entries: int
+        highWater: int
+        free: [FqFree]
+
+    proc btPutN(out: [int], v0: int, n: int) -> [int]:
+        let mut o = out
+        let mut v = v0
+        let mut i = 0
+        loop i < n:
+            o = append(o, v % 256)
+            v = v / 256
+            i = i + 1
+        return o
+
+    proc btGetN(b: [int], at: int, n: int) -> int:
+        let mut v = 0
+        let mut i = n - 1
+        loop i >= 0:
+            v = v * 256 + b[at + i]
+            i = i - 1
+        return v
+
+    proc btMetaEncode(m: FqMeta) -> [int]:
+        let mut count = len(m.free)
+        if count > 1024:
+            count = 1024
+        let mut out = [70, 81, 66, 84]
+        let a = do btPutN(out, m.generation, 8)
+        let b = do btPutN(a, m.root, 4)
+        let c = do btPutN(b, m.entries, 8)
+        let d = do btPutN(c, m.highWater, 4)
+        let e = do btPutN(d, count, 2)
+        out = e
+        let mut i = 0
+        loop i < count:
+            let f = do btPutN(out, m.free[i].generation, 8)
+            let g = do btPutN(f, m.free[i].page, 4)
+            out = g
+            i = i + 1
+        return out
+
+    proc btMetaDecode(bs: [int]) -> FqMeta:
+        let none = FqMeta{ok: false, generation: 0, root: 0, entries: 0, highWater: 0, free: []}
+        let n = len(bs)
+        if n < 30 || bs[0] != 70 || bs[1] != 81 || bs[2] != 66 || bs[3] != 84:
+            return none
+        let generation = do btGetN(bs, 4, 8)
+        let root = do btGetN(bs, 12, 4)
+        let entries = do btGetN(bs, 16, 8)
+        let hw = do btGetN(bs, 24, 4)
+        let count = do btGetN(bs, 28, 2)
+        if n < 30 + count * 12:
+            return none
+        let mut free = []
+        let mut i = 0
+        loop i < count:
+            let at = 30 + i * 12
+            let fg = do btGetN(bs, at, 8)
+            let fp = do btGetN(bs, at + 8, 4)
+            free = append(free, FqFree{generation: fg, page: fp})
+            i = i + 1
+        return FqMeta{ok: true, generation: generation, root: root, entries: entries, highWater: hw, free: free}
+
+    struct FqMetaRead:
+        pager: FqPager
+        meta: FqMeta
+
+    proc btReadMeta(p: FqPager, slot: int) -> FqMetaRead uses io.file:
+        let none = FqMeta{ok: false, generation: 0, root: 0, entries: 0, highWater: 0, free: []}
+        let r = do pgrRead(p, slot)
+        if !r.ok:
+            return FqMetaRead{pager: p, meta: none}
+        let kind = do pgKind(r.body)
+        let has = do pgHasCell(r.body, 0)
+        if kind != 1 || !has:
+            return FqMetaRead{pager: r.pager, meta: none}
+        let cell = do pgCell(r.body, 0)
+        let m = do btMetaDecode(cell)
+        return FqMetaRead{pager: r.pager, meta: m}
+
+    # ── open / commit / allocation ─────────────────────────────────────
+    proc btErr(t: FqBTree, msg: text) -> FqBtR:
+        return FqBtR{ok: false, err: msg, tree: t}
+
+    proc btOpen(path: text, key: [int], nonceBase: int, capacity: int) -> FqBtR uses io.file:
+        let pager = do pgrOpen(path, capacity, key, nonceBase)
+        let blank = FqBTree{pager: pager, generation: 0, root: 2, entries: 0, free: [], dirty: []}
+        if pager.pageCount < 2:
+            let r = do btInitialize(blank)
+            return r
+        let a = do btReadMeta(pager, 0)
+        let b = do btReadMeta(a.pager, 1)
+        let mut m = a.meta
+        if a.meta.ok && b.meta.ok:
+            if b.meta.generation > a.meta.generation:
+                m = b.meta
+        else:
+            if b.meta.ok:
+                m = b.meta
+            if !a.meta.ok && !b.meta.ok:
+                let e = do btErr(blank, "index " + path + " has no readable meta page — both generations failed validation. The index can be rebuilt from the record heap, which is the authoritative copy.")
+                return e
+        let p2 = do pgrSetPageCount(b.pager, m.highWater)
+        return FqBtR{ok: true, err: "", tree: FqBTree{pager: p2, generation: m.generation, root: m.root, entries: m.entries, free: m.free, dirty: []}}
+
+    proc btInitialize(t0: FqBTree) -> FqBtR uses io.file:
+        let p0 = do pgrSetPageCount(t0.pager, 0)
+        let a1 = do pgrAllocate(p0)
+        let a2 = do pgrAllocate(a1.pager)
+        let a3 = do pgrAllocate(a2.pager)
+        let leaf = do pgNew(2)
+        let w = do pgrWrite(a3.pager, 2, leaf)
+        if !w.ok:
+            let e = do btErr(t0, w.err)
+            return e
+        let t = FqBTree{pager: w.pager, generation: 0, root: 2, entries: 0, free: [], dirty: []}
+        let c = do btCommit(t)
+        return c
+
+    # btCommit: commit — every page flushed, then the next generation's
+    # meta written into its slot and flushed.
+    proc btCommit(t: FqBTree) -> FqBtR uses io.file:
+        let f1 = do pgrFlush(t.pager)
+        if !f1.ok:
+            let e = do btErr(t, f1.err)
+            return e
+        let generation = t.generation + 1
+        let meta = FqMeta{ok: true, generation: generation, root: t.root, entries: t.entries, highWater: f1.pager.pageCount, free: t.free}
+        let enc = do btMetaEncode(meta)
+        let page0 = do pgNew(1)
+        let pushed = do pgPushCell(page0, enc)
+        if !pushed.ok:
+            let e2 = do btErr(t, "index meta does not fit in one page")
+            return e2
+        let mut slot = 1
+        if generation % 2 == 0:
+            slot = 0
+        let w = do pgrWrite(f1.pager, slot, pushed.body)
+        if !w.ok:
+            let e3 = do btErr(t, w.err)
+            return e3
+        let f2 = do pgrFlush(w.pager)
+        if !f2.ok:
+            let e4 = do btErr(t, f2.err)
+            return e4
+        return FqBtR{ok: true, err: "", tree: FqBTree{pager: f2.pager, generation: generation, root: t.root, entries: t.entries, free: t.free, dirty: []}}
+
+    struct FqAlloc:
+        tree: FqBTree
+        id: int
+
+    # btAllocate: allocate — a free page released two generations ago
+    # (swap_remove, as Rust's Vec does), else the pager's next id.
+    proc btAllocate(t: FqBTree) -> FqAlloc:
+        let building = t.generation + 1
+        let n = len(t.free)
+        let mut i = 0
+        loop i < n:
+            if t.free[i].generation + 2 <= building:
+                let id = t.free[i].page
+                let mut free = t.free
+                free[i] = t.free[n - 1]
+                let mut kept = []
+                let mut k = 0
+                loop k < n - 1:
+                    kept = append(kept, free[k])
+                    k = k + 1
+                return FqAlloc{tree: FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: kept, dirty: t.dirty}, id: id}
+            i = i + 1
+        let a = do pgrAllocate(t.pager)
+        return FqAlloc{tree: FqBTree{pager: a.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty}, id: a.id}
+
+    proc btRelease(t: FqBTree, page: int) -> FqBTree:
+        if len(t.free) >= 1024:
+            return t
+        let free = append(t.free, FqFree{generation: t.generation + 1, page: page})
+        return FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: free, dirty: t.dirty}
+
+    proc btMarkDirty(t: FqBTree, id: int) -> FqBTree:
+        if id in t.dirty:
+            return t
+        return FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: append(t.dirty, id)}
+
+    struct FqCow:
+        ok: bool
+        err: text
+        tree: FqBTree
+        id: int
+        body: [int]
+
+    # btCow: cow — the page's contents, at a fresh page unless this
+    # transaction already made it.
+    proc btCow(t: FqBTree, pageId: int) -> FqCow uses io.file:
+        let r = do pgrRead(t.pager, pageId)
+        if !r.ok:
+            return FqCow{ok: false, err: r.err, tree: t, id: 0, body: []}
+        let t1 = do btWith(t, r.pager)
+        if pageId in t1.dirty:
+            return FqCow{ok: true, err: "", tree: t1, id: pageId, body: r.body}
+        let a = do btAllocate(t1)
+        let t2 = do btMarkDirty(a.tree, a.id)
+        let t3 = do btRelease(t2, pageId)
+        return FqCow{ok: true, err: "", tree: t3, id: a.id, body: r.body}
+
+    proc btRead(t: FqBTree, id: int) -> FqBtPage uses io.file:
+        let r = do pgrRead(t.pager, id)
+        if !r.ok:
+            return FqBtPage{ok: false, err: r.err, tree: t, body: []}
+        let t1 = do btWith(t, r.pager)
+        return FqBtPage{ok: true, err: "", tree: t1, body: r.body}
+
+    proc btWrite(t: FqBTree, id: int, body: [int]) -> FqBtR uses io.file:
+        let w = do pgrWrite(t.pager, id, body)
+        if !w.ok:
+            return FqBtR{ok: false, err: w.err, tree: t}
+        let t1 = do btWith(t, w.pager)
+        return FqBtR{ok: true, err: "", tree: t1}
+
+    # ── reads ───────────────────────────────────────────────────────────
+    struct FqDescend:
+        ok: bool
+        err: text
+        tree: FqBTree
+        leaf: int
+
+    proc btDescend(t0: FqBTree, root: int, key: [int]) -> FqDescend uses io.file:
+        let mut t = t0
+        let mut id = root
+        let mut d = 0
+        loop d < 64:
+            let r = do btRead(t, id)
+            if !r.ok:
+                return FqDescend{ok: false, err: r.err, tree: t, leaf: 0}
+            t = r.tree
+            let k = do pgKind(r.body)
+            if k == 2:
+                return FqDescend{ok: true, err: "", tree: t, leaf: id}
+            if k != 3:
+                let kn = do btKindName(k)
+                return FqDescend{ok: false, err: "tree descent reached a " + kn + " page", tree: t, leaf: 0}
+            let s = do btBranchChildFor(r.body, key)
+            id = s.child
+            d = d + 1
+        let dd = do btDeep("descent")
+        return FqDescend{ok: false, err: dd, tree: t, leaf: 0}
+
+    proc btGet(t: FqBTree, key: [int]) -> FqBtGet uses io.file:
+        let none = FqBtKV{found: false, key: [], value: []}
+        let d = do btDescend(t, t.root, key)
+        if !d.ok:
+            return FqBtGet{ok: false, err: d.err, tree: d.tree, entry: none}
+        let r = do btRead(d.tree, d.leaf)
+        if !r.ok:
+            return FqBtGet{ok: false, err: r.err, tree: r.tree, entry: none}
+        let s = do btLeafSearch(r.body, key)
+        if !s.found:
+            return FqBtGet{ok: true, err: "", tree: r.tree, entry: none}
+        let cell = do pgCell(r.body, s.index)
+        let v = do btLeafValue(cell)
+        return FqBtGet{ok: true, err: "", tree: r.tree, entry: FqBtKV{found: true, key: key, value: v}}
+
+    # btEdge: edge_entry — the first (or last) entry under page, walking
+    # past empty subtrees.
+    proc btEdge(t: FqBTree, pageId: int, first: bool, depth: int) -> FqBtGet uses io.file:
+        let none = FqBtKV{found: false, key: [], value: []}
+        if depth >= 64:
+            let dd = do btDeep("walk")
+            return FqBtGet{ok: false, err: dd, tree: t, entry: none}
+        let r = do btRead(t, pageId)
+        if !r.ok:
+            return FqBtGet{ok: false, err: r.err, tree: t, entry: none}
+        let k = do pgKind(r.body)
+        if k == 2:
+            let count = do pgSlotCount(r.body)
+            if count == 0:
+                return FqBtGet{ok: true, err: "", tree: r.tree, entry: none}
+            let mut slot = 0
+            if !first:
+                slot = count - 1
+            let cell = do pgCell(r.body, slot)
+            let lk = do btLeafKey(cell)
+            let lv = do btLeafValue(cell)
+            return FqBtGet{ok: true, err: "", tree: r.tree, entry: FqBtKV{found: true, key: lk, value: lv}}
+        if k != 3:
+            let kn = do btKindName(k)
+            return FqBtGet{ok: false, err: "tree walk reached a " + kn + " page", tree: r.tree, entry: none}
+        let sc = do pgSlotCount(r.body)
+        let children = sc + 1
+        let mut t2 = r.tree
+        let mut step = 0
+        loop step < children:
+            let mut slot2 = step
+            if !first:
+                slot2 = children - 1 - step
+            let child = do btBranchChildAt(r.body, slot2)
+            let e = do btEdge(t2, child, first, depth + 1)
+            if !e.ok || e.entry.found:
+                return e
+            t2 = e.tree
+            step = step + 1
+        return FqBtGet{ok: true, err: "", tree: t2, entry: none}
+
+    # btSeek: seek — mode 0 Ge, 1 Gt, 2 Le, 3 Lt.
+    proc btSeek(t0: FqBTree, root: int, key: [int], mode: int) -> FqBtGet uses io.file:
+        let none = FqBtKV{found: false, key: [], value: []}
+        let mut t = t0
+        let mut pathIds = []
+        let mut pathSlots = []
+        let mut id = root
+        let mut leaf = []
+        loop true:
+            if len(pathIds) >= 64:
+                let dd = do btDeep("seek")
+                return FqBtGet{ok: false, err: dd, tree: t, entry: none}
+            let r = do btRead(t, id)
+            if !r.ok:
+                return FqBtGet{ok: false, err: r.err, tree: t, entry: none}
+            t = r.tree
+            let k = do pgKind(r.body)
+            if k == 2:
+                leaf = r.body
+                break
+            if k != 3:
+                let kn = do btKindName(k)
+                return FqBtGet{ok: false, err: "tree seek reached a " + kn + " page", tree: t, entry: none}
+            let s = do btBranchChildFor(r.body, key)
+            pathIds = append(pathIds, id)
+            pathSlots = append(pathSlots, s.slot)
+            id = s.child
+        let sr = do btLeafSearch(leaf, key)
+        let forward = mode == 0 || mode == 1
+        let mut candidate = -1
+        let count = do pgSlotCount(leaf)
+        if forward:
+            let mut start = sr.index
+            if sr.found && mode == 1:
+                start = sr.index + 1
+            if start < count:
+                candidate = start
+        else:
+            if sr.found && mode == 2:
+                candidate = sr.index
+            else:
+                if sr.index > 0:
+                    candidate = sr.index - 1
+        if candidate >= 0:
+            let has = do pgHasCell(leaf, candidate)
+            if has:
+                let cell = do pgCell(leaf, candidate)
+                let lk = do btLeafKey(cell)
+                let lv = do btLeafValue(cell)
+                return FqBtGet{ok: true, err: "", tree: t, entry: FqBtKV{found: true, key: lk, value: lv}}
+        let mut up = len(pathIds) - 1
+        loop up >= 0:
+            let br = do btRead(t, pathIds[up])
+            if !br.ok:
+                return FqBtGet{ok: false, err: br.err, tree: t, entry: none}
+            t = br.tree
+            let slot = pathSlots[up]
+            let bsc = do pgSlotCount(br.body)
+            if forward:
+                if slot < bsc:
+                    let child = do btBranchChildAt(br.body, slot + 1)
+                    let e = do btEdge(t, child, true, 0)
+                    if !e.ok || e.entry.found:
+                        return e
+                    t = e.tree
+            else:
+                if slot > 0:
+                    let child2 = do btBranchChildAt(br.body, slot - 1)
+                    let e2 = do btEdge(t, child2, false, 0)
+                    if !e2.ok || e2.entry.found:
+                        return e2
+                    t = e2.tree
+            up = up - 1
+        return FqBtGet{ok: true, err: "", tree: t, entry: none}
+
+    # btRange: for_each_range — every entry whose key starts with prefix,
+    # after startAfter when given, in either direction, at most `limit`
+    # (0 = all), flattened as key/value lists.
+    struct FqRange:
+        ok: bool
+        err: text
+        tree: FqBTree
+        keys: [text]
+        values: [text]
+
+    proc btScan(t0: FqBTree, prefix: [int], hasStart: bool, startAfter: [int], reverse: bool, limit: int) -> FqRange uses io.file:
+        let mut t = t0
+        let mut hasCursor = hasStart
+        let mut cursor = startAfter
+        let mut keys = []
+        let mut values = []
+        loop limit == 0 || len(keys) < limit:
+            let mut e = FqBtGet{ok: true, err: "", tree: t, entry: FqBtKV{found: false, key: [], value: []}}
+            if reverse:
+                if hasCursor:
+                    let r1 = do btSeek(t, t.root, cursor, 3)
+                    e = r1
+                else:
+                    let ub = do btPrefixUpper(prefix)
+                    if ub.found:
+                        let r2 = do btSeek(t, t.root, ub.key, 3)
+                        e = r2
+                    else:
+                        let r3 = do btEdge(t, t.root, false, 0)
+                        e = r3
+            else:
+                if hasCursor:
+                    let r4 = do btSeek(t, t.root, cursor, 1)
+                    e = r4
+                else:
+                    let r5 = do btSeek(t, t.root, prefix, 0)
+                    e = r5
+            if !e.ok:
+                return FqRange{ok: false, err: e.err, tree: t, keys: [], values: []}
+            t = e.tree
+            if !e.entry.found:
+                break
+            let hp = do btHasPrefix(e.entry.key, prefix)
+            if !hp:
+                break
+            let kh = do cryptoEncodeHex(e.entry.key)
+            let vh = do cryptoEncodeHex(e.entry.value)
+            keys = append(keys, kh)
+            values = append(values, vh)
+            hasCursor = true
+            cursor = e.entry.key
+        return FqRange{ok: true, err: "", tree: t, keys: keys, values: values}
+
+    # ── writes ──────────────────────────────────────────────────────────
+    struct FqIns:
+        ok: bool
+        err: text
+        tree: FqBTree
+        split: bool
+        left: int
+        separator: [int]
+        right: int
+
+    proc btInsErr(t: FqBTree, msg: text) -> FqIns:
+        return FqIns{ok: false, err: msg, tree: t, split: false, left: 0, separator: [], right: 0}
+
+    proc btPut(t0: FqBTree, key: [int], value: [int]) -> FqBtR uses io.file:
+        if len(key) == 0 || len(key) > 1024:
+            let e0 = do btErr(t0, "index key is " + len(key) + " bytes; must be 1..=1024")
+            return e0
+        if len(value) > 4096:
+            let e1 = do btErr(t0, "index value is " + len(value) + " bytes; must be at most 4096")
+            return e1
+        let g = do btGet(t0, key)
+        if !g.ok:
+            let e2 = do btErr(t0, g.err)
+            return e2
+        let existed = g.entry.found
+        let ins = do btInsertInto(g.tree, g.tree.root, key, value, 0)
+        if !ins.ok:
+            let e3 = do btErr(ins.tree, ins.err)
+            return e3
+        let mut t = ins.tree
+        let mut root = ins.left
+        if ins.split:
+            let b0 = do pgNew(3)
+            let b1 = do pgSetExtra(b0, ins.left)
+            let bc = do btBranchCell(ins.separator, ins.right)
+            let b2 = do pgInsertCell(b1, 0, bc)
+            if !b2.ok:
+                let e4 = do btErr(t, "separator key does not fit in a fresh root page")
+                return e4
+            let a = do btAllocate(t)
+            let t2 = do btMarkDirty(a.tree, a.id)
+            let w = do btWrite(t2, a.id, b2.body)
+            if !w.ok:
+                return w
+            t = w.tree
+            root = a.id
+        let mut entries = t.entries
+        if !existed:
+            entries = entries + 1
+        return FqBtR{ok: true, err: "", tree: FqBTree{pager: t.pager, generation: t.generation, root: root, entries: entries, free: t.free, dirty: t.dirty}}
+
+    proc btInsertInto(t: FqBTree, pageId: int, key: [int], value: [int], depth: int) -> FqIns uses io.file:
+        if depth >= 64:
+            let dd = do btDeep("insert")
+            let e = do btInsErr(t, dd)
+            return e
+        let r = do btRead(t, pageId)
+        if !r.ok:
+            let e1 = do btInsErr(t, r.err)
+            return e1
+        let k = do pgKind(r.body)
+        if k == 2:
+            let l = do btInsertLeaf(r.tree, pageId, key, value)
+            return l
+        if k == 3:
+            let b = do btInsertBranch(r.tree, pageId, key, value, depth)
+            return b
+        let kn = do btKindName(k)
+        let e2 = do btInsErr(r.tree, "tree insert reached a " + kn + " page")
+        return e2
+
+    proc btKept(t: FqBTree, id: int) -> FqIns:
+        return FqIns{ok: true, err: "", tree: t, split: false, left: id, separator: [], right: 0}
+
+    proc btInsertLeaf(t0: FqBTree, pageId: int, key: [int], value: [int]) -> FqIns uses io.file:
+        let cw = do btCow(t0, pageId)
+        if !cw.ok:
+            let e0 = do btInsErr(t0, cw.err)
+            return e0
+        let id = cw.id
+        let page = cw.body
+        let cell = do btLeafCell(key, value)
+        let s = do btLeafSearch(page, key)
+        let reclaim = do pgReclaimableSpace(page)
+        if s.found:
+            let oldLen = do pgSlotLength(page, s.index)
+            if reclaim + oldLen >= len(cell):
+                let rp = do pgReplaceCell(page, s.index, cell)
+                let w = do btWrite(cw.tree, id, rp.body)
+                if !w.ok:
+                    let e1 = do btInsErr(cw.tree, w.err)
+                    return e1
+                let kr = do btKept(w.tree, id)
+                return kr
+        else:
+            if reclaim >= len(cell) + 4:
+                let ip = do pgInsertCell(page, s.index, cell)
+                let w2 = do btWrite(cw.tree, id, ip.body)
+                if !w2.ok:
+                    let e2 = do btInsErr(cw.tree, w2.err)
+                    return e2
+                let kr2 = do btKept(w2.tree, id)
+                return kr2
+        let cs0 = do btPageCells(page)
+        let cs = do btCellsEdit(cs0, s.index, cell, s.found)
+        let point = do btSplitPoint(cs)
+        if point < 0:
+            let e3 = do btInsErr(cw.tree, "leaf page cannot be split")
+            return e3
+        let sepCell = do btCellAt(cs, point)
+        let separator = do btLeafKey(sepCell)
+        let n = len(cs.lens)
+        let left = do btBuildPage(2, 0, cs, 0, point)
+        let right = do btBuildPage(2, 0, cs, point, n)
+        if !left.ok || !right.ok:
+            let e4 = do btInsErr(cw.tree, "rebuilt page overflowed while being filled")
+            return e4
+        let a = do btAllocate(cw.tree)
+        let t2 = do btMarkDirty(a.tree, a.id)
+        let w3 = do btWrite(t2, id, left.body)
+        if !w3.ok:
+            let e5 = do btInsErr(t2, w3.err)
+            return e5
+        let w4 = do btWrite(w3.tree, a.id, right.body)
+        if !w4.ok:
+            let e6 = do btInsErr(w3.tree, w4.err)
+            return e6
+        return FqIns{ok: true, err: "", tree: w4.tree, split: true, left: id, separator: separator, right: a.id}
+
+    proc btInsertBranch(t0: FqBTree, pageId: int, key: [int], value: [int], depth: int) -> FqIns uses io.file:
+        let r = do btRead(t0, pageId)
+        if !r.ok:
+            let e0 = do btInsErr(t0, r.err)
+            return e0
+        let sc = do btBranchChildFor(r.body, key)
+        let sub = do btInsertInto(r.tree, sc.child, key, value, depth + 1)
+        if !sub.ok:
+            return sub
+        if !sub.split:
+            if sub.left == sc.child:
+                let kr = do btKept(sub.tree, pageId)
+                return kr
+            let cw = do btCow(sub.tree, pageId)
+            if !cw.ok:
+                let e1 = do btInsErr(sub.tree, cw.err)
+                return e1
+            let p2 = do btSetBranchChild(cw.body, sc.slot, sub.left)
+            let w = do btWrite(cw.tree, cw.id, p2)
+            if !w.ok:
+                let e2 = do btInsErr(cw.tree, w.err)
+                return e2
+            let kr2 = do btKept(w.tree, cw.id)
+            return kr2
+        let cw2 = do btCow(sub.tree, pageId)
+        if !cw2.ok:
+            let e3 = do btInsErr(sub.tree, cw2.err)
+            return e3
+        let page = do btSetBranchChild(cw2.body, sc.slot, sub.left)
+        let cell = do btBranchCell(sub.separator, sub.right)
+        let reclaim = do pgReclaimableSpace(page)
+        if reclaim >= len(cell) + 4:
+            let ip = do pgInsertCell(page, sc.slot, cell)
+            let w2 = do btWrite(cw2.tree, cw2.id, ip.body)
+            if !w2.ok:
+                let e4 = do btInsErr(cw2.tree, w2.err)
+                return e4
+            let kr3 = do btKept(w2.tree, cw2.id)
+            return kr3
+        let cs0 = do btPageCells(page)
+        let cs = do btCellsEdit(cs0, sc.slot, cell, false)
+        let leftmost = do pgExtra(page)
+        let point = do btSplitPoint(cs)
+        if point < 0:
+            let e5 = do btInsErr(cw2.tree, "branch page cannot be split")
+            return e5
+        let pc = do btCellAt(cs, point)
+        let promoted = do btBranchKey(pc)
+        let rightLeftmost = do btBranchChild(pc)
+        let n = len(cs.lens)
+        let leftPage = do btBuildPage(3, leftmost, cs, 0, point)
+        let rightPage = do btBuildPage(3, rightLeftmost, cs, point + 1, n)
+        if !leftPage.ok || !rightPage.ok:
+            let e6 = do btInsErr(cw2.tree, "rebuilt page overflowed while being filled")
+            return e6
+        let a = do btAllocate(cw2.tree)
+        let t2 = do btMarkDirty(a.tree, a.id)
+        let w3 = do btWrite(t2, cw2.id, leftPage.body)
+        if !w3.ok:
+            let e7 = do btInsErr(t2, w3.err)
+            return e7
+        let w4 = do btWrite(w3.tree, a.id, rightPage.body)
+        if !w4.ok:
+            let e8 = do btInsErr(w3.tree, w4.err)
+            return e8
+        return FqIns{ok: true, err: "", tree: w4.tree, split: true, left: cw2.id, separator: promoted, right: a.id}
+
+    struct FqRem:
+        ok: bool
+        err: text
+        tree: FqBTree
+        page: int
+        removed: bool
+        empty: bool
+
+    proc btRemErr(t: FqBTree, msg: text) -> FqRem:
+        return FqRem{ok: false, err: msg, tree: t, page: 0, removed: false, empty: false}
+
+    struct FqRemoved:
+        ok: bool
+        err: text
+        tree: FqBTree
+        removed: bool
+
+    proc btRemove(t0: FqBTree, key: [int]) -> FqRemoved uses io.file:
+        let out = do btRemoveFrom(t0, t0.root, key, 0)
+        if !out.ok:
+            return FqRemoved{ok: false, err: out.err, tree: out.tree, removed: false}
+        if !out.removed:
+            return FqRemoved{ok: true, err: "", tree: out.tree, removed: false}
+        let mut entries = out.tree.entries - 1
+        if entries < 0:
+            entries = 0
+        let mut t = FqBTree{pager: out.tree.pager, generation: out.tree.generation, root: out.page, entries: entries, free: out.tree.free, dirty: out.tree.dirty}
+        let mut d = 0
+        loop d < 64:
+            let r = do btRead(t, t.root)
+            if !r.ok:
+                return FqRemoved{ok: false, err: r.err, tree: t, removed: true}
+            t = r.tree
+            let k = do pgKind(r.body)
+            let sc = do pgSlotCount(r.body)
+            if k != 3 || sc > 0:
+                break
+            let child = do pgExtra(r.body)
+            let rel = do btRelease(t, t.root)
+            t = FqBTree{pager: rel.pager, generation: rel.generation, root: child, entries: rel.entries, free: rel.free, dirty: rel.dirty}
+            d = d + 1
+        return FqRemoved{ok: true, err: "", tree: t, removed: true}
+
+    proc btRemoveFrom(t0: FqBTree, pageId: int, key: [int], depth: int) -> FqRem uses io.file:
+        if depth >= 64:
+            let dd = do btDeep("remove")
+            let e = do btRemErr(t0, dd)
+            return e
+        let r = do btRead(t0, pageId)
+        if !r.ok:
+            let e0 = do btRemErr(t0, r.err)
+            return e0
+        let k = do pgKind(r.body)
+        if k == 2:
+            let s = do btLeafSearch(r.body, key)
+            if !s.found:
+                return FqRem{ok: true, err: "", tree: r.tree, page: pageId, removed: false, empty: false}
+            let cw = do btCow(r.tree, pageId)
+            if !cw.ok:
+                let e1 = do btRemErr(r.tree, cw.err)
+                return e1
+            let p2 = do pgRemoveCell(cw.body, s.index)
+            let cnt = do pgSlotCount(p2)
+            let w = do btWrite(cw.tree, cw.id, p2)
+            if !w.ok:
+                let e2 = do btRemErr(cw.tree, w.err)
+                return e2
+            return FqRem{ok: true, err: "", tree: w.tree, page: cw.id, removed: true, empty: cnt == 0}
+        if k != 3:
+            let kn = do btKindName(k)
+            let e3 = do btRemErr(r.tree, "tree remove reached a " + kn + " page")
+            return e3
+        let sc = do btBranchChildFor(r.body, key)
+        let sub = do btRemoveFrom(r.tree, sc.child, key, depth + 1)
+        if !sub.ok:
+            return sub
+        if !sub.removed:
+            return FqRem{ok: true, err: "", tree: sub.tree, page: pageId, removed: false, empty: false}
+        let cw2 = do btCow(sub.tree, pageId)
+        if !cw2.ok:
+            let e4 = do btRemErr(sub.tree, cw2.err)
+            return e4
+        let mut t = cw2.tree
+        let mut page = cw2.body
+        if sub.empty:
+            let rel = do btRelease(t, sub.page)
+            t = rel
+            if sc.slot == 0:
+                let cnt2 = do pgSlotCount(page)
+                if cnt2 == 0:
+                    let w0 = do btWrite(t, cw2.id, page)
+                    if !w0.ok:
+                        let e5 = do btRemErr(t, w0.err)
+                        return e5
+                    return FqRem{ok: true, err: "", tree: w0.tree, page: cw2.id, removed: true, empty: true}
+                let promoted = do btBranchChildAt(page, 1)
+                let pe = do pgSetExtra(page, promoted)
+                let pr = do pgRemoveCell(pe, 0)
+                page = pr
+            else:
+                let pr2 = do pgRemoveCell(page, sc.slot - 1)
+                page = pr2
+        else:
+            let ps = do btSetBranchChild(page, sc.slot, sub.page)
+            page = ps
+        let w = do btWrite(t, cw2.id, page)
+        if !w.ok:
+            let e6 = do btRemErr(t, w.err)
+            return e6
+        return FqRem{ok: true, err: "", tree: w.tree, page: cw2.id, removed: true, empty: false}
+
+    # ── test harness ───────────────────────────────────────────────────
+    state btreeOut: text = ""
+
+    # btScriptText: open the tree at path, run `put KEY VAL`, `del KEY`,
+    # `get KEY`, `seek MODE KEY` (ge|gt|le|lt), `scan PREFIX [rev]`,
+    # `commit` (hex keys and values; `-` is empty), then report each result
+    # and the final generation, root, entry count and every entry.
+    proc btScriptText(path: text, keyHex: text, nonceBase: int, script: text) -> text uses io.file:
+        let key = do pgrHex(keyHex)
+        let o = do btOpen(path, key, nonceBase, 64)
+        if !o.ok:
+            return "error: " + o.err
+        let mut t = o.tree
+        let mut out = ""
+        let lines = split(script, "\n")
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let w = do pgrWords(lines[i])
+            if len(w) > 0:
+                let op = w[0]
+                let mut a = []
+                if len(w) > 1 && w[1] != "-":
+                    let ah = do pgrHex(w[1])
+                    a = ah
+                if op == "put":
+                    let mut v = []
+                    if len(w) > 2 && w[2] != "-":
+                        let vh = do pgrHex(w[2])
+                        v = vh
+                    let r = do btPut(t, a, v)
+                    if !r.ok:
+                        out = out + "put error: " + r.err + ";"
+                    else:
+                        t = r.tree
+                if op == "del":
+                    let rm = do btRemove(t, a)
+                    if !rm.ok:
+                        return out + "error: " + rm.err
+                    t = rm.tree
+                    out = out + "del " + rm.removed + ";"
+                if op == "get":
+                    let g = do btGet(t, a)
+                    if !g.ok:
+                        return out + "error: " + g.err
+                    t = g.tree
+                    if g.entry.found:
+                        let gv = do cryptoEncodeHex(g.entry.value)
+                        out = out + "get=" + gv + ";"
+                    else:
+                        out = out + "get none;"
+                if op == "seek":
+                    let mut mode = 0
+                    if w[1] == "gt":
+                        mode = 1
+                    if w[1] == "le":
+                        mode = 2
+                    if w[1] == "lt":
+                        mode = 3
+                    let sk = do pgrHex(w[2])
+                    let s = do btSeek(t, t.root, sk, mode)
+                    if !s.ok:
+                        return out + "error: " + s.err
+                    t = s.tree
+                    if s.entry.found:
+                        let skh = do cryptoEncodeHex(s.entry.key)
+                        out = out + "seek=" + skh + ";"
+                    else:
+                        out = out + "seek none;"
+                if op == "scan":
+                    let rev = len(w) > 2 && w[2] == "rev"
+                    let sc = do btScan(t, a, false, [], rev, 0)
+                    if !sc.ok:
+                        return out + "error: " + sc.err
+                    t = sc.tree
+                    out = out + "scan=" + len(sc.keys)
+                    let nk = len(sc.keys)
+                    let mut k = 0
+                    loop k < nk:
+                        out = out + " " + sc.keys[k]
+                        k = k + 1
+                    out = out + ";"
+                if op == "commit":
+                    let c = do btCommit(t)
+                    if !c.ok:
+                        return out + "error: " + c.err
+                    t = c.tree
+                    out = out + "commit;"
+            i = i + 1
+        let all = do btScan(t, [], false, [], false, 0)
+        if !all.ok:
+            return out + "error: " + all.err
+        out = out + "\ngeneration=" + all.tree.generation + " root=" + all.tree.root + " entries=" + all.tree.entries + " pages=" + all.tree.pager.pageCount
+        let nk2 = len(all.keys)
+        let mut k2 = 0
+        loop k2 < nk2:
+            out = out + "\n" + all.keys[k2] + "=" + all.values[k2]
+            k2 = k2 + 1
+        return out
+
+    action runBTree(path: text, keyHex: text, nonceBase: int, script: text):
+        let r = do btScriptText(path, keyHex, nonceBase, script)
+        btreeOut = r
+
+    view FqBTreeHome at "/fqbtree":
+        text "{btreeOut}"

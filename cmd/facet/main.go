@@ -109,6 +109,8 @@ func main() {
 			fatal(err)
 		}
 		return
+	case "exec":
+		os.Exit(cmdExec(os.Args[2:]))
 	case "check":
 		os.Exit(cmdCheck(os.Args[2:]))
 	case "ir":
@@ -470,6 +472,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  facet run <file.fct> [addr]    serve the web + API projections")
 	fmt.Fprintln(os.Stderr, "  facet serve [file] [--port N]  production server: no watcher, $PORT, preflight checks")
 	fmt.Fprintln(os.Stderr, "  facet check <file.fct> [--json] compile-only; report ok or diagnostics")
+	fmt.Fprintln(os.Stderr, "  facet exec <file.fct> [args...]  run the program's proc main(args: [text]) -> int as a command")
 	fmt.Fprintln(os.Stderr, "  facet build <file.fct> [--json] compile and print the IR (--json for error diagnostics)")
 	fmt.Fprintln(os.Stderr, "  facet build --release <file.fct> package the app as one self-contained binary (-o, --base)")
 	fmt.Fprintln(os.Stderr, "  facet ir <file.fct> [--compact] dump the compiled IR as JSON for tooling")

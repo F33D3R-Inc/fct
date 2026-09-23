@@ -1,0 +1,263 @@
+import "../../fabric_plan.fct"
+
+app FabricPlanCheck:
+    # fabric_plan.fct (frontdoor plan.rs) and fabric.fct's keyspace
+    # (frontdoor keyspace.rs) against the scratch Rust binary that printed
+    # plan_rust.tsv / keyspace_rust.tsv: every plan.rs and keyspace.rs
+    # #[test] input, front_door.rs's classification-level requests, and a
+    # corpus of methods x paths x bodies x query strings over six keyspaces.
+
+    proc lbHexVal(c: int) -> int:
+        if c >= 48 && c <= 57:
+            return c - 48
+        return c - 87
+
+    proc lbUnhex(h: text) -> [int]:
+        let hb = textToBytes(h)
+        let mut out = []
+        let mut i = 0
+        loop i + 1 < len(hb):
+            let a = do lbHexVal(hb[i])
+            let b = do lbHexVal(hb[i + 1])
+            out = append(out, a * 16 + b)
+            i = i + 2
+        return out
+
+    proc lbKey(shard: int, x: int, y: int) -> int:
+        let k = do routingKeyPack(shard, x, y)
+        return k
+
+    proc lbRule(ks: Keyspace, kind: text, prefix: text, key: int) -> Keyspace:
+        let r = do keyspaceRuleNew(kind, prefix, key)
+        let w = do keyspaceWithRule(ks, r.rule)
+        return w.keyspace
+
+    proc lbKeyspace(i: int) -> Keyspace:
+        let e = do keyspaceNew()
+        let k1 = do lbKey(1, 0, 0)
+        let k2 = do lbKey(2, 0, 0)
+        let k3 = do lbKey(3, 0, 0)
+        if i == 0:
+            let a = do lbRule(e, "Post", "Post:", k1)
+            let b = do lbRule(a, "User", "User:", k2)
+            return b
+        if i == 1:
+            let a = do lbRule(e, "Post", "Post:", k1)
+            let u = do lbKey(2, 3, 4)
+            let b = do lbRule(a, "User", "User:", u)
+            let f = do lbKey(9, 11, 12)
+            let c = do keyspaceWithFallback(b, f)
+            return c
+        if i == 2:
+            let s = do lbKey(7, 0, 0)
+            let one = do keyspaceSingle(s)
+            return one
+        if i == 3:
+            let a = do lbRule(e, "A", "__", k1)
+            let b = do lbRule(a, "B", "__fabric_placement:", k2)
+            let c = do lbRule(b, "C", "__fabric", k3)
+            return c
+        if i == 4:
+            let a = do lbRule(e, "Post", "Post:", k1)
+            let c = do keyspaceWithFallback(a, k1)
+            return c
+        return e
+
+    proc lbPlanKeyspace(i: int) -> PlanKeyspace:
+        let k = do lbKeyspace(i)
+        return PlanKeyspace{rules: k.rules, hasFallback: k.hasFallback, fallbackKey: k.fallbackKey}
+
+    proc lbPref(i: int) -> PlanReadPreference:
+        if i == 1:
+            return PlanReadPreference{code: 2, region: "eu"}
+        if i == 2:
+            return PlanReadPreference{code: 3, region: ""}
+        if i == 3:
+            return PlanReadPreference{code: 1, region: ""}
+        return PlanReadPreference{code: 0, region: ""}
+
+    proc lbIntent(i: PlanRouteIntent) -> text:
+        if i.isWrite:
+            return "W"
+        let p = i.readPref
+        if p.code == 1:
+            return "RF"
+        if p.code == 2:
+            return "RG(" + p.region + ")"
+        if p.code == 3:
+            return "RC"
+        return "RP"
+
+    proc lbPlanDigest(v: PlanValue) -> text:
+        if v.kind == 0:
+            let mut xs = []
+            let mut i = 0
+            loop i < len(v.keys):
+                let k = v.keys[i]
+                let kd = do routingKeyPackedDisplay(k.key)
+                let it = do lbIntent(k.intent)
+                xs = append(xs, kd + "~" + it + "~" + k.origin)
+                i = i + 1
+            return "C|" + join(xs, ";")
+        if v.kind == 1:
+            let mut a = "Required"
+            if v.broadcastAgreement == 1:
+                a = "NotRequired"
+            return "B|" + a + "|" + v.broadcastWhat
+        if v.kind == 2:
+            return "S"
+        let st = do planRefusalStatus(v.refusal)
+        let d = do planRefusalDisplay(v.refusal)
+        return "R|" + st + "|" + d
+
+    proc lbCase(hexInput: text) -> text:
+        let bs = do lbUnhex(hexInput)
+        let mut parts = []
+        let mut cur = []
+        let mut i = 0
+        loop i < len(bs):
+            if bs[i] == 31 && len(parts) < 5:
+                parts = append(parts, bytesToText(cur))
+                cur = []
+            else:
+                cur = append(cur, bs[i])
+            i = i + 1
+        parts = append(parts, bytesToText(cur))
+        let ks = do lbPlanKeyspace(toInt(parts[0]))
+        let rp = do lbPref(toInt(parts[1]))
+        let q = parts[4]
+        let hasQuery = slice(q, 0, 1) == "1"
+        let query = slice(q, 1, len(q))
+        let v = do planRequest(parts[2], parts[3], hasQuery, query, parts[5], ks, rp)
+        let d = do lbPlanDigest(v)
+        return d
+
+    proc lbBatch(hexList: text) -> text:
+        let items = split(hexList, ",")
+        let mut out = []
+        let mut i = 0
+        loop i < len(items):
+            let r = do lbCase(items[i])
+            out = append(out, r)
+            i = i + 1
+        return join(out, "\n")
+
+    state planResult: text = ""
+
+    action runPlanCases(tag: text, hexList: text):
+        let r = do lbBatch(hexList)
+        planResult = tag + "|" + r
+
+    # Rust `{:?}` of Option<String> / Option<Option<String>> key texts.
+    proc lbOptKey(o: KeyOption) -> text:
+        if !o.has:
+            return "None"
+        let d = do routingKeyPackedDisplay(o.key)
+        return "Some(\"" + d + "\")"
+
+    proc lbPush(t: text, s: text) -> text:
+        if t == "":
+            return s
+        return t + "#" + s
+
+    proc lbBuild() -> text:
+        let mut t = ""
+        let k1 = do lbKey(1, 0, 0)
+        let kinds = ["", "Post", "", "Post"]
+        let prefixes = ["Post:", "", "", "Post:"]
+        let mut i = 0
+        loop i < 4:
+            let r = do keyspaceRuleNew(kinds[i], prefixes[i], k1)
+            if r.ok:
+                let kd = do routingKeyPackedDisplay(r.rule.key)
+                t = do lbPush(t, "ok:" + r.rule.kind + ":" + r.rule.prefix + ":" + kd)
+            else:
+                let e = do keyspaceErrorDisplay(r.err)
+                t = do lbPush(t, "err:" + e)
+            i = i + 1
+        let base = do lbKeyspace(0)
+        let k3 = do lbKey(3, 0, 0)
+        let ks2 = ["Post", "Other", "Other", "post"]
+        let ps2 = ["Other:", "Post:", "Post", "post:"]
+        let mut j = 0
+        loop j < 4:
+            let r = do keyspaceRuleNew(ks2[j], ps2[j], k3)
+            let w = do keyspaceWithRule(base, r.rule)
+            if w.ok:
+                t = do lbPush(t, "ok:" + len(w.keyspace.rules))
+            else:
+                let e = do keyspaceErrorDisplay(w.err)
+                t = do lbPush(t, "err:" + e)
+            j = j + 1
+        return t
+
+    proc lbResolveAll(idx: int) -> text:
+        let ks = do lbKeyspace(idx)
+        let mut t = ""
+        let mut fb = "None"
+        if ks.hasFallback:
+            let d = do routingKeyPackedDisplay(ks.fallbackKey)
+            fb = "Some(\"" + d + "\")"
+        let sp = do keyspaceSpanningKey(ks)
+        let spd = do lbOptKey(sp)
+        t = fb + "|" + spd
+        let kinds = ["", "Post", "User", "Unknown", "A", "B", "C", ""]
+        let hasKinds = [false, true, true, true, true, true, true, true]
+        let addrs = ["", "Post:17", "User:9", "__session:abc", "__fabric_placement:1:0:0", "__fabricx", "Other:1", ""]
+        let hasAddrs = [false, true, true, true, true, true, true, true]
+        let mut i = 0
+        loop i < 8:
+            if !hasKinds[i]:
+                t = do lbPush(t, "None")
+            else:
+                let o = do keyspaceForKind(ks, kinds[i])
+                let d = do lbOptKey(o)
+                t = do lbPush(t, "Some(" + d + ")")
+            i = i + 1
+        let mut j = 0
+        loop j < 8:
+            if !hasAddrs[j]:
+                t = do lbPush(t, "None")
+            else:
+                let o = do keyspaceForAddress(ks, addrs[j])
+                let d = do lbOptKey(o)
+                t = do lbPush(t, "Some(" + d + ")")
+            j = j + 1
+        let mut a = 0
+        loop a < 8:
+            let mut b = 0
+            loop b < 8:
+                let r = do keyspaceResolve(ks, hasKinds[a], kinds[a], hasAddrs[b], addrs[b])
+                if r.ok:
+                    let d = do routingKeyPackedDisplay(r.key)
+                    t = do lbPush(t, "ok:" + d)
+                else:
+                    let m = do keyspaceMissDisplay(r.miss)
+                    t = do lbPush(t, "miss:" + m)
+                b = b + 1
+            a = a + 1
+        return t
+
+    state ksBuild: text = ""
+    state ksResolve0: text = ""
+    state ksResolve1: text = ""
+    state ksResolve2: text = ""
+    state ksResolve3: text = ""
+    state ksResolve4: text = ""
+    state ksResolve5: text = ""
+
+    action runKeyspaceCheck():
+        let a = do lbBuild()
+        let r0 = do lbResolveAll(0)
+        let r1 = do lbResolveAll(1)
+        let r2 = do lbResolveAll(2)
+        let r3 = do lbResolveAll(3)
+        let r4 = do lbResolveAll(4)
+        let r5 = do lbResolveAll(5)
+        ksBuild = a
+        ksResolve0 = r0
+        ksResolve1 = r1
+        ksResolve2 = r2
+        ksResolve3 = r3
+        ksResolve4 = r4
+        ksResolve5 = r5

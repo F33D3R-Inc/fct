@@ -31,14 +31,14 @@ func TestLangDerivesFromRealCompilerSource(t *testing.T) {
 	builtins := set(builtinNames(parserFiles))
 	for _, want := range []string{"now", "abs", "upper", "trim"} {
 		if !builtins[want] {
-			t.Errorf("expected builtin %q to be derived from isBuiltinCall, got %v", want, builtins)
+			t.Errorf("expected builtin %q to be derived from builtinSites, got %v", want, builtins)
 		}
 	}
 	// `count` is an aggregate over a range, a different grammar position from
-	// a call-position builtin — isBuiltinCall does not claim it, so this
+	// a call-position builtin — IsBuiltinCall does not claim it, so this
 	// derivation must not invent it either.
 	if builtins["count"] {
-		t.Error("count is an aggregate, not an isBuiltinCall entry — derivation picked up something it shouldn't have")
+		t.Error("count is an aggregate, not a builtinSites entry — derivation picked up something it shouldn't have")
 	}
 
 	mods := set(modifierNames(append(astFiles, parserFiles...)))

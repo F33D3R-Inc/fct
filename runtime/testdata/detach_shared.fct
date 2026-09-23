@@ -1,0 +1,102 @@
+# Concurrent daemon connections (`detach`), process-local `shared` cells, the
+# sleepMs/monoMs clock and shutdownConn — driven by
+# runtime/detach_shared_test.go over real TCP.
+app DetachShared:
+    struct Greeting:
+        word: text
+        served: [text]
+
+    shared greeting: Greeting
+    shared port: int
+
+    state result: text = ""
+
+    proc configure(p: int, word: text):
+        port = p
+        greeting = Greeting{word: word, served: []}
+
+    action setup(p: int, word: text):
+        do configure(p, word)
+
+    proc rename(word: text):
+        let g = greeting
+        greeting = Greeting{word: word, served: g.served}
+
+    action publish(word: text):
+        do rename(word)
+
+    proc currentWord() -> text:
+        let g = greeting
+        return g.word
+
+    action peek:
+        let w = do currentWord()
+        result = w
+
+    # readLine: bytes up to a newline, or "" when the client has gone.
+    proc readLine(c: int) -> text uses io.net.listen:
+        let mut got = ""
+        loop true:
+            let chunk = readBytes(c, 1)
+            if len(chunk) == 0:
+                return got
+            if chunk[0] == 10:
+                return got
+            got = got + bytesToText(chunk)
+        return got
+
+    # serveConn answers each line with the greeting as it is NOW — the shared
+    # cell is read per line, so a publish reaches a connection already open.
+    proc serveConn(c: int) uses io.net.listen:
+        let mut open = true
+        loop open:
+            let line = do readLine(c)
+            if line == "":
+                open = false
+            else:
+                let g = greeting
+                let wrote = writeBytes(c, textToBytes(g.word + " " + line + "\n"))
+        let closed = closeConn(c)
+
+    daemon Greeter uses io.net.listen:
+        let l = listen(port)
+        loop true:
+            let c = accept(l)
+            detach serveConn(c)
+
+    proc drain(c: int) -> int uses io.net:
+        let mut n = 0
+        loop true:
+            let chunk = readBytes(c, 64)
+            if len(chunk) == 0:
+                return n
+            n = n + len(chunk)
+        return n
+
+    # interrupt parks a spawned reader on a quiet connection, then ends its
+    # reads from outside with shutdownConn: the reader sees a clean EOF and is
+    # joined, and the handle is still this proc's to close.
+    proc interrupt(host: text, p: int) -> text uses io.net:
+        let c = connect(host, p)
+        let set = setTimeoutMs(c, 600000)
+        let h = spawn drain(c)
+        let slept = sleepMs(50)
+        let shut = shutdownConn(c)
+        let n = join h
+        let err = connError(c)
+        let closed = closeConn(c)
+        return "" + shut + "|" + n + "|" + err + "|" + closed
+
+    action stop(host: text, p: int):
+        let r = do interrupt(host, p)
+        result = r
+
+    proc timed(ms: int) -> text:
+        let t0 = monoMs()
+        let s = sleepMs(ms)
+        let t1 = monoMs()
+        return "" + s + "|" + (t1 - t0 >= ms)
+
+    action clock(ms: int):
+        let r = do timed(ms)
+        result = r

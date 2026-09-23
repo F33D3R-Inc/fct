@@ -1284,6 +1284,45 @@ func (s *fqStore) DeleteSession(sid string) error {
 	return s.c.deleteNode(context.Background(), fqSessionAddr(sid))
 }
 
+// DeleteVisitorSessions removes every session with this visitor key in one
+// native delete_where, the same shape PurgeExpiredSessions uses.
+func (s *fqStore) DeleteVisitorSessions(visitor string) error {
+	pred := fqBin("==", fqGet("visitor"), fqLitText(visitor))
+	return s.c.transaction(context.Background(), []fqTxOp{
+		{Type: "delete_where", Kind: "__session", Where: pred},
+	})
+}
+
+// RestateSessions re-roles every stored session of actor: each is read and
+// written back with the new role (the engine has no predicated update).
+func (s *fqStore) RestateSessions(actor, role string) error {
+	ctx := context.Background()
+	after := ""
+	for {
+		nodes, next, err := s.c.query(ctx, fqQueryRequest{
+			Kind: "__session", ItemVar: "item", Limit: 500, After: after,
+			Where: fqBin("==", fqGet("actor"), fqLitText(actor)),
+		})
+		if err != nil {
+			return fmt.Errorf("fqStore.RestateSessions: %w", err)
+		}
+		for _, n := range nodes {
+			var d fqSessionData
+			if err := json.Unmarshal([]byte(n.Data), &d); err != nil {
+				continue
+			}
+			d.Role = role
+			if err := s.reservedUpsert(ctx, "__session", n.Address, d); err != nil {
+				return fmt.Errorf("fqStore.RestateSessions: %w", err)
+			}
+		}
+		if next == "" || len(nodes) == 0 {
+			return nil
+		}
+		after = next
+	}
+}
+
 // PurgeExpiredSessions removes every expired session in ONE native delete_where
 // op (AGENT_LOG §4b): the engine evaluates `item._expires_unix < now` over each
 // __session node's data and tombstones the matches atomically — no N round-trips.

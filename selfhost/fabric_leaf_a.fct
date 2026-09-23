@@ -1,0 +1,912 @@
+import "fabric_protocol.fct"
+import "fabric_cli_render.fct"
+import "fabric_json.fct"
+app FabricLeafACheck:
+    # The driver fabric_leaf_a_test.go runs: every action takes its input as
+    # newline-separated lines and leaves one output line per input line in
+    # `leafAOut`, in the same text form testdata/fabric_check (the real Rust
+    # crates) prints for the same input.
+
+    state leafAOut: text = ""
+
+    proc leafALines(src: text) -> [text]:
+        if src == "":
+            return []
+        return split(src, "\n")
+
+    # serde_json's f64 text: each line an f64 bit pattern (signed decimal).
+    action runLeafAF64Text(src: text):
+        let r = do leafAF64Text(src)
+        leafAOut = r
+
+    proc leafAF64Text(src: text) -> text:
+        let lines = leafALines(src)
+        let mut out = []
+        let mut i = 0
+        loop i < len(lines):
+            let line = lines[i]
+            i = i + 1
+            out = append(out, sjF64Text(floatFromBits(toInt(line))))
+        return join(out, "\n")
+
+    # serde_json::from_slice::<f64>: each line JSON text; bits or
+    # ERR|<serde_json error Display>.
+    action runLeafAF64Parse(src: text):
+        let r = do leafAF64Parse(src)
+        leafAOut = r
+
+    proc leafAF64Parse(src: text) -> text:
+        let lines = leafALines(src)
+        let mut out = []
+        let mut i = 0
+        loop i < len(lines):
+            let line = lines[i]
+            i = i + 1
+            let r = sjDecode([], line, "f64")
+            let mut row = "ERR|" + r.err
+            if r.ok:
+                row = "" + floatBits(r.v.f)
+            out = append(out, row)
+        return join(out, "\n")
+
+    # ProtocolServer::decode then handle then encode: each line a payload;
+    # `<message re-encoded>|<response encoded>` or ERR|<ProtocolError>.
+    action runLeafAProtocolDecode(src: text):
+        let r = do leafAProtocolDecode(src)
+        leafAOut = r
+
+    proc leafAProtocolDecode(src: text) -> text:
+        let lines = leafALines(src)
+        let mut out = []
+        let mut i = 0
+        loop i < len(lines):
+            let d = protocolDecode(lines[i])
+            let mut row = "ERR|" + d.error
+            if d.ok:
+                row = protocolEncodeMessage(d.message) + "|" + protocolEncode(protocolHandle(d.message))
+            out = append(out, row)
+            i = i + 1
+        return join(out, "\n")
+
+    # serde_json::from_slice::<FabricResponse>: re-encoded, or
+    # ERR|<serde_json error Display>.
+    action runLeafAResponseDecode(src: text):
+        let r = do leafAResponseDecode(src)
+        leafAOut = r
+
+    proc leafAResponseDecode(src: text) -> text:
+        let lines = leafALines(src)
+        let mut out = []
+        let mut i = 0
+        loop i < len(lines):
+            let d = protocolDecodeResponse(lines[i])
+            let mut row = "ERR|" + d.error
+            if d.ok:
+                row = protocolEncode(d.response)
+            out = append(out, row)
+            i = i + 1
+        return join(out, "\n")
+
+    # fabric-cli's session file: each line a JSON string literal holding a
+    # whole payload, decoded as Vec<FabricMessage>; OK|<count>|<re-encoded>
+    # or ERR|<serde_json error Display>.
+    action runLeafASessionDecode(src: text):
+        let r = do leafASessionDecode(src)
+        leafAOut = r
+
+    proc leafASessionDecode(src: text) -> text:
+        let lines = leafALines(src)
+        let mut out = []
+        let mut i = 0
+        loop i < len(lines):
+            let payload = sjDecode([], lines[i], "string").v.s
+            let d = protocolDecodeMessages(payload)
+            let mut row = "ERR|" + d.error
+            if d.ok:
+                let mut parts = []
+                let mut k = 0
+                loop k < len(d.messages):
+                    parts = append(parts, protocolEncodeMessage(d.messages[k]))
+                    k = k + 1
+                row = "OK|" + len(d.messages) + "|[" + join(parts, ",") + "]"
+            out = append(out, row)
+            i = i + 1
+        return join(out, "\n")
+
+    proc leafACell(x: int, y: int, z: int, q: int, r: float, w: float, br: float, bw: float) -> CellWorkloadMetrics:
+        return CellWorkloadMetrics{x: x, y: y, z: z, q: q, readsPerSecond: r, writesPerSecond: w, bytesReadPerSecond: br, bytesWrittenPerSecond: bw}
+
+    proc leafASample(x: int, y: int, ops: float, cells: [CellWorkloadMetrics], partial: bool) -> TelemetrySample:
+        return TelemetrySample{coordinate: Coordinate{x: x, y: y}, operationsPerSecond: ops, readRatio: 0.25, writeRatio: 0.75, readLatencyUs: 99.125, writeLatencyUs: 0.000001, cpuUtilization: 2.0 / 3.0, memoryUtilization: 0.1 + 0.2, queueDepth: -2, cellBreakdown: cells, cellBreakdownPartial: partial}
+
+    # Messages this port builds itself, encoded: the fct -> Rust direction.
+    action runLeafAProtocolSamples():
+        let r = do leafAProtocolSamples()
+        leafAOut = r
+
+    proc leafAProtocolSamples() -> text:
+        let empty = protoEmptyFabricMessage()
+        let ctl = bytesToText([1, 31, 127])
+        let mut msgs = []
+        let reg = nodeRegistrationNew(DbmsId{value: "eu-db-" + ctl + "\"\\/é"}, "0.14.0\n", "eu\twest")
+        msgs = append(msgs, FabricMessage{kind: "RegisterNode", registerNode: reg, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: empty.telemetry, workload: empty.workload})
+        let hb = NodeHeartbeat{nodeId: DbmsId{value: "db-😀"}, timestampMs: -1, healthy: true}
+        msgs = append(msgs, FabricMessage{kind: "Heartbeat", registerNode: empty.registerNode, heartbeat: hb, topology: empty.topology, telemetry: empty.telemetry, workload: empty.workload})
+        let hb2 = NodeHeartbeat{nodeId: DbmsId{value: ""}, timestampMs: 9223372036854775807, healthy: false}
+        msgs = append(msgs, FabricMessage{kind: "Heartbeat", registerNode: empty.registerNode, heartbeat: hb2, topology: empty.topology, telemetry: empty.telemetry, workload: empty.workload})
+        let pa = ProtocolPlacement{coordinate: Coordinate{x: 11, y: 12}, dbmsId: DbmsId{value: "db-b"}, region: "ap-south"}
+        let pb = ProtocolPlacement{coordinate: Coordinate{x: 255, y: 0}, dbmsId: DbmsId{value: "db-c"}, region: ""}
+        let topo = TopologyReport{nodeId: DbmsId{value: "db-a"}, timestampMs: 1700000000123, placements: [pa, pb]}
+        msgs = append(msgs, FabricMessage{kind: "Topology", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: topo, telemetry: empty.telemetry, workload: empty.workload})
+        let c1 = leafACell(1, 2, 3, 4, toFloat("1e22"), 0.1, toFloat("5e-324"), 123456789.125)
+        let negZero = floatFromBits(1 << 63)
+        let c2 = leafACell(0, 255, 0, 7, negZero, toFloat("1.0e-7"), toFloat("9007199254740993"), toFloat("1.7976931348623157e308"))
+        let s1 = leafASample(0, 0, 1234567.5, [c1, c2], true)
+        let s2 = leafASample(7, 3, toFloat("1e16"), [], false)
+        let s3 = leafASample(3, 9, 0.0, [c1], false)
+        let batch = TelemetryBatch{timestampMs: 5, nodeId: DbmsId{value: "db-t"}, shard: ProtocolShard{id: -9223372036854775807, workloadDomain: "social\u0000"}, samples: [s1, s2, s3]}
+        msgs = append(msgs, FabricMessage{kind: "Telemetry", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: batch, workload: empty.workload})
+        let batch2 = TelemetryBatch{timestampMs: 0, nodeId: DbmsId{value: "db-u"}, shard: ProtocolShard{id: 0, workloadDomain: ""}, samples: []}
+        msgs = append(msgs, FabricMessage{kind: "Telemetry", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: batch2, workload: empty.workload})
+        let wl = WorkloadObservation{nodeId: "db-w", coordinate: Coordinate{x: 4, y: 5}, timestampMs: 77, operationsPerSecond: 12345678901234567890.0, readRatio: 1.0 / 3.0, writeRatio: 0.0001}
+        msgs = append(msgs, FabricMessage{kind: "Workload", registerNode: empty.registerNode, heartbeat: empty.heartbeat, topology: empty.topology, telemetry: empty.telemetry, workload: wl})
+        let mut out = []
+        let mut i = 0
+        loop i < len(msgs):
+            out = append(out, protocolEncodeMessage(msgs[i]))
+            i = i + 1
+        return join(out, "\n")
+
+    # Responses this port builds itself, encoded.
+    action runLeafAResponseSamples():
+        let r = do leafAResponseSamples()
+        leafAOut = r
+
+    proc leafAResponseSamples() -> text:
+        let e = protoEmptyFabricResponse()
+        let ack = FabricResponse{kind: "Acknowledged", registeredNodeId: e.registeredNodeId, proposalCoordinate: e.proposalCoordinate, proposalAction: e.proposalAction, proposalExpectedGain: e.proposalExpectedGain, proposalEstimatedCost: e.proposalEstimatedCost, proposalConfidence: e.proposalConfidence, rejectedReason: e.rejectedReason}
+        let reg = FabricResponse{kind: "Registered", registeredNodeId: "db-" + bytesToText([8, 12, 0]) + "\"x\"", proposalCoordinate: "", proposalAction: "", proposalExpectedGain: 0.0, proposalEstimatedCost: 0.0, proposalConfidence: 0.0, rejectedReason: ""}
+        let prop = FabricResponse{kind: "OptimizationProposal", registeredNodeId: "", proposalCoordinate: "(3,4)", proposalAction: "move -> db-b", proposalExpectedGain: 0.1 * 3.0, proposalEstimatedCost: toFloat("1e-5"), proposalConfidence: 123456789012345680000.0, rejectedReason: ""}
+        let rej = FabricResponse{kind: "Rejected", registeredNodeId: "", proposalCoordinate: "", proposalAction: "", proposalExpectedGain: 0.0, proposalEstimatedCost: 0.0, proposalConfidence: 0.0, rejectedReason: "😀 \\ /"}
+        return join([protocolEncode(ack), protocolEncode(reg), protocolEncode(prop), protocolEncode(rej)], "\n")
+
+    # ============================================================
+    # fabric-core digest (see leafa_digest core_d.rs for the Rust side)
+    # ============================================================
+    action runLeafACoreDigest():
+        let r = do leafACoreDigest()
+        leafAOut = r
+
+    proc leafAValueRow(v: Value) -> text:
+        let b = valueAsBool(v)
+        let mut bs = "-"
+        if b.has:
+            bs = sjBoolText(b.val)
+        let n = valueAsInteger(v)
+        let mut ns = "-"
+        if n.has:
+            ns = "" + n.val
+        let u = valueAsUnsigned(v)
+        let mut us = "-"
+        if u.has:
+            us = sjU64Text(u.val)
+        let f = valueAsFloat(v)
+        let mut fs = "-"
+        if f.has:
+            fs = sjF64Text(f.val)
+        let t = valueAsText(v)
+        let mut ts = "-"
+        if t.has:
+            ts = sjQuote(t.val)
+        let y = valueAsBytes(v)
+        let mut ys = "-"
+        if y.has:
+            ys = "[" + join(y.val, ",") + "]"
+        return valueJson(v) + "|" + sjBoolText(valueIsNull(v)) + "|" + bs + "|" + ns + "|" + us + "|" + fs + "|" + ts + "|" + ys
+
+    proc leafAAtomOpt(o: AtomOption) -> text:
+        if o.has:
+            return atomJson(o.val)
+        return "-"
+
+    proc leafARecOpt(has: bool, r: AtomRecord) -> text:
+        if has:
+            return atomRecordJson(r)
+        return "-"
+
+    proc leafAValOpt(o: ValueOption) -> text:
+        if o.has:
+            return valueJson(o.val)
+        return "-"
+
+    proc leafAWrite(r: FacetEngineWriteResult) -> text:
+        if r.ok:
+            return "ok"
+        return r.err
+
+    proc leafACoreDigest() -> text:
+        let mut sec = []
+        let xs = [0, 11, 12, 0, 7, 255, 11, 0]
+        let ys = [0, 12, 0, 13, 3, 255, 0, 12]
+        let mut rows = []
+        let mut i = 0
+        loop i < len(xs):
+            let c = coordinateNew(xs[i], ys[i])
+            rows = append(rows, "" + xs[i] + "," + ys[i] + ":" + sjBoolText(coordinateIsValid(c)) + ":" + coordinateIndex(c))
+            i = i + 1
+        sec = append(sec, join(rows, ";"))
+
+        let g = gridNew()
+        let mut allOk = true
+        let mut k = 0
+        loop k < len(g.atoms):
+            let a = g.atoms[k]
+            if a.id != "atom-" + k || atomIndex(a) != k || !coordinateIsValid(a.coordinate):
+                allOk = false
+            k = k + 1
+        sec = append(sec, "" + gridLen(g) + ":" + sjBoolText(gridIsEmpty(g)) + ":" + len(gridAtoms(g)) + ":" + sjBoolText(allOk) + ":" + atomJson(g.atoms[0]) + ":" + atomJson(g.atoms[155]) + ":" + leafAAtomOpt(gridAtom(g, coordinateNew(7, 3))) + ":" + leafAAtomOpt(gridAtom(g, coordinateNew(12, 0))) + ":" + leafAAtomOpt(gridAtom(g, coordinateNew(0, 13))) + ":" + leafAAtomOpt(gridAtom(g, coordinateNew(11, 12))) + ":" + byteLen(gridJson(g)))
+
+        let a1 = atomNew("a1", coordinateNew(7, 3))
+        let bad = atomNew("bad", coordinateNew(12, 0))
+        let mut badText = "ok"
+        if !bad.ok:
+            badText = "panic"
+        sec = append(sec, atomJson(a1.atom) + ":" + atomIndex(a1.atom) + ":" + badText)
+
+        let minInt = -9223372036854775807 - 1
+        let values = [valueNull(), valueBool(true), valueBool(false), valueInteger(-5), valueInteger(minInt), valueUnsigned(-1), valueUnsigned(7), valueFloat(1.5), valueFloat(floatFromBits(1 << 63)), valueFloat(0.0 / 0.0), valueFloat(toFloat("1e300")), valueText("a\"b\n"), valueText(""), valueBytes([0, 1, 255]), valueBytes([])]
+        let mut vrows = []
+        let mut vi = 0
+        loop vi < len(values):
+            vrows = append(vrows, leafAValueRow(values[vi]))
+            vi = vi + 1
+        sec = append(sec, join(vrows, ";"))
+
+        let s0 = shardStorageNew()
+        let mut out = ["len=" + shardStorageLen(s0) + ":empty=" + sjBoolText(shardStorageIsEmpty(s0))]
+        let r1 = atomRecordNew(atomNew("a1", coordinateNew(7, 3)).atom, valueInteger(42))
+        let ins1 = shardStorageInsert(s0, r1)
+        out = append(out, leafARecOpt(ins1.hadPrevious, ins1.previous))
+        let r2a = atomRecordNew(atomNew("a1", coordinateNew(7, 3)).atom, valueInteger(0))
+        let r2 = atomRecordSetValue(r2a, valueText("x"))
+        out = append(out, coordinateJson(atomRecordCoordinate(r2)) + ":" + valueJson(atomRecordValue(r2)))
+        let ins2 = shardStorageInsert(ins1.storage, r2)
+        out = append(out, leafARecOpt(ins2.hadPrevious, ins2.previous))
+        let s2 = ins2.storage
+        let g1 = shardStorageGet(s2, coordinateNew(7, 3))
+        out = append(out, leafARecOpt(g1.has, g1.val))
+        let g2 = shardStorageGet(s2, coordinateNew(0, 0))
+        out = append(out, leafARecOpt(g2.has, g2.val))
+        out = append(out, sjBoolText(shardStorageContains(s2, coordinateNew(7, 3))) + ":" + sjBoolText(shardStorageContains(s2, coordinateNew(0, 0))) + ":" + shardStorageLen(s2))
+        let s3 = shardStorageInsert(s2, atomRecordNew(atomNew("z", coordinateNew(0, 0)).atom, valueNull())).storage
+        let s4 = shardStorageInsert(s3, atomRecordNew(atomNew("q", coordinateNew(11, 12)).atom, valueFloat(0.1))).storage
+        let recs = shardStorageRecords(s4)
+        let mut ordered = []
+        let mut idx = 0
+        loop idx < 156:
+            let mut ri = 0
+            loop ri < len(recs):
+                if coordinateIndex(atomRecordCoordinate(recs[ri])) == idx:
+                    ordered = append(ordered, atomRecordJson(recs[ri]))
+                ri = ri + 1
+            idx = idx + 1
+        out = append(out, join(ordered, ","))
+        let rm1 = shardStorageRemove(s4, coordinateNew(7, 3))
+        out = append(out, leafARecOpt(rm1.removed, rm1.previous))
+        let rm2 = shardStorageRemove(rm1.storage, coordinateNew(7, 3))
+        out = append(out, leafARecOpt(rm2.removed, rm2.previous))
+        out = append(out, "len=" + shardStorageLen(rm2.storage) + ":empty=" + sjBoolText(shardStorageIsEmpty(rm2.storage)))
+        sec = append(sec, join(out, ";"))
+
+        let e0 = facetEngineNew(shardNew(1, "domain"))
+        let mut eo = []
+        let w1 = facetEngineWrite(e0, coordinateNew(2, 5), valueInteger(7))
+        eo = append(eo, leafAWrite(w1))
+        let w2 = facetEngineWrite(w1.engine, coordinateNew(12, 0), valueInteger(1))
+        eo = append(eo, leafAWrite(w2))
+        let w3 = facetEngineWrite(w2.engine, coordinateNew(0, 13), valueInteger(1))
+        eo = append(eo, leafAWrite(w3))
+        let w4 = facetEngineWrite(w3.engine, coordinateNew(11, 12), valueFloat(2.5))
+        eo = append(eo, leafAWrite(w4))
+        let e4 = w4.engine
+        eo = append(eo, leafAValOpt(facetEngineRead(e4, coordinateNew(2, 5))))
+        eo = append(eo, leafAValOpt(facetEngineRead(e4, coordinateNew(3, 3))))
+        eo = append(eo, sjBoolText(facetEngineContains(e4, coordinateNew(2, 5))) + ":" + facetEngineLen(e4))
+        let w5 = facetEngineWrite(e4, coordinateNew(2, 5), valueText("y"))
+        eo = append(eo, leafAWrite(w5))
+        let e5 = w5.engine
+        eo = append(eo, leafAValOpt(facetEngineRead(e5, coordinateNew(2, 5))))
+        let d1 = facetEngineDelete(e5, coordinateNew(2, 5))
+        let d2 = facetEngineDelete(d1.engine, coordinateNew(2, 5))
+        eo = append(eo, "" + facetEngineLen(e5) + ":" + sjBoolText(d1.removed) + ":" + sjBoolText(d2.removed))
+        let e6 = d2.engine
+        eo = append(eo, "" + facetEngineLen(e6) + ":" + sjBoolText(facetEngineContains(e6, coordinateNew(2, 5))))
+        eo = append(eo, shardJson(facetEngineShard(e6)) + ":" + shardAtomCount(facetEngineShard(e6)))
+        let sh6 = facetEngineShard(e6)
+        let stripped = shardStorageRemove(shardStorageOf(sh6), coordinateNew(11, 12))
+        let e7 = facetEngineNew(Shard{id: sh6.id, workloadDomain: sh6.workloadDomain, grid: sh6.grid, storage: stripped.storage})
+        eo = append(eo, "" + facetEngineLen(e7))
+        sec = append(sec, join(eo, ";"))
+
+        let sh = shardNew(3, "d")
+        let mut so = []
+        so = append(so, "" + shardAtomCount(sh) + ":" + sjBoolText(shardContains(sh, coordinateNew(11, 12))) + ":" + sjBoolText(shardContains(sh, coordinateNew(12, 12))) + ":" + leafAAtomOpt(shardAtom(sh, coordinateNew(1, 1))) + ":" + leafAAtomOpt(shardAtom(sh, coordinateNew(12, 0))) + ":" + gridLen(shardGrid(sh)))
+        let filled = shardStorageInsert(sh.storage, atomRecordNew(atomNew("x", coordinateNew(1, 1)).atom, valueBool(true))).storage
+        let sh2 = Shard{id: sh.id, workloadDomain: sh.workloadDomain, grid: sh.grid, storage: filled}
+        let cl = shardClone(sh2)
+        so = append(so, "" + shardStorageLen(sh2.storage) + ":" + shardStorageLen(cl.storage) + ":" + sjBoolText(shardEquals(cl, sh2)) + ":" + sjBoolText(shardEquals(shardNew(3, "e"), sh2)) + ":" + sjBoolText(shardEquals(shardNew(4, "d"), sh2)))
+        so = append(so, shardJson(shardNew(-1, "q\"")))
+        sec = append(sec, join(so, ";"))
+
+        let node0 = dbmsNodeNew(dbmsIdNew("node-1"), "us-east")
+        let node1 = dbmsNodeAddShard(node0, shardNew(1, "a"))
+        let node2 = dbmsNodeAddShard(node1, shardNew(2, "b"))
+        let topo = topologyAddNode(topologyAddNode(topologyNew(), node2), dbmsNodeNew(dbmsIdNew("node-2"), "eu"))
+        sec = append(sec, topologyJson(topo) + ":" + len(topo.nodes) + ":" + topologyJson(topologyNew()))
+
+        let classes = [workloadClassReadHeavy(), workloadClassWriteHeavy(), workloadClassMixed(), workloadClassEventHeavy(), workloadClassMedia(), workloadClassRealtime(), workloadClassUnknown()]
+        let mut wrows = []
+        let mut ci = 0
+        loop ci < len(classes):
+            wrows = append(wrows, workloadJson(workloadNew(ci * 1000, classes[ci])))
+            ci = ci + 1
+        sec = append(sec, join(wrows, ";"))
+        return join(sec, "#")
+
+    # ============================================================
+    # fabric-telemetry + fabric-workload digest (telemetry_d.rs)
+    # ============================================================
+    action runLeafATelemetryDigest():
+        let r = do leafATelemetryDigest()
+        leafAOut = r
+
+    proc leafAM(ops: float, reads: float, writes: float, rl: float, wl: float, cpu: float, mem: float, queue: int) -> WorkloadMetrics:
+        return WorkloadMetrics{operationsPerSecond: ops, readsPerSecond: reads, writesPerSecond: writes, readLatencyUs: rl, writeLatencyUs: wl, cpuUtilization: cpu, memoryUtilization: mem, storageBytesPerSecond: 0, networkInBytesPerSecond: 0, networkOutBytesPerSecond: 0, queueDepth: queue, cellBreakdown: [], cellBreakdownPartial: false}
+
+    # telemetry_d.rs metrics_set, in order.
+    proc leafAMetricsSet() -> [WorkloadMetrics]:
+        let nan = 0.0 / 0.0
+        let m6base = leafAM(0.0, 300.0, 100.0, 50000.0, 30000.0, 0.9, 0.5, 5000)
+        let m6 = WorkloadMetrics{operationsPerSecond: m6base.operationsPerSecond, readsPerSecond: m6base.readsPerSecond, writesPerSecond: m6base.writesPerSecond, readLatencyUs: m6base.readLatencyUs, writeLatencyUs: m6base.writeLatencyUs, cpuUtilization: m6base.cpuUtilization, memoryUtilization: m6base.memoryUtilization, storageBytesPerSecond: 7, networkInBytesPerSecond: 8, networkOutBytesPerSecond: 9, queueDepth: 5000, cellBreakdown: [CellWorkloadMetrics{x: 1, y: 2, z: 0, q: 0, readsPerSecond: 9.0, writesPerSecond: 1.0, bytesReadPerSecond: 0.0, bytesWrittenPerSecond: 0.0}], cellBreakdownPartial: true}
+        return [leafAM(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0), leafAM(0.0, 0.0, 0.0, 0.0, 0.0, 0.79, 0.79, 9999), leafAM(0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0), leafAM(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0), leafAM(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10000), leafAM(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1), m6, leafAM(0.0, 1.0, 2.0, nan, 200000.0, nan, -0.5, 20000), leafAM(0.0, 0.1, 0.2, 1000000.0, 0.0, 2.0, 1.5, 30000), leafAM(0.0, toFloat("1e308"), toFloat("1e308"), 0.0, 0.0, 0.7, 0.95, 0), leafAM(12.0, 11000.0, 1000.0, 60000.0, 60000.0, 0.99, 0.95, 30000)]
+
+    proc leafABit(b: bool) -> text:
+        if b:
+            return "1"
+        return "0"
+
+    proc leafAHotIdx(a: WorkloadAnalyzer) -> text:
+        let hot = workloadAnalyzerHotCoordinates(a)
+        let mut out = []
+        let mut idx = 0
+        loop idx < 156:
+            let mut i = 0
+            loop i < len(hot):
+                if coordinateIndex(hot[i]) == idx:
+                    out = append(out, "" + idx)
+                i = i + 1
+            idx = idx + 1
+        return join(out, ",")
+
+    proc leafAProfilesSorted(a: WorkloadAnalyzer) -> text:
+        let ps = workloadAnalyzerProfiles(a)
+        let mut out = []
+        let mut shard = 0
+        loop shard < 100:
+            let mut idx = 0
+            loop idx < 156:
+                let mut i = 0
+                loop i < len(ps):
+                    if ps[i].shardId == shard && coordinateIndex(ps[i].coordinate) == idx:
+                        out = append(out, "" + shard + ":" + idx + ":" + pressureLevelVariant(ps[i].pressure))
+                    i = i + 1
+                idx = idx + 1
+            shard = shard + 1
+        return join(out, ",")
+
+    proc leafAProfileOpt(o: WorkloadProfileOption) -> text:
+        if o.has:
+            return workloadProfileJson(o.val)
+        return "-"
+
+    proc leafATelemetryDigest() -> text:
+        let mut sec = []
+        let ms = leafAMetricsSet()
+        let mut rows = []
+        let mut i = 0
+        loop i < len(ms):
+            let m = ms[i]
+            let p = workloadProfileFromMetrics(i, coordinateNew(i, i), m)
+            rows = append(rows, sjF64Text(workloadMetricsTotalOperations(m)) + "|" + leafABit(workloadMetricsIsCpuHot(m)) + leafABit(workloadMetricsIsMemoryHot(m)) + leafABit(workloadMetricsIsQueueHot(m)) + leafABit(workloadMetricsIsHot(m)) + "|" + workloadMetricsJson(m) + "|" + workloadProfileJson(p) + "|" + sjBoolText(workloadProfileIsHot(p)))
+            i = i + 1
+        sec = append(sec, join(rows, ";"))
+
+        let scores = [0.0, 0.49, 0.5, 0.74, 0.75, 0.89, 0.9, 1.0, -1.0, 0.0 / 0.0, 0.7499999999999999]
+        let mut levels = []
+        let mut si = 0
+        loop si < len(scores):
+            levels = append(levels, pressureLevelVariant(pressureLevelFromScore(scores[si])))
+            si = si + 1
+        sec = append(sec, join(levels, ","))
+
+        let obs = observationNew(123456, ObservationShard{id: 55, workloadDomain: "billing"}, coordinateNew(2, 9), ms[6])
+        sec = append(sec, observationJson(obs))
+
+        let a0 = workloadAnalyzerNew()
+        let mut out = ["" + workloadAnalyzerLen(a0) + ":" + sjBoolText(workloadAnalyzerIsEmpty(a0))]
+        let a1 = workloadAnalyzerObserve(a0, observationNew(1000, ObservationShard{id: 7, workloadDomain: "s"}, coordinateNew(0, 0), ms[1]))
+        let a2 = workloadAnalyzerObserve(a1, observationNew(1000, ObservationShard{id: 7, workloadDomain: "s"}, coordinateNew(1, 1), ms[8]))
+        let a3 = workloadAnalyzerObserve(a2, observationNew(1000, ObservationShard{id: 8, workloadDomain: "s"}, coordinateNew(1, 1), ms[6]))
+        let a4 = workloadAnalyzerObserve(a3, observationNew(1000, ObservationShard{id: 8, workloadDomain: "s"}, coordinateNew(3, 4), ms[10]))
+        out = append(out, "" + workloadAnalyzerLen(a4) + ":" + sjBoolText(workloadAnalyzerIsEmpty(a4)) + ":" + leafAHotIdx(a4) + ":" + leafAProfilesSorted(a4))
+        let a5 = workloadAnalyzerObserve(a4, observationNew(2000, ObservationShard{id: 7, workloadDomain: "s"}, coordinateNew(1, 1), ms[0]))
+        out = append(out, "" + workloadAnalyzerLen(a5) + ":" + leafAHotIdx(a5) + ":" + leafAProfilesSorted(a5))
+        out = append(out, leafAProfileOpt(workloadAnalyzerProfile(a5, 7, coordinateNew(0, 0))))
+        out = append(out, leafAProfileOpt(workloadAnalyzerProfile(a5, 99, coordinateNew(0, 0))))
+        out = append(out, leafAProfileOpt(workloadAnalyzerProfile(a5, 8, coordinateNew(3, 4))))
+        sec = append(sec, join(out, ";"))
+        return join(sec, "#")
+
+    # ============================================================
+    # fabric-ml digest (ml_d.rs)
+    # ============================================================
+    action runLeafAMlDigest():
+        let r = do leafAMlDigest()
+        leafAOut = r
+
+    proc leafAMlDigest() -> text:
+        let mut sec = []
+        let metrics = leafAM(0.0, 10.0, 90.0, 0.0, 40000.0, 0.6, 0.3, 4000)
+        let profile = workloadProfileFromMetrics(1, coordinateNew(0, 0), metrics)
+        let p = workloadPredictorPredictHotspot(workloadPredictorDefault(), profile).probability
+        let lenient = hotspotPredictionIsLikelyHot(workloadPredictorPredictHotspot(workloadPredictorNew(p - 0.05), profile))
+        let strict = hotspotPredictionIsLikelyHot(workloadPredictorPredictHotspot(workloadPredictorNew(p + 0.05), profile))
+        let a = hotspotPredictionIsLikelyHot(HotspotPrediction{coordinate: coordinateNew(0, 0), probability: 0.78, threshold: 0.75})
+        let b = hotspotPredictionIsLikelyHot(HotspotPrediction{coordinate: coordinateNew(0, 0), probability: 0.78, threshold: 0.80})
+        sec = append(sec, sjF64Text(p) + "|" + sjBoolText(lenient) + "|" + sjBoolText(strict) + "|" + sjBoolText(a) + "|" + sjBoolText(b) + "|" + sjF64Text(workloadPredictorThreshold(workloadPredictorDefault())))
+
+        let def = workloadPredictorDefault()
+        let low = workloadPredictorNew(0.3)
+        let ms = leafAMetricsSet()
+        let mut rows = []
+        let mut i = 0
+        loop i < len(ms):
+            let prof = workloadProfileFromMetrics(i, coordinateNew(i, i), ms[i])
+            let hp = workloadPredictorPredictHotspot(def, prof)
+            let an = workloadPredictorDetectAnomaly(def, prof)
+            let lp = workloadPredictorPredictHotspot(low, prof)
+            rows = append(rows, workloadFeaturesJson(workloadFeaturesFromProfile(prof)) + "|" + hotspotPredictionJson(hp) + "|" + sjBoolText(hotspotPredictionIsLikelyHot(hp)) + "|" + anomalyScoreJson(an) + "|" + sjBoolText(anomalyScoreIsAnomalous(an)) + "|" + hotspotPredictionJson(lp) + "|" + sjBoolText(hotspotPredictionIsLikelyHot(lp)))
+            i = i + 1
+        sec = append(sec, join(rows, ";"))
+
+        let ts = [1.5, -0.5, 0.42, 0.0 / 0.0, 0.0, 1.0]
+        let mut th = []
+        let mut k = 0
+        loop k < len(ts):
+            th = append(th, sjF64Text(workloadPredictorThreshold(workloadPredictorNew(ts[k]))))
+            k = k + 1
+        sec = append(sec, join(th, ","))
+        return join(sec, "#")
+
+    # ============================================================
+    # fabric-optimizer digest (optimizer_d.rs)
+    # ============================================================
+    action runLeafAOptimizerDigest():
+        let r = do leafAOptimizerDigest()
+        leafAOut = r
+
+    proc leafAFNode(id: text, region: text, utilization: float, hosted: int, cap: int) -> FleetNode:
+        return FleetNode{id: id, region: region, acceptsPlacement: true, hostedPlacements: hosted, placementCapacity: cap, utilization: utilization}
+
+    proc leafAIds(ns: [FleetNode]) -> text:
+        let mut out = []
+        let mut i = 0
+        loop i < len(ns):
+            out = append(out, ns[i].id)
+            i = i + 1
+        return join(out, ",")
+
+    proc leafABest(f: Fleet, src: text, hasAway: bool, away: text) -> text:
+        let b = fleetBestDestination(f, src, hasAway, away)
+        if b.has:
+            return b.val.id
+        return "-"
+
+    proc leafADec(d: OptimizationDecision) -> text:
+        return optimizationDecisionJson(d) + "|" + sjBoolText(optimizationDecisionShouldExecute(d)) + "|" + sjF64Text(optimizationDecisionScore(d))
+
+    proc leafAHot(reads: float, writes: float) -> WorkloadProfile:
+        return workloadProfileFromMetrics(1, coordinateNew(3, 4), leafAM(reads + writes, reads, writes, 60000.0, 60000.0, 0.99, 0.95, 30000))
+
+    proc leafAWithShard(p: WorkloadProfile, shard: int) -> WorkloadProfile:
+        return WorkloadProfile{shardId: shard, coordinate: p.coordinate, operationsPerSecond: p.operationsPerSecond, readRatio: p.readRatio, writeRatio: p.writeRatio, readLatencyUs: p.readLatencyUs, writeLatencyUs: p.writeLatencyUs, cpuUtilization: p.cpuUtilization, memoryUtilization: p.memoryUtilization, storageBytesPerSecond: p.storageBytesPerSecond, networkInBytesPerSecond: p.networkInBytesPerSecond, networkOutBytesPerSecond: p.networkOutBytesPerSecond, queueDepth: p.queueDepth, cellBreakdown: p.cellBreakdown, cellBreakdownPartial: p.cellBreakdownPartial, pressureScore: p.pressureScore, pressure: p.pressure}
+
+    proc leafAOptFleet(reg: TopologyRegistry) -> Fleet:
+        return fleetNew(reg, [leafAFNode("db-a", "us-east", 0.99, 1, 8), leafAFNode("db-b", "us-east", 0.40, 1, 8), leafAFNode("db-c", "us-west", 0.50, 1, 8)])
+
+    proc leafAOptimizerDigest() -> text:
+        let mut sec = []
+        let reg = topologyRegistryPlace(topologyRegistryPlace(topologyRegistryNew(), "db-a", 1, coordinateNew(0, 0), "us-east"), "db-b", 2, coordinateNew(0, 0), "us-west")
+        let f1 = fleetNew(reg, [leafAFNode("db-a", "us-east", 0.90, 1, 4), leafAFNode("db-b", "us-west", 0.10, 1, 4), leafAFNode("db-c", "us-east", 0.20, 0, 4)])
+        let mut out = [leafABest(f1, "db-a", false, "") + ":" + leafAIds(fleetDestinations(f1, "db-a", false, ""))]
+        let draining = FleetNode{id: "db-c", region: "us-east", acceptsPlacement: false, hostedPlacements: 0, placementCapacity: 4, utilization: 0.05}
+        let f2 = fleetNew(reg, [leafAFNode("db-a", "us-east", 0.90, 1, 4), leafAFNode("db-b", "us-west", 0.10, 4, 4), draining])
+        out = append(out, leafABest(f2, "db-a", false, "") + ":" + leafAIds(fleetDestinations(f2, "db-a", false, "")))
+        let f3 = fleetNew(reg, [leafAFNode("db-a", "us-east", 0.90, 1, 4), leafAFNode("db-b", "us-east", 0.01, 0, 4), leafAFNode("db-c", "us-west", 0.50, 0, 4)])
+        out = append(out, leafABest(f3, "db-a", true, "us-east") + ":" + leafABest(f3, "db-a", false, "") + ":" + leafAIds(fleetDestinations(f3, "db-a", true, "us-east")) + ":" + leafAIds(fleetDestinations(f3, "db-a", false, "")))
+        let fp = fleetFromPlacements(reg)
+        let l1 = topologyRegistryLocate(fleetTopology(fp), 1, coordinateNew(0, 0))
+        let l2 = topologyRegistryLocate(fleetTopology(fp), 2, coordinateNew(0, 0))
+        let l3 = topologyRegistryLocate(fleetTopology(fp), 3, coordinateNew(0, 0))
+        let mut l3t = "-"
+        if l3.found:
+            l3t = l3.placement.dbmsId
+        out = append(out, l1.placement.dbmsId + ":" + l2.placement.dbmsId + ":" + l3t)
+        let fpn = fleetNodes(fp)
+        let mut nj = []
+        let mut allHead = true
+        let mut i = 0
+        loop i < len(fpn):
+            nj = append(nj, fleetNodeJson(fpn[i]))
+            if !fleetNodeHasHeadroom(fpn[i]):
+                allHead = false
+            i = i + 1
+        out = append(out, join(nj, ",") + ":" + sjBoolText(allHead))
+        sec = append(sec, join(out, ";"))
+
+        let oreg = topologyRegistryPlace(topologyRegistryNew(), "db-a", 1, coordinateNew(3, 4), "us-east")
+        let o = workloadOptimizerDefault()
+        let mut od = []
+        od = append(od, leafADec(workloadOptimizerOptimize(o, leafAHot(11000.0, 1000.0), leafAOptFleet(oreg))))
+        od = append(od, leafADec(workloadOptimizerOptimize(o, leafAHot(6000.0, 6000.0), leafAOptFleet(oreg))))
+        od = append(od, leafADec(workloadOptimizerOptimize(o, leafAHot(1000.0, 11000.0), leafAOptFleet(oreg))))
+        od = append(od, leafADec(workloadOptimizerOptimize(o, leafAHot(11000.0, 1000.0), fleetNew(oreg, [leafAFNode("db-a", "us-east", 0.99, 1, 8)]))))
+        let reg2 = topologyRegistryPlace(oreg, "db-z", 1, coordinateNew(9, 9), "us-west")
+        od = append(od, leafADec(workloadOptimizerOptimizeFromTopology(o, leafAHot(11000.0, 1000.0), reg2)))
+        let two = topologyRegistryPlace(topologyRegistryPlace(topologyRegistryNew(), "db-a", 1, coordinateNew(3, 4), "us-east"), "db-b", 2, coordinateNew(3, 4), "us-west")
+        let tf = fleetNew(two, [leafAFNode("db-a", "us-east", 0.10, 1, 8), leafAFNode("db-b", "us-west", 0.10, 1, 8), leafAFNode("db-c", "us-east", 0.10, 1, 8)])
+        od = append(od, leafADec(workloadOptimizerOptimize(o, leafAWithShard(leafAHot(11000.0, 1000.0), 1), tf)))
+        od = append(od, leafADec(workloadOptimizerOptimize(o, leafAWithShard(leafAHot(11000.0, 1000.0), 2), tf)))
+        sec = append(sec, join(od, ";"))
+
+        let mut ex = []
+        let cold = workloadProfileFromMetrics(1, coordinateNew(3, 4), leafAMetricsSet()[6])
+        ex = append(ex, leafADec(workloadOptimizerOptimize(o, cold, leafAOptFleet(oreg))))
+        ex = append(ex, leafADec(workloadOptimizerOptimize(o, leafAWithShard(leafAHot(11000.0, 1000.0), 9), leafAOptFleet(oreg))))
+        let eager = workloadOptimizerNew(workloadPredictorNew(0.2))
+        ex = append(ex, leafADec(workloadOptimizerOptimize(eager, cold, leafAOptFleet(oreg))))
+        ex = append(ex, sjF64Text(workloadPredictorThreshold(workloadOptimizerPredictor(eager))))
+        let ties = fleetNew(oreg, [leafAFNode("n-3", "us-west", 0.5, 1, 0), leafAFNode("n-1", "us-east", 0.5, 0, 2), leafAFNode("n-2", "us-west", 0.5, 0, 2), leafAFNode("n-0", "us-west", 0.5, 0, 2), leafAFNode("n-4", "us-east", 0.1, 2, 2), leafAFNode("src", "us-west", 0.0, 0, 0), leafAFNode("n-5", "eu", 0.7, 0, 0)])
+        ex = append(ex, leafAIds(fleetDestinations(ties, "src", false, "")))
+        ex = append(ex, leafAIds(fleetDestinations(ties, "src", true, "us-west")))
+        ex = append(ex, leafAIds(fleetDestinations(ties, "n-9", true, "eu")))
+        let many = topologyRegistryPlace(topologyRegistryPlace(topologyRegistryPlace(topologyRegistryPlace(topologyRegistryNew(), "db-b", 1, coordinateNew(0, 0), "r1"), "db-a", 1, coordinateNew(1, 0), "r2"), "db-b", 2, coordinateNew(0, 0), "r1"), "db-b", 1, coordinateNew(2, 0), "r1")
+        let mf = fleetNodes(fleetFromTopology(many))
+        let mut mj = []
+        let mut mi = 0
+        loop mi < len(mf):
+            mj = append(mj, fleetNodeJson(mf[mi]))
+            mi = mi + 1
+        ex = append(ex, join(mj, ","))
+        let unrep = fleetNodeUnreported("u", "r")
+        ex = append(ex, fleetNodeJson(unrep) + ":" + sjBoolText(fleetNodeHasHeadroom(unrep)) + ":" + sjBoolText(fleetNodeHasHeadroom(leafAFNode("h", "r", 0.0, 1, 2))) + ":" + sjBoolText(fleetNodeHasHeadroom(leafAFNode("h", "r", 0.0, 2, 2))))
+        sec = append(sec, join(ex, ";"))
+
+        let actions = [optimizationActionNoAction(), optimizationActionReplicate("db-c"), optimizationActionMove("db-\"q"), optimizationActionSplit(), optimizationActionIsolate(), optimizationActionColocate(coordinateNew(3, 4))]
+        let gs = [5.0, 0.1, 0.9, 0.9, 0.35, 1.2]
+        let cs = [0.0, 0.5, 0.1, 0.1, 0.35, 0.35]
+        let confs = [1.0, 0.95, 0.79, 0.80, 0.99, 0.0 / 0.0]
+        let mut ao = []
+        let mut ai = 0
+        loop ai < len(actions):
+            let d = OptimizationDecision{shardId: 3, coordinate: coordinateNew(1, 2), action: actions[ai], expectedGain: gs[ai], estimatedCost: cs[ai], confidence: confs[ai]}
+            ao = append(ao, optimizationActionJson(actions[ai]) + "|" + leafADec(d))
+            ai = ai + 1
+        sec = append(sec, join(ao, ";"))
+        return join(sec, "#")
+
+    # ============================================================
+    # fabric-routing + fabric-topology digest (routing_d.rs)
+    # ============================================================
+    action runLeafARoutingDigest():
+        let r = do leafARoutingDigest()
+        leafAOut = r
+
+    proc leafAErr(e: RoutingError) -> text:
+        return "err|" + routingErrorMessage(e) + "|" + routingErrorJson(e) + "|" + sjBoolText(routingErrorIsRetryable(e))
+
+    proc leafAKeyRow(r: RoutingKeyResult) -> text:
+        if r.ok:
+            return "ok|" + routingKeyDisplay(r.key) + "|" + routingKeyJson(r.key) + "|" + routingKeyIndex(r.key)
+        return leafAErr(r.err)
+
+    # routing_d.rs addresses(), in order.
+    proc leafAAddresses() -> [text]:
+        let arabic3 = bytesToText([217, 163])
+        let nbsp = bytesToText([194, 160])
+        let emsp = bytesToText([226, 128, 131])
+        let nel = bytesToText([194, 133])
+        let zwsp = bytesToText([226, 128, 139])
+        return ["42/7,3", " 42 / 7 , 3 ", "+42/+7,+3", "42/7,3,4", "42", "42/7", "/7,3", "-1/7,3", "42/256,0", "42/255,0", "18446744073709551615/1,1", "18446744073709551616/1,1", "9223372036854775808/0,0", "42/0x7,3", "42/7 ,3", "", "4 2/1,1", "42/1,12", "42/11,12", "42/12,12", "00042/007,003", "42/7,3/", "42//7,3", arabic3 + "/1,1", nbsp + "42" + emsp + "/1,1", "42/+,1", "+/1,1", "42/1,-0", "\t42\n/\r1,1 ", "42/1,1" + nel, "42/1,1" + zwsp, "99999999999999999999999/0,0", "1/99999999999999999999,0"]
+
+    proc leafARoutingDigest() -> text:
+        let mut sec = []
+        let k = routingKeyParse("42/7,3")
+        let off = routingKeyParse("42/12,0")
+        let bad = routingKeyParse("42")
+        let offIs = !off.ok && off.err.kind == "InvalidCoordinate" && off.err.x == 12 && off.err.y == 0
+        sec = append(sec, sjU64Text(k.key.shardId) + ":" + sjBoolText(k.key.coordinate.x == 7 && k.key.coordinate.y == 3) + ":" + routingKeyDisplay(k.key) + ":" + sjBoolText(offIs) + ":" + sjBoolText(bad.err.kind == "InvalidAddress") + ":" + leafAErr(bad.err))
+
+        let addrs = leafAAddresses()
+        let mut rows = []
+        let mut i = 0
+        loop i < len(addrs):
+            rows = append(rows, leafAKeyRow(routingKeyParse(addrs[i])))
+            i = i + 1
+        sec = append(sec, join(rows, ";"))
+
+        let errors = [routingErrorUnknownShard(7), routingErrorInvalidCoordinate(12, 0), routingErrorInvalidAddress("a'b", "r\""), routingErrorInvalidRange(coordinateNew(5, 5), coordinateNew(0, 0)), routingErrorUnknownNode("n"), routingErrorNoLiveOwner(3, ["db-a", "db-b"]), routingErrorNoLiveOwner(-1, []), routingErrorNoWritableReplica(4), routingErrorNoReadableReplica(5), routingErrorWriteFenced(7, "db-a", "db-b")]
+        let mut erows = []
+        let mut ei = 0
+        loop ei < len(errors):
+            erows = append(erows, leafAErr(errors[ei]))
+            ei = ei + 1
+        sec = append(sec, join(erows, ";"))
+
+        let full = coordinateRangeFull()
+        let mut round = true
+        let mut ri = 0
+        loop ri < 156:
+            if coordinateIndex(coordinateAt(ri)) != ri:
+                round = false
+            ri = ri + 1
+        let back = coordinateRangeNew(coordinateNew(5, 5), coordinateNew(0, 0))
+        let mut out = ["" + coordinateRangeLen(full) + ":" + len(coordinateRangeCoordinates(full)) + ":" + coordinateJson(full.start) + ":" + coordinateJson(full.end) + ":" + sjBoolText(coordinateRangeIsEmpty(full)) + ":" + sjBoolText(round) + ":" + sjBoolText(!back.ok && back.err.kind == "InvalidRange") + ":" + coordinateRangeJson(full)]
+        let ax = [0, 5, 12, 0, 3, 11, 3]
+        let ay = [0, 5, 0, 0, 1, 0, 1]
+        let bx = [11, 0, 0, 0, 3, 0, 5]
+        let by = [12, 0, 0, 13, 1, 1, 2]
+        let mut pi = 0
+        loop pi < len(ax):
+            let r = coordinateRangeNew(coordinateNew(ax[pi], ay[pi]), coordinateNew(bx[pi], by[pi]))
+            if r.ok:
+                let cs = coordinateRangeCoordinates(r.range)
+                let mut idxs = []
+                let mut ci = 0
+                loop ci < len(cs):
+                    idxs = append(idxs, "" + coordinateIndex(cs[ci]))
+                    ci = ci + 1
+                out = append(out, "ok|" + coordinateRangeJson(r.range) + "|" + coordinateRangeLen(r.range) + "|" + join(idxs, ","))
+            else:
+                out = append(out, leafAErr(r.err))
+            pi = pi + 1
+        let pr = coordinateRangeNew(coordinateNew(3, 1), coordinateNew(5, 2)).range
+        let px = [2, 3, 0, 5, 6, 12, 4]
+        let py = [1, 1, 2, 2, 2, 1, 1]
+        let mut probes = []
+        let mut qi = 0
+        loop qi < len(px):
+            probes = append(probes, sjBoolText(coordinateRangeContains(pr, coordinateNew(px[qi], py[qi]))))
+            qi = qi + 1
+        out = append(out, join(probes, ","))
+        let ats = [0, 11, 12, 155, 156, 200, 3315, 4000]
+        let mut atj = []
+        let mut ti = 0
+        loop ti < len(ats):
+            atj = append(atj, coordinateJson(coordinateAt(ats[ti])))
+            ti = ti + 1
+        out = append(out, join(atj, ","))
+        sec = append(sec, join(out, ";"))
+
+        let prefs = [ReadPreference{kind: "Primary", region: ""}, ReadPreference{kind: "AnyFresh", region: ""}, ReadPreference{kind: "PreferRegion", region: "eu"}, ReadPreference{kind: "AnyCopy", region: ""}]
+        let mut po = []
+        let mut pj = 0
+        loop pj < len(prefs):
+            po = append(po, readPreferenceJson(prefs[pj]) + "|" + sjBoolText(readPreferenceAllowsStale(prefs[pj])))
+            pj = pj + 1
+        let rd = routeIntentReadDefault()
+        let wr = RouteIntent{isWrite: true, readPref: ReadPreference{kind: "Primary", region: ""}}
+        po = append(po, routeIntentJson(rd) + "|\"" + routeIntentKind(rd) + "\"|" + routeIntentJson(wr) + "|\"" + routeIntentKind(wr) + "\"")
+        let anyCopy = RouteIntent{isWrite: false, readPref: ReadPreference{kind: "AnyCopy", region: ""}}
+        po = append(po, routeIntentJson(anyCopy) + "|\"" + routeIntentKind(anyCopy) + "\"")
+        po = append(po, "\"Primary\",\"Secondary\",\"ShardOwner\",\"MigrationSource\",\"MigrationDestination\"")
+        let route = Route{shardId: 9, hasCoordinate: true, coordinate: coordinateNew(1, 2), node: "db-a", region: "us", servedBy: "MigrationSource", kind: "Read", generation: -1}
+        let whole = Route{shardId: 9, hasCoordinate: false, coordinate: coordinateNew(0, 0), node: "db-a", region: "us", servedBy: "ShardOwner", kind: "Write", generation: 3}
+        po = append(po, routeJson(route))
+        po = append(po, routeJson(whole))
+        let seg = RouteSegment{range: coordinateRangeNew(coordinateNew(0, 1), coordinateNew(5, 1)).range, route: whole}
+        po = append(po, routeSegmentJson(seg) + "|" + routeSegmentLen(seg) + "|" + sjBoolText(routeSegmentIsEmpty(seg)))
+        let key = routingKeyNew(7, coordinateNew(2, 2)).key
+        po = append(po, routeRequestJson(routeRequestRead(key, ReadPreference{kind: "PreferRegion", region: "ap"})))
+        po = append(po, routeRequestJson(routeRequestWrite(key)))
+        sec = append(sec, join(po, ";"))
+
+        let reg0 = topologyRegistryNew()
+        let mut to = ["" + topologyRegistryLen(reg0) + ":" + sjBoolText(topologyRegistryIsEmpty(reg0))]
+        let reg2 = topologyRegistryPlace(topologyRegistryPlace(reg0, "a", 1, coordinateNew(0, 0), "r1"), "b", 2, coordinateNew(0, 0), "r2")
+        to = append(to, "" + topologyRegistryLen(reg2) + ":" + placementJson(topologyRegistryLocate(reg2, 1, coordinateNew(0, 0)).placement))
+        let reg3 = topologyRegistryPlace(reg2, "c", 1, coordinateNew(0, 0), "r3")
+        to = append(to, "" + topologyRegistryLen(reg3) + ":" + placementJson(topologyRegistryLocate(reg3, 1, coordinateNew(0, 0)).placement))
+        let mv1 = topologyRegistryMoveCoordinate(reg3, 2, coordinateNew(0, 0), "d", "r4")
+        let mv2 = topologyRegistryMoveCoordinate(mv1.registry, 2, coordinateNew(1, 0), "d", "r4")
+        let reg4 = mv2.registry
+        to = append(to, sjBoolText(mv1.moved) + ":" + sjBoolText(mv2.moved) + ":" + placementJson(topologyRegistryLocate(reg4, 2, coordinateNew(0, 0)).placement))
+        let l3 = topologyRegistryLocate(reg4, 3, coordinateNew(0, 0))
+        let mut l3t = "-"
+        if l3.found:
+            l3t = placementJson(l3.placement)
+        to = append(to, l3t)
+        let rm1 = topologyRegistryRemove(reg4, 1, coordinateNew(0, 0))
+        let mut rm1t = "-"
+        if rm1.removed:
+            rm1t = placementJson(rm1.placement)
+        to = append(to, rm1t)
+        let rm2 = topologyRegistryRemove(rm1.registry, 1, coordinateNew(0, 0))
+        let mut rm2t = "-"
+        if rm2.removed:
+            rm2t = placementJson(rm2.placement)
+        to = append(to, rm2t)
+        to = append(to, "" + topologyRegistryLen(rm2.registry) + ":" + sjBoolText(topologyRegistryIsEmpty(rm2.registry)))
+        let reg5 = topologyRegistryRemove(rm2.registry, 2, coordinateNew(0, 0)).registry
+        to = append(to, "" + topologyRegistryLen(reg5) + ":" + sjBoolText(topologyRegistryIsEmpty(reg5)))
+        let good = placementNew("x", -1, coordinateNew(11, 12), "rr")
+        let offp = placementNew("x", 5, coordinateNew(12, 0), "rr")
+        to = append(to, placementJson(good))
+        let gk = routingKeyFromPlacement(good)
+        let mut gkt = leafAErr(gk.err)
+        if gk.ok:
+            gkt = "ok|" + routingKeyDisplay(gk.key) + "|" + routingKeyJson(gk.key)
+        to = append(to, gkt)
+        let ok2 = routingKeyFromPlacement(offp)
+        let mut okt = leafAErr(ok2.err)
+        if ok2.ok:
+            okt = "ok|" + routingKeyDisplay(ok2.key) + "|" + routingKeyJson(ok2.key)
+        to = append(to, okt)
+        sec = append(sec, join(to, ";"))
+        return join(sec, "#")
+
+    # ============================================================
+    # fabric-cli render.rs digest (cli_d.rs)
+    # ============================================================
+    action runLeafACliDigest():
+        let r = do leafACliDigest()
+        leafAOut = r
+
+    proc leafACliProfiles() -> [WorkloadProfile]:
+        let ms = leafAMetricsSet()
+        let mut out = []
+        let mut i = 0
+        loop i < len(ms):
+            out = append(out, workloadProfileFromMetrics(i * 3, coordinateNew(i, i % 13), ms[i]))
+            i = i + 1
+        return out
+
+    proc leafADecision(a: OptimizationAction, g: float, c: float, conf: float) -> OptimizationDecision:
+        return OptimizationDecision{shardId: 1, coordinate: coordinateNew(0, 12), action: a, expectedGain: g, estimatedCost: c, confidence: conf}
+
+    proc leafAPredRow(h: float, a: float) -> PredictionRow:
+        return PredictionRow{coordinate: coordinateNew(2, 3), hotspotProbability: h, likelyHot: true, anomalyScore: a, anomalous: false}
+
+    proc leafACliMode(json: bool) -> text:
+        let rs = bytesToText([30])
+        let mut out = []
+        let summary = StatusSummary{placements: 2, profiles: 3, observations: 4, hotCoordinates: 1, gridWidth: 12, gridHeight: 13, gridAtoms: 156, protocolMajor: 1, protocolMinor: 0}
+        out = append(out, renderStatus(summary, json))
+        out = append(out, renderTopology([], json))
+        let placements = [placementNew("node-a", 7, coordinateNew(1, 2), "us-east"), placementNew("node-\"b\"", -1, coordinateNew(11, 12), "a-region-longer-than-sixteen"), placementNew("", 123456, coordinateNew(200, 0), "é")]
+        out = append(out, renderTopology(placements, json))
+        out = append(out, renderWorkload([], json))
+        let ps = leafACliProfiles()
+        out = append(out, renderWorkload(ps, json))
+        out = append(out, renderMetrics([], json))
+        let ms = leafAMetricsSet()
+        let mut obs = []
+        let mut oi = 0
+        loop oi < len(ms):
+            obs = append(obs, observationNew(1000 + oi, ObservationShard{id: oi * 11, workloadDomain: "s"}, coordinateNew(oi, 1), ms[oi]))
+            oi = oi + 1
+        out = append(out, renderMetrics(obs, json))
+        out = append(out, renderPlacement([], json))
+        let mut reg = topologyRegistryNew()
+        let mut pi = 0
+        loop pi < len(ps):
+            let mut region = "eu"
+            if ps[pi].shardId % 2 == 0:
+                region = "us"
+            reg = topologyRegistryPlace(reg, "db-" + (ps[pi].shardId % 4), ps[pi].shardId, ps[pi].coordinate, region)
+            pi = pi + 1
+        let opt = workloadOptimizerDefault()
+        let mut decisions = []
+        let mut di = 0
+        loop di < len(ps):
+            decisions = append(decisions, workloadOptimizerOptimizeFromTopology(opt, ps[di], reg))
+            di = di + 1
+        let nan = 0.0 / 0.0
+        let inf = toFloat("1e308") * 10.0
+        decisions = append(decisions, leafADecision(optimizationActionColocate(coordinateNew(3, 4)), 0.125, 0.375, 0.005))
+        decisions = append(decisions, leafADecision(optimizationActionSplit(), 2.5, -0.125, nan))
+        decisions = append(decisions, leafADecision(optimizationActionMove("a-very-long-node-name-indeed"), toFloat("1e20"), toFloat("1e-7"), 0.995))
+        decisions = append(decisions, leafADecision(optimizationActionIsolate(), floatFromBits(1 << 63), 0.0, 0.8))
+        decisions = append(decisions, leafADecision(optimizationActionReplicate("x"), inf, 1.0, 0.9))
+        out = append(out, renderPlacement(decisions, json))
+        out = append(out, renderPredict([], json))
+        let pred = workloadOptimizerPredictor(opt)
+        let mut rows = []
+        let mut ri = 0
+        loop ri < len(ps):
+            let h = workloadPredictorPredictHotspot(pred, ps[ri])
+            let a = workloadPredictorDetectAnomaly(pred, ps[ri])
+            rows = append(rows, PredictionRow{coordinate: ps[ri].coordinate, hotspotProbability: h.probability, likelyHot: hotspotPredictionIsLikelyHot(h), anomalyScore: a.score, anomalous: anomalyScoreIsAnomalous(a)})
+            ri = ri + 1
+        rows = append(rows, leafAPredRow(0.91, 0.42))
+        rows = append(rows, leafAPredRow(0.125, 0.375))
+        rows = append(rows, leafAPredRow(0.005, 0.015))
+        rows = append(rows, leafAPredRow(toFloat("1e20"), floatFromBits(1 << 63)))
+        rows = append(rows, leafAPredRow(nan, 0.0 - inf))
+        rows = append(rows, leafAPredRow(0.994999, 0.995))
+        out = append(out, renderPredict(rows, json))
+        out = append(out, renderNodes([], 0, 30000, json))
+        let nodes = [NodeRow{dbmsId: "db-a", region: "us-east", softwareVersion: "0.13.0", registeredAtMs: 0, hasLastHeartbeatMs: true, lastHeartbeatMs: 9000, hasSilenceMs: true, silenceMs: 1000, heartbeats: 3, health: "healthy"}, NodeRow{dbmsId: "db-b", region: "eu-west", softwareVersion: "unknown", registeredAtMs: 0, hasLastHeartbeatMs: false, lastHeartbeatMs: 0, hasSilenceMs: false, silenceMs: 0, heartbeats: 0, health: "unreachable"}, NodeRow{dbmsId: "a-node-with-a-long-id", region: "r\"q", softwareVersion: "1.2.3-beta.4", registeredAtMs: -1, hasLastHeartbeatMs: true, lastHeartbeatMs: -1, hasSilenceMs: true, silenceMs: 123456789012, heartbeats: 1234567, health: "degraded"}]
+        out = append(out, renderNodes(nodes, 10000, 30000, json))
+        out = append(out, renderValidation([], json))
+        let issues = [ValidationIssue{coordinate: coordinateNew(20, 20), reason: "coordinate (20,20) is outside the 12x13 grid"}, ValidationIssue{coordinate: coordinateNew(0, 13), reason: "tab\there " + bytesToText([1])}]
+        out = append(out, renderValidation(issues, json))
+        return join(out, rs)
+
+    proc leafACliDigest() -> text:
+        let mut sec = [leafACliMode(false), leafACliMode(true)]
+        sec = append(sec, join([pressureLabel("normal"), pressureLabel("elevated"), pressureLabel("high"), pressureLabel("critical")], ","))
+        let actions = [optimizationActionNoAction(), optimizationActionIsolate(), optimizationActionSplit(), optimizationActionMove("node-b"), optimizationActionReplicate("node-c"), optimizationActionColocate(coordinateNew(3, 4))]
+        let mut labels = []
+        let mut i = 0
+        loop i < len(actions):
+            labels = append(labels, actionLabel(actions[i]))
+            i = i + 1
+        sec = append(sec, join(labels, ","))
+        return join(sec, "#")
+
+    # ============================================================
+    # fabric-protocol digest (protocol_d.rs)
+    # ============================================================
+    action runLeafAProtocolDigest():
+        let r = do leafAProtocolDigest()
+        leafAOut = r
+
+    proc leafAZeros(n: int) -> text:
+        let mut bs = []
+        let mut i = 0
+        loop i < n:
+            bs = append(bs, 0)
+            i = i + 1
+        return bytesToText(bs)
+
+    proc leafAProtocolDigest() -> text:
+        let mut sec = []
+        let ps = ["secret", "secre", "secrets", "", "Secret", "", "", "é", "a" + bytesToText([0]), "x"]
+        let es = ["secret", "secret", "secret", "secret", "secret", "t", "", "e", "a", "x" + bytesToText([196, 128])]
+        let mut row = []
+        let mut i = 0
+        loop i < len(ps):
+            row = append(row, sjBoolText(protocolAuthorized(ps[i], es[i])))
+            i = i + 1
+        let zeros = leafAZeros(256)
+        row = append(row, sjBoolText(protocolAuthorized("", zeros)))
+        row = append(row, sjBoolText(protocolAuthorized(zeros, "")))
+        row = append(row, sjBoolText(protocolAuthorized(leafAZeros(1), leafAZeros(257))))
+        sec = append(sec, join(row, ","))
+        let errs = [ProtocolError{kind: "InvalidMessage", message: "bad"}, ProtocolError{kind: "Serialization", message: "expected value at line 1 column 1"}, ProtocolError{kind: "Io", message: "closed"}]
+        sec = append(sec, protocolErrorDisplay(errs[0]) + "|" + protocolErrorDisplay(errs[1]) + "|" + protocolErrorDisplay(errs[2]))
+        sec = append(sec, protocolTokenEnv() + ":" + protocolVersionJson(protocolVersionV1()))
+        let reg = nodeRegistrationNew(DbmsId{value: "db-1"}, "0.13.0", "us-east")
+        let sample = TelemetrySample{coordinate: coordinateNew(3, 4), operationsPerSecond: 1000.0, readRatio: 0.7, writeRatio: 0.3, readLatencyUs: 12.5, writeLatencyUs: 40.0, cpuUtilization: 0.5, memoryUtilization: 0.25, queueDepth: 17, cellBreakdown: [CellWorkloadMetrics{x: 1, y: 2, z: 3, q: 4, readsPerSecond: 1.0, writesPerSecond: 2.0, bytesReadPerSecond: 3.0, bytesWrittenPerSecond: 4.0}], cellBreakdownPartial: true}
+        let odd = TelemetrySample{coordinate: sample.coordinate, operationsPerSecond: 0.1, readRatio: 3.0, writeRatio: -1.0, readLatencyUs: sample.readLatencyUs, writeLatencyUs: sample.writeLatencyUs, cpuUtilization: sample.cpuUtilization, memoryUtilization: sample.memoryUtilization, queueDepth: -1, cellBreakdown: [], cellBreakdownPartial: false}
+        sec = append(sec, nodeRegistrationJson(reg) + "|" + workloadMetricsJson(telemetrySampleMetrics(sample)) + "|" + workloadMetricsJson(telemetrySampleMetrics(odd)))
+        let e = protoEmptyFabricMessage()
+        let msgs = [FabricMessage{kind: "RegisterNode", registerNode: reg, heartbeat: e.heartbeat, topology: e.topology, telemetry: e.telemetry, workload: e.workload}, FabricMessage{kind: "Heartbeat", registerNode: e.registerNode, heartbeat: NodeHeartbeat{nodeId: DbmsId{value: "h"}, timestampMs: 1, healthy: true}, topology: e.topology, telemetry: e.telemetry, workload: e.workload}, FabricMessage{kind: "Topology", registerNode: e.registerNode, heartbeat: e.heartbeat, topology: TopologyReport{nodeId: DbmsId{value: "t"}, timestampMs: 2, placements: []}, telemetry: e.telemetry, workload: e.workload}, FabricMessage{kind: "Telemetry", registerNode: e.registerNode, heartbeat: e.heartbeat, topology: e.topology, telemetry: TelemetryBatch{timestampMs: 3, nodeId: DbmsId{value: "b"}, shard: ProtocolShard{id: 4, workloadDomain: "s"}, samples: [sample]}, workload: e.workload}, FabricMessage{kind: "Workload", registerNode: e.registerNode, heartbeat: e.heartbeat, topology: e.topology, telemetry: e.telemetry, workload: WorkloadObservation{nodeId: "w", coordinate: coordinateNew(0, 0), timestampMs: 5, operationsPerSecond: 1.0, readRatio: 1.0, writeRatio: 0.0}}]
+        let mut rs = []
+        let mut k = 0
+        loop k < len(msgs):
+            rs = append(rs, protocolEncode(protocolHandle(msgs[k])))
+            k = k + 1
+        sec = append(sec, join(rs, ";"))
+        return join(sec, "#")

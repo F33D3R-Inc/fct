@@ -1,6 +1,9 @@
 package runtime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -23,80 +26,41 @@ type record = map[string]any
 // structVal is a proc-local struct value (`struct Name: field: Type` — see
 // LANGUAGE.md's `proc` section and ast.Struct's doc): a real named-field
 // composite, constructed by a `Type{field: expr, ...}` literal and read back
-// with ordinary `.field` access (evalInFrame's "struct"/"get" cases).
+// with ordinary `.field` access (proccompile.go's "struct"/"get" cases).
 //
-// A dedicated Go type rather than a bare map[string]any (which would work
-// just as well at the type-assertion level) so it can never be confused, in
-// a runtime type switch, with an entity row (this file's own `record` alias
-// for map[string]any) or a proc map value (map[any]any, the "map" case
-// below) — three genuinely different domains that happen to all be
-// string/any-ish, kept apart by using three different concrete Go types.
-// Type names which struct shape it is, purely for a clear diagnostic if a
-// value ever reaches a place expecting a different one; Fields holds the
-// field values by name.
+// A dedicated Go type so it can never be confused, in a runtime type switch,
+// with an entity row (this file's own `record` alias for map[string]any) or a
+// proc map value (map[any]any). Its fields are a slice in the declaration's
+// order, laid out by the struct type's structLayout (shared by every value of
+// the type), so building one is one small allocation and reading a field an
+// index — not a hash map per value.
 type structVal struct {
-	Type   string
-	Fields map[string]any
+	lay  *structLayout
+	vals []any
 }
 
-// frame is one proc invocation's local scope: its parameters plus its
-// `let`-bound locals, distinct from the flat action/session `map[string]any`
-// scope runActionLocked reads — a proc's scratch variable must never alias or
-// leak into session state or wire deltas, which a shared map could not guarantee
-// (a proc-local named the same as a state cell or an action parameter would
-// silently collide). It chains to a parent so a nested block can shadow an
-// outer local without a flat namespace: runProcLocked builds the proc's own
-// top-level frame (parent == nil), and execProcBlock (runtime/server.go) gives
-// each `loop` iteration a fresh child frame chained to the frame it was called
-// with, so a loop-local declared inside the body doesn't survive past that one
-// pass while a `let mut` declared OUTSIDE the loop and reassigned inside it
-// still resolves (via frame.set walking the chain) to the same outer slot every
-// iteration — the whole point of an accumulator.
-type frame struct {
-	vars   map[string]any
-	parent *frame
-	// builders backs the `x = x + e` fast path (appendText): one
-	// strings.Builder per text local that is being grown by repeated
-	// self-concatenation, so a parser or emitter written in fct that builds
-	// its output a piece at a time runs in linear time instead of copying
-	// the whole accumulated string on every statement. Lazily allocated.
-	builders map[string]*strings.Builder
+// structLayout is one struct type's field order: names by position, and the
+// position of each name.
+type structLayout struct {
+	name   string
+	fields []string
+	index  map[string]int
 }
 
-// appendText is the `x = x + e` fast path: append add to the text local
-// name in place, through a strings.Builder kept beside the variable, and
-// return the new value. strings.Builder.String() shares the builder's buffer
-// without copying, so the variable's value is always the builder's current
-// contents at zero cost; a value produced earlier keeps its own length and
-// never sees later appends. The builder is trusted only while the variable
-// still holds exactly the string it last produced (same backing pointer, same
-// length) — any other assignment to the variable in between makes the next
-// append start a fresh builder from the variable's real value, so the
-// optimization can never observe a stale buffer.
-func (f *frame) appendText(name, cur, add string) string {
-	fr := f
-	for ; fr != nil; fr = fr.parent {
-		if _, ok := fr.vars[name]; ok {
-			break
-		}
+func newStructLayout(name string, fields []string) *structLayout {
+	l := &structLayout{name: name, fields: fields, index: make(map[string]int, len(fields))}
+	for i, f := range fields {
+		l.index[f] = i
 	}
-	if fr == nil {
-		fr = f
+	return l
+}
+
+// field is the value of the named field, nil when the type has none.
+func (sv structVal) field(name string) any {
+	if i, ok := sv.lay.index[name]; ok {
+		return sv.vals[i]
 	}
-	if fr.builders == nil {
-		fr.builders = map[string]*strings.Builder{}
-	}
-	b := fr.builders[name]
-	if b == nil || b.Len() != len(cur) || (len(cur) > 0 && unsafe.StringData(b.String()) != unsafe.StringData(cur)) {
-		b = &strings.Builder{}
-		b.Grow(2*len(cur) + len(add) + 64)
-		b.WriteString(cur)
-		fr.builders[name] = b
-	}
-	b.WriteString(add)
-	v := b.String()
-	fr.vars[name] = v
-	return v
+	return nil
 }
 
 // ── rune-indexed text without allocation ─────────────────────────────────────
@@ -211,255 +175,13 @@ func runeSlice(s string, start, end int) string {
 	return s[offs[start]:offs[end]]
 }
 
-// get resolves a name by walking the frame chain from the innermost scope
-// outward.
-func (f *frame) get(name string) (any, bool) {
-	for fr := f; fr != nil; fr = fr.parent {
-		if v, ok := fr.vars[name]; ok {
-			return v, true
-		}
-	}
-	return nil, false
-}
-
-// set reassigns name in whichever frame of the chain already declares it (a
-// `let mut` local written back to by a plain `name = expr`); the compiler
-// guarantees the name was declared by a `let` first, so it is always found.
-func (f *frame) set(name string, v any) {
-	for fr := f; fr != nil; fr = fr.parent {
-		if _, ok := fr.vars[name]; ok {
-			fr.vars[name] = v
-			return
-		}
-	}
-	f.vars[name] = v
-}
-
-// evalInFrame evaluates an IR expression against a proc's frame chain instead of
-// the flat scope map eval() reads — the resolver a proc's own scope needs (see
-// frame, above). A proc's expressions are restricted at compile time
-// (internal/ir/build.go, checkProcExpr) to literals, its own locals/params,
-// arithmetic/comparison/boolean/bitwise operators, pure builtins, and array
-// literals/index reads — never a state read, an entity/aggregate read, or
-// client reactive state — so those are the only IR node kinds this needs to
-// know about. Where the logic is identical to eval's (binary/unary operators,
-// builtin calls), it delegates to the same helpers eval uses, so the two
-// interpreters cannot silently drift apart.
-//
-// Unlike eval(), this returns an error as its second result: an array index
-// read (case "index") is the one place a proc expression can fail at runtime
-// in a way no compile-time check can rule out (bounds are data-dependent, not
-// static — see ast.Index) — reading past an array's length, or indexing a
-// value that isn't an array despite the compile-time check on the common
-// `name[i]` shape (internal/ir/build.go's checkIndexTypes only catches
-// that shape; anything it couldn't prove statically is checked here instead).
-// That error threads back up through every caller in this function and in
-// runtime/server.go's execProcBlock/execProcLoop, the same way a `do` call's
-// own failure already does, and ends the request as a clean 5xx rather than a
-// Go panic reaching the HTTP layer.
-//
-// A Server method (not a free function, unlike eval()) because the "call"
-// case below may reach one of the I/O capability builtins (readFile/
-// writeFile/httpGet/httpPost — runtime/io.go), which need the server's
-// sandboxed data-directory root and HTTP client config; every other proc
-// builtin ignores s entirely.
-func (s *Server) evalInFrame(e *ir.Expr, fr *frame) (any, error) {
-	if e == nil {
-		return nil, nil
-	}
-	switch e.Kind {
-	case "lit":
-		return litValue(e), nil
-	case "list":
-		out := make([]any, len(e.Args))
-		for i, el := range e.Args {
-			v, err := s.evalInFrame(el, fr)
-			if err != nil {
-				return nil, err
-			}
-			out[i] = v
-		}
-		return out, nil
-	case "map":
-		// A map literal (`{k1: v1, ...}`) — see ast.MapLit's doc. Keys and Args
-		// (its values) are parallel, exactly as the AST holds them; each key is
-		// evaluated and validated (mapKey) exactly as an index read/write's key
-		// is, so a bad-typed key is refused here at construction time too, not
-		// only when it is later read or overwritten.
-		out := make(map[any]any, len(e.Args))
-		for i, valExpr := range e.Args {
-			kv, err := s.evalInFrame(e.Keys[i], fr)
-			if err != nil {
-				return nil, err
-			}
-			key, err := mapKey(kv)
-			if err != nil {
-				return nil, err
-			}
-			v, err := s.evalInFrame(valExpr, fr)
-			if err != nil {
-				return nil, err
-			}
-			out[key] = v
-		}
-		return out, nil
-	case "struct":
-		// A struct literal (`Type{f1: v1, ...}`) — see ast.StructLit's doc.
-		// internal/ir/build.go's checkStructFieldTypes already proved every
-		// field the struct declares is set exactly once (for the shapes it
-		// can see statically), so this just evaluates each value in field
-		// order; Fields and Args stay parallel exactly as the IR holds them.
-		fields := make(map[string]any, len(e.Args))
-		for i, valExpr := range e.Args {
-			v, err := s.evalInFrame(valExpr, fr)
-			if err != nil {
-				return nil, err
-			}
-			fields[e.Fields[i]] = v
-		}
-		return structVal{Type: e.Name, Fields: fields}, nil
-	case "get":
-		// `.field` read off a struct value (ast.Get) — the one composite-value
-		// field access a proc has (an entity/record's `.field` never reaches
-		// evalInFrame at all; those are eval()'s own "get" case, below).
-		// internal/ir/build.go's checkStructFieldTypes already proves this
-		// wherever the object's type is statically known; a value that
-		// reaches here as something other than a structVal is the runtime
-		// backstop for whatever that static check couldn't see through (a
-		// proc parameter's dynamic value, say) — a clean error, not a Go
-		// panic, the same stance an out-of-bounds array read already takes.
-		obj, err := s.evalInFrame(e.Obj, fr)
-		if err != nil {
-			return nil, err
-		}
-		sv, ok := obj.(structVal)
-		if !ok {
-			return nil, fmt.Errorf("cannot read field %q of a value that is not a struct", e.Field)
-		}
-		return sv.Fields[e.Field], nil
-	case "ref":
-		v, _ := fr.get(e.Name)
-		return v, nil
-	case "index":
-		obj, err := s.evalInFrame(e.Obj, fr)
-		if err != nil {
-			return nil, err
-		}
-		idxV, err := s.evalInFrame(e.Key, fr)
-		if err != nil {
-			return nil, err
-		}
-		switch coll := obj.(type) {
-		case []any:
-			idx := toInt(idxV)
-			if idx < 0 || idx >= len(coll) {
-				return nil, fmt.Errorf("array index %d out of bounds (length %d)", idx, len(coll))
-			}
-			return coll[idx], nil
-		case map[any]any:
-			key, err := mapKey(idxV)
-			if err != nil {
-				return nil, err
-			}
-			// A missing key answers nil (Go's own zero value for an absent map
-			// entry) rather than a clean error — deliberately the opposite
-			// stance from an out-of-bounds array read, above. This mirrors the
-			// language's existing precedent for "read of something absent"
-			// elsewhere: eval()'s "get" case already returns a missing record
-			// field silently (`m[e.Field]` on a Go map), not an error. A hash
-			// map's entire reason to exist is answering "is this key here" —
-			// unlike an array bound (fixed once the array is built, so any
-			// out-of-range index is a programmer bug), a map lookup missing is
-			// the ordinary, expected shape of building one up (a frequency
-			// counter's `m[k] = m[k] + 1` needs to read an as-yet-absent key
-			// without a guard first) — and toInt(nil) already answers 0, so
-			// that idiom works for free. See runtime/array_test.go's
-			// TestArrayOutOfBoundsIsCleanError for the array side of this
-			// same contrast and runtime/map_test.go's missing-key test for
-			// this one.
-			return coll[key], nil
-		default:
-			return nil, fmt.Errorf("cannot index a value that is not an array or map")
-		}
-	case "un":
-		x, err := s.evalInFrame(e.X, fr)
-		if err != nil {
-			return nil, err
-		}
-		switch e.Op {
-		case "!":
-			return !truthy(x), nil
-		case "-":
-			return negate(x), nil
-		case "~":
-			return ^toInt(x), nil
-		}
-	case "bin":
-		// `&&`/`||` short-circuit: the right operand must not even be
-		// evaluated once the left side already determines the result — see
-		// evalRest's "bin" case (this function's flat-scope counterpart) for
-		// the full reasoning, which applies here unchanged. This matters more
-		// here than there: a proc body is the one place an unevaluated right
-		// operand can otherwise throw a genuine runtime error (an
-		// out-of-bounds "index" read, e.g. `i < len(xs) && xs[i] == y`), not
-		// just waste work, so this has to happen before e.R is ever passed to
-		// evalInFrame, not inside applyBin (which only ever sees
-		// already-evaluated operands).
-		if e.Op == "&&" || e.Op == "||" {
-			l, err := s.evalInFrame(e.L, fr)
-			if err != nil {
-				return nil, err
-			}
-			lt := truthy(l)
-			if e.Op == "&&" && !lt {
-				return false, nil
-			}
-			if e.Op == "||" && lt {
-				return true, nil
-			}
-			r, err := s.evalInFrame(e.R, fr)
-			if err != nil {
-				return nil, err
-			}
-			return truthy(r), nil
-		}
-		l, err := s.evalInFrame(e.L, fr)
-		if err != nil {
-			return nil, err
-		}
-		r, err := s.evalInFrame(e.R, fr)
-		if err != nil {
-			return nil, err
-		}
-		return applyBin(e.Op, l, r), nil
-	case "call":
-		args := make([]any, len(e.Args))
-		for i, a := range e.Args {
-			v, err := s.evalInFrame(a, fr)
-			if err != nil {
-				return nil, err
-			}
-			args[i] = v
-		}
-		return s.callProcBuiltin(e.Name, args)
-	}
-	return nil, nil
-}
-
-// cloneArrayValue returns v unchanged unless it is a []any (an array value),
-// in which case it returns a fresh copy with its own backing array.
-//
-// This is what gives a proc-local array value semantics instead of Go's
-// default slice-aliasing assignment: called at every point a value flows into
-// a NEW binding — a `let`, a plain `name = expr` reassignment, and a proc
-// parameter — so `let ys = xs` (or passing xs as an argument) never leaves ys
-// and xs sharing a backing array. Mutating one afterward (via an index-write,
-// runtime/server.go's "indexset") therefore cannot be observed through the
-// other. This matches the rest of the language's copy-on-read value model
-// (an action's state cells are never shared references either) rather than
-// adding a new, inconsistent reference-semantics value kind; the cost is one
-// copy per assignment, paid only for actual array values (everything else —
-// the overwhelming majority of assignments — returns immediately unchanged).
+// cloneArrayValue, cloneMapValue and cloneStructValue each return v unchanged
+// unless it is their kind of proc-local composite value (a list or byte buffer,
+// a map, a struct), in which case they return a one-level copy with its own
+// backing storage. The proc engine (proccompile.go) calls them — through
+// cloneCompositeValue — exactly when it is about to mutate a value in place
+// that its slot does not own, which is what keeps every binding's value
+// independent of every other's: copy-on-write in place of copy-on-bind.
 func cloneArrayValue(v any) any {
 	arr, ok := v.([]any)
 	if !ok {
@@ -470,16 +192,6 @@ func cloneArrayValue(v any) any {
 	return out
 }
 
-// cloneMapValue is cloneArrayValue's counterpart for a map value: returns v
-// unchanged unless it is a map[any]any (a map value, runtime/eval.go's "map"
-// case), in which case it returns a fresh copy with its own backing map.
-//
-// This gives a proc-local map the same copy-on-assign value semantics an
-// array already has (see cloneArrayValue's doc, above, for the full
-// reasoning — it applies here unchanged): called at every point a value
-// flows into a new binding, so `let m2 = m1` never leaves m1 and m2 sharing
-// one backing map, and mutating one afterward (via an index-write,
-// runtime/server.go's "indexset") can never be observed through the other.
 func cloneMapValue(v any) any {
 	m, ok := v.(map[any]any)
 	if !ok {
@@ -498,46 +210,26 @@ func cloneMapValue(v any) any {
 // the runtime backstop for whatever internal/ir/build.go's checkMapKeyTypes
 // could not decide at compile time (a proc parameter, a `do`-bound result,
 // or any other key whose type isn't statically provable) — the same
-// division of labor checkIndexTypes/evalInFrame's "index" case already have
+// division of labor checkIndexTypes/the proc engine's "index" case already have
 // for an array's bounds. A key of any other type (bool, money, date, an
 // array, or a map) is a clean error here, not a Go panic and not a silently
 // wrong answer — this codebase's established convention (see
 // runtime/array_test.go's TestArrayOutOfBoundsIsCleanError).
 
-// cloneCompositeValue applies cloneArrayValue, cloneMapValue, then
-// cloneStructValue, so a value flowing into a new proc-local binding (a
-// `let`, a plain reassignment, or a parameter — see each clone helper's own
-// doc for why that copy matters) is copied whichever of the three
-// proc-local composite value kinds it happens to be. Composing them is safe
-// and total: each helper touches only its own kind and passes everything
-// else through unchanged, so a scalar passes through all three unchanged,
-// an array is copied by the first and passed through the other two, a map
-// the second, and a struct the third.
+// cloneCompositeValue copies v one level deep, whichever proc-local composite
+// kind it is (see cloneArrayValue); a scalar passes through unchanged.
 func cloneCompositeValue(v any) any {
 	return cloneStructValue(cloneMapValue(cloneArrayValue(v)))
 }
 
-// cloneStructValue is cloneArrayValue's/cloneMapValue's counterpart for a
-// struct value (see structVal): returns v unchanged unless it is a
-// structVal, in which case it returns a copy with its own backing Fields
-// map, so a struct gets the same copy-on-assign value semantics an array or
-// map already has (see cloneArrayValue's doc for the full reasoning — it
-// applies here unchanged). One level deep, exactly like the other two: a
-// field that itself holds an array/map/struct is carried over by reference
-// at this level, the same way an array of arrays or a map of maps already
-// is — there is no in-place field mutation this milestone (a struct's
-// fields are set once, by its literal), so this one-level copy is already
-// enough to make two bindings of the same struct value fully independent.
 func cloneStructValue(v any) any {
 	sv, ok := v.(structVal)
 	if !ok {
 		return v
 	}
-	out := make(map[string]any, len(sv.Fields))
-	for k, val := range sv.Fields {
-		out[k] = val
-	}
-	return structVal{Type: sv.Type, Fields: out}
+	out := make([]any, len(sv.vals))
+	copy(out, sv.vals)
+	return structVal{lay: sv.lay, vals: out}
 }
 
 func mapKey(v any) (any, error) {
@@ -694,7 +386,11 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 			// so a field an actor may not read belongs in a Dto{...} Sel, never
 			// in a bare row list (the generic /api/<entity> read gates fields;
 			// this does not).
-			rows = sortRows(rows, e.Order, e.Desc)
+			if e.OrderBy != nil {
+				rows = sortRowsBy(rows, e.Var, e.OrderBy, e.Desc, scope)
+			} else {
+				rows = sortRows(rows, e.Order, e.Desc)
+			}
 			if e.Limit != nil {
 				if lim := toInt(eval(e.Limit, scope)); lim >= 0 && len(rows) > lim {
 					rows = rows[:lim]
@@ -720,6 +416,12 @@ func evalColl(e *ir.Expr, scope map[string]any) any {
 		}
 		// sum/avg/min/max reduce a numeric value over the (filtered) rows: a
 		// bare column, or an expression evaluated once per row.
+		if e.VType == "text" { // min/max over a text column (see markTextAggs)
+			return reduceText(e.Op, rows, func(r any) (any, bool) {
+				m, ok := r.(record)
+				return m[e.Field], ok
+			})
+		}
 		if e.Sel == nil {
 			return reduceAgg(e.Op, rows, fieldValue(e.Field))
 		}
@@ -880,21 +582,43 @@ func reduceAgg(op string, rows []any, value func(row any) (any, bool)) any {
 	}
 }
 
+// reduceText is reduceAgg's min/max over text values.
+func reduceText(op string, rows []any, value func(row any) (any, bool)) any {
+	best, have := "", false
+	for _, r := range rows {
+		v, ok := value(r)
+		if !ok {
+			continue
+		}
+		t := toStr(v)
+		if !have || (op == "min" && t < best) || (op == "max" && t > best) {
+			best, have = t, true
+		}
+	}
+	return best
+}
+
 // evalRest is the remainder of the interpreter: everything that does not read a
 // collection, split out so eval's collection cases stay legible.
 func evalRest(e *ir.Expr, scope map[string]any) any {
 	switch e.Kind {
+	case "index":
+		// `x[i]` on a list or a json value (the builder allows nothing else
+		// outside a proc): the element or the member, nothing when absent.
+		return indexValue(eval(e.Obj, scope), eval(e.Key, scope))
 	case "struct":
 		// A wire-type literal (`Dto{f: v, …}`, see build.go's checkWireLits):
 		// a plain record — the same shape a row has — so it JSON-encodes as an
 		// object and `.field` reads work on it. (A proc-local struct literal
-		// never reaches eval(); evalInFrame builds those as structVal.)
+		// never reaches eval(); the proc engine builds those as structVal.)
 		out := record{}
 		for i, f := range e.Fields {
 			if i < len(e.Args) {
 				out[f] = eval(e.Args[i], scope)
 			}
 		}
+		omitEmpty(out, e.Omit)
+		nullEmpty(out, e.Nulls)
 		return out
 	case "astate":
 		// Action status and form-field status are client-only runtime state; the
@@ -924,13 +648,13 @@ func evalRest(e *ir.Expr, scope map[string]any) any {
 		// here, at the call site that decides whether e.R gets evaluated at
 		// all, rather than inside applyBin — by the time applyBin runs, both
 		// operands have already been evaluated, which is exactly the bug
-		// this fixes (see evalInFrame's "bin" case, this function's
+		// this fixes (see the proc engine's "bin" case, this function's
 		// proc-body counterpart, for the motivating out-of-bounds case that
 		// makes this more than a performance nicety there). eval() itself
 		// has no "index" case today (only a proc body can index an array —
-		// see evalInFrame), so no expression eval() evaluates can fail the
+		// see proccompile.go), so no expression eval() evaluates can fail the
 		// way an unguarded `xs[i]` can; this still keeps eval() and
-		// evalInFrame's short-circuit semantics identical, per this file's
+		// the proc engine's short-circuit semantics identical, per this file's
 		// existing convention that the two interpreters never disagree
 		// about what an operator means, and protects any future eval() case
 		// that can fail or have a side effect on the right of `&&`/`||`.
@@ -998,14 +722,14 @@ func textOperands(l, r any) (string, string, bool) {
 }
 
 // applyBin evaluates one binary operator over its already-evaluated operands.
-// Split out of evalRest's "bin" case so evalInFrame (a proc body's expression
+// Split out of evalRest's "bin" case so the proc engine (proccompile.go, a proc body's expression
 // evaluator, which has no flat scope map to hand eval) can share the exact same
-// operator semantics rather than reimplementing them — eval() and evalInFrame()
+// operator semantics rather than reimplementing them — eval() and the proc engine
 // must never disagree about what `+`/`==`/etc. mean.
 func applyBin(op string, l, r any) any {
 	switch op {
 	case "&&":
-		// Neither of applyBin's two callers (evalRest's and evalInFrame's
+		// Neither of applyBin's two callers (evalRest's and the proc engine's
 		// "bin" cases, above) ever reaches this arm for "&&"/"||" — both
 		// intercept these two ops before calling applyBin at all, so they
 		// can short-circuit and skip evaluating e.R entirely (see their own
@@ -1020,6 +744,12 @@ func applyBin(op string, l, r any) any {
 	case "||":
 		return truthy(l) || truthy(r)
 	case "+":
+		if la, ok := l.([]any); ok {
+			if ra, ok := r.([]any); ok {
+				out := make([]any, 0, len(la)+len(ra))
+				return append(append(out, la...), ra...)
+			}
+		}
 		if ls, ok := l.(string); ok {
 			return ls + toStr(r)
 		}
@@ -1177,23 +907,149 @@ func shiftRight(x, n int) int {
 // the pure standard library (string/date/math/money), evaluated identically here
 // and in assets/facet.js so every executor agrees.
 func evalCall(e *ir.Expr, scope map[string]any) any {
+	// given(p): whether the caller sent optional parameter p at all — an
+	// absent `bool?` and a sent `false` bind the same zero, this tells them
+	// apart.
+	if e.Name == "given" && len(e.Args) == 1 && e.Args[0].Kind == "ref" {
+		g, _ := scope[givenKey].(map[string]bool)
+		return g[e.Args[0].Name]
+	}
 	args := make([]any, len(e.Args))
 	for i, a := range e.Args {
 		args[i] = eval(a, scope)
 	}
+	// fileDigest(file): the hex sha256 of a stored upload's bytes, "" when the
+	// value is not one of this server's files — the content's identity, for
+	// spotting a duplicate without naming files by their content.
+	if e.Name == "fileDigest" {
+		if run, ok := scope[procRunnerKey].(procRunner); ok {
+			v, _ := run("\x00fileDigest", args)
+			return v
+		}
+		return ""
+	}
+	// A `proc` called in an action expression (the builder allows it only
+	// there): the action's scope carries the runner.
+	if run, ok := scope[procRunnerKey].(procRunner); ok {
+		if v, isProc := run(e.Name, args); isProc {
+			return v
+		}
+	}
 	return callBuiltin(e.Name, args)
 }
+
+// omitEmpty drops each named optional field whose value is empty — null, "",
+// or an empty list — so an optional wire field is absent rather than "" or [].
+func omitEmpty(rec map[string]any, optional []string) {
+	for _, f := range optional {
+		switch v := rec[f].(type) {
+		case nil:
+			delete(rec, f)
+		case string:
+			if v == "" {
+				delete(rec, f)
+			}
+		case []any:
+			if len(v) == 0 {
+				delete(rec, f)
+			}
+		}
+	}
+}
+
+// nullEmpty makes each named `T or null` field present, and null when it is
+// empty (unset, nothing, or "").
+func nullEmpty(rec map[string]any, nullable []string) {
+	for _, f := range nullable {
+		if s, ok := rec[f].(string); !ok && rec[f] != nil || ok && s != "" {
+			continue
+		}
+		rec[f] = nil
+	}
+}
+
+// sortRowsBy orders rows by a key computed per row (`list(… by <expr>)`),
+// stably, with v bound to each row while its key is read.
+func sortRowsBy(rows []any, v string, key *ir.Expr, desc bool, scope map[string]any) []any {
+	prev, had := scope[v]
+	keys := make([]any, len(rows))
+	for i, r := range rows {
+		scope[v] = r
+		keys[i] = evalPerRow(key, scope)
+	}
+	if had {
+		scope[v] = prev
+	} else {
+		delete(scope, v)
+	}
+	idx := make([]int, len(rows))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		if desc {
+			return lessVal(keys[idx[b]], keys[idx[a]])
+		}
+		return lessVal(keys[idx[a]], keys[idx[b]])
+	})
+	out := make([]any, len(rows))
+	for i, j := range idx {
+		out[i] = rows[j]
+	}
+	return out
+}
+
+// isWireType reports whether name is a declared wire `type`.
+func (s *Server) isWireType(name string) bool {
+	for _, t := range s.ir.Types {
+		if t.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// givenKey is the hidden action-scope entry naming the parameters a caller sent.
+const givenKey = "\x00given"
+
+// indexValue reads element i of a list, or member k of an object; nothing
+// when it is out of range or absent.
+func indexValue(obj, key any) any {
+	switch c := obj.(type) {
+	case []any:
+		i := toInt(key)
+		if i < 0 || i >= len(c) {
+			return nil
+		}
+		return c[i]
+	case map[string]any:
+		return c[toStr(key)]
+	}
+	return nil
+}
+
+// procRunnerKey is the hidden action-scope entry holding a procRunner; it is
+// not an identifier, so no program name can collide with it.
+const procRunnerKey = "\x00proc"
+
+// procRunner runs a proc by name, reporting false when name is not a proc.
+type procRunner func(name string, args []any) (any, bool)
+
+// procCallError carries a proc failure out of an expression evaluation to the
+// action that ran it (see execActionBlock's recover).
+type procCallError struct{ err error }
 
 // callProcBuiltin dispatches a proc-body builtin call, exactly like callBuiltin
 // below, except that it also recognizes the I/O capability builtins
 // (readFile/writeFile/httpGet/httpPost — see runtime/io.go — and
-// listen/accept/readBytes/writeBytes/closeConn — see runtime/netconn.go),
+// listen/accept/connect/readBytes/writeBytes/closeConn/setTimeoutMs/
+// connError — see runtime/netconn.go),
 // which callBuiltin itself cannot: they need the server's sandboxed
 // data-directory root, HTTP client config, or listener/connection registry,
 // and — unlike every builtin callBuiltin handles — they can fail for reasons
 // outside the program's control (missing file, permission, unreachable host,
 // non-2xx response, connection reset), so this returns an error where
-// callBuiltin never does. Only evalInFrame's "call" case reaches this;
+// callBuiltin never does. Only the proc engine's "call" case reaches this;
 // callBuiltin itself stays the single dispatch table for eval()/evalCall's
 // flat-scope (action/view) path, which can never be asked to run one of
 // these (internal/ir/build.go's checkNoIO bars them from ever reaching
@@ -1210,33 +1066,99 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioReadFile(toStr(arg(0)))
 	case "writeFile":
 		return s.ioWriteFile(toStr(arg(0)), toStr(arg(1)))
+	case "appendFile":
+		return s.ioAppendFile(toStr(arg(0)), toStr(arg(1)))
+	case "fileExists":
+		return s.ioFileExists(toStr(arg(0)))
+	case "truncateFile":
+		return s.ioTruncateFile(toStr(arg(0)), toInt(arg(1)))
+	case "fileSize":
+		return s.ioFileSize(toStr(arg(0)))
+	case "readFileAt":
+		return s.ioReadFileAt(toStr(arg(0)), toInt(arg(1)), toInt(arg(2)))
+	case "writeFileAt":
+		return s.ioWriteFileAt(toStr(arg(0)), toInt(arg(1)), arg(2))
+	case "syncFile":
+		return s.ioSyncFile(toStr(arg(0)))
+	case "renameFile":
+		return s.ioRenameFile(toStr(arg(0)), toStr(arg(1)))
+	case "removeFile":
+		return s.ioRemoveFile(toStr(arg(0)))
 	case "httpGet":
 		return s.ioHTTPGet(toStr(arg(0)))
 	case "httpPost":
 		return s.ioHTTPPost(toStr(arg(0)), toStr(arg(1)))
+	case "$shared.get":
+		return s.shared.get(toStr(arg(0)))
+	case "$shared.set":
+		s.shared.set(toStr(arg(0)), arg(1))
+		return true, nil
+	case "$detach":
+		return s.detachProc(toStr(arg(0)), argVals[1:])
+	case "sleepMs":
+		return ioSleepMs(toInt(arg(0)))
+	case "nowMs":
+		return ioNowMs()
+	case "signals":
+		return s.ioSignals()
+	case "monoMs":
+		return ioMonoMs()
 	case "channel":
 		return s.channels.create(), nil
 	case "send":
 		return s.channels.send(toInt(arg(0)), toStr(arg(1)))
 	case "recv":
 		return s.channels.recv(toInt(arg(0)))
+	case "listenOn":
+		return s.ioListenOn("listenOn", toStr(arg(0)), toInt(arg(1)))
 	case "listen":
 		return s.ioListen(toInt(arg(0)))
 	case "accept":
 		return s.ioAccept(toInt(arg(0)))
 	case "readBytes":
 		return s.ioReadBytes(toInt(arg(0)), toInt(arg(1)))
+	case "aesGcmSeal":
+		return aesGcmSeal(arg(0), arg(1), arg(2))
+	case "aesGcmOpen":
+		return aesGcmOpen(arg(0), arg(1), arg(2))
+	case "aesGcmAuthentic":
+		return aesGcmAuthentic(arg(0), arg(1), arg(2))
 	case "writeBytes":
 		return s.ioWriteBytes(toInt(arg(0)), arg(1))
 	case "closeConn":
 		return s.ioCloseConn(toInt(arg(0)))
+	case "connect":
+		return s.ioConnect(toStr(arg(0)), toInt(arg(1)))
+	case "setTimeoutMs":
+		return s.ioSetTimeoutMs(toInt(arg(0)), toInt(arg(1)))
+	case "connError":
+		return s.ioConnError(toInt(arg(0)))
+	case "pollBytes":
+		return s.ioPollBytes(toInt(arg(0)), toInt(arg(1)), toInt(arg(2)))
+	case "connOpen":
+		return s.ioConnOpen(toInt(arg(0)))
+	case "shutdownConn":
+		return s.ioShutdownConn(toInt(arg(0)))
+	case "writeStdout":
+		return s.ioWriteStdout(toStr(arg(0)))
+	case "writeStderr":
+		return s.ioWriteStderr(toStr(arg(0)))
+	case "readStdin":
+		return s.ioReadStdin()
+	case "envVar":
+		return os.Getenv(toStr(arg(0))), nil
+	case "envSet":
+		_, set := os.LookupEnv(toStr(arg(0)))
+		return set, nil
+	case "randomBytes":
+		return randomBytes(toInt(arg(0)))
 	}
 	return callBuiltin(name, argVals), nil
 }
 
 // callBuiltin dispatches a builtin over its already-evaluated arguments. Split
 // out of evalCall the same way applyBin is split out of evalRest's "bin" case:
-// evalInFrame has no flat scope map to hand eval, but a proc body may still call
+// the proc engine has no flat scope map to hand eval, but a proc body may still call
 // a pure builtin (abs/min/max/…), and it must resolve identically either way.
 func callBuiltin(name string, argVals []any) any {
 	arg := func(i int) any {
@@ -1254,6 +1176,39 @@ func callBuiltin(name string, argVals []any) any {
 			return 0
 		}
 		return rand.Intn(n)
+	case "ed25519Verify":
+		return ed25519Verify(toStr(arg(0)), toStr(arg(1)), toStr(arg(2)))
+	case "ecdsaP256Verify":
+		return ecdsaP256Verify(toStr(arg(0)), toStr(arg(1)), toStr(arg(2)))
+	case "sha256Hex":
+		sum := sha256.Sum256([]byte(toStr(arg(0))))
+		return hex.EncodeToString(sum[:])
+	case "canonicalJson":
+		return canonicalJSON(arg(0))
+	case "fromLocal":
+		return fromLocal(toStr(arg(0)), toStr(arg(1)))
+	case "formatIn":
+		return formatIn(toInt(arg(0)), toStr(arg(1)), toStr(arg(2)))
+	case "zoneValid":
+		_, ok := zone(toStr(arg(0)))
+		return ok
+	case "shuffleOrder":
+		order := shuffleOrder(toStr(arg(0)), toInt(arg(1)))
+		out := make([]any, len(order))
+		for i, v := range order {
+			out[i] = v
+		}
+		return out
+	case "verifyPassword":
+		// arg(0) is a @password field's stored hash (the compiler admits nothing
+		// else there), arg(1) the candidate.
+		return passwordMatches(toStr(arg(0)), toStr(arg(1)))
+	case "totpSecret":
+		return newTOTPSecret()
+	case "randomToken":
+		return secureText(toInt(arg(0)))
+	case "totpValid":
+		return totpValid(toStr(arg(0)), toStr(arg(1)), time.Now())
 	case "abs":
 		// Preserves whichever numeric flavour it is handed — abs(-2.5) is a
 		// float, abs(-2) is an int — matching internal/ir/build.go's
@@ -1433,7 +1388,7 @@ func callBuiltin(name string, argVals []any) any {
 		// of the array value, not a parallel runtime kind, so it is len()-able,
 		// index-readable, and copy-on-assign (cloneArrayValue) for free. What
 		// makes it a byte buffer rather than a plain array is purely the 0-255
-		// range check on every index-write (runtime/server.go's execProcBlock,
+		// range check on every index-write (runtime/proccompile.go,
 		// "indexset" case, gated on the IR's Stmt.Bytes flag) — a compile-time
 		// distinction the elements themselves carry no runtime tag for.
 		n := toInt(arg(0))
@@ -1479,6 +1434,23 @@ func callBuiltin(name string, argVals []any) any {
 		return ago(toInt(arg(0)), int(clock().Unix()))
 	case "iso":
 		return iso(toInt(arg(0)))
+	case "fromIso":
+		return fromIso(toStr(arg(0)))
+	case "fromJson":
+		// JSON text as the value it encodes (an object, a list, a scalar);
+		// nothing for "" or text that is not JSON.
+		var v any
+		if err := json.Unmarshal([]byte(toStr(arg(0))), &v); err != nil {
+			return nil
+		}
+		return v
+	case "first":
+		// A list's first element, or nothing — which an optional wire field
+		// then leaves out (`poll: first(list(pollDTO(p) in Poll where …))`).
+		if l, ok := arg(0).([]any); ok && len(l) > 0 {
+			return l[0]
+		}
+		return nil
 	case "compact":
 		return compact(toInt(arg(0)))
 	case "commas":
@@ -1489,6 +1461,15 @@ func callBuiltin(name string, argVals []any) any {
 			n = 0
 		}
 		return runeSlice(toStr(arg(0)), 0, n)
+	case "join":
+		// join(list, sep): the elements as text, sep between them — split's
+		// inverse.
+		items, _ := arg(0).([]any)
+		parts := make([]string, len(items))
+		for i, it := range items {
+			parts[i] = toStr(it)
+		}
+		return strings.Join(parts, toStr(arg(1)))
 	case "split":
 		// split(s, sep) -> [text], matching Go's strings.Split exactly,
 		// including its edge cases (empty sep splits after every UTF-8
@@ -1624,16 +1605,13 @@ func formatDebugValue(v any) string {
 		}
 		return formatDebugMap(keyed)
 	case structVal:
-		keys := make([]string, 0, len(t.Fields))
-		for k := range t.Fields {
-			keys = append(keys, k)
-		}
+		keys := append([]string{}, t.lay.fields...)
 		sort.Strings(keys)
 		parts := make([]string, len(keys))
 		for i, k := range keys {
-			parts[i] = k + ": " + formatDebugValue(t.Fields[k])
+			parts[i] = k + ": " + formatDebugValue(t.field(k))
 		}
-		return t.Type + "{" + strings.Join(parts, ", ") + "}"
+		return t.lay.name + "{" + strings.Join(parts, ", ") + "}"
 	default:
 		// int/int64 and anything else this runtime hands print() go through
 		// toStr, which already has their exact rendering (itoa, etc.) — no
@@ -1716,7 +1694,7 @@ func isFloatVal(v any) bool { _, ok := v.(float64); return ok }
 
 // negate implements unary `-`: float-preserving for a float64 operand (so
 // `-3.14` is a float, not toInt(3.14) truncated to 0 and then negated to 0),
-// int otherwise — shared by evalInFrame's and evalRest's "un" cases so they
+// int otherwise — shared by the proc engine's and evalRest's "un" cases so they
 // cannot disagree, the same reason applyBin is factored out for "bin".
 func negate(x any) any {
 	if isFloatVal(x) {
@@ -1746,11 +1724,9 @@ func toFloat(v any) float64 {
 		}
 		return 0
 	case string:
-		f, _ := strconv.ParseFloat(strings.TrimSpace(t), 64)
-		return f
+		return parseFloatText(t)
 	case []byte:
-		f, _ := strconv.ParseFloat(strings.TrimSpace(string(t)), 64)
-		return f
+		return parseFloatText(string(t))
 	}
 	return 0
 }
@@ -1782,6 +1758,18 @@ func parseNumericText(s string) (int, bool) {
 		return 0, false
 	}
 	return int(f), true
+}
+
+// parseFloatText is toFloat for text: the numericText shape toInt and toMoney
+// accept and nothing else ("inf", "NaN" and "0x1p3" are 0, as they are in
+// assets/facet.js's toFloatJS), at full float precision.
+func parseFloatText(s string) float64 {
+	t := strings.TrimSpace(s)
+	if !numericText.MatchString(t) {
+		return 0
+	}
+	f, _ := strconv.ParseFloat(t, 64)
+	return f
 }
 
 // parseMoneyText reports the value of a money amount written as decimal text

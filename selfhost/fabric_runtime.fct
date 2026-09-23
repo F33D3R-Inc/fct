@@ -1,0 +1,366 @@
+import "fabric_controller_core.fct"
+
+app FabricRuntimeSelfHost:
+    # Port of fabric/crates/fabric-runtime/src/lib.rs: FabricRuntime, the
+    # assembler that joins protocol -> telemetry -> workload -> optimizer ->
+    # controller -> PlacementMechanism into one control loop.
+    #
+    # Rust holds the PlacementFabric in an Rc<RefCell<_>> shared by the
+    # runtime and the mechanism the controller owns. Here the mechanism owns
+    # it (inside the controller's "fabric-placement" executor), and
+    # fabricRuntimePlacement / fabricRuntimeWithPlacement read and write it
+    # there — the one copy both sides see, as the RefCell was.
+
+    proc defaultPlacementCapacity() -> int:
+        return 64
+
+    proc recentObservations() -> int:
+        return 1024
+
+    struct FabricRuntime:
+        topology: TopologyRegistry
+        analyzer: WorkloadAnalyzer
+        optimizer: WorkloadOptimizer
+        observations: [Observation]
+        state: FabricState
+        nodes: NodeRegistry
+        clockMs: int
+        controller: FabricController
+        placementGeneration: int
+        placementCapacity: int
+        heartbeatDeadlineMs: int
+
+    proc fabricRuntimeNew() -> FabricRuntime:
+        let policy = do controllerPolicyDefault()
+        let rt = do fabricRuntimeWithPolicy(policy)
+        return rt
+
+    proc fabricRuntimeWithPolicy(policy: ControllerPolicy) -> FabricRuntime:
+        let fabric = do placementFabricNew()
+        let mechanism = do placementMechanismNew(fabric)
+        let executor = do placementMechanismExecutor(mechanism)
+        let bare = do fabricControllerNew(policy)
+        let controller = do fabricControllerRegisterExecutor(bare, executor)
+        let topology = do topologyRegistryNew()
+        let analyzer = do workloadAnalyzerNew()
+        let optimizer = do workloadOptimizerDefault()
+        let state = do fabricStateNew()
+        let nodes = do nodeRegistryNew()
+        let capacity = do defaultPlacementCapacity()
+        let deadline = do defaultHeartbeatDeadlineMs()
+        return FabricRuntime{topology: topology, analyzer: analyzer, optimizer: optimizer, observations: [], state: state, nodes: nodes, clockMs: 0, controller: controller, placementGeneration: fabric.generation, placementCapacity: capacity, heartbeatDeadlineMs: deadline}
+
+    proc fabricRuntimeWithPlacementCapacity(rt: FabricRuntime, capacity: int) -> FabricRuntime:
+        return FabricRuntime{topology: rt.topology, analyzer: rt.analyzer, optimizer: rt.optimizer, observations: rt.observations, state: rt.state, nodes: rt.nodes, clockMs: rt.clockMs, controller: rt.controller, placementGeneration: rt.placementGeneration, placementCapacity: max(capacity, 1), heartbeatDeadlineMs: rt.heartbeatDeadlineMs}
+
+    proc fabricRuntimeWithHeartbeatDeadlineMs(rt: FabricRuntime, deadlineMs: int) -> FabricRuntime:
+        return FabricRuntime{topology: rt.topology, analyzer: rt.analyzer, optimizer: rt.optimizer, observations: rt.observations, state: rt.state, nodes: rt.nodes, clockMs: rt.clockMs, controller: rt.controller, placementGeneration: rt.placementGeneration, placementCapacity: rt.placementCapacity, heartbeatDeadlineMs: deadlineMs}
+
+    private proc withController(rt: FabricRuntime, controller: FabricController) -> FabricRuntime:
+        return FabricRuntime{topology: rt.topology, analyzer: rt.analyzer, optimizer: rt.optimizer, observations: rt.observations, state: rt.state, nodes: rt.nodes, clockMs: rt.clockMs, controller: controller, placementGeneration: rt.placementGeneration, placementCapacity: rt.placementCapacity, heartbeatDeadlineMs: rt.heartbeatDeadlineMs}
+
+    private proc mechanismIndex(c: FabricController) -> int:
+        let name = do mechanismName()
+        let idx = do fabricControllerExecutorIndexByName(c.executors, name)
+        return idx
+
+    # placement: the routing/replication/migration state the mechanism
+    # shares with the runtime.
+    proc fabricRuntimePlacement(rt: FabricRuntime) -> PlacementFabric:
+        let idx = do mechanismIndex(rt.controller)
+        return rt.controller.executors[idx].mechanism.fabric
+
+    # withPlacement: write the shared state back (a `borrow_mut()` edit).
+    proc fabricRuntimeWithPlacement(rt: FabricRuntime, fabric: PlacementFabric) -> FabricRuntime:
+        let idx = do mechanismIndex(rt.controller)
+        let mut executors = rt.controller.executors
+        let mech = do placementMechanismWithFabric(executors[idx].mechanism, fabric)
+        let ex = do executorWithMechanism(executors[idx], mech)
+        executors[idx] = ex
+        let c = rt.controller
+        let out = do withController(rt, FabricController{policy: c.policy, executors: executors, actions: c.actions, ledger: c.ledger})
+        return out
+
+    proc fabricRuntimeObservations(rt: FabricRuntime) -> [Observation]:
+        return rt.observations
+
+    # remember: the bounded window drops its older half when full.
+    private proc remember(observations: [Observation], observation: Observation) -> [Observation]:
+        let limit = do recentObservations()
+        let mut kept = observations
+        if len(observations) >= limit:
+            let mut tail = []
+            let n = len(observations)
+            let mut i = limit / 2
+            loop i < n:
+                tail = append(tail, observations[i])
+                i = i + 1
+            kept = tail
+        return append(kept, observation)
+
+    # fleetView: condition from the heartbeat registry, load from the newest
+    # telemetry each node reported, generation from the placement map.
+    proc fabricRuntimeFleetView(rt: FabricRuntime) -> FleetView:
+        let fabric = do fabricRuntimePlacement(rt)
+        let mut fleet = do fleetViewNew(fabric.generation)
+        let placements = do topologyRegistryPlacements(rt.topology)
+        let n = len(rt.nodes.nodes)
+        let mut i = 0
+        loop i < n:
+            let node = rt.nodes.nodes[i]
+            let condition = do registeredNodeHealth(node, rt.clockMs, rt.heartbeatDeadlineMs)
+            let mut hosted = 0
+            let m = len(placements)
+            let mut j = 0
+            loop j < m:
+                if placements[j].dbmsId == node.id:
+                    hosted = hosted + 1
+                j = j + 1
+            let mut cpu = 0.0
+            let mut memory = 0.0
+            let seen = do fabricStateForNode(rt.state, node.id)
+            let k = len(seen)
+            let mut o = 0
+            loop o < k:
+                cpu = max(cpu, seen[o].metrics.cpuUtilization)
+                memory = max(memory, seen[o].metrics.memoryUtilization)
+                o = o + 1
+            let status = do nodeStatusNew(DbmsId{value: node.id}, node.region, condition, rt.placementCapacity)
+            let loaded = do nodeStatusWithLoad(status, hosted, cpu, memory)
+            let inserted = do fleetViewInsert(fleet, loaded)
+            fleet = inserted
+            i = i + 1
+        return fleet
+
+    private proc view(rt: FabricRuntime) -> ControlPlaneView:
+        let fleet = do fabricRuntimeFleetView(rt)
+        let v = do controlPlaneViewNew(rt.topology, fleet, rt.clockMs)
+        return v
+
+    # adoptTopology: take a placement map wholesale (a source that knows the
+    # real shard ids), then push it into the mechanisms.
+    proc fabricRuntimeAdoptTopology(rt: FabricRuntime, topology: TopologyRegistry) -> FabricRuntime:
+        let adopted = FabricRuntime{topology: topology, analyzer: rt.analyzer, optimizer: rt.optimizer, observations: rt.observations, state: rt.state, nodes: rt.nodes, clockMs: rt.clockMs, controller: rt.controller, placementGeneration: rt.placementGeneration, placementCapacity: rt.placementCapacity, heartbeatDeadlineMs: rt.heartbeatDeadlineMs}
+        let synced = do syncPlacement(adopted)
+        return synced
+
+    struct RuntimeSubmitResult:
+        ok: bool
+        id: ActionId
+        err: ValidationError
+        runtime: FabricRuntime
+
+    proc fabricRuntimeSubmit(rt: FabricRuntime, envelope: DecisionEnvelope, baseline: WorkloadProfile) -> RuntimeSubmitResult:
+        let v = do view(rt)
+        let submitted = do fabricControllerSubmit(rt.controller, envelope, baseline, v)
+        let out = do withController(rt, submitted.controller)
+        return RuntimeSubmitResult{ok: submitted.ok, id: submitted.id, err: submitted.err, runtime: out}
+
+    struct RuntimeTickResult:
+        ids: [ActionId]
+        states: [text]
+        runtime: FabricRuntime
+
+    # advanceActions: drive every in-flight action one step, then fold the
+    # placement edits back into the map.
+    proc fabricRuntimeAdvanceActions(rt: FabricRuntime) -> RuntimeTickResult:
+        let v = do view(rt)
+        let ticked = do fabricControllerTick(rt.controller, v)
+        let stepped = do withController(rt, ticked.controller)
+        let reconciled = do reconcilePlacement(stepped)
+        return RuntimeTickResult{ids: ticked.ids, states: ticked.states, runtime: reconciled}
+
+    struct RuntimeStepResult:
+        known: bool
+        execState: text
+        runtime: FabricRuntime
+
+    proc fabricRuntimeAdvance(rt: FabricRuntime, id: ActionId) -> RuntimeStepResult:
+        let v = do view(rt)
+        let advanced = do fabricControllerAdvance(rt.controller, id, v)
+        let stepped = do withController(rt, advanced.controller)
+        let reconciled = do reconcilePlacement(stepped)
+        return RuntimeStepResult{known: advanced.known, execState: advanced.execState, runtime: reconciled}
+
+    struct RuntimeMeasureResult:
+        ok: bool
+        outcome: ExecutionOutcome
+        err: MeasurementError
+        runtime: FabricRuntime
+
+    proc fabricRuntimeMeasure(rt: FabricRuntime, id: ActionId, after: WorkloadProfile) -> RuntimeMeasureResult:
+        let v = do view(rt)
+        let measured = do fabricControllerMeasure(rt.controller, id, after, v)
+        let out = do withController(rt, measured.controller)
+        return RuntimeMeasureResult{ok: measured.ok, outcome: measured.outcome, err: measured.err, runtime: out}
+
+    proc fabricRuntimeAbort(rt: FabricRuntime, id: ActionId) -> RuntimeStepResult:
+        let v = do view(rt)
+        let aborted = do fabricControllerAbort(rt.controller, id, v)
+        let out = do withController(rt, aborted.controller)
+        return RuntimeStepResult{known: aborted.known, execState: aborted.execState, runtime: out}
+
+    # syncPlacement: push the map and the fleet's liveness into the mechanisms.
+    private proc syncPlacement(rt: FabricRuntime) -> FabricRuntime:
+        let fabric = do fabricRuntimePlacement(rt)
+        let adopted = do placementFabricAdoptTopology(fabric, rt.topology)
+        let written = do fabricRuntimeWithPlacement(rt, adopted)
+        let seeded = do fabricControllerSeedReplicas(written.controller, rt.topology)
+        let withSeeded = do withController(written, seeded)
+        let regenerated = FabricRuntime{topology: withSeeded.topology, analyzer: withSeeded.analyzer, optimizer: withSeeded.optimizer, observations: withSeeded.observations, state: withSeeded.state, nodes: withSeeded.nodes, clockMs: withSeeded.clockMs, controller: withSeeded.controller, placementGeneration: adopted.generation, placementCapacity: withSeeded.placementCapacity, heartbeatDeadlineMs: withSeeded.heartbeatDeadlineMs}
+        let synced = do syncNodes(regenerated)
+        return synced
+
+    private proc syncNodes(rt: FabricRuntime) -> FabricRuntime:
+        let fabric = do fabricRuntimePlacement(rt)
+        let observed = do placementFabricObserveNodes(fabric, rt.nodes, rt.clockMs, rt.heartbeatDeadlineMs)
+        let out = do fabricRuntimeWithPlacement(rt, observed)
+        return out
+
+    # reconcilePlacement: the mechanism's map first (it moves a coordinate
+    # the instant authority moves, and is the only source when it chose the
+    # destination), then the controller's own PlacementChanges on top.
+    private proc reconcilePlacement(rt: FabricRuntime) -> FabricRuntime:
+        let fabric = do fabricRuntimePlacement(rt)
+        let moved = fabric.generation != rt.placementGeneration
+        let mut topology = rt.topology
+        let mut generation = rt.placementGeneration
+        if moved:
+            topology = fabric.topology
+            generation = fabric.generation
+        let mut changed = moved
+        let changes = do fabricControllerPlacementChanges(rt.controller)
+        let n = len(changes)
+        let mut i = 0
+        loop i < n:
+            let applied = do placementChangeApply(changes[i], topology)
+            topology = applied.registry
+            if applied.moved:
+                changed = true
+            i = i + 1
+        let mut controller = rt.controller
+        if changed:
+            let seeded = do fabricControllerSeedReplicas(controller, topology)
+            controller = seeded
+        return FabricRuntime{topology: topology, analyzer: rt.analyzer, optimizer: rt.optimizer, observations: rt.observations, state: rt.state, nodes: rt.nodes, clockMs: rt.clockMs, controller: controller, placementGeneration: generation, placementCapacity: rt.placementCapacity, heartbeatDeadlineMs: rt.heartbeatDeadlineMs}
+
+    proc fabricRuntimeClockMs(rt: FabricRuntime) -> int:
+        return rt.clockMs
+
+    # advanceClock: message time only ever moves forward.
+    private proc advanceClock(rt: FabricRuntime, timestampMs: int) -> FabricRuntime:
+        return FabricRuntime{topology: rt.topology, analyzer: rt.analyzer, optimizer: rt.optimizer, observations: rt.observations, state: rt.state, nodes: rt.nodes, clockMs: max(rt.clockMs, timestampMs), controller: rt.controller, placementGeneration: rt.placementGeneration, placementCapacity: rt.placementCapacity, heartbeatDeadlineMs: rt.heartbeatDeadlineMs}
+
+    # tickClock: a live "now" re-judges liveness even when nothing reports.
+    proc fabricRuntimeTickClock(rt: FabricRuntime, nowMs: int) -> FabricRuntime:
+        let advanced = do advanceClock(rt, nowMs)
+        let synced = do syncNodes(advanced)
+        return synced
+
+    struct RuntimeHandleResult:
+        response: FabricResponse
+        runtime: FabricRuntime
+
+    private proc withNodes(rt: FabricRuntime, nodes: NodeRegistry) -> FabricRuntime:
+        return FabricRuntime{topology: rt.topology, analyzer: rt.analyzer, optimizer: rt.optimizer, observations: rt.observations, state: rt.state, nodes: nodes, clockMs: rt.clockMs, controller: rt.controller, placementGeneration: rt.placementGeneration, placementCapacity: rt.placementCapacity, heartbeatDeadlineMs: rt.heartbeatDeadlineMs}
+
+    # handle: RegisterNode is the inventory's only entrance; a heartbeat
+    # from an unregistered node is Rejected rather than filed.
+    proc fabricRuntimeHandle(rt: FabricRuntime, message: FabricMessage) -> RuntimeHandleResult:
+        let base = do protoEmptyFabricResponse()
+        if message.kind == "RegisterNode":
+            let registered = do nodeRegistryRegister(rt.nodes, message.registerNode, rt.clockMs)
+            let withReg = do withNodes(rt, registered.registry)
+            let synced = do syncNodes(withReg)
+            return RuntimeHandleResult{response: FabricResponse{kind: "Registered", registeredNodeId: message.registerNode.nodeId.value, proposalCoordinate: base.proposalCoordinate, proposalAction: base.proposalAction, proposalExpectedGain: base.proposalExpectedGain, proposalEstimatedCost: base.proposalEstimatedCost, proposalConfidence: base.proposalConfidence, rejectedReason: base.rejectedReason}, runtime: synced}
+        let acknowledged = FabricResponse{kind: "Acknowledged", registeredNodeId: base.registeredNodeId, proposalCoordinate: base.proposalCoordinate, proposalAction: base.proposalAction, proposalExpectedGain: base.proposalExpectedGain, proposalEstimatedCost: base.proposalEstimatedCost, proposalConfidence: base.proposalConfidence, rejectedReason: base.rejectedReason}
+        if message.kind == "Heartbeat":
+            let clocked = do advanceClock(rt, message.heartbeat.timestampMs)
+            let beat = do nodeRegistryHeartbeat(clocked.nodes, message.heartbeat)
+            if !beat.ok:
+                return RuntimeHandleResult{response: FabricResponse{kind: "Rejected", registeredNodeId: base.registeredNodeId, proposalCoordinate: base.proposalCoordinate, proposalAction: base.proposalAction, proposalExpectedGain: base.proposalExpectedGain, proposalEstimatedCost: base.proposalEstimatedCost, proposalConfidence: base.proposalConfidence, rejectedReason: beat.err}, runtime: clocked}
+            let withBeat = do withNodes(clocked, beat.registry)
+            let synced2 = do syncNodes(withBeat)
+            return RuntimeHandleResult{response: acknowledged, runtime: synced2}
+        if message.kind == "Topology":
+            let clocked2 = do advanceClock(rt, message.topology.timestampMs)
+            let ingested = do ingestTopology(clocked2, message.topology)
+            return RuntimeHandleResult{response: acknowledged, runtime: ingested}
+        if message.kind == "Telemetry":
+            let clocked3 = do advanceClock(rt, message.telemetry.timestampMs)
+            let ingested2 = do ingestTelemetry(clocked3, message.telemetry)
+            return RuntimeHandleResult{response: acknowledged, runtime: ingested2}
+        let clocked4 = do advanceClock(rt, message.workload.timestampMs)
+        let ingested3 = do ingestWorkload(clocked4, message.workload)
+        return RuntimeHandleResult{response: acknowledged, runtime: ingested3}
+
+    # ingestTopology: the protocol's report carries no shard id, so one is
+    # derived from the coordinate (index), with an "unknown" domain.
+    private proc ingestTopology(rt: FabricRuntime, report: TopologyReport) -> FabricRuntime:
+        let mut topology = rt.topology
+        let n = len(report.placements)
+        let mut i = 0
+        loop i < n:
+            let p = report.placements[i]
+            let shardId = do coordinateIndex(p.coordinate)
+            let placed = do topologyRegistryPlace(topology, p.dbmsId.value, shardId, p.coordinate, p.region)
+            topology = placed
+            i = i + 1
+        let withTopology = FabricRuntime{topology: topology, analyzer: rt.analyzer, optimizer: rt.optimizer, observations: rt.observations, state: rt.state, nodes: rt.nodes, clockMs: rt.clockMs, controller: rt.controller, placementGeneration: rt.placementGeneration, placementCapacity: rt.placementCapacity, heartbeatDeadlineMs: rt.heartbeatDeadlineMs}
+        let synced = do syncPlacement(withTopology)
+        return synced
+
+    private proc observe(rt: FabricRuntime, dbmsId: text, observation: Observation) -> FabricRuntime:
+        let analyzer = do workloadAnalyzerObserve(rt.analyzer, observation)
+        let state = do fabricStateRecord(rt.state, dbmsId, observation)
+        let observations = do remember(rt.observations, observation)
+        return FabricRuntime{topology: rt.topology, analyzer: analyzer, optimizer: rt.optimizer, observations: observations, state: state, nodes: rt.nodes, clockMs: rt.clockMs, controller: rt.controller, placementGeneration: rt.placementGeneration, placementCapacity: rt.placementCapacity, heartbeatDeadlineMs: rt.heartbeatDeadlineMs}
+
+    private proc ingestTelemetry(rt: FabricRuntime, batch: TelemetryBatch) -> FabricRuntime:
+        let mut current = rt
+        let n = len(batch.samples)
+        let mut i = 0
+        loop i < n:
+            let sample = batch.samples[i]
+            let metrics = do telemetrySampleMetrics(sample)
+            let observation = do observationNew(batch.timestampMs, ObservationShard{id: batch.shard.id, workloadDomain: batch.shard.workloadDomain}, sample.coordinate, metrics)
+            let next = do observe(current, batch.nodeId.value, observation)
+            current = next
+            i = i + 1
+        return current
+
+    # ingestWorkload: shard 0 in the reporting node's domain; the node id is
+    # recovered from that domain, as the Rust does.
+    private proc ingestWorkload(rt: FabricRuntime, w: WorkloadObservation) -> FabricRuntime:
+        let base = do workloadMetricsDefault()
+        let total = w.operationsPerSecond
+        let metrics = WorkloadMetrics{operationsPerSecond: total, readsPerSecond: total * w.readRatio, writesPerSecond: total * w.writeRatio, readLatencyUs: base.readLatencyUs, writeLatencyUs: base.writeLatencyUs, cpuUtilization: base.cpuUtilization, memoryUtilization: base.memoryUtilization, storageBytesPerSecond: base.storageBytesPerSecond, networkInBytesPerSecond: base.networkInBytesPerSecond, networkOutBytesPerSecond: base.networkOutBytesPerSecond, queueDepth: base.queueDepth, cellBreakdown: [], cellBreakdownPartial: false}
+        let observation = do observationNew(w.timestampMs, ObservationShard{id: 0, workloadDomain: w.nodeId}, w.coordinate, metrics)
+        let out = do observe(rt, observation.shard.workloadDomain, observation)
+        return out
+
+    proc fabricRuntimeProfile(rt: FabricRuntime, shardId: int, coordinate: Coordinate) -> WorkloadProfileOption:
+        let p = do workloadAnalyzerProfile(rt.analyzer, shardId, coordinate)
+        return p
+
+    # fleet: the optimizer's candidate destinations, projected from the same
+    # FleetView the controller validates against.
+    proc fabricRuntimeFleet(rt: FabricRuntime) -> Fleet:
+        let v = do fabricRuntimeFleetView(rt)
+        let statuses = do fleetViewNodesSortedById(v)
+        let mut nodes = []
+        let n = len(statuses)
+        let mut i = 0
+        loop i < n:
+            let s = statuses[i]
+            let accepts = do nodeConditionAcceptsPlacement(s.condition)
+            let utilization = do nodeStatusUtilization(s)
+            nodes = append(nodes, FleetNode{id: s.id.value, region: s.region, acceptsPlacement: accepts, hostedPlacements: s.hostedPlacements, placementCapacity: s.placementCapacity, utilization: utilization})
+            i = i + 1
+        let fleet = do fleetNew(rt.topology, nodes)
+        return fleet
+
+    proc fabricRuntimeOptimize(rt: FabricRuntime, profile: WorkloadProfile) -> OptimizationDecision:
+        let fleet = do fabricRuntimeFleet(rt)
+        let d = do workloadOptimizerOptimize(rt.optimizer, profile, fleet)
+        return d

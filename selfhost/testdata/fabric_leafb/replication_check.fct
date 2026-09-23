@@ -1,0 +1,630 @@
+import "../../fabric_replication.fct"
+import "../../fabric.fct"
+
+app FabricReplicationCheck:
+    # Conformance scenarios for fabric_replication.fct (replica.rs, set.rs,
+    # placement.rs, failover.rs), mirroring step for step the scratch Rust
+    # binary whose output is replication_rust.tsv.
+
+    proc lbJoin(xs: [text], sep: text) -> text:
+        let mut s = ""
+        let mut i = 0
+        loop i < len(xs):
+            if i > 0:
+                s = s + sep
+            s = s + xs[i]
+            i = i + 1
+        return s
+
+    proc lbPush(t: text, s: text) -> text:
+        if t == "":
+            return s
+        return t + "#" + s
+
+    proc lbRec(r: ReplRecord) -> text:
+        let role = do replRoleLabel(r.isPrimary)
+        let st = do replStateLabel(r.state)
+        return r.node + ":" + r.region + ":" + role + ":" + st + ":" + r.pendingWrites + ":" + r.applyLagMs + ":" + r.lastReportMs + ":" + r.unreachableSinceMs
+
+    proc lbNodes(rs: [ReplRecord]) -> text:
+        let mut xs = []
+        let mut i = 0
+        loop i < len(rs):
+            xs = append(xs, rs[i].node)
+            i = i + 1
+        let j = do lbJoin(xs, ",")
+        return j
+
+    proc lbSet(g: ReplGroup) -> text:
+        let mut recs = []
+        let mut i = 0
+        loop i < len(g.replicas):
+            let r = do lbRec(g.replicas[i])
+            recs = append(recs, r)
+            i = i + 1
+        let rj = do lbJoin(recs, ";")
+        let eff = do replGroupEffectiveSize(g)
+        let n = do replGroupLen(g)
+        let empty = do replGroupIsEmpty(g)
+        let under = do replGroupIsUnderReplicated(g)
+        let risk = do replGroupIsAtRisk(g)
+        let p = do replGroupPrimary(g)
+        let mut pn = "-"
+        if p.found:
+            pn = p.record.node
+        let w = do replGroupWriteTarget(g)
+        let mut wn = "-"
+        if w.found:
+            wn = w.record.node
+        let rf = do replGroupReadTargets(g, false)
+        let rs = do replGroupReadTargets(g, true)
+        let sec = do replGroupSecondaries(g)
+        let rfj = do lbNodes(rf)
+        let rsj = do lbNodes(rs)
+        let secj = do lbNodes(sec)
+        return "" + g.shardId + ":" + g.desiredFactor + "|" + rj + "|" + eff + ":" + n + ":" + empty + ":" + under + ":" + risk + "|" + pn + "|" + wn + "|" + rfj + "|" + rsj + "|" + secj
+
+    proc lbRes(r: ReplOpResult) -> text:
+        if !r.ok:
+            let d = do replErrorDisplay(r.error)
+            return "err:" + d
+        if !r.changed:
+            return "ok:none"
+        let t = r.transition
+        let f = do replStateLabel(t.fromState)
+        let to = do replStateLabel(t.toState)
+        let mut at = -1
+        if t.hasAtMs:
+            at = t.atMs
+        return "ok:t:" + t.shardId + ":" + t.node + ":" + f + ">" + to + "@" + at
+
+    struct LbStep:
+        kind: text
+        op: ReplOp
+        report: ReplReport
+
+    proc lbOp(op: ReplOp) -> LbStep:
+        let r = do replReportNew(0, "", 0, 0, 0)
+        return LbStep{kind: "op", op: op, report: r}
+
+    proc lbObs(report: ReplReport) -> LbStep:
+        let op = ReplOp{kind: "", node: "", region: ""}
+        return LbStep{kind: "obs", op: op, report: report}
+
+    proc lbDump() -> LbStep:
+        let op = ReplOp{kind: "", node: "", region: ""}
+        let r = do replReportNew(0, "", 0, 0, 0)
+        return LbStep{kind: "set", op: op, report: r}
+
+    struct LbRun:
+        t: text
+        g: ReplGroup
+
+    proc lbRun(g0: ReplGroup, steps: [LbStep]) -> LbRun:
+        let th = do lagThresholdsDefault()
+        let mut g = g0
+        let mut t = ""
+        let mut i = 0
+        loop i < len(steps):
+            let st = steps[i]
+            if st.kind == "op":
+                let r = do replGroupApply(g, st.op)
+                let s = do lbRes(r)
+                t = do lbPush(t, s)
+                g = r.group
+            if st.kind == "obs":
+                let r = do replGroupObserve(g, st.report, th)
+                let s = do lbRes(r)
+                t = do lbPush(t, s)
+                g = r.group
+            if st.kind == "set":
+                let s = do lbSet(g)
+                t = do lbPush(t, s)
+            i = i + 1
+        return LbRun{t: t, g: g}
+
+    proc lbBase9() -> ReplGroup:
+        let g = do replGroupBootstrap(9, 3, "db-a", "phoenix")
+        let op = do replOpAdd("db-b", "dallas")
+        let r = do replGroupApply(g, op)
+        return r.group
+
+    proc lbReplica() -> text:
+        let states = ["absent", "seeding", "inSync", "lagging", "failed"]
+        let mut s = ""
+        let mut a = 0
+        loop a < 5:
+            let mut b = 0
+            loop b < 5:
+                let can = do replStateCanTransitionTo(states[a], states[b])
+                if can:
+                    s = s + "1"
+                else:
+                    s = s + "0"
+                b = b + 1
+            a = a + 1
+        s = s + "#"
+        let mut k = 0
+        loop k < 5:
+            let l = do replStateLabel(states[k])
+            let h = do replStateHoldsFullCopy(states[k])
+            let f = do replStateIsFresh(states[k])
+            s = s + l + ":" + h + ":" + f + ";"
+            k = k + 1
+        let pr = do replRoleLabel(true)
+        let sr = do replRoleLabel(false)
+        let th = do lagThresholdsDefault()
+        s = s + "#" + pr + ":" + sr + "#" + th.laggingPendingWrites + ":" + th.laggingApplyLagMs + ":" + th.unreachableGraceMs
+        let ps = [0, 1000, 1001, 0, 50000]
+        let as = [0, 5000, 0, 5001, 60000]
+        let mut j = 0
+        loop j < 5:
+            let e = do replLagExceeds(ps[j], as[j], th)
+            s = s + ":" + e
+            j = j + 1
+        let shard = ObservationShard{id: 17, workloadDomain: "social"}
+        let coord = do coordinateNew(3, 4)
+        let metrics = do workloadMetricsDefault()
+        let obs = do observationNew(4242, shard, coord, metrics)
+        let r1 = do replReportFromObservation("db-x", obs, 5, 6)
+        let r2 = do replReportUnreachable(8, "db-y", 99)
+        s = s + "#" + r1.shardId + ":" + r1.node + ":" + r1.timestampMs + ":" + r1.pendingWrites + ":" + r1.applyLagMs + ":" + r1.reachable
+        s = s + "#" + r2.shardId + ":" + r2.node + ":" + r2.timestampMs + ":" + r2.pendingWrites + ":" + r2.applyLagMs + ":" + r2.reachable
+        let g = do lbBase9()
+        let a0 = do replGroupGet(g, "db-a")
+        let s0 = do replRecordSilenceMs(a0.record, 500)
+        s = s + "#" + s0
+        let rep = do replReportNew(9, "db-a", 1000, 0, 0)
+        let o = do replGroupObserve(g, rep, th)
+        let a1 = do replGroupGet(o.group, "db-a")
+        let s1 = do replRecordSilenceMs(a1.record, 500)
+        let s2 = do replRecordSilenceMs(a1.record, 1500)
+        let fr = do replRecordCanServeFreshReads(a1.record)
+        let sr2 = do replRecordCanServeStaleReads(a1.record)
+        let w = do replRecordCanServeWrites(a1.record)
+        s = s + ":" + s1 + ":" + s2 + ":" + fr + ":" + sr2 + ":" + w + ":" + a1.record.isPrimary
+        return s
+
+    proc lbSeedBeforeServe() -> text:
+        let g = do lbBase9()
+        let d = do lbDump()
+        let o1 = do replOpMarkInSync("db-b")
+        let o2 = do replOpBeginSeed("db-b")
+        let s1 = do lbOp(o1)
+        let s2 = do lbOp(o2)
+        let r = do lbRun(g, [d, s1, s2, d, s1, d])
+        return r.t
+
+    proc lbPromoteSwap() -> text:
+        let g = do lbBase9()
+        let d = do lbDump()
+        let seedB = do replOpBeginSeed("db-b")
+        let syncB = do replOpMarkInSync("db-b")
+        let promB = do replOpPromote("db-b")
+        let seedA = do replOpBeginSeed("db-a")
+        let a = do lbOp(seedB)
+        let b = do lbOp(syncB)
+        let c = do lbOp(promB)
+        let e = do lbOp(seedA)
+        let r = do lbRun(g, [a, b, c, d, c, a, e, d])
+        return r.t
+
+    proc lbRefusals() -> text:
+        let g = do lbBase9()
+        let d = do lbDump()
+        let seedB = do replOpBeginSeed("db-b")
+        let promB = do replOpPromote("db-b")
+        let remA = do replOpRemove("db-a")
+        let remZ = do replOpRemove("db-z")
+        let promZ = do replOpPromote("db-z")
+        let addB = do replOpAdd("db-b", "x")
+        let remB = do replOpRemove("db-b")
+        let s1 = do lbOp(seedB)
+        let s2 = do lbOp(promB)
+        let s3 = do lbOp(remA)
+        let s4 = do lbOp(remZ)
+        let s5 = do lbOp(promZ)
+        let s6 = do lbOp(addB)
+        let s7 = do lbOp(remB)
+        let r = do lbRun(g, [s1, s2, d, s3, s4, s5, s6, s7, d])
+        return r.t
+
+    proc lbLag() -> text:
+        let g = do lbBase9()
+        let d = do lbDump()
+        let seedB = do replOpBeginSeed("db-b")
+        let syncB = do replOpMarkInSync("db-b")
+        let a = do lbOp(seedB)
+        let b = do lbOp(syncB)
+        let r1 = do replReportNew(9, "db-b", 1000, 50000, 60000)
+        let r2 = do replReportNew(9, "db-b", 2000, 0, 0)
+        let r3 = do replReportNew(9, "db-b", 5000, 0, 0)
+        let r4 = do replReportNew(9, "db-b", 1000, 99999, 99999)
+        let r5 = do replReportNew(9, "db-a", 6000, 99999, 99999)
+        let r6 = do replReportNew(9, "db-q", 6000, 0, 0)
+        let r7 = do replReportNew(404, "db-b", 1, 0, 0)
+        let o1 = do lbObs(r1)
+        let o2 = do lbObs(r2)
+        let o3 = do lbObs(r3)
+        let o4 = do lbObs(r4)
+        let o5 = do lbObs(r5)
+        let o6 = do lbObs(r6)
+        let o7 = do lbObs(r7)
+        let r = do lbRun(g, [a, b, o1, d, o2, d, o3, o4, d, o5, o6, o7, d])
+        return r.t
+
+    proc lbUnreachable() -> text:
+        let g = do lbBase9()
+        let d = do lbDump()
+        let seedB = do replOpBeginSeed("db-b")
+        let syncB = do replOpMarkInSync("db-b")
+        let a = do lbOp(seedB)
+        let b = do lbOp(syncB)
+        let u1 = do replReportUnreachable(9, "db-b", 1000)
+        let u2 = do replReportUnreachable(9, "db-b", 20000)
+        let u3 = do replReportUnreachable(9, "db-b", 31000)
+        let u4 = do replReportUnreachable(9, "db-b", 40000)
+        let addC = do replOpAdd("db-c", "austin")
+        let c1 = do replReportUnreachable(9, "db-c", 100)
+        let c2 = do replReportUnreachable(9, "db-c", 900000)
+        let c3 = do replReportNew(9, "db-c", 900001, 3, 3)
+        let failC = do replOpMarkFailed("db-c")
+        let failA = do replOpMarkFailed("db-a")
+        let s1 = do lbObs(u1)
+        let s2 = do lbObs(u2)
+        let s3 = do lbObs(u3)
+        let s4 = do lbObs(u4)
+        let s5 = do lbOp(addC)
+        let s6 = do lbObs(c1)
+        let s7 = do lbObs(c2)
+        let s8 = do lbObs(c3)
+        let s9 = do lbOp(failC)
+        let s10 = do lbOp(failA)
+        let r = do lbRun(g, [a, b, s1, d, s2, s3, d, s4, a, d, s5, s6, s7, s8, d, s9, s10, d])
+        return r.t
+
+    proc lbPlan(r: ReplPlanResult) -> text:
+        if !r.ok:
+            let e = do replErrorDisplay(r.error)
+            return "err:" + e
+        let p = r.plan
+        let mut adds = []
+        let mut i = 0
+        loop i < len(p.additions):
+            adds = append(adds, p.additions[i].node + "/" + p.additions[i].region)
+            i = i + 1
+        let aj = do lbJoin(adds, ",")
+        let rj = do lbJoin(p.removals, ",")
+        let fj = do lbJoin(p.failed, ",")
+        let sat = do replPlanIsSatisfiable(p)
+        let empty = do replPlanIsEmpty(p)
+        return "" + p.shardId + ":" + p.factor + "|" + aj + "|" + rj + "|" + p.shortfall + "|" + fj + "|" + sat + ":" + empty
+
+    proc lbPlacement() -> text:
+        let mut t = ""
+        let g = do replGroupBootstrap(7, 3, "db-a", "phoenix")
+        let rule = do replRuleDefault()
+        let c1 = do replCandidateNew("db-a", "phoenix", true, 0)
+        let c2 = do replCandidateNew("db-b", "phoenix", true, 4)
+        let c3 = do replCandidateNew("db-c", "dallas", true, 9)
+        let p1 = do replPlan(rule, g, [c1, c2, c3])
+        let s1 = do lbPlan(p1)
+        t = do lbPush(t, s1)
+        let strict = ReplRule{factor: 3, spread: "requireDistinctRegions"}
+        let d1 = do replCandidateNew("db-b", "dallas", true, 0)
+        let d2 = do replCandidateNew("db-c", "dallas", true, 0)
+        let p2 = do replPlan(strict, g, [d1, d2])
+        let s2 = do lbPlan(p2)
+        t = do lbPush(t, s2)
+        let one = ReplRule{factor: 1, spread: "distinctNodes"}
+        let empty = do replGroupNew(7, 1)
+        let down = do replCandidateNew("db-down", "phoenix", false, 0)
+        let p3 = do replPlan(one, empty, [down])
+        let s3 = do lbPlan(p3)
+        t = do lbPush(t, s3)
+        let e1 = do replCandidateNew("db-b", "x", true, 0)
+        let e2 = do replCandidateNew("db-c", "y", true, 0)
+        let e3 = do replCandidateNew("db-b", "z", true, 0)
+        let p4 = do replPlan(rule, g, [e1, e2, e3])
+        let s4 = do lbPlan(p4)
+        t = do lbPush(t, s4)
+        let z = do replFactorNew(0)
+        let mut zs = "ok"
+        if !z.ok:
+            let zd = do replErrorDisplay(z.error)
+            zs = "err:" + zd
+        t = do lbPush(t, zs)
+        let dflt = do replDefaultReplicationFactor()
+        let five = do replFactorNew(5)
+        t = do lbPush(t, "" + dflt + ":" + five.factor)
+        let k1 = do replCandidateNew("n5", "east", true, 2)
+        let k2 = do replCandidateNew("n1", "east", true, 2)
+        let k3 = do replCandidateNew("n3", "west", true, 7)
+        let k4 = do replCandidateNew("n2", "west", true, 1)
+        let k5 = do replCandidateNew("n4", "north", false, 0)
+        let k6 = do replCandidateNew("n6", "south", true, 9)
+        let k7 = do replCandidateNew("n0", "phoenix", true, 0)
+        let cands = [k1, k2, k3, k4, k5, k6, k7]
+        let spreads = ["distinctNodes", "preferDistinctRegions", "requireDistinctRegions"]
+        let factors = [1, 3, 5, 9]
+        let mut si = 0
+        loop si < 3:
+            let mut fi = 0
+            loop fi < 4:
+                let rr = ReplRule{factor: factors[fi], spread: spreads[si]}
+                let pp = do replPlan(rr, g, cands)
+                let ps = do lbPlan(pp)
+                t = do lbPush(t, ps)
+                fi = fi + 1
+            si = si + 1
+        let th = do lagThresholdsDefault()
+        let mut big = do replGroupBootstrap(11, 3, "db-a", "phoenix")
+        let names = ["db-x", "db-b", "db-m", "db-f", "db-l"]
+        let regions = ["dallas", "dallas", "austin", "austin", "reno"]
+        let mut ni = 0
+        loop ni < 5:
+            let ao = do replOpAdd(names[ni], regions[ni])
+            let ar = do replGroupApply(big, ao)
+            let so = do replOpBeginSeed(names[ni])
+            let sr = do replGroupApply(ar.group, so)
+            let yo = do replOpMarkInSync(names[ni])
+            let yr = do replGroupApply(sr.group, yo)
+            big = yr.group
+            ni = ni + 1
+        let fo = do replOpMarkFailed("db-f")
+        let fr = do replGroupApply(big, fo)
+        let lrep = do replReportNew(11, "db-l", 10, 5000, 0)
+        let lr = do replGroupObserve(fr.group, lrep, th)
+        big = lr.group
+        let bs = do lbSet(big)
+        t = do lbPush(t, bs)
+        let bf = [1, 2, 3, 4, 6, 8]
+        let mut bi = 0
+        loop bi < 6:
+            let mut sj = 0
+            loop sj < 3:
+                let rr = ReplRule{factor: bf[bi], spread: spreads[sj]}
+                let pp = do replPlan(rr, big, cands)
+                let ps = do lbPlan(pp)
+                t = do lbPush(t, ps)
+                sj = sj + 1
+            bi = bi + 1
+        return t
+
+    proc lbAssess(a: ReplFailoverAssessment) -> text:
+        let mut cs = []
+        let mut i = 0
+        loop i < len(a.candidates):
+            let c = a.candidates[i]
+            let st = do replStateLabel(c.state)
+            let el = do replPromotionCandidateIsEligible(c)
+            let mut inel = "-"
+            if c.ineligibility.has:
+                let d = do replIneligibilityDisplay(c.ineligibility)
+                inel = d
+            cs = append(cs, c.node + ":" + c.region + ":" + st + ":" + c.pendingWrites + ":" + c.applyLagMs + ":" + c.silenceMs + ":" + el + ":" + inel)
+            i = i + 1
+        let cj = do lbJoin(cs, ";")
+        let mut bl = []
+        let mut j = 0
+        loop j < len(a.blockers):
+            let d = do replFailoverBlockerDisplay(a.blockers[j])
+            bl = append(bl, d)
+            j = j + 1
+        let bj = do lbJoin(bl, ";")
+        let mut pn = "-"
+        let mut ps = "-"
+        if a.hasPrimary:
+            pn = a.primary
+            let l = do replStateLabel(a.primaryState)
+            ps = l
+        let best = do replFailoverBestCandidate(a)
+        let mut bn = "-"
+        if best.found:
+            bn = best.candidate.node
+        let promo = do replFailoverPromotion(a)
+        let mut pr = "-"
+        if promo.has:
+            pr = promo.op.node
+        let stuck = do replFailoverIsStuck(a)
+        return "" + a.shardId + ":" + a.assessedAtMs + "|" + pn + ":" + ps + ":" + a.primarySilenceMs + "|" + a.primaryNeedsReplacement + "|" + cj + "|" + bj + "|" + bn + "|" + pr + "|" + stuck
+
+    proc lbHealthyPair() -> ReplGroup:
+        let th = do lagThresholdsDefault()
+        let g = do replGroupBootstrap(3, 3, "db-a", "phoenix")
+        let a = do replOpAdd("db-b", "dallas")
+        let r1 = do replGroupApply(g, a)
+        let s = do replOpBeginSeed("db-b")
+        let r2 = do replGroupApply(r1.group, s)
+        let y = do replOpMarkInSync("db-b")
+        let r3 = do replGroupApply(r2.group, y)
+        let rep = do replReportNew(3, "db-b", 1000, 0, 0)
+        let r4 = do replGroupObserve(r3.group, rep, th)
+        return r4.group
+
+    proc lbFail(g: ReplGroup, node: text) -> ReplGroup:
+        let op = do replOpMarkFailed(node)
+        let r = do replGroupApply(g, op)
+        return r.group
+
+    proc lbObserve(g: ReplGroup, shard: int, node: text, ts: int, p: int, a: int) -> ReplGroup:
+        let th = do lagThresholdsDefault()
+        let rep = do replReportNew(shard, node, ts, p, a)
+        let r = do replGroupObserve(g, rep, th)
+        return r.group
+
+    # fabric.fct's older ReplicaEntry-based failover* procs over the same
+    # set (state as replica.rs's declaration order), for replFailoverLegacy.
+    proc lbStateCode(state: text) -> int:
+        if state == "absent":
+            return 0
+        if state == "seeding":
+            return 1
+        if state == "inSync":
+            return 2
+        if state == "lagging":
+            return 3
+        return 4
+
+    proc lbLegacy(g: ReplGroup, now: int, pol: ReplFailoverPolicy) -> text:
+        let mut entries = []
+        let mut i = 0
+        loop i < len(g.replicas):
+            let r = g.replicas[i]
+            let code = do lbStateCode(r.state)
+            entries = append(entries, ReplicaEntry{node: r.node, isPrimary: r.isPrimary, state: code, pendingWrites: r.pendingWrites, applyLagMs: r.applyLagMs, lastReportMs: r.lastReportMs})
+            i = i + 1
+        let fp = FailoverPolicy{primarySilenceBudgetMs: pol.primarySilenceMs, maxCandidateSilenceMs: pol.maxCandidateSilenceMs, maxPromotionPendingWrites: pol.maxPromotionPendingWrites, maxPromotionApplyLagMs: pol.maxPromotionApplyLagMs}
+        let blocker = do failoverBlockerCode(entries, now, fp)
+        let needs = do failoverPrimaryNeedsReplacement(entries, now, fp)
+        let has = do failoverHasPromotion(entries, now, fp)
+        let mut promo = "-"
+        if has:
+            promo = do failoverPromotionNode(entries, now, fp)
+        let stuck = do failoverIsStuck(entries, now, fp)
+        let mut cs = []
+        let mut k = 0
+        loop k < len(entries):
+            if !entries[k].isPrimary:
+                let c = do failoverIneligibility(entries[k], now, fp)
+                cs = append(cs, entries[k].node + "=" + c)
+            k = k + 1
+        return "" + blocker + ":" + needs + ":" + promo + ":" + stuck + ":" + join(cs, ",")
+
+    proc lbFailover() -> text:
+        let pol = do replFailoverPolicyDefault()
+        let mut lg = ""
+        let mut t = "" + pol.primarySilenceMs + ":" + pol.maxPromotionPendingWrites + ":" + pol.maxPromotionApplyLagMs + ":" + pol.maxCandidateSilenceMs
+        let g1 = do lbHealthyPair()
+        let a1 = do replFailoverEvaluate(g1, 1000, pol)
+        let lga1 = do lbLegacy(g1, 1000, pol)
+        lg = do lbPush(lg, lga1)
+        let s1 = do lbAssess(a1)
+        t = do lbPush(t, s1)
+        let g2 = do lbFail(g1, "db-a")
+        let a2 = do replFailoverEvaluate(g2, 1000, pol)
+        let lga2 = do lbLegacy(g2, 1000, pol)
+        lg = do lbPush(lg, lga2)
+        let s2 = do lbAssess(a2)
+        t = do lbPush(t, s2)
+        let st2 = do lbSet(g2)
+        t = do lbPush(t, st2)
+        let g3a = do lbObserve(g1, 3, "db-b", 2000, 12, 400)
+        let g3 = do lbFail(g3a, "db-a")
+        let a3 = do replFailoverEvaluate(g3, 2000, pol)
+        let lga3 = do lbLegacy(g3, 2000, pol)
+        lg = do lbPush(lg, lga3)
+        let s3 = do lbAssess(a3)
+        t = do lbPush(t, s3)
+        let lenient = ReplFailoverPolicy{primarySilenceMs: 30000, maxPromotionPendingWrites: 100, maxPromotionApplyLagMs: 1000, maxCandidateSilenceMs: 30000}
+        let a4 = do replFailoverEvaluate(g3, 2000, lenient)
+        let lga4 = do lbLegacy(g3, 2000, lenient)
+        lg = do lbPush(lg, lga4)
+        let s4 = do lbAssess(a4)
+        t = do lbPush(t, s4)
+        let mid = ReplFailoverPolicy{primarySilenceMs: 30000, maxPromotionPendingWrites: 100, maxPromotionApplyLagMs: 0, maxCandidateSilenceMs: 30000}
+        let a5 = do replFailoverEvaluate(g3, 2000, mid)
+        let lga5 = do lbLegacy(g3, 2000, mid)
+        lg = do lbPush(lg, lga5)
+        let s5 = do lbAssess(a5)
+        t = do lbPush(t, s5)
+        let g6 = do lbObserve(g1, 3, "db-a", 1000, 0, 0)
+        let a6 = do replFailoverEvaluate(g6, 31001, pol)
+        let lga6 = do lbLegacy(g6, 31001, pol)
+        lg = do lbPush(lg, lga6)
+        let s6 = do lbAssess(a6)
+        t = do lbPush(t, s6)
+        let a7 = do replFailoverEvaluate(g6, 31000, pol)
+        let lga7 = do lbLegacy(g6, 31000, pol)
+        lg = do lbPush(lg, lga7)
+        let s7 = do lbAssess(a7)
+        t = do lbPush(t, s7)
+        let empty = do replGroupNew(5, 3)
+        let a8 = do replFailoverEvaluate(empty, 10, pol)
+        let lga8 = do lbLegacy(empty, 10, pol)
+        lg = do lbPush(lg, lga8)
+        let s8 = do lbAssess(a8)
+        t = do lbPush(t, s8)
+        let h0 = do replGroupBootstrap(6, 3, "p", "r0")
+        let h1o = do replOpAdd("s1", "r1")
+        let h1 = do replGroupApply(h0, h1o)
+        let h2o = do replOpAdd("s2", "r2")
+        let h2 = do replGroupApply(h1.group, h2o)
+        let h3o = do replOpBeginSeed("s2")
+        let h3 = do replGroupApply(h2.group, h3o)
+        let h4 = do lbFail(h3.group, "p")
+        let a9 = do replFailoverEvaluate(h4, 50, pol)
+        let lga9 = do lbLegacy(h4, 50, pol)
+        lg = do lbPush(lg, lga9)
+        let s9 = do lbAssess(a9)
+        t = do lbPush(t, s9)
+        let mut k = do replGroupBootstrap(6, 3, "p", "r0")
+        let names = ["s4", "s1", "s3", "s2", "s5", "s0"]
+        let mut i = 0
+        loop i < 6:
+            let ao = do replOpAdd(names[i], "rx")
+            let ar = do replGroupApply(k, ao)
+            let so = do replOpBeginSeed(names[i])
+            let sr = do replGroupApply(ar.group, so)
+            let yo = do replOpMarkInSync(names[i])
+            let yr = do replGroupApply(sr.group, yo)
+            k = yr.group
+            i = i + 1
+        k = do lbObserve(k, 6, "s1", 100, 3, 10)
+        k = do lbObserve(k, 6, "s2", 100, 3, 5)
+        k = do lbObserve(k, 6, "s3", 100, 0, 7)
+        k = do lbObserve(k, 6, "s4", 100, 3, 5)
+        k = do lbObserve(k, 6, "s5", 100, 2000, 5)
+        k = do lbFail(k, "p")
+        let wide = ReplFailoverPolicy{primarySilenceMs: 30000, maxPromotionPendingWrites: 3, maxPromotionApplyLagMs: 9, maxCandidateSilenceMs: 30000}
+        let b1 = do replFailoverEvaluate(k, 200, wide)
+        let lgb1 = do lbLegacy(k, 200, wide)
+        lg = do lbPush(lg, lgb1)
+        let t1 = do lbAssess(b1)
+        t = do lbPush(t, t1)
+        let b2 = do replFailoverEvaluate(k, 200, pol)
+        let lgb2 = do lbLegacy(k, 200, pol)
+        lg = do lbPush(lg, lgb2)
+        let t2 = do lbAssess(b2)
+        t = do lbPush(t, t2)
+        let b3 = do replFailoverEvaluate(k, 40000, wide)
+        let lgb3 = do lbLegacy(k, 40000, wide)
+        lg = do lbPush(lg, lgb3)
+        let t3 = do lbAssess(b3)
+        t = do lbPush(t, t3)
+        return t + "@@" + lg
+
+    proc lbFailoverPart(k: int) -> text:
+        let all = do lbFailover()
+        let parts = split(all, "@@")
+        return parts[k]
+
+    state replReplica: text = ""
+    state replSetSeedBeforeServe: text = ""
+    state replSetPromoteSwap: text = ""
+    state replSetRefusals: text = ""
+    state replSetLag: text = ""
+    state replSetUnreachable: text = ""
+    state replPlacement: text = ""
+    state replFailover: text = ""
+    state replFailoverLegacy: text = ""
+
+    action runReplicationCheck():
+        let a = do lbReplica()
+        let b = do lbSeedBeforeServe()
+        let c = do lbPromoteSwap()
+        let d = do lbRefusals()
+        let e = do lbLag()
+        let f = do lbUnreachable()
+        let g = do lbPlacement()
+        let h = do lbFailoverPart(0)
+        let hl = do lbFailoverPart(1)
+        replReplica = a
+        replSetSeedBeforeServe = b
+        replSetPromoteSwap = c
+        replSetRefusals = d
+        replSetLag = e
+        replSetUnreachable = f
+        replPlacement = g
+        replFailover = h
+        replFailoverLegacy = hl

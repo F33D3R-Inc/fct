@@ -1,0 +1,51 @@
+app R:
+    type ChatDTO:
+        body: text
+    type ViewersDTO:
+        count: int
+    type RoomDTO:
+        name: text
+        viewers: int
+    entity Room:
+        id: int
+        name: text
+    entity Viewer:
+        id: int
+        room: int
+        who: text
+    policy member:
+        actor != "guest"
+    derive roomDTO(r: Room): RoomDTO = RoomDTO{name: r.name, viewers: count(v in Viewer where v.room == r.id)}
+    contract "/api/_contract"
+    stream "/api/v2/rooms/{id}/events" requires member rate read since "2026-09-18":
+        connect -> joinRoom as viewers
+        disconnect -> leaveRoom
+        chat: ChatDTO since "2026-09-06" "A chat message was posted."
+        viewers: ViewersDTO since "2026-09-06" "The viewer count; also sent once on connect."
+    stream "/api/v2/lobby": RoomDTO
+    api POST "/api/v2/rooms/{id}/say" -> say
+    api GET "/api/v2/rooms/{id}" -> room
+    action seed():
+        add Room { name: "a" }
+        add Room { name: "b" }
+    action joinRoom(id: int) -> ViewersDTO:
+        requires member
+        check exists(r in Room where r.id == id) "no such room" status 404
+        add Viewer { room: id, who: actor }
+        emit viewers ViewersDTO{count: count(v in Viewer where v.room == id)} on id
+        return ViewersDTO{count: count(v in Viewer where v.room == id)}
+    action leaveRoom(id: int):
+        remove v in Viewer where v.room == id && v.who == actor
+        emit viewers ViewersDTO{count: count(v in Viewer where v.room == id)} on id
+    action say(id: int, body: text):
+        emit chat ChatDTO{body: body} on id
+        emit roomDTO(Room(id))
+    action room(id: int) -> RoomDTO:
+        return roomDTO(Room(id)) status 201
+    action sayAll(ids: [int], body: text):
+        for i in ids:
+            emit chat ChatDTO{body: body} on i
+    action viewers(id: int) -> int:
+        return count(v in Viewer where v.room == id)
+    view Home at "/":
+        text "x"

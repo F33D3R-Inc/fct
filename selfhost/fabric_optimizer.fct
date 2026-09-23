@@ -297,8 +297,11 @@ app FabricOptimizerSelfHost:
         let rb = do fleetRegionRank(b, hasAwayFrom, awayFrom)
         if ra != rb:
             return ra < rb
-        if a.utilization != b.utilization:
-            return a.utilization < b.utilization
+        # partial_cmp(..).unwrap_or(Equal): a NaN utilization ties.
+        if a.utilization < b.utilization:
+            return true
+        if b.utilization < a.utilization:
+            return false
         if a.hostedPlacements != b.hostedPlacements:
             return a.hostedPlacements < b.hostedPlacements
         return a.id < b.id
@@ -434,6 +437,22 @@ app FabricOptimizerSelfHost:
         let fleet = do fleetFromTopology(topology)
         let decision = do workloadOptimizerOptimize(optimizer, profile, fleet)
         return decision
+
+    # ============================================================
+    # SERDE SHAPES — serde_json::to_string of each derived type
+    # ============================================================
+    proc optimizationActionJson(a: OptimizationAction) -> text:
+        if a.kind == "Replicate" || a.kind == "Move":
+            return "{\"" + a.kind + "\":{\"target\":" + sjQuote(a.target) + "}}"
+        if a.kind == "Colocate":
+            return "{\"Colocate\":{\"target\":" + coordinateJson(a.coordinate) + "}}"
+        return "\"" + a.kind + "\""
+
+    proc optimizationDecisionJson(d: OptimizationDecision) -> text:
+        return "{\"shard_id\":" + sjU64Text(d.shardId) + ",\"coordinate\":" + coordinateJson(d.coordinate) + ",\"action\":" + optimizationActionJson(d.action) + ",\"expected_gain\":" + sjF64Text(d.expectedGain) + ",\"estimated_cost\":" + sjF64Text(d.estimatedCost) + ",\"confidence\":" + sjF64Text(d.confidence) + "}"
+
+    proc fleetNodeJson(n: FleetNode) -> text:
+        return "{\"id\":" + sjQuote(n.id) + ",\"region\":" + sjQuote(n.region) + ",\"accepts_placement\":" + sjBoolText(n.acceptsPlacement) + ",\"hosted_placements\":" + sjU64Text(n.hostedPlacements) + ",\"placement_capacity\":" + sjU64Text(n.placementCapacity) + ",\"utilization\":" + sjF64Text(n.utilization) + "}"
 
     # ============================================================
     # DEMO / BUILD-CHECK FIXTURES — each demo below restates one of the 12

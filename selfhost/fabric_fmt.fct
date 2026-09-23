@@ -1,0 +1,142 @@
+app FabricFmtSelfHost:
+    # Rust's std::fmt for the fabric ports' human output, shared by every
+    # file that prints a table or a float: `{:<N}` / `{:>N}` padding
+    # (fmtPadRight / fmtPadLeft) and `{:.N}` for an f64 (fmtFixed: the exact
+    # binary value rounded half-to-even, as Rust's float formatting does).
+    # Imports nothing; every name is prefixed `fmt`.
+
+    # `{:<N}` / `{:>N}`: pad with spaces to at least N characters.
+    proc fmtPadLeft(s: text, width: int) -> text:
+        let mut result = s
+        loop len(result) < width:
+            result = " " + result
+        return result
+
+    proc fmtPadRight(s: text, width: int) -> text:
+        let mut result = s
+        loop len(result) < width:
+            result = result + " "
+        return result
+
+    # Non-negative big integers: base-1e9 limbs, least significant first.
+    proc fmtBigMul(a: [int], k: int) -> [int]:
+        let mut out = []
+        let mut carry = 0
+        let mut i = 0
+        loop i < len(a):
+            let v = a[i] * k + carry
+            out = append(out, v % 1000000000)
+            carry = v / 1000000000
+            i = i + 1
+        loop carry > 0:
+            out = append(out, carry % 1000000000)
+            carry = carry / 1000000000
+        return out
+
+    struct FmtBigDiv:
+        q: [int]
+        r: int
+
+    # Division by d <= 2^29; the quotient has no leading zero limbs.
+    proc fmtBigDiv(a: [int], d: int) -> FmtBigDiv:
+        let n = len(a)
+        let mut high = []
+        let mut r = 0
+        let mut i = n - 1
+        loop i >= 0:
+            let cur = r * 1000000000 + a[i]
+            high = append(high, cur / d)
+            r = cur % d
+            i = i - 1
+        let mut top = 0
+        loop top < n - 1 && high[top] == 0:
+            top = top + 1
+        let mut q = []
+        let mut j = n - 1
+        loop j >= top:
+            q = append(q, high[j])
+            j = j - 1
+        return FmtBigDiv{q: q, r: r}
+
+    proc fmtBigAddOne(a: [int]) -> [int]:
+        let mut out = a
+        let mut i = 0
+        loop i < len(out):
+            if out[i] < 999999999:
+                out[i] = out[i] + 1
+                return out
+            out[i] = 0
+            i = i + 1
+        out = append(out, 1)
+        return out
+
+    proc fmtBigText(a: [int]) -> text:
+        let n = len(a)
+        let mut out = "" + a[n - 1]
+        let mut i = n - 2
+        loop i >= 0:
+            let limb = "" + a[i]
+            out = out + slice("000000000", 0, 9 - len(limb)) + limb
+            i = i - 1
+        return out
+
+    # `format!("{:.prec$}", v)` for an f64: the exact binary value, scaled
+    # by 10^prec and rounded to the nearest integer with ties to even, then
+    # written with `prec` decimals; the sign is kept for -0.0 and for a
+    # negative value that rounds to zero; NaN / inf / -inf as Rust writes
+    # them.
+    proc fmtFixed(v: float, prec: int) -> text:
+        if v != v:
+            return "NaN"
+        let bits = floatBits(v)
+        let neg = bits < 0
+        let biased = (bits >> 52) & 2047
+        if biased == 2047:
+            if neg:
+                return "-inf"
+            return "inf"
+        let mant = bits & 4503599627370495
+        let mut m = mant
+        let mut e2 = -1074
+        if biased != 0:
+            m = mant + 4503599627370496
+            e2 = biased - 1075
+        let mut num = [m % 1000000000, m / 1000000000]
+        let mut k = 0
+        loop k < prec:
+            num = fmtBigMul(num, 10)
+            k = k + 1
+        if e2 >= 0:
+            let mut left = e2
+            loop left > 0:
+                let mut c = left
+                if c > 29:
+                    c = 29
+                num = fmtBigMul(num, 1 << c)
+                left = left - c
+        else:
+            num = fmtBigMul(num, 2)
+            let mut left = 0 - e2
+            let mut sticky = false
+            loop left > 0:
+                let mut c = left
+                if c > 29:
+                    c = 29
+                let d = fmtBigDiv(num, 1 << c)
+                if d.r != 0:
+                    sticky = true
+                num = d.q
+                left = left - c
+            let half = num[0] % 2
+            num = fmtBigDiv(num, 2).q
+            if half == 1 && (sticky || num[0] % 2 == 1):
+                num = fmtBigAddOne(num)
+        let mut digits = fmtBigText(fmtBigDiv(num, 1).q)
+        if prec > 0:
+            loop len(digits) < prec + 1:
+                digits = "0" + digits
+            let cut = len(digits) - prec
+            digits = slice(digits, 0, cut) + "." + slice(digits, cut, len(digits))
+        if neg:
+            return "-" + digits
+        return digits

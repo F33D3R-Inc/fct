@@ -33,7 +33,7 @@ import (
 //	           literal mechanism ast.Node uses to mark a type as a view node.
 //	builtins   the invocable builtin functions, derived by parsing
 //	           internal/parser's source and reading the case labels out of
-//	           isBuiltinCall, the single function the parser calls to decide.
+//	           builtinSites, the one table the parser reads to decide.
 //	modifiers  every `@name` annotation keyword, derived by scanning the same
 //	           parsed source for string literals of that shape (comments are
 //	           not literals, so prose mentioning "@required" is never picked
@@ -182,46 +182,74 @@ func writeNodeKinds(w *os.File, files []*ast.File) {
 	writeWrapped(w, kinds)
 }
 
-// builtinNames returns the invocable builtin functions, read out of
-// internal/parser's isBuiltinCall — the one function the parser calls to
-// decide whether a name in call position is a builtin. `count`, `sum`,
-// `avg`, `min`(range) and `max`(range) are deliberately absent: those are
-// aggregates over a range, a different grammar position, dispatched
-// elsewhere — isBuiltinCall does not claim them, so neither does this.
-func builtinNames(files []*ast.File) []string {
-	var names []string
+// builtinSites returns the invocable builtin functions and where each may
+// run, read out of internal/parser's builtinSites table — the one table the
+// parser (IsBuiltinCall), the compiler's placement rules and the browser
+// runtime's parity test all read. `count`, `sum`, `avg`, `min`(range) and
+// `max`(range) are deliberately absent: those are aggregates over a range, a
+// different grammar position, dispatched elsewhere.
+func builtinSites(files []*ast.File) map[string]string {
+	sites := map[string]string{}
 	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
-			fd, ok := n.(*ast.FuncDecl)
-			if !ok || fd.Name.Name != "isBuiltinCall" {
+			vs, ok := n.(*ast.ValueSpec)
+			if !ok || len(vs.Names) != 1 || vs.Names[0].Name != "builtinSites" || len(vs.Values) != 1 {
 				return true
 			}
-			ast.Inspect(fd.Body, func(n ast.Node) bool {
-				cc, ok := n.(*ast.CaseClause)
-				if !ok {
-					return true
-				}
-				for _, expr := range cc.List {
-					if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-						if s, err := strconv.Unquote(lit.Value); err == nil {
-							names = append(names, s)
-						}
-					}
-				}
+			lit, ok := vs.Values[0].(*ast.CompositeLit)
+			if !ok {
 				return true
-			})
-			return true
+			}
+			for _, el := range lit.Elts {
+				kv, ok := el.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, ok := kv.Key.(*ast.BasicLit)
+				site, isIdent := kv.Value.(*ast.Ident)
+				if !ok || key.Kind != token.STRING || !isIdent {
+					continue
+				}
+				if name, err := strconv.Unquote(key.Value); err == nil {
+					sites[name] = site.Name
+				}
+			}
+			return false
 		})
+	}
+	return sites
+}
+
+// builtinNames is every builtinSites name, sorted.
+func builtinNames(files []*ast.File) []string {
+	var names []string
+	for n := range builtinSites(files) {
+		names = append(names, n)
 	}
 	sort.Strings(names)
 	return names
 }
 
-// writeBuiltins prints the builtins builtinNames derives.
+// writeBuiltins prints the builtins builtinSites derives, grouped by where
+// each may run.
 func writeBuiltins(w *os.File, files []*ast.File) {
-	names := builtinNames(files)
-	fmt.Fprintf(w, "\nBUILT-IN FUNCTIONS (%d — internal/parser's isBuiltinCall, the parser's own list)\n", len(names))
-	writeWrapped(w, names)
+	sites := builtinSites(files)
+	fmt.Fprintf(w, "\nBUILT-IN FUNCTIONS (%d — internal/parser's builtinSites, the parser's own table)\n", len(sites))
+	for _, g := range []struct{ site, title string }{
+		{"SiteEverywhere", "everywhere (server and browser)"},
+		{"SiteAuthority", "authority only (actions, procs, derives used by actions)"},
+		{"SiteProc", "proc bodies only"},
+	} {
+		var names []string
+		for n, s := range sites {
+			if s == g.site {
+				names = append(names, n)
+			}
+		}
+		sort.Strings(names)
+		fmt.Fprintf(w, "  %s (%d):\n", g.title, len(names))
+		writeWrapped(w, names)
+	}
 }
 
 // modifierPattern matches an `@name` annotation keyword written as a Go string

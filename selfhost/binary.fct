@@ -1,0 +1,409 @@
+import "wal.fct"
+
+app BinarySelfHost:
+    # binary.fct — self-hosted port of facetql/src/storage/binary.rs: the
+    # one record frame every durable FacetQL structure uses (the users log,
+    # every heap record, the catalog), and the append-only framed log over
+    # it.
+    #
+    #   offset  size  field
+    #   0       4     "FQR1"
+    #   4       1     format version (2)
+    #   5       4     payload length (u32 LE)
+    #   9       4     CRC-32 (IEEE) of the payload (u32 LE)
+    #   13      N     payload
+    #
+    # In a log file (bnAppendRecord / bnReadAll) the payload is crypto.rs's
+    # `nonce || ciphertext || tag` of the record's bincode; a frame inside a
+    # page is not encrypted again (the page is). Reading classifies each
+    # frame exactly as read_one_frame does: a short header or payload at the
+    # end of the file is a torn tail (the records before it are returned and
+    # the caller may truncate at its offset), a bad magic, an over-long
+    # length prefix or a checksum mismatch is corruption, another version
+    # byte is an unsupported format — the last two refuse the whole read.
+    #
+    # binary.rs is generic over the record type; here a record is its
+    # bincode bytes, and the users log's UserOpRecord (Put(UserRecord) |
+    # Revoke(String)) has its own codec. The key and every nonce are
+    # parameters, as in wal.fct.
+    struct BnFrame:
+        ok: bool
+        err: text
+        bytes: [int]
+
+    proc bnMagic() -> [int]:
+        return [70, 81, 82, 49]
+
+    proc bnVersion() -> int:
+        return 2
+
+    proc bnMaxPayload() -> int:
+        return 67108864
+
+    proc bnCrcTable() -> [int]:
+        let mut t = []
+        let mut n = 0
+        loop n < 256:
+            let mut c = n
+            let mut k = 0
+            loop k < 8:
+                if (c & 1) == 1:
+                    c = (c >> 1) ^ 3988292384
+                else:
+                    c = c >> 1
+                k = k + 1
+            t = append(t, c)
+            n = n + 1
+        return t
+
+    # bnCrc32Range: crc32 over bs[from..to].
+    proc bnCrc32Range(bs: [int], from: int, to: int) -> int:
+        let t = do bnCrcTable()
+        let mut crc = 4294967295
+        let mut i = from
+        loop i < to:
+            crc = t[(crc ^ bs[i]) & 255] ^ (crc >> 8)
+            i = i + 1
+        return crc ^ 4294967295
+
+    proc bnGet32(b: [int], at: int) -> int:
+        return b[at] + b[at + 1] * 256 + b[at + 2] * 65536 + b[at + 3] * 16777216
+
+    # bnEncodeFrame: encode_frame — header then payload.
+    proc bnEncodeFrame(payload: [int]) -> BnFrame:
+        let n = len(payload)
+        if n > 67108864:
+            return BnFrame{ok: false, err: "record payload of " + n + " bytes exceeds the maximum of 67108864 bytes; refusing to write a record the read path would reject as corrupt", bytes: []}
+        let crc = do bnCrc32Range(payload, 0, n)
+        let mut out = bytes(13 + n)
+        out[0] = 70
+        out[1] = 81
+        out[2] = 82
+        out[3] = 49
+        out[4] = 2
+        let mut v = n
+        let mut c = crc
+        let mut i = 0
+        loop i < 4:
+            out[5 + i] = v % 256
+            out[9 + i] = c % 256
+            v = v / 256
+            c = c / 256
+            i = i + 1
+        let mut k = 0
+        loop k < n:
+            out[13 + k] = payload[k]
+            k = k + 1
+        return BnFrame{ok: true, err: "", bytes: out}
+
+    # bnDecodeFrame: decode_frame — a whole frame held in memory (a heap
+    # cell), verified and unwrapped to its payload.
+    proc bnDecodeFrame(bs: [int]) -> BnFrame:
+        let n = len(bs)
+        if n < 13:
+            return BnFrame{ok: false, err: "record frame is " + n + " bytes, shorter than the 13-byte header", bytes: []}
+        if bs[0] != 70 || bs[1] != 81 || bs[2] != 82 || bs[3] != 49:
+            return BnFrame{ok: false, err: "record frame magic mismatch", bytes: []}
+        if bs[4] != 2:
+            return BnFrame{ok: false, err: "record frame format version " + bs[4] + " is not supported by this build (expected 2)", bytes: []}
+        let declared = do bnGet32(bs, 5)
+        let expected = do bnGet32(bs, 9)
+        if n != 13 + declared:
+            return BnFrame{ok: false, err: "record frame declares a " + declared + "-byte payload but carries " + (n - 13), bytes: []}
+        let crc = do bnCrc32Range(bs, 13, n)
+        if crc != expected:
+            return BnFrame{ok: false, err: "record frame checksum mismatch — the record is corrupt", bytes: []}
+        let mut out = bytes(declared)
+        let mut i = 0
+        loop i < declared:
+            out[i] = bs[13 + i]
+            i = i + 1
+        return BnFrame{ok: true, err: "", bytes: out}
+
+    # bnDebugBytes: Rust's `{:?}` of a byte slice — "[70, 81, 82, 49]".
+    proc bnDebugBytes(bs: [int], from: int, to: int) -> text:
+        let mut out = "["
+        let mut i = from
+        loop i < to:
+            if i > from:
+                out = out + ", "
+            out = out + bs[i]
+            i = i + 1
+        return out + "]"
+
+    # bnHex8: `{:#010x}` — 0x and eight lowercase hex digits.
+    proc bnHex8(v0: int) -> text:
+        let digits = split("0123456789abcdef", "")
+        let mut v = v0
+        let mut s = ""
+        let mut i = 0
+        loop i < 8:
+            s = digits[v % 16] + s
+            v = v / 16
+            i = i + 1
+        return "0x" + s
+
+    # BnOne: read_one_frame's FrameOutcome — kind "record" | "truncated" |
+    # "corrupt" | "version".
+    struct BnOne:
+        kind: text
+        detail: text
+        payload: [int]
+        consumed: int
+        found: int
+
+    proc bnOneBad(kind: text, detail: text, found: int) -> BnOne:
+        return BnOne{kind: kind, detail: detail, payload: [], consumed: 0, found: found}
+
+    proc bnReadOne(path: text, offset: int, fileLen: int) -> BnOne uses io.file:
+        let remaining = fileLen - offset
+        if remaining < 13:
+            let t0 = do bnOneBad("truncated", "record header at offset " + offset + " is truncated: " + remaining + " of 13 header bytes present", 0)
+            return t0
+        let header = readFileAt(path, offset, 13)
+        if header[0] != 70 || header[1] != 81 || header[2] != 82 || header[3] != 49:
+            let found = do bnDebugBytes(header, 0, 4)
+            let c0 = do bnOneBad("corrupt", "bad record magic at offset " + offset + ": expected [70, 81, 82, 49], found " + found, 0)
+            return c0
+        if header[4] != 2:
+            let v0 = do bnOneBad("version", "", header[4])
+            return v0
+        let payloadLen = do bnGet32(header, 5)
+        let stored = do bnGet32(header, 9)
+        if payloadLen > 67108864:
+            let c1 = do bnOneBad("corrupt", "record at offset " + offset + " declares a payload of " + payloadLen + " bytes, over the 67108864-byte maximum — the length prefix is corrupt (no record this build writes can be that large)", 0)
+            return c1
+        let available = remaining - 13
+        if payloadLen > available:
+            let t1 = do bnOneBad("truncated", "record payload at offset " + offset + " is truncated: header declares " + payloadLen + " bytes but only " + available + " remain", 0)
+            return t1
+        let payload = readFileAt(path, offset + 13, payloadLen)
+        let actual = do bnCrc32Range(payload, 0, payloadLen)
+        if actual != stored:
+            let sh = do bnHex8(stored)
+            let ah = do bnHex8(actual)
+            let c2 = do bnOneBad("corrupt", "record checksum mismatch at offset " + offset + ": stored " + sh + ", computed " + ah + " — payload corrupted", 0)
+            return c2
+        return BnOne{kind: "record", detail: "", payload: payload, consumed: 13 + payloadLen, found: 0}
+
+    proc bnUnsupported(path: text, found: int, offset: int) -> text:
+        return path + " holds a v" + found + " record frame at offset " + offset + ", but this build reads and writes v2. The on-disk record format changed. There is no in-place upgrade for this: stop the server and recreate the data directory (or restore a backup taken with a matching build). Nothing here is corrupt — refusing to read is deliberate, because a v" + found + " payload decoded as v2 would not fail, it would quietly mean the wrong thing."
+
+    struct BnAppended:
+        ok: bool
+        err: text
+        offset: int
+
+    # bnAppendRecord: append_record — seal the record's bincode, frame it,
+    # append it at the end of the file and fsync; the frame's offset.
+    proc bnAppendRecord(path: text, record: [int], key: [int], nonce: [int]) -> BnAppended uses io.file:
+        let sealed = do cryptoEncrypt(key, nonce, record)
+        let fr = do bnEncodeFrame(sealed)
+        if !fr.ok:
+            return BnAppended{ok: false, err: fr.err, offset: 0}
+        let mut offset = fileSize(path)
+        if offset < 0:
+            offset = 0
+        let w = writeFileAt(path, offset, fr.bytes)
+        let s = syncFile(path)
+        return BnAppended{ok: true, err: "", offset: offset}
+
+    struct BnRecord:
+        offset: int
+        record: [int]
+
+    # BnReadAll: read_all_records_framed's (records, TailState) or error.
+    struct BnReadAll:
+        err: text
+        records: [BnRecord]
+        truncated: bool
+        tailOffset: int
+        tailDetail: text
+
+    proc bnReadAllErr(msg: text) -> BnReadAll:
+        return BnReadAll{err: msg, records: [], truncated: false, tailOffset: 0, tailDetail: ""}
+
+    # bnReadAll: every sealed record in file order, each frame verified
+    # and decrypted; a torn tail ends the read, damage refuses it.
+    proc bnReadAll(path: text, key: [int]) -> BnReadAll uses io.file:
+        let fileLen = fileSize(path)
+        if fileLen < 0:
+            return BnReadAll{err: "", records: [], truncated: false, tailOffset: 0, tailDetail: ""}
+        let mut records = []
+        let mut offset = 0
+        loop offset < fileLen:
+            let one = do bnReadOne(path, offset, fileLen)
+            if one.kind == "truncated":
+                return BnReadAll{err: "", records: records, truncated: true, tailOffset: offset, tailDetail: one.detail}
+            if one.kind == "corrupt":
+                let e0 = do bnReadAllErr("corrupt record in " + path + " at offset " + offset + ": " + one.detail)
+                return e0
+            if one.kind == "version":
+                let msg = do bnUnsupported(path, one.found, offset)
+                let e1 = do bnReadAllErr(msg)
+                return e1
+            let dec = do cryptoDecrypt(key, one.payload)
+            if !dec.ok:
+                let e2 = do bnReadAllErr("failed to decrypt record at offset " + offset + " in " + path + ": " + dec.err + " — wrong FACETQL_MASTER_KEY, or this file predates encryption at rest")
+                return e2
+            records = append(records, BnRecord{offset: offset, record: dec.plaintext})
+            offset = offset + one.consumed
+        return BnReadAll{err: "", records: records, truncated: false, tailOffset: 0, tailDetail: ""}
+
+    # bnRewriteRecords: rewrite_records — every record sealed and framed
+    # into a temp file, fsynced, renamed over `path`, directory fsynced.
+    # nonces supplies one fresh nonce per record (12 bytes each, in order).
+    proc bnRewriteRecords(path: text, records: [BnRecord], key: [int], nonceBase: int, tmpId: int) -> BnAppended uses io.file:
+        let tmp = path + ".fct." + tmpId + ".tmp"
+        let t0 = writeFile(tmp, "")
+        let mut at = 0
+        let n = len(records)
+        let mut i = 0
+        loop i < n:
+            let nonce = do fqwNonce(nonceBase, i)
+            let sealed = do cryptoEncrypt(key, nonce, records[i].record)
+            let fr = do bnEncodeFrame(sealed)
+            if !fr.ok:
+                return BnAppended{ok: false, err: fr.err, offset: 0}
+            let w = writeFileAt(tmp, at, fr.bytes)
+            at = at + len(fr.bytes)
+            i = i + 1
+        let s = syncFile(tmp)
+        let r = renameFile(tmp, path)
+        return BnAppended{ok: true, err: "", offset: at}
+
+    # ── the users log's record: UserOpRecord ───────────────────────────
+    # Put(UserRecord{token_hash, owner, role}) = variant 0, Revoke(String)
+    # = variant 1, in bincode's legacy encoding.
+    struct BnUserOp:
+        op: text
+        user: UserRecord
+        revoked: text
+
+    proc bnUserOpEncode(u: BnUserOp) -> [int]:
+        if u.op == "revoke":
+            let r0 = do fqwPutUint([], 1, 4)
+            let r1 = do fqwPutString(r0, u.revoked)
+            return r1
+        let p0 = do fqwPutUint([], 0, 4)
+        let p1 = do fqwPutString(p0, u.user.tokenHash)
+        let p2 = do fqwPutString(p1, u.user.owner)
+        let mut role = 0
+        if u.user.role == "admin":
+            role = 1
+        let p3 = do fqwPutUint(p2, role, 4)
+        return p3
+
+    struct BnUserOpR:
+        ok: bool
+        err: text
+        op: BnUserOp
+
+    proc bnUserOpDecode(bs: [int]) -> BnUserOpR:
+        let blankUser = UserRecord{tokenHash: "", owner: "", role: "user"}
+        let blank = BnUserOp{op: "", user: blankUser, revoked: ""}
+        let c0 = FqwCur{buf: bs, pos: 0, err: ""}
+        let tag = do fqwGetUint(c0, 4)
+        if tag.cur.err != "":
+            return BnUserOpR{ok: false, err: tag.cur.err, op: blank}
+        if tag.v == 1:
+            let s = do fqwGetString(tag.cur)
+            if s.cur.err != "":
+                return BnUserOpR{ok: false, err: s.cur.err, op: blank}
+            return BnUserOpR{ok: true, err: "", op: BnUserOp{op: "revoke", user: blankUser, revoked: s.v}}
+        if tag.v != 0:
+            return BnUserOpR{ok: false, err: "invalid value: integer `" + tag.v + "`, expected variant index 0 <= i < 2", op: blank}
+        let th = do fqwGetString(tag.cur)
+        let ow = do fqwGetString(th.cur)
+        let rl = do fqwGetUint(ow.cur, 4)
+        if rl.cur.err != "":
+            return BnUserOpR{ok: false, err: rl.cur.err, op: blank}
+        if rl.v > 1:
+            return BnUserOpR{ok: false, err: "invalid value: integer `" + rl.v + "`, expected variant index 0 <= i < 2", op: blank}
+        let mut role = "user"
+        if rl.v == 1:
+            role = "admin"
+        return BnUserOpR{ok: true, err: "", op: BnUserOp{op: "put", user: UserRecord{tokenHash: th.v, owner: ow.v, role: role}, revoked: ""}}
+
+    # ── test harness ───────────────────────────────────────────────────
+    state binaryOut: text = ""
+
+    # bnUsersText: append `put HASH OWNER ROLE` / `revoke HASH` ops (nonces
+    # from nonceBase), then read the whole log back.
+    proc bnUsersText(path: text, keyHex: text, nonceBase: int, script: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let lines = split(script, "\n")
+        let n = len(lines)
+        let mut out = ""
+        let mut i = 0
+        loop i < n:
+            let w = split(trim(lines[i]), " ")
+            if len(w) >= 2:
+                let mut op = BnUserOp{op: "revoke", user: UserRecord{tokenHash: "", owner: "", role: "user"}, revoked: w[1]}
+                if w[0] == "put" && len(w) == 4:
+                    op = BnUserOp{op: "put", user: UserRecord{tokenHash: w[1], owner: w[2], role: w[3]}, revoked: ""}
+                let rec = do bnUserOpEncode(op)
+                let nonce = do fqwNonce(nonceBase, i)
+                let a = do bnAppendRecord(path, rec, key, nonce)
+                if !a.ok:
+                    return out + "error: " + a.err
+                out = out + "@" + a.offset + " "
+            i = i + 1
+        let r = do bnReadText(path, keyHex)
+        return out + r
+
+    proc bnReadText(path: text, keyHex: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let all = do bnReadAll(path, key)
+        if all.err != "":
+            return "error: " + all.err
+        let mut out = ""
+        let n = len(all.records)
+        let mut i = 0
+        loop i < n:
+            let d = do bnUserOpDecode(all.records[i].record)
+            if !d.ok:
+                return out + "error: failed to deserialize record at offset " + all.records[i].offset + " in " + path + ": " + d.err + " — file may be corrupted"
+            if d.op.op == "put":
+                out = out + all.records[i].offset + ":put " + d.op.user.tokenHash + " " + d.op.user.owner + " " + d.op.user.role + ";"
+            else:
+                out = out + all.records[i].offset + ":revoke " + d.op.revoked + ";"
+            i = i + 1
+        if all.truncated:
+            out = out + "torn@" + all.tailOffset + " " + all.tailDetail
+        else:
+            out = out + "clean"
+        return out
+
+    proc bnFrameText(payloadHex: text) -> text:
+        let p = do fqwHexBytes(payloadHex)
+        let f = do bnEncodeFrame(p)
+        let h = do cryptoEncodeHex(f.bytes)
+        return h
+
+    proc bnUnframeText(frameHex: text) -> text:
+        let f = do fqwHexBytes(frameHex)
+        let d = do bnDecodeFrame(f)
+        if !d.ok:
+            return "error: " + d.err
+        let h = do cryptoEncodeHex(d.bytes)
+        return "payload=" + h
+
+    action runUsers(path: text, keyHex: text, nonceBase: int, script: text):
+        let r = do bnUsersText(path, keyHex, nonceBase, script)
+        binaryOut = r
+
+    action runUsersRead(path: text, keyHex: text):
+        let r = do bnReadText(path, keyHex)
+        binaryOut = r
+
+    action runFrame(payloadHex: text):
+        let r = do bnFrameText(payloadHex)
+        binaryOut = r
+
+    action runUnframe(frameHex: text):
+        let r = do bnUnframeText(frameHex)
+        binaryOut = r
+
+    view BinaryHome at "/binary":
+        text "{binaryOut}"

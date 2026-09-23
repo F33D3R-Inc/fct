@@ -1,4 +1,4 @@
-import "fabric_controller_plan.fct"
+import "fabric_executor.fct"
 
 app FabricControllerCoreSelfHost:
     # Self-hosting port of the REST of fabric/crates/fabric-controller/src/
@@ -169,40 +169,8 @@ app FabricControllerCoreSelfHost:
     # (fabric_controller_plan.fct). Nothing is redeclared.
 
     # ============================================================
-    # small text helpers — `{:.N}` and its padding, local to this file
+    # small text helpers (`{:.N}` is fabric_fmt.fct's fmtFixed)
     # ============================================================
-    proc ctrlPow10(n: int) -> int:
-        let mut result = 1
-        let mut i = 0
-        loop i < n:
-            result = result * 10
-            i = i + 1
-        return result
-
-    proc ctrlPadLeftZero(s: text, width: int) -> text:
-        let mut result = s
-        loop len(result) < width:
-            result = "0" + result
-        return result
-
-    # ctrlFloatFixed: `{:.N}` — see simplification 7 in this file's header.
-    proc ctrlFloatFixed(v: float, decimals: int) -> text:
-        let neg = v < 0.0
-        let av = abs(v)
-        let scale = do ctrlPow10(decimals)
-        let scaleFloat = toFloat(scale)
-        let scaled = round(av * scaleFloat)
-        let intPart = scaled / scale
-        let fracPart = scaled % scale
-        let fracRaw = "" + fracPart
-        let fracText = do ctrlPadLeftZero(fracRaw, decimals)
-        let mut result = "" + intPart
-        if decimals > 0:
-            result = result + "." + fracText
-        if neg:
-            result = "-" + result
-        return result
-
     proc ctrlJoinText(items: [text], sep: text) -> text:
         let n = len(items)
         let mut out = ""
@@ -244,10 +212,6 @@ app FabricControllerCoreSelfHost:
     proc decisionEnvelopeActionLabel(e: DecisionEnvelope) -> text:
         let label = do controllerPlanActionLabel(e.decision.action)
         return label
-
-    struct DbmsIdOption:
-        has: bool
-        val: DbmsId
 
     # decisionEnvelopeNamedDestination: Replicate/Move name a node; Split/
     # Isolate name none by construction; Colocate names a COORDINATE, so
@@ -417,9 +381,9 @@ app FabricControllerCoreSelfHost:
         if e.kind == "NoActionRequested":
             return "decision requests no action"
         if e.kind == "BelowExecutionThreshold":
-            let s = do ctrlFloatFixed(e.score, 3)
-            let c = do ctrlFloatFixed(e.confidence, 3)
-            let m = do ctrlFloatFixed(e.minConfidence, 3)
+            let s = do fmtFixed(e.score, 3)
+            let c = do fmtFixed(e.confidence, 3)
+            let m = do fmtFixed(e.minConfidence, 3)
             return "decision below execution threshold: score " + s + ", confidence " + c + " (minimum " + m + ")"
         if e.kind == "InvalidCoordinate":
             return "coordinate (" + e.coordinate.x + "," + e.coordinate.y + ") is outside the 12x13 grid"
@@ -440,8 +404,8 @@ app FabricControllerCoreSelfHost:
         if e.kind == "DestinationAtCapacity":
             return "destination '" + e.node.value + "' is at capacity: " + e.hosted + "/" + e.capacity + " placements"
         if e.kind == "DestinationSaturated":
-            let u = do ctrlFloatFixed(e.utilization, 3)
-            let l = do ctrlFloatFixed(e.limitUtilization, 3)
+            let u = do fmtFixed(e.utilization, 3)
+            let l = do fmtFixed(e.limitUtilization, 3)
             return "destination '" + e.node.value + "' is saturated at " + u + " utilization (limit " + l + ")"
         if e.kind == "DestinationIsSource":
             return "destination '" + e.node.value + "' already holds the target"
@@ -555,44 +519,6 @@ app FabricControllerCoreSelfHost:
 
     proc replicaLedgerNew() -> ReplicaLedger:
         return ReplicaLedger{entries: []}
-
-    # replicaTextSetInsert / Remove / Contains: `BTreeSet<String>`'s
-    # insert/remove/contains over a sorted unique array.
-    proc replicaTextSetInsert(xs: [text], s: text) -> [text]:
-        let n = len(xs)
-        let mut result = []
-        let mut inserted = false
-        let mut i = 0
-        loop i < n:
-            if !inserted && s < xs[i]:
-                result = append(result, s)
-                inserted = true
-            if xs[i] == s:
-                inserted = true
-            result = append(result, xs[i])
-            i = i + 1
-        if !inserted:
-            result = append(result, s)
-        return result
-
-    proc replicaTextSetRemove(xs: [text], s: text) -> [text]:
-        let n = len(xs)
-        let mut result = []
-        let mut i = 0
-        loop i < n:
-            if xs[i] != s:
-                result = append(result, xs[i])
-            i = i + 1
-        return result
-
-    proc replicaTextSetContains(xs: [text], s: text) -> bool:
-        let n = len(xs)
-        let mut i = 0
-        loop i < n:
-            if xs[i] == s:
-                return true
-            i = i + 1
-        return false
 
     proc replicaLedgerIndexOf(entries: [ReplicaHolding], target: ActionTarget) -> int:
         let n = len(entries)
@@ -1226,129 +1152,6 @@ app FabricControllerCoreSelfHost:
     proc actionRegistryIsEmpty(reg: ActionRegistry) -> bool:
         let n = len(reg.records)
         return n == 0
-
-    # ============================================================
-    # controller.rs — the `PlacementExecutor` trait, as a closed struct
-    # (simplification 1). `kind` selects the implementation; "stub" is the
-    # crate's own test mechanism. `startedPhases`/`startedAtMs` are the
-    # stub's `BTreeMap<PlanPhase, u64>` as parallel arrays.
-    # ============================================================
-    struct Executor:
-        kind: text
-        name: text
-        removes: [DbmsId]
-        startedPhases: [text]
-        startedAtMs: [int]
-
-    proc stubExecutorNew() -> Executor:
-        return Executor{kind: "stub", name: "stub", removes: [], startedPhases: [], startedAtMs: []}
-
-    # stubExecutorDropping: `StubExecutor::dropping(removes)` — a mechanism
-    # whose plans remove exactly these nodes instead of the source.
-    proc stubExecutorDropping(removes: [DbmsId]) -> Executor:
-        return Executor{kind: "stub", name: "stub", removes: removes, startedPhases: [], startedAtMs: []}
-
-    proc executorName(ex: Executor) -> text:
-        return ex.name
-
-    # executorSupports: stub — `!matches!(action, NoAction)`.
-    proc executorSupports(ex: Executor, action: OptimizationAction) -> bool:
-        if ex.kind == "stub":
-            return action.kind != "NoAction"
-        return false
-
-    # executorPlan: stub — needs a named destination; Prepare/Transfer/
-    # Cutover/Cleanup at Coordinate scope; adds=[destination]; removes=
-    # [source] unless `dropping` overrode them.
-    proc executorPlan(ex: Executor, request: PlanRequest) -> PlacementPlanNewResult:
-        if ex.kind != "stub":
-            let label = do controllerPlanActionLabel(request.action)
-            let unsupported = do planErrorUnsupportedAction(label)
-            let zero = do placementPlanZero()
-            return PlacementPlanNewResult{ok: false, value: zero, err: unsupported}
-        if !request.hasDestination:
-            let infeasible = do planErrorInfeasible("stub needs a named destination")
-            let zero2 = do placementPlanZero()
-            return PlacementPlanNewResult{ok: false, value: zero2, err: infeasible}
-        let mut removes = ex.removes
-        if len(removes) == 0:
-            removes = [DbmsId{value: request.source.dbmsId}]
-        let planned = do placementPlanNew(request.target, request.action, "coordinate", ["prepare", "transfer", "cutover", "cleanup"], [request.destination], removes)
-        return planned
-
-    proc executorStartedIndexOf(phases: [text], phase: text) -> int:
-        let n = len(phases)
-        let mut i = 0
-        loop i < n:
-            if phases[i] == phase:
-                return i
-            i = i + 1
-        return -1
-
-    struct ExecutorBeginResult:
-        ok: bool
-        fault: ExecutionFault
-        executor: Executor
-
-    # executorBeginPhase: stub — `started.insert(phase, at_ms)`; Ok(()).
-    proc executorBeginPhase(ex: Executor, plan: PlacementPlan, phase: text, atMs: int) -> ExecutorBeginResult:
-        if ex.kind != "stub":
-            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
-            return ExecutorBeginResult{ok: false, fault: fault, executor: ex}
-        let idx = do executorStartedIndexOf(ex.startedPhases, phase)
-        let mut phases = ex.startedPhases
-        let mut times = ex.startedAtMs
-        if idx == -1:
-            phases = append(phases, phase)
-            times = append(times, atMs)
-        else:
-            times[idx] = atMs
-        let noFault = do executionFaultInternal("")
-        return ExecutorBeginResult{ok: true, fault: noFault, executor: Executor{kind: ex.kind, name: ex.name, removes: ex.removes, startedPhases: phases, startedAtMs: times}}
-
-    struct ExecutorPollResult:
-        ok: bool
-        progress: PhaseProgress
-        fault: ExecutionFault
-        executor: Executor
-
-    # executorPollPhase: stub — NotStarted if the phase never began;
-    # Complete once `at_ms > started`, else Running{0.5}.
-    proc executorPollPhase(ex: Executor, plan: PlacementPlan, phase: text, atMs: int) -> ExecutorPollResult:
-        let complete = do phaseProgressComplete()
-        if ex.kind != "stub":
-            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
-            return ExecutorPollResult{ok: false, progress: complete, fault: fault, executor: ex}
-        let idx = do executorStartedIndexOf(ex.startedPhases, phase)
-        if idx == -1:
-            let notStarted = do executionFaultNotStarted(phase)
-            return ExecutorPollResult{ok: false, progress: complete, fault: notStarted, executor: ex}
-        let noFault = do executionFaultInternal("")
-        if atMs > ex.startedAtMs[idx]:
-            return ExecutorPollResult{ok: true, progress: complete, fault: noFault, executor: ex}
-        let running = do phaseProgressRunning(0.5)
-        return ExecutorPollResult{ok: true, progress: running, fault: noFault, executor: ex}
-
-    struct ExecutorAbortResult:
-        ok: bool
-        outcome: RollbackOutcome
-        fault: ExecutionFault
-        executor: Executor
-
-    # executorAbort: stub — Irreversible("authority already moved") once
-    # Cutover is among the completed phases, Restored otherwise.
-    proc executorAbort(ex: Executor, plan: PlacementPlan, completed: [text], atMs: int) -> ExecutorAbortResult:
-        let restored = do rollbackOutcomeRestored()
-        if ex.kind != "stub":
-            let fault = do executionFaultInternal("no mechanism of kind '" + ex.kind + "'")
-            return ExecutorAbortResult{ok: false, outcome: restored, fault: fault, executor: ex}
-        let noFault = do executionFaultInternal("")
-        let cutOver = do planPhaseArrayContains(completed, "cutover")
-        if cutOver:
-            let irreversible = do rollbackOutcomeIrreversible("authority already moved")
-            return ExecutorAbortResult{ok: true, outcome: irreversible, fault: noFault, executor: ex}
-        return ExecutorAbortResult{ok: true, outcome: restored, fault: noFault, executor: ex}
-
     # ============================================================
     # controller.rs — FabricController: holds no topology, performs no IO;
     # everything it knows arrives as a ControlPlaneView, everything it does

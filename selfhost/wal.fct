@@ -1,0 +1,1374 @@
+import "transaction.fct"
+import "aes_gcm.fct"
+
+app WalSelfHost:
+    # wal.fct — self-hosted port of facetql/src/storage/wal.rs's on-disk
+    # log and facetql/src/storage/recovery.rs's replay, over the language's
+    # real file capability (readFile / appendFile / fileExists /
+    # truncateFile under `uses io.file`).
+    #
+    # Byte-compatible with the Rust format end to end:
+    #   * the record is bincode 1.x's legacy encoding of `WalRecord`
+    #     (fixed-width little-endian integers, a u64 length before every
+    #     String, a u32 variant index before every enum, a u8 tag before an
+    #     Option) — fqwEncodeRecord / fqwDecodeRecord;
+    #   * the payload is crypto.rs's AES-256-GCM `nonce || ct || tag`
+    #     (aes_gcm.fct);
+    #   * the frame is `FQW1 | u16 frame version | u32 payload len |
+    #     u32 CRC-32(payload) | payload`, hex-encoded as one line
+    #     (fqwEncodeFrame / fqwDecodeFrame, decode_frame's exact check
+    #     order and Torn/Corrupt classification).
+    # wal_test.go decodes frames the real Rust encoder wrote
+    # (testdata/wal_golden.tsv) and re-encodes them bit for bit.
+    #
+    # The payload structs are transaction.fct's (Node, HistoryEntry, Edge,
+    # EdgeId, UserRecord, IndexDef, ReferenceDef, TextIndexDef carried in
+    # its `Operation`); a record's op tag is Operation.tag plus the three
+    # control tags "begin"/"commit"/"abort".
+    #
+    # Two things a proc cannot do are parameters instead: the master key
+    # (crypto.rs reads FACETQL_MASTER_KEY) and the nonce (crypto.rs draws
+    # 12 random bytes) — a caller passes both, and must never reuse a
+    # nonce under one key.
+    #
+    # Replay target: recovery.rs applies each operation through the
+    # engine's `apply_committed`, every one of which is idempotent by key.
+    # FqwState is that keyed logical state (nodes by address, edges by
+    # (from, to, kind), users by token hash, index/reference/text-index
+    # definitions by name, history by (address, version)) — the heap pages
+    # and B-trees beneath it are storage.fct/btree.fct's business.
+    struct FqwRecord:
+        formatVersion: int
+        sequence: int
+        transactionId: int
+        operationId: int
+        op: Operation
+
+    proc fqwFormatVersion() -> int:
+        return 3
+
+    proc fqwRecord(sequence: int, transactionId: int, operationId: int, op: Operation) -> FqwRecord:
+        return FqwRecord{formatVersion: 3, sequence: sequence, transactionId: transactionId, operationId: operationId, op: op}
+
+    proc fqwControl(tag: text) -> Operation:
+        let b = do operationBlank(tag)
+        return b
+
+    proc fqwIsControl(tag: text) -> bool:
+        return tag == "begin" || tag == "commit" || tag == "abort"
+
+    # WalOperation's variant order is its bincode index.
+    proc fqwOpTags() -> [text]:
+        return ["begin", "commit", "abort", "archive", "insert", "delete", "insert_edge", "delete_edge", "insert_user", "revoke_user", "create_index", "drop_index", "create_reference", "drop_reference", "create_text_index", "drop_text_index"]
+
+    proc fqwTagIndex(tag: text) -> int:
+        let tags = do fqwOpTags()
+        let mut i = 0
+        loop i < 16:
+            if tags[i] == tag:
+                return i
+            i = i + 1
+        return -1
+
+    # ── bincode writer ──────────────────────────────────────────────────
+    proc fqwPutUint(out: [int], v0: int, width: int) -> [int]:
+        let mut o = out
+        let mut v = v0
+        let mut i = 0
+        loop i < width:
+            o = append(o, v % 256)
+            v = v / 256
+            i = i + 1
+        return o
+
+    proc fqwPutBytes(out: [int], bs: [int]) -> [int]:
+        let mut o = out
+        let n = len(bs)
+        let mut i = 0
+        loop i < n:
+            o = append(o, bs[i])
+            i = i + 1
+        return o
+
+    proc fqwPutString(out: [int], s: text) -> [int]:
+        let bs = textToBytes(s)
+        let o1 = do fqwPutUint(out, len(bs), 8)
+        let o2 = do fqwPutBytes(o1, bs)
+        return o2
+
+    proc fqwPutNode(out: [int], n: Node) -> [int]:
+        let o1 = do fqwPutString(out, n.address)
+        let o2 = do fqwPutUint(o1, n.coordinate.x, 1)
+        let o3 = do fqwPutUint(o2, n.coordinate.y, 1)
+        let o4 = do fqwPutUint(o3, n.coordinate.z, 1)
+        let o5 = do fqwPutUint(o4, n.coordinate.q, 1)
+        let o6 = do fqwPutUint(o5, n.value, 8)
+        let o7 = do fqwPutString(o6, n.kind)
+        let o8 = do fqwPutString(o7, n.data)
+        let o9 = do fqwPutString(o8, n.owner)
+        let mut o = o9
+        if n.hasClaimedBy:
+            let a = do fqwPutUint(o, 1, 1)
+            let b = do fqwPutString(a, n.claimedBy)
+            o = b
+        else:
+            let c = do fqwPutUint(o, 0, 1)
+            o = c
+        let mut vis = 0
+        if n.visibility == "public":
+            vis = 1
+        let o10 = do fqwPutUint(o, vis, 4)
+        return o10
+
+    proc fqwEncodeRecord(r: FqwRecord) -> [int]:
+        let o1 = do fqwPutUint([], r.formatVersion, 2)
+        let o2 = do fqwPutUint(o1, r.sequence, 8)
+        let o3 = do fqwPutUint(o2, r.transactionId, 8)
+        let o4 = do fqwPutUint(o3, r.operationId, 8)
+        let tag = r.op.tag
+        let idx = do fqwTagIndex(tag)
+        let o5 = do fqwPutUint(o4, idx, 4)
+        let op = r.op
+        if tag == "archive":
+            let a1 = do fqwPutString(o5, op.entry.address)
+            let a2 = do fqwPutUint(a1, op.entry.archivedAtUnix, 8)
+            let a3 = do fqwPutNode(a2, op.entry.node)
+            let a4 = do fqwPutUint(a3, op.entry.version, 8)
+            return a4
+        if tag == "insert":
+            let b1 = do fqwPutNode(o5, op.node)
+            return b1
+        if tag == "delete" || tag == "revoke_user" || tag == "drop_index" || tag == "drop_reference" || tag == "drop_text_index":
+            let c1 = do fqwPutString(o5, op.name)
+            return c1
+        if tag == "insert_edge":
+            let d1 = do fqwPutString(o5, op.edge.from)
+            let d2 = do fqwPutString(d1, op.edge.to)
+            let d3 = do fqwPutString(d2, op.edge.kind)
+            let d4 = do fqwPutString(d3, op.edge.owner)
+            return d4
+        if tag == "delete_edge":
+            let e1 = do fqwPutString(o5, op.edgeId.from)
+            let e2 = do fqwPutString(e1, op.edgeId.to)
+            let e3 = do fqwPutString(e2, op.edgeId.kind)
+            return e3
+        if tag == "insert_user":
+            let f1 = do fqwPutString(o5, op.user.tokenHash)
+            let f2 = do fqwPutString(f1, op.user.owner)
+            let mut role = 0
+            if op.user.role == "admin":
+                role = 1
+            let f3 = do fqwPutUint(f2, role, 4)
+            return f3
+        if tag == "create_index":
+            let g4 = do fqwPutIndexDef(o5, op.indexDef)
+            return g4
+        if tag == "create_reference":
+            let h5 = do fqwPutReferenceDef(o5, op.reference)
+            return h5
+        if tag == "create_text_index":
+            let t3 = do fqwPutTextIndexDef(o5, op.textIndexDef)
+            return t3
+        return o5
+
+    # The index / reference / text-index definitions, as bincode writes
+    # them wherever they are carried — a WAL operation and each
+    # definition log (facetql.indexes, facetql.references,
+    # facetql.text_indexes).
+    proc fqwPutIndexDef(out: [int], d: IndexDef) -> [int]:
+        let g1 = do fqwPutString(out, d.name)
+        let g2 = do fqwPutString(g1, d.kind)
+        let g3 = do fqwPutString(g2, d.field)
+        let mut u = 0
+        if d.unique:
+            u = 1
+        let g4 = do fqwPutUint(g3, u, 1)
+        return g4
+
+    proc fqwPutReferenceDef(out: [int], rd: ReferenceDef) -> [int]:
+        let h1 = do fqwPutString(out, rd.name)
+        let h2 = do fqwPutString(h1, rd.kind)
+        let h3 = do fqwPutString(h2, rd.field)
+        let h4 = do fqwPutString(h3, rd.parentKind)
+        let mut h = h4
+        if rd.hasParentField:
+            let p1 = do fqwPutUint(h, 1, 1)
+            let p2 = do fqwPutString(p1, rd.parentField)
+            h = p2
+        else:
+            let p3 = do fqwPutUint(h, 0, 1)
+            h = p3
+        let mut onDel = 0
+        if rd.onDelete == "restrict":
+            onDel = 1
+        if rd.onDelete == "set_null":
+            onDel = 2
+        let h5 = do fqwPutUint(h, onDel, 4)
+        return h5
+
+    proc fqwPutTextIndexDef(out: [int], d: TextIndexDef) -> [int]:
+        let t1 = do fqwPutString(out, d.name)
+        let t2 = do fqwPutString(t1, d.kind)
+        let t3 = do fqwPutString(t2, d.field)
+        return t3
+
+    # ── bincode reader ──────────────────────────────────────────────────
+    # FqwCur: a read position over a buffer; `err` is the first failure
+    # (bincode's own "unexpected end of input" / invalid tag / invalid
+    # UTF-8), after which every read is a no-op.
+    struct FqwCur:
+        buf: [int]
+        pos: int
+        err: text
+
+    struct FqwUint:
+        cur: FqwCur
+        v: int
+
+    struct FqwStr:
+        cur: FqwCur
+        v: text
+
+    proc fqwFail(c: FqwCur, msg: text) -> FqwCur:
+        if c.err != "":
+            return c
+        return FqwCur{buf: c.buf, pos: c.pos, err: msg}
+
+    proc fqwGetUint(c: FqwCur, width: int) -> FqwUint:
+        if c.err != "":
+            return FqwUint{cur: c, v: 0}
+        if c.pos + width > len(c.buf):
+            let f = do fqwFail(c, "io error: unexpected end of file")
+            return FqwUint{cur: f, v: 0}
+        let mut v = 0
+        let mut i = width - 1
+        loop i >= 0:
+            v = v * 256 + c.buf[c.pos + i]
+            i = i - 1
+        return FqwUint{cur: FqwCur{buf: c.buf, pos: c.pos + width, err: ""}, v: v}
+
+    proc fqwGetString(c: FqwCur) -> FqwStr:
+        let n = do fqwGetUint(c, 8)
+        let c1 = n.cur
+        if c1.err != "":
+            return FqwStr{cur: c1, v: ""}
+        if n.v < 0 || c1.pos + n.v > len(c1.buf):
+            let f = do fqwFail(c1, "io error: unexpected end of file")
+            return FqwStr{cur: f, v: ""}
+        let mut bs = bytes(n.v)
+        let mut i = 0
+        loop i < n.v:
+            bs[i] = c1.buf[c1.pos + i]
+            i = i + 1
+        let s = bytesToText(bs)
+        let back = textToBytes(s)
+        let same = len(back) == n.v
+        if !same:
+            let f2 = do fqwFail(c1, "invalid utf-8 sequence")
+            return FqwStr{cur: f2, v: ""}
+        return FqwStr{cur: FqwCur{buf: c1.buf, pos: c1.pos + n.v, err: ""}, v: s}
+
+    struct FqwOptStr:
+        cur: FqwCur
+        has: bool
+        v: text
+
+    proc fqwGetOptString(c: FqwCur) -> FqwOptStr:
+        let t = do fqwGetUint(c, 1)
+        if t.cur.err != "":
+            return FqwOptStr{cur: t.cur, has: false, v: ""}
+        if t.v == 0:
+            return FqwOptStr{cur: t.cur, has: false, v: ""}
+        if t.v != 1:
+            let f = do fqwFail(t.cur, "invalid value: integer `" + t.v + "`, expected a tag for Option")
+            return FqwOptStr{cur: f, has: false, v: ""}
+        let s = do fqwGetString(t.cur)
+        return FqwOptStr{cur: s.cur, has: true, v: s.v}
+
+    struct FqwNodeR:
+        cur: FqwCur
+        node: Node
+
+    proc fqwGetNode(c: FqwCur) -> FqwNodeR:
+        let a = do fqwGetString(c)
+        let x = do fqwGetUint(a.cur, 1)
+        let y = do fqwGetUint(x.cur, 1)
+        let z = do fqwGetUint(y.cur, 1)
+        let q = do fqwGetUint(z.cur, 1)
+        let v = do fqwGetUint(q.cur, 8)
+        let k = do fqwGetString(v.cur)
+        let d = do fqwGetString(k.cur)
+        let o = do fqwGetString(d.cur)
+        let cb = do fqwGetOptString(o.cur)
+        let vis = do fqwGetUint(cb.cur, 4)
+        let mut cur = vis.cur
+        let mut visibility = "private"
+        if vis.v == 1:
+            visibility = "public"
+        if vis.v > 1:
+            let f = do fqwFail(cur, "invalid value: integer `" + vis.v + "`, expected variant index 0 <= i < 2")
+            cur = f
+        let coord = do coordinateNew(x.v, y.v, z.v, q.v)
+        return FqwNodeR{cur: cur, node: Node{address: a.v, coordinate: coord, value: v.v, kind: k.v, data: d.v, owner: o.v, hasClaimedBy: cb.has, claimedBy: cb.v, visibility: visibility}}
+
+    struct FqwRecordR:
+        ok: bool
+        err: text
+        record: FqwRecord
+
+    proc fqwRecordErr(msg: text) -> FqwRecordR:
+        let blank = do fqwControl("begin")
+        return FqwRecordR{ok: false, err: msg, record: FqwRecord{formatVersion: 0, sequence: 0, transactionId: 0, operationId: 0, op: blank}}
+
+    struct FqwIndexDefR:
+        cur: FqwCur
+        def: IndexDef
+
+    proc fqwGetIndexDef(c: FqwCur) -> FqwIndexDefR:
+        let n1 = do fqwGetString(c)
+        let n2 = do fqwGetString(n1.cur)
+        let n3 = do fqwGetString(n2.cur)
+        let u = do fqwGetUint(n3.cur, 1)
+        let mut cur = u.cur
+        if u.v > 1:
+            let fu = do fqwFail(cur, "invalid value: integer `" + u.v + "`, expected a boolean")
+            cur = fu
+        let idef = do indexDefNew(n1.v, n2.v, n3.v, u.v == 1)
+        return FqwIndexDefR{cur: cur, def: idef}
+
+    struct FqwReferenceDefR:
+        cur: FqwCur
+        def: ReferenceDef
+
+    proc fqwGetReferenceDef(c: FqwCur) -> FqwReferenceDefR:
+        let r1 = do fqwGetString(c)
+        let r2 = do fqwGetString(r1.cur)
+        let r3 = do fqwGetString(r2.cur)
+        let r4 = do fqwGetString(r3.cur)
+        let pf = do fqwGetOptString(r4.cur)
+        let ac = do fqwGetUint(pf.cur, 4)
+        let mut cur = ac.cur
+        let mut onDel = "cascade"
+        if ac.v == 1:
+            onDel = "restrict"
+        if ac.v == 2:
+            onDel = "set_null"
+        if ac.v > 2:
+            let fa = do fqwFail(cur, "invalid value: integer `" + ac.v + "`, expected variant index 0 <= i < 3")
+            cur = fa
+        let rdef = do referenceDefNew(r1.v, r2.v, r3.v, r4.v, pf.has, pf.v, onDel)
+        return FqwReferenceDefR{cur: cur, def: rdef}
+
+    struct FqwTextIndexDefR:
+        cur: FqwCur
+        def: TextIndexDef
+
+    proc fqwGetTextIndexDef(c: FqwCur) -> FqwTextIndexDefR:
+        let x1 = do fqwGetString(c)
+        let x2 = do fqwGetString(x1.cur)
+        let x3 = do fqwGetString(x2.cur)
+        let tdef = do textIndexDefNew(x1.v, x2.v, x3.v)
+        return FqwTextIndexDefR{cur: x3.cur, def: tdef}
+
+    proc fqwDecodeRecord(buf: [int]) -> FqwRecordR:
+        let c0 = FqwCur{buf: buf, pos: 0, err: ""}
+        let fv = do fqwGetUint(c0, 2)
+        let sq = do fqwGetUint(fv.cur, 8)
+        let tx = do fqwGetUint(sq.cur, 8)
+        let oi = do fqwGetUint(tx.cur, 8)
+        let tg = do fqwGetUint(oi.cur, 4)
+        if tg.cur.err != "":
+            let e0 = do fqwRecordErr(tg.cur.err)
+            return e0
+        if tg.v > 15:
+            let e1 = do fqwRecordErr("invalid value: integer `" + tg.v + "`, expected variant index 0 <= i < 16")
+            return e1
+        let tags = do fqwOpTags()
+        let tag = tags[tg.v]
+        let op0 = do operationBlank(tag)
+        let mut op = op0
+        let mut cur = tg.cur
+        if tag == "archive":
+            let ad = do fqwGetString(cur)
+            let at = do fqwGetUint(ad.cur, 8)
+            let nd = do fqwGetNode(at.cur)
+            let vr = do fqwGetUint(nd.cur, 8)
+            cur = vr.cur
+            let entry = HistoryEntry{address: ad.v, archivedAtUnix: at.v, node: nd.node, version: vr.v}
+            let o1 = do opArchive(entry)
+            op = o1
+        if tag == "insert":
+            let nd2 = do fqwGetNode(cur)
+            cur = nd2.cur
+            op = Operation{tag: "insert", entry: op.entry, node: nd2.node, name: "", edge: op.edge, edgeId: op.edgeId, user: op.user, indexDef: op.indexDef, reference: op.reference, textIndexDef: op.textIndexDef}
+        if tag == "delete" || tag == "revoke_user" || tag == "drop_index" || tag == "drop_reference" || tag == "drop_text_index":
+            let nm = do fqwGetString(cur)
+            cur = nm.cur
+            op = Operation{tag: tag, entry: op.entry, node: op.node, name: nm.v, edge: op.edge, edgeId: op.edgeId, user: op.user, indexDef: op.indexDef, reference: op.reference, textIndexDef: op.textIndexDef}
+        if tag == "insert_edge":
+            let f = do fqwGetString(cur)
+            let t = do fqwGetString(f.cur)
+            let k = do fqwGetString(t.cur)
+            let w = do fqwGetString(k.cur)
+            cur = w.cur
+            let e = do edgeNew(f.v, t.v, k.v, w.v)
+            op = Operation{tag: tag, entry: op.entry, node: op.node, name: "", edge: e, edgeId: op.edgeId, user: op.user, indexDef: op.indexDef, reference: op.reference, textIndexDef: op.textIndexDef}
+        if tag == "delete_edge":
+            let f2 = do fqwGetString(cur)
+            let t2 = do fqwGetString(f2.cur)
+            let k2 = do fqwGetString(t2.cur)
+            cur = k2.cur
+            let eid = do edgeIdNew(f2.v, t2.v, k2.v)
+            op = Operation{tag: tag, entry: op.entry, node: op.node, name: "", edge: op.edge, edgeId: eid, user: op.user, indexDef: op.indexDef, reference: op.reference, textIndexDef: op.textIndexDef}
+        if tag == "insert_user":
+            let th = do fqwGetString(cur)
+            let ow = do fqwGetString(th.cur)
+            let rl = do fqwGetUint(ow.cur, 4)
+            cur = rl.cur
+            let mut role = "user"
+            if rl.v == 1:
+                role = "admin"
+            if rl.v > 1:
+                let fr = do fqwFail(cur, "invalid value: integer `" + rl.v + "`, expected variant index 0 <= i < 2")
+                cur = fr
+            op = Operation{tag: tag, entry: op.entry, node: op.node, name: "", edge: op.edge, edgeId: op.edgeId, user: UserRecord{tokenHash: th.v, owner: ow.v, role: role}, indexDef: op.indexDef, reference: op.reference, textIndexDef: op.textIndexDef}
+        if tag == "create_index":
+            let gi = do fqwGetIndexDef(cur)
+            cur = gi.cur
+            let idef = gi.def
+            op = Operation{tag: tag, entry: op.entry, node: op.node, name: "", edge: op.edge, edgeId: op.edgeId, user: op.user, indexDef: idef, reference: op.reference, textIndexDef: op.textIndexDef}
+        if tag == "create_reference":
+            let gr = do fqwGetReferenceDef(cur)
+            cur = gr.cur
+            let rdef = gr.def
+            op = Operation{tag: tag, entry: op.entry, node: op.node, name: "", edge: op.edge, edgeId: op.edgeId, user: op.user, indexDef: op.indexDef, reference: rdef, textIndexDef: op.textIndexDef}
+        if tag == "create_text_index":
+            let gt = do fqwGetTextIndexDef(cur)
+            cur = gt.cur
+            let tdef = gt.def
+            op = Operation{tag: tag, entry: op.entry, node: op.node, name: "", edge: op.edge, edgeId: op.edgeId, user: op.user, indexDef: op.indexDef, reference: op.reference, textIndexDef: tdef}
+        if cur.err != "":
+            let e2 = do fqwRecordErr(cur.err)
+            return e2
+        return FqwRecordR{ok: true, err: "", record: FqwRecord{formatVersion: fv.v, sequence: sq.v, transactionId: tx.v, operationId: oi.v, op: op}}
+
+    # ── frame envelope ─────────────────────────────────────────────────
+    proc fqwCrc32(data: [int]) -> int:
+        let mut crc = 4294967295
+        let n = len(data)
+        let mut i = 0
+        loop i < n:
+            crc = crc ^ data[i]
+            let mut k = 0
+            loop k < 8:
+                if (crc & 1) == 1:
+                    crc = (crc >> 1) ^ 3988292384
+                else:
+                    crc = crc >> 1
+                k = k + 1
+            i = i + 1
+        return crc ^ 4294967295
+
+    proc fqwMaxPayload() -> int:
+        return 67108864
+
+    struct FqwEncoded:
+        ok: bool
+        err: text
+        line: text
+
+    # fqwEncodeFrame: encode_frame — bincode, seal, bound, checksum, frame,
+    # hex.
+    proc fqwEncodeFrame(r: FqwRecord, key: [int], nonce: [int]) -> FqwEncoded:
+        let plain = do fqwEncodeRecord(r)
+        let payload = do cryptoEncrypt(key, nonce, plain)
+        let n = len(payload)
+        if n > 67108864:
+            return FqwEncoded{ok: false, err: "WAL payload of " + n + " bytes exceeds the maximum of 67108864 bytes", line: ""}
+        let crc = do fqwCrc32(payload)
+        let h1 = do fqwPutBytes([], [70, 81, 87, 49])
+        let h2 = do fqwPutUint(h1, 1, 2)
+        let h3 = do fqwPutUint(h2, n, 4)
+        let h4 = do fqwPutUint(h3, crc, 4)
+        let frame = do fqwPutBytes(h4, payload)
+        let hex = do cryptoEncodeHex(frame)
+        return FqwEncoded{ok: true, err: "", line: hex}
+
+    # FqwFrame: FrameOutcome — kind "durable" (record set), "torn" or
+    # "corrupt" (detail set).
+    struct FqwFrame:
+        kind: text
+        detail: text
+        record: FqwRecord
+
+    proc fqwFrameBad(kind: text, detail: text) -> FqwFrame:
+        let blank = do fqwControl("begin")
+        return FqwFrame{kind: kind, detail: detail, record: FqwRecord{formatVersion: 0, sequence: 0, transactionId: 0, operationId: 0, op: blank}}
+
+    proc fqwDecodeFrame(line: text, key: [int]) -> FqwFrame:
+        let hx = do cryptoDecodeHex(line)
+        if !hx.ok:
+            let t0 = do fqwFrameBad("torn", "frame is not valid hex: " + hx.err)
+            return t0
+        let raw = hx.bytes
+        let n = len(raw)
+        if n < 14:
+            let t1 = do fqwFrameBad("torn", "frame header truncated: " + n + " of 14 header bytes present")
+            return t1
+        if raw[0] != 70 || raw[1] != 81 || raw[2] != 87 || raw[3] != 49:
+            let found = do cryptoEncodeHex([raw[0], raw[1], raw[2], raw[3]])
+            let c0 = do fqwFrameBad("corrupt", "frame magic mismatch: expected \"FQW1\" (46515731), found 0x" + found + ". This line carries no frame header, which means the WAL predates the frame envelope (or was written by another tool). It cannot be replayed safely and must be recovered or removed by an operator.")
+            return c0
+        let c = FqwCur{buf: raw, pos: 4, err: ""}
+        let ver = do fqwGetUint(c, 2)
+        if ver.v != 1:
+            let c1 = do fqwFrameBad("corrupt", "unsupported WAL frame version " + ver.v)
+            return c1
+        let pl = do fqwGetUint(ver.cur, 4)
+        let payloadLen = pl.v
+        if payloadLen > 67108864:
+            let c2 = do fqwFrameBad("corrupt", "frame declares a payload of " + payloadLen + " bytes, above the maximum of 67108864 bytes")
+            return c2
+        let dc = do fqwGetUint(pl.cur, 4)
+        let available = n - 14
+        if available < payloadLen:
+            let t2 = do fqwFrameBad("torn", "frame payload truncated: " + available + " of " + payloadLen + " bytes present")
+            return t2
+        if available > payloadLen:
+            let c3 = do fqwFrameBad("corrupt", "frame has " + (available - payloadLen) + " trailing byte(s) beyond declared payload length")
+            return c3
+        let mut payload = bytes(payloadLen)
+        let mut i = 0
+        loop i < payloadLen:
+            payload[i] = raw[14 + i]
+            i = i + 1
+        let crc = do fqwCrc32(payload)
+        if crc != dc.v:
+            let c4 = do fqwFrameBad("corrupt", "frame checksum mismatch")
+            return c4
+        let dec = do cryptoDecrypt(key, payload)
+        if !dec.ok:
+            let c5 = do fqwFrameBad("corrupt", "frame failed authentication/decryption: " + dec.err)
+            return c5
+        let rr = do fqwDecodeRecord(dec.plaintext)
+        if !rr.ok:
+            let c6 = do fqwFrameBad("corrupt", "frame contains an invalid record: " + rr.err)
+            return c6
+        let r = rr.record
+        if r.formatVersion != 3:
+            let c7 = do fqwFrameBad("corrupt", "unsupported WAL record format version " + r.formatVersion)
+            return c7
+        if r.sequence == 0:
+            let c8 = do fqwFrameBad("corrupt", "record has invalid sequence 0")
+            return c8
+        if r.operationId == 0:
+            let c9 = do fqwFrameBad("corrupt", "record has invalid operation ID 0")
+            return c9
+        return FqwFrame{kind: "durable", detail: "", record: r}
+
+    # ── reading the log back: read_all ──────────────────────────────────
+    # FqwRead: `io::Result<(Vec<WalRecord>, WalTail)>` — err set on a
+    # refusal; torn/durableLen/tornDetail describe WalTail::Torn.
+    struct FqwRead:
+        err: text
+        records: [FqwRecord]
+        torn: bool
+        durableLen: int
+        tornDetail: text
+
+    proc fqwReadText(src: text, key: [int]) -> FqwRead:
+        let segments = split(src, "\n")
+        let last = len(segments) - 1
+        let mut records = []
+        let mut offset = 0
+        let mut torn = false
+        let mut tornStart = 0
+        let mut tornLine = 0
+        let mut tornDetail = ""
+        let mut index = 0
+        loop index <= last:
+            let segment = segments[index]
+            let lineStart = offset
+            let lineNumber = index + 1
+            offset = offset + byteLen(segment)
+            if index < last:
+                offset = offset + 1
+            let t = trim(segment)
+            if t == "":
+                index = index + 1
+                continue
+            if torn:
+                return FqwRead{err: "WAL line " + tornLine + " is a torn frame (" + tornDetail + ") but line " + lineNumber + " follows it; a torn frame is only valid as the final line, so this is mid-log corruption rather than a crash tail and must be recovered by an operator", records: [], torn: false, durableLen: 0, tornDetail: ""}
+            let fr = do fqwDecodeFrame(t, key)
+            if fr.kind == "durable":
+                records = append(records, fr.record)
+            if fr.kind == "torn":
+                torn = true
+                tornStart = lineStart
+                tornLine = lineNumber
+                tornDetail = fr.detail
+            if fr.kind == "corrupt":
+                return FqwRead{err: "WAL line " + lineNumber + " at byte offset " + lineStart + " is corrupt: " + fr.detail, records: [], torn: false, durableLen: 0, tornDetail: ""}
+            index = index + 1
+        return FqwRead{err: "", records: records, torn: torn, durableLen: tornStart, tornDetail: tornDetail}
+
+    proc fqwReadAll(path: text, key: [int]) -> FqwRead uses io.file:
+        let exists = fileExists(path)
+        if !exists:
+            return FqwRead{err: "", records: [], torn: false, durableLen: 0, tornDetail: ""}
+        let src = readFile(path)
+        let r = do fqwReadText(src, key)
+        return r
+
+    # fqwTruncateTornTail: truncate_torn_tail — set_len + fsync file and
+    # directory (truncateFile does all three).
+    proc fqwTruncateTornTail(path: text, durableLen: int) -> bool uses io.file:
+        let ok = truncateFile(path, durableLen)
+        return ok
+
+    # ── appending: WalHandle + append ───────────────────────────────────
+    # FqwHandle: WalHandle's one piece of state — whether the file ends
+    # without a newline (a tear at exactly its last byte), so the next
+    # line must be preceded by one (the splice guard).
+    struct FqwHandle:
+        path: text
+        needsSeparator: bool
+
+    proc fqwOpen(path: text) -> FqwHandle uses io.file:
+        let exists = fileExists(path)
+        if !exists:
+            return FqwHandle{path: path, needsSeparator: false}
+        let src = readFile(path)
+        let n = len(src)
+        if n == 0:
+            return FqwHandle{path: path, needsSeparator: false}
+        return FqwHandle{path: path, needsSeparator: charAt(src, n - 1) != "\n"}
+
+    # fqwWriteLine: write_line — one durable (fsynced) append.
+    proc fqwWriteLine(h: FqwHandle, encoded: text) -> FqwHandle uses io.file:
+        let mut line = encoded + "\n"
+        if h.needsSeparator:
+            line = "\n" + line
+        let ok = appendFile(h.path, line)
+        return FqwHandle{path: h.path, needsSeparator: false}
+
+    struct FqwAppended:
+        ok: bool
+        err: text
+        handle: FqwHandle
+
+    proc fqwAppend(h: FqwHandle, r: FqwRecord, key: [int], nonce: [int]) -> FqwAppended uses io.file:
+        let enc = do fqwEncodeFrame(r, key, nonce)
+        if !enc.ok:
+            return FqwAppended{ok: false, err: enc.err, handle: h}
+        let h2 = do fqwWriteLine(h, enc.line)
+        return FqwAppended{ok: true, err: "", handle: h2}
+
+    # ── counters: next_* / initialize_counters ─────────────────────────
+    struct FqwCounters:
+        nextSequence: int
+        nextTransactionId: int
+        nextOperationId: int
+
+    proc fqwCountersFresh() -> FqwCounters:
+        return FqwCounters{nextSequence: 1, nextTransactionId: 1, nextOperationId: 1}
+
+    # advance_counter: counter = max(counter, observed + 1).
+    proc fqwInitializeCounters(c: FqwCounters, maxSequence: int, maxTransactionId: int, maxOperationId: int) -> FqwCounters:
+        let mut s = c.nextSequence
+        let mut t = c.nextTransactionId
+        let mut o = c.nextOperationId
+        if s < maxSequence + 1:
+            s = maxSequence + 1
+        if t < maxTransactionId + 1:
+            t = maxTransactionId + 1
+        if o < maxOperationId + 1:
+            o = maxOperationId + 1
+        return FqwCounters{nextSequence: s, nextTransactionId: t, nextOperationId: o}
+
+    # ── recovery.rs: validate, classify, replay ─────────────────────────
+    proc fqwValidateRecords(records: [FqwRecord]) -> text:
+        let n = len(records)
+        let mut i = 0
+        loop i < n:
+            let r = records[i]
+            if r.formatVersion != 3:
+                return "unsupported WAL format version " + r.formatVersion + " at sequence " + r.sequence
+            if r.sequence == 0:
+                return "WAL record has invalid sequence 0"
+            if r.operationId == 0:
+                return "WAL record at sequence " + r.sequence + " has invalid operation ID 0"
+            i = i + 1
+        return ""
+
+    proc fqwValidateSequence(records: [FqwRecord]) -> text:
+        let n = len(records)
+        let mut i = 1
+        loop i < n:
+            if records[i].sequence <= records[i - 1].sequence:
+                return "WAL sequence violation: " + records[i].sequence + " follows " + records[i - 1].sequence
+            i = i + 1
+        return ""
+
+    proc fqwReservedError(sequence: int) -> text:
+        return "transaction control record " + sequence + " uses reserved transaction ID 0"
+
+    struct FqwClassified:
+        err: text
+        txIds: [int]
+        commitSeqs: [int]
+
+    proc fqwSortInts(xs: [int]) -> [int]:
+        let mut out = xs
+        let n = len(out)
+        let mut i = 1
+        loop i < n:
+            let v = out[i]
+            let mut j = i - 1
+            loop j >= 0:
+                if out[j] > v:
+                    out[j + 1] = out[j]
+                    j = j - 1
+                else:
+                    break
+            out[j + 1] = v
+            i = i + 1
+        return out
+
+    # fqwClassifyTransaction: classify_transaction — -1 = not committed
+    # (None), a sequence = committed at that COMMIT; err on a malformed
+    # frame. `frame` is already in file order, which validate_sequence has
+    # proven ascending, so no re-sort is needed.
+    struct FqwTxClass:
+        err: text
+        commitSeq: int
+
+    proc fqwClassifyTransaction(txId: int, frame: [FqwRecord]) -> FqwTxClass:
+        let n = len(frame)
+        if n == 0:
+            return FqwTxClass{err: "", commitSeq: -1}
+        if frame[0].op.tag != "begin":
+            let mut i = 0
+            loop i < n:
+                if frame[i].op.tag == "commit":
+                    return FqwTxClass{err: "transaction " + txId + " has a durable COMMIT at sequence " + frame[i].sequence + " but no BEGIN record; its first surviving record is sequence " + frame[0].sequence + ". A committed transaction whose opening record is missing means the log was truncated through the middle of a frame, so replaying what is left would apply part of a batch and discarding it would silently lose one that was acknowledged. Recovery refuses both and must be resolved by an operator.", commitSeq: -1}
+                i = i + 1
+            return FqwTxClass{err: "", commitSeq: -1}
+        let mut commitSeq = -1
+        let mut aborted = false
+        let mut k = 0
+        loop k < n:
+            let r = frame[k]
+            let tag = r.op.tag
+            if tag == "begin":
+                if k != 0:
+                    return FqwTxClass{err: "transaction " + txId + " contains BEGIN after transaction start", commitSeq: -1}
+            else:
+                if tag == "commit":
+                    if aborted:
+                        return FqwTxClass{err: "transaction " + txId + " contains COMMIT after ABORT", commitSeq: -1}
+                    if commitSeq != -1:
+                        return FqwTxClass{err: "transaction " + txId + " contains duplicate COMMIT", commitSeq: -1}
+                    if k != n - 1:
+                        return FqwTxClass{err: "transaction " + txId + " contains records after COMMIT", commitSeq: -1}
+                    commitSeq = r.sequence
+                else:
+                    if tag == "abort":
+                        if commitSeq != -1:
+                            return FqwTxClass{err: "transaction " + txId + " contains ABORT after COMMIT", commitSeq: -1}
+                        if aborted:
+                            return FqwTxClass{err: "transaction " + txId + " contains duplicate ABORT", commitSeq: -1}
+                        if k != n - 1:
+                            return FqwTxClass{err: "transaction " + txId + " contains records after ABORT", commitSeq: -1}
+                        aborted = true
+                    else:
+                        if k == 0:
+                            return FqwTxClass{err: "transaction " + txId + " begins with a mutation instead of BEGIN", commitSeq: -1}
+                        if commitSeq != -1 || aborted:
+                            return FqwTxClass{err: "transaction " + txId + " contains mutation after transaction termination", commitSeq: -1}
+            k = k + 1
+        return FqwTxClass{err: "", commitSeq: commitSeq}
+
+    proc fqwClassifyTransactions(records: [FqwRecord]) -> FqwClassified:
+        let n = len(records)
+        let mut ids = []
+        let mut i = 0
+        loop i < n:
+            let r = records[i]
+            if r.transactionId == 0:
+                let isCtl = do fqwIsControl(r.op.tag)
+                if isCtl:
+                    let e = do fqwReservedError(r.sequence)
+                    return FqwClassified{err: e, txIds: [], commitSeqs: []}
+            else:
+                if !(r.transactionId in ids):
+                    ids = append(ids, r.transactionId)
+            i = i + 1
+        let sorted = do fqwSortInts(ids)
+        let mut txIds = []
+        let mut commitSeqs = []
+        let m = len(sorted)
+        let mut j = 0
+        loop j < m:
+            let id = sorted[j]
+            let mut frame = []
+            let mut k = 0
+            loop k < n:
+                if records[k].transactionId == id:
+                    frame = append(frame, records[k])
+                k = k + 1
+            let c = do fqwClassifyTransaction(id, frame)
+            if c.err != "":
+                return FqwClassified{err: c.err, txIds: [], commitSeqs: []}
+            if c.commitSeq != -1:
+                txIds = append(txIds, id)
+                commitSeqs = append(commitSeqs, c.commitSeq)
+            j = j + 1
+        return FqwClassified{err: "", txIds: txIds, commitSeqs: commitSeqs}
+
+    # FqwState: the keyed logical state apply_committed maintains.
+    struct FqwState:
+        nodes: [Node]
+        edges: [Edge]
+        users: [UserRecord]
+        indexes: [IndexDef]
+        references: [ReferenceDef]
+        textIndexes: [TextIndexDef]
+        history: [HistoryEntry]
+        appliedSequence: int
+
+    proc fqwStateEmpty() -> FqwState:
+        return FqwState{nodes: [], edges: [], users: [], indexes: [], references: [], textIndexes: [], history: [], appliedSequence: 0}
+
+    proc fqwWith(s: FqwState, nodes: [Node], edges: [Edge], users: [UserRecord], indexes: [IndexDef], references: [ReferenceDef], textIndexes: [TextIndexDef], history: [HistoryEntry]) -> FqwState:
+        return FqwState{nodes: nodes, edges: edges, users: users, indexes: indexes, references: references, textIndexes: textIndexes, history: history, appliedSequence: s.appliedSequence}
+
+    proc fqwNoteRecovered(s: FqwState, sequence: int) -> FqwState:
+        let mut a = s.appliedSequence
+        if sequence > a:
+            a = sequence
+        return FqwState{nodes: s.nodes, edges: s.edges, users: s.users, indexes: s.indexes, references: s.references, textIndexes: s.textIndexes, history: s.history, appliedSequence: a}
+
+    # fqwApply: apply_recovery_operation — every arm idempotent by key.
+    proc fqwApply(s: FqwState, op: Operation) -> FqwState:
+        let tag = op.tag
+        if tag == "insert" || tag == "delete":
+            let mut nodes = []
+            let mut addr = op.name
+            if tag == "insert":
+                addr = op.node.address
+            let n = len(s.nodes)
+            let mut i = 0
+            loop i < n:
+                if s.nodes[i].address != addr:
+                    nodes = append(nodes, s.nodes[i])
+                i = i + 1
+            if tag == "insert":
+                nodes = append(nodes, op.node)
+            let r1 = do fqwWith(s, nodes, s.edges, s.users, s.indexes, s.references, s.textIndexes, s.history)
+            return r1
+        if tag == "archive":
+            let mut hist = []
+            let hn = len(s.history)
+            let mut h = 0
+            loop h < hn:
+                let e = s.history[h]
+                if !(e.address == op.entry.address && e.version == op.entry.version):
+                    hist = append(hist, e)
+                h = h + 1
+            hist = append(hist, op.entry)
+            let r2 = do fqwWith(s, s.nodes, s.edges, s.users, s.indexes, s.references, s.textIndexes, hist)
+            return r2
+        if tag == "insert_edge" || tag == "delete_edge":
+            let mut from = op.edgeId.from
+            let mut to = op.edgeId.to
+            let mut kind = op.edgeId.kind
+            if tag == "insert_edge":
+                from = op.edge.from
+                to = op.edge.to
+                kind = op.edge.kind
+            let mut edges = []
+            let en = len(s.edges)
+            let mut j = 0
+            loop j < en:
+                let e = s.edges[j]
+                if !(e.from == from && e.to == to && e.kind == kind):
+                    edges = append(edges, e)
+                j = j + 1
+            if tag == "insert_edge":
+                edges = append(edges, op.edge)
+            let r3 = do fqwWith(s, s.nodes, edges, s.users, s.indexes, s.references, s.textIndexes, s.history)
+            return r3
+        if tag == "insert_user" || tag == "revoke_user":
+            let mut th = op.name
+            if tag == "insert_user":
+                th = op.user.tokenHash
+            let mut users = []
+            let un = len(s.users)
+            let mut u = 0
+            loop u < un:
+                if s.users[u].tokenHash != th:
+                    users = append(users, s.users[u])
+                u = u + 1
+            if tag == "insert_user":
+                users = append(users, op.user)
+            let r4 = do fqwWith(s, s.nodes, s.edges, users, s.indexes, s.references, s.textIndexes, s.history)
+            return r4
+        if tag == "create_index" || tag == "drop_index":
+            let mut nm = op.name
+            if tag == "create_index":
+                nm = op.indexDef.name
+            let mut defs = []
+            let dn = len(s.indexes)
+            let mut d = 0
+            loop d < dn:
+                if s.indexes[d].name != nm:
+                    defs = append(defs, s.indexes[d])
+                d = d + 1
+            if tag == "create_index":
+                defs = append(defs, op.indexDef)
+            let r5 = do fqwWith(s, s.nodes, s.edges, s.users, defs, s.references, s.textIndexes, s.history)
+            return r5
+        if tag == "create_reference" || tag == "drop_reference":
+            let mut nm2 = op.name
+            if tag == "create_reference":
+                nm2 = op.reference.name
+            let mut refs = []
+            let rn = len(s.references)
+            let mut q = 0
+            loop q < rn:
+                if s.references[q].name != nm2:
+                    refs = append(refs, s.references[q])
+                q = q + 1
+            if tag == "create_reference":
+                refs = append(refs, op.reference)
+            let r6 = do fqwWith(s, s.nodes, s.edges, s.users, s.indexes, refs, s.textIndexes, s.history)
+            return r6
+        if tag == "create_text_index" || tag == "drop_text_index":
+            let mut nm3 = op.name
+            if tag == "create_text_index":
+                nm3 = op.textIndexDef.name
+            let mut tdefs = []
+            let tn = len(s.textIndexes)
+            let mut w = 0
+            loop w < tn:
+                if s.textIndexes[w].name != nm3:
+                    tdefs = append(tdefs, s.textIndexes[w])
+                w = w + 1
+            if tag == "create_text_index":
+                tdefs = append(tdefs, op.textIndexDef)
+            let r7 = do fqwWith(s, s.nodes, s.edges, s.users, s.indexes, s.references, tdefs, s.history)
+            return r7
+        return s
+
+    struct FqwReplayed:
+        err: text
+        state: FqwState
+
+    # fqwReplay: replay_in_sequence_order — a standalone mutation applies
+    # at its own position; a committed transaction's mutations are
+    # buffered and applied at its COMMIT; everything else is dropped.
+    proc fqwReplay(s0: FqwState, records: [FqwRecord], cls: FqwClassified) -> FqwReplayed:
+        let mut s = s0
+        let mut bufTx = []
+        let mut bufOps = []
+        let n = len(records)
+        let mut i = 0
+        loop i < n:
+            let r = records[i]
+            let tag = r.op.tag
+            let isCtl = do fqwIsControl(tag)
+            if r.transactionId == 0:
+                if isCtl:
+                    let e = do fqwReservedError(r.sequence)
+                    return FqwReplayed{err: e, state: s}
+                let a = do fqwApply(s, r.op)
+                let b = do fqwNoteRecovered(a, r.sequence)
+                s = b
+                i = i + 1
+                continue
+            let mut at = -1
+            let nt = len(cls.txIds)
+            let mut k = 0
+            loop k < nt:
+                if cls.txIds[k] == r.transactionId:
+                    at = k
+                k = k + 1
+            if at < 0:
+                i = i + 1
+                continue
+            if tag == "commit":
+                let cs = cls.commitSeqs[at]
+                if r.sequence != cs:
+                    return FqwReplayed{err: "transaction " + r.transactionId + " COMMIT at sequence " + r.sequence + " disagrees with classified commit sequence " + cs, state: s}
+                let mut keepTx = []
+                let mut keepOps = []
+                let nb = len(bufTx)
+                let mut j = 0
+                loop j < nb:
+                    if bufTx[j] == r.transactionId:
+                        let ap = do fqwApply(s, bufOps[j])
+                        s = ap
+                    else:
+                        keepTx = append(keepTx, bufTx[j])
+                        keepOps = append(keepOps, bufOps[j])
+                    j = j + 1
+                bufTx = keepTx
+                bufOps = keepOps
+                let nr = do fqwNoteRecovered(s, r.sequence)
+                s = nr
+            else:
+                if tag != "begin" && tag != "abort":
+                    bufTx = append(bufTx, r.transactionId)
+                    bufOps = append(bufOps, r.op)
+            i = i + 1
+        return FqwReplayed{err: "", state: s}
+
+    # FqwRecovered: recover()'s outcome — the replayed state, the counters
+    # a restarted writer continues from, and whether a torn tail was cut.
+    struct FqwRecovered:
+        err: text
+        state: FqwState
+        counters: FqwCounters
+        truncatedTail: bool
+        durableLen: int
+
+    proc fqwRecoverFail(msg: text) -> FqwRecovered:
+        let s = do fqwStateEmpty()
+        let c = do fqwCountersFresh()
+        return FqwRecovered{err: msg, state: s, counters: c, truncatedTail: false, durableLen: 0}
+
+    # fqwRecover: recover(), against the log at `path` and the durable
+    # checkpoint `checkpoint` (checkpoint.rs's floor; 0 = none).
+    proc fqwRecover(path: text, key: [int], checkpoint: int) -> FqwRecovered uses io.file:
+        let fresh = do fqwCountersFresh()
+        let floor = do fqwInitializeCounters(fresh, checkpoint, 0, checkpoint)
+        let empty = do fqwStateEmpty()
+        let exists = fileExists(path)
+        if !exists:
+            return FqwRecovered{err: "", state: empty, counters: floor, truncatedTail: false, durableLen: 0}
+        let rd = do fqwReadAll(path, key)
+        if rd.err != "":
+            let f0 = do fqwRecoverFail(rd.err)
+            return f0
+        if rd.torn:
+            let cut = do fqwTruncateTornTail(path, rd.durableLen)
+        let v1 = do fqwValidateRecords(rd.records)
+        if v1 != "":
+            let f1 = do fqwRecoverFail(v1)
+            return f1
+        let v2 = do fqwValidateSequence(rd.records)
+        if v2 != "":
+            let f2 = do fqwRecoverFail(v2)
+            return f2
+        let mut maxSeq = 0
+        let mut maxTx = 0
+        let mut maxOp = 0
+        let n = len(rd.records)
+        let mut i = 0
+        loop i < n:
+            let r = rd.records[i]
+            if r.sequence > maxSeq:
+                maxSeq = r.sequence
+            if r.transactionId > maxTx:
+                maxTx = r.transactionId
+            if r.operationId > maxOp:
+                maxOp = r.operationId
+            i = i + 1
+        let counters = do fqwInitializeCounters(floor, maxSeq, maxTx, maxOp)
+        let mut live = []
+        let mut j = 0
+        loop j < n:
+            if rd.records[j].sequence > checkpoint:
+                live = append(live, rd.records[j])
+            j = j + 1
+        let cls = do fqwClassifyTransactions(live)
+        if cls.err != "":
+            let f3 = do fqwRecoverFail(cls.err)
+            return f3
+        let rp = do fqwReplay(empty, live, cls)
+        if rp.err != "":
+            let f4 = do fqwRecoverFail(rp.err)
+            return f4
+        return FqwRecovered{err: "", state: rp.state, counters: counters, truncatedTail: rd.torn, durableLen: rd.durableLen}
+
+    # ── live driver (wal_test.go) ────────────────────────────────────────
+    # An action takes scalars only, so keys and nonces travel as hex and a
+    # workload as a small line script. State cells carry the results.
+    proc fqwHexBytes(s: text) -> [int]:
+        let h = do cryptoDecodeHex(s)
+        return h.bytes
+
+    # fqwNonce: the n-th nonce of a run — 12 bytes, `base` in the first
+    # four, the counter big-endian in the last eight. Distinct per record.
+    # fqwNonce: the n-th nonce of a deterministic sequence (a test's
+    # reproducible nonces) — or, for a negative base, 12 fresh bytes from
+    # the OS's RNG, as crypto.rs draws for every seal in a real server.
+    proc fqwNonce(base: int, n: int) -> [int]:
+        if base < 0:
+            let r = randomBytes(12)
+            return r
+        let mut out = bytes(12)
+        let mut b = base
+        let mut i = 3
+        loop i >= 0:
+            out[i] = b % 256
+            b = b / 256
+            i = i - 1
+        let mut c = n
+        let mut j = 11
+        loop j >= 4:
+            out[j] = c % 256
+            c = c / 256
+            j = j - 1
+        return out
+
+    proc fqwNodeOf(address: text, data: text) -> Node:
+        let coord = do coordinateNew(1, 2, 3, 4)
+        let n = do nodeNew(coord, address, "Doc", "owner")
+        return Node{address: n.address, coordinate: n.coordinate, value: 7, kind: n.kind, data: data, owner: n.owner, hasClaimedBy: false, claimedBy: "", visibility: n.visibility}
+
+    # fqwScriptOp: one workload line → its Operation. Forms:
+    #   begin | commit | abort | insert <addr> <data> | delete <addr>
+    #   edge <from> <to> <kind> | unedge <from> <to> <kind>
+    #   user <hash> <owner> <role> | revoke <hash>
+    #   index <name> <kind> <field> | dropindex <name>
+    proc fqwScriptOp(line: text) -> Operation:
+        let f = split(line, " ")
+        let w = f[0]
+        if w == "begin" || w == "commit" || w == "abort":
+            let c = do fqwControl(w)
+            return c
+        let b = do operationBlank("insert")
+        if w == "insert":
+            let n = do fqwNodeOf(f[1], f[2])
+            return Operation{tag: "insert", entry: b.entry, node: n, name: "", edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+        if w == "delete":
+            return Operation{tag: "delete", entry: b.entry, node: b.node, name: f[1], edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+        if w == "edge":
+            let e = do edgeNew(f[1], f[2], f[3], "owner")
+            return Operation{tag: "insert_edge", entry: b.entry, node: b.node, name: "", edge: e, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+        if w == "unedge":
+            let eid = do edgeIdNew(f[1], f[2], f[3])
+            return Operation{tag: "delete_edge", entry: b.entry, node: b.node, name: "", edge: b.edge, edgeId: eid, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+        if w == "user":
+            return Operation{tag: "insert_user", entry: b.entry, node: b.node, name: "", edge: b.edge, edgeId: b.edgeId, user: UserRecord{tokenHash: f[1], owner: f[2], role: f[3]}, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+        if w == "revoke":
+            return Operation{tag: "revoke_user", entry: b.entry, node: b.node, name: f[1], edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+        if w == "index":
+            let d = do indexDefNew(f[1], f[2], f[3], false)
+            return Operation{tag: "create_index", entry: b.entry, node: b.node, name: "", edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: d, reference: b.reference, textIndexDef: b.textIndexDef}
+        return Operation{tag: "drop_index", entry: b.entry, node: b.node, name: f[1], edge: b.edge, edgeId: b.edgeId, user: b.user, indexDef: b.indexDef, reference: b.reference, textIndexDef: b.textIndexDef}
+
+    # fqwRunScript: append a workload through fqwAppend, continuing the
+    # counters recovery hands back (so a restarted writer never reuses an
+    # identifier). Each script line is `<tx> <op...>` — tx "0" standalone,
+    # "new" opens the next transaction id, "cur" continues it.
+    proc fqwRunScript(path: text, key: [int], nonceBase: int, script: text, c0: FqwCounters) -> FqwCounters uses io.file:
+        let h0 = do fqwOpen(path)
+        let mut h = h0
+        let mut c = c0
+        let mut tx = 0
+        let lines = split(script, "\n")
+        let n = len(lines)
+        let mut i = 0
+        loop i < n:
+            let line = trim(lines[i])
+            if line != "":
+                let sp = split(line, " ")
+                let which = sp[0]
+                let rest = trim(slice(line, len(which) + 1, len(line)))
+                let mut txId = 0
+                if which == "new":
+                    tx = c.nextTransactionId
+                    c = FqwCounters{nextSequence: c.nextSequence, nextTransactionId: c.nextTransactionId + 1, nextOperationId: c.nextOperationId}
+                    txId = tx
+                if which == "cur":
+                    txId = tx
+                let op = do fqwScriptOp(rest)
+                let r = do fqwRecord(c.nextSequence, txId, c.nextOperationId, op)
+                let nonce = do fqwNonce(nonceBase, c.nextSequence)
+                let ap = do fqwAppend(h, r, key, nonce)
+                h = ap.handle
+                c = FqwCounters{nextSequence: c.nextSequence + 1, nextTransactionId: c.nextTransactionId, nextOperationId: c.nextOperationId + 1}
+            i = i + 1
+        return c
+
+    proc fqwJoin(xs: [text]) -> text:
+        let mut out = ""
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            out = out + xs[i]
+            i = i + 1
+        return out
+
+    # fqwSummary: the recovered state, deterministically spelled.
+    proc fqwSummary(r: FqwRecovered) -> text:
+        if r.err != "":
+            return "error: " + r.err
+        let s = r.state
+        let mut nodes = []
+        let nn = len(s.nodes)
+        let mut i = 0
+        loop i < nn:
+            nodes = append(nodes, s.nodes[i].address + "=" + s.nodes[i].data)
+            i = i + 1
+        let mut edges = []
+        let ne = len(s.edges)
+        let mut j = 0
+        loop j < ne:
+            edges = append(edges, s.edges[j].from + ">" + s.edges[j].to + ":" + s.edges[j].kind)
+            j = j + 1
+        let mut users = []
+        let nu = len(s.users)
+        let mut k = 0
+        loop k < nu:
+            users = append(users, s.users[k].tokenHash + ":" + s.users[k].role)
+            k = k + 1
+        let mut idx = []
+        let ni = len(s.indexes)
+        let mut m = 0
+        loop m < ni:
+            idx = append(idx, s.indexes[m].name)
+            m = m + 1
+        let sn = do fqwSortText(nodes)
+        let se = do fqwSortText(edges)
+        let su = do fqwSortText(users)
+        let si = do fqwSortText(idx)
+        let jn = do fqwJoin(sn)
+        let je = do fqwJoin(se)
+        let ju = do fqwJoin(su)
+        let ji = do fqwJoin(si)
+        let mut torn = "0"
+        if r.truncatedTail:
+            torn = "1"
+        return "nodes[" + jn + "] edges[" + je + "] users[" + ju + "] indexes[" + ji + "] applied=" + s.appliedSequence + " next=" + r.counters.nextSequence + "/" + r.counters.nextTransactionId + "/" + r.counters.nextOperationId + " torn=" + torn + "@" + r.durableLen
+
+    proc fqwSortText(xs: [text]) -> [text]:
+        let mut out = xs
+        let n = len(out)
+        let mut i = 1
+        loop i < n:
+            let v = out[i]
+            let mut j = i - 1
+            loop j >= 0:
+                if out[j] > v:
+                    out[j + 1] = out[j]
+                    j = j - 1
+                else:
+                    break
+            out[j + 1] = v
+            i = i + 1
+        return out
+
+    proc fqwRecordHex(r: FqwRecord) -> text:
+        let bs = do fqwEncodeRecord(r)
+        let h = do cryptoEncodeHex(bs)
+        return h
+
+    # fqwGoldenCheck: decode a Rust-written frame line, then re-encode the
+    # decoded record under the SAME nonce it was sealed with (payload bytes
+    # 0..12) — "kind|bincode hex|re-encoded line".
+    proc fqwGoldenCheck(keyHex: text, line: text) -> text:
+        let key = do fqwHexBytes(keyHex)
+        let fr = do fqwDecodeFrame(line, key)
+        if fr.kind != "durable":
+            return fr.kind + "|" + fr.detail + "|"
+        let raw = do fqwHexBytes(line)
+        let mut nonce = bytes(12)
+        let mut i = 0
+        loop i < 12:
+            nonce[i] = raw[14 + i]
+            i = i + 1
+        let enc = do fqwEncodeFrame(fr.record, key, nonce)
+        let bh = do fqwRecordHex(fr.record)
+        return "durable|" + bh + "|" + enc.line
+
+    state walOut: text = ""
+
+    proc fqwSealHex(keyHex: text, nonceHex: text, ptHex: text) -> text:
+        let key = do fqwHexBytes(keyHex)
+        let nonce = do fqwHexBytes(nonceHex)
+        let pt = do fqwHexBytes(ptHex)
+        let sealed = do gcmSeal(key, nonce, pt)
+        let h = do cryptoEncodeHex(sealed)
+        return h
+
+    proc fqwOpenHex(keyHex: text, nonceHex: text, sealedHex: text) -> text:
+        let key = do fqwHexBytes(keyHex)
+        let nonce = do fqwHexBytes(nonceHex)
+        let sealed = do fqwHexBytes(sealedHex)
+        let o = do gcmOpen(key, nonce, sealed)
+        if !o.ok:
+            return "!auth"
+        let h = do cryptoEncodeHex(o.plaintext)
+        return "pt:" + h
+
+    proc fqwSealRefHex(keyHex: text, nonceHex: text, ptHex: text) -> text:
+        let sealed = do gcmSealRef(fqwHexBytes(keyHex), fqwHexBytes(nonceHex), fqwHexBytes(ptHex))
+        let h = do cryptoEncodeHex(sealed)
+        return h
+
+    proc fqwOpenRefHex(keyHex: text, nonceHex: text, sealedHex: text) -> text:
+        let o = do gcmOpenRef(fqwHexBytes(keyHex), fqwHexBytes(nonceHex), fqwHexBytes(sealedHex))
+        if !o.ok:
+            return "!auth"
+        let h = do cryptoEncodeHex(o.plaintext)
+        return "pt:" + h
+
+    action runGcmSealRef(keyHex: text, nonceHex: text, ptHex: text):
+        let r = do fqwSealRefHex(keyHex, nonceHex, ptHex)
+        walOut = r
+
+    action runGcmOpenRef(keyHex: text, nonceHex: text, sealedHex: text):
+        let r = do fqwOpenRefHex(keyHex, nonceHex, sealedHex)
+        walOut = r
+
+    action runGcmSeal(keyHex: text, nonceHex: text, ptHex: text):
+        let r = do fqwSealHex(keyHex, nonceHex, ptHex)
+        walOut = r
+
+    action runGcmOpen(keyHex: text, nonceHex: text, sealedHex: text):
+        let r = do fqwOpenHex(keyHex, nonceHex, sealedHex)
+        walOut = r
+
+    action runWalGolden(keyHex: text, line: text):
+        let r = do fqwGoldenCheck(keyHex, line)
+        walOut = r
+
+    proc fqwDecodeText(keyHex: text, line: text) -> text:
+        let key = do fqwHexBytes(keyHex)
+        let fr = do fqwDecodeFrame(line, key)
+        return fr.kind + "|" + fr.detail
+
+    proc fqwSessionText(path: text, keyHex: text, nonceBase: int, script: text) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let rec = do fqwRecover(path, key, 0)
+        if rec.err != "":
+            return "error: " + rec.err
+        let c = do fqwRunScript(path, key, nonceBase, script, rec.counters)
+        return "next=" + c.nextSequence + "/" + c.nextTransactionId + "/" + c.nextOperationId
+
+    proc fqwRecoverText(path: text, keyHex: text, checkpoint: int) -> text uses io.file:
+        let key = do fqwHexBytes(keyHex)
+        let rec = do fqwRecover(path, key, checkpoint)
+        let s = do fqwSummary(rec)
+        return s
+
+    action runWalDecode(keyHex: text, line: text):
+        let r = do fqwDecodeText(keyHex, line)
+        walOut = r
+
+    # runWalSession: recover whatever is at `path` (checkpoint 0), then
+    # append `script` continuing the recovered counters — a restart
+    # followed by new traffic.
+    action runWalSession(path: text, keyHex: text, nonceBase: int, script: text):
+        let r = do fqwSessionText(path, keyHex, nonceBase, script)
+        walOut = r
+
+    action runWalRecover(path: text, keyHex: text, checkpoint: int):
+        let r = do fqwRecoverText(path, keyHex, checkpoint)
+        walOut = r

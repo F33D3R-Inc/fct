@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,16 +40,21 @@ type Server struct {
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
 	byService   map[string]*ir.Service
-	byProc      map[string]*ir.Proc     // proc name -> its IR, for `do ProcName(args)`
-	byRecord    map[string]*ir.Record   // record name -> its field schema, for decoding a structured service reply
-	triggers    map[string][]ir.Trigger // source action name -> reactions to run on its success
-	gated       map[string][]gatedField // entity -> @requires-gated fields (API per-actor, never SSE)
-	apiRead     map[string]entityRead   // entity -> its JSON-API read rule; ABSENT MEANS REFUSED (see apiread.go)
-	privateNm   map[string]bool         // @private state names — never shipped to a client
-	uploadDir   string                  // directory uploaded files are written to and served from
-	dataDir     string                  // sandbox root for a proc's readFile/writeFile (io.file) — see runtime/io.go
-	channels    *channelRegistry        // backs the `channel()`/`send`/`recv` builtins — see runtime/channel.go
-	netConns    *netRegistry            // backs listen/accept/readBytes/writeBytes/closeConn (io.net.listen) — see runtime/netconn.go
+	byProc      map[string]*ir.Proc      // proc name -> its IR, for `do ProcName(args)`
+	procCode    sync.Map                 // *ir.Proc / *ir.Daemon -> its compiled *procCode (proccompile.go)
+	layoutOnce  sync.Once                // builds layouts, the first time a proc builds a struct
+	layouts     map[string]*structLayout // struct type -> its field layout (proccompile.go)
+	byRecord    map[string]*ir.Record    // record name -> its field schema, for decoding a structured service reply
+	triggers    map[string][]ir.Trigger  // source action name -> reactions to run on its success
+	gated       map[string][]gatedField  // entity -> @requires-gated fields (API per-actor, never SSE)
+	apiRead     map[string]entityRead    // entity -> its JSON-API read rule; ABSENT MEANS REFUSED (see apiread.go)
+	privateNm   map[string]bool          // @private state names — never shipped to a client
+	uploadDir   string                   // directory uploaded files are written to and served from
+	dataDir     string                   // sandbox root for a proc's readFile/writeFile (io.file) — see runtime/io.go
+	channels    *channelRegistry         // backs the `channel()`/`send`/`recv` builtins — see runtime/channel.go
+	netConns    *netRegistry             // backs listen/accept/readBytes/writeBytes/closeConn (io.net.listen) — see runtime/netconn.go
+	shared      *sharedCells             // backs `shared` cells ($shared.get/$shared.set) — see runtime/shared.go
+	console     *stdio                   // backs writeStdout/writeStderr/readStdin (io.console) — see runtime/stdio.go
 
 	uploadMu       sync.Mutex                // guards uploadSessions
 	uploadSessions map[string]*uploadSession // in-flight resumable uploads, keyed by session id
@@ -56,6 +63,7 @@ type Server struct {
 	idem   map[string]*idemRecord // webhook idempotency: dedup key -> the once-processed outcome (or an in-flight marker)
 
 	fieldRE   map[string]*regexp.Regexp // compiled @matches patterns, keyed by entity.field
+	hashed    map[string]bool           // @password fields, keyed by entity.field: every write stores a hash (storedValue)
 	softDel   map[string]bool           // entity names that soft-delete (archive) on remove
 	ephemeral map[string]bool           // entity names that never reach the durable store (see commit, attachStore)
 
@@ -73,9 +81,18 @@ type Server struct {
 	rateClasses map[string]*rateLimiter // per-class limiters for declared api routes (runtime/apidecl.go)
 	streamMu    sync.Mutex
 	streamSubs  map[string]map[*streamSub]bool // stream path -> live subscribers (runtime/streams.go)
-	lockout     *lockout                       // per-username brute-force login lockout
-	audit       *auditLog                      // append-only record of every server action
-	oidc        *oidcProvider                  // optional OIDC SSO (nil unless configured)
+	streamLogs  map[string]*streamLog          // stream path -> recent numbered frames, for Last-Event-ID replay
+
+	// The published contract (runtime/contract.go): a pure function of the IR
+	// and the schema version fixed at boot, so built once and kept.
+	contractOnce      sync.Once
+	contractDoc       map[string]any
+	contractRaw       []byte
+	contractGenerated time.Time
+	schemaVersion     int           // the data schema's ordinal in this deployment's history (contract x-schema-version)
+	lockout           *lockout      // per-username brute-force login lockout
+	audit             *auditLog     // append-only record of every server action
+	oidc              *oidcProvider // optional OIDC SSO (nil unless configured)
 
 	obs      *obs         // structured logs + metrics + tracing
 	cluster  *cluster     // cross-instance pub/sub + shared sessions (nil unless FACET_CLUSTER)
@@ -177,6 +194,7 @@ func newServer(graph *ir.IR) *Server {
 	// features before anything reads the entity set, so they ride the same load and
 	// migration path as a declared entity.
 	injectEnterpriseEntities(graph)
+	injectContractEntities(graph)
 	s := &Server{
 		ir:          graph,
 		byAction:    map[string]*ir.Action{},
@@ -192,10 +210,13 @@ func newServer(graph *ir.IR) *Server {
 		dataDir:     dataDirFromEnv(),
 		channels:    newChannelRegistry(),
 		netConns:    newNetRegistry(),
+		shared:      newSharedCells(),
+		console:     newStdio(),
 
 		uploadSessions: map[string]*uploadSession{},
 		idem:           map[string]*idemRecord{},
 		fieldRE:        map[string]*regexp.Regexp{},
+		hashed:         map[string]bool{},
 		softDel:        map[string]bool{},
 		ephemeral:      map[string]bool{},
 		entities:       map[string][]any{},
@@ -240,6 +261,9 @@ func newServer(graph *ir.IR) *Server {
 			s.ephemeral[ent.Name] = true
 		}
 		for _, f := range ent.Fields {
+			if f.Password {
+				s.hashed[ent.Name+"."+f.Name] = true
+			}
 			if f.Matches == "" {
 				continue
 			}
@@ -352,6 +376,9 @@ func (s *Server) attachStore(store Store) error {
 		}
 		s.cluster = c
 	}
+	// A declared `contract` records the document this process serves, under
+	// its version, so /history and /diff can answer across deploys.
+	s.recordContractVersion()
 	return nil
 }
 
@@ -517,6 +544,14 @@ func (s *Server) Handler() http.Handler {
 	// Declared event streams (runtime/streams.go), one SSE route each.
 	for i := range s.ir.Streams {
 		mux.HandleFunc(s.ir.Streams[i].Path, s.streamHandler(s.ir.Streams[i]))
+	}
+	// `contract "/path"`: the published contract, its version, history and
+	// diffs (runtime/contracthistory.go).
+	if c := s.ir.Contract; c != nil {
+		mux.HandleFunc(c.Path, s.contractRoute(s.handleContractDocument))
+		mux.HandleFunc(c.Path+"/version", s.contractRoute(s.handleContractVersion))
+		mux.HandleFunc(c.Path+"/history", s.contractRoute(s.handleContractHistory))
+		mux.HandleFunc(c.Path+"/diff", s.contractRoute(s.handleContractDiff))
 	}
 	// The app's view router, last and least specific: it receives every path no
 	// built-in above claimed. shadowedRoutes reports the ones it will never see.
@@ -1007,19 +1042,45 @@ func (s *Server) headMeta(pg *ir.Page, store map[string]any) string {
 	return b.String()
 }
 
+// serviceEndpoint is where an operation of sv is posted: the deployment's
+// URL override (`env VAR`, when set) or the declared base URL, plus "/op".
+func serviceEndpoint(sv ir.Service, op string) string {
+	base := sv.URL
+	if sv.URLEnv != "" {
+		if v := strings.TrimSpace(os.Getenv(sv.URLEnv)); v != "" {
+			base = v
+		}
+	}
+	return strings.TrimRight(base, "/") + "/" + op
+}
+
+// serviceRequest is the POST of one operation, carrying the service's
+// env-valued headers (`header "X-Internal-Key" env INTERNAL_API_KEY`); a header
+// whose variable is unset is not sent.
+func serviceRequest(sv ir.Service, endpoint string, payload []byte) *http.Request {
+	req, _ := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	for _, h := range sv.Headers {
+		if v := os.Getenv(h.Env); v != "" {
+			req.Header.Set(h.Name, v)
+		}
+	}
+	return req
+}
+
 // callService posts a service operation's arguments as JSON to an external brain,
 // fire-and-forget: a `call` is a side effect, so it never blocks the action's
 // response. Failures are logged, not surfaced — the authority did its part. The
 // only egress is to the URLs declared in `service` blocks.
-func (s *Server) callService(baseURL, op string, body map[string]any) {
+func (s *Server) callService(sv ir.Service, op string, body map[string]any) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return
 	}
-	endpoint := strings.TrimRight(baseURL, "/") + "/" + op
+	endpoint := serviceEndpoint(sv, op)
 	go func() {
 		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Post(endpoint, "application/json", strings.NewReader(string(payload)))
+		resp, err := client.Do(serviceRequest(sv, endpoint, payload))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "facet: service call %s failed: %v\n", endpoint, err)
 			return
@@ -1038,20 +1099,37 @@ func (s *Server) callService(baseURL, op string, body map[string]any) {
 // failure is an error, which aborts the action. (The action holds the store lock
 // for the round-trip, so a bound brain should answer fast — it is the authority's
 // egress, on localhost in the mesh.)
-func (s *Server) callServiceSync(baseURL, op string, body map[string]any) (any, error) {
+//
+// A `-> bytes` operation answers a file (fileReply): its raw body is stored
+// as an upload, named by the reply's Content-Type, and the result is the
+// stored file's reference — what a `bytes` action parameter holds.
+func (s *Server) callServiceSync(sv ir.Service, op string, body map[string]any, fileReply bool) (any, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	endpoint := strings.TrimRight(baseURL, "/") + "/" + op
+	endpoint := serviceEndpoint(sv, op)
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(endpoint, "application/json", strings.NewReader(string(payload)))
+	resp, err := client.Do(serviceRequest(sv, endpoint, payload))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("%s returned %d", endpoint, resp.StatusCode)
+	}
+	if fileReply {
+		ext := ""
+		if ct, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err == nil {
+			if exts, _ := mime.ExtensionsByType(ct); len(exts) > 0 {
+				ext = exts[0]
+			}
+		}
+		name, err := s.storeUpload(io.LimitReader(resp.Body, mediaTotalCap()), "reply"+ext)
+		if err != nil {
+			return nil, err
+		}
+		return mediaPathPrefix + name, nil
 	}
 	var decoded any
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
@@ -1079,11 +1157,46 @@ func (s *Server) coerceRet(v any, ret string, list bool) any {
 		}
 		items = []any{v} // a lone value where a list was declared — wrap it
 	}
+	if s.byRecord[ret] == nil && canonicalList(items, ret) {
+		// Already the declared element type throughout (every well-typed
+		// proc-to-proc return is): hand the list on as it is. The binding
+		// is not owned, so a caller that mutates it copies first.
+		return items
+	}
 	out := make([]any, len(items))
 	for i, it := range items {
 		out[i] = s.coerceOne(it, ret)
 	}
 	return out
+}
+
+// canonical reports whether v already has the Go type coerce(v, typ)
+// produces, so coercing it would only copy (and re-box) it.
+func canonical(v any, typ string) bool {
+	switch typ {
+	case "int", "money", "date":
+		_, ok := v.(int)
+		return ok
+	case "float":
+		_, ok := v.(float64)
+		return ok
+	case "bool":
+		_, ok := v.(bool)
+		return ok
+	case "text", "datetime":
+		_, ok := v.(string)
+		return ok
+	}
+	return true
+}
+
+func canonicalList(items []any, typ string) bool {
+	for _, it := range items {
+		if !canonical(it, typ) {
+			return false
+		}
+	}
+	return true
 }
 
 // coerceOne coerces one returned value to its declared type. A record return is
@@ -1415,13 +1528,14 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sid := s.session(w, r)
-	deltas, value, status, msg := s.runActionValue(sid, act, req.Args)
+	deltas, value, after, status, msg := s.runActionValue(sid, act, req.Args)
 	if status != http.StatusOK {
 		http.Error(w, msg, status)
 		return
 	}
-	if len(deltas) > 0 {
-		s.persistSession(sid) // the action changed per-session state; share it
+	s.adoptSession(w, sid, after)
+	if len(deltas) > 0 && after != "" {
+		s.persistSession(after) // the action changed per-session state; share it
 	}
 	w.Header().Set("Content-Type", "application/json")
 	reply := map[string]any{"deltas": deltas}
@@ -1443,22 +1557,96 @@ const maxTriggerDepth = 64
 // outside the action lock (it re-enters runAction for each reaction), so the lock
 // is never held re-entrantly.
 func (s *Server) runAction(sid string, act *ir.Action, args []any) (map[string]any, int, string) {
-	deltas, _, status, msg := s.runActionValue(sid, act, args)
+	deltas, _, _, status, msg := s.runActionValue(sid, act, args)
 	return deltas, status, msg
 }
 
 // runActionValue is runAction plus the action's reply value (`return expr`,
-// nil when the action declares none) — what the JSON projections answer with.
-func (s *Server) runActionValue(sid string, act *ir.Action, args []any) (map[string]any, any, int, string) {
-	return s.runActionDepth(sid, act, args, 0)
+// nil when the action declares none) — what the JSON projections answer with —
+// and the caller's session id afterwards: a new one when the action ran
+// `establish` (the session is re-keyed, see actionRun.rekey), "" when it
+// `revoke`d the caller's own session, else sid unchanged. An HTTP caller hands
+// that to adoptSession.
+func (s *Server) runActionValue(sid string, act *ir.Action, args []any) (map[string]any, any, string, int, string) {
+	deltas, value, after, status, msg := s.runActionDepth(sid, act, args, 0)
+	value, _ = unwrapReply(value)
+	return deltas, value, after, status, msg
 }
 
-func (s *Server) runActionDepth(sid string, act *ir.Action, args []any, depth int) (map[string]any, any, int, string) {
-	deltas, value, status, msg := s.runActionLocked(sid, act, args)
+// runActionReply is runActionValue for a declared api route: it also answers
+// the reply's HTTP-only outcome — the success status the reply chose with
+// `return … status N`, the headers it set, or a failed check's error code.
+func (s *Server) runActionReply(sid string, act *ir.Action, args []any) (any, string, int, string, replyMeta) {
+	_, value, after, status, msg := s.runActionDepth(sid, act, args, 0)
+	var meta replyMeta
+	if sr, ok := value.(statusReply); ok {
+		value, meta = sr.value, replyMeta{status: sr.status, headers: sr.headers, code: sr.code}
+	}
+	return value, after, status, msg, meta
+}
+
+// statusReply is a reply value that carries what only an HTTP surface (a
+// declared api route, a dispatched message variant) reads: its own success
+// status (an executed `return … status N`), the response headers the action
+// set (`header "Name" expr`), and — on a failure — the failing check's error
+// code (`check … code "…"`).
+type statusReply struct {
+	status  int
+	value   any
+	headers [][2]string
+	code    string
+}
+
+func unwrapReply(v any) (any, int) {
+	if sr, ok := v.(statusReply); ok {
+		return sr.value, sr.status
+	}
+	return v, 0
+}
+
+// replyMeta is the HTTP-only part of an action's outcome (see statusReply).
+type replyMeta struct {
+	status  int         // success status from `return … status N`; 0 = the route's
+	headers [][2]string // response headers, applied on success
+	code    string      // the failing check's error code; "" = the status's name
+}
+
+// validHeaderValue reports whether v is a legal HTTP field value (RFC 9110
+// §5.5): visible characters, spaces and tabs only — no CR/LF to split on.
+func validHeaderValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if c < ' ' && c != '\t' || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) runActionDepth(sid string, act *ir.Action, args []any, depth int) (map[string]any, any, string, int, string) {
+	deltas, value, after, status, msg := s.runActionLocked(sid, act, args)
 	if status == http.StatusOK {
 		s.fireTriggers(act.Name, depth)
 	}
-	return deltas, value, status, msg
+	return deltas, value, after, status, msg
+}
+
+// adoptSession carries what an action did to the caller's session into the
+// response: a session `establish` re-keyed is persisted under its new id and
+// the cookie now names it — and so does X-Session-Token, the same signed
+// value, for a native client holding its session as a Bearer token (whose old
+// token the re-key retired, and which reads no cookies); one the action
+// revoked has its cookie cleared.
+func (s *Server) adoptSession(w http.ResponseWriter, before, after string) {
+	switch {
+	case after == before:
+	case after == "":
+		s.clearSessionCookie(w)
+	default:
+		s.persistSession(after)
+		s.setSessionCookie(w, after)
+		w.Header().Set("X-Session-Token", signValue(after))
+	}
 }
 
 // fireTriggers runs the reactions registered for a just-completed action, each as
@@ -1482,6 +1670,21 @@ func (s *Server) fireTriggers(actName string, depth int) {
 // authoritative state under the lock, persists and fans out entity changes, and
 // returns the per-session scalar deltas (plus an HTTP-shaped status so each caller
 // can report failures in its own idiom). Trigger fan-out is the caller's job.
+// sessionToken is the credential an action body reads as `sessionToken`: the
+// caller's session id signed exactly as the `fa_sid` cookie carries it, which is
+// what `Authorization: Bearer` presents and sidForRequest verifies — so the token
+// a login action hands a native client names the very session it just signed
+// in, the one the cookie (if any) names too. It is bound only for an action run,
+// never into a render scope, so it cannot reach a page or a stream. An internal
+// caller (a job, trigger, webhook or tool) has no client to hand it to, and
+// signing the system session would mint an admin credential, so it gets "".
+func sessionToken(sid string) string {
+	if sid == "" || sid == systemSID || sid == toolSID {
+		return ""
+	}
+	return signValue(sid)
+}
+
 // ensureSession guarantees a session exists for sid before an action reads scope.
 // The system session (jobs, triggers, webhooks) is a verified admin so its actions
 // pass policies as a trusted internal caller; any other missing session starts as
@@ -1501,22 +1704,28 @@ func (s *Server) ensureSession(sid string) *sessionState {
 	return ses
 }
 
-func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[string]any, any, int, string) {
+func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[string]any, any, string, int, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.ensureSession(sid) // so scope() and policies see the right actor (system → admin)
 	scope := s.scope(sid)
+	scope["sessionToken"] = sessionToken(sid)
+	given := map[string]bool{} // the parameters the caller actually sent (given(p))
+	scope[givenKey] = given
 	for i, p := range act.Params {
 		var v any
+		if i < len(args) && args[i] != nil {
+			given[p.Name] = true
+		}
 		if i < len(args) {
 			var ok bool
-			if v, ok = coerceParam(args[i], p.Type); !ok {
-				return nil, nil, http.StatusBadRequest, fmt.Sprintf(
-					"%s: parameter %q expects %s, got %v", act.Name, p.Name, p.Type, args[i])
+			if v, ok = paramArg(args[i], p); !ok {
+				return nil, nil, sid, http.StatusBadRequest, fmt.Sprintf(
+					"%s: parameter %q expects %s, got %v", act.Name, p.Name, paramTypeName(p), args[i])
 			}
 		} else {
-			v = zero(p.Type)
+			v = paramZero(p)
 		}
 		scope[p.Name] = v
 	}
@@ -1528,7 +1737,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		if !s.policyPasses(req, scope) {
 			s.recordAudit(actor, act.Name, false, "denied: "+req.Name)
 			s.obs.metrics.observeAction(act.Name, "denied")
-			return nil, nil, http.StatusForbidden, "forbidden: " + req.Name
+			return nil, nil, sid, http.StatusForbidden, "forbidden: " + req.Name
 		}
 	}
 
@@ -1537,6 +1746,7 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 	ar := &actionRun{
 		act:        act,
 		actor:      actor,
+		sid:        sid,
 		scope:      scope,
 		ses:        ses,
 		sess:       sess,
@@ -1548,14 +1758,34 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		// reported (runtime/undo.go).
 		undo: newUndoLog(ses),
 	}
-	if status, msg := s.execActionBlock(act.Body, ar); status != http.StatusOK {
+	scope[procRunnerKey] = procRunner(func(name string, args []any) (any, bool) {
+		if name == "\x00fileDigest" && len(args) == 1 {
+			return s.fileDigest(toStr(args[0])), true
+		}
+		p := s.byProc[name]
+		if p == nil {
+			return nil, false
+		}
+		v, err := s.runProcLocked(p, args)
+		if err != nil {
+			panic(procCallError{err})
+		}
+		return v, true
+	})
+	defer delete(scope, procRunnerKey)
+	if status, msg := s.execActionBlockCatching(act.Body, ar); status != http.StatusOK {
 		// The body stopped part-way. Whatever it had already written to the
 		// working set comes back out, so the action either happened in full or
 		// not at all — in memory exactly as in the store below. (A check or a
 		// policy that fails before the first write has nothing to undo, and the
 		// rollback of an empty log is a no-op.)
 		ar.undo.rollback(s, ses, sess)
-		return nil, nil, status, msg
+		if ar.errCode != "" {
+			// The failed check's `code "…"`: carried to the HTTP surface in the
+			// reply slot, which a failure otherwise leaves empty.
+			return nil, statusReply{code: ar.errCode}, sid, status, msg
+		}
+		return nil, nil, sid, status, msg
 	}
 	deltas, entChanged, ops, undo := ar.deltas, ar.entChanged, ar.ops, ar.undo
 
@@ -1575,7 +1805,28 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 		s.obs.metrics.observeAction(act.Name, "error")
 		s.obs.log.Error("action rolled back: the store refused the write",
 			slog.String("action", act.Name), slog_err(err))
-		return nil, nil, http.StatusInternalServerError, "the write could not be stored and was rolled back"
+		return nil, nil, sid, http.StatusInternalServerError, "the write could not be stored and was rolled back"
+	}
+
+	// The action is durable, so its session effects land now, and only now: a
+	// failed action neither re-keys nor signs anyone out.
+	after := sid
+	if ar.rekey != "" {
+		delete(s.sessions, sid)
+		s.sessions[ar.rekey] = ses
+		s.dropSharedSession(sid)
+		after = ar.rekey
+	}
+	for _, key := range ar.revokes {
+		if key != "" && s.revokeVisitor(key, after) {
+			after = ""
+		}
+	}
+	for _, rs := range ar.restates {
+		s.restateActor(rs[0], rs[1])
+	}
+	if len(ar.revokes) > 0 || ar.rekey != "" {
+		s.obs.metrics.setSessions(int64(len(s.sessions)))
 	}
 
 	// Shared (entity) changes fan out to every live client over SSE — including
@@ -1591,7 +1842,28 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 	s.recordAudit(actor, act.Name, true, "")
 	s.obs.metrics.observeAction(act.Name, "ok")
 	s.fanoutEvents(ar.emits)
-	return deltas, ar.retVal, http.StatusOK, ""
+	reply := s.replyValue(act, ar.retVal, ar.scope)
+	if ar.retStatus != 0 || len(ar.headers) > 0 {
+		reply = statusReply{status: ar.retStatus, value: reply, headers: ar.headers}
+	}
+	return deltas, reply, after, http.StatusOK, ""
+}
+
+// replyValue projects an entity-typed reply (`-> Post`, `-> [Post]`) through
+// visibleRows, the one door every other path a row takes to a client goes
+// through, so a returned row carries exactly what the caller may receive: no
+// @requires-gated field its policy denies them, and never a @password hash.
+func (s *Server) replyValue(act *ir.Action, v any, scope map[string]any) any {
+	if _, isEntity := s.entityByName(act.Ret); !isEntity || v == nil {
+		return v
+	}
+	if act.RetList {
+		return s.visibleRows(act.Ret, v, scope)
+	}
+	if out, _ := s.visibleRows(act.Ret, []any{v}, scope).([]any); len(out) == 1 {
+		return out[0]
+	}
+	return v
 }
 
 // actionRun is the frame one action body executes in: the scope every
@@ -1602,8 +1874,16 @@ func (s *Server) runActionLocked(sid string, act *ir.Action, args []any) (map[st
 // back. One value, passed down through every nested block, so a `set` inside a
 // `for` inside an `if` lands in exactly the same batch a top-level one does.
 type actionRun struct {
-	act        *ir.Action
-	actor      string
+	act   *ir.Action
+	actor string
+	sid   string // the caller's session id as the action found it
+	// rekey is the fresh id an `establish` moves the caller's session to once
+	// the action commits (session fixation: an id minted before the identity
+	// change must not carry it), minted at the first establish so sessionToken
+	// already names it; revokes are the `session` keys a `revoke` ends then.
+	rekey      string
+	revokes    []string
+	restates   [][2]string // `restate actor A role R`: (A, R), applied after the commit
 	scope      map[string]any
 	ses        *sessionState
 	sess       map[string]any
@@ -1614,9 +1894,18 @@ type actionRun struct {
 	// retVal/returned carry `return expr`: the reply value, and the fact that
 	// the body has ended early — every enclosing block checks `returned`
 	// after a nested block runs and stops too.
-	retVal   any
-	returned bool
-	emits    []emitted // `emit` statements, delivered after the commit
+	retVal any
+	// retStatus is the executed `return … status N` (0 = none): the reply's
+	// own success status on a declared api route (see statusReply).
+	retStatus int
+	returned  bool
+	// errCode is the failing check's `code "…"` ("" = none): the
+	// APIErrorDTO code a declared route answers the failure with.
+	errCode string
+	// headers are the executed `header "Name" expr` statements, in order:
+	// response headers the HTTP reply carries once the action commits.
+	headers [][2]string
+	emits   []emitted // `emit` statements, delivered after the commit
 }
 
 // execActionBlock runs one statement list of an action body — the body itself,
@@ -1624,7 +1913,7 @@ type actionRun struct {
 // message the way runActionLocked's callers expect: 200 with "" when every
 // statement ran, or the first failure's status and message. It is recursive
 // for the two statements that carry a block (`for`, `if`), mirroring
-// execProcBlock's shape for a proc body.
+// the proc engine's shape for a proc body (proccompile.go).
 //
 // Locals a block binds (`let`, a bound `add`) live in the action's one flat
 // scope map for the rest of that block and are removed when it ends; a `for`'s
@@ -1648,12 +1937,17 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 			// write the body already made (runtime/undo.go), so nothing this
 			// check found wrong is left standing.
 			if !truthy(eval(st.Value, ar.scope)) {
-				s.recordAudit(ar.actor, ar.act.Name, false, "check failed: "+st.Msg)
+				msg := st.Msg
+				if st.Key != nil { // an interpolating message
+					msg = toStr(eval(st.Key, ar.scope))
+				}
+				ar.errCode = st.Target
+				s.recordAudit(ar.actor, ar.act.Name, false, "check failed: "+msg)
 				s.obs.metrics.observeAction(ar.act.Name, "invalid")
 				if st.Status != 0 {
-					return st.Status, st.Msg
+					return st.Status, msg
 				}
-				return http.StatusUnprocessableEntity, st.Msg
+				return http.StatusUnprocessableEntity, msg
 			}
 		case "assign":
 			v := eval(st.Value, ar.scope)
@@ -1670,6 +1964,10 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 			// optionally role) in place — effective for every later request — and
 			// echo it as a delta so a reactive {actor} updates and clustering syncs.
 			na := toStr(eval(st.Value, ar.scope))
+			if ar.rekey == "" && sessionToken(ar.sid) != "" {
+				ar.rekey = newSessionID()
+				ar.scope["sessionToken"] = sessionToken(ar.rekey)
+			}
 			ar.ses.actor = na
 			ar.scope["actor"] = na
 			ar.deltas["actor"] = na
@@ -1679,6 +1977,10 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 				ar.scope["role"] = nr
 				ar.deltas["role"] = nr
 			}
+		case "revoke":
+			ar.revokes = append(ar.revokes, toStr(eval(st.Value, ar.scope)))
+		case "restate":
+			ar.restates = append(ar.restates, [2]string{toStr(eval(st.Value, ar.scope)), toStr(eval(st.Role, ar.scope))})
 		case "add":
 			row := record{}
 			for _, fi := range st.Fields {
@@ -1687,6 +1989,11 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 			// Declarative constraints (@required/@unique/@min/@max/@matches) are
 			// enforced before the row lands, so invalid data never reaches the store.
 			if msg := s.constraintError(st.Entity, row, "", nil); msg != "" {
+				s.recordAudit(ar.actor, ar.act.Name, false, "constraint: "+msg)
+				s.obs.metrics.observeAction(ar.act.Name, "invalid")
+				return http.StatusUnprocessableEntity, msg
+			}
+			if msg := s.storeRow(st.Entity, row); msg != "" {
 				s.recordAudit(ar.actor, ar.act.Name, false, "constraint: "+msg)
 				s.obs.metrics.observeAction(ar.act.Name, "invalid")
 				return http.StatusUnprocessableEntity, msg
@@ -1745,6 +2052,12 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 							break
 						}
 					}
+					for _, fi := range st.Fields {
+						if bad != "" {
+							break
+						}
+						cand[fi.Name], bad = s.storedValue(st.Entity, fi.Name, cand[fi.Name])
+					}
 					if bad != "" {
 						if had {
 							ar.scope[st.Var] = prev
@@ -1783,6 +2096,12 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 					}
 					cand[st.Field] = nv
 					if msg := s.constraintError(st.Entity, cand, st.Field, m["id"]); msg != "" {
+						s.recordAudit(ar.actor, ar.act.Name, false, "constraint: "+msg)
+						s.obs.metrics.observeAction(ar.act.Name, "invalid")
+						return http.StatusUnprocessableEntity, msg
+					}
+					var msg string
+					if nv, msg = s.storedValue(st.Entity, st.Field, nv); msg != "" {
 						s.recordAudit(ar.actor, ar.act.Name, false, "constraint: "+msg)
 						s.obs.metrics.observeAction(ar.act.Name, "invalid")
 						return http.StatusUnprocessableEntity, msg
@@ -1898,14 +2217,14 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 					// Request→response: wait for the brain's typed answer and bind it
 					// into ar.scope so the rest of the body can use it. A failed call
 					// aborts the action (surfaces via failed(<action>)).
-					res, err := s.callServiceSync(sv.URL, st.Field, body)
+					res, err := s.callServiceSync(*sv, st.Field, body, st.Ret == "bytes")
 					if err != nil {
 						s.obs.metrics.observeAction(ar.act.Name, "service_error")
 						return http.StatusBadGateway, fmt.Sprintf("%s.%s unavailable", st.Service, st.Field)
 					}
 					ar.scope[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
 				} else {
-					s.callService(sv.URL, st.Field, body) // fire-and-forget
+					s.callService(*sv, st.Field, body) // fire-and-forget
 				}
 			}
 		case "do":
@@ -1934,21 +2253,35 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 			}
 		case "exprstmt":
 			// A bare builtin call for its side effect alone — print(...), its
-			// result discarded. Mirrors execProcBlock's identical "exprstmt" case
-			// below, using eval() (this action's flat ar.scope) instead of
-			// evalInFrame (a proc's frame chain) — internal/ir/build.go's
+			// result discarded. Mirrors the proc engine's identical "exprstmt" case
+			// (proccompile.go), using eval() (this action's flat ar.scope) instead of
+			// a proc's slot frame — internal/ir/build.go's
 			// action() builder already proved this is a builtin the language
 			// allows in an action body (readExpr's e.check funnel), so there is
 			// nothing left to fail on here.
 			eval(st.Value, ar.scope)
+		case "header":
+			// A response header for the HTTP reply. The compiler vetted the name
+			// (checkActionHeaderName); the value is checked here, where it is
+			// known: no control characters, so it can never split the response.
+			v := toStr(eval(st.Value, ar.scope))
+			if !validHeaderValue(v) {
+				s.obs.metrics.observeAction(ar.act.Name, "invalid")
+				return http.StatusInternalServerError, "header " + st.Msg + " has a value that is not a valid HTTP header value"
+			}
+			ar.headers = append(ar.headers, [2]string{st.Msg, v})
 		case "return":
 			if st.Value != nil {
 				ar.retVal = eval(st.Value, ar.scope)
 			}
+			ar.retStatus = st.Status
 			ar.returned = true
 			return http.StatusOK, ""
 		case "emit":
-			ev := emitted{typ: st.Field, payload: eval(st.Value, ar.scope)}
+			ev := emitted{typ: st.Field, name: st.Target, payload: eval(st.Value, ar.scope)}
+			if len(st.Args) > 0 {
+				ev.key = streamKey(evalArgs(st.Args, ar.scope))
+			}
 			if st.Key != nil {
 				ev.to, ev.targeted = toStr(eval(st.Key, ar.scope)), true
 			}
@@ -2032,6 +2365,26 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 				delete(ar.scope, st.Var)
 			}
 		}
+		if st.Op == "foreach" {
+			// `for x in list:` — each element of a list value, in order.
+			items, _ := eval(st.Value, ar.scope).([]any)
+			prev, had := ar.scope[st.Var]
+			restore := func() {
+				if had {
+					ar.scope[st.Var] = prev
+				} else {
+					delete(ar.scope, st.Var)
+				}
+			}
+			for _, it := range items {
+				ar.scope[st.Var] = it
+				if status, msg := s.execActionBlock(st.Body, ar); status != http.StatusOK || ar.returned {
+					restore()
+					return status, msg
+				}
+			}
+			restore()
+		}
 		// keep entity collections in scope fresh for later statements.
 		for ent := range ar.entChanged {
 			ar.scope[ent] = s.entities[ent]
@@ -2040,25 +2393,56 @@ func (s *Server) execActionBlock(body []ir.Stmt, ar *actionRun) (int, string) {
 	return http.StatusOK, ""
 }
 
+// execActionBlockCatching is execActionBlock for an action body, turning a
+// proc that failed inside an expression (procCallError) into the action's
+// failure, the same 500 a failed `do` answers.
+func (s *Server) execActionBlockCatching(body []ir.Stmt, ar *actionRun) (status int, msg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			pe, ok := r.(procCallError)
+			if !ok {
+				panic(r)
+			}
+			s.obs.metrics.observeAction(ar.act.Name, "proc_error")
+			status, msg = http.StatusInternalServerError, pe.err.Error()
+		}
+	}()
+	return s.execActionBlock(body, ar)
+}
+
 // runProcLocked runs a proc synchronously, in-process, under the caller's lock
 // (an action's `do ProcName(args)`, or another proc's). Unlike runActionLocked
 // above, it has no placement to compute (a proc is unconditionally
 // server-executed), no policy gate, no entity/session state to read or write,
 // and no wire deltas to produce — it is pure computation over a fresh frame of
-// its own: one scope-frame chain (runtime/eval.go's `frame`) built fresh for this
+// its own: one slot frame (proccompile.go's `pfr`) built fresh for this
 // call, holding only its parameters and its `let`-bound locals. That frame is
 // never the caller's scope map, so a proc-local can share a name with a state
 // cell, an entity, or the calling action's own parameter without aliasing or
 // leaking into it — when the proc returns, the frame (and everything in it) is
 // simply discarded; only the `return`ed value crosses back to the caller.
 //
-// The body itself is interpreted by execProcBlock, a genuinely recursive
-// tree-walker (Milestone 2: `loop`/`if` bodies nest). A proc whose body falls
+// The body runs as compiled code (proccompile.go: names resolved to slots
+// once, the first time the proc runs). A proc whose body falls
 // off the end without a `return` — only possible when it declares no return
 // type, since internal/ir/build.go's stmtsReturnComplete refuses that for a
 // return-typed proc — simply yields nil.
 func (s *Server) runProcLocked(p *ir.Proc, args []any) (any, error) {
-	fr := &frame{vars: map[string]any{}}
+	return s.runCode(s.codeFor(p, p.Params, p.Body), p, args)
+}
+
+// runCode runs proc p's compiled code pc over args.
+func (s *Server) runCode(pc *procCode, p *ir.Proc, args []any) (any, error) {
+	v, _, err := s.runCodeOwned(pc, p, args, 0)
+	return v, err
+}
+
+// runCodeOwned is runCode for a call that hands over some arguments: bit i
+// of owned says argument i is referenced from nowhere else, so its
+// parameter owns it. The result reports whether the returned value is
+// likewise the caller's alone.
+func (s *Server) runCodeOwned(pc *procCode, p *ir.Proc, args []any, owned uint64) (any, bool, error) {
+	fr := pc.newFrame()
 	for i, prm := range p.Params {
 		var v any
 		if i < len(args) {
@@ -2077,24 +2461,24 @@ func (s *Server) runProcLocked(p *ir.Proc, args []any) (any, error) {
 		} else {
 			v = zero(prm.Type)
 		}
-		// cloneCompositeValue: a param binding is a new variable taking on a
-		// value, exactly like a `let` — see cloneArrayValue's/cloneMapValue's
-		// docs for why an array or map value is copied at every such point
-		// instead of aliased.
-		fr.vars[prm.Name] = cloneCompositeValue(v)
+		// Shared, not copied: unless the caller handed the value over, the
+		// parameter's slot does not own it, so the proc's first in-place
+		// write to it copies (proccompile.go).
+		pc.bindParam(fr, i, v, i < 64 && owned&(1<<uint(i)) != 0)
 	}
-	c, err := s.execProcBlock(p.Body, fr)
+	c, err := runStmts(pc.body, fr)
+	pc.release(fr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return c.val, nil
+	return c.val, c.owned, nil
 }
 
 // ctlKind distinguishes how a proc block finished, so a `return` can unwind
 // every nested loop/if it is inside (all the way out of the proc) while
 // `break`/`continue` stop or restart exactly one enclosing loop and go no
 // further — the standard tree-walking-interpreter control-transfer signal,
-// threaded back up through execProcBlock's recursive calls and checked after
+// threaded back up through the compiled blocks (proccompile.go's runStmts) and checked after
 // every statement/nested block so it propagates correctly.
 type ctlKind int
 
@@ -2105,388 +2489,13 @@ const (
 	ctlContinue                // `continue`: skip to the nearest enclosing loop's next condition check
 )
 
-// ctlSignal is what execProcBlock and its loop/if helpers pass back up: which
+// ctlSignal is what a compiled proc statement passes back up: which
 // of the four things happened, and — for ctlReturn only — the value the proc
 // returns.
 type ctlSignal struct {
-	kind ctlKind
-	val  any
-}
-
-// execProcBlock runs one nested statement list — a proc's own top-level body,
-// or a `loop`/`if` statement's own Body/Else — against frame fr, in source
-// order, stopping early the moment a statement (or a nested block it calls
-// into) produces a non-ctlNone signal so nothing after it ever runs; that
-// signal is simply returned to the caller, which is what makes a `return`
-// inside an `if` inside a `loop` unwind every one of those levels: each level
-// just forwards whatever its nested call handed back instead of only checking
-// its own immediate statements.
-func (s *Server) execProcBlock(body []ir.Stmt, fr *frame) (ctlSignal, error) {
-	for _, st := range body {
-		switch st.Op {
-		case "let":
-			// Declares fresh in this frame; internal/ir/build.go already refused a
-			// name already in scope, so there is nothing to accidentally shadow.
-			// cloneCompositeValue: see its doc — a `let` is a new variable taking
-			// on a value, so an array or map value is copied here rather than
-			// aliased.
-			v, err := s.evalInFrame(st.Value, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			fr.vars[st.Target] = cloneCompositeValue(v)
-		case "assign":
-			// A `let mut` reassignment; the compiler guarantees st.Target was already
-			// declared somewhere in the enclosing frame chain, so frame.set always
-			// finds and updates it in place — including a local declared OUTSIDE a
-			// loop and reassigned inside it, which is how an accumulator persists
-			// across iterations instead of resetting. cloneCompositeValue for the
-			// same reason as "let": the local is taking on a freshly-computed
-			// value.
-			//
-			// `x = x + e` on a text local is the one shape that grows a string a
-			// piece at a time — an emitter or a parser written in fct does it
-			// once per output character — and evaluating the whole `x + e`
-			// copies everything x already holds each time, which is quadratic.
-			// frame.appendText appends e in place instead; `+` with a text left
-			// operand is exactly concatenation with toStr of the right side
-			// (applyBin's textOperands rule), so the value is identical.
-			if v := st.Value; v != nil && v.Kind == "bin" && v.Op == "+" && v.L != nil && v.L.Kind == "ref" && v.L.Name == st.Target {
-				if cur, ok := fr.get(st.Target); ok {
-					if cs, isText := cur.(string); isText {
-						rv, err := s.evalInFrame(v.R, fr)
-						if err != nil {
-							return ctlSignal{}, err
-						}
-						fr.appendText(st.Target, cs, toStr(rv))
-						continue
-					}
-				}
-			}
-			v, err := s.evalInFrame(st.Value, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			fr.set(st.Target, cloneCompositeValue(v))
-		case "indexset":
-			// `xs[i] = expr` — mutate one element of an array/byte-buffer local
-			// in place — or `m[k] = expr` — insert-or-overwrite a map local's
-			// entry. internal/ir/build.go's procBlock already proved Target is a
-			// declared `let mut` local of one of these kinds, so frame.get always
-			// finds it; which of the two this actually is can only be told apart
-			// here, at runtime, by Target's dynamic value (checkIndexTypes only
-			// catches the statically-provable cases at compile time). Because
-			// cloneCompositeValue guarantees Target's backing array/map is never
-			// shared with any other variable, this mutation is safely in place:
-			// it cannot be observed through any alias.
-			tv, _ := fr.get(st.Target)
-			switch coll := tv.(type) {
-			case []any:
-				// The index itself is only bounds-checked here, at runtime (see
-				// ast.Index's doc for why it cannot be checked earlier).
-				idxV, err := s.evalInFrame(st.Key, fr)
-				if err != nil {
-					return ctlSignal{}, err
-				}
-				idx := toInt(idxV)
-				if idx < 0 || idx >= len(coll) {
-					return ctlSignal{}, fmt.Errorf("array index %d out of bounds (length %d) assigning to %q", idx, len(coll), st.Target)
-				}
-				val, err := s.evalInFrame(st.Value, fr)
-				if err != nil {
-					return ctlSignal{}, err
-				}
-				if st.Bytes {
-					// A byte buffer: the whole point of this specialization over a plain
-					// array is that every slot holds a raw byte (0-255), so a write outside
-					// that range is a clean error here — never a silent truncate/wrap
-					// (e.g. Go's own byte(v) modulo-256 behavior), matching this codebase's
-					// stance on out-of-bounds array access above.
-					n := toInt(val)
-					if n < 0 || n > 255 {
-						return ctlSignal{}, fmt.Errorf("byte value %d out of range (must be 0-255) assigning to %q[%d]", n, st.Target, idx)
-					}
-					val = n
-				}
-				coll[idx] = val
-			case map[any]any:
-				idxV, err := s.evalInFrame(st.Key, fr)
-				if err != nil {
-					return ctlSignal{}, err
-				}
-				key, err := mapKey(idxV)
-				if err != nil {
-					return ctlSignal{}, err
-				}
-				val, err := s.evalInFrame(st.Value, fr)
-				if err != nil {
-					return ctlSignal{}, err
-				}
-				// Insert-or-overwrite: unlike an array's fixed-length write, a map
-				// simply grows to fit a new key — that is the entire point of a
-				// map set, so there is no "out of bounds" case to reject here.
-				coll[key] = val
-			default:
-				return ctlSignal{}, fmt.Errorf("%q is not an array or map", st.Target)
-			}
-		case "do":
-			sub := s.byProc[st.Service]
-			if sub == nil {
-				return ctlSignal{}, fmt.Errorf("calls unknown proc %q", st.Service)
-			}
-			subArgs := make([]any, len(st.Args))
-			for i, a := range st.Args {
-				v, err := s.evalInFrame(a, fr)
-				if err != nil {
-					return ctlSignal{}, err
-				}
-				subArgs[i] = v
-			}
-			res, err := s.runProcLocked(sub, subArgs)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			if st.Bind != "" {
-				fr.vars[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
-			} else if st.Target != "" {
-				// `name = do …`: a reassignment of an existing `let mut` local, so
-				// it goes through frame.set to reach the frame that declared it.
-				fr.set(st.Target, s.coerceRet(res, st.Ret, st.RetList))
-			}
-		case "fieldset":
-			// `s.field = expr` — one field of a struct local written in place.
-			// internal/ir/build.go proved Target is a `let mut` struct local with
-			// this field; the map behind a structVal is never shared between two
-			// locals (cloneCompositeValue), so the write is invisible elsewhere.
-			tv, _ := fr.get(st.Target)
-			sv, ok := tv.(structVal)
-			if !ok {
-				return ctlSignal{}, fmt.Errorf("%q is not a struct", st.Target)
-			}
-			val, err := s.evalInFrame(st.Value, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			sv.Fields[st.Field] = cloneCompositeValue(val)
-		case "actcall":
-			// `act ActionName(args)` (daemon-only — internal/ir/build.go's
-			// procBlock never emits this for a real proc's body): invoke a
-			// full server action exactly the way a Job or trigger already
-			// does, under the synthetic system actor. s.runAction acquires
-			// s.mu (runActionLocked) for only THIS call's duration and
-			// releases it before returning — never for the daemon's own
-			// lifetime — which is precisely what lets a daemon's own loop
-			// (execProcBlock's "loop" case, or runtime/daemon.go's ticker)
-			// run forever between calls without holding up any concurrent
-			// request the rest of the server is handling.
-			act := s.byAction[st.Service]
-			if act == nil {
-				return ctlSignal{}, fmt.Errorf("act calls unknown action %q", st.Service)
-			}
-			argVals := make([]any, len(st.Args))
-			for i, a := range st.Args {
-				v, err := s.evalInFrame(a, fr)
-				if err != nil {
-					return ctlSignal{}, err
-				}
-				argVals[i] = v
-			}
-			if _, status, msg := s.runAction(systemSID, act, argVals); status != http.StatusOK {
-				return ctlSignal{}, fmt.Errorf("act %s failed: %s", st.Service, msg)
-			}
-		case "exprstmt":
-			// A bare builtin call for its side effect alone (writeFile/httpPost/
-			// …), its result discarded — the "do" case above, but for a builtin
-			// instead of a proc (internal/ir/build.go's ast.ExprStmt). A failing
-			// I/O call (missing file, unreachable host, non-2xx…) surfaces here
-			// exactly like any other proc-body failure.
-			if _, err := s.evalInFrame(st.Value, fr); err != nil {
-				return ctlSignal{}, err
-			}
-		case "fileread":
-			// `let x = read Name()` (or a bare, result-discarded `read Name()`)
-			// — the verb form of readFile/writeFile over a declared `file`
-			// resource (internal/ir/build.go's ast.FileOp case already
-			// resolved st.Path/st.Bytes from that declaration at compile
-			// time). Wired to the exact same sandboxed primitives readFile
-			// itself uses — st.Bytes only picks which representation (text
-			// vs. byte-buffer array) the content comes back as.
-			var v any
-			var err error
-			if st.Bytes {
-				v, err = s.ioReadFileBytes(st.Path)
-			} else {
-				v, err = s.ioReadFile(st.Path)
-			}
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			if st.Bind != "" {
-				fr.vars[st.Bind] = cloneCompositeValue(v)
-			}
-		case "filewrite":
-			// `write Name(content)` (or a bound `let ok = write Name(content)`)
-			// — writeFile's verb form. internal/ir/build.go's ast.FileOp case
-			// already proved content's static type matches the file's
-			// declared Type, so st.Bytes alone is enough to pick which
-			// underlying primitive runs.
-			val, err := s.evalInFrame(st.Value, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			var res any
-			if st.Bytes {
-				res, err = s.ioWriteFileBytes(st.Path, val)
-			} else {
-				res, err = s.ioWriteFile(st.Path, toStr(val))
-			}
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			if st.Bind != "" {
-				fr.vars[st.Bind] = res
-			}
-		case "spawn":
-			// `let h = spawn ProcName(args)` (Milestone 5: structured
-			// concurrency) — internal/ir/build.go's checkSpawnsJoined already
-			// proved this handle is joined before this exact block ends, so the
-			// goroutine launched here can never outlive the proc call that
-			// started it (join, below, blocks until it finishes).
-			sub := s.byProc[st.Service]
-			if sub == nil {
-				return ctlSignal{}, fmt.Errorf("spawn calls unknown proc %q", st.Service)
-			}
-			subArgs := make([]any, len(st.Args))
-			for i, a := range st.Args {
-				v, err := s.evalInFrame(a, fr)
-				if err != nil {
-					return ctlSignal{}, err
-				}
-				// Cloned HERE, synchronously, before the goroutine starts — not
-				// left to runProcLocked's own per-parameter clone (which still
-				// happens too, redundantly but harmlessly). An array/map
-				// argument, evaluated above, is still an alias of whatever the
-				// spawning frame holds; the spawning proc keeps running once
-				// this statement returns (its own `join` is still ahead of it
-				// in this block) and could mutate that same local via an
-				// "indexset" before the new goroutine gets around to cloning
-				// its own copy. Cloning on this side of the `go` statement —
-				// while still the only goroutine touching the value — is what
-				// makes the two frames genuinely independent from the first
-				// instant the child exists, with no window for a data race.
-				subArgs[i] = cloneCompositeValue(v)
-			}
-			// s.byProc, s.dataDir, and ioHTTPClient are all read-only after
-			// server startup (see runtime/io.go's doc and newServer), and
-			// runProcLocked/execProcBlock never touch s.mu (the durable-store
-			// lock) at all — a proc is pure computation plus, at most, the I/O
-			// capability builtins (runtime/io.go), which are already
-			// concurrency-safe on their own terms. So running this on a fresh
-			// goroutine, concurrently with whatever the spawning call does
-			// next, touches no state the spawning call (or any other request)
-			// could race against.
-			fr.vars[st.Target] = spawnTask(func() (any, error) {
-				return s.runProcLocked(sub, subArgs)
-			})
-		case "join":
-			// `join h` / `let r = join h`: block until the spawned goroutine
-			// finishes, then propagate its outcome exactly like a `do` call's
-			// own failure path — a clean error through execProcBlock's normal
-			// return, never a panic reaching further up.
-			hv, _ := fr.get(st.Target)
-			h, ok := hv.(*taskHandle)
-			if !ok {
-				return ctlSignal{}, fmt.Errorf("%q is not a spawned task handle", st.Target)
-			}
-			res, err := h.join()
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			if st.Bind != "" {
-				fr.vars[st.Bind] = s.coerceRet(res, st.Ret, st.RetList)
-			}
-		case "return":
-			v, err := s.evalInFrame(st.Value, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			return ctlSignal{kind: ctlReturn, val: v}, nil
-		case "break":
-			return ctlSignal{kind: ctlBreak}, nil
-		case "continue":
-			return ctlSignal{kind: ctlContinue}, nil
-		case "loop":
-			sig, err := s.execProcLoop(st, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			if sig.kind == ctlReturn {
-				return sig, nil
-			}
-			// ctlNone: the loop's condition started (or ended) false; carry on to
-			// whatever follows the loop in this block.
-		case "if":
-			branch := st.Else
-			cond, err := s.evalInFrame(st.Value, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			if truthy(cond) {
-				branch = st.Body
-			}
-			if branch == nil {
-				continue // the untaken side of a one-armed `if` — nothing to run
-			}
-			// Runs directly against fr, not a child frame: only one branch ever
-			// executes per pass through this block, so a `let` declared inside it
-			// cannot collide with the other (unreached) branch, and the compiler
-			// already refused any reference to it once the `if` ends.
-			sig, err := s.execProcBlock(branch, fr)
-			if err != nil {
-				return ctlSignal{}, err
-			}
-			if sig.kind != ctlNone {
-				return sig, nil
-			}
-		}
-	}
-	return ctlSignal{}, nil
-}
-
-// execProcLoop runs a `loop <cond>:` statement's iterations. Each pass gets its
-// own fresh child frame chained to fr, so a `let` declared inside the loop body
-// is redeclared clean every iteration instead of accumulating stale bindings —
-// while a `let mut` declared OUTSIDE the loop and reassigned inside it resolves
-// through the chain to the same outer slot every time (frame.set walks parent
-// links), which is what makes an accumulator actually accumulate.
-//
-// A `return` from anywhere inside the loop body (however deeply nested in its
-// own if/loop statements) is handed straight back to the caller, unwinding out
-// of the loop entirely. `break` stops iterating and lets execProcBlock resume
-// with whatever follows the loop; `continue` simply moves on to the next
-// condition check.
-func (s *Server) execProcLoop(st ir.Stmt, fr *frame) (ctlSignal, error) {
-	for {
-		cond, err := s.evalInFrame(st.Value, fr)
-		if err != nil {
-			return ctlSignal{}, err
-		}
-		if !truthy(cond) {
-			return ctlSignal{}, nil
-		}
-		child := &frame{vars: map[string]any{}, parent: fr}
-		sig, err := s.execProcBlock(st.Body, child)
-		if err != nil {
-			return ctlSignal{}, err
-		}
-		switch sig.kind {
-		case ctlReturn:
-			return sig, nil
-		case ctlBreak:
-			return ctlSignal{}, nil
-		}
-		// ctlNone or ctlContinue: re-check the condition and go again.
-	}
+	kind  ctlKind
+	val   any
+	owned bool // a returned value referenced from nowhere else (proccompile.go)
 }
 
 // policyPasses evaluates one permission check against the action scope. A
@@ -2943,14 +2952,20 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "action is client-placed and not callable over the API", http.StatusBadRequest)
 			return
 		}
-		sid := s.session(w, r)
-		deltas, value, status, msg := s.runActionValue(sid, act, req.Args)
+		sid, ok := s.actionSession(w, r)
+		if !ok {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "invalid or expired bearer token", http.StatusUnauthorized)
+			return
+		}
+		deltas, value, after, status, msg := s.runActionValue(sid, act, req.Args)
 		if status != http.StatusOK {
 			http.Error(w, msg, status)
 			return
 		}
-		if len(deltas) > 0 {
-			s.persistSession(sid)
+		s.adoptSession(w, sid, after)
+		if len(deltas) > 0 && after != "" {
+			s.persistSession(after)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		reply := map[string]any{"ok": true, "deltas": deltas}
@@ -3979,7 +3994,10 @@ func (s *Server) persistSession(sid string) {
 	}
 }
 
-// dropSharedSession removes a session from the shared store (logout/expiry).
+// dropSharedSession retires a session id cluster-wide (logout, expiry, a
+// re-key, a `revoke`): it is deleted from the shared store, which is the
+// authority on which sessions exist, and announced on the cluster bus so every
+// peer evicts its cached copy now rather than serving it until it expires.
 func (s *Server) dropSharedSession(sid string) {
 	if s.cluster == nil {
 		return
@@ -3987,6 +4005,53 @@ func (s *Server) dropSharedSession(sid string) {
 	if err := s.store.DeleteSession(sid); err != nil {
 		s.obs.log.Warn("delete session", slog_err(err))
 	}
+	s.cluster.publishEndedSessions([]string{sid}, nil)
+}
+
+// revokeVisitor ends every session carrying this `session` key, on every
+// instance: the local cache, the shared table (sessions minted on a peer this
+// instance never saw included), and each peer's cache over the bus. It reports
+// whether it ended the session named by own. Caller holds s.mu.
+func (s *Server) revokeVisitor(key, own string) (endedOwn bool) {
+	for id, other := range s.sessions {
+		if other.visitor == key && sessionToken(id) != "" {
+			delete(s.sessions, id)
+			endedOwn = endedOwn || id == own
+		}
+	}
+	if s.cluster == nil {
+		return endedOwn
+	}
+	if err := s.store.DeleteVisitorSessions(key); err != nil {
+		s.obs.log.Warn("revoke sessions", slog_err(err))
+	}
+	s.cluster.publishEndedSessions(nil, []string{key})
+	return endedOwn
+}
+
+// restateActor gives every live session signed in as actor the role, here
+// and — through the shared session table and the cluster bus — on every
+// peer, which drops its cached copies and rehydrates the new role on the
+// next request. Nobody is signed out. Caller holds s.mu.
+func (s *Server) restateActor(actor, role string) {
+	if actor == "" || actor == roleGuest {
+		return
+	}
+	for id, ses := range s.sessions {
+		if ses.actor == actor && id != systemSID && id != toolSID {
+			ses.role = role
+			if ses.state != nil {
+				ses.state["role"] = role
+			}
+		}
+	}
+	if s.cluster == nil {
+		return
+	}
+	if err := s.store.RestateSessions(actor, role); err != nil {
+		s.obs.log.Warn("restate sessions", slog_err(err))
+	}
+	s.cluster.publishRestated([]string{actor})
 }
 
 // persistedFromSession snapshots a live session for the shared store.
@@ -4020,7 +4085,46 @@ func sessionFromPersisted(ps *persistedSession) *sessionState {
 }
 
 // setSessionCookie writes the signed, hardened session cookie.
+// actionSession resolves who is calling the generic `/api/<action>` endpoint.
+// A native client's `Authorization: Bearer <token>` goes through sidForRequest,
+// the one resolution the declared routes and the reads already share, so a
+// forged, expired or revoked token is no session at all (ok is false) rather
+// than a fresh guest one. A browser carries the cookie, minted if absent.
+func (s *Server) actionSession(w http.ResponseWriter, r *http.Request) (sid string, ok bool) {
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		sid = s.sidForRequest(r)
+		return sid, sid != ""
+	}
+	return s.session(w, r), true
+}
+
+// dropSessionCookieHeaders removes any fa_sid Set-Cookie this response already
+// carries, so a session re-keyed or ended mid-request leaves exactly one
+// instruction for the client rather than two that disagree.
+func dropSessionCookieHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	kept := h["Set-Cookie"][:0]
+	for _, c := range h["Set-Cookie"] {
+		if !strings.HasPrefix(c, "fa_sid=") {
+			kept = append(kept, c)
+		}
+	}
+	if len(kept) == 0 {
+		h.Del("Set-Cookie")
+		return
+	}
+	h["Set-Cookie"] = kept
+}
+
+// clearSessionCookie tells the client its session is gone.
+func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+	dropSessionCookieHeaders(w)
+	http.SetCookie(w, &http.Cookie{Name: "fa_sid", Value: "", Path: "/", HttpOnly: true,
+		Secure: s.secure, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+}
+
 func (s *Server) setSessionCookie(w http.ResponseWriter, sid string) {
+	dropSessionCookieHeaders(w)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "fa_sid",
 		Value:    signValue(sid),
@@ -4171,12 +4275,13 @@ func cloneScope(m map[string]any) map[string]any {
 //	                  Whether text names a member of its enum is a question about
 //	                  the value, not about its shape, and is not this gate's.
 //
-// Objects and arrays are refused for every scalar type because no parameter can
-// be declared record- or list-typed (`parseSignature` refuses a list outright),
-// so a structured argument is malformed whichever scalar it is aimed at. The
-// total conversions do have readings for them — `toStr` joins an array with
-// commas, `truthy` calls any map true — but those are rendering conventions the
-// two interpreters agree on, not interpretations of an argument.
+// Objects and arrays are refused for every scalar type because a scalar
+// parameter is not record- or list-typed — a list parameter (`ids: [int]`) is
+// decoded by paramArg, which hands each element here — so a structured argument
+// is malformed whichever scalar it is aimed at. The total conversions do have
+// readings for them — `toStr` joins an array with commas, `truthy` calls any
+// map true — but those are rendering conventions the two interpreters agree
+// on, not interpretations of an argument.
 //
 // []byte is text throughout: it is the shape a database driver hands back for a
 // text column, and `toStr`/`toInt`/`truthy` all read it as the string it holds.
@@ -4226,6 +4331,72 @@ func coerceParam(v any, typ string) (any, bool) {
 	return coerce(v, typ), true
 }
 
+// paramArg coerces one argument to the action parameter it binds: coerceParam
+// for a scalar, and for a list parameter (`ids: [int]`) each element in turn,
+// so `w.id in ids` compares ints with ints. A list arrives as a JSON array (a
+// request body, the generic `/api/<action>` args) or as text — a query string
+// or form field, `?ids=12,13` or `?ids=12&ids=13` — which is split on commas,
+// the non-exploded form style the contract documents for it. An absent or
+// blank value is the empty list; an element its type refuses fails the whole
+// argument, exactly as a malformed scalar does.
+func paramArg(v any, p ir.Param) (any, bool) {
+	if !p.List {
+		return coerceParam(v, p.Type)
+	}
+	var items []any
+	split := func(s string) {
+		for _, part := range strings.Split(s, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				items = append(items, part)
+			}
+		}
+	}
+	switch t := v.(type) {
+	case nil:
+	case []any:
+		items = t
+	case []string:
+		for _, s := range t {
+			split(s)
+		}
+	case string:
+		split(t)
+	case []byte:
+		split(string(t))
+	case map[string]any:
+		return nil, false
+	default:
+		items = []any{t} // a lone JSON scalar where a list was declared
+	}
+	out := make([]any, 0, len(items))
+	for _, it := range items {
+		cv, ok := coerceParam(it, p.Type)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, cv)
+	}
+	return out, true
+}
+
+// paramZero is an omitted argument's value: the type's zero, or for a list
+// parameter the empty list.
+func paramZero(p ir.Param) any {
+	if p.List {
+		return []any{}
+	}
+	return zero(p.Type)
+}
+
+// paramTypeName spells a parameter's declared type the way its source does,
+// for a refusal naming what was expected.
+func paramTypeName(p ir.Param) string {
+	if p.List {
+		return "[" + p.Type + "]"
+	}
+	return p.Type
+}
+
 // floatArg interprets a float parameter that arrived as text: blank is the
 // zero, anything that is not a decimal number is a refusal.
 func floatArg(s string) (any, bool) {
@@ -4254,13 +4425,16 @@ func numericArg(s, typ string) (any, bool) {
 }
 
 func coerce(v any, typ string) any {
+	if canonical(v, typ) {
+		return v // already that type: returned as is, not re-boxed
+	}
 	switch typ {
 	case "int", "money", "date":
 		return toInt(v)
 	case "float":
 		// Canonicalizes to a genuine Go float64 regardless of what actually
 		// produced v — e.g. a `do`-bound proc-to-proc call's return value
-		// (runtime/server.go's execProcBlock "do" case calls coerceRet, which
+		// (the proc engine's "do" case calls coerceRet, which
 		// calls this) should already be a float64 by construction, but
 		// running it through toFloat anyway guarantees it, the same
 		// belt-and-suspenders canonicalization "int"/"money"/"date" get from
@@ -4347,6 +4521,34 @@ func (s *Server) constraintError(entity string, row record, changedField string,
 				}
 			}
 		}
+	}
+	return ""
+}
+
+// storedValue is what a write of v to entity.field puts in the row: v itself,
+// or for a @password field the salted one-way hash of it, so the plaintext never
+// reaches the working set, the store, the undo log or a stream. It runs after
+// constraintError, which validates what was written (a @min length reads the
+// plaintext, not its hash). msg is non-empty when v cannot be stored.
+func (s *Server) storedValue(entity, field string, v any) (any, string) {
+	if !s.hashed[entity+"."+field] {
+		return v, ""
+	}
+	h, err := hashPassword(toStr(v))
+	if err != nil {
+		return nil, field + " " + err.Error()
+	}
+	return h, ""
+}
+
+// storeRow applies storedValue to every field of a row about to be inserted.
+func (s *Server) storeRow(entity string, row record) string {
+	for k, v := range row {
+		nv, msg := s.storedValue(entity, k, v)
+		if msg != "" {
+			return msg
+		}
+		row[k] = nv
 	}
 	return ""
 }

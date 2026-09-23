@@ -2,10 +2,12 @@ package ir
 
 import (
 	"fmt"
+	"net/textproto"
 	"sort"
 	"strings"
 
 	"facet/internal/ast"
+	"facet/internal/parser"
 )
 
 // BuildError is a semantic (post-parse) compile error.
@@ -22,45 +24,72 @@ func (e *BuildError) Error() string {
 }
 
 // env is the name environment used to validate references and compute deps.
+// emittedEvent is one `emit [name] Dto{…}` statement, checked against the
+// declared streams once they are built.
+type emittedEvent struct {
+	name, typ string
+	line      int
+	on        int // how many `on` path values it names
+}
+
 type env struct {
-	wireTypes     map[string]bool                   // wire `type`/`message` names (SCHEMA_IDL_SCOPE Tier C) — an action may return one
-	emittedTypes  map[string]int                    // wire type -> line of an `emit` of it, checked against the streams that carry it
-	wireFields    map[string]map[string]bool        // wire type -> field set, for a `Dto{...}` literal's field check
-	states        map[string]string                 // name -> placement
-	entities      map[string]bool                   // entity names
-	entityFields  map[string]map[string]bool        // entity -> field set (incl id)
-	entityDerives map[string]map[string]bool        // entity -> derive-field set (never a stored column; read-only, see ast.Entity.Derives)
-	queriedFields map[string]map[string]bool        // entity -> fields a `where`/`by`/relation reads at all
-	indexFields   map[string]map[string]bool        // entity -> fields whose use an index can actually serve
-	inline        map[string]*Expr                  // zero-arg policy/derive name -> lowered expr, inlined at every use
-	inlineType    map[string]vtype                  // the same names -> the type they resolve to (a derive's declared type, a policy's bool)
-	policySet     map[string]bool                   // policy names (gating via `requires`)
-	policyParams  map[string][]Param                // policy name -> its parameters (row-level policies)
-	enums         map[string][]string               // enum name -> ordered member values
-	components    map[string][]ast.Param            // component name -> its parameters (a reference parameter carries its Ref kind)
-	compAST       map[string]*ast.Component         // component name -> its source, for call-site expansion of templates
-	compSlot      map[string]bool                   // component names whose body contains a `slot` (so a `use` may pass children)
-	compDeps      map[string]map[string]bool        // component name -> the state/entity names its body reads (for use-site refresh)
-	compRegions   map[string]map[string][]string    // component name -> the dependency edges its own regions/inputs need, folded into every page that uses it
-	special       []Component                       // per-call-site expansions of template components, appended to the IR
-	specialCalls  []call                            // action references made inside expansions, validated with the rest
-	specialLinks  []linkRef                         // link destinations inside expansions, route-checked with the rest
-	specStack     []string                          // components currently being expanded, to refuse recursion
-	nspec         int                               // expansions minted so far; names them and namespaces their region ids
-	stateTypes    map[string]string                 // state name -> its (core/element) type, for enum-defaulted selects
-	stateList     map[string]bool                   // state names that are `[T]` list cells, for `for x in <list>`
-	services      map[string]map[string]int         // service name -> op name -> parameter count, for checking `call`
-	serviceRets   map[string]map[string]opRet       // service name -> op name -> return type, for binding `let x = call …`
-	private       map[string]bool                   // @private state names — server-only, non-renderable
-	entFieldEnum  map[string]map[string]string      // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
-	entFieldType  map[string]map[string]string      // entity -> field -> stored type core (enum fields read as "text"), for typing a data-driven option's value
-	records       map[string]map[string]recField    // record name -> field name -> its type, for `let`-bound field access
-	structs       map[string]map[string]structField // struct name -> field name -> its type, for a proc-local struct literal/field access (see ast.Struct)
-	entE2E        map[string]map[string]bool        // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
-	locRecords    map[string]recBind                // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
-	actionSet     map[string]bool                   // action names, for validating pending()/failed() targets
-	procSigs      map[string]procSig                // proc name -> its signature, for checking `do` (from an action or another proc)
-	files         map[string]*ast.File              // file name -> its declaration, for checking a proc's `read`/`write` statements
+	wireTypes        map[string]bool                   // wire `type`/`message` names (SCHEMA_IDL_SCOPE Tier C) — an action may return one
+	emittedTypes     map[string]int                    // wire type -> line of an `emit` of it, checked against the streams that carry it
+	actLocalTypes    map[string]vtype                  // the action being built: its parameters' and lets' types
+	procNames        map[string]bool                   // every declared proc, known before derives are checked
+	procArity        map[string]int                    // every declared proc's parameter count
+	procDerives      map[string]bool                   // parameterized derives that call a proc: usable only in actions
+	inDerive         string                            // the parameterized derive whose body is being checked
+	inProc           bool                              // a proc body is being checked
+	inDaemon         bool                              // a daemon body is being checked (server-only, like a proc)
+	actParams        map[string]bool                   // the action being built: its parameter names (given(p))
+	deriveParamTypes map[string]vtype                  // the parameterized derive being checked: its parameters' types
+	entDeriveExprs   map[string]map[string]*Expr       // entity -> its derives' lowered expressions (over "$row")
+	wireOptional     map[string]map[string]bool        // wire type -> its optional (`?`) fields
+	wireNullable     map[string][]string               // wire type -> its `T or null` fields
+	wireFieldTypes   map[string]map[string]vtype       // wire type -> field -> its declared type
+	emittedEvents    []emittedEvent                    // every `emit name Dto{…}`: the named event must be one a stream carries with that payload
+	unnamedEmits     []emittedEvent                    // every `emit Dto{…}`: no stream may carry Dto under two names
+	wireFields       map[string]map[string]bool        // wire type -> field set, for a `Dto{...}` literal's field check
+	states           map[string]string                 // name -> placement
+	entities         map[string]bool                   // entity names
+	entityFields     map[string]map[string]bool        // entity -> field set (incl id)
+	entityDerives    map[string]map[string]bool        // entity -> derive-field set (never a stored column; read-only, see ast.Entity.Derives)
+	queriedFields    map[string]map[string]bool        // entity -> fields a `where`/`by`/relation reads at all
+	indexFields      map[string]map[string]bool        // entity -> fields whose use an index can actually serve
+	inline           map[string]*Expr                  // zero-arg policy/derive name -> lowered expr, inlined at every use
+	inlineType       map[string]vtype                  // the same names -> the type they resolve to (a derive's declared type, a policy's bool)
+	deriveFns        map[string]*deriveFn              // parameterized derive name -> its signature and lowered body, expanded at every call
+	policySet        map[string]bool                   // policy names (gating via `requires`)
+	policyParams     map[string][]Param                // policy name -> its parameters (row-level policies)
+	enums            map[string][]string               // enum name -> ordered member values
+	components       map[string][]ast.Param            // component name -> its parameters (a reference parameter carries its Ref kind)
+	compAST          map[string]*ast.Component         // component name -> its source, for call-site expansion of templates
+	compSlot         map[string]bool                   // component names whose body contains a `slot` (so a `use` may pass children)
+	compDeps         map[string]map[string]bool        // component name -> the state/entity names its body reads (for use-site refresh)
+	compRegions      map[string]map[string][]string    // component name -> the dependency edges its own regions/inputs need, folded into every page that uses it
+	special          []Component                       // per-call-site expansions of template components, appended to the IR
+	specialCalls     []call                            // action references made inside expansions, validated with the rest
+	specialLinks     []linkRef                         // link destinations inside expansions, route-checked with the rest
+	specStack        []string                          // components currently being expanded, to refuse recursion
+	nspec            int                               // expansions minted so far; names them and namespaces their region ids
+	stateTypes       map[string]string                 // state name -> its (core/element) type, for enum-defaulted selects
+	stateList        map[string]bool                   // state names that are `[T]` list cells, for `for x in <list>`
+	services         map[string]map[string]int         // service name -> op name -> parameter count, for checking `call`
+	serviceRets      map[string]map[string]opRet       // service name -> op name -> return type, for binding `let x = call …`
+	private          map[string]bool                   // @private state names — server-only, non-renderable
+	entFieldEnum     map[string]map[string]string      // entity -> field -> enum name (only enum-typed fields), for `match` exhaustiveness
+	entFieldType     map[string]map[string]string      // entity -> field -> stored type core (enum fields read as "text"), for typing a data-driven option's value
+	records          map[string]map[string]recField    // record name -> field name -> its type, for `let`-bound field access
+	structs          map[string]map[string]structField // struct name -> field name -> its type, for a proc-local struct literal/field access (see ast.Struct)
+	entE2E           map[string]map[string]bool        // entity -> field -> true for @e2e (sealed) fields, for render-marking and the seal dataflow
+	locRecords       map[string]recBind                // record-typed action locals (a `let` bind) -> the record bound, for `v.field` checking (reset per action)
+	entPassword      map[string]map[string]bool        // entity -> field -> true for @password (one-way hashed) fields, which only verifyPassword may read
+	rowLocals        map[string]string                 // row-typed locals of the body being checked (an action's `for` variable or `let r = Entity(k)`, a read clause's $row) -> entity, for refusing a @password read (reset per body)
+	actionSet        map[string]bool                   // action names, for validating pending()/failed() targets
+	procSigs         map[string]procSig                // proc name -> its signature, for checking `do` (from an action or another proc)
+	shareds          map[string]*ast.Shared            // `shared` cell name -> its declaration (see ast.Shared); read/assigned only from proc-shaped bodies
+	files            map[string]*ast.File              // file name -> its declaration, for checking a proc's `read`/`write` statements
 }
 
 // procSig is a proc's signature: enough to check a `do` call site (arity) and to
@@ -69,6 +98,15 @@ type procSig struct {
 	params  []ast.Param
 	ret     string
 	retList bool
+}
+
+// deriveFn is a parameterized derive: what a call site is checked against (its
+// parameters, its declared type) and what it expands to (the lowered body, whose
+// parameters are still plain refs — see expandDerive).
+type deriveFn struct {
+	params []ast.Param
+	ret    vtype
+	body   *Expr
 }
 
 // actionSig is enough of an already-built action's signature to check an
@@ -182,7 +220,7 @@ func (e *env) markIndex(entity, field string) {
 // mutation refreshes exactly the affected regions.
 func Build(app *ast.App) (*IR, error) {
 	out := &IR{App: app.Name, DepGraph: map[string][]string{}}
-	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, structs: map[string]map[string]structField{}, entE2E: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}, files: map[string]*ast.File{}, emittedTypes: map[string]int{}}
+	e := &env{states: map[string]string{}, entities: map[string]bool{}, entityFields: map[string]map[string]bool{}, entityDerives: map[string]map[string]bool{}, queriedFields: map[string]map[string]bool{}, indexFields: map[string]map[string]bool{}, inline: map[string]*Expr{}, inlineType: map[string]vtype{}, policySet: map[string]bool{}, policyParams: map[string][]Param{}, enums: map[string][]string{}, components: map[string][]ast.Param{}, compAST: map[string]*ast.Component{}, compSlot: map[string]bool{}, compDeps: map[string]map[string]bool{}, compRegions: map[string]map[string][]string{}, stateTypes: map[string]string{}, stateList: map[string]bool{}, services: map[string]map[string]int{}, serviceRets: map[string]map[string]opRet{}, private: map[string]bool{}, entFieldEnum: map[string]map[string]string{}, entFieldType: map[string]map[string]string{}, records: map[string]map[string]recField{}, structs: map[string]map[string]structField{}, entE2E: map[string]map[string]bool{}, entPassword: map[string]map[string]bool{}, actionSet: map[string]bool{}, procSigs: map[string]procSig{}, files: map[string]*ast.File{}, emittedTypes: map[string]int{}}
 
 	// 0. Enums: closed text types. Collected first so field/state/param types and
 	// `Enum.member` literals resolve while everything else is built.
@@ -294,6 +332,24 @@ func Build(app *ast.App) (*IR, error) {
 		wireSeen[ty.Name] = ty.Line
 		wireNames[ty.Name] = true
 	}
+	// A type's contract schema name (`type Name as "schema":`) is unique
+	// across every published schema name, its own alias or another's Name.
+	schemaSeen := map[string]string{}
+	for _, ty := range app.Types {
+		sn := ty.Schema
+		if sn == "" {
+			sn = ty.Name
+		}
+		if other, ok := schemaSeen[sn]; ok {
+			return nil, &BuildError{ty.Line, fmt.Sprintf("type %q publishes schema %q, which type %q already publishes", ty.Name, sn, other)}
+		}
+		schemaSeen[sn] = ty.Name
+	}
+	for _, ty := range app.Types {
+		if ty.Schema != "" && wireNames[ty.Schema] && ty.Schema != ty.Name {
+			return nil, &BuildError{ty.Line, fmt.Sprintf("type %q publishes schema %q, the name of another declared type", ty.Name, ty.Schema)}
+		}
+	}
 	for _, ms := range app.Messages {
 		if prev, ok := wireSeen[ms.Name]; ok {
 			return nil, &BuildError{ms.Line, fmt.Sprintf("message %q redeclared (first at line %d, possibly as a type)", ms.Name, prev)}
@@ -302,12 +358,20 @@ func Build(app *ast.App) (*IR, error) {
 		wireNames[ms.Name] = true
 	}
 	e.wireTypes = wireNames
+	e.procNames = map[string]bool{}
+	e.entDeriveExprs = map[string]map[string]*Expr{}
+	e.procArity = map[string]int{}
+	e.procDerives = map[string]bool{}
+	for _, p := range app.Procs {
+		e.procNames[p.Name] = true
+		e.procArity[p.Name] = len(p.Params)
+	}
 	resolveWireField := func(declName string, f ast.RecordField, seen map[string]bool) (WireField, error) {
 		if seen[f.Name] {
 			return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q has duplicate field %q", declName, f.Name)}
 		}
 		seen[f.Name] = true
-		wf := WireField{Name: f.Name, Type: f.Type, List: f.List, Optional: f.Optional}
+		wf := WireField{Name: f.Name, Type: f.Type, List: f.List, Optional: f.Optional, Description: f.Description, Aliases: f.Aliases, Enum: f.Enum, Into: f.Into, Nullable: f.Nullable}
 		if f.Default != nil {
 			wf.Default = *f.Default
 		}
@@ -360,7 +424,21 @@ func Build(app *ast.App) (*IR, error) {
 		return wf, nil
 	}
 	e.wireFields = map[string]map[string]bool{}
+	e.wireOptional = map[string]map[string]bool{}
+	e.wireNullable = map[string][]string{}
+	e.wireFieldTypes = map[string]map[string]vtype{}
 	for _, ty := range app.Types {
+		e.wireOptional[ty.Name] = map[string]bool{}
+		e.wireFieldTypes[ty.Name] = map[string]vtype{}
+		for _, f := range ty.Fields {
+			if f.Optional {
+				e.wireOptional[ty.Name][f.Name] = true
+			}
+			if f.Nullable {
+				e.wireNullable[ty.Name] = append(e.wireNullable[ty.Name], f.Name)
+			}
+			e.wireFieldTypes[ty.Name][f.Name] = vtype{core: f.Type, list: f.List}
+		}
 		seen := map[string]bool{}
 		var fields []WireField
 		e.wireFields[ty.Name] = map[string]bool{}
@@ -372,7 +450,7 @@ func Build(app *ast.App) (*IR, error) {
 			fields = append(fields, wf)
 			e.wireFields[ty.Name][f.Name] = true
 		}
-		out.Types = append(out.Types, WireType{Name: ty.Name, Query: ty.Query, Fields: fields})
+		out.Types = append(out.Types, WireType{Name: ty.Name, Schema: ty.Schema, Query: ty.Query, Fields: fields})
 	}
 	for _, ms := range app.Messages {
 		var variants []WireMessageVariant
@@ -386,9 +464,12 @@ func Build(app *ast.App) (*IR, error) {
 				}
 				fields = append(fields, wf)
 			}
-			variants = append(variants, WireMessageVariant{Name: v.Name, Fields: fields})
+			if v.BodyType != "" && !wireNames[v.BodyType] {
+				return nil, &BuildError{v.Line, fmt.Sprintf("%s.%s: body type %q is not a declared wire type", ms.Name, v.Name, v.BodyType)}
+			}
+			variants = append(variants, WireMessageVariant{Name: v.Name, Fields: fields, Wire: v.Wire, Action: v.Action, Since: v.Since, Summary: v.Summary, BodyParam: v.BodyParam, BodyType: v.BodyType})
 		}
-		out.Messages = append(out.Messages, WireMessage{Name: ms.Name, Variants: variants})
+		out.Messages = append(out.Messages, WireMessage{Name: ms.Name, Tag: ms.Tag, Variants: variants})
 	}
 
 	// 1. Entities.
@@ -410,10 +491,16 @@ func Build(app *ast.App) (*IR, error) {
 			if f.Secret && f.Name == "id" {
 				return nil, &BuildError{f.Line, "the id field cannot be @secret"}
 			}
-			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, E2E: f.E2E, ReadPolicy: f.ReadPolicy, Optional: f.Optional,
+			fld := Field{Name: f.Name, Type: f.Type, Secret: f.Secret, E2E: f.E2E, Password: f.Password, ReadPolicy: f.ReadPolicy, Optional: f.Optional,
 				Unique: f.Unique, Required: f.Required, Min: f.Min, Max: f.Max, Matches: f.Matches, OnDelete: f.OnDelete}
 			if f.Unique {
 				e.markIndex(ent.Name, f.Name) // a uniqueness check reads by value; index it
+			}
+			if f.Password {
+				if e.entPassword[ent.Name] == nil {
+					e.entPassword[ent.Name] = map[string]bool{}
+				}
+				e.entPassword[ent.Name][f.Name] = true
 			}
 			if f.E2E {
 				if e.entE2E[ent.Name] == nil {
@@ -463,7 +550,10 @@ func Build(app *ast.App) (*IR, error) {
 		// from withActor exactly as a policy's does.
 		if ent.Read != nil {
 			locals := withActor(map[string]bool{"$row": true})
-			if err := e.checkPure(ent.Read, locals, ent.Line, fmt.Sprintf("entity %q's read clause", ent.Name)); err != nil {
+			e.rowLocals = map[string]string{"$row": ent.Name}
+			err := e.checkPure(ent.Read, locals, ent.Line, fmt.Sprintf("entity %q's read clause", ent.Name))
+			e.rowLocals = nil
+			if err != nil {
 				return nil, err
 			}
 			ei.Read = e.low(ent.Read)
@@ -491,10 +581,17 @@ func Build(app *ast.App) (*IR, error) {
 				}
 				seenDerive[d.Name] = d.Line
 				locals := withActor(map[string]bool{"$row": true})
-				if err := e.checkPure(d.Expr, locals, d.Line, fmt.Sprintf("entity %q's derive %q", ent.Name, d.Name)); err != nil {
+				e.rowLocals = map[string]string{"$row": ent.Name}
+				err := e.checkPure(d.Expr, locals, d.Line, fmt.Sprintf("entity %q's derive %q", ent.Name, d.Name))
+				e.rowLocals = nil
+				if err != nil {
 					return nil, err
 				}
 				ei.Derives = append(ei.Derives, Derive{Name: d.Name, Type: d.Type, Expr: e.low(d.Expr)})
+				if e.entDeriveExprs[ent.Name] == nil {
+					e.entDeriveExprs[ent.Name] = map[string]*Expr{}
+				}
+				e.entDeriveExprs[ent.Name][d.Name] = ei.Derives[len(ei.Derives)-1].Expr
 				e.entityDerives[ent.Name][d.Name] = true
 			}
 		}
@@ -622,8 +719,16 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			pseen[pp.Name] = true
 			plocals[pp.Name] = true
+			if e.entities[pp.Type] {
+				if e.rowLocals == nil {
+					e.rowLocals = map[string]string{}
+				}
+				e.rowLocals[pp.Name] = pp.Type
+			}
 		}
-		if err := e.checkPure(p.Expr, plocals, p.Line, "a policy"); err != nil {
+		err := e.checkPure(p.Expr, plocals, p.Line, "a policy")
+		e.rowLocals = nil
+		if err != nil {
 			return nil, err
 		}
 		lowered := e.low(p.Expr)
@@ -640,19 +745,42 @@ func Build(app *ast.App) (*IR, error) {
 	}
 
 	// 3b. Derives (named computed values). Inlined like policies: each is lowered
-	// with every earlier policy/derive already substituted, so the IR a derive
+	// with every derive it reads already substituted, so the IR a derive
 	// carries — and every place it is read — is fully resolved to base cells. A
 	// derive is pure and read-only, so it has no placement of its own; its deps
 	// drive dependency tracking wherever it is used.
+	//
+	// They are built in dependency order, not declaration order: an app merged
+	// from imported files lists the importer's derives before its imports', so a
+	// projection built on another file's projection must not depend on which
+	// file happened to be written first.
 	derSeen := map[string]int{}
 	for _, d := range app.Derives {
 		if prev, ok := derSeen[d.Name]; ok {
 			return nil, &BuildError{d.Line, fmt.Sprintf("derive %q redeclared (first at line %d)", d.Name, prev)}
 		}
+		derSeen[d.Name] = d.Line
+	}
+	derives, err := deriveOrder(app.Derives)
+	if err != nil {
+		return nil, err
+	}
+	e.deriveFns = map[string]*deriveFn{}
+	for _, d := range derives {
 		if err := e.checkName(d.Name, d.Line, "derive"); err != nil {
 			return nil, err
 		}
-		derSeen[d.Name] = d.Line
+		if len(d.Params) > 0 {
+			e.inDerive = d.Name
+			fn, err := e.deriveFn(d)
+			e.inDerive = ""
+			if err != nil {
+				return nil, err
+			}
+			e.deriveFns[d.Name] = fn
+			out.Derives = append(out.Derives, Derive{Name: d.Name, Params: irParams(d.Params), Type: d.Type, Expr: fn.body, Deps: sortedKeys(e.depsIR(fn.body))})
+			continue
+		}
 		if err := e.checkPure(d.Expr, withActor(nil), d.Line, "a derive"); err != nil {
 			return nil, err
 		}
@@ -836,7 +964,10 @@ func Build(app *ast.App) (*IR, error) {
 			"a service's base URL is fixed at compile time — it is where the authority connects, not something a render decides; put the varying part in the operation's arguments"); err != nil {
 			return nil, err
 		}
-		irsv := Service{Name: sv.Name, URL: sv.URL}
+		irsv := Service{Name: sv.Name, URL: sv.URL, URLEnv: sv.URLEnv}
+		for _, h := range sv.Headers {
+			irsv.Headers = append(irsv.Headers, ServiceHeader{Name: h.Name, Env: h.Env})
+		}
 		for _, op := range sv.Ops {
 			if _, dup := ops[op.Name]; dup {
 				return nil, &BuildError{op.Line, fmt.Sprintf("service %q declares operation %q twice", sv.Name, op.Name)}
@@ -844,7 +975,13 @@ func Build(app *ast.App) (*IR, error) {
 			// A declared return type must resolve: a primitive, an enum, or a record
 			// (the structured-reply case). A bare capitalized name the parser accepted
 			// is only valid here if it names a real record/enum.
-			if op.Ret != "" && !isPrimitive(op.Ret) {
+			// `-> bytes`: the brain answers a file (its raw response body, e.g. a
+			// rendered image), which the runtime stores as an upload; the bound
+			// value is that file, exactly what a `bytes` action parameter holds.
+			if op.Ret == "bytes" && op.RetList {
+				return nil, &BuildError{op.Line, fmt.Sprintf("%s.%s returns [bytes] — a service answers one file per call", sv.Name, op.Name)}
+			}
+			if op.Ret != "" && op.Ret != "bytes" && !isPrimitive(op.Ret) {
 				_, isEnum := e.enums[op.Ret]
 				_, isRec := e.records[op.Ret]
 				if !isEnum && !isRec {
@@ -907,7 +1044,7 @@ func Build(app *ast.App) (*IR, error) {
 			_, isEnum := e.enums[p.Ret]
 			_, isRec := e.records[p.Ret]
 			_, isStruct := e.structs[p.Ret]
-			if !isEnum && !isRec && !isStruct {
+			if !isEnum && !isRec && !isStruct && !e.wireTypes[p.Ret] {
 				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q returns unknown type %q", p.Name, p.Ret)}
 			}
 		}
@@ -918,7 +1055,7 @@ func Build(app *ast.App) (*IR, error) {
 		seenUse := map[string]bool{}
 		for _, u := range p.Uses {
 			if !knownCapabilities[u] {
-				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q declares unknown capability %q — known capabilities: io.file, io.net, io.net.listen", p.Name, u)}
+				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q declares unknown capability %q — known capabilities: io.console, io.env, io.file, io.net, io.net.listen", p.Name, u)}
 			}
 			if seenUse[u] {
 				return nil, &BuildError{p.Line, fmt.Sprintf("proc %q declares capability %q more than once", p.Name, u)}
@@ -927,7 +1064,18 @@ func Build(app *ast.App) (*IR, error) {
 		}
 		e.procSigs[p.Name] = procSig{params: p.Params, ret: p.Ret, retList: p.RetList}
 	}
+	// Shared cells (see ast.Shared) are known before any proc or daemon body
+	// is lowered: those are the only bodies that may name one.
+	if err := e.buildShareds(app, out); err != nil {
+		return nil, err
+	}
+	entryAt := -1 // the program's `main`, lowered below with the daemons
 	for _, p := range app.Procs {
+		if isProcessEntry(p) {
+			entryAt = len(out.Procs)
+			out.Procs = append(out.Procs, Proc{})
+			continue
+		}
 		pr, err := e.proc(p)
 		if err != nil {
 			return nil, err
@@ -1006,6 +1154,21 @@ func Build(app *ast.App) (*IR, error) {
 	for name, act := range byActionName {
 		actionSigs[name] = actionSig{params: act.Params, placement: act.Placement}
 	}
+	// The process entry point (`facet exec`, runtime/stdio.go) runs exactly
+	// where a daemon body does — on its own goroutine, under no request's
+	// lock, for as long as it likes — so its body is lowered with the same
+	// allowances: listen/accept, detach and act.
+	if entryAt >= 0 {
+		for _, p := range app.Procs {
+			if isProcessEntry(p) {
+				pr, err := e.procIn(p, actionSigs)
+				if err != nil {
+					return nil, err
+				}
+				out.Procs[entryAt] = pr
+			}
+		}
+	}
 	daemonSeen := map[string]int{}
 	for _, d := range app.Daemons {
 		if prev, ok := daemonSeen[d.Name]; ok {
@@ -1036,7 +1199,7 @@ func Build(app *ast.App) (*IR, error) {
 		// is encrypted at rest (@secret). The whole table is hidden from the API/SSE.
 		out.Entities = append(out.Entities, Entity{Name: reservedUserEntity, Fields: []Field{
 			{Name: "id", Type: "int"}, {Name: "username", Type: "text"},
-			{Name: "password", Type: "text"}, {Name: "role", Type: "text"},
+			{Name: "password", Type: "text", Password: true}, {Name: "role", Type: "text"},
 			{Name: "email", Type: "text"}, {Name: "verified", Type: "bool"},
 			{Name: "verifyToken", Type: "text"}, {Name: "resetToken", Type: "text"},
 			{Name: "resetExpires", Type: "int"},
@@ -1080,6 +1243,14 @@ func Build(app *ast.App) (*IR, error) {
 	// method+path is unique; the auth mode is read off the action's gate.
 	apiSeen := map[string]int{}
 	for _, ap := range app.APIs {
+		if msg := findMessage(out.Messages, ap.Action); msg != nil {
+			// `api POST "/events" -> Mutation`: a dispatching route.
+			if err := e.dispatchRoute(ap, msg, byActionName, apiSeen); err != nil {
+				return nil, err
+			}
+			out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Status: 200, Rate: ap.Rate, Since: ap.Since, Auth: "none", Dispatch: msg.Name})
+			continue
+		}
 		act, ok := byActionName[ap.Action]
 		if !ok {
 			return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q targets unknown action %q", ap.Method, ap.Path, ap.Action)}
@@ -1113,6 +1284,11 @@ func Build(app *ast.App) (*IR, error) {
 				if !paramSet[name] {
 					return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: path parameter {%s} is not a parameter of action %q", ap.Method, ap.Path, name, ap.Action)}
 				}
+				for _, p := range act.Params {
+					if p.Name == name && p.List {
+						return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: path parameter {%s} is a list — a path segment carries one value; take the list from the query or body instead", ap.Method, ap.Path, name)}
+					}
+				}
 				pathParams = append(pathParams, name)
 			} else if strings.ContainsAny(seg, "{}") {
 				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: a path parameter is a whole segment, {name}", ap.Method, ap.Path)}
@@ -1144,24 +1320,89 @@ func Build(app *ast.App) (*IR, error) {
 		if len(act.Requires) > 0 {
 			auth = "session"
 		}
-		out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Params: pathParams, Action: ap.Action, Status: status, Rate: ap.Rate, Since: ap.Since, Auth: auth, Ret: act.Ret, RetList: act.RetList})
+		if ap.Bearer != "" {
+			// The bearer credential is the app's own (verified by the action),
+			// so it cannot also be a session: the Authorization header carries
+			// one or the other.
+			if len(act.Requires) > 0 {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q authenticates with %s bearer tokens, so action %q cannot also require a session policy", ap.Method, ap.Path, ap.AuthScheme, ap.Action)}
+			}
+			var bp *Param
+			for i := range act.Params {
+				if act.Params[i].Name == ap.Bearer {
+					bp = &act.Params[i]
+				}
+			}
+			if bp == nil || bp.Type != "text" || bp.List {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: bearer parameter %q must be a text parameter of action %q", ap.Method, ap.Path, ap.Bearer, ap.Action)}
+			}
+			for _, pp := range pathParams {
+				if pp == ap.Bearer {
+					return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: {%s} is a path parameter, not the bearer credential", ap.Method, ap.Path, ap.Bearer)}
+				}
+			}
+			if ap.AuthScheme == "none" || ap.AuthScheme == "session" {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q: auth scheme %q is reserved; name the credential (e.g. dev_token)", ap.Method, ap.Path, ap.AuthScheme)}
+			}
+			auth = ap.AuthScheme
+		}
+		out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Params: pathParams, Action: ap.Action, Status: status, Rate: ap.Rate, Since: ap.Since, Auth: auth, Ret: act.Ret, RetList: act.RetList, Bearer: ap.Bearer})
 	}
 
-	// 4d″. Streams: `stream "/path" [requires policy]: TypeA, TypeB`. Every
-	// event is a wire type; every `emit` in an action names a type some stream
-	// carries, or it could never reach anyone.
+	// 4d‴. `contract "/path"`: the runtime answers GET on the path and its
+	// /version, /history and /diff children, so none of them may also be a
+	// declared route.
+	if cd := app.Contract; cd != nil {
+		for _, sub := range []string{"", "/version", "/history", "/diff"} {
+			if line, ok := apiSeen["GET "+cd.Path+sub]; ok {
+				return nil, &BuildError{line, fmt.Sprintf("api GET %q is served by the contract declaration (line %d)", cd.Path+sub, cd.Line)}
+			}
+		}
+		out.Contract = &ContractRoute{Path: cd.Path, Rate: cd.Rate, Since: cd.Since}
+	}
+
+	// 4d″. Streams: `stream "/path" [requires policy]: TypeA, TypeB`, or the
+	// block form naming each event. Every payload is a wire type; within one
+	// stream an event name is unique; every `emit` names a type (and, when
+	// given, an event) some stream carries, or it could never reach anyone;
+	// an unnamed `emit Dto{…}` must be unambiguous on every stream carrying Dto.
 	streamSeen := map[string]int{}
 	carried := map[string]bool{}
+	namesOf := map[string]map[string][]string{} // stream path -> payload type -> event names
+	streamParams := map[string]int{}            // stream path -> its {param} count
+	carriesNamed := map[string]bool{}           // name + " " + type
 	for _, st := range app.Streams {
 		if prev, ok := streamSeen[st.Path]; ok {
 			return nil, &BuildError{st.Line, fmt.Sprintf("stream path %q redeclared (first at line %d)", st.Path, prev)}
 		}
 		streamSeen[st.Path] = st.Line
-		for _, ev := range st.Events {
-			if !e.wireTypes[ev] {
-				return nil, &BuildError{st.Line, fmt.Sprintf("stream %q carries %q, which is not a declared wire type", st.Path, ev)}
+		namesOf[st.Path] = map[string][]string{}
+		evSeen := map[string]bool{}
+		var events []StreamEvent
+		var params []string
+		for _, seg := range strings.Split(st.Path, "/") {
+			if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
+				params = append(params, seg[1:len(seg)-1])
+			} else if strings.ContainsAny(seg, "{}") {
+				return nil, &BuildError{st.Line, fmt.Sprintf("stream %q: a path parameter is a whole segment, {name}", st.Path)}
 			}
-			carried[ev] = true
+		}
+		streamParams[st.Path] = len(params)
+		for _, ev := range st.Events {
+			if !e.wireTypes[ev.Type] {
+				return nil, &BuildError{ev.Line, fmt.Sprintf("stream %q carries %q, which is not a declared wire type", st.Path, ev.Type)}
+			}
+			if evSeen[ev.Name] {
+				return nil, &BuildError{ev.Line, fmt.Sprintf("stream %q declares event %q twice", st.Path, ev.Name)}
+			}
+			if ev.Name == "hello" {
+				return nil, &BuildError{ev.Line, fmt.Sprintf("stream %q: `hello` is the connect frame the runtime sends itself", st.Path)}
+			}
+			evSeen[ev.Name] = true
+			carried[ev.Type] = true
+			carriesNamed[ev.Name+" "+ev.Type] = true
+			namesOf[st.Path][ev.Type] = append(namesOf[st.Path][ev.Type], ev.Name)
+			events = append(events, StreamEvent{Name: ev.Name, Type: ev.Type, Since: ev.Since, Summary: ev.Summary})
 		}
 		auth := "none"
 		if st.Requires != "" {
@@ -1174,11 +1415,102 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			auth = "session"
 		}
-		out.Streams = append(out.Streams, Stream{Path: st.Path, Events: st.Events, Requires: st.Requires, Auth: auth})
+		hook := func(kind, name string) error {
+			if name == "" {
+				return nil
+			}
+			act, ok := byActionName[name]
+			if !ok {
+				return &BuildError{st.Line, fmt.Sprintf("stream %q %s -> %s: no such action", st.Path, kind, name)}
+			}
+			if len(act.Params) != len(params) {
+				return &BuildError{st.Line, fmt.Sprintf("stream %q %s -> %s: the action takes the path's parameters (%s), no more and no fewer", st.Path, kind, name, strings.Join(params, ", "))}
+			}
+			for _, p := range act.Params {
+				found := false
+				for _, pp := range params {
+					found = found || pp == p.Name
+				}
+				if !found {
+					return &BuildError{st.Line, fmt.Sprintf("stream %q %s -> %s: parameter %q is not one of the path's {params}", st.Path, kind, name, p.Name)}
+				}
+			}
+			act.Placement = Server
+			act.Reason = fmt.Sprintf("runs on %s of stream %s — the authority holds the connection", kind, st.Path)
+			return nil
+		}
+		var connects []StreamHook
+		for _, h := range st.Connects {
+			if err := hook("connect", h.Action); err != nil {
+				return nil, err
+			}
+			if h.Event != "" {
+				var evType string
+				for _, ev := range events {
+					if ev.Name == h.Event {
+						evType = ev.Type
+					}
+				}
+				if evType == "" {
+					return nil, &BuildError{st.Line, fmt.Sprintf("stream %q connect -> %s as %s: the stream carries no event %q", st.Path, h.Action, h.Event, h.Event)}
+				}
+				if a := byActionName[h.Action]; a.Ret != evType || a.RetList {
+					return nil, &BuildError{st.Line, fmt.Sprintf("stream %q connect -> %s as %s: the action must return %s, the event's payload", st.Path, h.Action, h.Event, evType)}
+				}
+			}
+			connects = append(connects, StreamHook{Action: h.Action, Event: h.Event})
+		}
+		if err := hook("disconnect", st.Disconnect); err != nil {
+			return nil, err
+		}
+		out.Streams = append(out.Streams, Stream{Path: st.Path, Events: events, Requires: st.Requires, Auth: auth, Rate: st.Rate, Since: st.Since,
+			Params: params, Connects: connects, Disconnect: st.Disconnect})
+	}
+	for _, st := range app.Streams {
+		if line, ok := apiSeen["GET "+st.Path]; ok {
+			return nil, &BuildError{line, fmt.Sprintf("api GET %q is also declared as a stream (line %d) — a route is one or the other", st.Path, st.Line)}
+		}
+	}
+	// An emit into a parameterized stream names its instance (`on id`), and
+	// one into a plain stream names none.
+	checkOn := func(em emittedEvent) error {
+		for _, st := range app.Streams {
+			for _, ev := range st.Events {
+				if ev.Type != em.typ || (em.name != "" && ev.Name != em.name) {
+					continue
+				}
+				if n := streamParams[st.Path]; n != em.on {
+					if n == 0 {
+						return &BuildError{em.line, fmt.Sprintf("emit %s{…} on …: stream %q has no path parameters to name", em.typ, st.Path)}
+					}
+					return &BuildError{em.line, fmt.Sprintf("emit %s{…}: stream %q is one per %d path value(s) — name the instance: emit … %s{…} on <value>", em.typ, st.Path, n, em.typ)}
+				}
+			}
+		}
+		return nil
+	}
+	for _, em := range append(append([]emittedEvent{}, e.emittedEvents...), e.unnamedEmits...) {
+		if err := checkOn(em); err != nil {
+			return nil, err
+		}
+	}
+	for _, em := range e.emittedEvents {
+		if !carriesNamed[em.name+" "+em.typ] {
+			return nil, &BuildError{em.line, fmt.Sprintf("emit %s %s{…}: no stream carries an event %q with a %s payload", em.name, em.typ, em.name, em.typ)}
+		}
 	}
 	for typ, line := range e.emittedTypes {
 		if !carried[typ] {
 			return nil, &BuildError{line, fmt.Sprintf("emit %s{…}: no stream carries %q — declare one: stream \"/path\": %s", typ, typ, typ)}
+		}
+	}
+	// An unnamed emit of a type one stream carries under several names could
+	// mean any of them; the author must say which.
+	for _, u := range e.unnamedEmits {
+		for path, byType := range namesOf {
+			if names := byType[u.typ]; len(names) > 1 {
+				return nil, &BuildError{u.line, fmt.Sprintf("emit %s{…}: stream %q carries %s as %s — name the event: emit %s %s{…}", u.typ, path, u.typ, strings.Join(names, " and "), names[0], u.typ)}
+			}
 		}
 	}
 
@@ -1452,6 +1784,10 @@ func Build(app *ast.App) (*IR, error) {
 			if queried[f.Name] && f.Secret {
 				return nil, &BuildError{0, fmt.Sprintf(
 					"field %q is @secret and cannot be used in a `where`, `by`, or relation; it is encrypted at rest", f.Name)}
+			}
+			if queried[f.Name] && f.Password {
+				return nil, &BuildError{0, fmt.Sprintf(
+					"field %q is @password and cannot be used in a `where`, `by`, or relation; it stores only a salted one-way hash — check a candidate against it with verifyPassword in an action body", f.Name)}
 			}
 			if idx[f.Name] {
 				f.Index = true
@@ -1843,7 +2179,12 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		if e.structs[a.Ret] != nil {
 			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q returns %s, a proc-only type with no wire form — return a primitive, an entity row, or a wire `type`", a.Name, a.Ret)}
 		}
-		if !isPrimitive(a.Ret) && !e.entities[a.Ret] && !e.wireTypes[a.Ret] && e.records[a.Ret] == nil {
+		// `-> bytes`: the reply is a stored file (an upload, or a service's
+		// `-> bytes` answer), served as the response body itself.
+		if a.Ret == "bytes" && a.RetList {
+			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q returns [bytes] — a reply carries one file", a.Name)}
+		}
+		if a.Ret != "bytes" && !isPrimitive(a.Ret) && !e.entities[a.Ret] && !e.wireTypes[a.Ret] && e.records[a.Ret] == nil {
 			if _, isEnum := e.enums[a.Ret]; !isEnum {
 				return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q returns unknown type %q", a.Name, a.Ret)}
 			}
@@ -1853,12 +2194,20 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	// Record-typed locals (a `let v = call …` whose op returns a record) live for the
 	// span of this action build, so a later `v.field` resolves against the record.
 	e.locRecords = map[string]recBind{}
-	defer func() { e.locRecords = nil }()
+	e.rowLocals = map[string]string{}
+	e.actLocalTypes = map[string]vtype{}
+	e.actParams = map[string]bool{}
+	defer func() { e.locRecords, e.rowLocals, e.actLocalTypes, e.actParams = nil, nil, nil, nil }()
 	sealParams := map[string]bool{} // params whose value flows into an @e2e field (the client seals them before sending)
 	paramSet := map[string]bool{}   // this action's parameter names
-	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true, "session": true}
+	loc := map[string]bool{"actor": true, "role": true, "verified": true, "tenant": true, "tenantRole": true, "session": true, sessionTokenRef: true}
 	for _, p := range a.Params {
+		if p.List && !isPrimitive(p.Type) && e.enums[p.Type] == nil {
+			return Action{}, &BuildError{a.Line, fmt.Sprintf("action %q parameter %q is a list of %s — a list parameter holds scalars (int, text, bool, money, date, float, datetime or an enum), the values a client sends as a JSON array or a comma-separated query", a.Name, p.Name, p.Type)}
+		}
 		act.Params = append(act.Params, Param{Name: p.Name, Type: p.Type, Optional: p.Optional, List: p.List})
+		e.actLocalTypes[p.Name] = vtype{core: p.Type, list: p.List}
+		e.actParams[p.Name] = true
 		loc[p.Name] = true
 		paramSet[p.Name] = true
 	}
@@ -1910,9 +2259,11 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	reads := map[string]bool{}  // state names read (for soundness)
 	impure := false             // uses an effectful builtin (now/rand)
 	usesPrint := false          // calls print(...) — unconditionally server-executed, see printCap
+	usesSecret := false         // handles an authentication secret (authorityCap builtins, sessionToken) — unconditionally server-executed
 	callsService := false       // calls an external service (an effect)
 	callsProc := false          // calls a proc (`do`) — unconditionally server-executed
 	establishesID := false      // sets the session identity (`establish`)
+	setsHeader := false         // sets a response header (`header "Name" expr`)
 	emits := false              // puts an event on a stream (`emit`) — only the authority holds subscribers
 
 	// readExprIn validates an expression against a named scope and records what it
@@ -1930,6 +2281,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		}
 		if hasPrint(ex) {
 			usesPrint = true
+		}
+		if handlesSecret(ex) {
+			usesSecret = true
 		}
 		for n := range e.depsIR(e.low(ex)) {
 			if _, isState := e.states[n]; isState {
@@ -1984,15 +2338,22 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		for _, s := range stmts {
 			switch st := s.(type) {
 			case ast.Check:
-				if err := e.checkPure(st.Cond, loc, st.Line, "a check"); err != nil {
+				if err := e.checkPureIn(st.Cond, loc, st.Line, "a check", true); err != nil {
 					return nil, err
 				}
-				if err := e.checkLiteral(st.Msg, loc, st.Line, "a check message",
-					"a check message is literal text the authority sends back when the guard fails — it has no scope to interpolate against, because it is written before the values it would read are known to be valid; "+
-						"state the rule instead of the value"); err != nil {
-					return nil, err
+				if handlesSecret(st.Cond) {
+					usesSecret = true
 				}
-				body = append(body, Stmt{Op: "check", Value: e.low(st.Cond), Msg: st.Msg, Status: st.Status})
+				out := Stmt{Op: "check", Value: e.low(st.Cond), Msg: st.Msg, Status: st.Status, Target: st.Code}
+				if st.MsgExpr != nil {
+					// `"No league named {league}."`: read in the action's scope
+					// when the check fails.
+					if err := readExpr(st.MsgExpr, st.Line); err != nil {
+						return nil, err
+					}
+					out.Key = e.low(st.MsgExpr)
+				}
+				body = append(body, out)
 			case ast.Assign:
 				p, ok := e.states[st.Target]
 				if !ok {
@@ -2084,7 +2445,15 @@ func (e *env) action(a *ast.Action) (Action, error) {
 						// row, the action's parameters and the clock, exactly as the by-id
 						// `set` may. Only the *predicate* has to be pure — it is what decides
 						// which rows are touched, and a store has to be able to agree.
-						if err := readExprIn(fi.Expr, wl, st.Line); err != nil {
+						prevRow, hadRow := e.rowLocals[st.Var]
+						e.rowLocals[st.Var] = st.Entity
+						err := readExprIn(fi.Expr, wl, st.Line)
+						if hadRow {
+							e.rowLocals[st.Var] = prevRow
+						} else {
+							delete(e.rowLocals, st.Var)
+						}
+						if err != nil {
 							return nil, err
 						}
 						out.Fields = append(out.Fields, FieldInit{Name: fi.Name, Expr: e.low(fi.Expr)})
@@ -2226,6 +2595,37 @@ func (e *env) action(a *ast.Action) (Action, error) {
 					}
 				}
 				body = append(body, ds)
+			case ast.Restate:
+				// Re-roling an account's live sessions is an identity change: the
+				// authority's job, applied after the commit (runtime).
+				establishesID = true
+				if err := readExpr(st.Actor, st.Line); err != nil {
+					return nil, err
+				}
+				if err := readExpr(st.Role, st.Line); err != nil {
+					return nil, err
+				}
+				body = append(body, Stmt{Op: "restate", Value: e.low(st.Actor), Role: e.low(st.Role)})
+			case ast.Header:
+				if err := checkActionHeaderName(st.Name); err != nil {
+					return nil, &BuildError{st.Line, err.Error()}
+				}
+				if err := readExpr(st.Value, st.Line); err != nil {
+					return nil, err
+				}
+				if err := e.checkNoPrivate(st.Value); err != nil {
+					return nil, &BuildError{st.Line, "a response header is sent to the caller, so it cannot carry a @private value"}
+				}
+				setsHeader = true
+				body = append(body, Stmt{Op: "header", Msg: textproto.CanonicalMIMEHeaderKey(st.Name), Value: e.low(st.Value)})
+			case ast.Revoke:
+				// Ending a session is an identity change like establishing one: the
+				// authority's job, and its effect lands after the commit (runtime).
+				establishesID = true
+				if err := readExpr(st.Session, st.Line); err != nil {
+					return nil, err
+				}
+				body = append(body, Stmt{Op: "revoke", Value: e.low(st.Session)})
 			case ast.Establish:
 				// Adopt a custom session identity. Setting who you are is the authority's
 				// job, so it forces server placement; the actor/role exprs are reads.
@@ -2266,22 +2666,40 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				// `emit Dto{…} [to expr]`: the value must be a literal of a wire type
 				// some stream carries (checked once streams are built, in the
 				// stream pass); here it is an ordinary action expression.
+				// The payload is a wire-type literal, or any expression of a
+				// wire type (a projection: `emit room roomDTO(f, me) on id`).
 				lit, ok := st.Value.(ast.StructLit)
+				if !ok {
+					if vt := e.exprType(st.Value, e.actionScope(loc)); vt.known() && !vt.list && e.wireTypes[vt.core] {
+						lit, ok = ast.StructLit{Type: vt.core}, true
+					}
+				}
 				if !ok || !e.wireTypes[lit.Type] {
-					return nil, &BuildError{st.Line, "emit takes a wire type literal: emit EventType{field: value, …}"}
+					return nil, &BuildError{st.Line, "emit takes a wire type value: emit EventType{field: value, …} or a projection returning one"}
 				}
 				if err := readExpr(st.Value, st.Line); err != nil {
 					return nil, err
 				}
-				out := Stmt{Op: "emit", Field: lit.Type, Value: e.low(st.Value)}
+				out := Stmt{Op: "emit", Field: lit.Type, Target: st.Event, Value: e.low(st.Value)}
 				if st.To != nil {
 					if err := readExpr(st.To, st.Line); err != nil {
 						return nil, err
 					}
 					out.Key = e.low(st.To)
 				}
+				for _, x := range st.On {
+					if err := readExpr(x, st.Line); err != nil {
+						return nil, err
+					}
+					out.Args = append(out.Args, e.low(x))
+				}
 				emits = true
 				e.emittedTypes[lit.Type] = st.Line
+				if st.Event != "" {
+					e.emittedEvents = append(e.emittedEvents, emittedEvent{name: st.Event, typ: lit.Type, line: st.Line, on: len(st.On)})
+				} else {
+					e.unnamedEmits = append(e.unnamedEmits, emittedEvent{typ: lit.Type, line: st.Line, on: len(st.On)})
+				}
 				body = append(body, out)
 			case ast.Return:
 				// `return expr`: the reply value. Its expression is an ordinary
@@ -2300,7 +2718,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				if err := readExpr(st.Value, st.Line); err != nil {
 					return nil, err
 				}
-				body = append(body, Stmt{Op: "return", Value: e.low(st.Value)})
+				body = append(body, Stmt{Op: "return", Value: e.low(st.Value), Status: st.Status})
 			case ast.Let:
 				// `let name = expr`: an action-local bound once, visible for the rest
 				// of this block. The value is an ordinary action expression — it may
@@ -2312,6 +2730,10 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				if err := bindLocal(st.Name, loc, "the local", st.Line); err != nil {
 					return nil, err
 				}
+				if row, ok := st.Value.(ast.EntityGet); ok && row.Field == "" {
+					e.rowLocals[st.Name] = row.Entity
+				}
+				e.actLocalTypes[st.Name] = e.exprType(st.Value, e.actionScope(loc))
 				body = append(body, Stmt{Op: "let", Target: st.Name, Value: e.low(st.Value)})
 			case ast.IfStmt:
 				if err := readExpr(st.Cond, st.Line); err != nil {
@@ -2334,13 +2756,34 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				// `remove … where` filter is — it decides which rows the body sees, and
 				// a store has to be able to agree — while the body is ordinary action
 				// code with the item variable in scope.
+				if !e.entities[st.Coll] && loc[st.Coll] {
+					// `for x in names:` over a list-valued local or parameter —
+					// each element in order, the body run once per element.
+					if st.Where != nil || st.Order != "" || st.Limit != nil {
+						return nil, &BuildError{st.Line, fmt.Sprintf("`for %s in %s` walks a list value; where/by/limit filter an entity's rows — shape the list before the loop", st.Var, st.Coll)}
+					}
+					wl := cloneNameSet(loc)
+					if err := bindLocal(st.Var, wl, "the loop variable", st.Line); err != nil {
+						return nil, err
+					}
+					if lt := e.actLocalTypes[st.Coll]; lt.list {
+						e.actLocalTypes[st.Var] = vtype{core: lt.core}
+					}
+					kids, err := block(st.Body, wl)
+					if err != nil {
+						return nil, err
+					}
+					body = append(body, Stmt{Op: "foreach", Var: st.Var, Value: &Expr{Kind: "ref", Name: st.Coll}, Body: kids})
+					continue
+				}
 				if !e.entities[st.Coll] {
-					return nil, &BuildError{st.Line, fmt.Sprintf("`for` in an action walks an entity's rows; %q is not an entity", st.Coll)}
+					return nil, &BuildError{st.Line, fmt.Sprintf("`for` in an action walks an entity's rows or a list-valued local; %q is not an entity or a local", st.Coll)}
 				}
 				wl := cloneNameSet(loc)
 				if err := bindLocal(st.Var, wl, "the loop variable", st.Line); err != nil {
 					return nil, err
 				}
+				e.rowLocals[st.Var] = st.Coll
 				out := Stmt{Op: "for", Entity: st.Coll, Var: st.Var, Order: st.Order, Desc: st.Desc}
 				if st.Where != nil {
 					if err := e.checkPure(st.Where, wl, st.Line, "a `for … where` filter"); err != nil {
@@ -2363,6 +2806,7 @@ func (e *env) action(a *ast.Action) (Action, error) {
 					out.Limit = e.low(st.Limit)
 				}
 				kids, err := block(st.Body, wl)
+				delete(e.rowLocals, st.Var)
 				if err != nil {
 					return nil, err
 				}
@@ -2440,6 +2884,13 @@ func (e *env) action(a *ast.Action) (Action, error) {
 			case ast.Establish:
 				collect(st.Actor)
 				collect(st.Role)
+			case ast.Revoke:
+				collect(st.Session)
+			case ast.Header:
+				collect(st.Value)
+			case ast.Restate:
+				collect(st.Actor)
+				collect(st.Role)
 			case ast.ExprStmt:
 				collect(st.Call)
 			}
@@ -2479,6 +2930,18 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	// Anything genuinely shared still goes to the authority: an entity write is
 	// caught above, a write to a `@server` cell below, and a service call or an
 	// identity change in their own arms here.
+	if !callsProc && stmtsCall(act.Body, func(name string) bool {
+		_, isProc := e.procSigs[name]
+		return isProc || e.procDerives[name]
+	}) != "" {
+		callsProc = true
+	}
+	// A builtin the browser does not implement (parser.BuiltinSiteOf) pins the
+	// action to the authority, whatever state it writes.
+	serverBuiltin := stmtsCall(act.Body, func(name string) bool {
+		site, ok := parser.BuiltinSiteOf(name)
+		return ok && site != parser.SiteEverywhere
+	})
 	act.Placement = Client
 	act.Reason = "only touches @client state, so it runs in the browser with no round-trip"
 	switch {
@@ -2493,6 +2956,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 		// must always run there, regardless of what state it writes.
 		act.Placement = Server
 		act.Reason = "calls print(...) — a server-only debugging aid with no client implementation; the authority is the only process with log output to write it to"
+	case usesSecret:
+		act.Placement = Server
+		act.Reason = "handles an authentication secret or a stored file (verifyPassword/totpSecret/totpValid/randomToken/sessionToken/fileDigest) — only the authority holds it"
 	case impure && !writesOnlyClientState(writes, e.states):
 		act.Placement = Server
 		act.Reason = "uses an effectful builtin (now/rand) — the authority owns nondeterminism, so every client sees one agreed result"
@@ -2505,6 +2971,9 @@ func (e *env) action(a *ast.Action) (Action, error) {
 	case establishesID:
 		act.Placement = Server
 		act.Reason = "establishes the session identity — only the authority may set who you are"
+	case setsHeader:
+		act.Placement = Server
+		act.Reason = "sets a response header — only the authority answers the HTTP request"
 	case a.Ret != "":
 		// A reply value is computed once, by the authority, and read back from
 		// the reply — the browser's own runner returns nothing, so a returning
@@ -2523,6 +2992,12 @@ func (e *env) action(a *ast.Action) (Action, error) {
 				break
 			}
 		}
+	}
+	if act.Placement == Client && serverBuiltin != "" {
+		// Last, so an action with any other reason to run on the authority is
+		// reported by that reason.
+		act.Placement = Server
+		act.Reason = fmt.Sprintf("calls %s(...), which only the authority implements — the browser has no mirror of it", serverBuiltin)
 	}
 	if act.Placement == Server {
 		// Soundness is symmetric: the authority can neither see nor touch ephemeral
@@ -2567,6 +3042,20 @@ func (e *env) action(a *ast.Action) (Action, error) {
 // lowered, a return-typed proc is checked for return-completeness (every
 // execution path must reach a `return`) by stmtsReturnComplete, below.
 func (e *env) proc(p *ast.Proc) (Proc, error) {
+	return e.procIn(p, nil)
+}
+
+// isProcessEntry: `proc main(args: [text]) -> int`, the program's entry point
+// when it is run as a command (`facet exec`, runtime/stdio.go's RunMain).
+func isProcessEntry(p *ast.Proc) bool {
+	return p.Name == "main" && len(p.Params) == 1 && p.Params[0].List && p.Params[0].Type == "text" && p.Ret == "int" && !p.RetList
+}
+
+// procIn lowers p; actionSigs non-nil lowers it as a daemon-context body
+// (the process entry point), exactly as e.daemon lowers a daemon's.
+func (e *env) procIn(p *ast.Proc, actionSigs map[string]actionSig) (Proc, error) {
+	e.inProc = true
+	defer func() { e.inProc = false }()
 	pr := Proc{Name: p.Name, Ret: p.Ret, RetList: p.RetList}
 	locals := map[string]bool{}  // every name in scope: params + `let`s seen so far
 	mutable := map[string]bool{} // the subset declared `let mut`, and so reassignable
@@ -2590,10 +3079,17 @@ func (e *env) proc(p *ast.Proc) (Proc, error) {
 		}
 		pr.Params = append(pr.Params, Param{Name: prm.Name, Type: prm.Type, Optional: prm.Optional, List: prm.List})
 	}
-	body, err := e.procBlock(p, p.Body, locals, mutable, types, 0, nil)
+	for _, prm := range p.Params {
+		if err := e.checkNotShared(prm.Name, p.Line); err != nil {
+			return Proc{}, err
+		}
+	}
+	e.seedSharedTypes(types)
+	body, err := e.procBlock(p, p.Body, locals, mutable, types, 0, actionSigs)
 	if err != nil {
 		return Proc{}, err
 	}
+	e.lowerSharedRefs(body)
 	pr.Body = body
 	if len(pr.Body) == 0 {
 		return Proc{}, &BuildError{p.Line, fmt.Sprintf("proc %q has no body", p.Name)}
@@ -2622,10 +3118,12 @@ func (e *env) proc(p *ast.Proc) (Proc, error) {
 // rules), so giving it a second, parallel lowering function would only
 // duplicate procBlock's ~400 lines for no behavioral difference.
 func (e *env) daemon(d *ast.Daemon, actionSigs map[string]actionSig) (Daemon, error) {
+	e.inDaemon = true
+	defer func() { e.inDaemon = false }()
 	seenUse := map[string]bool{}
 	for _, u := range d.Uses {
 		if !knownCapabilities[u] {
-			return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q declares unknown capability %q — known capabilities: io.file, io.net, io.net.listen", d.Name, u)}
+			return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q declares unknown capability %q — known capabilities: io.console, io.env, io.file, io.net, io.net.listen", d.Name, u)}
 		}
 		if seenUse[u] {
 			return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q declares capability %q more than once", d.Name, u)}
@@ -2633,10 +3131,13 @@ func (e *env) daemon(d *ast.Daemon, actionSigs map[string]actionSig) (Daemon, er
 		seenUse[u] = true
 	}
 	fake := &ast.Proc{Name: "daemon " + d.Name, Uses: d.Uses, Line: d.Line}
-	body, err := e.procBlock(fake, d.Body, map[string]bool{}, map[string]bool{}, map[string]string{}, 0, actionSigs)
+	types := map[string]string{}
+	e.seedSharedTypes(types)
+	body, err := e.procBlock(fake, d.Body, map[string]bool{}, map[string]bool{}, types, 0, actionSigs)
 	if err != nil {
 		return Daemon{}, err
 	}
+	e.lowerSharedRefs(body)
 	if len(body) == 0 {
 		return Daemon{}, &BuildError{d.Line, fmt.Sprintf("daemon %q has no body", d.Name)}
 	}
@@ -2722,11 +3223,14 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if locals[st.Name] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is already declared in proc %q", st.Name, p.Name)}
 			}
+			if err := e.checkNotShared(st.Name, st.Line); err != nil {
+				return nil, err
+			}
 			if err := e.checkProcExpr(p, st.Value, locals, types, st.Line, actionSigs); err != nil {
 				return nil, err
 			}
 			locals[st.Name] = true
-			types[st.Name] = inferProcType(st.Value, types)
+			types[st.Name] = e.structExprType(st.Value, types)
 			if st.Mut {
 				mutable[st.Name] = true
 			}
@@ -2736,6 +3240,18 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			// `let mut` — a bare `let` local is immutable, and an unknown name is not
 			// state (a proc has none in this milestone), so both are compile errors
 			// rather than the runtime silently creating or overwriting something.
+			// The one non-local a proc may assign is a `shared` cell (see
+			// ast.Shared): the whole value is replaced atomically.
+			if sh := e.shareds[st.Target]; sh != nil && !locals[st.Target] {
+				if err := e.checkProcExpr(p, st.Value, locals, types, st.Line, actionSigs); err != nil {
+					return nil, err
+				}
+				if err := e.checkSharedAssign(sh, st.Value, types, st.Line); err != nil {
+					return nil, err
+				}
+				out = append(out, Stmt{Op: "exprstmt", Value: &Expr{Kind: "call", Name: sharedSetIntrinsic, Args: []*Expr{{Kind: "lit", Val: sh.Name, VType: "text"}, e.low(st.Value)}}})
+				continue
+			}
 			if !locals[st.Target] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is not declared in proc %q — use `let %s = …` first", st.Target, p.Name, st.Target)}
 			}
@@ -2754,7 +3270,7 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			// that, the type map lets this catch the common case of indexing
 			// something that plainly isn't an array or map at compile time (see
 			// checkIndexTypes) — the index itself is never bounds-checked here; that
-			// can only be a runtime error (runtime/server.go's execProcBlock,
+			// can only be a runtime error (runtime/proccompile.go,
 			// "indexset"), since bounds are data-dependent (and, for a map, so is
 			// whether the key is already present).
 			if !locals[st.Target] {
@@ -2779,13 +3295,13 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			// in its own ast.Index node) needs the same check spelled out
 			// explicitly. Silent ("") when the key's type can't be proven — the
 			// runtime backstop (runtime/eval.go's mapKey, reached via
-			// execProcBlock's "indexset" case) catches that case instead.
+			// runtime/proccompile.go's "indexset" case) catches that case instead.
 			if types[st.Target] == mapType {
 				if kt := inferProcType(st.Index, types); !isMapKeyType(kt) {
 					return nil, &BuildError{st.Line, fmt.Sprintf("map key must be int or text, got %s", kt)}
 				}
 			}
-			// Bytes: true tells the runtime (execProcBlock's "indexset" case) to
+			// Bytes: true tells the runtime (runtime/proccompile.go's "indexset" case) to
 			// range-check the written value to 0-255 and reject anything outside it
 			// as a clean error, rather than accepting any int the way a plain array
 			// index-write does — the domain invariant a byte buffer exists to
@@ -2870,6 +3386,9 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				if sig.ret == "" {
 					return nil, &BuildError{st.Line, fmt.Sprintf("proc %q returns nothing — declare a return type to bind it", st.Proc)}
 				}
+				if err := e.checkNotShared(st.Bind, st.Line); err != nil {
+					return nil, err
+				}
 				locals[st.Bind] = true
 				if st.Mut {
 					mutable[st.Bind] = true
@@ -2940,10 +3459,38 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 			if locals[st.Bind] {
 				return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the spawned task handle", st.Bind)}
 			}
+			if err := e.checkNotShared(st.Bind, st.Line); err != nil {
+				return nil, err
+			}
 			locals[st.Bind] = true
 			types[st.Bind] = taskType
 			pendingSpawns[st.Bind] = spawnedTask{proc: st.Proc, sig: sig}
 			out = append(out, sp)
+		case ast.Detach:
+			// `detach ProcName(args)` — a concurrent call nothing joins, legal
+			// only where its lifetime is still bounded: a daemon body, whose
+			// own lifetime is the process's (see ast.Detach's doc). Checked
+			// exactly like spawn's call; lowered to the runtime intrinsic
+			// detachIntrinsic, which starts the proc on its own goroutine and
+			// logs a failure, since there is no caller to hand one to.
+			if actionSigs == nil {
+				return nil, &BuildError{st.Line, fmt.Sprintf("detach is only valid inside a daemon body — %q is a proc, and a proc's concurrency is structured: use `let h = spawn %s(...)` and `join h`", p.Name, st.Proc)}
+			}
+			sig, ok := e.procSigs[st.Proc]
+			if !ok {
+				return nil, &BuildError{st.Line, fmt.Sprintf("detach calls unknown proc %q", st.Proc)}
+			}
+			if len(st.Args) != len(sig.params) {
+				return nil, &BuildError{st.Line, fmt.Sprintf("proc %q expects %d argument(s), got %d", st.Proc, len(sig.params), len(st.Args))}
+			}
+			call := &Expr{Kind: "call", Name: detachIntrinsic, Args: []*Expr{{Kind: "lit", Val: st.Proc, VType: "text"}}}
+			for _, arg := range st.Args {
+				if err := e.checkProcExpr(p, arg, locals, types, st.Line, actionSigs); err != nil {
+					return nil, err
+				}
+				call.Args = append(call.Args, e.low(arg))
+			}
+			out = append(out, Stmt{Op: "exprstmt", Value: call})
 		case ast.Join:
 			// `join h` / `let r = join h` — consumes a handle pendingSpawns is
 			// tracking for THIS block. Three distinct failure shapes, each with
@@ -2970,6 +3517,9 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				}
 				if task.sig.ret == "" {
 					return nil, &BuildError{st.Line, fmt.Sprintf("spawned proc %q returns nothing — declare a return type to bind its joined result", task.proc)}
+				}
+				if err := e.checkNotShared(st.Bind, st.Line); err != nil {
+					return nil, err
 				}
 				locals[st.Bind] = true
 				// Same arrayType tagging as a `do` bind above — a spawned proc's
@@ -3024,6 +3574,9 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 					if locals[st.Bind] {
 						return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
 					}
+					if err := e.checkNotShared(st.Bind, st.Line); err != nil {
+						return nil, err
+					}
 					locals[st.Bind] = true
 					if isBytes {
 						types[st.Bind] = bytesType
@@ -3057,6 +3610,9 @@ func (e *env) procBlock(p *ast.Proc, stmts []ast.Stmt, locals, mutable map[strin
 				if st.Bind != "" {
 					if locals[st.Bind] {
 						return nil, &BuildError{st.Line, fmt.Sprintf("%q is already in scope — pick another name for the bound result", st.Bind)}
+					}
+					if err := e.checkNotShared(st.Bind, st.Line); err != nil {
+						return nil, err
 					}
 					locals[st.Bind] = true
 					types[st.Bind] = "bool"
@@ -3255,12 +3811,23 @@ func stmtsReturnComplete(body []Stmt) bool {
 // narrower than e.resolves' (no state, no entity, no actor/session builtin).
 func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, types map[string]string, line int, actionSigs map[string]actionSig) error {
 	for n := range freeNames(ex) {
-		if !locals[n] {
+		if !locals[n] && e.shareds[n] == nil {
 			return &BuildError{line, fmt.Sprintf(
 				"unknown reference %q — a proc sees only its own parameters and `let` locals (no state or entities in this milestone)", n)}
 		}
 	}
+	called := map[string]bool{}
+	calledNames(ex, called)
+	for n := range called {
+		if e.deriveFns[n] != nil {
+			return &BuildError{line, fmt.Sprintf(
+				"a proc cannot call derive %q — a derive is a projection over the app's rows and state, which a proc does not see (no state or entities in this milestone)", n)}
+		}
+	}
 	if err := e.checkBuiltins(ex, line); err != nil {
+		return err
+	}
+	if err := e.checkPasswordReads(ex, nil, line); err != nil {
 		return err
 	}
 	if err := checkDaemonOnlyBuiltins(ex, actionSigs != nil, line); err != nil {
@@ -3310,7 +3877,7 @@ const arrayType = "array"
 // place it actually diverges is index-WRITE: a byte buffer must reject a
 // value outside 0-255, which is exactly what this tag exists to let
 // procBlock's ast.IndexAssign case flag on the lowered Stmt (its Bytes
-// field), so runtime/server.go's execProcBlock can range-check only the
+// field), so runtime/proccompile.go can range-check only the
 // writes that need it.
 const bytesType = "bytes"
 
@@ -3322,8 +3889,8 @@ const bytesType = "bytes"
 // map[any]any (runtime/eval.go), a distinct representation from an array's
 // []any, so — unlike bytesType — it is NOT a specialization of the array
 // machinery: index-read/-write dispatch on the actual runtime value's Go
-// type (runtime/eval.go's evalInFrame "index" case, runtime/server.go's
-// execProcBlock "indexset" case), and this compile-time tag exists only to
+// type (runtime/proccompile.go "index" case, its "indexset" case), and
+// this compile-time tag exists only to
 // catch the statically-provable cases before that.
 const mapType = "map"
 
@@ -3399,13 +3966,18 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 		case "bytesToText":
 			// bytesToText(b) -> text, textToBytes' inverse.
 			return "text"
+		case "aesGcmSeal", "aesGcmOpen":
+			// AES-256-GCM (runtime/aesgcm.go): a byte buffer in, one out.
+			return bytesType
+		case "aesGcmAuthentic":
+			return "bool"
 		case "byteLen":
 			// byteLen(s) -> int, s's real UTF-8 byte length (as opposed to
 			// len(s)'s rune count) — always an int, the same as len().
 			return "int"
 		case "readFile", "httpGet", "httpPost":
 			return "text"
-		case "listen", "accept":
+		case "listen", "listenOn", "accept":
 			// Listener/Conn are, deliberately, just int handles — the exact same
 			// "no new type anywhere in this type system" move `channel()` already
 			// makes (see its case below and runtime/netconn.go's doc): an int is
@@ -3417,11 +3989,42 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// A raw byte-buffer array, exactly like ioReadFileBytes's return —
 			// see bytesType's doc for why this reuses the array machinery.
 			return bytesType
-		case "writeBytes", "closeConn":
-			// true on success; a transport failure (connection reset, bad
-			// handle) is a runtime error that aborts the daemon tick, the same
-			// stance writeFile already takes for a disk failure.
+		case "pollBytes":
+			// pollBytes(c, maxLen, waitMs) -> [int]: a byte buffer, like readBytes.
+			return bytesType
+		case "connOpen":
 			return "bool"
+		case "sleepMs", "shutdownConn":
+			return "bool"
+		case "monoMs", "nowMs", "signals":
+			// signals() is a channel handle, the same int channel() mints.
+			return "int"
+		case "writeBytes", "closeConn", "setTimeoutMs":
+			// true on success. writeBytes answers false on a transport
+			// failure (connection reset, deadline passed) — a value, so a
+			// client can report an unreachable peer as data; connError says
+			// why (see runtime/netconn.go's doc). A bad handle still aborts.
+			return "bool"
+		case "connect":
+			// An outbound connection is the same int handle accept() mints.
+			return "int"
+		case "connError":
+			return "text"
+		case "writeStdout", "writeStderr":
+			return "bool"
+		case "readStdin":
+			return "text"
+		case "envVar":
+			// envVar(name) -> text: the process environment variable, "" when
+			// unset (runtime/sysenv.go).
+			return "text"
+		case "envSet":
+			// envSet(name) -> bool: whether it is set at all — what tells an
+			// unset variable from one set to "".
+			return "bool"
+		case "randomBytes":
+			// randomBytes(n) -> bytes: n bytes from the OS's cryptographic RNG.
+			return bytesType
 		case "channel":
 			// A channel value is, deliberately, just an int handle — see
 			// runtime/channel.go's doc for why that needs no new type anywhere
@@ -3431,6 +4034,21 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 		case "recv":
 			return "text" // channels are text-only in this milestone — see LANGUAGE.md
 		case "send":
+			return "bool"
+		case "appendFile", "truncateFile", "fileExists":
+			// appendFile/truncateFile: true on success, a failure is a runtime
+			// error exactly as writeFile's below. fileExists answers the one
+			// question readFile cannot ask without failing: is it there.
+			return "bool"
+		case "fileSize":
+			// fileSize(path) -> int: the file's length in bytes, -1 when absent.
+			return "int"
+		case "readFileAt":
+			// readFileAt(path, offset, n): exactly n bytes from offset, as a
+			// byte buffer (a short read is a runtime error, never a short buffer).
+			return bytesType
+		case "writeFileAt", "syncFile", "renameFile", "removeFile":
+			// true on success; a failure is a runtime error, as writeFile's.
 			return "bool"
 		case "writeFile":
 			// true on success — a failure (missing dir, permission, disk full)
@@ -3557,6 +4175,17 @@ func (e *env) structExprType(ex ast.Expr, types map[string]string) string {
 		}
 		return ""
 	}
+	// An element of a struct's list field has the field's declared element
+	// type — the one place an array's element type is not erased.
+	if ix, ok := ex.(ast.Index); ok {
+		if g, ok := ix.Obj.(ast.Get); ok {
+			if fields, ok := e.structs[e.structExprType(g.Obj, types)]; ok {
+				if f, ok := fields[g.Field]; ok && f.list {
+					return f.typ
+				}
+			}
+		}
+	}
 	return inferProcType(ex, types)
 }
 
@@ -3579,6 +4208,19 @@ func (e *env) structExprType(ex ast.Expr, types map[string]string) string {
 func (e *env) checkStructFieldTypes(ex ast.Expr, types map[string]string, line int) error {
 	switch t := ex.(type) {
 	case ast.StructLit:
+		if _, isStruct := e.structs[t.Type]; !isStruct && e.wireTypes[t.Type] {
+			// A wire-type literal a proc builds (its reply to an action): the
+			// same field rules an action's literal is held to.
+			if err := e.checkWireLits(t, line); err != nil {
+				return err
+			}
+			for _, fi := range t.Fields {
+				if err := e.checkStructFieldTypes(fi.Expr, types, line); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		fields, ok := e.structs[t.Type]
 		if !ok {
 			return &BuildError{line, fmt.Sprintf("unknown struct type %q", t.Type)}
@@ -3601,7 +4243,11 @@ func (e *env) checkStructFieldTypes(ex ast.Expr, types map[string]string, line i
 				continue // unprovable — left to the runtime backstop, same stance as elsewhere
 			}
 			if fdecl.list {
-				if got != arrayType {
+				// A byte buffer is an [int] whose elements are range-checked on
+				// write (see bytesType), so it fills an [int] field exactly as it
+				// already satisfies a `-> [int]` proc return.
+				bytesAsInts := got == bytesType && fdecl.typ == "int"
+				if got != arrayType && !bytesAsInts {
 					return &BuildError{line, fmt.Sprintf("field %q of %s{...} wants [%s], got %s", fi.Name, t.Type, fdecl.typ, got)}
 				}
 			} else if got != fdecl.typ {
@@ -3892,8 +4538,8 @@ func checkNumericTypes(ex ast.Expr, types map[string]string, line int) error {
 // above. The index/key value itself is never type-checked here beyond that —
 // an array's bounds are data-dependent and a map's key-type restriction is
 // its own separate check (checkMapKeyTypes) — both can only be fully settled
-// at runtime (runtime/eval.go's evalInFrame, "index" case, and
-// runtime/server.go's execProcBlock, "indexset" case) — see ast.Index's doc.
+// at runtime (runtime/proccompile.go, "index" case, and
+// runtime/proccompile.go, "indexset" case) — see ast.Index's doc.
 func checkIndexTypes(ex ast.Expr, types map[string]string, line int) error {
 	switch t := ex.(type) {
 	case ast.Index:
@@ -5489,13 +6135,16 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 	if err := e.checkBuiltins(ex, line); err != nil {
 		return err
 	}
+	if err := e.checkPasswordReads(ex, e.rowLocals, line); err != nil {
+		return err
+	}
 	if err := checkNoBitwise(ex, line); err != nil {
 		return err
 	}
 	if err := e.checkWireLits(ex, line); err != nil {
 		return err
 	}
-	if err := checkNoIndex(ex, e.wireTypes, line); err != nil {
+	if err := e.checkIndexable(ex, line); err != nil {
 		return err
 	}
 	if err := checkNoIO(ex, line); err != nil {
@@ -5507,17 +6156,140 @@ func (e *env) check(ex ast.Expr, locals map[string]bool, line int) error {
 	if err := checkDaemonOnlyBuiltins(ex, false, line); err != nil {
 		return err
 	}
+	if err := checkArgRowVars(ex, locals, line); err != nil {
+		return err
+	}
 	for n := range freeNames(ex) {
 		if !e.resolves(n, locals) {
+			if fn, isFn := e.deriveFns[n]; isFn {
+				return &BuildError{line, fmt.Sprintf("derive %q takes %d argument(s) — call it: %s(…)", n, len(fn.params), n)}
+			}
 			return &BuildError{line, fmt.Sprintf("unknown reference %q", n)}
 		}
+	}
+	if err := e.checkDeriveArgs(ex, scope{locals: locals, varTypes: map[string]vtype{}}, line); err != nil {
+		return err
 	}
 	return e.checkLiteralExpr(ex, locals, line)
 }
 
+// checkPasswordReads refuses a read of a @password field anywhere except as
+// verifyPassword's first argument, and refuses a verifyPassword whose first
+// argument is not one. The column holds a salted one-way hash of what was
+// written (runtime/server.go hashes on every write), so the one question it
+// can answer is "does this candidate match?" — any other read could only carry
+// the hash somewhere it must not go: a reply, a render, an export. rows types
+// the row-valued locals in scope (their entity); an aggregate's item variable
+// is added as its filter and selection are entered, and a view adds its own
+// row locals through checkRowFields.
+func (e *env) checkPasswordReads(ex ast.Expr, rows map[string]string, line int) error {
+	refuse := func(ent, field string) error {
+		return &BuildError{line, fmt.Sprintf(
+			"%s.%s is @password: it stores only a one-way hash, which nothing may read — check a candidate against it with verifyPassword(%s(…).%s, candidate)", ent, field, ent, field)}
+	}
+	var walk func(ex ast.Expr, rows map[string]string) error
+	walk = func(ex ast.Expr, rows map[string]string) error {
+		switch t := ex.(type) {
+		case ast.EntityGet:
+			if e.entPassword[t.Entity][t.Field] {
+				return refuse(t.Entity, t.Field)
+			}
+			return walk(t.Key, rows)
+		case ast.Get:
+			if r, ok := t.Obj.(ast.Ref); ok && e.entPassword[rows[r.Name]][t.Field] {
+				return refuse(rows[r.Name], t.Field)
+			}
+			return walk(t.Obj, rows)
+		case ast.Call:
+			args := t.Args
+			if t.Name == "verifyPassword" && len(args) == 2 {
+				switch h := args[0].(type) {
+				case ast.EntityGet:
+					if !e.entPassword[h.Entity][h.Field] {
+						return &BuildError{line, "verifyPassword's first argument must be a @password field (e.g. `Account(id).password`) — only such a column holds a hash to check against"}
+					}
+					if err := walk(h.Key, rows); err != nil {
+						return err
+					}
+				case ast.Get:
+					r, ok := h.Obj.(ast.Ref)
+					if !ok || !e.entPassword[rows[r.Name]][h.Field] {
+						return &BuildError{line, "verifyPassword's first argument must be a @password field (e.g. `Account(id).password`) — only such a column holds a hash to check against"}
+					}
+				default:
+					return &BuildError{line, "verifyPassword's first argument must be a @password field (e.g. `Account(id).password`) — only such a column holds a hash to check against"}
+				}
+				args = args[1:]
+			}
+			for _, a := range args {
+				if err := walk(a, rows); err != nil {
+					return err
+				}
+			}
+		case ast.Agg:
+			if t.Sel == nil && e.entPassword[t.Coll][t.Field] {
+				return refuse(t.Coll, t.Field)
+			}
+			inner := rows
+			if t.Var != "" {
+				inner = make(map[string]string, len(rows)+1)
+				for k, v := range rows {
+					inner[k] = v
+				}
+				inner[t.Var] = t.Coll
+			}
+			for _, sub := range []ast.Expr{t.Where, t.Sel} {
+				if sub != nil {
+					if err := walk(sub, inner); err != nil {
+						return err
+					}
+				}
+			}
+			if t.Limit != nil {
+				return walk(t.Limit, rows)
+			}
+		case ast.ListLit:
+			for _, el := range t.Elems {
+				if err := walk(el, rows); err != nil {
+					return err
+				}
+			}
+		case ast.MapLit:
+			for i, k := range t.Keys {
+				if err := walk(k, rows); err != nil {
+					return err
+				}
+				if err := walk(t.Vals[i], rows); err != nil {
+					return err
+				}
+			}
+		case ast.StructLit:
+			for _, fi := range t.Fields {
+				if err := walk(fi.Expr, rows); err != nil {
+					return err
+				}
+			}
+		case ast.Index:
+			if err := walk(t.Obj, rows); err != nil {
+				return err
+			}
+			return walk(t.Idx, rows)
+		case ast.Bin:
+			if err := walk(t.L, rows); err != nil {
+				return err
+			}
+			return walk(t.R, rows)
+		case ast.Un:
+			return walk(t.X, rows)
+		}
+		return nil
+	}
+	return walk(ex, rows)
+}
+
 // bitwiseOps is the operator set restricted to `proc` bodies (see
 // checkNoBitwise and checkBitwiseTypes): `& | ^ << >>` and unary `~` have
-// exactly one interpreter today, runtime/eval.go's applyBin/evalInFrame/
+// exactly one interpreter today, runtime/eval.go's applyBin/runtime/proccompile.go/
 // evalRest, which only ever runs on the server. A `proc` is unconditionally
 // server-executed (LANGUAGE.md's `proc` section), so it can use them safely.
 // An action or view expression, by contrast, may be placed on (or
@@ -5596,7 +6368,7 @@ func checkNoBitwise(ex ast.Expr, line int) error {
 // checkNoIndex rejects an array/map index read (`x[i]` / `m[k]`) and a map
 // literal (`{...}`) anywhere outside a proc body, the same way checkNoBitwise
 // (above) rejects a bitwise operator there and for the same underlying
-// reason: an index read's only interpreter is runtime/eval.go's evalInFrame,
+// reason: an index read's only interpreter is runtime/proccompile.go,
 // which resolves it against a proc's own scope-frame. eval() — the flat
 // scope evaluator every action/view/policy/derive expression runs through
 // instead — has no "index" or "map" case, so without this check either would
@@ -5614,7 +6386,7 @@ func checkNoBitwise(ex ast.Expr, line int) error {
 // (different) checks that DO apply there.
 //
 // A struct literal (`Type{...}`, ast.StructLit) is barred the same way, for
-// the same reason: its only interpreter is evalInFrame's "struct" case,
+// the same reason: its only interpreter is runtime/proccompile.go's "struct" case,
 // there is no schema representation, wire encoding, or facet.js mirror for
 // one yet, and — like a map — it is a genuinely new proc-local value kind,
 // not a general field type any other part of the language already knows.
@@ -5628,6 +6400,15 @@ func checkNoBitwise(ex ast.Expr, line int) error {
 // encodes whatever the expression yields), which is the same stance the
 // generic `/api/<entity>` JSON already takes.
 func (e *env) checkWireLits(ex ast.Expr, line int) error {
+	// The types a field value can be read in: the action's parameters and
+	// lets, a derive's parameters, and each aggregate's row.
+	vt := map[string]vtype{}
+	for n, t := range e.actLocalTypes {
+		vt[n] = t
+	}
+	for n, t := range e.deriveParamTypes {
+		vt[n] = t
+	}
 	var walk func(ex ast.Expr) error
 	walk = func(ex ast.Expr) error {
 		switch t := ex.(type) {
@@ -5642,6 +6423,9 @@ func (e *env) checkWireLits(ex ast.Expr, line int) error {
 						return &BuildError{line, fmt.Sprintf("field %q set twice in a %s{...} literal", fi.Name, t.Type)}
 					}
 					set[fi.Name] = true
+					if err := e.checkWireFieldValue(t.Type, fi, vt, line); err != nil {
+						return err
+					}
 					if err := walk(fi.Expr); err != nil {
 						return err
 					}
@@ -5672,11 +6456,22 @@ func (e *env) checkWireLits(ex ast.Expr, line int) error {
 				}
 			}
 		case ast.Agg:
+			prev, had := vt[t.Var]
+			if t.Var != "" {
+				vt[t.Var] = vtype{core: t.Coll}
+			}
 			for _, sub := range []ast.Expr{t.Where, t.Sel, t.Limit} {
 				if sub != nil {
 					if err := walk(sub); err != nil {
 						return err
 					}
+				}
+			}
+			if t.Var != "" {
+				if had {
+					vt[t.Var] = prev
+				} else {
+					delete(vt, t.Var)
 				}
 			}
 		}
@@ -5685,10 +6480,97 @@ func (e *env) checkWireLits(ex ast.Expr, line int) error {
 	return walk(ex)
 }
 
+// checkWireFieldValue refuses a wire field value whose type is provably not
+// the field's: an instant (`datetime`, format date-time on the wire) filled
+// with text or a bare number rather than iso(<unix seconds>), and a DTO field
+// filled with a different DTO (a projection of the wrong shape). Values whose
+// type cannot be proved here are left to the runtime.
+func (e *env) checkWireFieldValue(typ string, fi ast.FieldInit, vt map[string]vtype, line int) error {
+	want, ok := e.wireFieldTypes[typ][fi.Name]
+	if !ok {
+		return nil
+	}
+	if _, isList := fi.Expr.(ast.ListLit); isList && !want.list && want.core != "json" {
+		return &BuildError{line, fmt.Sprintf("%s.%s is one value (a %s), but this value is a list", typ, fi.Name, want.core)}
+	}
+	locals := map[string]bool{}
+	for n := range vt {
+		locals[n] = true
+	}
+	got := e.exprType(fi.Expr, scope{locals: locals, varTypes: vt})
+	if !got.known() {
+		return nil
+	}
+	if got.list != want.list {
+		if want.core == "json" {
+			return nil // an opaque value takes any shape
+		}
+		what := map[bool]string{true: "a list", false: "one value"}
+		return &BuildError{line, fmt.Sprintf("%s.%s is %s, but this value is %s", typ, fi.Name, what[want.list], what[got.list])}
+	}
+	if want.core == "datetime" {
+		switch e.unify(got.core) {
+		case "text", "int", "money", "date":
+			return &BuildError{line, fmt.Sprintf("%s.%s is an instant (datetime, RFC 3339 on the wire) — fill it with iso(<unix seconds>), not a %s", typ, fi.Name, got.core)}
+		}
+	}
+	// A scalar of the wrong JSON kind: text where the wire carries a number
+	// or a boolean, a number or a boolean where it carries text.
+	kind := func(c string) string {
+		switch e.unify(c) {
+		case "int", "money", "number", "float", "date":
+			return "number"
+		case "text":
+			return "string"
+		case "bool":
+			return "boolean"
+		}
+		return ""
+	}
+	if kw, kg := kind(want.core), kind(got.core); want.core != "datetime" && kw != "" && kg != "" && kw != kg {
+		return &BuildError{line, fmt.Sprintf("%s.%s is a %s on the wire, but this value is a %s", typ, fi.Name, kw, kg)}
+	}
+	if e.wireTypes[want.core] && e.wireTypes[got.core] && want.core != got.core {
+		return &BuildError{line, fmt.Sprintf("%s.%s is a %s, but this value is a %s", typ, fi.Name, want.core, got.core)}
+	}
+	return nil
+}
+
+// checkIndexable is checkNoIndex for an expression in an action, view,
+// policy or derive: `x[i]` is allowed where x is a list or a `json` value
+// (an element, or an object's member by key; nothing when absent) — the
+// values these scopes do hold — and refused for proc-local arrays and maps.
+func (e *env) checkIndexable(ex ast.Expr, line int) error {
+	sc := scope{locals: map[string]bool{}, varTypes: map[string]vtype{}}
+	for _, m := range []map[string]vtype{e.actLocalTypes, e.deriveParamTypes} {
+		for n, t := range m {
+			sc.locals[n] = true
+			sc.varTypes[n] = t
+		}
+	}
+	return checkNoIndexIf(ex, e.wireTypes, line, func(ix ast.Index) bool {
+		t := e.exprType(ix.Obj, sc)
+		return t.list || t.core == "json"
+	})
+}
+
 func checkNoIndex(ex ast.Expr, wire map[string]bool, line int) error {
+	return checkNoIndexIf(ex, wire, line, nil)
+}
+
+func checkNoIndexIf(ex ast.Expr, wire map[string]bool, line int, allow func(ast.Index) bool) error {
+	checkNoIndex := func(ex ast.Expr, wire map[string]bool, line int) error {
+		return checkNoIndexIf(ex, wire, line, allow)
+	}
 	switch t := ex.(type) {
 	case ast.Index:
-		return &BuildError{line, "array/map indexing (`x[i]`) is only available inside a proc — arrays and maps are proc-local values, not readable from an action, view, policy, or derive yet"}
+		if allow != nil && allow(t) {
+			if err := checkNoIndex(t.Obj, wire, line); err != nil {
+				return err
+			}
+			return checkNoIndex(t.Idx, wire, line)
+		}
+		return &BuildError{line, "indexing (`x[i]`) outside a proc reads a list or a `json` value; this is neither (arrays and maps are proc-local values)"}
 	case ast.MapLit:
 		return &BuildError{line, "a map literal (`{...}`) is only available inside a proc — maps are proc-local values, not readable from an action, view, policy, or derive yet"}
 	case ast.StructLit:
@@ -5739,12 +6621,14 @@ func checkNoIndex(ex ast.Expr, wire map[string]bool, line int) error {
 // — proc-only, the same way bitwise operators are, and for the same
 // underlying reason (checkNoBitwise's doc): each has exactly one
 // interpreter, runtime/io.go, which only ever runs on the server inside a
-// proc's own frame (runtime/eval.go's evalInFrame), so an action/view/policy/
+// proc's own frame (runtime/proccompile.go), so an action/view/policy/
 // derive expression — which may be placed on or re-evaluated by the client —
 // must never be able to write one into source at all. checkNoIO is the
 // syntactic barrier that guarantees that, exactly mirroring checkNoBitwise's
 // shape and its single call site inside check().
-var ioBuiltins = map[string]bool{"readFile": true, "writeFile": true, "httpGet": true, "httpPost": true}
+var ioBuiltins = map[string]bool{"readFile": true, "writeFile": true, "appendFile": true, "fileExists": true, "truncateFile": true, "fileSize": true, "readFileAt": true, "writeFileAt": true, "syncFile": true, "renameFile": true, "removeFile": true, "httpGet": true, "httpPost": true,
+	"connect": true, "readBytes": true, "writeBytes": true, "closeConn": true, "setTimeoutMs": true, "connError": true, "pollBytes": true, "connOpen": true,
+	"writeStdout": true, "writeStderr": true, "readStdin": true}
 
 // checkNoIO rejects a call to readFile/writeFile/httpGet/httpPost anywhere
 // outside a proc body. checkProcExpr (proc bodies) never calls check(), so a
@@ -5755,6 +6639,9 @@ func checkNoIO(ex ast.Expr, line int) error {
 	case ast.Call:
 		if ioBuiltins[t.Name] {
 			cap, _ := builtinCapability(t.Name)
+			if cap == netConnCap {
+				cap = "io.net"
+			}
 			return &BuildError{line, fmt.Sprintf(
 				"%s(...) is only available inside a proc that declares `uses %s` — it is a real I/O effect, and only a proc is unconditionally server-executed with no client mirror to disagree with it", t.Name, cap)}
 		}
@@ -5813,12 +6700,12 @@ func checkNoIO(ex ast.Expr, line int) error {
 // primitive — proc-only for the same reason ioBuiltins is: it is real,
 // blocking, in-process concurrency machinery (runtime/channel.go) with
 // exactly one interpreter, reached only from a proc's own frame
-// (runtime/eval.go's evalInFrame), so an action/view/policy/derive
+// (runtime/proccompile.go), so an action/view/policy/derive
 // expression — which the client may itself evaluate, or the server may
 // re-evaluate outside any proc call — must never be able to write one into
 // source at all. checkNoConcurrency is ioBuiltins/checkNoIO's exact shape,
 // applied to this set instead.
-var concurrencyBuiltins = map[string]bool{"channel": true, "send": true, "recv": true}
+var concurrencyBuiltins = map[string]bool{"channel": true, "send": true, "recv": true, "sleepMs": true, "monoMs": true, "nowMs": true, "signals": true}
 
 // checkNoConcurrency rejects a call to channel/send/recv anywhere outside a
 // proc body, mirroring checkNoIO exactly (see its doc) — checkProcExpr (proc
@@ -5881,8 +6768,11 @@ func checkNoConcurrency(ex ast.Expr, line int) error {
 	return nil
 }
 
-// listenBuiltins is listen/accept/readBytes/writeBytes/closeConn — the
-// io.net.listen capability's five builtins (runtime/netconn.go). Unlike
+// listenBuiltins is listen/accept — the io.net.listen capability's two
+// handle-minting builtins (runtime/netconn.go). The connection-handle I/O
+// builtins (readBytes/writeBytes/closeConn/setTimeoutMs/connError) are not
+// here: they also serve connect()'s outbound connections, which are always
+// deadline-bounded and so safe in an ordinary proc. Unlike
 // every other capability-gated builtin (readFile/writeFile/httpGet/httpPost,
 // restricted only to "inside some proc-shaped body" by checkNoIO),
 // accept()/readBytes() can block INDEFINITELY — waiting for a client to
@@ -5899,10 +6789,10 @@ func checkNoConcurrency(ex ast.Expr, line int) error {
 // procBlock's own `act ActionName(...)` gate already uses (actionSigs == nil
 // means "lowering a real proc's body", non-nil means "lowering a daemon's")
 // rather than inventing a second one.
-var listenBuiltins = map[string]bool{"listen": true, "accept": true, "readBytes": true, "writeBytes": true, "closeConn": true}
+var listenBuiltins = map[string]bool{"listen": true, "listenOn": true, "accept": true}
 
-// checkDaemonOnlyBuiltins rejects a call to listen/accept/readBytes/
-// writeBytes/closeConn anywhere isDaemon is false, mirroring checkNoIO's
+// checkDaemonOnlyBuiltins rejects a call to listen/accept anywhere isDaemon
+// is false, mirroring checkNoIO's
 // exact recursive shape (see its doc) over this narrower set.
 func checkDaemonOnlyBuiltins(ex ast.Expr, isDaemon bool, line int) error {
 	if isDaemon {
@@ -5986,6 +6876,16 @@ func (e *env) checkNoPrivate(ex ast.Expr) error {
 }
 
 func (e *env) checkPure(ex ast.Expr, locals map[string]bool, line int, ctx string) error {
+	return e.checkPureIn(ex, locals, line, ctx, false)
+}
+
+// checkPureIn is checkPure with the one exception an action's `check` makes:
+// secrets says whether ex may call an authorityCap builtin (see its doc).
+func (e *env) checkPureIn(ex ast.Expr, locals map[string]bool, line int, ctx string, secrets bool) error {
+	if caps := procCapabilities(ex); caps[authorityCap] != "" && !secrets {
+		return &BuildError{line, fmt.Sprintf(
+			"%s cannot call %s(...); it handles an authentication secret and runs only on the authority. Call it from an action body instead", ctx, caps[authorityCap])}
+	}
 	if err := e.check(ex, locals, line); err != nil {
 		return err
 	}
@@ -6037,6 +6937,10 @@ func (c *viewCtx) checkRowFields(ex ast.Expr, sc scope, line int) error {
 		if r, ok := t.Obj.(ast.Ref); ok {
 			if ent, isRow := c.rowEntity(sc, r.Name); isRow && t.Field != "id" && !c.e.entityFields[ent][t.Field] && !c.e.entityDerives[ent][t.Field] {
 				return &BuildError{line, fmt.Sprintf("entity %q has no field %q (in `%s.%s`)", ent, t.Field, r.Name, t.Field)}
+			} else if isRow && c.e.entPassword[ent][t.Field] {
+				// A view can never call verifyPassword (it runs only on the
+				// authority), so any read of a @password column here is a leak.
+				return c.e.checkPasswordReads(t, map[string]string{r.Name: ent}, line)
 			}
 		}
 		return c.checkRowFields(t.Obj, sc, line)
@@ -6051,6 +6955,12 @@ func (c *viewCtx) checkRowFields(ex ast.Expr, sc scope, line int) error {
 	case ast.ListLit:
 		for _, el := range t.Elems {
 			if err := c.checkRowFields(el, sc, line); err != nil {
+				return err
+			}
+		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := c.checkRowFields(fi.Expr, sc, line); err != nil {
 				return err
 			}
 		}
@@ -6118,8 +7028,16 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			return &BuildError{line, fmt.Sprintf("exists needs a filtered form: exists(x in %s where <cond>)", t.Coll)}
 		}
 		if t.Op == "list" {
-			if t.Order != "" && t.Order != "id" && !e.entityFields[t.Coll][t.Order] {
-				return &BuildError{line, fmt.Sprintf("entity %q has no field %q to order list(...) by", t.Coll, t.Order)}
+			if t.Order != "" && t.Order != "id" && !e.entityFields[t.Coll][t.Order] && !e.entityDerives[t.Coll][t.Order] {
+				return &BuildError{line, fmt.Sprintf("entity %q has no field %q to order list(...) by (nor a derive of that name)", t.Coll, t.Order)}
+			}
+			if t.OrderExpr != nil {
+				if t.Var == "" {
+					return &BuildError{line, fmt.Sprintf("list(... in %s by <expression>) needs the row named — write list(x … in %s where … by <expression over x>)", t.Coll, t.Coll)}
+				}
+				if err := e.checkBuiltins(t.OrderExpr, line); err != nil {
+					return err
+				}
 			}
 			if t.Limit != nil {
 				if err := e.checkBuiltins(t.Limit, line); err != nil {
@@ -6158,21 +7076,113 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
-		case "writeFile", "httpPost":
+		case "writeFile", "httpPost", "appendFile", "truncateFile":
 			if len(t.Args) != 2 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
 			}
-		case "listen", "accept", "closeConn":
+		case "fileExists", "fileSize", "syncFile", "removeFile":
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
-		case "readBytes", "writeBytes":
+		case "renameFile":
+			if len(t.Args) != 2 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
+			}
+		case "readFileAt", "writeFileAt", "pollBytes":
+			if len(t.Args) != 3 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly three arguments", t.Name)}
+			}
+		case "writeStdout", "writeStderr", "envVar", "envSet", "randomBytes":
+			if len(t.Args) != 1 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
+			}
+		case "readStdin":
+			if len(t.Args) != 0 {
+				return &BuildError{line, "readStdin() takes no arguments"}
+			}
+		case "sleepMs":
+			if len(t.Args) != 1 {
+				return &BuildError{line, "sleepMs(ms) takes exactly one argument (milliseconds, 0-600000)"}
+			}
+		case "monoMs", "nowMs", "signals":
+			if len(t.Args) != 0 {
+				return &BuildError{line, t.Name + "() takes no arguments"}
+			}
+		case "listen", "accept", "closeConn", "connError", "shutdownConn", "connOpen":
+			if len(t.Args) != 1 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
+			}
+		case "readBytes", "writeBytes", "connect", "setTimeoutMs", "listenOn":
 			if len(t.Args) != 2 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly two arguments", t.Name)}
 			}
 		case "channel":
 			if len(t.Args) != 0 {
 				return &BuildError{line, "channel() takes no arguments"}
+			}
+		case "totpSecret":
+			if len(t.Args) != 0 {
+				return &BuildError{line, "totpSecret() takes no arguments"}
+			}
+		case "verifyPassword":
+			if len(t.Args) != 2 {
+				return &BuildError{line, "verifyPassword(stored, candidate) takes exactly two arguments: a @password field and the candidate text"}
+			}
+		case "randomToken":
+			if len(t.Args) != 1 {
+				return &BuildError{line, "randomToken(n) takes exactly one argument: the token's length in characters"}
+			}
+		case "fileDigest":
+			if len(t.Args) != 1 {
+				return &BuildError{line, "fileDigest(file) takes exactly one argument: an uploaded file (a `bytes` value)"}
+			}
+		case "ed25519Verify", "ecdsaP256Verify":
+			if len(t.Args) != 3 {
+				return &BuildError{line, fmt.Sprintf("%s(publicKey, message, signature) takes exactly three arguments", t.Name)}
+			}
+			if err := e.authorityOnlyCall(t.Name, line); err != nil {
+				return err
+			}
+		case "sha256Hex", "canonicalJson":
+			if len(t.Args) != 1 {
+				return &BuildError{line, fmt.Sprintf("%s(value) takes exactly one argument", t.Name)}
+			}
+			if err := e.authorityOnlyCall(t.Name, line); err != nil {
+				return err
+			}
+		case "given":
+			// given(p): p must be one of the action's own parameters.
+			r, isRef := func() (ast.Ref, bool) {
+				if len(t.Args) != 1 {
+					return ast.Ref{}, false
+				}
+				r, ok := t.Args[0].(ast.Ref)
+				return r, ok
+			}()
+			if !isRef || e.actLocalTypes == nil || e.inDerive != "" || e.inProc {
+				return &BuildError{line, "given(p) takes one of the action's own parameters by name, in the action's body"}
+			}
+			if !e.actParams[r.Name] {
+				return &BuildError{line, fmt.Sprintf("given(%s): %q is not a parameter of this action", r.Name, r.Name)}
+			}
+		case "fromLocal", "formatIn", "zoneValid":
+			want := map[string]int{"fromLocal": 2, "formatIn": 3, "zoneValid": 1}[t.Name]
+			if len(t.Args) != want {
+				return &BuildError{line, fmt.Sprintf("%s takes %d argument(s): fromLocal(wallClock, zone), formatIn(unixSeconds, zone, layout), zoneValid(zone)", t.Name, want)}
+			}
+			if err := e.authorityOnlyCall(t.Name, line); err != nil {
+				return err
+			}
+		case "shuffleOrder":
+			if len(t.Args) != 2 {
+				return &BuildError{line, "shuffleOrder(seed, n) takes exactly two arguments: the seed text and how many positions to permute"}
+			}
+			if err := e.authorityOnlyCall(t.Name, line); err != nil {
+				return err
+			}
+		case "totpValid":
+			if len(t.Args) != 2 {
+				return &BuildError{line, "totpValid(secret, code) takes exactly two arguments: the shared secret and the presented code"}
 			}
 		case "recv":
 			if len(t.Args) != 1 {
@@ -6183,13 +7193,66 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 				return &BuildError{line, "send(ch, value) takes exactly two arguments"}
 			}
 		default:
+			if fn, isFn := e.deriveFns[t.Name]; isFn {
+				if len(t.Args) != len(fn.params) {
+					return &BuildError{line, fmt.Sprintf("derive %q takes %d argument(s), got %d", t.Name, len(fn.params), len(t.Args))}
+				}
+				if e.procDerives[t.Name] {
+					// A projection that calls a proc is server-only, like the proc.
+					if e.inDerive != "" {
+						e.procDerives[e.inDerive] = true
+					} else if e.actLocalTypes == nil {
+						return &BuildError{line, fmt.Sprintf("derive %q calls a proc, so it runs only on the authority — use it in an action, not a view or policy", t.Name)}
+					}
+				}
+				break
+			}
+			// A proc is callable in an action's expressions (the authority runs
+			// both) and in a parameterized derive, which then is usable only in
+			// actions; a view or policy has no proc runner behind it.
+			if e.procNames[t.Name] {
+				switch {
+				case e.inDerive != "":
+					e.procDerives[e.inDerive] = true
+				case e.inProc:
+					// a proc calling a proc: both run on the authority
+				case e.actLocalTypes == nil:
+					return &BuildError{line, fmt.Sprintf("proc %q runs on the authority, so it can be called only in an action or a derive used by one (a view or policy is evaluated where no proc runs) — bind it in the action and pass the value", t.Name)}
+				}
+				if len(t.Args) != e.procArity[t.Name] {
+					return &BuildError{line, fmt.Sprintf("proc %q takes %d argument(s), got %d", t.Name, e.procArity[t.Name], len(t.Args))}
+				}
+				break
+			}
 			// A pure standard-library builtin (string/date/math): fixed arity.
 			n, ok := pureBuiltinArity(t.Name)
-			if !ok {
-				return &BuildError{line, fmt.Sprintf("unknown builtin %q", t.Name)}
+			if _, isBuiltin := parser.BuiltinSiteOf(t.Name); !ok && !isBuiltin {
+				return &BuildError{line, fmt.Sprintf("unknown function %q — neither a builtin (see `facet lang`) nor a derive declared with parameters", t.Name)}
 			}
-			if len(t.Args) != n {
+			if ok && len(t.Args) != n {
 				return &BuildError{line, fmt.Sprintf("%s takes %d argument(s), got %d", t.Name, n, len(t.Args))}
+			}
+		}
+		// Where the builtin may run (parser.BuiltinSiteOf — the one table): a
+		// server-only one is refused where the browser evaluates, a proc-only
+		// one anywhere but a proc body.
+		if site, ok := parser.BuiltinSiteOf(t.Name); ok && !e.procNames[t.Name] {
+			switch site {
+			case parser.SiteAuthority:
+				// given and print keep their own, narrower rules (above, and
+				// checkPure's printCap); the rest follow the proc rule.
+				if t.Name != "given" && t.Name != "print" {
+					if err := e.authorityOnlyCall(t.Name, line); err != nil {
+						return err
+					}
+				}
+			case parser.SiteProc:
+				// I/O, concurrency and listen builtins keep their own, more
+				// specific barriers (checkNoIO / checkNoConcurrency /
+				// checkDaemonOnlyBuiltins name the capability or the context).
+				if !e.inProc && !e.inDaemon && !ioBuiltins[t.Name] && !concurrencyBuiltins[t.Name] && !listenBuiltins[t.Name] {
+					return &BuildError{line, fmt.Sprintf("%s(...) is only available inside a proc body — only the proc engine implements it, and a proc always runs on the authority", t.Name)}
+				}
 			}
 		}
 		for _, a := range t.Args {
@@ -6274,19 +7337,34 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 // a proc must opt into on its own header.
 func builtinCapability(name string) (string, bool) {
 	switch name {
-	case "readFile", "writeFile":
+	case "readFile", "writeFile", "appendFile", "fileExists", "truncateFile",
+		"fileSize", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile":
 		return "io.file", true
-	case "httpGet", "httpPost":
+	case "httpGet", "httpPost", "connect":
 		return "io.net", true
-	case "listen", "accept", "readBytes", "writeBytes", "closeConn":
+	case "writeStdout", "writeStderr", "readStdin", "signals":
+		// io.console: the process's own stdio, for a program run as a
+		// command (`facet exec`, runtime/stdio.go). A server's stdout is its
+		// operator log, so writing to it is opted into by name.
+		return "io.console", true
+	case "envVar", "envSet":
+		// io.env: the process environment — how a program run as a service
+		// is configured (ports, keys, credentials), so reading it is opted
+		// into by name like any other channel to the outside.
+		return "io.env", true
+	case "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "shutdownConn", "pollBytes", "connOpen":
+		// I/O on a connection handle, whichever way it was minted: an
+		// outbound connect() (io.net) or a daemon's accept() (io.net.listen).
+		return netConnCap, true
+	case "listen", "listenOn", "accept":
 		// io.net.listen: deliberately a MORE specific capability than io.net
 		// (outbound httpGet/httpPost), not a reuse of it — accepting arbitrary
 		// inbound connections is a materially bigger trust boundary than this
 		// instance choosing to make its own outbound calls, so a proc/daemon
 		// must opt into it by name, separately from io.net. See
-		// checkDaemonOnlyBuiltins for the other half of this gate: these five
+		// checkDaemonOnlyBuiltins for the other half of this gate: these two
 		// are additionally restricted to a daemon body specifically, never an
-		// ordinary proc, because accept()/readBytes() block indefinitely (see
+		// ordinary proc, because accept() blocks indefinitely (see
 		// runtime/netconn.go).
 		return "io.net.listen", true
 	}
@@ -6298,7 +7376,14 @@ func builtinCapability(name string) (string, bool) {
 // Checked against at proc-registration time (see e.proc's caller) so a typo
 // (`uses io.fiel`) is a clear compile error instead of a capability that can
 // never be satisfied.
-var knownCapabilities = map[string]bool{"io.file": true, "io.net": true, "io.net.listen": true}
+var knownCapabilities = map[string]bool{"io.file": true, "io.net": true, "io.net.listen": true, "io.console": true, "io.env": true}
+
+// netConnCap is the never-user-declared capability key of the connection-
+// handle I/O builtins (readBytes/writeBytes/closeConn/setTimeoutMs/
+// connError): either declared network capability satisfies it, since a
+// handle comes from connect() under io.net or accept() under io.net.listen
+// (see requireProcCapability).
+const netConnCap = "io.net.conn"
 
 // impureCap is the internal (never user-declared) capability key
 // procCapabilities uses to flag now()/rand() — the nondeterminism that forces
@@ -6314,7 +7399,7 @@ const impureCap = "impure"
 // flags a print(...) call under this key so hasPrint (below) can answer "does
 // ex call print" without a second tree-walk, and checkProcCapabilities skips
 // it exactly like impureCap — print needs no `uses` declaration (see
-// isBuiltinCall's doc in internal/parser/expr.go: it is a language-level
+// IsBuiltinCall's doc in internal/parser/expr.go: it is a language-level
 // debugging aid, not I/O to an external resource). It is deliberately its own
 // key rather than reusing impureCap: unlike now/rand, print must never fall
 // into the "an impure action that only writes @client state runs on the
@@ -6322,6 +7407,36 @@ const impureCap = "impure"
 // there is no client-side implementation of it and its whole point is a line
 // in the AUTHORITY's own log output.
 const printCap = "print"
+
+// authorityCap is the never-user-declared capability key for the builtins that
+// handle an authentication secret: verifyPassword (reads a @password hash),
+// totpSecret (mints a TOTP shared secret), totpValid (checks a code against
+// one) and randomToken (mints an unguessable token from the OS CSPRNG — rand()
+// is a fast, predictable generator, fine for a die roll and wrong for a
+// credential). Like print they have no client implementation and must never run
+// anywhere but the authority — the secret they touch is exactly what a client
+// must not hold — so they force server placement unconditionally and are
+// refused in every expression a client may evaluate (checkPure). Unlike print
+// they are allowed in an action's `check`: that call pins the action to the
+// server, so the guard runs where the secret is. It needs no `uses`
+// declaration in a proc (a proc is server-executed already).
+const authorityCap = "authority"
+
+// sessionTokenRef is the action-only name for the caller's signed session
+// credential (runtime/server.go binds it; see isBuiltinRef for the names every
+// context shares). It is a credential, so it is visible to an action body and
+// nowhere a view, policy or derive could render or stream it.
+const sessionTokenRef = "sessionToken"
+
+// handlesSecret reports whether ex touches an authentication secret — an
+// authorityCap builtin or the sessionToken credential — which pins an action
+// that evaluates it to the server.
+func handlesSecret(ex ast.Expr) bool {
+	if _, ok := procCapabilities(ex)[authorityCap]; ok {
+		return true
+	}
+	return freeNames(ex)[sessionTokenRef]
+}
 
 // procCapabilities walks ex and collects every capability its builtin calls
 // require, keyed by capability name to one builtin call that needed it (for a
@@ -6339,10 +7454,13 @@ func procCapabilities(ex ast.Expr) map[string]string {
 	walk = func(ex ast.Expr) {
 		switch t := ex.(type) {
 		case ast.Call:
-			if t.Name == "now" || t.Name == "rand" {
+			if t.Name == "now" || t.Name == "rand" || t.Name == "randomBytes" {
 				caps[impureCap] = t.Name
 			} else if t.Name == "print" {
 				caps[printCap] = t.Name
+			} else if t.Name == "verifyPassword" || t.Name == "totpSecret" || t.Name == "totpValid" || t.Name == "randomToken" || t.Name == "fileDigest" ||
+				t.Name == "ed25519Verify" || t.Name == "ecdsaP256Verify" || t.Name == "sha256Hex" || t.Name == "canonicalJson" || t.Name == "shuffleOrder" {
+				caps[authorityCap] = t.Name
 			} else if cap, ok := builtinCapability(t.Name); ok {
 				caps[cap] = t.Name
 			}
@@ -6422,7 +7540,7 @@ func checkProcCapabilities(p *ast.Proc, ex ast.Expr, line int) error {
 	caps := procCapabilities(ex)
 	names := make([]string, 0, len(caps))
 	for cap := range caps {
-		if cap != impureCap && cap != printCap {
+		if cap != impureCap && cap != printCap && cap != authorityCap {
 			names = append(names, cap)
 		}
 	}
@@ -6445,9 +7563,14 @@ func checkProcCapabilities(p *ast.Proc, ex ast.Expr, line int) error {
 // statement) — the two callers differ only in that string.
 func requireProcCapability(p *ast.Proc, cap, what string, line int) error {
 	for _, u := range p.Uses {
-		if u == cap {
+		if u == cap || (cap == netConnCap && (u == "io.net" || u == "io.net.listen")) {
 			return nil
 		}
+	}
+	if cap == netConnCap {
+		return &BuildError{line, fmt.Sprintf(
+			"proc %q calls %s, which requires capability \"io.net\" (or \"io.net.listen\" for an accepted connection) — declare it on the proc header (e.g. `proc %s(...) -> ... uses io.net:`)",
+			p.Name, what, p.Name)}
 	}
 	return &BuildError{line, fmt.Sprintf(
 		"proc %q calls %s, which requires capability %q — declare it on the proc header (e.g. `proc %s(...) -> ... uses %s:`)",
@@ -6459,7 +7582,7 @@ func requireProcCapability(p *ast.Proc, cap, what string, line int) error {
 func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
-		"ago", "compact", "commas", "iso", "bytes", "toFloat", "toInt", "toMoney", "slug",
+		"ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug",
 		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits":
 		return 1, true
 	case "print":
@@ -6472,9 +7595,9 @@ func pureBuiltinArity(name string) (int, bool) {
 		return 1, true
 	case "append":
 		return 2, true
-	case "min", "max", "contains", "take", "split", "charAt":
+	case "min", "max", "contains", "take", "split", "join", "charAt":
 		return 2, true
-	case "slice", "replace":
+	case "slice", "replace", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic":
 		return 3, true
 	}
 	return 0, false
@@ -6545,6 +7668,229 @@ func (e *env) checkName(name string, line int, kind string) error {
 	if _, ok := e.inline[name]; ok {
 		return &BuildError{line, fmt.Sprintf("%s %q collides with an existing policy or derive", kind, name)}
 	}
+	if _, ok := e.deriveFns[name]; ok {
+		return &BuildError{line, fmt.Sprintf("%s %q collides with an existing derive", kind, name)}
+	}
+	return nil
+}
+
+// deriveOrder returns the derives so that each follows every derive it reads
+// (by name or by call), keeping declaration order wherever that already holds,
+// and refuses a derive defined in terms of itself.
+func deriveOrder(ds []*ast.Derive) ([]*ast.Derive, error) {
+	byName := make(map[string]*ast.Derive, len(ds))
+	for _, d := range ds {
+		byName[d.Name] = d
+	}
+	const visiting, done = 1, 2
+	state := map[string]int{}
+	var out []*ast.Derive
+	var visit func(d *ast.Derive, path []string) error
+	visit = func(d *ast.Derive, path []string) error {
+		switch state[d.Name] {
+		case done:
+			return nil
+		case visiting:
+			return &BuildError{d.Line, fmt.Sprintf("derive %q is defined in terms of itself (%s)", d.Name, strings.Join(append(path, d.Name), " -> "))}
+		}
+		state[d.Name] = visiting
+		reads := freeNames(d.Expr)
+		calledNames(d.Expr, reads)
+		for _, p := range d.Params {
+			delete(reads, p.Name) // a parameter shadows a derive of its name (and is refused for it)
+		}
+		for _, n := range sortedKeys(reads) {
+			if dep, ok := byName[n]; ok {
+				if err := visit(dep, append(path, d.Name)); err != nil {
+					return err
+				}
+			}
+		}
+		state[d.Name] = done
+		out = append(out, d)
+		return nil
+	}
+	for _, d := range ds {
+		if err := visit(d, nil); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// calledNames adds the name of every call in ex to out.
+func calledNames(ex ast.Expr, out map[string]bool) {
+	switch t := ex.(type) {
+	case ast.Call:
+		out[t.Name] = true
+		for _, a := range t.Args {
+			calledNames(a, out)
+		}
+	case ast.Agg:
+		for _, sub := range []ast.Expr{t.Where, t.Sel, t.Limit} {
+			calledNames(sub, out)
+		}
+	case ast.Get:
+		calledNames(t.Obj, out)
+	case ast.EntityGet:
+		calledNames(t.Key, out)
+	case ast.Bin:
+		calledNames(t.L, out)
+		calledNames(t.R, out)
+	case ast.Un:
+		calledNames(t.X, out)
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			calledNames(el, out)
+		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			calledNames(fi.Expr, out)
+		}
+	case ast.MapLit:
+		for i, k := range t.Keys {
+			calledNames(k, out)
+			calledNames(t.Vals[i], out)
+		}
+	case ast.Index:
+		calledNames(t.Obj, out)
+		calledNames(t.Idx, out)
+	}
+}
+
+// deriveFn checks a parameterized derive and lowers its body. The body is an
+// ordinary pure expression over the actor and the parameters, each typed as
+// declared — so `w.bdoy` on a row parameter, a wrong-typed argument to another
+// projection, and a body whose type is not the declared one are all refused here,
+// at the definition, rather than at whichever call site first expands it.
+func (e *env) deriveFn(d *ast.Derive) (*deriveFn, error) {
+	if parser.IsBuiltinCall(d.Name) {
+		return nil, &BuildError{d.Line, fmt.Sprintf("derive %q collides with the builtin %s(...) — a parameterized derive is called the same way", d.Name, d.Name)}
+	}
+	locals := withActor(nil)
+	sc := scope{locals: map[string]bool{}, varTypes: map[string]vtype{}}
+	for _, p := range d.Params {
+		if isBuiltinRef(p.Name) {
+			return nil, &BuildError{d.Line, fmt.Sprintf("derive %q's parameter %q shadows the builtin %q", d.Name, p.Name, p.Name)}
+		}
+		if sc.locals[p.Name] {
+			return nil, &BuildError{d.Line, fmt.Sprintf("derive %q has duplicate parameter %q", d.Name, p.Name)}
+		}
+		if _, ok := e.inline[p.Name]; ok || e.deriveFns[p.Name] != nil {
+			return nil, &BuildError{d.Line, fmt.Sprintf("derive %q's parameter %q shadows the policy or derive of that name", d.Name, p.Name)}
+		}
+		t := e.declType(p.Type, p.List)
+		if !t.known() {
+			return nil, &BuildError{d.Line, fmt.Sprintf("derive %q's parameter %q has unknown type %q", d.Name, p.Name, p.Type)}
+		}
+		locals[p.Name] = true
+		sc.locals[p.Name] = true
+		sc.varTypes[p.Name] = t
+	}
+	e.deriveParamTypes = sc.varTypes
+	defer func() { e.deriveParamTypes = nil }()
+	core, list := strings.TrimSuffix(strings.TrimPrefix(d.Type, "["), "]"), strings.HasPrefix(d.Type, "[")
+	ret := e.declType(core, list)
+	if e.wireTypes[core] {
+		ret = vtype{core: core, list: list}
+	}
+	if !ret.known() {
+		return nil, &BuildError{d.Line, fmt.Sprintf("derive %q returns unknown type %q", d.Name, d.Type)}
+	}
+	ctx := fmt.Sprintf("derive %q", d.Name)
+	if err := e.checkPure(d.Expr, locals, d.Line, ctx); err != nil {
+		return nil, err
+	}
+	if err := (&viewCtx{e: e}).checkRowFields(d.Expr, sc, d.Line); err != nil {
+		return nil, err
+	}
+	if err := e.checkDeriveArgs(d.Expr, sc, d.Line); err != nil {
+		return nil, err
+	}
+	if got := e.exprType(d.Expr, sc); !e.assignable(got, ret) {
+		return nil, &BuildError{d.Line, fmt.Sprintf("derive %q is declared %s, but its definition is %s", d.Name, ret.label(), got.label())}
+	}
+	return &deriveFn{params: d.Params, ret: ret, body: e.low(d.Expr)}, nil
+}
+
+// checkDeriveArgs checks every call of a parameterized derive in ex against the
+// derive's parameters, in the scope ex is written in (an aggregate's item
+// variable typed as a row of the collection it walks).
+func (e *env) checkDeriveArgs(ex ast.Expr, sc scope, line int) error {
+	switch t := ex.(type) {
+	case ast.Call:
+		if fn, ok := e.deriveFns[t.Name]; ok && len(t.Args) == len(fn.params) {
+			for i, p := range fn.params {
+				if err := e.checkDeriveArg(t.Name, i, p, t.Args[i], sc, line); err != nil {
+					return err
+				}
+			}
+		}
+		for _, a := range t.Args {
+			if err := e.checkDeriveArgs(a, sc, line); err != nil {
+				return err
+			}
+		}
+	case ast.Agg:
+		inner := sc
+		if t.Var != "" {
+			inner = sc.with(t.Var)
+			inner.varTypes[t.Var] = vtype{core: t.Coll}
+		}
+		for _, sub := range []ast.Expr{t.Where, t.Sel} {
+			if err := e.checkDeriveArgs(sub, inner, line); err != nil {
+				return err
+			}
+		}
+		return e.checkDeriveArgs(t.Limit, sc, line)
+	case ast.Get:
+		return e.checkDeriveArgs(t.Obj, sc, line)
+	case ast.EntityGet:
+		return e.checkDeriveArgs(t.Key, sc, line)
+	case ast.Bin:
+		if err := e.checkDeriveArgs(t.L, sc, line); err != nil {
+			return err
+		}
+		return e.checkDeriveArgs(t.R, sc, line)
+	case ast.Un:
+		return e.checkDeriveArgs(t.X, sc, line)
+	case ast.ListLit:
+		for _, el := range t.Elems {
+			if err := e.checkDeriveArgs(el, sc, line); err != nil {
+				return err
+			}
+		}
+	case ast.StructLit:
+		for _, fi := range t.Fields {
+			if err := e.checkDeriveArgs(fi.Expr, sc, line); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkDeriveArg is checkArgType's rule for one argument of a derive call: the
+// value must be assignable to the parameter, and an entity parameter needs a
+// row. A bare local the builder holds no type for (an action `let`) may be one
+// and is accepted; anything shown not to be one — an id like `w.id` or
+// `h.work`, a literal — is refused, since it would read every field as nothing.
+func (e *env) checkDeriveArg(name string, i int, p ast.Param, arg ast.Expr, sc scope, line int) error {
+	want := e.declType(p.Type, p.List)
+	got := e.exprType(arg, sc)
+	if !e.assignable(got, want) {
+		return &BuildError{line, fmt.Sprintf("derive %q parameter %q is %s, but argument %d is %s", name, p.Name, want.label(), i+1, got.label())}
+	}
+	if want.known() && !want.list && e.entities[want.core] && !isRowExpr(arg, sc, want.core) {
+		if r, isRef := arg.(ast.Ref); isRef {
+			if _, typed := sc.varTypes[r.Name]; !typed {
+				return nil
+			}
+		}
+		return &BuildError{line, fmt.Sprintf(
+			"derive %q parameter %q is a %s row, but argument %d (%s) is not one — pass the row itself (the variable a `list(… in %s …)` binds, or `%s(id)`), not its id",
+			name, p.Name, want.core, i+1, describeArg(arg, got), want.core, want.core)}
+	}
 	return nil
 }
 
@@ -6587,8 +7933,12 @@ func (e *env) depsIR(le *Expr) map[string]bool {
 			}
 			// The filter may read outer state/entities (e.g. `actor`, another entity);
 			// the item variable is a bare ref to neither, so it is ignored naturally.
+			// So may the value a list shapes per row (a Dto{…} counting another
+			// entity's rows) and its limit.
 			walk(x.Where)
-		case "call", "list":
+			walk(x.Sel)
+			walk(x.Limit)
+		case "call", "list", "struct":
 			for _, a := range x.Args {
 				walk(a)
 			}
@@ -6667,7 +8017,302 @@ func (c *viewCtx) optionDeps(node Node, kids []Node, sc scope) {
 	}
 }
 
+// actionScope is a type scope over locals carrying the types known for an
+// action's parameters and `let`s (empty outside an action body).
+func (e *env) actionScope(locals map[string]bool) scope {
+	vt := map[string]vtype{}
+	for n, t := range e.actLocalTypes {
+		if locals[n] {
+			vt[n] = t
+		}
+	}
+	return scope{locals: locals, varTypes: vt}
+}
+
+// stmtsCall returns the name of the first call in body (any expression, any
+// nesting) that match accepts, or "" when there is none.
+func stmtsCall(body []Stmt, match func(name string) bool) string {
+	var hit func(x *Expr) string
+	hit = func(x *Expr) string {
+		if x == nil {
+			return ""
+		}
+		if x.Kind == "call" && match(x.Name) {
+			return x.Name
+		}
+		for _, k := range x.Kids() {
+			if n := hit(k); n != "" {
+				return n
+			}
+		}
+		return ""
+	}
+	for _, st := range body {
+		for _, x := range []*Expr{st.Value, st.Key, st.Where, st.Limit, st.Role} {
+			if n := hit(x); n != "" {
+				return n
+			}
+		}
+		for _, a := range st.Args {
+			if n := hit(a); n != "" {
+				return n
+			}
+		}
+		for _, f := range st.Fields {
+			if n := hit(f.Expr); n != "" {
+				return n
+			}
+		}
+		if n := stmtsCall(st.Body, match); n != "" {
+			return n
+		}
+		if n := stmtsCall(st.Else, match); n != "" {
+			return n
+		}
+	}
+	return ""
+}
+
+func findMessage(ms []WireMessage, name string) *WireMessage {
+	for i := range ms {
+		if ms[i].Name == name {
+			return &ms[i]
+		}
+	}
+	return nil
+}
+
+// dispatchRoute validates `api METHOD "/path" -> Message`: a body-carrying,
+// literal route whose every variant names the action it runs, and whose every
+// variant field (and alias) binds one of that action's parameters, the rest
+// of which must be optional. Each variant's action runs on the authority.
+func (e *env) dispatchRoute(ap *ast.API, msg *WireMessage, acts map[string]*Action, apiSeen map[string]int) error {
+	if ap.Method == "GET" || ap.Method == "DELETE" {
+		return &BuildError{ap.Line, fmt.Sprintf("api %s %q -> %s: a dispatching route decodes its body, so it is a POST, PUT or PATCH", ap.Method, ap.Path, msg.Name)}
+	}
+	if strings.ContainsAny(ap.Path, "{}") {
+		return &BuildError{ap.Line, fmt.Sprintf("api %s %q -> %s: a dispatching route's path is literal — the variant carries everything", ap.Method, ap.Path, msg.Name)}
+	}
+	if ap.Bearer != "" {
+		return &BuildError{ap.Line, fmt.Sprintf("api %s %q -> %s: each variant's action carries its own auth", ap.Method, ap.Path, msg.Name)}
+	}
+	key := ap.Method + " " + ap.Path
+	if prev, ok := apiSeen[key]; ok {
+		return &BuildError{ap.Line, fmt.Sprintf("api %s %q redeclared (first at line %d)", ap.Method, ap.Path, prev)}
+	}
+	apiSeen[key] = ap.Line
+	for _, v := range msg.Variants {
+		if v.Action == "" {
+			return &BuildError{ap.Line, fmt.Sprintf("api %s %q -> %s: variant %q names no action (| %s -> action)", ap.Method, ap.Path, msg.Name, v.WireName(), v.Name)}
+		}
+		act, ok := acts[v.Action]
+		if !ok {
+			return &BuildError{ap.Line, fmt.Sprintf("%s variant %q runs unknown action %q", msg.Name, v.WireName(), v.Action)}
+		}
+		bound := map[string]bool{}
+		if v.BodyParam != "" {
+			ok := false
+			for _, p := range act.Params {
+				ok = ok || (p.Name == v.BodyParam && p.Type == v.BodyType && !p.List)
+			}
+			if !ok {
+				return &BuildError{ap.Line, fmt.Sprintf("%s variant %q: body %s: %s must be a %s parameter of action %q", msg.Name, v.WireName(), v.BodyParam, v.BodyType, v.BodyType, v.Action)}
+			}
+			bound[v.BodyParam] = true
+		}
+		for _, f := range v.Fields {
+			name := f.Name
+			if f.Into != "" {
+				name = f.Into
+			}
+			var param *Param
+			for i := range act.Params {
+				if act.Params[i].Name == name {
+					param = &act.Params[i]
+				}
+			}
+			if f.Into != "" {
+				if param == nil || param.Type != "json" || !param.Optional {
+					return &BuildError{ap.Line, fmt.Sprintf("%s variant %q: pattern field %q gathers into %q, which must be an optional json parameter of action %q", msg.Name, v.WireName(), f.Name, f.Into, v.Action)}
+				}
+				bound[name] = true
+				continue
+			}
+			if param == nil {
+				return &BuildError{ap.Line, fmt.Sprintf("%s variant %q field %q is not a parameter of action %q", msg.Name, v.WireName(), f.Name, v.Action)}
+			}
+			if param.List != f.List {
+				return &BuildError{ap.Line, fmt.Sprintf("%s variant %q field %q and action %q's parameter disagree on being a list", msg.Name, v.WireName(), f.Name, v.Action)}
+			}
+			bound[f.Name] = true
+		}
+		for _, p := range act.Params {
+			if !bound[p.Name] && !p.Optional {
+				return &BuildError{ap.Line, fmt.Sprintf("%s variant %q does not carry action %q's required parameter %q", msg.Name, v.WireName(), v.Action, p.Name)}
+			}
+		}
+		if act.Placement != Server {
+			act.Placement = Server
+			act.Reason = fmt.Sprintf("serves %s %s (%s) — an endpoint runs on the authority", ap.Method, ap.Path, v.WireName())
+		}
+	}
+	return nil
+}
+
+// authorityOnlyCall applies the proc rule to a builtin only the server
+// implements (no browser mirror): callable in an action, a proc, or a derive
+// (which then is usable only in actions) — never a view or policy, which are
+// evaluated client-side too.
+func (e *env) authorityOnlyCall(name string, line int) error {
+	switch {
+	case e.inDerive != "":
+		e.procDerives[e.inDerive] = true
+	case e.actLocalTypes == nil && !e.inProc && !e.inDaemon:
+		return &BuildError{line, fmt.Sprintf("%s runs only on the authority, so it can be called only in an action, a proc, or a derive used by one — not in a view or policy", name)}
+	}
+	return nil
+}
+
+// checkArgRowVars refuses a `list(f(x, …) in Coll)` whose row name was read
+// off a bare call argument (ast.Agg.VarFromArg) when that name is also a
+// local: the author may have meant the local, so the row must be named
+// explicitly (`where x.id > 0` or a field read).
+func checkArgRowVars(ex ast.Expr, locals map[string]bool, line int) error {
+	var err error
+	ast.WalkExpr(ex, func(n ast.Expr) {
+		if a, ok := n.(ast.Agg); ok && a.VarFromArg && locals[a.Var] && err == nil {
+			err = &BuildError{line, fmt.Sprintf("list(... in %s): %q is a local, so it cannot also name the row — read a field of the row (list(f(r) in %s where r.id > 0)) or rename the local", a.Coll, a.Var, a.Coll)}
+		}
+	})
+	return err
+}
+
 // freeNames returns every root name an expression references.
+// detachIntrinsic and the shared-cell intrinsics are the runtime entry points
+// procBlock lowers `detach P(args)` and a shared cell's reads/assignments to
+// (runtime/daemon.go, runtime/shared.go). The `$` makes each a name no
+// source program can spell: they exist only as lowered IR.
+const (
+	detachIntrinsic    = "$detach"
+	sharedGetIntrinsic = "$shared.get"
+	sharedSetIntrinsic = "$shared.set"
+)
+
+// buildShareds validates every `shared` declaration (see ast.Shared) and
+// records it for the proc-shaped bodies built after it. A cell's type is a
+// primitive or a declared struct/record/enum (or a list of one); its name may
+// not also name a state cell, an entity or a proc, since a proc body resolves
+// a bare name to exactly one thing.
+func (e *env) buildShareds(app *ast.App, out *IR) error {
+	e.shareds = map[string]*ast.Shared{}
+	for _, sh := range app.Shareds {
+		if prev := e.shareds[sh.Name]; prev != nil {
+			return &BuildError{sh.Line, fmt.Sprintf("shared cell %q redeclared (first at line %d)", sh.Name, prev.Line)}
+		}
+		_, isState := e.states[sh.Name]
+		_, isProc := e.procSigs[sh.Name]
+		if isState || isProc || e.entities[sh.Name] {
+			return &BuildError{sh.Line, fmt.Sprintf("shared cell %q collides with a state cell, entity or proc of the same name", sh.Name)}
+		}
+		if !isPrimitive(sh.Type) {
+			_, isEnum := e.enums[sh.Type]
+			_, isRec := e.records[sh.Type]
+			_, isStruct := e.structs[sh.Type]
+			if !isEnum && !isRec && !isStruct {
+				return &BuildError{sh.Line, fmt.Sprintf("shared cell %q has unknown type %q", sh.Name, sh.Type)}
+			}
+		}
+		e.shareds[sh.Name] = sh
+		out.Shareds = append(out.Shareds, Shared{Name: sh.Name, Type: sh.Type, List: sh.List})
+	}
+	return nil
+}
+
+// checkNotShared refuses a parameter or local named like a shared cell: a
+// proc body's bare name must mean one thing, and lowerSharedRefs rewrites
+// every reference to a cell's name.
+func (e *env) checkNotShared(name string, line int) error {
+	if e.shareds[name] != nil {
+		return &BuildError{line, fmt.Sprintf("%q is a shared cell — a parameter or local may not reuse its name", name)}
+	}
+	return nil
+}
+
+// seedSharedTypes gives every shared cell its declared type in a proc
+// body's type map, so inferProcType and the struct/index checks see a read
+// of one exactly as they see a local of that type.
+func (e *env) seedSharedTypes(types map[string]string) {
+	for name, sh := range e.shareds {
+		if sh.List {
+			types[name] = arrayType
+		} else {
+			types[name] = sh.Type
+		}
+	}
+}
+
+// checkSharedAssign type-checks `cell = value` where the value's type is
+// provable, the same leniency a struct field write has.
+func (e *env) checkSharedAssign(sh *ast.Shared, value ast.Expr, types map[string]string, line int) error {
+	vt := inferProcType(value, types)
+	if vt == "" {
+		return nil
+	}
+	want := sh.Type
+	if sh.List {
+		want = arrayType
+	}
+	if vt != want && !(want == "float" && vt == "int") {
+		return &BuildError{line, fmt.Sprintf("cannot assign %s to shared cell %q, whose type is %s", vt, sh.Name, want)}
+	}
+	return nil
+}
+
+// lowerSharedRefs rewrites every read of a shared cell in a lowered proc or
+// daemon body into a call of sharedGetIntrinsic — one atomic snapshot of the
+// cell per evaluation. Parameters and locals can never carry a cell's name
+// (checkNotShared), so every ref by that name is the cell.
+func (e *env) lowerSharedRefs(body []Stmt) {
+	if len(e.shareds) == 0 {
+		return
+	}
+	var expr func(x *Expr)
+	expr = func(x *Expr) {
+		if x == nil {
+			return
+		}
+		if x.Kind == "ref" && e.shareds[x.Name] != nil {
+			name := x.Name
+			*x = Expr{Kind: "call", Name: sharedGetIntrinsic, Args: []*Expr{{Kind: "lit", Val: name, VType: "text"}}}
+			return
+		}
+		for _, k := range x.Kids() {
+			expr(k)
+		}
+		expr(x.OrderBy)
+	}
+	var stmts func(ss []Stmt)
+	stmts = func(ss []Stmt) {
+		for i := range ss {
+			st := &ss[i]
+			expr(st.Key)
+			expr(st.Value)
+			expr(st.Where)
+			expr(st.Limit)
+			expr(st.Role)
+			for _, a := range st.Args {
+				expr(a)
+			}
+			for _, f := range st.Fields {
+				expr(f.Expr)
+			}
+			stmts(st.Body)
+			stmts(st.Else)
+		}
+	}
+	stmts(body)
+}
+
 func freeNames(ex ast.Expr) map[string]bool {
 	out := map[string]bool{}
 	var walk func(ast.Expr)
@@ -6688,7 +8333,7 @@ func freeNames(ex ast.Expr) map[string]bool {
 			// reason; every OTHER name in it has to resolve in the enclosing scope,
 			// which is what makes a typo in `sum(l.qty * unitPrice in …)` a compile
 			// error naming `unitPrice` rather than a silent zero.
-			for _, sub := range [2]ast.Expr{t.Where, t.Sel} {
+			for _, sub := range [3]ast.Expr{t.Where, t.Sel, t.OrderExpr} {
 				if sub == nil {
 					continue
 				}
@@ -6747,14 +8392,77 @@ func freeNames(ex ast.Expr) map[string]bool {
 
 // low lowers an expression with this environment's inline (policy/derive) and
 // enum tables in scope. It is the method every build site uses.
-func (e *env) low(ex ast.Expr) *Expr { return lower(ex, e.inline, e.enums) }
+func (e *env) low(ex ast.Expr) *Expr {
+	out := lower(ex, e.inline, e.deriveFns, e.enums)
+	e.markTextAggs(out)
+	e.deriveOrders(out)
+	e.markOmits(out)
+	return out
+}
+
+// markOmits records, on every wire-type literal, which of its fields are
+// optional (`field: T?`), so the evaluators leave an empty one out.
+func (e *env) markOmits(x *Expr) {
+	if x == nil {
+		return
+	}
+	if x.Kind == "struct" && x.Omit == nil {
+		for _, f := range x.Fields {
+			if e.wireOptional[x.Name][f] {
+				x.Omit = append(x.Omit, f)
+			}
+		}
+		x.Nulls = e.wireNullable[x.Name]
+	}
+	for _, k := range x.Kids() {
+		e.markOmits(k)
+	}
+	e.markOmits(x.OrderBy)
+}
+
+// deriveOrders turns `list(… by d)` where d is an entity derive (a value
+// computed from the row, never a column) into the computed key it is: the
+// derive's expression over the list's row.
+func (e *env) deriveOrders(x *Expr) {
+	if x == nil {
+		return
+	}
+	if x.Kind == "agg" && x.Order != "" && e.entDeriveExprs[x.Name][x.Order] != nil {
+		v := x.Var
+		if v == "" {
+			v = "$item"
+			x.Var = v
+		}
+		x.OrderBy = substParams(e.entDeriveExprs[x.Name][x.Order], map[string]*Expr{"$row": {Kind: "ref", Name: v}}, map[string]bool{}, map[string]bool{})
+		x.Order = ""
+	}
+	for _, k := range x.Kids() {
+		e.deriveOrders(k)
+	}
+}
+
+// markTextAggs tags every min/max over a text column VType "text", so both
+// evaluators order the values as text and answer "" over an empty range
+// (a store's reduction is integer-valued and never answers it).
+func (e *env) markTextAggs(x *Expr) {
+	if x == nil {
+		return
+	}
+	if x.Kind == "agg" && (x.Op == "min" || x.Op == "max") && x.Field != "" && e.entFieldType[x.Name][x.Field] == "text" {
+		x.VType = "text"
+	}
+	for _, k := range x.Kids() {
+		e.markTextAggs(k)
+	}
+}
 
 // lower converts an ast.Expr to its serializable IR form, inlining any reference
 // to a policy or derive name with that name's lowered expression (so the same
 // value is computed identically wherever it is read — a server gate, a view
-// `if`, or another derivation) and folding enum member access (`Status.active`)
-// to its backing text literal.
-func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Expr {
+// `if`, or another derivation), expanding any call of a parameterized derive
+// (expandDerive), and folding enum member access (`Status.active`) to its
+// backing text literal.
+func lower(ex ast.Expr, inline map[string]*Expr, fns map[string]*deriveFn, enums map[string][]string) *Expr {
 	switch t := ex.(type) {
 	case ast.Lit:
 		return &Expr{Kind: "lit", Val: t.Val, VType: t.Kind}
@@ -6767,7 +8475,7 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 	case ast.ListLit:
 		out := &Expr{Kind: "list"}
 		for _, el := range t.Elems {
-			out.Args = append(out.Args, lower(el, inline, enums))
+			out.Args = append(out.Args, lower(el, inline, fns, enums))
 		}
 		return out
 	case ast.MapLit:
@@ -6775,8 +8483,8 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 		// Keys/Vals do — see its doc.
 		out := &Expr{Kind: "map"}
 		for i := range t.Keys {
-			out.Keys = append(out.Keys, lower(t.Keys[i], inline, enums))
-			out.Args = append(out.Args, lower(t.Vals[i], inline, enums))
+			out.Keys = append(out.Keys, lower(t.Keys[i], inline, fns, enums))
+			out.Args = append(out.Args, lower(t.Vals[i], inline, fns, enums))
 		}
 		return out
 	case ast.StructLit:
@@ -6785,14 +8493,14 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 		out := &Expr{Kind: "struct", Name: t.Type}
 		for _, fi := range t.Fields {
 			out.Fields = append(out.Fields, fi.Name)
-			out.Args = append(out.Args, lower(fi.Expr, inline, enums))
+			out.Args = append(out.Args, lower(fi.Expr, inline, fns, enums))
 		}
 		return out
 	case ast.Index:
 		// Reuses Obj (the array) and Key (the index expression) — the same fields
 		// "get" and "eget" already carry an addressing sub-expression in — rather
 		// than adding new Expr fields just for this one kind.
-		return &Expr{Kind: "index", Obj: lower(t.Obj, inline, enums), Key: lower(t.Idx, inline, enums)}
+		return &Expr{Kind: "index", Obj: lower(t.Obj, inline, fns, enums), Key: lower(t.Idx, inline, fns, enums)}
 	case ast.Ref:
 		if inline != nil {
 			if p, ok := inline[t.Name]; ok {
@@ -6807,37 +8515,43 @@ func lower(ex ast.Expr, inline map[string]*Expr, enums map[string][]string) *Exp
 				return &Expr{Kind: "lit", Val: t.Field, VType: "text"}
 			}
 		}
-		return &Expr{Kind: "get", Obj: lower(t.Obj, inline, enums), Field: t.Field}
+		return &Expr{Kind: "get", Obj: lower(t.Obj, inline, fns, enums), Field: t.Field}
 	case ast.EntityGet:
-		return &Expr{Kind: "eget", Name: t.Entity, Key: lower(t.Key, inline, enums), Field: t.Field}
+		return &Expr{Kind: "eget", Name: t.Entity, Key: lower(t.Key, inline, fns, enums), Field: t.Field}
 	case ast.ActState:
 		return &Expr{Kind: "astate", Op: t.Op, Name: t.Action}
 	case ast.Agg:
 		a := &Expr{Kind: "agg", Op: t.Op, Name: t.Coll, Field: t.Field, Var: t.Var, Order: t.Order, Desc: t.Desc}
 		if t.Where != nil {
-			a.Where = lower(t.Where, inline, enums)
+			a.Where = lower(t.Where, inline, fns, enums)
 		}
 		if t.Limit != nil {
-			a.Limit = lower(t.Limit, inline, enums)
+			a.Limit = lower(t.Limit, inline, fns, enums)
+		}
+		if t.OrderExpr != nil {
+			a.OrderBy = lower(t.OrderExpr, inline, fns, enums)
 		}
 		if t.Sel != nil {
 			// The reduced value, when it is more than one of the row's columns.
 			// Exclusive with Field (the parser guarantees it), so a bare
 			// `sum(x.amount in …)` lowers exactly as it always did and every
 			// program written before this is byte-identical through the compiler.
-			a.Sel = lower(t.Sel, inline, enums)
+			a.Sel = lower(t.Sel, inline, fns, enums)
 		}
 		return a
 	case ast.Call:
 		out := &Expr{Kind: "call", Name: t.Name}
 		for _, a := range t.Args {
-			out.Args = append(out.Args, lower(a, inline, enums))
+			out.Args = append(out.Args, lower(a, inline, fns, enums))
+		}
+		if fn, ok := fns[t.Name]; ok {
+			return expandDerive(fn, out.Args)
 		}
 		return out
 	case ast.Bin:
-		return &Expr{Kind: "bin", Op: t.Op, L: lower(t.L, inline, enums), R: lower(t.R, inline, enums)}
+		return &Expr{Kind: "bin", Op: t.Op, L: lower(t.L, inline, fns, enums), R: lower(t.R, inline, fns, enums)}
 	case ast.Un:
-		return &Expr{Kind: "un", Op: t.Op, X: lower(t.X, inline, enums)}
+		return &Expr{Kind: "un", Op: t.Op, X: lower(t.X, inline, fns, enums)}
 	}
 	return nil
 }
@@ -6855,6 +8569,7 @@ func cloneExpr(e *Expr) *Expr {
 	c.Where = cloneExpr(e.Where)
 	c.Sel = cloneExpr(e.Sel)
 	c.Limit = cloneExpr(e.Limit)
+	c.OrderBy = cloneExpr(e.OrderBy)
 	if e.Args != nil {
 		c.Args = make([]*Expr, len(e.Args))
 		for i, a := range e.Args {
@@ -6868,6 +8583,119 @@ func cloneExpr(e *Expr) *Expr {
 		}
 	}
 	return &c
+}
+
+// expandDerive is one call of a parameterized derive: its lowered body with each
+// parameter replaced by the lowered argument passed for it. The result is
+// exactly the expression the author would have written out by hand at the call
+// site, so every consumer of the IR — both evaluators, the materializer's
+// aggregate addresses, query pushdown of the surrounding `list(… where …)` —
+// sees nothing new.
+//
+// Substitution is hygienic. An argument is caller-scope code, so an aggregate in
+// the body whose item variable happens to share a name with anything the
+// arguments read is renamed first — otherwise `accountCard(w, me)` handed an
+// outer row `w` into a body counting `w in Work` would silently count against
+// the wrong row. An item variable that shares a parameter's name shadows it
+// inside that aggregate, exactly as it did in the body as written.
+func expandDerive(fn *deriveFn, args []*Expr) *Expr {
+	bind := make(map[string]*Expr, len(fn.params))
+	argNames := map[string]bool{}
+	for i, p := range fn.params {
+		bind[p.Name] = args[i]
+		irNames(args[i], argNames)
+	}
+	taken := map[string]bool{}
+	for n := range argNames {
+		taken[n] = true
+	}
+	irNames(fn.body, taken)
+	return substParams(fn.body, bind, argNames, taken)
+}
+
+// substParams clones x with every ref bound in bind replaced by a copy of its
+// binding — see expandDerive for the renaming argNames and taken drive.
+func substParams(x *Expr, bind map[string]*Expr, argNames, taken map[string]bool) *Expr {
+	if x == nil {
+		return nil
+	}
+	switch x.Kind {
+	case "ref":
+		if a, ok := bind[x.Name]; ok {
+			return cloneExpr(a)
+		}
+	case "get":
+		obj := substParams(x.Obj, bind, argNames, taken)
+		if obj.Kind == "eget" && obj.Field == "" {
+			// A row parameter handed a lookup, `card(Work(id))`: `w.body` reads
+			// the field straight off it, the same `Work(id).body` a hand-written
+			// body would have spelled.
+			obj.Field = x.Field
+			return obj
+		}
+		return &Expr{Kind: "get", Obj: obj, Field: x.Field}
+	case "agg":
+		c := *x
+		c.Limit = substParams(x.Limit, bind, argNames, taken)
+		inner := bind
+		if x.Var != "" {
+			inner = make(map[string]*Expr, len(bind)+1)
+			for k, v := range bind {
+				if k != x.Var {
+					inner[k] = v
+				}
+			}
+			if argNames[x.Var] {
+				fresh := x.Var
+				for i := 2; taken[fresh]; i++ {
+					fresh = fmt.Sprintf("%s%d", x.Var, i)
+				}
+				taken[fresh] = true
+				inner[x.Var] = &Expr{Kind: "ref", Name: fresh}
+				c.Var = fresh
+			}
+		}
+		c.Where = substParams(x.Where, inner, argNames, taken)
+		c.Sel = substParams(x.Sel, inner, argNames, taken)
+		c.OrderBy = substParams(x.OrderBy, inner, argNames, taken)
+		return &c
+	}
+	c := *x
+	c.L = substParams(x.L, bind, argNames, taken)
+	c.R = substParams(x.R, bind, argNames, taken)
+	c.X = substParams(x.X, bind, argNames, taken)
+	c.Obj = substParams(x.Obj, bind, argNames, taken)
+	c.Key = substParams(x.Key, bind, argNames, taken)
+	if x.Args != nil {
+		c.Args = make([]*Expr, len(x.Args))
+		for i, a := range x.Args {
+			c.Args[i] = substParams(a, bind, argNames, taken)
+		}
+	}
+	if x.Keys != nil {
+		c.Keys = make([]*Expr, len(x.Keys))
+		for i, k := range x.Keys {
+			c.Keys[i] = substParams(k, bind, argNames, taken)
+		}
+	}
+	return &c
+}
+
+// irNames adds every name a lowered expression refs or binds to out.
+func irNames(x *Expr, out map[string]bool) {
+	if x == nil {
+		return
+	}
+	if x.Kind == "ref" {
+		out[x.Name] = true
+	}
+	if x.Var != "" {
+		out[x.Var] = true
+	}
+	for _, k := range x.Kids() {
+		irNames(k, out)
+	}
+	irNames(x.OrderBy, out)
 }
 
 func locals(names ...string) map[string]bool {
@@ -7013,4 +8841,51 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// runtimeOwnedHeaders are the response headers an action may not set with
+// `header "Name" expr`: the ones the runtime itself writes and whose meaning
+// it guarantees — the session (cookies, X-Session-Token), HTTP framing and
+// content negotiation, caching and conditional GET, rate limiting, auth
+// challenges, and the security policy every response carries. An app header
+// that overrode one of these would silently break a guarantee made elsewhere.
+var runtimeOwnedHeaders = map[string]bool{
+	"Set-Cookie": true, "Cookie": true, "X-Session-Token": true,
+	"Content-Type": true, "Content-Length": true, "Content-Encoding": true,
+	"Content-Disposition": true, "Content-Range": true, "Accept-Ranges": true,
+	"Transfer-Encoding": true, "Connection": true, "Keep-Alive": true,
+	"Upgrade": true, "Trailer": true, "Te": true, "Host": true, "Date": true,
+	"Server": true, "Location": true, "Authorization": true, "Www-Authenticate": true,
+	"Cache-Control": true, "Etag": true, "Last-Modified": true, "Vary": true,
+	"Expires": true, "Pragma": true, "Age": true, "Retry-After": true,
+	"Strict-Transport-Security": true, "Content-Security-Policy": true,
+	"X-Content-Type-Options": true, "X-Frame-Options": true, "Referrer-Policy": true,
+	"Permissions-Policy": true, "Allow": true, "Alt-Svc": true,
+}
+
+// runtimeOwnedHeaderPrefixes are whole families the runtime owns (CORS, the
+// rate-limit quota, proxy auth, cross-origin isolation).
+var runtimeOwnedHeaderPrefixes = []string{"Access-Control-", "X-Ratelimit-", "Proxy-", "Cross-Origin-", "Sec-"}
+
+// checkActionHeaderName vets `header "Name" expr`'s name: an RFC 9110 token,
+// and not a header the runtime owns.
+func checkActionHeaderName(name string) error {
+	if name == "" {
+		return fmt.Errorf("header needs a name: header \"HX-Redirect\" expr")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0) {
+			return fmt.Errorf("header name %q is not an HTTP token (letters, digits, and !#$%%&'*+-.^_`|~ only)", name)
+		}
+	}
+	canon := textproto.CanonicalMIMEHeaderKey(name)
+	owned := runtimeOwnedHeaders[canon]
+	for _, p := range runtimeOwnedHeaderPrefixes {
+		owned = owned || strings.HasPrefix(canon, p)
+	}
+	if owned {
+		return fmt.Errorf("header %q is written by the runtime itself (session, framing, caching, rate limits or security policy) — an action cannot set it", canon)
+	}
+	return nil
 }

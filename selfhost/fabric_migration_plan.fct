@@ -1,62 +1,16 @@
+import "fabric_core.fct"
+import "fabric.fct"
+
 app FabricMigrationPlanSelfHost:
-    # Self-hosting port of the parts of fabric/crates/fabric-migration/src/
-    # NOT already covered by fabric.fct's "THIRD PORT, SAME FILE" section
-    # (phase.rs + migration.rs + plan.rs's one construction-time guard,
-    # ported there as MigrationState / migrationPlanStatus). All three
-    # remaining files — plan.rs (123L), progress.rs (72L), lib.rs (54L) —
-    # read in full before writing a line here.
-    #
-    # ============================================================
-    # SURVEY OF THE THREE FILES
-    # ============================================================
-    # lib.rs (54L): crate doc comment + `pub mod` declarations
-    # (migration/phase/plan/progress) + `pub use` re-exports of the types
-    # those modules define. No logic and no type of its own — confirmed by
-    # reading it in full. Nothing to port from it.
-    #
-    # plan.rs (123L): DEFAULT_MAX_CUTOVER_PENDING_WRITES (a plain constant —
-    # already restated as the literal 64 in fabric.fct's MigrationState demo
-    # fixtures, but never given its own named accessor; ported here as
-    # migrationDefaultMaxCutoverPendingWrites); MigrationId (a u64 wrapper
-    # whose only behavior is Display, `"migration-{}"`; ported as
-    # migrationIdLabel); MigrationReason (an enum recording WHY a migration
-    # was ordered — Hotspot{pressure_score}/Rebalance/DrainNode/
-    # RegionLocality{target_region}/CapacityPressure/Operator{note} — plus
-    # its one real method, `label()`, a match returning a static string per
-    # variant; ported below as the MigrationReason struct, its six
-    # migrationReason* constructors, and migrationReasonLabel).
-    # MigrationPlan itself and MigrationPlan::new are NOT re-ported here —
-    # fabric.fct's own header, right above its MigrationState struct,
-    # already explains why: every field MigrationPlan carries besides
-    # maxCutoverPendingWrites either folds into MigrationState directly
-    # (atoms -> atomsTotal) or is never read by a decision procedure at all
-    # (source/destination node identity only matters for EQUALITY at
-    # planning time, which is migrationPlanStatus, already ported there).
-    # Restating the struct here too would just be a second, unused home for
-    # fields nothing in this file's procs inspect either.
-    #
-    # progress.rs (72L): MigrationProgress, a plain counters struct
-    # (atoms_total/atoms_copied/bytes_copied/pending_writes/
-    # phase_started_at_ms/updated_at_ms) plus four real methods —
-    # copy_fraction, is_copy_complete, overall_fraction (a per-phase
-    # fixed-vs-measured blend, explicitly documented in the Rust as an
-    # ESTIMATE never used to decide anything — "Never use this to decide
-    # anything — the phase and the counters are the truth"), and
-    # phase_age_ms (saturating_sub). This is a distinct, REPORTING-only
-    # struct the real crate keeps separate from Migration's own decision
-    # state: migration.rs holds a MigrationProgress field but never reads it
-    # back for a decision, only returns it verbatim from `status()`. Ported
-    # below as its own struct with all four methods restated.
-    #
-    # `overall_fraction` takes a `MigrationPhase` in the real crate; this
-    # selfhost directory has no cross-file `import` (the same standalone-file
-    # constraint fabric_telemetry.fct's own header documents), so sharing
-    # fabric.fct's MigrationState/phase table is not possible — instead
-    # `migrationProgressOverallFraction` takes a plain `phase: int` in the
-    # IDENTICAL 0..7 encoding fabric.fct's phase table already uses
-    # (0=Planned, 1=Copying, 2=CatchingUp, 3=Cutover, 4=Cleanup,
-    # 5=Completed, 6=Aborted, 7=Failed) — restated, not reinvented.
-    # ============================================================
+    # Self-hosting port of fabric/crates/fabric-migration: plan.rs
+    # (MigrationId, MigrationReason, MigrationPlan::new /
+    # with_max_cutover_pending_writes, DEFAULT_MAX_CUTOVER_PENDING_WRITES),
+    # progress.rs (MigrationProgress), phase.rs's label / PhaseTransition,
+    # and migration.rs's stateful Migration with MigrationError's Display
+    # and MigrationStatus. Phases are fabric.fct's ints (0=Planned 1=Copying
+    # 2=CatchingUp 3=Cutover 4=Cleanup 5=Completed 6=Aborted 7=Failed) and
+    # its phase table procs are reused. Conformance:
+    # fabric_leaf_b_test.go's TestFabricLeafBMigration.
 
     # ------------------------------------------------------------
     # plan.rs
@@ -164,6 +118,539 @@ app FabricMigrationPlanSelfHost:
     proc migrationProgressPhaseAgeMs(progress: MigrationProgress, nowMs: int) -> int:
         let age = nowMs - progress.phaseStartedAtMs
         return max(age, 0)
+
+    # ============================================================
+    # migration.rs — the stateful `Migration` (plan + phase + progress +
+    # write-sequence marks + fence + outcome + history), phase.rs's
+    # `label`/`PhaseTransition`, plan.rs's `MigrationPlan::new` /
+    # `with_max_cutover_pending_writes`, and `MigrationError` with its
+    # Display text. Functional-update API: every Rust `&mut self` method
+    # returns a result struct {ok, err, value} whose `value` is the
+    # migration after the call (the unchanged input on an error, exactly
+    # like Rust, whose methods check before they mutate).
+    #
+    # Phases are fabric.fct's ints (0=Planned 1=Copying 2=CatchingUp
+    # 3=Cutover 4=Cleanup 5=Completed 6=Aborted 7=Failed) and its
+    # phaseCanAdvanceTo / phaseIsTerminal / phaseAllowsAbort / phaseIsFenced
+    # are reused, not restated. `Option<WriteSeq>` / `Option<u64>` fields
+    # are `-1` when None (every real value is a u64 >= 0).
+    # ============================================================
+
+    proc migrationPhaseLabel(phase: int) -> text:
+        if phase == 0:
+            return "planned"
+        if phase == 1:
+            return "copying"
+        if phase == 2:
+            return "catching-up"
+        if phase == 3:
+            return "cutover"
+        if phase == 4:
+            return "cleanup"
+        if phase == 5:
+            return "completed"
+        if phase == 6:
+            return "aborted"
+        return "failed"
+
+    # `impl Display for WriteSeq`: "#{n}".
+    proc migrationWriteSeqLabel(seq: int) -> text:
+        return "#" + seq
+
+    struct PhaseTransition:
+        fromPhase: int
+        toPhase: int
+        atMs: int
+        hasNote: bool
+        note: text
+
+    struct CutoverFence:
+        atMs: int
+        lastWrite: int
+
+    # MigrationOutcome: kind "completed" | "aborted" | "failed"; `detail` is
+    # the Aborted `reason` / Failed `error` ("" for Completed).
+    struct MigrationOutcome:
+        kind: text
+        atMs: int
+        detail: text
+
+    struct MigrationPlan:
+        id: MigrationId
+        shardId: int
+        source: text
+        destination: text
+        reason: MigrationReason
+        createdAtMs: int
+        atoms: int
+        maxCutoverPendingWrites: int
+
+    # MigrationError: `kind` is the Rust variant name. Only the fields the
+    # variant carries are meaningful; the rest stay 0/"" (highWater -1 is
+    # UnknownWrite's `None`).
+    struct MigrationError:
+        kind: text
+        node: text
+        fromPhase: int
+        toPhase: int
+        expected: int
+        actual: int
+        copied: int
+        total: int
+        pending: int
+        allowed: int
+        shardId: int
+        source: text
+        destination: text
+        seq: int
+        highWater: int
+        applied: int
+        phase: int
+
+    proc migrationErrorNone() -> MigrationError:
+        return MigrationError{kind: "", node: "", fromPhase: 0, toPhase: 0, expected: 0, actual: 0, copied: 0, total: 0, pending: 0, allowed: 0, shardId: 0, source: "", destination: "", seq: 0, highWater: -1, applied: 0, phase: 0}
+
+    private proc migrationErrorOf(kind: text) -> MigrationError:
+        let mut e = do migrationErrorNone()
+        e.kind = kind
+        return e
+
+    # `impl Display for MigrationError`, arm for arm.
+    proc migrationErrorDisplay(e: MigrationError) -> text:
+        if e.kind == "SameSourceAndDestination":
+            return "source and destination are both '" + e.node + "'"
+        if e.kind == "InvalidTransition":
+            let f = do migrationPhaseLabel(e.fromPhase)
+            let t = do migrationPhaseLabel(e.toPhase)
+            return "a migration cannot go from " + f + " to " + t
+        if e.kind == "WrongPhase":
+            let x = do migrationPhaseLabel(e.expected)
+            let a = do migrationPhaseLabel(e.actual)
+            return "operation requires phase " + x + ", migration is " + a
+        if e.kind == "CopyIncomplete":
+            return "only " + e.copied + " of " + e.total + " atoms have been copied"
+        if e.kind == "ProgressExceedsTotal":
+            return "reported " + e.copied + " atoms copied, the shard has " + e.total
+        if e.kind == "ProgressWentBackwards":
+            return "reported " + e.copied + " atoms copied, " + e.total + " were already recorded"
+        if e.kind == "NotCaughtUp":
+            return "" + e.pending + " writes still unapplied, cutover allows at most " + e.allowed
+        if e.kind == "WriteFenced":
+            return "shard " + e.shardId + " is fenced for cutover from '" + e.source + "' to '" + e.destination + "'; retry"
+        if e.kind == "NonMonotonicWrite":
+            let s = do migrationWriteSeqLabel(e.seq)
+            let h = do migrationWriteSeqLabel(e.highWater)
+            return "write " + s + " is not past the high-water mark " + h
+        if e.kind == "WriteAlreadyApplied":
+            let s = do migrationWriteSeqLabel(e.seq)
+            let a = do migrationWriteSeqLabel(e.applied)
+            return "write " + s + " was already applied (destination is at " + a + ")"
+        if e.kind == "UnknownWrite":
+            let s = do migrationWriteSeqLabel(e.seq)
+            if e.highWater == -1:
+                return "write " + s + " was never accepted by the source"
+            let h = do migrationWriteSeqLabel(e.highWater)
+            return "write " + s + " was never accepted by the source (high-water " + h + ")"
+        if e.kind == "CutoverNotDrained":
+            return "cutover cannot complete with " + e.pending + " writes still unapplied"
+        if e.kind == "AbortAfterCutover":
+            let p = do migrationPhaseLabel(e.phase)
+            return "cannot abort in phase " + p + ": authority has already moved"
+        let p = do migrationPhaseLabel(e.phase)
+        return "migration has already " + p
+
+    struct MigrationPlanResult:
+        ok: bool
+        err: MigrationError
+        plan: MigrationPlan
+
+    # `MigrationPlan::new`: refuses a move onto the node the shard is on;
+    # the atom count comes from the core model (`shard.atom_count()`).
+    proc migrationPlanNew(id: MigrationId, shard: Shard, source: text, destination: text, reason: MigrationReason, createdAtMs: int) -> MigrationPlanResult:
+        let atoms = do shardAtomCount(shard)
+        let maxPending = do migrationDefaultMaxCutoverPendingWrites()
+        let plan = MigrationPlan{id: id, shardId: shard.id, source: source, destination: destination, reason: reason, createdAtMs: createdAtMs, atoms: atoms, maxCutoverPendingWrites: maxPending}
+        if source == destination:
+            let mut e = do migrationErrorOf("SameSourceAndDestination")
+            e.node = source
+            return MigrationPlanResult{ok: false, err: e, plan: plan}
+        let none = do migrationErrorNone()
+        return MigrationPlanResult{ok: true, err: none, plan: plan}
+
+    proc migrationPlanWithMaxCutoverPendingWrites(plan: MigrationPlan, writes: int) -> MigrationPlan:
+        let mut p = plan
+        p.maxCutoverPendingWrites = writes
+        return p
+
+    struct Migration:
+        plan: MigrationPlan
+        phase: int
+        progress: MigrationProgress
+        sourceHighWater: int
+        destinationApplied: int
+        hasFence: bool
+        fence: CutoverFence
+        cutoverCompletedAtMs: int
+        hasOutcome: bool
+        outcome: MigrationOutcome
+        history: [PhaseTransition]
+
+    struct MigrationResult:
+        ok: bool
+        err: MigrationError
+        value: Migration
+
+    # route: "source" | "destination" (`WriteRoute`), "" on an error.
+    struct MigrationWriteResult:
+        ok: bool
+        err: MigrationError
+        value: Migration
+        route: text
+
+    proc migrationNew(plan: MigrationPlan) -> Migration:
+        let progress = do migrationProgressNew(plan.atoms, plan.createdAtMs)
+        return Migration{plan: plan, phase: 0, progress: progress, sourceHighWater: -1, destinationApplied: -1, hasFence: false, fence: CutoverFence{atMs: 0, lastWrite: -1}, cutoverCompletedAtMs: -1, hasOutcome: false, outcome: MigrationOutcome{kind: "", atMs: 0, detail: ""}, history: []}
+
+    proc migrationIsTerminal(m: Migration) -> bool:
+        let t = do phaseIsTerminal(m.phase)
+        return t
+
+    # `pending_writes`: slots the source accepted that the destination has
+    # not applied.
+    proc migrationPendingWritesOf(m: Migration) -> int:
+        if m.sourceHighWater == -1:
+            return 0
+        if m.destinationApplied == -1:
+            return m.sourceHighWater + 1
+        return max(m.sourceHighWater - m.destinationApplied, 0)
+
+    proc migrationHasCutOverOf(m: Migration) -> bool:
+        return m.cutoverCompletedAtMs != -1
+
+    proc migrationIsWriteFencedOf(m: Migration) -> bool:
+        let f = do phaseIsFenced(m.phase)
+        return f
+
+    # `read_owner`: never absent (invariant 1).
+    proc migrationReadOwner(m: Migration) -> text:
+        if m.cutoverCompletedAtMs != -1:
+            return m.plan.destination
+        return m.plan.source
+
+    struct MigrationOwner:
+        has: bool
+        node: text
+
+    # `write_owner`: None while the fence is up.
+    proc migrationWriteOwner(m: Migration) -> MigrationOwner:
+        let fenced = do migrationIsWriteFencedOf(m)
+        if fenced:
+            return MigrationOwner{has: false, node: ""}
+        let owner = do migrationReadOwner(m)
+        return MigrationOwner{has: true, node: owner}
+
+    private proc migrationOk(m: Migration) -> MigrationResult:
+        let none = do migrationErrorNone()
+        return MigrationResult{ok: true, err: none, value: m}
+
+    private proc migrationFailWith(m: Migration, e: MigrationError) -> MigrationResult:
+        return MigrationResult{ok: false, err: e, value: m}
+
+    private proc migrationRequirePhase(m: Migration, expected: int) -> MigrationResult:
+        if m.phase != expected:
+            let mut e = do migrationErrorOf("WrongPhase")
+            e.expected = expected
+            e.actual = m.phase
+            let r = do migrationFailWith(m, e)
+            return r
+        let r = do migrationOk(m)
+        return r
+
+    # `fn advance`: not terminal, the edge exists, then record the
+    # transition and restart the phase clock.
+    private proc migrationAdvance(m: Migration, to: int, atMs: int, hasNote: bool, note: text) -> MigrationResult:
+        let terminal = do phaseIsTerminal(m.phase)
+        if terminal:
+            let mut e = do migrationErrorOf("AlreadyTerminal")
+            e.phase = m.phase
+            let r = do migrationFailWith(m, e)
+            return r
+        let can = do phaseCanAdvanceTo(m.phase, to)
+        if !can:
+            let mut e = do migrationErrorOf("InvalidTransition")
+            e.fromPhase = m.phase
+            e.toPhase = to
+            let r = do migrationFailWith(m, e)
+            return r
+        let mut next = m
+        next.history = append(m.history, PhaseTransition{fromPhase: m.phase, toPhase: to, atMs: atMs, hasNote: hasNote, note: note})
+        next.phase = to
+        let mut progress = m.progress
+        progress.phaseStartedAtMs = atMs
+        progress.updatedAtMs = max(progress.updatedAtMs, atMs)
+        next.progress = progress
+        let r = do migrationOk(next)
+        return r
+
+    # `accept_write`: route one write, refusing a replay on either side of
+    # the handover.
+    proc migrationAcceptWrite(m: Migration, seq: int) -> MigrationWriteResult:
+        let fenced = do migrationIsWriteFencedOf(m)
+        if fenced:
+            let mut e = do migrationErrorOf("WriteFenced")
+            e.shardId = m.plan.shardId
+            e.source = m.plan.source
+            e.destination = m.plan.destination
+            return MigrationWriteResult{ok: false, err: e, value: m, route: ""}
+        if m.cutoverCompletedAtMs != -1:
+            if m.hasFence && m.fence.lastWrite != -1 && seq <= m.fence.lastWrite:
+                let mut e = do migrationErrorOf("WriteAlreadyApplied")
+                e.seq = seq
+                e.applied = m.fence.lastWrite
+                return MigrationWriteResult{ok: false, err: e, value: m, route: ""}
+            if m.destinationApplied != -1 && seq <= m.destinationApplied:
+                let mut e = do migrationErrorOf("WriteAlreadyApplied")
+                e.seq = seq
+                e.applied = m.destinationApplied
+                return MigrationWriteResult{ok: false, err: e, value: m, route: ""}
+            let mut next = m
+            next.destinationApplied = seq
+            let none = do migrationErrorNone()
+            return MigrationWriteResult{ok: true, err: none, value: next, route: "destination"}
+        if m.sourceHighWater != -1 && seq <= m.sourceHighWater:
+            let mut e = do migrationErrorOf("NonMonotonicWrite")
+            e.seq = seq
+            e.highWater = m.sourceHighWater
+            return MigrationWriteResult{ok: false, err: e, value: m, route: ""}
+        let mut next = m
+        next.sourceHighWater = seq
+        let pending = do migrationPendingWritesOf(next)
+        let mut progress = m.progress
+        progress.pendingWrites = pending
+        next.progress = progress
+        let none = do migrationErrorNone()
+        return MigrationWriteResult{ok: true, err: none, value: next, route: "source"}
+
+    # `record_applied`: the destination applied the stream up to `seq`.
+    proc migrationRecordApplied(m: Migration, seq: int, atMs: int) -> MigrationResult:
+        if m.sourceHighWater == -1 || seq > m.sourceHighWater:
+            let mut e = do migrationErrorOf("UnknownWrite")
+            e.seq = seq
+            e.highWater = m.sourceHighWater
+            let r = do migrationFailWith(m, e)
+            return r
+        if m.destinationApplied != -1 && seq <= m.destinationApplied:
+            let mut e = do migrationErrorOf("WriteAlreadyApplied")
+            e.seq = seq
+            e.applied = m.destinationApplied
+            let r = do migrationFailWith(m, e)
+            return r
+        let mut next = m
+        next.destinationApplied = seq
+        let pending = do migrationPendingWritesOf(next)
+        let mut progress = m.progress
+        progress.pendingWrites = pending
+        progress.updatedAtMs = max(progress.updatedAtMs, atMs)
+        next.progress = progress
+        let r = do migrationOk(next)
+        return r
+
+    proc migrationBeginCopy(m: Migration, atMs: int) -> MigrationResult:
+        let r = do migrationAdvance(m, 1, atMs, false, "")
+        return r
+
+    # `record_copy`: cumulative, never decreasing.
+    proc migrationRecordCopy(m: Migration, atomsCopied: int, bytesCopied: int, atMs: int) -> MigrationResult:
+        let req = do migrationRequirePhase(m, 1)
+        if !req.ok:
+            return req
+        if atomsCopied > m.progress.atomsTotal:
+            let mut e = do migrationErrorOf("ProgressExceedsTotal")
+            e.copied = atomsCopied
+            e.total = m.progress.atomsTotal
+            let r = do migrationFailWith(m, e)
+            return r
+        if atomsCopied < m.progress.atomsCopied:
+            let mut e = do migrationErrorOf("ProgressWentBackwards")
+            e.copied = atomsCopied
+            e.total = m.progress.atomsCopied
+            let r = do migrationFailWith(m, e)
+            return r
+        let mut next = m
+        let mut progress = m.progress
+        progress.atomsCopied = atomsCopied
+        progress.bytesCopied = max(progress.bytesCopied, bytesCopied)
+        progress.updatedAtMs = max(progress.updatedAtMs, atMs)
+        next.progress = progress
+        let r = do migrationOk(next)
+        return r
+
+    private proc migrationCopyIncomplete(m: Migration) -> MigrationResult:
+        let mut e = do migrationErrorOf("CopyIncomplete")
+        e.copied = m.progress.atomsCopied
+        e.total = m.progress.atomsTotal
+        let r = do migrationFailWith(m, e)
+        return r
+
+    proc migrationBeginCatchUp(m: Migration, atMs: int) -> MigrationResult:
+        let req = do migrationRequirePhase(m, 1)
+        if !req.ok:
+            return req
+        let complete = do migrationProgressIsCopyComplete(m.progress)
+        if !complete:
+            let r = do migrationCopyIncomplete(m)
+            return r
+        let r = do migrationAdvance(m, 2, atMs, false, "")
+        return r
+
+    # `restart_copy`: discard the destination copy and copy again.
+    proc migrationRestartCopy(m: Migration, atMs: int, note: text) -> MigrationResult:
+        let req = do migrationRequirePhase(m, 2)
+        if !req.ok:
+            return req
+        let adv = do migrationAdvance(m, 1, atMs, true, note)
+        if !adv.ok:
+            return adv
+        let mut next = adv.value
+        let mut progress = next.progress
+        progress.atomsCopied = 0
+        progress.bytesCopied = 0
+        next.destinationApplied = -1
+        let pending = do migrationPendingWritesOf(next)
+        progress.pendingWrites = pending
+        next.progress = progress
+        let r = do migrationOk(next)
+        return r
+
+    # `begin_cutover`: fence the source, only with the gap inside budget.
+    proc migrationBeginCutover(m: Migration, atMs: int) -> MigrationResult:
+        let req = do migrationRequirePhase(m, 2)
+        if !req.ok:
+            return req
+        let complete = do migrationProgressIsCopyComplete(m.progress)
+        if !complete:
+            let r = do migrationCopyIncomplete(m)
+            return r
+        let pending = do migrationPendingWritesOf(m)
+        if pending > m.plan.maxCutoverPendingWrites:
+            let mut e = do migrationErrorOf("NotCaughtUp")
+            e.pending = pending
+            e.allowed = m.plan.maxCutoverPendingWrites
+            let r = do migrationFailWith(m, e)
+            return r
+        let adv = do migrationAdvance(m, 3, atMs, false, "")
+        if !adv.ok:
+            return adv
+        let mut next = adv.value
+        next.hasFence = true
+        next.fence = CutoverFence{atMs: atMs, lastWrite: m.sourceHighWater}
+        let r = do migrationOk(next)
+        return r
+
+    # `complete_cutover`: authority moves only with the gap drained to zero.
+    proc migrationCompleteCutover(m: Migration, atMs: int) -> MigrationResult:
+        let req = do migrationRequirePhase(m, 3)
+        if !req.ok:
+            return req
+        let pending = do migrationPendingWritesOf(m)
+        if pending > 0:
+            let mut e = do migrationErrorOf("CutoverNotDrained")
+            e.pending = pending
+            let r = do migrationFailWith(m, e)
+            return r
+        let adv = do migrationAdvance(m, 4, atMs, false, "")
+        if !adv.ok:
+            return adv
+        let mut next = adv.value
+        next.cutoverCompletedAtMs = atMs
+        let r = do migrationOk(next)
+        return r
+
+    proc migrationComplete(m: Migration, atMs: int) -> MigrationResult:
+        let req = do migrationRequirePhase(m, 4)
+        if !req.ok:
+            return req
+        let adv = do migrationAdvance(m, 5, atMs, false, "")
+        if !adv.ok:
+            return adv
+        let mut next = adv.value
+        next.hasOutcome = true
+        next.outcome = MigrationOutcome{kind: "completed", atMs: atMs, detail: ""}
+        let r = do migrationOk(next)
+        return r
+
+    # `abort`: legal up to an uncompleted cutover; the fence comes down.
+    proc migrationAbort(m: Migration, atMs: int, reason: text) -> MigrationResult:
+        let terminal = do phaseIsTerminal(m.phase)
+        if terminal:
+            let mut e = do migrationErrorOf("AlreadyTerminal")
+            e.phase = m.phase
+            let r = do migrationFailWith(m, e)
+            return r
+        let allows = do phaseAllowsAbort(m.phase)
+        if !allows:
+            let mut e = do migrationErrorOf("AbortAfterCutover")
+            e.phase = m.phase
+            let r = do migrationFailWith(m, e)
+            return r
+        let adv = do migrationAdvance(m, 6, atMs, true, reason)
+        if !adv.ok:
+            return adv
+        let mut next = adv.value
+        next.hasFence = false
+        next.fence = CutoverFence{atMs: 0, lastWrite: -1}
+        next.destinationApplied = -1
+        let mut progress = next.progress
+        progress.pendingWrites = 0
+        next.progress = progress
+        next.hasOutcome = true
+        next.outcome = MigrationOutcome{kind: "aborted", atMs: atMs, detail: reason}
+        let r = do migrationOk(next)
+        return r
+
+    # `fail`: ownership stays wherever the cutover left it.
+    proc migrationFail(m: Migration, atMs: int, error: text) -> MigrationResult:
+        let terminal = do phaseIsTerminal(m.phase)
+        if terminal:
+            let mut e = do migrationErrorOf("AlreadyTerminal")
+            e.phase = m.phase
+            let r = do migrationFailWith(m, e)
+            return r
+        let adv = do migrationAdvance(m, 7, atMs, true, error)
+        if !adv.ok:
+            return adv
+        let mut next = adv.value
+        next.hasOutcome = true
+        next.outcome = MigrationOutcome{kind: "failed", atMs: atMs, detail: error}
+        let r = do migrationOk(next)
+        return r
+
+    struct MigrationStatus:
+        id: MigrationId
+        shardId: int
+        source: text
+        destination: text
+        phase: int
+        atomsCopied: int
+        atomsTotal: int
+        bytesCopied: int
+        pendingWrites: int
+        fraction: float
+        phaseAgeMs: int
+        readOwner: text
+        hasWriteOwner: bool
+        writeOwner: text
+        hasOutcome: bool
+        outcome: MigrationOutcome
+
+    # `status`: a flat snapshot; advances nothing.
+    proc migrationStatus(m: Migration, nowMs: int) -> MigrationStatus:
+        let pending = do migrationPendingWritesOf(m)
+        let fraction = do migrationProgressOverallFraction(m.progress, m.phase)
+        let age = do migrationProgressPhaseAgeMs(m.progress, nowMs)
+        let readOwner = do migrationReadOwner(m)
+        let writeOwner = do migrationWriteOwner(m)
+        return MigrationStatus{id: m.plan.id, shardId: m.plan.shardId, source: m.plan.source, destination: m.plan.destination, phase: m.phase, atomsCopied: m.progress.atomsCopied, atomsTotal: m.progress.atomsTotal, bytesCopied: m.progress.bytesCopied, pendingWrites: pending, fraction: fraction, phaseAgeMs: age, readOwner: readOwner, hasWriteOwner: writeOwner.has, writeOwner: writeOwner.node, hasOutcome: m.hasOutcome, outcome: m.outcome}
 
     # ------------------------------------------------------------
     # DEMOS — hand-traced directly against plan.rs/progress.rs (neither has

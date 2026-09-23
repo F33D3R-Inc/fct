@@ -69,15 +69,6 @@ func TestLiteralBracesAreRefused(t *testing.T) {
 `,
 		want: "a `case` value does not interpolate",
 	}, {
-		name: "a check message",
-		src: `app A:
-    state count: int = 0
-    action bump(n: int):
-        check n > 0 "n was {n}"
-        count = count + n
-`,
-		want: "a check message does not interpolate",
-	}, {
 		name: "a route path",
 		src: `app A:
     entity Post:

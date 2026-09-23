@@ -1,0 +1,989 @@
+import "fabric_daemon_config.fct"
+import "fabric_daemon_status.fct"
+import "fabric_daemon_liveness.fct"
+import "fabric_daemon_telemetry.fct"
+import "fabric_daemon_mover.fct"
+
+app FabricDaemonControlSelfHost:
+    # Port of fabric/crates/fabric-daemon/src/control.rs: the control loop —
+    # the only thing allowed to touch the runtime — as procs over a
+    # DaemonControl value.
+    #
+    # Every step of `ControlPlane::cycle` is its own proc, in the Rust
+    # order: tick the clock; probe (when due) and file what the probes
+    # found; poll telemetry (when due) and ingest it; decide (unless
+    # draining); advance every action; drive the movers; measure; publish
+    # routing; persist; count the cycle; publish the status. The steps that
+    # touch the outside world take its answers as arguments (a sweep's
+    # probes, a sample) or say what it must do (the copies to start, the
+    # routing table to hand the front door), and `daemonControlCycle` is the
+    # whole cycle with the I/O done. "Now" is always a parameter: the Rust
+    # reads the wall clock at each step; here the caller passes the instant.
+    #
+    # Operator requests (control.rs `serve`): a transfer report, a mover's
+    # copy report and an abort each answer `Ok(message)` or `Err(reason)` in
+    # the crate's words, and are applied at once (advance, publish, persist,
+    # publish status), exactly when the Rust applies them.
+    #
+    # Shutdown (`drain`): stop the copies, roll back everything short of its
+    # cutover, run cycles until nothing is left running or the drain budget
+    # is spent, then report — never aborting an action past its cutover.
+    #
+    # Names are prefixed `dco` / `daemon` / `Daemon`.
+
+    # GET /stats reports no server build; registered honestly as unknown.
+    proc dcoUnknownVersion() -> text:
+        return "unknown"
+
+    # How many concluded actions the admin surface reports, newest last.
+    proc dcoPublishedHistory() -> int:
+        return 50
+
+    struct DaemonControl:
+        settings: DaemonSettings
+        runtime: FabricRuntime
+        telemetrySource: text
+        hasStore: bool
+        store: PlacementStore
+        versions: [StoredPlacement]
+        storeState: text
+        hasStoreError: bool
+        storeError: text
+        storeWrites: int
+        movers: DaemonMovers
+        acceptedIds: [int]
+        acceptedCounts: [int]
+        publishedGeneration: int
+        doorRouting: TableRoutingTable
+        startedAtMs: int
+        cycles: int
+        draining: bool
+        nextProbeMs: int
+        nextPollMs: int
+        decisions: DaemonDecisionCounters
+        probeIds: [text]
+        probeVerdicts: [text]
+        probeAts: [int]
+        sampleIds: [text]
+        sampleNotes: [text]
+        status: DaemonStatus
+
+    # ------------------------------------------------------------ boot
+
+    # bootstrap_placement's answer: the map, where it came from, and — with
+    # a store — the versions read or seeded.
+    struct DaemonBootstrap:
+        ok: bool
+        err: text
+        hasStore: bool
+        store: PlacementStore
+        versions: [StoredPlacement]
+        topology: TopologyRegistry
+        state: text
+
+    proc dcoBlankStore() -> PlacementStore:
+        let endpoint = FqlEndpoint{dbmsId: "", baseUrl: "", token: ""}
+        return placementStoreNew(fqlClientNew(endpoint))
+
+    # Without a placement store the declared map is all there is — and the
+    # admin port says so.
+    proc daemonBootstrapDeclared(settings: DaemonSettings) -> DaemonBootstrap:
+        return DaemonBootstrap{ok: true, err: "", hasStore: false, store: dcoBlankStore(), versions: [], topology: settings.topology, state: "not configured: the placement map is declared, not durable"}
+
+    # With one, the store is the authority: read it back; an empty store is
+    # seeded from the declaration once. A store that cannot be read is a
+    # startup failure (DaemonError::Startup's text).
+    proc daemonBootstrapPlacement(settings: DaemonSettings) -> DaemonBootstrap uses io.net:
+        if !settings.hasPlacementStore:
+            return daemonBootstrapDeclared(settings)
+        let id = settings.placementStore
+        let backend = do daemonSettingsBackend(settings, id)
+        let blank = do daemonBootstrapDeclared(settings)
+        let endpoint = do fqlEndpointNew(id, backend.url, backend.token)
+        if !endpoint.ok:
+            let shown = do fqlErrorDisplay(endpoint.err)
+            return DaemonBootstrap{ok: false, err: shown, hasStore: false, store: blank.store, versions: [], topology: blank.topology, state: ""}
+        let store = do placementStoreNew(fqlClientNew(endpoint.v))
+        let loaded = do placementStoreLoadRegistry(store)
+        if !loaded.ok:
+            let why = do fqlErrorDisplay(loaded.err)
+            return DaemonBootstrap{ok: false, err: "could not read the durable placement store on '" + id + "': " + why + ". Starting from the declared map instead would route cells that have since moved to the instance that used to hold them", hasStore: false, store: store, versions: [], topology: blank.topology, state: ""}
+        if len(loaded.versions) > 0:
+            return DaemonBootstrap{ok: true, err: "", hasStore: true, store: store, versions: loaded.versions, topology: loaded.registry, state: "loaded " + len(loaded.versions) + " placement(s) from '" + id + "'"}
+        let mut seeded = []
+        let placements = do topologyRegistryPlacements(settings.topology)
+        let n = len(placements)
+        let mut k = 0
+        loop k < n:
+            let created = do placementStoreCreate(store, placements[k])
+            if !created.ok:
+                let why2 = do fqlErrorDisplay(created.err)
+                return DaemonBootstrap{ok: false, err: "could not seed the placement store on '" + id + "': " + why2, hasStore: false, store: store, versions: [], topology: blank.topology, state: ""}
+            let at = do placementVersionsIndexOf(seeded, storedPlacementAddress(created.v))
+            if at >= 0:
+                seeded[at] = created.v
+            else:
+                seeded = append(seeded, created.v)
+            k = k + 1
+        return DaemonBootstrap{ok: true, err: "", hasStore: true, store: store, versions: seeded, topology: settings.topology, state: "seeded " + len(seeded) + " placement(s) into '" + id + "' from the declaration"}
+
+    proc dcoRegistration(id: text, region: text) -> FabricMessage:
+        let m = do protoEmptyFabricMessage()
+        let reg = do nodeRegistrationNew(DbmsId{value: id}, dcoUnknownVersion(), region)
+        return FabricMessage{kind: "RegisterNode", registerNode: reg, heartbeat: m.heartbeat, topology: m.topology, telemetry: m.telemetry, workload: m.workload}
+
+    # ControlPlane::boot up to (not including) its first cycle: the runtime
+    # with the configured policy, capacity and silence budget, the clock at
+    # the start, every backend registered as of unknown version, the
+    # bootstrapped placement map adopted, and the routing table the front
+    # door starts from.
+    proc daemonControlNew(settings: DaemonSettings, telemetrySource: text, startedAtMs: int, boot: DaemonBootstrap) -> DaemonControl:
+        let base = do fabricRuntimeWithPolicy(settings.policy)
+        let sized = do fabricRuntimeWithPlacementCapacity(base, settings.placementCapacity)
+        let mut rt = do fabricRuntimeWithHeartbeatDeadlineMs(sized, settings.silenceBudgetMs)
+        rt = fabricRuntimeTickClock(rt, startedAtMs)
+        let n = len(settings.backends)
+        let mut k = 0
+        loop k < n:
+            let handled = do fabricRuntimeHandle(rt, dcoRegistration(settings.backends[k].id, settings.backends[k].region))
+            rt = handled.runtime
+            k = k + 1
+        rt = fabricRuntimeAdoptTopology(rt, boot.topology)
+        let routing = do placementFabricRouting(fabricRuntimePlacement(rt))
+        let status = do daemonStartingStatus(settings, daemonAddrText(settings.dataListen), daemonAddrText(settings.adminListen), startedAtMs)
+        return DaemonControl{settings: settings, runtime: rt, telemetrySource: telemetrySource, hasStore: boot.hasStore, store: boot.store, versions: boot.versions, storeState: boot.state, hasStoreError: false, storeError: "", storeWrites: 0, movers: daemonMoversNew(), acceptedIds: [], acceptedCounts: [], publishedGeneration: 0, doorRouting: routing, startedAtMs: startedAtMs, cycles: 0, draining: false, nextProbeMs: 0, nextPollMs: 0, decisions: daemonDecisionCountersDefault(), probeIds: [], probeVerdicts: [], probeAts: [], sampleIds: [], sampleNotes: [], status: status}
+
+    # ------------------------------------------------------------ the cycle's steps
+
+    # Time passing is itself evidence: it turns silence into unreachability.
+    proc daemonControlTickClock(c: DaemonControl, nowMs: int) -> DaemonControl:
+        let mut out = c
+        out.runtime = fabricRuntimeTickClock(c.runtime, nowMs)
+        return out
+
+    proc daemonControlProbeDue(c: DaemonControl, nowMs: int) -> bool:
+        return !sjU64Gt(c.nextProbeMs, nowMs)
+
+    proc daemonControlPollDue(c: DaemonControl, nowMs: int) -> bool:
+        return !sjU64Gt(c.nextPollMs, nowMs)
+
+    proc daemonControlProbeTargets(c: DaemonControl) -> [DaemonProbeTarget]:
+        let mut out = []
+        let n = len(c.settings.backends)
+        let mut k = 0
+        loop k < n:
+            out = append(out, DaemonProbeTarget{id: c.settings.backends[k].id, url: c.settings.backends[k].url})
+            k = k + 1
+        return out
+
+    proc dcoIndexOf(ids: [text], id: text) -> int:
+        let n = len(ids)
+        let mut k = 0
+        loop k < n:
+            if ids[k] == id:
+                return k
+            k = k + 1
+        return -1
+
+    # `probe`: every answer is recorded for the status page; a reached
+    # instance files a heartbeat, an unreachable one files NONE. Then the
+    # next probe is due one interval on.
+    proc daemonControlApplyProbes(c: DaemonControl, nowMs: int, ids: [text], probes: [DaemonProbe]) -> DaemonControl:
+        let mut out = c
+        let n = len(ids)
+        let mut k = 0
+        loop k < n:
+            let verdict = do daemonProbeDescribe(probes[k])
+            let at = do dcoIndexOf(out.probeIds, ids[k])
+            if at >= 0:
+                let mut verdicts = out.probeVerdicts
+                verdicts[at] = verdict
+                out.probeVerdicts = verdicts
+                let mut ats = out.probeAts
+                ats[at] = nowMs
+                out.probeAts = ats
+            else:
+                out.probeIds = append(out.probeIds, ids[k])
+                out.probeVerdicts = append(out.probeVerdicts, verdict)
+                out.probeAts = append(out.probeAts, nowMs)
+            let beat = do daemonProbeHeartbeat(ids[k], probes[k], nowMs)
+            if beat.has:
+                let handled = do fabricRuntimeHandle(out.runtime, beat.message)
+                out.runtime = handled.runtime
+            k = k + 1
+        out.nextProbeMs = nowMs + c.settings.cadence.livenessProbeMs
+        return out
+
+    # `poll`: the source's notes for the status page, its messages into the
+    # runtime; the next poll is due one interval on.
+    proc daemonControlApplySample(c: DaemonControl, nowMs: int, sample: DaemonSample) -> DaemonControl:
+        let mut out = c
+        let n = len(sample.noteIds)
+        let mut k = 0
+        loop k < n:
+            let at = do dcoIndexOf(out.sampleIds, sample.noteIds[k])
+            if at >= 0:
+                let mut notes = out.sampleNotes
+                notes[at] = sample.notes[k]
+                out.sampleNotes = notes
+            else:
+                out.sampleIds = append(out.sampleIds, sample.noteIds[k])
+                out.sampleNotes = append(out.sampleNotes, sample.notes[k])
+            k = k + 1
+        let m = len(sample.messages)
+        let mut j = 0
+        loop j < m:
+            let handled = do fabricRuntimeHandle(out.runtime, sample.messages[j])
+            out.runtime = handled.runtime
+            j = j + 1
+        out.nextPollMs = nowMs + c.settings.cadence.telemetryPollMs
+        return out
+
+    proc dcoSameTarget(a: ActionTarget, b: ActionTarget) -> bool:
+        return a.shardId == b.shardId && a.coordinate.x == b.coordinate.x && a.coordinate.y == b.coordinate.y
+
+    # `cooling`: whether this cell's last action concluded within the
+    # decision cooldown — asking again would be oscillation, not control.
+    proc daemonControlCooling(c: DaemonControl, target: ActionTarget, nowMs: int) -> bool:
+        let records = do actionRegistryRecords(c.runtime.controller.actions)
+        let mut found = false
+        let mut latest = 0
+        let n = len(records)
+        let mut k = 0
+        loop k < n:
+            let r = records[k]
+            let t = do executionRecordTarget(r)
+            let same = do dcoSameTarget(t, target)
+            let terminal = do executionStateIsTerminal(r.execState)
+            if same && terminal:
+                let report = do executionRecordReport(r)
+                if !found || sjU64Gt(report.concludedAtMs, latest):
+                    latest = report.concludedAtMs
+                found = true
+            k = k + 1
+        if !found:
+            return false
+        let mut since = 0
+        if sjU64Gt(nowMs, latest):
+            since = nowMs - latest
+        return sjU64Gt(c.settings.decisionCooldownMs, since)
+
+    struct DcoTimeOption:
+        has: bool
+        ms: int
+
+    # When the newest observation of this cell was taken.
+    proc daemonControlObservedAtMs(c: DaemonControl, shardId: int, coordinate: Coordinate) -> DcoTimeOption:
+        let observations = do fabricStateObservations(c.runtime.state)
+        let mut found = false
+        let mut latest = 0
+        let n = len(observations)
+        let mut k = 0
+        loop k < n:
+            let o = observations[k]
+            if o.shard.id == shardId && o.coordinate.x == coordinate.x && o.coordinate.y == coordinate.y:
+                if !found || sjU64Gt(o.timestampMs, latest):
+                    latest = o.timestampMs
+                found = true
+            k = k + 1
+        return DcoTimeOption{has: found, ms: latest}
+
+    # `decide`: optimize every hot cell not cooling down, and submit what
+    # survives the optimizer's own gate to the controller's, stamped with
+    # the observation's time (never "now") and the fleet generation seen
+    # before any of them. A refusal is counted and kept, not swallowed.
+    proc daemonControlDecide(c: DaemonControl, nowMs: int) -> DaemonControl:
+        let mut out = c
+        let view = do fabricRuntimeFleetView(c.runtime)
+        let generation = view.generation
+        let profiles = do workloadAnalyzerProfiles(c.runtime.analyzer)
+        let mut hot = []
+        let n = len(profiles)
+        let mut k = 0
+        loop k < n:
+            if workloadProfileIsHot(profiles[k]):
+                hot = append(hot, profiles[k])
+            k = k + 1
+        let m = len(hot)
+        let mut j = 0
+        loop j < m:
+            let profile = hot[j]
+            let target = ActionTarget{shardId: profile.shardId, coordinate: profile.coordinate}
+            let cooling = do daemonControlCooling(out, target, nowMs)
+            if !cooling:
+                let decision = do fabricRuntimeOptimize(out.runtime, profile)
+                let execute = do optimizationDecisionShouldExecute(decision)
+                if execute:
+                    let observed = do daemonControlObservedAtMs(out, profile.shardId, profile.coordinate)
+                    if observed.has:
+                        let mut counters = out.decisions
+                        counters.proposed = counters.proposed + 1
+                        let envelope = do decisionEnvelopeNew(decision, observed.ms, generation)
+                        let submitted = do fabricRuntimeSubmit(out.runtime, envelope, profile)
+                        out.runtime = submitted.runtime
+                        if submitted.ok:
+                            counters.admitted = counters.admitted + 1
+                        else:
+                            counters.refused = counters.refused + 1
+                            counters.hasLastRefusal = true
+                            counters.lastRefusal = validationErrorDisplay(submitted.err)
+                        out.decisions = counters
+            j = j + 1
+        return out
+
+    proc daemonControlAdvanceActions(c: DaemonControl) -> DaemonControl:
+        let mut out = c
+        let ticked = do fabricRuntimeAdvanceActions(c.runtime)
+        out.runtime = ticked.runtime
+        return out
+
+    struct DcoTextOption:
+        has: bool
+        value: text
+
+    # destination_of: read off the plan (what it adds), else the envelope's
+    # named destination.
+    proc daemonDestinationOf(r: ExecutionRecord) -> DcoTextOption:
+        if len(r.plan.adds) > 0:
+            return DcoTextOption{has: true, value: r.plan.adds[0].value}
+        if r.hasDestination:
+            return DcoTextOption{has: true, value: r.destination.value}
+        return DcoTextOption{has: false, value: ""}
+
+    # mover_endpoint: the credential the mover copies with, for one
+    # instance — or why there is none.
+    struct DcoEndpoint:
+        ok: bool
+        err: text
+        endpoint: FqlEndpoint
+
+    proc daemonMoverEndpoint(settings: DaemonSettings, node: text) -> DcoEndpoint:
+        let blank = FqlEndpoint{dbmsId: node, baseUrl: "", token: ""}
+        let declared = do daemonSettingsHasBackend(settings, node)
+        if !declared:
+            return DcoEndpoint{ok: false, err: "'" + node + "' is not a declared backend", endpoint: blank}
+        let backend = do daemonSettingsBackend(settings, node)
+        if !backend.hasToken:
+            return DcoEndpoint{ok: false, err: "'" + node + "' has no configured credential, so this daemon cannot copy to or from it; declare `token_env` for it, or move the data with an out-of-band mover reporting through POST /actions/{id}/transfer", endpoint: blank}
+        let made = do fqlEndpointNew(node, backend.url, backend.token)
+        if !made.ok:
+            return DcoEndpoint{ok: false, err: fqlErrorDisplay(made.err), endpoint: blank}
+        return DcoEndpoint{ok: true, err: "", endpoint: made.v}
+
+    # A copy the caller must start: `daemonMoversEnsure` recorded it.
+    struct DaemonCopyStart:
+        id: int
+        target: ActionTarget
+        source: FqlEndpoint
+        destination: FqlEndpoint
+        scope: CellScope
+
+    struct DaemonMoverDrive:
+        control: DaemonControl
+        starts: [DaemonCopyStart]
+
+    proc dcoLiveIds(c: DaemonControl) -> [int]:
+        let inFlight = do fabricControllerInFlight(c.runtime.controller)
+        let mut out = []
+        let n = len(inFlight)
+        let mut k = 0
+        loop k < n:
+            if !executionRecordHasCutOver(inFlight[k]):
+                out = append(out, inFlight[k].id.value)
+            k = k + 1
+        return out
+
+    # `drive_movers`: every relocation in flight short of its cutover has a
+    # mover (or a recorded refusal saying why not), and no concluded or
+    # cut-over one keeps its bookkeeping. A Replicate gets none: only a plan
+    # that removes the source is a move.
+    proc daemonControlDriveMovers(c: DaemonControl) -> DaemonMoverDrive:
+        let mut out = c
+        let mut starts = []
+        let inFlight = do fabricControllerInFlight(c.runtime.controller)
+        let n = len(inFlight)
+        let mut k = 0
+        loop k < n:
+            let r = inFlight[k]
+            let destination = do daemonDestinationOf(r)
+            let relocating = len(r.plan.removes) > 0 && !executionRecordHasCutOver(r) && destination.has
+            if relocating && !out.draining:
+                let target = do executionRecordTarget(r)
+                let key = do routingKeyNew(target.shardId, target.coordinate)
+                if !key.ok:
+                    out.movers = daemonMoversRefuse(out.movers, r.id.value, routingErrorMessage(key.err))
+                else:
+                    let scope = do cellScopeForKey(c.settings.keyspace.packed, routingKeyPack(target.shardId, target.coordinate.x, target.coordinate.y))
+                    let source = do daemonMoverEndpoint(c.settings, r.source.value)
+                    let dest = do daemonMoverEndpoint(c.settings, destination.value)
+                    if source.ok && dest.ok:
+                        let ensured = do daemonMoversEnsure(out.movers, r.id.value, dest.endpoint.dbmsId)
+                        out.movers = ensured.movers
+                        if ensured.started:
+                            starts = append(starts, DaemonCopyStart{id: r.id.value, target: target, source: source.endpoint, destination: dest.endpoint, scope: scope})
+                    else:
+                        let mut reason = source.err
+                        if source.ok:
+                            reason = dest.err
+                        out.movers = daemonMoversRefuse(out.movers, r.id.value, reason)
+            k = k + 1
+        let live = do dcoLiveIds(out)
+        out.movers = daemonMoversRetain(out.movers, live)
+        let mut ids = []
+        let mut counts = []
+        let m = len(out.acceptedIds)
+        let mut j = 0
+        loop j < m:
+            if dmvContains(live, out.acceptedIds[j]):
+                ids = append(ids, out.acceptedIds[j])
+                counts = append(counts, out.acceptedCounts[j])
+            j = j + 1
+        out.acceptedIds = ids
+        out.acceptedCounts = counts
+        return DaemonMoverDrive{control: out, starts: starts}
+
+    # `measure`: the after-measurement for everything awaiting one whose
+    # cell has reported since. TooSoon is the normal answer before the
+    # settle window closes.
+    proc daemonControlMeasure(c: DaemonControl) -> DaemonControl:
+        let mut out = c
+        let waiting = do fabricControllerAwaitingMeasurement(c.runtime.controller)
+        let n = len(waiting)
+        let mut k = 0
+        loop k < n:
+            let target = do executionRecordTarget(waiting[k])
+            let after = do fabricRuntimeProfile(out.runtime, target.shardId, target.coordinate)
+            if after.has:
+                let measured = do fabricRuntimeMeasure(out.runtime, waiting[k].id, after.val)
+                out.runtime = measured.runtime
+            k = k + 1
+        return out
+
+    struct DaemonRoutingPublish:
+        control: DaemonControl
+        published: bool
+        routing: TableRoutingTable
+
+    # `publish_routing`: the front door gets the routing table whenever its
+    # generation has moved — which is exactly "something a request would be
+    # routed by has changed". `published` says the caller must hand
+    # `routing` to the door.
+    proc daemonControlPublishRouting(c: DaemonControl) -> DaemonRoutingPublish:
+        let routing = do placementFabricRouting(fabricRuntimePlacement(c.runtime))
+        if routing.generation == c.publishedGeneration:
+            return DaemonRoutingPublish{control: c, published: false, routing: routing}
+        let mut out = c
+        out.publishedGeneration = routing.generation
+        out.doorRouting = routing
+        return DaemonRoutingPublish{control: out, published: true, routing: routing}
+
+    proc dcoSamePlacement(a: Placement, b: Placement) -> bool:
+        return a.dbmsId == b.dbmsId && a.shardId == b.shardId && a.coordinate.x == b.coordinate.x && a.coordinate.y == b.coordinate.y && a.region == b.region
+
+    proc daemonPlacementLabel(p: Placement) -> text:
+        return "shard " + sjU64Text(p.shardId) + " (" + p.coordinate.x + "," + p.coordinate.y + ") on '" + p.dbmsId + "'"
+
+    # `persist`: completed moves written back to the durable placement
+    # store, compare-and-set on the version read; a refused write is said
+    # loudly (last_error) rather than merged.
+    proc daemonControlPersist(c: DaemonControl) -> DaemonControl uses io.net:
+        if !c.hasStore:
+            return c
+        let mut out = c
+        let current = do topologyRegistryPlacements(c.runtime.topology)
+        let n = len(current)
+        let mut k = 0
+        loop k < n:
+            let placement = current[k]
+            let address = do placementAddressOf(placement.shardId, placement.coordinate)
+            let at = do placementVersionsIndexOf(out.versions, address)
+            if at >= 0:
+                let stored = out.versions[at]
+                if !dcoSamePlacement(stored.placement, placement):
+                    let updated = do placementStoreUpdate(out.store, stored, placement)
+                    if updated.ok:
+                        let mut versions = out.versions
+                        versions[at] = updated.v
+                        out.versions = versions
+                        out.storeWrites = out.storeWrites + 1
+                        out.hasStoreError = false
+                    else:
+                        out.hasStoreError = true
+                        out.storeError = "could not persist " + daemonPlacementLabel(placement) + ": " + fqlErrorDisplay(updated.err)
+            else:
+                let created = do placementStoreCreate(out.store, placement)
+                if created.ok:
+                    out.versions = append(out.versions, created.v)
+                    out.storeWrites = out.storeWrites + 1
+                    out.hasStoreError = false
+                else:
+                    out.hasStoreError = true
+                    out.storeError = "could not record " + daemonPlacementLabel(placement) + ": " + fqlErrorDisplay(created.err)
+            k = k + 1
+        return out
+
+    # ------------------------------------------------------------ the status
+
+    proc dcoAvailabilityLabel(a: text) -> text:
+        return lower(a)
+
+    proc dcoPlacementBefore(a: DaemonPlacementStatus, b: DaemonPlacementStatus) -> bool:
+        if a.shard != b.shard:
+            let gt = do sjU64Gt(b.shard, a.shard)
+            return gt
+        if a.y != b.y:
+            return a.y < b.y
+        return a.x < b.x
+
+    # `publish_status`: one immutable snapshot, as of `atMs`.
+    proc daemonControlStatus(c: DaemonControl, atMs: int) -> DaemonStatus:
+        let view = do fabricRuntimeFleetView(c.runtime)
+        let clockMs = do fabricRuntimeClockMs(c.runtime)
+        let fabric = do fabricRuntimePlacement(c.runtime)
+        let routing = do placementFabricRouting(fabric)
+        let mut backends = []
+        let nb = len(c.settings.backends)
+        let mut b = 0
+        loop b < nb:
+            let backend = c.settings.backends[b]
+            let node = do nodeRegistryGet(c.runtime.nodes, backend.id)
+            let mut health = "unreachable"
+            let mut hasSilence = false
+            let mut silence = 0
+            let mut heartbeats = 0
+            if node.has:
+                health = nodeHealthLabel(registeredNodeHealth(node.val, clockMs, c.settings.silenceBudgetMs))
+                let s = do registeredNodeSilenceMs(node.val, clockMs)
+                hasSilence = s.has
+                silence = s.val
+                heartbeats = node.val.heartbeats
+            let entry = do tableNodeLookup(routing, backend.id)
+            let mut availability = "unknown"
+            if entry.found:
+                availability = dcoAvailabilityLabel(entry.entry.availability)
+            let pi = do dcoIndexOf(c.probeIds, backend.id)
+            let mut lastProbe = "not probed yet"
+            let mut hasProbeAt = false
+            let mut probeAt = 0
+            if pi >= 0:
+                lastProbe = c.probeVerdicts[pi]
+                hasProbeAt = true
+                probeAt = c.probeAts[pi]
+            let si = do dcoIndexOf(c.sampleIds, backend.id)
+            let mut hasSample = false
+            let mut sample = ""
+            if si >= 0:
+                hasSample = true
+                sample = c.sampleNotes[si]
+            backends = append(backends, DaemonBackendStatus{id: backend.id, url: backend.url, region: backend.region, availability: availability, health: health, lastProbe: lastProbe, hasLastProbeAtMs: hasProbeAt, lastProbeAtMs: probeAt, hasSilenceMs: hasSilence, silenceMs: silence, heartbeats: heartbeats, telemetry: backend.hasToken, hasLastSample: hasSample, lastSample: sample})
+            b = b + 1
+        let mut placements = []
+        let ps = do topologyRegistryPlacements(c.runtime.topology)
+        let np = len(ps)
+        let mut p = 0
+        loop p < np:
+            let pl = ps[p]
+            let target = ActionTarget{shardId: pl.shardId, coordinate: pl.coordinate}
+            let mig = do placementFabricMigration(fabric, target)
+            let mut migration = do daemonMigrationStatusNone()
+            if mig.has:
+                migration = DaemonMigrationStatus{phase: migrationPhaseLabel(mig.val.phase), source: mig.val.plan.source, destination: mig.val.plan.destination, readOwner: migrationReadOwner(mig.val), writeFenced: migrationIsWriteFencedOf(mig.val), hasCutOver: migrationHasCutOverOf(mig.val)}
+            let row = DaemonPlacementStatus{shard: pl.shardId, x: pl.coordinate.x, y: pl.coordinate.y, holder: pl.dbmsId, region: pl.region, hasMigration: mig.has, migration: migration}
+            let mut inserted = []
+            let mut placed = false
+            let nq = len(placements)
+            let mut q = 0
+            loop q < nq:
+                if !placed && dcoPlacementBefore(row, placements[q]):
+                    inserted = append(inserted, row)
+                    placed = true
+                inserted = append(inserted, placements[q])
+                q = q + 1
+            if !placed:
+                inserted = append(inserted, row)
+            placements = inserted
+            p = p + 1
+        let mut inFlight = []
+        let records = do fabricControllerInFlight(c.runtime.controller)
+        let nr = len(records)
+        let mut r = 0
+        loop r < nr:
+            let rec = records[r]
+            let target = do executionRecordTarget(rec)
+            let destination = do daemonDestinationOf(rec)
+            let running = rec.execState == "running"
+            let mut bytes = 0
+            if destination.has:
+                let transfer = do placementFabricTransfer(fabric, target, destination.value)
+                if transfer.has:
+                    bytes = transfer.val.bytesCopied
+            let size = do placementFabricSize(fabric, target)
+            inFlight = append(inFlight, DaemonActionStatus{id: rec.id.value, shard: target.shardId, x: target.coordinate.x, y: target.coordinate.y, action: decisionEnvelopeActionLabel(rec.envelope), mechanism: rec.mechanism, state: executionStateLabel(rec.execState), hasPhase: running, phase: rec.runningPhase, hasFraction: running, fraction: rec.runningFraction, source: rec.source.value, hasDestination: destination.has, destination: destination.value, admittedAtMs: rec.admittedAtMs, hasCutOver: executionRecordHasCutOver(rec), bytesCopied: bytes, hasResidentBytes: size.has, residentBytes: size.val})
+            r = r + 1
+        let reports = do fabricControllerReports(c.runtime.controller)
+        let mut history = []
+        let keep = do dcoPublishedHistory()
+        let nh = len(reports)
+        let mut h = 0
+        if nh > keep:
+            h = nh - keep
+        loop h < nh:
+            history = append(history, reports[h])
+            h = h + 1
+        let mut rules = []
+        let nk = len(c.settings.keyspace.rules)
+        let mut k = 0
+        loop k < nk:
+            let rule = c.settings.keyspace.rules[k]
+            rules = append(rules, rule.kind + " / " + rule.addressPrefix + "* -> " + routingKeyDisplay(rule.key))
+            k = k + 1
+        let mut fallback = ""
+        if c.settings.keyspace.hasFallback:
+            fallback = routingKeyDisplay(c.settings.keyspace.fallback)
+        let span = do daemonKeyspaceSpanningKey(c.settings.keyspace)
+        let keyspace = DaemonKeyspaceStatus{rules: rules, hasFallback: c.settings.keyspace.hasFallback, fallback: fallback, spansOnePlace: span.has}
+        let store = DaemonStoreStatus{hasConfigured: c.settings.hasPlacementStore, configured: c.settings.placementStore, state: c.storeState, hasLastError: c.hasStoreError, lastError: c.storeError, writes: c.storeWrites}
+        let hotCells = do workloadAnalyzerHotCoordinates(c.runtime.analyzer)
+        return DaemonStatus{version: daemonVersion(), startedAtMs: c.startedAtMs, snapshotAtMs: atMs, clockMs: clockMs, cycles: c.cycles, draining: c.draining, dataListen: daemonAddrText(c.settings.dataListen), adminListen: daemonAddrText(c.settings.adminListen), routingGeneration: c.doorRouting.generation, placementGeneration: view.generation, telemetrySource: c.telemetrySource, observations: fabricStateLen(c.runtime.state), profiles: workloadAnalyzerLen(c.runtime.analyzer), hotCells: len(hotCells), keyspace: keyspace, backends: backends, placements: placements, inFlight: inFlight, decisions: c.decisions, placementStore: store, movers: daemonMoversStatus(c.movers), history: history}
+
+    proc daemonControlPublishStatus(c: DaemonControl, atMs: int) -> DaemonControl:
+        let mut out = c
+        out.status = daemonControlStatus(c, atMs)
+        return out
+
+    # ------------------------------------------------------------ one whole cycle
+
+    # The cycle's work after its I/O inputs are in: decide (unless
+    # draining), advance, drive the movers, measure, publish routing. The
+    # caller then persists, and finishes with daemonControlFinishCycle.
+    struct DaemonCycleMiddle:
+        control: DaemonControl
+        starts: [DaemonCopyStart]
+        published: bool
+        routing: TableRoutingTable
+
+    proc daemonControlCycleMiddle(c: DaemonControl, nowMs: int) -> DaemonCycleMiddle:
+        let mut out = c
+        if !out.draining:
+            out = daemonControlDecide(out, nowMs)
+        out = daemonControlAdvanceActions(out)
+        let driven = do daemonControlDriveMovers(out)
+        out = daemonControlMeasure(driven.control)
+        let published = do daemonControlPublishRouting(out)
+        return DaemonCycleMiddle{control: published.control, starts: driven.starts, published: published.published, routing: published.routing}
+
+    proc daemonControlFinishCycle(c: DaemonControl, nowMs: int) -> DaemonControl:
+        let mut out = c
+        out.cycles = c.cycles + 1
+        out.status = daemonControlStatus(out, nowMs)
+        return out
+
+    # ------------------------------------------------------------ operator requests
+
+    struct DaemonAnswer:
+        control: DaemonControl
+        ok: bool
+        message: text
+
+    proc dcoAnswer(c: DaemonControl, ok: bool, message: text) -> DaemonAnswer:
+        return DaemonAnswer{control: c, ok: ok, message: message}
+
+    # `record_transfer`: the mover's progress against the plan's copy.
+    proc daemonControlRecordTransfer(c: DaemonControl, id: int, atomsCopied: int, bytesCopied: int, hasResident: bool, residentBytes: int, nowMs: int) -> DaemonAnswer:
+        let aid = ActionId{value: id}
+        let shown = do actionIdDisplay(aid)
+        let record = do fabricControllerRecord(c.runtime.controller, aid)
+        if !record.has:
+            return dcoAnswer(c, false, "no action " + shown)
+        let terminal = do executionStateIsTerminal(record.val.execState)
+        if terminal:
+            return dcoAnswer(c, false, shown + " has already concluded (" + executionStateLabel(record.val.execState) + ")")
+        let target = do executionRecordTarget(record.val)
+        let destination = do daemonDestinationOf(record.val)
+        if !destination.has:
+            return dcoAnswer(c, false, shown + " copies nothing: its plan adds no copy")
+        let mut fabric = do fabricRuntimePlacement(c.runtime)
+        if hasResident:
+            fabric = placementFabricRecordSize(fabric, target, residentBytes)
+        fabric = placementFabricRecordTransfer(fabric, target, destination.value, atomsCopied, bytesCopied, nowMs)
+        let mut out = c
+        out.runtime = fabricRuntimeWithPlacement(c.runtime, fabric)
+        return dcoAnswer(out, true, shown + ": " + sjU64Text(bytesCopied) + " byte(s), " + atomsCopied + " atom(s) recorded against '" + destination.value + "'")
+
+    proc dcoAccepted(c: DaemonControl, id: int) -> int:
+        let n = len(c.acceptedIds)
+        let mut k = 0
+        loop k < n:
+            if c.acceptedIds[k] == id:
+                return c.acceptedCounts[k]
+            k = k + 1
+        return 0
+
+    # `record_copy`: the copy's progress (one atom only once the whole cell
+    # is walked AND checked), the write gap (counting stops at the fence;
+    # the drain is clamped to what was accepted), and the verdict the
+    # cutover gate consults.
+    proc daemonControlRecordCopy(c: DaemonControl, id: int, report: MoverReport, nowMs: int) -> DaemonAnswer:
+        let aid = ActionId{value: id}
+        let shown = do actionIdDisplay(aid)
+        let record = do fabricControllerRecord(c.runtime.controller, aid)
+        if !record.has:
+            return dcoAnswer(c, false, "no action " + shown)
+        let terminal = do executionStateIsTerminal(record.val.execState)
+        if terminal:
+            return dcoAnswer(c, false, shown + " has already concluded (" + executionStateLabel(record.val.execState) + ")")
+        let target = do executionRecordTarget(record.val)
+        let destination = do daemonDestinationOf(record.val)
+        if !destination.has:
+            return dcoAnswer(c, false, shown + " copies nothing: its plan adds no copy")
+        let mut atoms = 0
+        if report.snapshotComplete && copyVerdictIsVerified(report.verdict):
+            atoms = 1
+        let mut accepted = do dcoAccepted(c, id)
+        let mut fabric = do fabricRuntimePlacement(c.runtime)
+        fabric = placementFabricDemandVerification(fabric, target, destination.value)
+        if report.hasResidentBytes:
+            fabric = placementFabricRecordSize(fabric, target, report.residentBytes)
+        fabric = placementFabricRecordTransfer(fabric, target, destination.value, atoms, report.bytesCopied, nowMs)
+        let mut fenced = false
+        loop !fenced && sjU64Gt(report.observedWrites, accepted):
+            let written = do placementFabricAcceptWrite(fabric, target, accepted)
+            if !written.ok:
+                fenced = true
+            else:
+                fabric = written.fabric
+                accepted = accepted + 1
+        let mut applied = report.appliedWrites
+        if sjU64Gt(applied, accepted):
+            applied = accepted
+        if applied != 0:
+            let recorded = do placementFabricRecordApplied(fabric, target, applied - 1, nowMs)
+            if recorded.ok:
+                fabric = recorded.fabric
+        fabric = placementFabricRecordVerification(fabric, target, destination.value, report.verdict)
+        let mut out = c
+        out.runtime = fabricRuntimeWithPlacement(c.runtime, fabric)
+        let at = do dmvIndexOfInt(out.acceptedIds, id)
+        if at >= 0:
+            let mut counts = out.acceptedCounts
+            counts[at] = accepted
+            out.acceptedCounts = counts
+        else:
+            out.acceptedIds = append(out.acceptedIds, id)
+            out.acceptedCounts = append(out.acceptedCounts, accepted)
+        return dcoAnswer(out, true, shown + ": " + sjU64Text(report.rowsCopied) + " row(s), " + sjU64Text(report.bytesCopied) + " byte(s) onto '" + destination.value + "'; " + sjU64Text(report.observedWrites) + " change(s) seen, " + sjU64Text(report.appliedWrites) + " applied; copy " + copyVerdictLabel(report.verdict))
+
+    proc dmvIndexOfInt(xs: [int], x: int) -> int:
+        let n = len(xs)
+        let mut k = 0
+        loop k < n:
+            if xs[k] == x:
+                return k
+            k = k + 1
+        return -1
+
+    # `abort`: never past a cutover — authority has moved, and going back is
+    # a new decision in the other direction.
+    proc daemonControlAbort(c: DaemonControl, id: int) -> DaemonAnswer:
+        let aid = ActionId{value: id}
+        let shown = do actionIdDisplay(aid)
+        let record = do fabricControllerRecord(c.runtime.controller, aid)
+        if !record.has:
+            return dcoAnswer(c, false, "no action " + shown)
+        let terminal = do executionStateIsTerminal(record.val.execState)
+        if terminal:
+            return dcoAnswer(c, false, shown + " has already concluded (" + executionStateLabel(record.val.execState) + ")")
+        let cut = do executionRecordHasCutOver(record.val)
+        if cut:
+            let destination = do daemonDestinationOf(record.val)
+            let mut where = "the destination"
+            if destination.has:
+                where = destination.value
+            return dcoAnswer(c, false, shown + " has already cut over: authority for " + actionTargetDisplay(executionRecordTarget(record.val)) + " is on '" + where + "', so aborting cannot restore the previous arrangement. Moving it back is a new decision in the other direction.")
+        let aborted = do fabricRuntimeAbort(c.runtime, aid)
+        let mut out = c
+        out.runtime = aborted.runtime
+        if !aborted.known:
+            return dcoAnswer(out, false, "no action " + shown)
+        return dcoAnswer(out, true, shown + ": " + executionStateLabel(aborted.execState))
+
+    # `serve` for a transfer or copy report that was accepted: applied at
+    # once — the advance it allows, the routing it moves, the status. (The
+    # caller persists between routing and status, as the Rust does.)
+    struct DaemonApplied:
+        control: DaemonControl
+        published: bool
+        routing: TableRoutingTable
+
+    proc daemonControlApplyAccepted(c: DaemonControl, id: int) -> DaemonApplied:
+        let mut out = c
+        let advanced = do fabricRuntimeAdvance(c.runtime, ActionId{value: id})
+        out.runtime = advanced.runtime
+        let published = do daemonControlPublishRouting(out)
+        return DaemonApplied{control: published.control, published: published.published, routing: published.routing}
+
+    # ------------------------------------------------------------ shutdown
+
+    struct DaemonAbandoned:
+        id: int
+        target: text
+        source: text
+        hasDestination: bool
+        destination: text
+        state: text
+        hasMigrationPhase: bool
+        migrationPhase: text
+
+    struct DaemonShutdownReport:
+        rolledBack: [int]
+        unmeasured: [int]
+        abandoned: [DaemonAbandoned]
+        hasUnpersisted: bool
+        unpersisted: text
+
+    proc daemonShutdownIsClean(r: DaemonShutdownReport) -> bool:
+        return len(r.abandoned) == 0 && !r.hasUnpersisted
+
+    proc daemonAbandonedOf(r: ExecutionRecord) -> DaemonAbandoned:
+        let destination = do daemonDestinationOf(r)
+        return DaemonAbandoned{id: r.id.value, target: actionTargetDisplay(executionRecordTarget(r)), source: r.source.value, hasDestination: destination.has, destination: destination.value, state: executionStateLabel(r.execState), hasMigrationPhase: false, migrationPhase: ""}
+
+    struct DaemonDrainBegun:
+        control: DaemonControl
+        report: DaemonShutdownReport
+        deadlineMs: int
+        published: bool
+        routing: TableRoutingTable
+
+    # `drain`, up to its waiting loop: stop deciding and copying, roll back
+    # every action short of its cutover (one whose rollback could not
+    # restore the arrangement is carried as abandoned), publish the
+    # rollbacks' routing.
+    proc daemonControlDrainBegin(c: DaemonControl, nowMs: int) -> DaemonDrainBegun:
+        let mut out = c
+        out.draining = true
+        out.movers = daemonMoversStopAll(c.movers)
+        let mut report = DaemonShutdownReport{rolledBack: [], unmeasured: [], abandoned: [], hasUnpersisted: false, unpersisted: ""}
+        let inFlight = do fabricControllerInFlight(out.runtime.controller)
+        let n = len(inFlight)
+        let mut k = 0
+        loop k < n:
+            let cut = do executionRecordHasCutOver(inFlight[k])
+            if !cut:
+                let aborted = do fabricRuntimeAbort(out.runtime, inFlight[k].id)
+                out.runtime = aborted.runtime
+                if aborted.known:
+                    if aborted.execState == "rolled-back":
+                        report.rolledBack = append(report.rolledBack, inFlight[k].id.value)
+                    else:
+                        let record = do fabricControllerRecord(out.runtime.controller, inFlight[k].id)
+                        if record.has:
+                            report.abandoned = append(report.abandoned, daemonAbandonedOf(record.val))
+            k = k + 1
+        let published = do daemonControlPublishRouting(out)
+        return DaemonDrainBegun{control: published.control, report: report, deadlineMs: nowMs + c.settings.drainMs, published: published.published, routing: published.routing}
+
+    # Whether anything is still admitted or running: the drain loop's
+    # condition.
+    proc daemonControlDrainUnfinished(c: DaemonControl) -> bool:
+        let inFlight = do fabricControllerInFlight(c.runtime.controller)
+        let n = len(inFlight)
+        let mut k = 0
+        loop k < n:
+            let s = inFlight[k].execState
+            if s == "admitted" || s == "running":
+                return true
+            k = k + 1
+        return false
+
+    # The drain's cadence: tighter than the loop's, clamped to 10..250 ms.
+    proc daemonDrainStepMs(c: DaemonControl) -> int:
+        let cycle = c.settings.cadence.controlCycleMs
+        if !sjU64Gt(cycle, 10):
+            return 10
+        if sjU64Gt(cycle, 250):
+            return 250
+        return cycle
+
+    # `drain` after its loop: every record still awaiting measurement is
+    # unmeasured, every one still admitted or running abandoned, each
+    # abandoned action named with the migration phase it is stuck in.
+    # (Persisting, and `unpersisted`, are the caller's next step:
+    # daemonDrainFinishStore.)
+    proc daemonControlDrainReport(c: DaemonControl, begun: DaemonShutdownReport) -> DaemonShutdownReport:
+        let mut report = begun
+        let records = do actionRegistryRecords(c.runtime.controller.actions)
+        let n = len(records)
+        let mut k = 0
+        loop k < n:
+            let s = records[k].execState
+            if s == "awaiting-measurement":
+                report.unmeasured = append(report.unmeasured, records[k].id.value)
+            if s == "admitted" || s == "running":
+                report.abandoned = append(report.abandoned, daemonAbandonedOf(records[k]))
+            k = k + 1
+        let fabric = do fabricRuntimePlacement(c.runtime)
+        let mut named = []
+        let m = len(report.abandoned)
+        let mut j = 0
+        loop j < m:
+            let a = report.abandoned[j]
+            let mut phase = ""
+            let mut has = false
+            let mut i = 0
+            loop i < n:
+                if records[i].id.value == a.id:
+                    let mig = do placementFabricMigration(fabric, executionRecordTarget(records[i]))
+                    if mig.has:
+                        has = true
+                        phase = migrationPhaseLabel(mig.val.phase)
+                i = i + 1
+            named = append(named, DaemonAbandoned{id: a.id, target: a.target, source: a.source, hasDestination: a.hasDestination, destination: a.destination, state: a.state, hasMigrationPhase: has, migrationPhase: phase})
+            j = j + 1
+        report.abandoned = named
+        return report
+
+    proc daemonDrainFinishStore(c: DaemonControl, report: DaemonShutdownReport) -> DaemonShutdownReport:
+        let mut out = report
+        out.hasUnpersisted = c.hasStoreError
+        out.unpersisted = c.storeError
+        return out
+
+    # main.rs: what fabricd says about each part of the report on its way
+    # out, and the exit status (0 clean, 75 EX_TEMPFAIL otherwise).
+    proc daemonShutdownLines(r: DaemonShutdownReport) -> [text]:
+        let mut out = []
+        let nr = len(r.rolledBack)
+        let mut k = 0
+        loop k < nr:
+            out = append(out, "fabricd: action-" + sjU64Text(r.rolledBack[k]) + " was rolled back; the arrangement is restored")
+            k = k + 1
+        let nu = len(r.unmeasured)
+        k = 0
+        loop k < nu:
+            out = append(out, "fabricd: action-" + sjU64Text(r.unmeasured[k]) + " executed and was never measured; its verdict is lost, its data is not")
+            k = k + 1
+        if r.hasUnpersisted:
+            out = append(out, "fabricd: " + r.unpersisted)
+        let na = len(r.abandoned)
+        k = 0
+        loop k < na:
+            let a = r.abandoned[k]
+            let mut destination = "(none)"
+            if a.hasDestination:
+                destination = a.destination
+            let mut phase = "(none)"
+            if a.hasMigrationPhase:
+                phase = a.migrationPhase
+            out = append(out, "fabricd: action-" + sjU64Text(a.id) + " is past its cutover and did not finish: " + a.target + " moved from '" + a.source + "' to '" + destination + "', migration phase '" + phase + "', execution state '" + a.state + "'. It was NOT aborted -- an abort after cutover cannot restore the previous arrangement, and recording one would claim a rollback that did not happen. The data is on the destination.")
+            k = k + 1
+        let clean = do daemonShutdownIsClean(r)
+        if clean:
+            out = append(out, "fabricd: stopped cleanly")
+        return out
+
+    proc daemonShutdownExitCode(r: DaemonShutdownReport) -> int:
+        let clean = do daemonShutdownIsClean(r)
+        if clean:
+            return 0
+        return 75

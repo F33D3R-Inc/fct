@@ -1,6 +1,8 @@
 package ir
 
 import (
+	"strings"
+
 	"facet/internal/ast"
 	"facet/internal/parser"
 )
@@ -68,8 +70,18 @@ func envFromIR(graph *IR) *env {
 			e.inline[p.Name] = p.Expr // already lowered
 		}
 	}
+	e.deriveFns = map[string]*deriveFn{}
 	for i := range graph.Derives {
-		e.inline[graph.Derives[i].Name] = graph.Derives[i].Expr // already lowered
+		d := &graph.Derives[i]
+		if len(d.Params) == 0 {
+			e.inline[d.Name] = d.Expr // already lowered
+			continue
+		}
+		fn := &deriveFn{ret: vtype{core: strings.Trim(d.Type, "[]"), list: strings.HasPrefix(d.Type, "[")}, body: d.Expr}
+		for _, p := range d.Params {
+			fn.params = append(fn.params, ast.Param{Name: p.Name, Type: p.Type, List: p.List, Optional: p.Optional})
+		}
+		e.deriveFns[d.Name] = fn
 	}
 	return e
 }

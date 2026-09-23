@@ -1,0 +1,505 @@
+app AesGcmSelfHost:
+    # aes_gcm.fct — self-hosted AES-256-GCM, the cipher facetql/src/crypto.rs
+    # seals every WAL frame, heap record and history entry with (the
+    # `aes-gcm` crate's Aes256Gcm: a 32-byte key, a 12-byte nonce, no
+    # associated data, a 16-byte tag appended to the ciphertext), plus
+    # crypto.rs's own framing around it — `encrypt` returns
+    # nonce || ciphertext || tag and `decrypt` reverses it — and its
+    # two-hex-digits-per-byte codec.
+    #
+    # FIPS-197 AES (key expansion for Nk = 8 / Nr = 14, SubBytes, ShiftRows,
+    # MixColumns, AddRoundKey) and NIST SP 800-38D GCM (GHASH over
+    # GF(2^128) with R = 0xe1 || 0^120, J0 = nonce || 0^31 || 1, inc32
+    # counters) are written out directly over byte lists ([int], 0..255),
+    # so the result is the standard's and therefore byte-identical to any
+    # conforming implementation — wal_test.go checks it against Go's
+    # crypto/aes + cipher.NewGCM. The engine itself seals and opens through
+    # the standard builtins aesGcmSeal/aesGcmOpen (gcmSeal/gcmOpen below);
+    # this implementation (gcmSealRef/gcmOpenRef) is their conformance
+    # reference, checked against them on every test run.
+    #
+    # A proc cannot draw randomness, so the nonce is a parameter: crypto.rs
+    # draws 12 fresh random bytes per call, and a caller here must pass 12
+    # bytes it has never used with this key (the only property GCM needs
+    # of a nonce).
+    proc aesSbox() -> [int]:
+        return [99, 124, 119, 123, 242, 107, 111, 197, 48, 1, 103, 43, 254, 215, 171, 118, 202, 130, 201, 125, 250, 89, 71, 240, 173, 212, 162, 175, 156, 164, 114, 192, 183, 253, 147, 38, 54, 63, 247, 204, 52, 165, 229, 241, 113, 216, 49, 21, 4, 199, 35, 195, 24, 150, 5, 154, 7, 18, 128, 226, 235, 39, 178, 117, 9, 131, 44, 26, 27, 110, 90, 160, 82, 59, 214, 179, 41, 227, 47, 132, 83, 209, 0, 237, 32, 252, 177, 91, 106, 203, 190, 57, 74, 76, 88, 207, 208, 239, 170, 251, 67, 77, 51, 133, 69, 249, 2, 127, 80, 60, 159, 168, 81, 163, 64, 143, 146, 157, 56, 245, 188, 182, 218, 33, 16, 255, 243, 210, 205, 12, 19, 236, 95, 151, 68, 23, 196, 167, 126, 61, 100, 93, 25, 115, 96, 129, 79, 220, 34, 42, 144, 136, 70, 238, 184, 20, 222, 94, 11, 219, 224, 50, 58, 10, 73, 6, 36, 92, 194, 211, 172, 98, 145, 149, 228, 121, 231, 200, 55, 109, 141, 213, 78, 169, 108, 86, 244, 234, 101, 122, 174, 8, 186, 120, 37, 46, 28, 166, 180, 198, 232, 221, 116, 31, 75, 189, 139, 138, 112, 62, 181, 102, 72, 3, 246, 14, 97, 53, 87, 185, 134, 193, 29, 158, 225, 248, 152, 17, 105, 217, 142, 148, 155, 30, 135, 233, 206, 85, 40, 223, 140, 161, 137, 13, 191, 230, 66, 104, 65, 153, 45, 15, 176, 84, 187, 22]
+
+    proc aesXtime(b: int) -> int:
+        let s = (b << 1) & 255
+        if (b & 128) != 0:
+            return s ^ 27
+        return s
+
+    # aesExpandKey: FIPS-197 §5.2 for a 32-byte key — 60 words, returned
+    # as the 240 round-key bytes in order.
+    proc aesExpandKey(key: [int]) -> [int]:
+        let sbox = do aesSbox()
+        let mut w = bytes(240)
+        let mut i = 0
+        loop i < 32:
+            w[i] = key[i]
+            i = i + 1
+        let mut rcon = 1
+        let mut word = 8
+        loop word < 60:
+            let p = 4 * (word - 1)
+            let mut t0 = w[p]
+            let mut t1 = w[p + 1]
+            let mut t2 = w[p + 2]
+            let mut t3 = w[p + 3]
+            if word % 8 == 0:
+                let r0 = t1
+                let r1 = t2
+                let r2 = t3
+                let r3 = t0
+                t0 = sbox[r0] ^ rcon
+                t1 = sbox[r1]
+                t2 = sbox[r2]
+                t3 = sbox[r3]
+                let nr = do aesXtime(rcon)
+                rcon = nr
+            else:
+                if word % 8 == 4:
+                    t0 = sbox[t0]
+                    t1 = sbox[t1]
+                    t2 = sbox[t2]
+                    t3 = sbox[t3]
+            let q = 4 * (word - 8)
+            let o = 4 * word
+            w[o] = w[q] ^ t0
+            w[o + 1] = w[q + 1] ^ t1
+            w[o + 2] = w[q + 2] ^ t2
+            w[o + 3] = w[q + 3] ^ t3
+            word = word + 1
+        return w
+
+    # aesEncryptBlock: FIPS-197 §5.1, Nr = 14. The state is column-major
+    # (state[r + 4c] = byte r of column c), exactly the input order.
+    proc aesEncryptBlock(rk: [int], sbox: [int], block: [int]) -> [int]:
+        let mut s = bytes(16)
+        let mut i = 0
+        loop i < 16:
+            s[i] = block[i] ^ rk[i]
+            i = i + 1
+        let mut round = 1
+        loop round <= 14:
+            # SubBytes + ShiftRows: row r rotates left by r columns.
+            let mut t = bytes(16)
+            let mut c = 0
+            loop c < 4:
+                let mut r = 0
+                loop r < 4:
+                    t[r + 4 * c] = sbox[s[r + 4 * ((c + r) % 4)]]
+                    r = r + 1
+                c = c + 1
+            if round < 14:
+                # MixColumns
+                let mut c2 = 0
+                loop c2 < 4:
+                    let a0 = t[4 * c2]
+                    let a1 = t[4 * c2 + 1]
+                    let a2 = t[4 * c2 + 2]
+                    let a3 = t[4 * c2 + 3]
+                    let x0 = do aesXtime(a0)
+                    let x1 = do aesXtime(a1)
+                    let x2 = do aesXtime(a2)
+                    let x3 = do aesXtime(a3)
+                    s[4 * c2] = x0 ^ x1 ^ a1 ^ a2 ^ a3
+                    s[4 * c2 + 1] = a0 ^ x1 ^ x2 ^ a2 ^ a3
+                    s[4 * c2 + 2] = a0 ^ a1 ^ x2 ^ x3 ^ a3
+                    s[4 * c2 + 3] = x0 ^ a0 ^ a1 ^ a2 ^ x3
+                    c2 = c2 + 1
+            else:
+                let mut k = 0
+                loop k < 16:
+                    s[k] = t[k]
+                    k = k + 1
+            let base = 16 * round
+            let mut j = 0
+            loop j < 16:
+                s[j] = s[j] ^ rk[base + j]
+                j = j + 1
+            round = round + 1
+        return s
+
+    # ── GCM (NIST SP 800-38D) ───────────────────────────────────────────
+    # gcmMul: X · Y in GF(2^128), the specification's bitwise algorithm
+    # (§6.3), bits numbered from the most significant bit of byte 0.
+    proc gcmMul(x: [int], y: [int]) -> [int]:
+        let mut z = bytes(16)
+        let mut v = bytes(16)
+        let mut i = 0
+        loop i < 16:
+            v[i] = y[i]
+            i = i + 1
+        let mut bit = 0
+        loop bit < 128:
+            let xb = (x[bit / 8] >> (7 - bit % 8)) & 1
+            if xb == 1:
+                let mut k = 0
+                loop k < 16:
+                    z[k] = z[k] ^ v[k]
+                    k = k + 1
+            let lsb = v[15] & 1
+            let mut j = 15
+            loop j > 0:
+                v[j] = (v[j] >> 1) | ((v[j - 1] & 1) << 7)
+                j = j - 1
+            v[0] = v[0] >> 1
+            if lsb == 1:
+                v[0] = v[0] ^ 225
+            bit = bit + 1
+        return z
+
+    # gcmGhash: GHASH_H over no associated data and the ciphertext c,
+    # finished with the 128-bit lengths block (len(A)·8 || len(C)·8).
+    #
+    # Multiplication by H uses Shoup's 8-bit tables rather than gcmMul's
+    # bit-serial loop: m holds H·a for every byte a (a's most significant
+    # bit is x^0), r the reduction a byte shifted off the end folds back
+    # in, so each block costs sixteen table steps instead of 128 bit
+    # steps. Both tables are flat byte lists (entry a at a·16 / a·2),
+    # built once per call; the result is the same field product.
+    proc gcmGhash(h: [int], c: [int]) -> [int]:
+        let mut m = bytes(4096)
+        let mut v = bytes(16)
+        let mut i = 0
+        loop i < 16:
+            v[i] = h[i]
+            m[128 * 16 + i] = h[i]
+            i = i + 1
+        # m[128 >> k] = H · x^k
+        let mut p = 64
+        loop p >= 1:
+            let lsb = v[15] & 1
+            let mut j = 15
+            loop j > 0:
+                v[j] = (v[j] >> 1) | ((v[j - 1] & 1) << 7)
+                j = j - 1
+            v[0] = v[0] >> 1
+            if lsb == 1:
+                v[0] = v[0] ^ 225
+            let mut k = 0
+            loop k < 16:
+                m[p * 16 + k] = v[k]
+                k = k + 1
+            p = p / 2
+        # every other byte: the sum of its high bit's entry and the rest's
+        let mut a = 2
+        loop a < 256:
+            let mut hb = 128
+            loop hb > a:
+                hb = hb / 2
+            if hb != a:
+                let rest = a ^ hb
+                let mut k2 = 0
+                loop k2 < 16:
+                    m[a * 16 + k2] = m[hb * 16 + k2] ^ m[rest * 16 + k2]
+                    k2 = k2 + 1
+            a = a + 1
+        # r[b]: the 16-bit fold of byte b shifted past x^127 by eight steps
+        let mut r = bytes(512)
+        let mut b = 0
+        loop b < 256:
+            let mut w = bytes(16)
+            w[15] = b
+            let mut s = 0
+            loop s < 8:
+                let lsb2 = w[15] & 1
+                let mut j2 = 15
+                loop j2 > 0:
+                    w[j2] = (w[j2] >> 1) | ((w[j2 - 1] & 1) << 7)
+                    j2 = j2 - 1
+                w[0] = w[0] >> 1
+                if lsb2 == 1:
+                    w[0] = w[0] ^ 225
+                s = s + 1
+            r[b * 2] = w[0]
+            r[b * 2 + 1] = w[1]
+            b = b + 1
+        let mut y = bytes(16)
+        let n = len(c)
+        let blocks = (n + 15) / 16 + 1
+        let mut blk = 0
+        loop blk < blocks:
+            let mut x = bytes(16)
+            if blk < blocks - 1:
+                let off = blk * 16
+                let mut k3 = 0
+                loop k3 < 16:
+                    if off + k3 < n:
+                        x[k3] = y[k3] ^ c[off + k3]
+                    else:
+                        x[k3] = y[k3]
+                    k3 = k3 + 1
+            else:
+                # the lengths block: len(A)·8 = 0, len(C)·8 big-endian
+                let mut bits = n * 8
+                let mut lb = bytes(16)
+                let mut q = 15
+                loop q >= 8:
+                    lb[q] = bits % 256
+                    bits = bits / 256
+                    q = q - 1
+                let mut k4 = 0
+                loop k4 < 16:
+                    x[k4] = y[k4] ^ lb[k4]
+                    k4 = k4 + 1
+            # z = x · H, most significant byte of x (byte 15) first
+            let mut z = bytes(16)
+            let mut bi = 15
+            loop bi >= 0:
+                if bi < 15:
+                    let out = z[15]
+                    let mut j3 = 15
+                    loop j3 > 0:
+                        z[j3] = z[j3 - 1]
+                        j3 = j3 - 1
+                    z[0] = r[out * 2]
+                    z[1] = z[1] ^ r[out * 2 + 1]
+                let base = x[bi] * 16
+                let mut k5 = 0
+                loop k5 < 16:
+                    z[k5] = z[k5] ^ m[base + k5]
+                    k5 = k5 + 1
+                bi = bi - 1
+            y = z
+            blk = blk + 1
+        return y
+
+    proc gcmInc32(ctr: [int]) -> [int]:
+        let mut out = bytes(16)
+        let mut i = 0
+        loop i < 16:
+            out[i] = ctr[i]
+            i = i + 1
+        let mut j = 15
+        let mut carry = 1
+        loop j >= 12 && carry == 1:
+            let v = out[j] + 1
+            if v == 256:
+                out[j] = 0
+            else:
+                out[j] = v
+                carry = 0
+            j = j - 1
+        return out
+
+    proc gcmJ0(nonce: [int]) -> [int]:
+        let mut j0 = bytes(16)
+        let mut i = 0
+        loop i < 12:
+            j0[i] = nonce[i]
+            i = i + 1
+        j0[15] = 1
+        return j0
+
+    # gcmCtr: GCTR from inc32(J0) — the keystream XOR both directions use.
+    proc gcmCtr(rk: [int], sbox: [int], j0: [int], data: [int]) -> [int]:
+        let n = len(data)
+        let mut out = bytes(n)
+        let c0 = do gcmInc32(j0)
+        let mut ctr = c0
+        let mut off = 0
+        loop off < n:
+            let ks = do aesEncryptBlock(rk, sbox, ctr)
+            let mut k = 0
+            loop k < 16 && off + k < n:
+                out[off + k] = data[off + k] ^ ks[k]
+                k = k + 1
+            let nc = do gcmInc32(ctr)
+            ctr = nc
+            off = off + 16
+        return out
+
+    proc gcmTag(rk: [int], sbox: [int], j0: [int], ct: [int]) -> [int]:
+        let zero = bytes(16)
+        let h = do aesEncryptBlock(rk, sbox, zero)
+        let s = do gcmGhash(h, ct)
+        let ekj0 = do aesEncryptBlock(rk, sbox, j0)
+        let mut tag = bytes(16)
+        let mut i = 0
+        loop i < 16:
+            tag[i] = ekj0[i] ^ s[i]
+            i = i + 1
+        return tag
+
+    # gcmSealRef: Aes256Gcm::encrypt(nonce, plaintext) — ciphertext || tag,
+    # computed here. It is the conformance reference for the standard
+    # builtin aesGcmSeal (runtime/aesgcm.go) that gcmSeal uses.
+    proc gcmSealRef(key: [int], nonce: [int], plaintext: [int]) -> [int]:
+        let rk = do aesExpandKey(key)
+        let sbox = do aesSbox()
+        let j0 = do gcmJ0(nonce)
+        let ct = do gcmCtr(rk, sbox, j0, plaintext)
+        let tag = do gcmTag(rk, sbox, j0, ct)
+        let n = len(ct)
+        let mut out = bytes(n + 16)
+        let mut i = 0
+        loop i < n:
+            out[i] = ct[i]
+            i = i + 1
+        let mut k = 0
+        loop k < 16:
+            out[n + k] = tag[k]
+            k = k + 1
+        return out
+
+    # GcmOpen: Aes256Gcm::decrypt's result — ok false when the tag does
+    # not authenticate (wrong key, or a modified ciphertext).
+    struct GcmOpen:
+        ok: bool
+        plaintext: [int]
+
+    proc gcmOpenRef(key: [int], nonce: [int], sealed: [int]) -> GcmOpen:
+        let n = len(sealed)
+        if n < 16:
+            return GcmOpen{ok: false, plaintext: []}
+        let rk = do aesExpandKey(key)
+        let sbox = do aesSbox()
+        let j0 = do gcmJ0(nonce)
+        let mut ct = bytes(n - 16)
+        let mut i = 0
+        loop i < n - 16:
+            ct[i] = sealed[i]
+            i = i + 1
+        let tag = do gcmTag(rk, sbox, j0, ct)
+        let mut diff = 0
+        let mut k = 0
+        loop k < 16:
+            diff = diff | (tag[k] ^ sealed[n - 16 + k])
+            k = k + 1
+        if diff != 0:
+            return GcmOpen{ok: false, plaintext: []}
+        let pt = do gcmCtr(rk, sbox, j0, ct)
+        return GcmOpen{ok: true, plaintext: pt}
+
+    # gcmSeal / gcmOpen: AES-256-GCM through the language's standard
+    # builtins — what every seal and open in the storage engine uses.
+    proc gcmSeal(key: [int], nonce: [int], plaintext: [int]) -> [int]:
+        let s = aesGcmSeal(key, nonce, plaintext)
+        return s
+
+    proc gcmOpen(key: [int], nonce: [int], sealed: [int]) -> GcmOpen:
+        if len(sealed) < 16:
+            return GcmOpen{ok: false, plaintext: []}
+        let ok = aesGcmAuthentic(key, nonce, sealed)
+        if !ok:
+            return GcmOpen{ok: false, plaintext: []}
+        let pt = aesGcmOpen(key, nonce, sealed)
+        return GcmOpen{ok: true, plaintext: pt}
+
+    # ── crypto.rs's framing ─────────────────────────────────────────────
+    # cryptoEncrypt: nonce || ciphertext || tag.
+    proc cryptoEncrypt(key: [int], nonce: [int], plaintext: [int]) -> [int]:
+        let sealed = do gcmSeal(key, nonce, plaintext)
+        let n = len(sealed)
+        let mut out = bytes(12 + n)
+        let mut i = 0
+        loop i < 12:
+            out[i] = nonce[i]
+            i = i + 1
+        let mut k = 0
+        loop k < n:
+            out[12 + k] = sealed[k]
+            k = k + 1
+        return out
+
+    # CryptoDecrypted: decrypt's Result<Vec<u8>, String>.
+    struct CryptoDecrypted:
+        ok: bool
+        err: text
+        plaintext: [int]
+
+    proc cryptoDecrypt(key: [int], blob: [int]) -> CryptoDecrypted:
+        let n = len(blob)
+        if n < 12:
+            return CryptoDecrypted{ok: false, err: "ciphertext too short to contain a nonce", plaintext: []}
+        let mut nonce = bytes(12)
+        let mut i = 0
+        loop i < 12:
+            nonce[i] = blob[i]
+            i = i + 1
+        let mut rest = bytes(n - 12)
+        let mut k = 0
+        loop k < n - 12:
+            rest[k] = blob[12 + k]
+            k = k + 1
+        let o = do gcmOpen(key, nonce, rest)
+        if !o.ok:
+            return CryptoDecrypted{ok: false, err: "decryption failed — wrong FACETQL_MASTER_KEY, or data is corrupted/tampered", plaintext: []}
+        return CryptoDecrypted{ok: true, err: "", plaintext: o.plaintext}
+
+    # cryptoEncodeHex: encode_hex — two lowercase digits per byte.
+    #
+    # Built in 256-byte chunks: appending to a list or a string copies it,
+    # so one growing accumulator would make a 16 KiB page quadratic.
+    proc cryptoEncodeHex(bs: [int]) -> text:
+        let digits = split("0123456789abcdef", "")
+        let n = len(bs)
+        let mut chunks = []
+        let mut i = 0
+        loop i < n:
+            let mut chunk = ""
+            let mut j = 0
+            loop j < 256 && i < n:
+                let b = bs[i]
+                chunk = chunk + digits[b / 16] + digits[b % 16]
+                i = i + 1
+                j = j + 1
+            chunks = append(chunks, chunk)
+        let mut out = ""
+        let nc = len(chunks)
+        let mut k = 0
+        loop k < nc:
+            out = out + chunks[k]
+            k = k + 1
+        return out
+
+    proc cryptoHexVal(c: text) -> int:
+        if c >= "0" && c <= "9":
+            return toInt(c)
+        if c >= "a" && c <= "f":
+            let lo = "abcdef"
+            let mut i = 0
+            loop i < 6:
+                if charAt(lo, i) == c:
+                    return 10 + i
+                i = i + 1
+        if c >= "A" && c <= "F":
+            let up = "ABCDEF"
+            let mut k = 0
+            loop k < 6:
+                if charAt(up, k) == c:
+                    return 10 + k
+                k = k + 1
+        return -1
+
+    # CryptoHex: decode_hex's Result<Vec<u8>, String>.
+    struct CryptoHex:
+        ok: bool
+        err: text
+        bytes: [int]
+
+    # cryptoDecodeHex: decode_hex — trimmed first, an even digit count, each
+    # pair read by u8::from_str_radix (which also accepts a leading '+').
+    proc cryptoDecodeHex(s0: text) -> CryptoHex:
+        let s = trim(s0)
+        let cs = split(s, "")
+        let n = len(cs)
+        if n % 2 != 0:
+            return CryptoHex{ok: false, err: "hex string has an odd number of characters", bytes: []}
+        let mut out = bytes(n / 2)
+        let mut i = 0
+        loop i < n:
+            let hi = do cryptoHexVal(cs[i])
+            let lo = do cryptoHexVal(cs[i + 1])
+            if lo < 0 || (hi < 0 && cs[i] != "+"):
+                return CryptoHex{ok: false, err: "invalid hex at position " + i, bytes: []}
+            if hi < 0:
+                out[i / 2] = lo
+            else:
+                out[i / 2] = hi * 16 + lo
+            i = i + 2
+        return CryptoHex{ok: true, err: "", bytes: out}

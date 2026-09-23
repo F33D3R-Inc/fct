@@ -1,0 +1,805 @@
+import "fabric_plan.fct"
+import "fabric_table.fct"
+import "http_server.fct"
+import "fqjson.fct"
+
+app FabricFrontDoorSelfHost:
+    # fabric_frontdoor.fct — the transparent front door, in fct: a port of
+    # fabric/crates/fabric-facetql/src/frontdoor.rs and frontdoor/proxy.rs.
+    #
+    # Fabric speaking FacetQL's wire protocol: `FACET_DATABASE_URL` points
+    # here instead of at one FacetQL, and every request this server accepts
+    # is one FacetQL accepts, every byte it answers with is one a FacetQL
+    # answered with — except the refusals, each of which names why. The three
+    # layers are the Rust module's:
+    #   * the keyspace (fabric.fct) and the plan (fabric_plan.fct) — what a
+    #     request touches and what the door will do with it;
+    #   * this file's resolution — a plan's keys through the LIVE routing
+    #     table (fabric_table.fct) to the one backend that serves them all,
+    #     every way that can fail turned into a status a client can act on
+    #     (the table in frontdoor.rs's module doc, restated in
+    #     fdRoutingStatus), a cutover fence absorbed within a budget;
+    #   * the proxy — forwarding over http_client.fct, broadcasting with or
+    #     without agreement, and the SSE fan-in — which moves bytes and
+    #     decides nothing.
+    #
+    # And the server itself: an HTTP/1.1 server written here over the raw
+    # TCP primitives (listen/accept/readBytes/writeBytes), serving each
+    # accepted connection on its own `detach`ed handler so one slow client,
+    # or one subscription held open for days, never holds up another.
+    #
+    # The fleet (keyspace, routing table, backends) and the config live in
+    # two `shared` cells — the Rust door's Arc<RwLock<Fleet>>: every handler
+    # reads a snapshot per resolution attempt, and the control plane
+    # publishes a new routing table (fdPublishRouting) while requests are in
+    # flight; a request waiting out a cutover fence sees it on its next tick.
+    #
+    # Authentication: the door holds no identity. It refuses a request that
+    # carries no credential at all (in FacetQL's own words) and forwards
+    # whatever did arrive, unread and unmodified.
+    #
+    # Differences from the Rust transport that are the runtime's, not the
+    # door's: the upstream timeout bounds each read/write of an exchange
+    # rather than the whole exchange; an SSE upstream is read with the
+    # runtime's largest per-read deadline (ten minutes — FacetQL's /events
+    # sends a keep-alive every fifteen seconds, so only a dead upstream
+    # trips it, which ends the merged stream exactly as an upstream error
+    # does in Rust); bodies are UTF-8 text end to end, as FacetQL's are.
+
+    # ============================================================
+    # CONFIGURATION: Backend, FrontDoorConfig, the fleet
+    # ============================================================
+    struct FdBackend:
+        id: text
+        baseUrl: text
+
+    struct FdBackendResult:
+        ok: bool
+        err: text
+        backend: FdBackend
+
+    proc fdTrimTrailingSlashes(s: text) -> text:
+        let mut out = s
+        loop len(out) > 0 && charAt(out, len(out) - 1) == "/":
+            out = slice(out, 0, len(out) - 1)
+        return out
+
+    proc fdStartsWith(s: text, prefix: text) -> bool:
+        if len(prefix) > len(s):
+            return false
+        return slice(s, 0, len(prefix)) == prefix
+
+    # fdBackendNew: `Backend::new` — the base URL trimmed of whitespace and
+    # trailing slashes, and refused unless it is http(s).
+    proc fdBackendNew(id: text, baseUrl: text) -> FdBackendResult:
+        let url = do fdTrimTrailingSlashes(trim(baseUrl))
+        let isHttp = do fdStartsWith(url, "http://")
+        let isHttps = do fdStartsWith(url, "https://")
+        if !isHttp && !isHttps:
+            return FdBackendResult{ok: false, err: "facetql endpoint misconfigured: FacetQL backend '" + id + "' has a base URL that is not http(s): " + url, backend: FdBackend{id: id, baseUrl: url}}
+        return FdBackendResult{ok: true, err: "", backend: FdBackend{id: id, baseUrl: url}}
+
+    # FdConfig: `FrontDoorConfig`, plus the port the server listens on.
+    struct FdConfig:
+        readPref: PlanReadPreference
+        fenceRetryBudgetMs: int
+        fenceRetryIntervalMs: int
+        upstreamTimeoutMs: int
+        maxBodyBytes: int
+        port: int
+
+    # fdConfigDefault: `FrontDoorConfig::default()` — Primary reads, a 2s
+    # fence budget re-checked every 50ms, a 35s upstream bound, FacetQL's
+    # own 4 MiB body limit.
+    proc fdConfigDefault(port: int) -> FdConfig:
+        return FdConfig{readPref: PlanReadPreference{code: 0, region: ""}, fenceRetryBudgetMs: 2000, fenceRetryIntervalMs: 50, upstreamTimeoutMs: 35000, maxBodyBytes: 4194304, port: port}
+
+    # FdFleet: everything the door needs to answer, swapped whole while it
+    # serves. backends are kept sorted by id — the Rust BTreeMap's order,
+    # which is the order a broadcast visits them in.
+    struct FdFleet:
+        keyspace: PlanKeyspace
+        routing: TableRoutingTable
+        backends: [FdBackend]
+
+    struct FdFleetResult:
+        ok: bool
+        err: text
+        fleet: FdFleet
+
+    # fdBackendsInsert: BTreeMap::insert — replace an id already present,
+    # else insert in id order.
+    proc fdBackendsInsert(backends: [FdBackend], b: FdBackend) -> [FdBackend]:
+        let mut out = []
+        let mut placed = false
+        let n = len(backends)
+        let mut i = 0
+        loop i < n:
+            let cur = backends[i]
+            if !placed && cur.id == b.id:
+                out = append(out, b)
+                placed = true
+            else:
+                if !placed && cur.id > b.id:
+                    out = append(out, b)
+                    placed = true
+                out = append(out, cur)
+            i = i + 1
+        if !placed:
+            out = append(out, b)
+        return out
+
+    # fdFleetNew: `FrontDoor::with_config`'s fleet — refused with no
+    # backends at all.
+    proc fdFleetNew(keyspace: PlanKeyspace, backends: [FdBackend], routing: TableRoutingTable) -> FdFleetResult:
+        let mut sorted = []
+        let n = len(backends)
+        let mut i = 0
+        loop i < n:
+            sorted = do fdBackendsInsert(sorted, backends[i])
+            i = i + 1
+        let fleet = FdFleet{keyspace: keyspace, routing: routing, backends: sorted}
+        if n == 0:
+            return FdFleetResult{ok: false, err: "facetql endpoint misconfigured: a front door with no backends can serve nothing", fleet: fleet}
+        return FdFleetResult{ok: true, err: "", fleet: fleet}
+
+    proc fdBackendIndex(backends: [FdBackend], id: text) -> int:
+        let n = len(backends)
+        let mut i = 0
+        loop i < n:
+            if backends[i].id == id:
+                return i
+            i = i + 1
+        return -1
+
+    # The door's two cells: what it serves, and how.
+    shared fdFleet: FdFleet
+    shared fdConfig: FdConfig
+
+    # fdInstall: set the door up before its daemon starts (an `on start`
+    # job's action, or a test, calls this through a proc).
+    proc fdInstall(config: FdConfig, fleet: FdFleet):
+        fdConfig = config
+        fdFleet = fleet
+
+    # fdPublishRouting: `FrontDoor::publish_routing` — the control loop's
+    # decisions reaching real traffic. In-flight requests keep the answer
+    # they already resolved; the next resolution reads the new table.
+    proc fdPublishRouting(routing: TableRoutingTable):
+        let f = fdFleet
+        fdFleet = FdFleet{keyspace: f.keyspace, routing: routing, backends: f.backends}
+
+    # fdPublishKeyspace: `FrontDoor::publish_keyspace`.
+    proc fdPublishKeyspace(keyspace: PlanKeyspace):
+        let f = fdFleet
+        fdFleet = FdFleet{keyspace: keyspace, routing: f.routing, backends: f.backends}
+
+    # fdPublishBackend: `FrontDoor::publish_backend` — add or replace one
+    # backend's address without a restart.
+    proc fdPublishBackend(backend: FdBackend):
+        let f = fdFleet
+        let bs = do fdBackendsInsert(f.backends, backend)
+        fdFleet = FdFleet{keyspace: f.keyspace, routing: f.routing, backends: bs}
+
+    # fdGeneration: `FrontDoor::generation`.
+    proc fdGeneration() -> int:
+        let f = fdFleet
+        return f.routing.generation
+
+    # ============================================================
+    # RESPONSES
+    # ============================================================
+    proc fdWithRetryAfter(r: HttpServerResponse) -> HttpServerResponse:
+        return HttpServerResponse{status: r.status, reason: "", headers: append(r.headers, HttpHeader{name: "retry-after", value: "1"}), body: r.body}
+
+    # fdRefuse: `refuse` — a plan's refusal, in its own status and words.
+    proc fdRefuse(refusal: PlanRefusal) -> HttpServerResponse:
+        let status = do planRefusalStatus(refusal)
+        let msg = do planRefusalDisplay(refusal)
+        let r = do httpServerPlain(status, msg)
+        return r
+
+    # fdBadGateway: `bad_gateway` — every unreachable backend named, and
+    # Retry-After, because a backend coming back is worth waiting for.
+    proc fdBadGateway(messages: [text]) -> HttpServerResponse:
+        let r = do httpServerPlain(502, "fabric front door: " + join(messages, "; "))
+        let out = do fdWithRetryAfter(r)
+        return out
+
+    # ============================================================
+    # THE ROUTING-FAILURE TABLE
+    # ============================================================
+    struct FdStatus:
+        status: int
+        retryable: bool
+
+    # fdRoutingStatus: `routing_status` — the whole mapping in one place.
+    # Only UnknownNode is a 500: Fabric disagreeing with itself.
+    proc fdRoutingStatus(e: RoutingError) -> FdStatus:
+        let k = e.kind
+        if k == "WriteFenced" || k == "NoWritableReplica" || k == "NoLiveOwner" || k == "NoReadableReplica":
+            return FdStatus{status: 503, retryable: true}
+        if k == "UnknownShard" || k == "InvalidCoordinate":
+            return FdStatus{status: 421, retryable: false}
+        if k == "InvalidAddress" || k == "InvalidRange":
+            return FdStatus{status: 400, retryable: false}
+        return FdStatus{status: 500, retryable: false}
+
+    # FdDoorError: `DoorError` — kind "Refuse" (refusal), "Routing"
+    # (routing) or "NoBackendUrl" (node).
+    struct FdDoorError:
+        kind: text
+        refusal: PlanRefusal
+        routing: RoutingError
+        node: text
+
+    # fdDoorErrorResponse: `DoorError::into_response`.
+    proc fdDoorErrorResponse(e: FdDoorError) -> HttpServerResponse:
+        if e.kind == "Refuse":
+            let r = do fdRefuse(e.refusal)
+            return r
+        if e.kind == "Routing":
+            let st = do fdRoutingStatus(e.routing)
+            let msg = do routingErrorMessage(e.routing)
+            let r = do httpServerPlain(st.status, "fabric front door: " + msg)
+            if st.retryable:
+                let rr = do fdWithRetryAfter(r)
+                return rr
+            return r
+        let r = do httpServerPlain(503, "fabric front door: node '" + e.node + "' serves this request but has no registered address; the fleet knows who should answer and not how to reach them")
+        let rr = do fdWithRetryAfter(r)
+        return rr
+
+    # ============================================================
+    # RESOLUTION: a plan's keys through the live routing table
+    # ============================================================
+    # fdRoutingKeyOf: fabric.fct's packed key (`shard_id * 156 +
+    # coordinate.index()`) as fabric_routing's RoutingKey.
+    proc fdRoutingKeyOf(packed: int) -> RoutingKey:
+        let idx = packed % 156
+        return RoutingKey{shardId: packed / 156, coordinate: Coordinate{x: idx % 12, y: idx / 12}}
+
+    # fdRouteIntentOf: fabric_plan's intent as fabric_routing's (codes
+    # 0=Primary 1=AnyFresh 2=PreferRegion 3=AnyCopy).
+    proc fdRouteIntentOf(intent: PlanRouteIntent) -> RouteIntent:
+        let code = intent.readPref.code
+        let mut kind = "Primary"
+        if code == 1:
+            kind = "AnyFresh"
+        if code == 2:
+            kind = "PreferRegion"
+        if code == 3:
+            kind = "AnyCopy"
+        return RouteIntent{isWrite: intent.isWrite, readPref: ReadPreference{kind: kind, region: intent.readPref.region}}
+
+    struct FdResolved:
+        ok: bool
+        backend: FdBackend
+        err: FdDoorError
+
+    proc fdResolvedErr(e: FdDoorError) -> FdResolved:
+        return FdResolved{ok: false, backend: FdBackend{id: "", baseUrl: ""}, err: e}
+
+    proc fdNoDoorError() -> FdDoorError:
+        let none = do planRefusalNone()
+        let noErr = do routingErrorNone()
+        return FdDoorError{kind: "", refusal: none, routing: noErr, node: ""}
+
+    # fdResolveOnce: `resolve_once` — every key against ONE snapshot of the
+    # fleet, so a batch is never judged colocated across a table swap. Keys
+    # that land on two nodes are refused having forwarded nothing, naming
+    # the two origins that collided.
+    proc fdResolveOnce(fleet: FdFleet, keys: [PlanKeyIntent]) -> FdResolved:
+        let none = do fdNoDoorError()
+        let mut chosen = ""
+        let mut firstOrigin = ""
+        let mut nodes = []
+        let n = len(keys)
+        let mut i = 0
+        loop i < n:
+            let k = keys[i]
+            let key = do fdRoutingKeyOf(k.key)
+            let intent = do fdRouteIntentOf(k.intent)
+            let res = do tableResolve(fleet.routing, RouteRequest{key: key, intent: intent})
+            if !res.ok:
+                let r = do fdResolvedErr(FdDoorError{kind: "Routing", refusal: none.refusal, routing: res.err, node: ""})
+                return r
+            let node = res.route.node
+            let mut seen = false
+            let mut j = 0
+            loop j < len(nodes):
+                if nodes[j] == node:
+                    seen = true
+                j = j + 1
+            if !seen:
+                nodes = append(nodes, node)
+            if i == 0:
+                chosen = node
+                firstOrigin = k.origin
+            else:
+                if node != chosen:
+                    let refusal = do planRefusalSpansBackends(firstOrigin + " and " + k.origin, nodes)
+                    let r = do fdResolvedErr(FdDoorError{kind: "Refuse", refusal: refusal, routing: none.routing, node: ""})
+                    return r
+            i = i + 1
+        let at = do fdBackendIndex(fleet.backends, chosen)
+        if at < 0:
+            let r = do fdResolvedErr(FdDoorError{kind: "NoBackendUrl", refusal: none.refusal, routing: none.routing, node: chosen})
+            return r
+        return FdResolved{ok: true, backend: fleet.backends[at], err: none}
+
+    # fdResolveColocated: `resolve_colocated` — resolve_once, re-reading the
+    # live fleet each attempt, absorbing a cutover fence for up to the
+    # budget. Retrying is safe because the fence is met while RESOLVING:
+    # nothing has been forwarded, so a retry is a first send.
+    proc fdResolveColocated(keys: [PlanKeyIntent]) -> FdResolved:
+        let config = fdConfig
+        let deadline = monoMs() + config.fenceRetryBudgetMs
+        loop true:
+            let fleet = fdFleet
+            let attempt = do fdResolveOnce(fleet, keys)
+            let fenced = !attempt.ok && attempt.err.kind == "Routing" && attempt.err.routing.kind == "WriteFenced"
+            if fenced && monoMs() < deadline:
+                let slept = sleepMs(config.fenceRetryIntervalMs)
+            else:
+                return attempt
+        let never = do fdResolveOnce(fdFleet, keys)
+        return never
+
+    # ============================================================
+    # THE CREDENTIAL
+    # ============================================================
+    # fdCarriesCredential: `carries_credential` — an x-api-key header, or
+    # the `?key=` fallback browser EventSource needs, non-empty. Its
+    # validity is FacetQL's to judge; the door has no user store.
+    proc fdCarriesCredential(headers: [HttpHeader], hasQuery: bool, query: text) -> bool:
+        let has = do httpHasHeader(headers, "x-api-key")
+        if has:
+            return true
+        if !hasQuery:
+            return false
+        let pairs = split(query, "&")
+        let n = len(pairs)
+        let mut i = 0
+        loop i < n:
+            let p = pairs[i]
+            let eq = do indexOf(p, "=")
+            if eq >= 0:
+                if slice(p, 0, eq) == "key" && eq + 1 < len(p):
+                    return true
+            i = i + 1
+        return false
+
+    # ============================================================
+    # THE PROXY: forwarding, agreement, headers
+    # ============================================================
+    # fdIsHopByHop: headers that describe one hop and must not be copied onto
+    # the next (ASCII case-insensitive).
+    proc fdIsHopByHop(name: text) -> bool:
+        let l = lower(name)
+        return l == "connection" || l == "keep-alive" || l == "proxy-authenticate" || l == "proxy-authorization" || l == "te" || l == "trailer" || l == "transfer-encoding" || l == "upgrade"
+
+    # fdOutboundHeaders: a client's headers as they go to a backend — every
+    # end-to-end header, x-api-key included, unread and unmodified; not the
+    # hop-by-hop ones, not `host` (the outbound one is the backend's), and
+    # not `content-length`, which http_client.fct re-frames from the body it
+    # actually sends (reqwest does the same when it is handed a body).
+    proc fdOutboundHeaders(headers: [HttpHeader]) -> [HttpHeader]:
+        let mut out = []
+        let n = len(headers)
+        let mut i = 0
+        loop i < n:
+            let h = headers[i]
+            let l = lower(h.name)
+            let hop = do fdIsHopByHop(l)
+            if !hop && l != "host" && l != "content-length":
+                out = append(out, h)
+            i = i + 1
+        return out
+
+    # fdInboundHeaders: a backend's headers as they go back to the client —
+    # everything but hop-by-hop and content-length (the body is re-framed
+    # onto a different connection; a stale length is unparseable).
+    proc fdInboundHeaders(headers: [HttpHeader]) -> [HttpHeader]:
+        let mut out = []
+        let n = len(headers)
+        let mut i = 0
+        loop i < n:
+            let h = headers[i]
+            let hop = do fdIsHopByHop(h.name)
+            if !hop && lower(h.name) != "content-length":
+                out = append(out, h)
+            i = i + 1
+        return out
+
+    # FdUpstream: `Result<Upstream, Unreachable>` flattened — ok false is a
+    # backend that could not be reached at all (message says how), distinct
+    # from one that answered with a refusal, which is a response to relay.
+    struct FdUpstream:
+        ok: bool
+        node: text
+        status: int
+        headers: [HttpHeader]
+        body: text
+        message: text
+
+    # fdForward: `proxy::forward` — one request to one backend, its whole
+    # answer read.
+    proc fdForward(node: text, baseUrl: text, method: text, target: text, headers: [HttpHeader], body: text, timeoutMs: int) -> FdUpstream uses io.net:
+        let hs = do fdOutboundHeaders(headers)
+        let r = do httpExchange(HttpRequest{method: method, url: baseUrl + target, headers: hs, body: body, timeoutMs: timeoutMs})
+        if !r.ok:
+            return FdUpstream{ok: false, node: node, status: 0, headers: [], body: "", message: "'" + node + "' at " + baseUrl + " did not answer: " + r.err}
+        let back = do fdInboundHeaders(r.headers)
+        return FdUpstream{ok: true, node: node, status: r.status, headers: back, body: r.body, message: ""}
+
+    proc fdUpstreamResponse(u: FdUpstream) -> HttpServerResponse:
+        return HttpServerResponse{status: u.status, reason: "", headers: u.headers, body: u.body}
+
+    proc fdIsSuccess(status: int) -> bool:
+        return status >= 200 && status < 300
+
+    # fdJsonEqual: serde_json's `Value == Value` — structural, object
+    # members compared by key (fjParse keeps them sorted), numbers by kind
+    # and value (1 and 1.0 differ; 0.0 and -0.0 do not).
+    proc fdJsonEqual(a: FqJ, b: FqJ) -> bool:
+        if a.kind != b.kind:
+            return false
+        if a.kind == "null":
+            return true
+        if a.kind == "bool":
+            return a.b == b.b
+        if a.kind == "int" || a.kind == "str":
+            return a.s == b.s
+        if a.kind == "float":
+            return a.f == b.f
+        let n = len(a.items)
+        if n != len(b.items):
+            return false
+        let mut i = 0
+        loop i < n:
+            if a.kind == "obj" && a.keys[i] != b.keys[i]:
+                return false
+            let same = do fdJsonEqual(a.items[i], b.items[i])
+            if !same:
+                return false
+            i = i + 1
+        return true
+
+    proc fdSortTexts(items0: [text]) -> [text]:
+        let mut items = items0
+        let n = len(items)
+        let mut i = 1
+        loop i < n:
+            let v = items[i]
+            let mut j = i - 1
+            loop j >= 0 && items[j] > v:
+                items[j + 1] = items[j]
+                j = j - 1
+            items[j + 1] = v
+            i = i + 1
+        return items
+
+    proc fdItemTexts(v: FqJ) -> [text]:
+        let mut out = []
+        let n = len(v.items)
+        let mut i = 0
+        loop i < n:
+            let t = do fjText(v.items[i])
+            out = append(out, t)
+            i = i + 1
+        let sorted = do fdSortTexts(out)
+        return sorted
+
+    # fdAnswersAgree: `proxy::answers_agree` — same status, then: two JSON
+    # arrays as multisets of their items' serializations (two instances
+    # listing the same indexes in a different order agree), any other two
+    # JSON values structurally, and anything not JSON by its bytes.
+    proc fdAnswersAgree(leftStatus: int, leftBody: text, rightStatus: int, rightBody: text) -> bool:
+        if leftStatus != rightStatus:
+            return false
+        let l = do fjParse(leftBody)
+        let r = do fjParse(rightBody)
+        if l.ok && r.ok:
+            if l.v.kind == "arr" && r.v.kind == "arr":
+                let lt = do fdItemTexts(l.v)
+                let rt = do fdItemTexts(r.v)
+                if len(lt) != len(rt):
+                    return false
+                let mut i = 0
+                loop i < len(lt):
+                    if lt[i] != rt[i]:
+                        return false
+                    i = i + 1
+                return true
+            let eq = do fdJsonEqual(l.v, r.v)
+            return eq
+        return leftBody == rightBody
+
+    # ============================================================
+    # BROADCAST
+    # ============================================================
+    # fdBroadcast: `broadcast` — to every REGISTERED backend (a declaration
+    # every instance must carry, a liveness probe that answers for the
+    # fleet), not only those routing resolves to. Any unreachable backend is
+    # a 502 naming it; any refusal is relayed verbatim; a read that must
+    # agree and does not is a 409 naming the two instances.
+    proc fdBroadcast(agreement: int, what: text, method: text, target: text, headers: [HttpHeader], body: text) -> HttpServerResponse uses io.net:
+        let fleet = fdFleet
+        let config = fdConfig
+        let backends = fleet.backends
+        let mut answers = []
+        let mut unreachable = []
+        let n = len(backends)
+        let mut i = 0
+        loop i < n:
+            let b = backends[i]
+            let u = do fdForward(b.id, b.baseUrl, method, target, headers, body, config.upstreamTimeoutMs)
+            if u.ok:
+                answers = append(answers, u)
+            else:
+                unreachable = append(unreachable, u.message)
+            i = i + 1
+        if len(unreachable) > 0:
+            let r = do fdBadGateway(unreachable)
+            return r
+        let mut k = 0
+        loop k < len(answers):
+            let ok = do fdIsSuccess(answers[k].status)
+            if !ok:
+                let r = do fdUpstreamResponse(answers[k])
+                return r
+            k = k + 1
+        let first = answers[0]
+        if agreement == 0:
+            let mut j = 1
+            loop j < len(answers):
+                let agree = do fdAnswersAgree(first.status, first.body, answers[j].status, answers[j].body)
+                if !agree:
+                    let r = do httpServerPlain(409, "fabric front door: " + what + " does not agree across the fleet: '" + first.node + "' and '" + answers[j].node + "' returned different answers. This is a real divergence between instances, not a tie to break — reconcile them rather than reading one of them as the fleet's answer.")
+                    return r
+                j = j + 1
+        let r = do fdUpstreamResponse(first)
+        return r
+
+    # ============================================================
+    # SSE FAN-IN
+    # ============================================================
+    # fdFrameEnd: `frame_end` — the index just past the blank line ending
+    # the first SSE event in bs, or -1.
+    proc fdFrameEnd(bs: [int]) -> int:
+        let n = len(bs)
+        let mut i = 0
+        loop i + 1 < n:
+            if bs[i] == 10 && bs[i + 1] == 10:
+                return i + 2
+            if i + 3 < n && bs[i] == 13 && bs[i + 1] == 10 && bs[i + 2] == 13 && bs[i + 3] == 10:
+                return i + 4
+            i = i + 1
+        return -1
+
+    # FdStream: one opened upstream subscription — http_client.fct's
+    # HttpStream (head read, body left on the wire) and the backend it is.
+    struct FdStream:
+        node: text
+        stream: HttpStream
+
+    struct FdOpened:
+        ok: bool
+        stream: FdStream
+        message: text
+
+    # fdOpenStream: `proxy::open_stream`. A non-2xx answer is read whole and
+    # fails the subscription, naming the status and what the backend said.
+    # The stream is read with the runtime's largest per-read deadline — see
+    # this file's header.
+    proc fdOpenStream(node: text, baseUrl: text, method: text, target: text, headers: [HttpHeader]) -> FdOpened uses io.net:
+        let hs = do fdOutboundHeaders(headers)
+        let s = do httpOpenStream(HttpRequest{method: method, url: baseUrl + target, headers: hs, body: "", timeoutMs: 600000})
+        if !s.ok:
+            return FdOpened{ok: false, stream: FdStream{node: node, stream: s}, message: "'" + node + "' at " + baseUrl + " did not answer: " + s.err}
+        let ok = do fdIsSuccess(s.status)
+        if !ok:
+            let closed = closeConn(s.conn)
+            return FdOpened{ok: false, stream: FdStream{node: node, stream: s}, message: "'" + node + "' refused the subscription (" + s.status + "): " + bytesToText(s.data)}
+        return FdOpened{ok: true, stream: FdStream{node: node, stream: s}, message: ""}
+
+    # fdStreamReader: `frames` — one upstream re-framed into whole SSE
+    # events, each sent on ch as "F<frame>" before anything reaches the
+    # client, so two backends emitting at once never splice a frame. It
+    # ends with exactly one "E<why>" message: the upstream ended, failed,
+    # or was shut from outside (fdMerge, tearing the subscription down).
+    proc fdStreamReader(fs: FdStream, ch: int) -> int uses io.net:
+        let mut st = fs.stream
+        let mut body = []
+        let mut sent = 0
+        loop true:
+            body = body + st.data
+            st = httpStreamWithData(st, [])
+            let mut end = do fdFrameEnd(body)
+            loop end >= 0:
+                let ok = send(ch, "F" + bytesToText(httpBytesRange(body, 0, end)))
+                sent = sent + 1
+                body = httpBytesRange(body, end, len(body))
+                end = do fdFrameEnd(body)
+            if st.ended:
+                if st.endErr != "":
+                    let e = send(ch, "Efabric front door: the event stream from '" + fs.node + "' failed (" + st.endErr + "); this merged stream is no longer complete")
+                    return sent
+                let e = send(ch, "Efabric front door: the event stream from '" + fs.node + "' ended; this merged stream is no longer complete")
+                return sent
+            let chunk = readBytes(st.conn, 65536)
+            if len(chunk) == 0:
+                st = httpStreamEnd(st, connError(st.conn))
+            else:
+                st = httpStreamDeframe(httpStreamWithRaw(st, st.raw + chunk))
+        return sent
+
+    # fdMerge: `merge_events` — frames from every reader written to the
+    # client as they arrive, each as one chunk. The first upstream to end
+    # ends the merge: every upstream's reads are shut (fdStreamReader then
+    # sends its one end message), every reader is heard from, and the
+    # client's stream is cut WITHOUT the terminating chunk — a truncated
+    # stream a client reconnects from, never one that looks complete while
+    # silently missing an instance. A client that goes away does the same.
+    proc fdMerge(client: int, ch: int, streams: [FdStream]) -> int uses io.net, io.net.listen:
+        let n = len(streams)
+        let mut ends = 0
+        let mut open = true
+        loop open:
+            let msg = recv(ch)
+            if charAt(msg, 0) == "E":
+                ends = ends + 1
+                open = false
+            else:
+                let ok = do httpServerWriteChunk(client, textToBytes(slice(msg, 1, len(msg))))
+                if !ok:
+                    open = false
+        let mut i = 0
+        loop i < n:
+            let shut = shutdownConn(streams[i].stream.conn)
+            i = i + 1
+        loop ends < n:
+            let msg = recv(ch)
+            if charAt(msg, 0) == "E":
+                ends = ends + 1
+        return ends
+
+    # fdFanIn: one reader spawned per upstream and joined — structured, a
+    # level of recursion per stream since each handle is joined in the block
+    # that spawned it — with the merge running at the innermost level.
+    proc fdFanIn(client: int, ch: int, streams: [FdStream], i: int) -> int uses io.net, io.net.listen:
+        if i >= len(streams):
+            let ends = do fdMerge(client, ch, streams)
+            return ends
+        let h = spawn fdStreamReader(streams[i], ch)
+        let inner = do fdFanIn(client, ch, streams, i + 1)
+        let frames = join h
+        return inner
+
+    proc fdCloseStreams(streams: [FdStream]) -> int uses io.net:
+        let mut i = 0
+        loop i < len(streams):
+            let closed = closeConn(streams[i].stream.conn)
+            i = i + 1
+        return i
+
+    # fdSubscribe: `subscribe` — every backend's stream opened, or none: one
+    # refusing (or down) fails the whole subscription with a 502, and the
+    # streams opened so far are dropped with it. Answers false when the
+    # client connection is finished with (the merged stream always is).
+    proc fdSubscribe(client: int, method: text, target: text, headers: [HttpHeader]) -> bool uses io.net, io.net.listen:
+        let fleet = fdFleet
+        let backends = fleet.backends
+        let mut streams = []
+        let n = len(backends)
+        let mut i = 0
+        loop i < n:
+            let b = backends[i]
+            let o = do fdOpenStream(b.id, b.baseUrl, method, target, headers)
+            if !o.ok:
+                let closed = do fdCloseStreams(streams)
+                let r = do fdBadGateway([o.message])
+                let wrote = do httpServerWriteResponse(client, method, r, true)
+                return wrote
+            streams = append(streams, o.stream)
+            i = i + 1
+        let wrote = do httpServerStartStream(client, 200, [HttpHeader{name: "content-type", value: "text/event-stream"}, HttpHeader{name: "cache-control", value: "no-cache"}])
+        if wrote:
+            let ch = channel()
+            let ends = do fdFanIn(client, ch, streams, 0)
+        let closed = do fdCloseStreams(streams)
+        return false
+
+    # ============================================================
+    # DISPATCH: the one handler
+    # ============================================================
+    # FdRouted: what the door will do with one request — `plan` (valid only
+    # when checked) or the response already decided without one.
+    struct FdRouted:
+        decided: bool
+        response: HttpServerResponse
+        plan: PlanValue
+
+    # fdRoute: `dispatch`'s front half — the credential check (before any
+    # route is resolved: a caller FacetQL would turn away never costs a
+    # lookup or learns which shards exist), then the plan against the
+    # current keyspace.
+    proc fdRoute(req: HttpServerRequest) -> FdRouted:
+        if req.path != "/":
+            let has = do fdCarriesCredential(req.headers, req.hasQuery, req.query)
+            if !has:
+                let missing = do planRefusalMissingCredential()
+                let r = do fdRefuse(missing)
+                let refused = do planValueRefuse(missing)
+                return FdRouted{decided: true, response: r, plan: refused}
+        let fleet = fdFleet
+        let config = fdConfig
+        let plan = do planRequest(req.method, req.path, req.hasQuery, req.query, req.body, fleet.keyspace, config.readPref)
+        if plan.kind == 3:
+            let r = do fdRefuse(plan.refusal)
+            return FdRouted{decided: true, response: r, plan: plan}
+        let none = do httpServerPlain(500, "")
+        return FdRouted{decided: false, response: none, plan: plan}
+
+    # fdDispatch: `dispatch`'s back half for a colocated or broadcast plan —
+    # resolve and forward, or broadcast.
+    proc fdDispatch(req: HttpServerRequest, plan: PlanValue) -> HttpServerResponse uses io.net:
+        let config = fdConfig
+        if plan.kind == 0:
+            let resolved = do fdResolveColocated(plan.keys)
+            if !resolved.ok:
+                let r = do fdDoorErrorResponse(resolved.err)
+                return r
+            let b = resolved.backend
+            let u = do fdForward(b.id, b.baseUrl, req.method, req.target, req.headers, req.body, config.upstreamTimeoutMs)
+            if !u.ok:
+                let r = do fdBadGateway([u.message])
+                return r
+            let r = do fdUpstreamResponse(u)
+            return r
+        let r = do fdBroadcast(plan.broadcastAgreement, plan.broadcastWhat, req.method, req.target, req.headers, req.body)
+        return r
+
+    # fdServeConn: one client connection, request after request, for as long
+    # as it keeps the connection alive — on its own detached task, so no
+    # other connection waits on it.
+    proc fdServeConn(c: int) uses io.net, io.net.listen:
+        let config = fdConfig
+        let mut pending = []
+        let mut open = true
+        loop open:
+            let req = do httpServerReadRequest(c, pending, config.maxBodyBytes)
+            if req.state == 0:
+                open = false
+            if req.state == -1:
+                let refused = do httpServerRefuse(c, 400, "bad request: " + req.err)
+                return
+            if req.state == -2:
+                let refused = do httpServerRefuse(c, 413, "request body exceeds the " + config.maxBodyBytes + " byte limit")
+                return
+            if req.state == 1:
+                pending = req.rest
+                let keep = do httpServerKeepAlive(req)
+                let routed = do fdRoute(req)
+                if routed.decided:
+                    let wrote = do httpServerWriteResponse(c, req.method, routed.response, keep)
+                    open = wrote && keep
+                else:
+                    if routed.plan.kind == 2:
+                        let again = do fdSubscribe(c, req.method, req.target, req.headers)
+                        open = again && keep
+                    else:
+                        let r = do fdDispatch(req, routed.plan)
+                        let wrote = do httpServerWriteResponse(c, req.method, r, keep)
+                        open = wrote && keep
+        let closed = closeConn(c)
+
+    # FrontDoor: the server — `FrontDoor::serve`. Every accepted connection
+    # is handed to its own concurrently running fdServeConn.
+    daemon FrontDoor uses io.net, io.net.listen:
+        let config = fdConfig
+        let l = listen(config.port)
+        loop true:
+            let c = accept(l)
+            detach fdServeConn(c)

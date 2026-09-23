@@ -213,9 +213,9 @@ func genGoMessage(b *strings.Builder, m ir.WireMessage, enums map[string]bool) {
 	fmt.Fprintf(b, "func (m %s) MarshalJSON() ([]byte, error) {\n", m.Name)
 	b.WriteString("\tswitch m.Type {\n")
 	for _, v := range m.Variants {
-		fmt.Fprintf(b, "\tcase %q:\n", v.Name)
+		fmt.Fprintf(b, "\tcase %q:\n", v.WireName())
 		b.WriteString("\t\treturn json.Marshal(struct {\n")
-		b.WriteString("\t\t\tType string `json:\"type\"`\n")
+		fmt.Fprintf(b, "\t\t\tType string `json:\"%s\"`\n", m.TagName())
 		for _, f := range v.Fields {
 			fmt.Fprintf(b, "\t\t\t%s %s `json:\"%s%s\"`\n", snakeToUpperCamel(f.Name), goFieldType(f, enums), f.Name, jsonTag(f))
 		}
@@ -233,11 +233,11 @@ func genGoMessage(b *strings.Builder, m ir.WireMessage, enums map[string]bool) {
 	// variant's fields — a decode of one variant never populates another
 	// variant's fields with a zero value that looks like real data.
 	fmt.Fprintf(b, "func (m *%s) UnmarshalJSON(data []byte) error {\n", m.Name)
-	b.WriteString("\tvar probe struct {\n\t\tType string `json:\"type\"`\n\t}\n")
+	fmt.Fprintf(b, "\tvar probe struct {\n\t\tType string `json:\"%s\"`\n\t}\n", m.TagName())
 	b.WriteString("\tif err := json.Unmarshal(data, &probe); err != nil {\n\t\treturn err\n\t}\n")
 	b.WriteString("\tswitch probe.Type {\n")
 	for _, v := range m.Variants {
-		fmt.Fprintf(b, "\tcase %q:\n", v.Name)
+		fmt.Fprintf(b, "\tcase %q:\n", v.WireName())
 		b.WriteString("\t\tvar v struct {\n")
 		for _, f := range v.Fields {
 			fmt.Fprintf(b, "\t\t\t%s %s `json:\"%s%s\"`\n", snakeToUpperCamel(f.Name), goFieldType(f, enums), f.Name, jsonTag(f))

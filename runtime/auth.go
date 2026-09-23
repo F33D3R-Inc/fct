@@ -3,8 +3,6 @@ package runtime
 import (
 	"net/http"
 	"time"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
 // Built-in authentication and the account lifecycle. When an app declares
@@ -93,9 +91,9 @@ func (s *Server) authSignup(w http.ResponseWriter, sid, username, password strin
 		http.Error(w, "username and password are required", http.StatusBadRequest)
 		return
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := hashPassword(password)
 	if err != nil {
-		http.Error(w, "could not create account", http.StatusInternalServerError)
+		http.Error(w, "password "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	verifyToken := randomToken(24)
@@ -113,7 +111,7 @@ func (s *Server) authSignup(w http.ResponseWriter, sid, username, password strin
 	s.nextID[reservedUserEntity]++
 	row := record{
 		"id": s.nextID[reservedUserEntity], "username": username,
-		"password": string(hash), "role": role, "email": "",
+		"password": hash, "role": role, "email": "",
 		"verified": false, "verifyToken": hashToken(verifyToken),
 		"resetToken": "", "resetExpires": 0, "mfaSecret": "", "mfaEnabled": false,
 	}
@@ -145,7 +143,7 @@ func (s *Server) authLogin(w http.ResponseWriter, sid, username, password string
 	s.mu.Lock()
 	u := s.findUser(username)
 	s.mu.Unlock()
-	if u == nil || bcrypt.CompareHashAndPassword([]byte(toStr(u["password"])), []byte(password)) != nil {
+	if u == nil || !passwordMatches(toStr(u["password"]), password) {
 		s.lockout.fail(username)
 		s.recordAudit(username, "login", false, "bad credentials")
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
@@ -292,16 +290,16 @@ func (s *Server) authResetPassword(w http.ResponseWriter, username, token, passw
 		http.Error(w, "a new password is required", http.StatusBadRequest)
 		return
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := hashPassword(password)
 	if err != nil {
-		http.Error(w, "could not reset password", http.StatusInternalServerError)
+		http.Error(w, "password "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	s.mu.Lock()
 	u := s.findUser(username)
 	ok := u != nil && tokenEqual(token, toStr(u["resetToken"])) && int64(toInt(u["resetExpires"])) > time.Now().Unix()
 	if ok {
-		u["password"] = string(hash)
+		u["password"] = hash
 		u["resetToken"] = ""
 		u["resetExpires"] = 0
 		s.persist(s.store.Save(reservedUserEntity, u))

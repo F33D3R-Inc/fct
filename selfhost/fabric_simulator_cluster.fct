@@ -1,0 +1,797 @@
+import "fabric_simulator_base.fct"
+import "fabric_controller_plan.fct"
+
+app FabricSimulatorClusterSelfHost:
+    # Self-hosting port of fabric/crates/fabric-simulator/src/cluster.rs
+    # (ClusterSpec, SimNode, SimCell, ClusterState) and executor.rs
+    # (SimExecutor — the crate's `PlacementExecutor`). This file sits BELOW
+    # the executor layer: fabric_executor.fct imports it and dispatches its
+    # "simulated-placement" arm to the `simExecutor*` procs here, so the
+    # controller's ordinary submit/advance/abort drive the simulated fleet.
+    # It therefore imports only what cluster.rs/executor.rs themselves use:
+    # the leaf ports (Rng, class_profile — fabric_simulator_base.fct) and
+    # the plan vocabulary the trait speaks (fabric_controller_plan.fct, which
+    # brings ActionTarget/FleetView/NodeStatus, TopologyRegistry,
+    # ObservationShard, Workload and the sorted text sets). It must never
+    # import fabric_controller_core.fct (that imports fabric_executor.fct).
+    #
+    # Conventions (as in fabric_simulator.fct):
+    # 1. `Rc<RefCell<ClusterState>>` -> the SimExecutor OWNS its world
+    #    (`SimExecutor.world`), exactly as fabric-runtime's PlacementMechanism
+    #    owns its PlacementFabric. Every trait method returns the executor
+    #    with the world it edited; the Simulation reads/writes the shared
+    #    world through `simExecutorWorld` / `simExecutorWithWorld`.
+    # 2. `&mut self` -> functional update; `node_mut`/`cell_mut` are the
+    #    `simNodeRebuild`/`simCellRebuild` helpers plus an index
+    #    write-back.
+    # 3. BTreeMap/BTreeSet -> sorted arrays: `nodes` by id, `cells` and
+    #    `jobs` by `actionTargetLess`; replica/staging sets are the sorted
+    #    unique `[text]` of `replicaTextSetInsert/Remove/Contains`.
+    # 4. Option -> `has`/`val`; enums -> text tags (NodeCondition "healthy"|
+    #    "degraded"|"unreachable", PlanPhase "prepare"|"transfer"|"cutover"|
+    #    "cleanup", PlanScope "coordinate").
+    # 5. `Shard` is only read for `id`/`workload_domain`, so
+    #    `ClusterState.shards` holds `ObservationShard{id, workloadDomain}`.
+    # 6. `f64 as u64` (non-negative) -> `floor()`; `saturating_sub` ->
+    #    `max(a - b, 0)`.
+
+    # ============================================================
+    # cluster.rs — ClusterSpec: how to build a cluster. `Default` is
+    # `clusterSpecDefault`, every literal copied from the real impl.
+    # ============================================================
+    struct ClusterSpec:
+        seed: int
+        tickMs: int
+        startMs: int
+        regions: [text]
+        nodesPerRegion: int
+        shardsPerNode: int
+        cellsPerShard: int
+        placementCapacity: int
+        nodeCapacityOps: float
+        classes: [text]
+        transferBytesPerMs: int
+        diurnalPeriodMs: int
+
+    proc clusterSpecDefault() -> ClusterSpec:
+        return ClusterSpec{seed: 1, tickMs: 1000, startMs: 1700000000000, regions: ["us-east", "us-west"], nodesPerRegion: 2, shardsPerNode: 1, cellsPerShard: 6, placementCapacity: 12, nodeCapacityOps: 4000.0, classes: ["ReadHeavy", "WriteHeavy", "Mixed", "EventHeavy", "Realtime"], transferBytesPerMs: 100000, diurnalPeriodMs: 600000}
+
+    proc clusterSpecWithSeed(spec: ClusterSpec, seed: int) -> ClusterSpec:
+        return ClusterSpec{seed: seed, tickMs: spec.tickMs, startMs: spec.startMs, regions: spec.regions, nodesPerRegion: spec.nodesPerRegion, shardsPerNode: spec.shardsPerNode, cellsPerShard: spec.cellsPerShard, placementCapacity: spec.placementCapacity, nodeCapacityOps: spec.nodeCapacityOps, classes: spec.classes, transferBytesPerMs: spec.transferBytesPerMs, diurnalPeriodMs: spec.diurnalPeriodMs}
+
+    proc clusterSpecNodeCount(spec: ClusterSpec) -> int:
+        return len(spec.regions) * spec.nodesPerRegion
+
+    # SimNode: one simulated FacetQL instance. `online` is whether the
+    # process runs; `reachable` whether the Fabric can hear it.
+    struct SimNode:
+        id: DbmsId
+        region: text
+        online: bool
+        reachable: bool
+        placementCapacity: int
+        capacityOps: float
+        servedOps: float
+        cpuUtilization: float
+        memoryUtilization: float
+        queueDepth: int
+
+    proc simNodeNew(id: DbmsId, region: text, placementCapacity: int, capacityOps: float) -> SimNode:
+        return SimNode{id: id, region: region, online: true, reachable: true, placementCapacity: placementCapacity, capacityOps: capacityOps, servedOps: 0.0, cpuUtilization: 0.0, memoryUtilization: 0.0, queueDepth: 0}
+
+    # simNodeRebuild: the `&mut SimNode` write-back (simplification 2).
+    proc simNodeRebuild(n: SimNode, online: bool, reachable: bool, servedOps: float, cpuUtilization: float, memoryUtilization: float, queueDepth: int) -> SimNode:
+        return SimNode{id: n.id, region: n.region, online: online, reachable: reachable, placementCapacity: n.placementCapacity, capacityOps: n.capacityOps, servedOps: servedOps, cpuUtilization: cpuUtilization, memoryUtilization: memoryUtilization, queueDepth: queueDepth}
+
+    # simNodeCondition: `SimNode::condition` — offline or partitioned are
+    # both Unreachable ("silence is silence"); cpu >= 0.95 is Degraded.
+    proc simNodeCondition(n: SimNode) -> text:
+        if !n.online || !n.reachable:
+            return "unreachable"
+        if n.cpuUtilization >= 0.95:
+            return "degraded"
+        return "healthy"
+
+    # SimCell: one placed logical cell and its workload. `replicas` and
+    # `staging` are sorted-unique `[text]` sets (simplification 3).
+    struct SimCell:
+        target: ActionTarget
+        workload: Workload
+        owner: text
+        replicas: [text]
+        staging: [text]
+        scale: float
+        bytes: int
+        hotMultiplier: float
+        hotUntilMs: int
+        phaseOffsetMs: int
+
+    proc simCellRebuild(c: SimCell, owner: text, replicas: [text], staging: [text], hotMultiplier: float, hotUntilMs: int) -> SimCell:
+        return SimCell{target: c.target, workload: c.workload, owner: owner, replicas: replicas, staging: staging, scale: c.scale, bytes: c.bytes, hotMultiplier: hotMultiplier, hotUntilMs: hotUntilMs, phaseOffsetMs: c.phaseOffsetMs}
+
+    proc simCellClass(c: SimCell) -> text:
+        return c.workload.class
+
+    proc simCellProfile(c: SimCell) -> ClassProfile:
+        let profile = do classProfile(c.workload.class)
+        return profile
+
+    # simCellHolders: owner first, then every replica that is not the owner,
+    # in id order (the set is already sorted).
+    proc simCellHolders(c: SimCell) -> [text]:
+        let mut holders = [c.owner]
+        let n = len(c.replicas)
+        let mut i = 0
+        loop i < n:
+            if c.replicas[i] != c.owner:
+                holders = append(holders, c.replicas[i])
+            i = i + 1
+        return holders
+
+    proc simCellOccupies(c: SimCell, node: text) -> bool:
+        if c.owner == node:
+            return true
+        let inReplicas = do replicaTextSetContains(c.replicas, node)
+        if inReplicas:
+            return true
+        let inStaging = do replicaTextSetContains(c.staging, node)
+        return inStaging
+
+    # ClusterState: the mutable world (simplification 3 for the three maps;
+    # simplification 5 for `shards`).
+    struct ClusterState:
+        nodes: [SimNode]
+        cells: [SimCell]
+        shards: [ObservationShard]
+        generation: int
+        transferBytesPerMs: int
+
+    # simNodeArrayInsertSorted: `BTreeMap<String, SimNode>::insert` — keyed
+    # by id, overwriting an equal key, ascending text order.
+    private proc simNodeArrayInsertSorted(nodes: [SimNode], node: SimNode) -> [SimNode]:
+        let n = len(nodes)
+        let mut result = []
+        let mut inserted = false
+        let mut i = 0
+        loop i < n:
+            if !inserted && node.id.value < nodes[i].id.value:
+                result = append(result, node)
+                inserted = true
+            if nodes[i].id.value == node.id.value:
+                if !inserted:
+                    result = append(result, node)
+                    inserted = true
+            else:
+                result = append(result, nodes[i])
+            i = i + 1
+        if !inserted:
+            result = append(result, node)
+        return result
+
+    # simCellArrayInsertSorted: `BTreeMap<ActionTarget, SimCell>::insert`.
+    private proc simCellArrayInsertSorted(cells: [SimCell], cell: SimCell) -> [SimCell]:
+        let n = len(cells)
+        let mut result = []
+        let mut inserted = false
+        let mut i = 0
+        loop i < n:
+            let less = do actionTargetLess(cell.target, cells[i].target)
+            let same = do actionTargetEquals(cell.target, cells[i].target)
+            if !inserted && less:
+                result = append(result, cell)
+                inserted = true
+            if same:
+                if !inserted:
+                    result = append(result, cell)
+                    inserted = true
+            else:
+                result = append(result, cells[i])
+            i = i + 1
+        if !inserted:
+            result = append(result, cell)
+        return result
+
+    # clusterStateBuild: `ClusterState::build` — every draw from
+    # `Rng::new(spec.seed)` in the real loop order (class, scale, phase
+    # offset per cell; regions -> nodes -> shards -> cells), so the port is
+    # reproducible down to which class landed on which cell.
+    proc clusterStateBuild(spec: ClusterSpec) -> ClusterState:
+        let rng0 = do rngNew(spec.seed)
+        let mut rng = rng0
+        let mut nodes = []
+        let mut cells = []
+        let mut shards = []
+        let cellsPerShard = min(spec.cellsPerShard, 156)
+        let mut shardId = 1
+        let mut workloadId = 1
+        let classCount = len(spec.classes)
+        let regionCount = len(spec.regions)
+        let mut r = 0
+        loop r < regionCount:
+            let region = spec.regions[r]
+            let mut index = 0
+            loop index < spec.nodesPerRegion:
+                let id = do dbmsIdNew(region + "-db-" + index)
+                let node = do simNodeNew(id, region, spec.placementCapacity, spec.nodeCapacityOps)
+                let grownNodes = do simNodeArrayInsertSorted(nodes, node)
+                nodes = grownNodes
+                let mut s = 0
+                loop s < spec.shardsPerNode:
+                    let mut cellIndex = 0
+                    loop cellIndex < cellsPerShard:
+                        let coordinate = Coordinate{x: cellIndex % 12, y: cellIndex / 12}
+                        let drawnClass = do rngBelow(rng, max(classCount, 1))
+                        rng = drawnClass.rng
+                        let classIdx = min(drawnClass.value, max(classCount - 1, 0))
+                        let class = spec.classes[classIdx]
+                        let drawnScale = do rngRange(rng, 0.5, 1.5)
+                        rng = drawnScale.rng
+                        let scale = drawnScale.value
+                        let profile = do classProfile(class)
+                        let bytes = floor(toFloat(profile.bytesPerOp) * profile.baseOps * scale * 4.0)
+                        let drawnOffset = do rngBelow(rng, max(spec.diurnalPeriodMs, 1))
+                        rng = drawnOffset.rng
+                        let target = do actionTargetNew(shardId, coordinate)
+                        let workload = do workloadNew(workloadId, class)
+                        let cell = SimCell{target: target, workload: workload, owner: id.value, replicas: [], staging: [], scale: scale, bytes: bytes, hotMultiplier: 1.0, hotUntilMs: 0, phaseOffsetMs: drawnOffset.value}
+                        let grownCells = do simCellArrayInsertSorted(cells, cell)
+                        cells = grownCells
+                        workloadId = workloadId + 1
+                        cellIndex = cellIndex + 1
+                    shards = append(shards, ObservationShard{id: shardId, workloadDomain: region})
+                    shardId = shardId + 1
+                    s = s + 1
+                index = index + 1
+            r = r + 1
+        return ClusterState{nodes: nodes, cells: cells, shards: shards, generation: 1, transferBytesPerMs: max(spec.transferBytesPerMs, 1)}
+
+    # clusterStateEmpty: a world with nothing in it (the `simulated` slot of
+    # an Executor that is not the simulated mechanism).
+    proc clusterStateEmpty() -> ClusterState:
+        return ClusterState{nodes: [], cells: [], shards: [], generation: 0, transferBytesPerMs: 1}
+
+    proc clusterStateGeneration(world: ClusterState) -> int:
+        return world.generation
+
+    proc clusterStateTransferBytesPerMs(world: ClusterState) -> int:
+        return world.transferBytesPerMs
+
+    proc clusterStateNodeIndexOf(nodes: [SimNode], id: text) -> int:
+        let n = len(nodes)
+        let mut i = 0
+        loop i < n:
+            if nodes[i].id.value == id:
+                return i
+            i = i + 1
+        return -1
+
+    struct SimNodeOption:
+        has: bool
+        val: SimNode
+
+    proc clusterStateNode(world: ClusterState, id: text) -> SimNodeOption:
+        let idx = do clusterStateNodeIndexOf(world.nodes, id)
+        if idx == -1:
+            let zero = do simNodeNew(DbmsId{value: ""}, "", 0, 0.0)
+            return SimNodeOption{has: false, val: zero}
+        return SimNodeOption{has: true, val: world.nodes[idx]}
+
+    proc clusterStateCellIndexOf(cells: [SimCell], target: ActionTarget) -> int:
+        let n = len(cells)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(cells[i].target, target)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    struct SimCellOption:
+        has: bool
+        val: SimCell
+
+    private proc simCellZero() -> SimCell:
+        let workload = do workloadNew(0, "Unknown")
+        return SimCell{target: ActionTarget{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}, workload: workload, owner: "", replicas: [], staging: [], scale: 0.0, bytes: 0, hotMultiplier: 1.0, hotUntilMs: 0, phaseOffsetMs: 0}
+
+    proc clusterStateCell(world: ClusterState, target: ActionTarget) -> SimCellOption:
+        let idx = do clusterStateCellIndexOf(world.cells, target)
+        if idx == -1:
+            let zero = do simCellZero()
+            return SimCellOption{has: false, val: zero}
+        return SimCellOption{has: true, val: world.cells[idx]}
+
+    proc clusterStateShardIndexOf(shards: [ObservationShard], shardId: int) -> int:
+        let n = len(shards)
+        let mut i = 0
+        loop i < n:
+            if shards[i].id == shardId:
+                return i
+            i = i + 1
+        return -1
+
+    struct ObservationShardOption:
+        has: bool
+        val: ObservationShard
+
+    proc clusterStateShard(world: ClusterState, shardId: int) -> ObservationShardOption:
+        let idx = do clusterStateShardIndexOf(world.shards, shardId)
+        if idx == -1:
+            return ObservationShardOption{has: false, val: ObservationShard{id: 0, workloadDomain: ""}}
+        return ObservationShardOption{has: true, val: world.shards[idx]}
+
+    # clusterStateHostedPlacements: placements a node holds, staged copies
+    # included.
+    proc clusterStateHostedPlacements(world: ClusterState, node: text) -> int:
+        let n = len(world.cells)
+        let mut count = 0
+        let mut i = 0
+        loop i < n:
+            let occupies = do simCellOccupies(world.cells[i], node)
+            if occupies:
+                count = count + 1
+            i = i + 1
+        return count
+
+    proc clusterStateWithCells(world: ClusterState, cells: [SimCell]) -> ClusterState:
+        return ClusterState{nodes: world.nodes, cells: cells, shards: world.shards, generation: world.generation, transferBytesPerMs: world.transferBytesPerMs}
+
+    proc clusterStateWithNodes(world: ClusterState, nodes: [SimNode]) -> ClusterState:
+        return ClusterState{nodes: nodes, cells: world.cells, shards: world.shards, generation: world.generation, transferBytesPerMs: world.transferBytesPerMs}
+
+    # clusterStateStage: capacity is consumed, traffic is not served.
+    proc clusterStateStage(world: ClusterState, target: ActionTarget, node: text) -> ClusterState:
+        let idx = do clusterStateCellIndexOf(world.cells, target)
+        if idx == -1:
+            return world
+        let cell = world.cells[idx]
+        let staging = do replicaTextSetInsert(cell.staging, node)
+        let rebuilt = do simCellRebuild(cell, cell.owner, cell.replicas, staging, cell.hotMultiplier, cell.hotUntilMs)
+        let mut cells = world.cells
+        cells[idx] = rebuilt
+        let updated = do clusterStateWithCells(world, cells)
+        return updated
+
+    proc clusterStateUnstage(world: ClusterState, target: ActionTarget, node: text) -> ClusterState:
+        let idx = do clusterStateCellIndexOf(world.cells, target)
+        if idx == -1:
+            return world
+        let cell = world.cells[idx]
+        let staging = do replicaTextSetRemove(cell.staging, node)
+        let rebuilt = do simCellRebuild(cell, cell.owner, cell.replicas, staging, cell.hotMultiplier, cell.hotUntilMs)
+        let mut cells = world.cells
+        cells[idx] = rebuilt
+        let updated = do clusterStateWithCells(world, cells)
+        return updated
+
+    # clusterStatePromote: a staged copy becomes a live replica.
+    proc clusterStatePromote(world: ClusterState, target: ActionTarget, node: text) -> ClusterState:
+        let idx = do clusterStateCellIndexOf(world.cells, target)
+        if idx == -1:
+            return world
+        let cell = world.cells[idx]
+        let staging = do replicaTextSetRemove(cell.staging, node)
+        let replicas = do replicaTextSetInsert(cell.replicas, node)
+        let rebuilt = do simCellRebuild(cell, cell.owner, replicas, staging, cell.hotMultiplier, cell.hotUntilMs)
+        let mut cells = world.cells
+        cells[idx] = rebuilt
+        let updated = do clusterStateWithCells(world, cells)
+        return updated
+
+    struct ClusterStateSetOwnerResult:
+        changed: bool
+        world: ClusterState
+
+    # clusterStateSetOwner: move authority — the only operation that changes
+    # the placement map, so the only one that bumps the generation. The
+    # previous owner becomes a replica; the new owner leaves staging and
+    # replicas.
+    proc clusterStateSetOwner(world: ClusterState, target: ActionTarget, node: text) -> ClusterStateSetOwnerResult:
+        let idx = do clusterStateCellIndexOf(world.cells, target)
+        if idx == -1:
+            return ClusterStateSetOwnerResult{changed: false, world: world}
+        let cell = world.cells[idx]
+        if cell.owner == node:
+            return ClusterStateSetOwnerResult{changed: false, world: world}
+        let previous = cell.owner
+        let staging = do replicaTextSetRemove(cell.staging, node)
+        let replicasLess = do replicaTextSetRemove(cell.replicas, node)
+        let replicas = do replicaTextSetInsert(replicasLess, previous)
+        let rebuilt = do simCellRebuild(cell, node, replicas, staging, cell.hotMultiplier, cell.hotUntilMs)
+        let mut cells = world.cells
+        cells[idx] = rebuilt
+        return ClusterStateSetOwnerResult{changed: true, world: ClusterState{nodes: world.nodes, cells: cells, shards: world.shards, generation: world.generation + 1, transferBytesPerMs: world.transferBytesPerMs}}
+
+    # clusterStateDropCopy: the owner is never dropped this way.
+    proc clusterStateDropCopy(world: ClusterState, target: ActionTarget, node: text) -> ClusterState:
+        let idx = do clusterStateCellIndexOf(world.cells, target)
+        if idx == -1:
+            return world
+        let cell = world.cells[idx]
+        let staging = do replicaTextSetRemove(cell.staging, node)
+        let mut replicas = cell.replicas
+        if cell.owner != node:
+            let removed = do replicaTextSetRemove(cell.replicas, node)
+            replicas = removed
+        let rebuilt = do simCellRebuild(cell, cell.owner, replicas, staging, cell.hotMultiplier, cell.hotUntilMs)
+        let mut cells = world.cells
+        cells[idx] = rebuilt
+        let updated = do clusterStateWithCells(world, cells)
+        return updated
+
+    # clusterStateTopology: the placement map as the Fabric would hold it
+    # (simplification 5 for the shard argument).
+    proc clusterStateTopology(world: ClusterState) -> TopologyRegistry:
+        let empty = do topologyRegistryNew()
+        let mut topology = empty
+        let n = len(world.cells)
+        let mut i = 0
+        loop i < n:
+            let cell = world.cells[i]
+            let shardIdx = do clusterStateShardIndexOf(world.shards, cell.target.shardId)
+            let nodeIdx = do clusterStateNodeIndexOf(world.nodes, cell.owner)
+            if shardIdx != -1 && nodeIdx != -1:
+                let node = world.nodes[nodeIdx]
+                let placed = do topologyRegistryPlace(topology, node.id.value, world.shards[shardIdx].id, cell.target.coordinate, node.region)
+                topology = placed
+            i = i + 1
+        return topology
+
+    # clusterStateFleetView: the fleet as the controller would see it.
+    proc clusterStateFleetView(world: ClusterState) -> FleetView:
+        let empty = do fleetViewNew(world.generation)
+        let mut fleet = empty
+        let n = len(world.nodes)
+        let mut i = 0
+        loop i < n:
+            let node = world.nodes[i]
+            let condition = do simNodeCondition(node)
+            let base = do nodeStatusNew(node.id, node.region, condition, node.placementCapacity)
+            let hosted = do clusterStateHostedPlacements(world, node.id.value)
+            let loaded = do nodeStatusWithLoad(base, hosted, node.cpuUtilization, node.memoryUtilization)
+            let inserted = do fleetViewInsert(fleet, loaded)
+            fleet = inserted
+            i = i + 1
+        return fleet
+
+    # clusterStateLeastLoadedNode: the least-loaded healthy node with
+    # headroom, other than `exclude`, by cpu then by id (the array is in id
+    # order and a tie keeps the earlier node: `best_load <= load` skips).
+    proc clusterStateLeastLoadedNode(world: ClusterState, exclude: [text]) -> DbmsIdOption:
+        let n = len(world.nodes)
+        let mut hasBest = false
+        let mut bestId = DbmsId{value: ""}
+        let mut bestLoad = 0.0
+        let mut i = 0
+        loop i < n:
+            let node = world.nodes[i]
+            let excluded = do replicaTextSetContains(exclude, node.id.value)
+            let mut skip = excluded
+            if !skip:
+                let condition = do simNodeCondition(node)
+                if condition != "healthy":
+                    skip = true
+            if !skip:
+                let hosted = do clusterStateHostedPlacements(world, node.id.value)
+                if hosted >= node.placementCapacity:
+                    skip = true
+            if !skip:
+                let load = node.cpuUtilization
+                if !hasBest || load < bestLoad:
+                    hasBest = true
+                    bestId = node.id
+                    bestLoad = load
+            i = i + 1
+        return DbmsIdOption{has: hasBest, val: bestId}
+
+    # ============================================================
+    # executor.rs — SimExecutor: a `PlacementExecutor` backed by the
+    # simulated cluster, owning the world it edits (convention 1).
+    # PREPARE_MS = 2000, CUTOVER_MS = 0, CLEANUP_MS = 1000.
+    # ============================================================
+    struct SimJob:
+        target: ActionTarget
+        hasDestination: bool
+        destination: text
+        hasPhase: bool
+        phase: text
+        phaseStartedAtMs: int
+        cutOver: bool
+
+    private proc simJobNew(target: ActionTarget) -> SimJob:
+        return SimJob{target: target, hasDestination: false, destination: "", hasPhase: false, phase: "", phaseStartedAtMs: 0, cutOver: false}
+
+    struct SimExecutor:
+        world: ClusterState
+        jobs: [SimJob]
+
+    # simExecutorNew: `SimExecutor::new(Rc::clone(&state))`.
+    proc simExecutorNew(world: ClusterState) -> SimExecutor:
+        return SimExecutor{world: world, jobs: []}
+
+    # simExecutorWorld / simExecutorWithWorld: the two halves of the shared
+    # `Rc<RefCell<ClusterState>>` — `borrow()` and a `borrow_mut()` write.
+    proc simExecutorWorld(ex: SimExecutor) -> ClusterState:
+        return ex.world
+
+    proc simExecutorWithWorld(ex: SimExecutor, world: ClusterState) -> SimExecutor:
+        return SimExecutor{world: world, jobs: ex.jobs}
+
+    proc simExecutorName(ex: SimExecutor) -> text:
+        return "simulated-placement"
+
+    # simExecutorSupports: Replicate | Move | Isolate | Colocate. Split is
+    # declined rather than faked; NoAction is nothing to execute.
+    proc simExecutorSupports(ex: SimExecutor, action: OptimizationAction) -> bool:
+        let kind = action.kind
+        return kind == "Replicate" || kind == "Move" || kind == "Isolate" || kind == "Colocate"
+
+    private proc simJobIndexOf(jobs: [SimJob], target: ActionTarget) -> int:
+        let n = len(jobs)
+        let mut i = 0
+        loop i < n:
+            let same = do actionTargetEquals(jobs[i].target, target)
+            if same:
+                return i
+            i = i + 1
+        return -1
+
+    # simJobArrayInsertSorted: `BTreeMap<ActionTarget, SimJob>::insert`.
+    private proc simJobArrayInsertSorted(jobs: [SimJob], job: SimJob) -> [SimJob]:
+        let n = len(jobs)
+        let mut result = []
+        let mut inserted = false
+        let mut i = 0
+        loop i < n:
+            let less = do actionTargetLess(job.target, jobs[i].target)
+            let same = do actionTargetEquals(job.target, jobs[i].target)
+            if !inserted && less:
+                result = append(result, job)
+                inserted = true
+            if same:
+                if !inserted:
+                    result = append(result, job)
+                    inserted = true
+            else:
+                result = append(result, jobs[i])
+            i = i + 1
+        if !inserted:
+            result = append(result, job)
+        return result
+
+    private proc simJobArrayRemoveAt(jobs: [SimJob], idx: int) -> [SimJob]:
+        let n = len(jobs)
+        let mut result = []
+        let mut i = 0
+        loop i < n:
+            if i != idx:
+                result = append(result, jobs[i])
+            i = i + 1
+        return result
+
+    # simExecutorPhaseDurationMs: `phase_duration_ms` — Prepare 2000,
+    # Transfer `max(bytes / max(rate, 1), 1)`, Cutover 0, Cleanup 1000.
+    private proc simExecutorPhaseDurationMs(world: ClusterState, plan: PlacementPlan, phase: text) -> int:
+        if phase == "prepare":
+            return 2000
+        if phase == "transfer":
+            let rate = max(world.transferBytesPerMs, 1)
+            return max(plan.estimatedBytes / rate, 1)
+        if phase == "cutover":
+            return 0
+        return 1000
+
+    struct SimExecutionFaultOption:
+        has: bool
+        fault: ExecutionFault
+
+    # simExecutorCheckDestination: a destination that stopped being usable
+    # (missing or offline) is a `DestinationLost` fault, not something to
+    # wait on. No destination -> Ok.
+    private proc simExecutorCheckDestination(world: ClusterState, hasDestination: bool, destination: text) -> SimExecutionFaultOption:
+        let noFault = do executionFaultInternal("")
+        if !hasDestination:
+            return SimExecutionFaultOption{has: false, fault: noFault}
+        let node = do clusterStateNode(world, destination)
+        if node.has && node.val.online:
+            return SimExecutionFaultOption{has: false, fault: noFault}
+        let lost = do executionFaultDestinationLost(DbmsId{value: destination})
+        return SimExecutionFaultOption{has: true, fault: lost}
+
+    # simExecutorApplyCompletion: `apply_completion` — no job, nothing.
+    # Cutover: with a destination, `set_owner` if the plan removes the
+    # current owner, else `promote`; the job is marked cut over either way.
+    # Cleanup: `drop_copy` for every removed node.
+    private proc simExecutorApplyCompletion(ex: SimExecutor, plan: PlacementPlan, phase: text) -> SimExecutor:
+        let idx = do simJobIndexOf(ex.jobs, plan.target)
+        if idx == -1:
+            return ex
+        let world = ex.world
+        let job = ex.jobs[idx]
+        let mut next = world
+        let mut jobs = ex.jobs
+        if phase == "cutover":
+            if job.hasDestination:
+                let cell = do clusterStateCell(world, plan.target)
+                let mut ownerIsLeaving = false
+                if cell.has:
+                    let m = len(plan.removes)
+                    let mut i = 0
+                    loop i < m:
+                        if plan.removes[i].value == cell.val.owner:
+                            ownerIsLeaving = true
+                        i = i + 1
+                if ownerIsLeaving:
+                    let moved = do clusterStateSetOwner(world, plan.target, job.destination)
+                    next = moved.world
+                else:
+                    let promoted = do clusterStatePromote(world, plan.target, job.destination)
+                    next = promoted
+            jobs[idx] = SimJob{target: job.target, hasDestination: job.hasDestination, destination: job.destination, hasPhase: job.hasPhase, phase: job.phase, phaseStartedAtMs: job.phaseStartedAtMs, cutOver: true}
+        if phase == "cleanup":
+            let m = len(plan.removes)
+            let mut i = 0
+            loop i < m:
+                let dropped = do clusterStateDropCopy(next, plan.target, plan.removes[i].value)
+                next = dropped
+                i = i + 1
+        return SimExecutor{world: next, jobs: jobs}
+
+    # simExecutorPlan: `plan` — the cell must exist; Replicate/Move/Colocate
+    # need the named destination; Isolate picks the least-loaded node not
+    # already holding or staging a copy; anything else is UnsupportedAction.
+    # Replicate is Prepare/Transfer/Cutover with no removes; the rest add
+    # Cleanup and remove the source. Estimate = bytes and 2000 + transfer
+    # (+ 1000 unless replicating).
+    proc simExecutorPlan(ex: SimExecutor, request: PlanRequest) -> PlacementPlanNewResult:
+        let world = ex.world
+        let zero = do placementPlanZero()
+        let cell = do clusterStateCell(world, request.target)
+        if !cell.has:
+            let targetText = do actionTargetDisplay(request.target)
+            let missing = do planErrorInfeasible(targetText + " does not exist")
+            return PlacementPlanNewResult{ok: false, value: zero, err: missing}
+        let kind = request.action.kind
+        let mut destination = ""
+        if kind == "Replicate" || kind == "Move" || kind == "Colocate":
+            if !request.hasDestination:
+                let noDest = do planErrorInfeasible("action names no destination")
+                return PlacementPlanNewResult{ok: false, value: zero, err: noDest}
+            destination = request.destination.value
+        else:
+            if kind == "Isolate":
+                let holders = do simCellHolders(cell.val)
+                let mut exclude = holders
+                let m = len(cell.val.staging)
+                let mut i = 0
+                loop i < m:
+                    exclude = append(exclude, cell.val.staging[i])
+                    i = i + 1
+                let chosen = do clusterStateLeastLoadedNode(world, exclude)
+                if !chosen.has:
+                    let nowhere = do planErrorInfeasible("no healthy node with headroom to isolate onto")
+                    return PlacementPlanNewResult{ok: false, value: zero, err: nowhere}
+                destination = chosen.val.value
+            else:
+                let label = do controllerPlanActionLabel(request.action)
+                let unsupported = do planErrorUnsupportedAction(label)
+                return PlacementPlanNewResult{ok: false, value: zero, err: unsupported}
+        let replicating = kind == "Replicate"
+        let mut phases = ["prepare", "transfer", "cutover"]
+        let mut removes = []
+        if !replicating:
+            phases = ["prepare", "transfer", "cutover", "cleanup"]
+            removes = [DbmsId{value: request.source.dbmsId}]
+        let bytes = cell.val.bytes
+        let transferMs = max(bytes / max(world.transferBytesPerMs, 1), 1)
+        let mut durationMs = 2000 + transferMs + 0
+        if !replicating:
+            durationMs = durationMs + 1000
+        let planned = do placementPlanNew(request.target, request.action, "coordinate", phases, [DbmsId{value: destination}], removes)
+        if !planned.ok:
+            return planned
+        let estimated = do placementPlanWithEstimate(planned.value, bytes, durationMs)
+        let noErr = do planErrorEmptyPlan()
+        return PlacementPlanNewResult{ok: true, value: estimated, err: noErr}
+
+    struct SimExecutorBeginResult:
+        ok: bool
+        fault: ExecutionFault
+        executor: SimExecutor
+
+    # simExecutorBeginPhase: `begin_phase` — destination = plan.adds.first();
+    # a lost destination faults before the job table is touched; the job is
+    # created or updated; Prepare stages the copy on the destination.
+    proc simExecutorBeginPhase(ex: SimExecutor, plan: PlacementPlan, phase: text, atMs: int) -> SimExecutorBeginResult:
+        let world = ex.world
+        let hasDestination = len(plan.adds) > 0
+        let mut destination = ""
+        if hasDestination:
+            destination = plan.adds[0].value
+        let check = do simExecutorCheckDestination(world, hasDestination, destination)
+        if check.has:
+            return SimExecutorBeginResult{ok: false, fault: check.fault, executor: ex}
+        let idx = do simJobIndexOf(ex.jobs, plan.target)
+        let mut cutOver = false
+        if idx != -1:
+            cutOver = ex.jobs[idx].cutOver
+        let job = SimJob{target: plan.target, hasDestination: hasDestination, destination: destination, hasPhase: true, phase: phase, phaseStartedAtMs: atMs, cutOver: cutOver}
+        let jobs = do simJobArrayInsertSorted(ex.jobs, job)
+        let mut next = world
+        if phase == "prepare" && hasDestination:
+            let staged = do clusterStateStage(world, plan.target, destination)
+            next = staged
+        let noFault = do executionFaultInternal("")
+        return SimExecutorBeginResult{ok: true, fault: noFault, executor: SimExecutor{world: next, jobs: jobs}}
+
+    struct SimExecutorPollResult:
+        ok: bool
+        progress: PhaseProgress
+        fault: ExecutionFault
+        executor: SimExecutor
+
+    # simExecutorPollPhase: `poll_phase` — NotStarted unless this exact phase
+    # began; a lost destination faults; Running{elapsed/duration} until the
+    # phase's duration has elapsed, then the completion is applied.
+    proc simExecutorPollPhase(ex: SimExecutor, plan: PlacementPlan, phase: text, atMs: int) -> SimExecutorPollResult:
+        let complete = do phaseProgressComplete()
+        let idx = do simJobIndexOf(ex.jobs, plan.target)
+        let mut started = false
+        if idx != -1:
+            let found = ex.jobs[idx]
+            started = found.hasPhase && found.phase == phase
+        if !started:
+            let notStarted = do executionFaultNotStarted(phase)
+            return SimExecutorPollResult{ok: false, progress: complete, fault: notStarted, executor: ex}
+        let job = ex.jobs[idx]
+        let check = do simExecutorCheckDestination(ex.world, job.hasDestination, job.destination)
+        if check.has:
+            return SimExecutorPollResult{ok: false, progress: complete, fault: check.fault, executor: ex}
+        let durationMs = do simExecutorPhaseDurationMs(ex.world, plan, phase)
+        let elapsedMs = max(atMs - job.phaseStartedAtMs, 0)
+        let noFault = do executionFaultInternal("")
+        if elapsedMs < durationMs:
+            let fraction = toFloat(elapsedMs) / toFloat(durationMs)
+            let running = do phaseProgressRunning(fraction)
+            return SimExecutorPollResult{ok: true, progress: running, fault: noFault, executor: ex}
+        let applied = do simExecutorApplyCompletion(ex, plan, phase)
+        return SimExecutorPollResult{ok: true, progress: complete, fault: noFault, executor: applied}
+
+    struct SimExecutorAbortResult:
+        ok: bool
+        outcome: RollbackOutcome
+        fault: ExecutionFault
+        executor: SimExecutor
+
+    # simExecutorAbort: `abort` — the job is removed; cut over (per the job
+    # or the completed list) with a destination is Irreversible ("authority
+    # for {target} already moved to '{dest}'"); not cut over with a
+    # destination unstages it and is Restored; no destination but cut over
+    # is Irreversible ("{target} already cut over"); otherwise Restored.
+    proc simExecutorAbort(ex: SimExecutor, plan: PlacementPlan, completed: [text], atMs: int) -> SimExecutorAbortResult:
+        let noFault = do executionFaultInternal("")
+        let restored = do rollbackOutcomeRestored()
+        let idx = do simJobIndexOf(ex.jobs, plan.target)
+        let mut jobs = ex.jobs
+        let mut hasJob = false
+        let emptyJob = do simJobNew(plan.target)
+        let mut job = emptyJob
+        if idx != -1:
+            hasJob = true
+            job = ex.jobs[idx]
+            let removed = do simJobArrayRemoveAt(ex.jobs, idx)
+            jobs = removed
+        let next = SimExecutor{world: ex.world, jobs: jobs}
+        let completedCutover = do planPhaseArrayContains(completed, "cutover")
+        let cutOver = (hasJob && job.cutOver) || completedCutover
+        let targetText = do actionTargetDisplay(plan.target)
+        if hasJob && job.hasDestination:
+            if cutOver:
+                let irreversible = do rollbackOutcomeIrreversible("authority for " + targetText + " already moved to '" + job.destination + "'")
+                return SimExecutorAbortResult{ok: true, outcome: irreversible, fault: noFault, executor: next}
+            let unstaged = do clusterStateUnstage(ex.world, plan.target, job.destination)
+            return SimExecutorAbortResult{ok: true, outcome: restored, fault: noFault, executor: SimExecutor{world: unstaged, jobs: jobs}}
+        if cutOver:
+            let alreadyCut = do rollbackOutcomeIrreversible(targetText + " already cut over")
+            return SimExecutorAbortResult{ok: true, outcome: alreadyCut, fault: noFault, executor: next}
+        return SimExecutorAbortResult{ok: true, outcome: restored, fault: noFault, executor: next}
