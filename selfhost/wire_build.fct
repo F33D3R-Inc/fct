@@ -24,6 +24,8 @@ app WireBuildSelfHost:
         enum: [text]
         into: text
         nullable: bool
+        map: bool
+        depth: int
 
     struct WType:
         err: text
@@ -61,7 +63,7 @@ app WireBuildSelfHost:
 
     # wSplitDefault: splitWireDefault — `type = <literal>`.
     proc wField(spec0: text, what: text) -> WFieldR:
-        let blank = WField{name: "", type: "", list: false, optional: false, hasDefault: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false}
+        let blank = WField{name: "", type: "", list: false, optional: false, hasDefault: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false, map: false, depth: 0}
         let spec = trim(spec0)
         if spec == "":
             return WFieldR{err: "", field: blank, skip: true}
@@ -107,14 +109,37 @@ app WireBuildSelfHost:
         if lb && rb:
             list = true
             core = trim(slice(core, 1, len(core) - 1))
+        # `{T}`: a JSON object of T values; `[[T]]`: a list of lists.
+        let mut isMap = false
+        let mut depth = 0
+        let mb = do vpHasPrefix(core, "{")
+        let me = do vpHasSuffix(core, "}")
+        if !list && mb && me:
+            isMap = true
+            core = trim(slice(core, 1, len(core) - 1))
+        if list:
+            depth = 1
+            let mut nested = true
+            loop nested:
+                let nb = do vpHasPrefix(core, "[")
+                let ne = do vpHasSuffix(core, "]")
+                if nb && ne:
+                    depth = depth + 1
+                    core = trim(slice(core, 1, len(core) - 1))
+                else:
+                    nested = false
+            if depth == 1:
+                depth = 0
         let tn = do wIsWireTypeName(core)
         if !tn:
-            return WFieldR{err: "unknown type \"" + core + "\" in field \"" + fn + "\" (use a primitive, `json`, `number`, an enum, another type/message, or a list of those)", field: blank, skip: false}
+            return WFieldR{err: "unknown type \"" + core + "\" in field \"" + fn + "\" (use a primitive, `json`, `number`, an enum, another type/message, a list [T] or [[T]], or a map {T} of those)", field: blank, skip: false}
+        if (isMap || depth > 0) && core == "json":
+            return WFieldR{err: "field \"" + fn + "\": a map or nested list of json is just json", field: blank, skip: false}
         if optional && hasDef:
             return WFieldR{err: "field \"" + fn + "\" cannot be both optional (?) and have a default (=) — pick one", field: blank, skip: false}
-        if nullable && (optional || hasDef):
-            return WFieldR{err: "field \"" + fn + "\": `or null` is a present-but-maybe-null field; it is neither optional (?) nor defaulted", field: blank, skip: false}
-        return WFieldR{err: "", field: WField{name: fn, type: core, list: list, optional: optional, hasDefault: hasDef, default: def, description: "", aliases: [], enum: [], into: "", nullable: nullable}, skip: false}
+        if nullable && hasDef:
+            return WFieldR{err: "field \"" + fn + "\": `or null` and a default (=) contradict — a defaulted field always has a value", field: blank, skip: false}
+        return WFieldR{err: "", field: WField{name: fn, type: core, list: list, optional: optional, hasDefault: hasDef, default: def, description: "", aliases: [], enum: [], into: "", nullable: nullable, map: isMap, depth: depth}, skip: false}
 
     proc wTypeErr(msg: text) -> WType:
         return WType{err: msg, name: "", schema: "", query: false, fields: []}
@@ -253,7 +278,7 @@ app WireBuildSelfHost:
     # ["description"] [also a, b] [one of "x", "y"]`, or a pattern field
     # `prefix_<field>: T "…" into param`.
     proc wVariantField(spec: text, vname: text) -> WFieldR:
-        let blank = WField{name: "", type: "", list: false, optional: false, hasDefault: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false}
+        let blank = WField{name: "", type: "", list: false, optional: false, hasDefault: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false, map: false, depth: 0}
         let vq = do goQuote(vname)
         let colon = do vpIndexOf(spec, ":")
         if colon < 0:
@@ -340,7 +365,7 @@ app WireBuildSelfHost:
             return WFieldR{err: "unknown type " + cq + " in variant " + vq + " field " + fq, field: blank, skip: false}
         if optional && sd.has:
             return WFieldR{err: "field " + fq + " in variant " + vq + " cannot be both optional (?) and have a default (=) — pick one", field: blank, skip: false}
-        return WFieldR{err: "", field: WField{name: fn, type: core, list: list, optional: optional, hasDefault: sd.has, default: sd.lit, description: desc, aliases: aliases, enum: enum, into: into, nullable: false}, skip: false}
+        return WFieldR{err: "", field: WField{name: fn, type: core, list: list, optional: optional, hasDefault: sd.has, default: sd.lit, description: desc, aliases: aliases, enum: enum, into: into, nullable: false, map: false, depth: 0}, skip: false}
 
     struct WVariantR:
         err: text
@@ -579,7 +604,7 @@ app WireBuildSelfHost:
         field: IRWireField
 
     proc wResolve(decl: text, f: WField, names: [text], enumNames: [text]) -> WResolved:
-        let blank = IRWireField{name: "", type: "", list: false, optional: false, ref: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false}
+        let blank = IRWireField{name: "", type: "", list: false, optional: false, ref: false, default: "", description: "", aliases: [], enum: [], into: "", nullable: false, map: false, depth: 0}
         let mut ref = false
         let prim = do vbIsPrimitive(f.type)
         if f.type == "json" || f.type == "number" || prim:
@@ -611,7 +636,7 @@ app WireBuildSelfHost:
                 let known = f.type == "bool" || f.type == "int" || f.type == "money" || f.type == "number" || f.type == "text" || f.type == "date" || f.type == "json"
                 if !known:
                     return WResolved{err: "\"" + decl + "\" field \"" + f.name + "\": a default is only supported on bool/int/money/number/text/date/json, or a list ([]), not \"" + f.type + "\"", field: blank}
-        return WResolved{err: "", field: IRWireField{name: f.name, type: f.type, list: f.list, optional: f.optional, ref: ref, default: d, description: f.description, aliases: f.aliases, enum: f.enum, into: f.into, nullable: f.nullable}}
+        return WResolved{err: "", field: IRWireField{name: f.name, type: f.type, list: f.list, optional: f.optional, ref: ref, default: d, description: f.description, aliases: f.aliases, enum: f.enum, into: f.into, nullable: f.nullable, map: f.map, depth: f.depth}}
 
     proc wResolveFields(decl: text, fs: [WField], names: [text], enumNames: [text]) -> WBuiltFields:
         let mut out = []
@@ -735,8 +760,261 @@ app WireBuildSelfHost:
         let d = do vpUnquote(v)
         return d
 
-    # wParseAPI: parseAPI.
-    proc wParseAPI(line: text) -> WAPI:
+    # ── route documentation blocks (parser.go's parseAPIDecl / docString /
+    # parseErrorCodes / parseContractBlock, build.go's apiDocs) ────────────
+    struct WDocs:
+        err: text
+        summary: text
+        description: text
+        body: text
+        errors: [int]
+        operation: text
+        paramDocs: [WField]
+        title: text
+        bearer: text
+
+    proc wDocsErr(msg: text) -> WDocs:
+        return WDocs{err: msg, summary: "", description: "", body: "", errors: [], operation: "", paramDocs: [], title: "", bearer: ""}
+
+    struct WDocStr:
+        is: bool
+        err: text
+        s: text
+
+    # wDocString: docString — a `<keyword> "text"` line.
+    proc wDocString(t: text, keyword: text) -> WDocStr:
+        let hp = do vpHasPrefix(t, keyword + " ")
+        if !hp:
+            return WDocStr{is: false, err: "", s: ""}
+        let rest = trim(slice(t, len(keyword) + 1, len(t)))
+        let ok = do vpUnquoteOk(rest)
+        if !ok:
+            return WDocStr{is: true, err: keyword + " takes one quoted string: " + keyword + " \"…\"", s: ""}
+        let s = do vpUnquote(rest)
+        return WDocStr{is: true, err: "", s: s}
+
+    struct WCodes:
+        err: text
+        codes: [int]
+
+    # wErrorCodes: parseErrorCodes — `errors 400, 404`.
+    proc wErrorCodes(t: text) -> WCodes:
+        let parts = split(slice(t, 7, len(t)), ",")
+        let mut codes = []
+        let np = len(parts)
+        let mut i = 0
+        loop i < np:
+            let p = trim(parts[i])
+            let isI = do vpIsInt(p)
+            let n = toInt(p)
+            if !isI || n < 400 || n > 599:
+                return WCodes{err: "errors lists the error statuses the route answers (400-599): errors 400, 404 — got \"" + p + "\"", codes: []}
+            if n in codes:
+                return WCodes{err: "errors lists " + n + " twice", codes: []}
+            codes = append(codes, n)
+            i = i + 1
+        return WCodes{err: "", codes: codes}
+
+    # wBlockHeader: blockHeader's consistency rule — a header ending in `:`
+    # has an indented block, and a block needs its header's `:`.
+    proc wBlockHeaderErr(header: text, bodySrc: text, what: text) -> text:
+        let colon = do vpHasSuffix(trim(header), ":")
+        let lines = do vpLinesOf(bodySrc)
+        if colon && len(lines) == 0:
+            return what + " header ends in `:` but has no indented block"
+        if !colon && len(lines) > 0:
+            return what + " header must end in `:` to take an indented block"
+        return ""
+
+    # wParseAPIDocs: parseAPIDecl's block lines.
+    proc wParseAPIDocs(header: text, bodySrc: text, methodPath: text) -> WDocs:
+        let he = do wBlockHeaderErr(header, bodySrc, "api")
+        if he != "":
+            let e0 = do wDocsErr(he)
+            return e0
+        let lines = do vpLinesOf(bodySrc)
+        let mut d = WDocs{err: "", summary: "", description: "", body: "", errors: [], operation: "", paramDocs: [], title: "", bearer: ""}
+        let nl = len(lines)
+        let mut j = 0
+        loop j < nl:
+            let t = trim(lines[j].text)
+            let sm = do wDocString(t, "summary")
+            let de = do wDocString(t, "description")
+            let op = do wDocString(t, "operation")
+            let isBody = do vpHasPrefix(t, "body ")
+            let isErr = do vpHasPrefix(t, "errors ")
+            if sm.is:
+                if sm.err != "":
+                    let e1 = do wDocsErr(sm.err)
+                    return e1
+                d = WDocs{err: "", summary: sm.s, description: d.description, body: d.body, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: ""}
+            else:
+                if de.is:
+                    if de.err != "":
+                        let e2 = do wDocsErr(de.err)
+                        return e2
+                    d = WDocs{err: "", summary: d.summary, description: de.s, body: d.body, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: ""}
+                else:
+                    if op.is:
+                        if op.err != "":
+                            let e3 = do wDocsErr(op.err)
+                            return e3
+                        let oi = do vpIsIdent(op.s)
+                        if !oi:
+                            let e4 = do wDocsErr("operation \"" + op.s + "\" must be an identifier (the operationId clients generate a method from)")
+                            return e4
+                        d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: d.errors, operation: op.s, paramDocs: d.paramDocs, title: "", bearer: ""}
+                    else:
+                        if isBody:
+                            let b = trim(slice(t, 5, len(t)))
+                            let bi = do vpIsIdent(b)
+                            let bu = do vpIsUpper(b)
+                            if !bi || !bu:
+                                let e5 = do wDocsErr("body names the wire type the request body is: body V2NumberMintRequest")
+                                return e5
+                            d = WDocs{err: "", summary: d.summary, description: d.description, body: b, errors: d.errors, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: ""}
+                        else:
+                            if isErr:
+                                let ec = do wErrorCodes(t)
+                                if ec.err != "":
+                                    let e6 = do wDocsErr(ec.err)
+                                    return e6
+                                d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: ec.codes, operation: d.operation, paramDocs: d.paramDocs, title: "", bearer: ""}
+                            else:
+                                if contains(t, ":"):
+                                    let fr = do wVariantField(t, methodPath)
+                                    if fr.err != "":
+                                        let e7 = do wDocsErr(fr.err)
+                                        return e7
+                                    let npd = len(d.paramDocs)
+                                    let mut k = 0
+                                    loop k < npd:
+                                        if d.paramDocs[k].name == fr.field.name:
+                                            let e8 = do wDocsErr("parameter \"" + fr.field.name + "\" documented twice")
+                                            return e8
+                                        k = k + 1
+                                    d = WDocs{err: "", summary: d.summary, description: d.description, body: d.body, errors: d.errors, operation: d.operation, paramDocs: append(d.paramDocs, fr.field), title: "", bearer: ""}
+                                else:
+                                    let e9 = do wDocsErr("an api block holds summary \"…\", description \"…\", body Type, errors N, …, operation \"…\", or `param: type \"description\"` lines")
+                                    return e9
+            j = j + 1
+        return d
+
+    # wParseContractDocs: parseContractBlock's block lines.
+    proc wParseContractDocs(header: text, bodySrc: text) -> WDocs:
+        let he = do wBlockHeaderErr(header, bodySrc, "contract")
+        if he != "":
+            let e0 = do wDocsErr(he)
+            return e0
+        let lines = do vpLinesOf(bodySrc)
+        let mut title = ""
+        let mut desc = ""
+        let mut bearer = ""
+        let nl = len(lines)
+        let mut j = 0
+        loop j < nl:
+            let t = trim(lines[j].text)
+            let ti = do wDocString(t, "title")
+            let de = do wDocString(t, "description")
+            let be = do wDocString(t, "bearer")
+            let mut msg = ""
+            if ti.is:
+                msg = ti.err
+                title = ti.s
+            else:
+                if de.is:
+                    msg = de.err
+                    desc = de.s
+                else:
+                    if be.is:
+                        msg = be.err
+                        bearer = be.s
+                    else:
+                        msg = "a contract block holds title \"…\", description \"…\" and bearer \"…\" lines"
+            if msg != "":
+                let e1 = do wDocsErr(msg)
+                return e1
+            j = j + 1
+        return WDocs{err: "", summary: "", description: desc, body: "", errors: [], operation: "", paramDocs: [], title: title, bearer: bearer}
+
+    struct WAPIDocs:
+        err: text
+        docs: [IRAPIParamDoc]
+
+    # wAPIDocsCheck: apiDocs — every body parameter is a field of the body
+    # type, with its type; each documented parameter is one the route reads
+    # from its path or query, with a type a client may send it as.
+    proc wAPIDocsCheck(ap: WAPI, d: WDocs, act: IRAction, pathParams: [text], types: [IRWireType]) -> WAPIDocs:
+        let where = "api " + ap.method + " \"" + ap.path + "\""
+        let aq = do goQuote(act.name)
+        if d.body != "":
+            if ap.method == "GET":
+                return WAPIDocs{err: where + ": a GET carries no request body — drop `body`", docs: []}
+            let mut ti = -1
+            let nt = len(types)
+            let mut k = 0
+            loop k < nt:
+                if types[k].name == d.body:
+                    ti = k
+                k = k + 1
+            if ti < 0:
+                return WAPIDocs{err: where + ": body \"" + d.body + "\" is not a declared wire type", docs: []}
+            let wt = types[ti]
+            let np = len(act.params)
+            let mut pi = 0
+            loop pi < np:
+                let p = act.params[pi]
+                if !(p.name in pathParams) && p.name != ap.bearer:
+                    let mut fi = -1
+                    let nf = len(wt.fields)
+                    let mut f = 0
+                    loop f < nf:
+                        if wt.fields[f].name == p.name:
+                            fi = f
+                        f = f + 1
+                    let pq = do goQuote(p.name)
+                    if fi < 0:
+                        return WAPIDocs{err: where + ": action " + aq + "'s body parameter " + pq + " is not a field of body " + d.body, docs: []}
+                    let fl = wt.fields[fi]
+                    let structured = (fl.map || fl.depth > 0) && p.type == "json" && !p.list
+                    let sameType = fl.type == p.type || (fl.type == "number" && p.type == "float")
+                    if !structured && (!sameType || fl.list != p.list || fl.map || fl.depth > 0):
+                        return WAPIDocs{err: where + ": body " + d.body + " field " + pq + " and action " + aq + "'s parameter disagree on its type", docs: []}
+                pi = pi + 1
+        let mut docs = []
+        let nd = len(d.paramDocs)
+        let mut di = 0
+        loop di < nd:
+            let dd = d.paramDocs[di]
+            let dq = do goQuote(dd.name)
+            let mut found = -1
+            let np2 = len(act.params)
+            let mut pj = 0
+            loop pj < np2:
+                if act.params[pj].name == dd.name:
+                    found = pj
+                pj = pj + 1
+            if found < 0:
+                return WAPIDocs{err: where + " documents " + dq + ", which is not a parameter of action " + aq, docs: []}
+            let p = act.params[found]
+            if !(dd.name in pathParams) && ap.method != "GET":
+                return WAPIDocs{err: where + " documents " + dq + ", which travels in the body — document it on the body type", docs: []}
+            let asText = dd.type == "text" && !dd.list && (p.type == "int" || p.list)
+            if (dd.list != p.list && !asText) || dd.optional || dd.hasDefault || len(dd.aliases) > 0 || dd.into != "":
+                return WAPIDocs{err: where + ": a parameter doc is `name: type \"description\" [one of …]`, its type the action parameter's (or text for an int a client holds as an opaque string, or a list it sends comma-separated)", docs: []}
+            if dd.type != p.type && !asText && !(dd.type == "number" && p.type == "float"):
+                return WAPIDocs{err: where + " documents " + dq + " as " + dd.type + ", but action " + aq + " takes it as " + p.type, docs: []}
+            docs = append(docs, IRAPIParamDoc{name: dd.name, type: dd.type, description: dd.description, enum: dd.enum})
+            di = di + 1
+        return WAPIDocs{err: "", docs: docs}
+
+    # wParseAPI: parseAPI (a block header's trailing `:` is the block's, not
+    # the route's).
+    proc wParseAPI(line0: text) -> WAPI:
+        let mut line = trim(line0)
+        let hc = do vpHasSuffix(line, ":")
+        if hc:
+            line = trim(slice(line, 0, len(line) - 1))
         let r0 = do vpTrimPrefix(trim(line), "api")
         let mut rest = trim(r0)
         let sp = do vpIndexOf(rest, " ")
@@ -876,9 +1154,14 @@ app WireBuildSelfHost:
         events: [IRStreamEvent]
         connects: [IRStreamHook]
         disconnect: text
+        hello: text
+        summary: text
+        description: text
+        paramDocs: [WField]
+        errors: [int]
 
     proc wStreamErr(msg: text) -> WStream:
-        return WStream{err: msg, path: "", requires: "", rate: "", since: "", events: [], connects: [], disconnect: ""}
+        return WStream{err: msg, path: "", requires: "", rate: "", since: "", events: [], connects: [], disconnect: "", hello: "", summary: "", description: "", paramDocs: [], errors: []}
 
     proc wParseStream(header: text, bodySrc: text) -> WStream:
         let r0 = do vpTrimPrefix(trim(header), "stream")
@@ -960,9 +1243,60 @@ app WireBuildSelfHost:
         let nl = len(lines)
         let mut connects = []
         let mut disconnect = ""
+        let mut hello = ""
+        let mut ssum = ""
+        let mut sdesc = ""
+        let mut sdocs = []
+        let mut serrs = []
         let mut j = 0
         loop j < nl:
             let t = trim(lines[j].text)
+            let sds = do wDocString(t, "summary")
+            if sds.is:
+                if sds.err != "":
+                    let esd = do wStreamErr(sds.err)
+                    return esd
+                ssum = sds.s
+                j = j + 1
+                continue
+            let sdd = do wDocString(t, "description")
+            if sdd.is:
+                if sdd.err != "":
+                    let esdd = do wStreamErr(sdd.err)
+                    return esdd
+                sdesc = sdd.s
+                j = j + 1
+                continue
+            let isErrs = do vpHasPrefix(t, "errors ")
+            if isErrs:
+                let sec = do wErrorCodes(t)
+                if sec.err != "":
+                    let esec = do wStreamErr(sec.err)
+                    return esec
+                serrs = sec.codes
+                j = j + 1
+                continue
+            let isHello = do vpHasPrefix(t, "hello ")
+            if t == "hello" || isHello:
+                # `hello since "<date>"`: the runtime's connect frame.
+                let hf = do vpFields(t)
+                let mut hok = len(hf) == 3
+                if hok:
+                    let hq = do vpUnquoteOk(hf[2])
+                    hok = hf[1] == "since" && hq
+                let mut hd = ""
+                if hok:
+                    let hu = do vpUnquote(hf[2])
+                    hd = hu
+                if hd == "":
+                    let ehl = do wStreamErr("a stream's connect frame is declared as: hello since \"2026-09-13\"")
+                    return ehl
+                if hello != "":
+                    let eh2x = do wStreamErr("stream \"" + path + "\" declares hello twice")
+                    return eh2x
+                hello = hd
+                j = j + 1
+                continue
             let isCon = do vpHasPrefix(t, "connect ")
             let isDis = do vpHasPrefix(t, "disconnect ")
             if isCon || isDis:
@@ -1000,6 +1334,24 @@ app WireBuildSelfHost:
                             return eh3
                 j = j + 1
                 continue
+            let pc = do vpIndexOf(t, ":")
+            if pc > 0:
+                let pf = do vpFields(slice(t, pc + 1, len(t)))
+                if len(pf) > 0:
+                    let mut pt = pf[0]
+                    let pq = do vpHasSuffix(pt, "?")
+                    if pq:
+                        pt = slice(pt, 0, len(pt) - 1)
+                    let isScalar = pt == "int" || pt == "text" || pt == "bool" || pt == "money" || pt == "date" || pt == "float" || pt == "bytes" || pt == "datetime"
+                    if isScalar:
+                        # `id: text "Stream id."` — a path parameter's documentation.
+                        let pdr = do wVariantField(t, path)
+                        if pdr.err != "":
+                            let epd = do wStreamErr(pdr.err)
+                            return epd
+                        sdocs = append(sdocs, pdr.field)
+                        j = j + 1
+                        continue
             let c2 = do vpIndexOf(t, ":")
             if c2 < 0:
                 let e11 = do wStreamErr("a stream event is name: Type [since \"<date>\"] [\"summary\"]")
@@ -1054,7 +1406,7 @@ app WireBuildSelfHost:
         if len(events) == 0:
             let e17 = do wStreamErr("stream declares no events")
             return e17
-        return WStream{err: "", path: path, requires: guard, rate: rate, since: since, events: events, connects: connects, disconnect: disconnect}
+        return WStream{err: "", path: path, requires: guard, rate: rate, since: since, events: events, connects: connects, disconnect: disconnect, hello: hello, summary: ssum, description: sdesc, paramDocs: sdocs, errors: serrs}
 
     # ── Build 4d′/4d‴/4d″ ───────────────────────────────────────────────
     struct WRoutes:
@@ -1193,7 +1545,7 @@ app WireBuildSelfHost:
             vi = vi + 1
         return WDispatch{err: "", actions: actions}
 
-    proc wBuildRoutes(actions0: [IRAction], raws: [RawDecl], clientStates: [text], policyNames: [text], policyCounts: [int], wireNames: [text], messages: [IRWireMessage]) -> WRoutes:
+    proc wBuildRoutes(actions0: [IRAction], raws: [RawDecl], clientStates: [text], policyNames: [text], policyCounts: [int], wireNames: [text], messages: [IRWireMessage], wireTypes: [IRWireType]) -> WRoutes:
         let mut actions = actions0
         let mut apis = []
         let mut apiKeys = []
@@ -1209,6 +1561,10 @@ app WireBuildSelfHost:
                 if ap.err != "":
                     let e0 = do wRoutesErr(ap.err)
                     return e0
+                let docs = do wParseAPIDocs(rd.header, rd.bodySrc, ap.method + " " + ap.path)
+                if docs.err != "":
+                    let ed0 = do wRoutesErr(docs.err)
+                    return ed0
                 let mi = do wFindMessage(messages, ap.action)
                 if mi >= 0:
                     # `api POST "/events" -> Mutation`: a dispatching route.
@@ -1219,7 +1575,10 @@ app WireBuildSelfHost:
                     actions = dr.actions
                     apiKeys = append(apiKeys, ap.method + " " + ap.path)
                     apiLines = append(apiLines, rd.line)
-                    apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: [], action: "", status: 200, rate: ap.rate, since: ap.since, auth: "none", ret: "", retList: false, bearer: "", dispatch: messages[mi].name})
+                    if docs.body != "" || len(docs.errors) > 0 || len(docs.paramDocs) > 0:
+                        let edd = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\" -> " + messages[mi].name + ": a dispatching route documents its variants in the message — its block takes only summary, description and operation")
+                        return edd
+                    apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: [], action: "", status: 200, rate: ap.rate, since: ap.since, auth: "none", ret: "", retList: false, bearer: "", dispatch: messages[mi].name, summary: docs.summary, description: docs.description, body: "", errors: [], operation: docs.operation, paramDocs: []})
                     ri = ri + 1
                     continue
                 let ai = do wFindAction(actions, ap.action)
@@ -1310,7 +1669,11 @@ app WireBuildSelfHost:
                         let e12 = do wRoutesErr("api " + ap.method + " \"" + ap.path + "\": auth scheme \"" + ap.authScheme + "\" is reserved; name the credential (e.g. dev_token)")
                         return e12
                     auth = ap.authScheme
-                apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: pathParams, action: ap.action, status: status, rate: ap.rate, since: ap.since, auth: auth, ret: act.ret, retList: act.retList, bearer: ap.bearer, dispatch: ""})
+                let adc = do wAPIDocsCheck(ap, docs, act, pathParams, wireTypes)
+                if adc.err != "":
+                    let eadc = do wRoutesErr(adc.err)
+                    return eadc
+                apis = append(apis, IRAPI{method: ap.method, path: ap.path, params: pathParams, action: ap.action, status: status, rate: ap.rate, since: ap.since, auth: auth, ret: act.ret, retList: act.retList, bearer: ap.bearer, dispatch: "", summary: docs.summary, description: docs.description, body: docs.body, errors: docs.errors, operation: docs.operation, paramDocs: adc.docs})
             ri = ri + 1
         # the contract route
         let mut rc = 0
@@ -1319,7 +1682,15 @@ app WireBuildSelfHost:
                 if len(contract) > 0:
                     let e13 = do wRoutesErr("contract redeclared")
                     return e13
-                let cd = do wParseContract(raws[rc].header)
+                let mut chead = trim(raws[rc].header)
+                let chc = do vpHasSuffix(chead, ":")
+                if chc:
+                    chead = trim(slice(chead, 0, len(chead) - 1))
+                let cdoc = do wParseContractDocs(raws[rc].header, raws[rc].bodySrc)
+                if cdoc.err != "":
+                    let ecd = do wRoutesErr(cdoc.err)
+                    return ecd
+                let cd = do wParseContract(chead)
                 if cd.err != "":
                     let e14 = do wRoutesErr(cd.err)
                     return e14
@@ -1330,7 +1701,7 @@ app WireBuildSelfHost:
                         let e15 = do wRoutesErr("api GET \"" + cd.path + subs[sb] + "\" is served by the contract declaration")
                         return e15
                     sb = sb + 1
-                contract = [IRContract{path: cd.path, rate: cd.rate, since: cd.since}]
+                contract = [IRContract{path: cd.path, rate: cd.rate, since: cd.since, title: cdoc.title, description: cdoc.description, bearer: cdoc.bearer}]
             rc = rc + 1
         # streams
         let mut streamPaths = []
@@ -1443,7 +1814,21 @@ app WireBuildSelfHost:
                                 let e31 = do wRoutesErr("stream \"" + st.path + "\" connect -> " + hname + " as " + hevent + ": the action must return " + evType + ", the event's payload")
                                 return e31
                     hk = hk + 1
-                streams = append(streams, IRStream{path: st.path, events: st.events, requires: st.requires, auth: auth, rate: st.rate, since: st.since, params: sparams, connects: st.connects, disconnect: st.disconnect})
+                let mut sdocs2 = []
+                let nsd = len(st.paramDocs)
+                let mut sdi = 0
+                loop sdi < nsd:
+                    let sd = st.paramDocs[sdi]
+                    let sdq = do goQuote(sd.name)
+                    if !(sd.name in sparams):
+                        let esd1 = do wRoutesErr("stream \"" + st.path + "\" documents " + sdq + ", which is not one of its {path} parameters")
+                        return esd1
+                    if sd.type != "text" || sd.list || sd.optional || sd.hasDefault || len(sd.aliases) > 0 || sd.into != "":
+                        let esd2 = do wRoutesErr("stream \"" + st.path + "\": a path parameter is text: " + sd.name + ": text \"description\" [one of …]")
+                        return esd2
+                    sdocs2 = append(sdocs2, IRAPIParamDoc{name: sd.name, type: sd.type, description: sd.description, enum: sd.enum})
+                    sdi = sdi + 1
+                streams = append(streams, IRStream{path: st.path, events: st.events, requires: st.requires, auth: auth, rate: st.rate, since: st.since, params: sparams, connects: st.connects, disconnect: st.disconnect, hello: st.hello, summary: st.summary, description: st.description, paramDocs: sdocs2, errors: st.errors})
             rs = rs + 1
         let nsp = len(streamParamPaths)
         let mut gs = 0

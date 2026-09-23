@@ -244,7 +244,7 @@ app FabricPlanSelfHost:
     struct PlanKeyspace:
         rules: [RoutingRule]
         hasFallback: bool
-        fallbackKey: int
+        fallbackKey: RoutingKey
 
     proc planKeyspaceOf(ks: PlanKeyspace) -> Keyspace:
         return Keyspace{rules: ks.rules, hasFallback: ks.hasFallback, fallbackKey: ks.fallbackKey}
@@ -254,24 +254,24 @@ app FabricPlanSelfHost:
     # Inconsistent (missByKind/missByAddress hold the two differing keys).
     struct PlanResolveResult:
         missCode: int
-        key: int
+        key: RoutingKey
         missHasKind: bool
         missKind: text
         missHasAddress: bool
         missAddress: text
-        missByKind: int
-        missByAddress: int
+        missByKind: RoutingKey
+        missByAddress: RoutingKey
 
     # Keyspace::resolve (fabric.fct's keyspaceResolve).
     proc planKeyspaceResolve(ks: PlanKeyspace, hasKind: bool, kind: text, hasAddress: bool, address: text) -> PlanResolveResult:
         let k = do planKeyspaceOf(ks)
         let r = do keyspaceResolve(k, hasKind, kind, hasAddress, address)
         if r.ok:
-            return PlanResolveResult{missCode: -1, key: r.key, missHasKind: false, missKind: "", missHasAddress: false, missAddress: "", missByKind: -1, missByAddress: -1}
+            return PlanResolveResult{missCode: -1, key: r.key, missHasKind: false, missKind: "", missHasAddress: false, missAddress: "", missByKind: r.miss.byKind, missByAddress: r.miss.byAddress}
         let mut code = 0
         if r.miss.kind == "Inconsistent":
             code = 1
-        return PlanResolveResult{missCode: code, key: -1, missHasKind: r.miss.hasKind, missKind: r.miss.kindName, missHasAddress: r.miss.hasAddress, missAddress: r.miss.address, missByKind: r.miss.byKind, missByAddress: r.miss.byAddress}
+        return PlanResolveResult{missCode: code, key: r.key, missHasKind: r.miss.hasKind, missKind: r.miss.kindName, missHasAddress: r.miss.hasAddress, missAddress: r.miss.address, missByKind: r.miss.byKind, missByAddress: r.miss.byAddress}
 
     # ============================================================
     # SECTION 3: ROUTE INTENT, KEY INTENT
@@ -285,7 +285,7 @@ app FabricPlanSelfHost:
         readPref: PlanReadPreference
 
     struct PlanKeyIntent:
-        key: int
+        key: RoutingKey
         intent: PlanRouteIntent
         origin: text
 
@@ -308,35 +308,35 @@ app FabricPlanSelfHost:
         missHasKind: bool
         missAddress: text
         missHasAddress: bool
-        missByKind: int
-        missByAddress: int
+        missByKind: RoutingKey
+        missByAddress: RoutingKey
         spansWhat: text
         spansNodes: [text]
         notProxyableWhat: text
 
     proc planRefusalNone() -> PlanRefusal:
-        return PlanRefusal{code: -1, method: "", path: "", reason: "", context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: -1, missByAddress: -1, spansWhat: "", spansNodes: [], notProxyableWhat: ""}
+        return PlanRefusal{code: -1, method: "", path: "", reason: "", context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: routingKeyUnset(), missByAddress: routingKeyUnset(), spansWhat: "", spansNodes: [], notProxyableWhat: ""}
 
     proc planRefusalUnknownRoute(method: text, path: text) -> PlanRefusal:
-        return PlanRefusal{code: 0, method: method, path: path, reason: "", context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: -1, missByAddress: -1, spansWhat: "", spansNodes: [], notProxyableWhat: ""}
+        return PlanRefusal{code: 0, method: method, path: path, reason: "", context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: routingKeyUnset(), missByAddress: routingKeyUnset(), spansWhat: "", spansNodes: [], notProxyableWhat: ""}
 
     proc planRefusalMalformedPath(reason: text) -> PlanRefusal:
-        return PlanRefusal{code: 1, method: "", path: "", reason: reason, context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: -1, missByAddress: -1, spansWhat: "", spansNodes: [], notProxyableWhat: ""}
+        return PlanRefusal{code: 1, method: "", path: "", reason: reason, context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: routingKeyUnset(), missByAddress: routingKeyUnset(), spansWhat: "", spansNodes: [], notProxyableWhat: ""}
 
     proc planRefusalMalformedBody(context: text, message: text) -> PlanRefusal:
-        return PlanRefusal{code: 2, method: "", path: "", reason: "", context: context, message: message, keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: -1, missByAddress: -1, spansWhat: "", spansNodes: [], notProxyableWhat: ""}
+        return PlanRefusal{code: 2, method: "", path: "", reason: "", context: context, message: message, keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: routingKeyUnset(), missByAddress: routingKeyUnset(), spansWhat: "", spansNodes: [], notProxyableWhat: ""}
 
     proc planKeyspaceMissToRefusal(r: PlanResolveResult) -> PlanRefusal:
         return PlanRefusal{code: 3, method: "", path: "", reason: "", context: "", message: "", keyspaceMissCode: r.missCode, missKind: r.missKind, missHasKind: r.missHasKind, missAddress: r.missAddress, missHasAddress: r.missHasAddress, missByKind: r.missByKind, missByAddress: r.missByAddress, spansWhat: "", spansNodes: [], notProxyableWhat: ""}
 
     proc planRefusalSpansBackends(what: text, nodes: [text]) -> PlanRefusal:
-        return PlanRefusal{code: 4, method: "", path: "", reason: "", context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: -1, missByAddress: -1, spansWhat: what, spansNodes: nodes, notProxyableWhat: ""}
+        return PlanRefusal{code: 4, method: "", path: "", reason: "", context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: routingKeyUnset(), missByAddress: routingKeyUnset(), spansWhat: what, spansNodes: nodes, notProxyableWhat: ""}
 
     proc planRefusalNotProxyable(what: text, reason: text) -> PlanRefusal:
-        return PlanRefusal{code: 5, method: "", path: "", reason: reason, context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: -1, missByAddress: -1, spansWhat: "", spansNodes: [], notProxyableWhat: what}
+        return PlanRefusal{code: 5, method: "", path: "", reason: reason, context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: routingKeyUnset(), missByAddress: routingKeyUnset(), spansWhat: "", spansNodes: [], notProxyableWhat: what}
 
     proc planRefusalMissingCredential() -> PlanRefusal:
-        return PlanRefusal{code: 6, method: "", path: "", reason: "", context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: -1, missByAddress: -1, spansWhat: "", spansNodes: [], notProxyableWhat: ""}
+        return PlanRefusal{code: 6, method: "", path: "", reason: "", context: "", message: "", keyspaceMissCode: -1, missKind: "", missHasKind: false, missAddress: "", missHasAddress: false, missByKind: routingKeyUnset(), missByAddress: routingKeyUnset(), spansWhat: "", spansNodes: [], notProxyableWhat: ""}
 
     # planRefusalStatus: `Refusal::status()` — the whole mapping, restated
     # exactly (404 / 400 / 401 / 421 for Keyspace|SpansBackends|NotProxyable).
@@ -350,10 +350,6 @@ app FabricPlanSelfHost:
         if r.code == 3 || r.code == 4 || r.code == 5:
             return 421
         return 500
-
-    proc planRoutingKeyDisplay(packed: int) -> text:
-        let t = do routingKeyPackedDisplay(packed)
-        return t
 
     proc planKeyspaceMissOf(r: PlanRefusal) -> KeyspaceMiss:
         let mut kind = "Unmapped"
@@ -792,22 +788,25 @@ app FabricPlanSelfHost:
     proc planDemoReadPrimary() -> PlanReadPreference:
         return PlanReadPreference{code: 0, region: ""}
 
-    # split(): {"Post"->key(1)=156, "User"->key(2)=312}, no fallback —
-    # restates plan.rs's own test helper `split()` exactly (key(shard_id) =
-    # RoutingKey::new(shard_id, Coordinate::new(0,0)), packed as
-    # shard_id*156).
-    proc planDemoSplitKeyspace() -> PlanKeyspace:
-        let rules = [RoutingRule{kind: "Post", prefix: "Post:", key: 156}, RoutingRule{kind: "User", prefix: "User:", key: 312}]
-        return PlanKeyspace{rules: rules, hasFallback: false, fallbackKey: -1}
+    # key(shard_id) = RoutingKey::new(shard_id, Coordinate::new(0,0)), plan.rs's
+    # own test helper; displayed "{shard}/0,0".
+    proc planDemoKey(shardId: int) -> RoutingKey:
+        return RoutingKey{shardId: shardId, coordinate: Coordinate{x: 0, y: 0}}
 
-    # Keyspace::single(key(7)=1092) — restates the namespace-wide tests' own
+    # split(): {"Post"->key(1), "User"->key(2)}, no fallback — restates
+    # plan.rs's own test helper `split()` exactly.
+    proc planDemoSplitKeyspace() -> PlanKeyspace:
+        let rules = [RoutingRule{kind: "Post", prefix: "Post:", key: planDemoKey(1)}, RoutingRule{kind: "User", prefix: "User:", key: planDemoKey(2)}]
+        return PlanKeyspace{rules: rules, hasFallback: false, fallbackKey: routingKeyUnset()}
+
+    # Keyspace::single(key(7)) — restates the namespace-wide tests' own
     # single-backend fixture.
     proc planDemoSingleKeyspace() -> PlanKeyspace:
-        return PlanKeyspace{rules: [], hasFallback: true, fallbackKey: 1092}
+        return PlanKeyspace{rules: [], hasFallback: true, fallbackKey: planDemoKey(7)}
 
     # a_point_read_routes_by_its_address +
     # a_percent_encoded_address_routes_the_same_as_a_bare_one. Expected:
-    # bareKey=156 isWrite=false percentEncodedKey=156.
+    # bareKey=1/0,0 isWrite=false percentEncodedKey=1/0,0.
     proc planDemoPointReadRoutesByAddress() -> text:
         let ks = do planDemoSplitKeyspace()
         let rp = do planDemoReadPrimary()
@@ -815,7 +814,7 @@ app FabricPlanSelfHost:
         let ki1 = v1.keys[0]
         let v2 = do planRequest("GET", "/node/Post%3A17", false, "", "", ks, rp)
         let ki2 = v2.keys[0]
-        return "bareKey=" + ki1.key + " isWrite=" + ki1.intent.isWrite + " percentEncodedKey=" + ki2.key
+        return "bareKey=" + routingKeyDisplay(ki1.key) + " isWrite=" + ki1.intent.isWrite + " percentEncodedKey=" + routingKeyDisplay(ki2.key)
 
     # a_write_is_planned_as_a_write. Expected: put=true delete=true
     # claim=true.
@@ -827,26 +826,26 @@ app FabricPlanSelfHost:
         let vClaim = do planRequest("POST", "/node/Post:1/claim", false, "", "", ks, rp)
         return "put=" + vPut.keys[0].intent.isWrite + " delete=" + vDel.keys[0].intent.isWrite + " claim=" + vClaim.keys[0].intent.isWrite
 
-    # a_kind_scoped_query_routes_by_its_kind. Expected: byBodyKind=312
-    # byQueryParam=156.
+    # a_kind_scoped_query_routes_by_its_kind. Expected: byBodyKind=2/0,0
+    # byQueryParam=1/0,0.
     proc planDemoKindScopedQueryRoutesByKind() -> text:
         let ks = do planDemoSplitKeyspace()
         let rp = do planDemoReadPrimary()
         let vBody = do planRequest("POST", "/nodes/query", false, "", "{\"kind\":\"User\",\"limit\":500}", ks, rp)
         let vQuery = do planRequest("GET", "/nodes", true, "kind=Post&limit=50", "", ks, rp)
-        return "byBodyKind=" + vBody.keys[0].key + " byQueryParam=" + vQuery.keys[0].key
+        return "byBodyKind=" + routingKeyDisplay(vBody.keys[0].key) + " byQueryParam=" + routingKeyDisplay(vQuery.keys[0].key)
 
     # a_transaction_over_two_kinds_is_refused_not_split — plan.rs's own
     # comment: "Planning yields both keys; it is dispatch that discovers
     # they are two backends." Expected: kind=0 (Colocated) keyCount=2
-    # key0=156 key1=312.
+    # key0=1/0,0 key1=2/0,0.
     proc planDemoTransactionOverTwoKindsRefusedNotSplit() -> text:
         let ks = do planDemoSplitKeyspace()
         let rp = do planDemoReadPrimary()
         let body = "{\"operations\":[{\"type\":\"insert_node\",\"address\":\"Post:1\",\"kind\":\"Post\",\"x\":0,\"y\":0,\"z\":0,\"q\":0,\"data\":\"{}\",\"public\":false},{\"type\":\"delete_node\",\"address\":\"User:9\"}]}"
         let v = do planRequest("POST", "/transaction", false, "", body, ks, rp)
         let keyCount = len(v.keys)
-        return "kind=" + v.kind + " keyCount=" + keyCount + " key0=" + v.keys[0].key + " key1=" + v.keys[1].key
+        return "kind=" + v.kind + " keyCount=" + keyCount + " key0=" + routingKeyDisplay(v.keys[0].key) + " key1=" + routingKeyDisplay(v.keys[1].key)
 
     # every_transaction_op_shape_contributes_its_keys. Expected: keyCount=9
     # (6 single-address/kind ops + 2 two-ended edge ops). Exercises the
@@ -859,25 +858,25 @@ app FabricPlanSelfHost:
         let keyCount = len(v.keys)
         return "keyCount=" + keyCount
 
-    # an_edge_names_both_of_its_ends. Expected: key0=156 key1=312.
+    # an_edge_names_both_of_its_ends. Expected: key0=1/0,0 key1=2/0,0.
     proc planDemoEdgeNamesBothEnds() -> text:
         let ks = do planDemoSplitKeyspace()
         let rp = do planDemoReadPrimary()
         let body = "{\"from\":\"Post:1\",\"to\":\"User:2\",\"kind\":\"wrote\"}"
         let v = do planRequest("POST", "/edge", false, "", body, ks, rp)
-        return "key0=" + v.keys[0].key + " key1=" + v.keys[1].key
+        return "key0=" + routingKeyDisplay(v.keys[0].key) + " key1=" + routingKeyDisplay(v.keys[1].key)
 
-    # a_multiget_names_every_address_it_asks_about. Expected: key0=156
-    # key1=156 key2=312.
+    # a_multiget_names_every_address_it_asks_about. Expected: key0=1/0,0
+    # key1=1/0,0 key2=2/0,0.
     proc planDemoMultigetNamesEveryAddress() -> text:
         let ks = do planDemoSplitKeyspace()
         let rp = do planDemoReadPrimary()
         let body = "{\"addresses\":[\"Post:1\",\"Post:2\",\"User:3\"]}"
         let v = do planRequest("POST", "/nodes/multiget", false, "", body, ks, rp)
-        return "key0=" + v.keys[0].key + " key1=" + v.keys[1].key + " key2=" + v.keys[2].key
+        return "key0=" + routingKeyDisplay(v.keys[0].key) + " key1=" + routingKeyDisplay(v.keys[1].key) + " key2=" + routingKeyDisplay(v.keys[2].key)
 
     # namespace_wide_requests_are_refused_only_when_the_namespace_is_split.
-    # Expected: every splitCode=5 (NotProxyable) and every singleKey=1092
+    # Expected: every splitCode=5 (NotProxyable) and every singleKey=7/0,0
     # (key(7)).
     proc planDemoNamespaceWideRefusedOnlyWhenSplit() -> text:
         let split = do planDemoSplitKeyspace()
@@ -891,7 +890,7 @@ app FabricPlanSelfHost:
         let vUsersSingle = do planRequest("POST", "/admin/users", false, "", "{\"owner\":\"a\"}", single, rp)
         let vQuerySplit = do planRequest("POST", "/nodes/query", false, "", "{\"limit\":10}", split, rp)
         let vQuerySingle = do planRequest("POST", "/nodes/query", false, "", "{\"limit\":10}", single, rp)
-        return "nodes: splitCode=" + vNodesSplit.refusal.code + " singleKey=" + vNodesSingle.keys[0].key + "; stats: splitCode=" + vStatsSplit.refusal.code + " singleKey=" + vStatsSingle.keys[0].key + "; users: splitCode=" + vUsersSplit.refusal.code + " singleKey=" + vUsersSingle.keys[0].key + "; query: splitCode=" + vQuerySplit.refusal.code + " singleKey=" + vQuerySingle.keys[0].key
+        return "nodes: splitCode=" + vNodesSplit.refusal.code + " singleKey=" + routingKeyDisplay(vNodesSingle.keys[0].key) + "; stats: splitCode=" + vStatsSplit.refusal.code + " singleKey=" + routingKeyDisplay(vStatsSingle.keys[0].key) + "; users: splitCode=" + vUsersSplit.refusal.code + " singleKey=" + routingKeyDisplay(vUsersSingle.keys[0].key) + "; query: splitCode=" + vQuerySplit.refusal.code + " singleKey=" + routingKeyDisplay(vQuerySingle.keys[0].key)
 
     # declarations_go_to_every_backend_and_listings_must_agree. Expected:
     # indexesGet kind=1 agreement=0 what="a fleet-wide declaration listing";
@@ -906,13 +905,13 @@ app FabricPlanSelfHost:
         return "indexesGet: kind=" + vIndexesGet.kind + " agreement=" + vIndexesGet.broadcastAgreement + " what=" + vIndexesGet.broadcastWhat + "; referencesPost: agreement=" + vReferencesPost.broadcastAgreement + " what=" + vReferencesPost.broadcastWhat + "; root: kind=" + vRoot.kind + " agreement=" + vRoot.broadcastAgreement + " what=" + vRoot.broadcastWhat
 
     # a_publish_routes_by_its_channel_to_exactly_one_backend. Expected:
-    # publishKey=156 eventsKind=2 (Subscribe).
+    # publishKey=1/0,0 eventsKind=2 (Subscribe).
     proc planDemoPublishRoutesToOneBackendEventsSubscribe() -> text:
         let ks = do planDemoSplitKeyspace()
         let rp = do planDemoReadPrimary()
         let vPublish = do planRequest("POST", "/publish", false, "", "{\"channel\":\"Post\",\"payload\":\"{}\"}", ks, rp)
         let vEvents = do planRequest("GET", "/events", false, "", "", ks, rp)
-        return "publishKey=" + vPublish.keys[0].key + " eventsKind=" + vEvents.kind
+        return "publishKey=" + routingKeyDisplay(vPublish.keys[0].key) + " eventsKind=" + vEvents.kind
 
     # an_unknown_path_is_a_404_exactly_as_facetql_answers_it. Expected: 404.
     proc planDemoUnknownPathIs404() -> int:

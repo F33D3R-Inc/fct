@@ -153,7 +153,30 @@ type API struct {
 	// Bearer, and the contract names the scheme as the route's x-auth.
 	AuthScheme string
 	Bearer     string
-	Line       int
+	// The block form's contract documentation (the header ending in `:`):
+	//
+	//	api POST "/api/v2/numbers" -> mintNumber status 201 rate write since "…":
+	//	    summary "Mint a F33D3R Number."
+	//	    description "…"
+	//	    body V2NumberMintRequest
+	//	    errors 400, 409, 503
+	//	    operation "postNumbers"
+	//	    policy: text "The contact policy." one of "open", "closed"
+	//
+	// Body names the wire type the JSON body is (its fields bind the action's
+	// body parameters); Errors are the error statuses the route's contract
+	// publishes (in place of the ones its checks imply);
+	// Operation overrides the method+path operationId; a `name: type …` line
+	// documents a path or query parameter (its description, closed values,
+	// and — for an int parameter — `text` when clients hold it as an opaque
+	// string).
+	Summary     string
+	Description string
+	Body        string
+	Errors      []int
+	Operation   string
+	ParamDocs   []RecordField
+	Line        int
 }
 
 // ContractDecl is `contract "/api/v2/contract" [rate <class>] [since "<date>"]`:
@@ -164,7 +187,15 @@ type ContractDecl struct {
 	Path  string
 	Rate  string
 	Since string
-	Line  int
+	// Title and Description are the document's info.title and
+	// info.description (the block form's `title "…"` / `description "…"`
+	// lines); "" = the app's name and the runtime's own description.
+	Title       string
+	Description string
+	// Bearer describes the session credential (the bearer security scheme)
+	// in the block's `bearer "…"` line.
+	Bearer string
+	Line   int
 }
 
 // Stream is one named event stream of the contract — a server-sent-events
@@ -194,11 +225,24 @@ type Stream struct {
 	// is sent to that connection first) and when it closes.
 	Connects   []StreamHook // every `connect -> action [as event]` line, in order
 	Disconnect string
-	Events     []StreamEvent
-	Requires   string
-	Rate       string // read | write | auth: the rate class a connect is metered against
-	Since      string
-	Line       int
+	// Hello is the `hello since "<date>"` line's date: connections open with
+	// the runtime's HelloEventDTO connect frame, documented since then. ""
+	// = no connect frame (a room stream whose connect hook answers instead).
+	Hello string
+	// Summary and Description document the stream route (`summary "…"` /
+	// `description "…"` lines of its block).
+	Summary     string
+	Description string
+	// ParamDocs document the path's {params}: `id: text "Stream id."`.
+	ParamDocs []RecordField
+	// Errors are the error statuses its contract publishes (`errors 403,
+	// 404`), in place of the ones its connect hooks' checks imply.
+	Errors   []int
+	Events   []StreamEvent
+	Requires string
+	Rate     string // read | write | auth: the rate class a connect is metered against
+	Since    string
+	Line     int
 }
 
 // StreamHook is one `connect -> Action [as Event]` line.
@@ -349,8 +393,14 @@ type RecordField struct {
 	Enum        []string
 	// Nullable is `name: T or null`: a wire field that is always present
 	// (required) but may be null — an empty value ("" or nothing) crosses as
-	// null rather than being left out, which is what `T?` does.
+	// null rather than being left out, which is what `T?` does. On a wire
+	// type field, `T? or null` is both: left out when empty, and typed as
+	// maybe-null wherever it is present.
 	Nullable bool
+	// Map (`{T}`) is a wire type field that is a JSON object whose values are
+	// T; Depth (`[[T]]`) is a list's nesting depth when it is more than one.
+	Map   bool
+	Depth int
 	// Into is a pattern field's action parameter: `then_<field>: text? "…"
 	// into then_fields` gathers every body key starting with "then_" into
 	// one json object (key without the prefix -> value) bound to then_fields.

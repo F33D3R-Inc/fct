@@ -1126,6 +1126,53 @@ fn runtime_misc() -> String {
     out.join("|")
 }
 
+/// Values past i64::MAX where the Rust types take any u64: heartbeat
+/// clocks and liveness, ActionTarget's Ord and Display, ActionId,
+/// ValidationError's Display, and the simulator clock.
+fn big_u64() -> String {
+    const BIG: u64 = 9_223_372_036_854_775_808;
+    const MAX: u64 = u64::MAX;
+    let mut out = Vec::new();
+    let mut r = NodeRegistry::new();
+    r.register(&registration("db-a"), BIG);
+    r.heartbeat(&beat("db-a", BIG + 10, true)).unwrap();
+    r.heartbeat(&beat("db-a", 5, true)).unwrap();
+    let n = r.get(&DbmsId::new("db-a")).unwrap();
+    for now in [BIG + 20, BIG + 30_011, MAX, 3] {
+        out.push(node_digest(n, now, 30_000));
+    }
+    out.push(node_digest(n, MAX, BIG));
+    let mut targets = vec![
+        ActionTarget::new(BIG + 1, Coordinate::new(0, 0)),
+        ActionTarget::new(1, Coordinate::new(5, 0)),
+        ActionTarget::new(MAX, Coordinate::new(0, 0)),
+        ActionTarget::new(BIG, Coordinate::new(1, 0)),
+        ActionTarget::new(BIG, Coordinate::new(0, 1)),
+    ];
+    targets.sort();
+    out.push(targets.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(";"));
+    out.push(fabric_controller::ActionId(MAX).to_string());
+    out.push(fabric_controller::ValidationError::StaleDecision { observed_at_ms: BIG, now_ms: MAX, age_ms: MAX - BIG, max_age_ms: BIG + 1 }.to_string());
+    out.push(fabric_controller::ValidationError::DecisionFromTheFuture { observed_at_ms: MAX, now_ms: BIG }.to_string());
+    out.push(fabric_controller::ValidationError::TopologySuperseded { decision_generation: MAX, current_generation: BIG }.to_string());
+    let mut c = fabric_simulator::SimClock::new(BIG, BIG + 7);
+    let a = c.advance();
+    out.push(format!("{}:{}:{}:{}", c.tick_ms(), a, c.now_ms(), c.ticks()));
+    let mut c = fabric_simulator::SimClock::new(5, 0);
+    let a = c.advance();
+    out.push(format!("{}:{}", c.tick_ms(), a));
+    let mut sim = fabric_simulator::Simulation::new(fabric_simulator::ClusterSpec::default());
+    sim.schedule_fault(BIG + 1, fabric_simulator::Fault::NodeLoss { node: DbmsId::new("us-east-db-0") });
+    sim.schedule_fault(5, fabric_simulator::Fault::NodeLoss { node: DbmsId::new("us-east-db-1") });
+    sim.schedule_fault(MAX, fabric_simulator::Fault::PartitionRegion { region: "us-west".into() });
+    for _ in 0..2 {
+        let tick = sim.step();
+        let faults: Vec<String> = tick.faults.iter().map(|f| f.to_string()).collect();
+        out.push(format!("{}:{}:{}", tick.at_ms, faults.join(","), tick.observations.len()));
+    }
+    out.join("|")
+}
+
 pub fn print_all() {
     let cases: Vec<(&str, fn() -> String)> = vec![
         ("mechCutoverVerification", mech_cutover_verification),
@@ -1142,6 +1189,7 @@ pub fn print_all() {
         ("controlLoopMoveOneCell", cl_move_one_cell),
         ("controlLoopReplicate", cl_replicate),
         ("runtimeMisc", runtime_misc),
+        ("bigU64", big_u64),
     ];
     for (name, f) in cases {
         println!("{name}\t{}", f());

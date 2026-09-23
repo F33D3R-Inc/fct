@@ -262,12 +262,12 @@ func parseDecl(app *ast.App, c *source.Node, comments []source.Line) error {
 		}
 	case strings.HasPrefix(c.Line.Text, "api "):
 		var ap *ast.API
-		if ap, err = parseAPI(c.Line.Text, c.Line.No); err == nil {
+		if ap, err = parseAPIDecl(c); err == nil {
 			app.APIs = append(app.APIs, ap)
 		}
 	case strings.HasPrefix(c.Line.Text, "contract "):
 		var cd *ast.ContractDecl
-		if cd, err = parseContractDecl(c.Line.Text, c.Line.No); err == nil {
+		if cd, err = parseContractBlock(c); err == nil {
 			if app.Contract != nil {
 				err = &Error{c.Line.No, fmt.Sprintf("contract redeclared (first at line %d)", app.Contract.Line)}
 			} else {
@@ -1110,16 +1110,34 @@ func parseType(n *source.Node) (*ast.Type, error) {
 		}
 		ft, nullable := splitNullable(ft)
 		core, list, optional := splitType(ft)
+		// `{T}`: a JSON object of T values; `[[T]]`: a list of lists.
+		isMap, depth := false, 0
+		if !list && strings.HasPrefix(core, "{") && strings.HasSuffix(core, "}") {
+			isMap, core = true, strings.TrimSpace(core[1:len(core)-1])
+		}
+		if list {
+			depth = 1
+			for strings.HasPrefix(core, "[") && strings.HasSuffix(core, "]") {
+				depth++
+				core = strings.TrimSpace(core[1 : len(core)-1])
+			}
+			if depth == 1 {
+				depth = 0
+			}
+		}
 		if !isWireTypeName(core) {
-			return &Error{line, fmt.Sprintf("unknown type %q in field %q (use a primitive, `json`, `number`, an enum, another type/message, or a list of those)", core, fn)}
+			return &Error{line, fmt.Sprintf("unknown type %q in field %q (use a primitive, `json`, `number`, an enum, another type/message, a list [T] or [[T]], or a map {T} of those)", core, fn)}
+		}
+		if (isMap || depth > 0) && core == "json" {
+			return &Error{line, fmt.Sprintf("field %q: a map or nested list of json is just json", fn)}
 		}
 		if optional && def != nil {
 			return &Error{line, fmt.Sprintf("field %q cannot be both optional (?) and have a default (=) — pick one", fn)}
 		}
-		if nullable && (optional || def != nil) {
-			return &Error{line, fmt.Sprintf("field %q: `or null` is a present-but-maybe-null field; it is neither optional (?) nor defaulted", fn)}
+		if nullable && def != nil {
+			return &Error{line, fmt.Sprintf("field %q: `or null` and a default (=) contradict — a defaulted field always has a value", fn)}
 		}
-		t.Fields = append(t.Fields, ast.RecordField{Name: fn, Type: core, List: list, Optional: optional, Default: def, Nullable: nullable, Line: line})
+		t.Fields = append(t.Fields, ast.RecordField{Name: fn, Type: core, List: list, Optional: optional, Default: def, Nullable: nullable, Map: isMap, Depth: depth, Line: line})
 		return nil
 	}
 	if inline != "" {
@@ -2317,6 +2335,164 @@ var actionHeaderRe = regexp.MustCompile(`^header\s+"([^"]*)"\s+(\S.*)$`)
 // checkCodeRe is a check's `code "snake_case"` clause.
 var checkCodeRe = regexp.MustCompile(`\s+code\s+"([a-z][a-z0-9_]*)"$`)
 
+// docString reads a documentation line `<keyword> "text"`, reporting whether
+// the line is one.
+func docString(t, keyword string, no int) (string, bool, error) {
+	if !strings.HasPrefix(t, keyword+" ") {
+		return "", false, nil
+	}
+	s, err := unquote(strings.TrimSpace(t[len(keyword)+1:]), no)
+	if err != nil {
+		return "", true, &Error{no, fmt.Sprintf("%s takes one quoted string: %s \"…\"", keyword, keyword)}
+	}
+	return s, true, nil
+}
+
+// blockHeader strips a declaration header's trailing `:` when the node has
+// an indented block, and refuses a block without one.
+func blockHeader(n *source.Node, what string) (string, error) {
+	head := strings.TrimSpace(n.Line.Text)
+	if strings.HasSuffix(head, ":") {
+		if len(n.Children) == 0 {
+			return "", &Error{n.Line.No, fmt.Sprintf("%s header ends in `:` but has no indented block", what)}
+		}
+		return strings.TrimSpace(strings.TrimSuffix(head, ":")), nil
+	}
+	if len(n.Children) > 0 {
+		return "", &Error{n.Line.No, fmt.Sprintf("%s header must end in `:` to take an indented block", what)}
+	}
+	return head, nil
+}
+
+// parseAPIDecl parses an api declaration: the one-line form, or the block
+// form carrying its contract documentation (see ast.API).
+func parseAPIDecl(n *source.Node) (*ast.API, error) {
+	head, err := blockHeader(n, "api")
+	if err != nil {
+		return nil, err
+	}
+	ap, err := parseAPI(head, n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range n.Children {
+		t := strings.TrimSpace(c.Line.Text)
+		no := c.Line.No
+		if s, ok, err := docString(t, "summary", no); ok {
+			if err != nil {
+				return nil, err
+			}
+			ap.Summary = s
+			continue
+		}
+		if s, ok, err := docString(t, "description", no); ok {
+			if err != nil {
+				return nil, err
+			}
+			ap.Description = s
+			continue
+		}
+		if s, ok, err := docString(t, "operation", no); ok {
+			if err != nil {
+				return nil, err
+			}
+			if !isIdent(s) {
+				return nil, &Error{no, fmt.Sprintf("operation %q must be an identifier (the operationId clients generate a method from)", s)}
+			}
+			ap.Operation = s
+			continue
+		}
+		if strings.HasPrefix(t, "body ") {
+			b := strings.TrimSpace(t[len("body "):])
+			if !isIdent(b) || !isUpper(b) {
+				return nil, &Error{no, "body names the wire type the request body is: body V2NumberMintRequest"}
+			}
+			ap.Body = b
+			continue
+		}
+		if strings.HasPrefix(t, "errors ") {
+			codes, err := parseErrorCodes(t, no)
+			if err != nil {
+				return nil, err
+			}
+			ap.Errors = codes
+			continue
+		}
+		if strings.Contains(t, ":") {
+			f, err := parseVariantField(t, ap.Method+" "+ap.Path, no)
+			if err != nil {
+				return nil, err
+			}
+			for _, prev := range ap.ParamDocs {
+				if prev.Name == f.Name {
+					return nil, &Error{no, fmt.Sprintf("parameter %q documented twice", f.Name)}
+				}
+			}
+			ap.ParamDocs = append(ap.ParamDocs, f)
+			continue
+		}
+		return nil, &Error{no, "an api block holds summary \"…\", description \"…\", body Type, errors N, …, operation \"…\", or `param: type \"description\"` lines"}
+	}
+	return ap, nil
+}
+
+// parseErrorCodes reads an `errors 400, 404` line: distinct 4xx/5xx statuses.
+func parseErrorCodes(t string, no int) ([]int, error) {
+	var codes []int
+	for _, part := range strings.Split(t[len("errors "):], ",") {
+		code, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || code < 400 || code > 599 {
+			return nil, &Error{no, fmt.Sprintf("errors lists the error statuses the route answers (400-599): errors 400, 404 — got %q", strings.TrimSpace(part))}
+		}
+		for _, seen := range codes {
+			if seen == code {
+				return nil, &Error{no, fmt.Sprintf("errors lists %d twice", code)}
+			}
+		}
+		codes = append(codes, code)
+	}
+	return codes, nil
+}
+
+// parseContractBlock parses a contract declaration, one-line or with a block
+// of `title "…"` / `description "…"` lines.
+func parseContractBlock(n *source.Node) (*ast.ContractDecl, error) {
+	head, err := blockHeader(n, "contract")
+	if err != nil {
+		return nil, err
+	}
+	cd, err := parseContractDecl(head, n.Line.No)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range n.Children {
+		t := strings.TrimSpace(c.Line.Text)
+		if s, ok, err := docString(t, "title", c.Line.No); ok {
+			if err != nil {
+				return nil, err
+			}
+			cd.Title = s
+			continue
+		}
+		if s, ok, err := docString(t, "description", c.Line.No); ok {
+			if err != nil {
+				return nil, err
+			}
+			cd.Description = s
+			continue
+		}
+		if s, ok, err := docString(t, "bearer", c.Line.No); ok {
+			if err != nil {
+				return nil, err
+			}
+			cd.Bearer = s
+			continue
+		}
+		return nil, &Error{c.Line.No, "a contract block holds title \"…\", description \"…\" and bearer \"…\" lines"}
+	}
+	return cd, nil
+}
+
 // parseAPI parses a one-line typed HTTP endpoint (see ast.API):
 //
 //	api GET "/api/v2/works/{id}" -> getWork [status N] [rate read|write|auth] [since "YYYY-MM-DD"]
@@ -2492,6 +2668,45 @@ func parseStream(n *source.Node) (*ast.Stream, error) {
 	}
 	for _, c := range n.Children {
 		t := strings.TrimSpace(c.Line.Text)
+		if s, ok, err := docString(t, "summary", c.Line.No); ok {
+			if err != nil {
+				return nil, err
+			}
+			st.Summary = s
+			continue
+		}
+		if s, ok, err := docString(t, "description", c.Line.No); ok {
+			if err != nil {
+				return nil, err
+			}
+			st.Description = s
+			continue
+		}
+		if strings.HasPrefix(t, "errors ") {
+			codes, err := parseErrorCodes(t, c.Line.No)
+			if err != nil {
+				return nil, err
+			}
+			st.Errors = codes
+			continue
+		}
+		if t == "hello" || strings.HasPrefix(t, "hello ") {
+			// `hello since "<date>"`: open every connection with the runtime's
+			// HelloEventDTO connect frame.
+			f := strings.Fields(t)
+			if len(f) != 3 || f[1] != "since" {
+				return nil, &Error{c.Line.No, `a stream's connect frame is declared as: hello since "2026-09-13"`}
+			}
+			d, err := unquote(f[2], c.Line.No)
+			if err != nil || d == "" {
+				return nil, &Error{c.Line.No, `a stream's connect frame is declared as: hello since "2026-09-13"`}
+			}
+			if st.Hello != "" {
+				return nil, &Error{c.Line.No, fmt.Sprintf("stream %q declares hello twice", st.Path)}
+			}
+			st.Hello = d
+			continue
+		}
 		if strings.HasPrefix(t, "connect ") || strings.HasPrefix(t, "disconnect ") {
 			// `connect -> action [as event]` / `disconnect -> action`.
 			word := firstWord(t)
@@ -2514,6 +2729,18 @@ func parseStream(n *source.Node) (*ast.Stream, error) {
 				return nil, &Error{c.Line.No, "stream hooks are `connect -> action [as event]` and `disconnect -> action`"}
 			}
 			continue
+		}
+		if colon := strings.IndexByte(t, ':'); colon > 0 {
+			if f := strings.Fields(t[colon+1:]); len(f) > 0 && isType(strings.TrimSuffix(f[0], "?")) {
+				// `id: text "Stream id."` — a path parameter's documentation
+				// (an event's payload is a capitalized wire type).
+				d, err := parseVariantField(t, st.Path, c.Line.No)
+				if err != nil {
+					return nil, err
+				}
+				st.ParamDocs = append(st.ParamDocs, d)
+				continue
+			}
 		}
 		ev, err := parseStreamEvent(c.Line.Text, c.Line.No)
 		if err != nil {

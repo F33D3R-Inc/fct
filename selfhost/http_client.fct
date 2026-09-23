@@ -23,9 +23,12 @@ app HttpClientSelfHost:
     # pool to go stale. The body is decoded as UTF-8, the way `.text()`
     # decodes a response without a charset.
     #
-    # Not here, honestly: TLS. The runtime has no TLS primitive, so an
-    # https URL is a transport failure naming that, not a plaintext request
-    # to a TLS port.
+    # https is TLS through the runtime's connectTls (runtime/tlsconnect.go):
+    # the certificate verified against the URL's host, over the system roots
+    # plus, for the *Trust variants, a PEM file of extra trusted roots —
+    # reqwest's add_root_certificate. A failed handshake (an untrusted
+    # chain, a wrong name, a plain-http peer) is a transport failure like a
+    # refused dial.
     #
     # Transport failures are values: `HttpResponse.ok` false with `err`
     # saying what happened (a refused dial, a deadline, a truncated
@@ -513,14 +516,25 @@ app HttpClientSelfHost:
     # non-2xx status is a response like any other; only a transport
     # failure answers ok: false.
     proc httpExchange(req: HttpRequest) -> HttpResponse uses io.net:
+        let r = do httpExchangeTrust(req, "")
+        return r
+
+    # httpDial: the connection a URL asks for — TLS for https.
+    proc httpDial(u: HttpUrl, trustFile: text) -> int uses io.net:
+        if u.scheme == "https":
+            let t = connectTls(u.host, u.port, "", trustFile)
+            return t
+        let c = connect(u.host, u.port)
+        return c
+
+    # httpExchangeTrust: httpExchange, trusting the roots in trustFile (a
+    # PEM file in the data sandbox) as well as the system's for https.
+    proc httpExchangeTrust(req: HttpRequest, trustFile: text) -> HttpResponse uses io.net:
         let u = do httpParseUrl(req.url)
         if !u.ok:
             let f = do httpFailure("builder error: " + u.err)
             return f
-        if u.scheme == "https":
-            let f = do httpFailure("https is not supported: the fct runtime has no TLS primitive")
-            return f
-        let c = connect(u.host, u.port)
+        let c = do httpDial(u, trustFile)
         if req.timeoutMs > 0:
             let set = setTimeoutMs(c, req.timeoutMs)
         let wire = do httpSerialize(req, u)
@@ -612,14 +626,15 @@ app HttpClientSelfHost:
     # is read whole (its body in `data`, ended) — it is an error reply, not
     # a stream.
     proc httpOpenStream(req: HttpRequest) -> HttpStream uses io.net:
+        let s = do httpOpenStreamTrust(req, "")
+        return s
+
+    proc httpOpenStreamTrust(req: HttpRequest, trustFile: text) -> HttpStream uses io.net:
         let u = do httpParseUrl(req.url)
         if !u.ok:
             let f = do httpStreamFailed("builder error: " + u.err)
             return f
-        if u.scheme == "https":
-            let f = do httpStreamFailed("https is not supported: the fct runtime has no TLS primitive")
-            return f
-        let c = connect(u.host, u.port)
+        let c = do httpDial(u, trustFile)
         if req.timeoutMs > 0:
             let set = setTimeoutMs(c, req.timeoutMs)
         let wrote = writeBytes(c, httpSerialize(req, u))
@@ -819,6 +834,15 @@ app HttpClientSelfHost:
         let r = do httpExchange(HttpRequest{method: method, url: url, headers: hs, body: body, timeoutMs: timeoutMs})
         let out = do httpRender(r)
         return out
+
+    proc httpRunTrustOnce(url: text, trustFile: text) -> text uses io.net:
+        let r = do httpExchangeTrust(HttpRequest{method: "GET", url: url, headers: [], body: "", timeoutMs: 0}, trustFile)
+        let out = do httpRender(r)
+        return out
+
+    action httpRunTrust(url: text, trustFile: text):
+        let r = do httpRunTrustOnce(url, trustFile)
+        httpOut = r
 
     action httpRun(method: text, url: text, headerLines: text, body: text, timeoutMs: int):
         let r = do httpRunOnce(method, url, headerLines, body, timeoutMs)

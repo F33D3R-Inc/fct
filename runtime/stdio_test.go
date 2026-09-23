@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -177,9 +175,11 @@ func TestRunMainSignalsAndWallClock(t *testing.T) {
 	for !strings.Contains(out.String(), "ready") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
+	// Delivered through the same path the OS notification takes, not by
+	// signalling this test process (which would reach every other server
+	// under test that listens for SIGTERM). The OS path is exercised end to
+	// end by selfhost's fabricd SIGTERM tests, which signal a subprocess.
+	srv.deliverSignal("SIGTERM")
 	select {
 	case code := <-done:
 		if code != 0 {
@@ -197,4 +197,77 @@ func TestRunMainSignalsAndWallClock(t *testing.T) {
 	if ms < int(start)-1000 || ms > int(time.Now().UnixMilli())+1000 {
 		t.Fatalf("nowMs %d is not the wall clock (%d)", ms, start)
 	}
+}
+
+// A command's accept loops as detached tasks: main detaches one per port,
+// each detaches a handler per connection (internal/ir/detachctx.go).
+func TestRunMainDetachedAcceptLoops(t *testing.T) {
+	g, err := compile.File("testdata/detach_accept.fct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewInMemory(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ports := make([]string, 2)
+	for i := range ports {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ports[i] = strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+		l.Close()
+	}
+	var out syncBuf
+	srv.SetStdio(strings.NewReader(""), &out, io.Discard)
+	codes := make(chan int, 1)
+	go func() {
+		code, err := srv.RunMain(ports)
+		if err != nil {
+			t.Error(err)
+		}
+		codes <- code
+	}()
+	for end := time.Now().Add(5 * time.Second); !strings.Contains(out.String(), "listening"); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatal("main never listened")
+		}
+	}
+	for i, tag := range []string{"a", "b"} {
+		c, err := net.Dial("tcp", "127.0.0.1:"+ports[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Write([]byte("hi"))
+		got, _ := io.ReadAll(c)
+		c.Close()
+		if string(got) != tag+":hi" {
+			t.Fatalf("port %s answered %q", tag, got)
+		}
+	}
+	if code := <-codes; code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(out.String(), "served a b") {
+		t.Fatalf("stdout %q", out.String())
+	}
+}
+
+// syncBuf is a bytes.Buffer safe for a writer goroutine and a reader.
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

@@ -92,7 +92,7 @@ app FabricFacetqlMoverSelfHost:
     # cellScopeForKey: what `key` holds according to the keyspace — the
     # union of the rules naming it, and, when it is the fallback,
     # everything no other rule claims.
-    proc cellScopeForKey(ks: Keyspace, key: int) -> CellScope:
+    proc cellScopeForKey(ks: Keyspace, key: RoutingKey) -> CellScope:
         let mut kinds = []
         let mut prefixes = []
         let mut exKinds = []
@@ -101,14 +101,16 @@ app FabricFacetqlMoverSelfHost:
         let mut i = 0
         loop i < n:
             let r = ks.rules[i]
-            if r.key == key:
+            let same = do routingKeyEquals(r.key, key)
+            if same:
                 kinds = append(kinds, r.kind)
                 prefixes = append(prefixes, r.prefix)
             else:
                 exKinds = append(exKinds, r.kind)
                 exPrefixes = append(exPrefixes, r.prefix)
             i = i + 1
-        return CellScope{kinds: kinds, prefixes: prefixes, catchAll: ks.hasFallback && ks.fallbackKey == key, excludedKinds: exKinds, excludedPrefixes: exPrefixes}
+        let fallbackIsKey = do routingKeyEquals(ks.fallbackKey, key)
+        return CellScope{kinds: kinds, prefixes: prefixes, catchAll: ks.hasFallback && fallbackIsKey, excludedKinds: exKinds, excludedPrefixes: exPrefixes}
 
     proc cellScopeKinds(s: CellScope) -> [text]:
         if s.catchAll:
@@ -694,9 +696,8 @@ app FabricFacetqlMoverSelfHost:
         return MoverReport{rowsCopied: m.rowsCopied, bytesCopied: m.bytesCopied, hasResidentBytes: m.hasResident, residentBytes: m.residentBytes, snapshotComplete: m.snapshotComplete, observedWrites: f.observed, appliedWrites: f.applied, verdict: verdict}
 
     # ── mover.rs's #[test]s, input for input ──────────────────────────
-    proc moverTestKey(shard: int) -> int:
-        let k = do routingKeyPack(shard, 0, 0)
-        return k
+    proc moverTestKey(shard: int) -> RoutingKey:
+        return RoutingKey{shardId: shard, coordinate: Coordinate{x: 0, y: 0}}
 
     proc moverTestNode(address: text, kind: text, data: text) -> FqlNode:
         return FqlNode{address: address, coordinate: FqlCoordinate{x: 0, y: 0, z: 0, q: 0}, value: 0, kind: kind, data: data, owner: "app", hasClaimedBy: false, claimedBy: "", visibility: "Private"}
@@ -771,9 +772,9 @@ app FabricFacetqlMoverSelfHost:
         moverOut = "" + a + "," + b + "," + c + "," + d + "," + e + "," + f + "," + g
 
     # ── live flows, against two real FacetQL instances ────────────────
-    proc moverLiveClient(id: text, base: text, token: text) -> FqlClient:
+    proc moverLiveClient(id: text, base: text, token: text, trust: text) -> FqlClient:
         let ep = do fqlEndpointNew(id, base, token)
-        let c = do fqlClientNew(ep.v)
+        let c = do fqlClientTrusting(fqlClientNew(ep.v), trust)
         return c
 
     proc moverLiveCreate(c: FqlClient, address: text, kind: text, data: text) -> bool uses io.net:
@@ -790,9 +791,9 @@ app FabricFacetqlMoverSelfHost:
     # moverLiveCopy: seed a source, subscribe, snapshot, write to the source
     # while the copy is live, catch up, verify; then tamper with the copy,
     # and finally refuse a source that has an edge.
-    proc moverLiveCopy(src: text, dst: text, token: text) -> text uses io.net:
-        let s = do moverLiveClient("src", src, token)
-        let d = do moverLiveClient("dst", dst, token)
+    proc moverLiveCopy(src: text, dst: text, token: text, trust: text) -> text uses io.net:
+        let s = do moverLiveClient("src", src, token, trust)
+        let d = do moverLiveClient("dst", dst, token, trust)
         let mut seeded = 0
         let mut i = 0
         loop i < 30:
@@ -852,9 +853,9 @@ app FabricFacetqlMoverSelfHost:
 
     # moverLiveFeed: a source whose /events refuses, and one whose stream
     # ends — both fatal, both said.
-    proc moverLiveFeed(src: text, token: text) -> text uses io.net:
-        let s = do moverLiveClient("src", src, token)
-        let d = do moverLiveClient("dst", src, token)
+    proc moverLiveFeed(src: text, token: text, trust: text) -> text uses io.net:
+        let s = do moverLiveClient("src", src, token, trust)
+        let d = do moverLiveClient("dst", src, token, trust)
         let m = do cellMoverNew(s, d, cellScopeWholeNamespace(), moverConfigDefault())
         let sub = do moverSubscribe(m)
         if !sub.ok:
@@ -870,13 +871,13 @@ app FabricFacetqlMoverSelfHost:
         let v = do moverVerify(m, cu.feed, 7)
         return "dirty=" + join(feed.dirty, ",") + "\nobserved=" + feed.observed + "\ncatchUp=" + moverErrorDisplay(cu.err) + "\nverify=" + moverVerdictLine(v.verdict)
 
-    proc moverLiveFlow(flow: text, src: text, dst: text, token: text) -> text uses io.net:
+    proc moverLiveFlow(flow: text, src: text, dst: text, token: text, trust: text) -> text uses io.net:
         if flow == "copy":
-            let r = do moverLiveCopy(src, dst, token)
+            let r = do moverLiveCopy(src, dst, token, trust)
             return r
-        let r = do moverLiveFeed(src, token)
+        let r = do moverLiveFeed(src, token, trust)
         return r
 
-    action moverRunLive(flow: text, src: text, dst: text, token: text):
-        let r = do moverLiveFlow(flow, src, dst, token)
+    action moverRunLive(flow: text, src: text, dst: text, token: text, trust: text):
+        let r = do moverLiveFlow(flow, src, dst, token, trust)
         moverOut = r

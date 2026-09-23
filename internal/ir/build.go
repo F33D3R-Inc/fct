@@ -42,6 +42,7 @@ type env struct {
 	inDerive         string                            // the parameterized derive whose body is being checked
 	inProc           bool                              // a proc body is being checked
 	inDaemon         bool                              // a daemon body is being checked (server-only, like a proc)
+	daemonCtxWhy     map[string]string                 // a detached proc that is not daemon-context: the reference that disqualifies it (detachctx.go)
 	actParams        map[string]bool                   // the action being built: its parameter names (given(p))
 	deriveParamTypes map[string]vtype                  // the parameterized derive being checked: its parameters' types
 	entDeriveExprs   map[string]map[string]*Expr       // entity -> its derives' lowered expressions (over "$row")
@@ -371,7 +372,7 @@ func Build(app *ast.App) (*IR, error) {
 			return WireField{}, &BuildError{f.Line, fmt.Sprintf("%q has duplicate field %q", declName, f.Name)}
 		}
 		seen[f.Name] = true
-		wf := WireField{Name: f.Name, Type: f.Type, List: f.List, Optional: f.Optional, Description: f.Description, Aliases: f.Aliases, Enum: f.Enum, Into: f.Into, Nullable: f.Nullable}
+		wf := WireField{Name: f.Name, Type: f.Type, List: f.List, Optional: f.Optional, Description: f.Description, Aliases: f.Aliases, Enum: f.Enum, Into: f.Into, Nullable: f.Nullable, Map: f.Map, Depth: f.Depth}
 		if f.Default != nil {
 			wf.Default = *f.Default
 		}
@@ -434,10 +435,18 @@ func Build(app *ast.App) (*IR, error) {
 			if f.Optional {
 				e.wireOptional[ty.Name][f.Name] = true
 			}
-			if f.Nullable {
+			if f.Nullable && !f.Optional {
+				// A present-but-maybe-null field: the runtime sends null for
+				// an empty value. `T? or null` is left out when empty instead.
 				e.wireNullable[ty.Name] = append(e.wireNullable[ty.Name], f.Name)
 			}
-			e.wireFieldTypes[ty.Name][f.Name] = vtype{core: f.Type, list: f.List}
+			if f.Map || f.Depth > 0 {
+				// A map or nested list holds structured JSON: an expression
+				// filling it is checked as json (e.g. fromJson(…)).
+				e.wireFieldTypes[ty.Name][f.Name] = vtype{core: "json"}
+			} else {
+				e.wireFieldTypes[ty.Name][f.Name] = vtype{core: f.Type, list: f.List}
+			}
 		}
 		seen := map[string]bool{}
 		var fields []WireField
@@ -1070,9 +1079,19 @@ func Build(app *ast.App) (*IR, error) {
 		return nil, err
 	}
 	entryAt := -1 // the program's `main`, lowered below with the daemons
+	// Procs only ever `detach`ed from a daemon-context body are lowered with
+	// the daemons too, as daemon-context bodies themselves (detachctx.go).
+	daemonCtx, daemonCtxWhy := daemonContextProcs(app)
+	e.daemonCtxWhy = daemonCtxWhy
+	ctxAt := map[string]int{}
 	for _, p := range app.Procs {
 		if isProcessEntry(p) {
 			entryAt = len(out.Procs)
+			out.Procs = append(out.Procs, Proc{})
+			continue
+		}
+		if daemonCtx[p.Name] {
+			ctxAt[p.Name] = len(out.Procs)
 			out.Procs = append(out.Procs, Proc{})
 			continue
 		}
@@ -1158,16 +1177,19 @@ func Build(app *ast.App) (*IR, error) {
 	// where a daemon body does — on its own goroutine, under no request's
 	// lock, for as long as it likes — so its body is lowered with the same
 	// allowances: listen/accept, detach and act.
-	if entryAt >= 0 {
-		for _, p := range app.Procs {
-			if isProcessEntry(p) {
-				pr, err := e.procIn(p, actionSigs)
-				if err != nil {
-					return nil, err
-				}
-				out.Procs[entryAt] = pr
-			}
+	for _, p := range app.Procs {
+		at, ctx := ctxAt[p.Name]
+		if isProcessEntry(p) {
+			at, ctx = entryAt, true
 		}
+		if !ctx {
+			continue
+		}
+		pr, err := e.procIn(p, actionSigs)
+		if err != nil {
+			return nil, err
+		}
+		out.Procs[at] = pr
 	}
 	daemonSeen := map[string]int{}
 	for _, d := range app.Daemons {
@@ -1248,7 +1270,11 @@ func Build(app *ast.App) (*IR, error) {
 			if err := e.dispatchRoute(ap, msg, byActionName, apiSeen); err != nil {
 				return nil, err
 			}
-			out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Status: 200, Rate: ap.Rate, Since: ap.Since, Auth: "none", Dispatch: msg.Name})
+			if ap.Body != "" || len(ap.Errors) > 0 || len(ap.ParamDocs) > 0 {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("api %s %q -> %s: a dispatching route documents its variants in the message — its block takes only summary, description and operation", ap.Method, ap.Path, msg.Name)}
+			}
+			out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Status: 200, Rate: ap.Rate, Since: ap.Since, Auth: "none", Dispatch: msg.Name,
+				Summary: ap.Summary, Description: ap.Description, Operation: ap.Operation})
 			continue
 		}
 		act, ok := byActionName[ap.Action]
@@ -1346,7 +1372,12 @@ func Build(app *ast.App) (*IR, error) {
 			}
 			auth = ap.AuthScheme
 		}
-		out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Params: pathParams, Action: ap.Action, Status: status, Rate: ap.Rate, Since: ap.Since, Auth: auth, Ret: act.Ret, RetList: act.RetList, Bearer: ap.Bearer})
+		docs, err := e.apiDocs(ap, act, pathParams, out.Types)
+		if err != nil {
+			return nil, err
+		}
+		out.APIs = append(out.APIs, API{Method: ap.Method, Path: ap.Path, Params: pathParams, Action: ap.Action, Status: status, Rate: ap.Rate, Since: ap.Since, Auth: auth, Ret: act.Ret, RetList: act.RetList, Bearer: ap.Bearer,
+			Summary: ap.Summary, Description: ap.Description, Body: ap.Body, Errors: ap.Errors, Operation: ap.Operation, ParamDocs: docs})
 	}
 
 	// 4d‴. `contract "/path"`: the runtime answers GET on the path and its
@@ -1358,7 +1389,7 @@ func Build(app *ast.App) (*IR, error) {
 				return nil, &BuildError{line, fmt.Sprintf("api GET %q is served by the contract declaration (line %d)", cd.Path+sub, cd.Line)}
 			}
 		}
-		out.Contract = &ContractRoute{Path: cd.Path, Rate: cd.Rate, Since: cd.Since}
+		out.Contract = &ContractRoute{Path: cd.Path, Rate: cd.Rate, Since: cd.Since, Title: cd.Title, Description: cd.Description, Bearer: cd.Bearer}
 	}
 
 	// 4d″. Streams: `stream "/path" [requires policy]: TypeA, TypeB`, or the
@@ -1463,8 +1494,22 @@ func Build(app *ast.App) (*IR, error) {
 		if err := hook("disconnect", st.Disconnect); err != nil {
 			return nil, err
 		}
+		var sdocs []APIParamDoc
+		for _, d := range st.ParamDocs {
+			isParam := false
+			for _, p := range params {
+				isParam = isParam || p == d.Name
+			}
+			if !isParam {
+				return nil, &BuildError{d.Line, fmt.Sprintf("stream %q documents %q, which is not one of its {path} parameters", st.Path, d.Name)}
+			}
+			if d.Type != "text" || d.List || d.Optional || d.Default != nil || len(d.Aliases) > 0 || d.Into != "" {
+				return nil, &BuildError{d.Line, fmt.Sprintf("stream %q: a path parameter is text: %s: text \"description\" [one of …]", st.Path, d.Name)}
+			}
+			sdocs = append(sdocs, APIParamDoc{Name: d.Name, Type: d.Type, Description: d.Description, Enum: d.Enum})
+		}
 		out.Streams = append(out.Streams, Stream{Path: st.Path, Events: events, Requires: st.Requires, Auth: auth, Rate: st.Rate, Since: st.Since,
-			Params: params, Connects: connects, Disconnect: st.Disconnect})
+			Params: params, Connects: connects, Disconnect: st.Disconnect, Hello: st.Hello, Summary: st.Summary, Description: st.Description, ParamDocs: sdocs, Errors: st.Errors})
 	}
 	for _, st := range app.Streams {
 		if line, ok := apiSeen["GET "+st.Path]; ok {
@@ -3087,6 +3132,12 @@ func (e *env) procIn(p *ast.Proc, actionSigs map[string]actionSig) (Proc, error)
 	e.seedSharedTypes(types)
 	body, err := e.procBlock(p, p.Body, locals, mutable, types, 0, actionSigs)
 	if err != nil {
+		// A detached proc that is not daemon-context: say which reference
+		// made it an ordinary proc (detachctx.go).
+		if be, ok := err.(*BuildError); ok && actionSigs == nil && e.daemonCtxWhy[p.Name] != "" &&
+			(strings.Contains(be.Msg, "only available inside a daemon body") || strings.Contains(be.Msg, "only valid inside a daemon body")) {
+			return Proc{}, &BuildError{be.Line, fmt.Sprintf("%s (proc %q is started by `detach`, but it is also reached by %s, so it runs as an ordinary proc, possibly under a caller's lock)", be.Msg, p.Name, e.daemonCtxWhy[p.Name])}
+		}
 		return Proc{}, err
 	}
 	e.lowerSharedRefs(body)
@@ -3833,6 +3884,9 @@ func (e *env) checkProcExpr(p *ast.Proc, ex ast.Expr, locals map[string]bool, ty
 	if err := checkDaemonOnlyBuiltins(ex, actionSigs != nil, line); err != nil {
 		return err
 	}
+	if err := checkEntryOnlyBuiltins(ex, isProcessEntry(p), line); err != nil {
+		return err
+	}
 	if err := checkBitwiseTypes(ex, types, line); err != nil {
 		return err
 	}
@@ -3977,7 +4031,7 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			return "int"
 		case "readFile", "httpGet", "httpPost":
 			return "text"
-		case "listen", "listenOn", "accept":
+		case "listen", "listenOn", "listenTls", "accept":
 			// Listener/Conn are, deliberately, just int handles — the exact same
 			// "no new type anywhere in this type system" move `channel()` already
 			// makes (see its case below and runtime/netconn.go's doc): an int is
@@ -3999,6 +4053,20 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 		case "monoMs", "nowMs", "signals":
 			// signals() is a channel handle, the same int channel() mints.
 			return "int"
+		case "connectTls":
+			// connectTls(host, port, serverName, trustFile) -> int: the same
+			// connection handle connect() mints (runtime/tlsconnect.go).
+			return "int"
+		case "awaitAny":
+			// awaitAny(chans, ms) -> int: the position in chans of a channel
+			// with a value waiting (or closed), -1 when ms pass first
+			// (runtime/channel.go).
+			return "int"
+		case "closeChannel", "exitProcess":
+			return "bool"
+		case "processStats":
+			// processStats() -> text: a JSON object (runtime/process.go).
+			return "text"
 		case "writeBytes", "closeConn", "setTimeoutMs":
 			// true on success. writeBytes answers false on a transport
 			// failure (connection reset, deadline passed) — a value, so a
@@ -4008,8 +4076,10 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 		case "connect":
 			// An outbound connection is the same int handle accept() mints.
 			return "int"
-		case "connError":
+		case "connError", "connPeer", "listenError":
 			return "text"
+		case "closeListener", "grantRead":
+			return "bool"
 		case "writeStdout", "writeStderr":
 			return "bool"
 		case "readStdin":
@@ -4070,11 +4140,26 @@ func inferProcType(ex ast.Expr, types map[string]string) string {
 			// floatFromBits(b) -> float, the IEEE-754 bit-cast inverse of
 			// floatBits(f) -> int.
 			return "float"
+		case "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Parse":
+			// the u64 builtins (runtime/u64.go): an int's 64 bits read unsigned.
+			return "int"
+		case "u64Text", "u64ParseError":
+			return "text"
+		case "u64ToFloat":
+			return "float"
 		case "floatBits":
 			// floatBits(f) -> int, the raw IEEE-754 bit pattern of f
 			// reinterpreted as a signed 64-bit int — always int-typed, the
 			// same as toInt/floor/round, regardless of the float's value.
 			return "int"
+		case "slice":
+			// slice(s, start, end) is a substring of a text and a sublist of
+			// a list — the same type it was handed.
+			if len(t.Args) == 3 {
+				if at := inferProcType(t.Args[0], types); at == arrayType || at == bytesType || at == "text" {
+					return at
+				}
+			}
 		case "toInt", "floor", "round":
 			// floor/round always return int — see runtime/eval.go's callBuiltin
 			// doc for why a rounded value is int-typed regardless of whether the
@@ -6627,7 +6712,8 @@ func checkNoIndexIf(ex ast.Expr, wire map[string]bool, line int, allow func(ast.
 // syntactic barrier that guarantees that, exactly mirroring checkNoBitwise's
 // shape and its single call site inside check().
 var ioBuiltins = map[string]bool{"readFile": true, "writeFile": true, "appendFile": true, "fileExists": true, "truncateFile": true, "fileSize": true, "readFileAt": true, "writeFileAt": true, "syncFile": true, "renameFile": true, "removeFile": true, "httpGet": true, "httpPost": true,
-	"connect": true, "readBytes": true, "writeBytes": true, "closeConn": true, "setTimeoutMs": true, "connError": true, "pollBytes": true, "connOpen": true,
+	"connect": true, "connectTls": true, "readBytes": true, "writeBytes": true, "closeConn": true, "setTimeoutMs": true, "connError": true, "pollBytes": true, "connOpen": true,
+	"closeListener": true, "listenError": true, "grantRead": true,
 	"writeStdout": true, "writeStderr": true, "readStdin": true}
 
 // checkNoIO rejects a call to readFile/writeFile/httpGet/httpPost anywhere
@@ -6705,7 +6791,7 @@ func checkNoIO(ex ast.Expr, line int) error {
 // re-evaluate outside any proc call — must never be able to write one into
 // source at all. checkNoConcurrency is ioBuiltins/checkNoIO's exact shape,
 // applied to this set instead.
-var concurrencyBuiltins = map[string]bool{"channel": true, "send": true, "recv": true, "sleepMs": true, "monoMs": true, "nowMs": true, "signals": true}
+var concurrencyBuiltins = map[string]bool{"channel": true, "send": true, "recv": true, "sleepMs": true, "monoMs": true, "nowMs": true, "signals": true, "awaitAny": true, "closeChannel": true}
 
 // checkNoConcurrency rejects a call to channel/send/recv anywhere outside a
 // proc body, mirroring checkNoIO exactly (see its doc) — checkProcExpr (proc
@@ -6789,7 +6875,27 @@ func checkNoConcurrency(ex ast.Expr, line int) error {
 // procBlock's own `act ActionName(...)` gate already uses (actionSigs == nil
 // means "lowering a real proc's body", non-nil means "lowering a daemon's")
 // rather than inventing a second one.
-var listenBuiltins = map[string]bool{"listen": true, "listenOn": true, "accept": true}
+var listenBuiltins = map[string]bool{"listen": true, "listenOn": true, "listenTls": true, "accept": true}
+
+// checkEntryOnlyBuiltins rejects grantRead(...) anywhere but the process
+// entry point (`proc main`): a read grant must come from the one body that
+// runs before any request, connection or client input exists — see
+// runtime/grants.go for the whole model.
+func checkEntryOnlyBuiltins(ex ast.Expr, isEntry bool, line int) error {
+	if isEntry {
+		return nil
+	}
+	var found bool
+	ast.WalkExpr(ex, func(x ast.Expr) {
+		if c, ok := x.(ast.Call); ok && c.Name == "grantRead" {
+			found = true
+		}
+	})
+	if found {
+		return &BuildError{line, "grantRead(...) is only available in `proc main(args: [text]) -> int` — a file becomes readable outside the sandbox only when the operator names it (an argument or an environment variable) to the process entry point, before any request or connection exists"}
+	}
+	return nil
+}
 
 // checkDaemonOnlyBuiltins rejects a call to listen/accept anywhere isDaemon
 // is false, mirroring checkNoIO's
@@ -7104,11 +7210,27 @@ func (e *env) checkBuiltins(ex ast.Expr, line int) error {
 			if len(t.Args) != 1 {
 				return &BuildError{line, "sleepMs(ms) takes exactly one argument (milliseconds, 0-600000)"}
 			}
-		case "monoMs", "nowMs", "signals":
+		case "monoMs", "nowMs", "signals", "processStats":
 			if len(t.Args) != 0 {
 				return &BuildError{line, t.Name + "() takes no arguments"}
 			}
-		case "listen", "accept", "closeConn", "connError", "shutdownConn", "connOpen":
+		case "closeChannel", "exitProcess":
+			if len(t.Args) != 1 {
+				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
+			}
+		case "connectTls":
+			if len(t.Args) != 4 {
+				return &BuildError{line, "connectTls(host, port, serverName, trustFile) takes exactly four arguments: a host, a port, the name the certificate must carry (\"\": the host) and a PEM file of extra trusted roots (\"\": the system's only)"}
+			}
+		case "awaitAny":
+			if len(t.Args) != 2 {
+				return &BuildError{line, "awaitAny(chans, ms) takes exactly two arguments: a list of channel handles and a wait in milliseconds (negative: no limit)"}
+			}
+		case "listenTls":
+			if len(t.Args) != 3 {
+				return &BuildError{line, "listenTls(port, identity, password) takes exactly three arguments: a port, a PKCS#12 identity file and its password"}
+			}
+		case "listen", "accept", "closeConn", "connError", "connPeer", "shutdownConn", "connOpen", "closeListener", "listenError", "grantRead":
 			if len(t.Args) != 1 {
 				return &BuildError{line, fmt.Sprintf("%s(...) takes exactly one argument", t.Name)}
 			}
@@ -7340,9 +7462,9 @@ func builtinCapability(name string) (string, bool) {
 	case "readFile", "writeFile", "appendFile", "fileExists", "truncateFile",
 		"fileSize", "readFileAt", "writeFileAt", "syncFile", "renameFile", "removeFile":
 		return "io.file", true
-	case "httpGet", "httpPost", "connect":
+	case "httpGet", "httpPost", "connect", "connectTls":
 		return "io.net", true
-	case "writeStdout", "writeStderr", "readStdin", "signals":
+	case "writeStdout", "writeStderr", "readStdin", "signals", "exitProcess", "processStats":
 		// io.console: the process's own stdio, for a program run as a
 		// command (`facet exec`, runtime/stdio.go). A server's stdout is its
 		// operator log, so writing to it is opted into by name.
@@ -7352,11 +7474,17 @@ func builtinCapability(name string) (string, bool) {
 		// is configured (ports, keys, credentials), so reading it is opted
 		// into by name like any other channel to the outside.
 		return "io.env", true
-	case "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "shutdownConn", "pollBytes", "connOpen":
+	case "readBytes", "writeBytes", "closeConn", "setTimeoutMs", "connError", "connPeer", "shutdownConn", "pollBytes", "connOpen":
 		// I/O on a connection handle, whichever way it was minted: an
 		// outbound connect() (io.net) or a daemon's accept() (io.net.listen).
 		return netConnCap, true
-	case "listen", "listenOn", "accept":
+	case "grantRead":
+		// io.file: it makes a file readable (runtime/grants.go).
+		return "io.file", true
+	case "closeListener", "listenError":
+		// Operations on a listener handle: the listener's own capability.
+		return "io.net.listen", true
+	case "listen", "listenOn", "listenTls", "accept":
 		// io.net.listen: deliberately a MORE specific capability than io.net
 		// (outbound httpGet/httpPost), not a reuse of it — accepting arbitrary
 		// inbound connections is a materially bigger trust boundary than this
@@ -7583,7 +7711,8 @@ func pureBuiltinArity(name string) (int, bool) {
 	switch name {
 	case "abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day",
 		"ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug",
-		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits":
+		"textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits",
+		"u64Text", "u64Parse", "u64ParseError", "u64ToFloat":
 		return 1, true
 	case "print":
 		// print(value): a debugging aid, not real arithmetic/string/date
@@ -7595,7 +7724,8 @@ func pureBuiltinArity(name string) (int, bool) {
 		return 1, true
 	case "append":
 		return 2, true
-	case "min", "max", "contains", "take", "split", "join", "charAt":
+	case "min", "max", "contains", "take", "split", "join", "charAt",
+		"u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem":
 		return 2, true
 	case "slice", "replace", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic":
 		return 3, true
@@ -8888,4 +9018,77 @@ func checkActionHeaderName(name string) error {
 		return fmt.Errorf("header %q is written by the runtime itself (session, framing, caching, rate limits or security policy) — an action cannot set it", canon)
 	}
 	return nil
+}
+
+// apiDocs checks a declared route's contract documentation against its action
+// and returns the parameter docs as the IR carries them: every body parameter
+// of the action is a field of the body type, with its type, and each documented parameter is
+// one the route reads from its path or query, with a type a client may send
+// it as. `errors` is the route's published error set, as its contract states
+// it (validated by the parser: distinct 4xx/5xx codes).
+func (e *env) apiDocs(ap *ast.API, act *Action, pathParams []string, types []WireType) ([]APIParamDoc, error) {
+	where := fmt.Sprintf("api %s %q", ap.Method, ap.Path)
+	inPath := map[string]bool{}
+	for _, p := range pathParams {
+		inPath[p] = true
+	}
+	params := map[string]Param{}
+	for _, p := range act.Params {
+		params[p.Name] = p
+	}
+	if ap.Body != "" {
+		if ap.Method == "GET" {
+			return nil, &BuildError{ap.Line, where + ": a GET carries no request body — drop `body`"}
+		}
+		var wt *WireType
+		for i := range types {
+			if types[i].Name == ap.Body {
+				wt = &types[i]
+			}
+		}
+		if wt == nil {
+			return nil, &BuildError{ap.Line, fmt.Sprintf("%s: body %q is not a declared wire type", where, ap.Body)}
+		}
+		fields := map[string]WireField{}
+		for _, f := range wt.Fields {
+			fields[f.Name] = f
+		}
+		for _, p := range act.Params {
+			if inPath[p.Name] || p.Name == ap.Bearer {
+				continue
+			}
+			f, ok := fields[p.Name]
+			if !ok {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("%s: action %q's body parameter %q is not a field of body %s", where, act.Name, p.Name, ap.Body)}
+			}
+			structured := (f.Map || f.Depth > 0) && p.Type == "json" && !p.List       // a map or nested list binds a json parameter
+			sameType := f.Type == p.Type || (f.Type == "number" && p.Type == "float") // a wire number is a float
+			if !structured && (!sameType || f.List != p.List || f.Map || f.Depth > 0) {
+				return nil, &BuildError{ap.Line, fmt.Sprintf("%s: body %s field %q and action %q's parameter disagree on its type", where, ap.Body, p.Name, act.Name)}
+			}
+		}
+		// A field the action does not take is part of the published body
+		// (a legacy client may send it) and is ignored.
+	}
+	var docs []APIParamDoc
+	for _, d := range ap.ParamDocs {
+		p, ok := params[d.Name]
+		if !ok {
+			return nil, &BuildError{d.Line, fmt.Sprintf("%s documents %q, which is not a parameter of action %q", where, d.Name, act.Name)}
+		}
+		if !inPath[d.Name] && ap.Method != "GET" {
+			return nil, &BuildError{d.Line, fmt.Sprintf("%s documents %q, which travels in the body — document it on the body type", where, d.Name)}
+		}
+		// The documented type is the parameter's own, or text: an int a
+		// client holds as an opaque string, or a list it sends comma-separated.
+		asText := d.Type == "text" && !d.List && (p.Type == "int" || p.List)
+		if (d.List != p.List && !asText) || d.Optional || d.Default != nil || len(d.Aliases) > 0 || d.Into != "" {
+			return nil, &BuildError{d.Line, fmt.Sprintf("%s: a parameter doc is `name: type \"description\" [one of …]`, its type the action parameter's (or text for an int a client holds as an opaque string, or a list it sends comma-separated)", where)}
+		}
+		if d.Type != p.Type && !asText && !(d.Type == "number" && p.Type == "float") {
+			return nil, &BuildError{d.Line, fmt.Sprintf("%s documents %q as %s, but action %q takes it as %s", where, d.Name, d.Type, act.Name, p.Type)}
+		}
+		docs = append(docs, APIParamDoc{Name: d.Name, Type: d.Type, Description: d.Description, Enum: d.Enum})
+	}
+	return docs, nil
 }

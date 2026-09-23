@@ -534,14 +534,14 @@ func TestFabricFacetqlMoverFeedFailures(t *testing.T) {
 	defer denied.Close()
 	ts := fqltApp(t, "fabric_facetql_mover.fct")
 
-	m := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "feed", src.URL, "", "tok"))
+	m := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "feed", src.URL, "", "tok", ""))
 	broken := "the source's change feed is no longer complete (the stream from 'src' ended), so writes landing during the copy can no longer be seen"
 	for k, v := range map[string]string{"dirty": "Post:1,a,b", "observed": "4", "catchUp": broken, "verify": "failed " + broken} {
 		if m[k] != v {
 			t.Errorf("%s = %q, want %q", k, m[k], v)
 		}
 	}
-	got := fqltCall(t, ts, "moverOut", "moverRunLive", "feed", denied.URL, "", "tok")
+	got := fqltCall(t, ts, "moverOut", "moverRunLive", "feed", denied.URL, "", "tok", "")
 	if got != "subscribe='src': facetql refused the token (403): admin only\n" {
 		t.Errorf("refused subscription: %q", got)
 	}

@@ -1,0 +1,29 @@
+app DetachAccept:
+    # A command whose accept loops are tasks of their own: main detaches one
+    # loop per port; each loop accepts and detaches a handler per
+    # connection. Both loops are procs only ever detached from main, so they
+    # are daemon-context bodies (internal/ir/detachctx.go).
+    proc echo(c: int, tag: text, done: int) -> bool uses io.net.listen:
+        let data = readBytes(c, 64)
+        writeBytes(c, textToBytes(tag + ":" + bytesToText(data)))
+        closeConn(c)
+        send(done, tag)
+        return true
+
+    proc acceptLoop(l: int, tag: text, done: int) -> bool uses io.net.listen:
+        loop true:
+            let c = accept(l)
+            detach echo(c, tag, done)
+        return true
+
+    proc main(args: [text]) -> int uses io.net.listen, io.console:
+        let a = listenOn("127.0.0.1", toInt(args[0]))
+        let b = listenOn("127.0.0.1", toInt(args[1]))
+        let done = channel()
+        detach acceptLoop(a, "a", done)
+        detach acceptLoop(b, "b", done)
+        writeStdout("listening\n")
+        let x = recv(done)
+        let y = recv(done)
+        writeStdout("served " + x + " " + y + "\n")
+        return 0

@@ -80,12 +80,19 @@ app FabricFacetqlPollerSelfHost:
     # telemetryPollerNew: every target's client bounded by a 10 s deadline
     # — a sequential sweep must not stall behind one wedged instance.
     proc telemetryPollerNew(targets: [PollTarget]) -> TelemetryPoller:
+        let p = do telemetryPollerTrusting(targets, "")
+        return p
+
+    # telemetryPollerTrusting: the same, its clients trusting trustFile's
+    # roots besides the system's for https targets (with_http over a client
+    # built with add_root_certificate).
+    proc telemetryPollerTrusting(targets: [PollTarget], trustFile: text) -> TelemetryPoller:
         let mut states = []
         let n = len(targets)
         let mut i = 0
         loop i < n:
             let blank = do statsSampleFixture(0, 0, 0)
-            states = append(states, PollTargetState{target: targets[i], client: fqlClientWithTimeout(targets[i].endpoint, 10000), hasPrevious: false, previous: blank, hasVersion: false, version: "", hasAnnounced: false, announcedVersion: ""})
+            states = append(states, PollTargetState{target: targets[i], client: fqlClientTrusting(fqlClientWithTimeout(targets[i].endpoint, 10000), trustFile), hasPrevious: false, previous: blank, hasVersion: false, version: "", hasAnnounced: false, announcedVersion: ""})
             i = i + 1
         return TelemetryPoller{targets: states}
 
@@ -254,9 +261,9 @@ app FabricFacetqlPollerSelfHost:
     # a baseline; then real traffic until the (second-granularity) clock
     # has moved on; the second round is a measured interval that reaches
     # the analyzer and is scored by the same optimizer/predictor.
-    proc pollerLiveOptimizerPath(base: text, token: text) -> text uses io.net:
-        let client = do fqlLiveClient(base, token)
-        let poller0 = do telemetryPollerNew([pollTargetNew(client.endpoint, 9003, Coordinate{x: 4, y: 5}, "us-east")])
+    proc pollerLiveOptimizerPath(base: text, token: text, trust: text) -> text uses io.net:
+        let client = do fqlLiveClient(base, token, trust)
+        let poller0 = do telemetryPollerTrusting([pollTargetNew(client.endpoint, 9003, Coordinate{x: 4, y: 5}, "us-east")], trust)
         let rt0 = do fabricRuntimeNew()
         let rt1 = do telemetryPollerRegisterTargets(poller0, rt0)
         let registered = do nodeRegistryGet(rt1.nodes, "db-live")
@@ -283,9 +290,9 @@ app FabricFacetqlPollerSelfHost:
 
     # a_bad_token_fails_closed_rather_than_reading_as_healthy — the poller
     # half: unhealthy, not serviceable, no telemetry invented.
-    proc pollerLiveBadToken(base: text) -> text uses io.net:
+    proc pollerLiveBadToken(base: text, trust: text) -> text uses io.net:
         let ep = do fqlEndpointNew("db-badtoken", base, "not-a-real-token")
-        let poller = do telemetryPollerNew([pollTargetNew(ep.v, 9004, Coordinate{x: 0, y: 0}, "us-east")])
+        let poller = do telemetryPollerTrusting([pollTargetNew(ep.v, 9004, Coordinate{x: 0, y: 0}, "us-east")], trust)
         let rt0 = do fabricRuntimeNew()
         let rt = do telemetryPollerRegisterTargets(poller, rt0)
         let r = do telemetryPollerPollInto(poller, rt)
@@ -306,15 +313,15 @@ app FabricFacetqlPollerSelfHost:
         let r = do demoAnUnreachableInstanceIsMarkedUnhealthyNotLeftAlone()
         pollerOut = r
 
-    action pollerRunLive(flow: text, base: text, token: text):
-        let r = do pollerLiveFlow(flow, base, token)
+    action pollerRunLive(flow: text, base: text, token: text, trust: text):
+        let r = do pollerLiveFlow(flow, base, token, trust)
         pollerOut = r
 
     # run: three rounds 100 ms apart — a baseline, then two measured
     # intervals — ending healthy with telemetry in the analyzer.
-    proc pollerLiveRun(base: text, token: text) -> text uses io.net:
-        let client = do fqlLiveClient(base, token)
-        let poller = do telemetryPollerNew([pollTargetNew(client.endpoint, 9006, Coordinate{x: 2, y: 3}, "us-east")])
+    proc pollerLiveRun(base: text, token: text, trust: text) -> text uses io.net:
+        let client = do fqlLiveClient(base, token, trust)
+        let poller = do telemetryPollerTrusting([pollTargetNew(client.endpoint, 9006, Coordinate{x: 2, y: 3}, "us-east")], trust)
         let rt0 = do fabricRuntimeNew()
         let rt = do telemetryPollerRegisterTargets(poller, rt0)
         let t0 = monoMs()
@@ -324,12 +331,12 @@ app FabricFacetqlPollerSelfHost:
         let health = do registeredNodeHealth(node.val, fabricRuntimeClockMs(r.runtime), defaultHeartbeatDeadlineMs())
         return "outcome=" + r.outcomes[0].kind + "\nhealth=" + health + "\nobservations=" + (len(fabricRuntimeObservations(r.runtime)) >= 2) + "\nwaited=" + (elapsed >= 200)
 
-    proc pollerLiveFlow(flow: text, base: text, token: text) -> text uses io.net:
+    proc pollerLiveFlow(flow: text, base: text, token: text, trust: text) -> text uses io.net:
         if flow == "run":
-            let r = do pollerLiveRun(base, token)
+            let r = do pollerLiveRun(base, token, trust)
             return r
         if flow == "optimizer":
-            let r = do pollerLiveOptimizerPath(base, token)
+            let r = do pollerLiveOptimizerPath(base, token, trust)
             return r
-        let r = do pollerLiveBadToken(base)
+        let r = do pollerLiveBadToken(base, trust)
         return r

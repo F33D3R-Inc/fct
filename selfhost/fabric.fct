@@ -1,3 +1,5 @@
+import "fabric_routing.fct"
+
 app FabricSelfHost:
     # Self-hosting port of fabric/crates/fabric-facetql/src/frontdoor/keyspace.rs
     # — the declared map from FacetQL's namespace (a `kind` name, or an
@@ -95,23 +97,11 @@ app FabricSelfHost:
     # representation and storage.fct's states its byte-buffer one:
     # ============================================================
     # `fabric_routing::RoutingKey` is `{ shard_id: u64, coordinate:
-    # fabric_core::Coordinate }`, and `Coordinate` is `{ x: u8, y: u8 }` with
-    # `x < 12 && y < 13` (`Coordinate::is_valid`) and `index() = y*12 + x`,
-    # i.e. exactly 156 valid cells per shard (`fabric_core/src/coordinate.rs`,
-    # read directly, not assumed). A proc returns one scalar (LANGUAGE.md's
-    # `proc` section — no record/tuple return), and keyspace.rs itself never
-    # does arithmetic ON a `RoutingKey` beyond equality — every real
-    # operation this file ports is "are these two keys the SAME key", never
-    # "what shard is this" or "what cell is this" — so a `RoutingKey` is
-    # represented here as ONE `int`, packed as `shard_id * 156 +
-    # coordinate.index()`. This is a lossless encoding of the real type for
-    # every value keyspace.rs's own tests actually use (small shard ids,
-    # `Coordinate::new(0, 0)` in every test fixture) and is never unpacked
-    # back into shard/x/y anywhere below, exactly because nothing in
-    # `Keyspace::resolve` needs to: it is an opaque comparable token from
-    # `resolve`'s point of view, restated as an int instead of a struct
-    # purely so it can live in an `[int]` array and flow through a proc
-    # return the way LANGUAGE.md allows.
+    # fabric_core::Coordinate }`; this file uses fabric_routing.fct's own
+    # `RoutingKey` struct (shardId holding the u64's 64 bits, coordinate
+    # {x, y}) directly, so every u64 shard id is carried losslessly and a
+    # key is compared with `routingKeyEquals` (the derived `PartialEq`) and
+    # printed with `routingKeyDisplay` ("{shard}/{x},{y}").
     #
     # ============================================================
     # OPTIONAL PARAMETERS — `resolve(kind: Option<&str>, address:
@@ -127,26 +117,6 @@ app FabricSelfHost:
     # exist only to be printed, never branched on beyond "was one supplied".
     #
     # ============================================================
-    # WHY TWO FAMILIES OF PROC ("resolveStatus" vs "resolveKey") INSTEAD OF
-    # ONE, restating predicate.fct's own header rationale for the identical
-    # reason:
-    # ============================================================
-    # A proc cannot return "an outcome tag PLUS a payload that depends on the
-    # tag" in one call. `keyspaceResolveStatus` is the gatekeeper — it runs
-    # the WHOLE decision (kind lookup, address lookup, the consistency
-    # check, the fallback) and reports one of three outcome codes (0=Ok,
-    # 1=Unmapped, 2=Inconsistent), mirroring `Result<RoutingKey,
-    # KeyspaceMiss>`'s two-variant-of-which-one-has-two-shapes shape flattened
-    # into three plain codes. `keyspaceResolveKey` re-derives the identical
-    # lookup and returns the actual key — defined (and only ever called)
-    # when `keyspaceResolveStatus` already returned 0, exactly like
-    # predicate.fct's `evalNum`/`evalText`/`evalBool` are only ever called
-    # once `evalKind` has already vetted the node. Both procs are pure
-    # re-derivations of the same two lookups, guaranteed to agree because
-    # both are pure functions of the identical input — paid for by doing the
-    # kind/address lookup twice on the `Ok` path rather than once.
-    #
-    # ============================================================
     # RULE-TABLE REPRESENTATION:
     # ============================================================
     # REWRITE NOTE (struct milestone): a routing rule's three declared
@@ -158,13 +128,21 @@ app FabricSelfHost:
     # `[RoutingRule]` array:
     #   kind:   text  the rule's declared kind name
     #   prefix: text  the rule's declared address prefix
-    #   key:    int   the rule's routing key (packed, see above)
-    # plus `hasFallback: bool` / `fallbackKey: int` for the keyspace's single
+    #   key:    RoutingKey  the rule's routing key
+    # plus `hasFallback: bool` / `fallbackKey: RoutingKey` for the keyspace's single
     # optional fallback (there is at most one, so it needs no array).
     struct RoutingRule:
         kind: text
         prefix: text
-        key: int
+        key: RoutingKey
+
+    # `#[derive(PartialEq)] for RoutingKey`: same shard, same cell.
+    proc routingKeyEquals(a: RoutingKey, b: RoutingKey) -> bool:
+        return a.shardId == b.shardId && a.coordinate.x == b.coordinate.x && a.coordinate.y == b.coordinate.y
+
+    # The key an absent slot (has = false) carries; never read as a key.
+    proc routingKeyUnset() -> RoutingKey:
+        return RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}
 
     # ============================================================
     # SMALL STRING HELPER — restates the exact `starts_with` idiom
@@ -220,58 +198,6 @@ app FabricSelfHost:
         return bestIdx
 
     # ============================================================
-    # THE GATEKEEPER: keyspaceResolveStatus.
-    # ============================================================
-    # Restates `Keyspace::resolve`'s full match exactly:
-    #   (Some(by_kind), Some(by_address)) if by_kind != by_address -> Inconsistent
-    #   (Some(key), _) | (None, Some(key))                         -> Ok(key)
-    #   (None, None)                                                -> fallback, or Unmapped
-    # over this port's two `has*` flags standing in for `Option<&str>`.
-    proc keyspaceResolveStatus(rules: [RoutingRule], hasFallback: bool, hasKind: bool, kind: text, hasAddress: bool, address: text) -> int:
-        let mut kindIdx = -1
-        if hasKind:
-            let ki = do ruleIndexForKind(rules, kind)
-            kindIdx = ki
-        let mut addrIdx = -1
-        if hasAddress:
-            let ai = do ruleIndexForAddress(rules, address)
-            addrIdx = ai
-
-        if kindIdx != -1:
-            if addrIdx != -1:
-                if rules[kindIdx].key != rules[addrIdx].key:
-                    return 2
-                return 0
-            return 0
-        if addrIdx != -1:
-            return 0
-        if hasFallback:
-            return 0
-        return 1
-
-    # keyspaceResolveKey: only meaningful once `keyspaceResolveStatus` has
-    # already returned 0 for the identical arguments (see header). When both
-    # a kind and an address matched, `resolve` itself only reaches this
-    # branch once they are already known equal (the `Inconsistent` case took
-    # the other branch), so returning the kind-side key is exactly as
-    # correct as returning the address-side one — matching Rust's own
-    # `(Some(key), _)` pattern, which likewise prefers `by_kind` on a tie.
-    proc keyspaceResolveKey(rules: [RoutingRule], fallbackKey: int, hasKind: bool, kind: text, hasAddress: bool, address: text) -> int:
-        let mut kindIdx = -1
-        if hasKind:
-            let ki = do ruleIndexForKind(rules, kind)
-            kindIdx = ki
-        if kindIdx != -1:
-            return rules[kindIdx].key
-        let mut addrIdx = -1
-        if hasAddress:
-            let ai = do ruleIndexForAddress(rules, address)
-            addrIdx = ai
-        if addrIdx != -1:
-            return rules[addrIdx].key
-        return fallbackKey
-
-    # ============================================================
     # CONSTRUCTION-TIME VALIDATION — `KeyspaceRule::new` (empty kind / empty
     # prefix) fused with `Keyspace::with_rule` (duplicate kind / duplicate
     # prefix against the rules already in the table), in the exact order the
@@ -318,17 +244,18 @@ app FabricSelfHost:
     # single-shard `Keyspace::single` case), matching Rust's `.all(...)` on
     # an empty iterator returning `true`.
     # ============================================================
-    proc allRuleKeysEqual(rules: [RoutingRule], target: int) -> bool:
+    proc allRuleKeysEqual(rules: [RoutingRule], target: RoutingKey) -> bool:
         let n = len(rules)
         let mut i = 0
         let mut allEq = true
         loop i < n:
-            if rules[i].key != target:
+            let same = do routingKeyEquals(rules[i].key, target)
+            if !same:
                 allEq = false
             i = i + 1
         return allEq
 
-    proc spanningKeyPresent(rules: [RoutingRule], hasFallback: bool, fallbackKey: int) -> bool:
+    proc spanningKeyPresent(rules: [RoutingRule], hasFallback: bool, fallbackKey: RoutingKey) -> bool:
         if !hasFallback:
             return false
         let allEq = do allRuleKeysEqual(rules, fallbackKey)
@@ -337,18 +264,8 @@ app FabricSelfHost:
     # ============================================================
     # keyspace.rs as values: KeyspaceRule::new, Keyspace::{new, single,
     # with_rule, with_fallback, for_kind, for_address, spanning_key,
-    # resolve}, and the Display of KeyspaceError / KeyspaceMiss. A routing
-    # key is packed as shard * 156 + y * 12 + x (RoutingKey::new's grid).
+    # resolve}, and the Display of KeyspaceError / KeyspaceMiss.
     # ============================================================
-
-    proc routingKeyPack(shardId: int, x: int, y: int) -> int:
-        return shardId * 156 + y * 12 + x
-
-    # `impl Display for RoutingKey`: "{shard}/{x},{y}".
-    proc routingKeyPackedDisplay(packed: int) -> text:
-        let shardId = packed / 156
-        let idx = packed % 156
-        return "" + shardId + "/" + (idx % 12) + "," + (idx / 12)
 
     struct KeyspaceError:
         kind: text
@@ -368,7 +285,7 @@ app FabricSelfHost:
         err: KeyspaceError
         rule: RoutingRule
 
-    proc keyspaceRuleNew(kind: text, prefix: text, key: int) -> KeyspaceRuleResult:
+    proc keyspaceRuleNew(kind: text, prefix: text, key: RoutingKey) -> KeyspaceRuleResult:
         let rule = RoutingRule{kind: kind, prefix: prefix, key: key}
         if len(kind) == 0:
             return KeyspaceRuleResult{ok: false, err: KeyspaceError{kind: "EmptyKind", value: ""}, rule: rule}
@@ -379,12 +296,13 @@ app FabricSelfHost:
     struct Keyspace:
         rules: [RoutingRule]
         hasFallback: bool
-        fallbackKey: int
+        fallbackKey: RoutingKey
 
     proc keyspaceNew() -> Keyspace:
-        return Keyspace{rules: [], hasFallback: false, fallbackKey: -1}
+        let unset = do routingKeyUnset()
+        return Keyspace{rules: [], hasFallback: false, fallbackKey: unset}
 
-    proc keyspaceSingle(key: int) -> Keyspace:
+    proc keyspaceSingle(key: RoutingKey) -> Keyspace:
         return Keyspace{rules: [], hasFallback: true, fallbackKey: key}
 
     struct KeyspaceResult:
@@ -403,7 +321,7 @@ app FabricSelfHost:
         next.rules = append(ks.rules, rule)
         return KeyspaceResult{ok: true, err: KeyspaceError{kind: "", value: ""}, keyspace: next}
 
-    proc keyspaceWithFallback(ks: Keyspace, key: int) -> Keyspace:
+    proc keyspaceWithFallback(ks: Keyspace, key: RoutingKey) -> Keyspace:
         let mut next = ks
         next.hasFallback = true
         next.fallbackKey = key
@@ -411,25 +329,28 @@ app FabricSelfHost:
 
     struct KeyOption:
         has: bool
-        key: int
+        key: RoutingKey
 
     proc keyspaceForKind(ks: Keyspace, kind: text) -> KeyOption:
         let idx = do ruleIndexForKind(ks.rules, kind)
         if idx == -1:
-            return KeyOption{has: false, key: -1}
+            let unset = do routingKeyUnset()
+            return KeyOption{has: false, key: unset}
         return KeyOption{has: true, key: ks.rules[idx].key}
 
     proc keyspaceForAddress(ks: Keyspace, address: text) -> KeyOption:
         let idx = do ruleIndexForAddress(ks.rules, address)
         if idx == -1:
-            return KeyOption{has: false, key: -1}
+            let unset = do routingKeyUnset()
+            return KeyOption{has: false, key: unset}
         return KeyOption{has: true, key: ks.rules[idx].key}
 
     proc keyspaceSpanningKey(ks: Keyspace) -> KeyOption:
         let present = do spanningKeyPresent(ks.rules, ks.hasFallback, ks.fallbackKey)
         if present:
             return KeyOption{has: true, key: ks.fallbackKey}
-        return KeyOption{has: false, key: -1}
+        let unset = do routingKeyUnset()
+        return KeyOption{has: false, key: unset}
 
     # KeyspaceMiss: kind "Unmapped" (kind/address are Options) or
     # "Inconsistent" (both named, byKind != byAddress).
@@ -439,13 +360,13 @@ app FabricSelfHost:
         kindName: text
         hasAddress: bool
         address: text
-        byKind: int
-        byAddress: int
+        byKind: RoutingKey
+        byAddress: RoutingKey
 
     proc keyspaceMissDisplay(m: KeyspaceMiss) -> text:
         if m.kind == "Inconsistent":
-            let byAddr = do routingKeyPackedDisplay(m.byAddress)
-            let byKind = do routingKeyPackedDisplay(m.byKind)
+            let byAddr = do routingKeyDisplay(m.byAddress)
+            let byKind = do routingKeyDisplay(m.byKind)
             return "address '" + m.address + "' routes to " + byAddr + " but its kind '" + m.kindName + "' routes to " + byKind + "; the keyspace says these are different places, so this request cannot be served without putting the node where its own kind's queries will not look"
         let mut what = "this request, which names neither a kind nor an address"
         if m.hasKind && m.hasAddress:
@@ -460,29 +381,31 @@ app FabricSelfHost:
 
     struct KeyspaceResolution:
         ok: bool
-        key: int
+        key: RoutingKey
         miss: KeyspaceMiss
 
     # Keyspace::resolve.
     proc keyspaceResolve(ks: Keyspace, hasKind: bool, kind: text, hasAddress: bool, address: text) -> KeyspaceResolution:
-        let mut byKind = KeyOption{has: false, key: -1}
+        let unset = do routingKeyUnset()
+        let mut byKind = KeyOption{has: false, key: unset}
         if hasKind:
             byKind = do keyspaceForKind(ks, kind)
-        let mut byAddress = KeyOption{has: false, key: -1}
+        let mut byAddress = KeyOption{has: false, key: unset}
         if hasAddress:
             byAddress = do keyspaceForAddress(ks, address)
-        let noMiss = KeyspaceMiss{kind: "", hasKind: false, kindName: "", hasAddress: false, address: "", byKind: -1, byAddress: -1}
-        if byKind.has && byAddress.has && byKind.key != byAddress.key:
+        let noMiss = KeyspaceMiss{kind: "", hasKind: false, kindName: "", hasAddress: false, address: "", byKind: unset, byAddress: unset}
+        let same = do routingKeyEquals(byKind.key, byAddress.key)
+        if byKind.has && byAddress.has && !same:
             let miss = KeyspaceMiss{kind: "Inconsistent", hasKind: true, kindName: kind, hasAddress: true, address: address, byKind: byKind.key, byAddress: byAddress.key}
-            return KeyspaceResolution{ok: false, key: -1, miss: miss}
+            return KeyspaceResolution{ok: false, key: unset, miss: miss}
         if byKind.has:
             return KeyspaceResolution{ok: true, key: byKind.key, miss: noMiss}
         if byAddress.has:
             return KeyspaceResolution{ok: true, key: byAddress.key, miss: noMiss}
         if ks.hasFallback:
             return KeyspaceResolution{ok: true, key: ks.fallbackKey, miss: noMiss}
-        let miss2 = KeyspaceMiss{kind: "Unmapped", hasKind: hasKind, kindName: kind, hasAddress: hasAddress, address: address, byKind: -1, byAddress: -1}
-        return KeyspaceResolution{ok: false, key: -1, miss: miss2}
+        let miss2 = KeyspaceMiss{kind: "Unmapped", hasKind: hasKind, kindName: kind, hasAddress: hasAddress, address: address, byKind: unset, byAddress: unset}
+        return KeyspaceResolution{ok: false, key: unset, miss: miss2}
 
     # ============================================================
     # SECOND PORT, SAME FILE: fabric-replication's `failover.rs` —
@@ -623,7 +546,7 @@ app FabricSelfHost:
     # already says without a branch.
     # ============================================================
     proc failoverSaturatingSub(a: int, b: int) -> int:
-        return max(a - b, 0)
+        return u64SatSub(a, b)
 
     # ============================================================
     # INELIGIBILITY — restates `fn ineligibility` exactly, top to bottom, one
@@ -640,11 +563,11 @@ app FabricSelfHost:
         if entry.lastReportMs == -1:
             return 2
         let silenceMs = do failoverSaturatingSub(nowMs, entry.lastReportMs)
-        if silenceMs > policy.maxCandidateSilenceMs:
+        if u64Cmp(silenceMs, policy.maxCandidateSilenceMs) > 0:
             return 3
-        if entry.pendingWrites > policy.maxPromotionPendingWrites:
+        if u64Cmp(entry.pendingWrites, policy.maxPromotionPendingWrites) > 0:
             return 4
-        if entry.applyLagMs > policy.maxPromotionApplyLagMs:
+        if u64Cmp(entry.applyLagMs, policy.maxPromotionApplyLagMs) > 0:
             return 5
         return 0
 
@@ -679,7 +602,7 @@ app FabricSelfHost:
             return true
         if primary.lastReportMs != -1:
             let silenceMs = do failoverSaturatingSub(nowMs, primary.lastReportMs)
-            if silenceMs > policy.primarySilenceBudgetMs:
+            if u64Cmp(silenceMs, policy.primarySilenceBudgetMs) > 0:
                 return true
         return false
 
@@ -719,13 +642,13 @@ app FabricSelfHost:
                         bestLag = entries[i].applyLagMs
                         bestNode = entries[i].node
                     else:
-                        if entries[i].pendingWrites < bestPending:
+                        if u64Cmp(entries[i].pendingWrites, bestPending) < 0:
                             bestIdx = i
                             bestPending = entries[i].pendingWrites
                             bestLag = entries[i].applyLagMs
                             bestNode = entries[i].node
                         else:
-                            if entries[i].pendingWrites == bestPending && entries[i].applyLagMs < bestLag:
+                            if entries[i].pendingWrites == bestPending && u64Cmp(entries[i].applyLagMs, bestLag) < 0:
                                 bestIdx = i
                                 bestPending = entries[i].pendingWrites
                                 bestLag = entries[i].applyLagMs
@@ -759,10 +682,9 @@ app FabricSelfHost:
     # THE GATEKEEPER FAMILY — restating `evaluate`'s own field-by-field
     # derivation as independent, pure re-derivations of the identical inputs,
     # the same "one proc, one fact, guaranteed to agree because both are pure
-    # functions of the same arguments" shape this file's own
-    # `keyspaceResolveStatus`/`keyspaceResolveKey` pair already uses, restated
-    # here for the "evaluate() produces MANY facts from the same walk"
-    # constraint that gave that pair its name. Blocker codes (there is at
+    # functions of the same arguments" shape, restated here for the
+    # "evaluate() produces MANY facts from the same walk" constraint.
+    # Blocker codes (there is at
     # most one, matching `evaluate`'s own `if / else if / else if` chain,
     # which can never push more than one `FailoverBlocker` — read directly,
     # not assumed): -1=none, 0=PrimaryStillServing, 1=SetIsEmpty,
@@ -787,8 +709,7 @@ app FabricSelfHost:
     # exactly — `None` outright when the primary does not need replacing,
     # otherwise the best ELIGIBLE candidate if one exists. `failoverPromotionNode`
     # is only meaningful once `failoverHasPromotion` has already returned
-    # true for the identical arguments (the `keyspaceResolveKey` contract,
-    # restated): calling it when no candidate is eligible reads `entries[-1]`,
+    # true for the identical arguments: calling it when no candidate is eligible reads `entries[-1]`,
     # a clean out-of-bounds error rather than a silently wrong node name.
     proc failoverHasPromotion(entries: [ReplicaEntry], nowMs: int, policy: FailoverPolicy) -> bool:
         let needsReplacement = do failoverPrimaryNeedsReplacement(entries, nowMs, policy)
@@ -946,98 +867,112 @@ app FabricSelfHost:
     #      equal the fallback, 9); `Keyspace::single(key(1))` (no rules) IS
     #      spanning, and equals key(1).
     # `key(n)` throughout mirrors keyspace.rs's own test helper exactly:
-    # `RoutingKey::new(n, Coordinate::new(0, 0))`, packed per this file's
-    # header as `n * 156 + 0`.
+    # `RoutingKey::new(n, Coordinate::new(0, 0))` (demoKey). Statuses are
+    # 0=Ok, 1=Unmapped, 2=Inconsistent (demoResolveStatus).
+    proc demoKey(n: int) -> RoutingKey:
+        return RoutingKey{shardId: n, coordinate: Coordinate{x: 0, y: 0}}
+
     proc demoRulesAB() -> [RoutingRule]:
-        return [RoutingRule{kind: "Post", prefix: "Post:", key: 156}, RoutingRule{kind: "__session", prefix: "__session:", key: 312}]
+        let k1 = do demoKey(1)
+        let k2 = do demoKey(2)
+        return [RoutingRule{kind: "Post", prefix: "Post:", key: k1}, RoutingRule{kind: "__session", prefix: "__session:", key: k2}]
 
-    # Scenario A1: resolve(Some("Post"), Some("Post:17")) -> Ok, key(1)=156.
-    # Traced: kindIdx=0 (rules[0].kind=="Post"); addrIdx: "Post:" (len 5) is a
-    # prefix of "Post:17" (len 7, leading 5 = "Post:") -> bestIdx=0; "__session:"
-    # (len 10) is not (10 > 7) -> addrIdx stays 0. rules[0].key==rules[0].key, so
-    # status=0 (Ok), key=156.
-    proc demoScenarioA1Status() -> int:
+    proc demoResolveStatus(r: KeyspaceResolution) -> int:
+        if r.ok:
+            return 0
+        if r.miss.kind == "Unmapped":
+            return 1
+        return 2
+
+    # Scenario A1: resolve(Some("Post"), Some("Post:17")) -> Ok(key(1)).
+    # Scenario A2: resolve(Some("Post"), Some("__session:abc")) -> Inconsistent
+    # ("Post:" is not a prefix of the address, "__session:" is: key(1) vs key(2)).
+    proc demoScenarioA1() -> KeyspaceResolution:
         let rules = do demoRulesAB()
-        let status = do keyspaceResolveStatus(rules, false, true, "Post", true, "Post:17")
-        return status
+        let unset = do routingKeyUnset()
+        let r = do keyspaceResolve(Keyspace{rules: rules, hasFallback: false, fallbackKey: unset}, true, "Post", true, "Post:17")
+        return r
 
-    proc demoScenarioA1Key() -> int:
-        let rules = do demoRulesAB()
-        let key = do keyspaceResolveKey(rules, -1, true, "Post", true, "Post:17")
-        return key
-
-    # Scenario A2: resolve(Some("Post"), Some("__session:abc")) -> Inconsistent.
-    # Traced: kindIdx=0 (key 156). addrIdx: "Post:" (len5) is not a prefix of
-    # "__session:abc" (leading 5 = "__ses" != "Post:"); "__session:" (len10) IS
-    # a prefix (leading 10 = "__session:") -> addrIdx=1 (key 312). 156 != 312
-    # -> status=2 (Inconsistent).
     proc demoScenarioA2Status() -> int:
         let rules = do demoRulesAB()
-        let status = do keyspaceResolveStatus(rules, false, true, "Post", true, "__session:abc")
+        let unset = do routingKeyUnset()
+        let r = do keyspaceResolve(Keyspace{rules: rules, hasFallback: false, fallbackKey: unset}, true, "Post", true, "__session:abc")
+        let status = do demoResolveStatus(r)
         return status
 
     proc demoRulesB() -> [RoutingRule]:
-        return [RoutingRule{kind: "A", prefix: "__", key: 156}, RoutingRule{kind: "B", prefix: "__fabric_placement:", key: 312}]
+        let k1 = do demoKey(1)
+        let k2 = do demoKey(2)
+        return [RoutingRule{kind: "A", prefix: "__", key: k1}, RoutingRule{kind: "B", prefix: "__fabric_placement:", key: k2}]
 
-    # Scenario B1: resolve(None, Some("__fabric_placement:1:0:0")) -> Ok, key2=312.
-    # Traced: no kind. addrIdx: "__" (len2) matches (leading2="__") ->
-    # bestIdx=0,bestLen=2; "__fabric_placement:" (len19) matches (leading19
-    # equals it exactly) and 19 >= 2 -> bestIdx=1,bestLen=19. Final addrIdx=1,
-    # key=rules[1].key=312.
-    proc demoScenarioB1Status() -> int:
+    # Scenario B1: resolve(None, Some("__fabric_placement:1:0:0")) -> Ok(key(2))
+    # (both prefixes match; the longer one wins). Scenario B2:
+    # resolve(None, Some("__session:x")) -> Ok(key(1)) (only "__" matches).
+    proc demoScenarioB(address: text) -> KeyspaceResolution:
         let rules = do demoRulesB()
-        let status = do keyspaceResolveStatus(rules, false, false, "", true, "__fabric_placement:1:0:0")
-        return status
+        let unset = do routingKeyUnset()
+        let r = do keyspaceResolve(Keyspace{rules: rules, hasFallback: false, fallbackKey: unset}, false, "", true, address)
+        return r
 
-    proc demoScenarioB1Key() -> int:
-        let rules = do demoRulesB()
-        let key = do keyspaceResolveKey(rules, -1, false, "", true, "__fabric_placement:1:0:0")
-        return key
-
-    # Scenario B2: resolve(None, Some("__session:x")) -> Ok, key1=156.
-    # Traced: "__" (len2) matches "__session:x" (leading2="__") ->
-    # bestIdx=0,bestLen=2. "__fabric_placement:" (len19) does NOT match
-    # (19 > len("__session:x")=11) -> addrIdx stays 0, key=156.
-    proc demoScenarioB2Key() -> int:
-        let rules = do demoRulesB()
-        let key = do keyspaceResolveKey(rules, -1, false, "", true, "__session:x")
-        return key
-
-    # Scenario C1: keyspace() + with_fallback(key(9)=1404); resolve(Some("Unknown"), None) -> Ok, key(9).
-    # Traced: kindIdx: "Unknown" not in ["Post","__session"] -> -1. No address
-    # -> addrIdx=-1. hasFallback=true -> status=0; key=fallbackKey=1404.
-    proc demoScenarioC1Status() -> int:
+    # Scenario C1: keyspace() + with_fallback(key(9)); resolve(Some("Unknown"),
+    # None) -> Ok(key(9)). C1b: the same keyspace with no fallback is Unmapped,
+    # matching `an_unmapped_request_is_refused_rather_than_guessed`.
+    proc demoScenarioC1() -> KeyspaceResolution:
         let rules = do demoRulesAB()
-        let status = do keyspaceResolveStatus(rules, true, true, "Unknown", false, "")
-        return status
+        let k9 = do demoKey(9)
+        let r = do keyspaceResolve(Keyspace{rules: rules, hasFallback: true, fallbackKey: k9}, true, "Unknown", false, "")
+        return r
 
-    proc demoScenarioC1Key() -> int:
-        let rules = do demoRulesAB()
-        let key = do keyspaceResolveKey(rules, 1404, true, "Unknown", false, "")
-        return key
-
-    # Scenario C1b: the SAME keyspace() with no fallback declared at all ->
-    # resolve(Some("Unknown"), None) is Unmapped (status=1), matching
-    # keyspace.rs's own `an_unmapped_request_is_refused_rather_than_guessed`.
     proc demoScenarioC1bStatus() -> int:
         let rules = do demoRulesAB()
-        let status = do keyspaceResolveStatus(rules, false, true, "Unknown", false, "")
+        let unset = do routingKeyUnset()
+        let r = do keyspaceResolve(Keyspace{rules: rules, hasFallback: false, fallbackKey: unset}, true, "Unknown", false, "")
+        let status = do demoResolveStatus(r)
         return status
 
-    # Scenario C2: keyspace() (rule keys [156,312]) + with_fallback(1404) is
-    # NOT spanning (156 != 1404). Keyspace::single(key(1)=156) — an empty
-    # rule table — IS spanning, and equals 156.
+    # Scenario C2: keyspace() (rule keys key(1), key(2)) + with_fallback(key(9))
+    # is NOT spanning. Keyspace::single(key(1)) — an empty rule table — IS.
     proc demoEmptyRules() -> [RoutingRule]:
         return []
 
+    # Scalar views of the scenarios, for runDemoFabric.
+    proc demoScenarioA1Status() -> int:
+        let r = do demoScenarioA1()
+        let status = do demoResolveStatus(r)
+        return status
+
+    proc demoScenarioA1Key() -> text:
+        let r = do demoScenarioA1()
+        return routingKeyDisplay(r.key)
+
+    proc demoScenarioBStatus(address: text) -> int:
+        let r = do demoScenarioB(address)
+        let status = do demoResolveStatus(r)
+        return status
+
+    proc demoScenarioBKey(address: text) -> text:
+        let r = do demoScenarioB(address)
+        return routingKeyDisplay(r.key)
+
+    proc demoScenarioC1Status() -> int:
+        let r = do demoScenarioC1()
+        let status = do demoResolveStatus(r)
+        return status
+
+    proc demoScenarioC1Key() -> text:
+        let r = do demoScenarioC1()
+        return routingKeyDisplay(r.key)
+
     proc demoScenarioC2NotSpanning() -> bool:
         let rules = do demoRulesAB()
-        let present = do spanningKeyPresent(rules, true, 1404)
+        let k9 = do demoKey(9)
+        let present = do spanningKeyPresent(rules, true, k9)
         return present
 
     proc demoScenarioC2SingleSpanning() -> bool:
         let empty = do demoEmptyRules()
-        let present = do spanningKeyPresent(empty, true, 156)
+        let k1 = do demoKey(1)
+        let present = do spanningKeyPresent(empty, true, k1)
         return present
 
     # Construction-time validation demo, mirroring
@@ -1259,7 +1194,7 @@ app FabricSelfHost:
             return 0
         if state.destinationApplied == -1:
             return state.sourceHighWater + 1
-        return max(state.sourceHighWater - state.destinationApplied, 0)
+        return u64SatSub(state.sourceHighWater, state.destinationApplied)
 
     proc migrationHasCutOver(state: MigrationState) -> bool:
         return state.cutoverCompletedAtMs != -1
@@ -1279,8 +1214,7 @@ app FabricSelfHost:
         return cutOver
 
     # migrationHasWriteOwner / migrationWriteOwnerIsDestination: `write_owner`
-    # split the same way `keyspaceResolveStatus`/`keyspaceResolveKey` split
-    # "does an answer exist" from "what is it" — `migrationWriteOwnerIsDestination`
+    # split "does an answer exist" from "what is it" — `migrationWriteOwnerIsDestination`
     # is only meaningful once `migrationHasWriteOwner` has already returned
     # true for the identical state (mirroring `write_owner`'s own `None`
     # while fenced).
@@ -1310,24 +1244,24 @@ app FabricSelfHost:
         if cutOver:
             if state.hasFence:
                 if state.fenceLastWrite != -1:
-                    if seq <= state.fenceLastWrite:
+                    if u64Cmp(seq, state.fenceLastWrite) <= 0:
                         return 3
             if state.destinationApplied != -1:
-                if seq <= state.destinationApplied:
+                if u64Cmp(seq, state.destinationApplied) <= 0:
                     return 3
             return 1
         if state.sourceHighWater != -1:
-            if seq <= state.sourceHighWater:
+            if u64Cmp(seq, state.sourceHighWater) <= 0:
                 return 4
         return 0
 
     proc migrationRecordAppliedStatus(state: MigrationState, seq: int) -> int:
         if state.sourceHighWater == -1:
             return 1
-        if seq > state.sourceHighWater:
+        if u64Cmp(seq, state.sourceHighWater) > 0:
             return 1
         if state.destinationApplied != -1:
-            if seq <= state.destinationApplied:
+            if u64Cmp(seq, state.destinationApplied) <= 0:
                 return 2
         return 0
 
@@ -1343,9 +1277,9 @@ app FabricSelfHost:
     proc migrationRecordCopyStatus(state: MigrationState, newAtomsCopied: int) -> int:
         if state.phase != 1:
             return 1
-        if newAtomsCopied > state.atomsTotal:
+        if u64Cmp(newAtomsCopied, state.atomsTotal) > 0:
             return 2
-        if newAtomsCopied < state.atomsCopied:
+        if u64Cmp(newAtomsCopied, state.atomsCopied) < 0:
             return 3
         return 0
 
@@ -1353,7 +1287,7 @@ app FabricSelfHost:
     proc migrationBeginCatchUpStatus(state: MigrationState) -> int:
         if state.phase != 1:
             return 1
-        if state.atomsCopied < state.atomsTotal:
+        if u64Cmp(state.atomsCopied, state.atomsTotal) < 0:
             return 2
         let status = do migrationAdvanceStatus(state.phase, 2)
         return status
@@ -1369,10 +1303,10 @@ app FabricSelfHost:
     proc migrationBeginCutoverStatus(state: MigrationState) -> int:
         if state.phase != 2:
             return 1
-        if state.atomsCopied < state.atomsTotal:
+        if u64Cmp(state.atomsCopied, state.atomsTotal) < 0:
             return 2
         let pending = do migrationPendingWrites(state)
-        if pending > state.maxCutoverPendingWrites:
+        if u64Cmp(pending, state.maxCutoverPendingWrites) > 0:
             return 3
         return 0
 
@@ -1382,7 +1316,7 @@ app FabricSelfHost:
         if state.phase != 3:
             return 1
         let pending = do migrationPendingWrites(state)
-        if pending > 0:
+        if pending != 0:
             return 2
         return 0
 
@@ -1635,13 +1569,13 @@ app FabricSelfHost:
         demoD4CandidateIneligibility = d4CandidateIneligibility
 
     state demoA1Status: int = 0
-    state demoA1Key: int = 0
+    state demoA1Key: text = ""
     state demoA2Status: int = 0
     state demoB1Status: int = 0
-    state demoB1Key: int = 0
-    state demoB2Key: int = 0
+    state demoB1Key: text = ""
+    state demoB2Key: text = ""
     state demoC1Status: int = 0
-    state demoC1Key: int = 0
+    state demoC1Key: text = ""
     state demoC1bStatus: int = 0
     state demoC2NotSpanning: bool = true
     state demoC2SingleSpanning: bool = false
@@ -1655,9 +1589,9 @@ app FabricSelfHost:
         let a1Status = do demoScenarioA1Status()
         let a1Key = do demoScenarioA1Key()
         let a2Status = do demoScenarioA2Status()
-        let b1Status = do demoScenarioB1Status()
-        let b1Key = do demoScenarioB1Key()
-        let b2Key = do demoScenarioB2Key()
+        let b1Status = do demoScenarioBStatus("__fabric_placement:1:0:0")
+        let b1Key = do demoScenarioBKey("__fabric_placement:1:0:0")
+        let b2Key = do demoScenarioBKey("__session:x")
         let c1Status = do demoScenarioC1Status()
         let c1Key = do demoScenarioC1Key()
         let c1bStatus = do demoScenarioC1bStatus()

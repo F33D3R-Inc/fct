@@ -203,9 +203,7 @@ func (s *Server) serveDeclaredAPI(w http.ResponseWriter, r *http.Request, apis [
 		}
 		return false
 	}
-	if lim := s.rateClass(a.decl.Rate); lim != nil && !lim.allow(clientIP(r)) {
-		w.Header().Set("Retry-After", "60")
-		apiError(w, http.StatusTooManyRequests, "rate limited")
+	if !s.meterRate(w, r, a.decl.Rate) {
 		return true
 	}
 	if a.decl.Dispatch != "" {
@@ -465,9 +463,26 @@ func (s *Server) rateClass(class string) *rateLimiter {
 		return l
 	}
 	per := rateLimitFromEnvClass(class)
-	l := newRateLimiter(per)
+	l := newClassLimiter(per)
 	s.rateClasses[class] = l
 	return l
+}
+
+// meterRate meters a request against its route's rate class (nothing for an
+// unclassified route): every answer carries the budget headers, and a request
+// over budget is answered 429 here, reporting false.
+func (s *Server) meterRate(w http.ResponseWriter, r *http.Request, class string) bool {
+	lim := s.rateClass(class)
+	if lim == nil {
+		return true
+	}
+	d := lim.take(clientIP(r))
+	d.headers(w.Header())
+	if !d.allowed {
+		apiError(w, http.StatusTooManyRequests, "rate limited")
+		return false
+	}
+	return true
 }
 
 // serveDispatch answers a dispatching route (`api POST "/events" -> Mutation`):

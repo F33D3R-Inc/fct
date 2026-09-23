@@ -570,7 +570,7 @@ func TestDeclaredDeleteReadsBody(t *testing.T) {
 	_, doc, _ := me.do("GET", "/api/_contract", "")
 	var op map[string]any
 	json.Unmarshal([]byte(jsonOf(doc["paths"].(map[string]any)["/api/me/totp"].(map[string]any)["delete"])), &op)
-	if _, ok := op["requestBody"]; !ok || op["parameters"] != nil {
+	if ps, _ := op["parameters"].([]any); op["requestBody"] == nil || len(ps) != 0 {
 		t.Fatalf("the contract publishes DELETE /api/me/totp as %v, want a JSON body", op)
 	}
 }

@@ -180,16 +180,24 @@ app FabricFacetqlClientSelfHost:
 
     # ── client.rs ──────────────────────────────────────────────────────
     # timeoutMs: the per-operation deadline (with_http's caller-supplied
-    # timeouts); 0 keeps the runtime's default bound.
+    # timeouts); 0 keeps the runtime's default bound. trustFile: for an
+    # https base URL, a PEM file (data sandbox) of roots trusted besides
+    # the system's — with_http over a reqwest client built with
+    # add_root_certificate; "" trusts the system's only, as
+    # FacetqlClient::new does.
     struct FqlClient:
         endpoint: FqlEndpoint
         timeoutMs: int
+        trustFile: text
 
     proc fqlClientNew(endpoint: FqlEndpoint) -> FqlClient:
-        return FqlClient{endpoint: endpoint, timeoutMs: 0}
+        return FqlClient{endpoint: endpoint, timeoutMs: 0, trustFile: ""}
 
     proc fqlClientWithTimeout(endpoint: FqlEndpoint, timeoutMs: int) -> FqlClient:
-        return FqlClient{endpoint: endpoint, timeoutMs: timeoutMs}
+        return FqlClient{endpoint: endpoint, timeoutMs: timeoutMs, trustFile: ""}
+
+    proc fqlClientTrusting(c: FqlClient, trustFile: text) -> FqlClient:
+        return FqlClient{endpoint: c.endpoint, timeoutMs: c.timeoutMs, trustFile: trustFile}
 
     proc fqlClientDebug(c: FqlClient) -> text:
         return "FacetqlClient { endpoint: " + fqlEndpointDebug(c.endpoint) + ", timeout_ms: " + c.timeoutMs + " }"
@@ -222,7 +230,7 @@ app FabricFacetqlClientSelfHost:
     # variant that says what the caller must do.
     proc fqlSend(c: FqlClient, method: text, url: text, json: bool, body: text, context: text) -> FqlSendR uses io.net:
         let hs = do fqlRequestHeaders(c, json)
-        let r = do httpExchange(HttpRequest{method: method, url: url, headers: hs, body: body, timeoutMs: c.timeoutMs})
+        let r = do httpExchangeTrust(HttpRequest{method: method, url: url, headers: hs, body: body, timeoutMs: c.timeoutMs}, c.trustFile)
         let none = do fqlErrNone()
         if !r.ok:
             return FqlSendR{ok: false, err: fqlErrTransport(context + " on " + c.endpoint.baseUrl + ": " + r.err), body: ""}
@@ -412,7 +420,7 @@ app FabricFacetqlClientSelfHost:
     # the caller's pollBytes waits. A refusal maps 401/403 to Unauthorized
     # and any other non-2xx (404 included) to Status, as open_events does.
     proc fqlOpenEvents(c: FqlClient) -> FqlEventsResult uses io.net:
-        let s = do httpOpenStream(HttpRequest{method: "GET", url: fqlEndpointUrl(c.endpoint, "/events"), headers: [HttpHeader{name: "x-api-key", value: c.endpoint.token}, HttpHeader{name: "accept", value: "text/event-stream"}], body: "", timeoutMs: 0})
+        let s = do httpOpenStreamTrust(HttpRequest{method: "GET", url: fqlEndpointUrl(c.endpoint, "/events"), headers: [HttpHeader{name: "x-api-key", value: c.endpoint.token}, HttpHeader{name: "accept", value: "text/event-stream"}], body: "", timeoutMs: 0}, c.trustFile)
         if !s.ok:
             return FqlEventsResult{ok: false, err: fqlErrTransport("GET /events on " + c.endpoint.baseUrl + ": " + s.err), stream: s}
         if s.status < 200 || s.status > 299:
@@ -477,6 +485,21 @@ app FabricFacetqlClientSelfHost:
 
     action fqlEndpointEnvRun(dbms: text, url: text, tokenVar: text):
         let r = do fqlEndpointEnvLine(dbms, url, tokenVar)
+        fqlClientOut = r
+
+    # fqlStatsProbeLine: one GET /stats through a client trusting `trust`,
+    # as `OK <node_count>` or fqlErrLine — the TLS classification check.
+    proc fqlStatsProbeLine(base: text, token: text, trust: text) -> text uses io.net:
+        let ep = do fqlEndpointNew("db-tls", base, token)
+        let c = do fqlClientTrusting(fqlClientNew(ep.v), trust)
+        let r = do fqlStats(c)
+        if !r.ok:
+            let e = do fqlErrLine(r.err)
+            return e
+        return "OK " + r.v.nodeCount
+
+    action fqlStatsProbe(base: text, token: text, trust: text):
+        let r = do fqlStatsProbeLine(base, token, trust)
         fqlClientOut = r
 
     action fqlEndpointRun(dbms: text, url: text, token: text):

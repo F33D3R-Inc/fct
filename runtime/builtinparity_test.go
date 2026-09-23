@@ -16,7 +16,7 @@ import (
 // clientBuiltinFuncs are the assets/facet.js functions evCall and its helpers
 // are made of — the shipped source, extracted, never a copy.
 var clientBuiltinFuncs = []string{
-	"evCall", "isFloatNum", "roundAway", "runeSlice", "utf8Len", "mapCase", "goTrim",
+	"evCall", "isFloatNum", "roundAway", "runeSlice", "listSlice", "utf8Len", "mapCase", "goTrim",
 	"fromJsonJS", "fromIsoJS", "ago", "isoJS", "compact", "commas", "money", "toMoney",
 	"toFloatJS", "truthy", "toInt", "toStr", "numStr",
 }
@@ -96,6 +96,7 @@ var clientParityCases = []parityCase{
 	{"join", []any{[]any{"a", 1, true, nil, 2.5}, "-"}}, {"join", []any{[]any{}, ","}}, {"join", []any{"notalist", ","}},
 	{"slice", []any{"hello", 0, 3}}, {"slice", []any{"hello", 3, 1}}, {"slice", []any{"hello", -5, 99}}, {"slice", []any{"a😀bc", 1, 3}},
 	{"slice", []any{"", 0, 1}}, {"slice", []any{"héllo", 1, 2}},
+	{"slice", []any{[]any{1, 2, 3}, 1, 3}}, {"slice", []any{[]any{"a", "b"}, -1, 9}}, {"slice", []any{[]any{1, 2}, 2, 1}},
 	{"charAt", []any{"hello", 1}}, {"charAt", []any{"hello", -1}}, {"charAt", []any{"hello", 5}}, {"charAt", []any{"a😀b", 1}},
 	{"replace", []any{"a-b-c", "-", "+"}}, {"replace", []any{"abc", "", "-"}}, {"replace", []any{"", "", "-"}}, {"replace", []any{"a😀", "", "|"}}, {"replace", []any{"aaa", "aa", "b"}},
 	{"slug", []any{"Hello, World!"}}, {"slug", []any{"İx"}}, {"slug", []any{"--Ünïcode  Straße--"}}, {"slug", []any{"KELVIN"}},

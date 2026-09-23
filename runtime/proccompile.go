@@ -940,7 +940,7 @@ var inspectOnly = map[string]bool{
 	"len": true, "byteLen": true, "bytesToText": true, "join": true, "contains": true,
 	"charAt": true, "writeFileAt": true, "writeBytes": true, "writeFile": true,
 	"aesGcmSeal": true, "aesGcmOpen": true, "aesGcmAuthentic": true,
-	"appendFile": true, "sha256Hex": true, "canonicalJson": true,
+	"appendFile": true, "sha256Hex": true, "canonicalJson": true, "awaitAny": true,
 }
 
 // fresh reports whether e always evaluates to a composite value created by

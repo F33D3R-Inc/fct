@@ -61,6 +61,8 @@ func (s *Server) RunDaemons() error {
 	}
 	s.runOnStartJobs()
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var first error
 	for i := range s.ir.Daemons {
 		d := &s.ir.Daemons[i]
 		wg.Add(1)
@@ -68,13 +70,21 @@ func (s *Server) RunDaemons() error {
 			defer wg.Done()
 			if d.Every > 0 {
 				s.runDaemonTicking(d)
-			} else {
-				s.runDaemonOnce(d)
+				return
+			}
+			if err := s.runDaemonBody(d); err != nil {
+				mu.Lock()
+				if first == nil {
+					first = fmt.Errorf("daemon %s: %w", d.Name, err)
+				}
+				mu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
-	return nil
+	// A service whose daemon failed ends in failure: a command's exit
+	// status is how whatever started it learns why it stopped.
+	return first
 }
 
 // HasMain reports whether the program declares `proc main` (a command).
@@ -112,10 +122,11 @@ func (s *Server) runDaemonOnce(d *ir.Daemon) {
 // there is no caller here to propagate a panic to), and its error, if any,
 // only logged: nothing is waiting on a daemon's result the way a `join`
 // waits on a spawned task's, so there is nowhere else for a failure to go.
-func (s *Server) runDaemonBody(d *ir.Daemon) {
+func (s *Server) runDaemonBody(d *ir.Daemon) (failed error) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.obs.log.Error("daemon panicked", slog.String("daemon", d.Name), slog.Any("panic", r))
+			failed = fmt.Errorf("panicked: %v", r)
 		}
 	}()
 	pc := s.codeFor(d, nil, d.Body)
@@ -125,6 +136,7 @@ func (s *Server) runDaemonBody(d *ir.Daemon) {
 	if err != nil {
 		s.obs.log.Error("daemon failed", slog.String("daemon", d.Name), slog.Any("error", err))
 	}
+	return err
 }
 
 // detachProc implements `detach ProcName(args)` (see ast.Detach's doc; the

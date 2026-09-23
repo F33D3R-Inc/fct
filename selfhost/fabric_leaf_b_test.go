@@ -432,3 +432,10 @@ func TestFabricLeafBPathToError(t *testing.T) {
 		t.Errorf("... %d mismatches of %d", bad, len(corpus))
 	}
 }
+
+// The u64 builtins (runtime/u64.go) against Rust's u64 over values around
+// 2^32, 2^53, 2^63 and 2^64: cmp, min, max, saturating_sub, / and %,
+// Display, `as f64`, the i64 bit pattern, and FromStr's results/messages.
+func TestFabricLeafBU64Builtins(t *testing.T) {
+	lbRunCheck(t, "u64_check.fct", "runU64Check", "u64ops_rust.tsv")
+}

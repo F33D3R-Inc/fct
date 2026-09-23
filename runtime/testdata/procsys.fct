@@ -1,0 +1,59 @@
+app ProcSys:
+    # awaitAny/closeChannel, exitProcess, processStats and listenTls, driven
+    # by runtime/procsys_test.go through `proc main` (args[0] names the case).
+    proc later(ch: int, ms: int, v: text) -> bool:
+        let s = sleepMs(ms)
+        let ok = send(ch, v)
+        return ok
+
+    proc sendTwice(ch: int) -> text:
+        let first = send(ch, "one")
+        let second = send(ch, "two")
+        return "" + first + "," + second
+
+    proc channels() -> text:
+        let a = channel()
+        let b = channel()
+        let mut out = "" + awaitAny([a, b], 0)
+        let sent = send(b, "x")
+        out = out + " " + awaitAny([a, b], 0)
+        out = out + " " + recv(b)
+        let t0 = monoMs()
+        let none = awaitAny([a, b], 50)
+        out = out + " " + none + ":" + (monoMs() - t0 >= 50)
+        let h = spawn later(a, 30, "late")
+        out = out + " " + awaitAny([a, b], -1)
+        let delivered = join h
+        out = out + " " + recv(a) + ":" + delivered
+        out = out + " " + closeChannel(b) + " " + closeChannel(b) + " " + send(b, "y") + " " + awaitAny([a, b], 0)
+        let c = channel()
+        let h2 = spawn sendTwice(c)
+        let s2 = sleepMs(30)
+        let closed = closeChannel(c)
+        let sends = join h2
+        out = out + " " + sends
+        return out
+
+    proc main(args: [text]) -> int uses io.console, io.net.listen:
+        let mode = args[0]
+        if mode == "channels":
+            let r = do channels()
+            writeStdout(r + "\n")
+        if mode == "exit":
+            writeStdout("bye\n")
+            let e = exitProcess(7)
+            writeStdout("after\n")
+        if mode == "stats":
+            writeStdout(processStats() + "\n")
+        if mode == "tls":
+            let l = listenTls(toInt(args[1]), args[2], args[3])
+            writeStdout("ready\n")
+            let c = accept(l)
+            writeStdout("peer " + connPeer(c) + "\n")
+            let got = readBytes(c, 100)
+            if len(got) == 0:
+                writeStdout("failed: " + connError(c) + "\n")
+            else:
+                let wrote = writeBytes(c, textToBytes("echo:" + bytesToText(got)))
+            let closed = closeConn(c)
+        return 0

@@ -772,6 +772,215 @@ app DriverSelfHost:
         graph: IRGraph
         err: text
 
+    # ── daemon-context procs (internal/ir/detachctx.go) ────────────────
+    # A proc is a daemon-context body iff it is referenced, every reference
+    # to it anywhere in the program is a `detach` from a daemon-context body
+    # (a daemon, main, or another such proc), and it is reachable from a
+    # daemon or main by those detaches alone — computed to a fixpoint. why
+    # names, for a detached proc that is not one, the reference that makes
+    # it an ordinary proc.
+    struct DrRefs:
+        names: [text]
+        detach: [bool]
+        from: [text]
+        where: [text]
+
+    struct DrCtx:
+        procs: [text]
+        whyNames: [text]
+        whyTexts: [text]
+
+    proc driverIsIdentByte(b: int) -> bool:
+        return (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95
+
+    # driverScanRefs: every `P(` naming a proc in src (strings skipped),
+    # with whether it is the target of a `detach` statement, and how it is
+    # written (do / spawn / detach / a call).
+    proc driverScanRefs(r0: DrRefs, src: text, procNames: [text], renameFrom: [text], renameTo: [text], from: text, what: text) -> DrRefs:
+        let mut r = r0
+        let lines = split(src, "\n")
+        let nl = len(lines)
+        let mut li = 0
+        loop li < nl:
+            let line = trim(lines[li])
+            if line != "" && charAt(line, 0) != "#":
+                let bs = textToBytes(line)
+                let n = len(bs)
+                let mut i = 0
+                let mut inStr = false
+                let mut prevWord = ""
+                loop i < n:
+                    let b = bs[i]
+                    if inStr:
+                        if b == 92:
+                            i = i + 1
+                        else:
+                            if b == 34:
+                                inStr = false
+                        i = i + 1
+                    else:
+                        if b == 34:
+                            inStr = true
+                            i = i + 1
+                        else:
+                            if driverIsIdentByte(b) && !(b >= 48 && b <= 57):
+                                let st = i
+                                loop i < n && driverIsIdentByte(bs[i]):
+                                    i = i + 1
+                                let word = bytesToText(slice(bs, st, i))
+                                let mut j = i
+                                loop j < n && bs[j] == 32:
+                                    j = j + 1
+                                let dotted = st > 0 && bs[st - 1] == 46
+                                if !dotted && j < n && bs[j] == 40:
+                                    let at = do lowerFindName(renameFrom, word)
+                                    let mut target = word
+                                    if at >= 0:
+                                        target = renameTo[at]
+                                    if target in procNames:
+                                        let mut kind = "call"
+                                        if prevWord == "do" || prevWord == "spawn" || prevWord == "detach":
+                                            kind = prevWord
+                                        let mut shown = word + "(...)"
+                                        if kind != "call":
+                                            shown = kind + " " + word + "(...)"
+                                        r.names = append(r.names, target)
+                                        r.detach = append(r.detach, kind == "detach")
+                                        r.from = append(r.from, from)
+                                        r.where = append(r.where, "`" + shown + "` in " + what)
+                                prevWord = word
+                            else:
+                                if b != 32:
+                                    prevWord = ""
+                                i = i + 1
+            li = li + 1
+        return r
+
+    proc driverIsEntry(pd: ProcDecl) -> bool:
+        return pd.name == "main" && len(pd.paramNames) == 1 && pd.paramLists[0] && pd.paramTypes[0] == "text" && pd.hasRet && pd.retCore == "int" && !pd.retIsList
+
+    proc driverDaemonCtx(prog: Program) -> DrCtx:
+        let mut procNames = []
+        let mut i = 0
+        loop i < len(prog.procs):
+            procNames = append(procNames, prog.procs[i].name)
+            i = i + 1
+        let mut r = DrRefs{names: [], detach: [], from: [], where: []}
+        i = 0
+        loop i < len(prog.procs):
+            let pd = prog.procs[i]
+            let mut from = pd.name
+            if driverIsEntry(pd):
+                from = ""
+            r = do driverScanRefs(r, pd.bodySrc, procNames, pd.renameFrom, pd.renameTo, from, "proc " + pd.name)
+            i = i + 1
+        i = 0
+        loop i < len(prog.daemons):
+            let dd = prog.daemons[i]
+            r = do driverScanRefs(r, dd.bodySrc, procNames, dd.renameFrom, dd.renameTo, "", "daemon " + dd.name)
+            i = i + 1
+        i = 0
+        loop i < len(prog.actions):
+            r = do driverScanRefs(r, prog.actions[i].bodySrc, procNames, [], [], "\u0000", "the app's Actions")
+            i = i + 1
+        i = 0
+        loop i < len(prog.views):
+            r = do driverScanRefs(r, prog.views[i].bodySrc, procNames, [], [], "\u0000", "the app's Views")
+            i = i + 1
+        i = 0
+        loop i < len(prog.components):
+            r = do driverScanRefs(r, prog.components[i].bodySrc, procNames, [], [], "\u0000", "the app's Components")
+            i = i + 1
+        i = 0
+        loop i < len(prog.derives):
+            r = do driverScanRefs(r, prog.derives[i].line, procNames, [], [], "\u0000", "the app's Derives")
+            i = i + 1
+        let nr = len(r.names)
+        # candidates: every referenced proc
+        let mut ctx = []
+        let mut k = 0
+        loop k < nr:
+            if !(r.names[k] in ctx):
+                ctx = append(ctx, r.names[k])
+            k = k + 1
+        let mut changed = true
+        loop changed:
+            changed = false
+            let mut kept = []
+            let mut c = 0
+            loop c < len(ctx):
+                let name = ctx[c]
+                let mut ok = true
+                let mut q = 0
+                loop q < nr && ok:
+                    if r.names[q] == name && (!r.detach[q] || (r.from[q] != "" && !(r.from[q] in ctx))):
+                        ok = false
+                    q = q + 1
+                if ok:
+                    kept = append(kept, name)
+                else:
+                    changed = true
+                c = c + 1
+            ctx = kept
+        let mut reach = []
+        changed = true
+        loop changed:
+            changed = false
+            let mut c2 = 0
+            loop c2 < len(ctx):
+                let name2 = ctx[c2]
+                if !(name2 in reach):
+                    let mut q2 = 0
+                    let mut found = false
+                    loop q2 < nr && !found:
+                        if r.names[q2] == name2 && (r.from[q2] == "" || r.from[q2] in reach):
+                            found = true
+                        q2 = q2 + 1
+                    if found:
+                        reach = append(reach, name2)
+                        changed = true
+                c2 = c2 + 1
+        let mut whyNames = []
+        let mut whyTexts = []
+        let mut w = 0
+        loop w < len(procNames):
+            let pn = procNames[w]
+            if !(pn in reach):
+                let mut detached = false
+                let mut q3 = 0
+                loop q3 < nr:
+                    if r.names[q3] == pn && r.detach[q3]:
+                        detached = true
+                    q3 = q3 + 1
+                if detached:
+                    let mut why = ""
+                    let mut q4 = 0
+                    let mut stop = false
+                    loop q4 < nr && !stop:
+                        if r.names[q4] == pn:
+                            if !r.detach[q4]:
+                                why = r.where[q4]
+                                stop = true
+                            else:
+                                if r.from[q4] != "" && !(r.from[q4] in reach):
+                                    why = r.where[q4] + ", which is not itself only ever detached from a daemon or main"
+                        q4 = q4 + 1
+                    if why != "":
+                        whyNames = append(whyNames, pn)
+                        whyTexts = append(whyTexts, why)
+            w = w + 1
+        return DrCtx{procs: reach, whyNames: whyNames, whyTexts: whyTexts}
+
+    # driverCtxDiag: a daemon-only refusal in a detached proc that is not
+    # daemon-context says which reference made it an ordinary proc.
+    proc driverCtxDiag(dc: DrCtx, name: text, diag: text) -> text:
+        let at = do lowerFindName(dc.whyNames, name)
+        if at < 0:
+            return diag
+        if contains(diag, "only available inside a daemon body") || contains(diag, "only valid inside a daemon body"):
+            return diag + " (proc \"" + name + "\" is started by `detach`, but it is also reached by " + dc.whyTexts[at] + ", so it runs as an ordinary proc, possibly under a caller's lock)"
+        return diag
+
     proc compileGraph(src: text) -> DriverOut:
         let prog = do parseProgramSrc(src)
         let out = do compileProgram(prog)
@@ -890,7 +1099,7 @@ app DriverSelfHost:
             loop wfi < nwf:
                 if wt2.fields[wfi].optional:
                     wireOptKeys = append(wireOptKeys, wt2.name + "." + wt2.fields[wfi].name)
-                if wt2.fields[wfi].nullable:
+                if wt2.fields[wfi].nullable && !wt2.fields[wfi].optional:
                     wireNullKeys = append(wireNullKeys, wt2.name + "." + wt2.fields[wfi].name)
                 wfi = wfi + 1
             wti = wti + 1
@@ -1062,6 +1271,60 @@ app DriverSelfHost:
                 sfj = sfj + 1
             sdi = sdi + 1
 
+        # Shared cells (buildShareds): known before any proc or daemon body.
+        let mut sharedNames = []
+        let mut sharedTypes = []
+        let mut irShareds = []
+        let nsh = len(prog.shareds)
+        let mut shi = 0
+        loop shi < nsh:
+            let sh = prog.shareds[shi]
+            let shq = "\"" + sh.name + "\""
+            let prevAt = do lowerFindName(sharedNames, sh.name)
+            if prevAt >= 0:
+                let sf0 = do driverFailed(prog, "line " + sh.line + ": shared cell " + shq + " redeclared (first at line " + prog.shareds[prevAt].line + ")")
+                return sf0
+            let mut clash = sh.name in stateNames || sh.name in entityNames
+            let mut spi = 0
+            loop spi < len(prog.procs):
+                if prog.procs[spi].name == sh.name:
+                    clash = true
+                spi = spi + 1
+            if clash:
+                let sf1 = do driverFailed(prog, "line " + sh.line + ": shared cell " + shq + " collides with a state cell, entity or proc of the same name")
+                return sf1
+            let prim = do driverIsPrimitive(sh.type)
+            if !prim:
+                let mut known = sh.type in enumNames
+                let mut srk = 0
+                loop srk < len(prog.records):
+                    if prog.records[srk].name == sh.type:
+                        known = true
+                    srk = srk + 1
+                let mut ssk = 0
+                loop ssk < len(prog.structs):
+                    if prog.structs[ssk].name == sh.type:
+                        known = true
+                    ssk = ssk + 1
+                if !known:
+                    let sf2 = do driverFailed(prog, "line " + sh.line + ": shared cell " + shq + " has unknown type \"" + sh.type + "\"")
+                    return sf2
+            sharedNames = append(sharedNames, sh.name)
+            if sh.list:
+                sharedTypes = append(sharedTypes, "array")
+            else:
+                sharedTypes = append(sharedTypes, sh.type)
+            irShareds = append(irShareds, IRShared{name: sh.name, type: sh.type, list: sh.list})
+            shi = shi + 1
+        # daemon-context procs: lowered after the actions, with the daemons
+        let dctx = do driverDaemonCtx(prog)
+        let mut plStructNames = []
+        let mut psn = 0
+        loop psn < len(prog.structs):
+            plStructNames = append(plStructNames, prog.structs[psn].name)
+            psn = psn + 1
+        let plctx = PLCtx{sharedNames: sharedNames, sharedTypes: sharedTypes, ctxProcs: dctx.procs, lineNos: [], structNames: plStructNames, ty: tyEnv}
+
         # Procs (name/paramCount/ret/retList env, then real lowering).
         let mut procNames = []
         let mut procRets = []
@@ -1080,11 +1343,18 @@ app DriverSelfHost:
         let mut pci2 = 0
         loop pci2 < pcn:
             let pd2 = prog.procs[pci2]
-            let lp = do plLowerProcS(pd2.name, pd2.headerLine, pd2.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, pd2.renameFrom, pd2.renameTo, structFieldKeys, structFieldTypes)
-            if lp.diag != "":
-                let pf = do driverFailed(prog, lp.diag)
-                return pf
-            procs = append(procs, lp.proc)
+            let later = driverIsEntry(pd2) || pd2.name in dctx.procs
+            if later:
+                procs = append(procs, plEmptyProc())
+            else:
+                let mut pctx = plctx
+                pctx.lineNos = pd2.bodyLineNos
+                let lp = do plLowerProcX(pd2.name, pd2.headerLine, pd2.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, pd2.renameFrom, pd2.renameTo, structFieldKeys, structFieldTypes, pctx, false, [], [], [])
+                if lp.diag != "":
+                    let pdiag = do driverCtxDiag(dctx, pd2.name, lp.diag)
+                    let pf = do driverFailed(prog, pdiag)
+                    return pf
+                procs = append(procs, lp.proc)
             pci2 = pci2 + 1
 
         # Entity field env for action lowering: "Entity.field" / "Entity.derive".
@@ -1217,6 +1487,20 @@ app DriverSelfHost:
             sigServer = append(sigServer, actions[sgi].placement == "server")
             sigCounts = append(sigCounts, len(actions[sgi].params))
             sgi = sgi + 1
+        # the process entry point and the daemon-context procs: lowered as
+        # daemon bodies are (listen/accept, detach and act allowed)
+        let mut pcl = 0
+        loop pcl < len(prog.procs):
+            let pd3 = prog.procs[pcl]
+            if driverIsEntry(pd3) || pd3.name in dctx.procs:
+                let mut pctx3 = plctx
+                pctx3.lineNos = pd3.bodyLineNos
+                let lp3 = do plLowerProcX(pd3.name, pd3.headerLine, pd3.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, pd3.renameFrom, pd3.renameTo, structFieldKeys, structFieldTypes, pctx3, true, sigNames, sigServer, sigCounts)
+                if lp3.diag != "":
+                    let pf3 = do driverFailed(prog, lp3.diag)
+                    return pf3
+                procs[pcl] = lp3.proc
+            pcl = pcl + 1
         let mut daemons = []
         let mut daemonNames = []
         let ndm = len(prog.daemons)
@@ -1230,7 +1514,9 @@ app DriverSelfHost:
                 let fd2 = do driverFailed(prog, "daemon \"" + dd.name + "\" redeclared")
                 return fd2
             daemonNames = append(daemonNames, dd.name)
-            let ld = do plLowerDaemon(dd.name, dd.uses, dd.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, sigNames, sigServer, sigCounts, dd.renameFrom, dd.renameTo, structFieldKeys, structFieldTypes)
+            let mut dctx2 = plctx
+            dctx2.lineNos = dd.bodyLineNos
+            let ld = do plLowerDaemonX(dd.name, dd.uses, dd.bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, sigNames, sigServer, sigCounts, dd.renameFrom, dd.renameTo, structFieldKeys, structFieldTypes, dctx2)
             if ld.diag != "":
                 let fd3 = do driverFailed(prog, ld.diag)
                 return fd3
@@ -1247,7 +1533,7 @@ app DriverSelfHost:
             if allStates[csi].placement == "client":
                 clientStates = append(clientStates, allStates[csi].name)
             csi = csi + 1
-        let routesB = do wBuildRoutes(actions, prog.rawDecls, clientStates, policyNames, policyParamCounts, wire.names, wire.messages)
+        let routesB = do wBuildRoutes(actions, prog.rawDecls, clientStates, policyNames, policyParamCounts, wire.names, wire.messages, wire.types)
         if routesB.err != "":
             let rf = do driverFailed(prog, routesB.err)
             return rf
@@ -1353,11 +1639,11 @@ app DriverSelfHost:
         let built = do vbBuildPages(venv, vviews, vlayouts, builtComps)
         let noneVal = do jNone()
         if built.err != "":
-            let failed = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
+            let failed = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], shareds: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
             return DriverOut{graph: failed, err: built.err}
         let stamped = do driverStampIndexes(entities, built.indexKeys, built.queriedKeys)
         if stamped.err != "":
-            let failed2 = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
+            let failed2 = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], shareds: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
             return DriverOut{graph: failed2, err: stamped.err}
         let mut topView = []
         let mut topBindings = []
@@ -1368,7 +1654,7 @@ app DriverSelfHost:
         let themeBase = do driverThemeMap(prog, "base", "")
         let themeDark = do driverThemeMap(prog, "dark", "")
         let themesNamed = do driverNamedThemes(prog)
-        let g = IRGraph{app: prog.name, auth: prog.hasAuth, entities: stamped.entities, records: records, structs: structs, enums: enums, types: wire.types, messages: wire.messages, states: states, derives: builtDerives.derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: daemons, components: built.components, services: services, files: files, webhooks: webhooks, apis: routesB.apis, contract: routesB.contract, streams: routesB.streams, triggers: triggers, theme: themeBase, themeDark: themeDark, themes: themesNamed, css: prog.css, assets: noneVal, routes: built.routes, pages: built.pages, bindings: topBindings, view: topView, depGraph: depGraph}
+        let g = IRGraph{app: prog.name, auth: prog.hasAuth, entities: stamped.entities, records: records, structs: structs, enums: enums, types: wire.types, messages: wire.messages, states: states, derives: builtDerives.derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: daemons, shareds: irShareds, components: built.components, services: services, files: files, webhooks: webhooks, apis: routesB.apis, contract: routesB.contract, streams: routesB.streams, triggers: triggers, theme: themeBase, themeDark: themeDark, themes: themesNamed, css: prog.css, assets: noneVal, routes: built.routes, pages: built.pages, bindings: topBindings, view: topView, depGraph: depGraph}
         return DriverOut{graph: g, err: ""}
 
     proc driverEmptyOut(p: Program) -> DriverOut:
@@ -1386,7 +1672,7 @@ app DriverSelfHost:
 
     proc driverFailed(prog: Program, msg: text) -> DriverOut:
         let noneVal = do jNone()
-        let g = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
+        let g = IRGraph{app: prog.name, auth: prog.hasAuth, entities: [], records: [], structs: [], enums: [], types: [], messages: [], states: [], derives: [], policies: [], actions: [], procs: [], jobs: [], daemons: [], shareds: [], components: [], services: [], files: [], webhooks: [], apis: [], contract: [], streams: [], triggers: [], theme: noneVal, themeDark: noneVal, themes: noneVal, css: "", assets: noneVal, routes: [], pages: [], bindings: [], view: [], depGraph: noneVal}
         return DriverOut{graph: g, err: msg}
 
     proc driverStatesWithTheme(prog: Program) -> [StateDecl]:
@@ -1648,6 +1934,8 @@ app DriverSelfHost:
                 let mut wft = wt.fields[wf].type
                 if wt.fields[wf].list:
                     wft = "[" + wft + "]"
+                if wt.fields[wf].map || wt.fields[wf].depth > 0:
+                    wft = "json"
                 wireKeys = append(wireKeys, wt.name + "." + wt.fields[wf].name)
                 wireTypes = append(wireTypes, wft)
                 wf = wf + 1
@@ -2219,7 +2507,7 @@ app DriverSelfHost:
         loop pei < npe:
             parseErrors = append(parseErrors, src.parseErrors[pei])
             pei = pei + 1
-        return Program{name: dst.name, hasAuth: dst.hasAuth || src.hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: [], parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: dst.kind, into: dst.into, mounts: dst.mounts, sockets: dst.sockets, hasFrame: dst.hasFrame, frameSrc: dst.frameSrc, hasContent: dst.hasContent, contentSrc: dst.contentSrc, unknownKeywords: dst.unknownKeywords}
+        return Program{name: dst.name, hasAuth: dst.hasAuth || src.hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: [], parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: dst.kind, into: dst.into, mounts: dst.mounts, sockets: dst.sockets, hasFrame: dst.hasFrame, frameSrc: dst.frameSrc, hasContent: dst.hasContent, contentSrc: dst.contentSrc, unknownKeywords: dst.unknownKeywords, shareds: dst.shareds + src.shareds}
 
     proc driverCatEntities(a: [EntityDecl], b: [EntityDecl]) -> [EntityDecl]:
         let mut out = a
@@ -2371,7 +2659,7 @@ app DriverSelfHost:
                 views = append(views, v)
             vi = vi + 1
         if len(from) == 0:
-            return Program{name: prog.name, hasAuth: prog.hasAuth, entities: prog.entities, records: prog.records, structs: prog.structs, enums: prog.enums, states: prog.states, derives: prog.derives, policies: prog.policies, procs: prog.procs, actions: prog.actions, webhooks: prog.webhooks, jobs: prog.jobs, services: prog.services, components: prog.components, triggers: prog.triggers, views: views, themes: prog.themes, css: prog.css, daemons: prog.daemons, privateProcs: [], parseErrors: prog.parseErrors, layouts: prog.layouts, rawDecls: prog.rawDecls, kind: prog.kind, into: prog.into, mounts: prog.mounts, sockets: prog.sockets, hasFrame: prog.hasFrame, frameSrc: prog.frameSrc, hasContent: prog.hasContent, contentSrc: prog.contentSrc, unknownKeywords: prog.unknownKeywords}
+            return Program{name: prog.name, hasAuth: prog.hasAuth, entities: prog.entities, records: prog.records, structs: prog.structs, enums: prog.enums, states: prog.states, derives: prog.derives, policies: prog.policies, procs: prog.procs, actions: prog.actions, webhooks: prog.webhooks, jobs: prog.jobs, services: prog.services, components: prog.components, triggers: prog.triggers, views: views, themes: prog.themes, css: prog.css, daemons: prog.daemons, privateProcs: [], parseErrors: prog.parseErrors, layouts: prog.layouts, rawDecls: prog.rawDecls, kind: prog.kind, into: prog.into, mounts: prog.mounts, sockets: prog.sockets, hasFrame: prog.hasFrame, frameSrc: prog.frameSrc, hasContent: prog.hasContent, contentSrc: prog.contentSrc, unknownKeywords: prog.unknownKeywords, shareds: prog.shareds}
         let mut procs = []
         let npr = len(prog.procs)
         let mut pi = 0
@@ -2381,7 +2669,7 @@ app DriverSelfHost:
             let mut name = pd.name
             if at >= 0:
                 name = to[at]
-            procs = append(procs, ProcDecl{name: name, paramNames: pd.paramNames, paramTypes: pd.paramTypes, paramLists: pd.paramLists, paramOptionals: pd.paramOptionals, hasRet: pd.hasRet, retCore: pd.retCore, retIsList: pd.retIsList, retIsOptional: pd.retIsOptional, uses: pd.uses, headerValid: pd.headerValid, body: pd.body, bodyValid: pd.bodyValid, headerLine: pd.headerLine, bodySrc: pd.bodySrc, renameFrom: from, renameTo: to})
+            procs = append(procs, ProcDecl{name: name, paramNames: pd.paramNames, paramTypes: pd.paramTypes, paramLists: pd.paramLists, paramOptionals: pd.paramOptionals, hasRet: pd.hasRet, retCore: pd.retCore, retIsList: pd.retIsList, retIsOptional: pd.retIsOptional, uses: pd.uses, headerValid: pd.headerValid, body: pd.body, bodyValid: pd.bodyValid, headerLine: pd.headerLine, bodySrc: pd.bodySrc, renameFrom: from, renameTo: to, bodyLineNos: pd.bodyLineNos})
             pi = pi + 1
         let mut actions = []
         let na = len(prog.actions)
@@ -2395,9 +2683,9 @@ app DriverSelfHost:
         let mut di = 0
         loop di < nd:
             let dd = prog.daemons[di]
-            daemons = append(daemons, DaemonDecl{name: dd.name, every: dd.every, uses: dd.uses, bodySrc: dd.bodySrc, err: dd.err, renameFrom: from, renameTo: to})
+            daemons = append(daemons, DaemonDecl{name: dd.name, every: dd.every, uses: dd.uses, bodySrc: dd.bodySrc, err: dd.err, renameFrom: from, renameTo: to, bodyLineNos: dd.bodyLineNos})
             di = di + 1
-        return Program{name: prog.name, hasAuth: prog.hasAuth, entities: prog.entities, records: prog.records, structs: prog.structs, enums: prog.enums, states: prog.states, derives: prog.derives, policies: prog.policies, procs: procs, actions: actions, webhooks: prog.webhooks, jobs: prog.jobs, services: prog.services, components: prog.components, triggers: prog.triggers, views: views, themes: prog.themes, css: prog.css, daemons: daemons, privateProcs: [], parseErrors: prog.parseErrors, layouts: prog.layouts, rawDecls: prog.rawDecls, kind: prog.kind, into: prog.into, mounts: prog.mounts, sockets: prog.sockets, hasFrame: prog.hasFrame, frameSrc: prog.frameSrc, hasContent: prog.hasContent, contentSrc: prog.contentSrc, unknownKeywords: prog.unknownKeywords}
+        return Program{name: prog.name, hasAuth: prog.hasAuth, entities: prog.entities, records: prog.records, structs: prog.structs, enums: prog.enums, states: prog.states, derives: prog.derives, policies: prog.policies, procs: procs, actions: actions, webhooks: prog.webhooks, jobs: prog.jobs, services: prog.services, components: prog.components, triggers: prog.triggers, views: views, themes: prog.themes, css: prog.css, daemons: daemons, privateProcs: [], parseErrors: prog.parseErrors, layouts: prog.layouts, rawDecls: prog.rawDecls, kind: prog.kind, into: prog.into, mounts: prog.mounts, sockets: prog.sockets, hasFrame: prog.hasFrame, frameSrc: prog.frameSrc, hasContent: prog.hasContent, contentSrc: prog.contentSrc, unknownKeywords: prog.unknownKeywords, shareds: prog.shareds}
 
     # ── layered composition: internal/compile/compose.go ───────────────
     proc driverIsLayered(mods: [Program]) -> bool:
@@ -2587,7 +2875,7 @@ app DriverSelfHost:
             let c1 = do driverJoinCSS(css, w2.css)
             css = c1
             wj = wj + 1
-        let mut app = Program{name: pg.name, hasAuth: false, entities: [], records: [], structs: [], enums: [], states: [], derives: [], policies: [], procs: [], actions: [], webhooks: [], jobs: [], services: [], components: [], triggers: [], views: [], themes: [], css: "", daemons: [], privateProcs: [], parseErrors: [], layouts: [], rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: []}
+        let mut app = Program{name: pg.name, hasAuth: false, entities: [], records: [], structs: [], enums: [], states: [], derives: [], policies: [], procs: [], actions: [], webhooks: [], jobs: [], services: [], components: [], triggers: [], views: [], themes: [], css: "", daemons: [], privateProcs: [], parseErrors: [], layouts: [], rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: [], shareds: []}
         let mut policyNames = []
         let mut policyCounts = []
         let mut bj = 0
@@ -2611,7 +2899,7 @@ app DriverSelfHost:
             loop lyi < nly:
                 layouts = append(layouts, b2.layouts[lyi])
                 lyi = lyi + 1
-            app = Program{name: app.name, hasAuth: false, entities: entities, records: [], structs: [], enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: [], jobs: jobs, services: services, components: components, triggers: [], views: [], themes: [], css: "", daemons: daemons, privateProcs: [], parseErrors: [], layouts: layouts, rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: []}
+            app = Program{name: app.name, hasAuth: false, entities: entities, records: [], structs: [], enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: [], jobs: jobs, services: services, components: components, triggers: [], views: [], themes: [], css: "", daemons: daemons, privateProcs: [], parseErrors: [], layouts: layouts, rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: [], shareds: app.shareds + b2.shareds}
             let t2 = do driverAppendThemes(themes, b2.themes)
             themes = t2
             let c2 = do driverJoinCSS(css, b2.css)
@@ -2747,7 +3035,7 @@ app DriverSelfHost:
                     views = append(views, VView{err: "", name: v.name, path: v.path, params: v.params, layout: "", requires: v.requires, titleSegs: v.titleSegs, descSegs: v.descSegs, root: sp2.nodes, screen: true})
                     bv = bv + 1
             bk = bk + 1
-        let out = Program{name: app.name, hasAuth: hasAuth, entities: app.entities, records: [], structs: [], enums: app.enums, states: app.states, derives: app.derives, policies: app.policies, procs: app.procs, actions: app.actions, webhooks: [], jobs: app.jobs, services: app.services, components: components2, triggers: [], views: [], themes: themes, css: css, daemons: app.daemons, privateProcs: [], parseErrors: [], layouts: layouts2, rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: []}
+        let out = Program{name: app.name, hasAuth: hasAuth, entities: app.entities, records: [], structs: [], enums: app.enums, states: app.states, derives: app.derives, policies: app.policies, procs: app.procs, actions: app.actions, webhooks: [], jobs: app.jobs, services: app.services, components: components2, triggers: [], views: [], themes: themes, css: css, daemons: app.daemons, privateProcs: [], parseErrors: [], layouts: layouts2, rawDecls: [], kind: "app", into: "", mounts: [], sockets: [], hasFrame: false, frameSrc: "", hasContent: false, contentSrc: "", unknownKeywords: [], shareds: app.shareds}
         return DriverComposed{err: "", prog: out, views: views}
 
     # driverCSSFrom: collectModules' `css from "styles.css"` pass — each
@@ -2797,7 +3085,7 @@ app DriverSelfHost:
                 if body != "":
                     css = css + "\n" + body
             i = i + 1
-        let out = Program{name: p.name, hasAuth: p.hasAuth, entities: p.entities, records: p.records, structs: p.structs, enums: p.enums, states: p.states, derives: p.derives, policies: p.policies, procs: p.procs, actions: p.actions, webhooks: p.webhooks, jobs: p.jobs, services: p.services, components: p.components, triggers: p.triggers, views: p.views, themes: p.themes, css: css, daemons: p.daemons, privateProcs: p.privateProcs, parseErrors: p.parseErrors, layouts: p.layouts, rawDecls: kept, kind: p.kind, into: p.into, mounts: p.mounts, sockets: p.sockets, hasFrame: p.hasFrame, frameSrc: p.frameSrc, hasContent: p.hasContent, contentSrc: p.contentSrc, unknownKeywords: p.unknownKeywords}
+        let out = Program{name: p.name, hasAuth: p.hasAuth, entities: p.entities, records: p.records, structs: p.structs, enums: p.enums, states: p.states, derives: p.derives, policies: p.policies, procs: p.procs, actions: p.actions, webhooks: p.webhooks, jobs: p.jobs, services: p.services, components: p.components, triggers: p.triggers, views: p.views, themes: p.themes, css: css, daemons: p.daemons, privateProcs: p.privateProcs, parseErrors: p.parseErrors, layouts: p.layouts, rawDecls: kept, kind: p.kind, into: p.into, mounts: p.mounts, sockets: p.sockets, hasFrame: p.hasFrame, frameSrc: p.frameSrc, hasContent: p.hasContent, contentSrc: p.contentSrc, unknownKeywords: p.unknownKeywords, shareds: p.shareds}
         return DriverCSSOut{prog: out, err: ""}
 
     proc driverFileExists(path: text) -> bool uses io.file:

@@ -20,13 +20,26 @@ app FqBTreeSelfHost:
     # either reads the other's file.
     #
     # btree.rs keeps its state behind a Mutex and pins generations for
-    # concurrent snapshot readers; a proc is single-threaded and has no
-    # shared state, so the tree is a value every call takes and returns and
-    # no reader is ever pinned (the reuse rule then reduces to "two
-    # generations old").
+    # concurrent snapshot readers; here the tree is a value every call takes
+    # and returns, a snapshot reader holds a copy of it, and the reader
+    # registry is kept by the engine that owns the tree (FqBtReaders): a
+    # page is reused only once no live reader could still reach it.
+    # FqFree: a released page, with the building generation that released
+    # it — and the engine epoch it was released in (-1 for one read from
+    # disk, which no live reader can still reach).
     struct FqFree:
         generation: int
         page: int
+        epoch: int
+
+    # FqBtReaders: btree.rs's reader registry, as the engine that owns the
+    # tree keeps it for every tree at once: the epoch this tree's releases
+    # are stamped with, and the oldest epoch a live snapshot reader is
+    # pinned to (-1: none). A released page may be reused only once every
+    # live reader is pinned past the epoch that released it.
+    struct FqBtReaders:
+        epoch: int
+        oldestPin: int
 
     struct FqBTree:
         pager: FqPager
@@ -35,6 +48,7 @@ app FqBTreeSelfHost:
         entries: int
         free: [FqFree]
         dirty: [int]
+        rd: FqBtReaders
 
     struct FqBtR:
         ok: bool
@@ -67,8 +81,14 @@ app FqBTreeSelfHost:
     proc btMaxDepth() -> int:
         return 64
 
+    proc btNoReaders() -> FqBtReaders:
+        return FqBtReaders{epoch: 0, oldestPin: -1}
+
+    proc btWithReaders(t: FqBTree, rd: FqBtReaders) -> FqBTree:
+        return FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty, rd: rd}
+
     proc btWith(t: FqBTree, pager: FqPager) -> FqBTree:
-        return FqBTree{pager: pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty}
+        return FqBTree{pager: pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty, rd: t.rd}
 
     proc btDeep(op: text) -> text:
         return "tree " + op + " exceeded 64 levels — a B+tree this deep cannot be built by any legitimate insert, so the index holds a cyclic or otherwise impossible child pointer. The index is derived state and can be rebuilt from the record heap, which is the authoritative copy."
@@ -446,7 +466,7 @@ app FqBTreeSelfHost:
             let at = 30 + i * 12
             let fg = do btGetN(bs, at, 8)
             let fp = do btGetN(bs, at + 8, 4)
-            free = append(free, FqFree{generation: fg, page: fp})
+            free = append(free, FqFree{generation: fg, page: fp, epoch: -1})
             i = i + 1
         return FqMeta{ok: true, generation: generation, root: root, entries: entries, highWater: hw, free: free}
 
@@ -473,7 +493,7 @@ app FqBTreeSelfHost:
 
     proc btOpen(path: text, key: [int], nonceBase: int, capacity: int) -> FqBtR uses io.file:
         let pager = do pgrOpen(path, capacity, key, nonceBase)
-        let blank = FqBTree{pager: pager, generation: 0, root: 2, entries: 0, free: [], dirty: []}
+        let blank = FqBTree{pager: pager, generation: 0, root: 2, entries: 0, free: [], dirty: [], rd: btNoReaders()}
         if pager.pageCount < 2:
             let r = do btInitialize(blank)
             return r
@@ -490,7 +510,7 @@ app FqBTreeSelfHost:
                 let e = do btErr(blank, "index " + path + " has no readable meta page — both generations failed validation. The index can be rebuilt from the record heap, which is the authoritative copy.")
                 return e
         let p2 = do pgrSetPageCount(b.pager, m.highWater)
-        return FqBtR{ok: true, err: "", tree: FqBTree{pager: p2, generation: m.generation, root: m.root, entries: m.entries, free: m.free, dirty: []}}
+        return FqBtR{ok: true, err: "", tree: FqBTree{pager: p2, generation: m.generation, root: m.root, entries: m.entries, free: m.free, dirty: [], rd: btNoReaders()}}
 
     proc btInitialize(t0: FqBTree) -> FqBtR uses io.file:
         let p0 = do pgrSetPageCount(t0.pager, 0)
@@ -502,7 +522,7 @@ app FqBTreeSelfHost:
         if !w.ok:
             let e = do btErr(t0, w.err)
             return e
-        let t = FqBTree{pager: w.pager, generation: 0, root: 2, entries: 0, free: [], dirty: []}
+        let t = FqBTree{pager: w.pager, generation: 0, root: 2, entries: 0, free: [], dirty: [], rd: btNoReaders()}
         let c = do btCommit(t)
         return c
 
@@ -532,7 +552,7 @@ app FqBTreeSelfHost:
         if !f2.ok:
             let e4 = do btErr(t, f2.err)
             return e4
-        return FqBtR{ok: true, err: "", tree: FqBTree{pager: f2.pager, generation: generation, root: t.root, entries: t.entries, free: t.free, dirty: []}}
+        return FqBtR{ok: true, err: "", tree: FqBTree{pager: f2.pager, generation: generation, root: t.root, entries: t.entries, free: t.free, dirty: [], rd: t.rd}}
 
     struct FqAlloc:
         tree: FqBTree
@@ -545,7 +565,7 @@ app FqBTreeSelfHost:
         let n = len(t.free)
         let mut i = 0
         loop i < n:
-            if t.free[i].generation + 2 <= building:
+            if t.free[i].generation + 2 <= building && (t.rd.oldestPin < 0 || t.rd.oldestPin > t.free[i].epoch):
                 let id = t.free[i].page
                 let mut free = t.free
                 free[i] = t.free[n - 1]
@@ -554,21 +574,21 @@ app FqBTreeSelfHost:
                 loop k < n - 1:
                     kept = append(kept, free[k])
                     k = k + 1
-                return FqAlloc{tree: FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: kept, dirty: t.dirty}, id: id}
+                return FqAlloc{tree: FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: kept, dirty: t.dirty, rd: t.rd}, id: id}
             i = i + 1
         let a = do pgrAllocate(t.pager)
-        return FqAlloc{tree: FqBTree{pager: a.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty}, id: a.id}
+        return FqAlloc{tree: FqBTree{pager: a.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: t.dirty, rd: t.rd}, id: a.id}
 
     proc btRelease(t: FqBTree, page: int) -> FqBTree:
         if len(t.free) >= 1024:
             return t
-        let free = append(t.free, FqFree{generation: t.generation + 1, page: page})
-        return FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: free, dirty: t.dirty}
+        let free = append(t.free, FqFree{generation: t.generation + 1, page: page, epoch: t.rd.epoch})
+        return FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: free, dirty: t.dirty, rd: t.rd}
 
     proc btMarkDirty(t: FqBTree, id: int) -> FqBTree:
         if id in t.dirty:
             return t
-        return FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: append(t.dirty, id)}
+        return FqBTree{pager: t.pager, generation: t.generation, root: t.root, entries: t.entries, free: t.free, dirty: append(t.dirty, id), rd: t.rd}
 
     struct FqCow:
         ok: bool
@@ -866,7 +886,7 @@ app FqBTreeSelfHost:
         let mut entries = t.entries
         if !existed:
             entries = entries + 1
-        return FqBtR{ok: true, err: "", tree: FqBTree{pager: t.pager, generation: t.generation, root: root, entries: entries, free: t.free, dirty: t.dirty}}
+        return FqBtR{ok: true, err: "", tree: FqBTree{pager: t.pager, generation: t.generation, root: root, entries: entries, free: t.free, dirty: t.dirty, rd: t.rd}}
 
     proc btInsertInto(t: FqBTree, pageId: int, key: [int], value: [int], depth: int) -> FqIns uses io.file:
         if depth >= 64:
@@ -1039,7 +1059,7 @@ app FqBTreeSelfHost:
         let mut entries = out.tree.entries - 1
         if entries < 0:
             entries = 0
-        let mut t = FqBTree{pager: out.tree.pager, generation: out.tree.generation, root: out.page, entries: entries, free: out.tree.free, dirty: out.tree.dirty}
+        let mut t = FqBTree{pager: out.tree.pager, generation: out.tree.generation, root: out.page, entries: entries, free: out.tree.free, dirty: out.tree.dirty, rd: out.tree.rd}
         let mut d = 0
         loop d < 64:
             let r = do btRead(t, t.root)
@@ -1052,7 +1072,7 @@ app FqBTreeSelfHost:
                 break
             let child = do pgExtra(r.body)
             let rel = do btRelease(t, t.root)
-            t = FqBTree{pager: rel.pager, generation: rel.generation, root: child, entries: rel.entries, free: rel.free, dirty: rel.dirty}
+            t = FqBTree{pager: rel.pager, generation: rel.generation, root: child, entries: rel.entries, free: rel.free, dirty: rel.dirty, rd: rel.rd}
             d = d + 1
         return FqRemoved{ok: true, err: "", tree: t, removed: true}
 

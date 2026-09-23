@@ -388,11 +388,11 @@ app FabricControllerCoreSelfHost:
         if e.kind == "InvalidCoordinate":
             return "coordinate (" + e.coordinate.x + "," + e.coordinate.y + ") is outside the 12x13 grid"
         if e.kind == "StaleDecision":
-            return "decision is stale: observed at " + e.observedAtMs + ", now " + e.nowMs + " (" + e.ageMs + "ms old, limit " + e.maxAgeMs + "ms)"
+            return "decision is stale: observed at " + u64Text(e.observedAtMs) + ", now " + u64Text(e.nowMs) + " (" + u64Text(e.ageMs) + "ms old, limit " + u64Text(e.maxAgeMs) + "ms)"
         if e.kind == "DecisionFromTheFuture":
-            return "decision claims observation at " + e.observedAtMs + ", ahead of the control plane clock at " + e.nowMs
+            return "decision claims observation at " + u64Text(e.observedAtMs) + ", ahead of the control plane clock at " + u64Text(e.nowMs)
         if e.kind == "TopologySuperseded":
-            return "decision was computed against topology generation " + e.decisionGeneration + "; the fleet is now at " + e.currentGeneration
+            return "decision was computed against topology generation " + u64Text(e.decisionGeneration) + "; the fleet is now at " + u64Text(e.currentGeneration)
         if e.kind == "UnknownPlacement":
             let t = do actionTargetDisplay(e.target)
             return "no placement is recorded for " + t
@@ -410,14 +410,14 @@ app FabricControllerCoreSelfHost:
         if e.kind == "DestinationIsSource":
             return "destination '" + e.node.value + "' already holds the target"
         if e.kind == "ColocationTargetMissing":
-            return "colocation target shard " + e.shardId + " (" + e.coordinate.x + "," + e.coordinate.y + ") is not placed"
+            return "colocation target shard " + u64Text(e.shardId) + " (" + e.coordinate.x + "," + e.coordinate.y + ") is not placed"
         if e.kind == "ConflictingAction":
             let existing = do actionIdDisplay(e.existing)
             let t = do actionTargetDisplay(e.target)
             return existing + " (" + e.existingAction + ") is already executing on " + t
         if e.kind == "ShardBusy":
             let existing = do actionIdDisplay(e.existing)
-            return "shard " + e.shardId + " is held by a shard-wide " + existing
+            return "shard " + u64Text(e.shardId) + " is held by a shard-wide " + existing
         if e.kind == "NodeBusy":
             return "node '" + e.node.value + "' already has " + e.inFlight + " action(s) in flight (limit " + e.limitCount + ")"
         if e.kind == "TooManyInFlight":
@@ -463,7 +463,7 @@ app FabricControllerCoreSelfHost:
             return id + " is not known to this controller"
         if e.kind == "NotAwaitingMeasurement":
             return id + " is " + e.execState + ", not awaiting measurement"
-        return id + " committed " + e.elapsedMs + "ms ago; the system settles for " + e.settleMs + "ms before a measurement counts"
+        return id + " committed " + u64Text(e.elapsedMs) + "ms ago; the system settles for " + u64Text(e.settleMs) + "ms before a measurement counts"
 
     # ============================================================
     # validation.rs — AbortReason: why an in-flight action was torn down.
@@ -501,7 +501,7 @@ app FabricControllerCoreSelfHost:
             return inner
         if r.kind == "PhaseTimeout":
             let label = do planPhaseLabel(r.phase)
-            return "phase '" + label + "' ran " + r.elapsedMs + "ms without completing (limit " + r.limitMs + "ms)"
+            return "phase '" + label + "' ran " + u64Text(r.elapsedMs) + "ms without completing (limit " + u64Text(r.limitMs) + "ms)"
         let condition = do nodeConditionLabel(r.condition)
         return "node '" + r.node.value + "' became " + condition + " mid-flight"
 
@@ -851,7 +851,7 @@ app FabricControllerCoreSelfHost:
 
     # executionRecordPhaseElapsedMs: `now_ms.saturating_sub(phase_started_at_ms)`.
     proc executionRecordPhaseElapsedMs(r: ExecutionRecord, nowMs: int) -> int:
-        return max(nowMs - r.phaseStartedAtMs, 0)
+        return u64SatSub(nowMs, r.phaseStartedAtMs)
 
     proc executionRecordCommit(r: ExecutionRecord, atMs: int) -> ExecutionRecord:
         let out = do executionRecordRebuild(r, "awaiting-measurement", "", 0.0, r.phaseStartedAtMs, true, atMs, r.hasConcludedAtMs, r.concludedAtMs, r.completedPhases, r.hasOutcome, r.outcome, r.hasVerdict, r.verdict, r.hasAbortReason, r.abortReason, r.hasRollback, r.rollback)
@@ -988,7 +988,7 @@ app FabricControllerCoreSelfHost:
     # is `record.id` (what the real method returns).
     proc actionRegistryAdmit(reg: ActionRegistry, record: ExecutionRecord) -> ActionRegistry:
         let id = record.id.value
-        let nextId = max(reg.nextId, id + 1)
+        let nextId = u64Max(reg.nextId, id + 1)
         let target = do executionRecordTarget(record)
         let mut activeTargets = reg.activeTargets
         let tidx = do targetHoldIndexOf(activeTargets, target)
@@ -1330,12 +1330,12 @@ app FabricControllerCoreSelfHost:
             let e3 = do validationErrorBelowExecutionThreshold(score, decision.confidence, c.policy.minConfidence)
             let r3 = do validateResultErr(e3)
             return r3
-        if envelope.observedAtMs > nowMs:
+        if u64Cmp(envelope.observedAtMs, nowMs) > 0:
             let e4 = do validationErrorDecisionFromTheFuture(envelope.observedAtMs, nowMs)
             let r4 = do validateResultErr(e4)
             return r4
-        let ageMs = max(nowMs - envelope.observedAtMs, 0)
-        if ageMs > c.policy.maxDecisionAgeMs:
+        let ageMs = u64SatSub(nowMs, envelope.observedAtMs)
+        if u64Cmp(ageMs, c.policy.maxDecisionAgeMs) > 0:
             let e5 = do validationErrorStaleDecision(envelope.observedAtMs, nowMs, ageMs, c.policy.maxDecisionAgeMs)
             let r5 = do validateResultErr(e5)
             return r5
@@ -1569,7 +1569,7 @@ app FabricControllerCoreSelfHost:
         let mut committedAtMs = nowMs
         if got.has && got.val.hasCommittedAtMs:
             committedAtMs = got.val.committedAtMs
-        if max(nowMs - committedAtMs, 0) <= c.policy.measurementDeadlineMs:
+        if u64Cmp(u64SatSub(nowMs, committedAtMs), c.policy.measurementDeadlineMs) <= 0:
             return ControllerStateResult{execState: "awaiting-measurement", controller: c}
         let mut actions = c.actions
         if got.has:
@@ -1639,7 +1639,7 @@ app FabricControllerCoreSelfHost:
             return AdvanceResult{known: true, execState: lostResult.execState, controller: lostResult.controller}
         if record0.execState == "running":
             let elapsed = do executionRecordPhaseElapsedMs(record0, nowMs)
-            if elapsed > c.policy.phaseTimeoutMs:
+            if u64Cmp(elapsed, c.policy.phaseTimeoutMs) > 0:
                 let timeout = do abortReasonPhaseTimeout(record0.runningPhase, elapsed, c.policy.phaseTimeoutMs)
                 let timedOut = do fabricControllerAbortWith(c, id, timeout, nowMs)
                 return AdvanceResult{known: true, execState: timedOut.execState, controller: timedOut.controller}
@@ -1764,8 +1764,8 @@ app FabricControllerCoreSelfHost:
         let mut committedAtMs = nowMs
         if record.hasCommittedAtMs:
             committedAtMs = record.committedAtMs
-        let elapsedMs = max(nowMs - committedAtMs, 0)
-        if elapsedMs < c.policy.measurementSettleMs:
+        let elapsedMs = u64SatSub(nowMs, committedAtMs)
+        if u64Cmp(elapsedMs, c.policy.measurementSettleMs) < 0:
             let e3 = do measurementErrorTooSoon(id, elapsedMs, c.policy.measurementSettleMs)
             return MeasureResult{ok: false, outcome: zeroOutcome, err: e3, controller: c}
         let afterSnapshot = do measurementSnapshotFromProfile(after, nowMs)

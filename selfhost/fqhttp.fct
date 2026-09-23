@@ -14,37 +14,42 @@ app FqHttpSelfHost:
     # serde_path_to_error writes it, then `at line L column C`).
 
     # ── reading a request ──────────────────────────────────────────────
-    # The transport is http_server.fct's (hyper's framing); what differs is
-    # the body limit. axum's DefaultBodyLimit is not a gate in front of the
-    # router: the request is routed, authenticated and rate limited first,
-    # and only a handler that reads the body (the Json extractor) finds it
-    # too large. So a body over the limit is not read — the head is kept
-    # and `tooLarge` says so — and the connection, whose unread bytes
-    # cannot carry another request, is drained and closed after the
-    # answer.
-    struct HRead:
+    # The transport is http_server.fct's (hyper's framing), read in two
+    # steps as hyper hands a request to its service: the head, and then —
+    # only when the handler asks for it, inside the request's timeout — the
+    # body. axum's DefaultBodyLimit is not a gate in front of the router:
+    # the request is routed, authenticated and rate limited first, and only
+    # a handler that reads the body (the Json extractor) finds it too large
+    # or waits on a slow one. A body nobody read is discarded after the
+    # answer, as hyper drains it, so the connection can carry the next
+    # request.
+    struct HHead:
         state: int
         err: text
         req: HttpServerRequest
-        tooLarge: bool
+        framing: text
+        length: int
 
-    proc hReadFail(state: int, err: text) -> HRead:
+    proc hHeadFail(state: int, err: text) -> HHead:
         let r = do httpServerRequestFailed(state, err)
-        return HRead{state: state, err: err, req: r, tooLarge: false}
+        return HHead{state: state, err: err, req: r, framing: "none", length: 0}
 
-    proc hReadRequest(c: int, pending: [int], maxBody: int) -> HRead uses io.net.listen:
+    # hReadHead: the next request's head. state 1 = a request (req.rest is
+    # what was read past the head); 0 = the peer closed between requests;
+    # -1 = malformed. framing: "none" | "length" (length bytes) | "chunked".
+    proc hReadHead(c: int, pending: [int]) -> HHead uses io.net.listen:
         let mut buf = pending
         let mut end = do httpFindHeadEnd(buf, 0)
         loop end < 0:
             if len(buf) > 65536:
-                let f = do hReadFail(-1, "request head too large")
+                let f = do hHeadFail(-1, "request head too large")
                 return f
             let chunk = readBytes(c, 65536)
             if len(chunk) == 0:
                 if len(buf) == 0:
-                    let f0 = do hReadFail(0, "")
+                    let f0 = do hHeadFail(0, "")
                     return f0
-                let f1 = do hReadFail(-1, "connection closed mid-request")
+                let f1 = do hHeadFail(-1, "connection closed mid-request")
                 return f1
             let mut scan = len(buf) - 3
             if scan < 0:
@@ -53,24 +58,11 @@ app FqHttpSelfHost:
             end = do httpFindHeadEnd(buf, scan)
         let head = do httpServerParseHead(buf, end)
         if head.state != 1:
-            return HRead{state: head.state, err: head.err, req: head, tooLarge: false}
+            return HHead{state: head.state, err: head.err, req: head, framing: "none", length: 0}
+        let held = HttpServerRequest{state: 1, err: "", method: head.method, target: head.target, path: head.path, hasQuery: head.hasQuery, query: head.query, version: head.version, headers: head.headers, body: "", rest: httpBytesRange(buf, end, len(buf))}
         let te = lower(httpHeaderValue(head.headers, "transfer-encoding"))
         if contains(te, "chunked"):
-            loop true:
-                let d = do httpServerDechunk(buf, end, maxBody)
-                if d.state == 1:
-                    let whole = HttpServerRequest{state: 1, err: "", method: head.method, target: head.target, path: head.path, hasQuery: head.hasQuery, query: head.query, version: head.version, headers: head.headers, body: bytesToText(d.bytes), rest: httpBytesRange(buf, d.end, len(buf))}
-                    return HRead{state: 1, err: "", req: whole, tooLarge: false}
-                if d.state == -1:
-                    let f2 = do hReadFail(-1, "invalid chunked body")
-                    return f2
-                if d.state == -2:
-                    return HRead{state: 1, err: "", req: head, tooLarge: true}
-                let chunk2 = readBytes(c, 65536)
-                if len(chunk2) == 0:
-                    let f3 = do hReadFail(-1, "connection closed mid-body")
-                    return f3
-                buf = buf + chunk2
+            return HHead{state: 1, err: "", req: held, framing: "chunked", length: 0}
         let cl = do httpContentLength(head.headers)
         let mut lengths = []
         let mut h = 0
@@ -79,21 +71,105 @@ app FqHttpSelfHost:
                 lengths = append(lengths, head.headers[h].value)
             h = h + 1
         if cl == -2 || len(lengths) > 1:
-            let f4 = do hReadFail(-1, "invalid content-length")
+            let f4 = do hHeadFail(-1, "invalid content-length")
             return f4
-        let mut want = cl
-        if want < 0:
-            want = 0
-        if want > maxBody:
-            return HRead{state: 1, err: "", req: head, tooLarge: true}
-        loop len(buf) - end < want:
-            let chunk3 = readBytes(c, 65536)
-            if len(chunk3) == 0:
-                let f5 = do hReadFail(-1, "connection closed mid-body")
-                return f5
-            buf = buf + chunk3
-        let full = HttpServerRequest{state: 1, err: "", method: head.method, target: head.target, path: head.path, hasQuery: head.hasQuery, query: head.query, version: head.version, headers: head.headers, body: bytesToText(httpBytesRange(buf, end, end + want)), rest: httpBytesRange(buf, end + want, len(buf))}
-        return HRead{state: 1, err: "", req: full, tooLarge: false}
+        if cl <= 0:
+            return HHead{state: 1, err: "", req: held, framing: "none", length: 0}
+        return HHead{state: 1, err: "", req: held, framing: "length", length: cl}
+
+    # HBodyRead: state 1 = the body read (rest: what follows it); 2 = over
+    # maxBody, unread (skip: body bytes to discard, those in rest first;
+    # -1 when only reading a chunked body to its end would find it); 0 =
+    # the peer closed first; -1 = a malformed chunked body; -3 = the
+    # deadline passed.
+    struct HBodyRead:
+        state: int
+        body: text
+        rest: [int]
+        skip: int
+
+    # hDeadlineRead: readBytes within the deadline (a monoMs instant; < 0
+    # none) — [] with timedOut when it passed.
+    struct HTimedRead:
+        bytes: [int]
+        timedOut: bool
+
+    proc hDeadlineRead(c: int, deadline: int) -> HTimedRead uses io.net.listen:
+        if deadline >= 0:
+            let left = deadline - monoMs()
+            if left <= 0:
+                return HTimedRead{bytes: [], timedOut: true}
+            let mut ms = left
+            if ms > 600000:
+                ms = 600000
+            let set = setTimeoutMs(c, ms)
+        let chunk = readBytes(c, 65536)
+        if len(chunk) == 0 && deadline >= 0 && monoMs() >= deadline:
+            return HTimedRead{bytes: [], timedOut: true}
+        return HTimedRead{bytes: chunk, timedOut: false}
+
+    proc hReadBody(c: int, held: [int], framing: text, length: int, maxBody: int, deadline: int) -> HBodyRead uses io.net.listen:
+        let mut buf = held
+        if framing == "none":
+            return HBodyRead{state: 1, body: "", rest: buf, skip: 0}
+        if framing == "length":
+            if length > maxBody:
+                return HBodyRead{state: 2, body: "", rest: buf, skip: length}
+            loop len(buf) < length:
+                let r = do hDeadlineRead(c, deadline)
+                if r.timedOut:
+                    return HBodyRead{state: -3, body: "", rest: [], skip: 0}
+                if len(r.bytes) == 0:
+                    return HBodyRead{state: 0, body: "", rest: [], skip: 0}
+                buf = buf + r.bytes
+            return HBodyRead{state: 1, body: bytesToText(httpBytesRange(buf, 0, length)), rest: httpBytesRange(buf, length, len(buf)), skip: 0}
+        loop true:
+            let d = do httpServerDechunk(buf, 0, maxBody)
+            if d.state == 1:
+                return HBodyRead{state: 1, body: bytesToText(d.bytes), rest: httpBytesRange(buf, d.end, len(buf)), skip: 0}
+            if d.state == -1:
+                return HBodyRead{state: -1, body: "", rest: [], skip: 0}
+            if d.state == -2:
+                return HBodyRead{state: 2, body: "", rest: [], skip: -1}
+            let r2 = do hDeadlineRead(c, deadline)
+            if r2.timedOut:
+                return HBodyRead{state: -3, body: "", rest: [], skip: 0}
+            if len(r2.bytes) == 0:
+                return HBodyRead{state: 0, body: "", rest: [], skip: 0}
+            buf = buf + r2.bytes
+        return HBodyRead{state: -1, body: "", rest: [], skip: 0}
+
+    # hDiscardBody: the unread body of a request whose answer went out
+    # without it, read and dropped (hyper's drain); ok false when the
+    # connection cannot carry another request.
+    struct HSkipped:
+        ok: bool
+        rest: [int]
+
+    proc hDiscardBody(c: int, held: [int], framing: text, length: int) -> HSkipped uses io.net.listen:
+        if framing == "none":
+            return HSkipped{ok: true, rest: held}
+        if framing == "chunked":
+            let d = do hReadBody(c, held, "chunked", 0, 9223372036854775807, -1)
+            return HSkipped{ok: d.state == 1, rest: d.rest}
+        let sk = do hSkipBody(c, held, length)
+        return sk
+
+    # hSkipBody: discard `skip` body bytes (those in `held` first); what
+    # follows them is the next request's start. ok false when the peer
+    # closed first.
+    proc hSkipBody(c: int, held: [int], skip: int) -> HSkipped uses io.net.listen:
+        if len(held) >= skip:
+            return HSkipped{ok: true, rest: httpBytesRange(held, skip, len(held))}
+        let mut left = skip - len(held)
+        loop left > 0:
+            let chunk = readBytes(c, 65536)
+            if len(chunk) == 0:
+                return HSkipped{ok: false, rest: []}
+            if len(chunk) > left:
+                return HSkipped{ok: true, rest: httpBytesRange(chunk, left, len(chunk))}
+            left = left - len(chunk)
+        return HSkipped{ok: true, rest: []}
 
     proc hRange(bs: [int], from: int, to: int) -> [int]:
         let r = do httpBytesRange(bs, from, to)
@@ -323,7 +399,9 @@ app FqHttpSelfHost:
         resp: HttpServerResponse
         v: SjV
 
-    proc hJsonBody(req: HttpServerRequest, tooLarge: bool, types: [SjType], name: text) -> HBody:
+    # hJsonPrecheck: Json's checks before it reads the body — a JSON
+    # content type (415), then the body within the limit (413).
+    proc hJsonPrecheck(req: HttpServerRequest, tooLarge: bool) -> HBody:
         let blank = do sjNull()
         let ct = lower(httpHeaderValue(req.headers, "content-type"))
         let mut mime = ct
@@ -337,12 +415,22 @@ app FqHttpSelfHost:
         if tooLarge:
             let r1 = do hText(413, "Failed to buffer the request body: length limit exceeded")
             return HBody{ok: false, resp: r1, v: blank}
-        let d = do sjDecode(types, req.body, name)
+        return HBody{ok: true, resp: hEmpty(200), v: blank}
+
+    proc hJsonBody(req: HttpServerRequest, tooLarge: bool, types: [SjType], name: text) -> HBody:
+        let blank = do sjNull()
+        let pre = do hJsonPrecheck(req, tooLarge)
+        if !pre.ok:
+            return pre
+        # serde_path_to_error::deserialize, and no end(): what follows the
+        # value is not looked at (axum's Json::from_bytes)
+        let d = do sjDeAny(types, textToBytes(req.body), 0, name, 128)
         if !d.ok:
+            let path = do sjPathText(d.path)
             let mut prefix = ""
-            if d.path != "":
-                prefix = d.path + ": "
-            if d.category == "data":
+            if path != "":
+                prefix = path + ": "
+            if d.cat == "data":
                 let r2 = do hText(422, "Failed to deserialize the JSON body into the target type: " + prefix + d.err)
                 return HBody{ok: false, resp: r2, v: blank}
             let r3 = do hText(400, "Failed to parse the request body as JSON: " + prefix + d.err)
@@ -374,73 +462,335 @@ app FqHttpSelfHost:
     proc hTypes() -> [SjType]:
         let o = false
         let d = true
-        return [sjOptionType("?bool", "bool"), sjOptionType("?string", "string"), sjOptionType("?usize", "usize"), sjOptionType("?f64", "f64"), sjOptionType("?value", "value"), sjOptionType("?Expr", "Expr"), sjOptionType("?values", "values"), sjOptionType("?exprs", "exprs"), sjVecType("strings", "string"), sjVecType("values", "value"), sjVecType("exprs", "Expr"), sjVecType("edgespecs", "EdgeSpec"), sjStructType("EdgeSpec", "struct EdgeSpec", ["to", "kind"], ["string", "string"], [o, o]), sjStructType("Expr", "struct Expr", ["kind", "val", "vtype", "name", "field", "obj", "key", "op", "args", "l", "r", "x", "var", "where"], ["string", "?value", "?string", "?string", "?string", "?Expr", "?Expr", "?string", "?exprs", "?Expr", "?Expr", "?Expr", "?string", "?Expr"], [o, d, d, d, d, d, d, d, d, d, d, d, d, d]), sjStructType("CreateNodeRequest", "struct CreateNodeRequest", ["address", "kind", "x", "y", "z", "q", "data", "public", "edges", "if_absent"], ["string", "string", "u8", "u8", "u8", "u8", "string", "?bool", "edgespecs", "bool"], [o, o, o, o, o, o, o, o, d, d]), sjStructType("UpdateNodeRequest", "struct UpdateNodeRequest", ["data", "public"], ["string", "?bool"], [o, d]), sjStructType("CreateEdgeRequest", "struct CreateEdgeRequest", ["from", "to", "kind"], ["string", "string", "string"], [o, o, o]), sjStructType("DeleteEdgeRequest", "struct DeleteEdgeRequest", ["from", "to", "kind"], ["string", "string", "string"], [o, o, o]), sjStructType("SequenceRequest", "struct SequenceRequest", ["count"], ["u64"], [d]), sjStructType("MultiGetRequest", "struct MultiGetRequest", ["addresses"], ["strings"], [o]), sjStructType("QueryWhereRequest", "struct QueryWhereRequest", ["kind", "owner", "where", "item_var", "order", "desc", "after", "limit", "offset"], ["?string", "?string", "?Expr", "string", "?string", "bool", "?string", "?usize", "?usize"], [o, o, o, d, o, d, o, o, o]), sjStructType("CountRequest", "struct CountRequest", ["kind", "owner", "where", "item_var"], ["?string", "?string", "?Expr", "string"], [o, o, o, d]), sjStructType("CountByRequest", "struct CountByRequest", ["kind", "owner", "where", "item_var", "group_by", "values"], ["?string", "?string", "?Expr", "string", "string", "?values"], [o, o, o, d, o, o]), sjStructType("AggregateRequest", "struct AggregateRequest", ["kind", "owner", "where", "item_var", "func", "field"], ["?string", "?string", "?Expr", "string", "string", "?string"], [o, o, o, d, o, o]), sjStructType("AggregateByRequest", "struct AggregateByRequest", ["kind", "owner", "where", "item_var", "group_by", "values", "func", "field"], ["?string", "?string", "?Expr", "string", "string", "?values", "string", "?string"], [o, o, o, d, o, o, o, o]), sjStructType("TransactionRequest", "struct TransactionRequest", ["operations"], ["values"], [o]), sjStructType("PublishRequest", "struct PublishRequest", ["payload"], ["string"], [o]), sjStructType("CreateUserRequest", "struct CreateUserRequest", ["owner", "role"], ["string", "?string"], [o, d]), sjStructType("CreateIndexRequest", "struct CreateIndexRequest", ["name", "kind", "field", "unique", "mode"], ["string", "string", "string", "bool", "?string"], [o, o, o, d, d]), sjStructType("CreateReferenceRequest", "struct CreateReferenceRequest", ["name", "kind", "field", "parent_kind", "parent_field", "on_delete"], ["string", "string", "string", "string", "?string", "ReferentialAction"], [o, o, o, o, d, o]), sjEnumType("ReferentialAction", "enum ReferentialAction", ["cascade", "restrict", "set_null"], ["", "", ""], ["unit", "unit", "unit"]), sjStructType("insert_node", "struct variant TxOpRequest::InsertNode", ["address", "kind", "x", "y", "z", "q", "data", "public", "owner", "claimed_by"], ["string", "string", "u8", "u8", "u8", "u8", "string", "?bool", "?string", "?string"], [o, o, o, o, o, o, o, o, o, o]), sjStructType("insert_edge", "struct variant TxOpRequest::InsertEdge", ["from", "to", "kind"], ["string", "string", "string"], [o, o, o]), sjStructType("delete_edge", "struct variant TxOpRequest::DeleteEdge", ["from", "to", "kind"], ["string", "string", "string"], [o, o, o]), sjStructType("delete_node", "struct variant TxOpRequest::DeleteNode", ["address"], ["string"], [o]), sjStructType("clear_kind", "struct variant TxOpRequest::ClearKind", ["kind"], ["string"], [o]), sjStructType("delete_where", "struct variant TxOpRequest::DeleteWhere", ["kind", "where"], ["string", "?Expr"], [o, o]), sjStructType("set_if", "struct variant TxOpRequest::SetIf", ["address", "field", "expect_le", "expect_eq", "expect_absent", "set"], ["string", "string", "?f64", "?value", "?bool", "value"], [o, o, o, o, o, d])]
+        return [sjOptionType("?bool", "bool"), sjOptionType("?string", "string"), sjOptionType("?usize", "usize"), sjOptionType("?f64", "f64"), sjOptionType("?value", "value"), sjOptionType("?Expr", "Expr"), sjOptionType("?values", "values"), sjOptionType("?exprs", "exprs"), sjVecType("strings", "string"), sjVecType("values", "value"), sjVecType("exprs", "Expr"), sjVecType("edgespecs", "EdgeSpec"), sjStructType("EdgeSpec", "struct EdgeSpec", ["to", "kind"], ["string", "string"], [o, o]), sjStructType("Expr", "struct Expr", ["kind", "val", "vtype", "name", "field", "obj", "key", "op", "args", "l", "r", "x", "var", "where"], ["string", "?value", "?string", "?string", "?string", "?Expr", "?Expr", "?string", "?exprs", "?Expr", "?Expr", "?Expr", "?string", "?Expr"], [o, d, d, d, d, d, d, d, d, d, d, d, d, d]), sjStructType("CreateNodeRequest", "struct CreateNodeRequest", ["address", "kind", "x", "y", "z", "q", "data", "public", "edges", "if_absent"], ["string", "string", "u8", "u8", "u8", "u8", "string", "?bool", "edgespecs", "bool"], [o, o, o, o, o, o, o, o, d, d]), sjStructType("UpdateNodeRequest", "struct UpdateNodeRequest", ["data", "public"], ["string", "?bool"], [o, d]), sjStructType("CreateEdgeRequest", "struct CreateEdgeRequest", ["from", "to", "kind"], ["string", "string", "string"], [o, o, o]), sjStructType("DeleteEdgeRequest", "struct DeleteEdgeRequest", ["from", "to", "kind"], ["string", "string", "string"], [o, o, o]), sjStructType("SequenceRequest", "struct SequenceRequest", ["count"], ["u64"], [d]), sjStructType("MultiGetRequest", "struct MultiGetRequest", ["addresses"], ["strings"], [o]), sjStructType("QueryWhereRequest", "struct QueryWhereRequest", ["kind", "owner", "where", "item_var", "order", "desc", "after", "limit", "offset"], ["?string", "?string", "?Expr", "string", "?string", "bool", "?string", "?usize", "?usize"], [o, o, o, d, o, d, o, o, o]), sjStructType("CountRequest", "struct CountRequest", ["kind", "owner", "where", "item_var"], ["?string", "?string", "?Expr", "string"], [o, o, o, d]), sjStructType("CountByRequest", "struct CountByRequest", ["kind", "owner", "where", "item_var", "group_by", "values"], ["?string", "?string", "?Expr", "string", "string", "?values"], [o, o, o, d, o, o]), sjStructType("AggregateRequest", "struct AggregateRequest", ["kind", "owner", "where", "item_var", "func", "field"], ["?string", "?string", "?Expr", "string", "string", "?string"], [o, o, o, d, o, o]), sjStructType("AggregateByRequest", "struct AggregateByRequest", ["kind", "owner", "where", "item_var", "group_by", "values", "func", "field"], ["?string", "?string", "?Expr", "string", "string", "?values", "string", "?string"], [o, o, o, d, o, o, o, o]), sjStructType("PublishRequest", "struct PublishRequest", ["payload"], ["string"], [o]), sjStructType("CreateUserRequest", "struct CreateUserRequest", ["owner", "role"], ["string", "?string"], [o, d]), sjStructType("CreateIndexRequest", "struct CreateIndexRequest", ["name", "kind", "field", "unique", "mode"], ["string", "string", "string", "bool", "?string"], [o, o, o, d, d]), sjStructType("CreateReferenceRequest", "struct CreateReferenceRequest", ["name", "kind", "field", "parent_kind", "parent_field", "on_delete"], ["string", "string", "string", "string", "?string", "ReferentialAction"], [o, o, o, o, d, o]), sjEnumType("ReferentialAction", "enum ReferentialAction", ["cascade", "restrict", "set_null"], ["", "", ""], ["unit", "unit", "unit"]), sjStructType("insert_node", "struct variant TxOpRequest::InsertNode", ["address", "kind", "x", "y", "z", "q", "data", "public", "owner", "claimed_by"], ["string", "string", "u8", "u8", "u8", "u8", "string", "?bool", "?string", "?string"], [o, o, o, o, o, o, o, o, o, o]), sjStructType("insert_edge", "struct variant TxOpRequest::InsertEdge", ["from", "to", "kind"], ["string", "string", "string"], [o, o, o]), sjStructType("delete_edge", "struct variant TxOpRequest::DeleteEdge", ["from", "to", "kind"], ["string", "string", "string"], [o, o, o]), sjStructType("delete_node", "struct variant TxOpRequest::DeleteNode", ["address"], ["string"], [o]), sjStructType("clear_kind", "struct variant TxOpRequest::ClearKind", ["kind"], ["string"], [o]), sjStructType("delete_where", "struct variant TxOpRequest::DeleteWhere", ["kind", "where"], ["string", "?Expr"], [o, o]), sjStructType("set_if", "struct variant TxOpRequest::SetIf", ["address", "field", "expect_le", "expect_eq", "expect_absent", "set"], ["string", "string", "?f64", "?value", "?bool", "value"], [o, o, o, o, o, d])]
 
     proc hTxVariants() -> [text]:
         return ["insert_node", "insert_edge", "delete_edge", "delete_node", "clear_kind", "delete_where", "set_if"]
 
     # ── an internally tagged enum: #[serde(tag = "type")] TxOpRequest ──
-    # serde buffers each operation's members (in document order, repeats
-    # kept) while it looks for the tag, reads the tag as a variant
-    # identifier, then deserializes the variant from the buffer. Tag errors
-    # are positioned where the tag is read; an error from the buffered
-    # variant carries no position of its own and takes the reader's
-    # position when it reaches the sequence — past end_seq's look at what
-    # follows the element — with the element's path (the buffer is not
-    # tracked). TransactionRequest is decoded first with its operations as
-    # plain values, so the body is known to be well-formed JSON.
-    struct HMembers:
-        keys: [text]
-        keyEnds: [int]
-        starts: [int]
-        ends: [int]
-        end: int
+    # TransactionRequest { operations: Vec<TxOpRequest> } decoded as serde
+    # does it, in one pass in document order (so a type error in one
+    # operation is reported before a syntax error in a later one): the
+    # struct and the Vec as fabric_json.fct decodes them, each operation
+    # through serde's TaggedContentVisitor — its members buffered (a JSON
+    # value's syntax checked where it stands, repeats kept) while the tag is
+    # found and read as a variant identifier, then the variant deserialized
+    # from the buffer. Tag errors are positioned where the tag is read; a
+    # variant error, raised from the buffer, carries no position and takes
+    # the reader's once it reaches the sequence (past end_seq). The sequence
+    # form [tag, fields…] is taken too. A decoded operation is its
+    # variant's struct value with the variant name in `s`.
+    proc hTxVariantOf(bs: [int], i: int, variants: [text]) -> SjD:
+        let t = do sjDeString(bs, i, "variant identifier")
+        if !t.ok:
+            return t
+        if !(t.v.s in variants):
+            let e = do sjErr(bs, t.i, "unknown variant `" + t.v.s + "`, " + sjOneOf(variants))
+            return SjD{ok: false, err: e.err, posd: true, i: t.i, v: sjNull(), cat: "data", path: []}
+        return t
 
-    proc hMembersAt(bs: [int], p0: int) -> HMembers:
-        let mut keys = []
-        let mut keyEnds = []
-        let mut starts = []
-        let mut ends = []
-        let mut q = do fjWs(bs, p0 + 1)
+    # hTxContent: the buffered variant — ContentDeserializer over the
+    # members (or elements) read: its errors are data errors with no
+    # position (the buffer has none).
+    proc hTxContent(types: [SjType], text0: text, tag: text, i: int) -> SjD:
+        let d = do sjDecode(types, text0, tag)
+        if !d.ok:
+            let mut msg = do hStripPosition(d.err)
+            # serde's derive words a one-field struct "with 1 element";
+            # fabric_json.fct's sjDeStruct always pluralises
+            if hHasSuffixT(msg, " with 1 elements"):
+                msg = slice(msg, 0, len(msg) - 1)
+            return sjRaw(i, msg)
+        let v = d.v
+        return sjOk(i, SjV{kind: v.kind, b: v.b, s: tag, num: v.num, u: v.u, f: v.f, items: v.items, keys: v.keys})
+
+    proc hDeTxOp(types: [SjType], bs: [int], i0: int, depth: int) -> SjD:
+        let variants = do hTxVariants()
         let n = len(bs)
-        loop q < n && bs[q] != 125:
-            let k = do fjString(bs, q)
-            q = do fjWs(bs, k.pos)
-            keyEnds = append(keyEnds, q)
-            q = do fjWs(bs, q + 1)
-            let v = do fjValue(bs, q, 0)
-            keys = append(keys, k.v.s)
-            starts = append(starts, q)
-            ends = append(ends, v.pos)
-            q = do fjWs(bs, v.pos)
-            if q < n && bs[q] == 44:
-                q = do fjWs(bs, q + 1)
-        return HMembers{keys: keys, keyEnds: keyEnds, starts: starts, ends: ends, end: q + 1}
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        let c = bs[i]
+        if c != 123 && c != 91:
+            let u = do sjPeekInvalidType(bs, i, "internally tagged enum TxOpRequest")
+            return u
+        if depth - 1 == 0:
+            return sjPeekErr(bs, i, "recursion limit exceeded")
+        let mut k = i + 1
+        let mut ret = sjOk(k, sjNull())
+        let mut tag = ""
+        let mut hasTag = false
+        if c == 91:
+            # visit_seq: the tag, then the rest as content
+            let mut first = true
+            let mut idx = 0
+            let mut rest = []
+            let mut done = false
+            loop !done:
+                let nx = sjNextElement(bs, k, first)
+                first = false
+                if !nx.ok:
+                    ret = nx
+                    k = nx.i
+                    done = true
+                else:
+                    if nx.v.u < 0:
+                        k = nx.i
+                        done = true
+                    else:
+                        let mut el = sjOk(0, sjNull())
+                        if idx == 0:
+                            el = do hTxVariantOf(bs, nx.v.u, variants)
+                        else:
+                            el = do sjDeValue(bs, nx.v.u, depth - 1)
+                        k = el.i
+                        if !el.ok:
+                            ret = sjUnder(el, "[" + idx + "]")
+                            done = true
+                        else:
+                            if idx == 0:
+                                tag = el.v.s
+                                hasTag = true
+                            else:
+                                let st = sjWs(bs, nx.v.u)
+                                rest = append(rest, bytesToText(httpBytesRange(bs, st, el.i)))
+                            idx = idx + 1
+            if ret.ok && !hasTag:
+                ret = sjRaw(k, "missing field `type`")
+            let closed = sjClose(bs, ret, sjEndSeq(bs, k))
+            if !closed.ok:
+                return closed
+            let cs = do hTxContent(types, "[" + join(rest, ",") + "]", tag, closed.i)
+            return cs
+        # visit_map
+        let mut first2 = true
+        let mut done2 = false
+        loop !done2:
+            let w = sjWs(bs, k)
+            if w >= n:
+                ret = sjPeekErr(bs, w, "EOF while parsing an object")
+                k = w
+                done2 = true
+            else:
+                let mut p = w
+                let mut stop = false
+                if bs[w] == 125:
+                    k = w
+                    done2 = true
+                    stop = true
+                else:
+                    if bs[w] == 44 && !first2:
+                        p = sjWs(bs, w + 1)
+                    else:
+                        if first2:
+                            first2 = false
+                        else:
+                            ret = sjPeekErr(bs, w, "expected `,` or `}`")
+                            k = w
+                            done2 = true
+                            stop = true
+                if !stop:
+                    if p >= n:
+                        ret = sjPeekErr(bs, p, "EOF while parsing a value")
+                        k = p
+                        done2 = true
+                    else:
+                        if bs[p] != 34:
+                            let mut code = "key must be a string"
+                            if bs[p] == 125:
+                                code = "trailing comma"
+                            ret = sjPeekErr(bs, p, code)
+                            k = p
+                            done2 = true
+                        else:
+                            let key = sjStr(bs, p + 1)
+                            k = key.i
+                            if !key.ok:
+                                ret = key
+                                done2 = true
+                            else:
+                                if key.v.s == "type" && hasTag:
+                                    ret = sjRaw(k, "duplicate field `type`")
+                                    done2 = true
+                                else:
+                                    let colon = sjParseColon(bs, k)
+                                    k = colon.i
+                                    if !colon.ok:
+                                        ret = colon
+                                        done2 = true
+                                    else:
+                                        let mut val = sjOk(k, sjNull())
+                                        if key.v.s == "type":
+                                            val = do hTxVariantOf(bs, k, variants)
+                                        else:
+                                            val = do sjDeValue(bs, k, depth - 1)
+                                        k = val.i
+                                        if !val.ok:
+                                            ret = sjUnder(val, key.v.s)
+                                            done2 = true
+                                        else:
+                                            if key.v.s == "type":
+                                                tag = val.v.s
+                                                hasTag = true
+        if ret.ok && !hasTag:
+            ret = sjRaw(k, "missing field `type`")
+        let closed2 = sjClose(bs, ret, sjEndMap(bs, k))
+        if !closed2.ok:
+            return closed2
+        let cs2 = do hTxContent(types, bytesToText(httpBytesRange(bs, i, closed2.i)), tag, closed2.i)
+        return cs2
 
-    proc hElementsAt(bs: [int], p0: int) -> HMembers:
-        let mut starts = []
-        let mut ends = []
-        let mut q = do fjWs(bs, p0 + 1)
+    # hDeTxOps: Vec<TxOpRequest>, as sjDeVec reads a Vec.
+    proc hDeTxOps(types: [SjType], bs: [int], i0: int, depth: int) -> SjD:
         let n = len(bs)
-        loop q < n && bs[q] != 93:
-            let v = do fjValue(bs, q, 0)
-            starts = append(starts, q)
-            ends = append(ends, v.pos)
-            q = do fjWs(bs, v.pos)
-            if q < n && bs[q] == 44:
-                q = do fjWs(bs, q + 1)
-        return HMembers{keys: [], keyEnds: [], starts: starts, ends: ends, end: q + 1}
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        if bs[i] != 91:
+            let u = do sjPeekInvalidType(bs, i, "a sequence")
+            return u
+        if depth - 1 == 0:
+            return sjPeekErr(bs, i, "recursion limit exceeded")
+        let mut k = i + 1
+        let mut items = []
+        let mut first = true
+        let mut idx = 0
+        let mut ret = sjOk(k, sjNull())
+        let mut done = false
+        loop !done:
+            let nx = sjNextElement(bs, k, first)
+            first = false
+            if !nx.ok:
+                ret = nx
+                k = nx.i
+                done = true
+            else:
+                if nx.v.u < 0:
+                    k = nx.i
+                    done = true
+                else:
+                    let el = do hDeTxOp(types, bs, nx.v.u, depth - 1)
+                    k = el.i
+                    if !el.ok:
+                        ret = sjUnder(el, "[" + idx + "]")
+                        done = true
+                    else:
+                        items = append(items, el.v)
+                        idx = idx + 1
+        if ret.ok:
+            ret = sjOk(k, SjV{kind: "arr", b: false, s: "", num: "", u: 0, f: 0.0, items: items, keys: []})
+        return sjClose(bs, ret, sjEndSeq(bs, k))
 
-    struct HTxOps:
-        ok: bool
-        resp: HttpServerResponse
-        tags: [text]
-        ops: [SjV]
-
-    proc hTxDataError(bs: [int], path: text, msg: text, at: int) -> HttpServerResponse:
-        let lc = do hLineCol(bs, at)
-        let r = do hText(422, "Failed to deserialize the JSON body into the target type: " + path + ": " + msg + " at " + lc)
-        return r
+    # hDeTransaction: the TransactionRequest struct — map or sequence form,
+    # its one field `operations`.
+    proc hDeTransaction(types: [SjType], bs: [int], i0: int, depth: int) -> SjD:
+        let n = len(bs)
+        let i = sjWs(bs, i0)
+        if i >= n:
+            return sjPeekErr(bs, i, "EOF while parsing a value")
+        if (bs[i] == 91 || bs[i] == 123) && depth - 1 == 0:
+            return sjPeekErr(bs, i, "recursion limit exceeded")
+        let mut k = i + 1
+        let mut ret = sjOk(k, sjNull())
+        let mut ops = sjAbsent()
+        let mut present = false
+        if bs[i] == 91:
+            let nx = sjNextElement(bs, k, true)
+            if !nx.ok:
+                ret = nx
+                k = nx.i
+            else:
+                if nx.v.u < 0:
+                    k = nx.i
+                    ret = sjRaw(k, "invalid length 0, expected struct TransactionRequest with 1 element")
+                else:
+                    let el = do hDeTxOps(types, bs, nx.v.u, depth - 1)
+                    k = el.i
+                    if !el.ok:
+                        ret = sjUnder(el, "[0]")
+                    else:
+                        ops = el.v
+            if ret.ok:
+                ret = sjOk(k, SjV{kind: "obj", b: false, s: "", num: "", u: 0, f: 0.0, items: [ops], keys: ["operations"]})
+            return sjClose(bs, ret, sjEndSeq(bs, k))
+        if bs[i] != 123:
+            let u = do sjPeekInvalidType(bs, i, "struct TransactionRequest")
+            return u
+        let mut first = true
+        let mut done = false
+        loop !done:
+            let w = sjWs(bs, k)
+            if w >= n:
+                ret = sjUnder(sjPeekErr(bs, w, "EOF while parsing an object"), "?")
+                k = w
+                done = true
+            else:
+                let mut p = w
+                let mut stop = false
+                if bs[w] == 125:
+                    k = w
+                    done = true
+                    stop = true
+                else:
+                    if bs[w] == 44 && !first:
+                        p = sjWs(bs, w + 1)
+                    else:
+                        if first:
+                            first = false
+                        else:
+                            ret = sjUnder(sjPeekErr(bs, w, "expected `,` or `}`"), "?")
+                            k = w
+                            done = true
+                            stop = true
+                if !stop:
+                    if p >= n:
+                        ret = sjUnder(sjPeekErr(bs, p, "EOF while parsing a value"), "?")
+                        k = p
+                        done = true
+                    else:
+                        if bs[p] != 34:
+                            let mut code = "key must be a string"
+                            if bs[p] == 125:
+                                code = "trailing comma"
+                            ret = sjUnder(sjPeekErr(bs, p, code), "?")
+                            k = p
+                            done = true
+                        else:
+                            let key = sjStr(bs, p + 1)
+                            k = key.i
+                            if !key.ok:
+                                ret = sjUnder(key, "?")
+                                done = true
+                            else:
+                                let isOps = key.v.s == "operations"
+                                if isOps && present:
+                                    ret = sjRaw(k, "duplicate field `operations`")
+                                    done = true
+                                else:
+                                    let colon = sjParseColon(bs, k)
+                                    k = colon.i
+                                    if !colon.ok:
+                                        ret = colon
+                                        done = true
+                                    else:
+                                        let mut val = sjOk(k, sjNull())
+                                        if isOps:
+                                            val = do hDeTxOps(types, bs, k, depth - 1)
+                                        else:
+                                            val = do sjIgnoreValue(bs, k)
+                                        k = val.i
+                                        if !val.ok:
+                                            ret = sjUnder(val, key.v.s)
+                                            done = true
+                                        else:
+                                            if isOps:
+                                                ops = val.v
+                                                present = true
+        if ret.ok && !present:
+            ret = sjRaw(k, "missing field `operations`")
+        if ret.ok:
+            ret = sjOk(k, SjV{kind: "obj", b: false, s: "", num: "", u: 0, f: 0.0, items: [ops], keys: ["operations"]})
+        return sjClose(bs, ret, sjEndMap(bs, k))
 
     proc hStripPosition(err: text) -> text:
         let bs = textToBytes(err)
@@ -455,68 +805,32 @@ app FqHttpSelfHost:
             i = i - 1
         return err
 
-    proc hTxOps(body: text, types: [SjType]) -> HTxOps:
-        let bs = textToBytes(body)
-        let root = do hMembersAt(bs, fjWs(bs, 0))
-        let at = do fqwIndexOfText(root.keys, "operations")
-        let arr = do hElementsAt(bs, root.starts[at])
-        let variants = do hTxVariants()
-        let mut tags = []
-        let mut ops = []
-        let n = len(arr.starts)
-        let mut i = 0
-        loop i < n:
-            let path = "operations[" + i + "]"
-            let s = arr.starts[i]
-            if bs[s] != 123:
-                let d0 = do sjDeValue(bs, s, 128)
-                let mut what = "map"
-                if bs[s] == 91:
-                    what = "sequence"
-                else:
-                    let u = do sjPeekInvalidType(bs, s, "internally tagged enum TxOpRequest")
-                    let r0 = do hTxDataError(bs, path, hStripPosition(u.err), arr.ends[i])
-                    return HTxOps{ok: false, resp: r0, tags: [], ops: []}
-                let r00 = do hTxDataError(bs, path, "invalid type: " + what + ", expected internally tagged enum TxOpRequest", arr.ends[i])
-                return HTxOps{ok: false, resp: r00, tags: [], ops: []}
-            let m = do hMembersAt(bs, s)
-            let mut tag = ""
-            let mut hasTag = false
-            let nm = len(m.keys)
-            let mut k = 0
-            loop k < nm:
-                if m.keys[k] == "type":
-                    if hasTag:
-                        let r1 = do hTxDataError(bs, path, "duplicate field `type`", m.keyEnds[k])
-                        return HTxOps{ok: false, resp: r1, tags: [], ops: []}
-                    let t = do sjDeString(bs, m.starts[k], "variant identifier")
-                    if !t.ok:
-                        let r2 = do hTxDataError(bs, path + ".type", hStripPosition(t.err), m.ends[k])
-                        return HTxOps{ok: false, resp: r2, tags: [], ops: []}
-                    if !(t.v.s in variants):
-                        let r3 = do hTxDataError(bs, path + ".type", "unknown variant `" + t.v.s + "`, " + sjOneOf(variants), m.ends[k])
-                        return HTxOps{ok: false, resp: r3, tags: [], ops: []}
-                    tag = t.v.s
-                    hasTag = true
-                k = k + 1
-            if !hasTag:
-                let r4 = do hTxDataError(bs, path, "missing field `type`", m.end)
-                return HTxOps{ok: false, resp: r4, tags: [], ops: []}
-            let slice0 = bytesToText(httpBytesRange(bs, s, arr.ends[i]))
-            let dv = do sjDecode(types, slice0, tag)
-            if !dv.ok:
-                # end_seq: whitespace, then `]` or `,` consumed
-                let mut q = do fjWs(bs, arr.ends[i])
-                if q < len(bs) && (bs[q] == 93 || bs[q] == 44):
-                    q = q + 1
-                    if bs[q - 1] == 44:
-                        q = do fjWs(bs, q)
-                let r5 = do hTxDataError(bs, path, hStripPosition(dv.err), q)
-                return HTxOps{ok: false, resp: r5, tags: [], ops: []}
-            tags = append(tags, tag)
-            ops = append(ops, dv.v)
-            i = i + 1
-        return HTxOps{ok: true, resp: hEmpty(200), tags: tags, ops: ops}
+    # hJsonTransaction: Json<TransactionRequest> — hJsonBody's checks, then
+    # hDeTransaction and serde_json's end().
+    proc hJsonTransaction(req: HttpServerRequest, tooLarge: bool, types: [SjType]) -> HBody:
+        let pre = do hJsonPrecheck(req, tooLarge)
+        let blank = do sjNull()
+        if !pre.ok:
+            return pre
+        let bs = textToBytes(req.body)
+        let d = do hDeTransaction(types, bs, 0, 128)
+        let mut err = ""
+        let mut cat = ""
+        let mut path = ""
+        if !d.ok:
+            err = d.err
+            cat = d.cat
+            path = do sjPathText(d.path)
+        if err == "":
+            return HBody{ok: true, resp: hEmpty(200), v: d.v}
+        let mut prefix = ""
+        if path != "":
+            prefix = path + ": "
+        if cat == "data":
+            let r = do hText(422, "Failed to deserialize the JSON body into the target type: " + prefix + err)
+            return HBody{ok: false, resp: r, v: blank}
+        let r2 = do hText(400, "Failed to parse the request body as JSON: " + prefix + err)
+        return HBody{ok: false, resp: r2, v: blank}
 
     # ── reading a decoded value ────────────────────────────────────────
     # A decoded struct is an "obj" whose items follow the declared fields;

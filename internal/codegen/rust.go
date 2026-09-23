@@ -150,15 +150,19 @@ func rustIdent(name string) string {
 func rustFieldType(f ir.WireField, enums map[string]bool) string {
 	inner := rustScalar(f.Type, enums, f.Ref)
 	switch {
+	case f.Map:
+		inner = "std::collections::HashMap<String, " + inner + ">"
 	case f.List:
-		inner = "Vec<" + inner + ">"
+		for i := 0; i < max(f.Depth, 1); i++ {
+			inner = "Vec<" + inner + ">"
+		}
 	case f.Ref:
 		// A single (non-list) self/mutual reference must be boxed: without
 		// indirection the struct would have infinite size the moment two
 		// Types/Messages refer to each other or to themselves (Expr.l: Expr).
 		inner = "Box<" + inner + ">"
 	}
-	if f.Optional {
+	if f.Optional || f.Nullable {
 		inner = "Option<" + inner + ">"
 	}
 	return inner

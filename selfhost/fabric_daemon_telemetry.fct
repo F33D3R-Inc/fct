@@ -61,35 +61,65 @@ app FabricDaemonTelemetrySelfHost:
             k = k + 1
         return targets
 
+    # A telemetry source (the TelemetrySource trait): kind "facetql" —
+    # FacetQL's own counters through the poller — or "fixed": the same
+    # protocol messages every sample, each telemetry batch restamped to the
+    # sample's instant (the shape of tests/mover.rs's HotCell and
+    # tests/daemon.rs's duress observation: telemetry is an input to the
+    # loop, and everything downstream of it runs untouched). `describe` is
+    # what the admin port names it.
     struct DaemonTelemetry:
+        kind: text
         poller: TelemetryPoller
+        describe: text
+        messages: [FabricMessage]
 
     proc daemonFacetqlTelemetry(settings: DaemonSettings) -> DaemonTelemetry:
         let targets = do daemonTelemetryTargets(settings)
         let poller = do telemetryPollerNew(targets)
-        return DaemonTelemetry{poller: poller}
+        return DaemonTelemetry{kind: "facetql", poller: poller, describe: daemonFacetqlDescribe(len(targets)), messages: []}
+
+    proc daemonFixedTelemetry(describe: text, messages: [FabricMessage]) -> DaemonTelemetry:
+        let poller = do telemetryPollerNew([])
+        return DaemonTelemetry{kind: "fixed", poller: poller, describe: describe, messages: messages}
 
     proc daemonTelemetryDescribe(t: DaemonTelemetry) -> text:
-        let n = do telemetryPollerLen(t.poller)
-        return daemonFacetqlDescribe(n)
+        if t.kind == "facetql":
+            let n = do telemetryPollerLen(t.poller)
+            return daemonFacetqlDescribe(n)
+        return t.describe
 
     struct DaemonTelemetrySampled:
         telemetry: DaemonTelemetry
         sample: DaemonSample
 
-    # FacetqlTelemetry::sample: one sweep's evidence, plus what went wrong
-    # getting it.
-    proc daemonTelemetrySample(t: DaemonTelemetry) -> DaemonTelemetrySampled uses io.net:
-        let round = do telemetryPollerPollOnce(t.poller)
+    # TelemetrySource::sample at `nowMs`: one sweep's evidence, plus what
+    # went wrong getting it.
+    proc daemonTelemetrySample(t: DaemonTelemetry, nowMs: int) -> DaemonTelemetrySampled uses io.net:
         let mut sample = do daemonSampleEmpty()
+        if t.kind == "fixed":
+            let n0 = len(t.messages)
+            let mut j = 0
+            loop j < n0:
+                let mut m = t.messages[j]
+                if m.kind == "Telemetry":
+                    let mut batch = m.telemetry
+                    batch.timestampMs = nowMs
+                    m.telemetry = batch
+                sample.messages = append(sample.messages, m)
+                j = j + 1
+            return DaemonTelemetrySampled{telemetry: t, sample: sample}
+        let round = do telemetryPollerPollOnce(t.poller)
         let n = len(round.ids)
         let mut k = 0
         loop k < n:
             let o = round.outcomes[k]
             if o.kind == "Sampled":
-                let m = do protoEmptyFabricMessage()
-                sample.messages = append(sample.messages, FabricMessage{kind: "Telemetry", registerNode: m.registerNode, heartbeat: m.heartbeat, topology: m.topology, telemetry: o.batch, workload: m.workload})
+                let e = do protoEmptyFabricMessage()
+                sample.messages = append(sample.messages, FabricMessage{kind: "Telemetry", registerNode: e.registerNode, heartbeat: e.heartbeat, topology: e.topology, telemetry: o.batch, workload: e.workload})
             sample.noteIds = append(sample.noteIds, round.ids[k])
             sample.notes = append(sample.notes, daemonPollNote(o))
             k = k + 1
-        return DaemonTelemetrySampled{telemetry: DaemonTelemetry{poller: round.poller}, sample: sample}
+        let mut next = t
+        next.poller = round.poller
+        return DaemonTelemetrySampled{telemetry: next, sample: sample}

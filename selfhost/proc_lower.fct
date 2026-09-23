@@ -102,6 +102,27 @@ app ProcLowerSelfHost:
         # type ("int", "[int]", …), for a `local.field = expr` write.
         structFieldKeys: [text]
         structFieldTypes: [text]
+        # sharedNames/sharedTypes: the app's `shared` cells and their types
+        # ("array" for a list cell) — build.go's e.shareds, seeded into a
+        # body's type map (seedSharedTypes) but never its locals.
+        sharedNames: [text]
+        sharedTypes: [text]
+        # lineNos: each body line's source line number ([] when unknown).
+        lineNos: [int]
+        # structNames: the declared structs; ty: the wire types (a proc may
+        # build a wire-type literal, held to checkWireLits' rules).
+        structNames: [text]
+        ty: TyEnv
+
+    # PLCtx: what a body is lowered against beyond its own file: the shared
+    # cells, and the procs that are daemon-context bodies (detachctx.go).
+    struct PLCtx:
+        sharedNames: [text]
+        sharedTypes: [text]
+        ctxProcs: [text]
+        lineNos: [int]
+        structNames: [text]
+        ty: TyEnv
 
     struct PLBlock:
         stmts: [IRStmt]
@@ -110,6 +131,226 @@ app ProcLowerSelfHost:
     struct PLResult:
         proc: IRProc
         diag: text
+
+    # ── shared cells ───────────────────────────────────────────────────
+    # plNotShared: checkNotShared — a parameter or local may not take a
+    # shared cell's name.
+    proc plNotShared(env: PLEnv, name: text) -> text:
+        let at = do lowerFindName(env.sharedNames, name)
+        if at < 0:
+            return ""
+        let q = do plQuote(name)
+        return q + " is a shared cell — a parameter or local may not reuse its name"
+
+    # plSharedExpr / plSharedStmts: lowerSharedRefs — every read of a shared
+    # cell becomes a "$shared.get" call (no local can carry a cell's name,
+    # so every ref by that name is the cell).
+    proc plSharedExpr(e0: IRExpr, shared: [text]) -> IRExpr:
+        if e0.kind == "ref" && lowerFindName(shared, e0.name) >= 0:
+            let c = do irCall("$shared.get", [irLit(e0.name, "text")])
+            return c
+        let mut e = e0
+        e.obj = plSharedList(e0.obj, shared)
+        e.key = plSharedList(e0.key, shared)
+        e.args = plSharedList(e0.args, shared)
+        e.keys = plSharedList(e0.keys, shared)
+        e.l = plSharedList(e0.l, shared)
+        e.r = plSharedList(e0.r, shared)
+        e.x = plSharedList(e0.x, shared)
+        e.where = plSharedList(e0.where, shared)
+        e.sel = plSharedList(e0.sel, shared)
+        e.limit = plSharedList(e0.limit, shared)
+        e.orderBy = plSharedList(e0.orderBy, shared)
+        return e
+
+    proc plSharedList(xs: [IRExpr], shared: [text]) -> [IRExpr]:
+        let mut out = []
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            let x = do plSharedExpr(xs[i], shared)
+            out = append(out, x)
+            i = i + 1
+        return out
+
+    # plDesugar: desugarNestedWrite — `target = val` two or more steps deep
+    # as one-level writes: the innermost step written on a `let mut`
+    # temporary holding its container (named `__w<line>_<n>`), written back
+    # into its own container the same way, up to the root local. Each
+    # statement comes with the line text the lowering reads its names from.
+    struct PLDesugar:
+        stmts: [Stmt]
+        texts: [text]
+        n: int
+        err: text
+
+    proc plStmtNodeOf(x: Stmt) -> Stmt:
+        return x
+
+    proc plDesugar(target: ExprNode, val: ExprNode, line: int, n0: int, acc: [Stmt]) -> PLDesugar:
+        let none = do emptyNode()
+        if target.kind == "ref":
+            return PLDesugar{stmts: [Stmt{kind: "assign", lineIdx: 0, expr: val, args: [], body: [], elseBody: [], index: none}], texts: [target.text + " = _"], n: n0, err: ""}
+        if (target.kind == "get" || target.kind == "index") && len(target.children) >= 1:
+            let obj = target.children[0]
+            let mut one = Stmt{kind: "fieldAssign", lineIdx: 0, expr: val, args: [], body: [], elseBody: [], index: none}
+            if target.kind == "index":
+                one = Stmt{kind: "indexAssign", lineIdx: 0, expr: val, args: [], body: [], elseBody: [], index: target.children[1]}
+            if obj.kind == "ref":
+                let mut t1 = obj.text + "." + target.text + " = _"
+                if target.kind == "index":
+                    t1 = obj.text + "[_] = _"
+                return PLDesugar{stmts: [one], texts: [t1], n: n0, err: ""}
+            let n = n0 + 1
+            let tmp = "__w" + line + "_" + n
+            let up = do plDesugar(obj, refNode(tmp), line, n, [])
+            if up.err != "":
+                return up
+            let letTmp = Stmt{kind: "letMut", lineIdx: 0, expr: obj, args: [], body: [], elseBody: [], index: none}
+            let mut t2 = tmp + "." + target.text + " = _"
+            if target.kind == "index":
+                t2 = tmp + "[_] = _"
+            return PLDesugar{stmts: [letTmp, one] + up.stmts, texts: ["let mut " + tmp + " = _", t2] + up.texts, n: up.n, err: ""}
+        return PLDesugar{stmts: [], texts: [], n: n0, err: "invalid assignment target — a write goes through a local's fields and indexes"}
+
+    proc plStmtOf(x: IRStmt) -> IRStmt:
+        return x
+
+    proc plSharedStmts(ss: [IRStmt], shared: [text]) -> [IRStmt]:
+        if len(shared) == 0:
+            return ss
+        let mut out = []
+        let n = len(ss)
+        let mut i = 0
+        loop i < n:
+            let mut st = do plStmtOf(ss[i])
+            st.key = plSharedList(ss[i].key, shared)
+            st.value = plSharedList(ss[i].value, shared)
+            st.where = plSharedList(ss[i].where, shared)
+            st.limit = plSharedList(ss[i].limit, shared)
+            st.role = plSharedList(ss[i].role, shared)
+            st.args = plSharedList(ss[i].args, shared)
+            st.fieldExprs = plSharedList(ss[i].fieldExprs, shared)
+            st.body = plSharedStmts(ss[i].body, shared)
+            st.elseBody = plSharedStmts(ss[i].elseBody, shared)
+            out = append(out, st)
+            i = i + 1
+        return out
+
+    # plStructExprType: structExprType — inferProcType, and a `.field` read
+    # chased through the struct table to the field's declared type (a list
+    # field answers "array").
+    proc plStructExprType(env: PLEnv, e: ExprNode, names: [text], types: [text]) -> text:
+        if e.kind == "get" && len(e.children) == 1:
+            let ot = do plStructExprType(env, e.children[0], names, types)
+            if ot != "":
+                let at = do lowerFindName(env.structFieldKeys, ot + "." + e.text)
+                if at >= 0:
+                    let ft = env.structFieldTypes[at]
+                    if len(ft) > 0 && charAt(ft, 0) == "[":
+                        return "array"
+                    return ft
+            return ""
+        # an element of a struct's list field has the field's element type
+        if e.kind == "index" && len(e.children) >= 1 && e.children[0].kind == "get":
+            let g = e.children[0]
+            let ot2 = do plStructExprType(env, g.children[0], names, types)
+            let at2 = do lowerFindName(env.structFieldKeys, ot2 + "." + g.text)
+            if ot2 != "" && at2 >= 0:
+                let ft2 = env.structFieldTypes[at2]
+                if len(ft2) > 1 && charAt(ft2, 0) == "[":
+                    return slice(ft2, 1, len(ft2) - 1)
+        let t = do plInferType(e, names, types)
+        return t
+
+    # plStructFieldTypes: checkStructFieldTypes — a struct literal sets every
+    # declared field exactly once, each to a value of its type where that is
+    # provable, and nothing else; a `.field` read of a value known to be a
+    # struct names a field it has (and of one known not to be a struct, is
+    # refused). A wire-type literal is held to checkWireLits' rules.
+    proc plStructFieldTypes(env: PLEnv, e: ExprNode, names: [text], types: [text]) -> text:
+        if e.kind == "struct":
+            if !(e.text in env.structNames) && e.text in env.ty.wireNames:
+                let wd = do tyWireLitsDiag(env.ty, e, tyEmptyScope())
+                if wd != "":
+                    return wd
+                let mut wi = 0
+                loop wi < len(e.pairs):
+                    let wsub = do plStructFieldTypes(env, e.pairs[wi].value, names, types)
+                    if wsub != "":
+                        return wsub
+                    wi = wi + 1
+                return ""
+            if !(e.text in env.structNames):
+                return "unknown struct type \"" + e.text + "\""
+            let mut seenF = []
+            let np = len(e.pairs)
+            let mut i = 0
+            loop i < np:
+                let fname = e.pairs[i].key.text
+                let at = do lowerFindName(env.structFieldKeys, e.text + "." + fname)
+                if at < 0:
+                    return "struct \"" + e.text + "\" has no field \"" + fname + "\""
+                if fname in seenF:
+                    return "field \"" + fname + "\" set twice in a " + e.text + "{...} literal"
+                seenF = append(seenF, fname)
+                let sub = do plStructFieldTypes(env, e.pairs[i].value, names, types)
+                if sub != "":
+                    return sub
+                let got = do plStructExprType(env, e.pairs[i].value, names, types)
+                if got != "":
+                    let ft = env.structFieldTypes[at]
+                    if len(ft) > 0 && charAt(ft, 0) == "[":
+                        let elem = slice(ft, 1, len(ft) - 1)
+                        let bytesAsInts = got == "bytes" && elem == "int"
+                        if got != "array" && !bytesAsInts:
+                            return "field \"" + fname + "\" of " + e.text + "{...} wants " + ft + ", got " + got
+                    else:
+                        if got != ft:
+                            return "field \"" + fname + "\" of " + e.text + "{...} wants " + ft + ", got " + got
+                i = i + 1
+            let pre = e.text + "."
+            let mut k = 0
+            loop k < len(env.structFieldKeys):
+                let key = env.structFieldKeys[k]
+                if len(key) > len(pre) && slice(key, 0, len(pre)) == pre:
+                    let fn = slice(key, len(pre), len(key))
+                    if !(fn in seenF):
+                        return e.text + "{...} literal is missing field \"" + fn + "\""
+                k = k + 1
+            return ""
+        if e.kind == "get" && len(e.children) == 1:
+            let ot = do plStructExprType(env, e.children[0], names, types)
+            if ot != "":
+                if ot in env.structNames:
+                    let fat = do lowerFindName(env.structFieldKeys, ot + "." + e.text)
+                    if fat < 0:
+                        return "struct \"" + ot + "\" has no field \"" + e.text + "\""
+                else:
+                    let prim = ot == "int" || ot == "text" || ot == "bool" || ot == "money" || ot == "date" || ot == "float" || ot == "datetime"
+                    if ot == "array" || ot == "map" || ot == "bytes" || ot == "task" || prim:
+                        return "field access (`." + e.text + "`) needs a struct value, but this expression is " + ot
+            let r = do plStructFieldTypes(env, e.children[0], names, types)
+            return r
+        if e.kind == "bin" || e.kind == "un" || e.kind == "call" || e.kind == "list" || e.kind == "index":
+            let mut c = 0
+            loop c < len(e.children):
+                let sub2 = do plStructFieldTypes(env, e.children[c], names, types)
+                if sub2 != "":
+                    return sub2
+                c = c + 1
+            return ""
+        if e.kind == "map":
+            let mut m = 0
+            loop m < len(e.pairs):
+                let sk = do plStructFieldTypes(env, e.pairs[m].key, names, types)
+                if sk != "":
+                    return sk
+                let sv = do plStructFieldTypes(env, e.pairs[m].value, names, types)
+                if sv != "":
+                    return sv
+                m = m + 1
+        return ""
 
     # ── small helpers ──────────────────────────────────────────────────
     proc plQuote(s: text) -> text:
@@ -271,17 +512,19 @@ app ProcLowerSelfHost:
 
     # plBuiltinCap: builtinCapability().
     proc plBuiltinCap(name: text) -> text:
-        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile":
+        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "grantRead":
             return "io.file"
-        if name == "httpGet" || name == "httpPost" || name == "connect":
+        if name == "closeListener" || name == "listenError":
+            return "io.net.listen"
+        if name == "httpGet" || name == "httpPost" || name == "connect" || name == "connectTls":
             return "io.net"
-        if name == "writeStdout" || name == "writeStderr" || name == "readStdin" || name == "signals":
+        if name == "writeStdout" || name == "writeStderr" || name == "readStdin" || name == "signals" || name == "exitProcess" || name == "processStats":
             return "io.console"
         if name == "envVar" || name == "envSet":
             return "io.env"
-        if name == "readBytes" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "connError" || name == "pollBytes" || name == "connOpen" || name == "shutdownConn":
+        if name == "readBytes" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "connError" || name == "connPeer" || name == "pollBytes" || name == "connOpen" || name == "shutdownConn":
             return "io.net.conn"
-        if name == "listen" || name == "listenOn" || name == "accept":
+        if name == "listen" || name == "listenOn" || name == "listenTls" || name == "accept":
             return "io.net.listen"
         return ""
 
@@ -331,6 +574,20 @@ app ProcLowerSelfHost:
                 let d = do plRequireCap(env, caps[i], b + "(...)")
                 if d != "":
                     return d
+            i = i + 1
+        return ""
+
+    # plEntryOnly: checkEntryOnlyBuiltins() with isEntry false.
+    proc plEntryOnly(e: ExprNode) -> text:
+        if e.kind == "call" && e.text == "grantRead":
+            return "grantRead(...) is only available in `proc main(args: [text]) -> int` — a file becomes readable outside the sandbox only when the operator names it (an argument or an environment variable) to the process entry point, before any request or connection exists"
+        let subs = do plSubNodes(e)
+        let n = len(subs)
+        let mut i = 0
+        loop i < n:
+            let d = do plEntryOnly(subs[i])
+            if d != "":
+                return d
             i = i + 1
         return ""
 
@@ -427,14 +684,18 @@ app ProcLowerSelfHost:
             return "array"
         if name == "bytes" || name == "textToBytes" || name == "readBytes" || name == "pollBytes" || name == "readFileAt" || name == "aesGcmSeal" || name == "aesGcmOpen" || name == "randomBytes":
             return "bytes"
-        if name == "bytesToText" || name == "readFile" || name == "httpGet" || name == "httpPost" || name == "recv" || name == "connError" || name == "readStdin" || name == "envVar":
+        if name == "bytesToText" || name == "readFile" || name == "httpGet" || name == "httpPost" || name == "recv" || name == "connError" || name == "connPeer" || name == "listenError" || name == "readStdin" || name == "envVar" || name == "processStats":
             return "text"
-        if name == "byteLen" || name == "listen" || name == "listenOn" || name == "accept" || name == "connect" || name == "channel" || name == "monoMs" || name == "nowMs" || name == "signals" || name == "floatBits" || name == "toInt" || name == "floor" || name == "round" || name == "fileSize":
+        if name == "byteLen" || name == "listen" || name == "listenOn" || name == "listenTls" || name == "awaitAny" || name == "accept" || name == "connect" || name == "connectTls" || name == "channel" || name == "monoMs" || name == "nowMs" || name == "signals" || name == "floatBits" || name == "toInt" || name == "floor" || name == "round" || name == "fileSize":
             return "int"
-        if name == "aesGcmAuthentic" || name == "envSet" || name == "connOpen" || name == "shutdownConn" || name == "sleepMs" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "send" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "writeStdout" || name == "writeStderr":
+        if name == "aesGcmAuthentic" || name == "closeListener" || name == "grantRead" || name == "envSet" || name == "closeChannel" || name == "exitProcess" || name == "connOpen" || name == "shutdownConn" || name == "sleepMs" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "send" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "writeStdout" || name == "writeStderr":
             return "bool"
-        if name == "toFloat" || name == "floatFromBits":
+        if name == "toFloat" || name == "floatFromBits" || name == "u64ToFloat":
             return "float"
+        if name == "u64Cmp" || name == "u64Min" || name == "u64Max" || name == "u64SatSub" || name == "u64Div" || name == "u64Rem" || name == "u64Parse":
+            return "int"
+        if name == "u64Text" || name == "u64ParseError":
+            return "text"
         if name == "print":
             if len(e.children) == 1:
                 let r = do plInferType(e.children[0], names, types)
@@ -550,7 +811,9 @@ app ProcLowerSelfHost:
         return ""
 
     # plCheckExpr: checkProcExpr()'s gating subset, in Go's order.
-    proc plCheckExpr(env: PLEnv, e: ExprNode, names: [text], types: [text]) -> text:
+    proc plCheckExpr(env: PLEnv, e: ExprNode, names0: [text], types0: [text]) -> text:
+        let names = names0 + env.sharedNames
+        let types = types0 + env.sharedTypes
         let free = do plFreeNames(e)
         let nf = len(free)
         let mut i = 0
@@ -569,6 +832,12 @@ app ProcLowerSelfHost:
             let d1 = do plDaemonOnly(e)
             if d1 != "":
                 return d1
+        # checkEntryOnlyBuiltins: grantRead only in `proc main` (the entry
+        # point is the one daemon-context body named "main").
+        if !(env.isDaemon && env.procName == "main"):
+            let d0 = do plEntryOnly(e)
+            if d0 != "":
+                return d0
         let td = do plTypeDiag(e, names, types)
         if td != "":
             return td
@@ -578,6 +847,9 @@ app ProcLowerSelfHost:
         let d3 = do plTaskUse(e, names, types)
         if d3 != "":
             return d3
+        let d35 = do plStructFieldTypes(env, e, names, types)
+        if d35 != "":
+            return d35
         let d4 = do plCheckCaps(env, e)
         if d4 != "":
             return d4
@@ -637,6 +909,7 @@ app ProcLowerSelfHost:
 
     # ── procBlock ──────────────────────────────────────────────────────
     proc plBlock(env: PLEnv, stmts: [Stmt], names0: [text], muts0: [bool], types0: [text], loopDepth: int) -> PLBlock:
+        let mut nestedN = 0
         let mut names = names0
         let mut muts = muts0
         let mut types = types0
@@ -656,17 +929,35 @@ app ProcLowerSelfHost:
                 if at >= 0:
                     let q = do plQuote(name)
                     return PLBlock{stmts: [], diag: q + " is already declared in proc " + pq}
+                let ns = do plNotShared(env, name)
+                if ns != "":
+                    return PLBlock{stmts: [], diag: ns}
                 let d = do plCheckExpr(env, s.expr, names, types)
                 if d != "":
                     return PLBlock{stmts: [], diag: d}
-                let ty = do plInferType(s.expr, names, types)
+                let ty = do plStructExprType(env, s.expr, names + env.sharedNames, types + env.sharedTypes)
                 names = append(names, name)
                 muts = append(muts, s.kind == "letMut")
                 types = append(types, ty)
                 let v = do plLower(env, s.expr)
                 let st = do irLet(name, v)
                 out = append(out, st)
-            if s.kind == "assign":
+            let sharedAt = do lowerFindName(env.sharedNames, letOrAssignName(lineText))
+            if s.kind == "assign" && sharedAt >= 0 && lowerFindName(names, letOrAssignName(lineText)) < 0:
+                # a shared cell's whole value replaced (build.go's ast.Assign
+                # case for e.shareds)
+                let d = do plCheckExpr(env, s.expr, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let vt = do plInferType(s.expr, names + env.sharedNames, types + env.sharedTypes)
+                let want = env.sharedTypes[sharedAt]
+                if vt != "" && vt != want && !(want == "float" && vt == "int"):
+                    let sq = do plQuote(env.sharedNames[sharedAt])
+                    return PLBlock{stmts: [], diag: "cannot assign " + vt + " to shared cell " + sq + ", whose type is " + want}
+                let v = do plLower(env, s.expr)
+                let st = do irExprStmt(irCall("$shared.set", [irLit(env.sharedNames[sharedAt], "text"), v]))
+                out = append(out, st)
+            if s.kind == "assign" && !(sharedAt >= 0 && lowerFindName(names, letOrAssignName(lineText)) < 0):
                 let target = do letOrAssignName(lineText)
                 let at = do lowerFindName(names, target)
                 let q = do plQuote(target)
@@ -698,7 +989,7 @@ app ProcLowerSelfHost:
                 if d2 != "":
                     return PLBlock{stmts: [], diag: d2}
                 if ty == "map":
-                    let kt = do plInferType(s.index, names, types)
+                    let kt = do plInferType(s.index, names + env.sharedNames, types + env.sharedTypes)
                     let keyOk = kt == "" || kt == "int" || kt == "text"
                     if !keyOk:
                         return PLBlock{stmts: [], diag: "map key must be int or text, got " + kt}
@@ -737,7 +1028,7 @@ app ProcLowerSelfHost:
                     return PLBlock{stmts: [], diag: d}
                 let ftype = env.structFieldTypes[fat]
                 let isListField = len(ftype) > 0 && charAt(ftype, 0) == "["
-                let vt = do plInferType(s.expr, names, types)
+                let vt = do plInferType(s.expr, names + env.sharedNames, types + env.sharedTypes)
                 if vt != "" && !isListField && vt != ftype && !(ftype == "float" && vt == "int"):
                     let fq2 = do plQuote(field)
                     let sq2 = do plQuote(sty)
@@ -746,6 +1037,28 @@ app ProcLowerSelfHost:
                 let fs0 = do irStmt("fieldset")
                 let fs = IRStmt{op: "fieldset", target: local, entity: fs0.entity, field: field, key: fs0.key, value: [v], fieldNames: fs0.fieldNames, fieldExprs: fs0.fieldExprs, service: fs0.service, args: fs0.args, itemVar: fs0.itemVar, where: fs0.where, order: fs0.order, desc: fs0.desc, limit: fs0.limit, bind: fs0.bind, ret: fs0.ret, retList: fs0.retList, role: fs0.role, msg: fs0.msg, status: fs0.status, body: fs0.body, elseBody: fs0.elseBody, bytesFlag: fs0.bytesFlag, file: fs0.file, path: fs0.path}
                 out = append(out, fs)
+            if s.kind == "nestedAssign":
+                let mut line = 0
+                if s.lineIdx < len(env.lineNos):
+                    line = env.lineNos[s.lineIdx]
+                let ds = do plDesugar(s.index, s.expr, line, nestedN, [])
+                nestedN = ds.n
+                if ds.err != "":
+                    return PLBlock{stmts: [], diag: ds.err}
+                let base = len(env.texts)
+                let mut synth = []
+                let mut k = 0
+                loop k < len(ds.stmts):
+                    let mut st0 = do plStmtNodeOf(ds.stmts[k])
+                    st0.lineIdx = base + k
+                    synth = append(synth, st0)
+                    k = k + 1
+                let mut env2 = env
+                env2.texts = env.texts + ds.texts
+                let sub = do plBlock(env2, synth, names, muts, types, loopDepth)
+                if sub.diag != "":
+                    return PLBlock{stmts: [], diag: sub.diag}
+                out = out + sub.stmts
             if s.kind == "assignDo":
                 let target = do assignDoTarget(lineText)
                 let pn0 = do assignDoProcName(lineText)
@@ -805,6 +1118,9 @@ app ProcLowerSelfHost:
                     if bat >= 0:
                         let bq = do plQuote(bind)
                         return PLBlock{stmts: [], diag: bq + " is already in scope — pick another name for the bound result"}
+                    let nsh = do plNotShared(env, bind)
+                    if nsh != "":
+                        return PLBlock{stmts: [], diag: nsh}
                     if sigRet == "":
                         return PLBlock{stmts: [], diag: "proc " + cq + " returns nothing — declare a return type to bind it"}
                     names = append(names, bind)
@@ -833,6 +1149,9 @@ app ProcLowerSelfHost:
                 if hat >= 0:
                     let hq = do plQuote(handle)
                     return PLBlock{stmts: [], diag: hq + " is already in scope — pick another name for the spawned task handle"}
+                let nsh = do plNotShared(env, handle)
+                if nsh != "":
+                    return PLBlock{stmts: [], diag: nsh}
                 names = append(names, handle)
                 muts = append(muts, false)
                 types = append(types, "task")
@@ -875,6 +1194,9 @@ app ProcLowerSelfHost:
                     if bat >= 0:
                         let bq = do plQuote(bind)
                         return PLBlock{stmts: [], diag: bq + " is already in scope — pick another name for the joined result"}
+                    let nsh = do plNotShared(env, bind)
+                    if nsh != "":
+                        return PLBlock{stmts: [], diag: nsh}
                     if sigRet == "":
                         let tq = do plQuote(taskProc)
                         return PLBlock{stmts: [], diag: "spawned proc " + tq + " returns nothing — declare a return type to bind its joined result"}
@@ -928,6 +1250,9 @@ app ProcLowerSelfHost:
                         if bat >= 0:
                             let bq = do plQuote(bind)
                             return PLBlock{stmts: [], diag: bq + " is already in scope — pick another name for the bound result"}
+                        let nsh = do plNotShared(env, bind)
+                        if nsh != "":
+                            return PLBlock{stmts: [], diag: nsh}
                         names = append(names, bind)
                         muts = append(muts, false)
                         if isBytes:
@@ -948,7 +1273,7 @@ app ProcLowerSelfHost:
                     let mut wantType = "text"
                     if isBytes:
                         wantType = "bytes"
-                    let argType = do plInferType(s.args[0], names, types)
+                    let argType = do plInferType(s.args[0], names + env.sharedNames, types + env.sharedTypes)
                     if argType != "" && argType != wantType:
                         if isBytes:
                             return PLBlock{stmts: [], diag: "write " + fileName + "(...) needs a byte buffer — file " + fq + " is declared `bytes`, got " + argType}
@@ -958,6 +1283,9 @@ app ProcLowerSelfHost:
                         if bat >= 0:
                             let bq = do plQuote(bind)
                             return PLBlock{stmts: [], diag: bq + " is already in scope — pick another name for the bound result"}
+                        let nsh = do plNotShared(env, bind)
+                        if nsh != "":
+                            return PLBlock{stmts: [], diag: nsh}
                         names = append(names, bind)
                         muts = append(muts, false)
                         types = append(types, "bool")
@@ -1049,6 +1377,28 @@ app ProcLowerSelfHost:
                 let st0 = do irStmt("actcall")
                 let st = IRStmt{op: st0.op, target: "", entity: "", field: "", key: [], value: [], fieldNames: [], fieldExprs: [], service: an, args: args, itemVar: "", where: [], order: "", desc: false, limit: [], bind: "", ret: "", retList: false, role: [], msg: "", status: 0, body: [], elseBody: [], bytesFlag: false, file: "", path: ""}
                 out = append(out, st)
+            if s.kind == "detach":
+                # build.go's ast.Detach case: daemon-context bodies only, a
+                # known proc, its arguments checked, lowered to the "$detach"
+                # intrinsic call with the proc's name as its first argument.
+                let t0 = trim(lineText)
+                let rest0 = do stmtTrimPrefix(t0, "detach ")
+                let rest = trim(rest0)
+                let openParen = do firstParenIndex(rest)
+                let pn = do plRename(env, trim(slice(rest, 0, openParen)))
+                if !env.isDaemon:
+                    return PLBlock{stmts: [], diag: "detach is only valid inside a daemon body — " + pq + " is a proc, and a proc's concurrency is structured: use `let h = spawn " + pn + "(...)` and `join h`"}
+                let sigAt = do lowerFindName(env.procNames, pn)
+                if sigAt < 0:
+                    let dq = do plQuote(pn)
+                    return PLBlock{stmts: [], diag: "detach calls unknown proc " + dq}
+                let d = do plCheckArgs(env, s.args, names, types)
+                if d != "":
+                    return PLBlock{stmts: [], diag: d}
+                let args = do plLowerList(env, s.args)
+                let call = do irCall("$detach", [irLit(pn, "text")] + args)
+                let st = do irExprStmt(call)
+                out = append(out, st)
             if s.kind == "unsupported":
                 return PLBlock{stmts: [], diag: "unsupported statement in proc " + pq}
             i = i + 1
@@ -1079,6 +1429,23 @@ app ProcLowerSelfHost:
     # plLowerProcS: plLowerProcR with the app's struct table, for a
     # `local.field = expr` write.
     proc plLowerProcS(name: text, headerLine: text, bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text], renameFrom: [text], renameTo: [text], structFieldKeys: [text], structFieldTypes: [text]) -> PLResult:
+        let pNames = do parseProcHeaderParamNames(headerLine)
+        let pTypes = do parseProcHeaderParamTypes(headerLine)
+        let pLists = do parseProcHeaderParamLists(headerLine)
+        let hasRet = do parseProcHeaderHasRet(headerLine)
+        let retCore0 = do parseProcHeaderRetCore(headerLine)
+        let retList0 = do parseProcHeaderRetIsList(headerLine)
+        # the program entry point (`proc main(args: [text]) -> int`) is a
+        # daemon-context body, as isProcessEntry makes it in build.go
+        let entry = name == "main" && len(pNames) == 1 && pLists[0] && pTypes[0] == "text" && hasRet && retCore0 == "int" && !retList0
+        let r = do plLowerProcX(name, headerLine, bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, renameFrom, renameTo, structFieldKeys, structFieldTypes, PLCtx{sharedNames: [], sharedTypes: [], ctxProcs: [], lineNos: [], structNames: [], ty: tyEmptyEnv()}, entry, [], [], [])
+        return r
+
+    # plLowerProcX: procIn — a proc lowered against the app's shared cells;
+    # daemonCtx lowers it as a daemon-context body (the entry point, or a
+    # proc only ever detached from one), with `act` resolved against the
+    # action signatures.
+    proc plLowerProcX(name: text, headerLine: text, bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text], renameFrom: [text], renameTo: [text], structFieldKeys: [text], structFieldTypes: [text], ctx: PLCtx, daemonCtx: bool, actionNames: [text], actionServer: [bool], actionParamCounts: [int]) -> PLResult:
         let pNames = do parseProcHeaderParamNames(headerLine)
         let pTypes = do parseProcHeaderParamTypes(headerLine)
         let pLists = do parseProcHeaderParamLists(headerLine)
@@ -1113,18 +1480,22 @@ app ProcLowerSelfHost:
                 types = append(types, pTypes[i])
             params = append(params, IRParam{name: pNames[i], type: pTypes[i], optional: pOpts[i], list: pLists[i]})
             i = i + 1
+        let mut si = 0
+        loop si < np:
+            if lowerFindName(ctx.sharedNames, pNames[si]) >= 0:
+                let sq = do plQuote(pNames[si])
+                return PLResult{proc: empty, diag: sq + " is a shared cell — a parameter or local may not reuse its name"}
+            si = si + 1
         let texts = do plBodyTexts(bodySrc)
         let stmts = do parseProcBodySrc(bodySrc)
         let mut unchecked = []
         loop len(unchecked) < len(procNames):
             unchecked = append(unchecked, -1)
-        # the program entry point (`proc main(args: [text]) -> int`) is a
-        # daemon-context body, as isProcessEntry makes it in build.go.
-        let entry = name == "main" && np == 1 && pLists[0] && pTypes[0] == "text" && ret == "int" && !retList
-        let env = PLEnv{procName: name, procRet: ret, uses: uses, texts: texts, procNames: procNames, procArities: unchecked, procRets: procRets, procRetLists: procRetLists, fileNames: fileNames, fileTypes: fileTypes, filePaths: filePaths, enumNames: enumNames, isDaemon: entry, actionNames: [], actionServer: [], actionParamCounts: [], renameFrom: renameFrom, renameTo: renameTo, structFieldKeys: structFieldKeys, structFieldTypes: structFieldTypes}
-        let blk = do plBlock(env, stmts, names, muts, types, 0)
-        if blk.diag != "":
-            return PLResult{proc: empty, diag: blk.diag}
+        let env = PLEnv{procName: name, procRet: ret, uses: uses, texts: texts, procNames: procNames, procArities: unchecked, procRets: procRets, procRetLists: procRetLists, fileNames: fileNames, fileTypes: fileTypes, filePaths: filePaths, enumNames: enumNames, isDaemon: daemonCtx, actionNames: actionNames, actionServer: actionServer, actionParamCounts: actionParamCounts, renameFrom: renameFrom, renameTo: renameTo, structFieldKeys: structFieldKeys, structFieldTypes: structFieldTypes, sharedNames: ctx.sharedNames, sharedTypes: ctx.sharedTypes, lineNos: ctx.lineNos, structNames: ctx.structNames, ty: ctx.ty}
+        let blk0 = do plBlock(env, stmts, names, muts, types, 0)
+        if blk0.diag != "":
+            return PLResult{proc: empty, diag: blk0.diag}
+        let blk = PLBlock{stmts: plSharedStmts(blk0.stmts, ctx.sharedNames), diag: ""}
         if len(blk.stmts) == 0:
             return PLResult{proc: empty, diag: "proc " + pq + " has no body"}
         if ret != "":
@@ -1151,6 +1522,10 @@ app ProcLowerSelfHost:
         diag: text
 
     proc plLowerDaemon(name: text, uses: [text], bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text], actionNames: [text], actionServer: [bool], actionParamCounts: [int], renameFrom: [text], renameTo: [text], structFieldKeys: [text], structFieldTypes: [text]) -> PLDaemon:
+        let r = do plLowerDaemonX(name, uses, bodySrc, procNames, procRets, procRetLists, fileNames, fileTypes, filePaths, enumNames, actionNames, actionServer, actionParamCounts, renameFrom, renameTo, structFieldKeys, structFieldTypes, PLCtx{sharedNames: [], sharedTypes: [], ctxProcs: [], lineNos: [], structNames: [], ty: tyEmptyEnv()})
+        return r
+
+    proc plLowerDaemonX(name: text, uses: [text], bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text], actionNames: [text], actionServer: [bool], actionParamCounts: [int], renameFrom: [text], renameTo: [text], structFieldKeys: [text], structFieldTypes: [text], ctx: PLCtx) -> PLDaemon:
         let dq = do plQuote(name)
         let mut seen = []
         let nu = len(uses)
@@ -1170,13 +1545,14 @@ app ProcLowerSelfHost:
         let mut unchecked = []
         loop len(unchecked) < len(procNames):
             unchecked = append(unchecked, -1)
-        let env = PLEnv{procName: "daemon " + name, procRet: "", uses: uses, texts: texts, procNames: procNames, procArities: unchecked, procRets: procRets, procRetLists: procRetLists, fileNames: fileNames, fileTypes: fileTypes, filePaths: filePaths, enumNames: enumNames, isDaemon: true, actionNames: actionNames, actionServer: actionServer, actionParamCounts: actionParamCounts, renameFrom: renameFrom, renameTo: renameTo, structFieldKeys: structFieldKeys, structFieldTypes: structFieldTypes}
+        let env = PLEnv{procName: "daemon " + name, procRet: "", uses: uses, texts: texts, procNames: procNames, procArities: unchecked, procRets: procRets, procRetLists: procRetLists, fileNames: fileNames, fileTypes: fileTypes, filePaths: filePaths, enumNames: enumNames, isDaemon: true, actionNames: actionNames, actionServer: actionServer, actionParamCounts: actionParamCounts, renameFrom: renameFrom, renameTo: renameTo, structFieldKeys: structFieldKeys, structFieldTypes: structFieldTypes, sharedNames: ctx.sharedNames, sharedTypes: ctx.sharedTypes, lineNos: ctx.lineNos, structNames: ctx.structNames, ty: ctx.ty}
         let blk = do plBlock(env, stmts, [], [], [], 0)
         if blk.diag != "":
             return PLDaemon{body: [], diag: blk.diag}
         if len(blk.stmts) == 0:
             return PLDaemon{body: [], diag: "daemon " + dq + " has no body"}
-        return PLDaemon{body: blk.stmts, diag: ""}
+        let body = do plSharedStmts(blk.stmts, ctx.sharedNames)
+        return PLDaemon{body: body, diag: ""}
 
     # lowerProcSrc: the IRProc (name "" on a compile error).
     proc lowerProcSrc(headerLine: text, bodySrc: text, procNames: [text], procRets: [text], procRetLists: [bool], fileNames: [text], fileTypes: [text], filePaths: [text], enumNames: [text]) -> IRProc:

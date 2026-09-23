@@ -53,6 +53,55 @@ func (s *Server) contractVersion() string {
 // (see apiError).
 const errorSchemaName = "APIErrorDTO"
 
+// nullable marks a schema as maybe-null the way the contract spells it: a
+// reference becomes oneOf [the reference, null]; any other schema gains
+// "null" in its type (a schema with no type — any JSON value — is typed
+// ["null"] alongside its description).
+func nullable(schema map[string]any) map[string]any {
+	if r, ok := schema["$ref"]; ok {
+		return map[string]any{"oneOf": []any{map[string]any{"$ref": r}, map[string]any{"type": "null"}}}
+	}
+	out := make(map[string]any, len(schema)+1)
+	for k, v := range schema {
+		out[k] = v
+	}
+	switch t := out["type"].(type) {
+	case string:
+		out["type"] = []string{t, "null"}
+	case nil:
+		out["type"] = []string{"null"}
+	}
+	return out
+}
+
+// bodySchema is a request or reply body's schema: a named DTO is referenced
+// as maybe-null (a client decoding it tolerates a null body), anything else
+// as itself.
+func bodySchema(schema map[string]any) map[string]any {
+	if _, ok := schema["$ref"]; ok {
+		return nullable(schema)
+	}
+	return schema
+}
+
+// fieldSchema is one wire type field's schema: its element type, as a list
+// (nested to its depth) or a map of it, maybe-null when declared `or null`.
+func fieldSchema(f ir.WireField, g *ir.IR, usedEntities map[string]bool) map[string]any {
+	sch := wireSchema(f.Type, false, g, usedEntities)
+	switch {
+	case f.Map:
+		sch = map[string]any{"type": "object", "additionalProperties": sch}
+	case f.List:
+		for i := 0; i < max(f.Depth, 1); i++ {
+			sch = map[string]any{"type": "array", "items": sch}
+		}
+	}
+	if f.Nullable {
+		sch = nullable(sch)
+	}
+	return sch
+}
+
 // errorSchemas are the error envelope's components.
 func errorSchemas() map[string]any {
 	return map[string]any{
@@ -80,7 +129,8 @@ func objSchema(props map[string]any, required ...string) map[string]any {
 // it. A limited request is answered 429 with Retry-After.
 func rateLimitDoc(class string) map[string]any {
 	per := rateLimitFromEnvClass(class)
-	return map[string]any{"limiter": class, "per_minute": per, "burst": per, "keyed_by": "ip", "headers": []string{"Retry-After"}}
+	return map[string]any{"limiter": class, "per_minute": per, "burst": rateBurst(per), "keyed_by": "ip",
+		"headers": []string{"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Retry-After"}}
 }
 
 // operationIDFor names a runtime-served route the way declared routes'
@@ -114,7 +164,7 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 	usedEntities := map[string]bool{}
 	paths := map[string]map[string]any{}
 	errResp := func(desc string) map[string]any {
-		return map[string]any{"description": desc, "content": map[string]any{"application/json": map[string]any{"schema": ref(errorSchemaName)}}}
+		return map[string]any{"description": desc, "content": map[string]any{"application/json": map[string]any{"schema": nullable(ref(errorSchemaName))}}}
 	}
 	for _, a := range g.APIs {
 		if a.Dispatch != "" {
@@ -137,7 +187,35 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		for _, p := range a.Params {
 			inPath[p] = true
 		}
-		var params []map[string]any
+		params := []map[string]any{}
+		docs := map[string]ir.APIParamDoc{}
+		for _, d := range a.ParamDocs {
+			docs[d.Name] = d
+		}
+		// paramSchema is a path or query parameter's schema: its documented
+		// wire type and closed values when the route documents it.
+		paramSchema := func(p ir.Param) map[string]any {
+			d, ok := docs[p.Name]
+			if !ok {
+				return wireSchema(p.Type, p.List, g, usedEntities)
+			}
+			list := p.List && d.Type != "text" // a list documented as its comma-separated text
+			sch := wireSchema(d.Type, list, g, usedEntities)
+			if len(d.Enum) > 0 {
+				if list {
+					sch["items"].(map[string]any)["enum"] = d.Enum
+				} else {
+					sch["enum"] = d.Enum
+				}
+			}
+			return sch
+		}
+		withDoc := func(entry map[string]any, name string) map[string]any {
+			if d, ok := docs[name]; ok && d.Description != "" {
+				entry["description"] = d.Description
+			}
+			return entry
+		}
 		body := map[string]any{}
 		var required []string
 		var bodyWireParams []ir.Param // POST/PUT/PATCH params that bind from the JSON body, in order
@@ -149,17 +227,17 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 			schema := wireSchema(p.Type, p.List, g, usedEntities)
 			switch {
 			case inPath[p.Name]:
-				params = append(params, map[string]any{"name": p.Name, "in": "path", "required": true, "schema": schema})
+				params = append(params, withDoc(map[string]any{"name": p.Name, "in": "path", "required": true, "schema": paramSchema(p)}, p.Name))
 			case a.Method == http.MethodGet:
 				// A DELETE carries its non-path parameters in a JSON body like any
 				// other write (`DELETE /me/two-factor {"code": …}`); only a GET,
 				// which has no body, reads them from the query.
-				qp := map[string]any{"name": p.Name, "in": "query", "required": !p.Optional, "schema": schema}
-				if p.List {
+				qp := map[string]any{"name": p.Name, "in": "query", "required": !p.Optional, "schema": paramSchema(p)}
+				if d, ok := docs[p.Name]; p.List && !(ok && d.Type == "text") {
 					// Comma-separated (`?ids=1,2`), the form runtime/server.go's paramArg splits.
 					qp["style"], qp["explode"] = "form", false
 				}
-				params = append(params, qp)
+				params = append(params, withDoc(qp, p.Name))
 			default:
 				if p.Type == "bytes" {
 					hasBytesBody = true
@@ -182,10 +260,21 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 			wholeBodyWireType = bodyWireParams[0].Type
 		}
 		binary := a.Ret == "bytes" // the reply is a file, answered as the body itself
+		opID := a.Operation
+		if opID == "" {
+			opID = operationIDFor(a.Method, a.Path)
+		}
 		op := map[string]any{
-			"operationId": a.Action,
+			"operationId": opID,
 			"x-auth":      a.Auth,
 			"x-since":     a.Since,
+			"parameters":  params,
+		}
+		if a.Summary != "" {
+			op["summary"] = a.Summary
+		}
+		if a.Description != "" {
+			op["description"] = a.Description
 		}
 		if a.Rate != "" {
 			op["x-rate-limit"] = rateLimitDoc(a.Rate)
@@ -194,14 +283,15 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		if conditional {
 			op["x-conditional-get"] = true
 		}
-		if len(params) > 0 {
-			op["parameters"] = params
-		}
-		if wholeBodyWireType != "" {
-			op["requestBody"] = map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": wireSchema(wholeBodyWireType, false, g, usedEntities)}}}
-		} else if len(body) > 0 {
+		switch {
+		case a.Body != "":
+			op["requestBody"] = map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": nullable(ref(schemaNameOf(a.Body, g)))}}}
+		case wholeBodyWireType != "":
+			op["requestBody"] = map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": bodySchema(wireSchema(wholeBodyWireType, false, g, usedEntities))}}}
+		case len(body) > 0:
 			bodySchema := map[string]any{"type": "object", "properties": body}
 			if len(required) > 0 {
+				sort.Strings(required)
 				bodySchema["required"] = required
 			}
 			contentType := "application/json"
@@ -213,34 +303,32 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		responses := map[string]any{}
 		okResp := map[string]any{"description": http.StatusText(a.Status)}
 		if a.Ret != "" && a.Status != http.StatusNoContent && !binary {
-			okResp["content"] = map[string]any{"application/json": map[string]any{"schema": wireSchema(a.Ret, a.RetList, g, usedEntities)}}
-		}
-		if binary {
-			okResp["description"] = "OK — the file itself, as an attachment, with its own Content-Type"
+			okResp["content"] = map[string]any{"application/json": map[string]any{"schema": bodySchema(wireSchema(a.Ret, a.RetList, g, usedEntities))}}
 		}
 		responses[itoa(a.Status)] = okResp
+		// The error statuses: the route's declared `errors` (which the
+		// compiler proved cover every check), else every status its checks
+		// can fail with; a credentialed route also answers 401. The
+		// runtime's own refusals — a malformed request (400), a spent rate
+		// budget (429), a conditional GET's 304 — are conventions the
+		// document states once (info.description), not per route.
 		with := func(code int, desc string) { responses[itoa(code)] = errResp(desc) }
-		with(400, "Bad Request")
-		with(422, "Unprocessable Entity")
-		if conditional {
-			responses["304"] = map[string]any{"description": "Not Modified"}
+		for _, code := range a.Errors {
+			with(code, http.StatusText(code))
 		}
 		switch {
-		case a.Auth == "session":
-			with(401, "Unauthorized")
-			with(403, "Forbidden")
-			op["security"] = []map[string]any{{"bearer": []string{}}}
-		case a.Bearer != "":
-			with(401, "Unauthorized")
+		case a.Auth == "session", a.Bearer != "":
+			if _, ok := responses["401"]; !ok {
+				with(401, "Unauthorized")
+			}
 			op["security"] = []map[string]any{{"bearer": []string{}}}
 		default:
 			op["security"] = []map[string]any{} // open: no credential required
 		}
-		if a.Rate != "" {
-			with(429, "Too Many Requests")
-		}
 		for _, st := range act.Body {
-			collectCheckStatuses(st, func(code int) { with(code, http.StatusText(code)) })
+			if len(a.Errors) == 0 {
+				collectCheckStatuses(st, func(code int) { with(code, http.StatusText(code)) })
+			}
 			// `return … status N`: a second success outcome, same reply shape.
 			collectReturnStatuses(st, func(code int) {
 				alt := map[string]any{"description": http.StatusText(code)}
@@ -250,7 +338,7 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 				responses[itoa(code)] = alt
 			})
 		}
-		if binary {
+		if binary && len(a.Errors) == 0 {
 			with(http.StatusBadGateway, "Bad Gateway") // the file came from a service that did not answer
 		}
 		op["responses"] = responses
@@ -263,19 +351,13 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		props := map[string]any{}
 		var req []string
 		for _, f := range t.Fields {
-			props[f.Name] = wireSchema(f.Type, f.List, g, usedEntities)
-			if f.Nullable {
-				props[f.Name] = map[string]any{"oneOf": []any{props[f.Name], map[string]any{"type": "null"}}}
-			}
+			props[f.Name] = fieldSchema(f, g, usedEntities)
 			if !f.Optional {
 				req = append(req, f.Name)
 			}
 		}
-		sch := map[string]any{"type": "object", "properties": props}
-		if len(req) > 0 {
-			sch["required"] = req
-		}
-		schemas[t.SchemaName()] = sch
+		sort.Strings(req)
+		schemas[t.SchemaName()] = objSchema(props, req...)
 	}
 	// A `message` is a tagged union: internally tagged on "type" with the
 	// variant's own (snake_case) name as the discriminant value — see
@@ -283,7 +365,18 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 	// plus a `type` const), and the message's own name is the oneOf across
 	// them, with an OpenAPI discriminator so a client can dispatch on the
 	// same field the wire actually carries.
+	dispatchOnly := map[string]bool{}
+	for _, a := range g.APIs {
+		if a.Dispatch != "" {
+			dispatchOnly[a.Dispatch] = true
+		}
+	}
 	for _, m := range g.Messages {
+		if dispatchOnly[m.Name] && !messageReferenced(m.Name, g) {
+			// A dispatching route's union is documented variant by variant in
+			// x-mutation-events; nothing references it as a schema.
+			continue
+		}
 		var variantRefs []map[string]any
 		mapping := map[string]any{}
 		for _, v := range m.Variants {
@@ -322,12 +415,16 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		}
 	}
 	// Streams: one GET route each, and every event it carries — the runtime's
-	// own `hello` connect frame first — in x-stream-events.
+	// own `hello` connect frame too, on a stream that declares it — in
+	// x-stream-events.
 	streamEvents := []map[string]any{}
 	for _, st := range g.Streams {
-		schemas["HelloEventDTO"] = helloEventSchema()
-		evs := []ir.StreamEvent{{Name: "hello", Type: "HelloEventDTO", Since: st.Since,
-			Summary: "Connect frame: this connection's id, the contract and schema versions the server serves, its clock. Unnumbered."}}
+		var evs []ir.StreamEvent
+		if st.Hello != "" {
+			schemas["HelloEventDTO"] = helloEventSchema()
+			evs = append(evs, ir.StreamEvent{Name: "hello", Type: "HelloEventDTO", Since: st.Hello,
+				Summary: "Connect frame: this connection's id, the contract and schema versions the server serves, its clock. Unnumbered."})
+		}
 		evs = append(evs, st.Events...)
 		sort.SliceStable(evs, func(i, j int) bool { return evs[i].Name < evs[j].Name })
 		var names []string
@@ -347,14 +444,25 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		op := map[string]any{
 			"operationId": operationIDFor(http.MethodGet, st.Path),
 			"x-auth":      st.Auth,
-			"x-stream":    true,
 			"x-since":     st.Since,
 			"parameters":  streamParams(st),
 			"responses":   responses,
 		}
-		// The connect hook's own refusals (`check … status 404`) are the
-		// stream's.
+		if st.Summary != "" {
+			op["summary"] = st.Summary
+		}
+		if st.Description != "" {
+			op["description"] = st.Description
+		}
+		// The stream's published errors; else its connect hooks' own
+		// refusals (`check … status 404`).
+		for _, code := range st.Errors {
+			responses[itoa(code)] = errResp(http.StatusText(code))
+		}
 		for _, h := range st.Connects {
+			if len(st.Errors) > 0 {
+				break
+			}
 			for i := range g.Actions {
 				if g.Actions[i].Name == h.Action {
 					for _, stmt := range g.Actions[i].Body {
@@ -365,12 +473,10 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 		}
 		if st.Rate != "" {
 			op["x-rate-limit"] = rateLimitDoc(st.Rate)
-			responses["429"] = errResp("Too Many Requests")
 		}
 		if st.Auth == "session" {
 			op["security"] = []map[string]any{{"bearer": []string{}}}
 			responses["401"] = errResp("Unauthorized")
-			responses["403"] = errResp("Forbidden")
 		} else {
 			op["security"] = []map[string]any{}
 		}
@@ -392,11 +498,24 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 			paths[p] = map[string]any{"get": op}
 		}
 	}
+	title, description := g.App, contractDescription
+	bearerDesc := "The session token the app's sign-in answers with (or a route's own credential, per its x-auth), as `Authorization: Bearer <token>`."
+	if c := g.Contract; c != nil {
+		if c.Title != "" {
+			title = c.Title
+		}
+		if c.Description != "" {
+			description = c.Description
+		}
+		if c.Bearer != "" {
+			bearerDesc = c.Bearer
+		}
+	}
 	doc := map[string]any{
-		"openapi":           "3.0.3",
-		"info":              map[string]any{"title": g.App, "version": "", "description": contractDescription},
+		"openapi":           "3.1.0",
+		"info":              map[string]any{"title": title, "version": "", "description": description},
 		"paths":             paths,
-		"components":        map[string]any{"schemas": schemas, "securitySchemes": map[string]any{"bearer": map[string]any{"type": "http", "scheme": "bearer", "bearerFormat": "opaque", "description": "The session token the app's sign-in answers with (or a route's own credential, per its x-auth), as `Authorization: Bearer <token>`."}}},
+		"components":        map[string]any{"schemas": schemas, "securitySchemes": map[string]any{"bearer": map[string]any{"type": "http", "scheme": "bearer", "bearerFormat": "opaque", "description": bearerDesc}}},
 		"security":          []map[string]any{{"bearer": []string{}}},
 		"x-schema-version":  schemaVersion,
 		"x-stream-events":   streamEvents,
@@ -416,7 +535,18 @@ func buildContract(g *ir.IR, schemaVersion int) map[string]any {
 func streamParams(st ir.Stream) []map[string]any {
 	var out []map[string]any
 	for _, p := range st.Params {
-		out = append(out, map[string]any{"name": p, "in": "path", "required": true, "schema": strSchema()})
+		entry := map[string]any{"name": p, "in": "path", "required": true, "schema": strSchema()}
+		for _, d := range st.ParamDocs {
+			if d.Name == p {
+				if d.Description != "" {
+					entry["description"] = d.Description
+				}
+				if len(d.Enum) > 0 {
+					entry["schema"] = map[string]any{"type": "string", "enum": d.Enum}
+				}
+			}
+		}
+		out = append(out, entry)
 	}
 	return append(out,
 		map[string]any{"name": "Last-Event-ID", "in": "header", "required": false, "schema": strSchema(), "description": "The last `id:` seen; missed frames are replayed after it."},
@@ -442,10 +572,20 @@ func dispatchOperation(a ir.API, g *ir.IR) map[string]any {
 	}
 	bodySchema := map[string]any{"type": "object", "additionalProperties": true,
 		"properties": map[string]any{tag: strSchema()}, "required": []string{tag}}
+	opID, summary, description := a.Operation, a.Summary, a.Description
+	if opID == "" {
+		opID = operationIDFor(a.Method, a.Path)
+	}
+	if summary == "" {
+		summary = "One " + tag + " per call, as a form or a JSON object."
+	}
+	if description == "" {
+		description = "See x-mutation-events for every " + tag + ", its fields, and the JSON result it answers with (204 when it has none)."
+	}
 	op := map[string]any{
-		"operationId": "post" + strings.TrimPrefix(operationIDFor("", a.Path), ""),
-		"summary":     "One " + tag + " per call, as a form or a JSON object.",
-		"description": "See x-mutation-events for every " + tag + ", its fields, and the JSON result it answers with (204 when it has none).",
+		"operationId": opID,
+		"summary":     summary,
+		"description": description,
 		"x-since":     a.Since,
 		"security":    []map[string]any{{"bearer": []string{}}},
 		"requestBody": map[string]any{"required": true, "content": map[string]any{
@@ -611,7 +751,7 @@ func wireSchema(typ string, list bool, g *ir.IR, usedEntities map[string]bool) m
 		// OpenAPI's own convention for a file upload field.
 		sch = map[string]any{"type": "string", "format": "binary"}
 	case "json":
-		sch = map[string]any{"type": "object"}
+		sch = map[string]any{"description": "Any JSON value."}
 	default:
 		isEnum := false
 		for _, en := range g.Enums {
@@ -673,4 +813,44 @@ func collectCheckStatuses(st ir.Stmt, f func(int)) {
 	for _, b := range st.Else {
 		collectCheckStatuses(b, f)
 	}
+}
+
+// messageReferenced reports whether a message is named as a type anywhere a
+// schema would reference it: a wire type's field, an action's parameter or
+// reply, a stream event's payload.
+func messageReferenced(name string, g *ir.IR) bool {
+	for _, t := range g.Types {
+		for _, f := range t.Fields {
+			if f.Type == name {
+				return true
+			}
+		}
+	}
+	for _, m := range g.Messages {
+		for _, v := range m.Variants {
+			for _, f := range v.Fields {
+				if f.Type == name {
+					return true
+				}
+			}
+		}
+	}
+	for _, a := range g.Actions {
+		if a.Ret == name {
+			return true
+		}
+		for _, p := range a.Params {
+			if p.Type == name {
+				return true
+			}
+		}
+	}
+	for _, st := range g.Streams {
+		for _, ev := range st.Events {
+			if ev.Type == name {
+				return true
+			}
+		}
+	}
+	return false
 }

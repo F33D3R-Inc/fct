@@ -39,6 +39,8 @@ app IRGraphSelfHost:
         enum: [text]
         into: text
         nullable: bool
+        map: bool
+        depth: int
 
     struct IRJob:
         name: text
@@ -96,6 +98,12 @@ app IRGraphSelfHost:
         every: int
         body: [IRStmt]
 
+    # IRShared: one `shared name: Type` cell (ir.Shared).
+    struct IRShared:
+        name: text
+        type: text
+        list: bool
+
     struct IRComponent:
         name: text
         params: [IRParam]
@@ -122,11 +130,27 @@ app IRGraphSelfHost:
         retList: bool
         bearer: text
         dispatch: text
+        summary: text
+        description: text
+        body: text
+        errors: [int]
+        operation: text
+        paramDocs: [IRAPIParamDoc]
+
+    # IRAPIParamDoc: one documented path/query parameter (ir.APIParamDoc).
+    struct IRAPIParamDoc:
+        name: text
+        type: text
+        description: text
+        enum: [text]
 
     struct IRContract:
         path: text
         rate: text
         since: text
+        title: text
+        description: text
+        bearer: text
 
     struct IRStreamEvent:
         name: text
@@ -149,6 +173,44 @@ app IRGraphSelfHost:
         params: [text]
         connects: [IRStreamHook]
         disconnect: text
+        hello: text
+        summary: text
+        description: text
+        paramDocs: [IRAPIParamDoc]
+        errors: [int]
+
+    # irIntListJSON / irParamDocsJSON: the JSON of an []int and an
+    # []ir.APIParamDoc, as encoding/json writes them.
+    proc irIntListJSON(xs: [int]) -> text:
+        let mut out = "["
+        let n = len(xs)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            out = out + xs[i]
+            i = i + 1
+        return out + "]"
+
+    proc irParamDocsJSON(ds: [IRAPIParamDoc]) -> text:
+        let mut out = "["
+        let n = len(ds)
+        let mut i = 0
+        loop i < n:
+            if i > 0:
+                out = out + ","
+            let nq = do jsonQuote(ds[i].name)
+            let tq = do jsonQuote(ds[i].type)
+            out = out + "{\"name\":" + nq + ",\"type\":" + tq
+            if ds[i].description != "":
+                let dq = do jsonQuote(ds[i].description)
+                out = out + ",\"description\":" + dq
+            if len(ds[i].enum) > 0:
+                let ej = do textListJSON(ds[i].enum)
+                out = out + ",\"enum\":" + ej
+            out = out + "}"
+            i = i + 1
+        return out + "]"
 
     proc irAPIJSON(a: IRAPI) -> text:
         let mq = do jsonQuote(a.method)
@@ -178,6 +240,24 @@ app IRGraphSelfHost:
         if a.dispatch != "":
             let dq = do jsonQuote(a.dispatch)
             out = out + ",\"dispatch\":" + dq
+        if a.summary != "":
+            let smq = do jsonQuote(a.summary)
+            out = out + ",\"summary\":" + smq
+        if a.description != "":
+            let deq = do jsonQuote(a.description)
+            out = out + ",\"description\":" + deq
+        if a.body != "":
+            let boq = do jsonQuote(a.body)
+            out = out + ",\"body\":" + boq
+        if len(a.errors) > 0:
+            let erj = do irIntListJSON(a.errors)
+            out = out + ",\"errors\":" + erj
+        if a.operation != "":
+            let opq = do jsonQuote(a.operation)
+            out = out + ",\"operation\":" + opq
+        if len(a.paramDocs) > 0:
+            let pdj = do irParamDocsJSON(a.paramDocs)
+            out = out + ",\"paramDocs\":" + pdj
         return out + "}"
 
     proc irContractJSON(c: IRContract) -> text:
@@ -189,6 +269,15 @@ app IRGraphSelfHost:
         if c.since != "":
             let sq = do jsonQuote(c.since)
             out = out + ",\"since\":" + sq
+        if c.title != "":
+            let tq = do jsonQuote(c.title)
+            out = out + ",\"title\":" + tq
+        if c.description != "":
+            let dq = do jsonQuote(c.description)
+            out = out + ",\"description\":" + dq
+        if c.bearer != "":
+            let bq = do jsonQuote(c.bearer)
+            out = out + ",\"bearer\":" + bq
         return out + "}"
 
     proc irStreamJSON(st: IRStream) -> text:
@@ -248,6 +337,21 @@ app IRGraphSelfHost:
         if st.disconnect != "":
             let dq = do jsonQuote(st.disconnect)
             out = out + ",\"disconnect\":" + dq
+        if st.hello != "":
+            let hq2 = do jsonQuote(st.hello)
+            out = out + ",\"hello\":" + hq2
+        if st.summary != "":
+            let smq = do jsonQuote(st.summary)
+            out = out + ",\"summary\":" + smq
+        if st.description != "":
+            let deq = do jsonQuote(st.description)
+            out = out + ",\"description\":" + deq
+        if len(st.paramDocs) > 0:
+            let pdj = do irParamDocsJSON(st.paramDocs)
+            out = out + ",\"paramDocs\":" + pdj
+        if len(st.errors) > 0:
+            let erj = do irIntListJSON(st.errors)
+            out = out + ",\"errors\":" + erj
         return out + "}"
 
     proc irAPIFromJVal(v: JVal) -> IRAPI:
@@ -263,7 +367,37 @@ app IRGraphSelfHost:
         let retList = do jBool(v, "retList")
         let bearer = do jStr(v, "bearer")
         let dispatch = do jStr(v, "dispatch")
-        return IRAPI{method: method, path: path, params: params, action: action, status: status, rate: rate, since: since, auth: auth, ret: ret, retList: retList, bearer: bearer, dispatch: dispatch}
+        let summary = do jStr(v, "summary")
+        let description = do jStr(v, "description")
+        let body = do jStr(v, "body")
+        let errors = do irIntListOf(v, "errors")
+        let operation = do jStr(v, "operation")
+        let paramDocs = do irParamDocsOf(v, "paramDocs")
+        return IRAPI{method: method, path: path, params: params, action: action, status: status, rate: rate, since: since, auth: auth, ret: ret, retList: retList, bearer: bearer, dispatch: dispatch, summary: summary, description: description, body: body, errors: errors, operation: operation, paramDocs: paramDocs}
+
+    proc irIntListOf(v: JVal, k: text) -> [int]:
+        let x = do jGet(v, k)
+        let mut out = []
+        let n = len(x.vals)
+        let mut i = 0
+        loop i < n:
+            out = append(out, toInt(x.vals[i].s))
+            i = i + 1
+        return out
+
+    proc irParamDocsOf(v: JVal, k: text) -> [IRAPIParamDoc]:
+        let x = do jGet(v, k)
+        let mut out = []
+        let n = len(x.vals)
+        let mut i = 0
+        loop i < n:
+            let dn = do jStr(x.vals[i], "name")
+            let dt = do jStr(x.vals[i], "type")
+            let dd = do jStr(x.vals[i], "description")
+            let de = do jTextListOf(x.vals[i], "enum")
+            out = append(out, IRAPIParamDoc{name: dn, type: dt, description: dd, enum: de})
+            i = i + 1
+        return out
 
     proc irStreamFromJVal(v: JVal) -> IRStream:
         let path = do jStr(v, "path")
@@ -294,7 +428,12 @@ app IRGraphSelfHost:
             connects = append(connects, IRStreamHook{action: ha, event: he})
             h = h + 1
         let disconnect = do jStr(v, "disconnect")
-        return IRStream{path: path, events: events, requires: requires, auth: auth, rate: rate, since: since, params: params, connects: connects, disconnect: disconnect}
+        let hello = do jStr(v, "hello")
+        let summary = do jStr(v, "summary")
+        let description = do jStr(v, "description")
+        let paramDocs = do irParamDocsOf(v, "paramDocs")
+        let errors = do irIntListOf(v, "errors")
+        return IRStream{path: path, events: events, requires: requires, auth: auth, rate: rate, since: since, params: params, connects: connects, disconnect: disconnect, hello: hello, summary: summary, description: description, paramDocs: paramDocs, errors: errors}
 
     struct IRGraph:
         app: text
@@ -312,6 +451,7 @@ app IRGraphSelfHost:
         procs: [IRProc]
         jobs: [IRJob]
         daemons: [IRDaemon]
+        shareds: [IRShared]
         components: [IRComponent]
         services: [IRService]
         files: [IRFile]
@@ -392,7 +532,9 @@ app IRGraphSelfHost:
         let f_enum = do jTextListOf(v, "enum")
         let f_into = do jStr(v, "into")
         let f_null = do jBool(v, "nullable")
-        return IRWireField{name: f_name, type: f_type, list: f_list, optional: f_optional, ref: f_ref, default: f_default, description: f_desc, aliases: f_aliases, enum: f_enum, into: f_into, nullable: f_null}
+        let f_map = do jBool(v, "map")
+        let f_depth = do jNumG(v, "depth")
+        return IRWireField{name: f_name, type: f_type, list: f_list, optional: f_optional, ref: f_ref, default: f_default, description: f_desc, aliases: f_aliases, enum: f_enum, into: f_into, nullable: f_null, map: f_map, depth: f_depth}
 
     proc irJobFromJVal(v: JVal) -> IRJob:
         let f_name = do jStr(v, "name")
@@ -617,6 +759,16 @@ app IRGraphSelfHost:
             let d = do irDaemonFromJVal(dmv.vals[i])
             daemons = append(daemons, d)
             i = i + 1
+        let shv = do jGet(v, "shareds")
+        let mut shareds = []
+        i = 0
+        loop i < len(shv.vals):
+            let sv0 = shv.vals[i]
+            let sn = do jGet(sv0, "name")
+            let stt = do jGet(sv0, "type")
+            let sl = do jBool(sv0, "list")
+            shareds = append(shareds, IRShared{name: sn.s, type: stt.s, list: sl})
+            i = i + 1
         let cv = do jGet(v, "components")
         let mut components = []
         i = 0
@@ -659,7 +811,10 @@ app IRGraphSelfHost:
             let cp = do jStr(cnv, "path")
             let cr = do jStr(cnv, "rate")
             let cs = do jStr(cnv, "since")
-            contract = [IRContract{path: cp, rate: cr, since: cs}]
+            let ct = do jStr(cnv, "title")
+            let cdsc = do jStr(cnv, "description")
+            let cb = do jStr(cnv, "bearer")
+            contract = [IRContract{path: cp, rate: cr, since: cs, title: ct, description: cdsc, bearer: cb}]
         let smv = do jGet(v, "streams")
         let mut streams = []
         i = 0
@@ -702,7 +857,7 @@ app IRGraphSelfHost:
             i = i + 1
         let view = do irNodesFromJVal(v, "view")
         let depGraph = do jGet(v, "depGraph")
-        return IRGraph{app: app, auth: auth, entities: entities, records: records, structs: structs, enums: enums, types: types, messages: messages, states: states, derives: derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: daemons, components: components, services: services, files: files, webhooks: webhooks, apis: apis, contract: contract, streams: streams, triggers: triggers, theme: theme, themeDark: themeDark, themes: themes, css: css, assets: assets, routes: routes, pages: pages, bindings: bindings, view: view, depGraph: depGraph}
+        return IRGraph{app: app, auth: auth, entities: entities, records: records, structs: structs, enums: enums, types: types, messages: messages, states: states, derives: derives, policies: policies, actions: actions, procs: procs, jobs: jobs, daemons: daemons, shareds: shareds, components: components, services: services, files: files, webhooks: webhooks, apis: apis, contract: contract, streams: streams, triggers: triggers, theme: theme, themeDark: themeDark, themes: themes, css: css, assets: assets, routes: routes, pages: pages, bindings: bindings, view: view, depGraph: depGraph}
 
     # ── emitters ────────────────────────────────────────────────────────────
     proc irRecordFieldJSON(x: IRRecordField) -> text:
@@ -790,6 +945,10 @@ app IRGraphSelfHost:
             out = out + ",\"enum\":" + ej
         if x.nullable:
             out = out + ",\"nullable\":true"
+        if x.map:
+            out = out + ",\"map\":true"
+        if x.depth != 0:
+            out = out + ",\"depth\":" + x.depth
         if x.into != "":
             let q_into = do jsonQuote(x.into)
             out = out + ",\"into\":" + q_into
@@ -1179,6 +1338,21 @@ app IRGraphSelfHost:
                     out = out + ","
                 let j = do irDaemonJSON(g.daemons[i])
                 out = out + j
+                i = i + 1
+            out = out + "]"
+        if len(g.shareds) > 0:
+            out = out + ",\"shareds\":["
+            let mut i = 0
+            loop i < len(g.shareds):
+                if i > 0:
+                    out = out + ","
+                let sh = g.shareds[i]
+                let nq = do jsonQuote(sh.name)
+                let tq = do jsonQuote(sh.type)
+                out = out + "{\"name\":" + nq + ",\"type\":" + tq
+                if sh.list:
+                    out = out + ",\"list\":true"
+                out = out + "}"
                 i = i + 1
             out = out + "]"
         if len(g.components) > 0:

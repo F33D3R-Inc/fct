@@ -69,16 +69,13 @@ func TestParameterizedStreams(t *testing.T) {
 	defer ts.Close()
 	srv.Run("ada", "member", true, "seed", nil)
 
+	// The room stream declares no hello: the connect hook's reply is first.
 	a1, closeA1 := subscribe(t, ts, "/api/v2/rooms/1/events", "ada")
-	if f := next(t, a1); !strings.HasPrefix(f, "event: hello") {
-		t.Fatalf("first frame %q", f)
-	}
 	if f := next(t, a1); f != "event: viewers\ndata: {\"count\":1}" {
 		t.Fatalf("connect reply = %q", f)
 	}
 	// A second viewer in room 1: the first sees the count move.
 	c1, closeC1 := subscribe(t, ts, "/api/v2/rooms/1/events", "cy")
-	next(t, c1)
 	if f := next(t, c1); f != "event: viewers\ndata: {\"count\":2}" {
 		t.Fatalf("second connect reply = %q", f)
 	}
@@ -90,8 +87,7 @@ func TestParameterizedStreams(t *testing.T) {
 		t.Fatalf("leave broadcast = %q", f)
 	}
 	b2, closeB2 := subscribe(t, ts, "/api/v2/rooms/2/events", "bob")
-	next(t, b2)
-	next(t, b2)
+	next(t, b2) // its connect reply
 	none(t, a1) // bob joined room 2, not room 1
 
 	srv.Run("ada", "member", true, "say", []any{1, "hi room one"})

@@ -74,14 +74,14 @@ app FabricDaemonCases:
         let mut r = 0
         loop r < nr:
             let rule = s.keyspace.rules[r]
-            rules = append(rules, rule.kind + " / " + rule.addressPrefix + "* -> " + dcaKeyText(rule.key))
+            rules = append(rules, rule.kind + " / " + rule.prefix + "* -> " + dcaKeyText(rule.key))
             r = r + 1
         out = append(out, "rules=[" + dcaJoin(rules, ";") + "]")
         let mut fallback = "-"
         if s.keyspace.hasFallback:
-            fallback = dcaKeyText(s.keyspace.fallback)
+            fallback = dcaKeyText(s.keyspace.fallbackKey)
         out = append(out, "fallback=" + fallback)
-        let span = do daemonKeyspaceSpanningKey(s.keyspace)
+        let span = do keyspaceSpanningKey(s.keyspace)
         let mut spanText = "-"
         if span.has:
             spanText = dcaKeyText(span.key)
@@ -203,7 +203,7 @@ app FabricDaemonCases:
         if !resolved.ok:
             return "ERR\t" + resolved.err
         let t = do daemonFacetqlTelemetry(resolved.settings)
-        let sampled = do daemonTelemetrySample(t)
+        let sampled = do daemonTelemetrySample(t, 0)
         let mut notes = []
         let m = len(sampled.sample.noteIds)
         let mut j = 0
@@ -437,6 +437,59 @@ app FabricDaemonCases:
                 out = append(out, dcaConfigCase(lines[i], true))
             i = i + 1
         return dcaJoin(out, "\n")
+
+    # tests/mover.rs a_loaded_cell_crosses_the_pressure_threshold_from_real_
+    # facetql_stats, the daemon's half: the production poller over one real
+    # instance (baseline first), then a poll every 500 ms for up to `seconds`
+    # while the test loads it, keeping the hottest profile and stopping once
+    # one is hot; then the production optimizer's decision for it, over a
+    # topology that places the cell on that instance.
+    # `pressure|hot|cpu|queue|writeLatency|writeRatio|action`.
+    proc dcaLoadedCell(base: text, token: text, seconds: int) -> text uses io.net:
+        let shard = 9
+        let cell = Coordinate{x: 0, y: 0}
+        let endpoint = do fqlEndpointNew("loaded-instance", base, token)
+        let mut poller = do telemetryPollerNew([pollTargetNew(endpoint.v, shard, cell, "us-east")])
+        let baseline = do telemetryPollerPollOnce(poller)
+        poller = baseline.poller
+        let mut has = false
+        let mut hottest = workloadProfileFromMetrics(shard, cell, workloadMetricsDefault())
+        let deadline = monoMs() + seconds * 1000
+        let mut failures = 0
+        let mut going = true
+        loop going && monoMs() < deadline:
+            let slept = sleepMs(500)
+            let round = do telemetryPollerPollOnce(poller)
+            poller = round.poller
+            let n = len(round.outcomes)
+            let mut k = 0
+            loop k < n:
+                let o = round.outcomes[k]
+                if o.kind == "Failed":
+                    failures = failures + 1
+                if o.kind == "Sampled":
+                    let m = len(o.batch.samples)
+                    let mut j = 0
+                    loop j < m:
+                        let profile = do workloadProfileFromMetrics(shard, cell, telemetrySampleMetrics(o.batch.samples[j]))
+                        if !has || profile.pressureScore > hottest.pressureScore:
+                            hottest = profile
+                            has = true
+                        j = j + 1
+                k = k + 1
+            if has && workloadProfileIsHot(hottest):
+                going = false
+        if !has:
+            return "no sample (" + failures + " poll(s) refused)"
+        let placed = do topologyRegistryPlace(topologyRegistryNew(), "loaded-instance", shard, cell, "us-east")
+        let decision = do workloadOptimizerOptimizeFromTopology(workloadOptimizerDefault(), hottest, placed)
+        return "" + hottest.pressureScore + "|" + workloadProfileIsHot(hottest) + "|" + hottest.cpuUtilization + "|" + hottest.queueDepth + "|" + hottest.writeLatencyUs + "|" + hottest.writeRatio + "|" + decision.action.kind
+
+    state daemonLoadedOut: text = ""
+
+    action runDaemonLoadedCell(base: text, token: text, seconds: int):
+        let out = do dcaLoadedCell(base, token, seconds)
+        daemonLoadedOut = out
 
     state daemonCaseOut: text = ""
 

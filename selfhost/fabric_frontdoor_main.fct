@@ -1,0 +1,187 @@
+import "fabric_frontdoor.fct"
+
+# fabric_frontdoor_main.fct — the front door as a process:
+#
+#   FRONTDOOR_PORT=8890 FRONTDOOR_BACKENDS=db-a=http://127.0.0.1:8892 \
+#       facet exec selfhost/fabric_frontdoor_main.fct
+#
+# Point FACET_DATABASE_URL at it instead of at one FacetQL and nothing above
+# changes. Configuration, all from the environment:
+#
+#   FRONTDOOR_PORT        the port to serve on (required)
+#   FRONTDOOR_BACKENDS    `id=url,...` — every FacetQL instance (required)
+#   FRONTDOOR_PLACEMENTS  `shard=id[@region],...` — which instance holds each
+#                         shard's cell (0,0); default: shard 1 on the first
+#                         backend, the one-FacetQL deployment
+#   FRONTDOOR_KEYSPACE    `Kind|Prefix|shard,...` — the declared keyspace
+#                         rules (fabric-facetql's KeyspaceRule)
+#   FRONTDOOR_FALLBACK_SHARD  the shard an unmatched kind/address routes to;
+#                         default 1 when no rules are declared
+#                         (Keyspace::single), none otherwise
+#   FRONTDOOR_TRUST_FILE  a PEM file of extra roots (relative to the data
+#                         directory, FACET_DATA_DIR) to trust for https
+#                         backends behind a private CA
+#   FRONTDOOR_FENCE_RETRY_BUDGET_MS / FRONTDOOR_FENCE_RETRY_INTERVAL_MS /
+#   FRONTDOOR_UPSTREAM_TIMEOUT_MS  FrontDoorConfig's knobs (defaults 2000 /
+#                         50 / 35000)
+#
+# A configuration the door cannot serve (no backends, a URL that is not
+# http(s), a malformed list, a keyspace naming a shard nothing places) is
+# refused before the port is opened, exit status 2, saying why.
+app FabricFrontDoorMain:
+    struct FdmParsed:
+        ok: bool
+        err: text
+        config: FdConfig
+        fleet: FdFleet
+
+    proc fdmDigits(s: text) -> int:
+        let bs = textToBytes(trim(s))
+        if len(bs) == 0 || len(bs) > 9:
+            return -1
+        let mut v = 0
+        let mut i = 0
+        loop i < len(bs):
+            if bs[i] < 48 || bs[i] > 57:
+                return -1
+            v = v * 10 + bs[i] - 48
+            i = i + 1
+        return v
+
+    proc fdmItems(raw: text) -> [text]:
+        let mut out = []
+        if trim(raw) == "":
+            return out
+        let parts = split(raw, ",")
+        let mut i = 0
+        loop i < len(parts):
+            let p = trim(parts[i])
+            if p != "":
+                out = append(out, p)
+            i = i + 1
+        return out
+
+    proc fdmFail(msg: text) -> FdmParsed:
+        let config = do fdConfigDefault(0)
+        let empty = FdFleet{keyspace: PlanKeyspace{rules: [], hasFallback: false, fallbackKey: routingKeyUnset()}, routing: tableNew(), backends: []}
+        return FdmParsed{ok: false, err: msg, config: config, fleet: empty}
+
+    proc fdmKnob(name: text, fallback: int) -> int uses io.env:
+        let raw = envVar(name)
+        if trim(raw) == "":
+            return fallback
+        let v = do fdmDigits(raw)
+        return v
+
+    # fdmParse: the environment, read into the door's config and fleet.
+    proc fdmParse() -> FdmParsed uses io.env:
+        let port = do fdmDigits(envVar("FRONTDOOR_PORT"))
+        if port <= 0 || port > 65535:
+            let f = do fdmFail("FRONTDOOR_PORT must be a port number, got '" + envVar("FRONTDOOR_PORT") + "'")
+            return f
+        let mut backends = []
+        let bs = do fdmItems(envVar("FRONTDOOR_BACKENDS"))
+        let mut i = 0
+        loop i < len(bs):
+            let eq = do indexOf(bs[i], "=")
+            if eq <= 0:
+                let f = do fdmFail("FRONTDOOR_BACKENDS entry '" + bs[i] + "' is not id=url")
+                return f
+            let b = do fdBackendNew(trim(slice(bs[i], 0, eq)), slice(bs[i], eq + 1, len(bs[i])))
+            if !b.ok:
+                let f = do fdmFail(b.err)
+                return f
+            backends = append(backends, b.backend)
+            i = i + 1
+        if len(backends) == 0:
+            let f = do fdmFail("facetql endpoint misconfigured: a front door with no backends can serve nothing (set FRONTDOOR_BACKENDS)")
+            return f
+        let mut reg = do topologyRegistryNew()
+        let ps = do fdmItems(envVar("FRONTDOOR_PLACEMENTS"))
+        if len(ps) == 0:
+            reg = topologyRegistryPlace(reg, backends[0].id, 1, Coordinate{x: 0, y: 0}, "local")
+        let mut j = 0
+        loop j < len(ps):
+            let eq = do indexOf(ps[j], "=")
+            let mut shard = -1
+            if eq > 0:
+                shard = fdmDigits(slice(ps[j], 0, eq))
+            if shard <= 0:
+                let f = do fdmFail("FRONTDOOR_PLACEMENTS entry '" + ps[j] + "' is not shard=id[@region]")
+                return f
+            let mut node = trim(slice(ps[j], eq + 1, len(ps[j])))
+            let mut region = "local"
+            let at = do indexOf(node, "@")
+            if at >= 0:
+                region = slice(node, at + 1, len(node))
+                node = slice(node, 0, at)
+            reg = topologyRegistryPlace(reg, node, shard, Coordinate{x: 0, y: 0}, region)
+            j = j + 1
+        let routing = do tableApplyPlacements(tableNew(), reg)
+        let mut rules = []
+        let rs = do fdmItems(envVar("FRONTDOOR_KEYSPACE"))
+        let mut k = 0
+        loop k < len(rs):
+            let parts = split(rs[k], "|")
+            let mut shard = -1
+            if len(parts) == 3:
+                shard = fdmDigits(parts[2])
+            if shard <= 0:
+                let f = do fdmFail("FRONTDOOR_KEYSPACE entry '" + rs[k] + "' is not Kind|Prefix|shard")
+                return f
+            let status = do keyspaceAddRuleStatus(rules, trim(parts[0]), trim(parts[1]))
+            if status != 0:
+                let f = do fdmFail("FRONTDOOR_KEYSPACE entry '" + rs[k] + "' is refused: an empty kind or prefix, or one another rule already declares")
+                return f
+            rules = append(rules, RoutingRule{kind: trim(parts[0]), prefix: trim(parts[1]), key: RoutingKey{shardId: shard, coordinate: Coordinate{x: 0, y: 0}}})
+            k = k + 1
+        let mut fallback = -1
+        let fb = envVar("FRONTDOOR_FALLBACK_SHARD")
+        if trim(fb) != "":
+            fallback = fdmDigits(fb)
+            if fallback <= 0:
+                let f = do fdmFail("FRONTDOOR_FALLBACK_SHARD must be a shard id, got '" + fb + "'")
+                return f
+        else:
+            if len(rules) == 0:
+                fallback = 1
+        let mut fallbackKey = routingKeyUnset()
+        if fallback > 0:
+            fallbackKey = RoutingKey{shardId: fallback, coordinate: Coordinate{x: 0, y: 0}}
+        let ks = PlanKeyspace{rules: rules, hasFallback: fallback > 0, fallbackKey: fallbackKey}
+        let mut named = []
+        if fallback > 0:
+            named = append(named, fallback)
+        let mut r = 0
+        loop r < len(rules):
+            named = append(named, rules[r].key.shardId)
+            r = r + 1
+        let mut n = 0
+        loop n < len(named):
+            let found = do tableShardLookup(routing, named[n])
+            if !found.found:
+                let f = do fdmFail("the keyspace names shard " + named[n] + ", which FRONTDOOR_PLACEMENTS places nowhere")
+                return f
+            n = n + 1
+        let d = do fdConfigDefault(port)
+        let budget = do fdmKnob("FRONTDOOR_FENCE_RETRY_BUDGET_MS", d.fenceRetryBudgetMs)
+        let interval = do fdmKnob("FRONTDOOR_FENCE_RETRY_INTERVAL_MS", d.fenceRetryIntervalMs)
+        let upstream = do fdmKnob("FRONTDOOR_UPSTREAM_TIMEOUT_MS", d.upstreamTimeoutMs)
+        if budget < 0 || interval <= 0 || upstream <= 0:
+            let f = do fdmFail("a FRONTDOOR_*_MS setting is not a positive number of milliseconds")
+            return f
+        let fleet = do fdFleetNew(ks, backends, routing)
+        let config = FdConfig{readPref: d.readPref, fenceRetryBudgetMs: budget, fenceRetryIntervalMs: interval, upstreamTimeoutMs: upstream, maxBodyBytes: d.maxBodyBytes, port: port, trustFile: trim(envVar("FRONTDOOR_TRUST_FILE"))}
+        return FdmParsed{ok: true, err: "", config: config, fleet: fleet.fleet}
+
+    daemon FrontDoor uses io.net, io.net.listen, io.env, io.console:
+        let parsed = do fdmParse()
+        if !parsed.ok:
+            let w = writeStderr("fabric front door: " + parsed.err + "\n")
+            let e = exitProcess(2)
+        do fdInstall(parsed.config, parsed.fleet)
+        let l = listen(parsed.config.port)
+        let b = writeStdout("fabric front door serving on port " + parsed.config.port + " in front of " + len(parsed.fleet.backends) + " FacetQL instance(s)\n")
+        loop true:
+            let c = accept(l)
+            detach fdServeConn(c)

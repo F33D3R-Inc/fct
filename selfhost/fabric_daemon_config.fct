@@ -15,15 +15,12 @@ app FabricDaemonConfigSelfHost:
     # address is both validated and printed back on the admin port.
     #
     # Seams, stated: `Keyspace` / `KeyspaceRule` belong to fabric-facetql's
-    # front door; their port is fabric.fct's (the one the front door and the
-    # mover ports share, a RoutingKey packed into one int). The resolved
-    # keyspace is built with it — its KeyspaceRule::new / with_rule checks
-    # and KeyspaceError text — and kept beside it with each key's full u64
-    # shard id (DaemonKeyspace), because the admin port prints keys and a
-    # packed key cannot carry a shard id above u64::MAX / 156. Backend::new's
-    # URL check (the only one config.rs makes of it) is restated here.
-    # FrontDoorConfig is carried as the one field config.rs sets
-    # (read_preference); the rest are the front door's defaults.
+    # front door; their port is fabric.fct's (shared with the front door and
+    # mover ports), and the resolved keyspace is built with it — its
+    # KeyspaceRule::new / with_rule checks and KeyspaceError text.
+    # Backend::new's URL check (the only one config.rs makes of it) is
+    # restated here. FrontDoorConfig is carried as the one field config.rs
+    # sets (read_preference); the rest are the front door's defaults.
     #
     # u64 settings are held in an int's 64 bits (sjU64Text prints them).
     # Every name here is prefixed `dc` / `daemon` / `Daemon`.
@@ -533,67 +530,24 @@ app FabricDaemonConfigSelfHost:
 
     # ------------------------------------------------------------ the keyspace (front door seam)
 
-    struct DaemonKeyspaceRule:
-        kind: text
-        addressPrefix: text
-        key: RoutingKey
-
-    struct DaemonKeyspace:
-        rules: [DaemonKeyspaceRule]
-        hasFallback: bool
-        fallback: RoutingKey
-        packed: Keyspace
-
+    # A keyspace step: KeyspaceRule::new / with_rule's refusal in
+    # KeyspaceError's words, or the keyspace so far. dcKeyFor carries the
+    # resolved key in `key`.
     struct DaemonKeyspaceStep:
         ok: bool
         err: text
-        keyspace: DaemonKeyspace
-
-    proc daemonKeyspaceNew() -> DaemonKeyspace:
-        let key = RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}
-        return DaemonKeyspace{rules: [], hasFallback: false, fallback: key, packed: keyspaceNew()}
-
-    proc dcPack(key: RoutingKey) -> int:
-        let packed = do routingKeyPack(key.shardId, key.coordinate.x, key.coordinate.y)
-        return packed
-
-    # KeyspaceRule::new then Keyspace::with_rule, with KeyspaceError's
-    # Display on refusal.
-    proc daemonKeyspaceWithRule(ks: DaemonKeyspace, kind: text, addressPrefix: text, key: RoutingKey) -> DaemonKeyspaceStep:
-        let rule = do keyspaceRuleNew(kind, addressPrefix, dcPack(key))
-        if !rule.ok:
-            return DaemonKeyspaceStep{ok: false, err: keyspaceErrorDisplay(rule.err), keyspace: ks}
-        let added = do keyspaceWithRule(ks.packed, rule.rule)
-        if !added.ok:
-            return DaemonKeyspaceStep{ok: false, err: keyspaceErrorDisplay(added.err), keyspace: ks}
-        let mut out = ks
-        out.rules = append(ks.rules, DaemonKeyspaceRule{kind: kind, addressPrefix: addressPrefix, key: key})
-        out.packed = added.keyspace
-        return DaemonKeyspaceStep{ok: true, err: "", keyspace: out}
-
-    proc daemonKeyspaceWithFallback(ks: DaemonKeyspace, key: RoutingKey) -> DaemonKeyspace:
-        let mut out = ks
-        out.hasFallback = true
-        out.fallback = key
-        out.packed = keyspaceWithFallback(ks.packed, dcPack(key))
-        return out
-
-    struct DaemonKeyOption:
-        has: bool
+        keyspace: Keyspace
         key: RoutingKey
 
-    # Keyspace::spanning_key.
-    proc daemonKeyspaceSpanningKey(ks: DaemonKeyspace) -> DaemonKeyOption:
-        if !ks.hasFallback:
-            return DaemonKeyOption{has: false, key: ks.fallback}
-        let n = len(ks.rules)
-        let mut k = 0
-        loop k < n:
-            let r = ks.rules[k].key
-            if r.shardId != ks.fallback.shardId || r.coordinate.x != ks.fallback.coordinate.x || r.coordinate.y != ks.fallback.coordinate.y:
-                return DaemonKeyOption{has: false, key: ks.fallback}
-            k = k + 1
-        return DaemonKeyOption{has: true, key: ks.fallback}
+    # KeyspaceRule::new then Keyspace::with_rule (fabric.fct's port).
+    proc daemonKeyspaceWithRule(ks: Keyspace, kind: text, addressPrefix: text, key: RoutingKey) -> DaemonKeyspaceStep:
+        let rule = do keyspaceRuleNew(kind, addressPrefix, key)
+        if !rule.ok:
+            return DaemonKeyspaceStep{ok: false, err: keyspaceErrorDisplay(rule.err), keyspace: ks, key: key}
+        let added = do keyspaceWithRule(ks, rule.rule)
+        if !added.ok:
+            return DaemonKeyspaceStep{ok: false, err: keyspaceErrorDisplay(added.err), keyspace: ks, key: key}
+        return DaemonKeyspaceStep{ok: true, err: "", keyspace: added.keyspace, key: key}
 
     # ------------------------------------------------------------ what it becomes
 
@@ -610,7 +564,7 @@ app FabricDaemonConfigSelfHost:
         adminListen: DaemonAddr
         adminToken: text
         backends: [DaemonResolvedBackend]
-        keyspace: DaemonKeyspace
+        keyspace: Keyspace
         topology: TopologyRegistry
         readPreference: ReadPreference
         cadence: DaemonCadence
@@ -633,7 +587,7 @@ app FabricDaemonConfigSelfHost:
         let key = RoutingKey{shardId: 0, coordinate: Coordinate{x: 0, y: 0}}
         let topology = do topologyRegistryNew()
         let policy = do controllerPolicyDefault()
-        return DaemonSettings{dataListen: none, adminListen: none, adminToken: "", backends: [], keyspace: daemonKeyspaceNew(), topology: topology, readPreference: ReadPreference{kind: "Primary", region: ""}, cadence: DaemonCadence{livenessProbeMs: 0, telemetryPollMs: 0, controlCycleMs: 0}, policy: policy, silenceBudgetMs: 0, probeTimeoutMs: 0, placementCapacity: 0, hasPlacementStore: false, placementStore: "", drainMs: 0, decisionCooldownMs: 0}
+        return DaemonSettings{dataListen: none, adminListen: none, adminToken: "", backends: [], keyspace: keyspaceNew(), topology: topology, readPreference: ReadPreference{kind: "Primary", region: ""}, cadence: DaemonCadence{livenessProbeMs: 0, telemetryPollMs: 0, controlCycleMs: 0}, policy: policy, silenceBudgetMs: 0, probeTimeoutMs: 0, placementCapacity: 0, hasPlacementStore: false, placementStore: "", drainMs: 0, decisionCooldownMs: 0}
 
     # ConfigError::Invalid(reason) — its Display is the reason itself.
     proc dcInvalid(reason: text) -> DaemonSettingsResult:
@@ -683,23 +637,22 @@ app FabricDaemonConfigSelfHost:
     # addressable.
     proc dcKeyFor(h: DcHolders, cell: DaemonCellRef) -> DaemonKeyspaceStep:
         let key = RoutingKey{shardId: cell.shard, coordinate: Coordinate{x: cell.x, y: cell.y}}
-        let mut empty = do daemonKeyspaceNew()
-        empty.fallback = key
+        let empty = do keyspaceNew()
         let index = do dcCellIndex(cell)
         let held = do dcHolderOf(h, cell.shard, index)
         let shown = do daemonCellText(cell)
         if held < 0:
-            return DaemonKeyspaceStep{ok: false, err: "the keyspace routes to " + shown + ", which no backend declares a placement for: every request that resolved there would be misdirected", keyspace: empty}
+            return DaemonKeyspaceStep{ok: false, err: "the keyspace routes to " + shown + ", which no backend declares a placement for: every request that resolved there would be misdirected", keyspace: empty, key: key}
         let routed = do routingKeyNew(cell.shard, Coordinate{x: cell.x, y: cell.y})
         if !routed.ok:
             let why = do routingErrorMessage(routed.err)
             let shard = do sjU64Text(cell.shard)
-            return DaemonKeyspaceStep{ok: false, err: "cell shard " + shard + " (" + cell.x + "," + cell.y + ") is not addressable: " + why, keyspace: empty}
-        return DaemonKeyspaceStep{ok: true, err: "", keyspace: empty}
+            return DaemonKeyspaceStep{ok: false, err: "cell shard " + shard + " (" + cell.x + "," + cell.y + ") is not addressable: " + why, keyspace: empty, key: key}
+        return DaemonKeyspaceStep{ok: true, err: "", keyspace: empty, key: key}
 
     # resolve_keyspace.
     proc dcResolveKeyspace(file: DaemonKeyspaceFile, h: DcHolders) -> DaemonKeyspaceStep:
-        let mut ks = do daemonKeyspaceNew()
+        let mut ks = do keyspaceNew()
         let n = len(file.rules)
         let mut k = 0
         loop k < n:
@@ -708,7 +661,7 @@ app FabricDaemonConfigSelfHost:
             let placed = do dcKeyFor(h, cell)
             if !placed.ok:
                 return placed
-            let step = do daemonKeyspaceWithRule(ks, rule.kind, rule.addressPrefix, placed.keyspace.fallback)
+            let step = do daemonKeyspaceWithRule(ks, rule.kind, rule.addressPrefix, placed.key)
             if !step.ok:
                 return step
             ks = step.keyspace
@@ -717,10 +670,10 @@ app FabricDaemonConfigSelfHost:
             let fb = do dcKeyFor(h, file.fallback)
             if !fb.ok:
                 return fb
-            ks = daemonKeyspaceWithFallback(ks, fb.keyspace.fallback)
+            ks = keyspaceWithFallback(ks, fb.key)
         if n == 0 && !file.hasFallback:
-            return DaemonKeyspaceStep{ok: false, err: "the keyspace declares no rules and no fallback, so no request has a route: declare a fallback for the single-instance case", keyspace: ks}
-        return DaemonKeyspaceStep{ok: true, err: "", keyspace: ks}
+            return DaemonKeyspaceStep{ok: false, err: "the keyspace declares no rules and no fallback, so no request has a route: declare a fallback for the single-instance case", keyspace: ks, key: routingKeyUnset()}
+        return DaemonKeyspaceStep{ok: true, err: "", keyspace: ks, key: routingKeyUnset()}
 
     # Settings::resolve: every check, in config.rs's order.
     proc daemonResolveSettings(file: DaemonConfigFile, env: DaemonEnv) -> DaemonSettingsResult:
@@ -948,11 +901,11 @@ app FabricDaemonConfigSelfHost:
             let rule = s.keyspace.rules[r]
             if r > 0:
                 rules = rules + ", "
-            rules = rules + "KeyspaceRule { kind: " + sjDebugStr(rule.kind) + ", address_prefix: " + sjDebugStr(rule.addressPrefix) + ", key: " + dcDebugKey(rule.key) + " }"
+            rules = rules + "KeyspaceRule { kind: " + sjDebugStr(rule.kind) + ", address_prefix: " + sjDebugStr(rule.prefix) + ", key: " + dcDebugKey(rule.key) + " }"
             r = r + 1
         let mut fallback = "None"
         if s.keyspace.hasFallback:
-            fallback = "Some(" + dcDebugKey(s.keyspace.fallback) + ")"
+            fallback = "Some(" + dcDebugKey(s.keyspace.fallbackKey) + ")"
         let placements = do topologyRegistryPlacements(s.topology)
         let mut topo = ""
         let np = len(placements)

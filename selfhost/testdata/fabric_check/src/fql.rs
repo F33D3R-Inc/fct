@@ -655,6 +655,28 @@ pub fn run(mode: &str) {
                 .unwrap();
             rt.block_on(mover_copy(&args[2], &args[3], &args[4]));
         }
+        // `fql-tls <base_url> <token> [ca.pem]`: one GET /stats through a
+        // reqwest client that trusts ca.pem besides its own roots, as
+        // `OK <node_count>` or the error line.
+        "fql-tls" => {
+            let args: Vec<String> = std::env::args().collect();
+            let mut builder = reqwest::Client::builder();
+            if let Some(ca) = args.get(4) {
+                let pem = std::fs::read(ca).expect("ca file");
+                builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem).expect("ca pem"));
+            }
+            let http = builder.build().expect("client");
+            let endpoint = FacetqlEndpoint::new(DbmsId::new("db-tls"), args[2].as_str(), args[3].as_str()).unwrap();
+            let client = FacetqlClient::with_http(endpoint, http);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            match rt.block_on(client.stats()) {
+                Ok(stats) => println!("OK {}", stats.node_count),
+                Err(e) => println!("{}", err_line(&e)),
+            }
+        }
         "fql-trace" => {
             let args: Vec<String> = std::env::args().collect();
             let rt = tokio::runtime::Builder::new_current_thread()

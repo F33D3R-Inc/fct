@@ -21,10 +21,18 @@ app FabricReplicationCheck:
             return s
         return t + "#" + s
 
+    # Rust's `Option<u64> as i64` digest: the bit pattern, -1 for None.
+    proc lbBits(has: bool, v: int) -> text:
+        if !has:
+            return "-1"
+        return "" + v
+
     proc lbRec(r: ReplRecord) -> text:
         let role = do replRoleLabel(r.isPrimary)
         let st = do replStateLabel(r.state)
-        return r.node + ":" + r.region + ":" + role + ":" + st + ":" + r.pendingWrites + ":" + r.applyLagMs + ":" + r.lastReportMs + ":" + r.unreachableSinceMs
+        let lr = do lbBits(r.hasLastReport, r.lastReportMs)
+        let us = do lbBits(r.hasUnreachableSince, r.unreachableSinceMs)
+        return r.node + ":" + r.region + ":" + role + ":" + st + ":" + u64Text(r.pendingWrites) + ":" + u64Text(r.applyLagMs) + ":" + lr + ":" + us
 
     proc lbNodes(rs: [ReplRecord]) -> text:
         let mut xs = []
@@ -62,7 +70,7 @@ app FabricReplicationCheck:
         let rfj = do lbNodes(rf)
         let rsj = do lbNodes(rs)
         let secj = do lbNodes(sec)
-        return "" + g.shardId + ":" + g.desiredFactor + "|" + rj + "|" + eff + ":" + n + ":" + empty + ":" + under + ":" + risk + "|" + pn + "|" + wn + "|" + rfj + "|" + rsj + "|" + secj
+        return u64Text(g.shardId) + ":" + g.desiredFactor + "|" + rj + "|" + eff + ":" + n + ":" + empty + ":" + under + ":" + risk + "|" + pn + "|" + wn + "|" + rfj + "|" + rsj + "|" + secj
 
     proc lbRes(r: ReplOpResult) -> text:
         if !r.ok:
@@ -76,7 +84,7 @@ app FabricReplicationCheck:
         let mut at = -1
         if t.hasAtMs:
             at = t.atMs
-        return "ok:t:" + t.shardId + ":" + t.node + ":" + f + ">" + to + "@" + at
+        return "ok:t:" + u64Text(t.shardId) + ":" + t.node + ":" + f + ">" + to + "@" + at
 
     struct LbStep:
         kind: text
@@ -402,7 +410,8 @@ app FabricReplicationCheck:
             if c.ineligibility.has:
                 let d = do replIneligibilityDisplay(c.ineligibility)
                 inel = d
-            cs = append(cs, c.node + ":" + c.region + ":" + st + ":" + c.pendingWrites + ":" + c.applyLagMs + ":" + c.silenceMs + ":" + el + ":" + inel)
+            let sil = do lbBits(c.hasSilence, c.silenceMs)
+            cs = append(cs, c.node + ":" + c.region + ":" + st + ":" + u64Text(c.pendingWrites) + ":" + u64Text(c.applyLagMs) + ":" + sil + ":" + el + ":" + inel)
             i = i + 1
         let cj = do lbJoin(cs, ";")
         let mut bl = []
@@ -427,7 +436,8 @@ app FabricReplicationCheck:
         if promo.has:
             pr = promo.op.node
         let stuck = do replFailoverIsStuck(a)
-        return "" + a.shardId + ":" + a.assessedAtMs + "|" + pn + ":" + ps + ":" + a.primarySilenceMs + "|" + a.primaryNeedsReplacement + "|" + cj + "|" + bj + "|" + bn + "|" + pr + "|" + stuck
+        let psil = do lbBits(a.hasPrimarySilence, a.primarySilenceMs)
+        return u64Text(a.shardId) + ":" + u64Text(a.assessedAtMs) + "|" + pn + ":" + ps + ":" + psil + "|" + a.primaryNeedsReplacement + "|" + cj + "|" + bj + "|" + bn + "|" + pr + "|" + stuck
 
     proc lbHealthyPair() -> ReplGroup:
         let th = do lagThresholdsDefault()
@@ -472,7 +482,10 @@ app FabricReplicationCheck:
         loop i < len(g.replicas):
             let r = g.replicas[i]
             let code = do lbStateCode(r.state)
-            entries = append(entries, ReplicaEntry{node: r.node, isPrimary: r.isPrimary, state: code, pendingWrites: r.pendingWrites, applyLagMs: r.applyLagMs, lastReportMs: r.lastReportMs})
+            let mut lastReport = -1
+            if r.hasLastReport:
+                lastReport = r.lastReportMs
+            entries = append(entries, ReplicaEntry{node: r.node, isPrimary: r.isPrimary, state: code, pendingWrites: r.pendingWrites, applyLagMs: r.applyLagMs, lastReportMs: lastReport})
             i = i + 1
         let fp = FailoverPolicy{primarySilenceBudgetMs: pol.primarySilenceMs, maxCandidateSilenceMs: pol.maxCandidateSilenceMs, maxPromotionPendingWrites: pol.maxPromotionPendingWrites, maxPromotionApplyLagMs: pol.maxPromotionApplyLagMs}
         let blocker = do failoverBlockerCode(entries, now, fp)
@@ -594,6 +607,78 @@ app FabricReplicationCheck:
         t = do lbPush(t, t3)
         return t + "@@" + lg
 
+    # Shard ids, report clocks, lag and policy budgets past i64::MAX
+    # (u64div_rust.tsv's bigReplication).
+    proc lbBigReplication() -> text:
+        let big = u64Parse("9223372036854775808")
+        let max = u64Parse("18446744073709551615")
+        let th = do lagThresholdsDefault()
+        let mut t = ""
+        let g0 = do replGroupBootstrap(big + 7, 3, "db-a", "r")
+        let o1 = do replOpAdd("db-b", "r")
+        let g1 = do replGroupApply(g0, o1)
+        let o2 = do replOpBeginSeed("db-b")
+        let g2 = do replGroupApply(g1.group, o2)
+        let o3 = do replOpMarkInSync("db-b")
+        let g3 = do replGroupApply(g2.group, o3)
+        let mut g = g3.group
+        let r1 = do replReportNew(5, "db-b", 1, 0, 0)
+        let x1 = do replGroupObserve(g, r1, th)
+        let s1 = do lbRes(x1)
+        t = do lbPush(t, s1)
+        let x2 = do replGroupApply(g, o1)
+        let s2 = do lbRes(x2)
+        t = do lbPush(t, s2)
+        let reports = [replReportNew(big + 7, "db-b", big + 10, big, 1), replReportNew(big + 7, "db-b", 5, 0, 0), replReportNew(big + 7, "db-b", big + 20, 3, big), replReportNew(big + 7, "db-b", big + 30, 0, 0), replReportUnreachable(big + 7, "db-a", big + 40), replReportUnreachable(big + 7, "db-a", max)]
+        let mut i = 0
+        loop i < len(reports):
+            let x = do replGroupObserve(g, reports[i], th)
+            let sx = do lbRes(x)
+            t = do lbPush(t, sx)
+            g = x.group
+            i = i + 1
+        let sd = do lbSet(g)
+        t = do lbPush(t, sd)
+        let b = do replGroupGet(g, "db-b")
+        let sa = do replRecordSilence(b.record, max)
+        let sb = do replRecordSilence(b.record, 3)
+        let mut fa = "None"
+        if sa.has:
+            fa = "Some(" + u64Text(sa.ms) + ")"
+        let mut fb = "None"
+        if sb.has:
+            fb = "Some(" + u64Text(sb.ms) + ")"
+        t = do lbPush(t, fa + ":" + fb)
+        let pol = ReplFailoverPolicy{primarySilenceMs: big, maxPromotionPendingWrites: big + 1, maxPromotionApplyLagMs: max, maxCandidateSilenceMs: big}
+        let a1 = do replFailoverEvaluate(g, max, pol)
+        let t1 = do lbAssess(a1)
+        t = do lbPush(t, t1)
+        let a2 = do replFailoverEvaluate(g, big + 31, pol)
+        let t2 = do lbAssess(a2)
+        t = do lbPush(t, t2)
+        let wideTh = LagThresholds{laggingPendingWrites: max, laggingApplyLagMs: max, unreachableGraceMs: 1}
+        let mut k = do replGroupBootstrap(9, 3, "p", "r")
+        let names = ["s1", "s2", "s3"]
+        let pend = [big + 2, 4, big]
+        let mut j = 0
+        loop j < 3:
+            let ao = do replOpAdd(names[j], "r")
+            let ar = do replGroupApply(k, ao)
+            let so = do replOpBeginSeed(names[j])
+            let sr = do replGroupApply(ar.group, so)
+            let yo = do replOpMarkInSync(names[j])
+            let yr = do replGroupApply(sr.group, yo)
+            let rep = do replReportNew(9, names[j], 10, pend[j], 0)
+            let ob = do replGroupObserve(yr.group, rep, wideTh)
+            k = ob.group
+            j = j + 1
+        k = do lbFail(k, "p")
+        let wide = ReplFailoverPolicy{primarySilenceMs: 30000, maxPromotionPendingWrites: max, maxPromotionApplyLagMs: max, maxCandidateSilenceMs: 30000}
+        let a3 = do replFailoverEvaluate(k, 20, wide)
+        let t3 = do lbAssess(a3)
+        t = do lbPush(t, t3)
+        return t
+
     proc lbFailoverPart(k: int) -> text:
         let all = do lbFailover()
         let parts = split(all, "@@")
@@ -608,6 +693,7 @@ app FabricReplicationCheck:
     state replPlacement: text = ""
     state replFailover: text = ""
     state replFailoverLegacy: text = ""
+    state bigReplication: text = ""
 
     action runReplicationCheck():
         let a = do lbReplica()
@@ -619,6 +705,7 @@ app FabricReplicationCheck:
         let g = do lbPlacement()
         let h = do lbFailoverPart(0)
         let hl = do lbFailoverPart(1)
+        let big = do lbBigReplication()
         replReplica = a
         replSetSeedBeforeServe = b
         replSetPromoteSwap = c
@@ -628,3 +715,4 @@ app FabricReplicationCheck:
         replPlacement = g
         replFailover = h
         replFailoverLegacy = hl
+        bigReplication = big

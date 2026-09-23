@@ -264,13 +264,13 @@ app CheckSelfHost:
     # restated with -1 as its "not a pure builtin" second return.
     # ============================================================
     proc pureBuiltinArity(name: text) -> int:
-        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits"]:
+        if name in ["abs", "floor", "round", "money", "len", "upper", "lower", "trim", "year", "month", "day", "ago", "compact", "commas", "iso", "fromIso", "first", "fromJson", "bytes", "toFloat", "toInt", "toMoney", "slug", "textToBytes", "bytesToText", "byteLen", "floatBits", "floatFromBits", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat"]:
             return 1
         if name == "print":
             return 1
         if name == "append":
             return 2
-        if name in ["min", "max", "contains", "take", "split", "join", "charAt"]:
+        if name in ["min", "max", "contains", "take", "split", "join", "charAt", "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem"]:
             return 2
         if name in ["slice", "replace", "aesGcmSeal", "aesGcmOpen", "aesGcmAuthentic"]:
             return 3
@@ -373,7 +373,7 @@ app CheckSelfHost:
             if argc != 1:
                 return "rand(n) takes exactly one argument (an exclusive upper bound)"
             return ""
-        if name == "readFile" || name == "httpGet" || name == "fileExists" || name == "fileSize" || name == "syncFile" || name == "removeFile" || name == "listen" || name == "accept" || name == "closeConn" || name == "connError" || name == "connOpen" || name == "shutdownConn" || name == "writeStdout" || name == "writeStderr" || name == "envVar" || name == "envSet" || name == "randomBytes":
+        if name == "readFile" || name == "httpGet" || name == "fileExists" || name == "fileSize" || name == "syncFile" || name == "removeFile" || name == "listen" || name == "accept" || name == "closeListener" || name == "listenError" || name == "grantRead" || name == "closeConn" || name == "connError" || name == "connPeer" || name == "connOpen" || name == "shutdownConn" || name == "writeStdout" || name == "writeStderr" || name == "envVar" || name == "envSet" || name == "randomBytes":
             if argc != 1:
                 return name + "(...) takes exactly one argument"
             return ""
@@ -397,9 +397,25 @@ app CheckSelfHost:
             if argc != 1:
                 return "sleepMs(ms) takes exactly one argument (milliseconds, 0-600000)"
             return ""
-        if name == "monoMs" || name == "nowMs" || name == "signals":
+        if name == "monoMs" || name == "nowMs" || name == "signals" || name == "processStats":
             if argc != 0:
                 return name + "() takes no arguments"
+            return ""
+        if name == "closeChannel" || name == "exitProcess":
+            if argc != 1:
+                return name + "(...) takes exactly one argument"
+            return ""
+        if name == "awaitAny":
+            if argc != 2:
+                return "awaitAny(chans, ms) takes exactly two arguments: a list of channel handles and a wait in milliseconds (negative: no limit)"
+            return ""
+        if name == "connectTls":
+            if argc != 4:
+                return "connectTls(host, port, serverName, trustFile) takes exactly four arguments: a host, a port, the name the certificate must carry (\"\": the host) and a PEM file of extra trusted roots (\"\": the system's only)"
+            return ""
+        if name == "listenTls":
+            if argc != 3:
+                return "listenTls(port, identity, password) takes exactly three arguments: a port, a PKCS#12 identity file and its password"
             return ""
         if name == "given":
             # given(p): one of the action's own parameters, by name.
@@ -576,16 +592,18 @@ app CheckSelfHost:
     # false, the only way check() ever calls it).
     # ============================================================
     proc ioCapability(name: text) -> text:
-        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile":
+        if name == "readFile" || name == "writeFile" || name == "appendFile" || name == "fileExists" || name == "truncateFile" || name == "fileSize" || name == "readFileAt" || name == "writeFileAt" || name == "syncFile" || name == "renameFile" || name == "removeFile" || name == "grantRead":
             return "io.file"
-        if name == "httpGet" || name == "httpPost" || name == "connect":
+        if name == "closeListener" || name == "listenError":
+            return "io.net.listen"
+        if name == "httpGet" || name == "httpPost" || name == "connect" || name == "connectTls":
             return "io.net"
-        if name == "writeStdout" || name == "writeStderr" || name == "readStdin" || name == "signals":
+        if name == "writeStdout" || name == "writeStderr" || name == "readStdin" || name == "signals" || name == "exitProcess" || name == "processStats":
             return "io.console"
         if name == "envVar" || name == "envSet":
             return "io.env"
         # netConnCap's builtins, named by the capability a proc declares.
-        if name == "readBytes" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "connError" || name == "pollBytes" || name == "connOpen" || name == "shutdownConn":
+        if name == "readBytes" || name == "writeBytes" || name == "closeConn" || name == "setTimeoutMs" || name == "connError" || name == "connPeer" || name == "pollBytes" || name == "connOpen" || name == "shutdownConn":
             return "io.net"
         return ""
 
@@ -610,11 +628,11 @@ app CheckSelfHost:
                     return n.text + "(...) is only available inside a proc that declares `uses " + capName + "` — it is a real I/O effect, and only a proc is unconditionally server-executed with no client mirror to disagree with it"
             return ""
         if rule == "concurrency":
-            if n.kind == "call" && (n.text == "channel" || n.text == "send" || n.text == "recv" || n.text == "sleepMs" || n.text == "monoMs" || n.text == "nowMs" || n.text == "signals"):
+            if n.kind == "call" && (n.text == "channel" || n.text == "send" || n.text == "recv" || n.text == "sleepMs" || n.text == "monoMs" || n.text == "nowMs" || n.text == "signals" || n.text == "awaitAny" || n.text == "closeChannel"):
                 return n.text + "(...) is only available inside a proc body — it is real, blocking concurrency machinery, and only a proc is unconditionally server-executed with no client mirror to disagree with it"
             return ""
         if rule == "daemon":
-            if n.kind == "call" && (n.text == "listen" || n.text == "listenOn" || n.text == "accept"):
+            if n.kind == "call" && (n.text == "listen" || n.text == "listenOn" || n.text == "listenTls" || n.text == "accept"):
                 return n.text + "(...) is only available inside a daemon body — it can block indefinitely, and only a daemon runs detached from every request's lock (see `daemon Name uses io.net.listen:`)"
             return ""
         return ""

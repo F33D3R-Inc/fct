@@ -8,11 +8,14 @@ package selfhost
 // HTTP server.
 
 import (
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -214,7 +217,8 @@ func TestHTTPClientFramingEdges(t *testing.T) {
 	}
 }
 
-// TestHTTPClientTransportFailuresAreValues: refused, deadline, https.
+// TestHTTPClientTransportFailuresAreValues: refused (plain and TLS),
+// deadline.
 func TestHTTPClientTransportFailuresAreValues(t *testing.T) {
 	ts := httpcApp(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -240,9 +244,9 @@ func TestHTTPClientTransportFailuresAreValues(t *testing.T) {
 		t.Fatalf("deadline: %q", out)
 	}
 
-	out = httpcCall(t, ts, "httpRun", "GET", "https://127.0.0.1:1/", "", "", 0)
-	if out != "ERR|https is not supported: the fct runtime has no TLS primitive" {
-		t.Fatalf("https: %q", out)
+	out = httpcCall(t, ts, "httpRun", "GET", "https://"+dead+"/", "", "", 0)
+	if !strings.HasPrefix(out, "ERR|connectTls "+dead+": ") || !strings.Contains(out, "refused") {
+		t.Fatalf("https refused: %q", out)
 	}
 }
 
@@ -284,5 +288,36 @@ func TestHTTPClientStreamPumpsAsDataArrives(t *testing.T) {
 	got = httpcCall(t, ts, "httpStreamRun", cut+"/", 50, 20)
 	if got != "200|[hello]|true|connection closed before the body was complete" {
 		t.Fatalf("cut: %q", got)
+	}
+}
+
+// TestHTTPClientSpeaksHTTPS: https through connectTls against Go's TLS
+// server — a verified exchange (a chunked body, the Host header without the
+// default port rule tripping), a stream over TLS, and the untrusted chain
+// refused as a transport failure.
+func TestHTTPClientSpeaksHTTPS(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f := w.(http.Flusher)
+		fmt.Fprintf(w, "tls %s %s ", r.Host, r.Proto)
+		f.Flush()
+		fmt.Fprint(w, "done")
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	t.Setenv("FACET_DATA_DIR", dir)
+	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw})
+	if err := os.WriteFile(filepath.Join(dir, "ca.pem"), ca, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ts := httpcApp(t)
+	host := upstream.Listener.Addr().String()
+
+	got := httpcCall(t, ts, "httpRunTrust", upstream.URL+"/x", "ca.pem")
+	if !strings.HasPrefix(got, "200|OK|") || !strings.Contains(got, "transfer-encoding=chunked") || !strings.HasSuffix(got, "|tls "+host+" HTTP/1.1 done") {
+		t.Fatalf("https: %q", got)
+	}
+	got = httpcCall(t, ts, "httpRunTrust", upstream.URL+"/x", "")
+	if got != "ERR|connectTls "+host+": tls: failed to verify certificate: x509: certificate signed by unknown authority" {
+		t.Fatalf("untrusted: %q", got)
 	}
 }

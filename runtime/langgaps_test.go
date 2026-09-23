@@ -449,11 +449,23 @@ func TestNullableWireFields(t *testing.T) {
 		}
 	}
 	sch, _ := json.Marshal(buildContract(g, 0)["components"].(map[string]any)["schemas"].(map[string]any)["D"])
-	if !strings.Contains(string(sch), `"a":{"oneOf":[{"type":"string"},{"type":"null"}]}`) || !strings.Contains(string(sch), `"required":["a","c"]`) {
+	if !strings.Contains(string(sch), `"a":{"type":["string","null"]}`) || !strings.Contains(string(sch), `"required":["a","c"]`) || !strings.Contains(string(sch), `"additionalProperties":false`) {
 		t.Fatalf("schema = %s", sch)
 	}
-	if _, err := compile.String(strings.Replace(src, "c: text or null", "c: text? or null", 1)); err == nil {
-		t.Fatal("`T? or null` should be refused")
+	// `T? or null`: left out when empty, typed maybe-null where present.
+	g2, err := compile.String(strings.Replace(src, "c: text or null", "c: text? or null", 1))
+	if err != nil {
+		t.Fatalf("`T? or null`: %v", err)
+	}
+	srv2, _ := NewInMemory(g2)
+	defer srv2.Shutdown()
+	v, _ := srv2.RunValue("ada", "member", true, "d", []any{""})
+	if raw, _ := json.Marshal(v); string(raw) != `{"a":null}` {
+		t.Errorf("an empty `T? or null` field is left out: %s", raw)
+	}
+	sch2, _ := json.Marshal(buildContract(g2, 0)["components"].(map[string]any)["schemas"].(map[string]any)["D"])
+	if !strings.Contains(string(sch2), `"c":{"type":["string","null"]}`) || !strings.Contains(string(sch2), `"required":["a"]`) {
+		t.Fatalf("`T? or null` schema = %s", sch2)
 	}
 }
 

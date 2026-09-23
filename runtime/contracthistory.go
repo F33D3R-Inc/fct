@@ -132,9 +132,7 @@ func (s *Server) contractRoute(h http.HandlerFunc) http.HandlerFunc {
 			apiError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if lim := s.rateClass(s.ir.Contract.Rate); lim != nil && !lim.allow(clientIP(r)) {
-			w.Header().Set("Retry-After", "60")
-			apiError(w, http.StatusTooManyRequests, "rate limited")
+		if !s.meterRate(w, r, s.ir.Contract.Rate) {
 			return
 		}
 		h(w, r)
@@ -321,24 +319,29 @@ func contractSchemas() map[string]any {
 // contractOperations are the contract routes' entries in paths.
 func contractOperations(c *ir.ContractRoute, errResp func(string) map[string]any) map[string]map[string]any {
 	ok := func(schema string) map[string]any {
-		return map[string]any{"description": "OK", "content": map[string]any{"application/json": map[string]any{"schema": ref(schema)}}}
+		return map[string]any{"description": "OK", "content": map[string]any{"application/json": map[string]any{"schema": nullable(ref(schema))}}}
 	}
 	op := func(path, summary, schema string, params []map[string]any, errs map[int]string) map[string]any {
-		responses := map[string]any{"200": ok(schema), "304": map[string]any{"description": "Not Modified"}}
+		responses := map[string]any{"200": ok(schema)}
+		if path == c.Path {
+			// The document names its own If-None-Match parameter, so its 304
+			// is part of its answer; every other GET's is the documented
+			// conditional-GET convention.
+			responses["304"] = map[string]any{"description": "Not Modified"}
+		}
 		for code, desc := range errs {
 			responses[itoa(code)] = errResp(desc)
+		}
+		if params == nil {
+			params = []map[string]any{}
 		}
 		o := map[string]any{
 			"operationId": operationIDFor(http.MethodGet, path), "summary": summary,
 			"x-auth": "none", "x-since": c.Since, "x-conditional-get": true,
-			"security": []map[string]any{}, "responses": responses,
-		}
-		if len(params) > 0 {
-			o["parameters"] = params
+			"security": []map[string]any{}, "responses": responses, "parameters": params,
 		}
 		if c.Rate != "" {
 			o["x-rate-limit"] = rateLimitDoc(c.Rate)
-			responses["429"] = errResp("Too Many Requests")
 		}
 		return o
 	}

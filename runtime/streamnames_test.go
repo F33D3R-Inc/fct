@@ -24,6 +24,7 @@ const namedStreamApp = `app S:
     policy member:
         actor != "guest"
     stream "/api/v2/events" requires member rate read since "2026-09-18":
+        hello since "2026-09-13"
         post_deleted: WorkRemoved since "2026-09-06" "A work was deleted; remove it from every screen."
         work_removed: WorkRemoved since "2026-09-13" "A watched work is gone."
         notify: Notify since "2026-09-06" "The unread notification count changed."
@@ -112,6 +113,9 @@ func TestNamedStreamEvents(t *testing.T) {
 	for _, e := range events {
 		ev := e.(map[string]any)
 		names = append(names, ev["name"].(string))
+		if ev["name"] == "hello" && ev["x-since"] != "2026-09-13" {
+			t.Fatalf("hello is documented since its own `hello since` date, not the stream's: %v", ev)
+		}
 		if ev["stream"] != "/api/v2/events" || ev["x-since"] == "" || ev["summary"] == "" || ev["auth"] != nil {
 			t.Fatalf("stream event entry = %v", ev)
 		}

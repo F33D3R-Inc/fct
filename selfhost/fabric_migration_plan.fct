@@ -23,7 +23,7 @@ app FabricMigrationPlanSelfHost:
 
     # migrationIdLabel: MigrationId's Display impl, `"migration-{}"`.
     proc migrationIdLabel(id: MigrationId) -> text:
-        return "migration-" + id.value
+        return "migration-" + u64Text(id.value)
 
     # MigrationReason: recorded, never acted on by this crate (the crate doc
     # says so directly), so — like MigrationPlan — only the one real method
@@ -89,10 +89,10 @@ app FabricMigrationPlanSelfHost:
     proc migrationProgressCopyFraction(progress: MigrationProgress) -> float:
         if progress.atomsTotal == 0:
             return 1.0
-        return toFloat(progress.atomsCopied) / toFloat(progress.atomsTotal)
+        return u64ToFloat(progress.atomsCopied) / u64ToFloat(progress.atomsTotal)
 
     proc migrationProgressIsCopyComplete(progress: MigrationProgress) -> bool:
-        return progress.atomsCopied >= progress.atomsTotal
+        return u64Cmp(progress.atomsCopied, progress.atomsTotal) >= 0
 
     # migrationProgressOverallFraction: `overall_fraction` restated arm for
     # arm — `phase` is the 0..7 int convention documented above, NOT a type
@@ -116,8 +116,7 @@ app FabricMigrationPlanSelfHost:
     # migrationProgressPhaseAgeMs: `phase_age_ms`'s `saturating_sub` — never
     # negative even if `now_ms` is (wrongly) earlier than the phase start.
     proc migrationProgressPhaseAgeMs(progress: MigrationProgress, nowMs: int) -> int:
-        let age = nowMs - progress.phaseStartedAtMs
-        return max(age, 0)
+        return u64SatSub(nowMs, progress.phaseStartedAtMs)
 
     # ============================================================
     # migration.rs — the stateful `Migration` (plan + phase + progress +
@@ -132,8 +131,11 @@ app FabricMigrationPlanSelfHost:
     # Phases are fabric.fct's ints (0=Planned 1=Copying 2=CatchingUp
     # 3=Cutover 4=Cleanup 5=Completed 6=Aborted 7=Failed) and its
     # phaseCanAdvanceTo / phaseIsTerminal / phaseAllowsAbort / phaseIsFenced
-    # are reused, not restated. `Option<WriteSeq>` / `Option<u64>` fields
-    # are `-1` when None (every real value is a u64 >= 0).
+    # are reused, not restated. A Rust u64 (ids, write sequences, counts,
+    # clocks) is an int's 64-bit pattern, compared, maxed, subtracted and
+    # displayed with the u64 builtins (runtime/u64.go); so every u64 value
+    # is a legal int, and an `Option<u64>` is a `hasX` flag beside its value
+    # (the value's content is meaningless when the flag is false).
     # ============================================================
 
     proc migrationPhaseLabel(phase: int) -> text:
@@ -155,7 +157,7 @@ app FabricMigrationPlanSelfHost:
 
     # `impl Display for WriteSeq`: "#{n}".
     proc migrationWriteSeqLabel(seq: int) -> text:
-        return "#" + seq
+        return "#" + u64Text(seq)
 
     struct PhaseTransition:
         fromPhase: int
@@ -166,6 +168,7 @@ app FabricMigrationPlanSelfHost:
 
     struct CutoverFence:
         atMs: int
+        hasLastWrite: bool
         lastWrite: int
 
     # MigrationOutcome: kind "completed" | "aborted" | "failed"; `detail` is
@@ -203,12 +206,13 @@ app FabricMigrationPlanSelfHost:
         source: text
         destination: text
         seq: int
+        hasHighWater: bool
         highWater: int
         applied: int
         phase: int
 
     proc migrationErrorNone() -> MigrationError:
-        return MigrationError{kind: "", node: "", fromPhase: 0, toPhase: 0, expected: 0, actual: 0, copied: 0, total: 0, pending: 0, allowed: 0, shardId: 0, source: "", destination: "", seq: 0, highWater: -1, applied: 0, phase: 0}
+        return MigrationError{kind: "", node: "", fromPhase: 0, toPhase: 0, expected: 0, actual: 0, copied: 0, total: 0, pending: 0, allowed: 0, shardId: 0, source: "", destination: "", seq: 0, hasHighWater: false, highWater: 0, applied: 0, phase: 0}
 
     private proc migrationErrorOf(kind: text) -> MigrationError:
         let mut e = do migrationErrorNone()
@@ -228,15 +232,15 @@ app FabricMigrationPlanSelfHost:
             let a = do migrationPhaseLabel(e.actual)
             return "operation requires phase " + x + ", migration is " + a
         if e.kind == "CopyIncomplete":
-            return "only " + e.copied + " of " + e.total + " atoms have been copied"
+            return "only " + u64Text(e.copied) + " of " + u64Text(e.total) + " atoms have been copied"
         if e.kind == "ProgressExceedsTotal":
-            return "reported " + e.copied + " atoms copied, the shard has " + e.total
+            return "reported " + u64Text(e.copied) + " atoms copied, the shard has " + u64Text(e.total)
         if e.kind == "ProgressWentBackwards":
-            return "reported " + e.copied + " atoms copied, " + e.total + " were already recorded"
+            return "reported " + u64Text(e.copied) + " atoms copied, " + u64Text(e.total) + " were already recorded"
         if e.kind == "NotCaughtUp":
-            return "" + e.pending + " writes still unapplied, cutover allows at most " + e.allowed
+            return u64Text(e.pending) + " writes still unapplied, cutover allows at most " + u64Text(e.allowed)
         if e.kind == "WriteFenced":
-            return "shard " + e.shardId + " is fenced for cutover from '" + e.source + "' to '" + e.destination + "'; retry"
+            return "shard " + u64Text(e.shardId) + " is fenced for cutover from '" + e.source + "' to '" + e.destination + "'; retry"
         if e.kind == "NonMonotonicWrite":
             let s = do migrationWriteSeqLabel(e.seq)
             let h = do migrationWriteSeqLabel(e.highWater)
@@ -247,12 +251,12 @@ app FabricMigrationPlanSelfHost:
             return "write " + s + " was already applied (destination is at " + a + ")"
         if e.kind == "UnknownWrite":
             let s = do migrationWriteSeqLabel(e.seq)
-            if e.highWater == -1:
+            if !e.hasHighWater:
                 return "write " + s + " was never accepted by the source"
             let h = do migrationWriteSeqLabel(e.highWater)
             return "write " + s + " was never accepted by the source (high-water " + h + ")"
         if e.kind == "CutoverNotDrained":
-            return "cutover cannot complete with " + e.pending + " writes still unapplied"
+            return "cutover cannot complete with " + u64Text(e.pending) + " writes still unapplied"
         if e.kind == "AbortAfterCutover":
             let p = do migrationPhaseLabel(e.phase)
             return "cannot abort in phase " + p + ": authority has already moved"
@@ -286,10 +290,13 @@ app FabricMigrationPlanSelfHost:
         plan: MigrationPlan
         phase: int
         progress: MigrationProgress
+        hasSourceHighWater: bool
         sourceHighWater: int
+        hasDestinationApplied: bool
         destinationApplied: int
         hasFence: bool
         fence: CutoverFence
+        hasCutOver: bool
         cutoverCompletedAtMs: int
         hasOutcome: bool
         outcome: MigrationOutcome
@@ -309,7 +316,7 @@ app FabricMigrationPlanSelfHost:
 
     proc migrationNew(plan: MigrationPlan) -> Migration:
         let progress = do migrationProgressNew(plan.atoms, plan.createdAtMs)
-        return Migration{plan: plan, phase: 0, progress: progress, sourceHighWater: -1, destinationApplied: -1, hasFence: false, fence: CutoverFence{atMs: 0, lastWrite: -1}, cutoverCompletedAtMs: -1, hasOutcome: false, outcome: MigrationOutcome{kind: "", atMs: 0, detail: ""}, history: []}
+        return Migration{plan: plan, phase: 0, progress: progress, hasSourceHighWater: false, sourceHighWater: 0, hasDestinationApplied: false, destinationApplied: 0, hasFence: false, fence: CutoverFence{atMs: 0, hasLastWrite: false, lastWrite: 0}, hasCutOver: false, cutoverCompletedAtMs: 0, hasOutcome: false, outcome: MigrationOutcome{kind: "", atMs: 0, detail: ""}, history: []}
 
     proc migrationIsTerminal(m: Migration) -> bool:
         let t = do phaseIsTerminal(m.phase)
@@ -318,14 +325,14 @@ app FabricMigrationPlanSelfHost:
     # `pending_writes`: slots the source accepted that the destination has
     # not applied.
     proc migrationPendingWritesOf(m: Migration) -> int:
-        if m.sourceHighWater == -1:
+        if !m.hasSourceHighWater:
             return 0
-        if m.destinationApplied == -1:
+        if !m.hasDestinationApplied:
             return m.sourceHighWater + 1
-        return max(m.sourceHighWater - m.destinationApplied, 0)
+        return u64SatSub(m.sourceHighWater, m.destinationApplied)
 
     proc migrationHasCutOverOf(m: Migration) -> bool:
-        return m.cutoverCompletedAtMs != -1
+        return m.hasCutOver
 
     proc migrationIsWriteFencedOf(m: Migration) -> bool:
         let f = do phaseIsFenced(m.phase)
@@ -333,7 +340,7 @@ app FabricMigrationPlanSelfHost:
 
     # `read_owner`: never absent (invariant 1).
     proc migrationReadOwner(m: Migration) -> text:
-        if m.cutoverCompletedAtMs != -1:
+        if m.hasCutOver:
             return m.plan.destination
         return m.plan.source
 
@@ -387,7 +394,7 @@ app FabricMigrationPlanSelfHost:
         next.phase = to
         let mut progress = m.progress
         progress.phaseStartedAtMs = atMs
-        progress.updatedAtMs = max(progress.updatedAtMs, atMs)
+        progress.updatedAtMs = u64Max(progress.updatedAtMs, atMs)
         next.progress = progress
         let r = do migrationOk(next)
         return r
@@ -402,27 +409,30 @@ app FabricMigrationPlanSelfHost:
             e.source = m.plan.source
             e.destination = m.plan.destination
             return MigrationWriteResult{ok: false, err: e, value: m, route: ""}
-        if m.cutoverCompletedAtMs != -1:
-            if m.hasFence && m.fence.lastWrite != -1 && seq <= m.fence.lastWrite:
+        if m.hasCutOver:
+            if m.hasFence && m.fence.hasLastWrite && u64Cmp(seq, m.fence.lastWrite) <= 0:
                 let mut e = do migrationErrorOf("WriteAlreadyApplied")
                 e.seq = seq
                 e.applied = m.fence.lastWrite
                 return MigrationWriteResult{ok: false, err: e, value: m, route: ""}
-            if m.destinationApplied != -1 && seq <= m.destinationApplied:
+            if m.hasDestinationApplied && u64Cmp(seq, m.destinationApplied) <= 0:
                 let mut e = do migrationErrorOf("WriteAlreadyApplied")
                 e.seq = seq
                 e.applied = m.destinationApplied
                 return MigrationWriteResult{ok: false, err: e, value: m, route: ""}
             let mut next = m
+            next.hasDestinationApplied = true
             next.destinationApplied = seq
             let none = do migrationErrorNone()
             return MigrationWriteResult{ok: true, err: none, value: next, route: "destination"}
-        if m.sourceHighWater != -1 && seq <= m.sourceHighWater:
+        if m.hasSourceHighWater && u64Cmp(seq, m.sourceHighWater) <= 0:
             let mut e = do migrationErrorOf("NonMonotonicWrite")
             e.seq = seq
+            e.hasHighWater = true
             e.highWater = m.sourceHighWater
             return MigrationWriteResult{ok: false, err: e, value: m, route: ""}
         let mut next = m
+        next.hasSourceHighWater = true
         next.sourceHighWater = seq
         let pending = do migrationPendingWritesOf(next)
         let mut progress = m.progress
@@ -433,24 +443,26 @@ app FabricMigrationPlanSelfHost:
 
     # `record_applied`: the destination applied the stream up to `seq`.
     proc migrationRecordApplied(m: Migration, seq: int, atMs: int) -> MigrationResult:
-        if m.sourceHighWater == -1 || seq > m.sourceHighWater:
+        if !m.hasSourceHighWater || u64Cmp(seq, m.sourceHighWater) > 0:
             let mut e = do migrationErrorOf("UnknownWrite")
             e.seq = seq
+            e.hasHighWater = m.hasSourceHighWater
             e.highWater = m.sourceHighWater
             let r = do migrationFailWith(m, e)
             return r
-        if m.destinationApplied != -1 && seq <= m.destinationApplied:
+        if m.hasDestinationApplied && u64Cmp(seq, m.destinationApplied) <= 0:
             let mut e = do migrationErrorOf("WriteAlreadyApplied")
             e.seq = seq
             e.applied = m.destinationApplied
             let r = do migrationFailWith(m, e)
             return r
         let mut next = m
+        next.hasDestinationApplied = true
         next.destinationApplied = seq
         let pending = do migrationPendingWritesOf(next)
         let mut progress = m.progress
         progress.pendingWrites = pending
-        progress.updatedAtMs = max(progress.updatedAtMs, atMs)
+        progress.updatedAtMs = u64Max(progress.updatedAtMs, atMs)
         next.progress = progress
         let r = do migrationOk(next)
         return r
@@ -464,13 +476,13 @@ app FabricMigrationPlanSelfHost:
         let req = do migrationRequirePhase(m, 1)
         if !req.ok:
             return req
-        if atomsCopied > m.progress.atomsTotal:
+        if u64Cmp(atomsCopied, m.progress.atomsTotal) > 0:
             let mut e = do migrationErrorOf("ProgressExceedsTotal")
             e.copied = atomsCopied
             e.total = m.progress.atomsTotal
             let r = do migrationFailWith(m, e)
             return r
-        if atomsCopied < m.progress.atomsCopied:
+        if u64Cmp(atomsCopied, m.progress.atomsCopied) < 0:
             let mut e = do migrationErrorOf("ProgressWentBackwards")
             e.copied = atomsCopied
             e.total = m.progress.atomsCopied
@@ -479,8 +491,8 @@ app FabricMigrationPlanSelfHost:
         let mut next = m
         let mut progress = m.progress
         progress.atomsCopied = atomsCopied
-        progress.bytesCopied = max(progress.bytesCopied, bytesCopied)
-        progress.updatedAtMs = max(progress.updatedAtMs, atMs)
+        progress.bytesCopied = u64Max(progress.bytesCopied, bytesCopied)
+        progress.updatedAtMs = u64Max(progress.updatedAtMs, atMs)
         next.progress = progress
         let r = do migrationOk(next)
         return r
@@ -515,7 +527,8 @@ app FabricMigrationPlanSelfHost:
         let mut progress = next.progress
         progress.atomsCopied = 0
         progress.bytesCopied = 0
-        next.destinationApplied = -1
+        next.hasDestinationApplied = false
+        next.destinationApplied = 0
         let pending = do migrationPendingWritesOf(next)
         progress.pendingWrites = pending
         next.progress = progress
@@ -532,7 +545,7 @@ app FabricMigrationPlanSelfHost:
             let r = do migrationCopyIncomplete(m)
             return r
         let pending = do migrationPendingWritesOf(m)
-        if pending > m.plan.maxCutoverPendingWrites:
+        if u64Cmp(pending, m.plan.maxCutoverPendingWrites) > 0:
             let mut e = do migrationErrorOf("NotCaughtUp")
             e.pending = pending
             e.allowed = m.plan.maxCutoverPendingWrites
@@ -543,7 +556,7 @@ app FabricMigrationPlanSelfHost:
             return adv
         let mut next = adv.value
         next.hasFence = true
-        next.fence = CutoverFence{atMs: atMs, lastWrite: m.sourceHighWater}
+        next.fence = CutoverFence{atMs: atMs, hasLastWrite: m.hasSourceHighWater, lastWrite: m.sourceHighWater}
         let r = do migrationOk(next)
         return r
 
@@ -553,7 +566,7 @@ app FabricMigrationPlanSelfHost:
         if !req.ok:
             return req
         let pending = do migrationPendingWritesOf(m)
-        if pending > 0:
+        if pending != 0:
             let mut e = do migrationErrorOf("CutoverNotDrained")
             e.pending = pending
             let r = do migrationFailWith(m, e)
@@ -562,6 +575,7 @@ app FabricMigrationPlanSelfHost:
         if !adv.ok:
             return adv
         let mut next = adv.value
+        next.hasCutOver = true
         next.cutoverCompletedAtMs = atMs
         let r = do migrationOk(next)
         return r
@@ -598,8 +612,9 @@ app FabricMigrationPlanSelfHost:
             return adv
         let mut next = adv.value
         next.hasFence = false
-        next.fence = CutoverFence{atMs: 0, lastWrite: -1}
-        next.destinationApplied = -1
+        next.fence = CutoverFence{atMs: 0, hasLastWrite: false, lastWrite: 0}
+        next.hasDestinationApplied = false
+        next.destinationApplied = 0
         let mut progress = next.progress
         progress.pendingWrites = 0
         next.progress = progress

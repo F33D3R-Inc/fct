@@ -106,7 +106,7 @@ app FqIndexSelfHost:
     proc ixOpen(dir: text, key: [int], nonceBase: int) -> FqIxR uses io.file:
         let names = ["primary", "kind", "owner", "edge_out", "edge_in", "history"]
         let o0 = do pgrOpen(dir + "facetql.idx.primary", 64, key, 0)
-        let blank = FqBTree{pager: o0, generation: 0, root: 2, entries: 0, free: [], dirty: []}
+        let blank = FqBTree{pager: o0, generation: 0, root: 2, entries: 0, free: [], dirty: [], rd: btNoReaders()}
         let mut ix = FqIndexes{dir: dir, key: key, nonceBase: nonceBase, opens: 0, primary: blank, kind: blank, owner: blank, edgeOut: blank, edgeIn: blank, history: blank, data: [], text: []}
         let mut i = 0
         loop i < 6:
@@ -261,6 +261,8 @@ app FqIndexSelfHost:
         overflowReads: int
         overflowWrites: int
         unattributed: int
+        # the cell keys in the order their slots were claimed
+        claims: [int]
 
     proc metaNew() -> FqCounts:
         let mut zeros = []
@@ -268,7 +270,7 @@ app FqIndexSelfHost:
         loop i < 256:
             zeros = append(zeros, 0)
             i = i + 1
-        return FqCounts{reads: 0, writes: 0, userLog: 0, horizon: 0, horizonMax: false, cellKeys: zeros, cellReads: zeros, cellWrites: zeros, cellBytesRead: zeros, cellBytesWritten: zeros, overflowReads: 0, overflowWrites: 0, unattributed: 0}
+        return FqCounts{reads: 0, writes: 0, userLog: 0, horizon: 0, horizonMax: false, cellKeys: zeros, cellReads: zeros, cellWrites: zeros, cellBytesRead: zeros, cellBytesWritten: zeros, overflowReads: 0, overflowWrites: 0, unattributed: 0, claims: []}
 
     proc stWithMeta(st: FqStore, m: FqCounts) -> FqStore:
         return FqStore{heap: st.heap, ix: st.ix, references: st.references, nonceBase: st.nonceBase, seq: st.seq, meta: m}
@@ -296,8 +298,11 @@ app FqIndexSelfHost:
         let at = do metaSlot(m, key)
         if at < 0:
             if write:
-                return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites + 1, unattributed: m.unattributed}
-            return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads + 1, overflowWrites: m.overflowWrites, unattributed: m.unattributed}
+                return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites + 1, unattributed: m.unattributed, claims: m.claims}
+            return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads + 1, overflowWrites: m.overflowWrites, unattributed: m.unattributed, claims: m.claims}
+        let mut claims = m.claims
+        if m.cellKeys[at] == 0:
+            claims = append(claims, key)
         let mut keys = m.cellKeys
         keys[at] = key
         let mut r = m.cellReads
@@ -310,10 +315,10 @@ app FqIndexSelfHost:
         else:
             r[at] = r[at] + 1
             br[at] = br[at] + nbytes
-        return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: keys, cellReads: r, cellWrites: w, cellBytesRead: br, cellBytesWritten: bw, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed}
+        return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: keys, cellReads: r, cellWrites: w, cellBytesRead: br, cellBytesWritten: bw, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed, claims: claims}
 
     proc metaCount(m: FqCounts, reads: int, writes: int, userLog: int, unattributed: int) -> FqCounts:
-        return FqCounts{reads: m.reads + reads, writes: m.writes + writes, userLog: m.userLog + userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed + unattributed}
+        return FqCounts{reads: m.reads + reads, writes: m.writes + writes, userLog: m.userLog + userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed + unattributed, claims: m.claims}
 
     # metaNoteHorizon: wal::note_scan_horizon — a fetch_max; `toMax` is
     # u64::MAX.
@@ -322,10 +327,10 @@ app FqIndexSelfHost:
         let mut hm = m.horizonMax || toMax
         if position > h:
             h = position
-        return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: h, horizonMax: hm, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed}
+        return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: h, horizonMax: hm, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed, claims: m.claims}
 
     proc metaSetUserLog(m: FqCounts, n: int) -> FqCounts:
-        return FqCounts{reads: m.reads, writes: m.writes, userLog: n, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed}
+        return FqCounts{reads: m.reads, writes: m.writes, userLog: n, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: m.cellKeys, cellReads: m.cellReads, cellWrites: m.cellWrites, cellBytesRead: m.cellBytesRead, cellBytesWritten: m.cellBytesWritten, overflowReads: m.overflowReads, overflowWrites: m.overflowWrites, unattributed: m.unattributed, claims: m.claims}
 
     struct FqStoreR:
         ok: bool
@@ -337,6 +342,74 @@ app FqIndexSelfHost:
 
     proc stWith(st: FqStore, h: FqHeap, ix: FqIndexes) -> FqStore:
         return FqStore{heap: h, ix: ix, references: st.references, nonceBase: st.nonceBase, seq: st.seq, meta: st.meta}
+
+    # stSetReaders: every tree's reader registry (FqBtReaders) set to the
+    # engine's — the epoch releases are stamped with, and the oldest pin.
+    proc stSetReaders(st: FqStore, rd: FqBtReaders) -> FqStore:
+        let ix = st.ix
+        let mut data = []
+        let mut i = 0
+        loop i < len(ix.data):
+            data = append(data, FqDataIx{def: ix.data[i].def, tree: btWithReaders(ix.data[i].tree, rd)})
+            i = i + 1
+        let mut text = []
+        let mut j = 0
+        loop j < len(ix.text):
+            text = append(text, FqTextIx{def: ix.text[j].def, tree: btWithReaders(ix.text[j].tree, rd)})
+            j = j + 1
+        let ix2 = FqIndexes{dir: ix.dir, key: ix.key, nonceBase: ix.nonceBase, opens: ix.opens, primary: btWithReaders(ix.primary, rd), kind: btWithReaders(ix.kind, rd), owner: btWithReaders(ix.owner, rd), edgeOut: btWithReaders(ix.edgeOut, rd), edgeIn: btWithReaders(ix.edgeIn, rd), history: btWithReaders(ix.history, rd), data: data, text: text}
+        let out = do stWith(st, st.heap, ix2)
+        return out
+
+    # ── read counters across snapshots ─────────────────────────────────
+    # A snapshot reader counts its reads on its own copy of the counters;
+    # metaDelta is what it added (reads_total, and per cell: reads and bytes
+    # read, cells it claimed in the order it claimed them), and metaApply
+    # adds that to the live counters — as if the reads had been counted
+    # there, which is where Rust's atomics count them.
+    proc metaDelta(before: FqCounts, after: FqCounts) -> text:
+        let mut parts = ["" + (after.reads - before.reads), "" + (after.overflowReads - before.overflowReads)]
+        let mut seen = []
+        let mut i = 0
+        loop i < len(after.claims):
+            let k = after.claims[i]
+            seen = append(seen, k)
+            let a = do metaSlot(after, k)
+            let b = do metaSlot(before, k)
+            let mut dr = after.cellReads[a]
+            let mut db = after.cellBytesRead[a]
+            if b >= 0 && before.cellKeys[b] == k:
+                dr = dr - before.cellReads[b]
+                db = db - before.cellBytesRead[b]
+            if dr != 0 || db != 0 || !(k in before.claims):
+                parts = append(parts, "" + k + "," + dr + "," + db)
+            i = i + 1
+        return join(parts, ";")
+
+    proc metaApply(m0: FqCounts, delta: text) -> FqCounts:
+        let parts = split(delta, ";")
+        let mut m = do metaCount(m0, toInt(parts[0]), 0, 0, 0)
+        let mut keys = m.cellKeys
+        let mut r = m.cellReads
+        let mut br = m.cellBytesRead
+        let mut claims = m.claims
+        let mut overflow = m.overflowReads + toInt(parts[1])
+        let mut i = 2
+        loop i < len(parts):
+            let f = split(parts[i], ",")
+            let k = toInt(f[0])
+            let cur = FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: keys, cellReads: r, cellWrites: m.cellWrites, cellBytesRead: br, cellBytesWritten: m.cellBytesWritten, overflowReads: overflow, overflowWrites: m.overflowWrites, unattributed: m.unattributed, claims: claims}
+            let at = do metaSlot(cur, k)
+            if at < 0:
+                overflow = overflow + toInt(f[1])
+            else:
+                if keys[at] == 0:
+                    claims = append(claims, k)
+                keys[at] = k
+                r[at] = r[at] + toInt(f[1])
+                br[at] = br[at] + toInt(f[2])
+            i = i + 1
+        return FqCounts{reads: m.reads, writes: m.writes, userLog: m.userLog, horizon: m.horizon, horizonMax: m.horizonMax, cellKeys: keys, cellReads: r, cellWrites: m.cellWrites, cellBytesRead: br, cellBytesWritten: m.cellBytesWritten, overflowReads: overflow, overflowWrites: m.overflowWrites, unattributed: m.unattributed, claims: claims}
 
     # stNonce: the next nonce for a sealed record this store appends.
     proc stNonce(st: FqStore) -> [int]:

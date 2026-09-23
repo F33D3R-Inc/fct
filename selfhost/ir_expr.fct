@@ -114,11 +114,12 @@ app IRExprSelfHost:
 
     # ── JSON ────────────────────────────────────────────────────────────────
     # jsonQuote: a JSON string literal for s, spelled as encoding/json spells
-    # it: `"`, `\` and the three common control characters escaped, and —
-    # because Go's encoder is HTML-safe by default — `<`, `>` and `&` written
-    # as \u003c, \u003e and \u0026 (an operator like `>=` therefore reads
-    # "\u003e=" in the real compiler's IR, and here). Other control characters
-    # do not occur in .fct source (the tokenizer never produces them).
+    # it: `"` and `\` escaped, \n \r \t \b \f by name, every other
+    # control character as \u00xx, and — because Go's encoder is HTML-safe
+    # by default — `<`, `>`, `&`, U+2028 and U+2029 as \u003c, \u003e,
+    # \u0026, \u2028 and \u2029 (an operator like `>=` therefore reads
+    # "\u003e=" in the real compiler's IR, and here). A string literal's
+    # escapes put any of these in source text.
     proc jsonQuote(s: text) -> text:
         let a = replace(s, "\\", "\\\\")
         let b = replace(a, "\"", "\\\"")
@@ -128,7 +129,42 @@ app IRExprSelfHost:
         let f = replace(e, "<", "\\u003c")
         let g = replace(f, ">", "\\u003e")
         let h = replace(g, "&", "\\u0026")
-        return "\"" + h + "\""
+        let bs = textToBytes(h)
+        let n = len(bs)
+        let mut rare = false
+        let mut i = 0
+        loop i < n && !rare:
+            let x = bs[i]
+            if x < 32 || (x == 226 && i + 2 < n && bs[i + 1] == 128 && (bs[i + 2] == 168 || bs[i + 2] == 169)):
+                rare = true
+            i = i + 1
+        if !rare:
+            return "\"" + h + "\""
+        let hex = "0123456789abcdef"
+        let mut out = ""
+        let mut from = 0
+        let mut j = 0
+        loop j < n:
+            let y = bs[j]
+            let mut esc = ""
+            let mut width = 1
+            if y < 32:
+                esc = "\\u00" + charAt(hex, y / 16) + charAt(hex, y % 16)
+                if y == 8:
+                    esc = "\\b"
+                if y == 12:
+                    esc = "\\f"
+            if y == 226 && j + 2 < n && bs[j + 1] == 128 && (bs[j + 2] == 168 || bs[j + 2] == 169):
+                esc = "\\u2028"
+                if bs[j + 2] == 169:
+                    esc = "\\u2029"
+                width = 3
+            if esc != "":
+                out = out + bytesToText(slice(bs, from, j)) + esc
+                from = j + width
+            j = j + width
+        out = out + bytesToText(slice(bs, from, n))
+        return "\"" + out + "\""
 
     proc irListJSON(xs: [IRExpr]) -> text:
         let n = len(xs)

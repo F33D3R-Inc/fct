@@ -48,7 +48,9 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -88,12 +90,49 @@ type netConn struct {
 type netRegistry struct {
 	mu        sync.Mutex
 	next      int
-	listeners map[int]net.Listener
+	listeners map[int]*netListener
 	conns     map[int]*netConn
 }
 
+// netListener is one listener handle's state. ln is nil when binding failed:
+// the handle still exists so the failure can be read back with listenError
+// (connect's own shape — see this file's doc — applied to listen). err is
+// that failure; closed is set by closeListener.
+type netListener struct {
+	ln     net.Listener
+	err    string
+	closed bool
+}
+
 func newNetRegistry() *netRegistry {
-	return &netRegistry{listeners: map[int]net.Listener{}, conns: map[int]*netConn{}}
+	return &netRegistry{listeners: map[int]*netListener{}, conns: map[int]*netConn{}}
+}
+
+// mintListener registers nl under a fresh handle.
+func (r *netRegistry) mintListener(nl *netListener) int {
+	r.mu.Lock()
+	r.next++
+	id := r.next
+	r.listeners[id] = nl
+	r.mu.Unlock()
+	return id
+}
+
+// osErrorText describes a failed socket call the way the operating system
+// does: the errno's own description and number ("Address already in use (os
+// error 98)"), which is what C's strerror and Rust's io::Error print — and
+// so what an operator's other tools already say for the same failure.
+// Anything that is not an errno keeps Go's description.
+func osErrorText(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		msg := errno.Error()
+		if msg != "" {
+			msg = strings.ToUpper(msg[:1]) + msg[1:]
+		}
+		return fmt.Sprintf("%s (os error %d)", msg, int(errno))
+	}
+	return err.Error()
 }
 
 // mint registers nc under a fresh handle.
@@ -197,10 +236,13 @@ func describeNetErr(who string, nc *netConn, err error) string {
 
 // ioListen implements the `listen(port: int) -> int` builtin (io.net.listen):
 // binds a TCP listener on port across every local interface and mints its
-// handle. The listener stays open for the life of the process (a daemon that
-// calls listen() typically does so once, before its accept loop) — there is
-// no listenClose builtin in this milestone, matching how a daemon itself is
-// never stopped short of process exit (see runtime/daemon.go's doc).
+// handle. A bind that fails (the port is taken, the address is not this
+// machine's, permission) is a value, not an abort: the handle is minted in a
+// failed state and listenError(l) says why — exactly as a failed connect()
+// mints a handle whose connError says why — so a server can answer its
+// operator (fabricd exits 78 naming the address) rather than dying. An
+// invalid port is still a programming error. The listener stays open until
+// closeListener(l) (or process exit).
 func (s *Server) ioListen(port int) (any, error) {
 	return s.ioListenOn("listen", "", port)
 }
@@ -215,15 +257,61 @@ func (s *Server) ioListenOn(who, host string, port int) (any, error) {
 	}
 	ln, err := net.Listen("tcp", net.JoinHostPort(host, fmt.Sprint(port)))
 	if err != nil {
-		return nil, fmt.Errorf("%s: %v", who, err)
+		return s.netConns.mintListener(&netListener{err: osErrorText(err)}), nil
+	}
+	return s.netConns.mintListener(&netListener{ln: ln}), nil
+}
+
+// ioListenError implements `listenError(l: int) -> text`: why l's bind
+// failed, or "" for a listener that bound (closed or not).
+func (s *Server) ioListenError(id int) (any, error) {
+	nl, err := s.lookupListener(id, "listenError")
+	if err != nil {
+		return nil, err
+	}
+	return nl.err, nil
+}
+
+// ioCloseListener implements `closeListener(l: int) -> bool`: stops l
+// accepting — the port is released, so a client connecting after this is
+// refused by the operating system, as it is by a server that dropped its
+// listener. An accept() parked on l, in any task, returns at once with a
+// connection handle in a failed state whose connError is "accept: the
+// listener is closed", and so does every later accept on it: the clean end
+// of an accept loop. Answers false for a listener that never bound or is
+// already closed.
+func (s *Server) ioCloseListener(id int) (any, error) {
+	nl, err := s.lookupListener(id, "closeListener")
+	if err != nil {
+		return nil, err
 	}
 	r := s.netConns
 	r.mu.Lock()
-	r.next++
-	id := r.next
-	r.listeners[id] = ln
+	if nl.ln == nil || nl.closed {
+		r.mu.Unlock()
+		return false, nil
+	}
+	nl.closed = true
 	r.mu.Unlock()
-	return id, nil
+	nl.ln.Close()
+	return true, nil
+}
+
+// lookupListener resolves a listener handle, or a clean error naming what
+// is wrong with it.
+func (s *Server) lookupListener(id int, who string) (*netListener, error) {
+	r := s.netConns
+	r.mu.Lock()
+	nl, ok := r.listeners[id]
+	_, isConn := r.conns[id]
+	r.mu.Unlock()
+	if !ok {
+		if isConn {
+			return nil, fmt.Errorf("%s: %d is a connection handle, not a listener", who, id)
+		}
+		return nil, fmt.Errorf("%s: listener %d does not exist", who, id)
+	}
+	return nl, nil
 }
 
 // ioAccept implements the `accept(l: int) -> int` builtin: blocks until a
@@ -232,21 +320,38 @@ func (s *Server) ioListenOn(who, host string, port int) (any, error) {
 // under the registry's mutex — the real Accept() call, which can block
 // indefinitely, runs after that mutex is released, exactly as this file's
 // doc promises.
+//
+// Accepting on a listener that never bound is a programming error (the
+// program did not check listenError) and aborts, naming the bind's failure.
+// Once the listener is closed, or when the operating system refuses one
+// accept (too many open files, say), accept answers a connection handle in
+// a failed state whose connError says why — a value, as a failed connect
+// is: an accept loop ends when connError(c) is "accept: the listener is
+// closed", and can carry on past a transient failure.
 func (s *Server) ioAccept(id int) (any, error) {
-	r := s.netConns
-	r.mu.Lock()
-	ln, ok := r.listeners[id]
-	_, isConn := r.conns[id]
-	r.mu.Unlock()
-	if !ok {
-		if isConn {
-			return nil, fmt.Errorf("accept: %d is a connection handle, not a listener", id)
-		}
-		return nil, fmt.Errorf("accept: listener %d does not exist", id)
-	}
-	conn, err := ln.Accept()
+	nl, err := s.lookupListener(id, "accept")
 	if err != nil {
-		return nil, fmt.Errorf("accept: %v", err)
+		return nil, err
+	}
+	r := s.netConns
+	if nl.ln == nil {
+		return nil, fmt.Errorf("accept: listener %d never bound: %s", id, nl.err)
+	}
+	r.mu.Lock()
+	closed := nl.closed
+	r.mu.Unlock()
+	if closed {
+		return r.mint(&netConn{err: "accept: the listener is closed"}), nil
+	}
+	conn, err := nl.ln.Accept()
+	if err != nil {
+		r.mu.Lock()
+		closed = nl.closed
+		r.mu.Unlock()
+		if closed || errors.Is(err, net.ErrClosed) {
+			return r.mint(&netConn{err: "accept: the listener is closed"}), nil
+		}
+		return r.mint(&netConn{err: "accept: " + osErrorText(err)}), nil
 	}
 	return r.mint(&netConn{c: conn}), nil
 }
@@ -496,4 +601,18 @@ func (s *Server) lookupConn(id int, who string) (*netConn, error) {
 		return nil, fmt.Errorf("%s: connection %d does not exist", who, id)
 	}
 	return nc, nil
+}
+
+// ioConnPeer implements `connPeer(c: int) -> text`: the remote address of
+// connection c as host:port ("" for a dial that never connected) — what an
+// operator log names a client by.
+func (s *Server) ioConnPeer(id int) (any, error) {
+	nc, err := s.lookupConn(id, "connPeer")
+	if err != nil {
+		return nil, err
+	}
+	if nc.c == nil {
+		return "", nil
+	}
+	return nc.c.RemoteAddr().String(), nil
 }

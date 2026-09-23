@@ -54,6 +54,13 @@ var builtinSites = map[string]BuiltinSite{
 	"verifyPassword": SiteAuthority, "totpSecret": SiteAuthority, "totpValid": SiteAuthority, "randomToken": SiteAuthority,
 	"fileDigest": SiteAuthority, "ed25519Verify": SiteAuthority, "ecdsaP256Verify": SiteAuthority,
 	"sha256Hex": SiteAuthority, "canonicalJson": SiteAuthority, "shuffleOrder": SiteAuthority,
+	// u64 arithmetic over an int's 64 bits: a Rust u64 (shard ids, write
+	// sequences, counters, byte counts off the wire) is held as that bit
+	// pattern, and these are the operations whose answer depends on reading
+	// it unsigned. A value past 2^53 does not survive a browser number.
+	"u64Cmp": SiteAuthority, "u64Min": SiteAuthority, "u64Max": SiteAuthority, "u64SatSub": SiteAuthority,
+	"u64Div": SiteAuthority, "u64Rem": SiteAuthority, "u64Text": SiteAuthority, "u64Parse": SiteAuthority,
+	"u64ParseError": SiteAuthority, "u64ToFloat": SiteAuthority,
 	// wall-clock time in an IANA zone (the zone database is embedded server-side)
 	"fromLocal": SiteAuthority, "formatIn": SiteAuthority, "zoneValid": SiteAuthority,
 
@@ -66,8 +73,10 @@ var builtinSites = map[string]BuiltinSite{
 	"listen": SiteProc, "listenOn": SiteProc, "accept": SiteProc, "connect": SiteProc,
 	"readBytes": SiteProc, "writeBytes": SiteProc, "closeConn": SiteProc, "setTimeoutMs": SiteProc, "connError": SiteProc,
 	"pollBytes": SiteProc, "connOpen": SiteProc, "shutdownConn": SiteProc,
+	"closeListener": SiteProc, "listenError": SiteProc, "grantRead": SiteProc,
 	"writeStdout": SiteProc, "writeStderr": SiteProc, "readStdin": SiteProc, "envVar": SiteProc, "envSet": SiteProc,
 	"channel": SiteProc, "send": SiteProc, "recv": SiteProc, "sleepMs": SiteProc, "monoMs": SiteProc, "nowMs": SiteProc, "signals": SiteProc,
+	"awaitAny": SiteProc, "closeChannel": SiteProc, "exitProcess": SiteProc, "processStats": SiteProc, "listenTls": SiteProc, "connPeer": SiteProc, "connectTls": SiteProc,
 }
 
 // BuiltinSiteOf reports where builtin name may run, and whether it is one.

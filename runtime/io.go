@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -77,10 +78,11 @@ func (s *Server) resolveDataPath(reqPath string) (string, error) {
 // runtime/array_test.go's TestArrayOutOfBoundsIsCleanError already proves for
 // an out-of-bounds array read.
 func (s *Server) ioReadFile(path string) (any, error) {
-	full, err := s.resolveDataPath(path)
+	full, err := s.resolveReadPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("readFile: %w", err)
 	}
+	defer lockFile(full, false)()
 	data, err := os.ReadFile(full)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -106,6 +108,7 @@ func (s *Server) ioWriteFile(path, content string) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("writeFile: %w", err)
 	}
+	defer lockFile(full, true)()
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return nil, fmt.Errorf("writeFile: %q: %v", path, err)
 	}
@@ -130,6 +133,7 @@ func (s *Server) ioAppendFile(path, content string) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("appendFile: %w", err)
 	}
+	defer lockFile(full, true)()
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return nil, fmt.Errorf("appendFile: %q: %v", path, err)
 	}
@@ -166,7 +170,7 @@ func (s *Server) ioAppendFile(path, content string) (any, error) {
 // not an error — the one question readFile cannot be asked without failing
 // (a first boot has no log yet). A sandbox escape is still an error.
 func (s *Server) ioFileExists(path string) (any, error) {
-	full, err := s.resolveDataPath(path)
+	full, err := s.resolveReadPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("fileExists: %w", err)
 	}
@@ -190,6 +194,7 @@ func (s *Server) ioTruncateFile(path string, size int) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("truncateFile: %w", err)
 	}
+	defer lockFile(full, true)()
 	if size < 0 {
 		return nil, fmt.Errorf("truncateFile: %q: negative size %d", path, size)
 	}
@@ -234,10 +239,11 @@ func syncDir(dir string) error {
 // fileExists, since a pager needs the length (how many whole pages a file
 // holds) and not merely whether it is there.
 func (s *Server) ioFileSize(path string) (any, error) {
-	full, err := s.resolveDataPath(path)
+	full, err := s.resolveReadPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("fileSize: %w", err)
 	}
+	defer lockFile(full, false)()
 	info, err := os.Stat(full)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -256,10 +262,11 @@ func (s *Server) ioFileSize(path string) (any, error) {
 // cannot supply all n bytes is an error naming the offset — never a short
 // buffer a caller could mistake for a whole page.
 func (s *Server) ioReadFileAt(path string, offset, n int) (any, error) {
-	full, err := s.resolveDataPath(path)
+	full, err := s.resolveReadPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("readFileAt: %w", err)
 	}
+	defer lockFile(full, false)()
 	if offset < 0 || n < 0 {
 		return nil, fmt.Errorf("readFileAt: %q: negative offset %d or length %d", path, offset, n)
 	}
@@ -292,6 +299,7 @@ func (s *Server) ioWriteFileAt(path string, offset int, content any) (any, error
 	if err != nil {
 		return nil, fmt.Errorf("writeFileAt: %w", err)
 	}
+	defer lockFile(full, true)()
 	if offset < 0 {
 		return nil, fmt.Errorf("writeFileAt: %q: negative offset %d", path, offset)
 	}
@@ -331,6 +339,7 @@ func (s *Server) ioSyncFile(path string) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("syncFile: %w", err)
 	}
+	defer lockFile(full, false)()
 	f, err := os.OpenFile(full, os.O_RDWR, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -386,6 +395,7 @@ func (s *Server) ioRemoveFile(path string) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("removeFile: %w", err)
 	}
+	defer lockFile(full, true)()
 	if err := os.Remove(full); err != nil {
 		if os.IsNotExist(err) {
 			return true, nil
@@ -407,7 +417,7 @@ func (s *Server) ioRemoveFile(path string) (any, error) {
 // is usable with every existing byte-buffer mechanic with no special-casing
 // anywhere else. Same sandbox and error shape as ioReadFile.
 func (s *Server) ioReadFileBytes(path string) (any, error) {
-	full, err := s.resolveDataPath(path)
+	full, err := s.resolveReadPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
@@ -540,4 +550,23 @@ func (s *Server) ioHTTPPost(rawURL, body string) (any, error) {
 		return nil, fmt.Errorf("httpPost %s: returned %d", rawURL, resp.StatusCode)
 	}
 	return string(respBody), nil
+}
+
+// fileLocks makes the positional file builtins atomic with respect to one
+// another: a readFileAt never observes half of a concurrent writeFileAt to
+// the same file, however the OS interleaves the two. One task writing a
+// paged file while others read it (a storage engine serving snapshot reads
+// beside its single writer) needs exactly that — a torn page would read as
+// corruption. Keyed by the resolved path; readers share, writers exclude.
+var fileLocks sync.Map // string -> *sync.RWMutex
+
+func lockFile(full string, write bool) func() {
+	v, _ := fileLocks.LoadOrStore(full, &sync.RWMutex{})
+	mu := v.(*sync.RWMutex)
+	if write {
+		mu.Lock()
+		return mu.Unlock
+	}
+	mu.RLock()
+	return mu.RUnlock
 }

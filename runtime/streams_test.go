@@ -77,6 +77,9 @@ func subscribe(t *testing.T, ts *httptest.Server, path, as string) (<-chan strin
 		var cur []string
 		for sc.Scan() {
 			line := sc.Text()
+			if strings.HasPrefix(line, ":") {
+				continue // an SSE comment (the ": connected" opener) is not a frame
+			}
 			if line == "" {
 				if len(cur) > 0 {
 					frames <- strings.Join(cur, "\n")
@@ -136,12 +139,8 @@ func TestStreamsDeliverEmittedEvents(t *testing.T) {
 	defer closeBob()
 	pub, closePub := subscribe(t, ts, "/api/v2/public", "")
 	defer closePub()
-	for _, ch := range []<-chan string{ada, bob, pub} {
-		if f := next(t, ch); !strings.HasPrefix(f, "event: hello") {
-			t.Fatalf("first frame should be the hello, got %q", f)
-		}
-	}
-
+	// Neither stream declares `hello since …`, so no connect frame precedes
+	// the first event.
 	if _, err := srv.Run("ada", "member", true, "ping", []any{7}); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +174,7 @@ func TestStreamsDeliverEmittedEvents(t *testing.T) {
 	json.NewDecoder(r2.Body).Decode(&doc)
 	r2.Body.Close()
 	events, _ := doc["x-stream-events"].([]any)
-	if len(events) != 5 { // Notify and Ping on one stream, Ping on the other, and each stream's hello
+	if len(events) != 3 { // Notify and Ping on one stream, Ping on the other; neither declares a hello
 		t.Fatalf("x-stream-events = %v", events)
 	}
 	if paths := doc["paths"].(map[string]any); paths["/api/v2/events"] == nil {

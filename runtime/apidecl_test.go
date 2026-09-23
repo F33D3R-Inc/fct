@@ -81,7 +81,7 @@ func (c *apiClient) do(method, path, body string) (int, map[string]any, []any) {
 }
 
 func TestDeclaredAPIRoutes(t *testing.T) {
-	t.Setenv("FACET_RATE_LIMIT_WRITE", "6")
+	t.Setenv("FACET_RATE_LIMIT_WRITE", "24") // a burst of 6 (a quarter of the minute)
 	g, err := compile.String(apiApp)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -311,8 +311,9 @@ func TestDeclaredAPIMessageBody(t *testing.T) {
 	paths := doc["paths"].(map[string]any)
 	op := paths["/api/v2/events"].(map[string]any)["post"].(map[string]any)
 	reqSchema := op["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
-	if ref, _ := reqSchema["$ref"].(string); ref != "#/components/schemas/ClientEvent" {
-		t.Fatalf("requestBody schema = %v, want a $ref to ClientEvent (the whole body IS the message)", reqSchema)
+	// The whole body IS the message: a (maybe-null) reference to it.
+	if raw, _ := json.Marshal(reqSchema); string(raw) != `{"oneOf":[{"$ref":"#/components/schemas/ClientEvent"},{"type":"null"}]}` {
+		t.Fatalf("requestBody schema = %s, want a reference to ClientEvent (the whole body IS the message)", raw)
 	}
 }
 

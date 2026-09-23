@@ -8,9 +8,9 @@ import "../../fabric_frontdoor.fct"
 app FrontDoorFixture:
     state fxOut: text = ""
 
-    # key(n): RoutingKey::new(n, (0,0)), packed as fabric.fct packs it.
-    proc fxKey(shard: int) -> int:
-        return shard * 156
+    # key(n): RoutingKey::new(n, (0,0)).
+    proc fxKey(shard: int) -> RoutingKey:
+        return RoutingKey{shardId: shard, coordinate: Coordinate{x: 0, y: 0}}
 
     proc fxRegistry(placeOneOn: text) -> TopologyRegistry:
         let r0 = do topologyRegistryNew()
@@ -75,16 +75,39 @@ app FrontDoorFixture:
             do fdInstall(fdConfigDefault(port), f.fleet)
             return f.err
         let rules = [RoutingRule{kind: "Post", prefix: "Post:", key: fxKey(1)}, RoutingRule{kind: "User", prefix: "User:", key: fxKey(2)}]
-        let ks = PlanKeyspace{rules: rules, hasFallback: false, fallbackKey: -1}
+        let ks = PlanKeyspace{rules: rules, hasFallback: false, fallbackKey: routingKeyUnset()}
         let f = do fdFleetNew(ks, [a.backend, b.backend], fxBaseRouting())
         let d = do fdConfigDefault(port)
-        let config = FdConfig{readPref: d.readPref, fenceRetryBudgetMs: 400, fenceRetryIntervalMs: 20, upstreamTimeoutMs: 5000, maxBodyBytes: d.maxBodyBytes, port: port}
+        let config = FdConfig{readPref: d.readPref, fenceRetryBudgetMs: 400, fenceRetryIntervalMs: 20, upstreamTimeoutMs: 5000, maxBodyBytes: d.maxBodyBytes, port: port, trustFile: ""}
         do fdInstall(config, f.fleet)
         return f.err
+
+    # fxInstallTls: the one-FacetQL door in front of an https backend,
+    # trusting the roots in trustFile ("" = the system's only).
+    proc fxInstallTls(port: int, url: text, trustFile: text) -> text:
+        let a = do fdBackendNew("db-a", url)
+        let ks = PlanKeyspace{rules: [], hasFallback: true, fallbackKey: fxKey(1)}
+        let f = do fdFleetNew(ks, [a.backend], fxRouting("single"))
+        let d = do fdConfigDefault(port)
+        let config = FdConfig{readPref: d.readPref, fenceRetryBudgetMs: d.fenceRetryBudgetMs, fenceRetryIntervalMs: d.fenceRetryIntervalMs, upstreamTimeoutMs: d.upstreamTimeoutMs, maxBodyBytes: d.maxBodyBytes, port: port, trustFile: trustFile}
+        do fdInstall(config, f.fleet)
+        return a.err + f.err
+
+    action fxStartTls(port: int, url: text, trustFile: text):
+        let err = do fxInstallTls(port, url, trustFile)
+        fxOut = err
 
     action fxStart(fleetName: text, port: int, urlA: text, urlB: text):
         let err = do fxInstall(fleetName, port, urlA, urlB)
         fxOut = err
+
+    # The door, served once fxStart has installed it.
+    daemon FrontDoor uses io.net, io.net.listen:
+        let config = fdConfig
+        let l = listen(config.port)
+        loop true:
+            let c = accept(l)
+            detach fdServeConn(c)
 
     proc fxPublishNamed(name: text) -> int:
         do fdPublishRouting(fxRouting(name))

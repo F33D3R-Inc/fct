@@ -525,6 +525,15 @@ app ProgramSelfHost:
         err: text
         renameFrom: [text]
         renameTo: [text]
+        bodyLineNos: [int]
+
+    # SharedDecl: one `shared name: Type` / `shared name: [Type]` cell
+    # (parser.go parseShared); err is its parse refusal, "" when none.
+    struct SharedDecl:
+        name: text
+        type: text
+        list: bool
+        line: int
 
     # ProgThemeBlock: one `theme:` / `theme dark:` / `theme <name>:` block
     # (parser.go parseTheme/parseNamedTheme) — kind is "base", "dark" or
@@ -574,6 +583,7 @@ app ProgramSelfHost:
         hasContent: bool
         contentSrc: text
         unknownKeywords: [text]
+        shareds: [SharedDecl]
 
     # ============================================================
     # STAGE 4: per-kind builders — thin composition over already-ported
@@ -979,7 +989,7 @@ app ProgramSelfHost:
             let usesPart = trim(slice(head, ui + 6, len(head)))
             head = trim(slice(head, 0, ui))
             if usesPart == "":
-                return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "uses needs at least one capability (e.g. `uses io.file`)", renameFrom: [], renameTo: []}
+                return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "uses needs at least one capability (e.g. `uses io.file`)", renameFrom: [], renameTo: [], bodyLineNos: []}
             let parts = split(usesPart, ",")
             let np = len(parts)
             let mut pi = 0
@@ -987,7 +997,7 @@ app ProgramSelfHost:
                 let c = trim(parts[pi])
                 let ok = do isCapabilityNameToken(c)
                 if !ok:
-                    return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "invalid capability \"" + c + "\" in uses clause (expected a dotted name like io.file)", renameFrom: [], renameTo: []}
+                    return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "invalid capability \"" + c + "\" in uses clause (expected a dotted name like io.file)", renameFrom: [], renameTo: [], bodyLineNos: []}
                 uses = append(uses, c)
                 pi = pi + 1
         let mut every = 0
@@ -997,13 +1007,13 @@ app ProgramSelfHost:
             head = trim(slice(head, 0, ei))
             let secs = do progDurationSecs(durS)
             if secs < 0:
-                return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "invalid duration \"" + durS + "\" (use 30s, 5m, 2h)", renameFrom: [], renameTo: []}
+                return DaemonDecl{name: "", every: 0, uses: [], bodySrc: bodySrc, err: "invalid duration \"" + durS + "\" (use 30s, 5m, 2h)", renameFrom: [], renameTo: [], bodyLineNos: []}
             every = secs
         let name = trim(head)
         let idOk = do isIdentToken(name)
         if !idOk:
-            return DaemonDecl{name: name, every: 0, uses: [], bodySrc: bodySrc, err: "invalid daemon name \"" + name + "\"", renameFrom: [], renameTo: []}
-        return DaemonDecl{name: name, every: every, uses: uses, bodySrc: bodySrc, err: "", renameFrom: [], renameTo: []}
+            return DaemonDecl{name: name, every: 0, uses: [], bodySrc: bodySrc, err: "invalid daemon name \"" + name + "\"", renameFrom: [], renameTo: [], bodyLineNos: []}
+        return DaemonDecl{name: name, every: every, uses: uses, bodySrc: bodySrc, err: "", renameFrom: [], renameTo: [], bodyLineNos: []}
 
     # buildProgThemeBlock: parser.go's three theme dispatch arms. Entries are
     # the block's direct children; a value's escapes are decoded the way
@@ -1153,7 +1163,7 @@ app ProgramSelfHost:
     # to know "was this recognized at all" separately from "which one".
     # ============================================================
     proc progKnownKeyword(kw: text) -> bool:
-        if kw == "auth":
+        if kw == "auth" || kw == "shared":
             return true
         if kw == "entity":
             return true
@@ -1245,6 +1255,7 @@ app ProgramSelfHost:
         let mut frameSrc = ""
         let mut hasContent = false
         let mut contentSrc = ""
+        let mut shareds = []
 
         if appHeaderIndex >= 0:
             let nm = do progFacetName(rawLines[appHeaderIndex])
@@ -1313,6 +1324,9 @@ app ProgramSelfHost:
                         kw = "socket"
                     if header == "frame:" || header == "frame":
                         kw = "frame"
+                    let isShared = do hasPrefixText(header, "shared ")
+                    if isShared:
+                        kw = "shared"
                     if header == "content:" || header == "content":
                         kw = "content"
 
@@ -1343,8 +1357,14 @@ app ProgramSelfHost:
                 if kw == "policy":
                     let pd = do buildPolicyDeclFull(header, bodyLines)
                     policies = append(policies, pd)
+                let mut bodyNos0 = []
+                let mut bn0 = bodyStart
+                loop bn0 < bodyEnd:
+                    bodyNos0 = append(bodyNos0, lineNos[bn0])
+                    bn0 = bn0 + 1
                 if kw == "proc":
-                    let pcd = do parseProcDecl(header, bodySrc)
+                    let mut pcd = do parseProcDecl(header, bodySrc)
+                    pcd.bodyLineNos = bodyNos0
                     procs = append(procs, pcd)
                     if isPrivate:
                         privateProcs = append(privateProcs, pcd.name)
@@ -1414,8 +1434,41 @@ app ProgramSelfHost:
                 if kw == "layout":
                     layouts = append(layouts, LayoutEntry{headerLine: header, bodySrc: bodySrc})
                 if kw == "daemon":
-                    let dm = do buildDaemonDecl(header, bodySrc)
+                    let mut dm = do buildDaemonDecl(header, bodySrc)
+                    dm.bodyLineNos = bodyNos0
                     daemons = append(daemons, dm)
+                if kw == "shared":
+                    # parseShared
+                    let lno = lineNos[headerIndex]
+                    let rest = trim(slice(header, 6, len(header)))
+                    let colon = do indexOf(rest, ":")
+                    let mut err = ""
+                    if trim(bodySrc) != "":
+                        err = "a shared cell has no body — write `shared name: Type`"
+                    let mut sname = rest
+                    let mut styp = ""
+                    if colon >= 0:
+                        sname = trim(slice(rest, 0, colon))
+                        styp = trim(slice(rest, colon + 1, len(rest)))
+                    if err == "" && (colon < 0 || styp == ""):
+                        err = "shared needs a type: `shared name: Type`"
+                    if err == "" && contains(styp, "="):
+                        err = "a shared cell has no initializer — assign it from a proc (`name = expr`); reading it before that is an error, not a default"
+                    let nameOk = do isIdentToken(sname)
+                    if err == "" && !nameOk:
+                        err = "invalid shared cell name \"" + sname + "\""
+                    let mut slist = false
+                    let tl = len(styp)
+                    if tl >= 2 && charAt(styp, 0) == "[" && charAt(styp, tl - 1) == "]":
+                        slist = true
+                        styp = trim(slice(styp, 1, tl - 1))
+                    let typOk = do isIdentToken(styp)
+                    if err == "" && !typOk:
+                        err = "invalid type \"" + styp + "\" for shared cell \"" + sname + "\""
+                    if err != "":
+                        parseErrors = append(parseErrors, "line " + lno + ": " + err)
+                    else:
+                        shareds = append(shareds, SharedDecl{name: sname, type: styp, list: slist, line: lno})
                 if kw == "theme":
                     let tb = do buildProgThemeBlock(header, bodyLines)
                     themes = append(themes, tb)
@@ -1458,7 +1511,7 @@ app ProgramSelfHost:
 
                 k = k + 1
 
-        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: privateProcs, parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: kind, into: into, mounts: mounts, sockets: sockets, hasFrame: hasFrame, frameSrc: frameSrc, hasContent: hasContent, contentSrc: contentSrc, unknownKeywords: unknownKeywords}
+        return Program{name: name, hasAuth: hasAuth, entities: entities, records: records, structs: structs, enums: enums, states: states, derives: derives, policies: policies, procs: procs, actions: actions, webhooks: webhooks, jobs: jobs, services: services, components: components, triggers: triggers, views: views, themes: themes, css: css, daemons: daemons, privateProcs: privateProcs, parseErrors: parseErrors, layouts: layouts, rawDecls: rawDecls, kind: kind, into: into, mounts: mounts, sockets: sockets, hasFrame: hasFrame, frameSrc: frameSrc, hasContent: hasContent, contentSrc: contentSrc, unknownKeywords: unknownKeywords, shareds: shareds}
 
     # ============================================================
     # STAGE 7: the live, HTTP-exercisable driver — proof `parseProgramSrc`

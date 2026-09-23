@@ -39,7 +39,7 @@ app FabricTableCheck:
         let mut w = "-"
         if m.hasWriteOwner:
             w = m.writeOwner
-        return "" + m.shardId + ":" + m.source + ":" + m.destination + ":" + m.hasCutOver + ":" + w
+        return u64Text(m.shardId) + ":" + m.source + ":" + m.destination + ":" + m.hasCutOver + ":" + w
 
     proc lbTbl(t: TableRoutingTable) -> text:
         let mut nodes = []
@@ -84,17 +84,17 @@ app FabricTableCheck:
             let mut msd = "-"
             if e.hasMigration:
                 msd = do lbMigD(e.migration)
-            shards = append(shards, "" + e.shardId + ":" + e.owner + ":" + extras + ":" + ovj + ":R[" + rsd + "]:M[" + msd + "]:S[" + scj + "]")
+            shards = append(shards, u64Text(e.shardId) + ":" + e.owner + ":" + extras + ":" + ovj + ":R[" + rsd + "]:M[" + msd + "]:S[" + scj + "]")
             k = k + 1
         let nj = do lbJoin(nodes, ";")
         let sj = do lbJoin(shards, ";")
-        return "g" + t.generation + "|" + nj + "|" + sj
+        return "g" + u64Text(t.generation) + "|" + nj + "|" + sj
 
     proc lbRoute(r: Route) -> text:
         let mut cc = "-"
         if r.hasCoordinate:
             cc = "" + r.coordinate.x + "," + r.coordinate.y
-        return "" + r.shardId + ":" + cc + ":" + r.node + ":" + r.region + ":" + r.servedBy + ":" + r.kind + ":" + r.generation
+        return u64Text(r.shardId) + ":" + cc + ":" + r.node + ":" + r.region + ":" + r.servedBy + ":" + r.kind + ":" + u64Text(r.generation)
 
     proc lbErr(e: RoutingError) -> text:
         let m = do routingErrorMessage(e)
@@ -724,6 +724,44 @@ app FabricTableCheck:
         t = do lbPush(t, d)
         return t
 
+    # Shard ids past i64::MAX (u64div_rust.tsv's bigTable): the
+    # BTreeMap<u64, ShardEntry> order and their Display.
+    proc tBigTable() -> text:
+        let big = u64Parse("9223372036854775808")
+        let max = u64Parse("18446744073709551615")
+        let mut a = do tableTopologyNodeNew("db-a", "r")
+        let ids = [big + 5, 1, max, 3, big]
+        let mut i = 0
+        loop i < len(ids):
+            a = do tableTopologyNodeAddShard(a, ids[i])
+            i = i + 1
+        let mut tb = do tableFromTopology(TableTopology{nodes: [a]})
+        let mut t = do lbTbl(tb)
+        let k1 = do routingKeyNew(max, Coordinate{x: 3, y: 4})
+        let w1 = do tableResolveWrite(tb, k1.key)
+        let s1 = do lbRes(w1)
+        t = do lbPush(t, s1)
+        let k2 = do routingKeyNew(big + 1, Coordinate{x: 0, y: 0})
+        let w2 = do tableResolveWrite(tb, k2.key)
+        let s2 = do lbRes(w2)
+        t = do lbPush(t, s2)
+        let g0 = do replGroupBootstrap(big + 9, 3, "db-z", "q")
+        let fo = do replOpMarkFailed("db-z")
+        let g1 = do replGroupApply(g0, fo)
+        let sr = do tableSetReplicaSet(tb, g1.group, false, Coordinate{x: 0, y: 0})
+        t = do lbPush(t, "" + sr.ok)
+        tb = sr.table
+        let k3 = do routingKeyNew(big + 9, Coordinate{x: 0, y: 0})
+        let w3 = do tableResolveWrite(tb, k3.key)
+        let s3 = do lbRes(w3)
+        t = do lbPush(t, s3)
+        let f = do tableForgetShard(tb, big)
+        t = do lbPush(t, "" + f.removed)
+        let d = do lbTbl(f.table)
+        t = do lbPush(t, d)
+        return t
+
+    state bigTable: text = ""
     state tblTopology: text = ""
     state tblTopologyOrder: text = ""
     state tblReplicas: text = ""
@@ -756,6 +794,7 @@ app FabricTableCheck:
         let m = do tNeedsShard()
         let n = do tGeneration()
         let o = do tScanFails()
+        let big = do tBigTable()
         tblTopology = a
         tblTopologyOrder = b
         tblReplicas = c
@@ -771,3 +810,4 @@ app FabricTableCheck:
         tblNeedsShard = m
         tblGeneration = n
         tblScanFails = o
+        bigTable = big

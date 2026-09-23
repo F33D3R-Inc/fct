@@ -1,0 +1,30 @@
+# connectTls from an ordinary proc: an HTTP/1.1 exchange over a verified
+# TLS connection, and every way the handshake can refuse — each a value
+# (connError), never an abort. Driven by runtime/tlsconnect_test.go.
+app TlsConnect:
+    state result: text = ""
+
+    proc fetch(host: text, port: int, name: text, trust: text) -> text uses io.net:
+        let c = connectTls(host, port, name, trust)
+        let wrote = writeBytes(c, textToBytes("GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n"))
+        let mut got = []
+        let mut more = true
+        loop more:
+            let chunk = readBytes(c, 4096)
+            if len(chunk) == 0:
+                more = false
+            let mut i = 0
+            loop i < len(chunk):
+                got = append(got, chunk[i])
+                i = i + 1
+        let err = connError(c)
+        let closed = closeConn(c)
+        return slice(bytesToText(got), 0, 12) + "|" + wrote + "|" + err
+
+    action get(host: text, port: int, name: text, trust: text):
+        let r = do fetch(host, port, name, trust)
+        result = r
+
+    view Home at "/":
+        box:
+            text "{result}"

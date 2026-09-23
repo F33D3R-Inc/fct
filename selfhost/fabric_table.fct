@@ -276,6 +276,7 @@ app FabricTableSelfHost:
     # ============================================================
     struct TableMigrationPhase:
         phase: int
+        hasCutOver: bool
         cutoverCompletedAtMs: int
 
     proc tablePhaseIsTerminal(phase: int) -> bool:
@@ -289,7 +290,7 @@ app FabricTableSelfHost:
         return fenced
 
     proc tableMigrationHasCutOver(state: TableMigrationPhase) -> bool:
-        return state.cutoverCompletedAtMs != -1
+        return state.hasCutOver
 
     # tableMigrationReadOwnerIsDestination: `Migration::read_owner`, restated
     # as "is it the destination" (true) or "is it the source" (false) — the
@@ -650,7 +651,7 @@ app FabricTableSelfHost:
         let mut placed = false
         let mut i = 0
         loop i < len(shards):
-            if !placed && entry.shardId < shards[i].shardId:
+            if !placed && u64Cmp(entry.shardId, shards[i].shardId) < 0:
                 out = append(out, entry)
                 placed = true
             out = append(out, shards[i])
@@ -983,7 +984,7 @@ app FabricTableSelfHost:
     # fabric_migration_plan.fct) that `observe_migration` / `ShardMigration::
     # from_migration` read — its phase and when authority moved.
     proc tableMigrationPhaseOf(m: Migration) -> TableMigrationPhase:
-        return TableMigrationPhase{phase: m.phase, cutoverCompletedAtMs: m.cutoverCompletedAtMs}
+        return TableMigrationPhase{phase: m.phase, hasCutOver: m.hasCutOver, cutoverCompletedAtMs: m.cutoverCompletedAtMs}
 
     # tableShardMigrationOf: `ShardMigration::from_migration(&migration)`.
     proc tableShardMigrationOf(m: Migration) -> TableShardMigration:
@@ -1616,7 +1617,7 @@ app FabricTableSelfHost:
     proc demoTableMigrationPlannedTable() -> TableRoutingTable:
         let topo = do demoTableTopology()
         let table = do tableFromTopology(topo)
-        let state = TableMigrationPhase{phase: 0, cutoverCompletedAtMs: -1}
+        let state = TableMigrationPhase{phase: 0, hasCutOver: false, cutoverCompletedAtMs: 0}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         return result.table
 
@@ -1631,7 +1632,7 @@ app FabricTableSelfHost:
     # (record_applied(0,...)), not yet fenced.
     proc demoTableMigrationCatchingUpTable() -> TableRoutingTable:
         let table = do demoTableMigrationPlannedTable()
-        let state = TableMigrationPhase{phase: 2, cutoverCompletedAtMs: -1}
+        let state = TableMigrationPhase{phase: 2, hasCutOver: false, cutoverCompletedAtMs: 0}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         return result.table
 
@@ -1647,7 +1648,7 @@ app FabricTableSelfHost:
     # (= 0), phase=Cutover(3). Fenced: writes retry, reads keep working.
     proc demoTableMigrationCutoverTable() -> TableRoutingTable:
         let table = do demoTableMigrationCatchingUpTable()
-        let state = TableMigrationPhase{phase: 3, cutoverCompletedAtMs: -1}
+        let state = TableMigrationPhase{phase: 3, hasCutOver: false, cutoverCompletedAtMs: 0}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         return result.table
 
@@ -1679,7 +1680,7 @@ app FabricTableSelfHost:
     # write follow it in the same instant.
     proc demoTableMigrationDestTable() -> TableRoutingTable:
         let table = do demoTableMigrationCutoverTable()
-        let state = TableMigrationPhase{phase: 4, cutoverCompletedAtMs: 5100}
+        let state = TableMigrationPhase{phase: 4, hasCutOver: true, cutoverCompletedAtMs: 5100}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         return result.table
 
@@ -1703,7 +1704,7 @@ app FabricTableSelfHost:
     # becomes the destination and the migration is dropped.
     proc demoTableMigrationCompletedOwner() -> text:
         let table = do demoTableMigrationDestTable()
-        let state = TableMigrationPhase{phase: 5, cutoverCompletedAtMs: 5100}
+        let state = TableMigrationPhase{phase: 5, hasCutOver: true, cutoverCompletedAtMs: 5100}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         let lookup = do tableShardLookup(result.table, 42)
         return lookup.entry.owner
@@ -1711,7 +1712,7 @@ app FabricTableSelfHost:
 
     proc demoTableMigrationCompletedHasMigration() -> bool:
         let table = do demoTableMigrationDestTable()
-        let state = TableMigrationPhase{phase: 5, cutoverCompletedAtMs: 5100}
+        let state = TableMigrationPhase{phase: 5, hasCutOver: true, cutoverCompletedAtMs: 5100}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         let lookup = do tableShardLookup(result.table, 42)
         return lookup.entry.hasMigration
@@ -1719,7 +1720,7 @@ app FabricTableSelfHost:
 
     proc demoTableMigrationCompletedWriteServedBy() -> text:
         let table = do demoTableMigrationDestTable()
-        let state = TableMigrationPhase{phase: 5, cutoverCompletedAtMs: 5100}
+        let state = TableMigrationPhase{phase: 5, hasCutOver: true, cutoverCompletedAtMs: 5100}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         let keyResult = do routingKeyNew(42, Coordinate{x: 7, y: 3})
         let route = do tableResolveWrite(result.table, keyResult.key)
@@ -1731,9 +1732,9 @@ app FabricTableSelfHost:
     proc demoTableMigrationAbortedOwner() -> text:
         let topo = do demoTableTopology()
         let table = do tableFromTopology(topo)
-        let copying = TableMigrationPhase{phase: 1, cutoverCompletedAtMs: -1}
+        let copying = TableMigrationPhase{phase: 1, hasCutOver: false, cutoverCompletedAtMs: 0}
         let afterCopy = do tableObserveMigration(table, copying, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
-        let aborted = TableMigrationPhase{phase: 6, cutoverCompletedAtMs: -1}
+        let aborted = TableMigrationPhase{phase: 6, hasCutOver: false, cutoverCompletedAtMs: 0}
         let afterAbort = do tableObserveMigration(afterCopy.table, aborted, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         let lookup = do tableShardLookup(afterAbort.table, 42)
         return lookup.entry.owner
@@ -1742,9 +1743,9 @@ app FabricTableSelfHost:
     proc demoTableMigrationAbortedHasMigration() -> bool:
         let topo = do demoTableTopology()
         let table = do tableFromTopology(topo)
-        let copying = TableMigrationPhase{phase: 1, cutoverCompletedAtMs: -1}
+        let copying = TableMigrationPhase{phase: 1, hasCutOver: false, cutoverCompletedAtMs: 0}
         let afterCopy = do tableObserveMigration(table, copying, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
-        let aborted = TableMigrationPhase{phase: 6, cutoverCompletedAtMs: -1}
+        let aborted = TableMigrationPhase{phase: 6, hasCutOver: false, cutoverCompletedAtMs: 0}
         let afterAbort = do tableObserveMigration(afterCopy.table, aborted, 42, "db-a", "db-b", false, Coordinate{x: 0, y: 0})
         let lookup = do tableShardLookup(afterAbort.table, 42)
         return lookup.entry.hasMigration
@@ -1842,7 +1843,7 @@ app FabricTableSelfHost:
     # fence.last_write is None too).
     proc demoTableCellMigCutoverTable() -> TableRoutingTable:
         let table = do demoTableTwoCelledTable()
-        let state = TableMigrationPhase{phase: 3, cutoverCompletedAtMs: -1}
+        let state = TableMigrationPhase{phase: 3, hasCutOver: false, cutoverCompletedAtMs: 0}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", true, Coordinate{x: 0, y: 0})
         return result.table
 
@@ -1863,7 +1864,7 @@ app FabricTableSelfHost:
     # Authority moves for CELL_A only: complete_cutover(5100).
     proc demoTableCellMigDestTable() -> TableRoutingTable:
         let table = do demoTableCellMigCutoverTable()
-        let state = TableMigrationPhase{phase: 4, cutoverCompletedAtMs: 5100}
+        let state = TableMigrationPhase{phase: 4, hasCutOver: true, cutoverCompletedAtMs: 5100}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", true, Coordinate{x: 0, y: 0})
         return result.table
 
@@ -1887,7 +1888,7 @@ app FabricTableSelfHost:
     # shard's owner: complete(6000).
     proc demoTableCellMigCompletedShardOwner() -> text:
         let table = do demoTableCellMigDestTable()
-        let state = TableMigrationPhase{phase: 5, cutoverCompletedAtMs: 5100}
+        let state = TableMigrationPhase{phase: 5, hasCutOver: true, cutoverCompletedAtMs: 5100}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", true, Coordinate{x: 0, y: 0})
         let lookup = do tableShardLookup(result.table, 42)
         return lookup.entry.owner
@@ -1895,7 +1896,7 @@ app FabricTableSelfHost:
 
     proc demoTableCellMigCompletedMovingOwnerOf() -> text:
         let table = do demoTableCellMigDestTable()
-        let state = TableMigrationPhase{phase: 5, cutoverCompletedAtMs: 5100}
+        let state = TableMigrationPhase{phase: 5, hasCutOver: true, cutoverCompletedAtMs: 5100}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", true, Coordinate{x: 0, y: 0})
         let lookup = do tableShardLookup(result.table, 42)
         let ownerOf = do tableShardEntryOwnerOf(lookup.entry, Coordinate{x: 0, y: 0})
@@ -1904,7 +1905,7 @@ app FabricTableSelfHost:
 
     proc demoTableCellMigCompletedSiblingOwnerOf() -> text:
         let table = do demoTableCellMigDestTable()
-        let state = TableMigrationPhase{phase: 5, cutoverCompletedAtMs: 5100}
+        let state = TableMigrationPhase{phase: 5, hasCutOver: true, cutoverCompletedAtMs: 5100}
         let result = do tableObserveMigration(table, state, 42, "db-a", "db-b", true, Coordinate{x: 0, y: 0})
         let lookup = do tableShardLookup(result.table, 42)
         let ownerOf = do tableShardEntryOwnerOf(lookup.entry, Coordinate{x: 1, y: 0})
@@ -1947,7 +1948,7 @@ app FabricTableSelfHost:
 
     proc demoTableRangeFencedErrKind() -> text:
         let table = do demoTableCellMigDestTable()
-        let fencingState = TableMigrationPhase{phase: 3, cutoverCompletedAtMs: -1}
+        let fencingState = TableMigrationPhase{phase: 3, hasCutOver: false, cutoverCompletedAtMs: 0}
         let afterFencing = do tableObserveMigration(table, fencingState, 42, "db-a", "db-b", true, Coordinate{x: 1, y: 0})
         let rangeResult = do coordinateRangeNew(Coordinate{x: 0, y: 0}, Coordinate{x: 1, y: 0})
         let writeIntent = RouteIntent{isWrite: true, readPref: ReadPreference{kind: "Primary", region: ""}}
@@ -1957,7 +1958,7 @@ app FabricTableSelfHost:
 
     proc demoTableRangeFencedCellAStillResolves() -> text:
         let table = do demoTableCellMigDestTable()
-        let fencingState = TableMigrationPhase{phase: 3, cutoverCompletedAtMs: -1}
+        let fencingState = TableMigrationPhase{phase: 3, hasCutOver: false, cutoverCompletedAtMs: 0}
         let afterFencing = do tableObserveMigration(table, fencingState, 42, "db-a", "db-b", true, Coordinate{x: 1, y: 0})
         let keyResult = do routingKeyNew(42, Coordinate{x: 0, y: 0})
         let result = do tableResolveWrite(afterFencing.table, keyResult.key)

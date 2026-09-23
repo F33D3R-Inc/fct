@@ -13,50 +13,50 @@ app FqServerSelfHost:
     # FACETQL_PORT, FACETQL_TOKENS, FACETQL_MASTER_KEY, FACETQL_ENV,
     # FACETQL_ALLOWED_ORIGINS, FACETQL_ALLOW_PLAINTEXT, FACETQL_RATE_*,
     # FACETQL_MAX_BODY_BYTES, FACETQL_MAX_SUBSCRIBERS,
+    # FACETQL_MAX_CONCURRENT_REQUESTS, FACETQL_REQUEST_TIMEOUT_SECS,
+    # FACETQL_MAX_CONNECTIONS, FACETQL_TLS_IDENTITY(_PASSWORD),
     # FACETQL_CHECKPOINT_INTERVAL, FACETQL_WAL_ROTATE_BYTES, with the
     # ENOCHIAN_* spellings still honoured (config.rs's legacy aliases).
     #
-    # The shape. The Rust server shares one StorageEngine behind locks
-    # between request tasks; a proc has no locks, so here the engine is a
-    # value owned by exactly one task — the engine loop (svLoop) — and every
-    # request reaches it as a message:
-    #   * the daemon (FacetQL) loads the database (Database::new), detaches
-    #     the engine loop and a keep-alive ticker, then accepts connections,
-    #     each on its own detached handler (svServeConn);
-    #   * a handler reads requests off its connection (fqhttp.fct's
-    #     hReadRequest, keep-alive and pipelining included), sends each to
-    #     the loop with its own reply channel, and writes the answer back;
-    #   * the loop runs the router as axum layers it — CORS, route match,
-    #     auth, rate limit, metrics, handler — so everything with state (the
-    #     engine, the event feed, live subscribers, rate buckets, metrics)
-    #     has one owner and requests are serialised as the engine's writes
-    #     are anyway;
-    #   * GET /events is answered by the loop itself: it writes the stream's
-    #     head and replayed backlog to the connection, keeps the connection
-    #     as a subscriber, and writes every admitted event to it as it is
-    #     published (and a keep-alive comment on the ticker's beat).
+    # The shape is facetql's locking model. engine.rs is a single-writer
+    # engine whose reads run beside the writer against snapshots, with read
+    # pins holding back segment deletion and B+tree page reuse:
+    #   * the daemon (FacetQL) opens the database (Database::new), detaches
+    #     the loop, and accepts connections — plain, or TLS from a PKCS#12
+    #     identity (tls_server.rs, with its connection cap) — each on its own
+    #     detached task (svServeConn);
+    #   * the loop (svLoop) is the one writer and owns what Rust keeps under
+    #     locks and atomics: the in-flight slots (limits.rs's semaphore), the
+    #     rate buckets, the metrics, the event feed, the read pins. Each
+    #     request's head goes to it first — the router's layers in axum's
+    #     order: the in-flight limit, CORS, the route, auth, the rate limit,
+    #     the metrics count;
+    #   * admitted, the request's own task reads the body (only a handler
+    #     that takes Json does, inside the request timeout, as axum's
+    #     extractor does) and the handler runs where facetql runs it: a read
+    #     on its own task against the engine snapshot the loop last
+    #     published (svSnapshot), pinned while it reads; a mutation queued
+    #     for the loop, which runs one at a time (engine.rs's writer mutex);
+    #   * the answer is awaited within FACETQL_REQUEST_TIMEOUT_SECS (408
+    #     past it; the handler is not stopped, as a tokio timeout does not
+    #     stop a blocking task), then the request's end goes back to the
+    #     loop — its slot, its latency, its read counters;
+    #   * an event stream runs on its connection's task: the head, the
+    #     retained backlog, every admitted event as the loop publishes it
+    #     (a notification per publish; lag reported as tokio reports it),
+    #     and the keep-alive comment 15 s after the last write;
+    #   * SIGINT/SIGTERM: in-flight requests finish, the last checkpoint is
+    #     taken, and the process exits 0; a refusal to start exits with
+    #     main.rs's status (7 for the posture, 1/4/5 for the database).
     #
-    # What differs from the Rust server, and why:
-    #   * a subscriber's writes carry a deadline (a stalled client would
-    #     otherwise stall the loop); one that fails or times out is dropped,
-    #     where tokio's broadcast channel would report it lagged;
-    #   * the keep-alive comment goes to every subscriber on one 15 s beat
-    #     rather than 15 s after each stream's last frame;
-    #   * the request timeout and the in-flight cap are satisfied by
-    #     construction (one request at a time), so `in_flight` reads 1 and
-    #     no 408/503 is ever produced by them;
-    #   * process statistics (CPU, resident memory, limits) are not
-    #     measurable from fct: those fields are null, as Rust reports them
-    #     on a platform that cannot measure them;
+    # What still differs from the Rust server, and why:
     #   * latency is measured on a millisecond clock (monoMs), so each
     #     sample is a whole number of milliseconds in microseconds;
-    #   * a refusal to start (bad posture, unreadable database) is printed
-    #     as Rust prints it, but the process exit status stays 0 — a
-    #     daemon has no way to set one;
-    #   * there is no SIGTERM drain/checkpoint (fct has no signals), which
-    #     costs only replay time: every acknowledged write is in the WAL;
-    #   * TLS: the runtime has no TLS primitive, so FACETQL_TLS_IDENTITY is
-    #     refused rather than silently served in plaintext.
+    #   * the write-queue depth counts the mutations the loop holds between
+    #     writes — the queue the single writer actually has — where Rust
+    #     counts threads waiting on its writer mutex;
+    #   * a failed TLS listener (an unreadable identity) ends the service
+    #     with status 1, where Rust panics (101).
 
     # ── configuration ──────────────────────────────────────────────────
     struct SvRate:
@@ -82,6 +82,9 @@ app FqServerSelfHost:
         maxSubscribers: int
         maxConcurrent: int
         timeoutSecs: int
+        maxConnections: int
+        tlsIdentity: text
+        tlsPassword: text
 
     # svEnv: a variable, or its deprecated ENOCHIAN_* alias when only that
     # is set (apply_legacy_env_aliases).
@@ -225,7 +228,7 @@ app FqServerSelfHost:
             let pu = do hParseUint(trim(svEnv("FACETQL_PORT")))
             if !pu.ok || pu.v > 65535:
                 let e0 = writeStderr("error: invalid value '" + svEnv("FACETQL_PORT") + "' for '--port <PORT>': invalid digit found in string\n")
-                return SvConfig{ok: false, dataDir: dir, port: 0, keyHex: "", dev: false, corsAny: false, origins: [], maxBody: 0, rates: [], tokHashes: [], tokOwners: [], tokAdmins: [], interval: 0, rotateBytes: 0, maxSubscribers: 0, maxConcurrent: 0, timeoutSecs: 0}
+                return SvConfig{ok: false, dataDir: dir, port: 0, keyHex: "", dev: false, corsAny: false, origins: [], maxBody: 0, rates: [], tokHashes: [], tokOwners: [], tokAdmins: [], interval: 0, rotateBytes: 0, maxSubscribers: 0, maxConcurrent: 0, timeoutSecs: 0, maxConnections: 0, tlsIdentity: "", tlsPassword: ""}
             port = pu.v
         let envName = lower(trim(envVar("FACETQL_ENV")))
         let dev = envName == "development" || envName == "dev" || envName == "test"
@@ -270,7 +273,10 @@ app FqServerSelfHost:
         let mut tsecs = do svEnvUsize("FACETQL_REQUEST_TIMEOUT_SECS")
         if tsecs == 0:
             tsecs = 30
-        return SvConfig{ok: true, dataDir: dir, port: port, keyHex: svEnv("FACETQL_MASTER_KEY"), dev: dev, corsAny: corsAny, origins: origins, maxBody: maxBody, rates: rates, tokHashes: toks.hashes, tokOwners: toks.owners, tokAdmins: toks.admins, interval: interval, rotateBytes: rotate, maxSubscribers: maxSubs, maxConcurrent: maxConc, timeoutSecs: tsecs}
+        let mut maxConns = do svEnvUsize("FACETQL_MAX_CONNECTIONS")
+        if maxConns == 0:
+            maxConns = 2048
+        return SvConfig{ok: true, dataDir: dir, port: port, keyHex: svEnv("FACETQL_MASTER_KEY"), dev: dev, corsAny: corsAny, origins: origins, maxBody: maxBody, rates: rates, tokHashes: toks.hashes, tokOwners: toks.owners, tokAdmins: toks.admins, interval: interval, rotateBytes: rotate, maxSubscribers: maxSubs, maxConcurrent: maxConc, timeoutSecs: tsecs, maxConnections: maxConns, tlsIdentity: svEnv("FACETQL_TLS_IDENTITY"), tlsPassword: svEnv("FACETQL_TLS_IDENTITY_PASSWORD")}
 
     # ── the deployment posture (main.rs's enforce_deployment_posture) ──
     struct SvKey:
@@ -324,7 +330,7 @@ app FqServerSelfHost:
                         i = i + 1
                     if zero:
                         findings = append(findings, "FACETQL_MASTER_KEY is set to the all-zero development key, which is a published constant and protects nothing")
-        if !envSet("FACETQL_ALLOW_PLAINTEXT"):
+        if cfg.tlsIdentity == "" && !envSet("FACETQL_ALLOW_PLAINTEXT"):
             findings = append(findings, "no TLS identity is configured, so every request — including the x-api-key bearer token in its header — would cross the network in the clear")
         return findings
 
@@ -359,11 +365,14 @@ app FqServerSelfHost:
         everyone: [bool]
         owners: [text]
         earliest: int
+        # every event ever emitted — a subscriber's position; the ring holds
+        # the last len(seqs) of them
+        emitted: int
 
+    # SvSubs: each live subscriber's notification channel (the loop's
+    # side of it: a non-blocking "something was published").
     struct SvSubs:
-        conns: [int]
-        owners: [text]
-        admins: [bool]
+        chans: [int]
 
     struct SvBuckets:
         keys: [text]
@@ -386,6 +395,22 @@ app FqServerSelfHost:
         lastDuration: int
         lastRead: text
         lastWrite: text
+        cpuOpen: float
+        cpuKnown: bool
+        lastCpu: text
+
+    # SvLoopState: what the loop keeps beyond the engine and the feed —
+    # the requests in flight (limits.rs's semaphore), the writes waiting
+    # for the writer (engine.rs's writer mutex, and metrics.rs's view of
+    # its queue), connections held (the TLS path's cap), and shutdown.
+    struct SvLoopState:
+        inflight: int
+        queue: [SvReq]
+        queueIds: [SvIdent]
+        contended: int
+        conns: int
+        shutting: bool
+        grace: int
 
     struct SvState:
         cfg: SvConfig
@@ -394,12 +419,25 @@ app FqServerSelfHost:
         subs: SvSubs
         buckets: SvBuckets
         met: SvMetrics
+        lp: SvLoopState
 
-    proc svWithEng(st: SvState, e: FqEngine) -> SvState:
-        return SvState{cfg: st.cfg, eng: e, feed: st.feed, subs: st.subs, buckets: st.buckets, met: st.met}
+    # The cells the loop publishes: the engine as of its last write (what a
+    # snapshot read reads), the event ring (what a stream reads), and
+    # whether shutdown has begun (the accept loop stops taking
+    # connections).
+    shared svSnapshot: FqEngine
+    shared svFeedCell: SvFeed
+    shared svDraining: bool
+
+    proc svWithEng(st0: SvState, e: FqEngine) -> SvState:
+        let mut st = st0
+        st.eng = e
+        return st
 
     # ── a request, as the loop sees it ─────────────────────────────────
     struct SvReq:
+        reply: int
+        reqid: int
         conn: int
         method: text
         path: text
@@ -449,46 +487,43 @@ app FqServerSelfHost:
             return "1"
         return "0"
 
-    proc svReqPack(reply: int, c: int, r: HttpServerRequest, tooLarge: bool) -> text:
-        let mut f = ["" + reply, "" + c, r.method, r.path, r.query, svBoolText(r.hasQuery), svBoolText(tooLarge), r.body]
+    # A request between a connection's task and the loop: [reply, reqid,
+    # conn, method, path, query, hasQuery, tooLarge, body, headers…].
+    proc svReqFields(r: SvReq) -> [text]:
+        let mut f = ["" + r.reply, "" + r.reqid, "" + r.conn, r.method, r.path, r.query, svBoolText(r.hasQuery), svBoolText(r.tooLarge), r.body]
         let mut i = 0
         loop i < len(r.headers):
             f = append(f, r.headers[i].name)
             f = append(f, r.headers[i].value)
             i = i + 1
-        let p = do svPack(f)
-        return "Q" + p
+        return f
 
-    proc svReqUnpack(f: [text]) -> SvReq:
+    proc svReqAt(f: [text], at: int) -> SvReq:
         let mut hs = []
-        let mut i = 8
+        let mut i = at + 9
         loop i + 1 < len(f):
             hs = append(hs, HttpHeader{name: f[i], value: f[i + 1]})
             i = i + 2
-        return SvReq{conn: toInt(f[1]), method: f[2], path: f[3], query: f[4], hasQuery: f[5] == "1", headers: hs, body: f[7], tooLarge: f[6] == "1"}
+        return SvReq{reply: toInt(f[at]), reqid: toInt(f[at + 1]), conn: toInt(f[at + 2]), method: f[at + 3], path: f[at + 4], query: f[at + 5], hasQuery: f[at + 6] == "1", tooLarge: f[at + 7] == "1", body: f[at + 8], headers: hs}
 
-    proc svRespPack(r: HttpServerResponse, sse: bool) -> text:
-        let mut f = ["" + r.status, svBoolText(sse), r.body]
+    # A response from the loop or a read task: [kind, reqid, status, body,
+    # headers…].
+    proc svRespFields(kind: text, reqid: int, r: HttpServerResponse) -> [text]:
+        let mut f = [kind, "" + reqid, "" + r.status, r.body]
         let mut i = 0
         loop i < len(r.headers):
             f = append(f, r.headers[i].name)
             f = append(f, r.headers[i].value)
             i = i + 1
-        let p = do svPack(f)
-        return p
+        return f
 
-    struct SvReply:
-        sse: bool
-        resp: HttpServerResponse
-
-    proc svRespUnpack(s: text) -> SvReply:
-        let f = do svUnpack(s)
+    proc svRespAt(f: [text]) -> HttpServerResponse:
         let mut hs = []
-        let mut i = 3
+        let mut i = 4
         loop i + 1 < len(f):
             hs = append(hs, HttpHeader{name: f[i], value: f[i + 1]})
             i = i + 2
-        return SvReply{sse: f[1] == "1", resp: HttpServerResponse{status: toInt(f[0]), reason: "", headers: hs, body: f[2]}}
+        return HttpServerResponse{status: toInt(f[2]), reason: "", headers: hs, body: f[3]}
 
     # ── routing (create_router) ────────────────────────────────────────
     # svRoute: the route pattern the path matches ("" for none), its
@@ -745,7 +780,8 @@ app FqServerSelfHost:
                 i = i + 1
             b = SvBuckets{keys: keys, tokens: tokens, updated: updated}
             if len(b.keys) >= 10000:
-                let st1 = SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: st.subs, buckets: b, met: st.met}
+                let mut st1 = st
+                st1.buckets = b
                 let r1 = do svTooMany(class, rate, -1)
                 return SvLimited{ok: false, st: st1, resp: r1}
         if at < 0:
@@ -765,7 +801,8 @@ app FqServerSelfHost:
         let mut toks = b.tokens
         toks[at] = tokens
         b = SvBuckets{keys: b.keys, tokens: toks, updated: upd}
-        let st2 = SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: st.subs, buckets: b, met: st.met}
+        let mut st2 = st
+        st2.buckets = b
         if allowed:
             return SvLimited{ok: true, st: st2, resp: hEmpty(200)}
         let r2 = do svTooMany(class, rate, retry)
@@ -792,7 +829,16 @@ app FqServerSelfHost:
         let z = do svZeros(512)
         let t = monoMs()
         let empty = "{\"count\":0,\"p50_us\":null,\"p99_us\":null,\"max_us\":null}"
-        return SvMetrics{started: t, total: 0, read: 0, write: 0, excluded: 0, unclassified: 0, readHist: z, writeHist: z, winOpened: t, winClosed: -1, readOpen: z, writeOpen: z, lastDuration: 0, lastRead: empty, lastWrite: empty}
+        let cpu = do svCpuSeconds()
+        return SvMetrics{started: t, total: 0, read: 0, write: 0, excluded: 0, unclassified: 0, readHist: z, writeHist: z, winOpened: t, winClosed: -1, readOpen: z, writeOpen: z, lastDuration: 0, lastRead: empty, lastWrite: empty, cpuOpen: cpu.f, cpuKnown: cpu.ok, lastCpu: "null"}
+
+    # svCpuSeconds: cpu_seconds_total, from the runtime's process stats.
+    proc svCpuSeconds() -> SvF64 uses io.console:
+        let p = do fjParse(processStats())
+        let g = do fjGet(p.v, "cpu_seconds_total")
+        if !p.ok || !g.ok || g.v.kind == "null":
+            return SvF64{ok: false, f: 0.0}
+        return SvF64{ok: true, f: g.v.f}
 
     # bucket_index / bucket_upper_us: a log-linear histogram, eight
     # sub-buckets per octave.
@@ -857,7 +903,10 @@ app FqServerSelfHost:
             rh[idx] = rh[idx] + 1
         if class == 1:
             wh[idx] = wh[idx] + 1
-        return SvMetrics{started: m.started, total: m.total, read: m.read, write: m.write, excluded: m.excluded, unclassified: m.unclassified, readHist: rh, writeHist: wh, winOpened: m.winOpened, winClosed: m.winClosed, readOpen: m.readOpen, writeOpen: m.writeOpen, lastDuration: m.lastDuration, lastRead: m.lastRead, lastWrite: m.lastWrite}
+        let mut out = m
+        out.readHist = rh
+        out.writeHist = wh
+        return out
 
     proc svCount(m: SvMetrics, class: int) -> SvMetrics:
         let mut r = m.read
@@ -872,17 +921,27 @@ app FqServerSelfHost:
             x = x + 1
         if class == 3:
             u = u + 1
-        return SvMetrics{started: m.started, total: m.total + 1, read: r, write: w, excluded: x, unclassified: u, readHist: m.readHist, writeHist: m.writeHist, winOpened: m.winOpened, winClosed: m.winClosed, readOpen: m.readOpen, writeOpen: m.writeOpen, lastDuration: m.lastDuration, lastRead: m.lastRead, lastWrite: m.lastWrite}
+        let mut out = m
+        out.total = m.total + 1
+        out.read = r
+        out.write = w
+        out.excluded = x
+        out.unclassified = u
+        return out
 
     struct SvRuntime:
         met: SvMetrics
         json: text
 
-    # snapshot(): the counters, the window (closed and reopened once it
-    # has run a second), and the process section.
-    proc svRuntime(m0: SvMetrics, maxConcurrent: int) -> SvRuntime:
+    # snapshot(): the counters (in flight and the writer queue as the loop
+    # sees them), the window (closed and reopened once it has run a
+    # second, with the CPU the process used over it), and the process
+    # section as the runtime measures it.
+    proc svRuntime(m0: SvMetrics, lp: SvLoopState, maxConcurrent: int) -> SvRuntime uses io.console:
         let now = monoMs()
         let mut m = m0
+        let proc0 = processStats()
+        let pp = do fjParse(proc0)
         let elapsed = now - m.winOpened
         if elapsed >= 1000:
             let mut rd = svZeros(512)
@@ -894,13 +953,43 @@ app FqServerSelfHost:
                 i = i + 1
             let lr = do svLatencyJson(rd)
             let lw = do svLatencyJson(wd)
-            m = SvMetrics{started: m.started, total: m.total, read: m.read, write: m.write, excluded: m.excluded, unclassified: m.unclassified, readHist: m.readHist, writeHist: m.writeHist, winOpened: now, winClosed: now, readOpen: m.readHist, writeOpen: m.writeHist, lastDuration: elapsed, lastRead: lr, lastWrite: lw}
+            let cpuNow = do svCpuSeconds()
+            let cores = do fjGet(pp.v, "cpu_cores")
+            let mut util = "null"
+            if m.cpuKnown && cpuNow.ok && cores.ok && cores.v.kind == "int" && cores.v.f > 0.0:
+                let secs = toFloat(elapsed) / 1000.0
+                let mut u = (cpuNow.f - m.cpuOpen) / (secs * cores.v.f)
+                if u < 0.0:
+                    u = 0.0
+                if u > 1.0:
+                    u = 1.0
+                util = do fjText(prNumber(u))
+            m.winOpened = now
+            m.winClosed = now
+            m.readOpen = m.readHist
+            m.writeOpen = m.writeHist
+            m.lastDuration = elapsed
+            m.lastRead = lr
+            m.lastWrite = lw
+            m.cpuOpen = cpuNow.f
+            m.cpuKnown = cpuNow.ok
+            m.lastCpu = util
         let mut age = 0
         if m.winClosed >= 0:
             age = now - m.winClosed
-        let requests = "{\"total\":" + m.total + ",\"read\":" + m.read + ",\"write\":" + m.write + ",\"excluded\":" + m.excluded + ",\"unclassified\":" + m.unclassified + ",\"in_flight\":1,\"max_concurrent\":" + maxConcurrent + ",\"write_queue_depth\":0,\"write_queue_contended_total\":0}"
-        let window = "{\"duration_ms\":" + m.lastDuration + ",\"age_ms\":" + age + ",\"cpu_utilization\":null,\"read_latency\":" + m.lastRead + ",\"write_latency\":" + m.lastWrite + "}"
-        let process = "{\"cpu_seconds_total\":null,\"cpu_cores\":null,\"resident_bytes\":null,\"memory_limit_bytes\":null,\"memory_limit_source\":null,\"memory_utilization\":null}"
+        let requests = "{\"total\":" + m.total + ",\"read\":" + m.read + ",\"write\":" + m.write + ",\"excluded\":" + m.excluded + ",\"unclassified\":" + m.unclassified + ",\"in_flight\":" + lp.inflight + ",\"max_concurrent\":" + maxConcurrent + ",\"write_queue_depth\":" + len(lp.queue) + ",\"write_queue_contended_total\":" + lp.contended + "}"
+        let window = "{\"duration_ms\":" + m.lastDuration + ",\"age_ms\":" + age + ",\"cpu_utilization\":" + m.lastCpu + ",\"read_latency\":" + m.lastRead + ",\"write_latency\":" + m.lastWrite + "}"
+        let names = ["cpu_seconds_total", "cpu_cores", "resident_bytes", "memory_limit_bytes", "memory_limit_source", "memory_utilization"]
+        let mut fields = []
+        let mut k = 0
+        loop k < len(names):
+            let g = do fjGet(pp.v, names[k])
+            let mut v = "null"
+            if pp.ok && g.ok:
+                v = do fjText(g.v)
+            fields = append(fields, "\"" + names[k] + "\":" + v)
+            k = k + 1
+        let process = "{" + join(fields, ",") + "}"
         let json = "{\"uptime_seconds\":" + ((now - m.started) / 1000) + ",\"requests\":" + requests + ",\"window\":" + window + ",\"process\":" + process + "}"
         return SvRuntime{met: m, json: json}
 
@@ -949,15 +1038,20 @@ app FqServerSelfHost:
         return everyone || admin || only == owner
 
     # svEmit: emit_with — the next operation id as the event's sequence,
-    # the ring trimmed to 1024, then every admitted live subscriber written
-    # to (one whose write fails is dropped and closed).
-    proc svEmit(st: SvState, everyone: bool, only: text, payload0: text, isJson: bool, keys: [text], vals: [text]) -> SvState uses io.net.listen:
+    # the ring trimmed to 1024 (the oldest one leaving sets the earliest
+    # resumable position), the ring published, and every live subscriber
+    # told there is something new (tokio's broadcast send). A subscriber's
+    # own task writes what it admits; a notification already pending is
+    # not repeated, so the loop never waits on a subscriber.
+    proc svEmit(st0: SvState, everyone: bool, only: text, payload0: text, isJson: bool, keys: [text], vals: [text]) -> SvState:
+        let mut st = st0
         let n = do enNextOperationId(st.eng)
+        st.eng = n.eng
         let seq = n.v
         let mut payload = payload0
         if isJson:
             payload = do svJsonObject(append(keys, "seq"), append(vals, "" + seq))
-        let mut f = st.feed
+        let f = st.feed
         let mut seqs = f.seqs
         let mut payloads = f.payloads
         let mut evs = f.everyone
@@ -969,50 +1063,25 @@ app FqServerSelfHost:
             payloads = slice(payloads, 1, len(payloads))
             evs = slice(evs, 1, len(evs))
             owners = slice(owners, 1, len(owners))
-        f = SvFeed{seqs: append(seqs, seq), payloads: append(payloads, payload), everyone: append(evs, everyone), owners: append(owners, only), earliest: earliest}
-        let frame = do svFrame(seq, payload)
-        let subs = st.subs
-        let mut conns = []
-        let mut sowners = []
-        let mut admins = []
+        st.feed = SvFeed{seqs: append(seqs, seq), payloads: append(payloads, payload), everyone: append(evs, everyone), owners: append(owners, only), earliest: earliest, emitted: f.emitted + 1}
+        svFeedCell = st.feed
+        let mut live = []
         let mut i = 0
-        loop i < len(subs.conns):
-            let mut keep = true
-            if svAdmits(everyone, only, subs.owners[i], subs.admins[i]):
-                if frame == "":
-                    keep = false
-                else:
-                    keep = do hWriteChunk(subs.conns[i], textToBytes(frame))
-            if keep:
-                conns = append(conns, subs.conns[i])
-                sowners = append(sowners, subs.owners[i])
-                admins = append(admins, subs.admins[i])
-            else:
-                let c = closeConn(subs.conns[i])
+        loop i < len(st.subs.chans):
+            let ch = st.subs.chans[i]
+            let pending = awaitAny([ch], 0)
+            let mut open = true
+            if pending < 0:
+                open = send(ch, "e")
+            if open:
+                live = append(live, ch)
             i = i + 1
-        return SvState{cfg: st.cfg, eng: n.eng, feed: f, subs: SvSubs{conns: conns, owners: sowners, admins: admins}, buckets: st.buckets, met: st.met}
+        st.subs = SvSubs{chans: live}
+        return st
 
-    proc svPublishJson(st: SvState, everyone: bool, only: text, keys: [text], vals: [text]) -> SvState uses io.net.listen:
+    proc svPublishJson(st: SvState, everyone: bool, only: text, keys: [text], vals: [text]) -> SvState:
         let r = do svEmit(st, everyone, only, "", true, keys, vals)
         return r
-
-    # svKeepAlive: KeepAlive's empty comment to every live subscriber.
-    proc svKeepAlive(st: SvState) -> SvState uses io.net.listen:
-        let subs = st.subs
-        let mut conns = []
-        let mut owners = []
-        let mut admins = []
-        let mut i = 0
-        loop i < len(subs.conns):
-            let ok = do hWriteChunk(subs.conns[i], textToBytes(":\n\n"))
-            if ok:
-                conns = append(conns, subs.conns[i])
-                owners = append(owners, subs.owners[i])
-                admins = append(admins, subs.admins[i])
-            else:
-                let c = closeConn(subs.conns[i])
-            i = i + 1
-        return SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: SvSubs{conns: conns, owners: owners, admins: admins}, buckets: st.buckets, met: st.met}
 
     proc svQ(s: text) -> text:
         let q = do fjQuote(s)
@@ -1535,14 +1604,11 @@ app FqServerSelfHost:
 
     proc svTransaction(st: SvState, req: SvReq, id: SvIdent, types: [SjType]) -> SvOut uses io.file, io.net.listen:
         let hr = HttpServerRequest{state: 1, err: "", method: req.method, target: req.path, path: req.path, hasQuery: req.hasQuery, query: req.query, version: "HTTP/1.1", headers: req.headers, body: req.body, rest: []}
-        let b = do hJsonBody(hr, req.tooLarge, types, "TransactionRequest")
+        let b = do hJsonTransaction(hr, req.tooLarge, types)
         if !b.ok:
             let o = do svOut(st, b.resp)
             return o
-        let dec = do hTxOps(req.body, types)
-        if !dec.ok:
-            let o0 = do svOut(st, dec.resp)
-            return o0
+        let decoded = b.v.items[0].items
         let n0 = do fjNull()
         let blankNode = do nodeNew(coordinateNew(0, 0, 0, 0), "", "", "")
         let e0 = do edgeNew("", "", "", "")
@@ -1550,9 +1616,9 @@ app FqServerSelfHost:
         let mut ops = []
         let mut touched = []
         let mut i = 0
-        loop i < len(dec.ops):
-            let tag = dec.tags[i]
-            let v = dec.ops[i]
+        loop i < len(decoded):
+            let tag = decoded[i].s
+            let v = decoded[i]
             if tag == "insert_node":
                 let address = do hStr(v, 0)
                 if !id.admin && (hHas(v, 8) || hHas(v, 9)):
@@ -1689,40 +1755,84 @@ app FqServerSelfHost:
         let o2 = do svOut(st1, hText(200, "published"))
         return o2
 
-    proc svSubscribe(st: SvState, req: SvReq, id: SvIdent) -> SvOut uses io.net.listen:
-        if len(st.subs.conns) >= st.cfg.maxSubscribers:
-            let o = do svOut(st, hText(503, "too many live subscribers; retry shortly"))
-            return o
+    # svSubscribe: subscribe_events' checks, in the loop — a subscriber
+    # slot, the query, the resume position. Taken, the answer is the
+    # position (in emitted events) the subscriber's stream starts reading
+    # at, and its notification channel.
+    struct SvSubscribed:
+        st: SvState
+        ok: bool
+        resp: HttpServerResponse
+        start: int
+        notify: int
+
+    proc svSubscribe(st0: SvState, req: SvReq, id: SvIdent) -> SvSubscribed:
+        let mut st = st0
+        if len(st.subs.chans) >= st.cfg.maxSubscribers:
+            return SvSubscribed{st: st, ok: false, resp: hText(503, "too many live subscribers; retry shortly"), start: 0, notify: 0}
         let q = do hQueryDecode(req.query, ["after"], ["uint"])
         if !q.ok:
-            let o0 = do svOut(st, hText(400, "Failed to deserialize query string: " + q.err))
-            return o0
+            return SvSubscribed{st: st, ok: false, resp: hText(400, "Failed to deserialize query string: " + q.err), start: 0, notify: 0}
         let f = st.feed
         if q.has[0] && q.ints[0] < f.earliest:
-            let o1 = do svOut(st, hText(410, "cannot resume the event feed from " + q.ints[0] + ": the oldest position still available is " + f.earliest + " (" + len(f.seqs) + " of at most 1024 events retained, in memory only — nothing published before this process started is retained at all). The events between those two positions are gone from the feed and this server will not pretend otherwise by starting from the live edge. Reconcile from a full read instead."))
-            return o1
-        let mut head = [HttpHeader{name: "content-type", value: "text/event-stream"}, HttpHeader{name: "cache-control", value: "no-cache"}]
-        let cors = do svCors(st.cfg, req, hEmpty(200))
-        head = head + cors.headers
-        let c = req.conn
-        let timed = setTimeoutMs(c, 10000)
-        let mut ok = do httpServerStartStream(c, 200, head)
+            return SvSubscribed{st: st, ok: false, resp: hText(410, "cannot resume the event feed from " + q.ints[0] + ": the oldest position still available is " + f.earliest + " (" + len(f.seqs) + " of at most 1024 events retained, in memory only — nothing published before this process started is retained at all). The events between those two positions are gone from the feed and this server will not pretend otherwise by starting from the live edge. Reconcile from a full read instead."), start: 0, notify: 0}
+        # the backlog: the retained events after `after`, then live
+        let mut start = f.emitted
         if q.has[0]:
-            let mut i = 0
-            loop i < len(f.seqs) && ok:
-                if f.seqs[i] > q.ints[0] && svAdmits(f.everyone[i], f.owners[i], id.owner, id.admin):
+            let first = f.emitted - len(f.seqs)
+            let mut i = len(f.seqs) - 1
+            loop i >= 0 && f.seqs[i] > q.ints[0]:
+                start = first + i
+                i = i - 1
+        let notify = channel()
+        st.subs = SvSubs{chans: append(st.subs.chans, notify)}
+        return SvSubscribed{st: st, ok: true, resp: hEmpty(200), start: start, notify: notify}
+
+    # svStream: the event stream, on the subscriber's own connection task —
+    # the head, then every retained event from `start` on that the
+    # identity's audience admits, as it is published, each frame one
+    # chunk; the keep-alive comment 15 s after the last thing written (a
+    # KeepAliveStream per stream); a subscriber more than the ring behind
+    # told how many it missed (tokio's Lagged). Ends when a write fails,
+    # the connection is cut on a payload SSE cannot carry.
+    proc svStream(c: int, cfg: SvConfig, req: SvReq, id: SvIdent, start: int, notify: int) uses io.net.listen:
+        let mut head = [HttpHeader{name: "content-type", value: "text/event-stream"}, HttpHeader{name: "cache-control", value: "no-cache"}]
+        let cors = do svCors(cfg, req, hEmpty(200))
+        head = head + cors.headers
+        let mut ok = do httpServerStartStream(c, 200, head)
+        let mut pos = start
+        let mut last = monoMs()
+        loop ok:
+            let f = svFeedCell
+            let first = f.emitted - len(f.seqs)
+            if pos < first:
+                let lag = do svJsonObject(["event", "dropped"], ["\"feed_lagged\"", "" + (first - pos)])
+                ok = do hWriteChunk(c, textToBytes("data: " + lag + "\n\n"))
+                last = monoMs()
+                pos = first
+            loop ok && pos < f.emitted:
+                let i = pos - first
+                if svAdmits(f.everyone[i], f.owners[i], id.owner, id.admin):
                     let frame = do svFrame(f.seqs[i], f.payloads[i])
                     if frame == "":
                         ok = false
                     else:
                         ok = do hWriteChunk(c, textToBytes(frame))
-                i = i + 1
-        if !ok:
-            let closed = closeConn(c)
-            return SvOut{st: st, resp: hEmpty(200), sse: true}
-        let subs = st.subs
-        let st1 = SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: SvSubs{conns: append(subs.conns, c), owners: append(subs.owners, id.owner), admins: append(subs.admins, id.admin)}, buckets: st.buckets, met: st.met}
-        return SvOut{st: st1, resp: hEmpty(200), sse: true}
+                        last = monoMs()
+                pos = pos + 1
+            if ok:
+                let wait = last + 15000 - monoMs()
+                let mut w = wait
+                if w < 0:
+                    w = 0
+                let which = awaitAny([notify], w)
+                if which < 0:
+                    ok = do hWriteChunk(c, textToBytes(":\n\n"))
+                    last = monoMs()
+                else:
+                    let e = recv(notify)
+        let closed = closeConn(c)
+        let freed = closeChannel(notify)
 
     proc svChanges(st: SvState, req: SvReq, id: SvIdent) -> SvOut uses io.file:
         let q = do hQueryDecode(req.query, ["after", "limit"], ["uint", "uint"])
@@ -1747,13 +1857,15 @@ app FqServerSelfHost:
         let o2 = do svOut(st1, hText(c.status, c.body))
         return o2
 
-    proc svStats(st: SvState, id: SvIdent) -> SvOut uses io.file:
+    proc svStats(st: SvState, id: SvIdent) -> SvOut uses io.file, io.console:
         if !id.admin:
             let o = do svOut(st, svAdminOnly())
             return o
-        let rt = do svRuntime(st.met, st.cfg.maxConcurrent)
+        let rt = do svRuntime(st.met, st.lp, st.cfg.maxConcurrent)
         let s = do enStatsJson(st.eng, rt.json)
-        let st1 = SvState{cfg: st.cfg, eng: s.eng, feed: st.feed, subs: st.subs, buckets: st.buckets, met: rt.met}
+        let mut st1 = st
+        st1.eng = s.eng
+        st1.met = rt.met
         if !s.ok:
             let o1 = do svOut(st1, svStorageFailure(s.err))
             return o1
@@ -1972,9 +2084,6 @@ app FqServerSelfHost:
         if p == "/transaction":
             let r14 = do svTransaction(st, req, id, types)
             return r14
-        if p == "/events":
-            let r15 = do svSubscribe(st, req, id)
-            return r15
         if p == "/changes":
             let r16 = do svChanges(st, req, id)
             return r16
@@ -1993,15 +2102,71 @@ app FqServerSelfHost:
         let r21 = do svReferences(st, req, route, id, types)
         return r21
 
-    # svHandle: one request through the router's layers, outermost first —
+    # ── the request pipeline ───────────────────────────────────────────
+    # Where each route's handler runs. Rust reads through snapshots without
+    # the writer lock, takes the lock for every mutation, and runs /stats
+    # and the admin listings as ordinary engine reads; here:
+    #   "task"   — a read, on its own task against the engine snapshot the
+    #              loop last published (svSnapshot), pinned while it reads;
+    #   "write"  — a mutation, queued for the loop, the one writer;
+    #   "loop"   — cheap reads of loop-owned state (stats, identities,
+    #              declarations) and /publish, run by the loop in turn;
+    #   "events" — the event stream.
+    proc svRouteKind(method: text, pattern: text) -> text:
+        if pattern == "/events":
+            return "events"
+        if pattern == "/stats" || pattern == "/publish":
+            return "loop"
+        if hHasPrefixT(pattern, "/admin/"):
+            if method == "GET":
+                return "loop"
+            return "write"
+        if pattern == "/node/:address" && method != "GET":
+            return "write"
+        if pattern == "/node" || pattern == "/node/:address/claim" || pattern == "/sequence/:name/next" || pattern == "/edge" || pattern == "/transaction":
+            return "write"
+        return "task"
+
+    # svNeedsBody: the routes whose handler takes Json — the only ones that
+    # read (and so wait on, and limit) the body.
+    proc svNeedsBody(method: text, pattern: text) -> bool:
+        if pattern == "/node":
+            return method == "POST"
+        if pattern == "/node/:address":
+            return method == "PUT"
+        if hHasPrefixT(pattern, "/admin/") && !contains(pattern, ":"):
+            return method == "POST"
+        return pattern == "/sequence/:name/next" || hHasPrefixT(pattern, "/nodes/") || pattern == "/edge" || pattern == "/transaction" || pattern == "/publish"
+
+    # svAdmit: a request's head through the router's outer layers,
+    # outermost first — the in-flight limit (a 503 no other layer sees),
     # CORS (a preflight answered here), the route match (404 / 405, whose
     # `allow` rides on whatever answers), auth and the rate limit (route
-    # layers, so a wrong method is still authenticated first), metrics for
-    # the request routes, then the handler; HEAD is GET without a body.
-    proc svHandle(st0: SvState, req0: SvReq, types: [SjType]) -> SvOut uses io.file, io.net.listen:
-        let mut req = req0
+    # layers, so a wrong method is still authenticated first), and the
+    # metrics count. Past them the request holds an in-flight slot (and, a
+    # snapshot read, a pin) until its end.
+    struct SvAdmit:
+        st: SvState
+        final: bool
+        resp: HttpServerResponse
+        id: SvIdent
+        route: SvRoute
+        mclass: int
+        observed: bool
+        kind: text
+        pin: int
+
+    proc svFinal(st: SvState, r: HttpServerResponse) -> SvAdmit:
+        let none = do svNoRoute()
+        return SvAdmit{st: st, final: true, resp: r, id: SvIdent{owner: "", admin: false}, route: none, mclass: 3, observed: false, kind: "", pin: -1}
+
+    proc svAdmit(st0: SvState, req: SvReq) -> SvAdmit uses io.file:
+        if st0.lp.inflight >= st0.cfg.maxConcurrent:
+            let busy = do hWithHeader(hText(503, "server is at its concurrency limit (in-flight requests); the request was not started. Retry shortly."), "retry-after", "1")
+            let f0 = do svFinal(st0, busy)
+            return f0
         let route = do svMatch(req.path)
-        let mut allowed = req.method in route.allow
+        let allowed = req.method in route.allow
         let mut allowHeader = ""
         if route.pattern != "" && !allowed:
             allowHeader = join(route.allow, ",")
@@ -2009,105 +2174,346 @@ app FqServerSelfHost:
             let mut pf = do svPreflight(st0.cfg, req)
             if allowHeader != "":
                 pf = do hWithHeader(pf, "allow", allowHeader)
-            let o0 = do svOut(st0, pf)
-            return o0
+            let f1 = do svFinal(st0, pf)
+            return f1
         if route.pattern == "":
-            let o1 = do svOut(st0, svCors(st0.cfg, req, hEmpty(404)))
-            return o1
+            let f2 = do svFinal(st0, svCors(st0.cfg, req, hEmpty(404)))
+            return f2
         if route.pattern == "/":
             let mut home = do hText(200, "FacetQL Online")
             if !allowed:
                 home = do hWithHeader(hEmpty(405), "allow", allowHeader)
-            let o2 = do svOut(st0, svCors(st0.cfg, req, home))
-            return o2
+            let f3 = do svFinal(st0, svCors(st0.cfg, req, home))
+            return f3
         let au = do svAuth(st0, req)
         if !au.ok:
             let mut r0 = do svCors(st0.cfg, req, au.resp)
             if allowHeader != "":
                 r0 = do hWithHeader(r0, "allow", allowHeader)
-            let o3 = do svOut(st0, r0)
-            return o3
-        if !allowed:
-            let r1 = do hWithHeader(svCors(st0.cfg, req, hEmpty(405)), "allow", allowHeader)
-            let o4 = do svOut(st0, r1)
-            return o4
+            let f4 = do svFinal(st0, r0)
+            return f4
         let lim = do svRateLimit(st0, req, au.id)
         let mut st = lim.st
         if !lim.ok:
-            let o5 = do svOut(st, svCors(st.cfg, req, lim.resp))
-            return o5
+            let mut r1 = do svCors(st.cfg, req, lim.resp)
+            if allowHeader != "":
+                r1 = do hWithHeader(r1, "allow", allowHeader)
+            let f5 = do svFinal(st, r1)
+            return f5
         let observed = route.pattern != "/events"
         let mclass = do svMetricClass(req.method, route.pattern)
         if observed:
-            st = SvState{cfg: st.cfg, eng: st.eng, feed: st.feed, subs: st.subs, buckets: st.buckets, met: svCount(st.met, mclass)}
-        if req.method == "HEAD":
-            req = SvReq{conn: req.conn, method: "GET", path: req.path, query: req.query, hasQuery: req.hasQuery, headers: req.headers, body: req.body, tooLarge: req.tooLarge}
-        let t0 = monoMs()
-        let out = do svDispatch(st, req, route, au.id, types)
-        let mut st2 = out.st
-        if observed && (mclass == 0 || mclass == 1):
-            let us = (monoMs() - t0) * 1000
-            st2 = SvState{cfg: st2.cfg, eng: st2.eng, feed: st2.feed, subs: st2.subs, buckets: st2.buckets, met: svRecord(st2.met, mclass, us)}
-        if out.sse:
-            return SvOut{st: st2, resp: out.resp, sse: true}
-        let o6 = do svOut(st2, svCors(st2.cfg, req, out.resp))
-        return o6
+            st.met = svCount(st.met, mclass)
+        if !allowed:
+            let r2 = do hWithHeader(svCors(st.cfg, req, hEmpty(405)), "allow", allowHeader)
+            let f6 = do svFinal(st, r2)
+            return f6
+        let mut method = req.method
+        if method == "HEAD":
+            method = "GET"
+        let kind = do svRouteKind(method, route.pattern)
+        let mut pin = -1
+        if kind == "task" && route.pattern != "/changes":
+            let pn = do enPin(st.eng)
+            st.eng = pn.eng
+            pin = pn.v
+        st.lp.inflight = st.lp.inflight + 1
+        return SvAdmit{st: st, final: false, resp: hEmpty(200), id: au.id, route: route, mclass: mclass, observed: observed, kind: kind, pin: pin}
 
-    # ── the tasks ──────────────────────────────────────────────────────
-    # svLoop: the engine's one owner. Messages: "Q…" a request (answered
-    # on the reply channel it names), "T" a keep-alive beat.
-    proc svLoop(ch: int, st0: SvState) uses io.file, io.net.listen:
+    # ── the loop ───────────────────────────────────────────────────────
+    # svLoop: the engine's one owner and its one writer. Messages (each a
+    # packed field list):
+    #   A  a request's head: admitted (G: identity, route, where it runs)
+    #      or answered outright (F)
+    #   S  an admitted GET /events: a subscriber slot (V) or a refusal (F)
+    #   W  a mutation, queued; the loop runs one whenever no message waits
+    #   L  a loop-run handler, answered in turn (R)
+    #   D  a snapshot read's counters, and its pin released
+    #   E  a request's end: its in-flight slot, and its latency
+    #   K  a TLS connection asking for a connection slot; k one released
+    # and SIGINT/SIGTERM: shutdown.
+    proc svLoop(ch: int, sig: int, st0: SvState) uses io.file, io.net.listen, io.console:
         let types = do hTypes()
         let mut st = st0
+        svSnapshot = st.eng
+        svFeedCell = st.feed
         loop true:
-            let msg = recv(ch)
-            let k = slice(msg, 0, 1)
-            if k == "T":
-                st = do svKeepAlive(st)
-            if k == "Q":
-                let f = do svUnpack(slice(msg, 1, len(msg)))
-                let req = do svReqUnpack(f)
-                let out = do svHandle(st, req, types)
-                st = out.st
-                let sent = send(toInt(f[0]), svRespPack(out.resp, out.sse))
+            # the writer takes turns with everything else: one queued write,
+            # then one message, so neither can starve the other
+            if len(st.lp.queue) > 0:
+                st = do svRunWrite(st, types)
+                svSnapshot = st.eng
+            let mut wait = -1
+            if st.lp.shutting:
+                wait = st.lp.grace - monoMs()
+                if wait < 0:
+                    wait = 0
+            if len(st.lp.queue) > 0:
+                wait = 0
+            let which = awaitAny([ch, sig], wait)
+            if which == 0:
+                let msg = recv(ch)
+                st = do svOnMessage(st, msg, types)
+            if which == 1:
+                let s = recv(sig)
+                st.lp.shutting = true
+                st.lp.grace = monoMs() + 15000
+                svDraining = true
+                let w = writeStdout("FacetQL: shutdown signal received; finishing in-flight requests\n")
+            svSnapshot = st.eng
+            if st.lp.shutting && st.lp.inflight == 0 && len(st.lp.queue) == 0:
+                let open = len(st.subs.chans) > 0
+                if !open || monoMs() >= st.lp.grace:
+                    do svSettle(st, open)
 
-    proc svTicker(ch: int):
+    # svSettle: the last checkpoint, and the process ends (main.rs's
+    # settle, after serve returns).
+    proc svSettle(st: SvState, open: bool) uses io.file, io.console:
+        if open:
+            let w0 = writeStderr("FacetQL: connections still open after 15s; closing them and stopping\n")
+        let ck = do enCheckpoint(st.eng)
+        if ck.ok:
+            let w1 = writeStdout("FacetQL: storage checkpointed; stopped cleanly\n")
+        else:
+            let w2 = writeStderr("warning: the final checkpoint failed: " + ck.err + ". Nothing is lost — every acknowledged write is durable in the write-ahead log — but the next start will replay more of it.\n")
+        let e = exitProcess(0)
+
+    proc svRespond(reply: int, kind: text, reqid: int, r: HttpServerResponse) -> bool:
+        let ok = send(reply, svPack(svRespFields(kind, reqid, r)))
+        return ok
+
+    proc svOnMessage(st0: SvState, msg: text, types: [SjType]) -> SvState uses io.file, io.net.listen, io.console:
+        let mut st = st0
+        let f = do svUnpack(msg)
+        let k = f[0]
+        if k == "A":
+            let req = do svReqAt(f, 1)
+            let ad = do svAdmit(st, req)
+            st = ad.st
+            if ad.final:
+                let s0 = do svRespond(req.reply, "F", req.reqid, ad.resp)
+            else:
+                let g = ["G", "" + req.reqid, ad.id.owner, svBoolText(ad.id.admin), ad.route.pattern, ad.route.param, svBoolText(ad.route.paramOk), "" + ad.mclass, svBoolText(ad.observed), ad.kind, "" + ad.pin]
+                let s1 = send(req.reply, svPack(g))
+        if k == "S":
+            let req2 = do svReqAt(f, 3)
+            let id = SvIdent{owner: f[1], admin: f[2] == "1"}
+            let sub = do svSubscribe(st, req2, id)
+            st = sub.st
+            st.lp.inflight = st.lp.inflight - 1
+            if sub.ok:
+                let s2 = send(req2.reply, svPack(["V", "" + req2.reqid, "" + sub.start, "" + sub.notify]))
+            else:
+                let s3 = do svRespond(req2.reply, "F", req2.reqid, svCors(st.cfg, req2, sub.resp))
+        if k == "W":
+            let req3 = do svReqAt(f, 3)
+            if len(st.lp.queue) > 0:
+                st.lp.contended = st.lp.contended + 1
+            st.lp.queue = append(st.lp.queue, req3)
+            st.lp.queueIds = append(st.lp.queueIds, SvIdent{owner: f[1], admin: f[2] == "1"})
+        if k == "L":
+            let req4 = do svReqAt(f, 3)
+            let route = do svMatch(req4.path)
+            let out = do svDispatch(st, req4, route, SvIdent{owner: f[1], admin: f[2] == "1"}, types)
+            st = out.st
+            let s4 = do svRespond(req4.reply, "R", req4.reqid, out.resp)
+        if k == "D":
+            let m = do metaApply(st.eng.st.meta, f[1])
+            st.eng = enWith(st.eng, stWithMeta(st.eng.st, m))
+            if toInt(f[2]) >= 0:
+                st.eng = enUnpin(st.eng, toInt(f[2]))
+        if k == "E":
+            st.lp.inflight = st.lp.inflight - 1
+            let mclass = toInt(f[2])
+            if f[3] == "1" && (mclass == 0 || mclass == 1):
+                st.met = svRecord(st.met, mclass, toInt(f[1]))
+        if k == "K":
+            let mut ok = "0"
+            if st.lp.conns < st.cfg.maxConnections:
+                st.lp.conns = st.lp.conns + 1
+                ok = "1"
+            let s5 = send(toInt(f[1]), ok)
+        if k == "k":
+            st.lp.conns = st.lp.conns - 1
+        return st
+
+    # svRunWrite: the writer — the oldest waiting mutation, run, answered.
+    proc svRunWrite(st0: SvState, types: [SjType]) -> SvState uses io.file, io.net.listen, io.console:
+        let mut st = st0
+        let req = st.lp.queue[0]
+        let id = st.lp.queueIds[0]
+        st.lp.queue = slice(st.lp.queue, 1, len(st.lp.queue))
+        st.lp.queueIds = slice(st.lp.queueIds, 1, len(st.lp.queueIds))
+        let route = do svMatch(req.path)
+        let out = do svDispatch(st, req, route, id, types)
+        let s = do svRespond(req.reply, "R", req.reqid, out.resp)
+        return out.st
+
+    # svReadTask: a read, on its own task, against the published snapshot
+    # it was pinned to: the answer to the request's task, what it counted
+    # and its pin to the loop.
+    proc svReadTask(ch: int, cfg: SvConfig, req: SvReq, id: SvIdent, pin: int) uses io.file, io.net.listen, io.console:
+        let types = do hTypes()
+        let eng = svSnapshot
+        let st = SvState{cfg: cfg, eng: eng, feed: SvFeed{seqs: [], payloads: [], everyone: [], owners: [], earliest: 0, emitted: 0}, subs: SvSubs{chans: []}, buckets: SvBuckets{keys: [], tokens: [], updated: []}, met: svMetricsNew(), lp: svLoopNew()}
+        let route = do svMatch(req.path)
+        let out = do svDispatch(st, req, route, id, types)
+        let delta = do metaDelta(eng.st.meta, out.st.eng.st.meta)
+        let d = send(ch, svPack(["D", delta, "" + pin]))
+        let r = do svRespond(req.reply, "R", req.reqid, out.resp)
+
+    proc svLoopNew() -> SvLoopState:
+        return SvLoopState{inflight: 0, queue: [], queueIds: [], contended: 0, conns: 0, shutting: false, grace: 0}
+
+    # ── a connection ───────────────────────────────────────────────────
+    struct SvAnswer:
+        timedOut: bool
+        f: [text]
+
+    # svAwait: the answer to request `reqid` on the connection's reply
+    # channel, by `deadline` (a monoMs instant; < 0: none). An answer to an
+    # earlier request that timed out arrives late, and is dropped.
+    proc svAwait(reply: int, reqid: int, deadline: int) -> SvAnswer:
         loop true:
-            let s = sleepMs(15000)
-            let sent = send(ch, "T")
+            let mut wait = -1
+            if deadline >= 0:
+                wait = deadline - monoMs()
+                if wait < 0:
+                    return SvAnswer{timedOut: true, f: []}
+            let which = awaitAny([reply], wait)
+            if which < 0:
+                return SvAnswer{timedOut: true, f: []}
+            let f = do svUnpack(recv(reply))
+            if f[1] == "" + reqid:
+                return SvAnswer{timedOut: false, f: f}
+        return SvAnswer{timedOut: true, f: []}
 
-    # svServeConn: one connection, request after request — each handed to
-    # the loop and its answer written back. A body over the limit is not
-    # read: the answer goes out and the connection is drained and closed.
-    # A connection that became an event stream belongs to the loop.
-    proc svServeConn(c: int, ch: int, maxBody: int) uses io.net.listen:
+    # svServeConn: one client connection, request after request: the head
+    # to the loop, then — admitted — the body (inside the request timeout,
+    # only for a handler that reads one), the handler where it runs, the
+    # answer within the timeout (408 past it: the handler is not stopped,
+    # as a tokio timeout does not stop a blocking task), and the end of the
+    # request back to the loop. A connection that became an event stream
+    # stays on this task as the stream.
+    proc svServeConn(c: int, ch: int, cfg: SvConfig, tlsMode: bool) uses io.file, io.net.listen, io.console:
         let reply = channel()
+        let mut reqid = 0
         let mut pending = []
         let mut open = true
+        let mut first = true
+        let mut stream = false
         loop open:
-            let rd = do hReadRequest(c, pending, maxBody)
-            if rd.state == 0:
+            let hd = do hReadHead(c, pending)
+            if first && tlsMode && hd.state != 1:
+                let err = connError(c)
+                if err != "":
+                    let w = writeStderr("TLS handshake failed for " + connPeer(c) + ": " + err + "\n")
+            first = false
+            if hd.state != 1:
+                if hd.state < 0:
+                    let refused = do hRefuseMalformed(c)
                 open = false
-            if rd.state < 0:
-                let refused = do hRefuseMalformed(c)
-                return
-            if rd.state == 1:
-                pending = rd.req.rest
-                let keep = do httpServerKeepAlive(rd.req)
-                let sent = send(ch, svReqPack(reply, c, rd.req, rd.tooLarge))
-                let answer = recv(reply)
-                let r = do svRespUnpack(answer)
-                if r.sse:
-                    return
-                let wrote = do hWriteResponse(c, rd.req.method, r.resp, keep && !rd.tooLarge)
-                if rd.tooLarge:
-                    let lingered = do httpServerLingerClose(c)
-                    return
-                open = wrote && keep
-        let closed = closeConn(c)
+            else:
+                reqid = reqid + 1
+                let head = SvReq{reply: reply, reqid: reqid, conn: c, method: hd.req.method, path: hd.req.path, query: hd.req.query, hasQuery: hd.req.hasQuery, headers: hd.req.headers, body: "", tooLarge: false}
+                let sa = send(ch, svPack(["A"] + svReqFields(head)))
+                let ad = do svAwait(reply, reqid, -1)
+                let keep = do httpServerKeepAlive(hd.req)
+                let mut resp = hEmpty(200)
+                let mut bodyRead = false
+                let mut rest = hd.req.rest
+                let mut resync = true
+                let mut done = false
+                if ad.f[0] == "F":
+                    resp = do svRespAt(ad.f)
+                    done = true
+                if !done && ad.f[9] == "events":
+                    let id = SvIdent{owner: ad.f[2], admin: ad.f[3] == "1"}
+                    let ss = send(ch, svPack(["S", id.owner, svBoolText(id.admin)] + svReqFields(head)))
+                    let sv = do svAwait(reply, reqid, -1)
+                    if sv.f[0] == "V":
+                        pending = []
+                        stream = true
+                        open = false
+                        done = true
+                        do svStream(c, cfg, head, id, toInt(sv.f[2]), toInt(sv.f[3]))
+                    else:
+                        resp = do svRespAt(sv.f)
+                        done = true
+                if !done:
+                    let id2 = SvIdent{owner: ad.f[2], admin: ad.f[3] == "1"}
+                    let pattern = ad.f[4]
+                    let mclass = ad.f[7]
+                    let observed = ad.f[8]
+                    let kind = ad.f[9]
+                    let t0 = monoMs()
+                    let deadline = t0 + cfg.timeoutSecs * 1000
+                    let mut method = hd.req.method
+                    if method == "HEAD":
+                        method = "GET"
+                    let mut timedOut = false
+                    let mut body = ""
+                    let mut tooLarge = false
+                    let mut gone = false
+                    if svNeedsBody(method, pattern):
+                        bodyRead = true
+                        let bd = do hReadBody(c, rest, hd.framing, hd.length, cfg.maxBody, deadline)
+                        if hd.framing != "none":
+                            let relax = setTimeoutMs(c, 600000)
+                        if bd.state == -3:
+                            timedOut = true
+                            resync = false
+                        if bd.state == 0 || bd.state == -1:
+                            gone = true
+                        if bd.state == 1:
+                            body = bd.body
+                            rest = bd.rest
+                        if bd.state == 2:
+                            tooLarge = true
+                            rest = bd.rest
+                            if bd.skip < 0:
+                                resync = false
+                            else:
+                                let sk = do hSkipBody(c, rest, bd.skip)
+                                resync = sk.ok
+                                rest = sk.rest
+                    if gone:
+                        let e0 = send(ch, svPack(["E", "" + ((monoMs() - t0) * 1000), mclass, observed]))
+                        open = false
+                        done = true
+                    else:
+                        if !timedOut:
+                            let q = SvReq{reply: reply, reqid: reqid, conn: c, method: method, path: hd.req.path, query: hd.req.query, hasQuery: hd.req.hasQuery, headers: hd.req.headers, body: body, tooLarge: tooLarge}
+                            if kind == "task":
+                                detach svReadTask(ch, cfg, q, id2, toInt(ad.f[10]))
+                            else:
+                                let mut tag = "W"
+                                if kind == "loop":
+                                    tag = "L"
+                                let sw = send(ch, svPack([tag, id2.owner, svBoolText(id2.admin)] + svReqFields(q)))
+                            let an = do svAwait(reply, reqid, deadline)
+                            if an.timedOut:
+                                timedOut = true
+                            else:
+                                resp = do svRespAt(an.f)
+                        if timedOut:
+                            resp = do hEmpty(408)
+                        let e1 = send(ch, svPack(["E", "" + ((monoMs() - t0) * 1000), mclass, observed]))
+                        resp = do svCors(cfg, head, resp)
+                if !stream && open:
+                    if !bodyRead:
+                        let dk = do hDiscardBody(c, rest, hd.framing, hd.length)
+                        resync = dk.ok
+                        rest = dk.rest
+                    let wrote = do hWriteResponse(c, hd.req.method, resp, keep && resync)
+                    pending = rest
+                    open = wrote && keep && resync
+        if !stream:
+            let closed = closeConn(c)
+        let freed = closeChannel(reply)
+        if tlsMode:
+            let rel = send(ch, svPack(["k"]))
 
-    # svOpen: Database::new — the engine loaded and recovered, the user log
-    # compacted, the event feed started at the next operation id.
     struct SvOpened:
         ok: bool
         st: SvState
@@ -2131,47 +2537,119 @@ app FqServerSelfHost:
 
     proc svOpen(cfg: SvConfig, key: [int]) -> SvOpened uses io.file, io.console:
         let blank = do svMetricsNew()
-        let noFeed = SvFeed{seqs: [], payloads: [], everyone: [], owners: [], earliest: 0}
-        let noSubs = SvSubs{conns: [], owners: [], admins: []}
+        let noSubs = SvSubs{chans: []}
         let noBuckets = SvBuckets{keys: [], tokens: [], updated: []}
-        let ld = do enLoad(cfg.dataDir, key, -1000000000, cfg.interval, cfg.rotateBytes)
+        let ld = do enOpen(cfg.dataDir, key, -1000000000, cfg.interval, cfg.rotateBytes)
         if !ld.ok:
-            let w3 = writeStderr("\nFacetQL could not open its database in " + cfg.dataDir + ": " + ld.err + "\n")
-            return SvOpened{ok: false, st: SvState{cfg: cfg, eng: ld.eng, feed: noFeed, subs: noSubs, buckets: noBuckets, met: blank}}
+            let code = do svStartupFailure(cfg, ld.err, ld.phase)
+            let e = exitProcess(code)
+            return SvOpened{ok: false, st: SvState{cfg: cfg, eng: ld.eng, feed: SvFeed{seqs: [], payloads: [], everyone: [], owners: [], earliest: 0, emitted: 0}, subs: noSubs, buckets: noBuckets, met: blank, lp: svLoopNew()}}
         let cu = do enCompactUserLog(ld.eng)
         if !cu.ok:
             let w4 = writeStderr("warning: could not compact the user log: " + cu.err + ". The existing log is intact and correct; it will simply stay longer than it needs to be.\n")
         let first = do enNextOperationId(cu.eng)
-        let feed = SvFeed{seqs: [], payloads: [], everyone: [], owners: [], earliest: first.v}
-        return SvOpened{ok: true, st: SvState{cfg: cfg, eng: first.eng, feed: feed, subs: noSubs, buckets: noBuckets, met: blank}}
+        let feed = SvFeed{seqs: [], payloads: [], everyone: [], owners: [], earliest: first.v, emitted: 0}
+        return SvOpened{ok: true, st: SvState{cfg: cfg, eng: first.eng, feed: feed, subs: noSubs, buckets: noBuckets, met: blank, lp: svLoopNew()}}
+
+    # svStartupFailure: report_startup_failure — Database::new's error
+    # classified as DatabaseError does it (storage unreachable, a record
+    # that fails authentication or verification, a WAL history that cannot
+    # be replayed), the operator's diagnosis printed, and its exit status.
+    proc svStartupFailure(cfg: SvConfig, err: text, phase: text) -> int uses io.console:
+        let low = lower(err)
+        let access = contains(low, "permission denied") || contains(low, "no such file") || contains(low, "not a directory") || contains(low, "read-only file system") || contains(low, "no space left") || contains(low, "escapes the sandboxed")
+        let mut authWord = false
+        let mut verifyWord = false
+        let auth = ["decrypt", "authentication", "master key", "master_key"]
+        let verify = ["checksum", "crc", "corrupt", "deserialize", "invalid record", "valid hex", "magic", "truncated", "format version"]
+        let mut i = 0
+        loop i < len(auth):
+            if contains(low, auth[i]):
+                authWord = true
+            i = i + 1
+        let mut j = 0
+        loop j < len(verify):
+            if contains(low, verify[j]):
+                verifyWord = true
+            j = j + 1
+        let mut kind = "integrity"
+        let mut code = 4
+        if access:
+            kind = "storage"
+            code = 1
+        else:
+            if !authWord && !verifyWord && phase == "recover":
+                kind = "wal"
+                code = 5
+        let mut dir = cfg.dataDir
+        if len(dir) > 1:
+            dir = slice(dir, 0, len(dir) - 1)
+        let mut out = "\nFacetQL failed to start — the database was not opened.\n\n  Data directory: " + dir + "\n  Detail:         " + err + "\n\n"
+        if kind == "storage":
+            let mut ph = "loading the storage files"
+            if phase == "recover":
+                ph = "recovering the write-ahead log"
+            out = out + "  What failed:    reaching the data files, while " + ph + ".\n  Likely cause:   the data directory is missing, is owned by another\n                  user, or its filesystem is full, read-only, or not\n                  mounted. Nothing has been read yet, so nothing is\n                  yet known to be wrong with the data itself.\n\n  Next steps:\n    1. Check the directory and its permissions:\n       ls -ld " + dir + "\n    2. Create it if it is genuinely absent:\n       facetql init --data-dir " + dir + "\n    3. If you meant a different directory, pass --data-dir or set\n       FACETQL_DATA_DIR, then start again.\n"
+        if kind == "integrity" && authWord:
+            out = out + "  What failed:    a stored record did not authenticate.\n  Likely cause:   in order of likelihood —\n                  1. the server was started with the wrong\n                     FACETQL_MASTER_KEY. Leaving it unset silently\n                     uses the all-zero dev key, so an unset key looks\n                     exactly like a wrong one;\n                  2. failing that, the file named above is corrupt.\n\n  Next steps:\n    1. Check FACETQL_MASTER_KEY is the same 64-hex-character key\n       this data was written with, then start again. A wrong key is\n       not destructive — nothing has been modified.\n    2. If the key is right, copy the files aside before anything\n       else: facetql backup <dir>\n    3. Then restore a known-good copy into an empty data directory:\n       facetql restore <dir>\n"
+        if kind == "integrity" && !authWord:
+            out = out + "  What failed:    a stored record failed verification — framing,\n                  checksum, or deserialization.\n  Likely cause:   the file named above is damaged: bit-rot, an\n                  interrupted write, or a partial copy. A wrong\n                  FACETQL_MASTER_KEY can also present this way, when\n                  a record decodes but then does not parse.\n\n  Next steps:\n    1. Copy the current files aside before touching anything:\n       facetql backup <dir>\n    2. Confirm FACETQL_MASTER_KEY matches the key this data was\n       written with.\n    3. Restore a known-good copy into an empty data directory:\n       facetql restore <dir>\n"
+        if kind == "wal":
+            out = out + "  What failed:    replaying the write-ahead log. The frames verified,\n                  but the history they describe is not a legal one.\n  Likely cause:   facetql.wal was written by a different build or\n                  format, or was copied in from another data\n                  directory, or a write was interrupted in a way that\n                  left the log inconsistent. Replaying it would invent\n                  a state that never existed, so recovery stops.\n\n  Next steps:\n    1. Back up the whole directory first: facetql backup <dir>. The\n       WAL is the only record of writes not yet folded into\n       the heap and the indexes.\n    2. Confirm facetql.wal belongs to this data directory and to this\n       build of FacetQL.\n    3. Restore a known-good copy into an empty data directory:\n       facetql restore <dir>\n"
+        out = out + "\n  FacetQL will not start until this is resolved, and there is no flag\n  to make it. Serving state that is not known to be durable and valid\n  would be worse than being down.\n\n"
+        let w = writeStderr(out)
+        return code
 
     daemon FacetQL uses io.file, io.net.listen, io.console, io.env:
         let cfg = do svConfig()
-        if cfg.ok:
-            let tls = do svEnvSet("FACETQL_TLS_IDENTITY")
-            if tls:
-                let t = writeStderr("FacetQL (fct): --tls-identity is not supported — the fct runtime has no TLS primitive. Terminate TLS at a reverse proxy in front of this server and set FACETQL_ALLOW_PLAINTEXT=1.\n")
+        if !cfg.ok:
+            let e0 = exitProcess(2)
+        let tls = cfg.tlsIdentity != ""
+        let may = do svPosture(cfg)
+        if !may:
+            let e1 = exitProcess(7)
+        let tokensSet = do svEnvSet("FACETQL_TOKENS")
+        if !tokensSet:
+            let w = writeStderr("warning: FACETQL_TOKENS not set — using a single dev token ('dev-local-key-change-me' -> owner 'dev', role Admin) so there's a way to bootstrap the first real admin via POST /admin/users. Do not run production traffic against this.\n")
+        let key = do svKeyFor(cfg)
+        if !key.ok:
+            let e2 = exitProcess(101)
+        let opened = do svOpen(cfg, key.key)
+        let mut shown = cfg.dataDir
+        if len(shown) > 1:
+            shown = slice(shown, 0, len(shown) - 1)
+        let b1 = writeStdout("Data directory: " + shown + "\n")
+        let b2 = writeStdout("Auth: every route except GET / requires header 'x-api-key', resolved to an owner identity via FACETQL_TOKENS (token:owner[:admin], comma-separated) or the persistent users created through POST /admin/users. Run `facetql routes` for the per-endpoint authorization matrix this build enforces.\n")
+        let b3 = writeStdout("Guards: body <= " + cfg.maxBody + " bytes, " + cfg.timeoutSecs + " s per request, <= " + cfg.maxConcurrent + " in-flight requests, per-identity rate limits by endpoint class (FACETQL_RATE_READ/WRITE/BULK/ADMIN/SUBSCRIBE).\n")
+        let ch = channel()
+        let sig = signals()
+        svDraining = false
+        let mut l = 0
+        if tls:
+            let pw = do svEnvSet("FACETQL_TLS_IDENTITY_PASSWORD")
+            if !pw:
+                let wp = writeStderr("warning: --tls-identity was set without --tls-identity-password — trying an empty password. This will fail for any real PKCS#12 file.\n")
+            l = listenTls(cfg.port, cfg.tlsIdentity, cfg.tlsPassword)
+            let b4 = writeStdout("FacetQL Server Running on port " + cfg.port + " (HTTPS)\n")
+        else:
+            l = listen(cfg.port)
+            let b5 = writeStdout("FacetQL Server Running on port " + cfg.port + " (HTTP — no TLS; either pass --tls-identity/--tls-identity-password for native HTTPS, or terminate TLS at a reverse proxy in front of this, before running with real traffic)\n")
+        detach svLoop(ch, sig, opened.st)
+        let permit = channel()
+        loop true:
+            let c = accept(l)
+            let draining = svDraining
+            if draining:
+                let shut = closeConn(c)
             else:
-                let may = do svPosture(cfg)
-                let tokensSet = do svEnvSet("FACETQL_TOKENS")
-                if may:
-                    if !tokensSet:
-                        let w = writeStderr("warning: FACETQL_TOKENS not set — using a single dev token ('dev-local-key-change-me' -> owner 'dev', role Admin) so there's a way to bootstrap the first real admin via POST /admin/users. Do not run production traffic against this.\n")
-                    let key = do svKeyFor(cfg)
-                    if key.ok:
-                        let opened = do svOpen(cfg, key.key)
-                        if opened.ok:
-                            let mut shown = cfg.dataDir
-                            if len(shown) > 1:
-                                shown = slice(shown, 0, len(shown) - 1)
-                            let b1 = writeStdout("Data directory: " + shown + "\n")
-                            let b2 = writeStdout("Auth: every route except GET / requires header 'x-api-key', resolved to an owner identity via FACETQL_TOKENS (token:owner[:admin], comma-separated) or the persistent users created through POST /admin/users. Run `facetql routes` for the per-endpoint authorization matrix this build enforces.\n")
-                            let b3 = writeStdout("Guards: body <= " + cfg.maxBody + " bytes, " + cfg.timeoutSecs + " s per request, <= " + cfg.maxConcurrent + " in-flight requests, per-identity rate limits by endpoint class (FACETQL_RATE_READ/WRITE/BULK/ADMIN/SUBSCRIBE).\n")
-                            let l = listen(cfg.port)
-                            let b4 = writeStdout("FacetQL Server Running on port " + cfg.port + " (HTTP — no TLS; either pass --tls-identity/--tls-identity-password for native HTTPS, or terminate TLS at a reverse proxy in front of this, before running with real traffic)\n")
-                            let ch = channel()
-                            detach svLoop(ch, opened.st)
-                            detach svTicker(ch)
-                            loop true:
-                                let c = accept(l)
-                                detach svServeConn(c, ch, cfg.maxBody)
+                if tls:
+                    let askMsg = do svPack(["K", "" + permit])
+                    let ask = send(ch, askMsg)
+                    let granted = recv(permit)
+                    if granted == "1":
+                        detach svServeConn(c, ch, cfg, true)
+                    else:
+                        let wc = writeStderr("warning: refusing a connection from " + connPeer(c) + ": at the concurrent-connection limit\n")
+                        let refused = closeConn(c)
+                else:
+                    detach svServeConn(c, ch, cfg, false)

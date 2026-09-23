@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -227,7 +228,18 @@ func fdoorNewFake(name string) *fdoorFake {
 	return f
 }
 
+// fdoorAgent is the User-Agent every scenario request carries, and the door
+// forwards (an end-to-end header). A fake answers anything without it 503
+// and does not record it: the fakes listen on ephemeral ports another
+// process on this machine may have just released, and its readiness poll
+// is not a request the scenario made.
+const fdoorAgent = "fdoor-scenario"
+
 func (f *fdoorFake) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("User-Agent") != fdoorAgent {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	body, _ := io.ReadAll(r.Body)
 	headers := map[string]any{}
 	for _, h := range fdoorRecordedHeaders {
@@ -320,6 +332,7 @@ func fdoorRequest(t *testing.T, url string, step map[string]any) *http.Request {
 	for _, h := range fdoorHeaders(step) {
 		req.Header.Add(h[0], h[1])
 	}
+	req.Header.Set("User-Agent", fdoorAgent)
 	return req
 }
 
@@ -565,5 +578,199 @@ func fdoorCompare(t *testing.T, key string, want map[string]any, out map[string]
 	}
 	if g, w := fdoorCanon(bLog), fdoorCanon(want["b"]); g != w {
 		t.Errorf("%s: db-b saw\n  fct:  %s\n  rust: %s", key, g, w)
+	}
+}
+
+// TestFrontDoorRustClientsAgree checks the two reverse transcripts the scratch
+// probe (/tmp/claude-1000/team5/frontdoor/rust, `fdprobe fct-door` and
+// `fdprobe real`) recorded with Rust clients driving the fct door as a
+// process (`facet exec selfhost/fabric_frontdoor_main.fct`):
+//
+//   - rust_client_via_fct_door.jsonl: reqwest sending every scenario without
+//     a mid-run publish to the fct door — each step must equal the Rust
+//     FrontDoor's own transcript;
+//   - facetql_client_paths.jsonl: fabric-facetql's FacetqlClient and
+//     PlacementStore running one sequence (writes, create-once, reads,
+//     multiget, query pages, count, compare-and-set, claim, an SSE event,
+//     placement create/update/stale-update/load/remove) against real
+//     engines — the Rust facetql and selfhost/fqserver.fct — directly and
+//     through the Rust and the fct front doors; every path must answer every
+//     step identically.
+func TestFrontDoorRustClientsAgree(t *testing.T) {
+	want := map[string]map[string]any{}
+	for _, line := range fdoorTranscript(t) {
+		if s, ok := line["scenario"].(string); ok {
+			want[fmt.Sprintf("%s#%v", s, line["step"])] = line
+		}
+	}
+	lines := func(file string) []map[string]any {
+		raw, err := os.ReadFile("testdata/frontdoor/" + file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []map[string]any
+		for _, l := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(l), &m); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, m)
+		}
+		return out
+	}
+	reverse := lines("rust_client_via_fct_door.jsonl")
+	if len(reverse) < 25 {
+		t.Fatalf("only %d reverse steps", len(reverse))
+	}
+	for _, got := range reverse {
+		key := fmt.Sprintf("%s#%v", got["scenario"], got["step"])
+		w := want[key]
+		if w == nil {
+			t.Errorf("%s: not in the Rust door's transcript", key)
+			continue
+		}
+		out := got["out"].(map[string]any)
+		if rb, ok := w["out"].(map[string]any)["body"].(string); ok {
+			if i := strings.Index(rb, "did not answer: "); i >= 0 {
+				cut := i + len("did not answer: ")
+				if gb, _ := out["body"].(string); len(gb) >= cut && gb[:cut] == rb[:cut] {
+					out["body"] = rb
+				}
+			}
+		}
+		for _, k := range []string{"out", "a", "b"} {
+			if g, r := fdoorCanon(got[k]), fdoorCanon(w[k]); g != r {
+				t.Errorf("%s %s:\n  via fct door: %s\n  via rust door: %s", key, k, g, r)
+			}
+		}
+	}
+	byStep := map[string]map[string]string{}
+	paths := map[string]bool{}
+	for _, l := range lines("facetql_client_paths.jsonl") {
+		step, path := l["step"].(string), l["path"].(string)
+		paths[path] = true
+		if byStep[step] == nil {
+			byStep[step] = map[string]string{}
+		}
+		byStep[step][path] = fdoorCanon(l["out"])
+	}
+	if len(paths) != 6 || len(byStep) < 20 {
+		t.Fatalf("%d paths, %d steps", len(paths), len(byStep))
+	}
+	for step, m := range byStep {
+		first := m["rust-facetql direct"]
+		for path, v := range m {
+			if v != first {
+				t.Errorf("%s: %s answered %s, the Rust facetql directly %s", step, path, v, first)
+			}
+		}
+	}
+}
+
+// TestFrontDoorFrontsHTTPSFacetqlWithAPrivateCA: the door in front of an
+// https FacetQL whose certificate a private CA signed — the Rust facetql and
+// fqserver.fct, each with its own TLS identity — forwarding, subscribing and
+// relaying over TLS when its config trusts that CA (trustFile), and refusing
+// the backend as unreachable (502, naming it) when it does not.
+func TestFrontDoorFrontsHTTPSFacetqlWithAPrivateCA(t *testing.T) {
+	pki := t.TempDir()
+	caPEM, p12 := fqlTlsPKI(t, pki)
+	data := t.TempDir()
+	t.Setenv("FACET_DATA_DIR", data)
+	raw, err := os.ReadFile(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "ca.pem"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, engine := range []struct {
+		name  string
+		start func(*testing.T, string, string) int
+	}{{"rust-facetql", fqlTlsStartRust}, {"fqserver", fqlTlsStartFct}} {
+		t.Run(engine.name, func(t *testing.T) {
+			backend := fmt.Sprintf("https://localhost:%d", engine.start(t, p12, caPEM))
+			door := func(trust string) string {
+				srv, ts := fdoorApp(t)
+				port := fdoorFreePort(t)
+				if e := fdoorCall(t, ts, "fxStartTls", port, backend, trust); e != "" {
+					t.Fatalf("fxStartTls: %s", e)
+				}
+				srv.StartJobs()
+				addr := fmt.Sprintf("127.0.0.1:%d", port)
+				for deadline := time.Now().Add(5 * time.Second); ; {
+					if c, err := net.Dial("tcp", addr); err == nil {
+						c.Close()
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("the door never listened")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				return "http://" + addr
+			}
+			call := func(url, method, path, body string) (int, string) {
+				t.Helper()
+				req, _ := http.NewRequest(method, url+path, strings.NewReader(body))
+				req.Header.Set("x-api-key", "fabtok")
+				if body != "" {
+					req.Header.Set("content-type", "application/json")
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("%s %s: %v", method, path, err)
+				}
+				defer resp.Body.Close()
+				b, _ := io.ReadAll(resp.Body)
+				return resp.StatusCode, string(b)
+			}
+
+			url := door("ca.pem")
+			if st, b := call(url, "GET", "/", ""); st != 200 || b != "FacetQL Online" {
+				t.Fatalf("GET / = %d %q", st, b)
+			}
+			node := `{"address":"Post:1","kind":"Post","x":0,"y":0,"z":0,"q":0,"data":"{\"t\":1}","public":false}`
+			if st, b := call(url, "POST", "/node", node); st != 201 || !strings.Contains(b, `"address":"Post:1"`) {
+				t.Fatalf("POST /node = %d %q", st, b)
+			}
+			if st, b := call(url, "GET", "/node/Post%3A1", ""); st != 200 || !strings.Contains(b, `"data":"{\"t\":1}"`) {
+				t.Fatalf("GET /node = %d %q", st, b)
+			}
+
+			// A subscription through the door sees a write made through it.
+			req, _ := http.NewRequest("GET", url+"/events", nil)
+			req.Header.Set("x-api-key", "fabtok")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/event-stream" {
+				t.Fatalf("GET /events = %d %v", resp.StatusCode, resp.Header)
+			}
+			got := make(chan string, 1)
+			go func() {
+				seen, _ := fdoorReadStream(resp.Body, []string{"Post:2"})
+				got <- seen
+			}()
+			time.Sleep(200 * time.Millisecond)
+			call(url, "POST", "/node", strings.ReplaceAll(node, "Post:1", "Post:2"))
+			select {
+			case seen := <-got:
+				if !strings.Contains(seen, "Post:2") {
+					t.Fatalf("the event stream through the door: %q", seen)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("no event through the door")
+			}
+
+			// Without the private CA the backend is not one the door can
+			// reach: a 502 naming it, with Retry-After.
+			plain := door("")
+			if st, b := call(plain, "GET", "/node/Post%3A1", ""); st != 502 || !strings.Contains(b, "'db-a' at "+backend+" did not answer") {
+				t.Fatalf("without the CA: %d %q", st, b)
+			}
+		})
 	}
 }

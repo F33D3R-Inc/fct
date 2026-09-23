@@ -163,7 +163,7 @@ app FabricStatsCheck:
         let r = do statsRatios(m)
         let hot = do workloadMetricsIsHot(m)
         let qhot = do workloadMetricsIsQueueHot(m)
-        return "" + floatBits(m.operationsPerSecond) + "," + floatBits(m.readsPerSecond) + "," + floatBits(m.writesPerSecond) + "," + floatBits(m.readLatencyUs) + "," + floatBits(m.writeLatencyUs) + "," + floatBits(m.cpuUtilization) + "," + floatBits(m.memoryUtilization) + "," + m.storageBytesPerSecond + "," + m.networkInBytesPerSecond + "," + m.networkOutBytesPerSecond + "," + m.queueDepth + ",[" + join(cells, ";") + "]," + m.cellBreakdownPartial + "|" + floatBits(r.read) + "," + floatBits(r.write) + "|" + hot + ":" + qhot
+        return "" + floatBits(m.operationsPerSecond) + "," + floatBits(m.readsPerSecond) + "," + floatBits(m.writesPerSecond) + "," + floatBits(m.readLatencyUs) + "," + floatBits(m.writeLatencyUs) + "," + floatBits(m.cpuUtilization) + "," + floatBits(m.memoryUtilization) + "," + u64Text(m.storageBytesPerSecond) + "," + u64Text(m.networkInBytesPerSecond) + "," + u64Text(m.networkOutBytesPerSecond) + "," + u64Text(m.queueDepth) + ",[" + join(cells, ";") + "]," + m.cellBreakdownPartial + "|" + floatBits(r.read) + "," + floatBits(r.write) + "|" + hot + ":" + qhot
 
     proc lbD(a: StatsSample, b: StatsSample) -> text:
         let o = do statsSampleDifference(a, b)
@@ -297,6 +297,43 @@ app FabricStatsCheck:
         t = do lbPush(t, d3)
         return t
 
+    # Monotonic counters, latencies and gauges past i64::MAX
+    # (u64div_rust.tsv's bigSample).
+    proc lbBig(ns: int, r: int, w: int) -> StatsSample:
+        let big = u64Parse("9223372036854775808")
+        let max = u64Parse("18446744073709551615")
+        let mut s = do lbS(ns, r, w)
+        s.hasReadLatencyP99Us = true
+        s.readLatencyP99Us = big + 1
+        s.inFlight = big
+        s.maxConcurrent = max
+        return s
+
+    proc lbBigSample() -> text:
+        let big = u64Parse("9223372036854775808")
+        let max = u64Parse("18446744073709551615")
+        let mut t = ""
+        let a1 = do lbBig(0, 5, 5)
+        let b1 = do lbBig(1000000000, big + 100, 7)
+        let d1 = do lbD(a1, b1)
+        t = do lbPush(t, d1)
+        let a2 = do lbBig(0, big + 100, 5)
+        let b2 = do lbBig(1000000000, 7, 7)
+        let d2 = do lbD(a2, b2)
+        t = do lbPush(t, d2)
+        let a3 = do lbBig(0, big, big)
+        let b3 = do lbBig(2000000000, max, big + 4)
+        let d3 = do lbD(a3, b3)
+        t = do lbPush(t, d3)
+        let mut a4 = do lbBig(0, 0, 0)
+        a4.cells = [CellStats{x: 1, y: 0, z: 0, q: 0, reads: big, writes: 5, bytesRead: max, bytesWritten: 0}]
+        let mut b4 = do lbBig(1000000000, 0, 0)
+        b4.cells = [CellStats{x: 1, y: 0, z: 0, q: 0, reads: big + 10, writes: 4, bytesRead: max, bytesWritten: big}, CellStats{x: 2, y: 0, z: 0, q: 0, reads: 7, writes: 0, bytesRead: 0, bytesWritten: 0}]
+        let d4 = do lbD(a4, b4)
+        t = do lbPush(t, d4)
+        return t
+
+    state bigSample: text = ""
     state sampleRates: text = ""
     state sampleCpu: text = ""
     state sampleQueue: text = ""
@@ -307,10 +344,12 @@ app FabricStatsCheck:
         let b = do lbCpu()
         let c = do lbQueue()
         let d = do lbCells()
+        let big = do lbBigSample()
         sampleRates = a
         sampleCpu = b
         sampleQueue = c
         sampleCells = d
+        bigSample = big
 
     # f64 bit patterns and their serde_json text (sjF64Text), for the Rust
     # side to print the same bits with serde_json::to_string.

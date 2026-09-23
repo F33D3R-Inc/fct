@@ -532,7 +532,7 @@
       }
       case "slug": return mapCase(toStr(a(0)), false).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
       case "split": { const s = toStr(a(0)), sep = toStr(a(1)); return sep === "" ? Array.from(s) : s.split(sep); }
-      case "slice": return runeSlice(toStr(a(0)), toInt(a(1)), toInt(a(2)));
+      case "slice": return Array.isArray(a(0)) ? listSlice(a(0), toInt(a(1)), toInt(a(2))) : runeSlice(toStr(a(0)), toInt(a(1)), toInt(a(2)));
       case "charAt": { const i = toInt(a(1)); return i < 0 ? "" : runeSlice(toStr(a(0)), i, i + 1); }
       case "take": { let n = toInt(a(1)); if (n < 0) n = 0; return runeSlice(toStr(a(0)), 0, n); }
       case "ago": return ago(toInt(a(0)), Math.floor(Date.now() / 1000));
@@ -551,6 +551,15 @@
   // roundAway is Go's math.Round: half away from zero (Math.round is half up).
   function roundAway(x) { return x < 0 ? -Math.round(-x) : Math.round(x); }
   // runeSlice: code points [start, end), both clamped into range, never an error.
+  // listSlice: slice() over a list — the elements [start, end), clamped as
+  // runeSlice clamps a string.
+  function listSlice(xs, start, end) {
+    const n = xs.length;
+    if (start < 0) start = 0; if (start > n) start = n;
+    if (end < 0) end = 0; if (end > n) end = n;
+    if (end < start) end = start;
+    return xs.slice(start, end);
+  }
   function runeSlice(s, start, end) {
     const r = Array.from(s), n = r.length;
     if (start < 0) start = 0; if (start > n) start = n;

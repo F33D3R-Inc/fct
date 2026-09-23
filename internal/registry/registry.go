@@ -60,10 +60,51 @@ import (
 // Bumped 1.33.0 → 1.34.0 for what the fabric port added to the language:
 // float literals with an exponent (`1e22`, `2.5E-3`); `proc main(args:
 // [text]) -> int` as a command's entry point (`facet exec`), lowered as a
-// daemon-context body (listen/accept/detach/act allowed); and the builtins
+// daemon-context body (listen/accept/detach/act allowed), as is any proc
+// only ever `detach`ed from a daemon-context body (internal/ir/detachctx.go:
+// every reference to it a detach from a daemon, main or another such proc,
+// computed to a fixpoint); and the builtins
 // listenOn (a listener bound to one address), nowMs (the wall clock in
-// milliseconds) and signals (SIGINT/SIGTERM delivered on a channel).
-var ToolchainVersion = "1.34.0"
+// milliseconds) and signals (SIGINT/SIGTERM delivered on a channel); and
+// writes through several levels of fields and list indexes (`a.b.c = x`,
+// `a.xs[i].f = x`), which were refused past one level.
+//
+// Bumped 1.34.0 → 1.35.0 for the builtins a server needs to run as its Rust
+// counterpart does: awaitAny (wait on several channels, or one with a
+// deadline), closeChannel, exitProcess (a daemon's exit status),
+// processStats (CPU, cores, resident memory and the memory limit, as JSON)
+// listenTls (a TLS listener over a PKCS#12 identity) and connPeer (a
+// connection's remote address); slice() also slices a list (it read any
+// argument as text, so slicing a list silently produced a string); positional file
+// reads and writes also became atomic with respect to one another.
+//
+// Bumped 1.35.0 → 1.36.0 for connectTls (an outbound TLS connection: a
+// connect() whose handshake verifies the peer against the system roots
+// plus an optional PEM trust file — the client side of the https the Rust
+// fabric speaks through reqwest). Also in 1.36.0: the u64 builtins
+// (u64Cmp, u64Min, u64Max, u64SatSub, u64Div, u64Rem, u64Text, u64Parse,
+// u64ParseError, u64ToFloat) — unsigned readings of an int's 64 bits, the
+// representation the fabric ports use for a Rust u64 (see runtime/u64.go).
+// Also in 1.36.0: closeListener (a listener stopped and its port released,
+// a parked accept() answering a failed connection handle rather than
+// aborting) and listenError (a bind that failed is a failed listener handle
+// whose error this reads — listen, listenOn and listenTls no longer abort
+// on it, as connect never did); and grantRead (in `proc main` only: a file
+// the operator named on argv or in the environment becomes readable outside
+// the io.file sandbox — runtime/grants.go).
+//
+// Bumped 1.36.0 → 1.37.0 for the contract and wire-type grammar the f33d3r
+// API's golden-contract conformance needed: an `api` declaration's block
+// (summary, description, body Type, errors N, …, operation "…", and
+// `param: type "description" [one of …]` lines), a `stream` block's summary,
+// description, path-parameter docs, `errors` and `hello since "<date>"` (a
+// stream now sends the hello connect frame only when it declares one), a
+// `contract` block's title, description and bearer text; wire type fields
+// `{T}` (an object of T values), `[[T]]` (a nested list) and `T? or null`
+// (left out when empty, maybe-null where present). The published contract
+// also changed shape: OpenAPI 3.1, closed schemas, nullable types, and
+// rate classes with their own budgets and X-RateLimit-* headers.
+var ToolchainVersion = "1.37.0"
 
 // CheckToolchainRange reports whether the running ToolchainVersion satisfies a
 // `facet` manifest range, returning a clear "upgrade the toolchain" error when

@@ -615,6 +615,19 @@ app StmtSelfHost:
             let args = do doArgsNodes(rest)
             let noExpr = do emptyNode()
             return Stmt{kind: "do", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
+        # `detach ProcName(args)` — parser.go parses it with parseSpawn's
+        # call grammar; build.go's procBlock restricts it to a daemon-context
+        # body and lowers it to the "$detach" intrinsic.
+        let isDetach = do stmtHasPrefix(t, "detach ")
+        if isDetach:
+            let rest0 = do stmtTrimPrefix(t, "detach ")
+            let rest = trim(rest0)
+            let noExpr = do emptyNode()
+            let openAt = do firstParenIndex(rest)
+            if openAt < 0:
+                return Stmt{kind: "unsupported", lineIdx: lineIdx, expr: noExpr, args: [], body: [], elseBody: [], index: noExpr}
+            let args = do doArgsNodes(rest)
+            return Stmt{kind: "detach", lineIdx: lineIdx, expr: noExpr, args: args, body: [], elseBody: [], index: noExpr}
         # `act ActionName(args)` — parser.go's parseAct: fire-and-forget only,
         # a `(` is required, the args are a call's own arg list. Valid to
         # parse in any proc-shaped body; proc_lower.fct's plBlock is what
@@ -781,6 +794,15 @@ app StmtSelfHost:
             let rk2 = do tokenKinds(rhs2)
             let rt2 = do tokenTexts(rhs2)
             let e2 = do orNodes(rk2, rt2, 0)
+            # a write through more than one level (`a.b.c = x`, `a.xs[i].f =
+            # x`): parser.go desugars it (desugarNestedWrite); the target
+            # expression rides in `index` for the lowering to do the same
+            let tk = do tokenKinds(target)
+            let tt = do tokenTexts(target)
+            let tx = do orNodes(tk, tt, 0)
+            let depth = do stmtWriteChainDepth(tx)
+            if depth >= 2:
+                return Stmt{kind: "nestedAssign", lineIdx: lineIdx, expr: e2, args: [], body: [], elseBody: [], index: tx}
             # `arr[i] = expr` / `map[k] = expr` — an indexed mutation, told
             # apart from a plain reassignment by the target ending in `]`
             # (mirrors parseProcBody's own `strings.HasSuffix(target, "]")`
@@ -945,6 +967,17 @@ app StmtSelfHost:
     # already does when it first classified that same line. Unchanged by
     # this rewrite.
     # ============================================================
+    # stmtWriteChainDepth: writeChainDepth — how many field/index steps a
+    # write target goes through down to a local (-1: not such a chain).
+    proc stmtWriteChainDepth(e: ExprNode) -> int:
+        if e.kind == "ref":
+            return 0
+        if (e.kind == "get" || e.kind == "index") && len(e.children) >= 1:
+            let d = do stmtWriteChainDepth(e.children[0])
+            if d >= 0:
+                return d + 1
+        return -1
+
     proc letOrAssignName(lineText: text) -> text:
         let t = trim(lineText)
         let hasLet = do stmtHasPrefix(t, "let ")

@@ -22,9 +22,10 @@ import (
 // stream after the emitting action has committed (runActionLocked collects
 // them; fanoutEvents delivers), so a rolled-back action emits nothing.
 //
-// Every connection opens with an unnumbered `hello` frame (HelloEventDTO:
-// the connection's id, the contract and schema versions this server
-// publishes, its clock). Each stream keeps its most recent numbered frames,
+// Every connection opens with an SSE comment, then — on a stream declaring
+// `hello since "<date>"` — an unnumbered `hello` frame (HelloEventDTO: the
+// connection's id, the contract and schema versions this server publishes,
+// its clock). Each stream keeps its most recent numbered frames,
 // so a client that reconnects with `Last-Event-ID` (or `?last_event_id=`)
 // is first replayed every frame after that id it was entitled to see.
 
@@ -113,9 +114,7 @@ func (s *Server) streamHandler(st ir.Stream) http.HandlerFunc {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 			return
 		}
-		if lim := s.rateClass(st.Rate); lim != nil && !lim.allow(clientIP(r)) {
-			w.Header().Set("Retry-After", "60")
-			apiError(w, http.StatusTooManyRequests, "rate limited")
+		if !s.meterRate(w, r, st.Rate) {
 			return
 		}
 		sid := s.sidForRequest(r)
@@ -203,10 +202,14 @@ func (s *Server) streamHandler(st ir.Stream) http.HandlerFunc {
 			delete(s.streamSubs[st.Path], sub)
 			s.streamMu.Unlock()
 		}()
-		// The hello, unnumbered, so the client knows the stream is open (and
-		// what contract it speaks) before any event.
-		hello, _ := json.Marshal(s.helloEvent())
-		fmt.Fprintf(w, "event: hello\ndata: %s\n\n", hello)
+		// An SSE comment first, so the client knows the stream is open before
+		// any event (legacy's ": connected"); then, on a stream that declares
+		// `hello since …`, the unnumbered hello saying what contract it speaks.
+		fmt.Fprint(w, ": connected\n\n")
+		if st.Hello != "" {
+			hello, _ := json.Marshal(s.helloEvent())
+			fmt.Fprintf(w, "event: hello\ndata: %s\n\n", hello)
+		}
 		for _, f := range connectFrames {
 			w.Write(f)
 		}

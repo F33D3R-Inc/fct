@@ -29,10 +29,11 @@ import (
 // test points them at buffers. The mutex keeps two procs (a spawned pair,
 // say) from interleaving inside one write.
 type stdio struct {
-	mu     sync.Mutex
-	in     io.Reader
-	out    io.Writer
-	errOut io.Writer
+	mu         sync.Mutex
+	in         io.Reader
+	out        io.Writer
+	errOut     io.Writer
+	signalSubs []int // signals() channels, each sent every signal's name
 }
 
 func newStdio() *stdio {
@@ -94,6 +95,7 @@ func (s *Server) RunMain(args []string) (int, error) {
 	if len(p.Params) != 1 || !p.Params[0].List || p.Params[0].Type != "text" || p.Ret != "int" || p.RetList {
 		return 0, fmt.Errorf("`main` must be declared `proc main(args: [text]) -> int`")
 	}
+	s.grants.setArgv(args)
 	argv := make([]any, len(args))
 	for i, a := range args {
 		argv[i] = a
@@ -112,18 +114,32 @@ func (s *Server) RunMain(args []string) (int, error) {
 // what a daemon that drains before it exits needs.
 func (s *Server) ioSignals() (any, error) {
 	id := s.channels.create()
-	c := make(chan os.Signal, 4)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		for sig := range c {
-			name := "SIGTERM"
-			if sig == syscall.SIGINT {
-				name = "SIGINT"
+	s.console.mu.Lock()
+	s.console.signalSubs = append(s.console.signalSubs, id)
+	first := len(s.console.signalSubs) == 1
+	s.console.mu.Unlock()
+	if first {
+		c := make(chan os.Signal, 4)
+		signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			for sig := range c {
+				name := "SIGTERM"
+				if sig == syscall.SIGINT {
+					name = "SIGINT"
+				}
+				s.deliverSignal(name)
 			}
-			if _, err := s.channels.send(id, name); err != nil {
-				return
-			}
-		}
-	}()
+		}()
+	}
 	return id, nil
+}
+
+// deliverSignal hands one signal's name to every signals() channel.
+func (s *Server) deliverSignal(name string) {
+	s.console.mu.Lock()
+	subs := append([]int(nil), s.console.signalSubs...)
+	s.console.mu.Unlock()
+	for _, id := range subs {
+		s.channels.send(id, name)
+	}
 }

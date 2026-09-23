@@ -32,6 +32,8 @@ func TestConnectGates(t *testing.T) {
 		{"connect_in_action.fct", []string{"connect(...) is only available inside a proc that declares `uses io.net`"}},
 		{"listen_in_proc.fct", []string{"listen(...) is only available inside a daemon body"}},
 		{"connect_arity.fct", []string{"connect(...) takes exactly two arguments"}},
+		{"connecttls_arity.fct", []string{"connectTls(host, port, serverName, trustFile) takes exactly four arguments"}},
+		{"connecttls_no_uses.fct", []string{`proc "dial" calls connectTls(...)`, `requires capability "io.net"`}},
 	}
 	for _, c := range cases {
 		t.Run(c.file, func(t *testing.T) {

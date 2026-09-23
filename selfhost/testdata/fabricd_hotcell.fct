@@ -1,0 +1,27 @@
+import "../fabricd_lib.fct"
+
+app FabricdHotCell:
+    # fabricd with tests/mover.rs's HotCell telemetry source: the command
+    # fabricd.fct is, with Daemon::start handed one cell under sustained
+    # write pressure (us-east-db-0, shard 1, cell (0,0) — the same numbers
+    # fabric-runtime's loop test and tests/daemon.rs use) instead of
+    # FacetQL's /stats. Telemetry is an input to the loop; everything
+    # downstream — analyzer, optimizer, controller, mechanisms, routing, the
+    # front door and the daemon's own mover — runs untouched.
+    # fabric_daemon_test.go's TestFabricDaemonMoverLive runs it.
+    proc hotCell() -> DaemonTelemetry:
+        let decoded = do protocolDecode("{\"Telemetry\":{\"timestamp_ms\":0,\"node_id\":\"us-east-db-0\",\"shard\":{\"id\":1,\"workload_domain\":\"us-east\"},\"samples\":[{\"coordinate\":{\"x\":0,\"y\":0},\"operations_per_second\":12000.0,\"read_ratio\":0.1,\"write_ratio\":0.9,\"read_latency_us\":40000.0,\"write_latency_us\":60000.0,\"cpu_utilization\":0.99,\"memory_utilization\":0.95,\"queue_depth\":30000,\"cell_breakdown\":[],\"cell_breakdown_partial\":false}]}}")
+        return daemonFixedTelemetry("one cell under sustained write pressure", [decoded.message])
+
+    proc main(args: [text]) -> int uses io.net, io.net.listen, io.file, io.env, io.console:
+        let named = do fabricdArguments(args)
+        if named.kind == "exit":
+            return named.code
+        let granted = grantRead(named.path)
+        let start = do fabricdConfigure(named.path)
+        if start.kind == "exit":
+            return start.code
+        let exit = channel()
+        detach fabricdRun(start.settings, hotCell(), exit)
+        let code = recv(exit)
+        return toInt(code)

@@ -427,9 +427,10 @@ app FabricFacetqlPlacementSelfHost:
     # Each returns `name=value` lines the Go test asserts on.
     state fqlLiveOut: text = ""
 
-    proc fqlLiveClient(base: text, token: text) -> FqlClient:
+    # trust: the PEM file of extra roots for an https base ("" for none).
+    proc fqlLiveClient(base: text, token: text, trust: text) -> FqlClient:
         let ep = do fqlEndpointNew("db-live", base, token)
-        let c = do fqlClientNew(ep.v)
+        let c = do fqlClientTrusting(fqlClientNew(ep.v), trust)
         return c
 
     proc fqlLivePlacement(shardId: int, dbms: text, region: text) -> Placement:
@@ -441,21 +442,21 @@ app FabricFacetqlPlacementSelfHost:
         return e.kind
 
     # stats_reads_the_engines_own_counters
-    proc fqlLiveStats(base: text, token: text) -> text uses io.net:
-        let c = do fqlLiveClient(base, token)
+    proc fqlLiveStats(base: text, trust: text, token: text) -> text uses io.net:
+        let c = do fqlLiveClient(base, token, trust)
         let first = do fqlStats(c)
         let second = do fqlStats(c)
         let mut out = ["first=" + fqlLiveErr(first.ok, first.err), "second=" + fqlLiveErr(second.ok, second.err)]
-        out = append(out, "readsMonotonic=" + (second.v.readsTotal >= first.v.readsTotal))
-        out = append(out, "writesMonotonic=" + (second.v.writesTotal >= first.v.writesTotal))
+        out = append(out, "readsMonotonic=" + (u64Cmp(second.v.readsTotal, first.v.readsTotal) >= 0))
+        out = append(out, "writesMonotonic=" + (u64Cmp(second.v.writesTotal, first.v.writesTotal) >= 0))
         out = append(out, "pageSize=" + second.v.storage.pageSize)
         out = append(out, "hasVersion=" + second.v.hasVersion)
         out = append(out, "maxConcurrent=" + second.v.runtime.requests.maxConcurrent)
         return join(out, "\n")
 
     # a_placement_is_written_and_read_back
-    proc fqlLiveWriteRead(base: text, token: text, shard: int) -> text uses io.net:
-        let store = do placementStoreNew(fqlLiveClient(base, token))
+    proc fqlLiveWriteRead(base: text, trust: text, token: text, shard: int) -> text uses io.net:
+        let store = do placementStoreNew(fqlLiveClient(base, token, trust))
         let stored = do placementStoreCreate(store, fqlLivePlacement(shard, "db-a", "us-east"))
         let mut out = ["create=" + fqlLiveErr(stored.ok, stored.err), "createVersion=" + stored.v.version]
         let back = do placementStoreGet(store, shard, Coordinate{x: 1, y: 2})
@@ -477,8 +478,8 @@ app FabricFacetqlPlacementSelfHost:
         return join(out, "\n")
 
     # a_stale_update_is_refused_by_the_engines_compare_and_set
-    proc fqlLiveStale(base: text, token: text, shard: int) -> text uses io.net:
-        let store = do placementStoreNew(fqlLiveClient(base, token))
+    proc fqlLiveStale(base: text, trust: text, token: text, shard: int) -> text uses io.net:
+        let store = do placementStoreNew(fqlLiveClient(base, token, trust))
         let v1 = do placementStoreCreate(store, fqlLivePlacement(shard, "db-a", "us-east"))
         let mut out = ["create=" + fqlLiveErr(v1.ok, v1.err)]
         let v2 = do placementStoreUpdate(store, v1.v, fqlLivePlacement(shard, "db-b", "eu-west"))
@@ -500,14 +501,14 @@ app FabricFacetqlPlacementSelfHost:
 
     # a_bad_token_fails_closed_rather_than_reading_as_healthy (the client
     # half; the poller half waits for poller.rs's port)
-    proc fqlLiveBadToken(base: text) -> text uses io.net:
-        let c = do fqlLiveClient(base, "not-a-real-token")
+    proc fqlLiveBadToken(base: text, trust: text) -> text uses io.net:
+        let c = do fqlLiveClient(base, "not-a-real-token", trust)
         let r = do fqlStats(c)
         return "stats=" + fqlLiveErr(r.ok, r.err) + "\nunhealthy=" + fqlErrorImpliesUnhealthy(r.err) + "\ntext=" + fqlErrorDisplay(r.err)
 
     # a_kind_larger_than_one_page_is_walked_by_cursor
-    proc fqlLiveCursor(base: text, token: text, shard: int, rows: int) -> text uses io.net:
-        let store = do placementStoreNew(fqlLiveClient(base, token))
+    proc fqlLiveCursor(base: text, trust: text, token: text, shard: int, rows: int) -> text uses io.net:
+        let store = do placementStoreNew(fqlLiveClient(base, token, trust))
         let mut created = []
         let mut failures = 0
         let mut i = 0
@@ -544,8 +545,8 @@ app FabricFacetqlPlacementSelfHost:
         return "createFailures=" + failures + "\nload=" + fqlLiveErr(loaded.ok, loaded.err) + "\nours=" + len(ours) + "\ndistinct=" + distinct + "\ncleanupFailures=" + cleanupFailures
 
     # claim_has_exactly_one_winner
-    proc fqlLiveClaim(base: text, token: text, shard: int) -> text uses io.net:
-        let c = do fqlLiveClient(base, token)
+    proc fqlLiveClaim(base: text, trust: text, token: text, shard: int) -> text uses io.net:
+        let c = do fqlLiveClient(base, token, trust)
         let store = do placementStoreNew(c)
         let stored = do placementStoreCreate(store, fqlLivePlacement(shard, "db-a", "us-east"))
         let address = do storedPlacementAddress(stored.v)
@@ -565,8 +566,8 @@ app FabricFacetqlPlacementSelfHost:
     # The rest of the client surface against the real engine: point read
     # (percent-encoded address), multiget, count, a predicate query page,
     # and a raw all-or-nothing transaction.
-    proc fqlLiveSurface(base: text, token: text) -> text uses io.net:
-        let c = do fqlLiveClient(base, token)
+    proc fqlLiveSurface(base: text, trust: text, token: text) -> text uses io.net:
+        let c = do fqlLiveClient(base, token, trust)
         let a1 = do fqlCreateNode(c, FqlCreateNodeRequest{address: "fqlive:a 1/é", kind: "FqLive", x: 1, y: 2, z: 3, q: 4, data: "{\"n\":1,\"tag\":\"x\"}", public: false, ifAbsent: false})
         let a2 = do fqlCreateNode(c, FqlCreateNodeRequest{address: "fqlive:b", kind: "FqLive", x: 0, y: 0, z: 0, q: 0, data: "{\"n\":5}", public: true, ifAbsent: false})
         let got = do fqlGetNode(c, "fqlive:a 1/é")
@@ -608,8 +609,8 @@ app FabricFacetqlPlacementSelfHost:
 
     # open_events against the real server: subscribe, write, and see the
     # write's frame arrive on the stream; a bad token is refused.
-    proc fqlLiveEvents(base: text, token: text) -> text uses io.net:
-        let c = do fqlLiveClient(base, token)
+    proc fqlLiveEvents(base: text, trust: text, token: text) -> text uses io.net:
+        let c = do fqlLiveClient(base, token, trust)
         let opened = do fqlOpenEvents(c)
         let w = do fqlCreateNode(c, FqlCreateNodeRequest{address: "fqevents:1", kind: "FqEvents", x: 0, y: 0, z: 0, q: 0, data: "{}", public: false, ifAbsent: false})
         let mut s = opened.stream
@@ -620,35 +621,35 @@ app FabricFacetqlPlacementSelfHost:
             seen = seen + bytesToText(s.data)
             s = httpStreamWithData(s, [])
         let closed = do httpStreamClose(s)
-        let bad = do fqlOpenEvents(fqlLiveClient(base, "not-a-real-token"))
+        let bad = do fqlOpenEvents(fqlLiveClient(base, "not-a-real-token", trust))
         let del = do fqlTransaction(c, [fqlTxClearKind("FqEvents")])
         return "opened=" + opened.ok + " " + opened.stream.status + " " + httpHeaderValue(opened.stream.headers, "content-type") + "\nwrite=" + w.ok + "\nseen=" + contains(seen, "\"event\":\"node_created\"") + " " + contains(seen, "fqevents:1") + "\nbad=" + fqlErrLine(bad.err)
 
-    proc fqlLiveFlow(flow: text, base: text, token: text, shard: int, rows: int) -> text uses io.net:
+    proc fqlLiveFlow(flow: text, base: text, trust: text, token: text, shard: int, rows: int) -> text uses io.net:
         if flow == "events":
-            let r = do fqlLiveEvents(base, token)
+            let r = do fqlLiveEvents(base, trust, token)
             return r
         if flow == "stats":
-            let r = do fqlLiveStats(base, token)
+            let r = do fqlLiveStats(base, trust, token)
             return r
         if flow == "writeRead":
-            let r = do fqlLiveWriteRead(base, token, shard)
+            let r = do fqlLiveWriteRead(base, trust, token, shard)
             return r
         if flow == "stale":
-            let r = do fqlLiveStale(base, token, shard)
+            let r = do fqlLiveStale(base, trust, token, shard)
             return r
         if flow == "badToken":
-            let r = do fqlLiveBadToken(base)
+            let r = do fqlLiveBadToken(base, trust)
             return r
         if flow == "cursor":
-            let r = do fqlLiveCursor(base, token, shard, rows)
+            let r = do fqlLiveCursor(base, trust, token, shard, rows)
             return r
         if flow == "claim":
-            let r = do fqlLiveClaim(base, token, shard)
+            let r = do fqlLiveClaim(base, trust, token, shard)
             return r
-        let r = do fqlLiveSurface(base, token)
+        let r = do fqlLiveSurface(base, trust, token)
         return r
 
-    action fqlLiveRun(flow: text, base: text, token: text, shard: int, rows: int):
-        let r = do fqlLiveFlow(flow, base, token, shard, rows)
+    action fqlLiveRun(flow: text, base: text, token: text, shard: int, rows: int, trust: text):
+        let r = do fqlLiveFlow(flow, base, trust, token, shard, rows)
         fqlLiveOut = r

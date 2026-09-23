@@ -515,16 +515,16 @@ app FabricRuntimeCases:
     proc caseNode(n: RegisteredNode, nowMs: int, deadlineMs: int) -> text:
         let mut last = "-"
         if n.hasLastHeartbeat:
-            last = "" + n.lastHeartbeatMs
+            last = u64Text(n.lastHeartbeatMs)
         let reported = do caseBool(n.reportedHealthy)
         let health = do registeredNodeHealth(n, nowMs, deadlineMs)
         let silence = do registeredNodeSilenceMs(n, nowMs)
         let mut silenceText = "-"
         if silence.has:
-            silenceText = "" + silence.val
+            silenceText = u64Text(silence.val)
         let serviceable = do nodeHealthIsServiceable(health)
         let serviceableText = do caseBool(serviceable)
-        return n.id + ":" + n.protocol + ":" + n.softwareVersion + ":" + n.region + ":" + n.registeredAtMs + ":" + last + ":" + reported + ":" + n.heartbeats + ":" + health + ":" + silenceText + ":" + serviceableText
+        return n.id + ":" + n.protocol + ":" + n.softwareVersion + ":" + n.region + ":" + u64Text(n.registeredAtMs) + ":" + last + ":" + reported + ":" + n.heartbeats + ":" + health + ":" + silenceText + ":" + serviceableText
 
     proc caseRegistry() -> [text]:
         let mut out = []
@@ -1025,9 +1025,9 @@ app FabricRuntimeCases:
                 if !hasBegan:
                     hasBegan = true
                     began = atMs
-                let copied = min(max(atMs - began, 0) * rate, bytes)
+                let copied = u64Min(u64SatSub(atMs, began) * rate, bytes)
                 let mut atoms = 0
-                if copied >= bytes:
+                if u64Cmp(copied, bytes) >= 0:
                     atoms = 1
                 let current = do fabricRuntimePlacement(rt)
                 let recorded = do placementFabricRecordTransfer(current, target, destination, atoms, copied, atMs)
@@ -1124,9 +1124,9 @@ app FabricRuntimeCases:
                 if !hasBegan:
                     hasBegan = true
                     began = atMs
-                let copied = min(max(atMs - began, 0) * rate, bytes)
+                let copied = u64Min(u64SatSub(atMs, began) * rate, bytes)
                 let mut atoms = 0
-                if copied >= bytes:
+                if u64Cmp(copied, bytes) >= 0:
                     atoms = 1
                 let current = do fabricRuntimePlacement(rtStep)
                 let recorded = do placementFabricRecordTransfer(current, target, destination, atoms, copied, atMs)
@@ -1466,6 +1466,93 @@ app FabricRuntimeCases:
             i = i + 1
         return out
 
+    # bigU64 — values past i64::MAX where the Rust types take any u64:
+    # heartbeat clocks and liveness, ActionTarget's Ord and Display,
+    # ActionId, ValidationError's Display, and the simulator clock.
+    proc caseBigU64() -> [text]:
+        let big = u64Parse("9223372036854775808")
+        let max = u64Parse("18446744073709551615")
+        let mut out = []
+        let empty = do nodeRegistryNew()
+        let regA = do caseRegistration("db-a")
+        let r1 = do nodeRegistryRegister(empty, regA, big)
+        let b1 = do nodeRegistryHeartbeat(r1.registry, NodeHeartbeat{nodeId: DbmsId{value: "db-a"}, timestampMs: big + 10, healthy: true})
+        let b2 = do nodeRegistryHeartbeat(b1.registry, NodeHeartbeat{nodeId: DbmsId{value: "db-a"}, timestampMs: 5, healthy: true})
+        let g = do nodeRegistryGet(b2.registry, "db-a")
+        let nows = [big + 20, big + 30011, max, 3]
+        let mut i = 0
+        loop i < 4:
+            let d = do caseNode(g.val, nows[i], 30000)
+            out = append(out, d)
+            i = i + 1
+        let dBig = do caseNode(g.val, max, big)
+        out = append(out, dBig)
+        let ts = [ActionTarget{shardId: big + 1, coordinate: Coordinate{x: 0, y: 0}}, ActionTarget{shardId: 1, coordinate: Coordinate{x: 5, y: 0}}, ActionTarget{shardId: max, coordinate: Coordinate{x: 0, y: 0}}, ActionTarget{shardId: big, coordinate: Coordinate{x: 1, y: 0}}, ActionTarget{shardId: big, coordinate: Coordinate{x: 0, y: 1}}]
+        let mut sorted = []
+        let mut k = 0
+        loop k < len(ts):
+            let mut next = []
+            let mut placed = false
+            let mut j = 0
+            loop j < len(sorted):
+                let less = do actionTargetLess(ts[k], sorted[j])
+                if !placed && less:
+                    next = append(next, ts[k])
+                    placed = true
+                next = append(next, sorted[j])
+                j = j + 1
+            if !placed:
+                next = append(next, ts[k])
+            sorted = next
+            k = k + 1
+        let mut shown = []
+        let mut m = 0
+        loop m < len(sorted):
+            let d = do actionTargetDisplay(sorted[m])
+            shown = append(shown, d)
+            m = m + 1
+        out = append(out, join(shown, ";"))
+        let aid = do actionIdNew(max)
+        let aidText = do actionIdDisplay(aid)
+        out = append(out, aidText)
+        let e1 = do validationErrorStaleDecision(big, max, max - big, big + 1)
+        let t1 = do validationErrorDisplay(e1)
+        out = append(out, t1)
+        let e2 = do validationErrorDecisionFromTheFuture(max, big)
+        let t2 = do validationErrorDisplay(e2)
+        out = append(out, t2)
+        let e3 = do validationErrorTopologySuperseded(max, big)
+        let t3 = do validationErrorDisplay(e3)
+        out = append(out, t3)
+        let c1 = do simClockNew(big, big + 7)
+        let a1 = do simClockAdvance(c1)
+        let now1 = do simClockNowMs(a1.clock)
+        out = append(out, u64Text(a1.clock.tickMs) + ":" + u64Text(a1.nowMs) + ":" + u64Text(now1) + ":" + u64Text(a1.clock.ticks))
+        let c2 = do simClockNew(5, 0)
+        let a2 = do simClockAdvance(c2)
+        out = append(out, u64Text(a2.clock.tickMs) + ":" + u64Text(a2.nowMs))
+        let spec = do clusterSpecDefault()
+        let mut sim = do simulationNew(spec)
+        let f1 = do faultNodeLoss(DbmsId{value: "us-east-db-0"})
+        sim = do simulationScheduleFault(sim, big + 1, f1)
+        let f2 = do faultNodeLoss(DbmsId{value: "us-east-db-1"})
+        sim = do simulationScheduleFault(sim, 5, f2)
+        let f3 = do faultPartitionRegion("us-west")
+        sim = do simulationScheduleFault(sim, max, f3)
+        let mut step = 0
+        loop step < 2:
+            let r = do simulationStep(sim)
+            sim = r.simulation
+            let mut fs = []
+            let mut q = 0
+            loop q < len(r.tick.faults):
+                let fd = do faultDisplay(r.tick.faults[q])
+                fs = append(fs, fd)
+                q = q + 1
+            out = append(out, u64Text(r.tick.atMs) + ":" + join(fs, ",") + ":" + len(r.tick.observations))
+            step = step + 1
+        return out
+
     proc runtimeCase(name: text) -> text:
         let mut parts = []
         if name == "mechCutoverVerification":
@@ -1510,6 +1597,9 @@ app FabricRuntimeCases:
         if name == "runtimeMisc":
             let r14 = do caseRuntimeMisc()
             parts = r14
+        if name == "bigU64":
+            let r15 = do caseBigU64()
+            parts = r15
         let joined = do caseJoin(parts)
         return joined
 

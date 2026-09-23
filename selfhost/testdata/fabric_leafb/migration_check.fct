@@ -7,22 +7,28 @@ app FabricMigrationCheck:
     # fabric_leaf_b_test.go (migration.rs / phase.rs #[test]s ported input
     # for input, plus restart/budget/wrong-phase traces).
 
-    proc lbOpt(v: int) -> text:
-        return "" + v
+    proc lbOpt(has: bool, v: int) -> text:
+        if !has:
+            return "-1"
+        return u64Text(v)
+
+    proc lbU(v: int) -> text:
+        return u64Text(v)
 
     proc lbOutcome(has: bool, o: MigrationOutcome) -> text:
         if !has:
             return "-"
         if o.kind == "completed":
-            return "completed@" + o.atMs
-        return o.kind + "@" + o.atMs + ":" + o.detail
+            return "completed@" + u64Text(o.atMs)
+        return o.kind + "@" + u64Text(o.atMs) + ":" + o.detail
 
     proc lbMig(m: Migration) -> text:
         let p = m.plan
         let pr = m.progress
         let mut fence = "-"
         if m.hasFence:
-            fence = "" + m.fence.atMs + ":" + m.fence.lastWrite
+            let lw = do lbOpt(m.fence.hasLastWrite, m.fence.lastWrite)
+            fence = u64Text(m.fence.atMs) + ":" + lw
         let outcome = do lbOutcome(m.hasOutcome, m.outcome)
         let mut hist = ""
         let mut i = 0
@@ -32,7 +38,7 @@ app FabricMigrationCheck:
             let t = do migrationPhaseLabel(h.toPhase)
             if i > 0:
                 hist = hist + ";"
-            hist = hist + f + ">" + t + "@" + h.atMs
+            hist = hist + f + ">" + t + "@" + u64Text(h.atMs)
             if h.hasNote:
                 hist = hist + ":" + h.note
             i = i + 1
@@ -47,7 +53,10 @@ app FabricMigrationCheck:
         let cut = do migrationHasCutOverOf(m)
         let term = do migrationIsTerminal(m)
         let read = do migrationReadOwner(m)
-        return phase + "|" + idLabel + ":" + p.shardId + ":" + p.source + ":" + p.destination + ":" + reason + ":" + p.createdAtMs + ":" + p.atoms + ":" + p.maxCutoverPendingWrites + "|" + pr.atomsTotal + ":" + pr.atomsCopied + ":" + pr.bytesCopied + ":" + pr.pendingWrites + ":" + pr.phaseStartedAtMs + ":" + pr.updatedAtMs + "|" + m.sourceHighWater + "|" + m.destinationApplied + "|" + fence + "|" + m.cutoverCompletedAtMs + "|" + outcome + "|" + hist + "|" + pending + "|" + cut + "|" + term + "|" + read + "|" + w
+        let shw = do lbOpt(m.hasSourceHighWater, m.sourceHighWater)
+        let dap = do lbOpt(m.hasDestinationApplied, m.destinationApplied)
+        let cco = do lbOpt(m.hasCutOver, m.cutoverCompletedAtMs)
+        return phase + "|" + idLabel + ":" + u64Text(p.shardId) + ":" + p.source + ":" + p.destination + ":" + reason + ":" + u64Text(p.createdAtMs) + ":" + u64Text(p.atoms) + ":" + u64Text(p.maxCutoverPendingWrites) + "|" + u64Text(pr.atomsTotal) + ":" + u64Text(pr.atomsCopied) + ":" + u64Text(pr.bytesCopied) + ":" + u64Text(pr.pendingWrites) + ":" + u64Text(pr.phaseStartedAtMs) + ":" + u64Text(pr.updatedAtMs) + "|" + shw + "|" + dap + "|" + fence + "|" + cco + "|" + outcome + "|" + hist + "|" + u64Text(pending) + "|" + cut + "|" + term + "|" + read + "|" + w
 
     proc lbStatus(s: MigrationStatus) -> text:
         let outcome = do lbOutcome(s.hasOutcome, s.outcome)
@@ -56,7 +65,7 @@ app FabricMigrationCheck:
         let mut w = "-"
         if s.hasWriteOwner:
             w = s.writeOwner
-        return idLabel + ":" + s.shardId + ":" + s.source + ":" + s.destination + ":" + phase + ":" + s.atomsCopied + ":" + s.atomsTotal + ":" + s.bytesCopied + ":" + s.pendingWrites + ":" + round(s.fraction * 1000000.0) + ":" + s.phaseAgeMs + ":" + s.readOwner + ":" + w + ":" + outcome
+        return idLabel + ":" + u64Text(s.shardId) + ":" + s.source + ":" + s.destination + ":" + phase + ":" + u64Text(s.atomsCopied) + ":" + u64Text(s.atomsTotal) + ":" + u64Text(s.bytesCopied) + ":" + u64Text(s.pendingWrites) + ":" + round(s.fraction * 1000000.0) + ":" + u64Text(s.phaseAgeMs) + ":" + s.readOwner + ":" + w + ":" + outcome
 
     proc lbR(r: MigrationResult) -> text:
         if r.ok:
@@ -554,6 +563,51 @@ app FabricMigrationCheck:
         t = do lbPush(t, sst)
         return t
 
+    # Values past i64::MAX (u64div_rust.tsv's bigMigration): ids, shard ids,
+    # write sequences, byte counts and clocks.
+    proc lbBigMigration() -> text:
+        let big = u64Parse("9223372036854775808")
+        let max = u64Parse("18446744073709551615")
+        let shard = do shardNew(big + 5, "s")
+        let reason = do migrationReasonRebalance()
+        let pr = do migrationPlanNew(MigrationId{value: max}, shard, "a", "b", reason, big + 1)
+        let m0 = do migrationNew(pr.plan)
+        let mut t = do lbMig(m0)
+        let a = do migrationBeginCopy(m0, big + 10)
+        let sa = do lbR(a)
+        t = do lbPush(t, sa)
+        let b = do migrationAcceptWrite(a.value, big)
+        let sb = do lbW(b)
+        t = do lbPush(t, sb)
+        let c = do migrationAcceptWrite(b.value, 5)
+        let sc = do lbW(c)
+        t = do lbPush(t, sc)
+        let d = do migrationAcceptWrite(c.value, big + 3)
+        let sd = do lbW(d)
+        t = do lbPush(t, sd)
+        let e = do migrationRecordApplied(d.value, max, big + 11)
+        let se = do lbR(e)
+        t = do lbPush(t, se)
+        let f = do migrationRecordApplied(e.value, 3, 7)
+        let sf = do lbR(f)
+        t = do lbPush(t, sf)
+        let g = do migrationRecordCopy(f.value, 10, big + 1, big + 12)
+        let sg = do lbR(g)
+        t = do lbPush(t, sg)
+        let h = do migrationRecordCopy(g.value, 20, 5, big + 13)
+        let sh = do lbR(h)
+        t = do lbPush(t, sh)
+        let dm = do lbMig(h.value)
+        t = do lbPush(t, dm)
+        let st1 = do migrationStatus(h.value, max)
+        let s1 = do lbStatus(st1)
+        t = do lbPush(t, s1)
+        let st2 = do migrationStatus(h.value, 3)
+        let s2 = do lbStatus(st2)
+        t = do lbPush(t, s2)
+        return t
+
+    state bigMigration: text = ""
     state migPhaseTable: text = ""
     state migPlanProgress: text = ""
     state migPlanNew: text = ""
@@ -584,6 +638,7 @@ app FabricMigrationCheck:
         let l = do lbFailCleanup()
         let m = do lbStatusCheck()
         let n = do lbRestart()
+        let big = do lbBigMigration()
         migPhaseTable = a
         migPlanProgress = b
         migPlanNew = c
@@ -598,3 +653,4 @@ app FabricMigrationCheck:
         migFailCleanup = l
         migStatus = m
         migRestart = n
+        bigMigration = big

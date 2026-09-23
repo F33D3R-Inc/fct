@@ -24,13 +24,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"facet/internal/compile"
 	"facet/runtime"
+	goruntime "runtime"
 )
 
 var (
@@ -1096,7 +1101,7 @@ func fdtFreePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// fabricd.fct run as the service `facet exec` runs it, against two fake
+// fabricd.fct's main run as `facet exec fabricd.fct --config …` runs it, against two fake
 // FacetQLs that record what arrives — the first half of tests/daemon.rs's
 // the_daemon_boots_routes_traffic_and_follows_a_control_loop_decision, its
 // own assertions: it boots (the operator port answers, and refuses without
@@ -1144,7 +1149,6 @@ func TestFabricDaemonProcess(t *testing.T) {
 	if err := os.WriteFile(path, []byte(config), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("FABRIC_CONFIG", path)
 	t.Setenv("FABRIC_ADMIN_TOKEN", "operator-secret")
 
 	g, err := compile.File("fabricd.fct")
@@ -1159,7 +1163,7 @@ func TestFabricDaemonProcess(t *testing.T) {
 	var stderr strings.Builder
 	var stderrMu sync.Mutex
 	srv.SetStdio(strings.NewReader(""), io.Discard, fdtLockedWriter{&stderrMu, &stderr})
-	go srv.RunDaemons()
+	go srv.RunMain([]string{"--config", path})
 
 	admin := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -1279,4 +1283,731 @@ func (l fdtLockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
+}
+
+// ---------------------------------------------------------------- main.rs, against the real binary
+
+var (
+	fdtBinOnce                 sync.Once
+	fdtFabricdBin, fdtFacetBin string
+	fdtBinErr                  string
+)
+
+// fdtBinaries builds the real `fabricd` (cargo build --locked into a
+// temporary target directory; fabric/ is untouched) and this tree's
+// `facet`, once, or skips when cargo is not installed.
+func fdtBinaries(t *testing.T) (string, string) {
+	t.Helper()
+	fdtBinOnce.Do(func() {
+		cargo, err := exec.LookPath("cargo")
+		if err != nil {
+			fdtBinErr = "skip: cargo is not installed"
+			return
+		}
+		target := os.Getenv("FCT_FABRICD_TARGET")
+		if target == "" {
+			target = filepath.Join(os.TempDir(), "fct-fabricd-target")
+		}
+		cmd := exec.Command(cargo, "build", "--locked", "--quiet", "-p", "fabric-daemon", "--bin", "fabricd")
+		cmd.Dir = "../../fabric"
+		cmd.Env = append(os.Environ(), "CARGO_TARGET_DIR="+target)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fdtBinErr = "cargo build fabricd failed: " + err.Error() + "\n" + string(out)
+			return
+		}
+		fdtFabricdBin = filepath.Join(target, "debug", "fabricd")
+		dir, err := os.MkdirTemp("", "fdt-facet")
+		if err != nil {
+			fdtBinErr = err.Error()
+			return
+		}
+		fdtFacetBin = filepath.Join(dir, "facet")
+		build := exec.Command("go", "build", "-o", fdtFacetBin, "./cmd/facet")
+		build.Dir = ".."
+		if out, err := build.CombinedOutput(); err != nil {
+			fdtBinErr = "go build facet failed: " + err.Error() + "\n" + string(out)
+		}
+	})
+	if strings.HasPrefix(fdtBinErr, "skip: ") {
+		t.Skip(fdtBinErr)
+	}
+	if fdtBinErr != "" {
+		t.Fatal(fdtBinErr)
+	}
+	return fdtFabricdBin, fdtFacetBin
+}
+
+// fdtCommand is `fabricd args...` as the crate's binary or as the port
+// (`facet exec fabricd.fct args...`), run in dir with exactly env.
+func fdtCommand(port bool, dir string, env []string, args ...string) *exec.Cmd {
+	return fdtProgram(port, "fabricd.fct", dir, env, args...)
+}
+
+// fdtProgram is fdtCommand for any fct program (the port side).
+func fdtProgram(port bool, program, dir string, env []string, args ...string) *exec.Cmd {
+	var cmd *exec.Cmd
+	if port {
+		self, _ := filepath.Abs(program)
+		cmd = exec.Command(fdtFacetBin, append([]string{"exec", self}, args...)...)
+	} else {
+		cmd = exec.Command(fdtFabricdBin, args...)
+	}
+	cmd.Dir = dir
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}, env...)
+	return cmd
+}
+
+type fdtRunResult struct {
+	stdout, stderr string
+	code           int
+}
+
+func fdtRunCommand(t *testing.T, cmd *exec.Cmd) fdtRunResult {
+	t.Helper()
+	var out, errOut strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	err := cmd.Run()
+	code := 0
+	if err != nil {
+		ee, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatal(err)
+		}
+		code = ee.ExitCode()
+	}
+	return fdtRunResult{out.String(), errOut.String(), code}
+}
+
+// main.rs's arguments, usage and exit statuses, and Settings::load's
+// refusals, compared on stdout, stderr and exit code between the crate's
+// binary and the port.
+func TestFabricDaemonMainMatchesRust(t *testing.T) {
+	fdtBinaries(t)
+	dir := t.TempDir()
+	files := map[string]string{
+		"good.json":    fdtMinimal,
+		"bad.json":     `{ "backends": [], "keysapce": {} }`,
+		"syntax.json":  "{\n  \"backends\": [\n",
+		"invalid.json": `{"backends": []}`,
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Configurations outside the directory fabricd runs in: named on argv
+	// or in FABRIC_CONFIG, they are the operator's to read (the port's
+	// read grant, runtime/grants.go), as they are for the crate.
+	outside := t.TempDir()
+	for name, body := range map[string]string{"invalid.json": `{"backends": []}`, "bad.json": `{"backends": 5}`} {
+		if err := os.WriteFile(filepath.Join(outside, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outInvalid, outBad, outMissing := filepath.Join(outside, "invalid.json"), filepath.Join(outside, "bad.json"), filepath.Join(outside, "missing.json")
+	token := "FABRIC_ADMIN_TOKEN=admin-secret"
+	cases := []struct {
+		env  []string
+		args []string
+	}{
+		{[]string{token}, []string{"--config", outInvalid}}, {nil, []string{"-c", outBad}}, {nil, []string{"-c", outMissing}},
+		{[]string{token, "FABRIC_CONFIG=" + outInvalid}, nil}, {[]string{"FABRIC_CONFIG=" + outBad}, nil},
+		{nil, []string{"-c", "../" + filepath.Base(outside) + "/bad.json"}},
+		{nil, nil}, {nil, []string{"-h"}}, {nil, []string{"--help"}}, {nil, []string{"-V"}}, {nil, []string{"--version"}},
+		{nil, []string{"-c"}}, {nil, []string{"--config"}}, {nil, []string{"-x"}}, {nil, []string{"config.json"}},
+		{nil, []string{"-x", "-h"}}, {nil, []string{"-h", "-x"}}, {nil, []string{"-c", "good.json", "-V"}},
+		{nil, []string{"-c", "missing.json"}}, {nil, []string{"--config", "bad.json"}}, {nil, []string{"-c", "syntax.json"}},
+		{[]string{token}, []string{"-c", "invalid.json"}}, {nil, []string{"-c", "good.json"}},
+		{[]string{"FABRIC_CONFIG=missing.json"}, nil}, {[]string{"FABRIC_CONFIG=bad.json"}, []string{"-c", "missing.json"}},
+		{[]string{"FABRIC_CONFIG="}, nil}, {[]string{"FABRIC_CONFIG=bad.json"}, []string{"--config"}},
+		{[]string{"FABRIC_CONFIG=good.json", "FABRIC_ADMIN_TOKEN="}, nil},
+	}
+	for _, c := range cases {
+		rust := fdtRunCommand(t, fdtCommand(false, dir, c.env, c.args...))
+		port := fdtRunCommand(t, fdtCommand(true, dir, c.env, c.args...))
+		if rust != port {
+			t.Errorf("fabricd %q (env %q):\n rust exit=%d stdout=%q stderr=%q\n port exit=%d stdout=%q stderr=%q",
+				c.args, c.env, rust.code, rust.stdout, rust.stderr, port.code, port.stdout, port.stderr)
+		}
+	}
+}
+
+// A real SIGTERM, to the crate's binary and to the port, each serving the
+// same fleet of fake FacetQLs on the same ports in turn: the startup line,
+// the drain, the report and the exit status must agree.
+func TestFabricDaemonSigtermMatchesRust(t *testing.T) {
+	fdtBinaries(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("FacetQL Online"))
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	run := func(port bool) fdtRunResult {
+		dataPort, adminPort := fdtFreePort(t), fdtFreePort(t)
+		config := fmt.Sprintf(`{"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
+			"backends": [{"id": "db-a", "url": %q, "placements": [{"shard": 1, "x": 0, "y": 0}]}],
+			"keyspace": {"fallback": {"shard": 1, "x": 0, "y": 0}},
+			"cadence": {"liveness_probe_ms": 100, "telemetry_poll_ms": 100, "control_cycle_ms": 50}}`, dataPort, adminPort, upstream.URL)
+		if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := fdtCommand(port, dir, []string{"FABRIC_ADMIN_TOKEN=operator-secret"}, "--config", "fabric.json")
+		var out, errOut fdtSyncBuffer
+		cmd.Stdout, cmd.Stderr = &out, &errOut
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		for end := time.Now().Add(20 * time.Second); !strings.Contains(errOut.String(), "serving FacetQL's wire"); time.Sleep(20 * time.Millisecond) {
+			if time.Now().After(end) {
+				cmd.Process.Kill()
+				t.Fatalf("never served (port=%v): %s", port, errOut.String())
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+		cmd.Process.Signal(syscall.SIGTERM)
+		err := cmd.Wait()
+		code := 0
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		}
+		// The startup line names this run's ports; the rest is the drain.
+		return fdtRunResult{out.String(), strings.ReplaceAll(strings.ReplaceAll(errOut.String(), fmt.Sprint(dataPort), "DATA"), fmt.Sprint(adminPort), "ADMIN"), code}
+	}
+	rust, port := run(false), run(true)
+	if rust != port {
+		t.Fatalf("SIGTERM:\n rust exit=%d stderr=%q\n port exit=%d stderr=%q", rust.code, rust.stderr, port.code, port.stderr)
+	}
+	if rust.code != 0 || !strings.HasSuffix(rust.stderr, "fabricd: draining\nfabricd: stopped cleanly\n") {
+		t.Fatalf("unexpected drain: %+v", rust)
+	}
+}
+
+type fdtSyncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *fdtSyncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *fdtSyncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// ---------------------------------------------------------------- tests/mover.rs
+
+func fdtInsert(index, generation int) map[string]any {
+	return map[string]any{
+		"type": "insert_node", "address": fmt.Sprintf("Post:%04d", index), "kind": "Post",
+		"x": index % 12, "y": index % 13, "z": 0, "q": 0,
+		"data":   fmt.Sprintf(`{"n":%d,"gen":%d,"body":"%s"}`, index, generation, strings.Repeat("x", 64)),
+		"public": index%7 == 0,
+	}
+}
+
+func fdtFacetqlPost(t *testing.T, url, token string, body any) (int, string) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", url, strings.NewReader(string(b)))
+	req.Header.Set("x-api-key", token)
+	req.Header.Set("content-type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(out)
+}
+
+func fdtFacetqlWrite(t *testing.T, base, token string, ops []any) {
+	t.Helper()
+	if code, body := fdtFacetqlPost(t, base+"/transaction", token, map[string]any{"operations": ops}); code != 200 {
+		t.Fatalf("transaction on %s: %d %s", base, code, body)
+	}
+}
+
+// fdtFacetqlNodes: every node an instance holds, by address, walked with the
+// keyset cursor the mover uses.
+func fdtFacetqlNodes(t *testing.T, base, token string) map[string]map[string]any {
+	t.Helper()
+	out := map[string]map[string]any{}
+	after := ""
+	for {
+		code, body := fdtFacetqlPost(t, base+"/nodes/query", token, map[string]any{"limit": 500, "after": after})
+		if code != 200 {
+			t.Fatalf("query on %s: %d %s", base, code, body)
+		}
+		var page struct {
+			Nodes []map[string]any `json:"nodes"`
+			Next  string           `json:"next"`
+		}
+		if err := json.Unmarshal([]byte(body), &page); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range page.Nodes {
+			out[n["address"].(string)] = n
+		}
+		if page.Next == "" {
+			return out
+		}
+		after = page.Next
+	}
+}
+
+// tests/mover.rs the_daemon_moves_a_cells_data_between_two_real_facetql_
+// instances, its own steps and assertions, against the port: two real
+// FacetQL servers, a cell seeded on one, fabricd (with the HotCell
+// telemetry source, testdata/fabricd_hotcell.fct) run as a process over
+// them — and nothing reported from outside. The daemon's own mover copies
+// the cell, a write landing on the source mid-copy arrives by the change
+// feed, every node lands byte-identical, the reported transfer is the
+// payload that committed, the cutover happens and a client's write through
+// the same front door follows it, and SIGTERM shuts it down cleanly.
+func TestFabricDaemonMoverLive(t *testing.T) {
+	fdtBinaries(t)
+	const token = "fabtok"
+	const seeded = 400
+	source, destination := fqlLiveStart(t), fqlLiveStart(t)
+	for start := 0; start < seeded; start += 100 {
+		var ops []any
+		for i := start; i < start+100; i++ {
+			ops = append(ops, fdtInsert(i, 1))
+		}
+		fdtFacetqlWrite(t, source, token, ops)
+	}
+	seededNodes := fdtFacetqlNodes(t, source, token)
+	if len(seededNodes) != seeded || len(fdtFacetqlNodes(t, destination, token)) != 0 {
+		t.Fatalf("seeding: source %d nodes, destination not empty", len(seededNodes))
+	}
+
+	dir := t.TempDir()
+	dataPort, adminPort := fdtFreePort(t), fdtFreePort(t)
+	config := fmt.Sprintf(`{
+		"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
+		"backends": [
+			{"id": %q, "url": %q, "region": "us-east", "token_env": "FABRIC_TEST_DB_TOKEN", "placements": [{"shard": 1, "x": 0, "y": 0}]},
+			{"id": %q, "url": %q, "region": "us-west", "token_env": "FABRIC_TEST_DB_TOKEN", "placements": [{"shard": 2, "x": 0, "y": 0}]}
+		],
+		"keyspace": {"rules": [{"kind": "Post", "address_prefix": "Post:", "shard": 1, "x": 0, "y": 0}], "fallback": {"shard": 1, "x": 0, "y": 0}},
+		"cadence": {"liveness_probe_ms": 100, "telemetry_poll_ms": 100, "control_cycle_ms": 50},
+		"silence_budget_ms": 5000, "probe_timeout_ms": 500,
+		"policy": {"measurement_settle_ms": 0, "phase_timeout_ms": 120000},
+		"drain_ms": 5000
+	}`, dataPort, adminPort, fdtSource, source, fdtDestination, destination)
+	if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := fdtProgram(true, "testdata/fabricd_hotcell.fct", dir, []string{"FABRIC_ADMIN_TOKEN=operator-secret", "FABRIC_TEST_DB_TOKEN=" + token}, "--config", "fabric.json")
+	var stderr fdtSyncBuffer
+	cmd.Stdout, cmd.Stderr = io.Discard, &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+
+	admin := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
+	adminJSON := func(path string) any {
+		req, _ := http.NewRequest("GET", admin+path, nil)
+		req.Header.Set("x-api-key", "operator-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil
+		}
+		defer resp.Body.Close()
+		var v any
+		json.NewDecoder(resp.Body).Decode(&v)
+		return v
+	}
+	until := func(what string, budget time.Duration, cond func() bool) {
+		t.Helper()
+		for end := time.Now().Add(budget); !cond(); time.Sleep(25 * time.Millisecond) {
+			if time.Now().After(end) {
+				st, _ := json.Marshal(adminJSON("/status"))
+				t.Fatalf("timed out waiting for %s; stderr: %s; status: %s", what, stderr.String(), st)
+			}
+		}
+	}
+	until("the daemon to boot", 20*time.Second, func() bool { return strings.Contains(stderr.String(), "serving FacetQL's wire") })
+
+	status := adminJSON("/status").(map[string]any)
+	backends := status["backends"].([]any)
+	if backends[0].(map[string]any)["availability"] != "serviceable" || backends[1].(map[string]any)["availability"] != "serviceable" ||
+		status["placements"].([]any)[0].(map[string]any)["holder"] != fdtSource {
+		t.Fatalf("boot status: %v", status)
+	}
+
+	// The loop decides, and this daemon's own mover starts.
+	until("the control loop to admit an action", 20*time.Second, func() bool {
+		a, _ := adminJSON("/actions").([]any)
+		return len(a) > 0
+	})
+	action := adminJSON("/actions").([]any)[0].(map[string]any)
+	if action["source"] != fdtSource || action["destination"] != fdtDestination {
+		t.Fatalf("action: %v", action)
+	}
+	until("the daemon's own mover to start", 20*time.Second, func() bool {
+		st := adminJSON("/status").(map[string]any)
+		movers := st["movers"].(map[string]any)
+		if refused, _ := movers["refused"].([]any); len(refused) > 0 {
+			t.Fatalf("the daemon refused to copy: %v", refused)
+		}
+		copying, _ := movers["copying"].([]any)
+		return len(copying) > 0
+	})
+
+	// A write lands on the source during the copy.
+	fdtFacetqlWrite(t, source, token, []any{fdtInsert(0, 2), fdtInsert(seeded-1, 2), fdtInsert(seeded, 2),
+		map[string]any{"type": "delete_node", "address": "Post:0001"}})
+	expected := fdtFacetqlNodes(t, source, token)
+	if len(expected) != seeded {
+		t.Fatalf("one added, one removed: %d", len(expected))
+	}
+
+	// The cutover happens, on the strength of the copy alone.
+	var reportedBytes, reportedResident float64
+	until("the cell to move", 60*time.Second, func() bool {
+		if actions, ok := adminJSON("/actions").([]any); ok {
+			for _, a := range actions {
+				m := a.(map[string]any)
+				if b, _ := m["bytes_copied"].(float64); b > reportedBytes {
+					reportedBytes = b
+				}
+				if r, _ := m["resident_bytes"].(float64); r > reportedResident {
+					reportedResident = r
+				}
+			}
+		}
+		routing, _ := adminJSON("/routing").(map[string]any)
+		placements, _ := routing["placements"].([]any)
+		return len(placements) > 0 && placements[0].(map[string]any)["holder"] == fdtDestination
+	})
+
+	// Every node landed, byte-identical.
+	arrived := fdtFacetqlNodes(t, destination, token)
+	if len(arrived) != len(expected) {
+		t.Fatalf("the destination holds %d nodes, the source %d", len(arrived), len(expected))
+	}
+	for address, node := range expected {
+		landed, ok := arrived[address]
+		if !ok {
+			t.Fatalf("%q never reached the destination", address)
+		}
+		a, _ := json.Marshal(landed)
+		b, _ := json.Marshal(node)
+		if string(a) != string(b) {
+			t.Fatalf("%q is not byte-identical on the destination:\n%s\n%s", address, a, b)
+		}
+	}
+	if !strings.Contains(arrived["Post:0000"]["data"].(string), `"gen":2`) {
+		t.Fatalf("the mid-copy write did not arrive: %v", arrived["Post:0000"])
+	}
+	if _, ok := arrived[fmt.Sprintf("Post:%04d", seeded)]; !ok {
+		t.Fatal("the mid-copy insert did not arrive")
+	}
+	if _, ok := arrived["Post:0001"]; ok {
+		t.Fatal("the mid-copy delete left a ghost")
+	}
+
+	// The progress that drove it was measured, not simulated.
+	payload := 0
+	for _, n := range seededNodes {
+		d, _ := n["data"].(string)
+		payload += len(d)
+	}
+	slack := 4 * 128.0
+	if d := reportedBytes - float64(payload); d > slack || -d > slack {
+		t.Errorf("the reported transfer was %v byte(s); the cell's rows carry %d", reportedBytes, payload)
+	}
+	if d := reportedResident - float64(payload); d > slack || -d > slack {
+		t.Errorf("the reported resident size was %v byte(s); the cell's rows carry %d", reportedResident, payload)
+	}
+
+	// A client's requests follow the cutover.
+	code, body := fdtFacetqlPost(t, fmt.Sprintf("http://127.0.0.1:%d/node", dataPort), token,
+		map[string]any{"address": "Post:9999", "kind": "Post", "x": 0, "y": 0, "z": 0, "q": 0, "data": `{"after_cutover":true}`})
+	if code != 201 {
+		t.Fatalf("write through the front door: %d %s", code, body)
+	}
+	if _, ok := fdtFacetqlNodes(t, destination, token)["Post:9999"]; !ok {
+		t.Fatal("a write through the front door after the cutover did not reach the new holder")
+	}
+	if _, ok := fdtFacetqlNodes(t, source, token)["Post:9999"]; ok {
+		t.Fatal("a write through the front door after the cutover still reached the old holder")
+	}
+
+	// And it shuts down cleanly.
+	cmd.Process.Signal(syscall.SIGTERM)
+	err := cmd.Wait()
+	if err != nil || !strings.HasSuffix(stderr.String(), "fabricd: stopped cleanly\n") {
+		t.Fatalf("an unclean shutdown (%v): %s", err, stderr.String())
+	}
+}
+
+// A port that is already taken: the crate's binary and the port each exit
+// 78 naming the address and the operating system's reason — for the data
+// port, and for the admin port once the data port has bound.
+func TestFabricDaemonBindFailureMatchesRust(t *testing.T) {
+	fdtBinaries(t)
+	dir := t.TempDir()
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	busy := taken.Addr().(*net.TCPAddr).Port
+	for _, which := range []string{"data", "admin"} {
+		free := fdtFreePort(t)
+		data, admin := busy, free
+		if which == "admin" {
+			data, admin = free, busy
+		}
+		config := fmt.Sprintf(`{"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
+			"backends": [{"id": "db-a", "url": "http://127.0.0.1:1", "placements": [{"shard": 1, "x": 0, "y": 0}]}],
+			"keyspace": {"fallback": {"shard": 1, "x": 0, "y": 0}}}`, data, admin)
+		if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		env := []string{"FABRIC_ADMIN_TOKEN=operator-secret"}
+		rust := fdtRunCommand(t, fdtCommand(false, dir, env, "--config", "fabric.json"))
+		port := fdtRunCommand(t, fdtCommand(true, dir, env, "--config", "fabric.json"))
+		want := fmt.Sprintf("fabricd: could not bind 127.0.0.1:%d: Address already in use (os error 98)\n", busy)
+		if rust != port || rust.code != 78 || rust.stderr != want {
+			t.Errorf("%s port taken:\n rust exit=%d stderr=%q\n port exit=%d stderr=%q", which, rust.code, rust.stderr, port.code, port.stderr)
+		}
+	}
+}
+
+// Daemon::shutdown's data-port half, against the crate's binary: SIGTERM
+// arrives while a request is being answered (its upstream is slow). The
+// data port stops taking connections at once — a new one is refused — the
+// operator port still answers, and the request in flight gets its answer
+// before the process exits 0.
+func TestFabricDaemonGracefulShutdownMatchesRust(t *testing.T) {
+	fdtBinaries(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.Write([]byte("FacetQL Online"))
+			return
+		}
+		time.Sleep(1500 * time.Millisecond)
+		w.Write([]byte(`{"nodes":[],"next_cursor":null}`))
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	type outcome struct {
+		inFlight, adminDuring int
+		refused               bool
+		code                  int
+		stderr                string
+	}
+	run := func(port bool) outcome {
+		dataPort, adminPort := fdtFreePort(t), fdtFreePort(t)
+		config := fmt.Sprintf(`{"data_listen": "127.0.0.1:%d", "admin_listen": "127.0.0.1:%d",
+			"backends": [{"id": "db-a", "url": %q, "placements": [{"shard": 1, "x": 0, "y": 0}]}],
+			"keyspace": {"fallback": {"shard": 1, "x": 0, "y": 0}}}`, dataPort, adminPort, upstream.URL)
+		if err := os.WriteFile(filepath.Join(dir, "fabric.json"), []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := fdtCommand(port, dir, []string{"FABRIC_ADMIN_TOKEN=operator-secret"}, "--config", "fabric.json")
+		var errOut fdtSyncBuffer
+		cmd.Stdout, cmd.Stderr = io.Discard, &errOut
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer cmd.Process.Kill()
+		for end := time.Now().Add(20 * time.Second); !strings.Contains(errOut.String(), "serving FacetQL's wire"); time.Sleep(20 * time.Millisecond) {
+			if time.Now().After(end) {
+				t.Fatalf("never served (port=%v): %s", port, errOut.String())
+			}
+		}
+		var o outcome
+		done := make(chan int, 1)
+		go func() {
+			req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/nodes?kind=Post", dataPort), nil)
+			req.Header.Set("x-api-key", "client-secret")
+			resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+			if err != nil {
+				done <- 0
+				return
+			}
+			io.ReadAll(resp.Body)
+			resp.Body.Close()
+			done <- resp.StatusCode
+		}()
+		time.Sleep(400 * time.Millisecond)
+		cmd.Process.Signal(syscall.SIGTERM)
+		time.Sleep(300 * time.Millisecond)
+		if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", dataPort), time.Second); err != nil {
+			o.refused = strings.Contains(err.Error(), "connection refused")
+		} else {
+			c.Close()
+		}
+		if resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", adminPort)); err == nil {
+			o.adminDuring = resp.StatusCode
+			resp.Body.Close()
+		}
+		o.inFlight = <-done
+		cmd.Wait()
+		o.code = cmd.ProcessState.ExitCode()
+		o.stderr = strings.ReplaceAll(strings.ReplaceAll(errOut.String(), fmt.Sprint(dataPort), "DATA"), fmt.Sprint(adminPort), "ADMIN")
+		return o
+	}
+	rust, port := run(false), run(true)
+	if rust != port {
+		t.Fatalf("graceful shutdown:\n rust %+v\n port %+v", rust, port)
+	}
+	if !rust.refused || rust.adminDuring != 200 || rust.inFlight != 200 || rust.code != 0 {
+		t.Fatalf("unexpected shutdown: %+v", rust)
+	}
+}
+
+// fdtLoadedFacetql starts a FacetQL pinned to one CPU core with a small
+// admission cap (tests/mover.rs start_with(..., FACETQL_MAX_CONCURRENT_REQUESTS
+// = 6, taskset)).
+func fdtLoadedFacetql(t *testing.T, taskset string) (string, func()) {
+	t.Helper()
+	bin := fqlLiveServerBin(t)
+	port := fdtFreePort(t)
+	var log fdtSyncBuffer
+	cmd := exec.Command(taskset, "-c", "0", bin, "start")
+	// Exactly the crate's Instance::start_with environment: development
+	// posture (its dev master key), one token that is both owner and
+	// admin, the admission cap, and nothing else.
+	cmd.Env = append(os.Environ(),
+		"FACETQL_ENV=development",
+		"ENOCHIAN_DATA_DIR="+t.TempDir(),
+		fmt.Sprintf("ENOCHIAN_PORT=%d", port),
+		"ENOCHIAN_TOKENS=app-secret:app:admin",
+		"FACETQL_MAX_CONCURRENT_REQUESTS=6",
+	)
+	cmd.Stdout, cmd.Stderr = &log, &log
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stop := func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	for end := time.Now().Add(60 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		req, _ := http.NewRequest("GET", base+"/stats", nil)
+		req.Header.Set("x-api-key", "app-secret")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return base, stop
+			}
+		}
+		if time.Now().After(end) {
+			stop()
+			t.Fatalf("facetql did not come up on %s:\n%s", base, log.String())
+		}
+	}
+}
+
+// tests/mover.rs a_loaded_cell_crosses_the_pressure_threshold_from_real_
+// facetql_stats, input for input: a real FacetQL pinned to one core with an
+// admission cap of 6, loaded by 60 concurrent writers of 20-insert, 9 KB
+// transactions; the port's production poller samples it every 500 ms for up
+// to 20 s (dcaLoadedCell) and the port's optimizer decides. Pressure must
+// leave 0.0, and within 8 fresh attempts the optimizer must propose an
+// action for a cell it saw only through GET /stats.
+func TestFabricDaemonLoadedCellCrossesThreshold(t *testing.T) {
+	taskset, err := exec.LookPath("taskset")
+	if err != nil {
+		t.Skip("no taskset on PATH to pin the instance to one core")
+	}
+	ts := fdtServer(t)
+	checkBin := laCheck(t)
+	// The crate's test runs its load, its poller and everything else on a
+	// four-thread runtime (`worker_threads = 4`); so does this one, or the
+	// load it generates is not the load the crate's test generates.
+	defer goruntime.GOMAXPROCS(goruntime.GOMAXPROCS(4))
+	var last string
+	for attempt := 1; attempt <= 8; attempt++ {
+		base, stop := fdtLoadedFacetql(t, taskset)
+		// The poller's baseline is taken before any load, as in the
+		// crate's test: the load starts once dcaLoadedCell is under way.
+		sampled := make(chan map[string]any, 1)
+		go func() { sampled <- postJSON(t, ts, "runDaemonLoadedCell", base, "app-secret", 20) }()
+		// The crate's own poller and optimizer, over the same instance in
+		// the same window, for comparison.
+		crate := make(chan string, 1)
+		go func() {
+			cmd := exec.Command(checkBin, "daemon-loaded-poll")
+			cmd.Stdin = strings.NewReader(base + "|app-secret|20\n")
+			out, _ := cmd.Output()
+			crate <- strings.TrimSpace(string(out))
+		}()
+		time.Sleep(300 * time.Millisecond)
+		var halt sync.WaitGroup
+		quit := make(chan struct{})
+		// reqwest's pool keeps every idle connection (Go's keeps two per
+		// host), so each worker reuses its own connection as the crate's do.
+		client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 100}}
+		for worker := 0; worker < 60; worker++ {
+			halt.Add(1)
+			go func(worker int) {
+				defer halt.Done()
+				for i := 0; ; i++ {
+					select {
+					case <-quit:
+						return
+					default:
+					}
+					var ops []any
+					for n := 0; n < 20; n++ {
+						ops = append(ops, map[string]any{"type": "insert_node", "address": fmt.Sprintf("Load:%d:%d:%d", worker, i, n), "kind": "Load",
+							"x": 0, "y": 0, "z": 0, "q": 0, "data": fmt.Sprintf(`{"n":%d,"body":"%s"}`, i, strings.Repeat("x", 9000)), "public": false})
+					}
+					b, _ := json.Marshal(map[string]any{"operations": ops})
+					req, _ := http.NewRequest("POST", base+"/transaction", strings.NewReader(string(b)))
+					req.Header.Set("x-api-key", "app-secret")
+					req.Header.Set("content-type", "application/json")
+					if resp, err := client.Do(req); err == nil {
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
+					}
+				}
+			}(worker)
+		}
+		d := <-sampled
+		close(quit)
+		halt.Wait()
+		stop()
+		last, _ = d["daemonLoadedOut"].(string)
+		crateSaw := <-crate
+		t.Logf("attempt %d/8: pressure|hot|cpu|queue|write_latency_us|write_ratio|action = %s (the crate's poller, same instance and window: %s)", attempt, last, crateSaw)
+		fields := strings.Split(last, "|")
+		if len(fields) != 7 {
+			// Every /stats of the window refused at the admission cap (a
+			// permit is try_acquire'd, and 60 writers hold all six nearly
+			// always): a property of the load — the crate's own poller,
+			// polling the same instance in the same window, has come away
+			// empty too — so a fresh attempt, as for any unlucky window.
+			continue
+		}
+		// Where both pollers sampled the same window, they read the same
+		// cell: the port's pressure is the crate's within sampling noise.
+		if crateFields := strings.Split(crateSaw, "|"); len(crateFields) == 7 {
+			portP, _ := strconv.ParseFloat(fields[0], 64)
+			crateP, _ := strconv.ParseFloat(crateFields[0], 64)
+			if portP-crateP > 0.15 || crateP-portP > 0.15 {
+				t.Errorf("attempt %d: the port read pressure %v where the crate's poller read %v in the same window", attempt, portP, crateP)
+			}
+		}
+		if fields[0] == "0" || fields[0] == "0.0" {
+			t.Fatalf("pressure stayed at exactly 0.0 under real, heavy, concurrent load: %s", last)
+		}
+		if fields[6] != "NoAction" {
+			return
+		}
+	}
+	t.Fatalf("a real, heavily loaded cell produced no decision in 8 attempts — last %s", last)
 }

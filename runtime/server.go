@@ -36,6 +36,7 @@ var clientJS []byte
 // Server serves one compiled app.
 type Server struct {
 	ir          *ir.IR
+	grants      readGrants // files the operator named, readable outside the sandbox (grants.go)
 	byAction    map[string]*ir.Action
 	byPolicy    map[string]*ir.Policy
 	byComponent map[string]*ir.Component
@@ -55,6 +56,7 @@ type Server struct {
 	netConns    *netRegistry             // backs listen/accept/readBytes/writeBytes/closeConn (io.net.listen) — see runtime/netconn.go
 	shared      *sharedCells             // backs `shared` cells ($shared.get/$shared.set) — see runtime/shared.go
 	console     *stdio                   // backs writeStdout/writeStderr/readStdin (io.console) — see runtime/stdio.go
+	exit        func(code int)           // ends the process for exitProcess (os.Exit; a test substitutes its own) — see runtime/process.go
 
 	uploadMu       sync.Mutex                // guards uploadSessions
 	uploadSessions map[string]*uploadSession // in-flight resumable uploads, keyed by session id
@@ -212,6 +214,7 @@ func newServer(graph *ir.IR) *Server {
 		netConns:    newNetRegistry(),
 		shared:      newSharedCells(),
 		console:     newStdio(),
+		exit:        os.Exit,
 
 		uploadSessions: map[string]*uploadSession{},
 		idem:           map[string]*idemRecord{},

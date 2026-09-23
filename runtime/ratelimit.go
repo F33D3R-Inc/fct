@@ -26,7 +26,29 @@ func rateLimitFromEnvClass(class string) int {
 			return n
 		}
 	}
-	return rateLimitFromEnv()
+	if v := os.Getenv("FACET_RATE_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	if n, ok := rateClassDefaults[class]; ok {
+		return n
+	}
+	return defaultRatePerMin
+}
+
+// rateClassDefaults are a declared route's per-minute budget by rate class
+// when the deployment names none: reads are cheap, writes change state, and
+// sign-in, sign-up and password reset are credential guesses.
+var rateClassDefaults = map[string]int{"read": 300, "write": 60, "auth": 40}
+
+// rateBurst is a class limiter's bucket: a quarter of the minute's budget, so
+// a quiet client's short spike passes and a flood does not.
+func rateBurst(perMinute int) int {
+	if b := perMinute / 4; b > 0 {
+		return b
+	}
+	return 1
 }
 
 func rateLimitFromEnv() int {
@@ -42,10 +64,11 @@ func rateLimitFromEnv() int {
 // steady rate and a request costs one token, so bursts up to the bucket size are
 // allowed but the sustained rate is capped.
 type rateLimiter struct {
-	mu      sync.Mutex
-	buckets map[string]*bucket
-	rate    float64 // tokens per second
-	burst   float64 // bucket capacity
+	mu        sync.Mutex
+	buckets   map[string]*bucket
+	rate      float64 // tokens per second
+	burst     float64 // bucket capacity
+	perMinute int     // the budget as configured; X-RateLimit-Limit
 }
 
 type bucket struct {
@@ -58,10 +81,68 @@ func newRateLimiter(perMinute int) *rateLimiter {
 		perMinute = defaultRatePerMin
 	}
 	return &rateLimiter{
-		buckets: map[string]*bucket{},
-		rate:    float64(perMinute) / 60.0,
-		burst:   float64(perMinute),
+		buckets:   map[string]*bucket{},
+		rate:      float64(perMinute) / 60.0,
+		burst:     float64(perMinute),
+		perMinute: perMinute,
 	}
+}
+
+// newClassLimiter is a declared rate class's limiter: perMinute sustained,
+// with a burst of rateBurst(perMinute).
+func newClassLimiter(perMinute int) *rateLimiter {
+	l := newRateLimiter(perMinute)
+	l.perMinute = perMinute
+	l.burst = float64(rateBurst(perMinute))
+	return l
+}
+
+// rateDecision is one metered request's outcome and the budget headers that
+// report it: X-RateLimit-Limit (the per-minute budget), -Remaining (whole
+// requests left in the bucket now) and -Reset (unix seconds when the bucket
+// is full again); a refusal adds Retry-After (seconds until one request has
+// refilled, at least 1).
+type rateDecision struct {
+	allowed    bool
+	limit      int
+	remaining  int
+	reset      int64
+	retryAfter int
+}
+
+func (d rateDecision) headers(h http.Header) {
+	h.Set("X-RateLimit-Limit", strconv.Itoa(d.limit))
+	h.Set("X-RateLimit-Remaining", strconv.Itoa(d.remaining))
+	h.Set("X-RateLimit-Reset", strconv.FormatInt(d.reset, 10))
+	if !d.allowed {
+		h.Set("Retry-After", strconv.Itoa(d.retryAfter))
+	}
+}
+
+// take meters one request from key and reports the decision.
+func (l *rateLimiter) take(key string) rateDecision {
+	allowed := l.allow(key)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	d := rateDecision{allowed: allowed, limit: l.perMinute}
+	now := time.Now()
+	tokens := l.burst
+	if b := l.buckets[key]; b != nil {
+		tokens = b.tokens
+	}
+	d.remaining = int(tokens)
+	d.reset = now.Add(time.Duration((l.burst - tokens) / l.rate * float64(time.Second))).Unix()
+	if !allowed {
+		wait := (1 - tokens) / l.rate
+		d.retryAfter = int(wait)
+		if float64(d.retryAfter) < wait {
+			d.retryAfter++
+		}
+		if d.retryAfter < 1 {
+			d.retryAfter = 1
+		}
+	}
+	return d
 }
 
 // allow reports whether a request from key may proceed, consuming a token.

@@ -757,8 +757,9 @@ app FabricStatsSelfHost:
         let s = do statsSampleTakeAt(stats, now() * 1000, mono * 1000000)
         return s
 
+    # u64 saturating_sub.
     proc statsSaturatingSub(a: int, b: int) -> int:
-        return max(a - b, 0)
+        return u64SatSub(a, b)
 
     # statsCellIndexOf: linear search for the coordinate key `cell_breakdown`
     # keys its `HashMap` by (`x`,`y`,`z`,`q`) — this directory's established
@@ -837,7 +838,7 @@ app FabricStatsSelfHost:
             let writes = do statsSaturatingSub(cell.writes, prevWrites)
             let bytesRead = do statsSaturatingSub(cell.bytesRead, prevBytesRead)
             let bytesWritten = do statsSaturatingSub(cell.bytesWritten, prevBytesWritten)
-            let metrics = CellWorkloadMetrics{x: cell.x, y: cell.y, z: cell.z, q: cell.q, readsPerSecond: toFloat(reads) / seconds, writesPerSecond: toFloat(writes) / seconds, bytesReadPerSecond: toFloat(bytesRead) / seconds, bytesWrittenPerSecond: toFloat(bytesWritten) / seconds}
+            let metrics = CellWorkloadMetrics{x: cell.x, y: cell.y, z: cell.z, q: cell.q, readsPerSecond: u64ToFloat(reads) / seconds, writesPerSecond: u64ToFloat(writes) / seconds, bytesReadPerSecond: u64ToFloat(bytesRead) / seconds, bytesWrittenPerSecond: u64ToFloat(bytesWritten) / seconds}
             cells = append(cells, metrics)
             i = i + 1
         let sorted = do statsSortCellBreakdownBusiestFirst(cells)
@@ -857,7 +858,7 @@ app FabricStatsSelfHost:
         let cpuSeconds = after.cpuSecondsTotal - before.cpuSecondsTotal
         if cpuSeconds < 0.0:
             return 0.0
-        let raw = cpuSeconds / (seconds * toFloat(after.cpuCores))
+        let raw = cpuSeconds / (seconds * u64ToFloat(after.cpuCores))
         let clamped = do clampFloat(raw, 0.0, 1.0)
         return clamped
 
@@ -867,7 +868,7 @@ app FabricStatsSelfHost:
     private proc statsQueuePressureUnits(inFlight: int, maxConcurrent: int) -> int:
         if maxConcurrent == 0:
             return 0
-        let raw = toFloat(inFlight) / toFloat(maxConcurrent)
+        let raw = u64ToFloat(inFlight) / u64ToFloat(maxConcurrent)
         let saturation = do clampFloat(raw, 0.0, 1.0)
         let scaled = saturation * 10000.0
         let rounded = round(scaled)
@@ -886,21 +887,21 @@ app FabricStatsSelfHost:
     proc statsSampleDifference(current: StatsSample, next: StatsSample) -> WorkloadMetricsOption:
         let zero = do workloadMetricsDefault()
         let none = WorkloadMetricsOption{has: false, metrics: zero}
-        if next.readsTotal < current.readsTotal || next.writesTotal < current.writesTotal:
+        if u64Cmp(next.readsTotal, current.readsTotal) < 0 || u64Cmp(next.writesTotal, current.writesTotal) < 0:
             return none
         let elapsed = max(next.takenAtNanos - current.takenAtNanos, 0)
         let seconds = toFloat(elapsed / 1000000000) + toFloat(elapsed % 1000000000) / 1000000000.0
         if seconds <= 0.0:
             return none
-        let readsPerSecond = toFloat(next.readsTotal - current.readsTotal) / seconds
-        let writesPerSecond = toFloat(next.writesTotal - current.writesTotal) / seconds
+        let readsPerSecond = u64ToFloat(next.readsTotal - current.readsTotal) / seconds
+        let writesPerSecond = u64ToFloat(next.writesTotal - current.writesTotal) / seconds
         let breakdown = do statsCellBreakdown(current, next, seconds)
         let mut readLatencyUs = 0.0
         if next.hasReadLatencyP99Us:
-            readLatencyUs = toFloat(next.readLatencyP99Us)
+            readLatencyUs = u64ToFloat(next.readLatencyP99Us)
         let mut writeLatencyUs = 0.0
         if next.hasWriteLatencyP99Us:
-            writeLatencyUs = toFloat(next.writeLatencyP99Us)
+            writeLatencyUs = u64ToFloat(next.writeLatencyP99Us)
         let cpu = do statsCpuUtilization(current, next, seconds)
         let mut memoryUtilization = 0.0
         if next.hasMemoryUtilization:

@@ -25,7 +25,7 @@ app FabricFrontDoorSelfHost:
     #
     # And the server itself: an HTTP/1.1 server written here over the raw
     # TCP primitives (listen/accept/readBytes/writeBytes), serving each
-    # accepted connection on its own `detach`ed handler so one slow client,
+    # accepted connection on its own `detach`ed handler (fdServeConn) so one slow client,
     # or one subscription held open for days, never holds up another.
     #
     # The fleet (keyspace, routing table, backends) and the config live in
@@ -79,7 +79,12 @@ app FabricFrontDoorSelfHost:
             return FdBackendResult{ok: false, err: "facetql endpoint misconfigured: FacetQL backend '" + id + "' has a base URL that is not http(s): " + url, backend: FdBackend{id: id, baseUrl: url}}
         return FdBackendResult{ok: true, err: "", backend: FdBackend{id: id, baseUrl: url}}
 
-    # FdConfig: `FrontDoorConfig`, plus the port the server listens on.
+    # FdConfig: `FrontDoorConfig`, plus the port the server listens on and
+    # trustFile: a PEM file (in the data sandbox) of extra roots to trust for
+    # an https backend — a FacetQL behind a private CA — on top of the
+    # system's; "" trusts the system's alone. (The Rust door's reqwest client
+    # carries its roots in the client it builds; this is that choice, made
+    # explicit.)
     struct FdConfig:
         readPref: PlanReadPreference
         fenceRetryBudgetMs: int
@@ -87,12 +92,13 @@ app FabricFrontDoorSelfHost:
         upstreamTimeoutMs: int
         maxBodyBytes: int
         port: int
+        trustFile: text
 
     # fdConfigDefault: `FrontDoorConfig::default()` — Primary reads, a 2s
     # fence budget re-checked every 50ms, a 35s upstream bound, FacetQL's
     # own 4 MiB body limit.
     proc fdConfigDefault(port: int) -> FdConfig:
-        return FdConfig{readPref: PlanReadPreference{code: 0, region: ""}, fenceRetryBudgetMs: 2000, fenceRetryIntervalMs: 50, upstreamTimeoutMs: 35000, maxBodyBytes: 4194304, port: port}
+        return FdConfig{readPref: PlanReadPreference{code: 0, region: ""}, fenceRetryBudgetMs: 2000, fenceRetryIntervalMs: 50, upstreamTimeoutMs: 35000, maxBodyBytes: 4194304, port: port, trustFile: ""}
 
     # FdFleet: everything the door needs to answer, swapped whole while it
     # serves. backends are kept sorted by id — the Rust BTreeMap's order,
@@ -253,12 +259,6 @@ app FabricFrontDoorSelfHost:
     # ============================================================
     # RESOLUTION: a plan's keys through the live routing table
     # ============================================================
-    # fdRoutingKeyOf: fabric.fct's packed key (`shard_id * 156 +
-    # coordinate.index()`) as fabric_routing's RoutingKey.
-    proc fdRoutingKeyOf(packed: int) -> RoutingKey:
-        let idx = packed % 156
-        return RoutingKey{shardId: packed / 156, coordinate: Coordinate{x: idx % 12, y: idx / 12}}
-
     # fdRouteIntentOf: fabric_plan's intent as fabric_routing's (codes
     # 0=Primary 1=AnyFresh 2=PreferRegion 3=AnyCopy).
     proc fdRouteIntentOf(intent: PlanRouteIntent) -> RouteIntent:
@@ -298,9 +298,8 @@ app FabricFrontDoorSelfHost:
         let mut i = 0
         loop i < n:
             let k = keys[i]
-            let key = do fdRoutingKeyOf(k.key)
             let intent = do fdRouteIntentOf(k.intent)
-            let res = do tableResolve(fleet.routing, RouteRequest{key: key, intent: intent})
+            let res = do tableResolve(fleet.routing, RouteRequest{key: k.key, intent: intent})
             if !res.ok:
                 let r = do fdResolvedErr(FdDoorError{kind: "Routing", refusal: none.refusal, routing: res.err, node: ""})
                 return r
@@ -425,9 +424,9 @@ app FabricFrontDoorSelfHost:
 
     # fdForward: `proxy::forward` — one request to one backend, its whole
     # answer read.
-    proc fdForward(node: text, baseUrl: text, method: text, target: text, headers: [HttpHeader], body: text, timeoutMs: int) -> FdUpstream uses io.net:
+    proc fdForward(node: text, baseUrl: text, method: text, target: text, headers: [HttpHeader], body: text, timeoutMs: int, trustFile: text) -> FdUpstream uses io.net:
         let hs = do fdOutboundHeaders(headers)
-        let r = do httpExchange(HttpRequest{method: method, url: baseUrl + target, headers: hs, body: body, timeoutMs: timeoutMs})
+        let r = do httpExchangeTrust(HttpRequest{method: method, url: baseUrl + target, headers: hs, body: body, timeoutMs: timeoutMs}, trustFile)
         if !r.ok:
             return FdUpstream{ok: false, node: node, status: 0, headers: [], body: "", message: "'" + node + "' at " + baseUrl + " did not answer: " + r.err}
         let back = do fdInboundHeaders(r.headers)
@@ -534,7 +533,7 @@ app FabricFrontDoorSelfHost:
         let mut i = 0
         loop i < n:
             let b = backends[i]
-            let u = do fdForward(b.id, b.baseUrl, method, target, headers, body, config.upstreamTimeoutMs)
+            let u = do fdForward(b.id, b.baseUrl, method, target, headers, body, config.upstreamTimeoutMs, config.trustFile)
             if u.ok:
                 answers = append(answers, u)
             else:
@@ -595,7 +594,8 @@ app FabricFrontDoorSelfHost:
     # this file's header.
     proc fdOpenStream(node: text, baseUrl: text, method: text, target: text, headers: [HttpHeader]) -> FdOpened uses io.net:
         let hs = do fdOutboundHeaders(headers)
-        let s = do httpOpenStream(HttpRequest{method: method, url: baseUrl + target, headers: hs, body: "", timeoutMs: 600000})
+        let config = fdConfig
+        let s = do httpOpenStreamTrust(HttpRequest{method: method, url: baseUrl + target, headers: hs, body: "", timeoutMs: 600000}, config.trustFile)
         if !s.ok:
             return FdOpened{ok: false, stream: FdStream{node: node, stream: s}, message: "'" + node + "' at " + baseUrl + " did not answer: " + s.err}
         let ok = do fdIsSuccess(s.status)
@@ -752,7 +752,7 @@ app FabricFrontDoorSelfHost:
                 let r = do fdDoorErrorResponse(resolved.err)
                 return r
             let b = resolved.backend
-            let u = do fdForward(b.id, b.baseUrl, req.method, req.target, req.headers, req.body, config.upstreamTimeoutMs)
+            let u = do fdForward(b.id, b.baseUrl, req.method, req.target, req.headers, req.body, config.upstreamTimeoutMs, config.trustFile)
             if !u.ok:
                 let r = do fdBadGateway([u.message])
                 return r
@@ -795,11 +795,16 @@ app FabricFrontDoorSelfHost:
                         open = wrote && keep
         let closed = closeConn(c)
 
-    # FrontDoor: the server — `FrontDoor::serve`. Every accepted connection
-    # is handed to its own concurrently running fdServeConn.
-    daemon FrontDoor uses io.net, io.net.listen:
-        let config = fdConfig
-        let l = listen(config.port)
-        loop true:
-            let c = accept(l)
-            detach fdServeConn(c)
+    # The server itself — `FrontDoor::serve` — is a daemon in the program
+    # that runs the door (listen/accept are daemon-only), after it has
+    # installed the fleet and config (fdInstall):
+    #
+    #   daemon FrontDoor uses io.net, io.net.listen:
+    #       let config = fdConfig
+    #       let l = listen(config.port)
+    #       loop true:
+    #           let c = accept(l)
+    #           detach fdServeConn(c)
+    #
+    # fabric_frontdoor_main.fct is that program, configured from the
+    # environment and run with `facet exec`.

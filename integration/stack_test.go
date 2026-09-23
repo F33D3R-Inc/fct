@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,6 +149,14 @@ type engine struct {
 	port  int
 	token string
 	cmd   *exec.Cmd
+	done  chan struct{} // closed once cmd has exited
+
+	// door is the fabric front door (selfhost/fabric_frontdoor_main.fct)
+	// in front of cmd's engine, in the front-door mode (frontdoorEnv); nil
+	// otherwise. port is then the door's, and the engine's own is behind it.
+	door        *exec.Cmd
+	doorDone    chan struct{}
+	lastDoorErr error // the last readiness probe's failure, for the refusal message
 }
 
 // startEngine boots FacetQL and waits for it to answer. The data directory is
@@ -163,76 +172,218 @@ func startEngine(t *testing.T) *engine {
 func startEngineIn(t *testing.T, dir string) *engine {
 	t.Helper()
 
-	bin := facetqlBinary(t)
-	port := freePort(t)
+	e := &engine{t: t, dir: dir, token: "integration-token"}
 
-	e := &engine{t: t, dir: dir, port: port, token: "integration-token"}
+	// freePort releases the port it found before the engine binds it, so
+	// another process may take it in between — rarely, but reliably under a
+	// full parallel `go test ./...`. An engine that exits because its port
+	// was taken is simply started again on another.
+	for attempt := 1; ; attempt++ {
+		port := freePort(t)
+		e.port = port
 
-	log, err := os.Create(filepath.Join(dir, "facetql.log"))
+		log, err := os.Create(filepath.Join(dir, "facetql.log"))
+		if err != nil {
+			t.Fatalf("engine log: %v", err)
+		}
+
+		e.cmd = engineCommand(t, dir)
+		e.cmd.Env = append(e.cmd.Env,
+			"ENOCHIAN_DATA_DIR="+dir,
+			fmt.Sprintf("ENOCHIAN_PORT=%d", port),
+			"ENOCHIAN_TOKENS="+e.token+":integration:admin",
+
+			// FacetQL refuses to start with development defaults — an all-zero
+			// at-rest key, no TLS — unless it is told this is not production. That
+			// refusal is correct and this harness is not going to work around it by
+			// supplying half-real credentials: a test that boots the engine the way
+			// production boots it would need a real key and a real certificate, and
+			// a test that pretends to have them teaches the wrong lesson. It says
+			// what it is instead.
+			"FACETQL_ENV=development",
+
+			// Rate limiting off, and only here. The engine limits per identity,
+			// and a test harness is one identity doing in two seconds what a
+			// real deployment spreads over minutes — a suite that seeds 500 rows
+			// would trip the `bulk` bucket and fail for a reason that is not the
+			// property under test. Turning it off is stated explicitly (the
+			// engine refuses to infer "unlimited" from a malformed value, so
+			// `off` is the only spelling that means this) rather than by
+			// choosing numbers large enough to hide the limiter, which would
+			// silently stop testing anything the day a suite got bigger.
+			"FACETQL_RATE_READ=off",
+			"FACETQL_RATE_WRITE=off",
+			"FACETQL_RATE_BULK=off",
+			"FACETQL_RATE_ADMIN=off",
+			"FACETQL_RATE_SUBSCRIBE=off",
+		)
+
+		e.cmd.Stdout = log
+		e.cmd.Stderr = log
+
+		if err := e.cmd.Start(); err != nil {
+			t.Fatalf("starting facetql: %v", err)
+		}
+		e.done = make(chan struct{})
+		go func(cmd *exec.Cmd, done chan struct{}) {
+			_ = cmd.Wait()
+			close(done)
+			log.Close()
+		}(e.cmd, e.done)
+
+		if e.waitReady() {
+			t.Cleanup(e.stop)
+			if os.Getenv(frontdoorEnv) != "" {
+				e.startDoor(dir)
+			}
+			return e
+		}
+		body, _ := os.ReadFile(filepath.Join(dir, "facetql.log"))
+		if attempt < 5 && strings.Contains(string(body), "address already in use") {
+			continue
+		}
+		e.stop()
+		t.Fatalf("facetql never became ready; log:\n%s", body)
+	}
+}
+
+// selfhostEnv names the harness mode that swaps the Rust engine for the
+// FacetQL server written in fct (selfhost/fqserver.fct), run by this tree's
+// own `facet exec`: the same suite, the same environment, the same wire —
+// only the process on the other end differs.
+const selfhostEnv = "FACETQL_SELFHOST"
+
+var (
+	facetBuild    sync.Once
+	facetBinPath  string
+	facetBuildErr error
+)
+
+// facetBinary builds this tree's `facet` command once per test process.
+func facetBinary(t *testing.T) string {
+	t.Helper()
+
+	facetBuild.Do(func() {
+		dir, err := os.MkdirTemp("", "facet-integration-")
+		if err != nil {
+			facetBuildErr = err
+			return
+		}
+		facetBinPath = filepath.Join(dir, "facet")
+		cmd := exec.Command("go", "build", "-o", facetBinPath, "facet/cmd/facet")
+		cmd.Dir = ".."
+		if out, err := cmd.CombinedOutput(); err != nil {
+			facetBuildErr = fmt.Errorf("go build facet/cmd/facet: %v\n%s", err, out)
+		}
+	})
+	if facetBuildErr != nil {
+		t.Fatalf("building facet for the self-hosted engine: %v", facetBuildErr)
+	}
+
+	return facetBinPath
+}
+
+// engineCommand is how the engine process is started: `facetql start`, or —
+// in the selfhost mode — `facet exec selfhost/fqserver.fct`, whose file
+// sandbox is the engine's own data directory.
+func engineCommand(t *testing.T, dir string) *exec.Cmd {
+	t.Helper()
+
+	if os.Getenv(selfhostEnv) == "" {
+		cmd := exec.Command(facetqlBinary(t), "start")
+		cmd.Env = os.Environ()
+		return cmd
+	}
+
+	server, err := filepath.Abs("../selfhost/fqserver.fct")
 	if err != nil {
-		t.Fatalf("engine log: %v", err)
+		t.Fatalf("locating fqserver.fct: %v", err)
+	}
+	cmd := exec.Command(facetBinary(t), "exec", server)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "FACET_DATA_DIR="+dir)
+
+	return cmd
+}
+
+// TestSuiteAgainstSelfhostedEngine runs this whole suite a second time with
+// the engine swapped for the self-hosted one, so a plain `go test ./...`
+// proves both: every property here holds whichever FacetQL the runtime is
+// talking to.
+func TestSuiteAgainstSelfhostedEngine(t *testing.T) {
+	if os.Getenv(selfhostEnv) != "" || os.Getenv(frontdoorEnv) != "" {
+		t.Skip("this run is the self-hosted or front-door one")
+	}
+	if testing.Short() {
+		t.Skip("the self-hosted pass runs the whole suite again")
 	}
 
-	e.cmd = exec.Command(bin, "start")
-	e.cmd.Env = append(os.Environ(),
-		"ENOCHIAN_DATA_DIR="+dir,
-		fmt.Sprintf("ENOCHIAN_PORT=%d", port),
-		"ENOCHIAN_TOKENS="+e.token+":integration:admin",
+	cmd := exec.Command("go", "test", "-count=1", ".")
+	cmd.Env = append(os.Environ(), selfhostEnv+"=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the suite against selfhost/fqserver.fct: %v\n%s", err, out)
+	}
+}
 
-		// FacetQL refuses to start with development defaults — an all-zero
-		// at-rest key, no TLS — unless it is told this is not production. That
-		// refusal is correct and this harness is not going to work around it by
-		// supplying half-real credentials: a test that boots the engine the way
-		// production boots it would need a real key and a real certificate, and
-		// a test that pretends to have them teaches the wrong lesson. It says
-		// what it is instead.
-		"FACETQL_ENV=development",
-
-		// Rate limiting off, and only here. The engine limits per identity,
-		// and a test harness is one identity doing in two seconds what a
-		// real deployment spreads over minutes — a suite that seeds 500 rows
-		// would trip the `bulk` bucket and fail for a reason that is not the
-		// property under test. Turning it off is stated explicitly (the
-		// engine refuses to infer "unlimited" from a malformed value, so
-		// `off` is the only spelling that means this) rather than by
-		// choosing numbers large enough to hide the limiter, which would
-		// silently stop testing anything the day a suite got bigger.
-		"FACETQL_RATE_READ=off",
-		"FACETQL_RATE_WRITE=off",
-		"FACETQL_RATE_BULK=off",
-		"FACETQL_RATE_ADMIN=off",
-		"FACETQL_RATE_SUBSCRIBE=off",
-	)
-	e.cmd.Stdout = log
-	e.cmd.Stderr = log
-
-	if err := e.cmd.Start(); err != nil {
-		t.Fatalf("starting facetql: %v", err)
+// TestSuiteThroughFrontDoor runs this whole suite through the fabric front
+// door written in fct, once in front of the Rust FacetQL and once in front of
+// selfhost/fqserver.fct — the all-fct stack: an fct app, the fct front door,
+// the fct FacetQL server.
+//
+// One known gap, the Rust spec's rather than the port's: fabric-facetql's
+// frontdoor/plan.rs classifies no route for POST /nodes/aggregate, POST
+// /nodes/aggregate_by or GET /changes, which FacetQL's router serves. The
+// Rust front door answers them 404 "no route for …", and so does this one;
+// fqStore's pushed-down aggregates then fall back to the in-memory working
+// set (logged as "aggregate failed"), which is why the suite still passes.
+// Classifying those routes belongs in plan.rs first.
+func TestSuiteThroughFrontDoor(t *testing.T) {
+	if os.Getenv(frontdoorEnv) != "" || os.Getenv(selfhostEnv) != "" {
+		t.Skip("this run is already a front-door or self-hosted one")
+	}
+	if testing.Short() {
+		t.Skip("the front-door passes run the whole suite again")
 	}
 
-	t.Cleanup(e.stop)
-	e.waitReady()
-
-	return e
+	for _, mode := range []struct {
+		name string
+		env  []string
+	}{
+		{"rust-facetql", []string{frontdoorEnv + "=1"}},
+		{"fct-facetql", []string{frontdoorEnv + "=1", selfhostEnv + "=1"}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			cmd := exec.Command("go", "test", "-count=1", ".")
+			cmd.Env = append(os.Environ(), mode.env...)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("the suite through the fct front door (%s): %v\n%s", mode.name, err, out)
+			}
+		})
+	}
 }
 
 func (e *engine) dsn() string {
 	return fmt.Sprintf("facetql://%s@127.0.0.1:%d", e.token, e.port)
 }
 
-func (e *engine) waitReady() {
+// waitReady reports whether the engine answers within the deadline; false
+// as soon as its process has exited.
+func (e *engine) waitReady() bool {
 	e.t.Helper()
 
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := e.get("/stats"); err == nil {
-			return
+			return true
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-e.done:
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
-	body, _ := os.ReadFile(filepath.Join(e.dir, "facetql.log"))
-	e.t.Fatalf("facetql never became ready; log:\n%s", body)
+	return false
 }
 
 func (e *engine) get(path string) ([]byte, error) {
@@ -254,12 +405,95 @@ func (e *engine) get(path string) ([]byte, error) {
 	return body, nil
 }
 
-// stop ends the engine. Killed rather than signalled politely: the test owns
-// this process and its data directory outlives nothing.
+// frontdoorEnv names the harness mode that puts the fabric front door —
+// written in fct, selfhost/fabric_frontdoor_main.fct, run by `facet exec` —
+// between the runtime and the engine: FACET_DATABASE_URL names the door, the
+// door forwards to the engine. With selfhostEnv as well, every process on the
+// data path is fct.
+const frontdoorEnv = "FACET_FRONTDOOR"
+
+// startDoor starts the front door in front of the running engine and makes
+// the engine's port the door's, so everything that talks to e — the runtime
+// through dsn, the harness's own get/stats — goes through the door.
+func (e *engine) startDoor(dir string) {
+	e.t.Helper()
+
+	main, err := filepath.Abs("../selfhost/fabric_frontdoor_main.fct")
+	if err != nil {
+		e.t.Fatalf("locating fabric_frontdoor_main.fct: %v", err)
+	}
+	backend := e.port
+	for attempt := 1; ; attempt++ {
+		port := freePort(e.t)
+		log, err := os.Create(filepath.Join(dir, "frontdoor.log"))
+		if err != nil {
+			e.t.Fatalf("front door log: %v", err)
+		}
+		e.door = exec.Command(facetBinary(e.t), "exec", main)
+		e.door.Env = append(os.Environ(),
+			fmt.Sprintf("FRONTDOOR_PORT=%d", port),
+			fmt.Sprintf("FRONTDOOR_BACKENDS=db-a=http://127.0.0.1:%d", backend),
+		)
+		e.door.Stdout = log
+		e.door.Stderr = log
+		if err := e.door.Start(); err != nil {
+			e.t.Fatalf("starting the front door: %v", err)
+		}
+		e.doorDone = make(chan struct{})
+		go func(cmd *exec.Cmd, done chan struct{}) {
+			_ = cmd.Wait()
+			close(done)
+			log.Close()
+		}(e.door, e.doorDone)
+
+		e.port = port
+		if e.waitDoor() {
+			return
+		}
+		e.stopDoor()
+		body, _ := os.ReadFile(filepath.Join(dir, "frontdoor.log"))
+		if attempt < 5 && strings.Contains(string(body), "address already in use") {
+			e.port = backend
+			continue
+		}
+		e.t.Fatalf("the front door never became ready (%v); log:\n%s", e.lastDoorErr, body)
+	}
+}
+
+// waitDoor is waitReady for the door: false as soon as its process exits.
+func (e *engine) waitDoor() bool {
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := e.get("/stats")
+		if err == nil {
+			return true
+		}
+		e.lastDoorErr = err
+		select {
+		case <-e.doorDone:
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return false
+}
+
+func (e *engine) stopDoor() {
+	if e.door != nil && e.door.Process != nil {
+		_ = e.door.Process.Kill()
+		<-e.doorDone
+		e.door = nil
+	}
+}
+
+// stop ends the engine (and the door in front of it). Killed rather than
+// signalled politely: the test owns this process and its data directory
+// outlives nothing.
 func (e *engine) stop() {
+	e.stopDoor()
 	if e.cmd != nil && e.cmd.Process != nil {
 		_ = e.cmd.Process.Kill()
-		_ = e.cmd.Wait()
+		<-e.done
 	}
 }
 

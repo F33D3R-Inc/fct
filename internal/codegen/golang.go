@@ -81,8 +81,14 @@ func jsonTag(f ir.WireField) string {
 
 func goFieldType(f ir.WireField, enums map[string]bool) string {
 	inner := goScalar(f.Type, enums, f.Ref)
+	if f.Map {
+		return "map[string]" + inner
+	}
 	if f.List {
-		return "[]" + inner
+		return strings.Repeat("[]", max(f.Depth, 1)) + inner
+	}
+	if f.Nullable && !f.Ref && f.Type != "json" {
+		return "*" + inner // a maybe-null scalar: nil crosses as null
 	}
 	if f.Ref {
 		// Always a pointer: a Go struct field naming another generated type

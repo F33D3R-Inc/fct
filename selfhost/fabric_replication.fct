@@ -54,9 +54,9 @@ app FabricReplicationSelfHost:
         return LagThresholds{laggingPendingWrites: 1000, laggingApplyLagMs: 5000, unreachableGraceMs: 30000}
 
     proc replLagExceeds(pendingWrites: int, applyLagMs: int, thresholds: LagThresholds) -> bool:
-        if pendingWrites > thresholds.laggingPendingWrites:
+        if u64Cmp(pendingWrites, thresholds.laggingPendingWrites) > 0:
             return true
-        return applyLagMs > thresholds.laggingApplyLagMs
+        return u64Cmp(applyLagMs, thresholds.laggingApplyLagMs) > 0
 
     struct ReplReport:
         shardId: int
@@ -87,11 +87,13 @@ app FabricReplicationSelfHost:
         state: text
         pendingWrites: int
         applyLagMs: int
+        hasLastReport: bool
         lastReportMs: int
+        hasUnreachableSince: bool
         unreachableSinceMs: int
 
     proc replRecordNew(shardId: int, node: text, region: text, isPrimary: bool, state: text) -> ReplRecord:
-        return ReplRecord{shardId: shardId, node: node, region: region, isPrimary: isPrimary, state: state, pendingWrites: 0, applyLagMs: 0, lastReportMs: -1, unreachableSinceMs: -1}
+        return ReplRecord{shardId: shardId, node: node, region: region, isPrimary: isPrimary, state: state, pendingWrites: 0, applyLagMs: 0, hasLastReport: false, lastReportMs: 0, hasUnreachableSince: false, unreachableSinceMs: 0}
 
     proc replRecordCanServeFreshReads(r: ReplRecord) -> bool:
         let fresh = do replStateIsFresh(r.state)
@@ -109,13 +111,24 @@ app FabricReplicationSelfHost:
         let fresh = do replStateIsFresh(r.state)
         return fresh
 
-    # silence_ms: `-1` restates Rust's `None` (never reported), otherwise the
-    # saturating milliseconds since the last report — the same `max(a-b,0)`
-    # restatement of `saturating_sub` fabric.fct's own failover port uses.
+    struct ReplSilence:
+        has: bool
+        ms: int
+
+    # silence_ms: None when nothing was ever reported, otherwise
+    # now_ms.saturating_sub(last) over u64s.
+    proc replRecordSilence(r: ReplRecord, nowMs: int) -> ReplSilence:
+        if !r.hasLastReport:
+            return ReplSilence{has: false, ms: 0}
+        return ReplSilence{has: true, ms: u64SatSub(nowMs, r.lastReportMs)}
+
+    # The same, -1 standing for None (for callers that only need "never
+    # reported" and never see a u64 silence of u64::MAX).
     proc replRecordSilenceMs(r: ReplRecord, nowMs: int) -> int:
-        if r.lastReportMs == -1:
+        let s = do replRecordSilence(r, nowMs)
+        if !s.has:
             return -1
-        return max(nowMs - r.lastReportMs, 0)
+        return s.ms
 
     struct ReplTransition:
         shardId: int
@@ -162,9 +175,9 @@ app FabricReplicationSelfHost:
     # off `kind`.
     proc replErrorDisplay(e: ReplError) -> text:
         if e.kind == "duplicateReplica":
-            return "shard " + e.shardId + " already has a replica on node '" + e.node + "'"
+            return "shard " + u64Text(e.shardId) + " already has a replica on node '" + e.node + "'"
         if e.kind == "unknownReplica":
-            return "shard " + e.shardId + " has no replica on node '" + e.node + "'"
+            return "shard " + u64Text(e.shardId) + " has no replica on node '" + e.node + "'"
         if e.kind == "illegalTransition":
             let f = do replStateLabel(e.fromState)
             let t = do replStateLabel(e.toState)
@@ -177,7 +190,7 @@ app FabricReplicationSelfHost:
         if e.kind == "primaryNotRemovable":
             return "replica on '" + e.node + "' is the primary; promote another copy before removing it"
         if e.kind == "wrongShard":
-            return "report is for shard " + e.actualShard + ", this set is shard " + e.expectedShard
+            return "report is for shard " + u64Text(e.actualShard) + ", this set is shard " + u64Text(e.expectedShard)
         if e.kind == "zeroReplicationFactor":
             return "replication factor must be at least 1"
         if e.kind == "duplicateCandidate":
@@ -427,7 +440,7 @@ app FabricReplicationSelfHost:
         if toState == "seeding" || toState == "failed":
             newPendingWrites = 0
             newApplyLagMs = 0
-        let updated = ReplRecord{shardId: existing.shardId, node: existing.node, region: existing.region, isPrimary: existing.isPrimary, state: toState, pendingWrites: newPendingWrites, applyLagMs: newApplyLagMs, lastReportMs: existing.lastReportMs, unreachableSinceMs: existing.unreachableSinceMs}
+        let updated = ReplRecord{shardId: existing.shardId, node: existing.node, region: existing.region, isPrimary: existing.isPrimary, state: toState, pendingWrites: newPendingWrites, applyLagMs: newApplyLagMs, hasLastReport: existing.hasLastReport, lastReportMs: existing.lastReportMs, hasUnreachableSince: existing.hasUnreachableSince, unreachableSinceMs: existing.unreachableSinceMs}
         let mut replicas = group.replicas
         replicas[idx] = updated
         let newGroup = ReplGroup{shardId: group.shardId, desiredFactor: group.desiredFactor, replicas: replicas}
@@ -455,7 +468,7 @@ app FabricReplicationSelfHost:
         loop i < n:
             let r = group.replicas[i]
             let isNowPrimary = r.node == node
-            let rebuilt = ReplRecord{shardId: r.shardId, node: r.node, region: r.region, isPrimary: isNowPrimary, state: r.state, pendingWrites: r.pendingWrites, applyLagMs: r.applyLagMs, lastReportMs: r.lastReportMs, unreachableSinceMs: r.unreachableSinceMs}
+            let rebuilt = ReplRecord{shardId: r.shardId, node: r.node, region: r.region, isPrimary: isNowPrimary, state: r.state, pendingWrites: r.pendingWrites, applyLagMs: r.applyLagMs, hasLastReport: r.hasLastReport, lastReportMs: r.lastReportMs, hasUnreachableSince: r.hasUnreachableSince, unreachableSinceMs: r.unreachableSinceMs}
             replicas = append(replicas, rebuilt)
             i = i + 1
         let newGroup = ReplGroup{shardId: group.shardId, desiredFactor: group.desiredFactor, replicas: replicas}
@@ -472,7 +485,7 @@ app FabricReplicationSelfHost:
             if lookup.found:
                 let err = ReplError{kind: "duplicateReplica", shardId: group.shardId, node: op.node, fromState: "", toState: "", state: "", expectedShard: 0, actualShard: 0}
                 return ReplOpResult{ok: false, changed: false, group: group, transition: noTransition, error: err}
-            let newRecord = ReplRecord{shardId: group.shardId, node: op.node, region: op.region, isPrimary: false, state: "absent", pendingWrites: 0, applyLagMs: 0, lastReportMs: -1, unreachableSinceMs: -1}
+            let newRecord = ReplRecord{shardId: group.shardId, node: op.node, region: op.region, isPrimary: false, state: "absent", pendingWrites: 0, applyLagMs: 0, hasLastReport: false, lastReportMs: 0, hasUnreachableSince: false, unreachableSinceMs: 0}
             let appended = append(group.replicas, newRecord)
             let grown = do replRecordArraySortByNodeAscending(appended)
             let newGroup = ReplGroup{shardId: group.shardId, desiredFactor: group.desiredFactor, replicas: grown}
@@ -523,9 +536,11 @@ app FabricReplicationSelfHost:
     # failing or by being demoted, never by a report.
     private proc replGroupVerdict(record: ReplRecord, report: ReplReport, thresholds: LagThresholds) -> ReplVerdict:
         if !report.reachable:
-            let since = record.unreachableSinceMs
-            let silentFor = max(report.timestampMs - since, 0)
-            if silentFor >= thresholds.unreachableGraceMs && record.state != "absent":
+            let mut since = report.timestampMs
+            if record.hasUnreachableSince:
+                since = record.unreachableSinceMs
+            let silentFor = u64SatSub(report.timestampMs, since)
+            if u64Cmp(silentFor, thresholds.unreachableGraceMs) >= 0 && record.state != "absent":
                 return ReplVerdict{has: true, state: "failed"}
             return ReplVerdict{has: false, state: ""}
         if record.isPrimary:
@@ -556,19 +571,22 @@ app FabricReplicationSelfHost:
             let err = ReplError{kind: "unknownReplica", shardId: group.shardId, node: report.node, fromState: "", toState: "", state: "", expectedShard: 0, actualShard: 0}
             return ReplOpResult{ok: false, changed: false, group: group, transition: noTransition, error: err}
         let existing = group.replicas[idx]
-        if existing.lastReportMs != -1 && report.timestampMs < existing.lastReportMs:
+        if existing.hasLastReport && u64Cmp(report.timestampMs, existing.lastReportMs) < 0:
             return ReplOpResult{ok: true, changed: false, group: group, transition: noTransition, error: noError}
+        let mut newHasUnreachableSince = existing.hasUnreachableSince
         let mut newUnreachableSince = existing.unreachableSinceMs
         let mut newPendingWrites = existing.pendingWrites
         let mut newApplyLagMs = existing.applyLagMs
         if report.reachable:
-            newUnreachableSince = -1
+            newHasUnreachableSince = false
+            newUnreachableSince = 0
             newPendingWrites = report.pendingWrites
             newApplyLagMs = report.applyLagMs
         if !report.reachable:
-            if existing.unreachableSinceMs == -1:
+            if !existing.hasUnreachableSince:
+                newHasUnreachableSince = true
                 newUnreachableSince = report.timestampMs
-        let updated = ReplRecord{shardId: existing.shardId, node: existing.node, region: existing.region, isPrimary: existing.isPrimary, state: existing.state, pendingWrites: newPendingWrites, applyLagMs: newApplyLagMs, lastReportMs: report.timestampMs, unreachableSinceMs: newUnreachableSince}
+        let updated = ReplRecord{shardId: existing.shardId, node: existing.node, region: existing.region, isPrimary: existing.isPrimary, state: existing.state, pendingWrites: newPendingWrites, applyLagMs: newApplyLagMs, hasLastReport: true, lastReportMs: report.timestampMs, hasUnreachableSince: newHasUnreachableSince, unreachableSinceMs: newUnreachableSince}
         let mut replicas = group.replicas
         replicas[idx] = updated
         let groupStep = ReplGroup{shardId: group.shardId, desiredFactor: group.desiredFactor, replicas: replicas}
@@ -890,11 +908,11 @@ app FabricReplicationSelfHost:
             let l = do replStateLabel(i.state)
             return "replica is " + l
         if i.kind == "WouldLoseWrites":
-            return "" + i.value + " unapplied writes would be lost"
+            return u64Text(i.value) + " unapplied writes would be lost"
         if i.kind == "TooFarBehind":
-            return "" + i.value + "ms behind the primary"
+            return u64Text(i.value) + "ms behind the primary"
         if i.kind == "HealthTooStale":
-            return "no health report for " + i.value + "ms"
+            return "no health report for " + u64Text(i.value) + "ms"
         return "no health report has ever arrived"
 
     proc replFailoverBlockerDisplay(kind: text) -> text:
@@ -912,6 +930,7 @@ app FabricReplicationSelfHost:
         state: text
         pendingWrites: int
         applyLagMs: int
+        hasSilence: bool
         silenceMs: int
         ineligibility: ReplIneligibility
 
@@ -924,22 +943,28 @@ app FabricReplicationSelfHost:
         hasPrimary: bool
         primary: text
         primaryState: text
+        hasPrimarySilence: bool
         primarySilenceMs: int
         primaryNeedsReplacement: bool
         candidates: [ReplPromotionCandidate]
         blockers: [text]
 
-    # `fn ineligibility`: the first reason, in the real order.
+    # `fn ineligibility`: the first reason, in the real order (`silenceMs`
+    # -1 for None; see replFailoverIneligibilityOf for the u64-exact form).
     proc replFailoverIneligibility(state: text, pendingWrites: int, applyLagMs: int, silenceMs: int, policy: ReplFailoverPolicy) -> ReplIneligibility:
+        let r = do replFailoverIneligibilityOf(state, pendingWrites, applyLagMs, silenceMs != -1, silenceMs, policy)
+        return r
+
+    proc replFailoverIneligibilityOf(state: text, pendingWrites: int, applyLagMs: int, hasSilence: bool, silenceMs: int, policy: ReplFailoverPolicy) -> ReplIneligibility:
         if state != "inSync":
             return ReplIneligibility{has: true, kind: "NotInSync", state: state, value: 0}
-        if silenceMs == -1:
+        if !hasSilence:
             return ReplIneligibility{has: true, kind: "NeverReported", state: "", value: 0}
-        if silenceMs > policy.maxCandidateSilenceMs:
+        if u64Cmp(silenceMs, policy.maxCandidateSilenceMs) > 0:
             return ReplIneligibility{has: true, kind: "HealthTooStale", state: "", value: silenceMs}
-        if pendingWrites > policy.maxPromotionPendingWrites:
+        if u64Cmp(pendingWrites, policy.maxPromotionPendingWrites) > 0:
             return ReplIneligibility{has: true, kind: "WouldLoseWrites", state: "", value: pendingWrites}
-        if applyLagMs > policy.maxPromotionApplyLagMs:
+        if u64Cmp(applyLagMs, policy.maxPromotionApplyLagMs) > 0:
             return ReplIneligibility{has: true, kind: "TooFarBehind", state: "", value: applyLagMs}
         return ReplIneligibility{has: false, kind: "", state: "", value: 0}
 
@@ -952,29 +977,28 @@ app FabricReplicationSelfHost:
         if ae != be:
             return be
         if a.pendingWrites != b.pendingWrites:
-            return a.pendingWrites > b.pendingWrites
+            return u64Cmp(a.pendingWrites, b.pendingWrites) > 0
         if a.applyLagMs != b.applyLagMs:
-            return a.applyLagMs > b.applyLagMs
+            return u64Cmp(a.applyLagMs, b.applyLagMs) > 0
         return a.node > b.node
 
     # `FailoverAssessment::evaluate`: pure; reads the set, writes nothing.
     proc replFailoverEvaluate(group: ReplGroup, nowMs: int, policy: ReplFailoverPolicy) -> ReplFailoverAssessment:
         let primary = do replGroupPrimary(group)
-        let mut primarySilence = -1
+        let mut primarySilence = ReplSilence{has: false, ms: 0}
         let mut needs = true
         if primary.found:
-            let s = do replRecordSilenceMs(primary.record, nowMs)
-            primarySilence = s
+            primarySilence = do replRecordSilence(primary.record, nowMs)
             let fresh = do replStateIsFresh(primary.record.state)
-            needs = !fresh || (primarySilence != -1 && primarySilence > policy.primarySilenceMs)
+            needs = !fresh || (primarySilence.has && u64Cmp(primarySilence.ms, policy.primarySilenceMs) > 0)
         let secondaries = do replGroupSecondaries(group)
         let mut candidates = []
         let mut i = 0
         loop i < len(secondaries):
             let r = secondaries[i]
-            let silence = do replRecordSilenceMs(r, nowMs)
-            let inel = do replFailoverIneligibility(r.state, r.pendingWrites, r.applyLagMs, silence, policy)
-            candidates = append(candidates, ReplPromotionCandidate{node: r.node, region: r.region, state: r.state, pendingWrites: r.pendingWrites, applyLagMs: r.applyLagMs, silenceMs: silence, ineligibility: inel})
+            let silence = do replRecordSilence(r, nowMs)
+            let inel = do replFailoverIneligibilityOf(r.state, r.pendingWrites, r.applyLagMs, silence.has, silence.ms, policy)
+            candidates = append(candidates, ReplPromotionCandidate{node: r.node, region: r.region, state: r.state, pendingWrites: r.pendingWrites, applyLagMs: r.applyLagMs, hasSilence: silence.has, silenceMs: silence.ms, ineligibility: inel})
             i = i + 1
         let n = len(candidates)
         let mut k = 1
@@ -1016,7 +1040,7 @@ app FabricReplicationSelfHost:
         if primary.found:
             pNode = primary.record.node
             pState = primary.record.state
-        return ReplFailoverAssessment{shardId: group.shardId, assessedAtMs: nowMs, hasPrimary: primary.found, primary: pNode, primaryState: pState, primarySilenceMs: primarySilence, primaryNeedsReplacement: needs, candidates: candidates, blockers: blockers}
+        return ReplFailoverAssessment{shardId: group.shardId, assessedAtMs: nowMs, hasPrimary: primary.found, primary: pNode, primaryState: pState, hasPrimarySilence: primarySilence.has, primarySilenceMs: primarySilence.ms, primaryNeedsReplacement: needs, candidates: candidates, blockers: blockers}
 
     struct ReplCandidateLookup:
         found: bool
@@ -1030,7 +1054,7 @@ app FabricReplicationSelfHost:
                 return ReplCandidateLookup{found: true, candidate: a.candidates[i]}
             i = i + 1
         let none = ReplIneligibility{has: false, kind: "", state: "", value: 0}
-        return ReplCandidateLookup{found: false, candidate: ReplPromotionCandidate{node: "", region: "", state: "", pendingWrites: 0, applyLagMs: 0, silenceMs: -1, ineligibility: none}}
+        return ReplCandidateLookup{found: false, candidate: ReplPromotionCandidate{node: "", region: "", state: "", pendingWrites: 0, applyLagMs: 0, hasSilence: false, silenceMs: 0, ineligibility: none}}
 
     struct ReplOpOption:
         has: bool

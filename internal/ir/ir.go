@@ -224,8 +224,14 @@ type WireField struct {
 	Description string   `json:"description,omitempty"`
 	Aliases     []string `json:"aliases,omitempty"` // other names a caller may send it under
 	Enum        []string `json:"enum,omitempty"`    // its closed set of values
-	// Nullable: `T or null` — required, but an empty value is null.
+	// Nullable: `T or null` — required, but an empty value is null. With
+	// Optional (`T? or null`) the field is left out when empty and typed as
+	// maybe-null where present.
 	Nullable bool `json:"nullable,omitempty"`
+	// Map: `{T}`, a JSON object whose values are Type. Depth: `[[T]]`, the
+	// list nesting depth when it is more than one (List is then set too).
+	Map   bool `json:"map,omitempty"`
+	Depth int  `json:"depth,omitempty"`
 	// Into: a pattern field's (`then_<field>`) action parameter, which
 	// receives every body key with the prefix as one json object.
 	Into string `json:"into,omitempty"`
@@ -462,6 +468,26 @@ type API struct {
 	// (`api POST "/events" -> Mutation`): the variant its tag selects runs its
 	// own action. Action is then "".
 	Dispatch string `json:"dispatch,omitempty"`
+	// The route's contract documentation (ast.API's block): Summary and
+	// Description as written; Body the wire type the JSON body is; Errors
+	// the error statuses it answers; Operation its operationId when not the
+	// method+path one; ParamDocs its documented path/query parameters.
+	Summary     string        `json:"summary,omitempty"`
+	Description string        `json:"description,omitempty"`
+	Body        string        `json:"body,omitempty"`
+	Errors      []int         `json:"errors,omitempty"`
+	Operation   string        `json:"operation,omitempty"`
+	ParamDocs   []APIParamDoc `json:"paramDocs,omitempty"`
+}
+
+// APIParamDoc documents one path or query parameter of a declared route:
+// Type is its wire type ("text" for an int a client holds as an opaque
+// string), Enum its closed set of values.
+type APIParamDoc struct {
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	Description string   `json:"description,omitempty"`
+	Enum        []string `json:"enum,omitempty"`
 }
 
 // ContractRoute is `contract "/path"`: the runtime serves the app's own
@@ -471,6 +497,12 @@ type ContractRoute struct {
 	Path  string `json:"path"`
 	Rate  string `json:"rate,omitempty"`
 	Since string `json:"since,omitempty"`
+	// Title and Description are the document's info.title and
+	// info.description ("" = the app's name, the runtime's own text).
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	// Bearer describes the bearer security scheme ("" = the runtime's text).
+	Bearer string `json:"bearer,omitempty"`
 }
 
 // Stream is one declared event stream (ast.Stream): Events are the wire type
@@ -490,6 +522,17 @@ type Stream struct {
 	Params     []string     `json:"params,omitempty"`
 	Connects   []StreamHook `json:"connects,omitempty"`
 	Disconnect string       `json:"disconnect,omitempty"`
+	// Hello is the since date of the runtime's `hello` connect frame
+	// (HelloEventDTO), sent unnumbered first on every connection; "" = the
+	// stream sends none.
+	Hello string `json:"hello,omitempty"`
+	// Summary and Description document the stream route; ParamDocs its
+	// path parameters.
+	Summary     string        `json:"summary,omitempty"`
+	Description string        `json:"description,omitempty"`
+	ParamDocs   []APIParamDoc `json:"paramDocs,omitempty"`
+	// Errors are the error statuses the stream's contract publishes.
+	Errors []int `json:"errors,omitempty"`
 }
 
 // StreamHook is one `connect -> Action [as Event]`: run as the subscriber when

@@ -148,6 +148,31 @@ func runeLen(s string) int {
 
 // runeSlice is s[start:end] in runes, both bounds clamped into [0, runeLen]
 // and end clamped up to start, exactly slice()'s documented behaviour.
+// listSlice is slice() over a list: elements [start, end), clamped into
+// [0, len(xs)] exactly as runeSlice clamps a string, copied so the result is
+// a list of its own.
+func listSlice(xs []any, start, end int) []any {
+	n := len(xs)
+	if start < 0 {
+		start = 0
+	}
+	if start > n {
+		start = n
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end > n {
+		end = n
+	}
+	if end < start {
+		end = start
+	}
+	out := make([]any, end-start)
+	copy(out, xs[start:end])
+	return out
+}
+
 func runeSlice(s string, start, end int) string {
 	ascii, offs := textIndex(s)
 	n := len(s)
@@ -953,6 +978,10 @@ func omitEmpty(rec map[string]any, optional []string) {
 			if len(v) == 0 {
 				delete(rec, f)
 			}
+		case map[string]any:
+			if len(v) == 0 {
+				delete(rec, f) // an empty `{T}` map, as encoding/json's omitempty leaves it out
+			}
 		}
 	}
 }
@@ -1109,6 +1138,20 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.channels.send(toInt(arg(0)), toStr(arg(1)))
 	case "recv":
 		return s.channels.recv(toInt(arg(0)))
+	case "closeChannel":
+		return s.channels.close(toInt(arg(0)))
+	case "awaitAny":
+		ids, err := intListArg("awaitAny", arg(0))
+		if err != nil {
+			return nil, err
+		}
+		return s.channels.awaitAny(ids, toInt(arg(1)))
+	case "exitProcess":
+		return s.ioExitProcess(toInt(arg(0)))
+	case "processStats":
+		return s.ioProcessStats()
+	case "listenTls":
+		return s.ioListenTls(toInt(arg(0)), toStr(arg(1)), toStr(arg(2)))
 	case "listenOn":
 		return s.ioListenOn("listenOn", toStr(arg(0)), toInt(arg(1)))
 	case "listen":
@@ -1127,12 +1170,16 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioWriteBytes(toInt(arg(0)), arg(1))
 	case "closeConn":
 		return s.ioCloseConn(toInt(arg(0)))
+	case "connectTls":
+		return s.ioConnectTls(toStr(arg(0)), toInt(arg(1)), toStr(arg(2)), toStr(arg(3)))
 	case "connect":
 		return s.ioConnect(toStr(arg(0)), toInt(arg(1)))
 	case "setTimeoutMs":
 		return s.ioSetTimeoutMs(toInt(arg(0)), toInt(arg(1)))
 	case "connError":
 		return s.ioConnError(toInt(arg(0)))
+	case "connPeer":
+		return s.ioConnPeer(toInt(arg(0)))
 	case "pollBytes":
 		return s.ioPollBytes(toInt(arg(0)), toInt(arg(1)), toInt(arg(2)))
 	case "connOpen":
@@ -1147,6 +1194,12 @@ func (s *Server) callProcBuiltin(name string, argVals []any) (any, error) {
 		return s.ioReadStdin()
 	case "envVar":
 		return os.Getenv(toStr(arg(0))), nil
+	case "grantRead":
+		return s.ioGrantRead(toStr(arg(0)))
+	case "listenError":
+		return s.ioListenError(toInt(arg(0)))
+	case "closeListener":
+		return s.ioCloseListener(toInt(arg(0)))
 	case "envSet":
 		_, set := os.LookupEnv(toStr(arg(0)))
 		return set, nil
@@ -1286,6 +1339,8 @@ func callBuiltin(name string, argVals []any) any {
 		return toFloat(arg(0))
 	case "toInt":
 		return toInt(arg(0))
+	case "u64Cmp", "u64Min", "u64Max", "u64SatSub", "u64Div", "u64Rem", "u64Text", "u64Parse", "u64ParseError", "u64ToFloat":
+		return u64Builtin(name, argVals)
 	case "floatBits":
 		// The raw IEEE-754 bit pattern of a float, reinterpreted as a signed
 		// 64-bit int — a bit-cast, not a numeric conversion (contrast
@@ -1497,6 +1552,11 @@ func callBuiltin(name string, argVals []any) any {
 		// [0, len(r)], and a start left past end after clamping yields "" —
 		// the exact same "clamp, never error" convention take already
 		// established for an n longer than the string.
+		// A list is sliced the same way, by position: slice(xs, start, end)
+		// is the elements [start, end), clamped the same way, as a new list.
+		if xs, ok := arg(0).([]any); ok {
+			return listSlice(xs, toInt(arg(1)), toInt(arg(2)))
+		}
 		return runeSlice(toStr(arg(0)), toInt(arg(1)), toInt(arg(2)))
 	case "charAt":
 		// charAt(s, i) -> text, a length-1 string (this language has no

@@ -138,7 +138,7 @@ func TestFabricFacetqlLiveAgainstRealFacetql(t *testing.T) {
 	ts := fqltApp(t, "fabric_facetql_placement.fct")
 	flow := func(name string, shard, rows int) map[string]string {
 		t.Helper()
-		return fqlLiveFields(t, fqltCall(t, ts, "fqlLiveOut", "fqlLiveRun", name, base, "fabtok", shard, rows))
+		return fqlLiveFields(t, fqltCall(t, ts, "fqlLiveOut", "fqlLiveRun", name, base, "fabtok", shard, rows, ""))
 	}
 	want := func(t *testing.T, m map[string]string, expect map[string]string) {
 		t.Helper()
@@ -203,7 +203,7 @@ func TestFabricFacetqlLiveAgainstRealFacetql(t *testing.T) {
 	poller := fqltApp(t, "fabric_facetql_poller.fct")
 	pollerFlow := func(name string) map[string]string {
 		t.Helper()
-		return fqlLiveFields(t, fqltCall(t, poller, "pollerOut", "pollerRunLive", name, base, "fabtok"))
+		return fqlLiveFields(t, fqltCall(t, poller, "pollerOut", "pollerRunLive", name, base, "fabtok", ""))
 	}
 
 	t.Run("polling_stats_drives_the_existing_optimizer_path", func(t *testing.T) {
@@ -273,7 +273,7 @@ func TestFabricFacetqlMoverAgainstRealFacetql(t *testing.T) {
 	src := fqlLiveStart(t)
 	dst := fqlLiveStart(t)
 	ts := fqltApp(t, "fabric_facetql_mover.fct")
-	m := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "copy", src, dst, "fabtok"))
+	m := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "copy", src, dst, "fabtok", ""))
 	edge := "true NotIdentical 'src' holds 1 edge(s). FacetQL exposes edges only per node (GET /node/:address/edges/out) and refuses an edge whose far endpoint is not readable on the instance it is written to, so an edge leaving this cell cannot be reconstructed on the destination. Copying the nodes alone would produce a destination that looks complete and is not"
 	for k, v := range map[string]string{
 		"seeded":      "35",
@@ -319,7 +319,7 @@ func TestFabricFacetqlMoverMatchesRustMover(t *testing.T) {
 
 	src, dst := fqlLiveStart(t), fqlLiveStart(t)
 	ts := fqltApp(t, "fabric_facetql_mover.fct")
-	port := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "copy", src, dst, "fabtok"))
+	port := fqlLiveFields(t, fqltCall(t, ts, "moverOut", "moverRunLive", "copy", src, dst, "fabtok", ""))
 
 	if len(rust) != len(port) {
 		t.Fatalf("rust reported %d fields, port %d:\nrust: %v\nport: %v", len(rust), len(port), rust, port)

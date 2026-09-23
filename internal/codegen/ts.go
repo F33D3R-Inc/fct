@@ -79,8 +79,14 @@ func writeTSField(b *strings.Builder, f ir.WireField, enums map[string]bool) {
 
 func tsFieldType(f ir.WireField, enums map[string]bool) string {
 	t := tsScalar(f.Type, enums)
-	if f.List {
-		t = t + "[]"
+	switch {
+	case f.Map:
+		t = "Record<string, " + t + ">"
+	case f.List:
+		t = t + strings.Repeat("[]", max(f.Depth, 1))
+	}
+	if f.Nullable {
+		t = t + " | null"
 	}
 	return t
 }

@@ -60,11 +60,14 @@ func TestToolchainVersionCoversBuiltins(t *testing.T) {
 		known[n] = parser.SiteEverywhere
 	}
 	for _, n := range strings.Fields(`canonicalJson ecdsaP256Verify ed25519Verify fileDigest floatBits floatFromBits formatIn
-		fromLocal given print randomToken sha256Hex shuffleOrder totpSecret totpValid verifyPassword zoneValid`) {
+		fromLocal given print randomToken sha256Hex shuffleOrder totpSecret totpValid verifyPassword zoneValid
+		u64Cmp u64Min u64Max u64SatSub u64Div u64Rem u64Text u64Parse u64ParseError u64ToFloat`) {
 		known[n] = parser.SiteAuthority
 	}
 	for _, n := range strings.Fields(`accept aesGcmAuthentic aesGcmOpen aesGcmSeal append appendFile bytes bytesToText channel
 		closeConn connError connOpen connect envSet envVar fileExists fileSize httpGet httpPost listen listenOn monoMs nowMs signals
+		awaitAny closeChannel exitProcess processStats listenTls connPeer connectTls
+		closeListener listenError grantRead
 		pollBytes randomBytes readBytes readFile readFileAt readStdin recv removeFile renameFile send setTimeoutMs
 		shutdownConn sleepMs syncFile textToBytes truncateFile writeBytes writeFile writeFileAt writeStderr writeStdout`) {
 		known[n] = parser.SiteProc

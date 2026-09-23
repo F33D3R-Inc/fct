@@ -447,6 +447,50 @@ fn admin_case(line: &str) -> String {
     })
 }
 
+/// tests/mover.rs's loaded-cell sampling with the crate's own poller and
+/// optimizer: `base|token|seconds` -> the hottest profile seen polling every
+/// 500 ms (after a baseline), stopping once one is hot:
+/// `pressure|hot|cpu|queue|write_latency_us|write_ratio|action`.
+fn loaded_poll_case(line: &str) -> String {
+    use fabric_facetql::poller::{PollOutcome, PollTarget, TelemetryPoller};
+    use fabric_facetql::FacetqlEndpoint;
+    use fabric_optimizer::WorkloadOptimizer;
+    use fabric_topology::TopologyRegistry;
+    use fabric_workload::WorkloadProfile;
+
+    let parts: Vec<&str> = line.split('|').collect();
+    let (base, token, seconds) = (parts[0], parts[1], parts[2].parse::<u64>().unwrap());
+    let shard = 9u64;
+    let cell = fabric_core::Coordinate::new(0, 0);
+    let endpoint = FacetqlEndpoint::new(fabric_core::DbmsId::new("loaded-instance"), base, token).unwrap();
+    block_on(async move {
+        let mut poller = TelemetryPoller::new(vec![PollTarget::new(endpoint, shard, cell, "us-east")]).unwrap();
+        poller.poll_once().await;
+        let mut hottest: Option<WorkloadProfile> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            for (_, outcome) in poller.poll_once().await {
+                let PollOutcome::Sampled(batch) = outcome else { continue };
+                for sample in &batch.samples {
+                    let profile = WorkloadProfile::from_metrics(shard, cell, sample.metrics());
+                    if hottest.as_ref().is_none_or(|h| profile.pressure_score > h.pressure_score) {
+                        hottest = Some(profile);
+                    }
+                }
+            }
+            if hottest.as_ref().is_some_and(|p| p.is_hot()) {
+                break;
+            }
+        }
+        let Some(h) = hottest else { return "no sample".to_string() };
+        let mut registry = TopologyRegistry::new();
+        registry.place(fabric_core::DbmsId::new("loaded-instance"), &fabric_core::Shard::new(shard, "us-east"), cell, "us-east");
+        let decision = WorkloadOptimizer::default().optimize(&h, &registry);
+        format!("{}|{}|{}|{}|{}|{}|{:?}", h.pressure_score, h.is_hot(), h.cpu_utilization, h.queue_depth, h.write_latency_us, h.write_ratio, decision.action)
+    })
+}
+
 pub fn run(mode: &str) {
     match mode {
         "daemon-config" => {
@@ -475,6 +519,11 @@ pub fn run(mode: &str) {
             }
         }
         "daemon-control" => crate::daemon_control::run(mode),
+        "daemon-loaded-poll" => {
+            for line in stdin_lines() {
+                println!("{}", loaded_poll_case(&line));
+            }
+        }
         "daemon-admin" => {
             for line in stdin_lines() {
                 println!("{}", admin_case(&line));

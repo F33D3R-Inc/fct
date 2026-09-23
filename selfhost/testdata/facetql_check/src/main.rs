@@ -486,6 +486,40 @@ fn main() {
                 println!("{res}");
             }
         }
+        // fqserver.fct's counterpart: `facetql start`'s server path — the
+        // environment's legacy aliases applied, Database::new over
+        // FACETQL_DATA_DIR, create_router — served over plain HTTP on
+        // 127.0.0.1:FACETQL_PORT until killed.
+        "serve" => {
+            facetql::config::apply_legacy_env_aliases();
+            if let Some(dir) = std::env::var_os("FACETQL_DATA_DIR") {
+                facetql::config::set_data_dir(dir.into());
+            }
+            let port: u16 = std::env::var("FACETQL_PORT").expect("FACETQL_PORT").parse().expect("port");
+            let db = Arc::new(facetql::database::Database::new().expect("open database"));
+            let app = facetql::api::routes::create_router(db);
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            // With FACETQL_TLS_IDENTITY, `facetql start --tls-identity`'s
+            // path: the PKCS#12 identity through native-tls, served by
+            // tls_server::serve_tls.
+            let tls = std::env::var("FACETQL_TLS_IDENTITY").ok().map(|path| {
+                let password = std::env::var("FACETQL_TLS_IDENTITY_PASSWORD").unwrap_or_default();
+                let bytes = std::fs::read(&path).expect("read TLS identity");
+                let identity = native_tls::Identity::from_pkcs12(&bytes, &password).expect("load TLS identity");
+                let acceptor: tokio_native_tls::TlsAcceptor = native_tls::TlsAcceptor::new(identity).expect("TLS acceptor").into();
+                acceptor
+            });
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind");
+                println!("listening");
+                match tls {
+                    Some(acceptor) => {
+                        facetql::tls_server::serve_tls(listener, app, acceptor, std::future::pending::<()>()).await
+                    }
+                    None => axum::serve(listener, app).await.expect("serve"),
+                }
+            });
+        }
         // fqjson.fct's fjCanonText: each stdin line parsed by serde_json,
         // written back, and its encode_order_value bytes.
         "json-canon" => {

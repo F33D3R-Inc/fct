@@ -23,11 +23,11 @@ app FabricPlanCheck:
             i = i + 2
         return out
 
-    proc lbKey(shard: int, x: int, y: int) -> int:
-        let k = do routingKeyPack(shard, x, y)
-        return k
+    proc lbKey(shard: int, x: int, y: int) -> RoutingKey:
+        let r = do routingKeyNew(shard, Coordinate{x: x, y: y})
+        return r.key
 
-    proc lbRule(ks: Keyspace, kind: text, prefix: text, key: int) -> Keyspace:
+    proc lbRule(ks: Keyspace, kind: text, prefix: text, key: RoutingKey) -> Keyspace:
         let r = do keyspaceRuleNew(kind, prefix, key)
         let w = do keyspaceWithRule(ks, r.rule)
         return w.keyspace
@@ -94,7 +94,7 @@ app FabricPlanCheck:
             let mut i = 0
             loop i < len(v.keys):
                 let k = v.keys[i]
-                let kd = do routingKeyPackedDisplay(k.key)
+                let kd = do routingKeyDisplay(k.key)
                 let it = do lbIntent(k.intent)
                 xs = append(xs, kd + "~" + it + "~" + k.origin)
                 i = i + 1
@@ -152,7 +152,7 @@ app FabricPlanCheck:
     proc lbOptKey(o: KeyOption) -> text:
         if !o.has:
             return "None"
-        let d = do routingKeyPackedDisplay(o.key)
+        let d = do routingKeyDisplay(o.key)
         return "Some(\"" + d + "\")"
 
     proc lbPush(t: text, s: text) -> text:
@@ -169,7 +169,7 @@ app FabricPlanCheck:
         loop i < 4:
             let r = do keyspaceRuleNew(kinds[i], prefixes[i], k1)
             if r.ok:
-                let kd = do routingKeyPackedDisplay(r.rule.key)
+                let kd = do routingKeyDisplay(r.rule.key)
                 t = do lbPush(t, "ok:" + r.rule.kind + ":" + r.rule.prefix + ":" + kd)
             else:
                 let e = do keyspaceErrorDisplay(r.err)
@@ -196,7 +196,7 @@ app FabricPlanCheck:
         let mut t = ""
         let mut fb = "None"
         if ks.hasFallback:
-            let d = do routingKeyPackedDisplay(ks.fallbackKey)
+            let d = do routingKeyDisplay(ks.fallbackKey)
             fb = "Some(\"" + d + "\")"
         let sp = do keyspaceSpanningKey(ks)
         let spd = do lbOptKey(sp)
@@ -229,7 +229,7 @@ app FabricPlanCheck:
             loop b < 8:
                 let r = do keyspaceResolve(ks, hasKinds[a], kinds[a], hasAddrs[b], addrs[b])
                 if r.ok:
-                    let d = do routingKeyPackedDisplay(r.key)
+                    let d = do routingKeyDisplay(r.key)
                     t = do lbPush(t, "ok:" + d)
                 else:
                     let m = do keyspaceMissDisplay(r.miss)
@@ -238,6 +238,73 @@ app FabricPlanCheck:
             a = a + 1
         return t
 
+    # Routing keys whose shard id * 156 passes i64::MAX (keyspace_rust.tsv's
+    # bigKeyspace).
+    proc lbBigKeyspace() -> text:
+        let k1 = do lbKey(59128823989521000, 11, 12)
+        let k2 = do lbKey(118248359446856099, 5, 1)
+        let e = do keyspaceNew()
+        let a = do lbRule(e, "Post", "Post:", k1)
+        let b = do lbRule(a, "User", "User:", k2)
+        let ks = do keyspaceWithFallback(b, k2)
+        let hasK = [true, false, true, false]
+        let kinds = ["Post", "", "Post", ""]
+        let hasA = [false, true, true, true]
+        let addrs = ["", "User:1", "User:1", "Nope:1"]
+        let mut t = ""
+        let mut i = 0
+        loop i < 4:
+            let r = do keyspaceResolve(ks, hasK[i], kinds[i], hasA[i], addrs[i])
+            if r.ok:
+                let d = do routingKeyDisplay(r.key)
+                t = do lbPush(t, "ok:" + d)
+            else:
+                let m = do keyspaceMissDisplay(r.miss)
+                t = do lbPush(t, "miss:" + m)
+            i = i + 1
+        let sp = do keyspaceSpanningKey(ks)
+        let spd = do lbOptKey(sp)
+        t = do lbPush(t, spd)
+        return t
+
+    # Keys a packed shard * 156 + index form could not tell apart (shard 1
+    # and 1 + 2^62 pack identically mod 2^64) or hold (u64::MAX)
+    # (keyspace_rust.tsv's wideKeyspace).
+    proc lbWideKeyspace() -> text:
+        let lo = do lbKey(1, 0, 0)
+        let hi = do lbKey(4611686018427387905, 0, 0)
+        let top = do lbKey(-1, 11, 12)
+        let e = do keyspaceNew()
+        let a = do lbRule(e, "Post", "Post:", lo)
+        let b = do lbRule(a, "User", "User:", hi)
+        let c = do lbRule(b, "Max", "Max:", top)
+        let ks = do keyspaceWithFallback(c, top)
+        let hasK = [true, true, true, false, true, false]
+        let kinds = ["Post", "Post", "User", "", "Max", ""]
+        let hasA = [true, true, false, true, true, true]
+        let addrs = ["User:1", "Post:1", "", "Max:9", "User:2", "Nope:1"]
+        let mut t = ""
+        let mut i = 0
+        loop i < 6:
+            let r = do keyspaceResolve(ks, hasK[i], kinds[i], hasA[i], addrs[i])
+            if r.ok:
+                let d = do routingKeyDisplay(r.key)
+                t = do lbPush(t, "ok:" + d)
+            else:
+                let m = do keyspaceMissDisplay(r.miss)
+                t = do lbPush(t, "miss:" + m)
+            i = i + 1
+        let sp = do keyspaceSpanningKey(ks)
+        let spd = do lbOptKey(sp)
+        t = do lbPush(t, spd)
+        let single = do keyspaceSingle(top)
+        let sp2 = do keyspaceSpanningKey(single)
+        let spd2 = do lbOptKey(sp2)
+        t = do lbPush(t, spd2)
+        return t
+
+    state bigKeyspace: text = ""
+    state wideKeyspace: text = ""
     state ksBuild: text = ""
     state ksResolve0: text = ""
     state ksResolve1: text = ""
@@ -254,6 +321,8 @@ app FabricPlanCheck:
         let r3 = do lbResolveAll(3)
         let r4 = do lbResolveAll(4)
         let r5 = do lbResolveAll(5)
+        let big = do lbBigKeyspace()
+        let wide = do lbWideKeyspace()
         ksBuild = a
         ksResolve0 = r0
         ksResolve1 = r1
@@ -261,3 +330,5 @@ app FabricPlanCheck:
         ksResolve3 = r3
         ksResolve4 = r4
         ksResolve5 = r5
+        bigKeyspace = big
+        wideKeyspace = wide

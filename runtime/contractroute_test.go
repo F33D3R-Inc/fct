@@ -246,7 +246,7 @@ func TestBearerAuthRoute(t *testing.T) {
 		t.Fatalf("good token = %d %v", code, body)
 	}
 	op := buildContract(g, 0)["paths"].(map[string]map[string]any)["/api/v2/dev/who"]["get"].(map[string]any)
-	if op["x-auth"] != "dev_token" || op["parameters"] != nil || op["security"] == nil {
+	if ps, _ := op["parameters"].([]map[string]any); op["x-auth"] != "dev_token" || len(ps) != 0 || op["security"] == nil {
 		t.Fatalf("contract op = %v", op)
 	}
 	bad := strings.Replace(src, "    action devWho(access_token: text) -> WhoDTO:\n", "    policy member:\n        actor != \"guest\"\n    action devWho(access_token: text) -> WhoDTO:\n        requires member\n", 1)
